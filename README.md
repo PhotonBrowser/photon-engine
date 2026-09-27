@@ -1,54 +1,28 @@
-# Ladybird
+# Photon Engine
 
-[Ladybird](https://ladybird.org) is a truly independent web browser, using a novel engine based on web standards.
+Photon Engine is the web engine used by the Photon browser. It is derived from [Ladybird](https://github.com/LadybirdBrowser/ladybird) and is actively maintained as a downstream repository. Photon-specific changes include engine integration, embedding APIs, rendering and web-platform work, performance fixes, services and tests.
 
-> [!IMPORTANT]
-> Ladybird is in a pre-alpha state, and only suitable for use by developers
->
+## Relationship to Ladybird
 
-## Features
+The Git remote named `upstream` should point to `https://github.com/LadybirdBrowser/ladybird.git`. Photon Engine retains Ladybird's BSD-2-Clause license, copyright notices and attribution. This repository does not claim authorship of the inherited engine.
 
-We aim to build a complete, usable browser for the modern web.
+Maintainers regularly merge Ladybird's `master` branch into the current Photon Engine branch:
 
-Ladybird uses a multi-process architecture with a main UI process, several WebContent renderer processes,
-an ImageDecoder process, and a RequestServer process.
+```sh
+git fetch upstream
+git merge upstream/master
+```
 
-Image decoding and network connections are done out of process to be more robust against malicious content.
-Each tab has its own renderer process, which is sandboxed from the rest of the system.
+Resolve conflicts in Photon Engine, validate the engine changes, then update the exact `Engine/` submodule commit in `PhotonBrowser/photon`. Do not merge Ladybird directly into the browser repository. Photon Engine is a normal maintained Git repository; it does not use a patch series or source-copy workflow.
 
-At the moment, many core library support components are inherited from SerenityOS:
+## Architecture
 
-- LibWeb: Web rendering engine
-- LibJS: JavaScript engine
-- LibWasm: WebAssembly implementation
-- LibCrypto/LibTLS: Cryptography primitives and Transport Layer Security
-- LibHTTP: HTTP/1.1 client
-- LibGfx: 2D Graphics Library, Image Decoding and Rendering
-- LibUnicode: Unicode and locale support
-- LibMedia: Audio and video playback
-- LibCore: Event loop, OS abstraction layer
-- LibIPC: Inter-process communication
+The engine repository contains the Ladybird-derived libraries (`LibWeb`, `LibJS`, `LibGfx`, `LibWebView` and supporting libraries), out-of-process services such as `WebContent`, `RequestServer`, `ImageDecoder` and `Compositor`, engine tests, Web Platform Tests and development utilities. Photon browser state and its Qt Quick/QML UI belong in `PhotonBrowser/photon`.
 
-## How do I build and run this?
+The CMake option `ENABLE_PHOTON_EMBEDDER=ON` builds engine libraries and services while `ENABLE_LADYBIRD_UI=OFF` omits Ladybird's browser application and UI tests. The named `LibPhotonEmbedder` target is currently a boundary scaffold; the stable runtime/view/presentation API remains to be implemented before Photon can navigate through the engine.
 
-See [build instructions](Documentation/BuildInstructionsLadybird.md) for information on how to build Ladybird.
+## Build
 
-Ladybird runs on Linux, macOS, Windows (with WSL2), and many other \*Nixes.
+For the integrated developer workflow, clone `PhotonBrowser/photon` with submodules and run `./photon setup`, `./photon build` and `./photon run`. The CLI keeps CMake, vcpkg and application build output under the browser repository's ignored `build/` directory.
 
-## How do I read the documentation?
-
-Code-related documentation can be found in the [documentation](Documentation/) folder.
-
-## Get in touch and participate!
-
-Join [our Discord server](https://discord.gg/nvfjVJ4Svh) to participate in issue and development discussions.
-
-Please read [Getting involved with Ladybird](Documentation/GettingStartedContributing.md) if you're new to Ladybird and want to help.
-
-Before opening an issue, please see the [issue policy](CONTRIBUTING.md#issue-policy) and the [detailed issue-reporting guidelines](ISSUES.md).
-
-The project participation guidelines can be found in [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## License
-
-Ladybird is licensed under a 2-clause BSD license.
+Photon Engine keeps upstream build documentation in `Documentation/BuildInstructionsLadybird.md`. For contribution and licensing details, see [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`LICENSE`](LICENSE).

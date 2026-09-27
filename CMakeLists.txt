@@ -48,6 +48,9 @@ set(LADYBIRD_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LADYBIRD_SOURCE_DIR}/Meta/CMake")
 
 include(cmake_options)
+if (ENABLE_PHOTON_EMBEDDER)
+    set(ENABLE_GUI_TARGETS ON CACHE BOOL "Enable engine libraries required by Photon" FORCE)
+endif()
 include(compile_options)
 include(check_for_dependencies)
 include(ladybird_helper_processes)
@@ -137,8 +140,16 @@ if (NOT (ENABLE_FUZZERS OR ENABLE_COMPILER_EXPLORER_BUILD OR ANDROID OR IOS))
     endif()
 endif()
 
-if (ENABLE_GUI_TARGETS)
+if (ENABLE_GUI_TARGETS OR ENABLE_PHOTON_EMBEDDER)
     add_subdirectory(Services)
+endif()
+
+if (ENABLE_PHOTON_EMBEDDER)
+    set_helper_process_properties(${ladybird_helper_processes})
+    set_helper_process_properties(WebDriver)
+endif()
+
+if (ENABLE_GUI_TARGETS AND ENABLE_LADYBIRD_UI)
     add_subdirectory(UI)
 endif()
 

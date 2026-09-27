@@ -1,0 +1,61 @@
+name: Photon Engine
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-engine-services:
+    name: Linux engine and services without Ladybird UI
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.08.28
+
+    env:
+      VCPKG_ROOT: ${{ runner.temp }}/vcpkg-debug
+      LADYBIRD_MAIN_SOURCE_DIR: ${{ runner.temp }}/photon-engine-build
+      PHOTON_ENGINE_BUILD_DIR: ${{ runner.temp }}/photon-engine-build/engine-debug
+      VCPKG_MAX_CONCURRENCY: 2
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Bootstrap the pinned vcpkg tool
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path("Meta").resolve()))
+          from Utils.build_vcpkg import build_vcpkg
+
+          build_vcpkg(Path(os.environ["VCPKG_ROOT"]))
+          PY
+
+      - name: Configure Photon Engine
+        run: >-
+          cmake -S . -B "$PHOTON_ENGINE_BUILD_DIR" -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DLADYBIRD_VCPKG_TYPE=debug
+          -DENABLE_PHOTON_EMBEDDER=ON
+          -DENABLE_LADYBIRD_UI=OFF
+          -DENABLE_CRANELIFT_JIT=OFF
+          -DPHOTON_HELPER_PROCESS_DIR="$RUNNER_TEMP/photon-engine-build/bin"
+
+      - name: Build Photon Engine and helper processes
+        run: >-
+          cmake --build "$PHOTON_ENGINE_BUILD_DIR" --parallel 2
+          --target WebContent RequestServer ImageDecoder Compositor MediaServer WebWorker
+
+      - name: Check patch whitespace
+        run: git diff --check

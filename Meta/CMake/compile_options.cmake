@@ -135,6 +135,11 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
     # FIXME: This warning seems useful but has too many false positives with GCC 13.
     add_cxx_compile_options(-Wno-dangling-reference)
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16")
+        # GCC 16 diagnoses the interpreter's intentional tail-call dispatch as
+        # a possible escaping local address. Keep other warnings fatal.
+        add_cxx_compile_options(-Wno-error=maybe-musttail-local-addr)
+    endif()
 elseif (MSVC)
     # Warning options and defines
     add_cxx_compile_options(/W4)

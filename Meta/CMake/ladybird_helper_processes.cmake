@@ -16,6 +16,21 @@ if (APPLE)
     list(APPEND ladybird_helper_processes ProcessReaper)
 endif()
 
+function(set_helper_process_properties)
+    set(targets ${ARGV})
+    if (ENABLE_PHOTON_EMBEDDER AND PHOTON_HELPER_PROCESS_DIR)
+        set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PHOTON_HELPER_PROCESS_DIR}")
+    elseif (APPLE OR WIN32)
+        if (TARGET ladybird)
+            set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:ladybird>")
+        else()
+            set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+        endif()
+    else()
+        set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${IN_BUILD_PREFIX}${CMAKE_INSTALL_LIBEXECDIR}")
+    endif()
+endfunction()
+
 # On macOS, helpers run with the hardened runtime, so the kernel refuses to run code from memory that was writable, except
 # in the MAP_JIT regions where the renderers put the WebAssembly code that Cranelift compiles. Library validation stays
 # off, since development builds sign their libraries ad hoc, without a team identifier. Every build of the helper signs

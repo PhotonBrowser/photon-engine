@@ -1,7 +1,7 @@
 ladybird_utility(js SOURCES js.cpp LIBS LibCrypto LibJS LibMain LibTextCodec LibGC)
 ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibMain LibJS LibCrypto LibGC)
 
-if (NOT WIN32 AND NOT ANDROID)
+if (NOT WIN32 AND NOT ANDROID AND LIBEDIT_FOUND)
     target_link_libraries(js PRIVATE PkgConfig::LIBEDIT)
 endif()
 

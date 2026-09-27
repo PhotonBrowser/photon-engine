@@ -40,6 +40,10 @@ if (ENABLE_GUI_TARGETS)
     add_subdirectory(LibWebView)
 endif()
 
+if (ENABLE_PHOTON_EMBEDDER)
+    add_subdirectory(LibPhotonEmbedder)
+endif()
+
 # FIXME: Increase support for building targets on Windows
 if (WIN32)
     return()

@@ -1,14 +1,14 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Join our Discord server
+  - name: Ladybird upstream Discord
     url: https://discord.gg/nvfjVJ4Svh
-    about: Chat with the Ladybird maintainers and contributors and other users.
-  - name: Read our FAQ
+    about: Chat with Ladybird upstream maintainers and contributors.
+  - name: Ladybird upstream FAQ
     url: https://github.com/LadybirdBrowser/ladybird/blob/master/Documentation/FAQ.md
-    about: Read answers for some of the most frequently-asked questions about Ladybird.
-  - name: Read our documentation
+    about: Read the Ladybird upstream FAQ.
+  - name: Ladybird upstream documentation
     url: https://github.com/LadybirdBrowser/ladybird/blob/master/Documentation/README.md
-    about: Read the docs about building Ladybird, and about configuring your Ladybird development environment.
-  - name: Get involved with Ladybird
+    about: Read Ladybird upstream build and development documentation.
+  - name: Ladybird upstream contribution guidelines
     url: https://github.com/LadybirdBrowser/ladybird/blob/master/CONTRIBUTING.md
-    about: Read the project participation guidelines.
+    about: Read the Ladybird upstream participation guidelines.

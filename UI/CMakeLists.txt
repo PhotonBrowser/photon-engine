@@ -73,16 +73,6 @@ if(WIN32)
     target_link_libraries(${LADYBIRD_TARGET} LibDevTools)
 endif()
 
-function(set_helper_process_properties)
-    set(targets ${ARGV})
-    if (APPLE OR WIN32)
-        # Store helper processes in the same bundle directory as the main application
-        set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:ladybird>")
-    else()
-        set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${IN_BUILD_PREFIX}${CMAKE_INSTALL_LIBEXECDIR}")
-    endif()
-endfunction()
-
 add_custom_target(run
     COMMAND "${CMAKE_COMMAND}" -E env "LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}" "$<TARGET_FILE:ladybird>" $ENV{LAGOM_ARGS}
     USES_TERMINAL

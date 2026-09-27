@@ -77,7 +77,7 @@ if (NOT WIN32)
     add_test(NAME Flap COMMAND ${flap_test_command})
 endif()
 
-if (ENABLE_GUI_TARGETS)
+if (ENABLE_GUI_TARGETS AND ENABLE_LADYBIRD_UI)
     add_subdirectory(Compositor)
     add_subdirectory(LibCompositing)
     add_subdirectory(LibDevTools)

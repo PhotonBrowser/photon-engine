@@ -3,7 +3,11 @@ include_guard()
 find_package(PkgConfig REQUIRED)
 
 if (NOT WIN32 AND NOT ANDROID)
-    pkg_check_modules(LIBEDIT REQUIRED IMPORTED_TARGET libedit)
+    if (ENABLE_PHOTON_EMBEDDER)
+        set(LIBEDIT_FOUND FALSE)
+    else()
+        pkg_check_modules(LIBEDIT REQUIRED IMPORTED_TARGET libedit)
+    endif()
 endif()
 
 find_package(mimalloc CONFIG REQUIRED)

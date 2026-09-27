@@ -1,4 +1,6 @@
-# Participating in Ladybird
+# Participating in Photon Engine
+
+This document carries forward Ladybird upstream participation guidance. Photon Engine is maintained in the PhotonBrowser organization; repository-specific engine workflow is described in the downstream section below.
 
 Ladybird is developed by a group of project maintainers, who introduce all changes to the codebase. We do not accept
 pull requests from non-maintainers and do not allow code change proposals through any other route.
@@ -58,3 +60,7 @@ We encourage everyone to share their personal views and opinions outside project
 We reserve the right to reject issues and other interactions that appear to be motivated by bad faith.
 
 Additionally, anyone found participating in social media brigading of Ladybird will be permanently banned from the project.
+
+## Photon Engine downstream workflow
+
+This repository is Photon Engine, a maintained downstream of Ladybird. Keep changes focused so they remain mergeable from `upstream/master`. Photon browser UI and application state belong in `PhotonBrowser/photon`; engine, service, web-platform, performance and embedding changes belong here. The browser repository pins an exact engine commit through its `Engine/` submodule. Do not merge upstream into the browser repository.

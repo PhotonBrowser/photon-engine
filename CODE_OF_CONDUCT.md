@@ -1,4 +1,4 @@
-The Ladybird code of conduct is derived from [The Ruby Community Conduct Guideline](https://www.ruby-lang.org/en/conduct/).
+Photon Engine follows these conduct guidelines, carried forward from its Ladybird ancestry and derived from [The Ruby Community Conduct Guideline](https://www.ruby-lang.org/en/conduct/).
 
 - Participants will be tolerant of opposing views.
 - Participants must ensure that their language and actions are free of personal attacks and disparaging personal remarks.
