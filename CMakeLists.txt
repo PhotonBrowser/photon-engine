@@ -145,6 +145,7 @@ if (ENABLE_GUI_TARGETS OR ENABLE_PHOTON_EMBEDDER)
 endif()
 
 if (ENABLE_PHOTON_EMBEDDER)
+    include(Meta/CMake/photon_resources.cmake)
     set_helper_process_properties(${ladybird_helper_processes})
     set_helper_process_properties(WebDriver)
 endif()

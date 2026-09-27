@@ -1,6 +1,8 @@
-# Photon-owned public boundary. Runtime and view operations are introduced as
-# they become usable by the Qt Quick presentation integration.
-add_library(LibPhotonEmbedder INTERFACE)
+set(SOURCES PhotonEmbedder.cpp)
+ladybird_lib(LibPhotonEmbedder photonembedder EXPLICIT_SYMBOL_EXPORT)
 add_library(Photon::Embedder ALIAS LibPhotonEmbedder)
-target_include_directories(LibPhotonEmbedder INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_features(LibPhotonEmbedder INTERFACE cxx_std_20)
+target_include_directories(LibPhotonEmbedder PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/Libraries>
+)
+target_link_libraries(LibPhotonEmbedder PRIVATE LibWebView LibWeb LibIPC LibGfx LibCore LibURL LibCompositing LibMain)
