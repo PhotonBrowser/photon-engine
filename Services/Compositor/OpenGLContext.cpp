@@ -147,7 +147,10 @@ static EGLConfig get_egl_config(EGLDisplay display)
 OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, WebGLVersion webgl_version, [[maybe_unused]] DrawingBufferOptions drawing_buffer_options)
 {
 #ifdef ENABLE_WEBGL
-#    if defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
+#    if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID) && !defined(USE_VULKAN_DMABUF_IMAGES)
+    // Skia's Vulkan context may exist even when ANGLE cannot share a DMABUF with it.
+    bool use_cpu_painting_surface = true;
+#    elif defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
     bool use_cpu_painting_surface = !skia_backend_context;
 #    elif defined(AK_OS_WINDOWS)
     // FIXME: Share the drawing buffer with Skia's Direct3D 12 device (via an NT shared handle opened on ANGLE's
