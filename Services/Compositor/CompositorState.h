@@ -211,6 +211,7 @@ private:
 
     // LUID of the GPU adapter the client can present shared GPU textures on, if any.
     Optional<u64> m_client_gpu_presentation_adapter_luid;
+    Optional<bool> m_client_gpu_presentation_supported;
 
     struct VideoSinkState {
         RefPtr<Media::DisplayingVideoSink> sink;

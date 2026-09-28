@@ -1010,6 +1010,10 @@ void CompositorState::resize_backing_stores_if_needed(Compositing::CompositorCon
 
 BackingStoreManager::GpuSharing CompositorState::gpu_sharing_for_client() const
 {
+#ifdef USE_VULKAN_DMABUF_IMAGES
+    if (m_client_gpu_presentation_supported.has_value() && !*m_client_gpu_presentation_supported)
+        return BackingStoreManager::GpuSharing::Disallowed;
+#endif
 #ifdef USE_DIRECTX
     // Shared Direct3D textures can only be opened by the client if it presents on the same adapter.
     if (!m_skia_backend_context || m_client_gpu_presentation_adapter_luid != m_skia_backend_context->direct3d_context().adapter_luid())
@@ -1020,11 +1024,13 @@ BackingStoreManager::GpuSharing CompositorState::gpu_sharing_for_client() const
 
 void CompositorState::set_client_gpu_presentation_capability(bool supported, u64 adapter_luid)
 {
+    Optional<bool> new_supported = supported;
     Optional<u64> new_adapter_luid;
     if (supported)
         new_adapter_luid = adapter_luid;
-    if (m_client_gpu_presentation_adapter_luid == new_adapter_luid)
+    if (m_client_gpu_presentation_supported == new_supported && m_client_gpu_presentation_adapter_luid == new_adapter_luid)
         return;
+    m_client_gpu_presentation_supported = new_supported;
     m_client_gpu_presentation_adapter_luid = new_adapter_luid;
 
     // Reallocate the backing stores of every presenting context so they match the new capability.
