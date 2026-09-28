@@ -202,13 +202,32 @@ fn paint_background_layers<O: Observer>(
             ForceDarkRole::Background,
         );
     } else {
-        recorder.recorder.fill_animated_background_color(
-            converter.rounded_device_rect(color_box.rect),
-            color,
-            color_box.radii.as_corners(&converter),
-            background_color_animation_effect,
-            ForceDarkRole::Background,
-        );
+        let device_rect = converter.rounded_device_rect(color_box.rect);
+        // Shaped (`corner-shape`) backgrounds paint as a superellipse path.
+        // Compositor-animated background colors have no path equivalent, so
+        // those keep the elliptical fast path.
+        if background_color_animation_effect.is_none()
+            && let Some(path) = color_box.radii.shaped_path(device_rect, &converter)
+        {
+            recorder
+                .recorder
+                .fill_path(crate::painting::display_list::recorder::FillPathParams {
+                    force_dark_role: ForceDarkRole::Background,
+                    path: &path,
+                    opacity: 1.0,
+                    paint_style_or_color: crate::painting::display_list::recorder::PaintStyleOrColor::Color(color),
+                    winding_rule: libgfx_rust::WindingRule::Nonzero,
+                    should_anti_alias: libgfx_rust::ShouldAntiAlias::Yes,
+                });
+        } else {
+            recorder.recorder.fill_animated_background_color(
+                device_rect,
+                color,
+                color_box.radii.as_corners(&converter),
+                background_color_animation_effect,
+                ForceDarkRole::Background,
+            );
+        }
     }
 
     // Shrink the effective clip rect to account for the bits the borders will definitely paint
@@ -325,13 +344,20 @@ fn paint_background_layers<O: Observer>(
             paint_layer(recorder);
         } else {
             let unshrunken_clip_float_rect = unshrunken_clip_rect.to_float();
-            let corner_radii = clip_box.radii.corners_unconditionally(&converter);
             let mut layer_inline_clips = Vec::new();
-            if corner_radii.has_any_radius() {
-                layer_inline_clips.push(PendingInlineClip::intersecting_rounded_rect(
-                    unshrunken_clip_float_rect,
-                    corner_radii,
+            if let Some(path) = clip_box.radii.shaped_path(unshrunken_clip_rect, &converter) {
+                layer_inline_clips.push(PendingInlineClip::intersecting_path(
+                    &path,
+                    libgfx_rust::WindingRule::Nonzero,
                 ));
+            } else {
+                let corner_radii = clip_box.radii.corners_unconditionally(&converter);
+                if corner_radii.has_any_radius() {
+                    layer_inline_clips.push(PendingInlineClip::intersecting_rounded_rect(
+                        unshrunken_clip_float_rect,
+                        corner_radii,
+                    ));
+                }
             }
             layer_inline_clips.push(PendingInlineClip::intersecting_float_rect(unshrunken_clip_float_rect));
             recorder.record_with_inline_clips(&layer_inline_clips, paint_layer);

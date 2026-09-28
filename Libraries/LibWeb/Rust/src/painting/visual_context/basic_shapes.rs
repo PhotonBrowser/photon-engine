@@ -308,6 +308,7 @@ fn inset_to_path(
             super::node_values::border_radius_pair_of_value(bottom_right.data()),
             super::node_values::border_radius_pair_of_value(bottom_left.data()),
         ],
+        crate::painting::border_radii::ROUND_CORNER_SHAPES,
     );
 
     if !radii.has_any_radius() {

@@ -112,9 +112,26 @@ pub(crate) fn paint_outline<O: Observer>(
         ForceDarkRole::Border
     };
     let borders_data = outline_borders_data(outline.geometry, Color(outline.color), force_dark_role, &converter);
+    let device_rect = converter.rounded_device_rect(borders_rect);
+    // Shaped outlines follow the superellipse ring like borders do; outlines
+    // are always uniform, so a shaped outline never falls back.
+    if border_radius_data.has_shaped_corners() {
+        let width = outline.geometry.width;
+        let painted = crate::painting::record::paint::border::paint_shaped_uniform_borders(
+            &mut recorder.recorder,
+            device_rect,
+            &border_radius_data,
+            [width, width, width, width],
+            &borders_data,
+            &converter,
+        );
+        if painted {
+            return;
+        }
+    }
     paint_all_borders(
         &mut recorder.recorder,
-        converter.rounded_device_rect(borders_rect),
+        device_rect,
         border_radius_data.as_corners(&converter),
         &borders_data,
     );

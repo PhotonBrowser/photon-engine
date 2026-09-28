@@ -1453,10 +1453,171 @@ pub(crate) fn paint_box_borders<O: Observer>(
         return;
     }
     let converter = recorder.converter;
+    let border_rect = converter.rounded_device_rect(border_box_rect);
+    // Shaped (`corner-shape`) borders paint as superellipse rings. Uniform
+    // borders (the common case, including outlines) take this path; patterned
+    // or multi-color shaped borders fall through to the elliptical painter.
+    if border_radii.has_shaped_corners()
+        && paint_shaped_uniform_borders(
+            &mut recorder.recorder,
+            border_rect,
+            &border_radii,
+            css_border_widths,
+            borders_data,
+            &converter,
+        )
+    {
+        return;
+    }
     paint_all_borders(
         &mut recorder.recorder,
-        converter.rounded_device_rect(border_box_rect),
+        border_rect,
         border_radii.as_corners(&converter),
         borders_data,
     );
+}
+
+/// Paint a uniform shaped border as a superellipse ring path. Returns false
+/// when the border is not uniformly colored (the caller falls back to the
+/// elliptical painter).
+pub(crate) fn paint_shaped_uniform_borders(
+    painter: &mut DisplayListRecorder,
+    border_rect: IntRect,
+    border_radii: &crate::painting::border_radii::BorderRadii,
+    css_border_widths: [CssPixels; 4],
+    borders_data: &BordersDataDevicePixels,
+    converter: &DevicePixelConverter,
+) -> bool {
+    let Some(uniform) = uniform_solid_border(borders_data) else {
+        return false;
+    };
+    let widths = [
+        borders_data.top.width,
+        borders_data.right.width,
+        borders_data.bottom.width,
+        borders_data.left.width,
+    ];
+    if uniform.double {
+        // Two third-width rings with a gap, mirroring the elliptical painter.
+        let line_widths = widths.map(|width| split_line_width(width, 1.0 / 3.0));
+        fill_shaped_ring(
+            painter,
+            border_rect,
+            border_radii,
+            line_widths,
+            uniform.color,
+            borders_data.force_dark_role,
+            converter,
+        );
+        let [top_inset, right_inset, bottom_inset, left_inset]: [i32; 4] =
+            std::array::from_fn(|edge| widths[edge] - line_widths[edge]);
+        let [top_css, right_css, bottom_css, left_css] = css_border_widths;
+        let zero = CssPixels::from_raw(0);
+        let scale = converter.device_pixels_per_css_pixel();
+        let to_css_gap =
+            |width: CssPixels, line: i32| (width - CssPixels::nearest_value_for(line as f64 / scale)).max(zero);
+        let inner_radii = border_radii.shrunken(
+            to_css_gap(top_css, line_widths[0]),
+            to_css_gap(right_css, line_widths[1]),
+            to_css_gap(bottom_css, line_widths[2]),
+            to_css_gap(left_css, line_widths[3]),
+        );
+        fill_shaped_ring(
+            painter,
+            border_rect.shrunken(top_inset, right_inset, bottom_inset, left_inset),
+            &inner_radii,
+            line_widths,
+            uniform.color,
+            borders_data.force_dark_role,
+            converter,
+        );
+        return true;
+    }
+    fill_shaped_ring(
+        painter,
+        border_rect,
+        border_radii,
+        widths,
+        uniform.color,
+        borders_data.force_dark_role,
+        converter,
+    );
+    true
+}
+
+/// Fill the ring between the shaped `border_rect` and the same rect shrunk by
+/// `edge_widths` (device pixels, top/right/bottom/left). The inner radii pull
+/// in by the matching widths, mirroring the elliptical ring.
+fn fill_shaped_ring(
+    painter: &mut DisplayListRecorder,
+    border_rect: IntRect,
+    border_radii: &crate::painting::border_radii::BorderRadii,
+    edge_widths: [i32; 4],
+    color: Color,
+    force_dark_role: ForceDarkRole,
+    converter: &DevicePixelConverter,
+) {
+    use crate::painting::corner_shapes::append_shaped_rect;
+    use libgfx_rust::path::PathBuilder;
+
+    let [top_width, right_width, bottom_width, left_width] = edge_widths;
+    if border_rect.is_empty() || edge_widths.iter().all(|width| *width <= 0) {
+        return;
+    }
+    let scale = converter.device_pixels_per_css_pixel();
+    let outer_rect = libgfx_rust::FloatRect::new(
+        border_rect.x as f32,
+        border_rect.y as f32,
+        border_rect.width as f32,
+        border_rect.height as f32,
+    );
+    let mut builder = PathBuilder::new();
+    append_shaped_rect(
+        &mut builder,
+        outer_rect,
+        border_radii.to_device_floats(converter),
+        border_radii.shapes,
+    );
+    let inner_rect = border_rect.shrunken(top_width, right_width, bottom_width, left_width);
+    if !inner_rect.is_empty() {
+        // The inner radii pull in by the adjacent edge widths, matching how
+        // the elliptical ring derives its inner outline.
+        let to_css = |device: i32| CssPixels::nearest_value_for(device as f64 / scale);
+        let inner_radii_css = border_radii.shrunken(
+            to_css(top_width),
+            to_css(right_width),
+            to_css(bottom_width),
+            to_css(left_width),
+        );
+        append_shaped_rect(
+            &mut builder,
+            libgfx_rust::FloatRect::new(
+                inner_rect.x as f32,
+                inner_rect.y as f32,
+                inner_rect.width as f32,
+                inner_rect.height as f32,
+            ),
+            inner_radii_css.to_device_floats(converter),
+            border_radii.shapes,
+        );
+        let path = builder.build();
+        painter.fill_path(FillPathParams {
+            force_dark_role,
+            path: &path,
+            opacity: 1.0,
+            paint_style_or_color: PaintStyleOrColor::Color(color),
+            winding_rule: WindingRule::EvenOdd,
+            should_anti_alias: ShouldAntiAlias::Yes,
+        });
+    } else {
+        let path = builder.build();
+        painter.fill_path(FillPathParams {
+            force_dark_role,
+            path: &path,
+            opacity: 1.0,
+            paint_style_or_color: PaintStyleOrColor::Color(color),
+            winding_rule: WindingRule::Nonzero,
+            should_anti_alias: ShouldAntiAlias::Yes,
+        });
+    }
 }

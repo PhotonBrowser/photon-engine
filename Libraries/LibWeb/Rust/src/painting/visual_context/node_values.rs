@@ -349,6 +349,16 @@ fn border_radius_is_initial(handle: &ComputedStyleValueHandle) -> bool {
     is_zero_px(horizontal_radius.data()) && is_zero_px(vertical_radius.data())
 }
 
+fn corner_shapes(style: ComputedValuesView<'_>) -> [f64; 4] {
+    let border = style.border();
+    [
+        border.corner_top_left_shape,
+        border.corner_top_right_shape,
+        border.corner_bottom_right_shape,
+        border.corner_bottom_left_shape,
+    ]
+}
+
 pub(crate) fn border_radii_data(
     style: ComputedValuesView<'_>,
     layout_arena: &impl PaintableRowsRead,
@@ -378,6 +388,7 @@ pub(crate) fn border_radii_data(
             border_radius_pair(&border.border_bottom_right_radius),
             border_radius_pair(&border.border_bottom_left_radius),
         ],
+        corner_shapes(style),
     )
 }
 
@@ -422,6 +433,7 @@ pub(crate) fn piece_border_radii_data(
             border_radius_pair(&border.border_bottom_right_radius),
             border_radius_pair(&border.border_bottom_left_radius),
         ],
+        corner_shapes(style),
     );
     // A corner only keeps its radius when the fragment piece retains both of the box's edges
     // meeting there; corners cut by fragmentation are square.
