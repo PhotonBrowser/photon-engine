@@ -74,6 +74,8 @@ enum class Key : uint16_t {
     Y = 'Y', Z = 'Z', F1 = 0x70, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12
 };
 
+enum class PreferredColorScheme : uint8_t { Auto, Dark, Light };
+
 class View;
 
 class PHOTONEMBEDDER_API Runtime {
@@ -106,12 +108,14 @@ public:
 
     void navigate(std::string const&);
     void reload();
+    void stop_loading();
     void go_back();
     void go_forward();
     void resize(int logical_width, int logical_height, double device_pixel_ratio);
     void set_focus(bool);
     void send_pointer_event(PointerEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);
+    void set_preferred_color_scheme(PreferredColorScheme);
     void shutdown();
 
 private:

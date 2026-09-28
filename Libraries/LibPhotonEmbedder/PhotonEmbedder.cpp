@@ -7,11 +7,13 @@
 #include <LibCompositing/KeyCode.h>
 #include <LibCompositing/MouseButton.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
 #include <LibURL/Parser.h>
+#include <LibWeb/CSS/PreferredColorScheme.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/HeadlessWebView.h>
@@ -58,6 +60,9 @@ public:
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
         auto view = adopt_own(*new PhotonHeadlessWebView(theme.release_value(), { physical_width, physical_height }, dpr, move(callbacks)));
+        // Qt Quick currently samples owned CPU frames; it cannot yet import
+        // the compositor's Vulkan DMA-BUF images with safe synchronization.
+        Application::the().notify_compositor_gpu_presentation_unavailable();
         view->initialize_client(CreateNewClient::Yes);
         view->notify_state();
         return view;
@@ -107,6 +112,23 @@ private:
         on_url_change = [this](URL::URL const&) { notify_state(); };
         on_title_change = [this](Utf16String const&) { notify_state(); };
         on_loading_state_change = [this](bool) { notify_state(); };
+        on_load_start = [this] {
+            m_initial_navigation_pending = true;
+            m_waiting_for_post_load_paint = false;
+            if (m_initial_paint_fallback_timer)
+                m_initial_paint_fallback_timer->stop();
+        };
+        on_load_finish = [this](URL::URL const&) {
+            m_waiting_for_post_load_paint = true;
+            m_initial_paint_fallback_timer = Core::Timer::create_single_shot(50, [weak_this = make_weak_ptr<PhotonHeadlessWebView>()] {
+                if (!weak_this)
+                    return;
+                weak_this->m_initial_navigation_pending = false;
+                weak_this->m_waiting_for_post_load_paint = false;
+                weak_this->present_pending_initial_frame();
+            });
+            m_initial_paint_fallback_timer->start();
+        };
         on_browser_history_traversal_complete = [this] { notify_state(); };
         on_web_content_crashed = [this](auto) {
             if (m_callbacks.failed)
@@ -133,11 +155,34 @@ private:
             for (int row = 0; row < frame->height; ++row)
                 std::copy_n(bitmap->scanline_u8(row), frame->stride, frame->pixels.data() + row * frame->stride);
             frame->copy_time_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - copy_started).count();
+            if (m_initial_navigation_pending) {
+                if (m_waiting_for_post_load_paint) {
+                    m_initial_navigation_pending = false;
+                    m_waiting_for_post_load_paint = false;
+                    if (m_initial_paint_fallback_timer)
+                        m_initial_paint_fallback_timer->stop();
+                    m_pending_initial_frame.reset();
+                    m_callbacks.frame_ready(move(frame));
+                    return;
+                }
+                m_pending_initial_frame = move(frame);
+                return;
+            }
             m_callbacks.frame_ready(move(frame));
         };
     }
 
     Photon::ViewCallbacks m_callbacks;
+    std::shared_ptr<Photon::PresentedFrame const> m_pending_initial_frame;
+    RefPtr<Core::Timer> m_initial_paint_fallback_timer;
+    bool m_initial_navigation_pending { false };
+    bool m_waiting_for_post_load_paint { false };
+
+    void present_pending_initial_frame()
+    {
+        if (m_pending_initial_frame && m_callbacks.frame_ready)
+            m_callbacks.frame_ready(move(m_pending_initial_frame));
+    }
 };
 
 }
@@ -207,6 +252,7 @@ View::View(View&&) noexcept = default;
 View& View::operator=(View&&) noexcept = default;
 void View::navigate(std::string const& url) { m_impl->view->navigate({ url.data(), url.size() }); }
 void View::reload() { m_impl->view->reload(); }
+void View::stop_loading() { m_impl->view->stop_loading(); }
 void View::go_back() { m_impl->view->traverse_the_history_by_delta(-1); }
 void View::go_forward() { m_impl->view->traverse_the_history_by_delta(1); }
 void View::resize(int width, int height, double dpr)
@@ -311,6 +357,23 @@ void View::send_key_event(Key key, bool pressed, uint32_t code_point, bool shift
         .id = 0,
     };
     m_impl->view->enqueue_input_event(move(event));
+}
+
+void View::set_preferred_color_scheme(PreferredColorScheme color_scheme)
+{
+    auto engine_color_scheme = Web::CSS::PreferredColorScheme::Auto;
+    switch (color_scheme) {
+    case PreferredColorScheme::Auto:
+        engine_color_scheme = Web::CSS::PreferredColorScheme::Auto;
+        break;
+    case PreferredColorScheme::Dark:
+        engine_color_scheme = Web::CSS::PreferredColorScheme::Dark;
+        break;
+    case PreferredColorScheme::Light:
+        engine_color_scheme = Web::CSS::PreferredColorScheme::Light;
+        break;
+    }
+    m_impl->view->set_preferred_color_scheme(engine_color_scheme);
 }
 
 void View::shutdown()
