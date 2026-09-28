@@ -789,5 +789,8 @@ pub(crate) fn establishes_stacking_context(arena: &LayoutNodeArena, node: NodeSl
         return true;
     }
 
-    effects.opacity < 1.0 || will_change(b"opacity")
+    effects.opacity < 1.0
+        || arena
+            .node_has_compositor_animation_frame(node, crate::layout::node_data::CompositorAnimationFrameKind::Opacity)
+        || will_change(b"opacity")
 }
