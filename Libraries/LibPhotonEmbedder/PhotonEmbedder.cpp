@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 
 namespace WebView {
 
@@ -37,7 +38,10 @@ public:
 private:
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions& content) override
     {
-        content.force_cpu_painting = ForceCPUPainting::Yes;
+        // Deprecated diagnostic fallback. Normal Photon painting uses Vulkan;
+        // remove this option once the GPU path is reliable on supported devices.
+        if (std::getenv("PHOTON_FORCE_CPU_PAINTING"))
+            content.force_cpu_painting = ForceCPUPainting::Yes;
     }
 };
 
