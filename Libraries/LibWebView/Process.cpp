@@ -131,6 +131,8 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
             is_allowed |= audio_names.contains_slow(entry.name);
         if (type == ProcessType::Compositor)
             is_allowed |= any_of(gpu_prefixes, [&](auto prefix) { return entry.name.starts_with(prefix); });
+        if (type == ProcessType::Compositor && entry.name == "PHOTON_VERBOSE"sv)
+            is_allowed = true;
         if (is_allowed)
             environment.append(entry.full_entry);
     }

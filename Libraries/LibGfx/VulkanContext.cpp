@@ -8,8 +8,16 @@
 #include <AK/Format.h>
 #include <AK/Vector.h>
 #include <LibGfx/VulkanContext.h>
+#include <cstdlib>
+#include <cstring>
 
 namespace Gfx {
+
+static bool photon_verbose_logging_enabled()
+{
+    auto* value = std::getenv("PHOTON_VERBOSE");
+    return value && value[0] != '\0' && value[0] != '0';
+}
 
 #if VULKAN_VALIDATION_LAYERS_DEBUG
 static void setup_vulkan_validation_layers_callback(VkInstanceCreateInfo& create_info, VkDebugUtilsMessengerCreateInfoEXT& debug_messenger_create_info);
@@ -50,6 +58,32 @@ static ErrorOr<VkInstance> create_instance(uint32_t api_version)
     return instance;
 }
 
+#ifdef USE_VULKAN_DMABUF_IMAGES
+static bool supports_photon_shared_image_extensions(VkPhysicalDevice device)
+{
+    static constexpr Array<char const*, 4> required_extensions = {
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+        VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+    };
+    uint32_t extension_count = 0;
+    if (vkEnumerateDeviceExtensionProperties(device, nullptr, &extension_count, nullptr) != VK_SUCCESS)
+        return false;
+    Vector<VkExtensionProperties> available_extensions;
+    available_extensions.resize(extension_count);
+    if (vkEnumerateDeviceExtensionProperties(device, nullptr, &extension_count, available_extensions.data()) != VK_SUCCESS)
+        return false;
+    for (auto* required_extension : required_extensions) {
+        if (!available_extensions.contains([&](auto const& extension) {
+                return std::strcmp(extension.extensionName, required_extension) == 0;
+            }))
+            return false;
+    }
+    return true;
+}
+#endif
+
 static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
 {
     uint32_t device_count = 0;
@@ -62,22 +96,32 @@ static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
     devices.resize(device_count);
     vkEnumeratePhysicalDevices(instance, &device_count, devices.data());
 
-    VkPhysicalDevice picked_device = VK_NULL_HANDLE;
-    // Pick discrete GPU or the first device in the list
+    VkPhysicalDevice picked_discrete_device = VK_NULL_HANDLE;
+    VkPhysicalDevice first_device = VK_NULL_HANDLE;
+    // Prefer a discrete adapter that supports the enabled external-memory
+    // extensions. The frontend logs its own device for comparison.
     for (auto const& device : devices) {
-        if (picked_device == VK_NULL_HANDLE)
-            picked_device = device;
+#ifdef USE_VULKAN_DMABUF_IMAGES
+        if (!supports_photon_shared_image_extensions(device))
+            continue;
+#endif
+        if (first_device == VK_NULL_HANDLE)
+            first_device = device;
 
         VkPhysicalDeviceProperties device_properties;
         vkGetPhysicalDeviceProperties(device, &device_properties);
-        if (device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-            picked_device = device;
+        if (device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            picked_discrete_device = device;
+            break;
+        }
     }
 
-    if (picked_device != VK_NULL_HANDLE)
-        return picked_device;
+    if (picked_discrete_device != VK_NULL_HANDLE)
+        return picked_discrete_device;
+    if (first_device != VK_NULL_HANDLE)
+        return first_device;
 
-    VERIFY_NOT_REACHED();
+    return Error::from_string_literal("No usable Vulkan physical device found");
 }
 
 static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device, uint32_t* graphics_queue_family)
@@ -105,6 +149,12 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device,
 
     *graphics_queue_family = graphics_queue_family_index;
 
+    if (photon_verbose_logging_enabled()) {
+        VkPhysicalDeviceProperties properties {};
+        vkGetPhysicalDeviceProperties(physical_device, &properties);
+        dbgln("Engine Vulkan queue: GPU={} family={} flags={:#x} count={}", StringView { properties.deviceName, std::strlen(properties.deviceName) }, graphics_queue_family_index, queue_families[graphics_queue_family_index].queueFlags, queue_families[graphics_queue_family_index].queueCount);
+    }
+
     VkDeviceQueueCreateInfo queue_create_info {};
     queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     queue_create_info.queueFamilyIndex = graphics_queue_family_index;
@@ -121,6 +171,20 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device,
         VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
     };
+    uint32_t extension_count = 0;
+    vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, nullptr);
+    Vector<VkExtensionProperties> available_extensions;
+    available_extensions.resize(extension_count);
+    vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, available_extensions.data());
+    for (auto* required_extension : device_extensions) {
+        bool const available = available_extensions.contains([&](auto const& extension) {
+            return std::strcmp(extension.extensionName, required_extension) == 0;
+        });
+        if (photon_verbose_logging_enabled())
+            dbgln("Engine Vulkan extension {}: {}", required_extension, available ? "available" : "missing");
+        if (!available)
+            return Error::from_string_literal("required Vulkan external-memory extension unavailable");
+    }
 #else
     Array<char const*, 0> device_extensions;
 #endif
@@ -181,6 +245,25 @@ ErrorOr<VulkanContext> create_vulkan_context()
     uint32_t const api_version = VK_API_VERSION_1_1; // v1.1 needed for vkGetPhysicalDeviceFormatProperties2
     auto* instance = TRY(create_instance(api_version));
     auto* physical_device = TRY(pick_physical_device(instance));
+
+    if (photon_verbose_logging_enabled()) {
+        VkPhysicalDeviceDriverProperties driver_properties {};
+        driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+        VkPhysicalDeviceIDProperties id_properties {};
+        id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        id_properties.pNext = &driver_properties;
+        VkPhysicalDeviceProperties2 properties {};
+        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        properties.pNext = &id_properties;
+        vkGetPhysicalDeviceProperties2(physical_device, &properties);
+        auto const& device = properties.properties;
+        auto const& uuid = id_properties.deviceUUID;
+        dbgln("Engine painting: Vulkan; GPU: {} vendor={:#06x} device={:#06x} driverVersion={} driver={} ({}) UUID={:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            StringView { device.deviceName, std::strlen(device.deviceName) }, device.vendorID, device.deviceID, device.driverVersion,
+            StringView { driver_properties.driverName, std::strlen(driver_properties.driverName) }, StringView { driver_properties.driverInfo, std::strlen(driver_properties.driverInfo) },
+            uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+            uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+    }
 
     uint32_t graphics_queue_family = 0;
     auto* logical_device = TRY(create_logical_device(physical_device, &graphics_queue_family));

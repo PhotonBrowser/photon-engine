@@ -70,7 +70,7 @@ public:
     NonnullRefPtr<Bitmap> snapshot_bitmap() const;
     SharedImage snapshot_into_shared_image() const;
 
-    void read_into_bitmap(Bitmap&, IntPoint source_position = {}) const;
+    bool read_into_bitmap(Bitmap&, IntPoint source_position = {}) const;
     void write_from_bitmap(Bitmap const&);
     void copy_from_surface(PaintingSurface&);
 
@@ -88,6 +88,7 @@ public:
     RefPtr<SkiaBackendContext> skia_backend_context() const;
 
     void flush();
+    bool requires_external_access() const;
 
     ~PaintingSurface();
 

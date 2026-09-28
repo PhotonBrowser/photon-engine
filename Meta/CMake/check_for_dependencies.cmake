@@ -55,7 +55,10 @@ if (NOT APPLE AND NOT WIN32)
         find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 
         # Sharable Vulkan images are currently only implemented on Linux and BSDs
-        if (((LINUX AND NOT ANDROID) OR BSD) AND GLSLANG_VALIDATOR)
+        # Photon embeds LibPhotonEmbedder directly and does not build Ladybird's
+        # Qt Widgets shader path. Keep DMA-BUF capability available for a
+        # future native Qt Quick presentation path.
+        if (((LINUX AND NOT ANDROID) OR BSD) AND (GLSLANG_VALIDATOR OR (ENABLE_PHOTON_EMBEDDER AND NOT ENABLE_LADYBIRD_UI)))
             set(USE_VULKAN_DMABUF_IMAGES ON CACHE BOOL "" FORCE)
             add_cxx_compile_definitions(USE_VULKAN_DMABUF_IMAGES=1)
         else()

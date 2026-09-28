@@ -684,8 +684,14 @@ void CompositorState::present_frame(Compositing::CompositorContextId context_id,
 
     auto& event_loop = Core::EventLoop::current();
     auto self = NonnullRefPtr { *this };
-    m_display_list_player->flush_async(*prepared_frame->rendered_surface, [self = move(self), &event_loop, pending_present] {
-        event_loop.deferred_invoke([self = move(self), pending_present] {
+    RefPtr<Gfx::PaintingSurface> rendered_surface = prepared_frame->rendered_surface;
+    auto& surface = *rendered_surface;
+    m_display_list_player->flush_async(surface, [self = move(self), &event_loop, pending_present, rendered_surface = move(rendered_surface)]() mutable {
+        event_loop.deferred_invoke([self = move(self), pending_present, rendered_surface = move(rendered_surface)] {
+            // Read back CPU-shareable frames only after the GPU completion
+            // callback has returned to the event loop. Starting a Skia read
+            // from inside Ganesh's finished callback re-enters the context.
+            rendered_surface->flush();
             self->did_finish_async_present(*pending_present);
         });
     });

@@ -36,6 +36,11 @@ class SkiaBackendContext : public AtomicRefCounted<SkiaBackendContext> {
     AK_MAKE_NONMOVABLE(SkiaBackendContext);
 
 public:
+    enum class SurfaceAccess {
+        Internal,
+        External,
+    };
+
 #ifdef USE_DIRECTX
     static RefPtr<SkiaBackendContext> create_direct3d_context(NonnullRefPtr<Direct3DContext>);
 #endif
@@ -55,8 +60,8 @@ public:
     SkiaBackendContext() { }
     virtual ~SkiaBackendContext() { }
 
-    void flush_and_submit(SkSurface*);
-    void flush_and_submit_async(SkSurface*, Function<void()>&&);
+    void flush_and_submit(SkSurface*, SurfaceAccess);
+    void flush_and_submit_async(SkSurface*, SurfaceAccess, Function<void()>&&);
     void check_async_work_completion();
     virtual GrDirectContext* sk_context() const = 0;
 
@@ -65,8 +70,8 @@ public:
     virtual Direct3DContext& direct3d_context() { VERIFY_NOT_REACHED(); }
 
 protected:
-    virtual void flush_and_submit_impl(SkSurface*) = 0;
-    virtual void flush_and_submit_async_impl(SkSurface*, Function<void()>&&) = 0;
+    virtual void flush_and_submit_impl(SkSurface*, SurfaceAccess) = 0;
+    virtual void flush_and_submit_async_impl(SkSurface*, SurfaceAccess, Function<void()>&&) = 0;
 
 private:
     void perform_post_flush_cleanup();

@@ -29,7 +29,8 @@ static NonnullRefPtr<Gfx::PaintingSurface> create_gpu_painting_surface_with_bitm
     auto surface = Gfx::PaintingSurface::create_with_size(size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, skia_backend_context);
     auto bitmap = buffer.bitmap();
     surface->on_flush = [bitmap = move(bitmap)](auto& surface) {
-        surface.read_into_bitmap(*bitmap);
+        if (!surface.read_into_bitmap(*bitmap))
+            dbgln("GPU frame readback into shareable bitmap failed");
     };
     return surface;
 }
@@ -154,7 +155,7 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
         for (size_t i = 0; i < buffer_count; ++i) {
             auto backing_store = create_shared_gpu_backing_store(allocation.size, *skia_backend_context);
             if (backing_store.is_error()) {
-                dbgln("Failed to allocate shared GPU backing store ({}), falling back to shareable bitmaps", backing_store.error());
+                dbgln("GPU shared-image allocation unavailable: {}. Keeping GPU painting enabled and copying completed frames to CPU-shareable bitmaps.", backing_store.error());
                 allocation_succeeded = false;
                 break;
             }

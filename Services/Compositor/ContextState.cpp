@@ -1890,7 +1890,10 @@ void ContextState::paint_current_display_list(Compositing::DisplayListPlayerSkia
             paint_paused_debugger_overlay(target_surface, m_viewport_size, m_paused_debugger_overlay_device_pixel_ratio, m_paused_debugger_overlay_font_family, m_paused_debugger_overlay_hovered_action);
     };
 
-    if (damage_rect.has_value() && !damage_rect->is_empty() && presents_to_client() && damage_rect->size() != surface.size() && surface.skia_backend_context()) {
+    // CPU-readback backing stores should be painted directly. Routing them
+    // through an intermediate GPU snapshot can leave an uninstantiated Skia
+    // image proxy on the readback path and also adds a full-size GPU copy.
+    if (damage_rect.has_value() && !damage_rect->is_empty() && presents_to_client() && damage_rect->size() != surface.size() && surface.skia_backend_context() && !surface.on_flush) {
         if (!m_damage_surface || m_damage_surface->size() != damage_rect->size()) {
             m_damage_surface = Gfx::PaintingSurface::create_with_size(
                 damage_rect->size(), Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, surface.skia_backend_context());
@@ -1903,6 +1906,11 @@ void ContextState::paint_current_display_list(Compositing::DisplayListPlayerSkia
         paint_display_list(*m_damage_surface);
         damage_canvas.restore();
 
+        // The damage surface is an independent Vulkan render target. Submit
+        // its draws before snapshotting it into the backing store; otherwise
+        // Ganesh may leave the snapshot's texture proxy uninstantiated when
+        // the destination surface is flushed.
+        display_list_player.flush(*m_damage_surface);
         auto image = m_damage_surface->sk_image_snapshot<sk_sp<SkImage>>();
         SkPaint paint;
         paint.setBlendMode(SkBlendMode::kSrc);

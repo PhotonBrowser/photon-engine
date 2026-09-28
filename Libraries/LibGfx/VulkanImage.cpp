@@ -10,6 +10,8 @@
 #    include <AK/Format.h>
 #    include <AK/Vector.h>
 #    include <LibGfx/VulkanImage.h>
+#    include <cstdlib>
+#    include <cstring>
 
 namespace Gfx {
 
@@ -110,21 +112,74 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
     format_mod_props_list.pDrmFormatModifierProperties = format_mod_props.data();
     vkGetPhysicalDeviceFormatProperties2(context.physical_device, format, &format_props);
 
-    // populate a list of all format modifiers that are both renderable, sampleable,
-    // and accepted by the caller
+    constexpr VkImageUsageFlags shared_image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // Keep only modifiers usable for the requested image and DMA-BUF memory
+    // type. A caller may constrain this to linear for a linear-only importer.
     Vector<uint64_t> format_mods;
     for (VkDrmFormatModifierPropertiesEXT const& props : format_mod_props) {
         VkFormatFeatureFlags required_features = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-        if ((props.drmFormatModifierTilingFeatures & required_features) == required_features && (props.drmFormatModifierPlaneCount == 1)) {
-            if (modifiers.contains_slow(props.drmFormatModifier))
-                format_mods.append(props.drmFormatModifier);
+        if (!modifiers.contains_slow(props.drmFormatModifier))
+            continue;
+        bool const renderable = (props.drmFormatModifierTilingFeatures & required_features) == required_features;
+        bool const single_plane = props.drmFormatModifierPlaneCount == 1;
+
+        VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+            .pNext = nullptr,
+            .drmFormatModifier = props.drmFormatModifier,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+        VkPhysicalDeviceExternalImageFormatInfo external_info {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+            .pNext = &modifier_info,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        };
+        VkPhysicalDeviceImageFormatInfo2 query {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+            .pNext = &external_info,
+            .format = format,
+            .type = VK_IMAGE_TYPE_2D,
+            .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+            .usage = shared_image_usage,
+            .flags = 0,
+        };
+        VkExternalImageFormatProperties external_properties {};
+        external_properties.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
+        VkImageFormatProperties2 image_properties {};
+        image_properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+        image_properties.pNext = &external_properties;
+        auto const result = vkGetPhysicalDeviceImageFormatProperties2(context.physical_device, &query, &image_properties);
+        auto const external = external_properties.externalMemoryProperties;
+        bool const exportable = (external.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) != 0;
+        bool const importable = (external.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+        bool const compatible_handle = (external.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) != 0;
+        if (result == VK_SUCCESS && exportable && importable && compatible_handle && renderable && single_plane) {
+            format_mods.append(props.drmFormatModifier);
+        } else if (std::getenv("PHOTON_VERBOSE")) {
+            dbgln("Vulkan shared-image modifier rejected: modifier={:#018x} planes={} features={:#x} format={} usage={:#x} result={} exportable={} importable={} dma_buf_compatible={}",
+                props.drmFormatModifier, props.drmFormatModifierPlaneCount, props.drmFormatModifierTilingFeatures, to_underlying(format), shared_image_usage,
+                to_underlying(result), exportable, importable, compatible_handle);
         }
     }
 
     // If the caller requested specific DRM modifiers and none are supported for a renderable image,
     // fail here so higher-level code can fall back to a different backing-store type.
-    if (!modifiers.is_empty() && format_mods.is_empty())
+    if (!modifiers.is_empty() && format_mods.is_empty()) {
+        if (std::getenv("PHOTON_VERBOSE")) {
+            VkPhysicalDeviceProperties device_properties {};
+            vkGetPhysicalDeviceProperties(context.physical_device, &device_properties);
+            dbgln("Vulkan shared-image probe failed: GPU={} vendor={:#06x} device={:#06x} format={} tiling=DRM_FORMAT_MODIFIER usage={:#x}; no requested modifier supports both COLOR_ATTACHMENT and SAMPLED_IMAGE on a single plane.",
+                StringView { device_properties.deviceName, std::strlen(device_properties.deviceName) }, device_properties.vendorID, device_properties.deviceID, to_underlying(format),
+                shared_image_usage);
+            for (VkDrmFormatModifierPropertiesEXT const& props : format_mod_props) {
+                dbgln("  DRM modifier={:#018x} planes={} features={:#x} requested={}", props.drmFormatModifier, props.drmFormatModifierPlaneCount, props.drmFormatModifierTilingFeatures,
+                    modifiers.contains_slow(props.drmFormatModifier));
+            }
+        }
         return Error::from_string_literal("no supported DRM format modifiers for shared image");
+    }
 
     NonnullRefPtr<VulkanImage> image = make_ref_counted<VulkanImage>(context);
     VkImageDrmFormatModifierListCreateInfoEXT image_drm_format_modifier_list_info = {
@@ -154,7 +209,7 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .usage = shared_image_usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = queue_families.size(),
         .pQueueFamilyIndices = queue_families.data(),
@@ -162,7 +217,7 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
     };
     auto result = vkCreateImage(context.logical_device, &image_info, nullptr, &image->image);
     if (result != VK_SUCCESS) {
-        dbgln("vkCreateImage returned {}", to_underlying(result));
+        dbgln("vkCreateImage failed: result={} extent={}x{} format={} tiling={} usage={:#x} modifiers={}", to_underlying(result), width, height, to_underlying(format), to_underlying(image_info.tiling), image_info.usage, format_mods.size());
         return Error::from_string_literal("image creation failed");
     }
 
@@ -183,7 +238,16 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
     }
 
     if (mem_type_idx == mem_props.memoryTypeCount) {
+        dbgln("Vulkan shared-image memory selection failed: no memory type satisfies required bits={:#x} flags={:#x} allocation_size={} linear={}", mem_reqs.memoryTypeBits,
+            is_linear_image ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            mem_reqs.size, is_linear_image);
         return Error::from_string_literal("unable to find suitable image memory type");
+    }
+
+    if (std::getenv("PHOTON_VERBOSE")) {
+        dbgln("Vulkan shared-image allocation: format={} tiling={} modifier={:#018x} extent={}x{} usage={:#x} memory_type={} memory_flags={:#x} allocation_size={} dedicated=true export_handle=DMA_BUF",
+            to_underlying(format), to_underlying(image_info.tiling), format_mods.is_empty() ? DRM_FORMAT_MOD_INVALID : format_mods[0], width, height, image_info.usage,
+            mem_type_idx, mem_props.memoryTypes[mem_type_idx].propertyFlags, mem_reqs.size);
     }
 
     // Set up dedicated memory allocation; required for NVIDIA 10 series GPUs.

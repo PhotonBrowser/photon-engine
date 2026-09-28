@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/RefPtr.h>
@@ -67,12 +68,19 @@ static void invoke_async_flush_callback(void* context)
     callback_to_invoke();
 }
 
-static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurface* surface, Function<void()>&& callback)
+static SkSurfaces::BackendSurfaceAccess to_backend_surface_access(SkiaBackendContext::SurfaceAccess access)
+{
+    return access == SkiaBackendContext::SurfaceAccess::External
+        ? SkSurfaces::BackendSurfaceAccess::kPresent
+        : SkSurfaces::BackendSurfaceAccess::kNoAccess;
+}
+
+static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurface* surface, SkiaBackendContext::SurfaceAccess access, Function<void()>&& callback)
 {
     GrFlushInfo flush_info {};
     flush_info.fFinishedProc = invoke_async_flush_callback;
     flush_info.fFinishedContext = new Function<void()>(move(callback));
-    context.flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
+    context.flush(surface, to_backend_surface_access(access), flush_info);
     VERIFY(context.submit(GrSyncCpu::kNo));
 }
 #endif
@@ -83,16 +91,16 @@ void SkiaBackendContext::check_async_work_completion()
         context->checkAsyncWorkCompletion();
 }
 
-void SkiaBackendContext::flush_and_submit(SkSurface* surface)
+void SkiaBackendContext::flush_and_submit(SkSurface* surface, SurfaceAccess access)
 {
-    flush_and_submit_impl(surface);
+    flush_and_submit_impl(surface, access);
 
     perform_post_flush_cleanup();
 }
 
-void SkiaBackendContext::flush_and_submit_async(SkSurface* surface, Function<void()>&& callback)
+void SkiaBackendContext::flush_and_submit_async(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback)
 {
-    flush_and_submit_async_impl(surface, move(callback));
+    flush_and_submit_async_impl(surface, access, move(callback));
 
     perform_post_flush_cleanup();
 }
@@ -183,16 +191,16 @@ public:
         m_context.reset();
     }
 
-    void flush_and_submit_impl(SkSurface* surface) override
+    void flush_and_submit_impl(SkSurface* surface, SurfaceAccess access) override
     {
         GrFlushInfo const flush_info {};
-        m_context->flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
+        m_context->flush(surface, to_backend_surface_access(access), flush_info);
         m_context->submit(GrSyncCpu::kYes);
     }
 
-    void flush_and_submit_async_impl(SkSurface* surface, Function<void()>&& callback) override
+    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback) override
     {
-        flush_and_submit_async_to_context(*m_context, surface, move(callback));
+        flush_and_submit_async_to_context(*m_context, surface, access, move(callback));
     }
 
     GrDirectContext* sk_context() const override { return m_context.get(); }
@@ -253,16 +261,16 @@ public:
             vkDestroyInstance(m_vulkan_context.instance, nullptr);
     }
 
-    void flush_and_submit_impl(SkSurface* surface) override
+    void flush_and_submit_impl(SkSurface* surface, SurfaceAccess access) override
     {
         GrFlushInfo const flush_info {};
-        m_context->flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
+        m_context->flush(surface, to_backend_surface_access(access), flush_info);
         m_context->submit(GrSyncCpu::kYes);
     }
 
-    void flush_and_submit_async_impl(SkSurface* surface, Function<void()>&& callback) override
+    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback) override
     {
-        flush_and_submit_async_to_context(*m_context, surface, move(callback));
+        flush_and_submit_async_to_context(*m_context, surface, access, move(callback));
     }
 
     skgpu::VulkanExtensions const* extensions() const { return m_extensions.ptr(); }
@@ -297,6 +305,19 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
     };
 
     auto extensions = make<skgpu::VulkanExtensions>();
+#ifdef USE_VULKAN_DMABUF_IMAGES
+    static constexpr Array<char const*, 4> enabled_device_extensions {
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+        VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+    };
+    extensions->init(backend_context.fGetProc, vulkan_context.instance, vulkan_context.physical_device,
+        0, nullptr, enabled_device_extensions.size(), enabled_device_extensions.data());
+#else
+    extensions->init(backend_context.fGetProc, vulkan_context.instance, vulkan_context.physical_device,
+        0, nullptr, 0, nullptr);
+#endif
     backend_context.fVkExtensions = extensions.ptr();
 
     backend_context.fMemoryAllocator = create_skia_vulkan_memory_allocator(vulkan_context);
@@ -329,16 +350,16 @@ public:
         m_context.reset();
     }
 
-    void flush_and_submit_impl(SkSurface* surface) override
+    void flush_and_submit_impl(SkSurface* surface, SurfaceAccess access) override
     {
         GrFlushInfo const flush_info {};
-        m_context->flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
+        m_context->flush(surface, to_backend_surface_access(access), flush_info);
         m_context->submit(GrSyncCpu::kYes);
     }
 
-    void flush_and_submit_async_impl(SkSurface* surface, Function<void()>&& callback) override
+    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback) override
     {
-        flush_and_submit_async_to_context(*m_context, surface, move(callback));
+        flush_and_submit_async_to_context(*m_context, surface, access, move(callback));
     }
 
     GrDirectContext* sk_context() const override { return m_context.get(); }

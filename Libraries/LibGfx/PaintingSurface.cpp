@@ -42,6 +42,7 @@ struct PaintingSurface::Impl {
     IntSize size;
     sk_sp<SkSurface> surface;
     RefPtr<Bitmap> bitmap;
+    bool external_access_required { false };
 };
 
 #if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX)
@@ -99,7 +100,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_vkimage(NonnullRefPt
     vulkan_image->ref();
     sk_sp<SkSurface> surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), rt, origin_to_sk_origin(origin), vk_format_to_sk_color_type(vulkan_image->info.format),
         SkColorSpace::MakeSRGB(), nullptr, release_vulkan_image, vulkan_image.ptr());
-    return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
+    return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr, true)));
 }
 #endif
 
@@ -125,7 +126,7 @@ ErrorOr<NonnullRefPtr<PaintingSurface>> PaintingSurface::create_from_d3d_texture
         kRGBA_8888_SkColorType, SkColorSpace::MakeSRGB(), nullptr, release_d3d_texture, texture.ptr());
     if (!surface)
         return Error::from_string_literal("Failed to wrap shared Direct3D texture in a Skia surface");
-    return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
+    return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr, true)));
 }
 #endif
 
@@ -173,7 +174,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_shared_image_buffer(
     mtl_info.fTexture = sk_ret_cfp(metal_texture->texture());
     auto backend_render_target = GrBackendRenderTargets::MakeMtl(metal_texture->width(), metal_texture->height(), mtl_info);
     auto surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), backend_render_target, origin_to_sk_origin(origin), kBGRA_8888_SkColorType, SkColorSpace::MakeSRGB(), nullptr);
-    return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
+    return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr, true)));
 }
 #endif
 
@@ -201,13 +202,13 @@ SharedImage PaintingSurface::snapshot_into_shared_image() const
     return shared_image_buffer.export_shared_image();
 }
 
-void PaintingSurface::read_into_bitmap(Bitmap& bitmap, IntPoint source_position) const
+bool PaintingSurface::read_into_bitmap(Bitmap& bitmap, IntPoint source_position) const
 {
     auto color_type = to_skia_color_type(bitmap.format());
     auto alpha_type = to_skia_alpha_type(bitmap.format(), bitmap.alpha_type());
     auto image_info = SkImageInfo::Make(bitmap.width(), bitmap.height(), color_type, alpha_type, SkColorSpace::MakeSRGB());
     SkPixmap const pixmap(image_info, bitmap.begin(), bitmap.pitch());
-    m_impl->surface->readPixels(pixmap, source_position.x(), source_position.y());
+    return m_impl->surface->readPixels(pixmap, source_position.x(), source_position.y());
 }
 
 void PaintingSurface::write_from_bitmap(Bitmap const& bitmap)
@@ -278,6 +279,11 @@ void PaintingSurface::flush()
 {
     if (on_flush)
         on_flush(*this);
+}
+
+bool PaintingSurface::requires_external_access() const
+{
+    return m_impl->external_access_required;
 }
 
 }
