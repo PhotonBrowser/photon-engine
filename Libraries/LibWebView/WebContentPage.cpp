@@ -12,8 +12,9 @@
 #include <LibCore/EventLoop.h>
 #include <LibDevTools/StorageHelpers.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
-#include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/WebDriver/Error.h>
+#include <LibWebCommon/HTML/BrowsingContext.h>
+#include <LibWebCommon/WebDriver/Error.h>
+#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
@@ -23,8 +24,6 @@
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
-#include <LibWebView/SiteIsolation.h>
-#include <LibWebView/SourceHighlighter.h>
 #include <LibWebView/StorageJar.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -308,7 +307,7 @@ Optional<WebContentPage::ViewPosition> WebContentPage::view_position(Web::HTML::
 }
 
 // A dialog blocks the whole tab, so every other page of the tab is told of the one a document of this page opened.
-void WebContentPage::did_open_dialog(Web::Page::PendingDialog dialog, Utf16String const& message)
+void WebContentPage::did_open_dialog(Web::PendingDialog dialog, Utf16String const& message)
 {
     traversable().for_each_hosting_page([&](WebContentPage& page) {
         if (&page != this)
@@ -386,17 +385,6 @@ Compositing::CompositorContextId WebContentPage::compositor_context_id()
     return client().compositor_context_id_for_page(m_id);
 }
 
-bool WebContentPage::send_async_scroll_to_compositor(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers)
-{
-    auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-
-    auto handled = Application::the().send_async_scroll_to_compositor(compositor_context_id(), position, delta_in_device_pixels, wheel_delta_precision, scroll_gesture_phase, modifiers);
-
-    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC async_scroll_by page {} returned {} in {} us",
-        m_id, handled, timer.elapsed_time().to_microseconds());
-    return handled;
-}
-
 bool WebContentPage::handle_key_event_in_compositor(Compositing::KeyEvent const& event)
 {
     return Application::the().handle_key_event_in_compositor(compositor_context_id(), event);
@@ -408,34 +396,47 @@ void WebContentPage::dispatch_key_event_to_web_content(Compositing::KeyEvent con
         async_key_event(event.clone_without_browser_data());
 }
 
-Compositing::MouseEventHandlingResult WebContentPage::handle_mouse_event_in_compositor(Compositing::MouseEvent const& event)
+void WebContentPage::handle_pinch_event_in_compositor(Compositing::PinchEvent const& event)
 {
-    auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-
-    auto result = Application::the().handle_mouse_event_in_compositor(compositor_context_id(), event);
-
-    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC mouse_event page {} returned {} in {} us",
-        m_id, result.handled, timer.elapsed_time().to_microseconds());
-    return result;
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI posted pinch event {} for page {} to the compositor", event.id, m_id);
+    Application::the().handle_pinch_event_in_compositor(compositor_context_id(), event);
 }
 
-bool WebContentPage::handle_pinch_event_in_compositor(Compositing::PinchEvent const& event)
+bool WebContentPage::handle_and_dispatch_mouse_event_in_compositor(Compositing::MouseEvent const& event)
 {
-    auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-
-    auto handled = Application::the().handle_pinch_event_in_compositor(compositor_context_id(), event);
-
-    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC pinch_event page {} returned {} in {} us",
-        m_id, handled, timer.elapsed_time().to_microseconds());
-    return handled;
+    auto posted = Application::the().handle_and_dispatch_mouse_event_in_compositor(compositor_context_id(), event);
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI posted mouse event {} (type {}) for page {} to the compositor: {}",
+        event.id, to_underlying(event.type), m_id, posted);
+    return posted;
 }
 
-void WebContentPage::dispatch_mouse_event_to_web_content(Compositing::MouseEvent const& event)
+void WebContentPage::did_consume_input_event_in_compositor(u64 event_id)
 {
-    if (Application::the().dispatch_mouse_event_to_web_content(compositor_context_id(), event))
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor consumed input event {} for page {}", event_id, m_id);
+    if (displays_tab()) {
+        view().did_consume_input_event_in_compositor({}, event_id);
         return;
+    }
 
-    async_mouse_event(event.clone_without_browser_data());
+    // The view displaying the tab handed the event down; it hears the result.
+    if (auto display_page = traversable().display_page(); display_page) {
+        if (display_page->is_open() && display_page.ptr() != this)
+            display_page->did_consume_input_event_in_compositor(event_id);
+    }
+}
+
+void WebContentPage::did_not_dispatch_input_event_through_compositor(u64 event_id)
+{
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor did not dispatch input event {} for page {}; sending it to WebContent directly", event_id, m_id);
+    if (displays_tab()) {
+        view().did_not_dispatch_input_event_through_compositor({}, event_id);
+        return;
+    }
+
+    if (auto display_page = traversable().display_page(); display_page) {
+        if (display_page->is_open() && display_page.ptr() != this)
+            display_page->did_not_dispatch_input_event_through_compositor(event_id);
+    }
 }
 
 void WebContentPage::did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id)
@@ -783,7 +784,7 @@ void WebContentPage::did_get_style_sheet_source(Web::CSS::StyleSheetIdentifier i
     }
 }
 
-void WebContentPage::did_list_devtools_sources(u64 request_id, Vector<Web::HTML::ScriptRegistry::Description> sources)
+void WebContentPage::did_list_devtools_sources(u64 request_id, Vector<Web::HTML::ScriptRegistryDescription> sources)
 {
     if (displays_tab()) {
         auto handler = view().on_received_devtools_sources.take(request_id);
@@ -792,7 +793,7 @@ void WebContentPage::did_list_devtools_sources(u64 request_id, Vector<Web::HTML:
     }
 }
 
-void WebContentPage::did_get_devtools_source(Web::HTML::ScriptRegistry::Identifier source_id, Optional<Web::HTML::ScriptRegistry::Content> source)
+void WebContentPage::did_get_devtools_source(Web::HTML::ScriptRegistryIdentifier source_id, Optional<Web::HTML::ScriptRegistryContent> source)
 {
     if (displays_tab()) {
         auto handler = view().on_received_devtools_source.take(source_id);
@@ -801,7 +802,7 @@ void WebContentPage::did_get_devtools_source(Web::HTML::ScriptRegistry::Identifi
     }
 }
 
-void WebContentPage::did_add_devtools_source(Web::HTML::ScriptRegistry::Description source)
+void WebContentPage::did_add_devtools_source(Web::HTML::ScriptRegistryDescription source)
 {
     if (displays_tab()) {
         if (view().on_devtools_source_available)
@@ -882,7 +883,7 @@ void WebContentPage::did_output_js_console_message(ConsoleOutput console_output)
     }
 }
 
-void WebContentPage::did_start_network_request(u64 request_id, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority priority)
+void WebContentPage::did_start_network_request(u64 request_id, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::RequestPriority priority)
 {
     if (displays_tab()) {
         if (view().on_network_request_started)
@@ -1964,18 +1965,16 @@ void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId lo
         target->view.did_request_image_context_menu({}, target->position, move(url), move(bitmap));
 }
 
-void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::Page::MediaContextMenu menu)
+void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu)
 {
     if (auto target = view_position(local_root_id, content_position); target.has_value())
         target->view.did_request_media_context_menu({}, *this, target->position, move(menu));
 }
 
-void WebContentPage::did_get_source(URL::URL url, URL::URL base_url, Utf16String source)
+void WebContentPage::did_get_highlighted_source(String html)
 {
-    if (auto new_tab = Application::the().open_blank_new_tab(Web::HTML::ActivateTab::Yes); new_tab.has_value()) {
-        auto html = highlight_source(url, base_url, source.to_utf8(), Syntax::Language::HTML);
+    if (auto new_tab = Application::the().open_blank_new_tab(Web::HTML::ActivateTab::Yes); new_tab.has_value())
         new_tab->load_html(html);
-    }
 }
 
 void WebContentPage::did_get_debugger_environments(u64 request_id, Optional<String> error, Vector<DebuggerEnvironment> environments)
@@ -2045,21 +2044,21 @@ void WebContentPage::did_get_debugger_source_positions(u64 request_id, Vector<De
 
 void WebContentPage::did_request_alert(Utf16String message)
 {
-    did_open_dialog(Web::Page::PendingDialog::Alert, message);
+    did_open_dialog(Web::PendingDialog::Alert, message);
     if (view().on_request_alert)
         view().on_request_alert(message);
 }
 
 void WebContentPage::did_request_confirm(Utf16String message)
 {
-    did_open_dialog(Web::Page::PendingDialog::Confirm, message);
+    did_open_dialog(Web::PendingDialog::Confirm, message);
     if (view().on_request_confirm)
         view().on_request_confirm(message);
 }
 
 void WebContentPage::did_request_prompt(Utf16String message, Utf16String default_)
 {
-    did_open_dialog(Web::Page::PendingDialog::Prompt, message);
+    did_open_dialog(Web::PendingDialog::Prompt, message);
     if (view().on_request_prompt)
         view().on_request_prompt(message, default_);
 }

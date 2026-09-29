@@ -27,6 +27,7 @@
 #include <LibDevTools/DevToolsServer.h>
 #include <LibDevTools/FirefoxClient.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibGfx/SystemTheme.h>
 #include <LibHTTP/Cache/CacheMode.h>
 #include <LibHTTP/Cookie/IncludeCredentials.h>
 #include <LibHTTP/HeaderList.h>
@@ -38,11 +39,12 @@
 #include <LibRequests/RequestControlClient.h>
 #include <LibURL/InternalURLs.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/CSS/PropertyID.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Statuses.h>
-#include <LibWeb/Loader/DownloadFilename.h>
-#include <LibWeb/Loader/UserAgent.h>
-#include <LibWeb/WebDriver/TimeoutsConfiguration.h>
+#include <LibWebCommon/CSS/PropertyList.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
+#include <LibWebCommon/Loader/DownloadFilename.h>
+#include <LibWebCommon/Loader/UserAgent.h>
+#include <LibWebCommon/WebDriver/TimeoutsConfiguration.h>
+#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/BlobURLStore.h>
@@ -59,7 +61,6 @@
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/SiteCompatibility.h>
-#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
@@ -1346,17 +1347,6 @@ void Application::update_compositor_context_visibility(Compositing::CompositorCo
     m_compositor_client->async_set_context_visibility(context_id, context_visibility);
 }
 
-bool Application::send_async_scroll_to_compositor(Compositing::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers)
-{
-    if (!can_send_compositor_process_ipc(m_compositor_client))
-        return false;
-
-    auto result = m_compositor_client->try_async_scroll_by(context_id, position, delta_in_device_pixels, wheel_delta_precision, scroll_gesture_phase, modifiers);
-    if (result.is_error())
-        return false;
-    return result.release_value();
-}
-
 bool Application::handle_key_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::KeyEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
@@ -1373,38 +1363,22 @@ bool Application::dispatch_key_event_to_web_content(Compositing::CompositorConte
     return !result.is_error() && result.release_value();
 }
 
-Compositing::MouseEventHandlingResult Application::handle_mouse_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
+void Application::handle_pinch_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
-        return {};
+        return;
 
-    auto result = m_compositor_client->try_handle_mouse_event(context_id, event.clone_without_browser_data());
-    if (result.is_error())
-        return {};
-    return result.release_value();
+    m_compositor_client->async_handle_pinch_event(context_id, event);
 }
 
-bool Application::handle_pinch_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
-{
-    if (!can_send_compositor_process_ipc(m_compositor_client))
-        return false;
-
-    auto result = m_compositor_client->try_handle_pinch_event(context_id, event);
-    if (result.is_error())
-        return false;
-    return result.release_value();
-}
-
-bool Application::dispatch_mouse_event_to_web_content(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
+bool Application::handle_and_dispatch_mouse_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
     VERIFY(m_compositor_client);
 
-    auto result = m_compositor_client->try_dispatch_mouse_event_to_web_content(context_id, event.clone_without_browser_data());
-    if (result.is_error())
-        return false;
-    return result.release_value();
+    m_compositor_client->async_handle_and_dispatch_mouse_event(context_id, event.clone_without_browser_data());
+    return true;
 }
 
 void Application::notify_compositor_presented_bitmap_ready_to_paint(Compositing::CompositorContextId context_id, i32 bitmap_id)
@@ -1702,6 +1676,16 @@ void Application::handle_compositor_process_death()
 {
     m_compositor_client = nullptr;
     m_compositor_font_service_connection = nullptr;
+
+    // Nothing will forward or hand back the input events the dead compositor still held.
+    WebContentClient::for_each_client([](WebContentClient& client) {
+        client.for_each_page([](WebContentPage& page) {
+            if (page.displays_tab())
+                page.view().discard_input_events_routed_through_lost_compositor({});
+            return IterationDecision::Continue;
+        });
+        return IterationDecision::Continue;
+    });
 
     if (Core::EventLoop::current().was_exit_requested())
         return;
@@ -2999,12 +2983,10 @@ Vector<DevTools::CSSProperty> Application::css_property_list() const
 {
     Vector<DevTools::CSSProperty> property_list;
 
-    for (auto i = to_underlying(Web::CSS::first_property_id); i <= to_underlying(Web::CSS::last_property_id); ++i) {
-        auto property_id = static_cast<Web::CSS::PropertyID>(i);
-
+    for (auto const& entry : Web::CSS::property_list()) {
         DevTools::CSSProperty property;
-        property.name = Web::CSS::string_from_property_id(property_id).to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
-        property.is_inherited = Web::CSS::is_inherited_property(property_id);
+        property.name = MUST(String::from_utf8(entry.name));
+        property.is_inherited = entry.is_inherited;
         property_list.append(move(property));
     }
 
@@ -3624,7 +3606,7 @@ void Application::retrieve_sources(DevTools::TabDescription const& description, 
     view->retrieve_devtools_sources(move(on_complete));
 }
 
-void Application::retrieve_source(DevTools::TabDescription const& description, Web::HTML::ScriptRegistry::Identifier source_id, OnSourceReceived on_complete) const
+void Application::retrieve_source(DevTools::TabDescription const& description, Web::HTML::ScriptRegistryIdentifier source_id, OnSourceReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3632,7 +3614,7 @@ void Application::retrieve_source(DevTools::TabDescription const& description, W
         return;
     }
 
-    view->on_received_devtools_source.set(source_id, [on_complete = move(on_complete)](Optional<Web::HTML::ScriptRegistry::Content> source) {
+    view->on_received_devtools_source.set(source_id, [on_complete = move(on_complete)](Optional<Web::HTML::ScriptRegistryContent> source) {
         if (!source.has_value()) {
             on_complete(Error::from_string_literal("Unable to locate source"));
             return;
@@ -3650,7 +3632,7 @@ void Application::listen_for_sources(DevTools::TabDescription const& description
     if (!view.has_value())
         return;
 
-    view->on_devtools_source_available = [on_source_available = move(on_source_available)](Web::HTML::ScriptRegistry::Description source) {
+    view->on_devtools_source_available = [on_source_available = move(on_source_available)](Web::HTML::ScriptRegistryDescription source) {
         on_source_available(move(source));
     };
 }
@@ -3762,7 +3744,7 @@ void Application::remove_debugger_breakpoint(DevTools::TabDescription const& des
     view->remove_debugger_breakpoint(move(location), move(on_complete));
 }
 
-void Application::retrieve_debugger_source_positions(DevTools::TabDescription const& description, Web::HTML::ScriptRegistry::Identifier source_id, OnDebuggerSourcePositionsReceived on_complete) const
+void Application::retrieve_debugger_source_positions(DevTools::TabDescription const& description, Web::HTML::ScriptRegistryIdentifier source_id, OnDebuggerSourcePositionsReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3823,7 +3805,7 @@ void Application::listen_for_network_events(DevTools::TabDescription const& desc
     if (!view.has_value())
         return;
 
-    view->on_network_request_started = [on_request_started = move(on_request_started)](u64 request_id, URL::URL const& url, ByteString const& method, Vector<HTTP::Header> const& headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority priority) {
+    view->on_network_request_started = [on_request_started = move(on_request_started)](u64 request_id, URL::URL const& url, ByteString const& method, Vector<HTTP::Header> const& headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::RequestPriority priority) {
         on_request_started({
             .request_id = request_id,
             .url = url.to_string(),

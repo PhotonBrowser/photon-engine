@@ -133,7 +133,7 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
 
         self->set_up_producers();
 
-        if (!self->m_audio_output_disabled && !self->m_audio_sink && !self->m_audio_tracks.is_empty()) {
+        if (!self->m_audio_sink && !self->m_audio_tracks.is_empty()) {
             self->m_audio_mixer = MUST(AudioMixer::try_create());
             self->m_audio_time_stretch_processor = MUST(AudioTimeStretchProcessor::try_create());
             self->m_audio_sink = MUST(AudioPlaybackSink::try_create(
@@ -141,7 +141,8 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
                     if (!self)
                         return;
                     self->on_audio_sink_state_changed(status);
-                }));
+                },
+                self->m_audio_output));
             MUST(self->m_audio_time_stretch_processor->connect_input(*self->m_audio_mixer));
             MUST(self->m_audio_sink->connect_input(*self->m_audio_time_stretch_processor));
             self->set_clock(*self->m_audio_sink);
@@ -311,8 +312,6 @@ PipelineStatus PlaybackManager::combined_pipeline_status() const
 
     if (m_audio_sink != nullptr) {
         auto audio_status = m_audio_sink_status;
-        if (audio_status == PipelineStatus::Suspended)
-            audio_status = PipelineStatus::Pending;
         if (audio_status == PipelineStatus::Pending) {
             for (auto const& track_data : m_audio_track_datas) {
                 if (!track_data.enabled)
@@ -340,8 +339,6 @@ PipelineStatus PlaybackManager::combined_pipeline_status() const
         if (!track_data.handle.has_value())
             continue;
         auto track_status = track_data.sink_status;
-        if (track_status == PipelineStatus::Suspended)
-            track_status = PipelineStatus::Pending;
         if (!track_data.ticking && track_status != PipelineStatus::Error) {
             auto verified_end_time = verified_end_time_for_track(track_data.track);
             if (verified_end_time.has_value() && current_time() >= *verified_end_time)
@@ -514,14 +511,21 @@ void PlaybackManager::disable_video_sink_by_handle(VideoSinkHandle handle)
     if (!track_data)
         return;
     if (track_data->video_sink) {
-        track_data->video_sink->disconnect_input(track_data->producer);
-        track_data->video_sink = nullptr;
-        track_data->video_edge_sink = nullptr;
+        disconnect_video_sink(*track_data);
         track_data->sink_status = PipelineStatus::HaveData;
     }
     track_data->handle = {};
     update_pipeline_state();
     dispatch_buffered_ranges_change();
+}
+
+void PlaybackManager::disconnect_video_sink(VideoTrackData& track_data)
+{
+    track_data.video_sink->set_state_change_handler(nullptr);
+    track_data.video_sink->set_resize_handler(nullptr);
+    track_data.video_sink->disconnect_input(track_data.producer);
+    track_data.video_sink = nullptr;
+    track_data.video_edge_sink = nullptr;
 }
 
 void PlaybackManager::set_video_sink_ticking(VideoSinkHandle handle, bool ticking)
@@ -541,11 +545,8 @@ void PlaybackManager::detach_video_sink(VideoSinkHandle handle)
     auto* track_data = find_video_data_for_handle(handle);
     if (!track_data)
         return;
-    if (track_data->video_sink) {
-        track_data->video_sink->disconnect_input(track_data->producer);
-        track_data->video_sink = nullptr;
-        track_data->video_edge_sink = nullptr;
-    }
+    if (track_data->video_sink)
+        disconnect_video_sink(*track_data);
     track_data->sink_status = PipelineStatus::Pending;
     update_pipeline_state();
     dispatch_buffered_ranges_change();
@@ -575,10 +576,9 @@ void PlaybackManager::attach_video_edge(Badge<VideoPresentationServerConnection>
     if (!manager)
         return;
     auto& track_data = manager->get_video_data_for_handle(handle);
-    if (track_data.video_sink != nullptr) {
-        dbgln("PlaybackManager: Refusing to attach a video edge to an already-attached video sink handle");
-        return;
-    }
+    // The replaced sink's last status stands until the new one reports, so replacing does not interrupt buffering.
+    if (track_data.video_sink != nullptr)
+        disconnect_video_sink(track_data);
     pump->set_pool_retired_observer([self = manager->weak(), handle](VideoFramePoolID pool_id) {
         if (!self)
             return;
@@ -711,7 +711,6 @@ void PlaybackManager::pause()
 void PlaybackManager::seek(AK::Duration timestamp, SeekMode mode)
 {
     dbgln_if(PLAYBACK_MANAGER_DEBUG, "PlaybackManager({:p}): Seek to {} ({}) from {}", this, timestamp, mode, m_handler->state());
-    reset_pipeline_state();
     m_handler->seek(timestamp, mode);
     m_is_in_error_state = false;
     update_pipeline_state();

@@ -31,15 +31,15 @@
 #include <LibMain/Main.h>
 #include <LibRequests/Forward.h>
 #include <LibURL/URL.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/PreferredContrast.h>
-#include <LibWeb/CSS/PreferredMotion.h>
-#include <LibWeb/Clipboard/SystemClipboard.h>
-#include <LibWeb/HTML/ActivateTab.h>
-#include <LibWeb/HTML/CrossProcessId.h>
-#include <LibWeb/HTML/ReplicatedNavigableState.h>
-#include <LibWeb/HTML/SessionHistoryEntry.h>
-#include <LibWeb/HTML/VisibilityState.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredContrast.h>
+#include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
+#include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/ReplicatedNavigableState.h>
+#include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/HTML/VisibilityState.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowserProcess.h>
@@ -212,12 +212,10 @@ public:
     void update_compositor_paused_debugger_overlay(Compositing::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action);
     void update_compositor_display_metadata(Compositing::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void update_compositor_context_visibility(Compositing::CompositorContextId, Web::HTML::VisibilityState);
-    bool send_async_scroll_to_compositor(Compositing::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Compositing::WheelDeltaPrecision, Compositing::ScrollGesturePhase, u32 modifiers);
-    Compositing::MouseEventHandlingResult handle_mouse_event_in_compositor(Compositing::CompositorContextId, Compositing::MouseEvent const&);
     bool handle_key_event_in_compositor(Compositing::CompositorContextId, Compositing::KeyEvent const&);
     bool dispatch_key_event_to_web_content(Compositing::CompositorContextId, Compositing::KeyEvent const&);
-    bool handle_pinch_event_in_compositor(Compositing::CompositorContextId, Compositing::PinchEvent const&);
-    bool dispatch_mouse_event_to_web_content(Compositing::CompositorContextId, Compositing::MouseEvent const&);
+    void handle_pinch_event_in_compositor(Compositing::CompositorContextId, Compositing::PinchEvent const&);
+    bool handle_and_dispatch_mouse_event_in_compositor(Compositing::CompositorContextId, Compositing::MouseEvent const&);
     void notify_compositor_presented_bitmap_ready_to_paint(Compositing::CompositorContextId, i32 bitmap_id);
 
     Function<void()> on_compositor_process_death;
@@ -484,7 +482,7 @@ private:
     virtual void listen_for_style_sheet_sources(DevTools::TabDescription const&, OnStyleSheetSourceReceived) const override;
     virtual void stop_listening_for_style_sheet_sources(DevTools::TabDescription const&) const override;
     virtual void retrieve_sources(DevTools::TabDescription const&, OnSourcesReceived) const override;
-    virtual void retrieve_source(DevTools::TabDescription const&, Web::HTML::ScriptRegistry::Identifier, OnSourceReceived) const override;
+    virtual void retrieve_source(DevTools::TabDescription const&, Web::HTML::ScriptRegistryIdentifier, OnSourceReceived) const override;
     virtual void listen_for_sources(DevTools::TabDescription const&, OnSourceAvailable) const override;
     virtual void stop_listening_for_sources(DevTools::TabDescription const&) const override;
     virtual void attach_debugger(DevTools::TabDescription const&, OnDebuggerPaused, OnDebuggerResumed) const override;
@@ -498,7 +496,7 @@ private:
     virtual void retrieve_debugger_environments(DevTools::TabDescription const&, u64 frame_id, OnDebuggerEnvironmentsReceived) const override;
     virtual void evaluate_javascript_in_debugger_frame(DevTools::TabDescription const&, u64 frame_id, String const&, OnDebuggerEvaluationComplete) const override;
     virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, OnDebuggerObjectPropertiesReceived) const override;
-    virtual void retrieve_debugger_source_positions(DevTools::TabDescription const&, Web::HTML::ScriptRegistry::Identifier, OnDebuggerSourcePositionsReceived) const override;
+    virtual void retrieve_debugger_source_positions(DevTools::TabDescription const&, Web::HTML::ScriptRegistryIdentifier, OnDebuggerSourcePositionsReceived) const override;
     virtual void resolve_dom_node_url(DevTools::TabDescription const&, Optional<Compositing::UniqueNodeID>, String const&, OnResolvedURLReceived) const override;
     virtual void evaluate_javascript(DevTools::TabDescription const&, String const&, OnScriptEvaluationComplete) const override;
     virtual void listen_for_console_messages(DevTools::TabDescription const&, OnConsoleMessage) const override;

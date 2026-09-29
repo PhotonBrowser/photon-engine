@@ -42,37 +42,37 @@
 #include <LibRequests/Forward.h>
 #include <LibRequests/NetworkError.h>
 #include <LibURL/Origin.h>
-#include <LibWeb/Bindings/Navigation.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Forward.h>
-#include <LibWeb/HTML/ActivateTab.h>
-#include <LibWeb/HTML/AudioPlayState.h>
-#include <LibWeb/HTML/ColorPickerUpdateState.h>
-#include <LibWeb/HTML/FileFilter.h>
-#include <LibWeb/HTML/HistoryOperation.h>
-#include <LibWeb/HTML/Scripting/ScriptRegistry.h>
-#include <LibWeb/HTML/SelectItem.h>
-#include <LibWeb/Page/DragEvent.h>
-#include <LibWeb/Page/EventResult.h>
-#include <LibWeb/Page/QueuedInputEvent.h>
-#include <LibWeb/Page/ScreenWakeLockHandle.h>
-#include <LibWeb/Page/ViewportIsFullscreen.h>
-#include <LibWeb/WebDriver/Contexts.h>
-#include <LibWeb/WebDriver/Response.h>
+#include <LibWebCommon/Bindings/Navigation.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestPriority.h>
+#include <LibWebCommon/Forward.h>
+#include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/HTML/AudioPlayState.h>
+#include <LibWebCommon/HTML/ColorPickerUpdateState.h>
+#include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/HTML/HistoryOperation.h>
+#include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
+#include <LibWebCommon/HTML/SelectItem.h>
+#include <LibWebCommon/Page/DragEvent.h>
+#include <LibWebCommon/Page/EventResult.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <LibWebCommon/Page/ScreenWakeLockState.h>
+#include <LibWebCommon/Page/ViewportIsFullscreen.h>
+#include <LibWebCommon/WebDriver/Response.h>
+#include <LibWebCommon/WebDriver/SessionBrowsingContext.h>
+#include <LibWebCommon/WebView/DOMNodeProperties.h>
+#include <LibWebCommon/WebView/Debugger.h>
+#include <LibWebCommon/WebView/DictionaryLookup.h>
+#include <LibWebCommon/WebView/PageInfo.h>
+#include <LibWebCommon/WebView/StorageSetResult.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
-#include <LibWebView/DOMNodeProperties.h>
-#include <LibWebView/Debugger.h>
-#include <LibWebView/DictionaryLookup.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HistoryVisitTransition.h>
-#include <LibWebView/PageInfo.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
-#include <LibWebView/StorageSetResult.h>
 #include <LibWebView/TabPerformanceStats.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
@@ -188,6 +188,10 @@ public:
     void did_finish_handling_input_event(Badge<WebContentPage>, u64 event_id, Web::EventResult event_result);
     void did_forward_input_event(Badge<WebContentPage>, u64 event_id, WebContentPage& endpoint);
     void did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage&);
+    void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
+    void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
+    void discard_input_events_routed_through_lost_compositor(Badge<Application>);
+    size_t pending_input_event_count_for_testing() const { return m_pending_input_events.size(); }
     void handle_external_url(Badge<WebContentPage>, URL::URL, URL::Origin, bool has_transient_activation);
     void did_request_cursor_change(Badge<WebContentPage>, Gfx::Cursor);
 
@@ -258,7 +262,7 @@ public:
     void inspect_current_grid(Compositing::UniqueNodeID node_id);
     void inspect_current_flexbox(Compositing::UniqueNodeID node_id, bool only_look_at_parents);
     void retrieve_devtools_sources(DevTools::DevToolsDelegate::OnSourcesReceived);
-    void request_devtools_source(Web::HTML::ScriptRegistry::Identifier const&);
+    void request_devtools_source(Web::HTML::ScriptRegistryIdentifier const&);
     void attach_debugger(DevTools::DevToolsDelegate::OnDebuggerPaused, DevTools::DevToolsDelegate::OnDebuggerResumed);
     void configure_debugger(DebuggerConfiguration);
     void detach_debugger();
@@ -273,7 +277,7 @@ public:
     void retrieve_debugger_environments(u64 frame_id, DevTools::DevToolsDelegate::OnDebuggerEnvironmentsReceived);
     void evaluate_javascript_in_debugger_frame(u64 frame_id, String const&, DevTools::DevToolsDelegate::OnDebuggerEvaluationComplete);
     void retrieve_debugger_object_properties(u64 object_id, DevTools::DevToolsDelegate::OnDebuggerObjectPropertiesReceived);
-    void retrieve_debugger_source_positions(Web::HTML::ScriptRegistry::Identifier, DevTools::DevToolsDelegate::OnDebuggerSourcePositionsReceived);
+    void retrieve_debugger_source_positions(Web::HTML::ScriptRegistryIdentifier, DevTools::DevToolsDelegate::OnDebuggerSourcePositionsReceived);
     void resolve_dom_node_url(Optional<Compositing::UniqueNodeID> node_id, String const& url, DevTools::DevToolsDelegate::OnResolvedURLReceived);
     void clear_inspected_dom_node();
 
@@ -448,14 +452,14 @@ public:
     Function<void(Vector<Web::CSS::StyleSheetIdentifier>)> on_received_style_sheet_list;
     Function<void(Web::CSS::StyleSheetIdentifier const&, URL::URL const&, Utf16String const&)> on_received_style_sheet_source;
     HashMap<u64, DevTools::DevToolsDelegate::OnSourcesReceived> on_received_devtools_sources;
-    HashMap<Web::HTML::ScriptRegistry::Identifier, Function<void(Optional<Web::HTML::ScriptRegistry::Content>)>> on_received_devtools_source;
+    HashMap<Web::HTML::ScriptRegistryIdentifier, Function<void(Optional<Web::HTML::ScriptRegistryContent>)>> on_received_devtools_source;
     HashMap<u64, DevTools::DevToolsDelegate::OnResolvedURLReceived> on_resolved_dom_node_url;
-    Function<void(Web::HTML::ScriptRegistry::Description)> on_devtools_source_available;
+    Function<void(Web::HTML::ScriptRegistryDescription)> on_devtools_source_available;
     DevTools::DevToolsDelegate::OnDebuggerPaused on_debugger_paused;
     DevTools::DevToolsDelegate::OnDebuggerResumed on_debugger_resumed;
     Function<void(JsonValue)> on_received_js_console_result;
     Function<void(ConsoleOutput)> on_console_message;
-    Function<void(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ByteBuffer, Optional<String>, String, bool, Web::Fetch::Infrastructure::Request::Priority)> on_network_request_started;
+    Function<void(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ByteBuffer, Optional<String>, String, bool, Web::Fetch::Infrastructure::RequestPriority)> on_network_request_started;
     Function<void(u64 request_id, u32 status_code, Optional<String> const&, Vector<HTTP::Header> const&, Requests::CameFromCache)> on_network_response_headers_received;
     Function<void(u64 request_id, ByteBuffer)> on_network_response_body_received;
     Function<void(u64 request_id, u64 body_size, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const&)> on_network_request_finished;
@@ -505,7 +509,7 @@ public:
     void did_request_page_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target);
     void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, URL::URL url);
     void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, URL::URL url, Optional<Gfx::ShareableBitmap> bitmap);
-    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::Page::MediaContextMenu menu);
+    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu);
     void send_to_media_context_menu_page(Function<void(WebContentPage&)> const&);
 
     void did_request_color_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Color current_color);
@@ -726,6 +730,10 @@ protected:
         // The page handling the event, which is not the view's own page when another process hosts the focused
         // navigable. A lost page never finishes the events it held.
         NonnullRefPtr<WebContentPage> endpoint;
+
+        // Set while the compositor decides whether it consumes the event, forwards it or hands it back. A compositor
+        // that dies forwards none of the events still marked this way.
+        bool routed_through_compositor { false };
     };
     Vector<PendingInputEvent> m_pending_input_events;
     u64 m_next_input_event_id { 1 };

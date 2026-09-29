@@ -5,7 +5,9 @@
  */
 
 #include <AK/Math.h>
+#include <AK/Random.h>
 #include <AK/StdLibExtras.h>
+#include <Compositor/CanvasHost.h>
 #include <Compositor/CompositorState.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
@@ -64,6 +66,66 @@ void CompositorState::destroy_contexts_for_web_content_client(CompositorStateWeb
     }
 
     m_video_sink_states.remove(&client);
+
+    m_placeholder_canvases.remove_all_matching([&](auto canvas_id, auto const& placeholder) {
+        if (placeholder.owner != &client)
+            return false;
+        m_canvas_surface_registry.remove_canvas_surface(canvas_id);
+        return true;
+    });
+}
+
+CompositorState::PlaceholderCanvasAllocation CompositorState::allocate_placeholder_canvas(CompositorStateWebContentClient& client)
+{
+    auto canvas_id = m_canvas_surface_registry.allocate_canvas_id();
+    auto secret = get_random<u64>();
+    m_placeholder_canvases.set(canvas_id, { .owner = &client, .secret = secret, .surface = nullptr, .size = {}, .origin_clean = true });
+    return { canvas_id, secret };
+}
+
+void CompositorState::release_placeholder_canvas(CompositorStateWebContentClient& client, Compositing::CanvasId canvas_id)
+{
+    auto it = m_placeholder_canvases.find(canvas_id);
+    if (it == m_placeholder_canvases.end() || it->value.owner != &client)
+        return;
+    m_placeholder_canvases.remove(it);
+    m_canvas_surface_registry.remove_canvas_surface(canvas_id);
+}
+
+void CompositorState::commit_placeholder_canvas(Compositing::CanvasId canvas_id, u64 secret, RefPtr<Gfx::PaintingSurface> source_surface, Gfx::IntSize size, bool origin_clean)
+{
+    auto it = m_placeholder_canvases.find(canvas_id);
+    if (it == m_placeholder_canvases.end() || it->value.secret != secret)
+        return;
+
+    auto& placeholder = it->value;
+    if (source_surface) {
+        if (!placeholder.surface || placeholder.surface->size() != source_surface->size())
+            placeholder.surface = Gfx::PaintingSurface::create_with_size(source_surface->size(), Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, m_skia_backend_context);
+        placeholder.surface->copy_from_surface(*source_surface);
+        m_canvas_surface_registry.set_canvas_surface(canvas_id, *placeholder.surface);
+    } else {
+        placeholder.surface = nullptr;
+        m_canvas_surface_registry.remove_canvas_surface(canvas_id);
+    }
+    present_contexts_drawing_canvas(*placeholder.owner, canvas_id);
+
+    if (placeholder.size == size && placeholder.origin_clean == origin_clean)
+        return;
+    placeholder.size = size;
+    placeholder.origin_clean = origin_clean;
+    placeholder.owner->placeholder_canvas_committed(canvas_id, size, origin_clean);
+}
+
+CompositorState::PlaceholderCanvasPixels CompositorState::read_placeholder_canvas_pixels(CompositorStateWebContentClient& client, Compositing::CanvasId canvas_id, Gfx::IntRect rect)
+{
+    auto it = m_placeholder_canvases.find(canvas_id);
+    if (it == m_placeholder_canvases.end() || it->value.owner != &client)
+        return {};
+    auto& placeholder = it->value;
+    if (!placeholder.surface)
+        return { .pixels = {}, .origin_clean = placeholder.origin_clean };
+    return { .pixels = CanvasHost::read_back_surface(*placeholder.surface, rect), .origin_clean = placeholder.origin_clean };
 }
 
 void CompositorState::create_context(Compositing::CompositorContextId context_id, Optional<u64> page_id, CompositorStateWebContentClient& web_content_client)
@@ -270,11 +332,24 @@ void CompositorState::present_contexts_drawing_video_sink(CompositorStateWebCont
             continue;
         for (auto const& resource_entry : context.video_sink_handles()) {
             if (resource_entry.value == handle) {
-                if (auto rect = context.video_present_rect(); rect.has_value())
+                if (auto rect = context.self_present_rect(); rect.has_value())
                     schedule_present_frame(context_entry.key, context, *rect);
                 break;
             }
         }
+    }
+}
+
+void CompositorState::present_contexts_drawing_canvas(CompositorStateWebContentClient& client, Compositing::CanvasId canvas_id)
+{
+    for (auto& context_entry : m_contexts) {
+        auto& context = *context_entry.value;
+        if (&context.web_content_client() != &client)
+            continue;
+        if (!context_is_effectively_visible(context) || !context.draws_canvas(canvas_id))
+            continue;
+        if (auto rect = context.self_present_rect(); rect.has_value())
+            schedule_present_frame(context_entry.key, context, *rect);
     }
 }
 
@@ -442,36 +517,47 @@ bool CompositorState::dispatch_key_event_to_web_content(Compositing::CompositorC
     return true;
 }
 
-Compositing::MouseEventHandlingResult CompositorState::handle_mouse_event(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
+void CompositorState::handle_and_dispatch_mouse_event(Compositing::CompositorContextId context_id, Compositing::MouseEvent event)
 {
+    VERIFY(m_client);
     auto* context = context_if_present(context_id);
-    if (!context)
-        return {};
+    if (!context || !context->can_dispatch_input_to_web_content()) {
+        m_client->did_not_dispatch_input_event(context_id, event.id);
+        return;
+    }
 
-    auto result = context->handle_mouse_event(event);
-    return {
-        .handled = apply_context_update_result(context_id, *context, result),
-        .scrollbar_dragged_by_compositor = result.scrollbar_dragged_by_compositor,
-    };
-}
+    auto is_wheel_event = event.type == Compositing::MouseEvent::Type::MouseWheel;
+    ContextState::ContextUpdateResult result;
+    if (is_wheel_event) {
+        if (m_async_scrolling_enabled)
+            result = context->handle_wheel_event(event);
+    } else {
+        result = context->handle_mouse_event(event);
+    }
 
-bool CompositorState::dispatch_mouse_event_to_web_content(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
-{
-    auto* context = context_if_present(context_id);
-    if (!context)
-        return false;
-
+    // Schedules the present, publishes the scroll updates the event produced and asks for a rendering update, all of
+    // which reach WebContent ahead of the event itself on the same connection.
+    auto handled = apply_context_update_result(context_id, *context, result);
+    if (is_wheel_event) {
+        event.async_scroll_performed_default_action = handled;
+    } else if (handled) {
+        // The page still sees the events of a drag the compositor scrolls for a scrollbar the display list paints.
+        if (!result.scrollbar_dragged_by_compositor.has_value()) {
+            m_client->did_consume_input_event(context_id, event.id);
+            return;
+        }
+        event.scrollbar_dragged_by_compositor = result.scrollbar_dragged_by_compositor;
+    }
     context->dispatch_mouse_event_to_web_content(event);
-    return true;
 }
 
-bool CompositorState::handle_pinch_event(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
+void CompositorState::handle_pinch_event(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
 {
     auto* context = context_if_present(context_id);
     if (!context)
-        return false;
+        return;
 
-    return apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
+    apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
 }
 
 Compositing::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Compositing::CompositorContextId context_id, Compositing::UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
@@ -516,18 +602,6 @@ void CompositorState::cancel_smooth_scroll(Compositing::CompositorContextId cont
         return;
     context->cancel_smooth_scroll(stable_node_id);
     publish_pending_async_scroll_updates(context_id, *context);
-}
-
-bool CompositorState::async_scroll_by(Compositing::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers)
-{
-    if (!m_async_scrolling_enabled)
-        return false;
-
-    auto* context = context_if_present(context_id);
-    if (!context)
-        return false;
-
-    return apply_context_update_result(context_id, *context, context->async_scroll_by(position, delta, wheel_delta_precision, scroll_gesture_phase, modifiers));
 }
 
 Compositing::PendingAsyncScrollUpdates CompositorState::take_pending_async_scroll_updates(Compositing::CompositorContextId context_id)

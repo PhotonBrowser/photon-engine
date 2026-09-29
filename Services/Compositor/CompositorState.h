@@ -49,6 +49,10 @@ public:
 
     virtual void did_allocate_backing_stores(Compositing::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores) = 0;
     virtual void did_present_frame(Compositing::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id) = 0;
+    // The compositor performed the event's whole default action, so the UI hears nothing more about it.
+    virtual void did_consume_input_event(Compositing::CompositorContextId, u64 event_id) = 0;
+    // No context could take the event; the UI sends it to WebContent itself.
+    virtual void did_not_dispatch_input_event(Compositing::CompositorContextId, u64 event_id) = 0;
 };
 
 class CompositorStateWebContentClient {
@@ -62,6 +66,7 @@ public:
     virtual void async_scroll_updates(Compositing::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) = 0;
     virtual void create_video_edge(Media::VideoSinkHandle) = 0;
     virtual void release_video_edge(Media::VideoSinkHandle) = 0;
+    virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) = 0;
 };
 
 class CompositorState final : public RefCounted<CompositorState> {
@@ -100,13 +105,11 @@ public:
     void invalidate_keyboard_scroll_state(Compositing::CompositorContextId, u64 generation);
     bool handle_key_event(Compositing::CompositorContextId, Compositing::KeyEvent const&);
     bool dispatch_key_event_to_web_content(Compositing::CompositorContextId, Compositing::KeyEvent const&);
-    Compositing::MouseEventHandlingResult handle_mouse_event(Compositing::CompositorContextId, Compositing::MouseEvent const&);
-    bool dispatch_mouse_event_to_web_content(Compositing::CompositorContextId, Compositing::MouseEvent const&);
-    bool handle_pinch_event(Compositing::CompositorContextId, Compositing::PinchEvent const&);
+    void handle_and_dispatch_mouse_event(Compositing::CompositorContextId, Compositing::MouseEvent);
+    void handle_pinch_event(Compositing::CompositorContextId, Compositing::PinchEvent const&);
     Compositing::AsyncScrollEnqueueResult async_scroll_by(Compositing::CompositorContextId, Compositing::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Compositing::WheelDeltaPrecision, Compositing::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking);
     Compositing::AsyncScrollEnqueueResult smooth_scroll_to(Compositing::CompositorContextId, Compositing::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator);
     void cancel_smooth_scroll(Compositing::CompositorContextId, Compositing::AsyncScrollNodeStableID);
-    bool async_scroll_by(Compositing::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta, Compositing::WheelDeltaPrecision, Compositing::ScrollGesturePhase, u32 modifiers);
     void viewport_size_updated(Compositing::CompositorContextId, Gfx::IntSize, Compositing::WindowResizingInProgress);
     void request_rendering_opportunity(Compositing::CompositorContextId, double maximum_frames_per_second);
     void set_paused_debugger_overlay(Compositing::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<Compositing::PausedDebuggerOverlayAction> hovered_action);
@@ -119,6 +122,19 @@ public:
     bool request_screenshot(Compositing::CompositorContextId, Gfx::ShareableBitmap&);
     void presented_bitmap_ready_to_paint(Compositing::CompositorContextId, i32 bitmap_id);
     void set_client_gpu_presentation_capability(bool supported, u64 adapter_luid);
+
+    struct PlaceholderCanvasAllocation {
+        Compositing::CanvasId canvas_id;
+        u64 secret { 0 };
+    };
+    PlaceholderCanvasAllocation allocate_placeholder_canvas(CompositorStateWebContentClient&);
+    void release_placeholder_canvas(CompositorStateWebContentClient&, Compositing::CanvasId);
+    void commit_placeholder_canvas(Compositing::CanvasId, u64 secret, RefPtr<Gfx::PaintingSurface> source_surface, Gfx::IntSize, bool origin_clean);
+    struct PlaceholderCanvasPixels {
+        Gfx::ShareableBitmap pixels;
+        bool origin_clean { true };
+    };
+    PlaceholderCanvasPixels read_placeholder_canvas_pixels(CompositorStateWebContentClient&, Compositing::CanvasId, Gfx::IntRect);
 
 private:
     CompositorState(RefPtr<Gfx::SkiaBackendContext>, bool async_scrolling_enabled);
@@ -176,6 +192,7 @@ private:
     void schedule_unpainted_video_updates();
     int unpainted_video_update_interval_ms() const;
     void present_contexts_drawing_video_sink(CompositorStateWebContentClient&, Media::VideoSinkHandle);
+    void present_contexts_drawing_canvas(CompositorStateWebContentClient&, Compositing::CanvasId);
     bool apply_context_update_result(
         Compositing::CompositorContextId,
         ContextState&,
@@ -224,6 +241,15 @@ private:
     void update_unpainted_video_update_scheduling();
     HashMap<CompositorStateWebContentClient*, HashMap<Media::VideoSinkHandle, VideoSinkState>> m_video_sink_states;
     RefPtr<Core::Timer> m_unpainted_video_update_timer;
+
+    struct PlaceholderCanvas {
+        CompositorStateWebContentClient* owner { nullptr };
+        u64 secret { 0 };
+        RefPtr<Gfx::PaintingSurface> surface;
+        Optional<Gfx::IntSize> size;
+        bool origin_clean { true };
+    };
+    HashMap<Compositing::CanvasId, PlaceholderCanvas> m_placeholder_canvases;
 };
 
 }

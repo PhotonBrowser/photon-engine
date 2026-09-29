@@ -10,10 +10,13 @@
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/LocalServer.h>
+#include <LibCore/Platform/TaskRole.h>
+#include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
 #include <LibCore/Resource.h>
 #include <LibCore/System.h>
 #include <LibCore/TimeZone.h>
+#include <LibCrypto/OpenSSL.h>
 #include <LibCrypto/OpenSSLForward.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibIPC/ConnectionFromClient.h>
@@ -33,8 +36,8 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWebView/Plugins/ImageCodecPlugin.h>
-#include <LibWebView/Utilities.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <Services/RendererSandbox.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
@@ -42,6 +45,7 @@
 #include <WebContent/WebDriverConnection.h>
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasm/Types.h>
 #    include <LibWasmCompilerClient/State.h>
 #endif
 
@@ -188,6 +192,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         Core::Process::wait_for_debugger_and_break();
     }
 
+    if (auto result = Core::Platform::adopt_foreground_application_task_role(); result.is_error())
+        warnln("Could not adopt the foreground application task role: {}", result.error());
+    // Match the UI process, but let its main thread win a tie, as WebKit does for its WebContent process.
+    if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInteractive, -1); result.is_error())
+        warnln("Could not set main thread QoS: {}", result.error());
+
     if (!default_time_zone.is_empty()) {
         if (auto result = Core::TimeZone::set_current_time_zone(default_time_zone); result.is_error())
             dbgln("Failed to set default time zone: {}", result.error());
@@ -261,7 +271,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     });
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)
-    WasmCompilerClient::compiler_state().install_compiler_callback();
+    Wasm::set_cranelift_compile_callback([](Core::AnonymousBuffer const& buffer) {
+        return WasmCompilerClient::compiler_state().compile(buffer);
+    });
 
     webcontent_client->on_wasm_compiler_connection = [](auto handle) {
         WasmCompilerClient::compiler_state().replace_connection(move(handle));
@@ -295,8 +307,8 @@ ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
     new_client->transport().set_peer_pid(response->peer_pid());
 #endif
     if (Web::Platform::ImageCodecPlugin::is_initialized())
-        static_cast<WebView::ImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
     else
-        Web::Platform::ImageCodecPlugin::install(*new WebView::ImageCodecPlugin(move(new_client)));
+        Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(new_client)));
     return {};
 }

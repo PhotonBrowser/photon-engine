@@ -7,8 +7,11 @@
 #include <LibCore/ArgsParser.h>
 #include <LibCore/CrashHandler.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/Platform/TaskRole.h>
+#include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
+#include <LibCrypto/OpenSSL.h>
 #include <LibCrypto/OpenSSLForward.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibIPC/SingleServer.h>
@@ -24,12 +27,13 @@
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWebView/Plugins/ImageCodecPlugin.h>
-#include <LibWebView/Utilities.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <Services/RendererSandbox.h>
 #include <WebWorker/ConnectionFromClient.h>
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasm/Types.h>
 #    include <LibWasmCompilerClient/State.h>
 #endif
 
@@ -64,6 +68,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     bool wait_for_debugger = false;
     bool file_origins_are_tuple_origins = false;
     bool disable_sandbox = false;
+    bool enable_test_mode = false;
 
     int crash_report_fd = -1;
     Core::ArgsParser args_parser;
@@ -78,6 +83,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
     args_parser.add_option(file_origins_are_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
+    args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
 
     args_parser.parse(arguments);
 
@@ -88,6 +94,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     if (wait_for_debugger)
         Core::Process::wait_for_debugger_and_break();
+
+    if (auto result = Core::Platform::adopt_foreground_application_task_role(); result.is_error())
+        warnln("Could not adopt the foreground application task role: {}", result.error());
+    if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInitiated); result.is_error())
+        warnln("Could not set main thread QoS: {}", result.error());
 
     if (file_origins_are_tuple_origins)
         URL::set_file_scheme_urls_have_tuple_origins();
@@ -112,7 +123,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     if (!disable_sandbox)
         TRY(RendererSandbox::apply_sandbox(mach_server_name, cache_path, RendererSandbox::AudioAccess::No));
 
-    auto client = TRY(IPC::take_over_accepted_client_from_system_server<WebWorker::ConnectionFromClient>(mach_server_name));
+    auto client = TRY(IPC::take_over_accepted_client_from_system_server<WebWorker::ConnectionFromClient>(mach_server_name, enable_test_mode));
 
     auto& heap = Web::Bindings::main_thread_vm().heap();
     client->on_request_server_connection = [&heap](auto const& handle) {
@@ -129,7 +140,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     });
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)
-    WasmCompilerClient::compiler_state().install_compiler_callback();
+    Wasm::set_cranelift_compile_callback([](Core::AnonymousBuffer const& buffer) {
+        return WasmCompilerClient::compiler_state().compile(buffer);
+    });
 
     client->on_wasm_compiler_connection = [](auto handle) {
         WasmCompilerClient::compiler_state().replace_connection(move(handle));
@@ -163,8 +176,8 @@ static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle
     new_client->transport().set_peer_pid(response->peer_pid());
 #endif
     if (Web::Platform::ImageCodecPlugin::is_initialized())
-        static_cast<WebView::ImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
     else
-        Web::Platform::ImageCodecPlugin::install(*new WebView::ImageCodecPlugin(move(new_client)));
+        Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(new_client)));
     return {};
 }

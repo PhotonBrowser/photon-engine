@@ -954,6 +954,23 @@ Optional<Gfx::IntRect> ContextState::advance_smooth_scroll_animations(MonotonicT
     return {};
 }
 
+ContextState::ContextUpdateResult ContextState::handle_wheel_event(Compositing::MouseEvent const& event, Optional<MonotonicTime> now_for_testing)
+{
+    VERIFY(event.type == Compositing::MouseEvent::Type::MouseWheel);
+    auto wheel_delta_x = event.wheel_delta_x;
+    auto wheel_delta_y = event.wheel_delta_y;
+    if (event.modifiers & Compositing::KeyModifier::Mod_Shift)
+        swap(wheel_delta_x, wheel_delta_y);
+
+    auto position = Gfx::FloatPoint {
+        static_cast<float>(event.position.x().value()),
+        static_cast<float>(event.position.y().value()),
+    };
+    auto delta_in_device_pixels = Gfx::FloatPoint { static_cast<float>(wheel_delta_x), static_cast<float>(wheel_delta_y) }
+                                      .scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
+    return async_scroll_by(position, delta_in_device_pixels, event.wheel_delta_precision, event.scroll_gesture_phase, event.modifiers, now_for_testing);
+}
+
 ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Optional<MonotonicTime> now_for_testing)
 {
     if (!presents_to_client())
@@ -1372,13 +1389,18 @@ Optional<Gfx::IntRect> ContextState::frame_rect_to_repaint() const
     return m_presented_frame;
 }
 
-Optional<Gfx::IntRect> ContextState::video_present_rect() const
+Optional<Gfx::IntRect> ContextState::self_present_rect() const
 {
     if (m_presented_frame.has_value())
         return m_presented_frame;
     if (!m_viewport_size.is_empty())
         return Gfx::IntRect { {}, m_viewport_size };
     return {};
+}
+
+bool ContextState::draws_canvas(Compositing::CanvasId canvas_id) const
+{
+    return m_last_rasterized_frame.has_value() && m_last_rasterized_frame->canvas_content_generations.contains(canvas_id);
 }
 
 Optional<ContextState::PreparedFrame> ContextState::prepare_frame(Compositing::DisplayListPlayerSkia& display_list_player, PendingFrame pending_frame, CompositedContextResolver const* composited_context_resolver)

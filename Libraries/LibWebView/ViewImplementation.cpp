@@ -8,6 +8,7 @@
 #include <AK/Error.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/NumericLimits.h>
+#include <AK/Random.h>
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/Time.h>
@@ -18,11 +19,11 @@
 #include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/CSS/SystemColor.h>
-#include <LibWeb/Crypto/Crypto.h>
-#include <LibWeb/Geolocation/GeolocationPositionError.h>
-#include <LibWeb/Infra/Strings.h>
-#include <LibWeb/WebDriver/Error.h>
+#include <LibWebCommon/CSS/SystemColor.h>
+#include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
+#include <LibWebCommon/Infra/Strings.h>
+#include <LibWebCommon/WebDriver/Error.h>
+#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/ErrorHTML.h>
@@ -31,7 +32,6 @@
 #include <LibWebView/HistoryDebug.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
-#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
@@ -627,7 +627,6 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 
     auto* key_event = event.get_pointer<Compositing::KeyEvent>();
     auto* mouse_event = event.get_pointer<Compositing::MouseEvent>();
-    auto* pinch_event = event.get_pointer<Compositing::PinchEvent>();
     if (m_debugger_paused) {
         if (mouse_event) {
             if (mouse_event->type == Compositing::MouseEvent::Type::MouseMove) {
@@ -691,46 +690,6 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         }
     }
 
-    if (Application::web_content_options().enable_async_scrolling == EnableAsyncScrolling::Yes
-        && m_client_state.has_usable_bitmap
-        && mouse_event) {
-        if (mouse_event->type == Compositing::MouseEvent::Type::MouseWheel) {
-            auto wheel_delta_x = mouse_event->wheel_delta_x;
-            auto wheel_delta_y = mouse_event->wheel_delta_y;
-            if (mouse_event->modifiers & Compositing::KeyModifier::Mod_Shift)
-                swap(wheel_delta_x, wheel_delta_y);
-
-            auto device_pixels_per_css_pixel = static_cast<float>(device_pixel_ratio() * zoom_level());
-            auto position = Gfx::FloatPoint {
-                static_cast<float>(mouse_event->position.x().value()),
-                static_cast<float>(mouse_event->position.y().value()),
-            };
-            auto delta_in_device_pixels = Gfx::FloatPoint { wheel_delta_x, wheel_delta_y }.scaled(device_pixels_per_css_pixel);
-            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI attempting compositor wheel bypass for page {} at {},{} device delta {},{}",
-                page_id(), position.x(), position.y(), delta_in_device_pixels.x(), delta_in_device_pixels.y());
-            if (page().send_async_scroll_to_compositor(position, delta_in_device_pixels, mouse_event->wheel_delta_precision, mouse_event->scroll_gesture_phase, mouse_event->modifiers))
-                mouse_event->async_scroll_performed_default_action = true;
-            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor wheel bypass result for page {}: {}",
-                page_id(), mouse_event->async_scroll_performed_default_action ? "accepted"sv : "rejected"sv);
-        } else if (auto result = page().handle_mouse_event_in_compositor(*mouse_event); result.handled) {
-            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor handled mouse event for page {} at {},{}",
-                page_id(), mouse_event->position.x().value(), mouse_event->position.y().value());
-            // The page still sees the events of a drag the compositor scrolls for a scrollbar the display list paints.
-            if (!result.scrollbar_dragged_by_compositor.has_value())
-                return;
-            mouse_event->scrollbar_dragged_by_compositor = result.scrollbar_dragged_by_compositor;
-        }
-    }
-    if (Application::web_content_options().enable_async_scrolling == EnableAsyncScrolling::Yes
-        && m_client_state.has_usable_bitmap
-        && pinch_event) {
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI attempting compositor pinch bypass for page {} at {},{} scale delta {}",
-            page_id(), pinch_event->position.x().value(), pinch_event->position.y().value(), pinch_event->scale_delta);
-        auto handled = page().handle_pinch_event_in_compositor(*pinch_event);
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor pinch bypass result for page {}: {}",
-            page_id(), handled ? "accepted"sv : "rejected"sv);
-    }
-
     // Send the next event over to the WebContent to be handled by JS. We'll later get a message to say whether JS
     // prevented the default event behavior, at which point we either discard or handle that event, and then try to
     // process the next one.
@@ -748,8 +707,13 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
                 host.async_key_event(event.clone_without_browser_data());
             }
         },
-        [this](Compositing::MouseEvent const& event) {
-            page().dispatch_mouse_event_to_web_content(event);
+        [&](Compositing::MouseEvent const& event) {
+            // The compositor scrolls or drags a scrollbar for the event when it can, then forwards the event to
+            // WebContent behind the scroll updates that produced, consumes it, or hands it back for direct dispatch.
+            if (page().handle_and_dispatch_mouse_event_in_compositor(event))
+                pending.routed_through_compositor = true;
+            else
+                page().async_mouse_event(event.clone_without_browser_data());
         },
         [this](Web::DragEvent& event) {
             auto cloned_event = event.clone_without_browser_data();
@@ -758,6 +722,7 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
             client().async_drag_event(page_id(), cloned_event);
         },
         [this](Compositing::PinchEvent const& event) {
+            page().handle_pinch_event_in_compositor(event);
             client().async_pinch_event(page_id(), event);
         });
 }
@@ -968,6 +933,36 @@ void ViewImplementation::did_lose_input_event_endpoint(Badge<WebContentClient>, 
 {
     // Nothing will finish the events the lost page held, and a pending event holds back compositor input.
     m_pending_input_events.remove_all_matching([&](auto const& pending) { return pending.endpoint == page; });
+}
+
+void ViewImplementation::did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id)
+{
+    // The compositor performed the default action itself, so there is no result to hand to the view.
+    m_pending_input_events.remove_first_matching([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
+}
+
+void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id)
+{
+    auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
+    if (!index.has_value())
+        return;
+
+    auto& pending = m_pending_input_events[*index];
+    pending.routed_through_compositor = false;
+    pending.event.visit(
+        [&](Compositing::MouseEvent const& event) {
+            pending.endpoint->async_mouse_event(event.clone_without_browser_data());
+        },
+        [](auto const&) {
+            VERIFY_NOT_REACHED();
+        });
+}
+
+void ViewImplementation::discard_input_events_routed_through_lost_compositor(Badge<Application>)
+{
+    // The compositor may have forwarded some of these before it died, and WebContent does not de-duplicate event ids,
+    // so sending them again could run an event twice. Acknowledgements that still arrive for them are ignored.
+    m_pending_input_events.remove_all_matching([](auto const& pending) { return pending.routed_through_compositor; });
 }
 
 void ViewImplementation::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)
@@ -1516,7 +1511,7 @@ void ViewImplementation::retrieve_devtools_sources(DevTools::DevToolsDelegate::O
     client().async_list_devtools_sources(page_id(), request_id);
 }
 
-void ViewImplementation::request_devtools_source(Web::HTML::ScriptRegistry::Identifier const& source_id)
+void ViewImplementation::request_devtools_source(Web::HTML::ScriptRegistryIdentifier const& source_id)
 {
     client().async_request_devtools_source(page_id(), source_id);
 }
@@ -1689,7 +1684,7 @@ void ViewImplementation::retrieve_debugger_object_properties(u64 object_id, DevT
     client().async_get_debugger_object_properties(page_id(), request_id, object_id);
 }
 
-void ViewImplementation::retrieve_debugger_source_positions(Web::HTML::ScriptRegistry::Identifier source_id, DevTools::DevToolsDelegate::OnDebuggerSourcePositionsReceived on_complete)
+void ViewImplementation::retrieve_debugger_source_positions(Web::HTML::ScriptRegistryIdentifier source_id, DevTools::DevToolsDelegate::OnDebuggerSourcePositionsReceived on_complete)
 {
     auto request_id = m_next_debugger_source_positions_request_id++;
     m_pending_debugger_source_positions_requests.set(request_id, move(on_complete));
@@ -2194,7 +2189,7 @@ void ViewImplementation::initialize_client(CreateNewClient create_new_client)
     VERIFY(has_display_page());
 
     if (m_client_state.client_handle.is_empty()) {
-        m_client_state.client_handle = Web::Crypto::generate_random_uuid();
+        m_client_state.client_handle = generate_random_uuid();
         Application::the().notify_webdriver_window_created(m_client_state.client_handle);
     }
     prepare_page_for_tab(page());
@@ -2204,7 +2199,7 @@ void ViewImplementation::initialize_client(CreateNewClient create_new_client)
     content_settings_changed();
     geolocation_settings_changed();
 
-    using GeolocationErrorCode = Web::Geolocation::GeolocationPositionError::ErrorCode;
+    using GeolocationErrorCode = Web::Geolocation::GeolocationPositionErrorCode;
 
     auto geolocation_error_code = [](Core::GeolocationError const& error) {
         switch (error.type) {
@@ -3343,7 +3338,7 @@ void ViewImplementation::global_privacy_control_changed()
 
 void ViewImplementation::geolocation_settings_changed()
 {
-    using ErrorCode = Web::Geolocation::GeolocationPositionError::ErrorCode;
+    using ErrorCode = Web::Geolocation::GeolocationPositionErrorCode;
 
     if (Application::web_content_options().is_test_mode != IsTestMode::Yes && !Application::settings().geolocation_enabled()) {
         auto geolocation_position_request_ids = move(m_geolocation_position_request_ids);
@@ -3370,7 +3365,7 @@ void ViewImplementation::geolocation_settings_changed()
 
 void ViewImplementation::send_geolocation_emulated_position(WebContentPage& page)
 {
-    using ErrorCode = Web::Geolocation::GeolocationPositionError::ErrorCode;
+    using ErrorCode = Web::Geolocation::GeolocationPositionErrorCode;
 
     if (Application::web_content_options().is_test_mode == IsTestMode::Yes)
         page.async_set_geolocation_emulated_position({ 37.7647658, -122.4345892, 100.0, 0.0, 0.0, 0.0, 0.0 }, {});
@@ -4050,7 +4045,7 @@ void ViewImplementation::send_to_media_context_menu_page(Function<void(WebConten
         send(target);
 }
 
-void ViewImplementation::did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::Page::MediaContextMenu menu)
+void ViewImplementation::did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu)
 {
     m_media_context_menu_page = requesting_page;
     auto request_id = ++m_context_menu_request_id;

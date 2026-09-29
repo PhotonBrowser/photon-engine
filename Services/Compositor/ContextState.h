@@ -102,6 +102,7 @@ public:
     void request_rendering_update();
     void dispatch_mouse_event_to_web_content(Compositing::MouseEvent const&);
     void dispatch_key_event_to_web_content(Compositing::KeyEvent const&);
+    bool can_dispatch_input_to_web_content() const { return m_page_id.has_value(); }
 
     bool presents_to_client() const { return m_presents_to_client; }
     void stop_presenting_to_client();
@@ -127,6 +128,8 @@ public:
     void invalidate_keyboard_scroll_state(u64 generation);
     ContextUpdateResult handle_key_event(Compositing::KeyEvent const&);
     ContextUpdateResult handle_mouse_event(Compositing::MouseEvent const&);
+    // The UI's wheel deltas are in CSS pixels; this scales them for the scroll tree, which works in device pixels.
+    ContextUpdateResult handle_wheel_event(Compositing::MouseEvent const&, Optional<MonotonicTime> now_for_testing = {});
     ContextUpdateResult handle_pinch_event(Compositing::PinchEvent const&);
     AsyncScrollResult async_scroll_by(
         Compositing::UniqueNodeID document_id,
@@ -187,7 +190,8 @@ public:
     Optional<PendingFrame> take_pending_present_frame_if_unblocked();
     bool needs_rasterization() const;
     Optional<Gfx::IntRect> frame_rect_to_repaint() const;
-    Optional<Gfx::IntRect> video_present_rect() const;
+    Optional<Gfx::IntRect> self_present_rect() const;
+    bool draws_canvas(Compositing::CanvasId) const;
     Optional<PreparedFrame> prepare_frame(Compositing::DisplayListPlayerSkia&, PendingFrame, CompositedContextResolver const*);
     void did_submit_prepared_frame(Gfx::IntRect);
     bool present_synchronously(Compositing::DisplayListPlayerSkia&, CompositedContextResolver const*);
