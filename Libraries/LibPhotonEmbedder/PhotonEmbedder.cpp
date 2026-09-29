@@ -118,6 +118,39 @@ private:
         on_url_change = [this](URL::URL const&) { notify_state(); };
         on_title_change = [this](Utf16String const&) { notify_state(); };
         on_loading_state_change = [this](bool) { notify_state(); };
+        on_cursor_change = [this](Gfx::Cursor const& cursor) {
+            if (!m_callbacks.cursor_changed)
+                return;
+            cursor.visit(
+                [this](Gfx::StandardCursor standard) {
+                    auto mapped = Photon::Cursor::Arrow;
+                    switch (standard) {
+                    case Gfx::StandardCursor::Hidden: mapped = Photon::Cursor::Hidden; break;
+                    case Gfx::StandardCursor::Crosshair: mapped = Photon::Cursor::Crosshair; break;
+                    case Gfx::StandardCursor::IBeam: mapped = Photon::Cursor::IBeam; break;
+                    case Gfx::StandardCursor::ResizeHorizontal: mapped = Photon::Cursor::ResizeHorizontal; break;
+                    case Gfx::StandardCursor::ResizeVertical: mapped = Photon::Cursor::ResizeVertical; break;
+                    case Gfx::StandardCursor::ResizeDiagonalTLBR: mapped = Photon::Cursor::ResizeDiagonalTLBR; break;
+                    case Gfx::StandardCursor::ResizeDiagonalBLTR: mapped = Photon::Cursor::ResizeDiagonalBLTR; break;
+                    case Gfx::StandardCursor::ResizeColumn: mapped = Photon::Cursor::ResizeColumn; break;
+                    case Gfx::StandardCursor::ResizeRow: mapped = Photon::Cursor::ResizeRow; break;
+                    case Gfx::StandardCursor::Hand: mapped = Photon::Cursor::Hand; break;
+                    case Gfx::StandardCursor::Help: mapped = Photon::Cursor::Help; break;
+                    case Gfx::StandardCursor::OpenHand: mapped = Photon::Cursor::OpenHand; break;
+                    case Gfx::StandardCursor::Drag: mapped = Photon::Cursor::Drag; break;
+                    case Gfx::StandardCursor::DragCopy: mapped = Photon::Cursor::DragCopy; break;
+                    case Gfx::StandardCursor::Move: mapped = Photon::Cursor::Move; break;
+                    case Gfx::StandardCursor::Wait: mapped = Photon::Cursor::Wait; break;
+                    case Gfx::StandardCursor::Disallowed: mapped = Photon::Cursor::Disallowed; break;
+                    case Gfx::StandardCursor::None:
+                    case Gfx::StandardCursor::Arrow:
+                    case Gfx::StandardCursor::Eyedropper:
+                    case Gfx::StandardCursor::Zoom: break;
+                    }
+                    m_callbacks.cursor_changed(mapped);
+                },
+                [this](Gfx::ImageCursor const&) { m_callbacks.cursor_changed(Photon::Cursor::Arrow); });
+        };
         on_load_start = [this] {
             m_initial_navigation_pending = true;
             m_waiting_for_post_load_paint = false;
@@ -141,12 +174,15 @@ private:
                 m_callbacks.failed("WebContent process crashed");
         };
         on_ready_to_paint = [this] {
+            auto paint_completed = std::chrono::steady_clock::now();
             auto const& front = m_client_state.front_bitmap;
             if (!front.shared_image_buffer || !m_callbacks.frame_ready) {
                 dbgln("Photon embedder: paint callback without a shared image buffer");
                 return;
             }
+            auto bitmap_started = std::chrono::steady_clock::now();
             auto bitmap = front.shared_image_buffer->bitmap_if_present();
+            auto bitmap_acquisition_time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - bitmap_started).count();
             if (!bitmap) {
                 dbgln("Photon embedder: shared image has no CPU bitmap");
                 return;
@@ -156,6 +192,10 @@ private:
             frame->height = bitmap->height();
             frame->stride = bitmap->pitch();
             frame->device_pixel_ratio = m_device_pixel_ratio;
+            if (m_last_paint_completed.has_value())
+                frame->engine_paint_interval_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(paint_completed - *m_last_paint_completed).count();
+            m_last_paint_completed = paint_completed;
+            frame->bitmap_acquisition_microseconds = static_cast<uint64_t>(bitmap_acquisition_time);
             auto copy_started = std::chrono::steady_clock::now();
             frame->pixels.resize(bitmap->data_size());
             for (int row = 0; row < frame->height; ++row)
@@ -168,12 +208,14 @@ private:
                     if (m_initial_paint_fallback_timer)
                         m_initial_paint_fallback_timer->stop();
                     m_pending_initial_frame.reset();
+                    frame->paint_to_callback_microseconds = 0;
                     m_callbacks.frame_ready(move(frame));
                     return;
                 }
                 m_pending_initial_frame = move(frame);
                 return;
             }
+            frame->paint_to_callback_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - paint_completed).count();
             m_callbacks.frame_ready(move(frame));
         };
     }
@@ -183,6 +225,7 @@ private:
     RefPtr<Core::Timer> m_initial_paint_fallback_timer;
     bool m_initial_navigation_pending { false };
     bool m_waiting_for_post_load_paint { false };
+    Optional<std::chrono::steady_clock::time_point> m_last_paint_completed;
 
     void present_pending_initial_frame()
     {

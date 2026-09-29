@@ -21,6 +21,9 @@ struct PresentedFrame {
     size_t stride { 0 };
     double device_pixel_ratio { 1.0 };
     uint64_t copy_time_microseconds { 0 };
+    uint64_t engine_paint_interval_microseconds { 0 };
+    uint64_t bitmap_acquisition_microseconds { 0 };
+    uint64_t paint_to_callback_microseconds { 0 };
     // BGRA8888, premultiplied alpha. Pixels are owned by this value.
     std::vector<uint8_t> pixels;
 };
@@ -33,9 +36,16 @@ struct ViewState {
     bool can_go_forward { false };
 };
 
+enum class Cursor : uint8_t {
+    Arrow, Hidden, Crosshair, IBeam, ResizeHorizontal, ResizeVertical,
+    ResizeDiagonalTLBR, ResizeDiagonalBLTR, ResizeColumn, ResizeRow, Hand,
+    Help, OpenHand, Drag, DragCopy, Move, Wait, Disallowed,
+};
+
 struct ViewCallbacks {
     std::function<void(ViewState const&)> state_changed;
     std::function<void(std::shared_ptr<PresentedFrame const>)> frame_ready;
+    std::function<void(Cursor)> cursor_changed;
     std::function<void(std::string const&)> failed;
 };
 
