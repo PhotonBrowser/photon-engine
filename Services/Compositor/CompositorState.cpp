@@ -13,9 +13,97 @@
 #include <LibCore/Timer.h>
 #include <LibMedia/Sinks/DisplayingVideoSink.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <vector>
+
 namespace Compositor {
 
 static constexpr int gpu_completion_check_interval_ms = 1;
+
+struct CompositorFrameProfile {
+    using Clock = std::chrono::steady_clock;
+
+    struct Stage {
+        std::vector<u64> samples;
+
+        void record(u64 microseconds) { samples.push_back(microseconds); }
+
+        struct Summary {
+            double average_ms { 0 };
+            double p50_ms { 0 };
+            double p95_ms { 0 };
+            double max_ms { 0 };
+        };
+
+        Summary summarize()
+        {
+            if (samples.empty())
+                return {};
+            std::sort(samples.begin(), samples.end());
+            auto percentile = [&](double fraction) {
+                auto index = static_cast<size_t>(std::ceil(fraction * samples.size())) - 1;
+                return static_cast<double>(samples[index]) / 1000.0;
+            };
+            u64 sum = 0;
+            for (auto sample : samples)
+                sum += sample;
+            return {
+                .average_ms = static_cast<double>(sum) / samples.size() / 1000.0,
+                .p50_ms = percentile(0.50),
+                .p95_ms = percentile(0.95),
+                .max_ms = static_cast<double>(samples.back()) / 1000.0,
+            };
+        }
+    };
+
+    Clock::time_point started_at { Clock::now() };
+    Optional<Clock::time_point> last_frame_started_at;
+    u64 frames { 0 };
+    Stage frame_interval;
+    Stage paint;
+    Stage submit;
+    Stage gpu_completion;
+    Stage readback;
+
+    void record_frame(Clock::time_point frame_started_at, u64 paint_microseconds, u64 submit_microseconds, u64 gpu_completion_microseconds, u64 readback_microseconds)
+    {
+        if (!std::getenv("PHOTON_VERBOSE"))
+            return;
+        auto now = Clock::now();
+        ++frames;
+        if (last_frame_started_at.has_value())
+            frame_interval.record(std::chrono::duration_cast<std::chrono::microseconds>(frame_started_at - *last_frame_started_at).count());
+        last_frame_started_at = frame_started_at;
+        paint.record(paint_microseconds);
+        submit.record(submit_microseconds);
+        gpu_completion.record(gpu_completion_microseconds);
+        readback.record(readback_microseconds);
+
+        if (now - started_at < std::chrono::seconds(5))
+            return;
+        auto elapsed = std::chrono::duration<double>(now - started_at).count();
+        auto log_stage = [](char const* name, Stage& stage) {
+            auto summary = stage.summarize();
+            dbgln("{} avg/p50/p95/max={:.2f}/{:.2f}/{:.2f}/{:.2f} ms", name, summary.average_ms, summary.p50_ms, summary.p95_ms, summary.max_ms);
+        };
+        dbgln("Photon compositor profile: presented_frames={} FPS={:.1f}", frames, frames / elapsed);
+        log_stage("frame interval", frame_interval);
+        log_stage("display-list raster", paint);
+        log_stage("Skia flush/submit", submit);
+        log_stage("GPU completion wait", gpu_completion);
+        log_stage("GPU→CPU bitmap readback", readback);
+        *this = {};
+        started_at = now;
+    }
+};
+
+static CompositorFrameProfile& compositor_frame_profile()
+{
+    static CompositorFrameProfile profile;
+    return profile;
+}
 
 NonnullRefPtr<CompositorState> CompositorState::create(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, bool async_scrolling_enabled)
 {
@@ -748,12 +836,15 @@ void CompositorState::present_frame(Compositing::CompositorContextId context_id,
 
 void CompositorState::present_frame(Compositing::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
 {
+    auto frame_paint_started_at = std::chrono::steady_clock::now();
     auto composited_context_resolver = resolver_for(context_id);
     auto prepared_frame = context.prepare_frame(*m_display_list_player, pending_frame, &composited_context_resolver);
     if (!prepared_frame.has_value())
         return;
+    auto frame_paint_duration_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - frame_paint_started_at).count();
 
-    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id);
+    auto submit_started_at = std::chrono::steady_clock::now();
+    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, frame_paint_started_at, frame_paint_duration_microseconds, 0);
     auto* pending_present = &m_pending_async_presents.last();
 
     auto& event_loop = Core::EventLoop::current();
@@ -761,14 +852,29 @@ void CompositorState::present_frame(Compositing::CompositorContextId context_id,
     RefPtr<Gfx::PaintingSurface> rendered_surface = prepared_frame->rendered_surface;
     auto& surface = *rendered_surface;
     m_display_list_player->flush_async(surface, [self = move(self), &event_loop, pending_present, rendered_surface = move(rendered_surface)]() mutable {
-        event_loop.deferred_invoke([self = move(self), pending_present, rendered_surface = move(rendered_surface)] {
+        auto gpu_completed_at = std::chrono::steady_clock::now();
+        event_loop.deferred_invoke([self = move(self), pending_present, rendered_surface = move(rendered_surface), gpu_completed_at] {
             // Read back CPU-shareable frames only after the GPU completion
             // callback has returned to the event loop. Starting a Skia read
             // from inside Ganesh's finished callback re-enters the context.
+            pending_present->gpu_completion_microseconds = gpu_completed_at > pending_present->submit_completed_at
+                ? std::chrono::duration_cast<std::chrono::microseconds>(gpu_completed_at - pending_present->submit_completed_at).count()
+                : 0;
+            auto readback_started_at = std::chrono::steady_clock::now();
             rendered_surface->flush();
+            pending_present->readback_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - readback_started_at).count();
+            compositor_frame_profile().record_frame(
+                pending_present->paint_started_at,
+                pending_present->paint_duration_microseconds,
+                pending_present->submit_duration_microseconds,
+                pending_present->gpu_completion_microseconds,
+                pending_present->readback_microseconds);
             self->did_finish_async_present(*pending_present);
         });
     });
+    auto submit_returned_at = std::chrono::steady_clock::now();
+    pending_present->submit_duration_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(submit_returned_at - submit_started_at).count();
+    pending_present->submit_completed_at = submit_returned_at;
     context.did_submit_prepared_frame(pending_frame.viewport_rect);
     schedule_gpu_completion_check();
 }

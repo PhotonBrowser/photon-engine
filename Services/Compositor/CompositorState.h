@@ -32,6 +32,7 @@
 #include <LibMedia/Forward.h>
 #include <LibMedia/VideoFramePool.h>
 #include <LibMedia/VideoSinkHandle.h>
+#include <chrono>
 
 namespace Compositing {
 
@@ -140,11 +141,16 @@ private:
     CompositorState(RefPtr<Gfx::SkiaBackendContext>, bool async_scrolling_enabled);
 
     struct PendingAsyncPresent {
-        PendingAsyncPresent(Compositing::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id)
+        using Clock = std::chrono::steady_clock;
+
+        PendingAsyncPresent(Compositing::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id, Clock::time_point paint_started_at, u64 paint_duration_microseconds, u64 submit_duration_microseconds)
             : context_id(context_id)
             , viewport_rect(viewport_rect)
             , damage_rect(damage_rect)
             , bitmap_id(bitmap_id)
+            , paint_started_at(paint_started_at)
+            , paint_duration_microseconds(paint_duration_microseconds)
+            , submit_duration_microseconds(submit_duration_microseconds)
         {
         }
 
@@ -152,6 +158,12 @@ private:
         Gfx::IntRect viewport_rect;
         Gfx::IntRect damage_rect;
         i32 bitmap_id { 0 };
+        Clock::time_point paint_started_at;
+        Clock::time_point submit_completed_at;
+        u64 paint_duration_microseconds { 0 };
+        u64 submit_duration_microseconds { 0 };
+        u64 gpu_completion_microseconds { 0 };
+        u64 readback_microseconds { 0 };
         bool was_cancelled { false };
     };
 
