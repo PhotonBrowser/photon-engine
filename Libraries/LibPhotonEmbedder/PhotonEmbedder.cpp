@@ -13,7 +13,7 @@
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/HeadlessWebView.h>
