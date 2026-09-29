@@ -64,6 +64,12 @@ public:
         // the compositor's Vulkan DMA-BUF images with safe synchronization.
         Application::the().notify_compositor_gpu_presentation_unavailable();
         view->initialize_client(CreateNewClient::Yes);
+        // initialize_client() establishes the WebContent client and can
+        // initialize its viewport from the platform screen before the
+        // embedder's requested size has propagated. Reapply the view's actual
+        // initial viewport after that setup so the first presented frame uses
+        // the requested bounds.
+        view->resize(width, height, dpr);
         view->notify_state();
         return view;
     }
