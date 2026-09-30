@@ -3,9 +3,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCompositing/PixelUnits.h>
-#include <LibCompositing/KeyCode.h>
-#include <LibCompositing/MouseButton.h>
+#include <LibWebCommon/Page/InputEvent.h>
+#include <LibWebCommon/PixelUnits.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
@@ -110,7 +109,7 @@ public:
     void clear_callbacks() { m_callbacks = {}; }
 
 private:
-    PhotonHeadlessWebView(Core::AnonymousBuffer theme, Compositing::DevicePixelSize size, double dpr, Photon::ViewCallbacks callbacks)
+    PhotonHeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize size, double dpr, Photon::ViewCallbacks callbacks)
         : HeadlessWebView(move(theme), size)
         , m_callbacks(move(callbacks))
     {
@@ -317,53 +316,53 @@ void View::resize(int width, int height, double dpr)
 }
 void View::set_focus(bool focused) { m_impl->view->set_has_system_focus(focused); }
 
-static Compositing::KeyModifier modifiers(bool shift, bool control, bool alt, bool meta)
+static Web::UIEvents::KeyModifier modifiers(bool shift, bool control, bool alt, bool meta)
 {
-    auto result = Compositing::KeyModifier::Mod_None;
+    auto result = Web::UIEvents::KeyModifier::Mod_None;
     if (shift)
-        result |= Compositing::KeyModifier::Mod_Shift;
+        result |= Web::UIEvents::KeyModifier::Mod_Shift;
     if (control)
-        result |= Compositing::KeyModifier::Mod_Ctrl;
+        result |= Web::UIEvents::KeyModifier::Mod_Ctrl;
     if (alt)
-        result |= Compositing::KeyModifier::Mod_Alt;
+        result |= Web::UIEvents::KeyModifier::Mod_Alt;
     if (meta)
-        result |= Compositing::KeyModifier::Mod_Super;
+        result |= Web::UIEvents::KeyModifier::Mod_Super;
     return result;
 }
 
-static Compositing::MouseButton mouse_button(PointerButton button)
+static Web::UIEvents::MouseButton mouse_button(PointerButton button)
 {
     switch (button) {
-    case PointerButton::None: return Compositing::MouseButton::None;
-    case PointerButton::Primary: return Compositing::MouseButton::Primary;
-    case PointerButton::Secondary: return Compositing::MouseButton::Secondary;
-    case PointerButton::Middle: return Compositing::MouseButton::Middle;
-    case PointerButton::Back: return Compositing::MouseButton::Backward;
-    case PointerButton::Forward: return Compositing::MouseButton::Forward;
+    case PointerButton::None: return Web::UIEvents::MouseButton::None;
+    case PointerButton::Primary: return Web::UIEvents::MouseButton::Primary;
+    case PointerButton::Secondary: return Web::UIEvents::MouseButton::Secondary;
+    case PointerButton::Middle: return Web::UIEvents::MouseButton::Middle;
+    case PointerButton::Back: return Web::UIEvents::MouseButton::Backward;
+    case PointerButton::Forward: return Web::UIEvents::MouseButton::Forward;
     }
-    return Compositing::MouseButton::None;
+    return Web::UIEvents::MouseButton::None;
 }
 
 void View::send_pointer_event(PointerEvent const& event)
 {
-    auto type = Compositing::MouseEvent::Type::MouseMove;
+    auto type = Web::MouseEvent::Type::MouseMove;
     switch (event.type) {
-    case PointerType::Move: type = Compositing::MouseEvent::Type::MouseMove; break;
-    case PointerType::Leave: type = Compositing::MouseEvent::Type::MouseLeave; break;
-    case PointerType::Press: type = Compositing::MouseEvent::Type::MouseDown; break;
-    case PointerType::Release: type = Compositing::MouseEvent::Type::MouseUp; break;
-    case PointerType::Wheel: type = Compositing::MouseEvent::Type::MouseWheel; break;
+    case PointerType::Move: type = Web::MouseEvent::Type::MouseMove; break;
+    case PointerType::Leave: type = Web::MouseEvent::Type::MouseLeave; break;
+    case PointerType::Press: type = Web::MouseEvent::Type::MouseDown; break;
+    case PointerType::Release: type = Web::MouseEvent::Type::MouseUp; break;
+    case PointerType::Wheel: type = Web::MouseEvent::Type::MouseWheel; break;
     }
-    auto to_device = [&](double value) { return Compositing::DevicePixels(static_cast<int>(std::lround(value * m_impl->view->device_pixel_ratio()))); };
+    auto to_device = [&](double value) { return Web::DevicePixels(static_cast<int>(std::lround(value * m_impl->view->device_pixel_ratio()))); };
     auto button = mouse_button(event.button);
-    Compositing::MouseButton buttons = Compositing::MouseButton::None;
+    Web::UIEvents::MouseButton buttons = Web::UIEvents::MouseButton::None;
     for (auto candidate : { PointerButton::Primary, PointerButton::Secondary, PointerButton::Middle, PointerButton::Back, PointerButton::Forward }) {
         if ((event.buttons & static_cast<uint8_t>(candidate)) != 0)
             buttons |= mouse_button(candidate);
     }
-    auto precision = event.precise_wheel ? Compositing::WheelDeltaPrecision::Precise : Compositing::WheelDeltaPrecision::Discrete;
-    auto phase = static_cast<Compositing::ScrollGesturePhase>(event.scroll_phase);
-    Compositing::MouseEvent native_event {
+    auto precision = event.precise_wheel ? Web::WheelDeltaPrecision::Precise : Web::WheelDeltaPrecision::Discrete;
+    auto phase = static_cast<Web::ScrollGesturePhase>(event.scroll_phase);
+    Web::MouseEvent native_event {
         .type = type,
         .position = { to_device(event.x), to_device(event.y) },
         .screen_position = { to_device(event.screen_x), to_device(event.screen_y) },
@@ -378,24 +377,23 @@ void View::send_pointer_event(PointerEvent const& event)
         .browser_data = {},
         .async_scroll_performed_default_action = false,
         .id = 0,
-        .scrollbar_dragged_by_compositor = {},
     };
     m_impl->view->enqueue_input_event(move(native_event));
 }
 
-static Compositing::KeyCode engine_key_code(Key key, uint32_t code_point)
+static Web::UIEvents::KeyCode engine_key_code(Key key, uint32_t code_point)
 {
     if (key == Key::Unknown)
-        return Compositing::code_point_to_key_code(code_point);
+        return Web::UIEvents::code_point_to_key_code(code_point);
     // Photon::Key deliberately uses the browser virtual-key values documented in
     // this API; convert at the boundary into the engine's distinct enum type.
-    return static_cast<Compositing::KeyCode>(static_cast<uint16_t>(key));
+    return static_cast<Web::UIEvents::KeyCode>(static_cast<uint16_t>(key));
 }
 
 void View::send_key_event(Key key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text)
 {
-    Compositing::KeyEvent event {
-        .type = pressed ? Compositing::KeyEvent::Type::KeyDown : Compositing::KeyEvent::Type::KeyUp,
+    Web::KeyEvent event {
+        .type = pressed ? Web::KeyEvent::Type::KeyDown : Web::KeyEvent::Type::KeyUp,
         .key = engine_key_code(key, code_point),
         .modifiers = modifiers(shift, control, alt, meta),
         .code_point = code_point,
