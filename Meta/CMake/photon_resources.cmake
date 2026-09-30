@@ -21,10 +21,17 @@ foreach(resource IN LISTS photon_engine_resources)
     list(GET parts 1 destination_relative)
     get_filename_component(resource_name "${source_relative}" NAME)
     set(source "${LADYBIRD_SOURCE_DIR}/${source_relative}")
-    set(destination "${CMAKE_BINARY_DIR}/share/Lagom/${destination_relative}/${resource_name}")
+    if (APPLE)
+        # LibWebCommon resolves resource:// URIs relative to the app helper
+        # directory's parent on macOS (build/Resources for Photon).
+        set(resource_root "${CMAKE_BINARY_DIR}/../Resources")
+    else()
+        set(resource_root "${CMAKE_BINARY_DIR}/share/Lagom")
+    endif()
+    set(destination "${resource_root}/${destination_relative}/${resource_name}")
     add_custom_command(
         OUTPUT "${destination}"
-        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/share/Lagom/${destination_relative}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${resource_root}/${destination_relative}"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${source}" "${destination}"
         DEPENDS "${source}"
         VERBATIM
