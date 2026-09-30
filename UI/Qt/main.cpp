@@ -24,7 +24,7 @@
 #if defined(AK_OS_MACOS)
 #    include <QColorSpace>
 #    include <QSurfaceFormat>
-#    include <UI/AppKit/Utilities/ApplicationIcon.h>
+#    include <UI/Qt/ApplicationIcon.h>
 #    include <UI/Qt/MacWindow.h>
 #endif
 
@@ -97,6 +97,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
                 return;
             }
             app->new_window({ file_url });
+        };
+
+        browser_process.on_open_urls = [&](auto const& urls) {
+            for (auto const& url : urls)
+                app->on_open_file(url);
         };
 
         browser_process.on_new_tab = [&](auto const& urls) {

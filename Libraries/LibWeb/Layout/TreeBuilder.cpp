@@ -846,17 +846,24 @@ RustFFI::FfiPseudoTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_pseudo_tr
             VERIFY(frame.layout_node);
             frame.layout_node->attach_style_resources(); },
 
-        .create_nested_list_marker = [](void* frame_pointer, void* element_pointer) -> Compositing::RustFFI::NodeSlotId {
+        .create_nested_list_marker = [](void* frame_pointer, void* element_pointer, RustFFI::FfiPseudoElement originating_pseudo) -> Compositing::RustFFI::NodeSlotId {
             VERIFY(frame_pointer);
             VERIFY(element_pointer);
             auto& frame = *static_cast<PseudoElementFrame*>(frame_pointer);
             auto& element = *static_cast<DOM::Element*>(element_pointer);
             VERIFY(frame.layout_node);
-            auto marker_style = element.document().style_computer().materialize_style_record({ element, CSS::PseudoElement::Marker });
+            auto marker_style = [&] {
+                // NB: Republishing the element's own ::marker style can retire its animation record while the
+                //     pseudo-element still refers to it. Give the nested marker a copy of the existing style.
+                if (auto style = element.computed_style(CSS::PseudoElement::Marker))
+                    return CSS::ComputedValues::Builder { *style }.build();
+                return element.document().style_computer().materialize_style_record({ element, CSS::PseudoElement::Marker });
+            }();
             auto& list_item_marker = create_list_item_marker(as<Box>(*frame.layout_node), move(marker_style));
             list_item_marker.attach_style_resources();
-            list_item_marker.set_generated_for(CSS::PseudoElement::Marker, element);
-            LayoutTreeBuilderAccess::set_synthetic_pseudo_element_node(element, CSS::PseudoElement::Marker, &list_item_marker);
+            // NB: The marker of a list-item ::before or ::after belongs to that pseudo-element, not to the element's own
+            //     ::marker, so it is generated for the originating pseudo-element and never becomes the ::marker's box.
+            list_item_marker.set_generated_for(css_pseudo_element(originating_pseudo), element);
             return Node::slot_id(&list_item_marker); },
         .create_nested_list_marker_content = [](void* frame_pointer, void* element_pointer, RustFFI::FfiPseudoElement originating_pseudo, void* marker_pointer) -> Compositing::RustFFI::NodeSlotId {
             VERIFY(frame_pointer);
@@ -871,14 +878,14 @@ RustFFI::FfiPseudoTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_pseudo_tr
             auto& content_node = [&]() -> Node& {
                 if (auto const* text = content.data.first().get_pointer<Utf16String>()) {
                     auto& text_node = allocate_layout_node<GeneratedTextNode>(list_box.document(), *text);
-                    text_node.set_generated_for(CSS::PseudoElement::Marker, element);
+                    text_node.set_generated_for(css_pseudo_element(originating_pseudo), element);
                     return text_node;
                 }
                 auto& image = *content.data.first().get<NonnullRefPtr<CSS::AbstractImageStyleValue>>();
                 auto& image_box = create_content_image_box(list_box.document(), nullptr, list_item_marker.copy_computed_values(), image);
                 image_box.set_display(CSS::Display(CSS::DisplayOutside::Inline, CSS::DisplayInside::Flow));
                 image_box.attach_style_resources();
-                image_box.set_generated_for(CSS::PseudoElement::Marker, element);
+                image_box.set_generated_for(css_pseudo_element(originating_pseudo), element);
                 return image_box;
             }();
             list_item_marker.set_content(content);
@@ -1143,10 +1150,17 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
             auto* parent_node = as_if<DOM::ParentNode>(node);
             auto shadow_root = element ? element->shadow_root() : nullptr;
             auto* graphics_element = as_if<SVG::SVGGraphicsElement>(node);
-            auto mask = graphics_element ? graphics_element->mask() : nullptr;
-            auto clip_path = graphics_element ? graphics_element->clip_path() : nullptr;
-            auto fill_pattern = graphics_element ? graphics_element->fill_pattern() : nullptr;
-            auto stroke_pattern = graphics_element ? graphics_element->stroke_pattern() : nullptr;
+            GC::Ptr<SVG::SVGMaskElement const> mask;
+            GC::Ptr<SVG::SVGClipPathElement const> clip_path;
+            GC::Ptr<SVG::SVGPatternElement const> fill_pattern;
+            GC::Ptr<SVG::SVGPatternElement const> stroke_pattern;
+            if (graphics_element) {
+                auto const& layout_node = as<NodeWithStyle>(*static_cast<Node*>(layout_node_pointer));
+                mask = graphics_element->mask(layout_node);
+                clip_path = graphics_element->clip_path(layout_node);
+                fill_pattern = graphics_element->fill_pattern(layout_node);
+                stroke_pattern = graphics_element->stroke_pattern(layout_node);
+            }
             return {
                 .is_element = element != nullptr,
                 .content_visibility_hidden = element && element->style_group<CSS::ComputedValues::InheritedBoxValues>()->content_visibility_value() == CSS::ContentVisibility::Hidden,

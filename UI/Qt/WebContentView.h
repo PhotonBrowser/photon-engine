@@ -13,12 +13,12 @@
 #include <AK/OwnPtr.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
-#include <LibCompositing/PageId.h>
 #include <LibGfx/Cursor.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Forward.h>
+#include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/ViewImplementation.h>
 
@@ -29,8 +29,7 @@
 #include <QVariant>
 
 #ifdef AK_OS_MACOS
-#    define LADYBIRD_QT_USE_METAL_RHI_WIDGET 1
-#    define LADYBIRD_QT_USE_RHI_WIDGET 1
+#    define LADYBIRD_QT_USE_IOSURFACE_LAYER 1
 #elif defined(USE_DIRECTX)
 #    define LADYBIRD_QT_USE_D3D_RHI_WIDGET 1
 #    define LADYBIRD_QT_USE_RHI_WIDGET 1
@@ -83,10 +82,10 @@ class WebContentView final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Compositing::PageId page_index = 0, WebContentViewInitialState initial_state = {});
+    WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Web::PageId page_index = 0, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
-#ifndef LADYBIRD_QT_USE_RHI_WIDGET
+#if !defined(LADYBIRD_QT_USE_RHI_WIDGET) && !defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
     virtual void paintEvent(QPaintEvent*) override;
 #endif
     virtual void resizeEvent(QResizeEvent*) override;
@@ -142,7 +141,7 @@ private:
     // ^WebView::ViewImplementation
     virtual void prepare_page_for_tab(WebView::WebContentPage&) override;
     virtual void update_zoom() override;
-    virtual Compositing::DevicePixelSize viewport_size() const override;
+    virtual Web::DevicePixelSize viewport_size() const override;
     virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override;
     virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const override;
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) override;
@@ -171,16 +170,16 @@ private:
     void update_compositor_display_metadata();
     void update_compositor_display_metadata(WebView::WebContentPage&);
 
-    Compositing::DevicePixelPoint node_picker_position_for(QSinglePointEvent const&) const;
+    Web::DevicePixelPoint node_picker_position_for(QSinglePointEvent const&) const;
 
-    void enqueue_native_event(Compositing::MouseEvent::Type, QSinglePointEvent const& event);
+    void enqueue_native_event(Web::MouseEvent::Type, QSinglePointEvent const& event);
     void handle_pointer_leave();
 
     void enqueue_native_event(Web::DragEvent::Type, QDropEvent const& event);
     void finish_handling_drag_event(Web::DragEvent const&);
 
-    void enqueue_native_event(Compositing::KeyEvent::Type, QKeyEvent const& event);
-    void finish_handling_key_event(Compositing::KeyEvent const&);
+    void enqueue_native_event(Web::KeyEvent::Type, QKeyEvent const& event);
+    void finish_handling_key_event(Web::KeyEvent const&);
 
     void update_screen_rects();
     void update_screen_rects(WebView::WebContentPage&);
@@ -204,21 +203,15 @@ private:
     CrashOverlayUrlLabel* m_crash_overlay_url { nullptr };
     QPushButton* m_crash_overlay_reload_button { nullptr };
 
-#ifdef AK_OS_MACOS
-    bool prepare_metal_renderer(unsigned long render_target_pixel_format);
-    bool update_imported_iosurface_texture(Gfx::SharedImageBuffer const&);
-    void release_metal_resources();
-    void release_imported_iosurface_texture();
+#ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
+    bool ensure_iosurface_layer_attached_to_native_view();
+    void present_current_paintable_as_layer_contents();
+    void update_iosurface_layer_frame();
+    void update_iosurface_layer_background_color();
+    void detach_iosurface_layer_from_native_view();
+    void destroy_iosurface_layer();
 
-    void* m_metal_device { nullptr };
-    void* m_metal_library { nullptr };
-    void* m_metal_pipeline_state { nullptr };
-    void* m_metal_sampler_state { nullptr };
-    void* m_imported_iosurface_texture { nullptr };
-    Gfx::SharedImageBuffer const* m_imported_shared_image_buffer { nullptr };
-    unsigned long m_render_target_pixel_format { 0 };
-
-    bool m_repaint_retry_scheduled { false };
+    void* m_iosurface_layer { nullptr };
 #endif
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET

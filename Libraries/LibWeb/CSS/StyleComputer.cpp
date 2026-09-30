@@ -95,7 +95,6 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
-#include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
@@ -1368,7 +1367,7 @@ void StyleComputer::process_animation_definitions(ComputedStyleWorkingSet const&
 
             if (auto effect = existing_animation->effect()) {
                 as<Animations::KeyframeEffect>(*effect).set_key_frame_set(resolve_keyframes());
-                existing_animation->apply_css_properties(animation_properties);
+                existing_animation->apply_css_properties(animation_properties, abstract_element);
             }
             existing_animation->set_animation_name_index(i);
             new_animations.append(existing_animation);
@@ -1387,7 +1386,7 @@ void StyleComputer::process_animation_definitions(ComputedStyleWorkingSet const&
         auto effect = Animations::KeyframeEffect::create();
         animation->set_effect(effect);
 
-        animation->apply_css_properties(animation_properties);
+        animation->apply_css_properties(animation_properties, abstract_element);
         animation->set_animation_name_index(i);
 
         effect->set_key_frame_set(resolve_keyframes());
@@ -3265,6 +3264,10 @@ ComputationContext StyleComputer::make_computation_context_for_property(Property
         return true;
     }();
 
+    bool const is_document_element = abstract_element.has_value()
+        && !abstract_element->pseudo_element().has_value()
+        && abstract_element->element().is_document_element();
+
     switch (property_id) {
     // FIXME: While `color-scheme` doesn't actually require a computation context (since it only takes keyword values),
     //        callers request one uniformly. Since `color-scheme` must be computed before creating a generic computation
@@ -3313,11 +3316,11 @@ ComputationContext StyleComputer::make_computation_context_for_property(Property
             .length_resolution_context = {
                 .viewport_rect = viewport_rect(),
                 .font_metrics = line_height_font_metrics,
-                .root_font_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
+                .root_font_metrics = is_document_element
                     ? line_height_font_metrics
                     : m_root_element_font_metrics,
                 .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
-                .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
+                .root_font_metrics_depend_on_viewport_metrics = is_document_element
                     ? style.font_metrics_depend_on_viewport_metrics()
                     : m_root_element_font_metrics_depend_on_viewport_metrics,
                 .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
@@ -3327,16 +3330,18 @@ ComputationContext StyleComputer::make_computation_context_for_property(Property
         };
     }
     default: {
+        auto font_metrics = Length::FontMetrics {
+            style.font_size(),
+            style.first_available_computed_font(document().font_computer())->pixel_metrics(),
+            style.line_height(document().font_computer())
+        };
         return {
             .length_resolution_context = {
                 .viewport_rect = viewport_rect(),
-                .font_metrics = {
-                    style.font_size(),
-                    style.first_available_computed_font(document().font_computer())->pixel_metrics(),
-                    style.line_height(document().font_computer()) },
-                .root_font_metrics = m_root_element_font_metrics,
+                .font_metrics = font_metrics,
+                .root_font_metrics = is_document_element ? font_metrics : m_root_element_font_metrics,
                 .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
-                .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element() ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
+                .root_font_metrics_depend_on_viewport_metrics = is_document_element ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
                 .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
                 .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
             },
@@ -4341,11 +4346,19 @@ bool custom_property_value_moved(Utf16FlyString const& name, CustomPropertyData 
     return !old_property->value->equals(*new_property->value);
 }
 
+static bool is_in_display_none_subtree(StyleEngine::StyleRecordView const& style_record)
+{
+    return has_flag(static_cast<StyleRecordDependencyFlag>(style_record.dependency_flags), StyleRecordDependencyFlag::InDisplayNoneSubtree);
+}
+
 RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractElement abstract_element, ComputeStyleMode mode, Optional<bool&> did_change_custom_properties, StyleScope const& style_scope, IncludeInlineStyle include_inline_style, StyleEngineMatchResult* reusable_matches, StyleSharingCandidate* sharing) const
 {
     // Special path for elements that represent a pseudo-element in some element's internal shadow tree.
-    // FirstLetter is excluded so that ::first-letter rules can match against such elements normally.
-    if (abstract_element.element().associated_shadow_host_pseudo_element().has_value() && abstract_element.pseudo_element() != CSS::PseudoElement::FirstLetter) {
+    // FirstLetter and Selection are excluded so their own rules and highlight inheritance can
+    // match against the internal element normally.
+    if (abstract_element.element().associated_shadow_host_pseudo_element().has_value()
+        && abstract_element.pseudo_element() != CSS::PseudoElement::FirstLetter
+        && abstract_element.pseudo_element() != CSS::PseudoElement::Selection) {
         auto& element = abstract_element.element();
         auto& host_element = *element.root().parent_or_shadow_host_element();
 
@@ -4463,6 +4476,12 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             sharing->key.computation_inputs.append(0);
         }
         sharing->key.computation_inputs.append(0);
+        // The parent's inherited groups don't say if it's inside a display:none subtree, which the record computed here
+        // takes from the parent's record. A parent on either side of that line can hold the same inherited values, so
+        // the key names it too. Blink's MatchedPropertiesCache::Find() likewise won't hand a rendered parent's child a
+        // style cached under a parent that IsEnsuredInDisplayNone().
+        // NB: This goes after the style scope's word, which style_sharing_style_scope_index locates by its position.
+        sharing->key.computation_inputs.append(is_in_display_none_subtree(inheritance_parent_style_record));
         sharing->key.computation_inputs.append(style_environment_version_for_sharing());
         sharing->key.computation_inputs.append(abstract_element.pseudo_element().has_value() ? to_underlying(*abstract_element.pseudo_element()) + 1 : 0);
         sharing->key.computation_inputs.append(cascade_input.matching_pseudo_element_styles);
@@ -4786,6 +4805,13 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         if (!previous_style_record.present
             || previous_style_record.animated_overlay
             || previous_style_record.animation_overlay_identity != 0)
+            return false;
+        // A record also says if its element is inside a display:none subtree, which it takes from the parent's record
+        // rather than from any input above. So, a style computed while an ancestor was display:none can't stand once
+        // that ancestor is shown, or the other way around. Blink's Element::RecalcOwnStyle() likewise drops an old
+        // style that IsEnsuredInDisplayNone() rather than keep it for an element that's now rendered.
+        auto const* previous_box_values = static_cast<ComputedValuesFFI::BoxValues const*>(previous_style_record.payloads[to_underlying(StyleGroupIndex::BoxValues)]);
+        if (is_in_display_none_subtree(previous_style_record) != (is_in_display_none_subtree(inheritance_parent_style_record) || display_from_ffi_display(previous_box_values->display).is_none()))
             return false;
         // A recompute can carry the parent's non-inherited half moving, which the record names for
         // no computation that read it through `inherit`.
@@ -5348,7 +5374,7 @@ RefPtr<StyleValue const> StyleComputer::recascade_font_size_if_needed(DOM::Abstr
 
     // FIXME: This should be configurable.
     constexpr CSSPixels default_monospace_font_size_in_px = 13;
-    static auto const& monospace_font_family_name = *new String(Platform::FontPlugin::the().generic_font_name(Platform::GenericFont::Monospace, 400, 0));
+    static auto const& monospace_font_family_name = *new String(Platform::FontPlugin::the().generic_font_name(Platform::GenericFont::Monospace));
     static auto const& monospace_font = Gfx::FontDatabase::the().get(monospace_font_family_name, default_monospace_font_size_in_px * 0.75f, 400, Gfx::FontWidth::Normal, 0).release_nonnull().leak_ref();
 
     // Reconstruct the line of ancestor elements we need to inherit style from, and then do the cascade again
@@ -5567,7 +5593,7 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
                 auto& state = *context.state->custom_property_resolution;
                 auto& style_computer = context.abstract_element.document().style_computer();
                 if (!state.root_font_metrics_prepared) {
-                    if (is<HTML::HTMLHtmlElement>(context.abstract_element.element())) {
+                    if (!context.abstract_element.pseudo_element().has_value() && context.abstract_element.element().is_document_element()) {
                         style_computer.m_root_element_font_metrics = style_computer.calculate_root_element_font_metrics(computed_style);
                         style_computer.m_root_element_font_metrics_depend_on_viewport_metrics = computed_style.font_metrics_depend_on_viewport_metrics();
                     }
@@ -5852,23 +5878,14 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
                     duration = "auto"_utf16;
                 auto timing_function = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
                     static_cast<StyleValueFFI::StyleValueData const*>(animation.timing_function)));
-                GC::Ptr<Animations::AnimationTimeline> timeline;
-                switch (animation.timeline_kind) {
-                case ComputedValuesFFI::FfiAnimationTimelineKind::Document:
-                    timeline = context.abstract_element.document().timeline();
-                    break;
-                case ComputedValuesFFI::FfiAnimationTimelineKind::None:
-                    break;
-                case ComputedValuesFFI::FfiAnimationTimelineKind::Scroll:
-                    timeline = Animations::ScrollTimeline::create(
-                        context.abstract_element.document(),
-                        Animations::ScrollTimeline::AnonymousSource {
-                            .scroller = static_cast<Scroller>(animation.scroll_scroller),
-                            .target = context.abstract_element,
-                        },
-                        Animations::scroll_axis_from_css_axis(static_cast<Axis>(animation.scroll_axis)));
-                    break;
-                }
+                static_assert(to_underlying(AnimationTimelineSource::Kind::Document) == to_underlying(ComputedValuesFFI::FfiAnimationTimelineKind::Document));
+                static_assert(to_underlying(AnimationTimelineSource::Kind::None) == to_underlying(ComputedValuesFFI::FfiAnimationTimelineKind::None));
+                static_assert(to_underlying(AnimationTimelineSource::Kind::Scroll) == to_underlying(ComputedValuesFFI::FfiAnimationTimelineKind::Scroll));
+                AnimationTimelineSource timeline {
+                    .kind = static_cast<AnimationTimelineSource::Kind>(animation.timeline_kind),
+                    .scroller = static_cast<Scroller>(animation.scroll_scroller),
+                    .axis = static_cast<Axis>(animation.scroll_axis),
+                };
                 state.animation_definitions.unchecked_append({
                     .duration = move(duration),
                     .timing_function = EasingFunction::from_style_value(timing_function),
@@ -5905,7 +5922,7 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
                 if (context.explicitly_inherited_non_inherited_style_groups)
                     *context.explicitly_inherited_non_inherited_style_groups |= style_groups;
             }
-            if (!context.stop_after_longhand_drive && is<HTML::HTMLHtmlElement>(context.abstract_element.element())) {
+            if (!context.stop_after_longhand_drive && !context.abstract_element.pseudo_element().has_value() && context.abstract_element.element().is_document_element()) {
                 style_computer.m_root_element_font_metrics = style_computer.calculate_root_element_font_metrics(computed_style);
                 style_computer.m_root_element_font_metrics_depend_on_viewport_metrics = computed_style.font_metrics_depend_on_viewport_metrics();
             }
@@ -5993,19 +6010,12 @@ static NonnullRefPtr<StyleValue const> resolve_css_wide_keyword_for_custom_prope
         return StyleValue::create_guaranteed_invalid();
 
     // Unset is the same as inherit for inherited properties, and by default all unregistered custom properties inherit.
-    if (keyword_value->is_unset())
+    // FIXME: Roll revert and revert-layer back to a declaration of the custom property from a lower cascade layer or
+    //        origin when there is one, instead of treating them as unset.
+    if (keyword_value->is_unset() || keyword_value->is_revert() || keyword_value->is_revert_layer())
         return registration.has_value() && !registration->inherit
             ? initial_custom_property_value(registration, element.document())
             : inherited_custom_property_value(registration, element, name, computed_style_for_custom_property_resolution);
-
-    if (keyword_value->is_revert()) {
-        // FIXME: Implement reverting custom properties.
-        return keyword_value;
-    }
-    if (keyword_value->is_revert_layer()) {
-        // FIXME: Implement reverting custom properties.
-        return keyword_value;
-    }
 
     VERIFY_NOT_REACHED();
 }

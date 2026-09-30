@@ -51,6 +51,7 @@ protected:
     template<typename T>
     ReadonlySpan<T> inline_objects(DisplayListDataSpan span) const
     {
+        static_assert(alignof(T) <= alignof(DisplayListCommandHeader));
         auto bytes = inline_data(span);
         VERIFY(bytes.size() % sizeof(T) == 0);
         VERIFY(reinterpret_cast<FlatPtr>(bytes.data()) % alignof(T) == 0);
@@ -127,7 +128,7 @@ public:
     void set_async_scrolling_metadata(AsyncScrollingMetadata metadata) { m_async_scrolling_metadata = metadata; }
     Optional<AsyncScrollingMetadata> const& async_scrolling_metadata() const { return m_async_scrolling_metadata; }
 
-    static constexpr size_t command_alignment = 16;
+    static constexpr size_t command_alignment = 8;
 
     template<typename SpanType, typename Callback>
     static void for_each_command_header(SpanType command_bytes, Callback callback)
@@ -147,7 +148,11 @@ public:
     template<typename Callback>
     void for_each_command_header(Callback callback) const
     {
-        for_each_command_header(command_bytes(), move(callback));
+        for (auto const& run : command_runs()) {
+            for_each_command_header(command_bytes_of_run(run), [&](auto const& header, auto payload) {
+                callback(run.context, header, payload);
+            });
+        }
     }
 
 private:
@@ -178,11 +183,8 @@ private:
     friend ErrorOr<T> IPC::decode(IPC::Decoder&);
 };
 
-// The run table the Rust builder records while it writes the tape, derived from the tape alone;
-// tests build tapes by hand and debug builds check that both agree.
-COMPOSITING_API Vector<DisplayListCommandRun> compute_display_list_command_runs(ReadonlyBytes command_bytes);
-// Runs must start at offset zero, follow each other without gaps, stay aligned, end at the tape's
-// end, and under DISPLAY_LIST_RUNS_DEBUG match the table recomputed from the tape.
+// Runs must start at offset zero, follow each other without gaps, stay aligned, and end at the tape's
+// end. Under DISPLAY_LIST_RUNS_DEBUG their boundaries and summaries are checked against the commands.
 COMPOSITING_API ErrorOr<void> validate_display_list_command_runs(ReadonlyBytes command_bytes, ReadonlySpan<DisplayListCommandRun>);
 COMPOSITING_API ErrorOr<void> validate_display_list_references_live_visual_context_nodes(DisplayList const&, AccumulatedVisualContextTree const&);
 

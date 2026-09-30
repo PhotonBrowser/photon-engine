@@ -292,6 +292,8 @@ struct RuleDeclarationData {
     /// canonical identity may have rewritten. Empty when the rule arrived without them.
     written_values: Vec<RetainedStyleValueData>,
     written_value_checks: Vec<super::publication::WrittenValueChecks>,
+    /// Whether a declared property may move layout geometry, including custom properties.
+    may_affect_layout_geometry: bool,
     /// The custom properties the rule declares, in declaration order, and the values they were
     /// written with, parallel to them: a custom property resolves from its written spelling.
     custom_declarations: Vec<CustomDeclaration>,
@@ -406,6 +408,9 @@ pub struct StyleSheetProgram {
     /// How many rules declare a custom property. A document without any resolves no environment
     /// of its own, and a cascade need not look.
     rules_declaring_custom_properties: usize,
+    /// How many rules sit behind a container query. A document without any answers that no rule
+    /// is gated without reading the rule's record.
+    rules_gated_by_container_query: usize,
     rule_versions: RuleVersionTable,
     semantic_declarations: HashMap<u64, Vec<SemanticDeclarationEntry>>,
     next_semantic_declaration_id: u32,
@@ -469,6 +474,7 @@ impl StyleSheetProgram {
             rules: RuleRecordTable::default(),
             rule_children: Vec::new(),
             rules_declaring_custom_properties: 0,
+            rules_gated_by_container_query: 0,
             rule_versions: RuleVersionTable::default(),
             semantic_declarations: HashMap::default(),
             next_semantic_declaration_id: 1,
@@ -1056,6 +1062,13 @@ impl StyleSheetProgram {
                 self.rules_declaring_custom_properties -= 1;
             }
         }
+        if entry.gated_by_container_query {
+            if live {
+                self.rules_gated_by_container_query += 1;
+            } else {
+                self.rules_gated_by_container_query -= 1;
+            }
+        }
         entry.live = live;
         true
     }
@@ -1284,12 +1297,19 @@ impl StyleSheetProgram {
             return;
         }
         self.rules[rule.0 as usize].gated_by_container_query = gated;
+        if self.rules[rule.0 as usize].live {
+            if gated {
+                self.rules_gated_by_container_query += 1;
+            } else {
+                self.rules_gated_by_container_query -= 1;
+            }
+        }
         self.bump_rule_sheet_dispatch_version(rule);
     }
 
     #[must_use]
     pub fn rule_is_gated_by_container_query(&self, rule: RuleID) -> bool {
-        self.rules[rule.0 as usize].gated_by_container_query
+        self.rules_gated_by_container_query != 0 && self.rules[rule.0 as usize].gated_by_container_query
     }
 
     /// Record which longhand properties a rule declares, and which of them it marks important.
@@ -1317,10 +1337,17 @@ impl StyleSheetProgram {
             .zip(&written_values)
             .map(|(declared, value)| super::publication::WrittenValueChecks::prepare(declared.property, value))
             .collect();
+        let may_affect_layout_geometry = !custom_declarations.is_empty()
+            || declared
+                .iter()
+                .any(|declared| crate::css::property_metadata::property_may_affect_layout_geometry(declared.property));
+        let moves_layout_geometry = entry.declarations.data.may_affect_layout_geometry != may_affect_layout_geometry
+            || entry.declarations_are_complete != declarations_are_complete;
         entry.declarations = share_rule_declarations(RuleDeclarationData {
             declared_properties: declared,
             written_values,
             written_value_checks,
+            may_affect_layout_geometry,
             custom_declarations,
             custom_written_values,
         });
@@ -1333,6 +1360,11 @@ impl StyleSheetProgram {
             _ => {}
         }
         entry.declarations_are_complete = declarations_are_complete;
+        // The routing liveness view carries which live routes' rules may move layout geometry. A rule that cannot
+        // decide has no live routes, and moves the routing liveness when it comes to.
+        if moves_layout_geometry && self.rule_can_decide(rule) {
+            self.bump_routing_liveness_version();
+        }
         self.bump_rule_sheet_dispatch_version(rule);
     }
 
@@ -1451,6 +1483,12 @@ impl StyleSheetProgram {
     ) -> Option<&RetainedStyleValueData> {
         self.written_winner_declaration(rule, property, important, value)
             .map(|(_, value)| value)
+    }
+
+    /// Whether a match of this rule may move geometry. Incomplete declarations cannot prove independence.
+    pub(super) fn rule_may_affect_layout_geometry(&self, rule: RuleID) -> bool {
+        let rule = &self.rules[rule.0 as usize];
+        !rule.declarations_are_complete || rule.may_affect_layout_geometry
     }
 
     pub(super) fn written_value_checks(&self, rule: RuleID, index: usize) -> super::publication::WrittenValueChecks {
@@ -2006,6 +2044,33 @@ mod tests {
             program.capacity_bytes()
         );
         assert!(memory.bytes_in_category(MemoryCategory::RuleProgram) > 0);
+    }
+
+    #[test]
+    fn container_gate_count_tracks_rule_liveness() {
+        let (mut program, sheet) = program_with_sheet();
+        let parent = program.append_rule(sheet, None, RuleKind::Style);
+        let child = program.append_rule(sheet, Some(parent), RuleKind::Style);
+        program.set_rule_gated_by_container_query(parent, true);
+        program.set_rule_gated_by_container_query(child, true);
+        assert_eq!(program.rules_gated_by_container_query, 2);
+
+        program.remove_rule(parent);
+        assert_eq!(program.rules_gated_by_container_query, 0);
+        assert!(!program.set_rule_live(parent, false));
+        assert_eq!(program.rules_gated_by_container_query, 0);
+
+        program.set_rule_gated_by_container_query(child, false);
+        program.set_rule_gated_by_container_query(child, true);
+        assert_eq!(program.rules_gated_by_container_query, 0);
+        program.set_rule_liveness(&[(parent, true), (child, true)]);
+        assert_eq!(program.rules_gated_by_container_query, 2);
+        assert!(program.rule_is_gated_by_container_query(child));
+        program.set_rule_liveness(&[(parent, true), (child, true)]);
+        assert_eq!(program.rules_gated_by_container_query, 2);
+        program.set_rule_gated_by_container_query(parent, false);
+        program.set_rule_gated_by_container_query(child, false);
+        assert_eq!(program.rules_gated_by_container_query, 0);
     }
 
     #[test]

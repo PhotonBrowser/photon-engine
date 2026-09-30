@@ -322,6 +322,18 @@ TEST_CASE(sandboxed_process_looks_up_only_its_own_mach_server)
     EXPECT_EQ(run_sandboxed({ .mach_server_name = browser_endpoint }, [&] { return can_look_up_bootstrap_service("com.apple.pasteboard.1"); }), Outcome::Denied);
 }
 
+TEST_CASE(sandboxed_process_reaches_the_window_server_only_when_granted)
+{
+    // Only a process in a GUI login session sees the window server at all.
+    if (!can_look_up_bootstrap_service("com.apple.windowserver.active")) {
+        warnln("Skipping: the window server is not reachable from this session");
+        return;
+    }
+
+    EXPECT_EQ(run_sandboxed({}, [] { return can_look_up_bootstrap_service("com.apple.windowserver.active"); }), Outcome::Denied);
+    EXPECT_EQ(run_sandboxed({ .system_services = Sandbox::SystemService::Display }, [] { return can_look_up_bootstrap_service("com.apple.windowserver.active"); }), Outcome::Allowed);
+}
+
 TEST_CASE(sandboxed_process_cannot_obtain_task_ports_for_other_processes)
 {
     auto parent = getpid();
@@ -467,13 +479,18 @@ TEST_CASE(sandboxed_process_cannot_change_shared_file_state_through_fcntl)
     char path[PATH_MAX];
     EXPECT_EQ(run_fcntl(F_GETPATH, path), Outcome::Denied);
 
-    // The GPU service needs F_GETPATH, and it never receives files from the Browser.
-    EXPECT_EQ(run_sandboxed({ .paths = paths, .system_services = Sandbox::SystemService::GPU }, [&] {
-        auto fd = open(fixture.granted_file.characters(), O_RDONLY | O_CLOEXEC);
-        char path[PATH_MAX];
-        return fd >= 0 && fcntl(fd, F_GETPATH, path) != -1;
-    }),
-        Outcome::Allowed);
+    // The GPU service and AudioToolbox's decoders need F_GETPATH, and the helpers that hold those services never
+    // receive files from the Browser. The renderer that plays WebAudio does, so the Audio service alone grants nothing.
+    auto run_getpath_with = [&](Sandbox::SystemService services) {
+        return run_sandboxed({ .paths = paths, .system_services = services }, [&] {
+            auto fd = open(fixture.granted_file.characters(), O_RDONLY | O_CLOEXEC);
+            char path[PATH_MAX];
+            return fd >= 0 && fcntl(fd, F_GETPATH, path) != -1;
+        });
+    };
+    EXPECT_EQ(run_getpath_with(Sandbox::SystemService::GPU), Outcome::Allowed);
+    EXPECT_EQ(run_getpath_with(Sandbox::SystemService::Audio | Sandbox::SystemService::AudioDecoding), Outcome::Allowed);
+    EXPECT_EQ(run_getpath_with(Sandbox::SystemService::Audio), Outcome::Denied);
 }
 
 TEST_CASE(sandboxed_process_cannot_preallocate_disk_space_through_inherited_files)

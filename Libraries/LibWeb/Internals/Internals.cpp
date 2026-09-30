@@ -11,7 +11,6 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16StringBuilder.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibCompositing/InputEvent.h>
 #include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibCore/EventLoop.h>
@@ -26,6 +25,7 @@
 #include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/Reference.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibMediaClient/Client.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/ARIA/AriaData.h>
 #include <LibWeb/ARIA/StateAndProperties.h>
@@ -102,27 +102,28 @@
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/Page/DragEvent.h>
+#include <LibWebCommon/Page/InputEvent.h>
 
 namespace Web::Internals {
 
 static u16 s_echo_server_port { 0 };
 
-static Compositing::WheelDeltaPrecision wheel_delta_precision_from(bool precise)
+static Web::WheelDeltaPrecision wheel_delta_precision_from(bool precise)
 {
-    return precise ? Compositing::WheelDeltaPrecision::Precise : Compositing::WheelDeltaPrecision::Discrete;
+    return precise ? Web::WheelDeltaPrecision::Precise : Web::WheelDeltaPrecision::Discrete;
 }
 
-static Compositing::ScrollGesturePhase scroll_gesture_phase_from(Bindings::ScrollGesturePhase scroll_gesture_phase)
+static Web::ScrollGesturePhase scroll_gesture_phase_from(Bindings::ScrollGesturePhase scroll_gesture_phase)
 {
     switch (scroll_gesture_phase) {
     case Bindings::ScrollGesturePhase::None:
-        return Compositing::ScrollGesturePhase::None;
+        return Web::ScrollGesturePhase::None;
     case Bindings::ScrollGesturePhase::Ongoing:
-        return Compositing::ScrollGesturePhase::Ongoing;
+        return Web::ScrollGesturePhase::Ongoing;
     case Bindings::ScrollGesturePhase::Momentum:
-        return Compositing::ScrollGesturePhase::Momentum;
+        return Web::ScrollGesturePhase::Momentum;
     case Bindings::ScrollGesturePhase::Ended:
-        return Compositing::ScrollGesturePhase::Ended;
+        return Web::ScrollGesturePhase::Ended;
     }
     VERIFY_NOT_REACHED();
 }
@@ -538,12 +539,12 @@ void Internals::send_text(HTML::HTMLElement& target, Utf16String const& text, We
 void Internals::send_text_through_ui_process(Utf16String const& text)
 {
     for (auto code_point : text) {
-        for (auto type : { Compositing::KeyEvent::Type::KeyDown, Compositing::KeyEvent::Type::KeyUp }) {
-            Compositing::KeyEvent event;
+        for (auto type : { Web::KeyEvent::Type::KeyDown, Web::KeyEvent::Type::KeyUp }) {
+            Web::KeyEvent event;
             event.type = type;
             event.key = UIEvents::code_point_to_key_code(code_point);
             event.code_point = code_point;
-            event.should_insert_text = type == Compositing::KeyEvent::Type::KeyDown;
+            event.should_insert_text = type == Web::KeyEvent::Type::KeyDown;
             page().client().page_did_request_key_event_for_testing(move(event));
         }
     }
@@ -560,13 +561,13 @@ void Internals::click_through_ui_process(double x, double y)
     auto& page = this->page();
     auto position = page.css_to_device_point(window().navigable()->to_page_position({ x, y }));
     auto local_root_id = window().navigable()->local_root()->id();
-    for (auto type : { Compositing::MouseEvent::Type::MouseDown, Compositing::MouseEvent::Type::MouseUp }) {
-        Compositing::MouseEvent event;
+    for (auto type : { Web::MouseEvent::Type::MouseDown, Web::MouseEvent::Type::MouseUp }) {
+        Web::MouseEvent event;
         event.type = type;
         event.position = position;
         event.screen_position = position;
         event.button = UIEvents::MouseButton::Primary;
-        event.buttons = type == Compositing::MouseEvent::Type::MouseDown ? UIEvents::MouseButton::Primary : UIEvents::MouseButton::None;
+        event.buttons = type == Web::MouseEvent::Type::MouseDown ? UIEvents::MouseButton::Primary : UIEvents::MouseButton::None;
         event.click_count = 1;
         page.client().page_did_request_webdriver_mouse_event(local_root_id, move(event), GC::create_function(heap(), [] { }));
     }
@@ -578,8 +579,8 @@ void Internals::wheel_through_ui_process(double x, double y, double delta_x, dou
     auto position = page.css_to_device_point(window().navigable()->to_page_position({ x, y }));
     auto local_root_id = window().navigable()->local_root()->id();
 
-    Compositing::MouseEvent event;
-    event.type = Compositing::MouseEvent::Type::MouseWheel;
+    Web::MouseEvent event;
+    event.type = Web::MouseEvent::Type::MouseWheel;
     event.position = position;
     event.screen_position = position;
     event.wheel_delta_x = delta_x;
@@ -650,7 +651,7 @@ void Internals::mouse_down_on_scrollbar_dragged_by_compositor(double x, double y
     auto& page = this->page();
     auto position = page.css_to_device_point({ x, y });
     page.handle_mousedown(position, position, UIEvents::MouseButton::Primary, 0, 0, 1,
-        Compositing::ScrollbarDraggedByCompositor { .scroller_stable_node_id = *scroller_stable_node_id, .vertical = vertical });
+        Web::ScrollbarDraggedByCompositor { .scroller_stable_node_id = *scroller_stable_node_id, .vertical = vertical });
 }
 
 void Internals::mouse_up(double x, double y, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers)
@@ -799,6 +800,7 @@ void Internals::spoof_current_url(Utf16String const& url_string)
     window.associated_document().set_url(url.value());
     window.associated_document().set_origin(origin);
     HTML::relevant_settings_object(window.associated_document()).creation_url = url.release_value();
+    page().client().page_did_spoof_document_origin_for_testing(window.associated_document().relevant_settings_object(), origin);
 }
 
 void Internals::load_url(Utf16String const& url_string)
@@ -1500,6 +1502,12 @@ void Internals::set_media_element_seeking(HTML::HTMLMediaElement& element, bool 
     element.set_seeking(seeking);
 }
 
+void Internals::disconnect_media_server()
+{
+    if (auto client = MediaClient::Client::acquire(); !client.is_error())
+        client.value()->shutdown();
+}
+
 void Internals::set_page_muted(bool muted)
 {
     window().associated_document().page().set_page_mute_state(muted ? HTML::MuteState::Muted : HTML::MuteState::Unmuted);
@@ -1672,7 +1680,7 @@ u64 Internals::style_record_identity(DOM::Element& element)
 u64 Internals::layout_style_record_identity(DOM::Element& element)
 {
     element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = element.unsafe_layout_node();
+    auto const* layout_node = element.layout_node();
     return layout_node ? layout_node->style_record_identity().value() : 0;
 }
 
@@ -1684,14 +1692,14 @@ u64 Internals::before_style_record_identity(DOM::Element& element)
 u64 Internals::before_layout_style_record_identity(DOM::Element& element)
 {
     element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = element.pseudo_element_unsafe_layout_node(CSS::PseudoElement::Before);
+    auto const* layout_node = element.pseudo_element_layout_node(CSS::PseudoElement::Before);
     return layout_node ? layout_node->style_record_identity().value() : 0;
 }
 
 u64 Internals::paint_style_record_identity(DOM::Element& element)
 {
     element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = element.unsafe_layout_node();
+    auto const* layout_node = element.layout_node();
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
     return Painting::style_record_identity(*layout_node).value();
@@ -2122,7 +2130,7 @@ String Internals::viewport_overflow_x()
 {
     auto& document = window().associated_document();
     document.update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto overflow = document.unsafe_layout_node()->overflow_x();
+    auto overflow = document.layout_node()->overflow_x();
     switch (overflow) {
     case CSS::Overflow::Auto:
         return "auto"_string;

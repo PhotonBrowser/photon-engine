@@ -15,6 +15,7 @@
 #include <AK/Span.h>
 #include <AK/Vector.h>
 #include <Compositor/BackingStoreManager.h>
+#include <Compositor/FramePacer.h>
 #include <Compositor/ScrollSnapController.h>
 #include <Compositor/ScrollbarController.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
@@ -22,7 +23,6 @@
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/Forward.h>
-#include <LibCompositing/KeyCode.h>
 #include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
@@ -35,18 +35,11 @@
 #include <LibGfx/Rect.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibGfx/Size.h>
+#include <LibWebCommon/UIEvents/KeyCode.h>
 
 namespace Gfx {
 
 class SkiaBackendContext;
-
-}
-
-namespace Compositing {
-
-struct KeyEvent;
-struct MouseEvent;
-struct PinchEvent;
 
 }
 
@@ -85,7 +78,7 @@ public:
         bool accepted { false };
         Optional<PendingFrame> frame_to_present;
         bool should_request_rendering_update { false };
-        Optional<Compositing::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
+        Optional<Web::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
     };
 
     struct PreparedFrame {
@@ -94,22 +87,22 @@ public:
         Gfx::IntRect damage_rect;
     };
 
-    ContextState(Compositing::CompositorContextId, Optional<u64> page_id, CompositorStateWebContentClient&, Compositing::CanvasSurfaceRegistry const&, bool async_scrolling_enabled, Function<void(Gfx::IntRect)> schedule_caret_repaint = {});
+    ContextState(Web::CompositorContextId, Optional<u64> page_id, CompositorStateWebContentClient&, Compositing::CanvasSurfaceRegistry const&, Function<void(Gfx::IntRect)> schedule_caret_repaint = {});
     ~ContextState();
 
     bool is_owned_by(CompositorStateWebContentClient const&) const;
     CompositorStateWebContentClient& web_content_client() const { return m_web_content_client; }
     void request_rendering_update();
-    void dispatch_mouse_event_to_web_content(Compositing::MouseEvent const&);
-    void dispatch_key_event_to_web_content(Compositing::KeyEvent const&);
+    void dispatch_mouse_event_to_web_content(Web::MouseEvent const&);
+    void dispatch_key_event_to_web_content(Web::KeyEvent const&);
     bool can_dispatch_input_to_web_content() const { return m_page_id.has_value(); }
 
     bool presents_to_client() const { return m_presents_to_client; }
     void stop_presenting_to_client();
     void did_stop_presenting_to_client_if_needed(bool was_presenting_to_client, bool will_present_to_client);
 
-    void set_parent_context(Optional<Compositing::CompositorContextId>);
-    Optional<Compositing::CompositorContextId> parent_context_id() const { return m_parent_context_id; }
+    void set_parent_context(Optional<Web::CompositorContextId>);
+    Optional<Web::CompositorContextId> parent_context_id() const { return m_parent_context_id; }
     RefPtr<Gfx::PaintingSurface> latest_rendered_surface() const { return m_latest_rendered_surface; }
     bool update_composited_raster_transform(Gfx::FloatRect destination_rect, Gfx::FloatMatrix4x4 const& canvas_transform);
     Compositing::CompositedContextSurface composited_surface() const;
@@ -126,31 +119,31 @@ public:
 
     void invalidate_wheel_event_listener_state(u64 generation);
     void invalidate_keyboard_scroll_state(u64 generation);
-    ContextUpdateResult handle_key_event(Compositing::KeyEvent const&);
-    ContextUpdateResult handle_mouse_event(Compositing::MouseEvent const&);
+    ContextUpdateResult handle_key_event(Web::KeyEvent const&);
+    ContextUpdateResult handle_mouse_event(Web::MouseEvent const&);
     // The UI's wheel deltas are in CSS pixels; this scales them for the scroll tree, which works in device pixels.
-    ContextUpdateResult handle_wheel_event(Compositing::MouseEvent const&, Optional<MonotonicTime> now_for_testing = {});
-    ContextUpdateResult handle_pinch_event(Compositing::PinchEvent const&);
+    ContextUpdateResult handle_wheel_event(Web::MouseEvent const&, Optional<MonotonicTime> now_for_testing = {});
+    ContextUpdateResult handle_pinch_event(Web::PinchEvent const&);
     AsyncScrollResult async_scroll_by(
-        Compositing::UniqueNodeID document_id,
+        Web::UniqueNodeID document_id,
         Gfx::FloatPoint position,
         Gfx::FloatPoint delta,
         Gfx::IntRect viewport_rect,
-        Compositing::WheelDeltaPrecision,
-        Compositing::ScrollGesturePhase,
+        Web::WheelDeltaPrecision,
+        Web::ScrollGesturePhase,
         u32 modifiers,
         Compositing::AsyncScrollOperationTracking,
         Optional<MonotonicTime> now_for_testing = {});
-    AsyncScrollResult smooth_scroll_to(Compositing::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator);
-    void cancel_smooth_scroll(Compositing::AsyncScrollNodeStableID);
+    AsyncScrollResult smooth_scroll_to(Web::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator);
+    void cancel_smooth_scroll(Web::AsyncScrollNodeStableID);
     Optional<Gfx::IntRect> advance_smooth_scroll_animations(MonotonicTime now);
     bool has_active_smooth_scroll_animations() const { return !m_smooth_scroll_animations.is_empty(); }
     bool advance_visual_animations(MonotonicTime now);
     bool has_active_visual_animations() const { return m_has_active_visual_animations; }
     bool visual_animations_need_frame();
     u64 visual_context_tree_copy_count_for_testing() const { return m_visual_context_tree_copy_count; }
-    Optional<Compositing::AsyncScrollNodeStableID> latched_wheel_scroller_for_testing() const;
-    ContextUpdateResult async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Compositing::WheelDeltaPrecision, Compositing::ScrollGesturePhase, u32 modifiers, Optional<MonotonicTime> now_for_testing = {});
+    Optional<Web::AsyncScrollNodeStableID> latched_wheel_scroller_for_testing() const;
+    ContextUpdateResult async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Optional<MonotonicTime> now_for_testing = {});
     Compositing::PendingAsyncScrollUpdates take_pending_async_scroll_updates();
     bool has_pending_async_scroll_updates() const;
     // A gesture whose steps this context chains ends once they stop arriving, which is reported to WebContent so
@@ -166,6 +159,10 @@ public:
     void finish_window_resize();
     Optional<BackingStoreManager::Publication> resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const&, BackingStoreManager::GpuSharing);
     void invalidate_backing_stores();
+    Optional<BackingStoreManager::Publication> add_backing_store_for_pending_frame_if_needed(RefPtr<Gfx::SkiaBackendContext> const&);
+    bool has_surplus_backing_stores() const { return m_backing_store_manager.has_surplus_backing_stores(); }
+    Vector<i32> retire_idle_surplus_backing_stores() { return m_backing_store_manager.retire_idle_surplus_backing_stores(); }
+    void schedule_surplus_backing_store_retirement(Function<void()>);
 
     bool set_display_metadata(Optional<u64> display_id, double refresh_rate);
     Optional<u64> display_id() const { return m_display_id; }
@@ -202,7 +199,7 @@ public:
 
 private:
     struct ActiveSmoothScrollAnimation {
-        Compositing::AsyncScrollNodeStableID stable_node_id;
+        Web::AsyncScrollNodeStableID stable_node_id;
         Compositing::AsyncScrollOperationID operation_id;
         Compositing::SmoothScrollAnimation animation;
         MonotonicTime started_at;
@@ -217,7 +214,7 @@ private:
     // The scroller the first step of a wheel gesture was routed to. Every later step of the gesture scrolls it without
     // hit testing, and stops at its edge rather than handing the rest of the gesture to an ancestor.
     struct WheelScrollLatch {
-        Compositing::AsyncScrollNodeStableID stable_node_id;
+        Web::AsyncScrollNodeStableID stable_node_id;
         Compositing::WheelGestureIdentity gesture;
     };
 
@@ -230,6 +227,7 @@ private:
     };
 
     void stop_backing_store_shrink_timer();
+    void stop_surplus_backing_store_retirement_timer();
     void end_keyboard_scroll_gesture();
     Compositing::ScrollStateSnapshot scroll_state_snapshot_at_keyboard_step_starts() const;
     void apply_keyboard_scroll_state(Compositing::KeyboardScrollState);
@@ -243,17 +241,17 @@ private:
         // The viewport to present, when the scroll moved a scrolling box or started a snap scroll of one.
         Optional<Gfx::IntRect> viewport_rect_to_present;
     };
-    WheelScrollOutcome perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID, Gfx::FloatPoint delta, Compositing::WheelDeltaPrecision, Compositing::ScrollGesturePhase, Compositing::AsyncScrollOperationTracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining);
+    WheelScrollOutcome perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID, Gfx::FloatPoint delta, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, Compositing::AsyncScrollOperationTracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining);
     // The latched scroller of the gesture the wheel event continues, in the current scroll tree, with the gesture
     // advanced to the event. A latch the event does not continue, or whose scroller the current display list no
     // longer has, is dropped here.
-    Optional<Compositing::AsyncScrollNodeID> resolve_wheel_scroll_latch(Gfx::FloatPoint position, Compositing::ScrollGesturePhase, u32 modifiers, MonotonicTime now);
+    Optional<Compositing::AsyncScrollNodeID> resolve_wheel_scroll_latch(Gfx::FloatPoint position, Web::ScrollGesturePhase, u32 modifiers, MonotonicTime now);
     // The scroller the first step of a wheel gesture is routed to, which the gesture is latched to.
-    Optional<Compositing::AsyncScrollNodeID> hit_test_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Compositing::ScrollGesturePhase, u32 modifiers, MonotonicTime now, Optional<Compositing::UniqueNodeID> expected_document_id);
+    Optional<Compositing::AsyncScrollNodeID> hit_test_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::ScrollGesturePhase, u32 modifiers, MonotonicTime now, Optional<Web::UniqueNodeID> expected_document_id);
     Gfx::IntRect note_async_scrolling_viewport_rect(Gfx::IntRect viewport_rect, Optional<Compositing::AsyncScrollOffset> const&);
     Optional<Compositing::AsyncScrollOperationID> snap_at_gesture_end(MonotonicTime now);
     Compositing::AsyncScrollOperationID start_snap_scroll(Compositing::AsyncScrollNodeID, ScrollSnapController::SnapScrollStart&&, bool settles_gesture, MonotonicTime now);
-    void retire_smooth_scroll_animation(Compositing::AsyncScrollNodeStableID);
+    void retire_smooth_scroll_animation(Web::AsyncScrollNodeStableID);
     void cancel_smooth_scroll_taken_over_by_user_input(Compositing::AsyncScrollNodeID);
     void note_user_scroll_gesture_end_if_drag_ended(bool was_dragging_scrollbar);
     bool user_scroll_gesture_in_progress() const;
@@ -280,12 +278,11 @@ private:
 
     CompositorStateWebContentClient& m_web_content_client;
     Compositing::CanvasSurfaceRegistry const& m_canvas_surface_registry;
-    Compositing::CompositorContextId m_context_id;
+    Web::CompositorContextId m_context_id;
     Optional<u64> m_page_id;
-    bool const m_async_scrolling_enabled { true };
 
     bool m_presents_to_client { false };
-    Optional<Compositing::CompositorContextId> m_parent_context_id;
+    Optional<Web::CompositorContextId> m_parent_context_id;
 
     RefPtr<Compositing::DisplayList const> m_display_list;
     Optional<Compositing::AccumulatedVisualContextTree> m_visual_context_tree;
@@ -313,7 +310,7 @@ private:
     // reapplying them over the main-thread state that arrives in the meantime.
     struct UnreconciledAsyncScrollOffset {
         u64 sequence { 0 };
-        Compositing::AsyncScrollNodeStableID stable_node_id;
+        Web::AsyncScrollNodeStableID stable_node_id;
         Gfx::FloatPoint compositor_scroll_offset;
     };
     Vector<UnreconciledAsyncScrollOffset> m_unreconciled_async_scroll_offsets;
@@ -322,7 +319,7 @@ private:
     Vector<Compositing::AsyncScrollOperationID> m_completed_async_scroll_operation_ids;
     Vector<Compositing::AsyncScrollOperationID> m_async_scroll_operation_ids_taken_over_by_user_input;
     Compositing::KeyboardScrollState m_keyboard_scroll_state;
-    Vector<Compositing::KeyCode, 3> m_held_scroll_keys;
+    Vector<Web::UIEvents::KeyCode, 3> m_held_scroll_keys;
     bool m_user_scroll_gesture_ended { false };
     bool m_published_user_scroll_gesture_in_progress { false };
     RefPtr<Core::Timer> m_scroll_step_gesture_input_timer;
@@ -345,6 +342,7 @@ private:
     Optional<Compositing::PausedDebuggerOverlayAction> m_paused_debugger_overlay_hovered_action;
     Compositing::WindowResizingInProgress m_window_resize_in_progress { Compositing::WindowResizingInProgress::No };
     RefPtr<Core::Timer> m_backing_store_shrink_timer;
+    RefPtr<Core::Timer> m_surplus_backing_store_retirement_timer;
     Function<void(Gfx::IntRect)> m_schedule_caret_repaint;
     RefPtr<Core::Timer> m_caret_blink_timer;
     Optional<i64> m_caret_blink_cycle_start_time_ns;
@@ -353,8 +351,7 @@ private:
     Compositing::ContextVisibility m_visibility { Compositing::ContextVisibility::Visible };
 
     bool m_rendering_opportunity_requested { false };
-    double m_maximum_rendering_frames_per_second { 60.0 };
-    Optional<i64> m_last_rendering_opportunity_time_nanoseconds;
+    FramePacer m_rendering_opportunity_pacer;
 
     Optional<PendingFrame> m_pending_present_frame;
     bool m_pending_present_frame_scheduled { false };

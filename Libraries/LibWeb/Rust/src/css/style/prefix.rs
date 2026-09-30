@@ -4088,6 +4088,10 @@ impl PrefixStates {
             entering.parent = parent;
             entering.previous = previous;
         }
+        // The states are renumbered, so this is another arena as far as anything that memoized
+        // answers by state index is concerned: a transition context prepared against the old
+        // numbering, which a cold matching traversal keeps across flushes, starts over.
+        self.identity = next_prefix_states_identity();
     }
 
     fn interned_working_bytes(&self) -> u64 {
@@ -4560,6 +4564,15 @@ impl PrefixStateCache {
         self.by_program.iter().flatten().any(|states| states.relation.is_some())
     }
 
+    /// Whether a retained relation still holds any of `nodes` as a live node.
+    pub(super) fn relation_holds_any(&self, nodes: &[StyleNodeID]) -> bool {
+        self.by_program
+            .iter()
+            .flatten()
+            .filter_map(|states| states.relation.as_deref())
+            .any(|relation| nodes.iter().any(|&node| relation.holds(node)))
+    }
+
     pub(super) fn lookup(&self, program: ScopeProgramID) -> Lookup<&PrefixStates, PrefixStateCacheGap> {
         match self.by_program.get(program.0 as usize).and_then(Option::as_deref) {
             Some(states) => Lookup::Known(states),
@@ -4887,20 +4900,13 @@ fn matches_feature(facts: &StyleNodeFacts, row: u32, feature: FeatureTest) -> bo
                 if !value_matches {
                     return false;
                 }
-                if !test.any_namespace {
-                    if attribute.name == test.name {
-                        return true;
-                    }
-                    if !folds {
-                        return false;
-                    }
-                }
-                let forms = facts.attribute_name_forms(attribute.name);
-                let (written, folded) = match test.any_namespace {
-                    true => (forms.local, forms.folded_local),
-                    false => (attribute.name, forms.folded_name),
+                let name = if folds { test.folded } else { test.name };
+                let written = if test.any_namespace {
+                    facts.attribute_name_forms(attribute.name).local
+                } else {
+                    attribute.name
                 };
-                written == test.name || (folds && folded == test.folded)
+                written == name
             })
         }
     }
@@ -5602,6 +5608,44 @@ mod tests {
             [retained, added]
         );
         assert_eq!(states.results[result.0 as usize].truth, PrefixTruthSetID::default());
+    }
+
+    #[test]
+    fn compaction_invalidates_a_prepared_transition_context() {
+        let mut states = PrefixStates::new();
+        let facts = StyleNodeFacts::new();
+        let mut context = PrefixTransitionContext::new(&mut states, &facts);
+        // An answer memoized against a state the compaction below drops.
+        states.states.push(PrefixState {
+            base: 0,
+            payload_start: 0,
+            additions_len: 0,
+            expiring_len: 0,
+            descendant_len: 0,
+            descendant_hash: 0,
+            expiring_hash: 0,
+        });
+        states.descendant_only.push(UNKNOWN_STATE);
+        let key = PrefixTransitionKey {
+            parent: 0,
+            previous: 0,
+            local_facts: 0,
+            is_document_root: true,
+            positional_bits: 0,
+        };
+        context.scratch.memo.insert(
+            key,
+            PrefixTransition {
+                state: 1,
+                right: 0,
+                result: PrefixResultID::default(),
+            },
+        );
+
+        states.compact_interned_states();
+        assert_eq!(states.states.len(), 1);
+        context.prepare(&mut states, &facts);
+        assert!(context.scratch.memo.is_empty());
     }
 
     #[test]

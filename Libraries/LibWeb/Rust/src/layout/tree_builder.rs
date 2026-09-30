@@ -2002,7 +2002,7 @@ pub struct FfiPseudoTreeBuilderCallbacks {
         FfiPseudoElementDecision,
     ) -> NodeSlotId,
     pub attach_style_resources: unsafe extern "C" fn(*mut c_void),
-    pub create_nested_list_marker: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
+    pub create_nested_list_marker: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiPseudoElement) -> NodeSlotId,
     pub create_nested_list_marker_content:
         unsafe extern "C" fn(*mut c_void, *mut c_void, FfiPseudoElement, *mut c_void) -> NodeSlotId,
     pub configure_layout_node: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiPseudoElement),
@@ -2173,7 +2173,8 @@ fn create_pseudo_element_with_frame(
     // FIXME: This code actually computes style for element::marker, and shouldn't for element::pseudo::marker.
     if layout_node_kind == NodeKind::ListItemBox {
         // SAFETY: The frame and element remain live throughout marker creation.
-        let marker = layout_host.created(unsafe { (callbacks.create_nested_list_marker)(frame, element) });
+        let marker =
+            layout_host.created(unsafe { (callbacks.create_nested_list_marker)(frame, element, pseudo_element) });
         let marker_slot = marker.slot();
         let first_child = layout_host.first_child(layout_node);
         layout_host.attach_child(layout_node, marker, first_child);
@@ -3999,38 +4000,60 @@ fn fixup_tables_in_rebuilt_subtrees(
     reused_child_list_update_roots: &[LayoutNode],
     additional_roots: &[LayoutNode],
 ) {
+    // A build can rebuild thousands of subtrees, one per element whose text was replaced, so the roots are kept unique,
+    // and found inside one another, through sets rather than by comparing every pair.
     let mut roots = Vec::new();
+    let mut root_set = HashSet::default();
     for &root in rebuilt_subtree_roots {
         if host.arena().node_data_if_live(root).is_none() || host.parent(root).is_invalid() {
             continue;
         }
         let scope = table_fixup_scope_for_rebuilt_subtree(host, root);
-        append_unique_node(&mut roots, scope);
-    }
-    for &root in reused_child_list_update_roots {
-        if host.arena().node_data_if_live(root).is_none() || host.parent(root).is_invalid() {
-            continue;
+        if root_set.insert(scope) {
+            roots.push(scope);
         }
-        let has_live_rebuilt_descendant = rebuilt_subtree_roots.iter().any(|&rebuilt_root| {
-            host.arena().node_data_if_live(rebuilt_root).is_some()
-                && is_inclusive_layout_ancestor_of(host, root, rebuilt_root)
-        });
-        if !has_live_rebuilt_descendant {
-            append_unique_node(&mut roots, root);
+    }
+    if !reused_child_list_update_roots.is_empty() {
+        // The inclusive ancestors of the live rebuilt subtree roots. A walk stops at an ancestor another walk reached,
+        // whose ancestors that walk reached too.
+        let mut ancestors_of_rebuilt_roots = HashSet::default();
+        for &rebuilt_root in rebuilt_subtree_roots {
+            if host.arena().node_data_if_live(rebuilt_root).is_none() {
+                continue;
+            }
+            let mut current = rebuilt_root;
+            while !current.is_invalid() && ancestors_of_rebuilt_roots.insert(current) {
+                current = host.parent(current);
+            }
+        }
+        for &root in reused_child_list_update_roots {
+            if host.arena().node_data_if_live(root).is_none() || host.parent(root).is_invalid() {
+                continue;
+            }
+            if !ancestors_of_rebuilt_roots.contains(&root) && root_set.insert(root) {
+                roots.push(root);
+            }
         }
     }
     for &root in additional_roots {
         if host.arena().node_data_if_live(root).is_none() || host.parent(root).is_invalid() {
             continue;
         }
-        append_unique_node(&mut roots, root);
+        if root_set.insert(root) {
+            roots.push(root);
+        }
     }
 
-    let candidate_roots = roots.clone();
+    // A root inside another root's subtree is fixed up with it.
     roots.retain(|&candidate| {
-        !candidate_roots
-            .iter()
-            .any(|&other| other != candidate && is_inclusive_layout_ancestor_of(host, other, candidate))
+        let mut ancestor = host.parent(candidate);
+        while !ancestor.is_invalid() {
+            if root_set.contains(&ancestor) {
+                return false;
+            }
+            ancestor = host.parent(ancestor);
+        }
+        true
     });
 
     let mut table_roots = Vec::new();

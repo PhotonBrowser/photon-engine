@@ -262,6 +262,47 @@ fn pending_paint_only_local_inputs_preserve_layout_geometry() {
 }
 
 #[test]
+fn pending_geometry_inputs_see_declaration_completeness_changes() {
+    let (mut engine, nodes) = linear_document();
+    let target = StyleAtomID(200);
+    let rule = add_target_rule(&mut engine, StyleSheetObjectID(1), target);
+    engine.set_rule_declared_properties(rule, &[(property_id::BACKGROUND_COLOR, false)], true);
+    discard_transaction(&mut engine);
+    prepare_route_liveness(&mut engine);
+
+    engine.set_rule_declared_properties(rule, &[(property_id::BACKGROUND_COLOR, false)], false);
+    discard_transaction(&mut engine);
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
+    assert!(engine.pending_transaction_may_affect_layout_geometry());
+    discard_transaction(&mut engine);
+    prepare_route_liveness(&mut engine);
+
+    engine.set_rule_declared_properties(rule, &[(property_id::BACKGROUND_COLOR, false)], true);
+    discard_transaction(&mut engine);
+    add_feature(&mut engine, nodes[2], LocalFeatureKey::Class(target));
+    assert!(!engine.pending_transaction_may_affect_layout_geometry());
+}
+
+#[test]
+fn pending_inputs_see_a_rule_whose_declarations_came_to_move_geometry() {
+    let (mut engine, nodes) = linear_document();
+    let target = StyleAtomID(200);
+    let rule = add_target_rule(&mut engine, StyleSheetObjectID(1), target);
+    engine.set_rule_declared_properties(rule, &[(property_id::BACKGROUND_COLOR, false)], true);
+    discard_transaction(&mut engine);
+    prepare_route_liveness(&mut engine);
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
+    assert!(!engine.pending_transaction_may_affect_layout_geometry());
+    discard_transaction(&mut engine);
+
+    // The view prepared for the paint-only rule does not answer for the rule it became.
+    engine.set_rule_declared_properties(rule, &[(property_id::WIDTH, false)], true);
+    discard_transaction(&mut engine);
+    add_feature(&mut engine, nodes[2], LocalFeatureKey::Class(target));
+    assert!(engine.pending_transaction_may_affect_layout_geometry());
+}
+
+#[test]
 fn pending_layout_and_incomplete_local_inputs_may_change_geometry() {
     for (property, declarations_are_complete) in [
         (property_id::WIDTH, true),
@@ -505,6 +546,13 @@ fn set_atom_feature(engine: &mut StyleEngine, node: StyleNodeID, feature: LocalF
         InputValue::Feature(FeatureValue::Absent),
         InputValue::Feature(FeatureValue::Atom(atom)),
     );
+}
+
+fn prepare_route_liveness(engine: &mut StyleEngine) {
+    let retained = &mut engine.retained;
+    std::sync::Arc::get_mut(&mut retained.routing)
+        .expect("routing is not shared outside a planning epoch")
+        .prepare_route_liveness(&retained.program, &retained.programs);
 }
 
 fn discard_transaction(engine: &mut StyleEngine) {
@@ -1965,7 +2013,10 @@ fn routing_phases_share_remaining_postings_for_one_transaction() {
         engine.counters().get(Counter::RemainingPostingReuses) > reuses_before,
         "the later routing phase must reuse the posting retained by the earlier phase"
     );
-    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        engine.cascade_compaction_scratch.capacity_bytes()
+    );
 }
 
 #[test]
@@ -3271,6 +3322,44 @@ fn cascade_matching_publishes_the_same_top_1_winners_it_compacts() {
     assert_eq!(engine.counters().get(Counter::CascadeStatesInterned), 1);
     assert_eq!(engine.counters().get(Counter::CascadeWinnerGroupsInterned), 1);
     assert_eq!(engine.counters().get(Counter::CascadeWinnerEntriesInterned), 2);
+}
+
+#[test]
+fn a_repeated_match_list_publishes_what_its_first_compaction_decided() {
+    let (mut engine, nodes) = linear_document();
+    let losing = add_target_rule(&mut engine, StyleSheetObjectID(1), StyleAtomID(200));
+    let lower = add_target_rule(&mut engine, StyleSheetObjectID(2), StyleAtomID(201));
+    let later = add_target_rule(&mut engine, StyleSheetObjectID(3), StyleAtomID(202));
+    engine.set_rule_declared_properties(losing, &[(1, false)], true);
+    engine.set_rule_declared_properties(lower, &[(1, false), (2, false)], true);
+    engine.set_rule_declared_properties(later, &[(1, false)], true);
+    commit_test_setup(&mut engine);
+    let matches_of = |engine: &StyleEngine, node| {
+        vec![
+            concrete_rule_match(engine, node, losing, 0, None),
+            concrete_rule_match(engine, node, lower, 1, None),
+            concrete_rule_match(engine, node, later, 2, None),
+        ]
+    };
+
+    // The second list marks it as one to remember, and the third publishes what was remembered.
+    for node in [nodes[0], nodes[1], nodes[2]] {
+        let compacted = engine.matches_for_cascade(matches_of(&engine, node), false, Some(node));
+
+        assert_eq!(
+            compacted.iter().map(|entry| entry.rule).collect::<Vec<_>>(),
+            vec![lower, later]
+        );
+        let key = WinnerGroupKey::current(node, engine.program.version());
+        assert!(
+            matches!(engine.winner_groups.winner(key, 1), Lookup::Known(winner) if winner.source == WinnerSource::Rule(later))
+        );
+        assert!(
+            matches!(engine.winner_groups.winner(key, 2), Lookup::Known(winner) if winner.source == WinnerSource::Rule(lower))
+        );
+    }
+    assert_eq!(engine.counters().get(Counter::CascadeNodeHandlesPublished), 3);
+    assert_eq!(engine.counters().get(Counter::CascadeStatesInterned), 1);
 }
 
 #[test]
@@ -6511,7 +6600,10 @@ fn retained_prefix_transitions_supply_invalidation_and_matching() {
     planned.clear();
     assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
     assert_eq!(planned, vec![nodes[3].raw()]);
-    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        engine.cascade_compaction_scratch.capacity_bytes()
+    );
 }
 
 #[test]
@@ -6833,7 +6925,10 @@ fn selective_matching_completes_a_bounded_prefix_transition_window() {
         1,
         "invalidation reuses the retained partial prefix transition cache"
     );
-    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        engine.cascade_compaction_scratch.capacity_bytes()
+    );
 }
 
 #[test]
@@ -9136,7 +9231,10 @@ fn exact_planning_shares_current_relation_indexes_with_matching() {
     engine.begin_adaptive_cold_matching_batch(nodes[0]);
     assert_eq!(engine.match_element(nodes[2]).unwrap().len(), 1);
     engine.end_cold_matching_batch();
-    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        engine.cascade_compaction_scratch.capacity_bytes()
+    );
 }
 
 #[test]
@@ -9403,6 +9501,79 @@ fn a_rootless_flush_preserves_element_style_inputs() {
         }));
     }));
     assert_eq!(planned, vec![(nodes[2].raw(), deferred_reactions, 0b111)]);
+}
+
+#[test]
+fn a_rootless_flush_drops_the_prefix_relation_after_a_move() {
+    let (mut engine, nodes) = nested_document();
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    add_guard_target_rule(&mut engine, guard, target);
+    for (node, class) in [(nodes[1], guard), (nodes[3], target)] {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+    }
+    discard_transaction(&mut engine);
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
+    engine.end_published_match_answer_completion_batch();
+    assert!(engine.memory().bytes_in_category(MemoryCategory::PrefixRelation) > 0);
+
+    engine.record_tree_delta(
+        nodes[3],
+        Some(relations(Some(nodes[2].raw()), None, None)),
+        Some(relations(Some(nodes[0].raw()), None, None)),
+    );
+    engine.flush_without_document_root();
+    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::PrefixRelation), 0);
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert!(engine.match_element(nodes[3]).unwrap().is_empty());
+    engine.end_published_match_answer_completion_batch();
+}
+
+#[test]
+fn a_rootless_flush_drops_the_prefix_relation_its_departures_leave() {
+    let (mut engine, nodes) = nested_document();
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    add_guard_target_rule(&mut engine, guard, target);
+    for (node, class) in [(nodes[1], guard), (nodes[3], target)] {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+    }
+    discard_transaction(&mut engine);
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
+    engine.end_published_match_answer_completion_batch();
+    assert!(engine.memory().bytes_in_category(MemoryCategory::PrefixRelation) > 0);
+
+    // The subtree leaves while there is no style root to plan a transaction for, so no routing
+    // walks the relation through the departures.
+    for index in (1..nodes.len()).rev() {
+        engine.record_tree_delta(
+            nodes[index],
+            Some(relations(Some(nodes[index - 1].raw()), None, None)),
+            None,
+        );
+    }
+    engine.flush_without_document_root();
+
+    // It comes back under new identities.
+    let mut raw = [0_u32; 3];
+    engine.allocate_style_nodes(&mut raw);
+    let arrived: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
+    let mut parent = nodes[0];
+    for &node in &arrived {
+        engine.record_tree_delta(node, None, Some(relations(Some(parent.raw()), None, None)));
+        set_atom_feature(&mut engine, node, LocalFeatureKey::TagName, StyleAtomID(100));
+        parent = node;
+    }
+    for (node, class) in [(arrived[0], guard), (arrived[2], target)] {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+    }
+    // The relation verifies every node it holds against the current facts.
+    assert!(engine.take_style_transaction_nodes(nodes[0], |_| {}));
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(arrived[2]).unwrap().len(), 1);
+    engine.end_published_match_answer_completion_batch();
 }
 
 #[test]
@@ -10110,7 +10281,10 @@ fn rule_activation_reaches_only_current_selector_matches() {
         assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
         assert_eq!(engine.program.rule_conditions_hold(rule), conditions_hold);
         assert_eq!(planned, vec![nodes[3].raw()]);
-        assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+        assert_eq!(
+            engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+            engine.cascade_compaction_scratch.capacity_bytes()
+        );
     }
 }
 
@@ -10225,7 +10399,10 @@ fn local_routes_for_one_exact_entry_are_compared_once() {
         0,
         "routes consolidate before late exact-entry grouping"
     );
-    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        engine.cascade_compaction_scratch.capacity_bytes()
+    );
 }
 
 #[test]
@@ -10338,7 +10515,10 @@ fn rule_activation_uses_the_fact_side_where_the_rule_contributes() {
         vec![nodes[3].raw()],
         "turning the rule on tests the new selector facts"
     );
-    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        engine.cascade_compaction_scratch.capacity_bytes()
+    );
 }
 
 #[test]
@@ -10369,7 +10549,10 @@ fn a_sheet_transition_reaches_only_selector_matches() {
     assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
     assert_eq!(planned, vec![nodes[3].raw()], "attaching reads the new selector facts");
     assert_eq!(engine.counters().get(Counter::SheetChangeCandidatesRejected), 2);
-    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        engine.cascade_compaction_scratch.capacity_bytes()
+    );
 }
 
 #[test]

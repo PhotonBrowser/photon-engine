@@ -1644,7 +1644,14 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
         RefPtr<CSS::ComputedValues const> computed_pseudo_element_style;
         if (engine_record.has_value())
             style_record_delta.new_style_record = *engine_record;
-        else
+        else if (CSS::is_element_reference_pseudo_element(pseudo_element)) {
+            // An element-backed pseudo-element is the element that backs it, and that element's own style
+            // computation is the one that finalizes its box type. Compute the refreshed style as that
+            // element, so this refresh republishes the record the element's own style walk assigns it
+            // instead of a second record cascaded against the originating element.
+            auto& referenced_element = as<ElementReferencePseudoElement>(*get_pseudo_element(pseudo_element)).referenced_element();
+            computed_pseudo_element_style = style_computer.compute_pseudo_element_style_if_needed({ referenced_element }, did_change_custom_properties, nullptr, style_record_delta);
+        } else
             computed_pseudo_element_style = style_computer.compute_pseudo_element_style_if_needed({ *this, pseudo_element }, did_change_custom_properties, reusable_matches, style_record_delta);
         auto engine_pseudo_element_style = engine_record.has_value() && !!*engine_record
             ? style_computer.computed_style_record_view(*engine_record)
@@ -1992,7 +1999,7 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
         return true;
     }
 
-    if (unsafe_layout_node() || is_shadow_root_child)
+    if (has_layout_box() || is_shadow_root_child)
         return false;
     if (style->position() == CSS::Positioning::Fixed || style->float_() != CSS::Float::None)
         return false;
@@ -2259,7 +2266,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
         // with the pseudo-element styles it still computes.
         install_custom_property_environment();
         set_computed_style({}, new_style_record);
-        if (is_html_html_element())
+        if (is_document_element())
             style_computer.update_root_element_font_metrics(*computed_style());
         counters.element_computed_style_changes++;
         auto invalidation = CSS::RequiredInvalidationAfterStyleChange::full();
@@ -2303,7 +2310,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
         // the next computation on this element derives a fresh one.
         set_style_input_record(nullptr);
         set_computed_style({}, new_style_record);
-        if (is_html_html_element()) {
+        if (is_document_element()) {
             // Root-relative units read document-global font metrics rather than inherited style.
             // Every descendant must recompute when they move.
             auto const root_font_metrics_before = style_computer.root_element_font_metrics();
@@ -2411,7 +2418,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_style_engine_reaction(b
     if (mode == StyleRecomputeMode::Verification)
         did_change_custom_properties = false;
     style_record_delta.old_style_record = old_style_record;
-    bool root_font_metrics_changed = is_html_html_element()
+    bool root_font_metrics_changed = is_document_element()
         && (root_font_metrics_before_recompute != style_computer.root_element_font_metrics()
             || root_font_metrics_depended_on_viewport_before_recompute != style_computer.root_element_font_metrics_depend_on_viewport_metrics());
     if (style_record_is_unchanged(style_record_delta))
@@ -2945,6 +2952,8 @@ void Element::set_shadow_root(GC::Ptr<ShadowRoot> shadow_root)
     if (m_shadow_root == shadow_root)
         return;
     if (m_shadow_root) {
+        if (auto count = m_shadow_root->associated_animation_count_in_subtree())
+            change_associated_animation_count_in_subtree(-static_cast<i32>(count));
         if (is_connected())
             CSS::record_subtree_disconnecting(*m_shadow_root);
         m_shadow_root->set_host(nullptr);
@@ -2966,6 +2975,8 @@ void Element::set_shadow_root(GC::Ptr<ShadowRoot> shadow_root)
 
         m_shadow_root->set_host(this);
         m_shadow_root->set_is_connected(is_connected());
+        if (auto count = m_shadow_root->associated_animation_count_in_subtree())
+            change_associated_animation_count_in_subtree(count);
     }
     set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::ElementSetShadowRoot);
 }
@@ -2989,7 +3000,8 @@ void Element::set_inline_style(GC::Ptr<CSS::CSSStyleProperties> style)
 {
     if (m_inline_style == style)
         return;
-    auto had_declarations = m_inline_style && !m_inline_style->properties().is_empty();
+    // NB: Asking the block itself does not build the views of its declarations, which nothing may ever read.
+    auto had_declarations = m_inline_style && !m_inline_style->declaration_block().is_empty();
     m_inline_style = style;
     if (auto* rare_data = element_rare_data())
         rare_data->attribute_style_map = nullptr;
@@ -3002,7 +3014,7 @@ void Element::set_inline_style(GC::Ptr<CSS::CSSStyleProperties> style)
         *this,
         CSS::ElementDeclarationKind::InlineStyle,
         had_declarations,
-        style && !style->properties().is_empty());
+        style && !style->declaration_block().is_empty());
 }
 
 void Element::prepare_for_inline_style_change()

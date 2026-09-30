@@ -40,7 +40,7 @@ public:
     virtual bool has_been_destroyed() const override { return m_has_been_destroyed; }
     virtual void set_has_been_destroyed() override { m_has_been_destroyed = true; }
 
-    Optional<Compositing::CompositorContextId> compositor_context_id() const { return m_replicated_state.compositor_context_id; }
+    Optional<Web::CompositorContextId> compositor_context_id() const { return m_replicated_state.compositor_context_id; }
 
     // The WindowProxy standing for the navigable, which the page keeps across changes of the hosting process.
     GC::Ptr<WindowProxy> window_proxy() const { return m_window_proxy; }
@@ -55,6 +55,7 @@ public:
     virtual GC::Ptr<WindowProxy> active_window_proxy() override;
     GC::Ref<RemoteWindow> active_window();
     virtual Utf16String const& target_name() const override { return m_replicated_state.target_name; }
+    virtual Optional<u64> browsing_context_group_id() const override { return m_replicated_state.browsing_context_group_id; }
 
     virtual bool is_traversable() const override { return parent() == nullptr; }
     virtual bool is_top_level_traversable() const override { return parent() == nullptr; }

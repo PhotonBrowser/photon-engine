@@ -13,18 +13,14 @@
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/EventLoopImplementationQt.h>
+#include <UI/Qt/ExternalURLHandler.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/ProcessManagerWindow.h>
 #include <UI/Qt/Settings.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WebContentView.h>
 
-#if defined(AK_OS_LINUX)
-#    include <UI/Qt/ExternalURLHandler.h>
-#endif
-
 #if defined(AK_OS_MACOS)
-#    include <UI/AppKit/Utilities/ExternalURLHandler.h>
 #    include <UI/Qt/MacWindow.h>
 #endif
 
@@ -467,7 +463,7 @@ Optional<String> Application::system_font_family() const
 }
 #endif
 
-BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Tab* parent_tab, RefPtr<WebView::WebContentClient> page_process, Optional<Compositing::PageId> page_index, ShowWindow show_window)
+BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Tab* parent_tab, RefPtr<WebView::WebContentClient> page_process, Optional<Web::PageId> page_index, ShowWindow show_window)
 {
     auto* window = new BrowserWindow(initial_urls, is_popup_window, is_private, parent_tab, move(page_process), move(page_index));
     set_active_window(*window);

@@ -6,12 +6,12 @@
 
 #pragma once
 
-#include <LibCompositing/PageId.h>
-#include <LibCompositing/PixelUnits.h>
 #include <LibGfx/Rect.h>
 #include <LibHTTP/Forward.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <LibWebCommon/PixelUnits.h>
 #include <WebWorker/Forward.h>
 
 namespace WebWorker {
@@ -25,12 +25,12 @@ public:
 
     virtual ~PageHost();
 
-    virtual Compositing::PageId id() const override { VERIFY_NOT_REACHED(); }
+    virtual Web::PageId id() const override { VERIFY_NOT_REACHED(); }
     virtual Web::Page& page() override;
     virtual Web::Page const& page() const override;
     virtual bool is_connection_open() const override;
     virtual Gfx::Palette palette() const override;
-    virtual Compositing::DevicePixelRect screen_rect() const override;
+    virtual Web::DevicePixelRect screen_rect() const override;
     virtual double zoom_level() const override;
     virtual double device_pixel_ratio() const override;
     virtual double device_pixels_per_css_pixel() const override;
@@ -41,10 +41,10 @@ public:
     virtual HTTP::Cookie::VersionedCookie page_did_request_cookie(URL::URL const&, HTTP::Cookie::Source) override;
     virtual bool page_did_is_known_hsts_host(String const&) override;
     virtual void page_did_report_worker_exception(Utf16String const& message, Utf16String const& filename, u32 lineno, u32 colno) override;
-    virtual void page_did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage const& message) override;
+    virtual void page_did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage const& message) override;
     virtual void request_file(Web::FileRequest) override;
-    virtual URL::BlobURLEntry::Token page_did_add_blob_url_entry(Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const&) override;
-    virtual void page_did_remove_blob_url_entries(Vector<Utf16String> const& urls, URL::Origin const&) override;
+    virtual URL::BlobURLEntry::Token page_did_add_blob_url_entry(Web::HTML::EnvironmentSettingsObject const&, Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const&) override;
+    virtual void page_did_remove_blob_url_entries(Web::HTML::EnvironmentSettingsObject const&, Vector<Utf16String> const& urls) override;
     virtual Optional<Web::FileAPI::SerializedBlobURLEntry> page_did_request_blob_url_entry(Utf16String const& url, Optional<URL::BlobURLEntry::Token> token) override;
     virtual Web::HTML::WorkerAgentId start_worker_agent(Web::HTML::WorkerAgentStartRequest&&) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
@@ -55,7 +55,7 @@ public:
     void compositor_process_lost();
     virtual bool is_headless() const override { VERIFY_NOT_REACHED(); }
     virtual Queue<Web::QueuedInputEvent>& input_event_queue() override { VERIFY_NOT_REACHED(); }
-    virtual void report_finished_handling_input_event([[maybe_unused]] Compositing::PageId page_id, [[maybe_unused]] u64 event_id, [[maybe_unused]] Web::EventResult event_was_handled) override { VERIFY_NOT_REACHED(); }
+    virtual void report_finished_handling_input_event([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] u64 event_id, [[maybe_unused]] Web::EventResult event_was_handled) override { VERIFY_NOT_REACHED(); }
     virtual void request_frame() override { VERIFY_NOT_REACHED(); }
     virtual double maximum_frames_per_second() const override { return m_maximum_frames_per_second; }
     void set_maximum_frames_per_second(double maximum_frames_per_second) { m_maximum_frames_per_second = maximum_frames_per_second; }

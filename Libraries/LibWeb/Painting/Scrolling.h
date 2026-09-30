@@ -42,7 +42,14 @@ CSSPixelPoint maximum_scroll_offset(Layout::Node const&);
 CSSPixelPoint clamp_scroll_offset(Layout::Node const&, CSSPixelPoint);
 CSSPixelRect scroll_snapport_rect(Layout::Node const&);
 CSSPixelRect scroll_snapport_rect(Layout::Node const&, CSSPixelRect scrollport);
-CSS::Overflow overflow_value_applied_to_viewport_for_wheel_scrolling(DOM::Document const&, ScrollDirection);
+// The overflow the viewport applies to a wheel, in both axes. Both axes come from the same
+// element - the root's, or the body's where the root defers to it - so they are resolved together.
+struct ViewportWheelOverflow {
+    CSS::Overflow x { CSS::Overflow::Auto };
+    CSS::Overflow y { CSS::Overflow::Auto };
+};
+
+ViewportWheelOverflow overflow_values_applied_to_viewport_for_wheel_scrolling(DOM::Document const&);
 struct WheelScrollableAxes {
     bool horizontal { false };
     bool vertical { false };
@@ -51,7 +58,7 @@ struct WheelScrollableAxes {
 WheelScrollableAxes wheel_scrollable_axes(Layout::Node const&);
 bool could_be_scrolled_by_wheel_event(Layout::Node const&);
 bool could_be_scrolled_by_wheel_event(Layout::Node const&, ScrollDirection);
-WEB_API Optional<Compositing::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node const&);
+WEB_API Optional<Web::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node const&);
 ScrollHandled set_scroll_offset(Layout::Node&, CSSPixelPoint);
 ScrollHandled set_scroll_offset_from_user_input(Layout::Node&, CSSPixelPoint, ScrollKind = ScrollKind::Relative);
 ScrollHandled scroll_by(Layout::Node&, double delta_x, double delta_y, ScrollKind = ScrollKind::Relative);

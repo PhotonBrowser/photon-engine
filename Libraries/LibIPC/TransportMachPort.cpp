@@ -573,12 +573,21 @@ void TransportMachPort::close()
 {
     m_is_open = false;
     stop_io_thread(IOThreadState::Stopped);
+    release_send_right_to_peer();
 }
 
 void TransportMachPort::close_after_sending_all_pending_messages()
 {
     stop_io_thread(IOThreadState::SendPendingMessagesAndStop);
     m_is_open = false;
+    release_send_right_to_peer();
+}
+
+// As closing a socket does, closing the transport tells the peer: its receive port gets MACH_NOTIFY_NO_SENDERS once
+// this send right is gone. The IO thread, the only one that sends through it, has stopped.
+void TransportMachPort::release_send_right_to_peer()
+{
+    m_send_port = {};
 }
 
 void TransportMachPort::wait_until_readable()
@@ -601,13 +610,16 @@ ErrorOr<void> TransportMachPort::post_message(MessageDataType bytes, Vector<Atta
 TransportMachPort::ShouldShutdown TransportMachPort::read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&& callback)
 {
     Vector<NonnullOwnPtr<Message>> messages;
+    bool eof;
     {
         MutexLocker locker(m_incoming_mutex);
         messages = move(m_incoming_messages);
+        // Snapshot EOF with the messages so later arrivals cannot be skipped by reporting shutdown.
+        eof = m_peer_eof;
     }
     for (auto& message : messages)
         callback(move(*message));
-    return m_peer_eof ? ShouldShutdown::Yes : ShouldShutdown::No;
+    return eof ? ShouldShutdown::Yes : ShouldShutdown::No;
 }
 
 ErrorOr<TransportHandle> TransportMachPort::release_for_transfer()

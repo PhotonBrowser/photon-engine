@@ -11,6 +11,7 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/NavigationParamsDescriptor.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
@@ -236,22 +237,38 @@ void HistoryExecutor::finalize_same_document_navigation(GC::Ref<LocalNavigable> 
         });
 }
 
-// Fire beforeunload for the documents hosted by this process.
-void HistoryExecutor::run_ui_beforeunload_check(Vector<CrossProcessId> navigable_ids, UnloadPromptShown unload_prompt_shown, GC::Ref<GC::Function<void(HistoryStepResult, UnloadPromptShown)>> on_complete)
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled
+// NB: The UI process has each page hosting documents to check run this for them. The traversable's host is also given
+//     the target entry, and runs step 4 for the traversable.
+void HistoryExecutor::run_ui_beforeunload_check(Vector<CrossProcessId> navigable_ids, Optional<SessionHistoryEntryDescriptor> target_entry_descriptor, Optional<UserNavigationInvolvement> user_involvement_for_navigate_event, UnloadPromptShown unload_prompt_shown, GC::Ref<GC::Function<void(HistoryStepResult, UnloadPromptShown)>> on_complete)
 {
+    GC::Ptr<LocalTraversableNavigable> traversable;
+    RefPtr<SessionHistoryEntry> target_entry;
+    if (target_entry_descriptor.has_value()) {
+        traversable = as<LocalTraversableNavigable>(*m_page->local_traversable());
+        target_entry = traversable->resolve_local_session_history_entry(target_entry_descriptor.release_value());
+    }
+
     Vector<GC::Root<LocalNavigable>> navigables;
     navigables.ensure_capacity(navigable_ids.size());
     for (auto navigable_id : navigable_ids) {
         if (auto navigable = local_navigable_with_id(navigable_id); navigable && !navigable->has_been_destroyed() && navigable->active_document())
             navigables.append(*navigable);
     }
-    check_if_unloading_is_canceled(move(navigables), {}, {}, {}, unload_prompt_shown,
+    check_if_unloading_is_canceled(move(navigables), traversable, move(target_entry), user_involvement_for_navigate_event, unload_prompt_shown,
         GC::create_function(heap(), [on_complete](CheckIfUnloadingIsCanceledResult result, UnloadPromptShown unload_prompt_shown) {
-            on_complete->function()(
-                result == CheckIfUnloadingIsCanceledResult::CanceledByBeforeUnload
-                    ? HistoryStepResult::CanceledByBeforeUnload
-                    : HistoryStepResult::Applied,
-                unload_prompt_shown);
+            switch (result) {
+            case CheckIfUnloadingIsCanceledResult::CanceledByBeforeUnload:
+                on_complete->function()(HistoryStepResult::CanceledByBeforeUnload, unload_prompt_shown);
+                return;
+            case CheckIfUnloadingIsCanceledResult::CanceledByNavigate:
+                on_complete->function()(HistoryStepResult::CanceledByNavigate, unload_prompt_shown);
+                return;
+            case CheckIfUnloadingIsCanceledResult::Continue:
+                on_complete->function()(HistoryStepResult::Applied, unload_prompt_shown);
+                return;
+            }
+            VERIFY_NOT_REACHED();
         }));
 }
 
@@ -550,6 +567,7 @@ bool HistoryExecutor::run_changing_navigable_history_step_job_impl(ChangingNavig
                 output->redirected_url = move(result.redirected_url);
                 output->classic_history_api_state = move(result.classic_history_api_state);
                 output->resource_cleared = result.resource_cleared;
+                output->inline_content_origin = move(result.inline_content_origin);
                 if (result.replacement_document_state.has_value()) {
                     output->replacement_document_state = DocumentState::create(result.replacement_document_state->id);
                     apply_session_history_document_state_descriptor_from_ui_process(*output->replacement_document_state, *result.replacement_document_state);
@@ -764,8 +782,10 @@ void HistoryExecutor::apply_changing_navigable_history_step_continuation_impl(GC
         auto previous_entry = navigable->active_session_history_entry();
 
         // NB: previousEntry's document is unloaded before updateDocument runs, so the fact navigation.activation needs
-        //     from it is captured from the document that was displayed when this step began.
-        auto previous_entry_document_is_initial_about_blank = continuation->displayed_document && continuation->displayed_document->is_initial_about_blank();
+        //     from it is captured from the document that was displayed when this step began. A provisional navigable's
+        //     entry is its stand-in's, which, like an initial about:blank's, gives navigation.activation no old entry.
+        auto previous_entry_document_is_initial_about_blank = continuation->displayed_document
+            && (continuation->displayed_document->is_initial_about_blank() || navigable->is_provisional());
 
         // 2. If changingNavigableContinuation's update-only is false, then activate history entry targetEntry for navigable.
         auto resolved_document = continuation->resolved_document;

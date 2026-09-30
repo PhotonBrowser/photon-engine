@@ -14,7 +14,7 @@
 
 namespace TestWeb {
 
-NonnullOwnPtr<TestWebView> TestWebView::create(Core::AnonymousBuffer theme, Compositing::DevicePixelSize window_size)
+NonnullOwnPtr<TestWebView> TestWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size)
 {
     auto view = adopt_own(*new TestWebView(move(theme), window_size));
     view->initialize_client(CreateNewClient::Yes);
@@ -22,7 +22,7 @@ NonnullOwnPtr<TestWebView> TestWebView::create(Core::AnonymousBuffer theme, Comp
     return view;
 }
 
-TestWebView::TestWebView(Core::AnonymousBuffer theme, Compositing::DevicePixelSize viewport_size)
+TestWebView::TestWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size)
     : WebView::HeadlessWebView(move(theme), viewport_size)
     , m_test_promise(TestPromise::construct())
 {
@@ -87,7 +87,11 @@ void TestWebView::on_test_complete(TestCompletion completion)
     m_pending_dialog = Web::PendingDialog::None;
     m_pending_prompt_text.clear();
     m_is_fullscreen = Web::ViewportIsFullscreen::No;
-    client().async_set_viewport(page_id(), viewport_size(), 1.0, Web::ViewportIsFullscreen::No);
+
+    // A crash of a child view's WebContent completes the test through its parent view, which can share the crashed
+    // process and not have replaced it yet. The replacement process gets the view's viewport when it is set up.
+    if (page().routed_connection())
+        client().async_set_viewport(page_id(), viewport_size(), 1.0, Web::ViewportIsFullscreen::No);
 
     m_test_promise->resolve(move(completion));
 }

@@ -352,7 +352,7 @@ void HTMLTextAreaElement::create_shadow_tree_if_needed()
             style = CSS::CSSStyleProperties::create({}, {});
             style->set_declarations_from_text(u"display: flex;"sv);
         }
-        element->set_inline_style(*style);
+        set_own_inline_style(*element, *style);
     }
     MUST(shadow_root->append_child(element));
 
@@ -363,7 +363,7 @@ void HTMLTextAreaElement::create_shadow_tree_if_needed()
             style = CSS::CSSStyleProperties::create({}, {});
             style->set_declarations_from_text(u"width: 100%;"sv);
         }
-        m_inner_text_element->set_inline_style(*style);
+        set_own_inline_style(*m_inner_text_element, *style);
     }
     MUST(element->append_child(*m_inner_text_element));
 
@@ -431,9 +431,9 @@ void HTMLTextAreaElement::update_placeholder_visibility()
         return;
     auto placeholder_text = get_attribute(AttributeNames::placeholder);
     if (placeholder_text.has_value() && m_text_node->data().is_empty())
-        m_placeholder_element->set_inline_style(placeholder_style_when_visible());
+        set_own_inline_style(*m_placeholder_element, placeholder_style_when_visible());
     else
-        m_placeholder_element->set_inline_style(placeholder_style_when_hidden());
+        set_own_inline_style(*m_placeholder_element, placeholder_style_when_hidden());
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element:children-changed-steps

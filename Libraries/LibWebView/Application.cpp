@@ -13,7 +13,6 @@
 #include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
-#include <LibCompositing/InputEvent.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/Directory.h>
@@ -43,6 +42,7 @@
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
 #include <LibWebCommon/Loader/DownloadFilename.h>
 #include <LibWebCommon/Loader/UserAgent.h>
+#include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/WebDriver/TimeoutsConfiguration.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
@@ -334,7 +334,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool disable_scrollbar_painting = false;
-    bool disable_async_scrolling = false;
     bool file_scheme_urls_have_tuple_origins = false;
 
     Core::ArgsParser args_parser;
@@ -439,7 +438,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation", 'g');
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical scrollbars on the main viewport", "disable-scrollbar-painting");
-    args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
     args_parser.add_option(dns_server_address, "Set the DNS server address", "dns-server", 0, "host|address");
     args_parser.add_option(dns_server_port, "Set the DNS server port", "dns-port", 0, "port (default: 53 or 853 if --dot)");
     args_parser.add_option(use_dns_over_tls, "Use DNS over TLS", "dot");
@@ -657,7 +655,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .enable_autoplay = enable_autoplay ? EnableAutoplay::Yes : EnableAutoplay::No,
         .collect_garbage_on_every_allocation = collect_garbage_on_every_allocation ? CollectGarbageOnEveryAllocation::Yes : CollectGarbageOnEveryAllocation::No,
         .paint_viewport_scrollbars = disable_scrollbar_painting ? PaintViewportScrollbars::No : PaintViewportScrollbars::Yes,
-        .enable_async_scrolling = disable_async_scrolling ? EnableAsyncScrolling::No : EnableAsyncScrolling::Yes,
         .file_scheme_urls_have_tuple_origins = file_scheme_urls_have_tuple_origins ? FileSchemeUrlsHaveTupleOrigins::Yes : FileSchemeUrlsHaveTupleOrigins::No,
         .default_time_zone = default_time_zone,
     };
@@ -1022,7 +1019,7 @@ void Application::open_bookmark_in_new_window(String const& bookmark_id, IsPriva
         open_url_in_new_window(bookmark->bookmark().url, is_private);
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, Compositing::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     // The client's WebContentClient picks up this same session when it is created.
     auto request_server_handle = TRY(connect_new_request_server_client(session_for_new_view(is_private)));
@@ -1043,9 +1040,15 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 
     // A view's first process creates its traversable from this entry. A process hosting a navigable of an existing tab
     // stands in for the canonical current entry.
-    auto initial_history_entry = canonical_initial_history_entry.has_value()
-        ? canonical_initial_history_entry.release_value()
-        : Web::HTML::create_initial_session_history_entry_descriptor(*initial_document_state_id, {}, {});
+    auto initial_history_entry = [&] {
+        if (canonical_initial_history_entry.has_value())
+            return canonical_initial_history_entry.release_value();
+        // The UI process determines the origin of the traversable's first document, which has no creator, before the
+        // process creates it.
+        auto entry = Web::HTML::create_initial_session_history_entry_descriptor(*initial_document_state_id, {}, {});
+        entry.document_state.origin = URL::Origin::create_opaque();
+        return entry;
+    }();
     client->async_initialize(initial_page_id, move(remote_navigables), root_navigable_id, cross_process_id_allocator, initial_history_entry, system_visibility_state);
 
     if (!navigable_to_adopt.has_value())
@@ -1077,10 +1080,10 @@ ErrorOr<void> Application::reload_site_compatibility_data()
     return {};
 }
 
-Compositing::PageId Application::allocate_page_id()
+Web::PageId Application::allocate_page_id()
 {
     VERIFY(m_next_page_or_compositor_context_id > 0);
-    return Compositing::PageId { m_next_page_or_compositor_context_id++ };
+    return Web::PageId { m_next_page_or_compositor_context_id++ };
 }
 
 Web::HTML::CrossProcessIdAllocator Application::allocate_cross_process_id_allocator()
@@ -1232,10 +1235,10 @@ void Application::reset_private_browsing_session()
     m_private_session.clear();
 }
 
-Compositing::CompositorContextId Application::allocate_compositor_context_id()
+Web::CompositorContextId Application::allocate_compositor_context_id()
 {
     VERIFY(m_next_page_or_compositor_context_id > 0);
-    return Compositing::CompositorContextId { m_next_page_or_compositor_context_id++ };
+    return Web::CompositorContextId { m_next_page_or_compositor_context_id++ };
 }
 
 static bool can_send_compositor_process_ipc(RefPtr<CompositorClient> const& compositor_client)
@@ -1277,7 +1280,7 @@ ErrorOr<IPC::TransportHandle> Application::connect_new_compositor_canvas_client(
     return response_or_error.release_value().take_handle();
 }
 
-void Application::register_compositor_context(WebContentClient& web_content_client, Compositing::CompositorContextId context_id, Optional<Compositing::PageId> page_id)
+void Application::register_compositor_context(WebContentClient& web_content_client, Web::CompositorContextId context_id, Optional<Web::PageId> page_id)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1286,7 +1289,7 @@ void Application::register_compositor_context(WebContentClient& web_content_clie
         dbgln("Unable to register Compositor context: {}", result.error());
 }
 
-ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web_content_client, Compositing::CompositorContextId context_id, Optional<Compositing::PageId> page_id)
+ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web_content_client, Web::CompositorContextId context_id, Optional<Web::PageId> page_id)
 {
     if (!m_compositor_client)
         return Error::from_string_literal("Compositor process is not available");
@@ -1300,7 +1303,7 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     }
     VERIFY(web_content_connection_id.has_value());
 
-    auto compositor_page_id = page_id.map([](Compositing::PageId id) { return id.value(); });
+    auto compositor_page_id = page_id.map([](Web::PageId id) { return id.value(); });
     auto result = m_compositor_client->try_create_context(context_id, compositor_page_id, *web_content_connection_id);
     if (result.is_error())
         return Error::from_string_literal("Compositor process disconnected while creating context");
@@ -1308,7 +1311,7 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     return {};
 }
 
-void Application::update_compositor_viewport(Compositing::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void Application::update_compositor_viewport(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1317,7 +1320,7 @@ void Application::update_compositor_viewport(Compositing::CompositorContextId co
     m_compositor_client->async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-void Application::update_compositor_paused_debugger_overlay(Compositing::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action)
+void Application::update_compositor_paused_debugger_overlay(Web::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1326,7 +1329,7 @@ void Application::update_compositor_paused_debugger_overlay(Compositing::Composi
     m_compositor_client->async_set_paused_debugger_overlay(context_id, visible, device_pixel_ratio, move(font_family), hovered_action);
 }
 
-void Application::update_compositor_display_metadata(Compositing::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
+void Application::update_compositor_display_metadata(Web::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1335,7 +1338,7 @@ void Application::update_compositor_display_metadata(Compositing::CompositorCont
     m_compositor_client->async_set_display_metadata(context_id, display_id, sanitized_display_refresh_rate(refresh_rate));
 }
 
-void Application::update_compositor_context_visibility(Compositing::CompositorContextId context_id, Web::HTML::VisibilityState visibility_state)
+void Application::update_compositor_context_visibility(Web::CompositorContextId context_id, Web::HTML::VisibilityState visibility_state)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1347,7 +1350,7 @@ void Application::update_compositor_context_visibility(Compositing::CompositorCo
     m_compositor_client->async_set_context_visibility(context_id, context_visibility);
 }
 
-bool Application::handle_key_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::KeyEvent const& event)
+bool Application::handle_key_event_in_compositor(Web::CompositorContextId context_id, Web::KeyEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
@@ -1355,7 +1358,7 @@ bool Application::handle_key_event_in_compositor(Compositing::CompositorContextI
     return !result.is_error() && result.release_value();
 }
 
-bool Application::dispatch_key_event_to_web_content(Compositing::CompositorContextId context_id, Compositing::KeyEvent const& event)
+bool Application::dispatch_key_event_to_web_content(Web::CompositorContextId context_id, Web::KeyEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
@@ -1363,7 +1366,7 @@ bool Application::dispatch_key_event_to_web_content(Compositing::CompositorConte
     return !result.is_error() && result.release_value();
 }
 
-void Application::handle_pinch_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::PinchEvent const& event)
+void Application::handle_pinch_event_in_compositor(Web::CompositorContextId context_id, Web::PinchEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -1371,7 +1374,7 @@ void Application::handle_pinch_event_in_compositor(Compositing::CompositorContex
     m_compositor_client->async_handle_pinch_event(context_id, event);
 }
 
-bool Application::handle_and_dispatch_mouse_event_in_compositor(Compositing::CompositorContextId context_id, Compositing::MouseEvent const& event)
+bool Application::handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId context_id, Web::MouseEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return false;
@@ -1381,7 +1384,7 @@ bool Application::handle_and_dispatch_mouse_event_in_compositor(Compositing::Com
     return true;
 }
 
-void Application::notify_compositor_presented_bitmap_ready_to_paint(Compositing::CompositorContextId context_id, i32 bitmap_id)
+void Application::notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
@@ -3297,7 +3300,7 @@ void Application::stop_listening_for_dom_properties(DevTools::TabDescription con
     view->on_received_dom_node_properties = nullptr;
 }
 
-void Application::inspect_dom_node(DevTools::TabDescription const& description, DOMNodeProperties::Type property_type, Compositing::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonObject options) const
+void Application::inspect_dom_node(DevTools::TabDescription const& description, DOMNodeProperties::Type property_type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonObject options) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value())
@@ -3306,7 +3309,7 @@ void Application::inspect_dom_node(DevTools::TabDescription const& description, 
     view->inspect_dom_node(node_id, property_type, pseudo_element, JsonValue { move(options) });
 }
 
-void Application::inspect_grid_layouts(DevTools::TabDescription const& description, Compositing::UniqueNodeID root_node_id, OnGridLayoutsReceived on_grid_layouts_received) const
+void Application::inspect_grid_layouts(DevTools::TabDescription const& description, Web::UniqueNodeID root_node_id, OnGridLayoutsReceived on_grid_layouts_received) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3322,7 +3325,7 @@ void Application::inspect_grid_layouts(DevTools::TabDescription const& descripti
     view->inspect_grid_layouts(root_node_id);
 }
 
-void Application::inspect_current_grid(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnCurrentGridReceived on_current_grid_received) const
+void Application::inspect_current_grid(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnCurrentGridReceived on_current_grid_received) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3338,7 +3341,7 @@ void Application::inspect_current_grid(DevTools::TabDescription const& descripti
     view->inspect_current_grid(node_id);
 }
 
-void Application::inspect_current_flexbox(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, bool only_look_at_parents, OnCurrentFlexboxReceived on_current_flexbox_received) const
+void Application::inspect_current_flexbox(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, bool only_look_at_parents, OnCurrentFlexboxReceived on_current_flexbox_received) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3378,7 +3381,7 @@ void Application::clear_node_picker(DevTools::TabDescription const& description)
         view->clear_node_picker();
 }
 
-void Application::highlight_dom_node(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element) const
+void Application::highlight_dom_node(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->highlight_dom_node(node_id, pseudo_element);
@@ -3390,25 +3393,25 @@ void Application::clear_highlighted_dom_node(DevTools::TabDescription const& des
         view->clear_highlighted_dom_node();
 }
 
-void Application::highlight_flexbox(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, JsonValue options) const
+void Application::highlight_flexbox(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, JsonValue options) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->highlight_flexbox(node_id, move(options));
 }
 
-void Application::clear_flexbox_highlight(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id) const
+void Application::clear_flexbox_highlight(DevTools::TabDescription const& description, Web::UniqueNodeID node_id) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->clear_flexbox_highlight(node_id);
 }
 
-void Application::highlight_grid(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, JsonValue options) const
+void Application::highlight_grid(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, JsonValue options) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->highlight_grid(node_id, move(options));
 }
 
-void Application::clear_grid_highlight(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id) const
+void Application::clear_grid_highlight(DevTools::TabDescription const& description, Web::UniqueNodeID node_id) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->clear_grid_highlight(node_id);
@@ -3455,7 +3458,7 @@ static void edit_dom_node(DevTools::TabDescription const& description, Applicati
     edit(*view);
 }
 
-void Application::get_dom_node_inner_html(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeHTMLReceived on_complete) const
+void Application::get_dom_node_inner_html(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeHTMLReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3471,7 +3474,7 @@ void Application::get_dom_node_inner_html(DevTools::TabDescription const& descri
     view->get_dom_node_inner_html(node_id);
 }
 
-void Application::get_dom_node_outer_html(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeHTMLReceived on_complete) const
+void Application::get_dom_node_outer_html(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeHTMLReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
@@ -3487,63 +3490,63 @@ void Application::get_dom_node_outer_html(DevTools::TabDescription const& descri
     view->get_dom_node_outer_html(node_id);
 }
 
-void Application::set_dom_node_outer_html(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
+void Application::set_dom_node_outer_html(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.set_dom_node_outer_html(node_id, value);
     });
 }
 
-void Application::set_dom_node_text(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
+void Application::set_dom_node_text(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.set_dom_node_text(node_id, value);
     });
 }
 
-void Application::set_dom_node_tag(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, Utf16FlyString const& value, OnDOMNodeEditComplete on_complete) const
+void Application::set_dom_node_tag(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Utf16FlyString const& value, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.set_dom_node_tag(node_id, value);
     });
 }
 
-void Application::add_dom_node_attributes(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
+void Application::add_dom_node_attributes(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.add_dom_node_attributes(node_id, replacement_attributes);
     });
 }
 
-void Application::replace_dom_node_attribute(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, Utf16FlyString const& name, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
+void Application::replace_dom_node_attribute(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Utf16FlyString const& name, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.replace_dom_node_attribute(node_id, name, replacement_attributes);
     });
 }
 
-void Application::create_child_element(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
+void Application::create_child_element(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.create_child_element(node_id);
     });
 }
 
-void Application::insert_dom_node_before(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, Compositing::UniqueNodeID parent_node_id, Optional<Compositing::UniqueNodeID> sibling_node_id, OnDOMNodeEditComplete on_complete) const
+void Application::insert_dom_node_before(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Web::UniqueNodeID parent_node_id, Optional<Web::UniqueNodeID> sibling_node_id, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.insert_dom_node_before(node_id, parent_node_id, sibling_node_id);
     });
 }
 
-void Application::clone_dom_node(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
+void Application::clone_dom_node(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.clone_dom_node(node_id);
     });
 }
 
-void Application::remove_dom_node(DevTools::TabDescription const& description, Compositing::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
+void Application::remove_dom_node(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.remove_dom_node(node_id);
@@ -3754,7 +3757,7 @@ void Application::retrieve_debugger_source_positions(DevTools::TabDescription co
     view->retrieve_debugger_source_positions(source_id, move(on_complete));
 }
 
-void Application::resolve_dom_node_url(DevTools::TabDescription const& description, Optional<Compositing::UniqueNodeID> node_id, String const& url, OnResolvedURLReceived on_complete) const
+void Application::resolve_dom_node_url(DevTools::TabDescription const& description, Optional<Web::UniqueNodeID> node_id, String const& url, OnResolvedURLReceived on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {

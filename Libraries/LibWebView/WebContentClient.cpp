@@ -9,7 +9,6 @@
 #include <AK/JsonObject.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/WeakPtr.h>
-#include <LibCompositing/InputEvent.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
@@ -20,6 +19,7 @@
 #include <LibIPC/TransportHandle.h>
 #include <LibRequests/Request.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
+#include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/WebDriver/Error.h>
 #include <LibWebCommon/WebView/ProcessHandle.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
@@ -27,7 +27,10 @@
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
+#include <LibWebView/CanonicalDocument.h>
+#include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/CanonicalWindow.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/FontService.h>
 #include <LibWebView/HSTSStore.h>
@@ -74,14 +77,32 @@ Messages::WebContentClient::ResolveGenericFontResponse WebContentClient::resolve
     return Optional<String> { resolved->to_string() };
 }
 
-Messages::WebContentClient::DidAddBlobUrlEntryResponse WebContentClient::did_add_blob_url_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry)
+Messages::WebContentClient::DidAddBlobUrlEntryResponse WebContentClient::did_add_blob_url_entry(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry)
 {
-    return m_session->blob_url_store->add_entry(move(url), move(entry), WeakPtr<WebContentClient> { *this });
+    if (auto* page = this->page(page_id))
+        return page->did_add_blob_url_entry(move(environment_id), move(url), move(entry));
+
+    return URL::BlobURLEntry::Token { 0 };
 }
 
-void WebContentClient::did_remove_blob_url_entries(Vector<Utf16String> urls, URL::Origin origin)
+bool WebContentClient::hosts_an_environment_with_storage_key(Web::StorageAPI::StorageKey const& storage_key)
 {
-    m_session->blob_url_store->remove_entries(urls, origin, WeakPtr<WebContentClient> { *this });
+    bool hosts_one = false;
+    for_each_page([&](WebContentPage& page) {
+        hosts_one = page.hosts_an_environment_with_storage_key(storage_key);
+        return hosts_one ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return hosts_one;
+}
+
+Optional<CanonicalEnvironmentSettingsObject const&> WebContentClient::hosted_environment(Web::HTML::EnvironmentId const& environment_id)
+{
+    Optional<CanonicalEnvironmentSettingsObject const&> environment;
+    for_each_page([&](WebContentPage& page) {
+        environment = page.hosted_environment(environment_id);
+        return environment.has_value() ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return environment;
 }
 
 void WebContentClient::did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token)
@@ -115,7 +136,7 @@ static constexpr auto detached_page_close_timeout_ms = 1000;
 static constexpr auto close_server_exit_timeout_ms = 5000;
 static constexpr auto detached_page_forced_exit_timeout_ms = detached_page_close_timeout_ms + close_server_exit_timeout_ms;
 
-WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, Compositing::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
+WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
     : WebContentClientPageRoutingStub(*this, move(transport))
     , m_is_private(is_private)
     , m_session(Application::existing_session(is_private))
@@ -138,7 +159,7 @@ WebContentClient::~WebContentClient()
     clients().remove(this);
 }
 
-Optional<WebContentClient&> WebContentClient::client_for_compositor_context_id(Compositing::CompositorContextId context_id)
+Optional<WebContentClient&> WebContentClient::client_for_compositor_context_id(Web::CompositorContextId context_id)
 {
     Optional<WebContentClient&> client;
     for_each_client([&](auto& candidate) {
@@ -164,9 +185,9 @@ void WebContentClient::did_misbehave(StringView message_name, StringView reason)
     shutdown();
 }
 
-Compositing::CompositorContextId WebContentClient::compositor_context_id_for_page(Compositing::PageId page_id)
+Web::CompositorContextId WebContentClient::compositor_context_id_for_page(Web::PageId page_id)
 {
-    auto context_id = Compositing::compositor_context_id_for_page(page_id);
+    auto context_id = Web::compositor_context_id_for_page(page_id);
     if (auto registered_page_id = m_compositor_contexts.get(context_id); registered_page_id.has_value()) {
         if (!registered_page_id->has_value() || **registered_page_id != page_id) {
             did_misbehave("allocate_compositor_context_id"sv, "page ID collides with an existing compositor context"sv);
@@ -180,7 +201,7 @@ Compositing::CompositorContextId WebContentClient::compositor_context_id_for_pag
     return context_id;
 }
 
-Optional<Compositing::PageId> WebContentClient::page_id_for_compositor_context_id(Compositing::CompositorContextId context_id) const
+Optional<Web::PageId> WebContentClient::page_id_for_compositor_context_id(Web::CompositorContextId context_id) const
 {
     auto page_id = m_compositor_contexts.get(context_id);
     if (!page_id.has_value())
@@ -188,14 +209,14 @@ Optional<Compositing::PageId> WebContentClient::page_id_for_compositor_context_i
     return *page_id;
 }
 
-Messages::WebContentClient::AllocateCompositorContextIdResponse WebContentClient::allocate_compositor_context_id(Compositing::PageId page_id, Compositing::PagePresentationRegistration page_presentation_registration)
+Messages::WebContentClient::AllocateCompositorContextIdResponse WebContentClient::allocate_compositor_context_id(Web::PageId page_id, Web::PagePresentationRegistration page_presentation_registration)
 {
     return allocate_compositor_context(page_id, page_presentation_registration);
 }
 
-Compositing::CompositorContextId WebContentClient::allocate_compositor_context(Compositing::PageId page_id, Compositing::PagePresentationRegistration page_presentation_registration)
+Web::CompositorContextId WebContentClient::allocate_compositor_context(Web::PageId page_id, Web::PagePresentationRegistration page_presentation_registration)
 {
-    if (page_presentation_registration == Compositing::PagePresentationRegistration::Yes)
+    if (page_presentation_registration == Web::PagePresentationRegistration::Yes)
         return compositor_context_id_for_page(page_id);
 
     auto context_id = Application::the().allocate_compositor_context_id();
@@ -204,19 +225,19 @@ Compositing::CompositorContextId WebContentClient::allocate_compositor_context(C
     return context_id;
 }
 
-void WebContentClient::did_destroy_compositor_context(Compositing::CompositorContextId context_id)
+void WebContentClient::did_destroy_compositor_context(Web::CompositorContextId context_id)
 {
     forget_compositor_context(context_id);
 }
 
-bool WebContentClient::forget_compositor_context(Compositing::CompositorContextId context_id)
+bool WebContentClient::forget_compositor_context(Web::CompositorContextId context_id)
 {
     if (!m_compositor_contexts.remove(context_id))
         return false;
     return true;
 }
 
-void WebContentClient::remember_compositor_context(Compositing::CompositorContextId context_id, Optional<Compositing::PageId> page_id)
+void WebContentClient::remember_compositor_context(Web::CompositorContextId context_id, Optional<Web::PageId> page_id)
 {
     m_compositor_contexts.set(context_id, page_id);
 }
@@ -231,7 +252,8 @@ void WebContentClient::assign_view(Badge<Application>, ViewImplementation& view)
     VERIFY(m_initial_top_level_history_entry.has_value());
     auto& traversable = CanonicalTraversable::create_a_new_top_level_traversable(m_root_navigable_id, {}, m_initial_top_level_history_entry.release_value());
     view.display_traversable({}, traversable);
-    open_page_for_new_top_level_traversable(initial_page_id, traversable);
+    auto& page = open_page_for_new_top_level_traversable(initial_page_id, traversable);
+    page.async_set_browsing_context_group(traversable.active_browsing_context().group()->id());
     view.update_navigation_action_state();
 }
 
@@ -240,7 +262,7 @@ void WebContentClient::set_compositor_connection_id(Badge<Application>, i32 comp
     m_compositor_connection_id = compositor_connection_id;
 }
 
-void WebContentClient::register_view(Compositing::PageId page_id, ViewImplementation& view)
+void WebContentClient::register_view(Web::PageId page_id, ViewImplementation& view)
 {
     // A process's initial page is assigned to the view that launched it, not registered.
     VERIFY(page_id > 0 || !has_views());
@@ -254,7 +276,7 @@ void WebContentClient::register_view(Compositing::PageId page_id, ViewImplementa
     view.display_traversable({}, page->traversable());
 }
 
-WebContentPage& WebContentClient::open_page_for_new_top_level_traversable(Compositing::PageId page_id, CanonicalTraversable& traversable)
+WebContentPage& WebContentClient::open_page_for_new_top_level_traversable(Web::PageId page_id, CanonicalTraversable& traversable)
 {
     auto& page = open_page(page_id, traversable);
     traversable.active_document().set_host(page);
@@ -262,15 +284,15 @@ WebContentPage& WebContentClient::open_page_for_new_top_level_traversable(Compos
 }
 
 // The process never learns of a page no view displays, so it can make no claim for it.
-void WebContentClient::discard_page_of_undisplayed_top_level_traversable(Compositing::PageId page_id)
+void WebContentClient::discard_page_of_undisplayed_top_level_traversable(Web::PageId page_id)
 {
     if (auto page = m_pages.take(page_id); page.has_value())
         page.value()->close();
 }
 
-void WebContentClient::unregister_view(Compositing::PageId page_id)
+void WebContentClient::unregister_view(Web::PageId page_id)
 {
-    forget_compositor_context(Compositing::compositor_context_id_for_page(page_id));
+    forget_compositor_context(Web::compositor_context_id_for_page(page_id));
     if (auto* page = this->page(page_id))
         page->traversable().remove_page(*page);
 
@@ -282,7 +304,7 @@ void WebContentClient::unregister_view(Compositing::PageId page_id)
             page->set_detached_close_pending(false);
         page->close();
     }
-    release_unneeded_opener_pages();
+    release_unneeded_representing_pages();
     close_server_if_unused();
 }
 
@@ -292,7 +314,7 @@ void WebContentClient::fail_renderer_owned_downloads()
         page.value->fail_renderer_owned_downloads();
 }
 
-void WebContentClient::register_embedded_page(Compositing::PageId page_id, CanonicalTraversable& traversable)
+void WebContentClient::register_embedded_page(Web::PageId page_id, CanonicalTraversable& traversable)
 {
     auto& page = open_page(page_id, traversable);
     if (m_unassigned_initial_page_id == page_id)
@@ -308,7 +330,7 @@ void WebContentClient::register_embedded_page(Compositing::PageId page_id, Canon
         page.async_set_focused_navigable(*focused_navigable_id);
 }
 
-Optional<Compositing::PageId> WebContentClient::page_id_for_traversable(CanonicalTraversable const& traversable) const
+Optional<Web::PageId> WebContentClient::page_id_for_traversable(CanonicalTraversable const& traversable) const
 {
     for (auto const& [page_id, page] : m_pages) {
         if (page->is_open() && &page->traversable() == &traversable)
@@ -317,66 +339,54 @@ Optional<Compositing::PageId> WebContentClient::page_id_for_traversable(Canonica
     return {};
 }
 
-void WebContentClient::unregister_embedded_page(Compositing::PageId page_id)
+void WebContentClient::unregister_embedded_page(Web::PageId page_id)
 {
     if (auto* page = find_page(page_id); page && !(page->is_open() && page->displays_tab()))
         page->close();
-    release_unneeded_opener_pages();
+    release_unneeded_representing_pages();
     close_server_if_unused();
 }
 
-// Whether a page of this process holds part of a tab the traversable's tab opened, directly or through the tabs those
-// opened.
-bool WebContentClient::holds_part_of_a_tab_opened_by(CanonicalTraversable const& opener_traversable)
+// Whether a page of this process holds part of a tab in the browsing context group of the traversable's tab.
+bool WebContentClient::holds_part_of_a_tab_in_the_group_of(CanonicalTraversable const& traversable)
 {
-    Vector<CanonicalTraversable const*> reached;
-    Vector<CanonicalTraversable const*> to_visit;
-    auto reach = [&](CanonicalTraversable const& traversable) {
-        if (reached.contains_slow(&traversable))
-            return;
-        reached.append(&traversable);
-        to_visit.append(&traversable);
-    };
-
+    auto group = traversable.active_browsing_context().group();
+    if (!group)
+        return false;
     for (auto const& [page_id, page] : m_pages) {
         if (!page->is_open())
             continue;
-        auto const& traversable = page->traversable();
-        if (!page->displays_tab() && traversable.is_opener_page(*page) && !traversable.page_hosts_any(*page))
+        auto const& held = page->traversable();
+        if (!page->displays_tab() && held.is_representing_page(*page) && !held.page_hosts_any(*page))
             continue;
-        reach(traversable);
+        if (held.active_browsing_context().group() == group)
+            return true;
     }
-
-    while (!to_visit.is_empty()) {
-        to_visit.take_last()->for_each_opener_traversable([&](CanonicalTraversable& traversable) {
-            reach(traversable);
-        });
-    }
-    return reached.contains_slow(&opener_traversable);
+    return false;
 }
 
-void WebContentClient::release_unneeded_opener_pages()
+void WebContentClient::release_unneeded_representing_pages()
 {
-    Vector<NonnullRefPtr<WebContentPage>> opener_pages;
+    Vector<NonnullRefPtr<WebContentPage>> representing_pages;
     for_each_page([&](WebContentPage& page) {
-        if (!page.displays_tab() && page.traversable().is_opener_page(page))
-            opener_pages.append(page);
+        if (!page.displays_tab() && page.traversable().is_representing_page(page))
+            representing_pages.append(page);
         return IterationDecision::Continue;
     });
-    for (auto const& page : opener_pages) {
+    for (auto const& page : representing_pages) {
         if (page->is_open())
             page->traversable().release_page_if_unused(page);
     }
 }
 
-WebContentPage& WebContentClient::open_page(Compositing::PageId page_id, CanonicalTraversable& traversable)
+WebContentPage& WebContentClient::open_page(Web::PageId page_id, CanonicalTraversable& traversable)
 {
     auto page = adopt_ref(*new WebContentPage(*this, page_id, traversable));
     m_pages.set(page_id, page);
     return page;
 }
 
-WebContentPage* WebContentClient::find_page(Compositing::PageId page_id) const
+WebContentPage* WebContentClient::find_page(Web::PageId page_id) const
 {
     auto page = m_pages.find(page_id);
     if (page == m_pages.end())
@@ -384,7 +394,7 @@ WebContentPage* WebContentClient::find_page(Compositing::PageId page_id) const
     return page->value.ptr();
 }
 
-WebContentPage* WebContentClient::page(Compositing::PageId page_id) const
+WebContentPage* WebContentClient::page(Web::PageId page_id) const
 {
     auto* page = find_page(page_id);
     if (!page || !page->is_open())
@@ -392,7 +402,7 @@ WebContentPage* WebContentClient::page(Compositing::PageId page_id) const
     return page;
 }
 
-bool WebContentClient::may_act_for_page(Compositing::PageId page_id) const
+bool WebContentClient::may_act_for_page(Web::PageId page_id) const
 {
     // A page ID the connection was given is not a false claim once the page is gone: the connection can
     // have sent the message while it still had the page, and the handler drops it.
@@ -495,7 +505,7 @@ void WebContentClient::replay_compositor_view_state_after_reconnect(Badge<Applic
     for (auto& [page_id, page] : m_pages) {
         if (!page->is_open() || !page->displays_tab())
             continue;
-        auto context_id = Compositing::compositor_context_id_for_page(page_id);
+        auto context_id = Web::compositor_context_id_for_page(page_id);
         if (!m_compositor_contexts.contains(context_id))
             continue;
         auto& view = page->view();
@@ -531,14 +541,12 @@ void WebContentClient::did_lose_process()
         return IterationDecision::Continue;
     });
 
-    // Every page reads as closed before pending history work resolves against this endpoint.
+    // Closing a page settles the replies it owed once this task is over.
     for (auto const& lost : lost_pages)
         lost.page->close();
 
     destroy_all_compositor_contexts();
 
-    // Resolve any history work waiting on this endpoint before removing the canonical page subtrees that identify
-    // their owning traversables. A missing renderer is an exactly-once completion for descendant unload tasks.
     for (auto const& lost : lost_pages) {
         // The view displaying the tab waits for the events it handed down to this page.
         if (!lost.view_id.has_value())
@@ -600,9 +608,29 @@ Messages::WebContentClient::DidRequestAllCookiesWebdriverResponse WebContentClie
     return m_session->cookie_jar->get_all_cookies_webdriver(url);
 }
 
-Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse WebContentClient::did_request_all_cookies_cookiestore(URL::URL url)
+// Script reaches cookies through a document the process hosts, and only those of such a document's origin.
+bool WebContentClient::hosts_an_environment_that_may_use_cookies_of(URL::URL const& url) const
 {
-    return m_session->cookie_jar->get_all_cookies_cookiestore(url);
+    for (auto const& [page_id, page] : m_pages) {
+        if (!page->is_open())
+            continue;
+        bool hosts_one = false;
+        page->for_each_hosted_document([&](CanonicalDocument& document) {
+            hosts_one = document.relevant_global_object().relevant_settings_object().may_use_cookies_of(url);
+            return hosts_one ? IterationDecision::Break : IterationDecision::Continue;
+        });
+        if (hosts_one)
+            return true;
+    }
+    return false;
+}
+
+Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse WebContentClient::did_request_all_cookies_cookiestore(Web::PageId page_id, URL::URL url)
+{
+    if (auto* page = this->page(page_id))
+        return page->did_request_all_cookies_cookiestore(move(url));
+
+    return Vector<HTTP::Cookie::Cookie> {};
 }
 
 Messages::WebContentClient::DidRequestNamedCookieResponse WebContentClient::did_request_named_cookie(URL::URL url, String name)
@@ -615,7 +643,7 @@ Messages::WebContentClient::DidRequestNamedCookieResponse WebContentClient::did_
     return m_session->cookie_jar->get_named_cookie(url, name);
 }
 
-Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_request_cookie(Compositing::PageId page_id, URL::URL url, HTTP::Cookie::Source source)
+Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_request_cookie(Web::PageId page_id, URL::URL url, HTTP::Cookie::Source source)
 {
     if (source == HTTP::Cookie::Source::Http && !renderers_may_access_cookies_like_http()) {
         did_misbehave("did_request_cookie"sv, "HTTP cookie source"sv);
@@ -625,8 +653,9 @@ Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_reque
     if (auto* page = this->page(page_id))
         return page->did_request_cookie(move(url), source);
 
-    // A spare process can request cookies for its initial page before a view adopts it.
-    if (m_unassigned_initial_page_id != page_id)
+    // A spare process can request cookies for its initial page before a view adopts it. No document of that page is
+    // known here, so only a request with the HTTP source is answered.
+    if (m_unassigned_initial_page_id != page_id || source != HTTP::Cookie::Source::Http)
         return HTTP::Cookie::VersionedCookie {};
 
     HTTP::Cookie::VersionedCookie cookie;
@@ -634,40 +663,40 @@ Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_reque
     return cookie;
 }
 
-Messages::WebContentClient::DidSetStorageItemResponse WebContentClient::did_set_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key, Utf16String value)
+Messages::WebContentClient::DidSetStorageItemResponse WebContentClient::did_set_storage_item(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key, Utf16String value)
 {
     if (auto* page = this->page(page_id))
-        return page->did_set_storage_item(storage_endpoint, move(storage_key), move(bottle_key), move(value));
+        return page->did_set_storage_item(storage_endpoint, move(environment_id), move(bottle_key), move(value));
 
     // A closed page has no storage left to set. Its reply cannot be empty, so it hears the refusal a full jar gives.
     return WebView::StorageOperationError::QuotaExceededError;
 }
 
-Messages::WebContentClient::DidRequestStorageItemResponse WebContentClient::did_request_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key)
+Messages::WebContentClient::DidRequestStorageItemResponse WebContentClient::did_request_storage_item(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key)
 {
     if (auto* page = this->page(page_id))
-        return page->did_request_storage_item(storage_endpoint, move(storage_key), move(bottle_key));
+        return page->did_request_storage_item(storage_endpoint, move(environment_id), move(bottle_key));
 
     return Optional<Utf16String> {};
 }
 
-Messages::WebContentClient::DidRequestStorageKeysResponse WebContentClient::did_request_storage_keys(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key)
+Messages::WebContentClient::DidRequestStorageKeysResponse WebContentClient::did_request_storage_keys(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id)
 {
     if (auto* page = this->page(page_id))
-        return page->did_request_storage_keys(storage_endpoint, move(storage_key));
+        return page->did_request_storage_keys(storage_endpoint, move(environment_id));
 
     return Vector<Utf16String> {};
 }
 
-Messages::WebContentClient::DidRequestStorageUsageResponse WebContentClient::did_request_storage_usage(Compositing::PageId page_id, String storage_key)
+Messages::WebContentClient::DidRequestStorageUsageResponse WebContentClient::did_request_storage_usage(Web::PageId page_id, Web::HTML::EnvironmentId environment_id)
 {
     if (auto* page = this->page(page_id))
-        return page->did_request_storage_usage(move(storage_key));
+        return page->did_request_storage_usage(move(environment_id));
 
     return 0u;
 }
 
-Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentClient::did_start_download_without_request(Compositing::PageId page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size)
+Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentClient::did_start_download_without_request(Web::PageId page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size)
 {
     if (auto* page = this->page(page_id))
         return page->did_start_download_without_request(move(url), move(suggested_filename), total_size);
@@ -675,7 +704,7 @@ Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentCli
     return Optional<u64> {};
 }
 
-Messages::WebContentClient::DidStartDownloadResponse WebContentClient::did_start_download(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
+Messages::WebContentClient::DidStartDownloadResponse WebContentClient::did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
 {
     if (auto* page = this->page(page_id))
         return page->did_start_download(navigable_id, move(navigation_id), move(url), move(suggested_filename), total_size, request_server_client_id, request_server_request_id, move(initial_data));
@@ -683,15 +712,15 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentClient::did_start
     return Optional<u64> {};
 }
 
-Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(Compositing::PageId page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set)
+Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(Web::PageId page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set)
 {
     if (auto* page = this->page(page_id))
         return page->did_request_new_web_view(activate_tab, hints, opener_navigable_id, move(opener_base_url), move(target_name), popup_sandboxing_flag_set);
 
-    return { Optional<Compositing::PageId> {}, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> {}, Web::HTML::VisibilityState::Hidden, String {} };
+    return { Optional<Web::PageId> {}, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> {}, Optional<Web::HTML::EnvironmentId> {}, Optional<u64> {}, Web::HTML::VisibilityState::Hidden, String {} };
 }
 
-Messages::WebContentClient::StartWorkerAgentResponse WebContentClient::start_worker_agent(Compositing::PageId page_id, Web::HTML::WorkerAgentStartRequest request)
+Messages::WebContentClient::StartWorkerAgentResponse WebContentClient::start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request)
 {
     if (auto* page = this->page(page_id))
         return page->start_worker_agent(move(request));
@@ -699,7 +728,7 @@ Messages::WebContentClient::StartWorkerAgentResponse WebContentClient::start_wor
     return Web::HTML::WorkerAgentId {};
 }
 
-void WebContentClient::did_close_browsing_context(Compositing::PageId page_id)
+void WebContentClient::did_close_browsing_context(Web::PageId page_id)
 {
     if (auto* page = this->page(page_id)) {
         page->did_close_browsing_context();
@@ -710,18 +739,8 @@ void WebContentClient::did_close_browsing_context(Compositing::PageId page_id)
     if (!page)
         return;
     page->set_detached_close_pending(false);
-    release_unneeded_opener_pages();
+    release_unneeded_representing_pages();
     close_server_if_unused();
-}
-
-void WebContentClient::did_set_cookie(URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source)
-{
-    if (source == HTTP::Cookie::Source::Http && !renderers_may_access_cookies_like_http()) {
-        did_misbehave("did_set_cookie"sv, "HTTP cookie source"sv);
-        return;
-    }
-
-    m_session->cookie_jar->set_cookie(url, cookie, source);
 }
 
 void WebContentClient::did_update_cookie(HTTP::Cookie::Cookie cookie)

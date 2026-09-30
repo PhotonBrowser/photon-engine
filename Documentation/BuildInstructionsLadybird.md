@@ -2,10 +2,10 @@
 
 ## Build Prerequisites
 
-Qt6.9+ development packages, nasm, additional build tools, and a C++23 capable compiler are required.
+Qt6.10+ development packages, nasm, additional build tools, and a C++23 capable compiler are required.
 
 > [!NOTE]
-> Some distributions still package a Qt6 older than 6.9; for example, Debian 13 (trixie) ships Qt 6.8 — so configuring against it fails. If your Qt6 is older than 6.9, install a newer one from a newer distribution release, or directly from the [Qt online installer](https://www.qt.io/download-open-source), and then point the build to it using `CMAKE_PREFIX_PATH`.
+> Some distributions still package a Qt6 older than 6.10; for example, Debian 13 (trixie) ships Qt 6.8 — so configuring against it fails. If your Qt6 is older than 6.10, install a newer one from a newer distribution release, or directly from the [Qt online installer](https://www.qt.io/download-open-source), and then point the build to it using `CMAKE_PREFIX_PATH`.
 
 A Rust toolchain is also required. You can install it via [rustup](https://rustup.rs/).
 
@@ -137,17 +137,12 @@ Xcode 15 or clang from homebrew is required to successfully build ladybird.
 
 ```
 xcode-select --install
-brew install autoconf autoconf-archive automake ccache cmake libtool nasm ninja pkg-config
+brew install autoconf autoconf-archive automake ccache cmake libtool nasm ninja pkg-config qt
 ```
 
 If you wish to use clang from homebrew instead:
 ```
 brew install llvm@21
-```
-
-If you also plan to use the Qt UI on macOS:
-```
-brew install qt
 ```
 
 > [!NOTE]
@@ -248,19 +243,8 @@ including sanitizer options. It does not update the binary or change its build c
 ### The User Interfaces
 
 Ladybird will be built with one of the following browser frontends, depending on the platform:
-* [AppKit](https://developer.apple.com/documentation/appkit?language=objc) - The native UI on macOS.
-* [Qt](https://doc.qt.io/qt-6/) - The UI used on all other platforms.
 * [Android UI](https://developer.android.com/develop/ui) - The native UI on Android.
-
-You can pick the UI using the `LADYBIRD_GUI_FRAMEWORK` option, or the `--gui` argument to ladybird.py.
-For example, to force building with the Qt UI:
-
-```bash
-# From /path/to/ladybird
-cmake --preset Release -DLADYBIRD_GUI_FRAMEWORK=Qt
-# Or
-./Meta/ladybird.py run --gui=Qt
-```
+* [Qt](https://doc.qt.io/qt-6/) - The UI used on all other platforms.
 
 ### Build error messages you may encounter
 

@@ -370,8 +370,28 @@ impl<'pass> NodeFacts<'pass> {
         }
     }
 
+    /// The facts of `node`, from the node data and style payloads that [`Self::new`] looked up for it.
+    #[inline]
+    pub(super) fn from_lookups(
+        callbacks: &LayoutPass<'pass>,
+        node: Node,
+        data: &'pass NodeData,
+        style_payloads: Option<&'pass FfiStylePayloads>,
+    ) -> Self {
+        Self {
+            callbacks: *callbacks,
+            node,
+            data,
+            style_payloads,
+        }
+    }
+
     pub(super) fn data(&self) -> &'pass NodeData {
         self.data
+    }
+
+    pub(super) fn style_payloads(&self) -> Option<&'pass FfiStylePayloads> {
+        self.style_payloads
     }
 
     fn parent_data(&self) -> Option<&'pass NodeData> {
@@ -781,6 +801,19 @@ impl<'pass> NodeFacts<'pass> {
         }
         let style = self.style();
         style.has_size_containment() || style.is_size_container()
+    }
+
+    // https://drafts.csswg.org/css-contain-2/#containment-inline-size
+    // "Giving an element inline-size containment applies size containment to the inline-axis sizing of its principal
+    //  box."
+    pub(crate) fn node_has_inline_size_containment(&self) -> bool {
+        // NB: So it has no effect where size containment would have none.
+        let display = self.display();
+        if display.is_table_inside() || display.is_internal_table() {
+            return false;
+        }
+        let style = self.style();
+        style.has_inline_size_containment() || style.is_inline_size_container()
     }
 
     pub(crate) fn has_preferred_aspect_ratio(&self) -> bool {
