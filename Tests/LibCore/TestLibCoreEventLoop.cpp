@@ -12,6 +12,11 @@
 #include <LibCore/Timer.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
+#ifdef AK_OS_MACOS
+#    include <CoreFoundation/CoreFoundation.h>
+#    include <LibCore/Notifier.h>
+#    include <fcntl.h>
+#endif
 
 #if !defined(AK_OS_WINDOWS)
 #    include <LibCore/System.h>
@@ -25,6 +30,64 @@ TEST_CASE(test_poll_for_events)
 
     event_loop.pump(Core::EventLoop::WaitMode::PollForEvents);
 }
+
+#ifdef AK_OS_MACOS
+TEST_CASE(cf_run_loop_notifier_rearms_until_readiness_is_drained)
+{
+    Core::EventLoop event_loop;
+    auto fds = MUST(Core::System::pipe2(O_NONBLOCK | O_CLOEXEC));
+    auto owner = pthread_self();
+    int received = 0;
+    int deferred = 0;
+    auto notifier = Core::Notifier::construct(fds[0], Core::NotificationType::Read);
+    notifier->on_activation = [&] {
+        EXPECT(pthread_equal(owner, pthread_self()));
+        char byte;
+        if (auto result = Core::System::read(fds[0], { &byte, 1 }); !result.is_error() && result.value() == 1) {
+            ++received;
+            Core::deferred_invoke([&] { ++deferred; });
+        }
+    };
+    // Leave the FD readable after each activation. No new write/readiness edge
+    // and no explicit Core pump may be needed to deliver the remaining bytes.
+    Array<u8, 32> bytes {};
+    MUST(Core::System::write(fds[1], bytes));
+    auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(2);
+    while (deferred < 32 && MonotonicTime::now() < deadline) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+        MUST(Core::System::sleep_ms(1));
+    }
+    EXPECT_EQ(received, 32);
+    EXPECT_EQ(deferred, 32);
+    notifier->set_enabled(false);
+    MUST(Core::System::close(fds[0]));
+    MUST(Core::System::close(fds[1]));
+}
+
+TEST_CASE(cf_run_loop_notifier_can_unregister_inside_its_callback)
+{
+    Core::EventLoop event_loop;
+    auto fds = MUST(Core::System::pipe2(O_NONBLOCK | O_CLOEXEC));
+    int received = 0;
+    auto notifier = Core::Notifier::construct(fds[0], Core::NotificationType::Read);
+    notifier->on_activation = [&] {
+        char byte;
+        MUST(Core::System::read(fds[0], { &byte, 1 }));
+        ++received;
+        notifier->set_enabled(false);
+    };
+    char byte = 0;
+    MUST(Core::System::write(fds[1], { &byte, 1 }));
+    auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(2);
+    while (!received && MonotonicTime::now() < deadline) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+        MUST(Core::System::sleep_ms(1));
+    }
+    EXPECT_EQ(received, 1);
+    MUST(Core::System::close(fds[0]));
+    MUST(Core::System::close(fds[1]));
+}
+#endif
 
 // Simulate the condition that occurs during exit(): ThreadData (thread-local) is destroyed
 // while the EventLoop (normally stack-allocated) is still alive. Another thread holding a

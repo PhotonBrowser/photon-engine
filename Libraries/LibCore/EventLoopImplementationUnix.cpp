@@ -16,6 +16,7 @@
 #include <AK/WeakPtr.h>
 #include <AK/kmalloc.h>
 #include <LibCore/Event.h>
+#include <LibCore/EventLoop.h>
 #include <LibCore/EventLoopImplementationUnix.h>
 #include <LibCore/EventReceiver.h>
 #include <LibCore/Notifier.h>
@@ -23,12 +24,24 @@
 #include <LibCore/System.h>
 #include <LibCore/ThreadEventQueue.h>
 #include <LibCore/TimeoutSet.h>
+#ifdef AK_OS_MACOS
+#    include <AK/AtomicRefCounted.h>
+#    include <CoreFoundation/CoreFoundation.h>
+#    include <dispatch/dispatch.h>
+#endif
+#include <cstdlib>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/select.h>
 #include <unistd.h>
 
 namespace Core {
+
+static bool run_loop_trace_enabled()
+{
+    static bool enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    return enabled;
+}
 
 // Signals remain bound to the first event loop that registers a handler.
 static Atomic<int> s_signal_wake_pipe_write_fd { -1 };
@@ -94,6 +107,10 @@ public:
 
     virtual void fire(TimeoutSet& timeout_set, MonotonicTime current_time) override
     {
+        auto requested_deadline_ns = fire_time().nanoseconds();
+        if (run_loop_trace_enabled()) dbgln("[CoreTimer] id={} core_fire_ns={} deadline_ns={} lateness_ns={} repeat_interval_ms={} repeating={}",
+            reinterpret_cast<FlatPtr>(this), current_time.nanoseconds(), requested_deadline_ns,
+            current_time.nanoseconds() - requested_deadline_ns, interval.to_milliseconds(), should_reload);
         auto strong_owner = owner.strong_ref();
 
         if (!strong_owner)
@@ -105,6 +122,8 @@ public:
                 next_fire_time = current_time + interval;
             }
             m_fire_time = next_fire_time;
+            if (run_loop_trace_enabled()) dbgln("[CoreTimer] id={} next_deadline_ns={} repeat_interval_ms={} repeating=true",
+                reinterpret_cast<FlatPtr>(this), next_fire_time.nanoseconds(), interval.to_milliseconds());
             if (next_fire_time != current_time) {
                 timeout_set.schedule_absolute(this);
             } else {
@@ -126,6 +145,171 @@ public:
     pthread_t owner_thread { 0 };
     Atomic<bool> is_being_deleted { false };
 };
+
+#ifdef AK_OS_MACOS
+static void dispatch_core_events_from_run_loop()
+{
+    // The AppKit/GPUI run loop owns this thread. Turn native readiness into
+    // Core events here instead of periodically polling the Core loop.
+    EventLoop::current().pump(EventLoop::WaitMode::PollForEvents);
+}
+
+// Dispatch observes descriptor readiness independently of an embedded host's
+// short CFRunLoop passes. A version-zero source dispatches Core work on its
+// owning thread. Suspend readiness while that work is pending, then re-arm.
+class RunLoopFdSource final : public AtomicRefCounted<RunLoopFdSource> {
+public:
+    static NonnullRefPtr<RunLoopFdSource> create(int fd, NotificationType type)
+    {
+        auto state = adopt_ref(*new RunLoopFdSource(fd));
+        CFRunLoopSourceContext context {};
+        context.info = state.ptr();
+        context.retain = [](void const* info) -> void const* {
+            const_cast<RunLoopFdSource*>(static_cast<RunLoopFdSource const*>(info))->ref();
+            return info;
+        };
+        context.release = [](void const* info) {
+            const_cast<RunLoopFdSource*>(static_cast<RunLoopFdSource const*>(info))->unref();
+        };
+        context.perform = [](void* info) { static_cast<RunLoopFdSource*>(info)->perform(); };
+        state->m_source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context);
+        VERIFY(state->m_source);
+        CFRunLoopAddSource(state->m_loop, state->m_source, kCFRunLoopCommonModes);
+        if (has_flag(static_cast<u8>(type), static_cast<u8>(NotificationType::Read)))
+            state->add_monitor(0, DISPATCH_SOURCE_TYPE_READ);
+        if (has_flag(static_cast<u8>(type), static_cast<u8>(NotificationType::Write)))
+            state->add_monitor(1, DISPATCH_SOURCE_TYPE_WRITE);
+        return state;
+    }
+
+    ~RunLoopFdSource()
+    {
+        VERIFY(m_stopped);
+        CFRelease(m_loop);
+    }
+
+    void stop()
+    {
+        MutexLocker locker(m_mutex);
+        if (m_stopped)
+            return;
+        m_stopped = true;
+        for (auto& monitor : m_monitors) {
+            if (!monitor.source)
+                continue;
+            if (monitor.suspended)
+                dispatch_resume(monitor.source);
+            dispatch_source_cancel(monitor.source);
+            dispatch_release(monitor.source);
+            monitor.source = nullptr;
+        }
+        CFRunLoopSourceInvalidate(m_source);
+        CFRelease(m_source);
+        m_source = nullptr;
+    }
+
+private:
+    struct Monitor {
+        RunLoopFdSource* owner { nullptr };
+        dispatch_source_t source { nullptr };
+        bool suspended { false };
+    };
+
+    explicit RunLoopFdSource(int fd)
+        : m_fd(fd)
+        , m_loop(CFRunLoopGetCurrent())
+    {
+        CFRetain(m_loop);
+    }
+
+    void add_monitor(size_t index, dispatch_source_type_t type)
+    {
+        auto& monitor = m_monitors[index];
+        monitor.owner = this;
+        monitor.source = dispatch_source_create(type, m_fd, 0, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+        VERIFY(monitor.source);
+        ref(); // The monitor retains us until its cancellation handler runs.
+        dispatch_set_context(monitor.source, &monitor);
+        dispatch_source_set_event_handler_f(monitor.source, [](void* info) {
+            auto& monitor = *static_cast<Monitor*>(info);
+            auto& state = *monitor.owner;
+            MutexLocker locker(state.m_mutex);
+            if (state.m_stopped)
+                return;
+            if (!monitor.suspended) {
+                dispatch_suspend(monitor.source);
+                monitor.suspended = true;
+            }
+            if (run_loop_trace_enabled())
+                dbgln("[CFNotifier] event=FD_READINESS at_ns={} fd={} callbacks_enabled=false", MonotonicTime::now().nanoseconds(), state.m_fd);
+            CFRunLoopSourceSignal(state.m_source);
+            CFRunLoopWakeUp(state.m_loop);
+        });
+        dispatch_source_set_cancel_handler_f(monitor.source, [](void* info) {
+            static_cast<Monitor*>(info)->owner->unref();
+        });
+        dispatch_resume(monitor.source);
+    }
+
+    void perform()
+    {
+        NonnullRefPtr protect = *this;
+        {
+            MutexLocker locker(m_mutex);
+            if (m_stopped)
+                return;
+        }
+        if (run_loop_trace_enabled()) {
+            auto mode = CFRunLoopCopyCurrentMode(m_loop);
+            char mode_name[128] {};
+            if (mode) {
+                CFStringGetCString(mode, mode_name, sizeof(mode_name), kCFStringEncodingUTF8);
+                CFRelease(mode);
+            }
+            dbgln("[CFNotifier] event=CALLBACK_ENTER at_ns={} fd={} callbacks_disabled=true mode={}", MonotonicTime::now().nanoseconds(), m_fd, mode_name);
+        }
+        dispatch_core_events_from_run_loop();
+        MutexLocker locker(m_mutex);
+        if (m_stopped)
+            return;
+        for (auto& monitor : m_monitors) {
+            if (monitor.source && monitor.suspended) {
+                monitor.suspended = false;
+                dispatch_resume(monitor.source);
+            }
+        }
+        // Core dispatch can enqueue deferred work without making an FD ready.
+        if (ThreadEventQueue::current().has_pending_events()) {
+            CFRunLoopSourceSignal(m_source);
+            CFRunLoopWakeUp(m_loop);
+        }
+        if (run_loop_trace_enabled())
+            dbgln("[CFNotifier] event=REARM at_ns={} fd={} callbacks_enabled=true", MonotonicTime::now().nanoseconds(), m_fd);
+    }
+
+    int m_fd;
+    CFRunLoopRef m_loop;
+    CFRunLoopSourceRef m_source { nullptr };
+    Array<Monitor, 2> m_monitors;
+    Mutex m_mutex;
+    bool m_stopped { false };
+};
+
+static void timer_callback(CFRunLoopTimerRef run_loop_timer, void*)
+{
+    CFRunLoopTimerContext context {};
+    CFRunLoopTimerGetContext(run_loop_timer, &context);
+    auto* timer = static_cast<EventLoopTimer*>(context.info);
+    auto actual_fire_ns = MonotonicTime::now().nanoseconds();
+    if (timer) {
+        auto deadline_ns = timer->fire_time().nanoseconds();
+        if (run_loop_trace_enabled()) dbgln("[CFRunLoopTimer] id={} fire_ns={} core_deadline_ns={} lateness_ns={} repeat_interval_ms={} repeating={}",
+            reinterpret_cast<FlatPtr>(timer), actual_fire_ns, deadline_ns, actual_fire_ns - deadline_ns,
+            timer->interval.to_milliseconds(), timer->should_reload);
+    }
+    dispatch_core_events_from_run_loop();
+}
+#endif
 
 struct ThreadData {
     AK_ALLOC_WITH_KMALLOC;
@@ -168,10 +352,25 @@ struct ThreadData {
         // The wake pipe informs us of POSIX signals as well as manual calls to wake()
         poll_fds.append({ .fd = wake_pipe_fds[0], .events = POLLIN, .revents = 0 });
         notifiers.append(nullptr);
+#ifdef AK_OS_MACOS
+        run_loop_wake_descriptor = RunLoopFdSource::create(wake_pipe_fds[0], NotificationType::Read);
+#endif
     }
 
     ~ThreadData()
     {
+#ifdef AK_OS_MACOS
+        if (run_loop_wake_descriptor) {
+            run_loop_wake_descriptor->stop();
+        }
+        for (auto const& [_, descriptor] : run_loop_notifiers) {
+            descriptor->stop();
+        }
+        for (auto const& [_, timer] : run_loop_timers) {
+            CFRunLoopTimerInvalidate(timer);
+            CFRelease(timer);
+        }
+#endif
         // Keep signal pipes open so an in-flight handler cannot write to a reused descriptor.
         if (!wake_pipe_is_signal_target) {
             close(wake_pipe_fds[0]);
@@ -194,6 +393,12 @@ struct ThreadData {
     // The wake pipe is used to notify another event loop that someone has called wake(), or a signal has been received.
     Array<int, 2> wake_pipe_fds { -1, -1 };
     bool wake_pipe_is_signal_target { false };
+
+#ifdef AK_OS_MACOS
+    HashMap<Notifier*, NonnullRefPtr<RunLoopFdSource>> run_loop_notifiers;
+    HashMap<EventLoopTimer*, CFRunLoopTimerRef> run_loop_timers;
+    RefPtr<RunLoopFdSource> run_loop_wake_descriptor;
+#endif
 
     pthread_t thread_id { 0 };
 };
@@ -227,8 +432,13 @@ int EventLoopImplementationUnix::exec()
 size_t EventLoopImplementationUnix::pump(PumpMode mode)
 {
     ScopedAutoreleasePool autorelease_pool;
+    auto started_ns = MonotonicTime::now().nanoseconds();
+    if (run_loop_trace_enabled()) dbgln("[CorePump] enter_ns={} mode={}", started_ns, mode == PumpMode::WaitForEvents ? "wait" : "poll");
     static_cast<EventLoopManagerUnix&>(EventLoopManager::the()).wait_for_events(mode);
-    return ThreadEventQueue::current().process();
+    auto processed = ThreadEventQueue::current().process();
+    if (run_loop_trace_enabled()) dbgln("[CorePump] exit_ns={} duration_ns={} processed_events={}",
+        MonotonicTime::now().nanoseconds(), MonotonicTime::now().nanoseconds() - started_ns, processed);
+    return processed;
 }
 
 void EventLoopImplementationUnix::quit(int code)
@@ -290,6 +500,7 @@ try_select_again:
     // We woke up due to a call to wake() or a POSIX signal.
     // Handle signals and see whether we need to handle events as well.
     if (has_flag(thread_data.poll_fds[0].revents, POLLIN)) {
+        if (run_loop_trace_enabled()) dbgln("[CoreWakePipe] fire_ns={} fd={}", MonotonicTime::now().nanoseconds(), thread_data.wake_pipe_fds[0]);
         int wake_events[8];
         ssize_t nread;
         // We might receive another signal while read()ing here. The signal will go to the handle_signal properly,
@@ -332,6 +543,8 @@ try_select_again:
 
             type &= notifier.type();
 
+            if (type != NotificationType::None)
+                if (run_loop_trace_enabled()) dbgln("[CoreNotifier] fire_ns={} fd={} type={}", MonotonicTime::now().nanoseconds(), notifier.fd(), static_cast<unsigned>(type));
             if (type != NotificationType::None)
                 ThreadEventQueue::current().post_event(&notifier, Core::Event::Type::NotifierActivation);
 #endif
@@ -569,6 +782,22 @@ intptr_t EventLoopManagerUnix::register_timer(EventReceiver& object, int millise
     timer->reload(MonotonicTime::now());
     timer->should_reload = should_reload;
     thread_data.timeouts.schedule_absolute(timer);
+#ifdef AK_OS_MACOS
+    CFRunLoopTimerContext context {};
+    context.info = timer;
+    auto interval = static_cast<CFTimeInterval>(milliseconds) / 1000.0;
+    auto* run_loop_timer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+        CFAbsoluteTimeGetCurrent() + interval,
+        should_reload ? interval : 0,
+        0, 0, timer_callback, &context);
+    if (run_loop_timer) {
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), run_loop_timer, kCFRunLoopCommonModes);
+        thread_data.run_loop_timers.set(timer, run_loop_timer);
+        if (run_loop_trace_enabled()) dbgln("[CoreTimer] register id={} deadline_ns={} interval_ms={} repeating={} cf_first_fire={} cf_repeat_interval={}",
+            reinterpret_cast<FlatPtr>(timer), timer->fire_time().nanoseconds(), milliseconds, should_reload,
+            CFAbsoluteTimeGetCurrent() + interval, should_reload ? interval : 0.0);
+    }
+#endif
     return bit_cast<intptr_t>(timer);
 }
 
@@ -581,6 +810,14 @@ void EventLoopManagerUnix::unregister_timer(intptr_t timer_id)
         return;
     MutexLocker thread_data_content_locker(thread_data_ptr->mutex);
     auto& thread_data = *thread_data_ptr;
+#ifdef AK_OS_MACOS
+    if (auto run_loop_timer = thread_data.run_loop_timers.take(timer); run_loop_timer.has_value()) {
+        if (run_loop_trace_enabled()) dbgln("[CoreTimer] unregister id={} at_ns={} deadline_ns={}",
+            reinterpret_cast<FlatPtr>(timer), MonotonicTime::now().nanoseconds(), timer->fire_time().nanoseconds());
+        CFRunLoopTimerInvalidate(*run_loop_timer);
+        CFRelease(*run_loop_timer);
+    }
+#endif
     auto expected = false;
     if (timer->is_being_deleted.compare_exchange_strong(expected, true, AK::MemoryOrder::memory_order_acq_rel)) {
         if (timer->is_scheduled())
@@ -601,6 +838,11 @@ void EventLoopManagerUnix::register_notifier(Notifier& notifier)
     thread_data.poll_fds.append({ .fd = notifier.fd(), .events = events, .revents = 0 });
 
     notifier.set_owner_thread(thread_data.thread_id);
+#ifdef AK_OS_MACOS
+    thread_data.run_loop_notifiers.set(&notifier, RunLoopFdSource::create(notifier.fd(), notifier.type()));
+    if (run_loop_trace_enabled())
+        dbgln("[CFRunLoop] notifier_register fd={} type={} at_ns={}", notifier.fd(), static_cast<unsigned>(notifier.type()), MonotonicTime::now().nanoseconds());
+#endif
 }
 
 void EventLoopManagerUnix::unregister_notifier(Notifier& notifier)
@@ -610,6 +852,12 @@ void EventLoopManagerUnix::unregister_notifier(Notifier& notifier)
     if (!thread_data)
         return;
     MutexLocker thread_data_content_locker(thread_data->mutex);
+
+#ifdef AK_OS_MACOS
+    if (auto run_loop_descriptor = thread_data->run_loop_notifiers.take(&notifier); run_loop_descriptor.has_value()) {
+        (*run_loop_descriptor)->stop();
+    }
+#endif
 
     auto notifier_index = thread_data->notifier_to_index.take(&notifier).release_value();
 

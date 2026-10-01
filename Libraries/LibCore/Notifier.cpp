@@ -5,6 +5,8 @@
  */
 
 #include <AK/Badge.h>
+#include <AK/Time.h>
+#include <cstdlib>
 #include <LibCore/Event.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Notifier.h>
@@ -30,6 +32,9 @@ void Notifier::set_enabled(bool enabled)
     if (enabled == m_is_enabled)
         return;
     m_is_enabled = enabled;
+    static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    if (trace_enabled)
+        dbgln("[CoreNotifier] event=SET_ENABLED at_ns={} notifier={} fd={} enabled={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), m_fd, enabled);
     if (enabled)
         Core::EventLoop::register_notifier({}, *this);
     else
@@ -59,6 +64,9 @@ void Notifier::set_type(Type type)
 void Notifier::event(Core::Event& event)
 {
     if (event.type() == Core::Event::NotifierActivation) {
+        static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+        if (trace_enabled)
+            dbgln("[CoreNotifier] event=DISPATCH at_ns={} notifier={} fd={} enabled={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), m_fd, m_is_enabled);
         if (on_activation)
             on_activation();
         return;

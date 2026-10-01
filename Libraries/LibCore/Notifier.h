@@ -39,6 +39,7 @@ public:
     void close();
 
     int fd() const { return m_fd; }
+    bool is_enabled() const { return m_is_enabled; }
     Type type() const { return m_type; }
     void set_type(Type type);
 
