@@ -8,6 +8,8 @@
 #include <LibWeb/Compositor/CompositorConnection.h>
 
 #include <AK/Debug.h>
+#include <AK/Time.h>
+#include <cstdlib>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
 #include <LibGfx/Bitmap.h>
@@ -398,6 +400,9 @@ void CompositorConnection::hurry_rendering_opportunity(Web::CompositorContextId 
 
 void CompositorConnection::present_frame(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect)
 {
+    static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    if (trace_enabled)
+        dbgln("[FrameTrace] compositor_frame_requested context={} at_ns={} viewport={}x{} can_send={}", context_id, MonotonicTime::now().nanoseconds(), viewport_rect.width(), viewport_rect.height(), can_send_message_to_compositor());
     if (!can_send_message_to_compositor())
         return;
     async_present_frame(context_id, viewport_rect);

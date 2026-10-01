@@ -346,6 +346,7 @@ public:
     // (e.g. importing a shared Direct3D texture failed), so the Compositor falls back to
     // CPU-shared backing stores.
     void notify_compositor_gpu_presentation_unavailable();
+    void notify_compositor_gpu_presentation_available();
 
 protected:
     explicit Application(Optional<ByteString> ladybird_binary_path = {});
@@ -567,6 +568,7 @@ private:
     // This must be destroyed before m_font_service, which its IPC thread accesses.
     RefPtr<CompositorFontServiceConnection> m_compositor_font_service_connection;
     bool m_reported_compositor_gpu_presentation_unavailable { false };
+    bool m_compositor_metal_presentation_enabled { false };
     size_t m_compositor_restart_count { 0 };
     enum class CompositorRecoveryState {
         Idle,

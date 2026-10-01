@@ -13,6 +13,7 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16StringBuilder.h>
+#include <cstdlib>
 #include <LibCore/Process.h>
 #include <LibCore/Timer.h>
 #include <LibDevTools/IndexedDBSerialization.h>
@@ -611,6 +612,9 @@ void PageClient::set_zoom_level(double zoom_level)
 
 void PageClient::request_frame()
 {
+    static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    if (trace_enabled)
+        dbgln("[FrameTrace] page_request_frame page={} at_ms={:.3f} hidden={} page_visible={} requested={} opportunity_outstanding={} granted={} timer_active={} rendering_task_active={}", m_id, Web::HighResolutionTime::unsafe_shared_current_time(), hosted_documents_are_hidden(), page().system_visibility_state() == Web::HTML::VisibilityState::Visible, m_rendering_update_requested, m_compositor_rendering_opportunity_outstanding, m_rendering_opportunity_granted, m_frame_timer->is_active(), Web::HTML::main_thread_event_loop().rendering_task_queued_or_running());
     Web::HTML::main_thread_event_loop().request_rendering_update();
 
     if (m_rendering_opportunity_granted)

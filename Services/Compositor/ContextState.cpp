@@ -1486,9 +1486,9 @@ void ContextState::paint_screenshot(Compositing::DisplayListPlayerSkia& display_
     display_list_player.flush(*target_surface);
 }
 
-bool ContextState::acknowledge_presented_bitmap(i32 bitmap_id)
+bool ContextState::acknowledge_presented_bitmap(i32 bitmap_id, bool consumer_gpu_work_complete)
 {
-    return m_backing_store_manager.release_buffer(bitmap_id);
+    return m_backing_store_manager.release_buffer(bitmap_id, consumer_gpu_work_complete);
 }
 
 void ContextState::did_finish_gpu_present(i32 bitmap_id)

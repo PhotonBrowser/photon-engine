@@ -44,7 +44,7 @@ public:
     // The stores join the ones allocated last, and leave them again once retired.
     virtual void did_add_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores) = 0;
     virtual void did_retire_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids) = 0;
-    virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id) = 0;
+    virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, u64 presentation_signal_value) = 0;
     // The compositor performed the event's whole default action, so the UI hears nothing more about it.
     virtual void did_consume_input_event(Web::CompositorContextId, u64 event_id) = 0;
     // No context could take the event; the UI sends it to WebContent itself.
@@ -138,11 +138,12 @@ private:
     struct PendingAsyncPresent {
         using Clock = std::chrono::steady_clock;
 
-        PendingAsyncPresent(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id, Clock::time_point paint_started_at, u64 paint_duration_microseconds, u64 submit_duration_microseconds)
+        PendingAsyncPresent(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id, u64 presentation_signal_value, Clock::time_point paint_started_at, u64 paint_duration_microseconds, u64 submit_duration_microseconds)
             : context_id(context_id)
             , viewport_rect(viewport_rect)
             , damage_rect(damage_rect)
             , bitmap_id(bitmap_id)
+            , presentation_signal_value(presentation_signal_value)
             , paint_started_at(paint_started_at)
             , paint_duration_microseconds(paint_duration_microseconds)
             , submit_duration_microseconds(submit_duration_microseconds)
@@ -153,12 +154,14 @@ private:
         Gfx::IntRect viewport_rect;
         Gfx::IntRect damage_rect;
         i32 bitmap_id { 0 };
+        u64 presentation_signal_value { 0 };
         Clock::time_point paint_started_at;
         Clock::time_point submit_completed_at;
         u64 paint_duration_microseconds { 0 };
         u64 submit_duration_microseconds { 0 };
         u64 gpu_completion_microseconds { 0 };
         u64 readback_microseconds { 0 };
+        bool published_before_gpu_completion { false };
         bool was_cancelled { false };
     };
 

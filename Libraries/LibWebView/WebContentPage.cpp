@@ -7,6 +7,7 @@
 #include <AK/Debug.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
+#include <AK/Time.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/EventLoop.h>
 #include <LibDevTools/StorageHelpers.h>
@@ -31,10 +32,18 @@
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
+
+#include <cstdlib>
 #include <LibWebView/WebUI.h>
 #include <LibWebView/WorkerProcessManager.h>
 
 namespace WebView {
+
+static bool external_image_lease_trace_enabled()
+{
+    static bool enabled = std::getenv("EXTERNAL_IMAGE_LEASE_TRACE") != nullptr;
+    return enabled;
+}
 
 static JsonObject parse_json(StringView json, StringView name)
 {
@@ -512,12 +521,12 @@ void WebContentPage::did_not_dispatch_input_event_through_compositor(u64 event_i
     }
 }
 
-void WebContentPage::did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id)
+void WebContentPage::did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, u64 presentation_signal_value)
 {
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC did_paint for page {} bitmap {} rect={}x{} at {},{}",
         m_id, bitmap_id, content_rect.width(), content_rect.height(), content_rect.x(), content_rect.y());
     if (displays_tab()) {
-        view().server_did_paint({}, bitmap_id, content_rect.size(), damage_rect);
+        view().server_did_paint({}, bitmap_id, content_rect.size(), damage_rect, presentation_signal_value);
         return;
     }
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI dropping did_paint for page {} bitmap {}: no view", m_id, bitmap_id);
@@ -583,6 +592,8 @@ void WebContentPage::release_presented_bitmap(i32 bitmap_id)
     if (client().page_id_for_compositor_context_id(context_id) != m_id)
         return;
 
+    if (external_image_lease_trace_enabled())
+        dbgln("[ExternalImageLease][WebContent] at_ns={} context={} bitmap_id={} backing_id={} generation=not-available frame_id=not-available state=RELEASE_SENT_TO_COMPOSITOR", MonotonicTime::now().nanoseconds(), context_id, bitmap_id, static_cast<u64>(bitmap_id) + 1);
     Application::the().notify_compositor_presented_bitmap_ready_to_paint(context_id, bitmap_id);
 }
 

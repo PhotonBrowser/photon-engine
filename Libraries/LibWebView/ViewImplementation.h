@@ -123,7 +123,7 @@ public:
 
     String const& handle() const { return m_client_state.client_handle; }
 
-    void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect);
+    void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect, u64 presentation_signal_value = 0);
 
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
@@ -410,6 +410,7 @@ public:
     void remove_navigation_listener(u64 listener_id);
 
     Function<void()> on_ready_to_paint;
+    Function<void()> on_backing_store_pool_changed;
     Function<void(TabPerformanceStats const&)> on_performance_stats;
     Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, WebContentClient& page_process, Optional<Web::PageId>)> on_new_web_view;
     Function<void()> on_activate_tab;
@@ -636,6 +637,7 @@ protected:
 
     struct SharedBitmap {
         i32 id { -1 };
+        u64 presentation_signal_value { 0 };
         Web::DevicePixelSize last_painted_size;
         OwnPtr<Gfx::SharedImageBuffer> shared_image_buffer;
     };

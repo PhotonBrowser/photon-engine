@@ -20,6 +20,12 @@
 
 namespace Compositor {
 
+static bool photon_frame_trace_enabled()
+{
+    static bool enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    return enabled;
+}
+
 static constexpr int gpu_completion_check_interval_ms = 1;
 
 struct CompositorFrameProfile {
@@ -90,8 +96,8 @@ struct CompositorFrameProfile {
         };
         dbgln("Photon compositor profile: presented_frames={} FPS={:.1f}", frames, frames / elapsed);
         log_stage("frame interval", frame_interval);
-        log_stage("display-list raster", paint);
-        log_stage("Skia flush/submit", submit);
+        log_stage("prepare_frame", paint);
+        log_stage("Skia submit + post-submit cleanup", submit);
         log_stage("GPU completion wait", gpu_completion);
         log_stage("GPU→CPU bitmap readback", readback);
         *this = {};
@@ -781,7 +787,9 @@ void CompositorState::request_rendering_opportunity(Web::CompositorContextId con
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
-    if (!context->request_rendering_opportunity(maximum_frames_per_second))
+    auto newly_requested = context->request_rendering_opportunity(maximum_frames_per_second);
+    if (photon_frame_trace_enabled()) dbgln("[Compositor] rendering_opportunity_request context={} at_ns={} max_fps={:.2f} newly_requested={} visible={}", context_id, MonotonicTime::now().nanoseconds(), maximum_frames_per_second, newly_requested, context_is_effectively_visible(*context));
+    if (!newly_requested)
         return;
     if (!context_is_effectively_visible(*context))
         return;
@@ -827,6 +835,7 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Gfx::In
 
 void CompositorState::present_frame(Web::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
 {
+    if (photon_frame_trace_enabled()) dbgln("[Compositor] frame_submit_begin context={} at_ns={} viewport={}x{}", context_id, MonotonicTime::now().nanoseconds(), pending_frame.viewport_rect.width(), pending_frame.viewport_rect.height());
     auto frame_paint_started_at = std::chrono::steady_clock::now();
     auto composited_context_resolver = resolver_for(context_id);
     auto prepared_frame = context.prepare_frame(*m_display_list_player, pending_frame, &composited_context_resolver);
@@ -835,8 +844,22 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
     auto frame_paint_duration_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - frame_paint_started_at).count();
 
     auto submit_started_at = std::chrono::steady_clock::now();
-    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, frame_paint_started_at, frame_paint_duration_microseconds, 0);
+    u64 presentation_signal_value = 0;
+#ifdef AK_OS_MACOS
+    if (auto backend_context = prepared_frame->rendered_surface->skia_backend_context(); backend_context) {
+        auto& metal_context = backend_context->metal_context();
+        if (metal_context.presentation_event_registered())
+            presentation_signal_value = metal_context.next_presentation_signal_value();
+    }
+#endif
+    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, presentation_signal_value, frame_paint_started_at, frame_paint_duration_microseconds, 0);
     auto* pending_present = &m_pending_async_presents.last();
+    bool publish_before_gpu_completion = context.presents_to_client()
+        && presentation_signal_value != 0
+        && m_client_gpu_presentation_supported.has_value()
+        && *m_client_gpu_presentation_supported;
+    pending_present->published_before_gpu_completion = publish_before_gpu_completion;
+    if (photon_frame_trace_enabled()) dbgln("[Compositor] frame_submit_encoded context={} bitmap={} signal={} at_ns={} paint_us={} native_publish={}", context_id, prepared_frame->bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds(), frame_paint_duration_microseconds, publish_before_gpu_completion);
 
     auto& event_loop = Core::EventLoop::current();
     auto self = NonnullRefPtr { *this };
@@ -862,12 +885,17 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
                 pending_present->readback_microseconds);
             self->did_finish_async_present(*pending_present);
         });
-    });
+    }, presentation_signal_value);
     auto submit_returned_at = std::chrono::steady_clock::now();
     pending_present->submit_duration_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(submit_returned_at - submit_started_at).count();
     pending_present->submit_completed_at = submit_returned_at;
     context.did_submit_prepared_frame(pending_frame.viewport_rect);
     schedule_gpu_completion_check();
+    if (publish_before_gpu_completion) {
+        VERIFY(m_client);
+        if (photon_frame_trace_enabled()) dbgln("[Compositor] frame_submitted_to_client context={} bitmap={} signal={} at_ns={}", context_id, prepared_frame->bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds());
+        m_client->did_present_frame(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, presentation_signal_value);
+    }
 }
 
 void CompositorState::schedule_present_frame(Web::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
@@ -898,11 +926,12 @@ void CompositorState::schedule_pending_present_frame(Web::CompositorContextId co
     schedule_pending_present_frame_on_vsync(context_id, context);
 }
 
-void CompositorState::schedule_pending_present_frame_on_vsync(Web::CompositorContextId, ContextState& context)
+void CompositorState::schedule_pending_present_frame_on_vsync(Web::CompositorContextId context_id, ContextState& context)
 {
     if (!context_is_effectively_visible(context))
         return;
     context.mark_pending_present_frame_scheduled();
+    if (photon_frame_trace_enabled()) dbgln("[Compositor] present_frame_requested context={} at_ns={} refresh_hz={:.2f}", context_id, MonotonicTime::now().nanoseconds(), context.display_refresh_rate());
     vsync_scheduler_for_display(context.display_id()).schedule(context.display_refresh_rate());
 }
 
@@ -968,6 +997,7 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id, 
     for (auto& context_entry : m_contexts) {
         auto context_id = context_entry.key;
         auto& context = *context_entry.value;
+        if (photon_frame_trace_enabled()) dbgln("[Compositor] vsync_tick context={} at_ns={} display_tick_ns={} display={} active_visual_animation={} active_scroll_animation={} rendering_opportunity={} pending_present={} effectively_visible={} visibility={} backing_rendering={} backing_available={}", context_id, MonotonicTime::now().nanoseconds(), frame_time.nanoseconds(), display_id.value_or(0), context.visual_animations_need_frame(), context.has_active_smooth_scroll_animations(), context.rendering_opportunity_requested(), context.pending_present_frame_viewport_rect().has_value(), context_is_effectively_visible(context), static_cast<int>(context.visibility()), context.is_backing_store_rendering(), context.has_available_backing_store_buffer());
         if (!context_is_effectively_visible(context)) {
             context.unschedule_pending_present_frame();
             continue;
@@ -977,6 +1007,7 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id, 
             auto display_refresh_rate = display_refresh_rate_for_context(context);
             if (context.rendering_opportunity_is_due(frame_time, display_refresh_rate)) {
                 auto frame_interval = context.rendering_opportunity_frame_interval(display_refresh_rate);
+                if (photon_frame_trace_enabled()) dbgln("[Compositor] rendering_opportunity_deliver context={} at_ns={} display_tick_ns={} frame_interval_ms={:.3f}", context_id, MonotonicTime::now().nanoseconds(), frame_time.nanoseconds(), frame_interval);
                 context.did_deliver_rendering_opportunity(frame_time);
                 context.web_content_client().rendering_opportunity(context_id, frame_time.nanoseconds(), frame_interval);
             } else {
@@ -1001,6 +1032,10 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id, 
         auto pending_present_frame = context.take_pending_present_frame_if_unblocked();
         if (!pending_present_frame.has_value()) {
             has_active_animation_on_display = (context.has_active_smooth_scroll_animations() || context.visual_animations_need_frame()) && display_id_for_context(context) == display_id;
+            if (photon_frame_trace_enabled() && (has_active_animation_on_display || context.pending_present_frame_viewport_rect().has_value()))
+                dbgln("[Compositor] frame_submit_deferred context={} at_ns={} blocked={} backing_rendering={} backing_available={} active_animation={} pending_frame={} scheduled={}", context_id, MonotonicTime::now().nanoseconds(), context.is_present_blocked(), context.is_backing_store_rendering(), context.has_available_backing_store_buffer(), has_active_animation_on_display, context.pending_present_frame_viewport_rect().has_value(), context.has_pending_present_frame_scheduled_on(display_id));
+            if (context.is_present_blocked())
+                context.log_backing_store_pool_state("frame_submit_deferred"sv);
             if (context.has_pending_present_frame_scheduled_on(display_id) || has_active_animation_on_display)
                 vsync_scheduler_for_display(display_id).schedule(display_refresh_rate_for_context(context));
             continue;
@@ -1030,7 +1065,15 @@ void CompositorState::presented_bitmap_ready_to_paint(Web::CompositorContextId c
     if (!context)
         return;
 
-    if (!context->acknowledge_presented_bitmap(bitmap_id))
+    bool consumer_gpu_work_complete = false;
+#ifdef AK_OS_MACOS
+    consumer_gpu_work_complete = m_client_gpu_presentation_supported.has_value()
+        && *m_client_gpu_presentation_supported;
+#endif
+    auto released = context->acknowledge_presented_bitmap(bitmap_id, consumer_gpu_work_complete);
+    if (std::getenv("EXTERNAL_IMAGE_LEASE_TRACE"))
+        dbgln("[ExternalImageLease][Pool] at_ns={} context={} bitmap_id={} backing_id={} generation={} frame_id=not-available event=release_ack_received released={}", MonotonicTime::now().nanoseconds(), context_id, bitmap_id, static_cast<u64>(bitmap_id) + 1, 0, released);
+    if (!released)
         return;
 
     schedule_pending_present_frame_if_unblocked(context_id, *context);
@@ -1049,6 +1092,9 @@ void CompositorState::did_finish_async_present(PendingAsyncPresent& pending_pres
     auto viewport_rect = pending_present.viewport_rect;
     auto damage_rect = pending_present.damage_rect;
     auto bitmap_id = pending_present.bitmap_id;
+    auto presentation_signal_value = pending_present.presentation_signal_value;
+    if (photon_frame_trace_enabled()) dbgln("[Compositor] gpu_present_complete context={} bitmap={} signal={} at_ns={} gpu_us={}", context_id, bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds(), pending_present.gpu_completion_microseconds);
+    auto was_published_before_gpu_completion = pending_present.published_before_gpu_completion;
     auto was_cancelled = pending_present.was_cancelled;
     (void)m_pending_async_presents.remove(pending_present_iterator);
     if (m_pending_async_presents.is_empty() && m_gpu_completion_timer)
@@ -1061,9 +1107,10 @@ void CompositorState::did_finish_async_present(PendingAsyncPresent& pending_pres
     VERIFY(context);
 
     context->did_finish_gpu_present(bitmap_id);
-    if (context->presents_to_client()) {
+    if (context->presents_to_client() && !was_published_before_gpu_completion) {
         VERIFY(m_client);
-        m_client->did_present_frame(context_id, viewport_rect, damage_rect, bitmap_id);
+        if (photon_frame_trace_enabled()) dbgln("[Compositor] frame_submitted_to_client context={} bitmap={} signal={} at_ns={} after_gpu=true", context_id, bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds());
+        m_client->did_present_frame(context_id, viewport_rect, damage_rect, bitmap_id, presentation_signal_value);
     }
     resize_backing_stores_if_needed(context_id, *context);
     if (auto parent_context_id = context->parent_context_id(); parent_context_id.has_value()) {

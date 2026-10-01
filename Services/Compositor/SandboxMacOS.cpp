@@ -10,6 +10,7 @@
 #include <Compositor/Sandbox.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <LibCore/Directory.h>
+#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibSandbox/Sandbox.h>
 #include <limits.h>
@@ -52,6 +53,10 @@ ErrorOr<void> apply_sandbox(StringView mach_server_name, StringView cache_path, 
 
     TRY(Core::Directory::create(cache_path, Core::Directory::CreateDirectories::Yes));
     TRY(Sandbox::add_seatbelt_path_if_exists(paths, cache_path, Sandbox::SeatbeltPath::Access::ReadWrite));
+
+    auto photon_cache_path = ByteString::formatted("{}/Photon", Core::StandardPaths::cache_directory());
+    TRY(Core::Directory::create(photon_cache_path, Core::Directory::CreateDirectories::Yes));
+    TRY(Sandbox::add_seatbelt_path_if_exists(paths, photon_cache_path, Sandbox::SeatbeltPath::Access::ReadWrite));
 
     // Metal keeps its shader caches in the Darwin user cache directory, in a directory named after the application's
     // bundle identifier. The rest of that directory belongs to other applications.

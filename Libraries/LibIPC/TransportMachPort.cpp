@@ -13,6 +13,7 @@
 #include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/System.h>
 #include <LibIPC/TransportMachPort.h>
+#include <cstdlib>
 #include <LibThreading/Thread.h>
 
 #include <mach/mach.h>
@@ -213,7 +214,9 @@ void TransportMachPort::write_read_notification_byte()
         return;
 
     Array<u8, 1> bytes = { 0 };
-    (void)Core::System::write(m_notify_hook_write_fd->value(), bytes);
+    auto result = Core::System::write(m_notify_hook_write_fd->value(), bytes);
+    if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE"))
+        dbgln("[MachIPC] event=NOTIFICATION_WRITE at_ns={} transport={} fd={} bytes={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), m_notify_hook_read_fd->value(), result.is_error() ? -1 : static_cast<ssize_t>(result.value()));
 }
 
 void TransportMachPort::release_send_waiters()
@@ -533,6 +536,8 @@ void TransportMachPort::process_received_message(u8* buffer)
         m_incoming_messages.append(move(message));
         if (was_empty)
             should_write_notification = schedule_read_notification_if_needed_locked();
+        if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE"))
+            dbgln("[MachIPC] event=IO_ENQUEUE at_ns={} transport={} fd={} queued={} notification_pending={} write_notification={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), m_notify_hook_read_fd->value(), m_incoming_messages.size(), m_read_notification_pending, should_write_notification);
     }
     m_incoming_cv.signal();
     if (should_write_notification)
@@ -543,9 +548,13 @@ void TransportMachPort::set_up_read_hook(Function<void()> hook)
 {
     m_on_read_hook = move(hook);
     m_read_hook_notifier = Core::Notifier::construct(m_notify_hook_read_fd->value(), Core::NotificationType::Read);
+    if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE"))
+        dbgln("[MachIPC] event=REGISTER at_ns={} transport={} fd={} notifier={} enabled={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), m_notify_hook_read_fd->value(), reinterpret_cast<FlatPtr>(m_read_hook_notifier.ptr()), m_read_hook_notifier->is_enabled());
     m_read_hook_notifier->on_activation = [this] {
         char buf[64];
-        (void)Core::System::read(m_notify_hook_read_fd->value(), { buf, sizeof(buf) });
+        auto notification_read = Core::System::read(m_notify_hook_read_fd->value(), { buf, sizeof(buf) });
+        if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE"))
+            dbgln("[MachIPC] event=READ_HOOK at_ns={} transport={} fd={} notification_bytes={} enabled={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), m_notify_hook_read_fd->value(), notification_read.is_error() ? -1 : static_cast<ssize_t>(notification_read.value()), m_read_hook_notifier->is_enabled());
         {
             MutexLocker locker(m_incoming_mutex);
             m_read_notification_pending = false;

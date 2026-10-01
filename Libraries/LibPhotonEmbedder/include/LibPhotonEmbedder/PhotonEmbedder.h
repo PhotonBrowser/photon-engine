@@ -28,6 +28,31 @@ struct PresentedFrame {
     std::vector<uint8_t> pixels;
 };
 
+#if defined(__APPLE__)
+using NativeReleaseDrainCallback = void (*)(void*);
+
+// Native, copy-free presentation metadata. The IOSurface Mach send right is
+// transferred to native_backing_registered and must be adopted by its caller.
+struct NativeGpuBacking {
+    uint64_t backing_id { 0 };
+    uint64_t generation { 0 };
+    uint32_t width { 0 };
+    uint32_t height { 0 };
+    uint32_t pixel_format { 0 };
+    uint32_t iosurface_mach_port { 0 };
+};
+
+struct NativeGpuFrame {
+    uint64_t backing_id { 0 };
+    uint64_t generation { 0 };
+    uint64_t frame_id { 0 };
+    uint64_t signal_value { 0 };
+    int width { 0 };
+    int height { 0 };
+    double device_pixel_ratio { 1.0 };
+};
+#endif
+
 struct ViewState {
     std::string url;
     std::string title;
@@ -45,6 +70,12 @@ enum class Cursor : uint8_t {
 struct ViewCallbacks {
     std::function<void(ViewState const&)> state_changed;
     std::function<void(std::shared_ptr<PresentedFrame const>)> frame_ready;
+#if defined(__APPLE__)
+    // Enable only after the shell has an operational native surface consumer.
+    bool native_metal_presentation { false };
+    std::function<bool(NativeGpuBacking const&)> native_backing_registered;
+    std::function<void(NativeGpuFrame const&)> native_frame_ready;
+#endif
     std::function<void(Cursor)> cursor_changed;
     std::function<void(std::string const&)> failed;
 };
@@ -100,6 +131,12 @@ public:
     // Call regularly on the thread that created the runtime. Engine callbacks
     // and ViewCallbacks are delivered synchronously from this call.
     void pump();
+#if defined(__APPLE__)
+    // Queue a callback on the run loop that created this runtime and wake it.
+    // The callback runs independently of Runtime::pump().
+    void set_native_release_drain_callback(void*, NativeReleaseDrainCallback);
+    void schedule_native_release_drain();
+#endif
     std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks);
 
 private:
@@ -122,6 +159,10 @@ public:
     void go_back();
     void go_forward();
     void resize(int logical_width, int logical_height, double device_pixel_ratio);
+#if defined(__APPLE__)
+    void release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id);
+    void set_native_metal_presentation(bool enabled);
+#endif
     void set_focus(bool);
     void send_pointer_event(PointerEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);

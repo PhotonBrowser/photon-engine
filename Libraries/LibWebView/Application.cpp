@@ -1668,11 +1668,22 @@ ErrorOr<void> Application::launch_compositor_process()
 
 void Application::notify_compositor_gpu_presentation_unavailable()
 {
+    m_compositor_metal_presentation_enabled = false;
     if (m_reported_compositor_gpu_presentation_unavailable)
         return;
     m_reported_compositor_gpu_presentation_unavailable = true;
     if (m_compositor_client)
         m_compositor_client->async_set_client_gpu_presentation_capability(false, 0);
+}
+
+void Application::notify_compositor_gpu_presentation_available()
+{
+    if (m_compositor_metal_presentation_enabled)
+        return;
+    m_compositor_metal_presentation_enabled = true;
+    m_reported_compositor_gpu_presentation_unavailable = false;
+    if (m_compositor_client)
+        m_compositor_client->async_set_client_gpu_presentation_capability(true, 0);
 }
 
 void Application::handle_compositor_process_death()

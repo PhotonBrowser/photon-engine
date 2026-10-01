@@ -174,6 +174,9 @@ public:
     bool rendering_opportunity_requested() const { return m_rendering_opportunity_requested; }
     bool window_resize_in_progress() const { return m_window_resize_in_progress == Compositing::WindowResizingInProgress::Yes; }
     bool is_present_blocked() const;
+    bool is_backing_store_rendering() const { return m_backing_store_manager.is_rendering(); }
+    bool has_available_backing_store_buffer() const { return m_backing_store_manager.has_available_buffer(); }
+    void log_backing_store_pool_state(StringView event) const { m_backing_store_manager.log_pool_state(event); }
     double rendering_opportunity_frame_interval(double display_refresh_rate) const;
     bool rendering_opportunity_is_due(MonotonicTime frame_time, double display_refresh_rate) const;
     void did_deliver_rendering_opportunity(MonotonicTime frame_time);
@@ -194,7 +197,7 @@ public:
     bool present_synchronously(Compositing::DisplayListPlayerSkia&, CompositedContextResolver const*);
     bool can_paint_screenshot(Gfx::ShareableBitmap&) const;
     void paint_screenshot(Compositing::DisplayListPlayerSkia&, Gfx::ShareableBitmap&, CompositedContextResolver const*);
-    bool acknowledge_presented_bitmap(i32 bitmap_id);
+    bool acknowledge_presented_bitmap(i32 bitmap_id, bool consumer_gpu_work_complete = false);
     void did_finish_gpu_present(i32 bitmap_id);
 
 private:

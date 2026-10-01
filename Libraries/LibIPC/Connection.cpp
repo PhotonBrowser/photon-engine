@@ -8,6 +8,8 @@
 
 #include <AK/ScopeGuard.h>
 #include <AK/Vector.h>
+#include <AK/Time.h>
+#include <cstdlib>
 #include <LibIPC/Connection.h>
 #include <LibIPC/Message.h>
 #include <LibIPC/Stub.h>
@@ -150,8 +152,13 @@ void ConnectionBase::wait_for_transport_to_become_readable()
 ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
 {
     VERIFY(m_owner_thread_id.is_current_thread());
+    static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    size_t drained = 0;
+    if (trace_enabled)
+        dbgln("[IPCDispatch] event=RECEIVE_BEGIN at_ns={} connection={} transport={} endpoint={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), reinterpret_cast<FlatPtr>(m_transport.ptr()), m_local_endpoint_magic);
     bool parse_error = false;
     auto schedule_shutdown = m_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
+        ++drained;
         auto bytes = raw_message.bytes.bytes();
         if (auto message = try_parse_message(bytes, raw_message.attachments)) {
             m_unprocessed_messages.append(message.release_nonnull());
@@ -160,6 +167,8 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
             parse_error = true;
         }
     });
+    if (trace_enabled)
+        dbgln("[IPCDispatch] event=RECEIVE_END at_ns={} connection={} transport={} drained={} pending={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), reinterpret_cast<FlatPtr>(m_transport.ptr()), drained, m_unprocessed_messages.size());
 
     if (parse_error) {
         dbgln("IPC::ConnectionBase ({:p}): Disconnecting peer after failing to parse a message", this);

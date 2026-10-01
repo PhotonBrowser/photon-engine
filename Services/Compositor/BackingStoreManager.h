@@ -10,7 +10,9 @@
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
+#include <AK/StringView.h>
 #include <AK/Types.h>
+#include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibCompositing/Types.h>
 #include <LibGfx/Forward.h>
@@ -57,7 +59,8 @@ public:
     bool has_available_buffer() const;
     Optional<RenderTarget> acquire_render_target(Gfx::IntRect frame_damage);
     void complete_rendering(i32 bitmap_id, bool release_to_external);
-    bool release_buffer(i32 bitmap_id);
+    bool release_buffer(i32 bitmap_id, bool consumer_gpu_work_complete = false);
+    void log_pool_state(StringView event) const;
     RefPtr<Gfx::PaintingSurface> latest_rendered_surface() const;
 
     Optional<Publication> add_backing_store_if_window_server_still_reads_every_released_store(RefPtr<Gfx::SkiaBackendContext> const&);
@@ -79,6 +82,8 @@ private:
         Gfx::IntRect accumulated_damage;
         bool was_presented_to_client { false };
         bool was_rendered_into_since_last_retirement_check { false };
+        Optional<MonotonicTime> last_consumer_release_time {};
+        bool consumer_gpu_work_complete { false };
     };
 
     static constexpr size_t maximum_backing_store_count = 8;
@@ -93,6 +98,7 @@ private:
     Gfx::IntSize m_allocated_size;
 
     Gfx::IntSize m_backing_store_size;
+    u64 m_pool_epoch { 0 };
     size_t m_initial_backing_store_count { 0 };
     Vector<BackingStore> m_backing_stores;
     Optional<size_t> m_rendering_store_index;

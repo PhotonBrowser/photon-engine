@@ -5,8 +5,9 @@
 
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/WebView/ConsoleOutput.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/Timer.h>
+#include <LibCore/MachPort.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SystemTheme.h>
@@ -20,12 +21,32 @@
 #include <LibWebView/ViewImplementation.h>
 #include <LibPhotonEmbedder/PhotonEmbedder.h>
 
+#if defined(__APPLE__)
+#    include <CoreFoundation/CoreFoundation.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <mutex>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace WebView {
+
+static bool photon_frame_trace_enabled()
+{
+    static bool enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    return enabled;
+}
+
+static bool external_image_lease_trace_enabled()
+{
+    static bool enabled = std::getenv("EXTERNAL_IMAGE_LEASE_TRACE") != nullptr;
+    return enabled;
+}
 
 class PhotonApplication final : public Application {
     WEB_VIEW_APPLICATION(PhotonApplication)
@@ -59,9 +80,10 @@ public:
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
         auto view = adopt_own(*new PhotonHeadlessWebView(theme.release_value(), { physical_width, physical_height }, dpr, move(callbacks)));
-        // Qt Quick currently samples owned CPU frames; it cannot yet import
-        // the compositor's Vulkan DMA-BUF images with safe synchronization.
-        Application::the().notify_compositor_gpu_presentation_unavailable();
+        if (!view->m_callbacks.native_metal_presentation
+            || !view->m_callbacks.native_backing_registered
+            || !view->m_callbacks.native_frame_ready)
+            Application::the().notify_compositor_gpu_presentation_unavailable();
         view->initialize_client(CreateNewClient::Yes);
         // initialize_client() establishes the WebContent client and can
         // initialize its viewport from the platform screen before the
@@ -75,9 +97,53 @@ public:
 
     void resize(int width, int height, double dpr)
     {
+        auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
+        auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
+        if (physical_width != m_native_width || physical_height != m_native_height) {
+            m_native_width = physical_width;
+            m_native_height = physical_height;
+            if (m_native_generation != 0)
+                ++m_native_generation;
+        }
         m_device_pixel_ratio = dpr;
-        reset_viewport_size({ max(1, static_cast<int>(std::lround(width * dpr))), max(1, static_cast<int>(std::lround(height * dpr))) });
+        if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE")) {
+            on_console_message = [](WebView::ConsoleOutput output) {
+                output.output.visit(
+                    [](WebView::ConsoleError const& error) { dbgln("[HTMLScript] error name={} message={}", error.name, error.message); },
+                    [](WebView::ConsoleLog const&) { dbgln("[HTMLScript] console_message at_ns={}", MonotonicTime::now().nanoseconds()); },
+                    [](WebView::ConsoleTrace const&) {});
+            };
+        }
+        reset_viewport_size({ physical_width, physical_height });
     }
+
+#if defined(AK_OS_MACOS)
+    void release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id)
+    {
+        auto it = m_native_leases.find(frame_id);
+        VERIFY(it != m_native_leases.end());
+        VERIFY(it->second.first == backing_id && it->second.second == generation);
+        m_native_leases.erase(it);
+        bool backing_still_leased = false;
+        for (auto const& lease : m_native_leases) {
+            if (lease.second.first == backing_id && lease.second.second == generation) {
+                backing_still_leased = true;
+                break;
+            }
+        }
+        if (external_image_lease_trace_enabled())
+            dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} state=RELEASE_RECEIVED remaining_leases={} backing_still_leased={} deferred_release={}", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id, m_native_leases.size(), backing_still_leased, m_deferred_backing_releases.contains(static_cast<i32>(backing_id - 1)));
+        if (!backing_still_leased) {
+            auto bitmap_id = static_cast<i32>(backing_id - 1);
+            m_native_leased_backings.erase(bitmap_id);
+            if (m_deferred_backing_releases.erase(bitmap_id) > 0) {
+                if (external_image_lease_trace_enabled())
+                    dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} state=DEFERRED_RELEASE->ENGINE_BACKING_RELEASE", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id);
+                release_backing_store(bitmap_id);
+            }
+        }
+    }
+#endif
 
     void navigate(StringView url)
     {
@@ -108,13 +174,44 @@ public:
 
     void clear_callbacks() { m_callbacks = {}; }
 
+    void set_native_metal_presentation(bool enabled)
+    {
+        m_native_metal_presentation = enabled;
+        if (enabled)
+            Application::the().notify_compositor_gpu_presentation_available();
+        else
+            Application::the().notify_compositor_gpu_presentation_unavailable();
+    }
+
 private:
     PhotonHeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize size, double dpr, Photon::ViewCallbacks callbacks)
         : HeadlessWebView(move(theme), size)
         , m_callbacks(move(callbacks))
     {
         m_device_pixel_ratio = dpr;
-        on_url_change = [this](URL::URL const&) { notify_state(); };
+        on_url_change = [this](URL::URL const& url) {
+            if (external_image_lease_trace_enabled()) {
+                auto serialized_url = url.serialize();
+#if defined(AK_OS_MACOS)
+                dbgln(
+                    "[ExternalImageLease][Embedder] at_ns={} state=NAVIGATION_STARTED url={} generation={} last_frame_id={}",
+                    MonotonicTime::now().nanoseconds(), serialized_url, m_native_generation, m_native_next_frame_id);
+#else
+                dbgln("[ExternalImageLease][Embedder] at_ns={} state=NAVIGATION_STARTED url={}", MonotonicTime::now().nanoseconds(), serialized_url);
+#endif
+            }
+            notify_state();
+        };
+#if defined(AK_OS_MACOS)
+        on_backing_store_pool_changed = [this] {
+            ++m_native_generation;
+            if (external_image_lease_trace_enabled()) {
+                dbgln(
+                    "[ExternalImageLease][Embedder] at_ns={} state=PRESENTATION_EPOCH_CHANGED reason=backing_store_pool_replaced generation={} last_frame_id={}",
+                    MonotonicTime::now().nanoseconds(), m_native_generation, m_native_next_frame_id);
+            }
+        };
+#endif
         on_title_change = [this](Utf16String const&) { notify_state(); };
         on_loading_state_change = [this](bool) { notify_state(); };
         on_cursor_change = [this](Gfx::Cursor const& cursor) {
@@ -150,23 +247,6 @@ private:
                 },
                 [this](Gfx::ImageCursor const&) { m_callbacks.cursor_changed(Photon::Cursor::Arrow); });
         };
-        on_load_start = [this] {
-            m_initial_navigation_pending = true;
-            m_waiting_for_post_load_paint = false;
-            if (m_initial_paint_fallback_timer)
-                m_initial_paint_fallback_timer->stop();
-        };
-        on_load_finish = [this](URL::URL const&) {
-            m_waiting_for_post_load_paint = true;
-            m_initial_paint_fallback_timer = Core::Timer::create_single_shot(50, [weak_this = make_weak_ptr<PhotonHeadlessWebView>()] {
-                if (!weak_this)
-                    return;
-                weak_this->m_initial_navigation_pending = false;
-                weak_this->m_waiting_for_post_load_paint = false;
-                weak_this->present_pending_initial_frame();
-            });
-            m_initial_paint_fallback_timer->start();
-        };
         on_browser_history_traversal_complete = [this] { notify_state(); };
         on_web_content_crashed = [this](auto) {
             if (m_callbacks.failed)
@@ -174,7 +254,67 @@ private:
         };
         on_ready_to_paint = [this] {
             auto paint_completed = std::chrono::steady_clock::now();
+            static uint64_t trace_frame_id = 0;
+            auto current_trace_frame_id = ++trace_frame_id;
             auto const& front = m_client_state.front_bitmap;
+            if (photon_frame_trace_enabled()) dbgln("[Photon] frame_callback id={} at_ns={} bitmap={} native={}", current_trace_frame_id, MonotonicTime::now().nanoseconds(), front.id,
+#if defined(AK_OS_MACOS)
+                m_callbacks.native_metal_presentation && !m_native_presentation_failed
+#else
+                false
+#endif
+            );
+#if defined(AK_OS_MACOS)
+            if (m_callbacks.native_metal_presentation && m_native_metal_presentation && !m_native_presentation_failed
+                && m_callbacks.native_backing_registered
+                && m_callbacks.native_frame_ready
+                && front.presentation_signal_value != 0
+                && front.shared_image_buffer) {
+                auto backing_id = static_cast<uint64_t>(front.id) + 1;
+                auto generation = m_native_generation;
+                VERIFY(backing_id != 0 && generation != 0);
+                if (!m_registered_native_backings.contains({ backing_id, generation })) {
+                    auto const& surface = front.shared_image_buffer->iosurface_handle();
+                    auto mach_port = surface.create_mach_port();
+                    Photon::NativeGpuBacking backing {
+                        .backing_id = backing_id,
+                        .generation = generation,
+                        .width = static_cast<uint32_t>(surface.width()),
+                        .height = static_cast<uint32_t>(surface.height()),
+                        .pixel_format = surface.pixel_format(),
+                        .iosurface_mach_port = static_cast<uint32_t>(mach_port.release()),
+                    };
+                    if (!m_callbacks.native_backing_registered(backing)) {
+                        m_native_presentation_failed = true;
+                        Application::the().notify_compositor_gpu_presentation_unavailable();
+                        dbgln("Photon embedder: native Metal backing registration failed; using CPU frames");
+                    } else {
+                    m_registered_native_backings.emplace(backing_id, generation);
+                    }
+                }
+
+                if (m_native_presentation_failed)
+                    goto cpu_fallback;
+
+                auto frame_id = ++m_native_next_frame_id;
+                m_native_leases.emplace(frame_id, std::pair { backing_id, generation });
+                m_native_leased_backings.emplace(front.id);
+                if (external_image_lease_trace_enabled())
+                    dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} bitmap_id={} state=PUBLISHED signal_value={} leases={} leased_backings={}", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id, front.id, front.presentation_signal_value, m_native_leases.size(), m_native_leased_backings.size());
+                auto content_size = front.last_painted_size.to_type<int>();
+                m_callbacks.native_frame_ready(Photon::NativeGpuFrame {
+                    .backing_id = backing_id,
+                    .generation = generation,
+                    .frame_id = frame_id,
+                    .signal_value = front.presentation_signal_value,
+                    .width = content_size.width(),
+                    .height = content_size.height(),
+                    .device_pixel_ratio = m_device_pixel_ratio,
+                });
+                return;
+            }
+#endif
+        cpu_fallback:
             if (!front.shared_image_buffer || !m_callbacks.frame_ready) {
                 dbgln("Photon embedder: paint callback without a shared image buffer");
                 return;
@@ -200,42 +340,65 @@ private:
             for (int row = 0; row < frame->height; ++row)
                 std::copy_n(bitmap->scanline_u8(row), frame->stride, frame->pixels.data() + row * frame->stride);
             frame->copy_time_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - copy_started).count();
-            if (m_initial_navigation_pending) {
-                if (m_waiting_for_post_load_paint) {
-                    m_initial_navigation_pending = false;
-                    m_waiting_for_post_load_paint = false;
-                    if (m_initial_paint_fallback_timer)
-                        m_initial_paint_fallback_timer->stop();
-                    m_pending_initial_frame.reset();
-                    frame->paint_to_callback_microseconds = 0;
-                    m_callbacks.frame_ready(move(frame));
-                    return;
-                }
-                m_pending_initial_frame = move(frame);
-                return;
-            }
             frame->paint_to_callback_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - paint_completed).count();
             m_callbacks.frame_ready(move(frame));
         };
     }
 
     Photon::ViewCallbacks m_callbacks;
-    std::shared_ptr<Photon::PresentedFrame const> m_pending_initial_frame;
-    RefPtr<Core::Timer> m_initial_paint_fallback_timer;
-    bool m_initial_navigation_pending { false };
-    bool m_waiting_for_post_load_paint { false };
     Optional<std::chrono::steady_clock::time_point> m_last_paint_completed;
-
-    void present_pending_initial_frame()
+#if defined(AK_OS_MACOS)
+    virtual bool defer_backing_store_release(i32 bitmap_id) override
     {
-        if (m_pending_initial_frame && m_callbacks.frame_ready)
-            m_callbacks.frame_ready(move(m_pending_initial_frame));
+        if (!m_native_leased_backings.contains(bitmap_id)) {
+            if (external_image_lease_trace_enabled())
+                dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id=not-available state=BACKING_RELEASE_NOT_DEFERRED reason=no_active_native_lease", MonotonicTime::now().nanoseconds(), static_cast<u64>(bitmap_id) + 1, m_native_generation);
+            return false;
+        }
+        m_deferred_backing_releases.emplace(bitmap_id);
+        if (external_image_lease_trace_enabled())
+            dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id=active state=BACKING_RELEASE_DEFERRED native_leases={} deferred_backings={}", MonotonicTime::now().nanoseconds(), static_cast<u64>(bitmap_id) + 1, m_native_generation, m_native_leases.size(), m_deferred_backing_releases.size());
+        return true;
     }
+
+    uint64_t m_native_generation { 1 };
+    uint64_t m_native_next_frame_id { 0 };
+    int m_native_width { 0 };
+    int m_native_height { 0 };
+    std::set<std::pair<uint64_t, uint64_t>> m_registered_native_backings;
+    std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> m_native_leases;
+    std::unordered_set<i32> m_native_leased_backings;
+    std::unordered_set<i32> m_deferred_backing_releases;
+    bool m_native_presentation_failed { false };
+    bool m_native_metal_presentation { false };
+#endif
 };
 
 }
 
 namespace Photon {
+
+#if defined(__APPLE__)
+struct NativeReleaseDrainState {
+    std::mutex mutex;
+    void* context { nullptr };
+    NativeReleaseDrainCallback callback { nullptr };
+};
+
+static void perform_native_release_drain(void* info)
+{
+    auto& state = *static_cast<NativeReleaseDrainState*>(info);
+    NativeReleaseDrainCallback callback;
+    void* context;
+    {
+        std::lock_guard lock(state.mutex);
+        callback = state.callback;
+        context = state.context;
+    }
+    if (callback)
+        callback(context);
+}
+#endif
 
 struct Runtime::Impl {
     std::string executable { "photon" };
@@ -244,6 +407,28 @@ struct Runtime::Impl {
     AK::StringView argument_views[2] { { executable.data(), executable.size() }, { temporary_profile.data(), temporary_profile.size() } };
     Main::Arguments arguments { 2, argv, argument_views };
     OwnPtr<WebView::PhotonApplication> application;
+#if defined(__APPLE__)
+    CFRunLoopRef owner_run_loop { nullptr };
+    CFRunLoopSourceRef native_release_drain_source { nullptr };
+    CFRunLoopTimerRef diagnostic_pump_timer { nullptr };
+    std::shared_ptr<NativeReleaseDrainState> native_release_drain { std::make_shared<NativeReleaseDrainState>() };
+
+    ~Impl()
+    {
+        if (diagnostic_pump_timer) {
+            CFRunLoopTimerInvalidate(diagnostic_pump_timer);
+            CFRelease(diagnostic_pump_timer);
+        }
+        if (native_release_drain_source) {
+            CFRunLoopSourceInvalidate(native_release_drain_source);
+            if (owner_run_loop)
+                CFRunLoopRemoveSource(owner_run_loop, native_release_drain_source, kCFRunLoopCommonModes);
+            CFRelease(native_release_drain_source);
+        }
+        if (owner_run_loop)
+            CFRelease(owner_run_loop);
+    }
+#endif
 };
 
 struct View::Impl {
@@ -267,6 +452,36 @@ std::unique_ptr<Runtime> Runtime::create(std::string const& helper_directory, st
         return {};
     }
     impl->application = app.release_value();
+#if defined(__APPLE__)
+    impl->owner_run_loop = CFRunLoopGetCurrent();
+    CFRetain(impl->owner_run_loop);
+    CFRunLoopSourceContext source_context {};
+    source_context.info = impl->native_release_drain.get();
+    source_context.perform = perform_native_release_drain;
+    impl->native_release_drain_source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &source_context);
+    if (!impl->native_release_drain_source) {
+        error = "Could not create the native frame-release run-loop source";
+        return {};
+    }
+    CFRunLoopAddSource(impl->owner_run_loop, impl->native_release_drain_source, kCFRunLoopCommonModes);
+    // Opt-in, one-shot diagnostic comparison. Never used for normal progress.
+    if (auto* delay_text = std::getenv("PHOTON_DIAGNOSTIC_PUMP_AFTER_MS")) {
+        char* end = nullptr;
+        auto delay_ms = std::strtol(delay_text, &end, 10);
+        if (end != delay_text && *end == '\0' && delay_ms > 0 && delay_ms <= 60000) {
+            CFRunLoopTimerContext context {};
+            impl->diagnostic_pump_timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + static_cast<double>(delay_ms) / 1000.0, 0, 0, 0,
+                [](CFRunLoopTimerRef, void*) {
+                    dbgln("[DiagnosticPump] event=BEGIN at_ns={} one_shot=true", MonotonicTime::now().nanoseconds());
+                    auto processed = Core::EventLoop::current().pump(Core::EventLoop::WaitMode::PollForEvents);
+                    dbgln("[DiagnosticPump] event=END at_ns={} processed={}", MonotonicTime::now().nanoseconds(), processed);
+                },
+                &context);
+            if (impl->diagnostic_pump_timer)
+                CFRunLoopAddTimer(impl->owner_run_loop, impl->diagnostic_pump_timer, kCFRunLoopCommonModes);
+        }
+    }
+#endif
     return std::unique_ptr<Runtime>(new Runtime(move(impl)));
 }
 
@@ -278,6 +493,21 @@ void Runtime::pump()
 {
     (void)Core::EventLoop::current().pump(Core::EventLoop::WaitMode::PollForEvents);
 }
+
+#if defined(__APPLE__)
+void Runtime::set_native_release_drain_callback(void* context, NativeReleaseDrainCallback callback)
+{
+    std::lock_guard lock(m_impl->native_release_drain->mutex);
+    m_impl->native_release_drain->context = context;
+    m_impl->native_release_drain->callback = callback;
+}
+
+void Runtime::schedule_native_release_drain()
+{
+    CFRunLoopSourceSignal(m_impl->native_release_drain_source);
+    CFRunLoopWakeUp(m_impl->owner_run_loop);
+}
+#endif
 
 std::unique_ptr<View> Runtime::create_view(int width, int height, double dpr, ViewCallbacks callbacks)
 {
@@ -314,6 +544,19 @@ void View::resize(int width, int height, double dpr)
     m_impl->last_device_pixel_ratio = dpr;
     m_impl->view->resize(width, height, dpr);
 }
+#if defined(AK_OS_MACOS)
+void View::release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->release_native_frame(backing_id, generation, frame_id);
+}
+
+void View::set_native_metal_presentation(bool enabled)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->set_native_metal_presentation(enabled);
+}
+#endif
 void View::set_focus(bool focused) { m_impl->view->set_has_system_focus(focused); }
 
 static Web::UIEvents::KeyModifier modifiers(bool shift, bool control, bool alt, bool meta)

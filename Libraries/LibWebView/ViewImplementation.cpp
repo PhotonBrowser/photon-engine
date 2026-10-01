@@ -36,9 +36,18 @@
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/ViewImplementation.h>
+
 #include <LibWebView/WebContentTestClient.h>
 
+#include <cstdlib>
+
 namespace WebView {
+
+static bool external_image_lease_trace_enabled()
+{
+    static bool enabled = std::getenv("EXTERNAL_IMAGE_LEASE_TRACE") != nullptr;
+    return enabled;
+}
 
 static HashMap<u64, ViewImplementation*>& all_views()
 {
@@ -208,7 +217,7 @@ void ViewImplementation::set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap
 // The tab is displayed in a process of its own, whose page starts from a document standing in for the entry of the
 // document state given. The outgoing process keeps displaying the tab's document until the UI process has unloaded
 // it there, before a document activates in the new page.
-void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect)
+void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect, u64 presentation_signal_value)
 {
     bool did_swap_bitmap = false;
     auto previous_front_bitmap_id = m_client_state.front_bitmap.id;
@@ -216,6 +225,7 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
     if (bitmap_index.has_value()) {
         m_client_state.has_usable_bitmap = true;
         m_client_state.other_bitmaps[*bitmap_index].last_painted_size = size.to_type<Web::DevicePixels>();
+        m_client_state.other_bitmaps[*bitmap_index].presentation_signal_value = presentation_signal_value;
         swap(m_client_state.other_bitmaps[*bitmap_index], m_client_state.front_bitmap);
         m_backup_shared_image_buffer = nullptr;
         did_swap_bitmap = true;
@@ -225,6 +235,8 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
         bitmap_id, page_id(), size.width(), size.height(), did_swap_bitmap, m_client_state.front_bitmap.id);
 
     auto bitmap_to_release = did_swap_bitmap ? previous_front_bitmap_id : bitmap_id;
+    if (external_image_lease_trace_enabled())
+        dbgln("[ExternalImageLease][View] at_ns={} incoming_bitmap_id={} incoming_backing_id={} presentation_signal={} did_swap={} previous_front_bitmap_id={} bitmap_to_release={} state={}", MonotonicTime::now().nanoseconds(), bitmap_id, static_cast<u64>(bitmap_id) + 1, presentation_signal_value, did_swap_bitmap, previous_front_bitmap_id, bitmap_to_release, did_swap_bitmap ? "FRONT_REPLACED" : "PRESENTATION_REJECTED");
     if (!defer_backing_store_release(bitmap_to_release))
         release_backing_store(bitmap_to_release);
 
@@ -241,6 +253,8 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
 
 void ViewImplementation::release_backing_store(i32 bitmap_id)
 {
+    if (external_image_lease_trace_enabled())
+        dbgln("[ExternalImageLease][View] at_ns={} backing_id={} bitmap_id={} generation=not-available frame_id=not-available state=RELEASE_SENT_TO_WEB_CONTENT", MonotonicTime::now().nanoseconds(), static_cast<u64>(bitmap_id) + 1, bitmap_id);
     page().release_presented_bitmap(bitmap_id);
 }
 
@@ -2141,6 +2155,8 @@ void ViewImplementation::install_backing_stores(Vector<i32> bitmap_ids, Vector<G
             .shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::import_from_shared_image(move(backing_stores[i]))),
         });
     }
+    if (on_backing_store_pool_changed)
+        on_backing_store_pool_changed();
 }
 
 void ViewImplementation::update_zoom()

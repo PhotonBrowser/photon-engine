@@ -10,6 +10,8 @@
 #include <LibGfx/PaintingSurface.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SkiaBackendContext.h>
+#include <AK/Time.h>
+#include <cstdlib>
 
 #ifdef USE_VULKAN_DMABUF_IMAGES
 #    include <AK/Array.h>
@@ -22,6 +24,12 @@
 #endif
 
 namespace Compositor {
+
+static bool external_image_lease_trace_enabled()
+{
+    static bool enabled = std::getenv("EXTERNAL_IMAGE_LEASE_TRACE") != nullptr;
+    return enabled;
+}
 
 #if defined(USE_DIRECTX) || defined(USE_VULKAN)
 static NonnullRefPtr<Gfx::PaintingSurface> create_gpu_painting_surface_with_bitmap_flush(Gfx::IntSize size, Gfx::SharedImageBuffer& buffer, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
@@ -121,6 +129,7 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
 
     if (force_reallocate || m_allocated_size.is_empty() || !m_allocated_size.contains(minimum_needed_size)) {
         m_allocated_size = minimum_needed_size;
+        ++m_pool_epoch;
         auto buffer_count = backing_store_count_for(should_publish);
         Vector<i32> bitmap_ids;
         bitmap_ids.ensure_capacity(buffer_count);
@@ -329,9 +338,15 @@ Optional<BackingStoreManager::RenderTarget> BackingStoreManager::acquire_render_
         if (!store_can_be_rendered_into(store))
             continue;
 
+        auto acquired_at = MonotonicTime::now();
         store.state = BufferState::Rendering;
+        store.consumer_gpu_work_complete = false;
         store.was_rendered_into_since_last_retirement_check = true;
         m_rendering_store_index = i;
+        if (external_image_lease_trace_enabled())
+            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state=AVAILABLE->RENDERING", MonotonicTime::now().nanoseconds(), static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch);
+        if (external_image_lease_trace_enabled() && store.last_consumer_release_time.has_value())
+            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} pool_epoch={} state=ACQUIRED release_to_acquire_us={}", acquired_at.nanoseconds(), static_cast<u64>(store.bitmap_id) + 1, m_pool_epoch, (acquired_at - *store.last_consumer_release_time).to_microseconds());
         auto damage_rect = store.accumulated_damage;
         store.accumulated_damage = {};
         return RenderTarget { *store.surface, store.bitmap_id, damage_rect };
@@ -354,17 +369,61 @@ void BackingStoreManager::complete_rendering(i32 bitmap_id, bool wait_for_releas
         store.was_presented_to_client = true;
     m_latest_rendered_store_index = m_rendering_store_index;
     m_rendering_store_index.clear();
+    if (external_image_lease_trace_enabled())
+        dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state=RENDERING->PRESENTED wait_for_consumer_release={}", MonotonicTime::now().nanoseconds(), static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch, wait_for_release);
 }
 
-bool BackingStoreManager::release_buffer(i32 bitmap_id)
+bool BackingStoreManager::release_buffer(i32 bitmap_id, bool consumer_gpu_work_complete)
 {
     for (auto& store : m_backing_stores) {
-        if (store.bitmap_id != bitmap_id || store.state != BufferState::Presented)
+        if (store.bitmap_id != bitmap_id)
             continue;
+        auto received_at = MonotonicTime::now();
+        if (external_image_lease_trace_enabled())
+            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} pool_epoch={} state=RELEASE_RECEIVED buffer_state={} presented_to_client={} iosurface_in_use={} renderable={} consumer_gpu_work_complete={}", received_at.nanoseconds(), static_cast<u64>(bitmap_id) + 1, m_pool_epoch, static_cast<unsigned>(store.state), store.was_presented_to_client, published_surface_is_in_use(store), store_can_be_rendered_into(store), consumer_gpu_work_complete);
+        if (store.state != BufferState::Presented)
+            return false;
         store.state = BufferState::Available;
+        store.last_consumer_release_time = received_at;
+        store.consumer_gpu_work_complete = consumer_gpu_work_complete;
+        // An explicit native GPU completion release proves the client is no
+        // longer sampling this frame, even if its cached Metal texture keeps
+        // IOSurfaceIsInUse set while the backing remains registered.
+        if (consumer_gpu_work_complete)
+            store.was_presented_to_client = false;
+        if (external_image_lease_trace_enabled())
+            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state=PRESENTED->AVAILABLE consumer_gpu_work_complete={} available_for_rendering={}", MonotonicTime::now().nanoseconds(), static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch, consumer_gpu_work_complete, store_can_be_rendered_into(store));
+        if (external_image_lease_trace_enabled())
+            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} pool_epoch={} state=REUSE_GATE_UPDATED presented_to_client={} consumer_release_gpu_complete={} iosurface_in_use={} iosurface_gate_bypassed={} renderable={} release_to_renderable_us={}", MonotonicTime::now().nanoseconds(), static_cast<u64>(bitmap_id) + 1, m_pool_epoch, store.was_presented_to_client, store.consumer_gpu_work_complete, published_surface_is_in_use(store), !store.was_presented_to_client, store_can_be_rendered_into(store), (MonotonicTime::now() - received_at).to_microseconds());
         return true;
     }
     return false;
+}
+
+void BackingStoreManager::log_pool_state(StringView event) const
+{
+    if (!external_image_lease_trace_enabled())
+        return;
+    size_t available = 0;
+    size_t state_available = 0;
+    size_t rendering = 0;
+    size_t presented = 0;
+    for (auto const& store : m_backing_stores) {
+        switch (store.state) {
+        case BufferState::Available: ++state_available; break;
+        case BufferState::Rendering: ++rendering; break;
+        case BufferState::Presented: ++presented; break;
+        }
+    }
+    for (auto const& store : m_backing_stores) {
+        if (store_can_be_rendered_into(store))
+            ++available;
+    }
+    dbgln("[ExternalImageLease][Pool] at_ns={} event={} pool_epoch={} allocated={} available={} state_available={} rendering={} presented={} outstanding_presented={}", MonotonicTime::now().nanoseconds(), event, m_pool_epoch, m_backing_stores.size(), available, state_available, rendering, presented, presented);
+    for (auto const& store : m_backing_stores) {
+        auto state = store.state == BufferState::Available ? "AVAILABLE"sv : store.state == BufferState::Rendering ? "RENDERING"sv : "PRESENTED"sv;
+        dbgln("[ExternalImageLease][Pool] at_ns={} event={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state={} presented_to_client={} consumer_release_gpu_complete={} iosurface_in_use={} iosurface_gate_bypassed={} available_for_rendering={}", MonotonicTime::now().nanoseconds(), event, static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch, state, store.was_presented_to_client, store.consumer_gpu_work_complete, published_surface_is_in_use(store), !store.was_presented_to_client, store_can_be_rendered_into(store));
+    }
 }
 
 RefPtr<Gfx::PaintingSurface> BackingStoreManager::latest_rendered_surface() const
