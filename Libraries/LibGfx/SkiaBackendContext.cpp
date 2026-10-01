@@ -8,12 +8,17 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/RefPtr.h>
+#include <AK/String.h>
 #include <AK/Time.h>
+#include <AK/Vector.h>
 #include <LibGfx/Bitmap.h>
 #ifdef USE_DIRECTX
 #    include <LibGfx/Direct3DContext.h>
 #endif
 #include <LibGfx/SkiaBackendContext.h>
+#ifdef AK_OS_MACOS
+#    include <LibGfx/PhotonGaneshPersistentCache.h>
+#endif
 
 #include <core/SkSurface.h>
 #include <gpu/ganesh/GrContextOptions.h>
@@ -75,13 +80,23 @@ static SkSurfaces::BackendSurfaceAccess to_backend_surface_access(SkiaBackendCon
         : SkSurfaces::BackendSurfaceAccess::kNoAccess;
 }
 
-static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurface* surface, SkiaBackendContext::SurfaceAccess access, Function<void()>&& callback)
+static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurface* surface, SkiaBackendContext::SurfaceAccess access, Function<void()>&& callback, GrBackendSemaphore* signal_semaphore = nullptr)
 {
     GrFlushInfo flush_info {};
+    if (signal_semaphore) {
+        flush_info.fNumSemaphores = 1;
+        flush_info.fSignalSemaphores = signal_semaphore;
+    }
     flush_info.fFinishedProc = invoke_async_flush_callback;
     flush_info.fFinishedContext = new Function<void()>(move(callback));
+    auto const flush_started_at = MonotonicTime::now();
     context.flush(surface, to_backend_surface_access(access), flush_info);
+    auto const flush_duration = MonotonicTime::now() - flush_started_at;
+    auto const submit_started_at = MonotonicTime::now();
     VERIFY(context.submit(GrSyncCpu::kNo));
+    auto const submit_duration = MonotonicTime::now() - submit_started_at;
+    if (std::getenv("PHOTON_VERBOSE") && (flush_duration.to_microseconds() >= 5000 || submit_duration.to_microseconds() >= 5000))
+        dbgln("Photon Skia submit detail: flush={:.2f}ms metal_submit={:.2f}ms", flush_duration.to_seconds_f64() * 1000.0, submit_duration.to_seconds_f64() * 1000.0);
 }
 #endif
 
@@ -98,9 +113,9 @@ void SkiaBackendContext::flush_and_submit(SkSurface* surface, SurfaceAccess acce
     perform_post_flush_cleanup();
 }
 
-void SkiaBackendContext::flush_and_submit_async(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback)
+void SkiaBackendContext::flush_and_submit_async(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t presentation_signal_value)
 {
-    flush_and_submit_async_impl(surface, access, move(callback));
+    flush_and_submit_async_impl(surface, access, move(callback), presentation_signal_value);
 
     perform_post_flush_cleanup();
 }
@@ -119,20 +134,48 @@ void SkiaBackendContext::perform_post_flush_cleanup()
         return;
 
     s_last_deferred_cleanup = now;
-    context->performDeferredCleanup(skia_deferred_cleanup_resource_age);
+    int resource_count_before = 0;
+    size_t resource_bytes_before = 0;
+    context->getResourceCacheUsage(&resource_count_before, &resource_bytes_before);
 
+    auto const deferred_cleanup_started_at = MonotonicTime::now();
+    context->performDeferredCleanup(skia_deferred_cleanup_resource_age);
+    auto const deferred_cleanup_duration = MonotonicTime::now() - deferred_cleanup_started_at;
+
+    int resource_count_after_deferred_cleanup = 0;
     size_t resource_bytes = 0;
-    context->getResourceCacheUsage(nullptr, &resource_bytes);
-    if (resource_bytes < skia_resource_cache_high_watermark)
+    context->getResourceCacheUsage(&resource_count_after_deferred_cleanup, &resource_bytes);
+    auto const resource_bytes_after_deferred_cleanup = resource_bytes;
+    if (resource_bytes < skia_resource_cache_high_watermark) {
+        if (std::getenv("PHOTON_VERBOSE") && deferred_cleanup_duration.to_microseconds() >= 5000)
+            dbgln("Photon Skia cleanup detail: deferred={:.2f}ms aggressive=skipped purge=skipped resources={}->{} cache_bytes={}->{}", deferred_cleanup_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_bytes_before, resource_bytes);
         return;
-    if (s_last_aggressive_cleanup.has_value() && now - *s_last_aggressive_cleanup < skia_aggressive_cleanup_interval)
+    }
+    if (s_last_aggressive_cleanup.has_value() && now - *s_last_aggressive_cleanup < skia_aggressive_cleanup_interval) {
+        if (std::getenv("PHOTON_VERBOSE") && deferred_cleanup_duration.to_microseconds() >= 5000)
+            dbgln("Photon Skia cleanup detail: deferred={:.2f}ms aggressive=throttled purge=skipped resources={}->{} cache_bytes={}->{}", deferred_cleanup_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_bytes_before, resource_bytes);
         return;
+    }
 
     s_last_aggressive_cleanup = now;
+    auto const aggressive_cleanup_started_at = MonotonicTime::now();
     context->performDeferredCleanup(std::chrono::milliseconds(0));
-    context->getResourceCacheUsage(nullptr, &resource_bytes);
-    if (resource_bytes >= skia_resource_cache_critical_watermark)
+    auto const aggressive_cleanup_duration = MonotonicTime::now() - aggressive_cleanup_started_at;
+    int resource_count_after_aggressive_cleanup = 0;
+    context->getResourceCacheUsage(&resource_count_after_aggressive_cleanup, &resource_bytes);
+    AK::Duration purge_duration {};
+    if (resource_bytes >= skia_resource_cache_critical_watermark) {
+        auto const purge_started_at = MonotonicTime::now();
         context->purgeUnlockedResources(GrPurgeResourceOptions::kScratchResourcesOnly);
+        purge_duration = MonotonicTime::now() - purge_started_at;
+    }
+
+    int resource_count_after_purge = 0;
+    size_t resource_bytes_after_purge = 0;
+    context->getResourceCacheUsage(&resource_count_after_purge, &resource_bytes_after_purge);
+    auto const cleanup_duration = MonotonicTime::now() - deferred_cleanup_started_at;
+    if (std::getenv("PHOTON_VERBOSE") && cleanup_duration.to_microseconds() >= 5000)
+        dbgln("Photon Skia cleanup detail: total={:.2f}ms deferred={:.2f}ms aggressive={:.2f}ms purge={:.2f}ms resources={}/{}/{}/{} cache_bytes={}/{}/{}/{}", cleanup_duration.to_seconds_f64() * 1000.0, deferred_cleanup_duration.to_seconds_f64() * 1000.0, aggressive_cleanup_duration.to_seconds_f64() * 1000.0, purge_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_count_after_aggressive_cleanup, resource_count_after_purge, resource_bytes_before, resource_bytes_after_deferred_cleanup, resource_bytes, resource_bytes_after_purge);
 }
 
 void SkiaBackendContext::initialize_gpu_backend()
@@ -198,7 +241,7 @@ public:
         m_context->submit(GrSyncCpu::kYes);
     }
 
-    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback) override
+    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t) override
     {
         flush_and_submit_async_to_context(*m_context, surface, access, move(callback));
     }
@@ -268,7 +311,7 @@ public:
         m_context->submit(GrSyncCpu::kYes);
     }
 
-    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback) override
+    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t) override
     {
         flush_and_submit_async_to_context(*m_context, surface, access, move(callback));
     }
@@ -334,13 +377,15 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
 #endif
 
 #ifdef AK_OS_MACOS
+
 class SkiaMetalBackendContext final : public SkiaBackendContext {
     AK_MAKE_NONCOPYABLE(SkiaMetalBackendContext);
     AK_MAKE_NONMOVABLE(SkiaMetalBackendContext);
 
 public:
-    SkiaMetalBackendContext(sk_sp<GrDirectContext> context, NonnullRefPtr<MetalContext> metal_context)
+    SkiaMetalBackendContext(sk_sp<GrDirectContext> context, OwnPtr<PhotonGaneshPersistentCache> persistent_cache, NonnullRefPtr<MetalContext> metal_context)
         : m_context(move(context))
+        , m_persistent_cache(move(persistent_cache))
         , m_metal_context(move(metal_context))
     {
     }
@@ -357,9 +402,14 @@ public:
         m_context->submit(GrSyncCpu::kYes);
     }
 
-    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback) override
+    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t presentation_signal_value) override
     {
-        flush_and_submit_async_to_context(*m_context, surface, access, move(callback));
+        void* signal_semaphore = nullptr;
+        if (presentation_signal_value != 0)
+            signal_semaphore = m_metal_context->create_presentation_signal_semaphore(presentation_signal_value);
+        flush_and_submit_async_to_context(*m_context, surface, access, move(callback), static_cast<GrBackendSemaphore*>(signal_semaphore));
+        if (signal_semaphore)
+            m_metal_context->destroy_presentation_signal_semaphore(signal_semaphore);
     }
 
     GrDirectContext* sk_context() const override { return m_context.get(); }
@@ -370,6 +420,7 @@ public:
 
 private:
     sk_sp<GrDirectContext> m_context;
+    OwnPtr<PhotonGaneshPersistentCache> m_persistent_cache;
     NonnullRefPtr<MetalContext> m_metal_context;
 };
 
@@ -378,10 +429,13 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_metal_context(NonnullRefPt
     GrMtlBackendContext backend_context;
     backend_context.fDevice.retain(metal_context->device());
     backend_context.fQueue.retain(metal_context->queue());
-    sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeMetal(backend_context);
+    auto persistent_cache = make<PhotonGaneshPersistentCache>(metal_context->device_registry_id());
+    GrContextOptions options;
+    options.fPersistentCache = persistent_cache.ptr();
+    sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeMetal(backend_context, options);
     VERIFY(ctx);
     ctx->setResourceCacheLimit(skia_resource_cache_limit);
-    return adopt_ref(*new SkiaMetalBackendContext(move(ctx), move(metal_context)));
+    return adopt_ref(*new SkiaMetalBackendContext(move(ctx), move(persistent_cache), move(metal_context)));
 }
 #endif
 

@@ -174,7 +174,7 @@ void DisplayListPlayerSkia::flush(Gfx::PaintingSurface& surface)
     surface.flush();
 }
 
-void DisplayListPlayerSkia::flush_async(Gfx::PaintingSurface& surface, Function<void()>&& callback)
+void DisplayListPlayerSkia::flush_async(Gfx::PaintingSurface& surface, Function<void()>&& callback, uint64_t presentation_signal_value)
 {
     auto context = surface.skia_backend_context();
     auto const access = surface.requires_external_access()
@@ -182,7 +182,7 @@ void DisplayListPlayerSkia::flush_async(Gfx::PaintingSurface& surface, Function<
         : Gfx::SkiaBackendContext::SurfaceAccess::Internal;
 
     if (context)
-        context->flush_and_submit_async(&surface.sk_surface(), access, move(callback));
+        context->flush_and_submit_async(&surface.sk_surface(), access, move(callback), presentation_signal_value);
     else
         callback();
 }

@@ -10,6 +10,8 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
+
+#include <cstdint>
 #include <LibCompositing/DisplayList/CompositedContext.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
@@ -47,7 +49,7 @@ public:
         CompositedContextResolver const*);
 
     void flush(Gfx::PaintingSurface&) override;
-    void flush_async(Gfx::PaintingSurface&, Function<void()>&&);
+    void flush_async(Gfx::PaintingSurface&, Function<void()>&&, uint64_t presentation_signal_value = 0);
     void paint_scrollbar(Gfx::PaintingSurface&, PaintScrollBar const&);
 
 private:

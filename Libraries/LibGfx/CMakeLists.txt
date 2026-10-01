@@ -38,6 +38,7 @@ set(SOURCES
     Painter.cpp
     PainterSkia.cpp
     PaintingSurface.cpp
+    PhotonGaneshPersistentCache.cpp
     Palette.cpp
     Path.cpp
     PathSkia.cpp

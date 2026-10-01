@@ -1642,6 +1642,7 @@ mod tests {
         ClipNodeData::Rect(ClipData {
             rect,
             corner_radii: CornerRadii::default(),
+            corner_shapes: [1.0; 4],
             mode: ClipMode::Intersect,
         })
     }
@@ -2182,6 +2183,7 @@ mod tests {
                 ClipNodeData::Rect(ClipData {
                     rect: FloatRect::new(0.0, clip_y, 100.0, 100.0),
                     corner_radii: CornerRadii::default(),
+            corner_shapes: [1.0; 4],
                     mode: clip_mode,
                 }),
                 ClipNodeIndex::NONE,

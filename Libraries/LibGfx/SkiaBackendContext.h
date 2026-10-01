@@ -10,6 +10,8 @@
 #include <AK/Function.h>
 #include <AK/Noncopyable.h>
 
+#include <cstdint>
+
 #ifdef USE_DIRECTX
 #    include <LibGfx/Direct3DContext.h>
 #endif
@@ -61,7 +63,7 @@ public:
     virtual ~SkiaBackendContext() { }
 
     void flush_and_submit(SkSurface*, SurfaceAccess);
-    void flush_and_submit_async(SkSurface*, SurfaceAccess, Function<void()>&&);
+    void flush_and_submit_async(SkSurface*, SurfaceAccess, Function<void()>&&, uint64_t presentation_signal_value = 0);
     void check_async_work_completion();
     virtual GrDirectContext* sk_context() const = 0;
 
@@ -71,7 +73,7 @@ public:
 
 protected:
     virtual void flush_and_submit_impl(SkSurface*, SurfaceAccess) = 0;
-    virtual void flush_and_submit_async_impl(SkSurface*, SurfaceAccess, Function<void()>&&) = 0;
+    virtual void flush_and_submit_async_impl(SkSurface*, SurfaceAccess, Function<void()>&&, uint64_t presentation_signal_value) = 0;
 
 private:
     void perform_post_flush_cleanup();
