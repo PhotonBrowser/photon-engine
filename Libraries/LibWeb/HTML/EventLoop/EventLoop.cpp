@@ -8,6 +8,7 @@
 #include <AK/AnyOf.h>
 #include <AK/Debug.h>
 #include <AK/TemporaryChange.h>
+#include <cstdlib>
 #include <LibCore/EventLoop.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/VM.h>
@@ -38,6 +39,12 @@
 #include <LibWebCommon/Page/QueuedInputEvent.h>
 
 namespace Web::HTML {
+
+static bool photon_frame_trace_enabled()
+{
+    static bool enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    return enabled;
+}
 
 GC_DEFINE_ALLOCATOR(EventLoop);
 
@@ -83,8 +90,10 @@ void EventLoop::schedule()
         }));
     }
 
-    if (!m_system_event_loop_timer->is_active())
+    if (!m_system_event_loop_timer->is_active()) {
+        if (photon_frame_trace_enabled()) dbgln("[HTMLLoop] schedule_process loop={} at_ms={:.3f} timer_active=false", reinterpret_cast<FlatPtr>(this), HighResolutionTime::unsafe_shared_current_time());
         m_system_event_loop_timer->restart();
+    }
 }
 
 EventLoop& main_thread_event_loop()
@@ -267,9 +276,11 @@ void EventLoop::request_rendering_update()
 
     if (m_rendering_update_requested || m_rendering_task_queued) {
         ++m_rendering_scheduler_counters.coalesced_update_requests;
+        if (photon_frame_trace_enabled()) dbgln("[FrameTrace] rendering_update_request loop={} at_ms={:.3f} coalesced=true requested={} queued={} running={}", reinterpret_cast<FlatPtr>(this), HighResolutionTime::unsafe_shared_current_time(), m_rendering_update_requested, m_rendering_task_queued, m_running_rendering_task);
         return;
     }
 
+    if (photon_frame_trace_enabled()) dbgln("[FrameTrace] rendering_update_request loop={} at_ms={:.3f} coalesced=false", reinterpret_cast<FlatPtr>(this), HighResolutionTime::unsafe_shared_current_time());
     m_rendering_update_requested = true;
 }
 
@@ -279,6 +290,8 @@ bool EventLoop::rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp fr
     ++m_rendering_scheduler_counters.opportunities_received;
     if (source == RenderingOpportunitySource::Watchdog)
         ++m_rendering_scheduler_counters.watchdog_opportunities;
+    auto source_name = source == RenderingOpportunitySource::Compositor ? "compositor" : source == RenderingOpportunitySource::LocalTimer ? "local_timer" : source == RenderingOpportunitySource::Watchdog ? "watchdog" : "manual";
+    if (photon_frame_trace_enabled()) dbgln("[FrameTrace] rendering_opportunity loop={} at_ms={:.3f} frame_ms={:.3f} source={} requested={} queued={} running={}", reinterpret_cast<FlatPtr>(this), HighResolutionTime::unsafe_shared_current_time(), frame_time, source_name, m_rendering_update_requested, m_rendering_task_queued, m_running_rendering_task);
 
     // FIXME: 1. Wait until at least one navigable whose active document's relevant agent's event loop is eventLoop might have a rendering opportunity.
 
@@ -460,6 +473,7 @@ void EventLoop::update_the_rendering()
     for (auto const& page : pages_of_local_roots())
         page->client().will_begin_rendering_update();
     auto update_start_time = HighResolutionTime::unsafe_shared_current_time();
+    if (photon_frame_trace_enabled()) dbgln("[FrameTrace] update_rendering_begin loop={} at_ms={:.3f} last_opportunity_ms={:.3f}", reinterpret_cast<FlatPtr>(this), update_start_time, m_last_render_opportunity_time);
     ++m_rendering_scheduler_counters.updates_run;
     ScopeGuard const guard = [this, update_start_time] {
         auto update_end_time = HighResolutionTime::unsafe_shared_current_time();
@@ -493,6 +507,7 @@ void EventLoop::update_the_rendering()
             current.update_requests_while_rendering - previous.update_requests_while_rendering);
         m_rendering_scheduler_counters_at_last_update = current;
         m_last_rendering_update_end_time = update_end_time;
+        if (photon_frame_trace_enabled()) dbgln("[FrameTrace] update_rendering_end loop={} at_ms={:.3f} duration_ms={:.3f}", reinterpret_cast<FlatPtr>(this), update_end_time, update_end_time - update_start_time);
     };
 
     process_input_events();
@@ -514,6 +529,8 @@ void EventLoop::update_the_rendering()
     //      of their respective navigable containers in C's node tree.
     // 3. Filter non-renderable documents: Remove from docs any Document object doc for which any of the following are true:
     auto docs = documents_in_this_event_loop_matching([&](auto const& document) {
+        if (photon_frame_trace_enabled())
+            dbgln("[FrameTrace] rendering_document_state document={} at_ms={:.3f} hidden={} fully_active={} render_blocked={} transition_suppressed={} has_navigable={} rendering_opportunity={}", reinterpret_cast<FlatPtr>(&document), HighResolutionTime::unsafe_shared_current_time(), document.hidden(), document.is_fully_active(), document.is_render_blocked(), document.rendering_suppression_for_view_transitions(), document.navigable() != nullptr, document.navigable() && document.navigable()->has_a_rendering_opportunity());
         if (!document.is_fully_active())
             return false;
 

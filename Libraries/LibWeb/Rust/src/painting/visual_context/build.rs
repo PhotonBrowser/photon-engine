@@ -59,7 +59,7 @@ pub(crate) struct BoxFacts {
     pub transform_is_invertible: bool,
     pub perspective: Option<PerspectiveData>,
     pub effects: Option<std::rc::Rc<EffectsData>>,
-    pub overflow_clip: Option<ClipData>,
+    pub overflow_clip: Option<ClipNodeData>,
     pub css_clip: Option<ClipData>,
     pub line_clamp_float_clip: Option<ClipData>,
     pub clip_path: Option<(std::rc::Rc<libgfx_rust::path::OwnedPath>, IntRect, WindingRule)>,

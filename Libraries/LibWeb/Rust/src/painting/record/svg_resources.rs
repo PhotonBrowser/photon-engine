@@ -17,7 +17,7 @@ use crate::painting::visual_context::build::{
     BoxFacts, compute_svg_viewport_transform_data, svg_viewport_transform_of,
 };
 use crate::painting::visual_context::node_values::{MaskLayerPresenceEntry, mask_layer_presence};
-use crate::painting::visual_context::{ClipData, EffectNodeData, EffectNodeIndex, MaskData, MaskLayerOrigin};
+use crate::painting::visual_context::{ClipData, ClipNodeData, EffectNodeData, EffectNodeIndex, MaskData, MaskLayerOrigin};
 use libgfx_rust::path::PathBuilder;
 use libgfx_rust::{AffineTransform, CompositingAndBlendingOperator, FloatPoint, FloatRect, MaskKind, multiply_affine};
 
@@ -328,8 +328,19 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if facts.may_have_clip
             && let Some(clip) = facts.overflow_clip
         {
-            self.recorder
-                .push_ambient_inline_clips(&[transformed_rect_clip(to_enclosing_space, clip.rect, &clip)]);
+            match clip {
+                ClipNodeData::Rect(clip) => self
+                    .recorder
+                    .push_ambient_inline_clips(&[transformed_rect_clip(to_enclosing_space, clip.rect, &clip)]),
+                ClipNodeData::Path(clip) => {
+                    let path = clip.path.copy_transformed(to_enclosing_space.values);
+                    self.recorder.push_ambient_inline_clips(&[PendingInlineClip::intersecting_path(
+                        &path,
+                        clip.fill_rule,
+                    )]);
+                }
+                ClipNodeData::Dead => unreachable!("a newly computed overflow clip cannot be dead"),
+            }
         }
         let mut descendants_to_enclosing_space = to_enclosing_space;
         if let Some(svg_viewport_transform) = svg_viewport_transform_of(self.layout_arena, svg_box) {

@@ -534,7 +534,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     if facts.may_have_clip
         && let Some(overflow_clip) = facts.overflow_clip
     {
-        state_for_descendants = sink.append_clip_node_under(state_for_descendants, ClipNodeData::Rect(overflow_clip));
+        state_for_descendants = sink.append_clip_node_under(state_for_descendants, overflow_clip);
     }
 
     if paintable_geometry::has_scrollable_overflow(layout_arena, slot) {

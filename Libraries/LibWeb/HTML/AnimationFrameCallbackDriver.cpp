@@ -9,6 +9,8 @@
 #include <AK/ScopeGuard.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/HTML/AnimationFrameCallbackDriver.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <cstdlib>
 
 namespace Web::HTML {
 
@@ -48,8 +50,14 @@ void AnimationFrameCallbackDriver::run(double now)
     AK::ScopeGuard guard { [&]() { m_executing_callbacks.clear(); } };
     m_executing_callbacks = move(m_callbacks);
 
-    for (auto& [id, callback] : m_executing_callbacks)
+    static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    for (auto& [id, callback] : m_executing_callbacks) {
+        if (trace_enabled)
+            dbgln("[FrameTrace] raf_callback_begin driver={} handle={} at_ms={:.3f}", reinterpret_cast<FlatPtr>(this), id, HighResolutionTime::unsafe_shared_current_time());
         callback->function()(now);
+        if (trace_enabled)
+            dbgln("[FrameTrace] raf_callback_end driver={} handle={} at_ms={:.3f} pending_callbacks={}", reinterpret_cast<FlatPtr>(this), id, HighResolutionTime::unsafe_shared_current_time(), m_callbacks.size());
+    }
 }
 
 }

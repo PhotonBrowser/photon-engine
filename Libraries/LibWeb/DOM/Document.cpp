@@ -21,6 +21,7 @@
 #include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
+#include <cstdlib>
 #include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
@@ -9786,6 +9787,9 @@ void Document::set_navigable(GC::Ptr<HTML::LocalNavigable> navigable)
 
 void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
 {
+    static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    if (trace_enabled)
+        dbgln("[FrameTrace] visual_invalidation document={} at_ns={} invalidation={} hidden={} fully_active={}", reinterpret_cast<FlatPtr>(this), MonotonicTime::now().nanoseconds(), static_cast<int>(should_invalidate_display_list), hidden(), is_fully_active());
     auto navigable = this->navigable();
 
     switch (should_invalidate_display_list) {

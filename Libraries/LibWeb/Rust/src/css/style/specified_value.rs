@@ -171,8 +171,10 @@ impl SpecifiedValues {
         id: SpecifiedValueID,
         memory: &mut MemoryController,
     ) {
-        if let Lookup::Known(existing) = self.lookup(unsafe { &*value }) {
-            debug_assert_eq!(existing, id);
+        if let Lookup::Known(_) = self.lookup(unsafe { &*value }) {
+            // The authored spelling may already have an identity from an earlier declaration,
+            // while this declaration's context-free canonical form has a different identity.
+            // Keep the established mapping; both identities remain valid for their declarations.
             return;
         }
         if !memory.is_tier3_admitting(MemoryCategory::SpecifiedValueTable) {
@@ -356,6 +358,23 @@ mod tests {
 
         assert_eq!(authored_id, canonical_id);
         assert!(matches!(lookup, Lookup::Known(())));
+    }
+
+    #[test]
+    fn authored_spelling_keeps_an_existing_identity_when_canonical_id_differs() {
+        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut values = SpecifiedValues::new();
+        let canonical = std::sync::Arc::new(StyleValueData::Number { value: 42.0 });
+        let previous_authored = std::sync::Arc::new(StyleValueData::Number { value: 43.0 });
+        let authored = std::sync::Arc::new(StyleValueData::Number { value: 43.0 });
+
+        let (canonical_id, _) = unsafe { values.intern(std::sync::Arc::as_ptr(&canonical), &mut memory) };
+        let (authored_id, _) = unsafe { values.intern(std::sync::Arc::as_ptr(&previous_authored), &mut memory) };
+
+        unsafe { values.alias(std::sync::Arc::as_ptr(&authored), canonical_id, &mut memory) };
+
+        assert_ne!(authored_id, canonical_id);
+        assert!(matches!(values.lookup(&authored), Lookup::Known(id) if id == authored_id));
     }
 
     #[test]

@@ -12,8 +12,10 @@
 #include <AK/QuickSort.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
+#include <AK/Time.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
+#include <cstdlib>
 #include <LibCore/Timer.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
@@ -638,6 +640,8 @@ i32 WindowOrWorkerGlobalScopeMixin::set_timeout(TimerHandler handler, i32 timeou
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-setinterval
 i32 WindowOrWorkerGlobalScopeMixin::set_interval(TimerHandler handler, i32 timeout, GC::RootVector<JS::Value> arguments)
 {
+    if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE"))
+        dbgln("[HTMLTimer] setInterval at_ns={} requested_interval_ms={}", MonotonicTime::now().nanoseconds(), timeout);
     return run_timer_initialization_steps(move(handler), timeout, move(arguments), Repeat::Yes);
 }
 
@@ -710,7 +714,10 @@ i32 WindowOrWorkerGlobalScopeMixin::run_timer_initialization_steps(TimerHandler 
     // FIXME: 8. Let uniqueHandle be null.
 
     // 9. Let task be a task that runs the following substeps:
-    auto task = GC::create_function(GC::Heap::the(), Function<void()>([this, handler = move(handler), timeout, arguments = move(arguments), repeat, id, initiating_script, previous_id, &vm, &realm]() {
+    auto requested_deadline = MonotonicTime::now() + AK::Duration::from_milliseconds(timeout);
+    auto task = GC::create_function(GC::Heap::the(), Function<void()>([this, handler = move(handler), timeout, arguments = move(arguments), repeat, id, initiating_script, previous_id, requested_deadline, &vm, &realm]() {
+        if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE"))
+            dbgln("[HTMLTimer] task_fire id={} at_ns={} requested_deadline_ns={} lateness_us={} interval_ms={} repeating={} active={}", id, MonotonicTime::now().nanoseconds(), requested_deadline.nanoseconds(), (MonotonicTime::now() - requested_deadline).to_microseconds(), timeout, repeat == Repeat::Yes, m_timers.contains(id));
         // FIXME: 1. Assert: uniqueHandle is a unique internal value, not null.
 
         // 2. If id does not exist in global's map of setTimeout and setInterval IDs, then abort these steps.
@@ -834,6 +841,8 @@ i32 WindowOrWorkerGlobalScopeMixin::run_timer_initialization_steps(TimerHandler 
     // 13. Set uniqueHandle to the result of running steps after a timeout given global, "setTimeout/setInterval",
     //     timeout, and completionStep.
     //     FIXME: run_steps_after_a_timeout() needs to be updated to return a unique internal value that can be used here.
+    if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE"))
+        dbgln("[HTMLTimer] register id={} at_ns={} requested_deadline_ns={} interval_ms={} repeating={} rescheduled={}", id, MonotonicTime::now().nanoseconds(), requested_deadline.nanoseconds(), timeout, repeat == Repeat::Yes, previous_id.has_value());
     run_steps_after_a_timeout_impl(timeout, throttling_class, move(completion_step), id, repeat);
 
     // FIXME: 14. Set global's map of setTimeout and setInterval IDs[id] to uniqueHandle.

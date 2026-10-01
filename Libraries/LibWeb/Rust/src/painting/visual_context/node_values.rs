@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::{ClipData, EffectsData, PerspectiveData, TransformData, TransformDataRole};
+use super::{ClipData, ClipNodeData, ClipPathData, EffectsData, PerspectiveData, TransformData, TransformDataRole};
 use crate::css::computed_value_types::{ComputedClipEdge, ComputedStyleValueHandle};
 use crate::css::computed_value_views::{ComputedValuesView, LengthPercentageRef};
 use crate::css::css_enums;
@@ -22,7 +22,7 @@ use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::style_queries;
 use libgfx_rust::{
     AffineTransform, CompositingAndBlendingOperator, CornerRadii, FloatPoint, affine_to_matrix, perspective_matrix,
-    scale_matrix_for_device_pixels, translation_matrix,
+    enclosing_int_rect, scale_matrix_for_device_pixels, translation_matrix, FloatRect,
 };
 
 pub(crate) fn visual_viewport_transform_data(inputs: &FfiVisualContextTreeInputs) -> TransformData {
@@ -790,7 +790,7 @@ pub(crate) fn compute_clip_data(
     layout_arena: &impl PaintableRowsRead,
     slot: NodeSlotId,
     pixel_ratio: f64,
-) -> Option<ClipData> {
+) -> Option<ClipNodeData> {
     use crate::css::css_enums::{content_visibility, overflow};
     let node = slot;
     let style = layout_arena.node_style_if_live(node)?;
@@ -856,9 +856,18 @@ pub(crate) fn compute_clip_data(
         BorderRadii::default()
     };
     let converter = DevicePixelConverter::new(pixel_ratio);
-    Some(ClipData {
-        rect: converter.rounded_device_rect(clip_rect).to_float(),
+    let device_rect = converter.rounded_device_rect(clip_rect);
+    if let Some(path) = radii.shaped_path(device_rect, &converter) {
+        let bounding_rect = enclosing_int_rect(FloatRect::from_array(path.bounding_box()));
+        return Some(ClipNodeData::Path(ClipPathData {
+            path: std::rc::Rc::new(path),
+            bounding_rect,
+            fill_rule: libgfx_rust::WindingRule::Nonzero,
+        }));
+    }
+    Some(ClipNodeData::Rect(ClipData {
+        rect: device_rect.to_float(),
         corner_radii: radii.as_corners(&converter),
         mode: super::ClipMode::Intersect,
-    })
+    }))
 }

@@ -7,6 +7,8 @@
  */
 
 #include <AK/NeverDestroyed.h>
+#include <AK/Debug.h>
+#include <AK/Types.h>
 #include <AK/Utf8View.h>
 #include <LibGC/Heap.h>
 #include <LibGC/WeakHashSet.h>
@@ -82,6 +84,7 @@
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
 #include <LibWeb/HTML/Window.h>
+#include <cstdlib>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Internals/Internals.h>
@@ -268,6 +271,12 @@ JS::Value window_named_item_value(WrapperWorld& wrapper_world, JS::Realm& realm,
 
 namespace Web::HTML {
 
+static bool photon_frame_trace_enabled()
+{
+    static bool enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    return enabled;
+}
+
 GC_DEFINE_ALLOCATOR(Window);
 
 static GC::WeakHashSet<Window>& all_windows()
@@ -295,7 +304,11 @@ void Window::for_each_active(Function<IterationDecision(Window&)> callback)
 void run_animation_frame_callbacks(DOM::Document& document, double now)
 {
     // FIXME: Bring this closer to the spec.
-    document.window()->animation_frame_callback_driver().run(now);
+    auto window = document.window();
+    if (photon_frame_trace_enabled())
+        dbgln("[FrameTrace] raf_document_state window={} at_ms={:.3f} hidden={} fully_active={} page_visible={} rendering_opportunity={} animated_style_pending={}", reinterpret_cast<FlatPtr>(window.ptr()), HighResolutionTime::unsafe_shared_current_time(), document.hidden(), document.is_fully_active(), document.page().system_visibility_state() == VisibilityState::Visible, document.page().client().has_rendering_opportunity(), document.needs_animated_style_update());
+    if (photon_frame_trace_enabled()) dbgln("[FrameTrace] run_animation_frame_callbacks window={} at_ms={:.3f} frame_time_ms={:.3f} has_callbacks={}", reinterpret_cast<FlatPtr>(window.ptr()), HighResolutionTime::unsafe_shared_current_time(), now, window->has_animation_frame_callbacks());
+    window->animation_frame_callback_driver().run(now);
 }
 
 // NB: A GC cell, so that the window's two idle callback lists trace the handler, and with it the WebIDL callback the
@@ -2081,6 +2094,7 @@ WebIDL::UnsignedLong Window::request_animation_frame(AnimationFrameCallbackHandl
 {
     // FIXME: Make this fully spec compliant. Currently implements a mix of 'requestAnimationFrame()' and 'run the animation frame callbacks'.
     auto handle = animation_frame_callback_driver().add(GC::create_function(GC::Heap::the(), move(callback)));
+    if (photon_frame_trace_enabled()) dbgln("[FrameTrace] requestAnimationFrame window={} handle={} at_ms={:.3f}", reinterpret_cast<FlatPtr>(this), handle, HighResolutionTime::unsafe_shared_current_time());
     page().client().request_frame();
     return handle;
 }

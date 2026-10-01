@@ -32,7 +32,7 @@ pub(crate) const ROUND_SHAPE: f64 = 1.0;
 const ROUND_TOLERANCE: f64 = 1e-9;
 
 /// Line segments used to approximate one shaped corner.
-const SEGMENTS_PER_CORNER: usize = 24;
+const SEGMENTS_PER_CORNER: usize = 96;
 
 pub(crate) fn is_round(shape: f64) -> bool {
     (shape - ROUND_SHAPE).abs() < ROUND_TOLERANCE
