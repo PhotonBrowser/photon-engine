@@ -647,11 +647,11 @@ pub(crate) fn compute_effects_data(
             resolved_svg_filter,
             device_pixels_per_css_pixel,
         )
-        .map(std::rc::Rc::new)
+        .map(std::sync::Arc::new)
     } else {
         set_svg_filter_bounds(layout_arena, slot, None);
         crate::painting::css_filter::serialize_non_url_filter(&effects_values.filter, device_pixels_per_css_pixel)
-            .map(std::rc::Rc::new)
+            .map(std::sync::Arc::new)
     };
     let backdrop_filter = compute_backdrop_filter_data(layout_arena, slot, style, device_pixels_per_css_pixel);
     let keeps_effects_node_for_later_values = layout_arena
@@ -708,7 +708,7 @@ fn compute_backdrop_filter_data(
         crate::painting::css_filter::serialize_non_url_filter(backdrop_filter, device_pixels_per_css_pixel)
     }?;
     Some(super::BackdropFilterData {
-        filter: std::rc::Rc::new(filter),
+        filter: std::sync::Arc::new(filter),
         region,
         corner_radii: border_radii_data(style, layout_arena, slot).as_corners(&converter),
     })
@@ -860,7 +860,7 @@ pub(crate) fn compute_clip_data(
     if let Some(path) = radii.shaped_path(device_rect, &converter) {
         let bounding_rect = enclosing_int_rect(FloatRect::from_array(path.bounding_box()));
         return Some(ClipNodeData::Path(ClipPathData {
-            path: std::rc::Rc::new(path),
+            path: std::sync::Arc::new(path),
             bounding_rect,
             fill_rule: libgfx_rust::WindingRule::Nonzero,
         }));

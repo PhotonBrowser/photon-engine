@@ -35,7 +35,8 @@ use super::tree::PseudoElementKind;
 use super::tree::PseudoElementTarget;
 use super::tree::StyleNodeID;
 use crate::css::computed_longhand_table::{
-    ComputedLonghandTable, HIGHLIGHT_COLOR_IS_CURRENT_COLOR, HIGHLIGHT_COLORS_AUTHORED, longhand_slot_hash,
+    ComputedLonghandTable, DEPENDS_ON_VIEWPORT_METRICS, HIGHLIGHT_COLOR_IS_CURRENT_COLOR, HIGHLIGHT_COLORS_AUTHORED,
+    longhand_slot_hash,
 };
 use crate::css::computed_values::computed_group_output_mask;
 use crate::css::computed_values::release_group_payload;
@@ -271,6 +272,11 @@ impl FinalStyleRecordID {
         self.0
     }
 
+    /// The record a raw identity names; none for zero.
+    pub(crate) fn from_raw(raw: u64) -> Option<Self> {
+        (raw != 0).then_some(Self(raw))
+    }
+
     fn base_record(self) -> Option<StyleRecordID> {
         if self.0 & Self::ANIMATION_OVERLAY_TAG != 0 {
             return None;
@@ -381,6 +387,11 @@ struct PublishedComputedColumns {
     /// The element facts the style computation's adjustments read; see
     /// `bridge::element_adjustment_fact`.
     adjustment_facts: Vec<u32>,
+    /// One plus the element-backed pseudo-element kind the element stands for, or zero.
+    associated_pseudo_kinds: Vec<u8>,
+    /// The synthetic pseudo-elements the node's last published match answer has rules for, one
+    /// bit per kind; held while `HAS_PSEUDO_STYLE_MASK` is set.
+    pseudo_style_masks: Vec<u64>,
 }
 
 impl PublishedComputedColumns {
@@ -389,6 +400,10 @@ impl PublishedComputedColumns {
     const HAS_CASCADE_STATE: u8 = 1 << 2;
     /// The node's last published match answer declared past its winners.
     const INCOMPLETE_ANSWER: u8 = 1 << 3;
+    /// `pseudo_style_masks` holds the node's mask.
+    const HAS_PSEUDO_STYLE_MASK: u8 = 1 << 4;
+    /// What the node's last published match answer said, which outlives any record.
+    const ANSWER_FLAGS: u8 = Self::INCOMPLETE_ANSWER | Self::HAS_PSEUDO_STYLE_MASK;
 
     fn ensure(&mut self, index: usize) {
         if self.flags.len() > index {
@@ -406,6 +421,8 @@ impl PublishedComputedColumns {
         self.cascade_states.resize(len, 0);
         self.flags.resize(len, 0);
         self.adjustment_facts.resize(len, 0);
+        self.associated_pseudo_kinds.resize(len, 0);
+        self.pseudo_style_masks.resize(len, 0);
     }
 
     fn is_assigned(&self, index: usize) -> bool {
@@ -504,7 +521,8 @@ impl PublishedComputedColumns {
         self.custom_properties[index] = inputs.custom_properties.0;
         self.fixed_metadata[index] = inputs.fixed_metadata.0;
         self.set_animation_overlay_slot(index, inputs.animation_overlay_slot);
-        self.flags[index] = (self.flags[index] & (Self::HAS_CASCADE_STATE | Self::INCOMPLETE_ANSWER))
+        self.flags[index] = (self.flags[index]
+            & (Self::HAS_CASCADE_STATE | Self::INCOMPLETE_ANSWER | Self::HAS_PSEUDO_STYLE_MASK))
             | Self::ASSIGNED
             | if inherited_group_swap_eligible {
                 Self::INHERITED_GROUP_SWAP_ELIGIBLE
@@ -513,11 +531,25 @@ impl PublishedComputedColumns {
             };
     }
 
-    fn remove(&mut self, index: usize) -> Option<u32> {
+    /// Drop the record at `index`, keeping what the host and the node's match answer published
+    /// for it: its element facts, the pseudo-element it backs and the answer's flags.
+    fn unassign(&mut self, index: usize) -> Option<u32> {
         let overlay = self.animation_overlay_slot(index);
         if let Some(flags) = self.flags.get_mut(index) {
-            *flags = 0;
+            *flags &= Self::ANSWER_FLAGS;
             self.animation_overlay_slots[index] = 0;
+        }
+        overlay
+    }
+
+    fn remove(&mut self, index: usize) -> Option<u32> {
+        let overlay = self.unassign(index);
+        if let Some(flags) = self.flags.get_mut(index) {
+            *flags = 0;
+            // The index may be handed to a shadow root or the document next, which publish no facts
+            // of their own, so a retired element's facts must not stay behind for them.
+            self.adjustment_facts[index] = 0;
+            self.associated_pseudo_kinds[index] = 0;
         }
         overlay
     }
@@ -936,7 +968,7 @@ impl ComputedGroupSets {
 
     pub(super) fn viewport_dependent_nodes(&self) -> Vec<u32> {
         let depends_on_viewport = |fixed_metadata: ComputedFixedMetadataID| {
-            self.computed_fixed_metadata.get(fixed_metadata).dependency_flags & 1 != 0
+            self.computed_fixed_metadata.get(fixed_metadata).dependency_flags & DEPENDS_ON_VIEWPORT_METRICS != 0
         };
         let mut nodes = Vec::new();
         for index in 1..self.columns.flags.len() {
@@ -1429,11 +1461,11 @@ impl ComputedGroupSets {
     /// follows the table's dependency flags. The font group is never rebuilt here: it needs
     /// platform font resources the table does not hold.
     ///
-    /// This decides only whether the record can be assembled here: the node must hold a retained
-    /// longhand table, must not carry an animation overlay, and must have published under the
-    /// same eligibility the inherited-group swap needs. Its pseudo-elements' records are
-    /// untouched: they inherit from the element, and the caller has proven that nothing they
-    /// inherit moved.
+    /// The node's assigned record is the base the table was driven from; the table it held, if
+    /// any, only seeds the new table's identity. Its pseudo-elements' records are untouched: they
+    /// inherit from the element, and the caller has proven that nothing they inherit moved. The
+    /// record names `counter_style_environment_identity` as its counter-style registry, or the
+    /// one its base names when that is `None`.
     #[allow(clippy::arc_with_non_send_sync, clippy::too_many_arguments)]
     pub(super) fn replace_engine_computed_table(
         &mut self,
@@ -1446,34 +1478,36 @@ impl ComputedGroupSets {
         font: Option<&crate::css::table_group_builder::FfiFontGroupBuildInputs>,
         parent_in_display_none_subtree: bool,
         environment: Option<u64>,
+        counter_style_environment_identity: Option<u64>,
     ) -> Option<EngineComputedAssembly> {
-        use crate::css::computed_value_types::STYLE_GROUP_INDEX_FONT;
-        if groups_to_rebuild == 0 || (groups_to_rebuild & (1 << STYLE_GROUP_INDEX_FONT) != 0 && font.is_none()) {
-            return None;
-        }
-        let index = node.element_index()? as usize;
-        if self.columns.animation_overlay_slot(index).is_some() {
-            return None;
-        }
-        let base_style_record_identity = base_style_record.base_record()?;
-        if !self.style_record_generation_is_live(base_style_record_identity, base_style_record.base_generation()) {
-            return None;
-        }
-        let old_record = *self.style_records.get_index(base_style_record_identity.index())?;
-        let old_table = old_record.longhand_table?;
-        let old_group_set = self.sets.get_index(old_record.groups.0 as usize)?;
-        if groups_to_rebuild >> old_group_set.payloads.len() != 0
-            || old_group_set.payloads.len() <= crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_UI
-        {
-            return None;
-        }
-        let Ok(used_color_scheme) = u8::try_from(table.effective_color_scheme()) else {
+        // The caller drove the table from an element's live base record; a row that is not
+        // assembles nothing.
+        let base = node
+            .element_index()
+            .zip(base_style_record.base_record())
+            .filter(|&(_, base)| self.style_record_generation_is_live(base, base_style_record.base_generation()));
+        let Some((index, base_style_record_identity)) = base else {
+            debug_assert!(false, "a table is driven from an element's live base record");
             return None;
         };
+        let index = index as usize;
+        debug_assert!(
+            self.columns.animation_overlay_slot(index).is_none(),
+            "a record composing animations is not driven"
+        );
+        let old_record = *self.style_records.get_index(base_style_record_identity.index())?;
+        let old_table = old_record.longhand_table;
+        debug_assert_eq!(
+            self.sets
+                .get_index(old_record.groups.0 as usize)
+                .map(|set| set.payloads.len()),
+            Some(crate::css::table_group_builder::group_index::COUNT),
+            "an element's record holds every style group"
+        );
         // The builders take the element's own color from the caller, so it is resolved from the
         // driven table before any group reads it.
-        let current_color =
-            crate::css::table_group_builder::own_color_from_table(&table, used_color_scheme, Some(length))?;
+        let color_inputs = crate::css::table_group_builder::assembly_color_inputs(&table, length);
+        let (used_color_scheme, current_color) = color_inputs;
         for property in [
             crate::css::property_metadata::property_id::STOP_COLOR,
             crate::css::property_metadata::property_id::FLOOD_COLOR,
@@ -1497,7 +1531,11 @@ impl ComputedGroupSets {
                 length: Some(length),
                 channels: None,
             };
-            let resolved = crate::css::color_resolution::to_color(specified.data(), &input)?;
+            // A value that does not resolve keeps what the drive computed for it.
+            let Some(resolved) = crate::css::color_resolution::to_color(specified.data(), &input) else {
+                debug_assert!(false, "a currentcolor-relative color does not resolve");
+                continue;
+            };
             let resolved = unsafe {
                 RetainedStyleValueData::from_retained_pointer(std::sync::Arc::into_raw(std::sync::Arc::new(
                     crate::css::color_resolution::resolved_srgb_style_value(resolved),
@@ -1520,27 +1558,16 @@ impl ComputedGroupSets {
                 continue;
             }
             let old_payload = self.groups[*group_identity].payload;
-            let payload = if group == STYLE_GROUP_INDEX_FONT {
-                unsafe {
-                    crate::css::table_group_builder::rebuild_font_group_from_table(
-                        &table,
-                        font.expect("a font group rebuild carries the resolved font"),
-                        old_payload.as_ptr(),
-                    )
-                }
-            } else {
-                unsafe {
-                    crate::css::table_group_builder::rebuild_group_from_table(
-                        &table,
-                        group,
-                        old_payload.as_ptr(),
-                        current_color,
-                        used_color_scheme,
-                        Some(length),
-                    )
-                }
-            };
-            let payload = SharedPayload::new(payload?);
+            let payload = SharedPayload::new(unsafe {
+                crate::css::table_group_builder::assemble_group_from_table(
+                    &table,
+                    group,
+                    font,
+                    old_payload.as_ptr(),
+                    color_inputs,
+                    length,
+                )
+            });
             // An equal payload keeps the old identity, as a C++ build adopts its parent's and
             // predecessor's identical payloads.
             let identity = if payload == old_payload
@@ -1565,19 +1592,24 @@ impl ComputedGroupSets {
             .get_index(group_set.0 as usize)
             .is_some_and(|set| style_group_payloads_hold_image_values(SharedPayload::as_pointer_slice(&set.payloads)));
         let old_metadata = self.computed_fixed_metadata[old_record.fixed_metadata];
+        let counter_style_environment_identity =
+            counter_style_environment_identity.unwrap_or(old_metadata.counter_style_environment_identity);
         let swap_eligible = table_inherited_group_swap_eligible(&table);
         let dependency_flags =
             table.publication_dependency_flags() | (u8::from(holds_image_values) * HOLDS_IMAGE_VALUES);
-        let fixed_metadata = if dependency_flags == old_metadata.dependency_flags {
+        let fixed_metadata = if dependency_flags == old_metadata.dependency_flags
+            && counter_style_environment_identity == old_metadata.counter_style_environment_identity
+        {
             old_record.fixed_metadata
         } else {
             self.intern_fixed_metadata(ComputedFixedMetadata {
                 dependency_flags,
+                counter_style_environment_identity,
                 ..old_metadata
             })
             .0
         };
-        let longhand_table = self.intern_owned_longhand_table(table, Some(old_table), None);
+        let longhand_table = self.intern_owned_longhand_table(table, old_table, None);
         // The environment moves with the record when the node's custom declarations resolved to
         // another; a record keeps its environment otherwise.
         let custom_properties = match environment {
@@ -1636,9 +1668,11 @@ impl ComputedGroupSets {
         if self.final_base_style_record(current) != derived_style_record {
             return;
         }
-        // A first record never installed leaves the node the way it was: unassigned.
+        // A first record never installed leaves the node the way it was: unassigned, with what
+        // the host and its match answer published for it, which the layout tree and the next
+        // derivation read.
         if previous_style_record == FinalStyleRecordID::NONE {
-            self.remove(node);
+            self.unassign(node);
             return;
         }
         let Some(previous_base) = previous_style_record.base_record() else {
@@ -2819,6 +2853,46 @@ impl ComputedGroupSets {
         }
     }
 
+    /// Record the element-backed pseudo-element kind the element stands for, one plus the kind,
+    /// or zero for none.
+    pub fn set_associated_pseudo_kind(&mut self, node: StyleNodeID, pseudo_kind_plus_one: u8) {
+        let Some(index) = node.element_index().map(|index| index as usize) else {
+            return;
+        };
+        self.columns.ensure(index);
+        self.columns.associated_pseudo_kinds[index] = pseudo_kind_plus_one;
+    }
+
+    /// The element-backed pseudo-element kind the element stands for.
+    pub(super) fn associated_pseudo_kind(&self, node: StyleNodeID) -> Option<u8> {
+        node.element_index()
+            .and_then(|index| self.columns.associated_pseudo_kinds.get(index as usize))
+            .copied()
+            .and_then(|kind| kind.checked_sub(1))
+    }
+
+    /// The synthetic pseudo-elements the node's last published match answer has rules for.
+    pub(super) fn node_pseudo_style_mask(&self, node: StyleNodeID) -> Option<u64> {
+        let index = node.element_index()? as usize;
+        let flags = *self.columns.flags.get(index)?;
+        (flags & PublishedComputedColumns::HAS_PSEUDO_STYLE_MASK != 0).then(|| self.columns.pseudo_style_masks[index])
+    }
+
+    /// Keep the mask of the answer just published for the node; `None` when that answer cannot
+    /// say, so no earlier answer's mask stands in for it.
+    pub(super) fn set_node_pseudo_style_mask(&mut self, node: StyleNodeID, mask: Option<u64>) {
+        let Some(index) = node.element_index().map(|index| index as usize) else {
+            return;
+        };
+        if let Some(mask) = mask {
+            self.columns.ensure(index);
+            self.columns.pseudo_style_masks[index] = mask;
+            self.columns.flags[index] |= PublishedComputedColumns::HAS_PSEUDO_STYLE_MASK;
+        } else if let Some(flags) = self.columns.flags.get_mut(index) {
+            *flags &= !PublishedComputedColumns::HAS_PSEUDO_STYLE_MASK;
+        }
+    }
+
     pub(super) fn node_has_animation_overlay(&self, node: StyleNodeID) -> bool {
         let Some(index) = node.element_index().map(|index| index as usize) else {
             return false;
@@ -2881,6 +2955,20 @@ impl ComputedGroupSets {
     }
 
     pub fn remove(&mut self, node: StyleNodeID) {
+        self.remove_assignments(node, PublishedComputedColumns::remove);
+    }
+
+    /// Drop everything assigned to the node, keeping what the host and its match answer published
+    /// for it.
+    fn unassign(&mut self, node: StyleNodeID) {
+        self.remove_assignments(node, PublishedComputedColumns::unassign);
+    }
+
+    fn remove_assignments(
+        &mut self,
+        node: StyleNodeID,
+        clear_columns: fn(&mut PublishedComputedColumns, usize) -> Option<u32>,
+    ) {
         self.take_shared_computation_context(node);
         let Some(index) = node.element_index().map(|index| index as usize) else {
             return;
@@ -2888,7 +2976,7 @@ impl ComputedGroupSets {
         if let Some(slot) = self.style_record_column.get_mut(index) {
             *slot = None;
         }
-        if let Some(slot) = self.columns.remove(index) {
+        if let Some(slot) = clear_columns(&mut self.columns, index) {
             self.release_animation_overlay_assignment(slot);
         }
         self.pending_cascade_states.remove(&node);
@@ -4153,6 +4241,43 @@ mod tests {
         );
         sets.remove(node);
         assert_eq!(sets.live_animation_overlay_records(), 0);
+    }
+
+    #[test]
+    fn a_dropped_first_record_keeps_what_the_host_and_the_answer_published() {
+        let mut sets = ComputedGroupSets::default();
+        let node = StyleNodeID::element(1);
+        sets.set_adjustment_facts(node, 1 << 29);
+        sets.set_associated_pseudo_kind(node, 3);
+        sets.set_node_answer_incomplete(node, true);
+        sets.set_node_pseudo_style_mask(node, Some(1 << 2));
+        let derived = sets.publish_unowned(
+            Some(ComputedStyleTarget::new(node, u8::MAX)),
+            &[],
+            0,
+            0,
+            metadata(0, 0, 0),
+        );
+
+        sets.revert_engine_computed_record(node, derived.style_record_identity, FinalStyleRecordID::NONE);
+        assert!(sets.assigned_style_record(node).is_none());
+        assert_eq!(sets.adjustment_facts(node), 1 << 29);
+        assert_eq!(
+            node.element_index()
+                .map(|index| sets.columns.associated_pseudo_kinds[index as usize]),
+            Some(3)
+        );
+        assert!(sets.node_answer_is_incomplete(node));
+        assert_eq!(sets.node_pseudo_style_mask(node), Some(1 << 2));
+        // An answer that cannot say which pseudo-elements it styles leaves no earlier mask behind.
+        sets.set_node_pseudo_style_mask(node, None);
+        assert_eq!(sets.node_pseudo_style_mask(node), None);
+        sets.set_node_pseudo_style_mask(node, Some(1 << 2));
+
+        sets.remove(node);
+        assert_eq!(sets.adjustment_facts(node), 0);
+        assert!(!sets.node_answer_is_incomplete(node));
+        assert_eq!(sets.node_pseudo_style_mask(node), None);
     }
 
     #[test]

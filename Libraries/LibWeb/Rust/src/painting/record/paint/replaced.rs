@@ -65,7 +65,7 @@ impl Fraction {
         }
     }
 
-    fn of(numerator: CssPixels, denominator: CssPixels) -> Self {
+    pub(crate) fn of(numerator: CssPixels, denominator: CssPixels) -> Self {
         Self { numerator, denominator }
     }
 

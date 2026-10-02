@@ -14,6 +14,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <AK/WeakPtr.h>
+#include <LibGC/Weak.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/CSS/CSSAnimationProperties.h>
 #include <LibWeb/CSS/CSSFontFaceRule.h>
@@ -195,7 +196,7 @@ public:
     // see, which decides whether its answer can be offered to another element.
     [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> compute_properties(DOM::AbstractElement, CascadedProperties&, u64 matching_pseudo_element_styles, u32* explicitly_inherited_non_inherited_style_groups = nullptr, StyleRecordID previous_style_record = {}, u32 initial_computed_group_mask = ComputedValues::all_style_groups, bool use_retained_style_computation_selection = false, bool stop_after_longhand_drive = false, u32* selected_computed_group_mask = nullptr, bool* computation_reads_unkeyed_context = nullptr, bool* computation_reads_resource_context = nullptr) const;
 
-    void process_animation_definitions(ComputedStyleWorkingSet const& computed_properties, CascadedProperties const&, DOM::AbstractElement& abstract_element, ReadonlySpan<AnimationProperties> animation_definitions) const;
+    void apply_animation_definitions(ComputedStyleWorkingSet const& computed_properties, CascadedProperties const&, DOM::AbstractElement& abstract_element, ReadonlySpan<AnimationProperties> animation_definitions, ReadonlySpan<i32> definition_matches) const;
 
     enum class DeclaredValueSource : u8 {
         PublishedEnvironment,
@@ -223,6 +224,9 @@ public:
     void commit_transition_stabilization_epoch();
     void for_each_provisional_transition_effect(DOM::AbstractElement const&, Function<void(Animations::KeyframeEffect&)> const&) const;
 
+    // The media features of the current style update, which the style engine copies with each transaction.
+    [[nodiscard]] Parser::ValueParserFFI::FfiMediaEnvironment const* ensure_media_environment_for_style_update() const;
+
 private:
     virtual void finalize() override;
 
@@ -230,7 +234,6 @@ private:
 
     [[nodiscard]] StyleEngine::StyleRecordDelta record_computed_style_inputs(Optional<DOM::AbstractElement>, ComputedValues const&, StyleNodeID style_node_id) const;
     [[nodiscard]] Parser::ValueParserFFI::FfiMediaEnvironment const* cached_media_environment_for_style_update() const;
-    [[nodiscard]] Parser::ValueParserFFI::FfiMediaEnvironment const* ensure_media_environment_for_style_update() const;
 
     enum class ComputeStyleMode {
         Normal,
@@ -365,20 +368,23 @@ public:
 
     [[nodiscard]] HashMap<SharedCompiledStyleSheetKey, RefPtr<SharedCompiledStyleSheet>>& shared_compiled_style_sheets() { return m_shared_compiled_style_sheets; }
 
-    // The reverse of an element's style node identity. StyleEngine plans in identities; turning a
-    // plan back into elements needs this, and it is maintained at exactly the two points the
+    // The reverse of a node's style node identity. StyleEngine plans in identities; turning a
+    // plan back into nodes needs this, and it is maintained at exactly the two points the
     // identity itself is.
-    void register_style_node(StyleNodeID style_node_id, DOM::Element&);
+    void register_style_node(StyleNodeID style_node_id, DOM::Node&);
     void ensure_style_node_slot(StyleNodeID);
     void unregister_style_node(StyleNodeID style_node_id);
     [[nodiscard]] GC::Ptr<DOM::Element> element_for_style_node(StyleNodeID style_node_id) const;
+    [[nodiscard]] GC::Ptr<DOM::Node> node_for_style_node(StyleNodeID style_node_id) const;
     void prepare_elements_for_style_computation();
     void for_each_style_node(Function<void(DOM::Element&)>) const;
 
     // Style scopes are numbered per document, with zero naming the document's own scope. A scope is
     // never reused, so a sheet detached with an identity that has been retired detaches nothing
     // rather than something else.
-    [[nodiscard]] TreeScopeID allocate_tree_scope() { return ++m_next_tree_scope; }
+    [[nodiscard]] TreeScopeID allocate_tree_scope(DOM::ShadowRoot&);
+    // The shadow root a scope numbers, while it lives and still belongs to this document.
+    [[nodiscard]] DOM::ShadowRoot* shadow_root_for_tree_scope(TreeScopeID) const;
 
 private:
     [[nodiscard]] Length::FontMetrics calculate_root_element_font_metrics(ComputedStyleWorkingSet const&) const;
@@ -493,9 +499,6 @@ private:
     mutable Vector<ProvisionalTransitionState> m_provisional_transition_states;
     mutable HashMap<u64, size_t> m_provisional_transition_state_indices;
     mutable HashMap<u64, Vector<size_t>> m_provisional_transition_state_indices_by_target;
-    // Style, layout, or animation feedback can introduce a transition for any property in a later
-    // pass. Pin the authoritative before-change record until the stabilization epoch commits.
-    mutable HashMap<u64, StyleRecordID> m_transition_stabilization_baselines;
 
     ComputationContext make_computation_context_for_property(PropertyID, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
     ComputationContext const& get_computation_context_for_property(PropertyID, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
@@ -516,8 +519,12 @@ private:
     mutable StyleEngine m_style_engine;
     mutable u64 m_computed_style_record_view_pin_count { 0 };
     mutable u32 m_style_record_view_epoch_depth { 0 };
-    Vector<GC::Ptr<DOM::Element>> m_style_nodes;
-    TreeScopeID m_next_tree_scope;
+    // Indexed by each kind's dense index; see style_node_is_text(). The element-kind table also
+    // holds shadow roots: a root gets no style, but it has a StyleNodeID of its own.
+    Vector<GC::Ptr<DOM::Node>> m_element_style_nodes;
+    Vector<GC::Ptr<DOM::Text>> m_text_style_nodes;
+    // The root each scope numbers, by scope minus one.
+    Vector<GC::Weak<DOM::ShadowRoot>> m_shadow_roots_by_tree_scope;
     Vector<NonAuthorStyleSheet> m_non_author_style_sheets;
     HashMap<RefPtr<StyleSheetState const>, SheetID> m_constructed_sheet_ids;
     HashMap<SharedCompiledStyleSheetKey, RefPtr<SharedCompiledStyleSheet>> m_shared_compiled_style_sheets;

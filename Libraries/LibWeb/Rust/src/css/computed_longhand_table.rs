@@ -559,6 +559,12 @@ pub struct ComputedLonghandTable {
     frozen: bool,
 }
 
+/// The dependency-flag bit of a record holding a value resolved against the viewport, as a `vw`
+/// length is.
+pub(crate) const DEPENDS_ON_VIEWPORT_METRICS: u8 = 1;
+/// The dependency-flag bit of a record whose font metrics read the viewport, as a `vw` font size
+/// does: what `em` and the other font-relative units resolve against moves with the viewport.
+pub(crate) const FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS: u8 = 1 << 1;
 /// The dependency-flag bit of a highlight pseudo-element record whose `color` or `background-color`
 /// comes from the author origin, on itself or up its highlight chain, so the paired default colors
 /// do not apply. Bits 0 to 4 are the viewport, font-metric, display-none, swap-eligibility and image
@@ -794,8 +800,8 @@ impl ComputedLonghandTable {
         highlight_colors_authored: bool,
         highlight_color_is_current_color: bool,
     ) {
-        self.metadata.dependency_flags |= u8::from(depends_on_viewport_metrics)
-            | (u8::from(font_metrics_depend_on_viewport_metrics) << 1)
+        self.metadata.dependency_flags |= (u8::from(depends_on_viewport_metrics) * DEPENDS_ON_VIEWPORT_METRICS)
+            | (u8::from(font_metrics_depend_on_viewport_metrics) * FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS)
             | (u8::from(highlight_colors_authored) * HIGHLIGHT_COLORS_AUTHORED)
             | (u8::from(highlight_color_is_current_color) * HIGHLIGHT_COLOR_IS_CURRENT_COLOR);
     }

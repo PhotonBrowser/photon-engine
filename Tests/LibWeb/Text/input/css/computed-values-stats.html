@@ -10,7 +10,8 @@
         println(`totalComputedValuesCreated >= liveComputedValues: ${stats.totalComputedValuesCreated >= stats.liveComputedValues}`);
 
         let before = internals.computedValuesStats().totalComputedValuesCreated;
-        document.getElementById("target").style.color = "red";
+        // A transition is one only C++ computes.
+        document.getElementById("target").style.transitionDelay = "1s";
         internals.updateStyle();
         let after = internals.computedValuesStats().totalComputedValuesCreated;
         println(`restyle creates new ComputedValues: ${after > before}`);

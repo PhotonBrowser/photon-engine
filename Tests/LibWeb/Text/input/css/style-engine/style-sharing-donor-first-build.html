@@ -1,5 +1,9 @@
 <!DOCTYPE html>
 <script src="../../include.js"></script>
+<style>
+    /* A transition keeps the computation in C++, whose donor sharing this counts. */
+    font { transition-delay: 0s; }
+</style>
 <div id="container"></div>
 <script>
     function makeFont(color) {

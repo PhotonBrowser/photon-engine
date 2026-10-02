@@ -11,6 +11,7 @@
 #include <LibGC/WeakInlines.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
@@ -780,8 +781,11 @@ FontFeatureData ComputedStyleWorkingSet::font_feature_data() const
 
 Optional<FontVariantAlternates> ComputedStyleWorkingSet::font_variant_alternates() const
 {
-    auto const& value = property(PropertyID::FontVariantAlternates);
+    return font_variant_alternates_from_style_value(property(PropertyID::FontVariantAlternates));
+}
 
+Optional<FontVariantAlternates> font_variant_alternates_from_style_value(StyleValue const& value)
+{
     // normal
     if (value.is_keyword()) {
         VERIFY(value.to_keyword() == Keyword::Normal);
@@ -821,8 +825,11 @@ FontVariantCaps ComputedStyleWorkingSet::font_variant_caps() const
 
 Optional<FontVariantEastAsian> ComputedStyleWorkingSet::font_variant_east_asian() const
 {
-    auto const& value = property(PropertyID::FontVariantEastAsian);
+    return font_variant_east_asian_from_style_value(property(PropertyID::FontVariantEastAsian));
+}
 
+Optional<FontVariantEastAsian> font_variant_east_asian_from_style_value(StyleValue const& value)
+{
     if (value.to_keyword() == Keyword::Normal)
         return {};
 
@@ -850,8 +857,11 @@ FontVariantEmoji ComputedStyleWorkingSet::font_variant_emoji() const
 
 Optional<FontVariantLigatures> ComputedStyleWorkingSet::font_variant_ligatures() const
 {
-    auto const& value = property(PropertyID::FontVariantLigatures);
+    return font_variant_ligatures_from_style_value(property(PropertyID::FontVariantLigatures));
+}
 
+Optional<FontVariantLigatures> font_variant_ligatures_from_style_value(StyleValue const& value)
+{
     if (value.to_keyword() == Keyword::Normal)
         return {};
 
@@ -879,8 +889,11 @@ Optional<FontVariantLigatures> ComputedStyleWorkingSet::font_variant_ligatures()
 
 Optional<FontVariantNumeric> ComputedStyleWorkingSet::font_variant_numeric() const
 {
-    auto const& value = property(PropertyID::FontVariantNumeric);
+    return font_variant_numeric_from_style_value(property(PropertyID::FontVariantNumeric));
+}
 
+Optional<FontVariantNumeric> font_variant_numeric_from_style_value(StyleValue const& value)
+{
     if (value.to_keyword() == Keyword::Normal)
         return {};
 
@@ -914,8 +927,11 @@ FontVariantPosition ComputedStyleWorkingSet::font_variant_position() const
 
 HashMap<Utf16FlyString, u8> ComputedStyleWorkingSet::font_feature_settings() const
 {
-    auto const& value = property(PropertyID::FontFeatureSettings);
+    return font_feature_settings_from_style_value(property(PropertyID::FontFeatureSettings));
+}
 
+HashMap<Utf16FlyString, u8> font_feature_settings_from_style_value(StyleValue const& value)
+{
     if (value.is_keyword())
         return {}; // normal
 
@@ -936,8 +952,11 @@ HashMap<Utf16FlyString, u8> ComputedStyleWorkingSet::font_feature_settings() con
 
 HashMap<Utf16FlyString, double> ComputedStyleWorkingSet::font_variation_settings() const
 {
-    auto const& value = property(PropertyID::FontVariationSettings);
+    return font_variation_settings_from_style_value(property(PropertyID::FontVariationSettings));
+}
 
+HashMap<Utf16FlyString, double> font_variation_settings_from_style_value(StyleValue const& value)
+{
     if (value.is_keyword())
         return {}; // normal
 
@@ -1000,10 +1019,22 @@ ScrollbarColorData ComputedStyleWorkingSet::scrollbar_color(ColorResolutionConte
     return {};
 }
 
-ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer) const
+ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer, TreeScopeID tree_scope) const
 {
-    if (!m_cached_computed_font_list) {
-        m_cached_computed_font_list = font_computer.compute_font_for_style_values(computed_font_families(), font_size(), font_slope(), font_weight(), font_width(), font_optical_sizing(), font_variation_settings(), font_feature_data());
+    if (!m_cached_computed_font_list || m_cached_computed_font_list_scope != tree_scope) {
+        m_cached_computed_font_list = resolve_font_for_style_values(font_computer,
+            {
+                .font_families = computed_font_families(),
+                .font_optical_sizing = font_optical_sizing(),
+                .font_size = font_size(),
+                .font_slope = font_slope(),
+                .font_weight = font_weight(),
+                .font_width = font_width(),
+                .font_variation_settings = font_variation_settings(),
+                .font_feature_data = font_feature_data(),
+                .font_feature_values_scope = tree_scope,
+            });
+        m_cached_computed_font_list_scope = tree_scope;
         VERIFY(!m_cached_computed_font_list->is_empty());
     }
 
@@ -1012,8 +1043,10 @@ ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet:
 
 ValueComparingNonnullRefPtr<Gfx::Font const> ComputedStyleWorkingSet::first_available_computed_font(FontComputer const& font_computer) const
 {
+    // NB: Feature values only change how a font shapes text, not which font is first available, so the list
+    //     resolved for any tree scope answers.
     if (!m_cached_first_available_computed_font)
-        m_cached_first_available_computed_font = computed_font_list(font_computer)->first_available_font();
+        m_cached_first_available_computed_font = computed_font_list(font_computer, m_cached_computed_font_list_scope)->first_available_font();
     return *m_cached_first_available_computed_font;
 }
 
