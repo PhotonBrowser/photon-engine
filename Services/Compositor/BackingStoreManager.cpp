@@ -116,26 +116,30 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
     if (viewport_size.is_empty())
         return {};
 
-    auto minimum_needed_size = viewport_size;
+    auto allocation_size = viewport_size;
     bool force_reallocate = false;
     if (window_resize_in_progress == Compositing::WindowResizingInProgress::Yes) {
-        // Pad the minimum needed size so that we don't have to keep reallocating backing stores while the window is being resized.
-        minimum_needed_size = { viewport_size.width() + 256, viewport_size.height() + 256 };
+        // Pad a new allocation so that it can cover nearby viewport sizes
+        // without reallocating backing stores during every step of a resize.
+        allocation_size = { viewport_size.width() + 256, viewport_size.height() + 256 };
     } else {
         // If we're not in the middle of a resize, we can shrink the backing store size to match the viewport size.
-        minimum_needed_size = viewport_size;
-        force_reallocate = m_allocated_size != minimum_needed_size;
+        force_reallocate = m_allocated_size != viewport_size;
     }
 
-    if (force_reallocate || m_allocated_size.is_empty() || !m_allocated_size.contains(minimum_needed_size)) {
-        m_allocated_size = minimum_needed_size;
+    // During resize, test the actual viewport against the padded allocation.
+    // Testing `allocation_size` here would require another 256 px of headroom
+    // after every viewport change and cause the pool to be recreated on each
+    // resize event.
+    if (force_reallocate || m_allocated_size.is_empty() || !m_allocated_size.contains(viewport_size)) {
+        m_allocated_size = allocation_size;
         ++m_pool_epoch;
         auto buffer_count = backing_store_count_for(should_publish);
         Vector<i32> bitmap_ids;
         bitmap_ids.ensure_capacity(buffer_count);
         for (size_t i = 0; i < buffer_count; ++i)
             bitmap_ids.append(m_next_bitmap_id++);
-        return Allocation { .size = minimum_needed_size, .bitmap_ids = move(bitmap_ids) };
+        return Allocation { .size = allocation_size, .bitmap_ids = move(bitmap_ids) };
     }
 
     return {};

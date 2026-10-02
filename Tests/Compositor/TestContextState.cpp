@@ -376,6 +376,23 @@ TEST_CASE(oversized_backing_stores_are_rejected)
     EXPECT(!manager.is_valid());
 }
 
+TEST_CASE(backing_store_padding_is_reused_during_live_resize)
+{
+    Compositor::BackingStoreManager manager;
+    auto first = manager.resize_backing_stores_if_needed({ 100, 100 }, Compositing::WindowResizingInProgress::Yes, true);
+    VERIFY(first.has_value());
+    EXPECT_EQ(first->size, (Gfx::IntSize { 356, 356 }));
+
+    EXPECT(!manager.resize_backing_stores_if_needed({ 120, 120 }, Compositing::WindowResizingInProgress::Yes, true).has_value());
+    auto grown = manager.resize_backing_stores_if_needed({ 357, 120 }, Compositing::WindowResizingInProgress::Yes, true);
+    VERIFY(grown.has_value());
+    EXPECT_EQ(grown->size, (Gfx::IntSize { 613, 376 }));
+
+    auto settled = manager.resize_backing_stores_if_needed({ 357, 120 }, Compositing::WindowResizingInProgress::No, true);
+    VERIFY(settled.has_value());
+    EXPECT_EQ(settled->size, (Gfx::IntSize { 357, 120 }));
+}
+
 #ifdef AK_OS_MACOS
 TEST_CASE(a_released_backing_store_is_not_reused_while_its_surface_is_in_use)
 {
