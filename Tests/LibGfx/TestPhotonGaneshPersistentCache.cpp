@@ -48,6 +48,27 @@ TEST_CASE(persistent_cache_stores_and_retrieves_exact_bytes)
     std::filesystem::remove_all(root.characters());
 }
 
+TEST_CASE(persistent_cache_load_does_not_mutate_entry_metadata)
+{
+    auto root = test_cache_root("read-only-load");
+    std::filesystem::remove_all(root.characters());
+    Gfx::PhotonGaneshPersistentCache cache(root, ByteString("namespace-a"), 1024);
+    auto key = data("program-key"sv);
+    auto value = data("compiled-program-bytes"sv);
+    cache.store(*key, *value, SkString("read-only-load"));
+
+    auto path = cache.file_path_for_key(*key);
+    auto stored_time = std::filesystem::file_time_type::clock::now() - std::chrono::hours(2);
+    std::error_code error;
+    std::filesystem::last_write_time(path.characters(), stored_time, error);
+    EXPECT(!error);
+
+    EXPECT(cache.load(*key));
+    EXPECT(std::filesystem::last_write_time(path.characters(), error) == stored_time);
+    EXPECT(!error);
+    std::filesystem::remove_all(root.characters());
+}
+
 TEST_CASE(persistent_cache_namespaces_are_isolated)
 {
     auto root = test_cache_root("namespace"sv);

@@ -121,8 +121,9 @@ sk_sp<SkData> PhotonGaneshPersistentCache::load(SkData const& key)
         return nullptr;
     }
 
-    std::error_code error;
-    std::filesystem::last_write_time(path.characters(), std::filesystem::file_time_type::clock::now(), error);
+    // Do not update the entry's modification time on a cache hit. The Compositor sandbox denies
+    // utimensat, which terminates the process instead of returning an error. Eviction uses the
+    // last successful store time as its age, so reads remain metadata-read-only.
     {
         std::lock_guard diagnostics_guard(diagnostics_lock());
         ++cache_diagnostics().hits;
