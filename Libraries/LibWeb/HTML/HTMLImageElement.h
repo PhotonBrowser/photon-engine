@@ -135,7 +135,7 @@ private:
     // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attributes
     virtual bool supports_dimension_attributes() const override { return true; }
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     virtual void did_set_viewport_rect(CSSPixelRect const&) override;
 
@@ -147,7 +147,7 @@ private:
     void update_alt_text_shadow_tree();
     void set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason);
 
-    virtual void decoded_image_data_did_update() override { image_provider_contents_changed(); }
+    virtual void decoded_image_data_did_update() override;
     virtual Layout::Node const* image_provider_layout_node() const override;
 
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;

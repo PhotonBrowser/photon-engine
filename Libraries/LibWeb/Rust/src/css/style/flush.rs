@@ -1830,6 +1830,7 @@ impl StyleEngineState {
             style_delta_memory.resize_required_to(&mut self.retained.memory, style_delta_bytes);
             let mut engine_computed_record_scratch = publication::EngineComputedRecordScratch::default();
             engine_computed_record_scratch.document_environment_moved = environment_changed;
+            engine_computed_record_scratch.host_applies_animation_plans = true;
             // The viewport the records were driven against last, against the one they are driven
             // against now.
             let viewport = (
@@ -2146,8 +2147,10 @@ impl StyleEngineState {
                         && !parent_inputs_moved.display
                         && !self.node_style_reads_custom_properties(node)
                     {
-                        // C++ only refreshes the inherited environment for a non-consumer. There
-                        // is no element record to recompute or compare against the parent's groups.
+                        // A non-consumer's record and environment do not move with what it
+                        // inherits, beyond the environment move that already reached it. The row
+                        // still goes to the host so that what it derives for the children carries
+                        // the reaction on to the descendants whose style reads the environment.
                         false
                     } else if (previous_answer_was_incomplete
                         || selector_truth_changes.deltas_for(node).iter().any(|delta| {
@@ -2351,6 +2354,16 @@ impl StyleEngineState {
                         } else {
                             0
                         },
+                        owes_an_animation_plan: gap == FfiStyleDeltaGap::Computed
+                            && self
+                                .retained
+                                .row_owes_an_animation_plan(node, old_style_record, new_style_record),
+                        owes_a_transition_step: gap == FfiStyleDeltaGap::Computed
+                            && self.retained.row_owes_a_transition_step(node),
+                        composed_by_the_host: gap == FfiStyleDeltaGap::Computed
+                            && self
+                                .retained
+                                .host_composes_row(node, old_style_record, new_style_record),
                     };
                     if style_deltas.len() == style_deltas.capacity() {
                         style_deltas.reserve(1);
@@ -2398,6 +2411,9 @@ impl StyleEngineState {
                                 record_reads: 0,
                                 explicitly_inherited_groups: 0,
                                 record_damage,
+                                owes_an_animation_plan: false,
+                                owes_a_transition_step: false,
+                                composed_by_the_host: false,
                             });
                         }
                     }

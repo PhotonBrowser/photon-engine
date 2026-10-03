@@ -465,7 +465,7 @@ Utf16String HTMLElement::get_the_text_steps()
 {
     // 1. If element is not being rendered or if the user agent is a non-CSS user agent, then return element's descendant text content.
     document().update_layout(DOM::UpdateLayoutReason::HTMLElementGetTheTextSteps);
-    if (!layout_node())
+    if (!has_layout_box())
         return descendant_text_content();
 
     // 2. Let results be a new empty list.
@@ -538,7 +538,7 @@ Utf16String HTMLElement::outer_text()
 
 static bool any_ancestor_establishes_a_fixed_position_containing_block(Layout::NodeWithStyle const& node)
 {
-    return Layout::RustFFI::layout_arena_any_ancestor_establishes_a_fixed_position_containing_block(node.arena_handle(), Layout::Node::slot_id(&node));
+    return Layout::RustFFI::layout_row_any_ancestor_establishes_a_fixed_position_containing_block(node.document_host(), Layout::Node::slot_id(&node));
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-htmlelement-scrollparent
@@ -900,7 +900,7 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
 void HTMLElement::set_subtree_inertness(bool is_inert)
 {
     auto repaint_if_inertness_reaches_painted_output = [](DOM::Node& node) {
-        node.note_dom_paint_facts();
+        node.publish_dom_paint_facts();
     };
     auto update_inertness = [&](HTMLElement& element) {
         if (element.is_inert() == is_inert)

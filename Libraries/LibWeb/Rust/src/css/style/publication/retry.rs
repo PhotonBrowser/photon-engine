@@ -22,6 +22,7 @@ impl EngineComputedRecordScratch {
             viewport_moved: moves.viewport,
             root_font_inputs_changed: moves.root_font_inputs,
             installed_ancestors: Some(InstalledAncestors(())),
+            host_applies_animation_plans: true,
             ..Self::default()
         }
     }
@@ -119,11 +120,10 @@ impl RetainedState {
                 scratch,
                 counters,
             ) {
-                let pseudos = self.engine_pseudo_records(
+                let pseudos = self.engine_pseudo_records_beside(
                     node,
-                    Some(old_record),
+                    (old_record, record),
                     None,
-                    record,
                     cascade_state.0,
                     None,
                     scratch,
@@ -206,6 +206,12 @@ impl StyleEngineState {
         };
         if style_record != 0 {
             retried.explicitly_inherited_groups = scratch.element_explicitly_inherited_groups;
+            let held_style_record = self.retained.held_style_records.get(&node).copied().unwrap_or(0);
+            retried.owes_an_animation_plan =
+                self.retained
+                    .row_owes_an_animation_plan(node, held_style_record, style_record);
+            retried.owes_a_transition_step = self.retained.row_owes_a_transition_step(node);
+            retried.composed_by_the_host = self.retained.host_composes_row(node, held_style_record, style_record);
             for delta in &scratch.pseudo_deltas {
                 let kind = usize::from(delta.kind);
                 if kind < bridge::RETRY_PSEUDO_RECORD_SLOTS {

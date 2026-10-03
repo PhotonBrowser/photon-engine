@@ -37,6 +37,7 @@ use libweb_rust::css::style::bridge::FfiTreeDelta;
 use libweb_rust::css::style::bridge::RecordedExactCascadeWinner;
 use libweb_rust::css::style::cascade::CascadeOperator;
 use libweb_rust::css::style::cascade::SpecifiedValueID;
+use libweb_rust::css::style::engine_calls;
 use libweb_rust::css::style::fast_hash::FastMap;
 use libweb_rust::css::style::index::StyleAtomID;
 use libweb_rust::css::style::memory::MEMORY_CATEGORIES;
@@ -101,7 +102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Engine IDs and style-record tokens are sequential counters in the recorder, so lookups
         // that run once per event index dense arrays instead of hashing. Replay is short-lived;
         // the arrays are sized by the largest token seen and never shrink.
-        let mut live_engines = Vec::<Option<*mut c_void>>::new();
+        let mut live_engines = Vec::<Option<libweb_rust::css::style::StyleEngineHandle>>::new();
         let mut match_answer_identity_mappings = Vec::<MatchAnswerIdentityMapping>::new();
         let mut engine_count = 0_u64;
         let mut event_count = 0_u64;
@@ -218,20 +219,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     unsafe { bridge::style_engine_destroy(engine) };
                 }
-                EventKind::AllocateStyleNodes | EventKind::AllocateTextStyleNodes => {
+                EventKind::MintStyleNodes => {
+                    let engine = read_engine(&mut event.payload, &live_engines)?;
+                    let nodes = event.payload.read_u32_vec()?;
+                    unsafe { engine_calls::replay_mint_style_nodes(engine, &nodes) };
+                }
+                EventKind::DiscardStyleTransactionOutputs => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let expected = event.payload.read_u32_vec()?;
-                    let mut actual = vec![0; expected.len()];
-                    let allocate = if event.kind == EventKind::AllocateStyleNodes {
-                        bridge::style_engine_allocate_style_nodes
-                    } else {
-                        bridge::style_engine_allocate_text_style_nodes
-                    };
-                    unsafe { allocate(engine, actual.as_mut_ptr(), actual.len()) };
+                    let actual = unsafe { bridge::style_engine_end_style_transaction_for_replay(engine) };
                     if actual != expected {
-                        return Err(
-                            format!("style-node allocation diverged: expected {expected:?}, got {actual:?}").into(),
-                        );
+                        return Err(format!(
+                            "released style-node identities diverged: expected {expected:?}, got {actual:?}"
+                        )
+                        .into());
                     }
                 }
                 EventKind::ApplyTransaction => {
@@ -251,7 +252,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let row_count =
                         (tree.len() + features.len() + states.len() + declarations.len() + element_style_inputs.len())
                             as u64;
-                    *pending_changed_rows.entry(engine as usize).or_default() += row_count;
+                    *pending_changed_rows.entry(engine.address()).or_default() += row_count;
                     let transaction = FfiStyleInputTransaction {
                         tree_deltas: tree.as_ptr(),
                         tree_delta_count: tree.len(),
@@ -268,7 +269,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         element_style_inputs: element_style_inputs.as_ptr(),
                         element_style_input_count: element_style_inputs.len(),
                     };
-                    unsafe { bridge::style_engine_apply_transaction(engine, &transaction) };
+                    unsafe { engine_calls::replay_apply_transaction(engine, &transaction) };
                 }
                 EventKind::Flush => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
@@ -281,7 +282,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .read(engine)
                     });
                     let start = Instant::now();
-                    unsafe { bridge::style_engine_flush(engine) };
+                    bridge::operations::flush(unsafe { engine.get_mut() });
                     let elapsed = start.elapsed();
                     let after = counter_reader.read(engine);
                     let detailed_after = detailed_before
@@ -297,7 +298,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &mut selected_boundary_time,
                         &mut phase_times,
                     );
-                    let changed_rows = pending_changed_rows.remove(&(engine as usize)).unwrap_or(0);
+                    let changed_rows = pending_changed_rows.remove(&engine.address()).unwrap_or(0);
                     if selected {
                         amplification.record(changed_rows, &before, &after);
                         if let (Some(before), Some(after)) = (&detailed_before, &detailed_after) {
@@ -431,8 +432,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     let start = Instant::now();
-                    let actual_view =
-                        unsafe { bridge::style_engine_take_style_transaction(engine, root, computation_inputs) };
+                    let actual_view = unsafe {
+                        bridge::style_engine_take_style_transaction_for_replay(engine, root, computation_inputs)
+                    };
                     let actual_reclaimed_atoms = if actual_view.reclaimed_style_atom_count == 0 {
                         Vec::new()
                     } else {
@@ -484,7 +486,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &mut selected_boundary_time,
                         &mut phase_times,
                     );
-                    let changed_rows = pending_changed_rows.remove(&(engine as usize)).unwrap_or(0);
+                    let changed_rows = pending_changed_rows.remove(&engine.address()).unwrap_or(0);
                     if selected {
                         amplification.record(changed_rows, &before, &after);
                         if let (Some(before), Some(after)) = (&detailed_before, &detailed_after) {
@@ -526,22 +528,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         names.push(event.payload.read_u32()?);
                         hosts.push(event.payload.read_u32()?);
                     }
-                    unsafe {
-                        bridge::style_engine_set_element_parts(engine, node, names.as_ptr(), hosts.as_ptr(), count)
-                    };
+                    unsafe { engine_calls::replay_set_element_parts(engine, node, &names, &hosts) };
+                }
+                EventKind::SetTextData => {
+                    // A text node's characters are read by the layout tree build and by nothing in
+                    // the style engine, so replay reads the record past and publishes nothing. The
+                    // string would have to be built through AK, which this binary does not link.
+                    let _ = read_engine(&mut event.payload, &live_engines)?;
+                    let _ = event.payload.read_u32()?;
+                    let _ = event.payload.read_u16_vec()?;
                 }
                 EventKind::SetElementLanguage => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let node = event.payload.read_u32()?;
                     let language = event.payload.read_u32()?;
                     let text = event.payload.read_u16_vec()?;
-                    let text_pointer = match text.is_empty() {
-                        true => std::ptr::null(),
-                        false => text.as_ptr(),
-                    };
-                    unsafe {
-                        bridge::style_engine_set_element_language(engine, node, language, text_pointer, text.len())
-                    };
+                    unsafe { engine_calls::replay_set_element_language(engine, node, language, &text) };
                 }
                 EventKind::MatchDocument => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
@@ -761,7 +763,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let expected_absent = event.payload.read_bool()?;
                     let expected_uses_substitution = event.payload.read_bool()?;
                     let expected_present = event.payload.read_u8()?;
-                    let actual = unsafe { bridge::style_engine_answer_record_demand(engine, node, demand) };
+                    let actual = unsafe { bridge::style_engine_answer_record_demand_for_replay(engine, node, demand) };
                     if actual.record.style_record != expected
                         || actual.is_absent != expected_absent
                         || actual.record.uses_substitution != expected_uses_substitution
@@ -834,7 +836,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut actual_value = 0;
                     let mut actual_name_length = 0;
                     let actual_name = unsafe {
-                        bridge::style_engine_counter(engine, index, &mut actual_value, &mut actual_name_length)
+                        bridge::style_engine_counter_for_replay(
+                            engine,
+                            index,
+                            &mut actual_value,
+                            &mut actual_name_length,
+                        )
                     };
                     let actual = match actual_name.is_null() {
                         true => None,
@@ -1201,7 +1208,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 EventKind::HasDeferredGeometryTransaction => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let expected = event.payload.read_bool()?;
-                    let actual = unsafe { bridge::style_engine_has_deferred_geometry_transaction(engine) };
+                    let actual = bridge::operations::has_deferred_geometry_transaction(unsafe { engine.get() });
                     if actual != expected {
                         return Err(format!(
                             "deferred geometry transaction presence diverged: expected {expected}, got {actual}"
@@ -1212,7 +1219,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 EventKind::PendingTransactionMayAffectLayoutGeometry => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let expected = event.payload.read_bool()?;
-                    let actual = unsafe { bridge::style_engine_pending_transaction_may_affect_layout_geometry(engine) };
+                    let actual =
+                        bridge::operations::pending_transaction_may_affect_layout_geometry(unsafe { engine.get() });
                     if actual != expected {
                         return Err(
                             format!("pending geometry effect diverged: expected {expected}, got {actual}").into(),
@@ -1243,7 +1251,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 EventKind::EndDeferredGeometryTransactionFlush => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
-                    unsafe { bridge::style_engine_end_deferred_geometry_transaction_flush(engine) };
+                    bridge::operations::end_deferred_geometry_transaction_flush(unsafe { engine.get_mut() });
                 }
                 kind => return Err(format!("unhandled StyleEngine replay event {kind:?}").into()),
             }
@@ -1650,12 +1658,12 @@ struct DetailedCounterLedger {
 }
 
 impl DetailedCounterReader {
-    fn new(engine: *mut c_void) -> Self {
+    fn new(engine: libweb_rust::css::style::StyleEngineHandle) -> Self {
         let mut names = Vec::new();
         for index in 0.. {
             let mut value = 0_u64;
             let mut name_length = 0_usize;
-            let name = unsafe { bridge::style_engine_counter(engine, index, &mut value, &mut name_length) };
+            let name = unsafe { bridge::style_engine_counter_for_replay(engine, index, &mut value, &mut name_length) };
             if name.is_null() {
                 break;
             }
@@ -1665,7 +1673,7 @@ impl DetailedCounterReader {
         Self { names }
     }
 
-    fn read(&self, engine: *mut c_void) -> Vec<u64> {
+    fn read(&self, engine: libweb_rust::css::style::StyleEngineHandle) -> Vec<u64> {
         (0..self.names.len())
             .map(|index| read_counter_value(engine, index))
             .collect()
@@ -1707,7 +1715,7 @@ impl DetailedCounterLedger {
 }
 
 impl AmplificationCounterReader {
-    fn new(engine: *mut c_void) -> Self {
+    fn new(engine: libweb_rust::css::style::StyleEngineHandle) -> Self {
         let mut reader = Self {
             ingress_touched: usize::MAX,
             selector_changed: Vec::new(),
@@ -1720,7 +1728,7 @@ impl AmplificationCounterReader {
         for index in 0.. {
             let mut value = 0_u64;
             let mut name_length = 0_usize;
-            let name = unsafe { bridge::style_engine_counter(engine, index, &mut value, &mut name_length) };
+            let name = unsafe { bridge::style_engine_counter_for_replay(engine, index, &mut value, &mut name_length) };
             if name.is_null() {
                 break;
             }
@@ -1758,7 +1766,7 @@ impl AmplificationCounterReader {
         reader
     }
 
-    fn read(&self, engine: *mut c_void) -> AmplificationCounters {
+    fn read(&self, engine: libweb_rust::css::style::StyleEngineHandle) -> AmplificationCounters {
         let sum = |indices: &[usize]| indices.iter().map(|&index| read_counter_value(engine, index)).sum();
         AmplificationCounters {
             ingress_touched: read_counter_value(engine, self.ingress_touched),
@@ -1835,10 +1843,10 @@ fn amplification_stage_report(changed_rows: u64, touched_rows: u64, flushes: u64
     })
 }
 
-fn read_counter_value(engine: *mut c_void, index: usize) -> u64 {
+fn read_counter_value(engine: libweb_rust::css::style::StyleEngineHandle, index: usize) -> u64 {
     let mut value = 0_u64;
     let mut name_length = 0_usize;
-    let name = unsafe { bridge::style_engine_counter(engine, index, &mut value, &mut name_length) };
+    let name = unsafe { bridge::style_engine_counter_for_replay(engine, index, &mut value, &mut name_length) };
     assert!(!name.is_null(), "cached counter index is out of range");
     value
 }
@@ -2032,8 +2040,8 @@ fn read_document_style_computation_inputs(
 #[inline]
 fn read_engine_indexed(
     payload: &mut PayloadReader,
-    live_engines: &[Option<*mut c_void>],
-) -> Result<(usize, *mut c_void), Box<dyn std::error::Error>> {
+    live_engines: &[Option<libweb_rust::css::style::StyleEngineHandle>],
+) -> Result<(usize, libweb_rust::css::style::StyleEngineHandle), Box<dyn std::error::Error>> {
     let engine_id = payload.read_u64()?;
     let index = usize::try_from(engine_id)?;
     let Some(pointer) = live_engines.get(index).copied().flatten() else {
@@ -2062,8 +2070,8 @@ fn style_record_replay_index(style_record: u64) -> Result<usize, std::num::TryFr
 #[inline]
 fn read_engine(
     payload: &mut PayloadReader,
-    live_engines: &[Option<*mut c_void>],
-) -> Result<*mut c_void, Box<dyn std::error::Error>> {
+    live_engines: &[Option<libweb_rust::css::style::StyleEngineHandle>],
+) -> Result<libweb_rust::css::style::StyleEngineHandle, Box<dyn std::error::Error>> {
     let engine_id = payload.read_u64()?;
     let Some(pointer) = usize::try_from(engine_id)
         .ok()
@@ -2274,11 +2282,15 @@ fn read_style_transaction_outputs(
                     tag => return Err(format!("unknown style delta gap tag {tag}").into()),
                 },
                 uses_substitution: format_version >= 16 && payload.read_bool()?,
-                // NB: The recording does not carry the record reads, the explicit-inheritance marks
-                //     or the record damage, and replay does not compare them.
+                // NB: The recording does not carry the record reads, the explicit-inheritance marks,
+                //     the record damage or what a row owes the host and whether the host composes
+                //     it, and replay does not compare them.
                 record_reads: 0,
                 explicitly_inherited_groups: 0,
                 record_damage: 0,
+                owes_an_animation_plan: false,
+                owes_a_transition_step: false,
+                composed_by_the_host: false,
             });
         }
         emissions.push(StyleTransactionEmission {
@@ -2334,7 +2346,10 @@ fn write_style_transaction_outputs(
     payload.write_u32_slice(&outputs.reclaimed_atoms);
 }
 
-fn replay_atom_mappings(engine: *mut c_void, payload: &mut PayloadReader) -> Result<(), Box<dyn std::error::Error>> {
+fn replay_atom_mappings(
+    engine: libweb_rust::css::style::StyleEngineHandle,
+    payload: &mut PayloadReader,
+) -> Result<(), Box<dyn std::error::Error>> {
     let count = payload.read_length()?;
     for _ in 0..count {
         match payload.read_u8()? {
@@ -2348,7 +2363,7 @@ fn replay_atom_mappings(engine: *mut c_void, payload: &mut PayloadReader) -> Res
                 let namespace = payload.read_u32()?;
                 let name = payload.read_u32()?;
                 let expected = payload.read_u32()?;
-                let actual = unsafe { bridge::style_engine_intern_qualified_atom(engine, namespace, name) };
+                let actual = bridge::operations::intern_qualified_atom(unsafe { engine.get_mut() }, namespace, name);
                 assert_identity("selector qualified atom", expected, actual)?;
             }
             tag => return Err(format!("unknown selector atom mapping tag {tag}").into()),
@@ -2781,6 +2796,14 @@ extern "C" fn ladybird_rust_panic_will_abort() {}
 
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_utf16_fly_string_unref(_raw: usize) {}
+// A text node's published characters are the only owned AK::Utf16String the engine holds, and
+// replay never publishes one, so nothing here owns a reference to release.
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_utf16_string_unref(_raw: usize) {}
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_utf16_string_create_uninitialized(_length: usize, _has_ascii_storage: bool) -> usize {
+    panic!("style replay must not build strings through the document thread's allocator");
+}
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_utf16_fly_string_from_utf16(_data: *const u16, _length: usize) -> usize {
     panic!("style replay must use recorded atoms instead of the document-thread string interner");
@@ -2795,6 +2818,12 @@ extern "C" fn ladybird_gfx_font_cascade_list_unref(_list: *const c_void) {}
 extern "C" fn ladybird_gfx_font_cascade_list_equals(list: *const c_void, other: *const c_void) -> bool {
     list == other
 }
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_cascade_list_frozen(_list: *const c_void) -> *const c_void {
+    std::ptr::null()
+}
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_unref(_font: *const c_void) {}
 // Replay has no C++ CustomPropertyData to count references on.
 #[unsafe(no_mangle)]
 extern "C" fn web_css_custom_property_data_reference(_data: *const c_void) {}
@@ -3042,6 +3071,9 @@ mod tests {
                     record_reads: 0,
                     explicitly_inherited_groups: 0,
                     record_damage: 0,
+                    owes_an_animation_plan: false,
+                    owes_a_transition_step: false,
+                    composed_by_the_host: false,
                 }],
             }],
             style_atoms_swept: false,

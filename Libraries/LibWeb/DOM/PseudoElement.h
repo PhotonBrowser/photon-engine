@@ -52,7 +52,6 @@ public:
 
     Layout::NodeWithStyle* layout_node() const override { return unsafe_layout_node(); }
     Layout::NodeWithStyle* unsafe_layout_node() const override;
-    void set_layout_node(Layout::NodeWithStyle*);
 
     virtual Node& root() const override;
 
@@ -63,7 +62,8 @@ public:
     void refresh_computed_style(CSS::StyleRecordID);
 
     CSSPixelPoint scroll_offset() const { return m_scroll_offset; }
-    void set_scroll_offset(CSSPixelPoint value) { m_scroll_offset = value; }
+    void set_scroll_offset(CSSPixelPoint);
+    void publish_scroll_offset() const;
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
 

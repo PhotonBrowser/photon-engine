@@ -21,6 +21,7 @@
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Compositor/NavigablePresenter.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -81,6 +82,9 @@ public:
 
     Vector<GC::Root<LocalNavigable>> child_navigables() const;
     Vector<GC::Root<LocalNavigable>> hosted_inclusive_descendant_navigables();
+    // For a dump that descends into the documents navigable containers show: brings the layout of the active
+    // document of this navigable and of every navigable it hosts up to date.
+    void update_layout_of_hosted_inclusive_descendant_documents(DOM::UpdateLayoutReason);
 
     bool is_local_root() const;
     GC::Ref<LocalNavigable> local_root();
@@ -102,6 +106,7 @@ public:
     void stop_loading();
 
     void set_delaying_load_events(bool value);
+    void stop_delaying_load_events_for_navigation(Utf16String const& navigation_id);
     bool is_delaying_load_events() const { return m_is_delaying_load_events; }
 
     void set_navigation_load_event_guard(DOM::Document& parent_doc);
@@ -292,11 +297,13 @@ public:
     void prepare_to_populate_reconstructed_history_entry(Utf16String navigation_api_key);
 
     bool record_display_list_and_scroll_state(PaintConfig);
+    // Records what brings the compositor context up to date: a new display list, or what changed for the one it has.
+    Optional<Compositor::CompositorFrame> record_compositor_frame(PaintConfig);
     void paint_next_frame();
     bool paint_next_frame_if_needed(DOM::UpdateLayoutReason);
     void render_screenshot(Gfx::PaintingSurface&, PaintConfig, Function<void()>&& callback);
-    Compositing::DisplayListResourceStorage& display_list_resource_storage() { return m_display_list_resource_storage; }
-    Compositing::DisplayListResourceStorage const& display_list_resource_storage() const { return m_display_list_resource_storage; }
+    Compositing::DisplayListResourceStorage& display_list_resource_storage() { return m_presenter.display_list_resource_storage(); }
+    Compositing::DisplayListResourceStorage const& display_list_resource_storage() const { return m_presenter.display_list_resource_storage(); }
 
     bool needs_repaint() const { return m_needs_repaint; }
     void set_needs_repaint() { m_needs_repaint = true; }
@@ -561,12 +568,7 @@ private:
     i32 m_force_dark_foreground_threshold { default_force_dark_foreground_threshold };
     i32 m_force_dark_background_threshold { default_force_dark_background_threshold };
     bool m_should_show_caret_hit_test_debug_overlay { false };
-    Optional<PaintConfig> m_compositor_display_list_paint_config;
-    RefPtr<Compositing::DisplayList> m_compositor_display_list;
-    u64 m_compositor_display_list_visual_context_tree_structural_epoch { 0 };
-    Compositing::DisplayListResourceStorage m_display_list_resource_storage;
-    Compositing::DisplayListResourceSet m_compositor_display_list_resources;
-    Compositing::DisplayListResourceSet m_compositor_display_list_command_resources;
+    Compositor::NavigablePresenter m_presenter;
     OwnPtr<Compositor::CompositorContextHandle> m_compositor_context;
     RefPtr<Core::Timer> m_async_scroll_hover_update_timer;
     Vector<PendingUserScrollendTarget> m_pending_user_scrollend_targets;

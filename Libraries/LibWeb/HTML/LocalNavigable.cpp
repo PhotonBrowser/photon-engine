@@ -22,6 +22,7 @@
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/SerializationMode.h>
 #include <LibWeb/CSS/VisualViewport.h>
+#include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.h>
@@ -75,6 +76,7 @@
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/XMLSerializer.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Page/Page.h>
@@ -719,6 +721,28 @@ Vector<GC::Root<LocalNavigable>> LocalNavigable::hosted_inclusive_descendant_nav
     return navigables;
 }
 
+void LocalNavigable::update_layout_of_hosted_inclusive_descendant_documents(DOM::UpdateLayoutReason reason)
+{
+    // Laying out a document can resize the navigable containers in it, which resizes the viewports of the documents
+    // they show and leaves those out of date. Tree order lays out each document after the one hosting it. Laying out
+    // an SVG document an <object> shows can resize the <object> in turn, which leaves the document hosting it out of
+    // date, so later rounds lay out what is out of date again. Each round brings at least one more level of nesting
+    // to rest, which bounds the rounds by the number of documents.
+    auto navigables = hosted_inclusive_descendant_navigables();
+    for (size_t round = 0; round <= navigables.size(); ++round) {
+        bool laid_out_any = false;
+        for (auto const& navigable : navigables) {
+            auto document = navigable->active_document();
+            if (!document || (round > 0 && document->layout_is_up_to_date()))
+                continue;
+            document->update_layout(reason);
+            laid_out_any = true;
+        }
+        if (!laid_out_any)
+            return;
+    }
+}
+
 void LocalNavigable::remove_from_all_local_navigables()
 {
     cancel_hover_update_after_async_scroll();
@@ -815,6 +839,16 @@ void LocalNavigable::set_delaying_load_events(bool value)
         VERIFY(parent() && !is<LocalNavigable>(*parent()));
     }
     report_state_to_remote_container();
+}
+
+// AD-HOC: The spec leaves "is delaying load events" alone when a superseded navigation is dropped; we clear it there so
+//         a dropped navigation does not delay the load event forever. The flag is the navigable's, though, so only
+//         clear it when no newer navigation is ongoing: that one set it as it started and clears it as it ends.
+void LocalNavigable::stop_delaying_load_events_for_navigation(Utf16String const& navigation_id)
+{
+    if (auto const* ongoing_navigation_id = m_ongoing_navigation.get_pointer<Utf16String>(); ongoing_navigation_id && *ongoing_navigation_id != navigation_id)
+        return;
+    set_delaying_load_events(false);
 }
 
 void LocalNavigable::set_navigation_load_event_guard(DOM::Document& parent_doc)
@@ -3349,7 +3383,7 @@ void LocalNavigable::continue_navigation_after_population_dispatch(PreparedNavig
         return;
     }
     if (ongoing_navigation() != navigation_id) {
-        set_delaying_load_events(false);
+        stop_delaying_load_events_for_navigation(navigation_id);
         return;
     }
 
@@ -3839,13 +3873,13 @@ void LocalNavigable::run_navigation_unload_check(Utf16String const& navigation_i
             // NB: The UI process learns of the canceled check from the population-failure report and ends the
             //     recorded load itself.
             if (unload_prompt_canceled != CheckIfUnloadingIsCanceledResult::Continue) {
-                set_delaying_load_events(false);
+                stop_delaying_load_events_for_navigation(navigation_id);
                 completion_steps->function()(false);
                 return;
             }
 
             if (ongoing_navigation() != navigation_id) {
-                set_delaying_load_events(false);
+                stop_delaying_load_events_for_navigation(navigation_id);
                 completion_steps->function()(false);
                 return;
             }
@@ -3861,7 +3895,7 @@ bool LocalNavigable::resume_navigation_params_creation(Utf16String const& naviga
         return false;
 
     if (!request.has_value()) {
-        set_delaying_load_events(false);
+        stop_delaying_load_events_for_navigation(navigation_id);
         return true;
     }
 
@@ -4100,7 +4134,7 @@ void LocalNavigable::navigate_to_a_javascript_url(GC::Ref<Fetch::Infrastructure:
     // AD-HOC: These return paths do not run finalize_a_cross_document_navigation(). Clear a child navigable's
     //         load-event delay and tell the UI that the admitted navigation produced no document.
     auto finish_loading_without_navigation = [&] {
-        set_delaying_load_events(false);
+        stop_delaying_load_events_for_navigation(navigation_id);
         if (is_top_level_traversable())
             active_browsing_context()->page().client().navigation_population_failed(id(), navigation_id);
     };
@@ -4289,7 +4323,7 @@ static bool prepare_to_finalize_a_cross_document_navigation(GC::Ref<LocalNavigab
 
     // AD-HOC: This check is not in the spec but we should not continue navigation if ongoing navigation id has changed.
     if (expected_ongoing_navigation_id.has_value() && navigable->ongoing_navigation() != *expected_ongoing_navigation_id) {
-        navigable->set_delaying_load_events(false);
+        navigable->stop_delaying_load_events_for_navigation(*expected_ongoing_navigation_id);
         return false;
     }
 
@@ -4904,6 +4938,10 @@ void LocalNavigable::perform_scroll_of_viewport_scrolling_box(CSSPixelPoint new_
         scroll_offset_did_change();
 
         if (auto document = active_document()) {
+            // The viewport's row holds the offset, which is published next to the store it mirrors rather than by each
+            // caller. A document without a layout tree is handed it when it builds one.
+            if (auto* arena = document->layout_node_arena_if_created())
+                Layout::RustFFI::render_state_set_viewport_scroll_offset(arena->host(), new_position);
             document->set_needs_repaint(Badge<HTML::LocalNavigable> {}, InvalidateDisplayList::No);
             document->invalidate_scroll_state();
             document->inform_all_viewport_clients_about_the_current_viewport_rect();
@@ -6634,10 +6672,7 @@ void LocalNavigable::repaint_after_compositor_process_reconnect()
 
         m_needs_repaint = true;
         m_needs_to_record_display_list = true;
-        m_compositor_display_list_paint_config.clear();
-        m_compositor_display_list = nullptr;
-        m_compositor_display_list_resources = {};
-        m_compositor_display_list_command_resources = {};
+        m_presenter.forget_compositor_display_list();
     }
 
     for (auto const& child_navigable : child_navigables())
@@ -6760,7 +6795,7 @@ bool LocalNavigable::force_dark_applies_to_active_document() const
     return m_force_dark_enabled && !active_document_opts_out_of_force_dark();
 }
 
-bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_config)
+Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(PaintConfig paint_config)
 {
     // Per-navigable state is stamped here rather than where PaintConfig is built, so no call site (the headless
     // screenshot path above all) can leave it behind; kept in the config so a change compares unequal below.
@@ -6770,11 +6805,11 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
     paint_config.should_show_line_box_borders = m_should_show_line_box_borders;
 
     if (!has_compositor_context())
-        return false;
+        return {};
 
     auto document = active_document();
     if (!document)
-        return false;
+        return {};
 
     adopt_pending_async_scroll_offsets();
     document->update_paint_and_hit_testing_properties_if_needed();
@@ -6787,9 +6822,12 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
         paint_config.canvas_fill_rect = Gfx::IntRect { {}, viewport_size };
     }
 
+    auto& presenter = m_presenter;
+    auto& resource_storage = presenter.display_list_resource_storage();
+    auto const& compositor_display_list_paint_config = presenter.compositor_display_list_paint_config();
     auto should_record_display_list = m_needs_to_record_display_list
-        || !m_compositor_display_list_paint_config.has_value()
-        || !(m_compositor_display_list_paint_config.value() == paint_config);
+        || !compositor_display_list_paint_config.has_value()
+        || !(compositor_display_list_paint_config.value() == paint_config);
 
     RefPtr<Compositing::DisplayList> display_list;
     Compositing::DisplayListResourceSet display_list_command_resources;
@@ -6799,17 +6837,17 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
     auto& document_paint_state = document->paint_state();
     bool compositor_display_list_is_unchanged = false;
     if (should_record_display_list) {
-        display_list = document->record_display_list(paint_config, m_display_list_resource_storage, Painting::PaintCommandCacheMode::ReadWrite);
+        display_list = document->record_display_list(paint_config, resource_storage, Painting::PaintCommandCacheMode::ReadWrite);
         if (!display_list)
-            return false;
+            return {};
         VERIFY(document->has_committed_viewport_box());
-        compositor_display_list_is_unchanged = m_compositor_display_list == display_list;
+        compositor_display_list_is_unchanged = presenter.compositor_display_list() == display_list;
         if (!compositor_display_list_is_unchanged) {
             visual_context_tree = document_paint_state.visual_context_tree(*document);
-            display_list_command_resources = command_resources_of_display_list(m_display_list_resource_storage, document_paint_state, *display_list);
-            display_list_resources = compositor_display_list_resources(m_display_list_resource_storage, document_paint_state, display_list_command_resources, *visual_context_tree);
-            resource_transaction = m_display_list_resource_storage.create_transaction(
-                m_compositor_display_list_resources,
+            display_list_command_resources = command_resources_of_display_list(resource_storage, document_paint_state, *display_list);
+            display_list_resources = compositor_display_list_resources(resource_storage, document_paint_state, display_list_command_resources, *visual_context_tree);
+            resource_transaction = resource_storage.create_transaction(
+                presenter.compositor_display_list_resources(),
                 display_list_resources);
         }
     }
@@ -6822,7 +6860,7 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
 
     // Keyboard eligibility belongs to this publication, not to the cached paint commands. Refresh it even if
     // recording was skipped or returned the same display list, and send it with the corresponding scroll state.
-    auto& published_display_list = display_list ? *display_list : *m_compositor_display_list;
+    auto& published_display_list = display_list ? *display_list : *presenter.compositor_display_list();
     auto keyboard_scroll_state = is_top_level_traversable()
         ? page().take_keyboard_scroll_state_for_compositor(published_display_list.compatible_visual_context_tree_structural_epoch())
         : Compositing::KeyboardScrollState {};
@@ -6830,35 +6868,50 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
     async_scrolling_metadata.keyboard_scroll_state = keyboard_scroll_state;
     published_display_list.set_async_scrolling_metadata(move(async_scrolling_metadata));
 
+    Compositor::CompositorFrame frame;
     if (should_record_display_list && !compositor_display_list_is_unchanged) {
-        m_compositor_display_list_visual_context_tree_structural_epoch = display_list->compatible_visual_context_tree_structural_epoch();
-        compositor_context().update_display_list(*display_list, visual_context_tree.release_value(), move(resource_transaction), move(scroll_state_snapshot));
+        frame.display_list_update = Compositor::CompositorFrame::DisplayListUpdate {
+            .display_list = *display_list,
+            .visual_context_tree = visual_context_tree.release_value(),
+            .resource_transaction = move(resource_transaction),
+            .scroll_state_snapshot = move(scroll_state_snapshot),
+        };
         document_paint_state.did_update_visual_context_tree_in_compositor();
-        m_display_list_resource_storage.retain_only(display_list_resources);
-        m_compositor_display_list = display_list;
-        m_compositor_display_list_command_resources = move(display_list_command_resources);
-        m_compositor_display_list_resources = move(display_list_resources);
+        presenter.did_hand_display_list_to_compositor(*display_list, paint_config, move(display_list_command_resources), move(display_list_resources));
         m_needs_to_record_display_list = false;
-        m_compositor_display_list_paint_config = paint_config;
     } else {
         if (compositor_display_list_is_unchanged) {
             m_needs_to_record_display_list = false;
-            m_compositor_display_list_paint_config = paint_config;
-            if (m_display_list_resource_storage.has_resources_added_since_last_retain())
-                m_display_list_resource_storage.retain_only(m_compositor_display_list_resources);
+            presenter.set_compositor_display_list_paint_config(paint_config);
+            if (resource_storage.has_resources_added_since_last_retain())
+                resource_storage.retain_only(presenter.compositor_display_list_resources());
         }
         if (visual_context_tree_needs_compositor_update) {
             auto updated_visual_context_tree = document_paint_state.visual_context_tree(*document);
-            VERIFY(updated_visual_context_tree.structural_epoch() == m_compositor_display_list_visual_context_tree_structural_epoch);
-            auto updated_display_list_resources = compositor_display_list_resources(m_display_list_resource_storage, document_paint_state, m_compositor_display_list_command_resources, updated_visual_context_tree);
-            auto updated_resource_transaction = m_display_list_resource_storage.create_transaction(m_compositor_display_list_resources, updated_display_list_resources);
-            compositor_context().update_visual_context_tree(updated_visual_context_tree, move(updated_resource_transaction));
+            VERIFY(updated_visual_context_tree.structural_epoch() == presenter.compositor_display_list_visual_context_tree_structural_epoch());
+            auto updated_display_list_resources = compositor_display_list_resources(resource_storage, document_paint_state, presenter.compositor_display_list_command_resources(), updated_visual_context_tree);
+            auto updated_resource_transaction = resource_storage.create_transaction(presenter.compositor_display_list_resources(), updated_display_list_resources);
+            frame.visual_context_tree_update = Compositor::CompositorFrame::VisualContextTreeUpdate {
+                .visual_context_tree = move(updated_visual_context_tree),
+                .resource_transaction = move(updated_resource_transaction),
+            };
             document_paint_state.did_update_visual_context_tree_in_compositor();
-            m_display_list_resource_storage.retain_only(updated_display_list_resources);
-            m_compositor_display_list_resources = move(updated_display_list_resources);
+            presenter.did_hand_visual_context_tree_to_compositor(move(updated_display_list_resources));
         }
-        compositor_context().update_scroll_state(move(scroll_state_snapshot), move(keyboard_scroll_state));
+        frame.scroll_state_update = Compositor::CompositorFrame::ScrollStateUpdate {
+            .scroll_state_snapshot = move(scroll_state_snapshot),
+            .keyboard_scroll_state = move(keyboard_scroll_state),
+        };
     }
+    return frame;
+}
+
+bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_config)
+{
+    auto frame = record_compositor_frame(move(paint_config));
+    if (!frame.has_value())
+        return false;
+    compositor_context().submit_frame(frame.release_value());
     return true;
 }
 
@@ -6881,10 +6934,11 @@ void LocalNavigable::paint_next_frame()
 
     m_needs_repaint = false;
 
-    if (!record_display_list_and_scroll_state(paint_config))
+    auto frame = record_compositor_frame(paint_config);
+    if (!frame.has_value())
         return;
-    auto viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
-    compositor_context().present_frame(viewport_rect);
+    frame->present_viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
+    compositor_context().submit_frame(frame.release_value());
 }
 
 bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_reason)

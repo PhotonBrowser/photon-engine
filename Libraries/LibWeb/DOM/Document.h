@@ -515,7 +515,6 @@ public:
     void update_layout(UpdateLayoutReason);
     void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void update_style_and_layout_once(UpdateLayoutReason, ThrottledAnimationSamplingScope);
-    void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
     [[nodiscard]] u64 partial_layout_count() const;
     [[nodiscard]] u64 full_layout_count() const;
@@ -1088,7 +1087,6 @@ public:
 
     // https://drafts.csswg.org/css-anchor-position-1/#determining
     AnchorNameMap& anchor_name_map() { return m_anchor_name_map; }
-    GC::Ptr<Element> element_by_anchor_name(Utf16FlyString const& name, Node const& querying_node, Function<bool(Element&)> const& is_acceptable) const;
 
     void add_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
     void remove_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
@@ -1197,7 +1195,7 @@ public:
 
     // Confinement report of the most recent layout tree build, for tests observing whether a
     // partial rebuild stayed inside its rebuilt subtrees.
-    [[nodiscard]] Layout::RustFFI::FfiLayoutTreeBuildStats layout_tree_build_stats() const;
+    [[nodiscard]] Layout::RustFFI::FfiLayoutCounts layout_counts() const;
 
     enum class AccumulatedVisualContextUpdateScope : u8 {
         Values,
@@ -1229,6 +1227,17 @@ public:
     void set_may_have_scroll_snap_areas() { m_may_have_scroll_snap_areas = true; }
     [[nodiscard]] bool may_have_scroll_snap_areas() const { return m_may_have_scroll_snap_areas; }
 
+    // Whether a node in this document has ever carried a blocking wheel event listener. It never
+    // goes back to false: a node that stopped carrying one still has descendants whose inherited
+    // state has to be derived when they move.
+    void set_may_have_blocking_wheel_event_listener() { m_may_have_blocking_wheel_event_listener = true; }
+    [[nodiscard]] bool may_have_blocking_wheel_event_listener() const { return m_may_have_blocking_wheel_event_listener; }
+
+    // Whether a node in this document has ever published a paint fact. It never goes back to false:
+    // a node that lost its last fact still has to publish that it did.
+    void set_may_have_dom_paint_facts() { m_may_have_dom_paint_facts = true; }
+    [[nodiscard]] bool may_have_dom_paint_facts() const { return m_may_have_dom_paint_facts; }
+
     void register_scroll_snap_container(Layout::Node const&);
     [[nodiscard]] Vector<Compositing::RustFFI::NodeSlotId> collect_scroll_snap_containers();
 
@@ -1249,6 +1258,7 @@ public:
 
     void register_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot&);
     void unregister_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot&);
+    void publish_animation_keyframes_for_style_update();
     template<typename Callback>
     void for_each_shadow_root(Callback&& callback)
     {
@@ -1636,7 +1646,6 @@ private:
     NonnullOwnPtr<CommitMessages> m_commit_messages;
     OwnPtr<Painting::DocumentPaintState> m_paint_state;
     NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
-    bool m_may_have_content_visibility_auto_style { false };
 
     GC::Ptr<Node> m_hovered_node;
     GC::Ptr<Node> m_inspected_node;
@@ -1981,7 +1990,14 @@ private:
     HashMap<Web::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
     Vector<Compositing::RustFFI::NodeSlotId> m_scroll_snap_containers;
     bool m_needs_scroll_container_resnap { false };
+    // Whether an image box handed the provider it owns after a layout update found its image already there, so it lays
+    // out again with it.
+    bool m_owed_image_provider_arrived_with_image { false };
+    // Whether a layout update requested web faces its layout wanted, which may have resolved at once.
+    bool m_requested_wanted_font_faces { false };
     bool m_may_have_scroll_snap_areas { false };
+    bool m_may_have_blocking_wheel_event_listener { false };
+    bool m_may_have_dom_paint_facts { false };
 
     HashTable<GC::Ref<Element>> m_list_owners_pending_item_renumber;
     HashTable<GC::Ref<Element>> m_list_owners_with_stale_item_counters;
@@ -2000,6 +2016,10 @@ private:
     // It's responsibility of object that allocated ShadowRoot to keep it alive.
     ShadowRoot::DocumentShadowRootList m_shadow_roots;
     u64 m_style_sheet_set_generation { 0 };
+    // The `@keyframes` rows the style engine still holds for shadow roots that left this document.
+    Vector<CSS::StyleScope::DepartedAnimationKeyframes> m_departed_animation_keyframes;
+    // The style sheet set generation the `@keyframes` rows were last brought up to date at.
+    Optional<u64> m_animation_keyframes_published_generation;
 
     Optional<Utf16String> m_content_blocker_style_sheet;
     // Class/id tokens already covered by the cached content blocker stylesheet.

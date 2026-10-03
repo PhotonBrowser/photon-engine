@@ -34,6 +34,7 @@ use crate::css::property_metadata::longhands_for_shorthand;
 use crate::css::property_metadata::property_id;
 use crate::css::property_metadata::property_is_inherited;
 use crate::css::property_metadata::property_is_shorthand;
+use crate::css::retained_fly_string::RetainedUtf16FlyString;
 use crate::css::style_value::{
     BasicShapeData, GridTrackEntryKind, RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData,
 };
@@ -940,7 +941,7 @@ pub(crate) fn recascade_font_size_batch(
 /// `length_resolution_context` must be null or valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_recascade_font_size_batch(
-    style_engine: *const c_void,
+    style_engine: crate::css::style::StyleEngineHandle,
     style_records: *const u64,
     style_record_count: usize,
     start_index: usize,
@@ -951,7 +952,7 @@ pub unsafe extern "C" fn rust_recascade_font_size_batch(
     length_resolution_context: *const FfiLengthResolutionContext,
 ) -> FfiFontSizeRecascadeBatch {
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::NestedPropertyComputeEntry);
-    let style_engine = unsafe { &*style_engine.cast::<crate::css::style::StyleEngine>() };
+    let style_engine = unsafe { style_engine.get() };
     let style_records = if style_record_count == 0 {
         &[]
     } else {
@@ -2791,7 +2792,6 @@ pub struct FfiLonghandPhaseContext {
 pub struct FfiLonghandDriveResult {
     pub driver_results: FfiLonghandDriverResults,
     pub custom_properties: FfiResolvedCustomProperties,
-    pub animations: FfiComputedAnimationList,
 }
 
 #[derive(Clone, Copy)]
@@ -2820,13 +2820,9 @@ pub struct FfiComputedAnimation {
     /// The index, in the list of CSS animations the host already holds for this element or
     /// pseudo-element, of the animation this definition claims, or -1 where it asks for a new one.
     pub matched_existing_index: i32,
-}
-
-#[repr(C)]
-pub struct FfiComputedAnimationList {
-    pub animations: *const FfiComputedAnimation,
-    pub count: usize,
-    pub storage: *mut c_void,
+    /// The host's keyframe set for this definition's name, from the `@keyframes` the scopes in the
+    /// name's chain published, or null where none of them defines it.
+    pub keyframe_set: *const c_void,
 }
 
 #[repr(C)]
@@ -2836,7 +2832,7 @@ pub struct FfiComputePropertiesInput {
     /// none, and the registry their names may be registered in.
     pub custom_property_store: *const c_void,
     pub custom_property_registry: *const c_void,
-    pub style_engine: *const c_void,
+    pub style_engine: crate::css::style::StyleEngineHandle,
     pub style_node: u32,
     pub pseudo_kind: u8,
     pub previous_style_record: u64,
@@ -2859,12 +2855,15 @@ pub struct FfiComputePropertiesInput {
         *mut FfiLonghandDriveInput,
     ),
     pub finish_longhand_drive: unsafe extern "C" fn(*mut c_void, *const FfiLonghandDriveResult),
-    pub apply_animation_definitions: unsafe extern "C" fn(*mut c_void),
+    /// Reconciles the element's CSS animations against the definitions the computation decided,
+    /// borrowed for the call, and says whether the element is in a `display: none` subtree, where
+    /// no animation starts.
+    pub apply_animation_definitions: unsafe extern "C" fn(*mut c_void, *const FfiComputedAnimation, usize, bool),
     pub prepare_animations: unsafe extern "C" fn(*mut c_void) -> bool,
     pub apply_animations:
         unsafe extern "C" fn(*mut c_void, bool, *mut FfiInputLineHeightMetrics) -> *mut AnimatedOverlay,
     pub did_mutate_post_compute: unsafe extern "C" fn(*mut c_void, u16),
-    pub finish_properties: unsafe extern "C" fn(*mut c_void, bool),
+    pub finish_properties: unsafe extern "C" fn(*mut c_void),
 }
 
 /// Document-level inputs to used color-scheme resolution. Scheme values use
@@ -2903,7 +2902,7 @@ pub struct FfiDocumentLonghandInput {
 #[repr(C)]
 pub struct FfiAnimationKeyframeLonghandInput {
     pub underlying_longhand_table: *const ComputedLonghandTable,
-    pub style_engine: *const c_void,
+    pub style_engine: crate::css::style::StyleEngineHandle,
     pub inheritance_parent_style_record: u64,
     pub resolved_properties: *const c_void,
     pub property_count: usize,
@@ -3165,7 +3164,8 @@ pub(crate) struct ParentSnapshot<'a> {
 }
 
 impl<'a> ParentSnapshot<'a> {
-    /// A snapshot over a record's parts, for a caller holding the record view itself.
+    /// A snapshot over a record's parts, for a caller holding the record view itself. What the
+    /// record's animations sampled is what a child inherits.
     pub(crate) fn new(
         table: &'a ComputedLonghandTable,
         stored_animated_overlay: Option<&'a AnimatedOverlay>,
@@ -3174,7 +3174,7 @@ impl<'a> ParentSnapshot<'a> {
     ) -> Self {
         Self {
             table,
-            inherited_value_overlay: None,
+            inherited_value_overlay: stored_animated_overlay,
             stored_animated_overlay,
             font_metrics_depend_on_viewport_metrics,
             in_display_none_subtree,
@@ -4574,12 +4574,7 @@ pub(crate) unsafe fn drive_property_computation(
                     snapshot.and_then(|snapshot| snapshot.animated_property(inherited_property_id))
                 && let Some(animated_overlay) = unsafe { animated_overlay.as_mut() }
             {
-                animated_overlay.set_owned(
-                    property_id,
-                    animated_property.clone_value(),
-                    true,
-                    animated_property.result_of_transition,
-                );
+                animated_overlay.set_inherited(property_id, animated_property);
             }
 
             if property_id == prop::OVERFLOW_X {
@@ -4718,6 +4713,11 @@ pub(crate) unsafe fn drive_property_computation(
         }
         let display_before = computed_display.expect("display must be computed by the longhand driver");
         longhand_table.set_display_before_box_type_transformation(display_before.encoded());
+        let overflow_before = [
+            computed_overflow_x.expect("overflow-x must be computed by the longhand driver"),
+            computed_overflow_y.expect("overflow-y must be computed by the longhand driver"),
+        ];
+        longhand_table.set_overflow_before_adjustment(overflow_before);
         let mut box_type_input = *box_type_input;
         box_type_input.display = display_before;
         let float_before = computed_float.expect("float must be computed by the longhand driver");
@@ -4733,8 +4733,8 @@ pub(crate) unsafe fn drive_property_computation(
         let post_compute_adjustment = PostComputeAdjustment {
             display_before,
             float_before,
-            overflow_x_before: computed_overflow_x.expect("overflow-x must be computed by the longhand driver"),
-            overflow_y_before: computed_overflow_y.expect("overflow-y must be computed by the longhand driver"),
+            overflow_x_before: overflow_before[0],
+            overflow_y_before: overflow_before[1],
             text_align_before: computed_text_align_before_adjustment
                 .expect("text-align must be computed by the longhand driver"),
             position_before: box_type_input.position,
@@ -4899,11 +4899,6 @@ unsafe fn compute_longhands(
         FfiLonghandDriveResult {
             driver_results,
             custom_properties,
-            animations: FfiComputedAnimationList {
-                animations: std::ptr::null(),
-                count: 0,
-                storage: std::ptr::null_mut(),
-            },
         },
         remaining_context.input_line_height_metrics,
     )
@@ -5179,12 +5174,124 @@ fn animation_slot(pseudo_kind: u8) -> crate::css::style::animations::AnimationSl
     }
 }
 
+/// Whether the element whose animation plan is about to be applied is in a `display: none` subtree,
+/// where no animation starts. Only asked where a definition claims no existing animation, the one
+/// case that starts one.
+///
+/// <https://drafts.csswg.org/css-animations-1/#animations>
+fn in_display_none_subtree_for_animations(
+    style_engine: &crate::css::style::StyleEngine,
+    node: Option<crate::css::style::tree::StyleNodeID>,
+    pseudo_kind: u8,
+    table: &ComputedLonghandTable,
+    overlay: Option<&AnimatedOverlay>,
+    definitions: &[FfiComputedAnimation],
+) -> bool {
+    if !definitions
+        .iter()
+        .any(|definition| definition.matched_existing_index == crate::css::style::animations::NO_MATCHED_ANIMATION)
+    {
+        return false;
+    }
+    if effective_display(table, overlay).is_none() {
+        return true;
+    }
+    let Some(node) = node else {
+        return false;
+    };
+    // The element's own display is answered above, so an element's walk starts at its parent; a
+    // pseudo-element's starts at its originating element.
+    let start = match pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
+        true => style_engine.tree().parent_or_shadow_host(node),
+        false => Some(node),
+    };
+    start.is_some_and(|start| style_engine.has_inclusive_ancestor_with_display_none_ignoring_animations(start))
+}
+
+/// The animation plan the record an element holds decides, where applying it would change
+/// anything, and whether the element is in a `display: none` subtree: what a C++ computation
+/// decides beside the record it computes, decided for a record the style engine settled once the
+/// host has installed it. The definitions borrow the record's values.
+fn settled_animation_plan(
+    style_engine: &crate::css::style::StyleEngine,
+    node: crate::css::style::tree::StyleNodeID,
+    record: u64,
+) -> Option<(smallvec::SmallVec<[FfiComputedAnimation; 1]>, bool)> {
+    let view = style_engine.style_record_view(record)?;
+    let table = unsafe { view.longhand_table.as_ref() }?;
+    let pseudo_kind = crate::css::cascaded_properties::NO_PSEUDO_ELEMENT;
+    let declaration_scope = style_engine.element_animation_name_declaration_scope(node)?;
+    let existing_animations = style_engine.element_css_defined_animations(node, animation_slot(pseudo_kind));
+    let element_tree_scope = style_engine.tree().tree_scope(node);
+    let mut definitions = smallvec::SmallVec::new();
+    build_computed_animation_list(
+        table,
+        existing_animations,
+        |name| {
+            style_engine
+                .animation_keyframes()
+                .resolve(declaration_scope, element_tree_scope, name)
+        },
+        &mut definitions,
+    );
+    if crate::css::style::animations::plan_changes_nothing(&definitions, existing_animations) {
+        return None;
+    }
+    let in_display_none_subtree =
+        in_display_none_subtree_for_animations(style_engine, Some(node), pseudo_kind, table, None, &definitions);
+    Some((definitions, in_display_none_subtree))
+}
+
+/// Hands `apply` the animation plan of an element whose record the style engine settled, decided
+/// from the record the element holds now that the host has installed it, where applying the plan
+/// would change anything, with whether the element is in a `display: none` subtree.
+///
+/// # Safety
+/// `engine` must be live, `record` must be the record the element holds, and `apply` must not
+/// retain the definitions it is handed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_settled_animation_plan(
+    engine: crate::css::style::StyleEngineHandle,
+    node: u32,
+    record: u64,
+    context: *mut c_void,
+    apply: unsafe extern "C" fn(*mut c_void, *const FfiComputedAnimation, usize, bool),
+) {
+    let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(node) else {
+        return;
+    };
+    // Applying the plan publishes the element's animations to the engine, so nothing of the
+    // engine is borrowed while the host applies it: the definitions only point into the record.
+    let Some((definitions, in_display_none_subtree)) = settled_animation_plan(unsafe { engine.get() }, node, record)
+    else {
+        return;
+    };
+    unsafe {
+        apply(
+            context,
+            definitions.as_ptr(),
+            definitions.len(),
+            in_display_none_subtree,
+        );
+    }
+}
+
+/// Whether a computed `animation-name` names any animation, so that a first record computed with it
+/// decides an animation plan.
+pub(crate) fn table_declares_css_animations(table: &ComputedLonghandTable) -> bool {
+    computed_value_list(table, property_id::ANIMATION_NAME)
+        .iter()
+        .any(|name| !matches!(name.data(), StyleValueData::Keyword { keyword } if *keyword == keyword::NONE))
+}
+
 // https://drafts.csswg.org/css-values-4/#linked-properties
 // https://drafts.csswg.org/css-animations-1/#animations
 fn build_computed_animation_list(
     table: &ComputedLonghandTable,
-    existing_animation_names: &[crate::css::css_string::CssString],
-) -> FfiComputedAnimationList {
+    existing_animations: &[crate::css::style::animations::CssDefinedAnimation],
+    resolve_keyframes: impl Fn(&[u16]) -> Option<usize>,
+    animations: &mut smallvec::SmallVec<[FfiComputedAnimation; 1]>,
+) {
     use crate::css::property_metadata::property_id as prop;
 
     let name_values = computed_value_list(table, prop::ANIMATION_NAME);
@@ -5198,9 +5305,8 @@ fn build_computed_animation_list(
     let composition_values = computed_value_list(table, prop::ANIMATION_COMPOSITION);
     let timeline_values = computed_value_list(table, prop::ANIMATION_TIMELINE);
 
-    let mut animations = Vec::with_capacity(name_values.len());
     // The name of each definition, for matching against the animations the host holds.
-    let mut definition_names = Vec::new();
+    let mut definition_names = smallvec::SmallVec::<[&crate::css::css_string::CssString; 1]>::new();
     for (index, name_value) in name_values.iter().enumerate() {
         let name = match name_value.data() {
             StyleValueData::Keyword { keyword } if *keyword == keyword::NONE => continue,
@@ -5208,7 +5314,7 @@ fn build_computed_animation_list(
             StyleValueData::String { string, .. } => string,
             _ => unreachable!("computed animation-name must be none or a string"),
         };
-        if !existing_animation_names.is_empty() {
+        if !existing_animations.is_empty() {
             definition_names.push(name);
         }
         let duration_value = duration_values[index % duration_values.len()].data();
@@ -5244,6 +5350,7 @@ fn build_computed_animation_list(
             scroll_scroller,
             scroll_axis,
             matched_existing_index: crate::css::style::animations::NO_MATCHED_ANIMATION,
+            keyframe_set: resolve_keyframes(name.units()).map_or(std::ptr::null(), |set| set as *const c_void),
         });
     }
 
@@ -5251,24 +5358,13 @@ fn build_computed_animation_list(
     // rather than by the host searching the list it holds. An index past what the host's list can
     // hold claims nothing.
     crate::css::style::animations::match_existing_animations(
-        existing_animation_names,
+        existing_animations,
         &definition_names,
         |definition, animation| {
             animations[definition].matched_existing_index =
                 i32::try_from(animation).unwrap_or(crate::css::style::animations::NO_MATCHED_ANIMATION);
         },
     );
-
-    let animations = animations.into_boxed_slice();
-    let result = FfiComputedAnimationList {
-        animations: animations.as_ptr(),
-        count: animations.len(),
-        storage: std::ptr::null_mut(),
-    };
-    FfiComputedAnimationList {
-        storage: Box::into_raw(Box::new(animations)).cast(),
-        ..result
-    }
 }
 
 fn effective_longhand_data<'a>(
@@ -5315,7 +5411,7 @@ pub(crate) fn effective_display(table: &ComputedLonghandTable, overlay: Option<&
 pub unsafe extern "C" fn rust_compute_properties(input: *const FfiComputePropertiesInput) {
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::LonghandDriverEntry);
     let input = unsafe { &*input };
-    let style_engine = unsafe { &*input.style_engine.cast::<crate::css::style::StyleEngine>() };
+    let style_engine = unsafe { input.style_engine.get() };
     let previous_style = (input.previous_style_record != 0).then(|| {
         style_engine
             .style_record_view(input.previous_style_record)
@@ -5424,35 +5520,70 @@ pub unsafe extern "C" fn rust_compute_properties(input: *const FfiComputePropert
         snapshot.has_animated_property(property_id::TEXT_ALIGN)
             || snapshot.has_animated_property(property_id::DIRECTION)
     });
-    let (mut result, mut finalization_line_height_metrics) =
+    let (result, mut finalization_line_height_metrics) =
         unsafe { compute_longhands(&drive_input, parent_snapshot.as_ref(), highlight.as_ref()) };
     // The host's flag is its own precondition for holding any CSS animation, so an element without
     // it has an empty list in every one of its slots and nothing to match.
-    let existing_animation_names = match input.has_css_defined_animations {
+    let existing_animations = match input.has_css_defined_animations {
         true => crate::css::style::tree::StyleNodeID::from_raw(input.style_node).map_or(&[][..], |node| {
             style_engine.element_css_defined_animations(node, animation_slot(input.pseudo_kind))
         }),
         false => &[],
     };
+    let mut animation_definitions = smallvec::SmallVec::new();
     if !input.stop_after_longhand_drive {
-        result.animations =
-            build_computed_animation_list(unsafe { &*drive_input.longhand_table }, existing_animation_names);
+        // An animation's `@keyframes` are looked for in the tree scope the winning `animation-name`
+        // declaration was written in, then in the element's, then in the document's.
+        let declaration_scope = style_engine.animation_keyframes().scope_of_shadow_root(
+            unsafe { &*input.store }.winning_source_shadow_root_identity(property_id::ANIMATION_NAME),
+        );
+        let element_tree_scope = crate::css::style::tree::StyleNodeID::from_raw(input.style_node)
+            .map_or(crate::css::style::tree::TreeScopeID::DOCUMENT, |node| {
+                style_engine.tree().tree_scope(node)
+            });
+        build_computed_animation_list(
+            unsafe { &*drive_input.longhand_table },
+            existing_animations,
+            |name| {
+                style_engine
+                    .animation_keyframes()
+                    .resolve(declaration_scope, element_tree_scope, name)
+            },
+            &mut animation_definitions,
+        );
     }
-    // An element with no definitions and no animations to cancel has no plan to apply.
-    let has_animation_plan = result.animations.count != 0 || !existing_animation_names.is_empty();
+    // An element with no definitions and no animations to cancel has no plan to apply, and neither
+    // has one whose plan would leave every animation it holds as it is.
+    let has_animation_plan =
+        !crate::css::style::animations::plan_changes_nothing(&animation_definitions, existing_animations);
+    let in_display_none_subtree = in_display_none_subtree_for_animations(
+        style_engine,
+        crate::css::style::tree::StyleNodeID::from_raw(input.style_node),
+        input.pseudo_kind,
+        unsafe { &*drive_input.longhand_table },
+        unsafe { drive_input.animated_overlay.as_ref() },
+        &animation_definitions,
+    );
     let mut animated_overlay = drive_input.animated_overlay;
     let mut animation_values_applied = unsafe { animated_overlay.as_ref() }.is_some_and(|overlay| !overlay.is_empty());
     unsafe { (input.finish_longhand_drive)(input.callback_context, &raw const result) };
     unsafe { destroy_style_computation_result(&result) };
     unsafe { crate::css::cascaded_properties::destroy_style_computation_requirements(requirements.storage) };
     if input.stop_after_longhand_drive {
-        unsafe { (input.finish_properties)(input.callback_context, false) };
+        unsafe { (input.finish_properties)(input.callback_context) };
         unsafe { &mut *drive_input.longhand_table }.freeze();
         return;
     }
 
     if has_animation_plan {
-        unsafe { (input.apply_animation_definitions)(input.callback_context) };
+        unsafe {
+            (input.apply_animation_definitions)(
+                input.callback_context,
+                animation_definitions.as_ptr(),
+                animation_definitions.len(),
+                in_display_none_subtree,
+            );
+        }
     }
     let has_animations = unsafe { (input.prepare_animations)(input.callback_context) };
     if animation_values_applied || has_animations {
@@ -5503,7 +5634,7 @@ pub unsafe extern "C" fn rust_compute_properties(input: *const FfiComputePropert
     .is_none();
     unsafe { &mut *drive_input.longhand_table }
         .set_in_display_none_subtree(parent_style_in_display_none_subtree || display_is_none);
-    unsafe { (input.finish_properties)(input.callback_context, parent_style_in_display_none_subtree) };
+    unsafe { (input.finish_properties)(input.callback_context) };
     unsafe { &mut *drive_input.longhand_table }.freeze();
 }
 
@@ -5678,7 +5809,7 @@ pub unsafe extern "C" fn rust_compute_animation_keyframe_longhands(
     let parent_snapshot = if input.inheritance_parent_style_record == 0 {
         None
     } else {
-        let style_engine = unsafe { &*input.style_engine.cast::<crate::css::style::StyleEngine>() };
+        let style_engine = unsafe { input.style_engine.get() };
         Some(keyframe_parent_snapshot_for_style_record(
             style_engine,
             input.inheritance_parent_style_record,
@@ -5869,6 +6000,486 @@ pub unsafe extern "C" fn rust_compute_animation_keyframe_longhands(
     }
 }
 
+/// The arbitrary-substitution functions a value a keyframe substituted against the element held,
+/// which the host records on the element the way its own resolver recorded them.
+pub const SUBSTITUTION_MARK_VAR: u8 = 1 << 0;
+pub const SUBSTITUTION_MARK_ATTR: u8 = 1 << 1;
+pub const SUBSTITUTION_MARK_IF: u8 = 1 << 2;
+pub const SUBSTITUTION_MARK_INHERIT: u8 = 1 << 3;
+pub const SUBSTITUTION_MARK_CUSTOM_FUNCTION: u8 = 1 << 4;
+
+/// One effect the host samples: which of the element's described effects it is, which version of
+/// it, and how far along it is on the scale the host keys keyframes by.
+#[repr(C)]
+pub struct FfiSampledAnimationEffect {
+    pub identity: u64,
+    pub generation: u64,
+    pub current_key: f64,
+}
+
+/// The length-resolution contexts keyframe values compute in: a font's, a line height's, and every
+/// other longhand's.
+#[repr(C)]
+pub struct FfiAnimationLengthContexts {
+    pub font: FfiLengthResolutionContext,
+    pub line_height: FfiLengthResolutionContext,
+    pub remaining: FfiLengthResolutionContext,
+}
+
+/// One element's animation effects the host samples over its working set, in composite order, and
+/// what the sampling reads of the element.
+#[repr(C)]
+pub struct FfiHostAnimationSample {
+    pub style_engine: crate::css::style::StyleEngineHandle,
+    pub style_node: u32,
+    /// The pseudo-element sampled, or `NO_PSEUDO_ELEMENT` for the element itself.
+    pub pseudo_kind: u8,
+    pub effects: *const FfiSampledAnimationEffect,
+    pub effect_count: usize,
+    /// The working set's longhand table, which the animations compose over.
+    pub longhand_table: *const c_void,
+    /// The working set's overlay before this sample, or null.
+    pub animated_overlay: *const c_void,
+    /// The record the host holds for the element where the working set was reconstructed from it,
+    /// which the engine builds the length contexts over, or zero where the host builds them.
+    pub style_record: u64,
+    /// The custom-property store the element holds now, which keyframes substitute against.
+    pub custom_property_store: *const c_void,
+    /// The same beneath the overlay of the sample before, which animations compose over.
+    pub base_custom_property_store: *const c_void,
+    /// The store of the element the sampled one inherits from.
+    pub inheritance_custom_property_store: *const c_void,
+    pub element_declares_own_custom_properties: bool,
+    /// The identities of the element's custom-property environment and the one it inherits, under
+    /// which values substituted against the element hold.
+    pub custom_property_environments: [u64; 2],
+    pub inheritance_parent_style_record: u64,
+    /// The document's side of the environment keyframes compute in. The engine fills in the
+    /// element's own: its place among its siblings and its random bases.
+    pub environment: *const FfiStyleComputationEnvironment,
+    pub has_transform_reference_box: bool,
+    pub transform_reference_box_width: f64,
+    pub transform_reference_box_height: f64,
+    pub callback_context: *mut c_void,
+    /// Makes the working set's overlay writable and hands it over, the moment a value is written.
+    pub prepare_overlay_for_mutation: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    /// The element's length-resolution contexts, with the container bases the unit mask asks for.
+    pub length_contexts: unsafe extern "C" fn(*mut c_void, u8, *mut FfiAnimationLengthContexts),
+}
+
+/// What sampling did to the working set's overlay.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FfiHostAnimationSampleOutcome {
+    /// Nothing was written.
+    Unchanged,
+    /// No effect is active: the element's animated properties are to be cleared.
+    Cleared,
+    /// The overlay was written through `prepare_overlay_for_mutation`.
+    Evaluated,
+}
+
+/// One custom property an animation composed, by the raw representation of its name.
+#[repr(C)]
+pub struct FfiAnimatedCustomPropertyResult {
+    pub name: usize,
+    pub value: *const c_void,
+}
+
+/// What sampling found out that the host records on the element and its working set.
+#[repr(C)]
+pub struct FfiHostAnimationSampleResult {
+    pub outcome: FfiHostAnimationSampleOutcome,
+    /// The non-inherited style groups a keyframe saying `inherit` read from the parent.
+    pub keyframes_inherited_non_inherited_style_groups: u32,
+    pub depends_on_viewport_metrics: bool,
+    pub font_metrics_depend_on_viewport_metrics: bool,
+    pub uses_tree_counting_function: bool,
+    /// The `SUBSTITUTION_MARK_*` bits of what the values and easings substituted against the
+    /// element held.
+    pub substitution_marks: u8,
+    /// The custom properties a substituted `style()` query read, transferred to the caller, or null.
+    pub style_query_dependencies: *mut c_void,
+    pub animated_custom_properties: *const FfiAnimatedCustomPropertyResult,
+    pub animated_custom_property_count: usize,
+    /// Released with `rust_release_animated_custom_property_results`.
+    pub animated_custom_properties_storage: *mut c_void,
+}
+
+impl FfiHostAnimationSampleResult {
+    fn with_outcome(outcome: FfiHostAnimationSampleOutcome) -> Self {
+        Self {
+            outcome,
+            keyframes_inherited_non_inherited_style_groups: 0,
+            depends_on_viewport_metrics: false,
+            font_metrics_depend_on_viewport_metrics: false,
+            uses_tree_counting_function: false,
+            substitution_marks: 0,
+            style_query_dependencies: std::ptr::null_mut(),
+            animated_custom_properties: std::ptr::null(),
+            animated_custom_property_count: 0,
+            animated_custom_properties_storage: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// The custom properties a sample composed, with the names and values the rows point into.
+struct AnimatedCustomPropertyResults {
+    rows: Vec<FfiAnimatedCustomPropertyResult>,
+    _retained: Vec<(RetainedUtf16FlyString, RetainedStyleValueData)>,
+}
+
+/// Release what `rust_sample_animation_effects` handed back for the animated custom properties.
+///
+/// # Safety
+/// `storage` must be null or a sample result's `animated_custom_properties_storage`, released once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_release_animated_custom_property_results(storage: *mut c_void) {
+    if !storage.is_null() {
+        drop(unsafe { Box::from_raw(storage.cast::<AnimatedCustomPropertyResults>()) });
+    }
+}
+
+pub(crate) fn animation_length_resolution_context(
+    context: &FfiLengthResolutionContext,
+) -> crate::css::animation::FfiAnimationLengthResolutionContext {
+    let font_metrics = |metrics: &FfiFontMetrics| crate::css::animation::FfiAnimationFontMetrics {
+        font_size: metrics.font_size,
+        x_height: metrics.x_height,
+        cap_height: metrics.cap_height,
+        zero_advance: metrics.zero_advance,
+        line_height: metrics.line_height,
+    };
+    crate::css::animation::FfiAnimationLengthResolutionContext {
+        viewport_width: context.viewport_width,
+        viewport_height: context.viewport_height,
+        font_metrics: font_metrics(&context.font_metrics),
+        root_font_metrics: font_metrics(&context.root_font_metrics),
+        font_metrics_depend_on_viewport_metrics: context.font_metrics_depend_on_viewport_metrics,
+        root_font_metrics_depend_on_viewport_metrics: context.root_font_metrics_depend_on_viewport_metrics,
+    }
+}
+
+/// Sample one element's animation effects onto its working set's overlay.
+///
+/// The effects are sampled from the descriptions the host published of them: the style engine
+/// resolves their declarations, substitutes what was written as a token stream against the
+/// element, computes the keyframe values, and evaluates them. An effect with fewer than two
+/// keyframes to interpolate between composes nothing.
+///
+/// # Safety
+/// Every pointer in `input` must be live for the call, and nothing may hold a borrow of the style
+/// engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_sample_animation_effects(
+    input: *const FfiHostAnimationSample,
+) -> FfiHostAnimationSampleResult {
+    use crate::css::animation as anim;
+    use FfiHostAnimationSampleOutcome::{Cleared, Evaluated, Unchanged};
+
+    let input = unsafe { &*input };
+    // The host callbacks the sample makes may reach the engine as well, so the sample reads it
+    // through a shared borrow, and borrows it exclusively only to draw random base values below.
+    let engine = unsafe { input.style_engine.get() };
+    let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(input.style_node) else {
+        return FfiHostAnimationSampleResult::with_outcome(Cleared);
+    };
+    let pseudo = (input.pseudo_kind != crate::css::cascaded_properties::NO_PSEUDO_ELEMENT).then_some(input.pseudo_kind);
+    let sampled = unsafe { crate::css::custom_properties::ffi_slice(input.effects, input.effect_count) };
+    let table = unsafe { &*input.longhand_table.cast::<ComputedLonghandTable>() };
+    let overlay = unsafe { input.animated_overlay.cast::<AnimatedOverlay>().as_ref() };
+
+    let descriptions = engine.element_animation_effects(node, animation_slot(input.pseudo_kind));
+    let description = |identity| {
+        let description = descriptions.iter().find(|description| description.identity == identity);
+        debug_assert!(description.is_some(), "the host describes every effect it samples");
+        description
+    };
+    let composed: smallvec::SmallVec<[anim::FfiSampledAnimationEffect; 4]> = sampled
+        .iter()
+        .filter(|effect| {
+            description(effect.identity).is_some_and(|description| {
+                description.generation == effect.generation && description.keyframes.len() >= 2
+            })
+        })
+        .map(|effect| anim::FfiSampledAnimationEffect {
+            effect: anim::FfiAnimationPreparationEffect {
+                identity: effect.identity,
+                generation: effect.generation,
+            },
+            current_key: effect.current_key,
+        })
+        .collect();
+    if composed.is_empty() {
+        return FfiHostAnimationSampleResult::with_outcome(Cleared);
+    }
+    let current_color = table
+        .effective_value(overlay, crate::css::property_metadata::property_id::COLOR, true)
+        .value
+        .cast();
+    let animation_context =
+        |length_resolution_context: Option<&FfiLengthResolutionContext>| anim::FfiAnimationContext {
+            allow_discrete: length_resolution_context.is_some(),
+            current_color,
+            has_length_resolution_context: length_resolution_context.is_some(),
+            length_resolution_context: length_resolution_context
+                .map(animation_length_resolution_context)
+                .unwrap_or_default(),
+            has_transform_reference_box: input.has_transform_reference_box,
+            transform_reference_box_width: input.transform_reference_box_width,
+            transform_reference_box_height: input.transform_reference_box_height,
+        };
+    let prepare_overlay = || unsafe { (input.prepare_overlay_for_mutation)(input.callback_context) };
+
+    // A preparation the overlay already holds for exactly these effects needs no declarations and
+    // no keyframe values at all.
+    if anim::animation_preparation_matches(overlay, &composed, input.custom_property_environments) {
+        let batch = anim::FfiComputedAnimationBatch {
+            context: animation_context(None),
+            sampled_effects: composed.as_ptr(),
+            sampled_effect_count: composed.len(),
+            custom_property_environments: input.custom_property_environments,
+            cache_preparation: true,
+            preparation_reads_custom_property_environments: false,
+            resolved_animation_storage: std::ptr::null_mut(),
+            computed_keyframe_storage: std::ptr::null_mut(),
+            underlying_longhand_table: input.longhand_table,
+            overlay: prepare_overlay(),
+            custom_underlying_values: std::ptr::null(),
+            custom_initial_values: std::ptr::null(),
+            custom_value_count: 0,
+            custom_results: std::ptr::null_mut(),
+            custom_result_count: std::ptr::null_mut(),
+        };
+        unsafe { anim::rust_evaluate_animations(&raw const batch) };
+        return FfiHostAnimationSampleResult::with_outcome(Evaluated);
+    }
+
+    let (writing_mode, direction) = computed_writing_mode_and_direction(table);
+    let stores = anim::KeyframeStores {
+        substitution: input.custom_property_store,
+        base: input.base_custom_property_store,
+        inheritance: input.inheritance_custom_property_store,
+        element_declares_custom_properties: input.element_declares_own_custom_properties,
+    };
+    let selected: smallvec::SmallVec<[anim::SelectedEffect; 4]> = composed
+        .iter()
+        .filter_map(|composed| {
+            Some(anim::SelectedEffect {
+                effect: description(composed.effect.identity)?,
+                current_key: composed.current_key,
+            })
+        })
+        .collect();
+    let anim::PublishedAnimationDeclarations {
+        resolved,
+        custom_properties,
+        substitution_marks,
+        style_query_dependencies,
+    } = anim::resolve_published_animation_declarations(
+        engine,
+        node,
+        pseudo,
+        &selected,
+        table,
+        stores,
+        writing_mode,
+        direction,
+        table.importance_bits(),
+    );
+    drop(selected);
+    let mut result = FfiHostAnimationSampleResult::with_outcome(Unchanged);
+    result.substitution_marks = substitution_marks;
+    result.style_query_dependencies =
+        style_query_dependencies.map_or(std::ptr::null_mut(), |dependencies| Box::into_raw(dependencies).cast());
+    // Effects whose keyframes declare nothing the element animates compose nothing at all, and
+    // leave the overlay as it was.
+    if resolved.properties.is_empty() {
+        return result;
+    }
+
+    // A keyframe that inherits a non-inherited property leaves an invalidation mark on the parent.
+    for property in &resolved.properties {
+        if property.value_source != anim::FfiAnimationSpecifiedValueSource::Inherited
+            || property.custom_name_id != 0
+            || property_is_inherited(property.source_longhand_id)
+        {
+            continue;
+        }
+        result.keyframes_inherited_non_inherited_style_groups |=
+            crate::css::property_metadata::property_style_group_index(property.source_longhand_id)
+                .map_or(u32::MAX, |index| 1 << index);
+    }
+
+    // Over a record the host holds, the engine builds the length contexts itself. The host builds
+    // them over a working set it is computing, and wherever they need a container base: resolving
+    // one marks the container asked about and, before layout, has it evaluated again after.
+    let container_unit_mask = resolved.container_relative_length_unit_mask;
+    let length_contexts = (input.style_record != 0 && container_unit_mask == 0)
+        .then(|| engine.animation_sample_length_contexts(node, pseudo, input.style_record))
+        .flatten()
+        .unwrap_or_else(|| {
+            let mut length_contexts = std::mem::MaybeUninit::<FfiAnimationLengthContexts>::uninit();
+            unsafe {
+                (input.length_contexts)(
+                    input.callback_context,
+                    container_unit_mask,
+                    length_contexts.as_mut_ptr(),
+                );
+                length_contexts.assume_init()
+            }
+        });
+
+    // The element's own side of the environment: its place among its siblings, and the random base
+    // value each random function a keyframe holds draws.
+    let sibling_position = (resolved.uses_tree_counting_function || !custom_properties.is_empty())
+        .then(|| engine.element_sibling_position(node))
+        .flatten();
+    // Drawing a random base value is the sample's one write to the engine: nothing borrows the
+    // engine across it, and no host callback runs while it draws.
+    let random_base_values = {
+        let engine = unsafe { input.style_engine.get_mut() };
+        resolved
+            .unfixed_random_sharings
+            .iter()
+            .map(|sharing| {
+                let StyleValueData::RandomValueSharing { has_name, name, .. } = (unsafe { &*sharing.source }) else {
+                    unreachable!("an unfixed random sharing names its sharing value");
+                };
+                let name = if *has_name { name.units() } else { &[] };
+                FfiRandomBaseValue {
+                    source: sharing.source.cast(),
+                    value: engine.ensure_random_base_value(Some(node), name, sharing.element_shared),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let engine = unsafe { input.style_engine.get() };
+    let mut environment = unsafe { std::ptr::read(input.environment) };
+    environment.has_tree_counting_context = sibling_position.is_some();
+    environment.sibling_count = sibling_position.map_or(0, |(count, _)| u64::from(count));
+    environment.sibling_index = sibling_position.map_or(0, |(_, index)| u64::from(index));
+    environment.random_base_values = random_base_values.as_ptr();
+    environment.random_base_value_count = random_base_values.len();
+
+    let registry = engine.custom_property_registry();
+    let finalization = crate::css::custom_properties::CustomPropertyFinalization {
+        length: Some(&length_contexts.remaining),
+        environment: Some(&environment),
+        color_scheme: u8::try_from(table.effective_color_scheme())
+            .unwrap_or(environment.color_scheme_input.preferred_color_scheme),
+        draw_random_base_value: None,
+    };
+    let custom_values = resolved
+        .properties
+        .iter()
+        .map(|property| match property.custom_name_id {
+            0 => None,
+            _ => Some(custom_properties.computed_value(registry, property, &finalization)),
+        })
+        .collect::<Vec<_>>();
+    let custom_value_pointers = custom_values
+        .iter()
+        .map(|value| value.as_ref().map_or(std::ptr::null(), |value| value.pointer().cast()))
+        .collect::<Vec<*const c_void>>();
+    let (underlying_values, initial_values) = custom_properties.underlying_and_initial_values(registry);
+    let underlying_pointers = underlying_values
+        .iter()
+        .map(RetainedStyleValueData::pointer)
+        .collect::<Vec<_>>();
+    let initial_pointers = initial_values
+        .iter()
+        .map(RetainedStyleValueData::pointer)
+        .collect::<Vec<_>>();
+
+    let keyframe_input = FfiAnimationKeyframeLonghandInput {
+        underlying_longhand_table: input.longhand_table.cast(),
+        style_engine: input.style_engine,
+        inheritance_parent_style_record: input.inheritance_parent_style_record,
+        resolved_properties: resolved.properties.as_ptr().cast(),
+        property_count: resolved.properties.len(),
+        environment: &raw const environment,
+        font_length_resolution_context: &raw const length_contexts.font,
+        line_height_length_resolution_context: &raw const length_contexts.line_height,
+        remaining_length_resolution_context: &raw const length_contexts.remaining,
+        custom_property_values: custom_value_pointers.as_ptr(),
+    };
+    let computed_keyframes = unsafe { rust_compute_animation_keyframe_longhands(&raw const keyframe_input) };
+    result.depends_on_viewport_metrics = computed_keyframes.depends_on_viewport_metrics;
+    result.font_metrics_depend_on_viewport_metrics = computed_keyframes.font_metrics_depend_on_viewport_metrics;
+    // A custom property's keyframe that asks where the element sits among its siblings makes the
+    // element's style depend on it just as a longhand's does.
+    result.uses_tree_counting_function = resolved.uses_tree_counting_function
+        || resolved.properties.iter().any(|property| {
+            property.custom_name_id != 0
+                && property.value_source == anim::FfiAnimationSpecifiedValueSource::Value
+                && matches!(unsafe { &*property.value }, StyleValueData::Unresolved { components, .. }
+                    if crate::css::parser::value_parser::contains_tree_counting_function(components.as_slice()))
+        });
+
+    let mut custom_results = (0..custom_properties.len())
+        .map(|_| anim::FfiAnimatedCustomProperty {
+            custom_name_id: 0,
+            value: std::ptr::null(),
+        })
+        .collect::<Vec<_>>();
+    let mut custom_result_count = 0_usize;
+    // A preparation cached under these effects must hold for as long as they stand, so one that
+    // read anything outside them is not kept, and one that substituted against the element's
+    // custom-property environments is kept only under those.
+    let cache_preparation = custom_properties.is_empty()
+        && !resolved.uses_tree_counting_function
+        && resolved.container_relative_length_unit_mask == 0
+        && !resolved.needs_document_base_url
+        && resolved.unfixed_random_sharings.is_empty();
+    let batch = anim::FfiComputedAnimationBatch {
+        context: animation_context(Some(&length_contexts.remaining)),
+        sampled_effects: composed.as_ptr(),
+        sampled_effect_count: composed.len(),
+        custom_property_environments: input.custom_property_environments,
+        cache_preparation,
+        preparation_reads_custom_property_environments: substitution_marks != 0,
+        resolved_animation_storage: Box::into_raw(resolved).cast(),
+        computed_keyframe_storage: computed_keyframes.storage,
+        underlying_longhand_table: input.longhand_table,
+        overlay: prepare_overlay(),
+        custom_underlying_values: underlying_pointers.as_ptr(),
+        custom_initial_values: initial_pointers.as_ptr(),
+        custom_value_count: underlying_pointers.len(),
+        custom_results: custom_results.as_mut_ptr(),
+        custom_result_count: &raw mut custom_result_count,
+    };
+    unsafe { anim::rust_evaluate_animations(&raw const batch) };
+    result.outcome = Evaluated;
+    if custom_result_count != 0 {
+        let retained = custom_results[..custom_result_count]
+            .iter()
+            .map(|result| {
+                (
+                    custom_properties.name(result.custom_name_id).clone(),
+                    // SAFETY: the evaluation transfers one reference per written result.
+                    unsafe { RetainedStyleValueData::from_retained_pointer(result.value) },
+                )
+            })
+            .collect::<Vec<_>>();
+        let rows = retained
+            .iter()
+            .map(|(name, value)| FfiAnimatedCustomPropertyResult {
+                name: name.raw(),
+                value: value.pointer().cast(),
+            })
+            .collect();
+        let storage = Box::new(AnimatedCustomPropertyResults {
+            rows,
+            _retained: retained,
+        });
+        result.animated_custom_properties = storage.rows.as_ptr();
+        result.animated_custom_property_count = storage.rows.len();
+        result.animated_custom_properties_storage = Box::into_raw(storage).cast();
+    }
+    result
+}
+
 /// # Safety
 /// `storage` must be returned by `rust_compute_animation_keyframe_longhands`
 /// and must not have been consumed before.
@@ -5878,9 +6489,6 @@ pub(crate) unsafe fn take_animation_keyframe_longhand_values(storage: *mut c_voi
 }
 
 unsafe fn destroy_style_computation_result(result: &FfiLonghandDriveResult) {
-    if !result.animations.storage.is_null() {
-        drop(unsafe { Box::from_raw(result.animations.storage.cast::<Box<[FfiComputedAnimation]>>()) });
-    }
     if !result.custom_properties.storage.is_null() {
         unsafe {
             crate::css::cascaded_properties::destroy_resolved_custom_properties(
@@ -6277,7 +6885,6 @@ pub enum FfiStyleFinalizationMode {
     AnimatedBoxType,
     TextAlign,
     All,
-    Overflow,
     RestorePostCompute,
     RestorePostComputeTextAlign,
 }
@@ -6726,13 +7333,22 @@ fn finalize_computed_style(
             longhand_table.set_display_before_box_type_transformation(box_type.display.encoded());
         }
     }
-    let (overflow_x, overflow_y) = if mode == FfiStyleFinalizationMode::All {
-        (
+    let (overflow_x, overflow_y) = match mode {
+        FfiStyleFinalizationMode::All => (
             effective_keyword(longhand_table, overlay, prop::OVERFLOW_X),
             effective_keyword(longhand_table, overlay, prop::OVERFLOW_Y),
-        )
-    } else {
-        (0, 0)
+        ),
+        // An axis the overlay does not animate is adjusted from its keyword before the base
+        // adjusted it against the other axis, which the overlay may animate out of that adjustment.
+        FfiStyleFinalizationMode::AnimatedBoxType => {
+            let before = longhand_table.overflow_before_adjustment();
+            let unadjusted = |property: u16, axis: usize| match before {
+                Some(before) if overlay.is_none_or(|overlay| overlay.get(property).is_none()) => before[axis],
+                _ => effective_keyword(longhand_table, overlay, property),
+            };
+            (unadjusted(prop::OVERFLOW_X, 0), unadjusted(prop::OVERFLOW_Y, 1))
+        }
+        _ => (0, 0),
     };
     let (has_parent_with_computed_values, parent_text_align, parent_direction_is_ltr) =
         parent_snapshot.map_or((false, 0, true), |snapshot| {
@@ -6798,7 +7414,7 @@ fn finalize_style(
     };
     let overflow = if matches!(
         input.mode,
-        FfiStyleFinalizationMode::All | FfiStyleFinalizationMode::Overflow
+        FfiStyleFinalizationMode::All | FfiStyleFinalizationMode::AnimatedBoxType
     ) {
         resolve_effective_overflow_keywords(input.overflow_x, input.overflow_y)
     } else {
@@ -6964,6 +7580,32 @@ fn finalize_style(
     }
     finalization.invalidated_longhands = invalidated_longhands;
 
+    // An animated composition is adjusted in its overlay, over a base that stays as computed.
+    if animated_box_type {
+        let overlay = animated_overlay.expect("animated box-type finalization requires an overlay");
+        for (property, keyword) in [
+            (prop::OVERFLOW_X, finalization.overflow.x_keyword),
+            (prop::OVERFLOW_Y, finalization.overflow.y_keyword),
+        ] {
+            let value = retained_new(StyleValueData::Keyword { keyword });
+            let effective = longhand_table.effective_value(Some(overlay), property, true);
+            if unsafe { &*effective.value.cast::<StyleValueData>() } == value.data() {
+                continue;
+            }
+            // An axis the overlay animates keeps its animation's place; one it does not is adjusted
+            // over the base value.
+            match overlay
+                .get(property)
+                .map(|entry| (entry.inherited, entry.result_of_transition))
+            {
+                Some((inherited, result_of_transition)) => {
+                    overlay.set_owned(property, value, inherited, result_of_transition);
+                }
+                None => overlay.set_adjusted(property, value),
+            }
+        }
+        return finalization;
+    }
     if finalization.overflow.changed_x {
         longhand_table.set(
             prop::OVERFLOW_X,
@@ -7089,7 +7731,7 @@ pub(crate) mod ffi_test_stubs {
     extern "C" fn web_css_font_cascade_memo_unreference(_memo: *const c_void) {}
     #[unsafe(no_mangle)]
     extern "C" fn web_css_resolve_font(
-        _memo: *mut c_void,
+        _memo: *const c_void,
         _snapshot: *const c_void,
         _request: crate::css::style::bridge::FfiFontResolutionRequest,
     ) -> crate::css::style::bridge::FfiResolvedFont {
@@ -7154,6 +7796,10 @@ pub(crate) mod ffi_test_stubs {
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_font_cascade_list_equals(list: *const c_void, other: *const c_void) -> bool {
         list == other
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn ladybird_gfx_font_cascade_list_frozen(_raw: *const std::ffi::c_void) -> *const std::ffi::c_void {
+        std::ptr::null()
     }
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_font_ref(_raw: *const std::ffi::c_void) {}

@@ -120,6 +120,9 @@ public:
     virtual bool supports_vertical_tabs() const { return false; }
     virtual bool supports_private_browsing_windows() const { return false; }
     virtual bool supports_client_side_window_decorations() const { return false; }
+    // Returns true if the platform sends momentum scroll events after a touchpad flick.
+    // If it does not, the compositor makes the fling.
+    virtual bool platform_reports_scroll_momentum() const { return true; }
 
     void appearance_changed(Badge<ApplicationSettingsObserver>);
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
@@ -132,7 +135,7 @@ public:
     void content_blocker_settings_changed(Badge<ApplicationSettingsObserver>);
     bool content_blocker_list_update_in_progress() const;
     void update_content_blocker_lists(Badge<SettingsUI>);
-    void download_content_blocker_list_if_needed(Badge<SettingsUI>, StringView identifier);
+    void download_content_blocker_list_if_needed(Badge<Application, SettingsUI>, StringView identifier);
     ErrorOr<void> import_local_content_blocker_list(String name, String contents);
     void remove_content_blocker_list(Badge<SettingsUI>, StringView identifier);
     Optional<UnixDateTime> content_blocker_list_last_updated_at(StringView identifier) const;
@@ -534,7 +537,7 @@ private:
     Vector<int> m_cpu_profiler_signal_handlers;
     RequestServerOptions m_request_server_options;
     WebContentOptions m_web_content_options;
-    OwnPtr<FontService> m_font_service;
+    RefPtr<FontService> m_font_service;
     JsonValue m_site_compatibility_data;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
     RefPtr<Core::Timer> m_content_blocker_list_update_timer;
@@ -568,8 +571,7 @@ private:
     RefPtr<WasmCompilerClient::Client> m_wasm_compiler_client;
 #endif
     RefPtr<CompositorClient> m_compositor_client;
-    // This must be destroyed before m_font_service, which its IPC thread accesses.
-    RefPtr<CompositorFontServiceConnection> m_compositor_font_service_connection;
+    RefPtr<FontServiceConnection> m_compositor_font_service_connection;
     bool m_reported_compositor_gpu_presentation_unavailable { false };
     bool m_compositor_metal_presentation_enabled { false };
     size_t m_compositor_restart_count { 0 };

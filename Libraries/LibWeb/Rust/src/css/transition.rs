@@ -308,7 +308,7 @@ fn prepare_transition_values(
     }
     if let Some(entry) = after_overlay
         .and_then(|overlay| overlay.get(property.property_id))
-        .filter(|entry| !entry.result_of_transition)
+        .filter(|entry| !entry.result_of_transition && !entry.post_compute_adjustment)
     {
         property.before_change_value = entry.value_pointer();
         property.after_change_value = entry.value_pointer();
@@ -336,7 +336,7 @@ fn prepare_transition_values(
 /// properties, `actions` must point at writable storage for `property_count` actions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_decide_transitions(
-    style_engine: *const std::ffi::c_void,
+    style_engine: crate::css::style::StyleEngineHandle,
     before_style_record: u64,
     after_longhand_table: *const std::ffi::c_void,
     after_animated_overlay: *const std::ffi::c_void,
@@ -353,7 +353,7 @@ pub unsafe extern "C" fn rust_decide_transitions(
     if properties.is_empty() {
         return;
     }
-    let style_engine = unsafe { style_engine.cast::<crate::css::style::StyleEngine>().as_ref() };
+    let style_engine = (!style_engine.is_null()).then(|| unsafe { style_engine.get() });
     let before_style_view = style_engine
         .expect("transition decisions require a style engine")
         .style_record_view(before_style_record)
@@ -411,6 +411,25 @@ pub struct FfiTransitionEntry {
 pub struct FfiTransitionEntries {
     pub entries: *mut FfiTransitionEntry,
     pub count: usize,
+}
+
+/// What a transition on an element resolves its lengths against, answered from the record the
+/// element has installed. Returns false where the engine cannot read the record.
+///
+/// # Safety
+/// `style_engine` must be a live style engine, and `context` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_transition_length_resolution_context(
+    style_engine: crate::css::style::StyleEngineHandle,
+    style_record: u64,
+    context: *mut crate::css::animation::FfiAnimationLengthResolutionContext,
+) -> bool {
+    let style_engine = unsafe { style_engine.get() };
+    let Some(length) = style_engine.transition_length_resolution_context(style_record) else {
+        return false;
+    };
+    unsafe { context.write(length) };
+    true
 }
 
 /// The transitions a computed longhand table declares, per physical longhand they name. What the
@@ -544,7 +563,7 @@ mod tests {
         };
         unsafe {
             rust_decide_transitions(
-                std::ptr::null(),
+                crate::css::style::StyleEngineHandle::null(),
                 0,
                 std::ptr::null(),
                 std::ptr::null(),

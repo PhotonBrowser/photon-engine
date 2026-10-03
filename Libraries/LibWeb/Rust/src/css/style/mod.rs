@@ -67,12 +67,18 @@ mod custom_property_cascade;
 mod custom_property_environments;
 #[cfg(test)]
 mod differential_tests;
+pub(crate) mod effect_descriptions;
+pub mod engine_calls;
+mod engine_sample;
 mod environment_move;
 pub mod exact_matcher;
+pub(crate) mod style_job;
 pub use crate::fast_hash;
+mod engine_handle;
 mod flush;
 mod fnv;
 mod font_resolution;
+pub mod identities;
 pub mod impact;
 pub mod index;
 mod input_routing;
@@ -132,6 +138,11 @@ pub mod record_replay {
         pub fn write_native_u16(&mut self, _value: u16) {}
         pub fn write_native_u32(&mut self, _value: u32) {}
         pub fn write_raw_slice<T: RawRecord>(&mut self, _values: &[T]) {}
+        pub fn write_applied_animation_definitions(
+            &mut self,
+            _definitions: &[super::bridge::FfiAppliedAnimationDefinition],
+        ) {
+        }
         pub fn write_raw_rows(
             &mut self,
             _count: usize,
@@ -171,7 +182,6 @@ use fast_hash::FastMap as HashMap;
 use fast_hash::FastSet as HashSet;
 use planning::*;
 use smallvec::SmallVec;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -198,7 +208,8 @@ use exact_matcher::ExactMatchContext;
 use exact_matcher::ExactMatcher;
 
 pub use counter_context::StyleEngine;
-pub use inputs::{PublishedBoxFacts, TextStyleParentFacts};
+pub use engine_handle::StyleEngineHandle;
+pub use inputs::{NaturalSize, PublishedBoxFacts, PublishedTextSource, ReplacedContentInput, TextStyleParentFacts};
 
 use batch_matcher::AncestorRequirements;
 use batch_matcher::AncestorRequirementsCache;
@@ -924,9 +935,20 @@ pub struct RetainedState {
     /// The names of the CSS animations the host holds for each element, which the computation of
     /// its animation definitions matches them against.
     css_defined_animations: animations::CssDefinedAnimations,
+    /// The `@keyframes` each of the document's style scopes defines, as the host's rule caches
+    /// resolved them, which an animation definition's keyframes are resolved from.
+    animation_keyframes: animations::AnimationKeyframes,
+    /// The animation effects the host holds for each element, described for sampling.
+    animation_effect_descriptions: effect_descriptions::AnimationEffectDescriptions,
+    /// The font metrics of the record the host holds for the document element, which a `rem` the
+    /// host resolves reads, once it holds one.
+    held_root_font_inputs: Option<publication::RootFontInputs>,
     /// The random base value each random caching key has been given, for the random functions the
     /// document's styles hold.
     random_base_values: random_bases::RandomBaseValues,
+    /// What each element that has replaced content gives its natural size, which layout resolves
+    /// against the style of the element's box.
+    replaced_content_inputs: HashMap<StyleNodeID, inputs::ReplacedContentInput>,
     /// https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
     /// Per transition target, by element and then pseudo-element kind, the before-change style its
     /// transitions are decided against for the rest of the style stabilization epoch, pinned until
@@ -1008,7 +1030,7 @@ pub struct RetainedState {
     /// Prefix transitions and their canonical answers have one document-lifetime owner. Matching
     /// traversals and answer patches borrow it synchronously and change its cache-owned lifecycle
     /// between scratch and retained residency without moving the payload.
-    prefix_caches: Rc<RefCell<PrefixCaches>>,
+    prefix_caches: std::sync::Arc<SharedPrefixCaches>,
     /// Test-only: force the bounded completion window regardless of headroom.
     #[cfg(test)]
     force_bounded_prefix_completion: bool,
@@ -1091,9 +1113,6 @@ pub struct HostState {
     /// The capture-local document identity, absent when record-replay is disabled.
     #[cfg(feature = "style-recording")]
     recording_id: Option<u64>,
-    /// The instrumentation state to restore after C++ materializes a record for verification.
-    computed_record_verification_counters: Option<Box<Counters>>,
-    computed_record_verification_pins: Vec<u64>,
     journal: NormalizationJournal,
     /// Local selector facts through the latest geometry read which reused committed layout. A
     /// normal style observation merges this into `journal`; a newly introduced transition can

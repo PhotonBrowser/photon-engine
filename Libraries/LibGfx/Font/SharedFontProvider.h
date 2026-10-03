@@ -10,12 +10,14 @@
 #include <AK/HashFunctions.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
+#include <AK/Mutex.h>
 #include <AK/OwnPtr.h>
 #include <LibCore/MappedFile.h>
 #include <LibGfx/Font/FontCatalog.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/PathFontProvider.h>
 #include <LibIPC/File.h>
+#include <pthread.h>
 
 namespace Gfx {
 
@@ -61,6 +63,10 @@ public:
     ErrorOr<void> replace_catalog(NonnullOwnPtr<Core::MappedFile>, u64 generation);
     ErrorOr<void> replace_catalog(IPC::File, u64 size, u64 generation);
 
+    // The callbacks a provider is created with ask on a connection that belongs to the thread that created it, which
+    // no other thread may use. Once these are set, a question from any other thread asks them instead.
+    void set_callbacks_for_other_threads(SharedFontProviderCallbacks&&);
+
     virtual RefPtr<Gfx::Font> get_font(FlyString const& family, float point_size, unsigned weight, unsigned width, unsigned slope, Optional<FontVariationSettings> const& = {}, Optional<Gfx::ShapeFeatures> const& = {}) override;
     virtual void for_each_typeface_with_family_name(FlyString const&, Function<void(Typeface const&)>) override;
     virtual RefPtr<Typeface> get_typeface_by_id(u64 generation, u64 face_id) override;
@@ -90,15 +96,23 @@ private:
 
     SharedFontProvider(NonnullOwnPtr<Core::MappedFile>, NonnullOwnPtr<FontCatalog>, SharedFontProviderCallbacks);
 
+    // NB: These run with m_mutex held.
+    SharedFontProviderCallbacks const& callbacks_for_this_thread() const;
     RefPtr<Typeface> load_catalog_face(FontCatalogFace const&);
     RefPtr<Typeface> load_brokered_font(BrokeredFont);
     RefPtr<Typeface> load_font_file(u64 face_id, u32 ttc_index, FontFileFormat, IPC::File);
     RefPtr<Typeface> load_font_reference(u64 face_id, SystemFontReference const&);
     void clear_typeface_cache();
 
+    // Guards everything below. A font cascade can be resolved off the document thread, and every resolution fills
+    // these caches on its way past. The lock is held across a round trip to the font service, so that one face is
+    // opened once however many threads want it.
+    Mutex m_mutex;
     NonnullOwnPtr<Core::MappedFile> m_catalog_mapping;
     NonnullOwnPtr<FontCatalog> m_catalog;
     SharedFontProviderCallbacks m_callbacks;
+    pthread_t m_creating_thread { pthread_self() };
+    Optional<SharedFontProviderCallbacks> m_other_thread_callbacks;
     PathFontProvider m_resource_fonts;
     HashMap<u64, NonnullRefPtr<Typeface>> m_typeface_cache;
     HashTable<u64> m_failed_face_ids;

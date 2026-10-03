@@ -108,13 +108,13 @@ void DocumentPaintState::update_visual_viewport_accumulated_visual_context(DOM::
 void DocumentPaintState::begin_compositor_animation_update(DOM::Document& document)
 {
     ensure_visual_context_tree(document);
-    Layout::RustFFI::layout_arena_begin_compositor_animation_update(m_layout_node_arena->handle());
+    Layout::RustFFI::render_state_begin_compositor_animation_update(m_layout_node_arena->host());
 }
 
 void DocumentPaintState::publish_compositor_animations(DOM::Document& document, PublishPendingCompositorAnimations publish_pending)
 {
     ensure_visual_context_tree(document);
-    auto outcome = Layout::RustFFI::layout_arena_publish_compositor_animations(m_layout_node_arena->handle(), publish_pending == PublishPendingCompositorAnimations::Yes);
+    auto outcome = Layout::RustFFI::render_state_publish_compositor_animations(m_layout_node_arena->host(), publish_pending == PublishPendingCompositorAnimations::Yes);
     if (!outcome.published)
         return;
     m_visual_context_tree_needs_compositor_update = true;
@@ -139,7 +139,7 @@ void DocumentPaintState::append_paint_command_cache_source_resources(Compositing
 
 void DocumentPaintState::invalidate_all_cached_paint(DOM::Document& document)
 {
-    Layout::RustFFI::layout_arena_invalidate_all_paint_caches(m_layout_node_arena->handle());
+    Layout::RustFFI::render_state_invalidate_all_paint_caches(m_layout_node_arena->host());
     Painting::set_needs_repaint(*document.unsafe_layout_node());
 }
 
@@ -161,7 +161,7 @@ void DocumentPaintState::refresh_scroll_state(DOM::Document& document)
 
 void DocumentPaintState::reset_selection_states(DOM::Document& document)
 {
-    Layout::RustFFI::layout_arena_selection_clear(m_layout_node_arena->handle(), viewport_row_slot(document));
+    Layout::RustFFI::render_state_clear_selection(m_layout_node_arena->host(), viewport_row_slot(document));
 }
 
 void DocumentPaintState::recompute_selection_states(DOM::Document& document, DOM::Range& range)
@@ -189,7 +189,7 @@ void DocumentPaintState::recompute_selection_states(DOM::Document& document, DOM
         }
     };
     auto apply_entries = [&] {
-        Layout::RustFFI::layout_arena_selection_apply(m_layout_node_arena->handle(), viewport_row_slot(document), entries.data(), entries.size(), range.start_offset(), range.end_offset());
+        Layout::RustFFI::render_state_apply_selection(m_layout_node_arena->host(), viewport_row_slot(document), entries.data(), entries.size(), range.start_offset(), range.end_offset());
     };
 
     // https://drafts.csswg.org/css-ui/#valdef-user-select-none

@@ -17,6 +17,7 @@ use super::*;
 use crate::css::computed_longhand_table::{
     ComputedLonghandTable, DEPENDS_ON_VIEWPORT_METRICS, FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS,
 };
+use animations::DeclarationScope;
 pub(crate) use demand::RecordDemandAnswer;
 pub(super) use demand::WinnerRepublication;
 pub(super) use drive::{Drive, OrRefused, Suspension, Unanswered};
@@ -68,6 +69,21 @@ impl ElementAnswer {
 }
 
 impl RootFontInputs {
+    /// The metrics a `rem` resolves against, and whether they read the viewport.
+    pub(super) fn font_metrics(self) -> (crate::css::style_compute::FfiFontMetrics, bool) {
+        let [font_size, x_height, cap_height, zero_advance, line_height] = self.metrics.map(f64::from_bits);
+        (
+            crate::css::style_compute::FfiFontMetrics {
+                font_size,
+                x_height,
+                cap_height,
+                zero_advance,
+                line_height,
+            },
+            self.depends_on_viewport,
+        )
+    }
+
     fn apply_to(self, inputs: &mut bridge::FfiDocumentStyleComputationInputs) {
         inputs.root_font_size = f64::from_bits(self.metrics[0]);
         inputs.root_font_x_height = f64::from_bits(self.metrics[1]);
@@ -136,6 +152,16 @@ impl RetainedState {
     /// holds a record. Every record is assigned with its environment, so it holds one; should it
     /// not, the row waits for the parent as for one without a record.
     fn held_custom_property_environment(&self, node: StyleNodeID, counters: &mut Counters) -> Drive<u64> {
+        // What the node's animations sampled into its custom properties is an environment the host
+        // made over the record's, which the engine holds no store for.
+        if self
+            .element_custom_property_data
+            .get(&node)
+            .is_some_and(|held| held.is_animation_overlay)
+        {
+            counters.bump(Counter::EngineComputedRecordBailCustomProperties);
+            return Err(Unanswered::Refused);
+        }
         let environment = self.computed_group_sets.custom_property_environment_identity(node);
         debug_assert!(environment.is_some(), "an inheritance parent without an environment");
         environment.ok_or_else(|| {
@@ -328,6 +354,16 @@ impl RetainedState {
         scratch: &mut EngineComputedRecordScratch,
         counters: &mut Counters,
     ) -> Drive<RecordDelta> {
+        // A child of an element the host composes once it installs the element's record inherits
+        // that composition, which the host has made by the time it asks for the child again.
+        if self
+            .tree
+            .inheritance_parent(node)
+            .is_some_and(|parent| scratch.nodes_composed_by_the_host.contains(&parent))
+        {
+            counters.bump(Counter::EngineComputedRecordBailRecordParent);
+            return Err(Unanswered::AwaitsParent);
+        }
         let delta = self.decide_engine_computed_record_delta(
             node,
             cascade_winners_are_complete,
@@ -338,6 +374,13 @@ impl RetainedState {
             counters,
         );
         self.apply_substitution_effects(scratch);
+        // A record that does not move keeps the composition the children read already.
+        if let Ok((old, new)) = delta
+            && old != new
+            && self.host_composes_row(node, old.raw(), new.raw())
+        {
+            scratch.nodes_composed_by_the_host.insert(node);
+        }
         delta
     }
 
@@ -428,18 +471,10 @@ impl RetainedState {
         // The element's pseudo-elements are settled beside its record, as the C++ computation
         // refreshes them after the element's own; a pseudo-element the engine cannot settle
         // sends the whole element to C++.
-        let old_style_record = (delta.0 != computed::FinalStyleRecordID::NONE).then_some(delta.0);
         let generation = self.winner_groups.generation();
-        if let Err(unanswered) = self.engine_pseudo_records(
-            node,
-            old_style_record,
-            None,
-            delta.1,
-            generation,
-            full_drive_reason,
-            scratch,
-            counters,
-        ) {
+        if let Err(unanswered) =
+            self.engine_pseudo_records_beside(node, delta, None, generation, full_drive_reason, scratch, counters)
+        {
             match unanswered {
                 Unanswered::Suspended(_) => scratch.pending_element = Some(drive::PendingElement::new(node, delta)),
                 Unanswered::Refused | Unanswered::AwaitsParent => {
@@ -580,7 +615,6 @@ impl RetainedState {
             counters.bump(Counter::EngineComputedRecordBailWinner);
             return Err(Unanswered::Refused);
         };
-        // An element's animations compose into its style in the C++ computation.
         let facts = self.computed_group_sets.adjustment_facts(node);
         // Moved root inputs reach every row below the root. The root's font the root-input probe
         // drove is left pending for the root's own row, which resumes it in full the same way.
@@ -589,19 +623,30 @@ impl RetainedState {
         } else {
             scratch.root_font_inputs_changed
         };
-        if facts & bridge::element_adjustment_fact::HAS_ANIMATIONS != 0 {
+        // An element's animations compose over the record its winners decide, and the host samples
+        // them over the record it installs. A record demand installs none of its own.
+        if facts & bridge::element_adjustment_fact::HAS_ANIMATIONS != 0 && !scratch.host_applies_animation_plans {
             counters.bump(Counter::EngineComputedRecordBailWinnerElement);
-            return Err(Unanswered::Refused);
-        }
-        // Both first records and updates need the inherited values composed by the parent's animations.
-        if self.parent_composes_animations(node) {
-            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return Err(Unanswered::Refused);
         }
         let Some(old_style_record) = self.computed_group_sets.assigned_style_record(node) else {
             return self.engine_cold_record(node, (generation, state), scratch, goal, counters);
         };
-        if self.record_requires_cpp_animation(old_style_record) {
+        // A row derives the record beneath the composition the element's animations laid over it:
+        // the delta starts at the record the winners decided, and the composition stays the record
+        // the row moves the element away from.
+        let Some(underlying_style_record) = self.computed_group_sets.underlying_style_record(old_style_record) else {
+            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+            return Err(Unanswered::Refused);
+        };
+        let composes_animations = underlying_style_record != old_style_record;
+        // The custom properties an element's animations sample are what its own `var()` references
+        // read, which a record derived from the environment beneath them would miss.
+        let samples_custom_properties = self
+            .element_custom_property_data
+            .get(&node)
+            .is_some_and(|held| held.is_animation_overlay);
+        if (composes_animations && !scratch.host_applies_animation_plans) || samples_custom_properties {
             counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return Err(Unanswered::Refused);
         }
@@ -626,6 +671,27 @@ impl RetainedState {
             counters.bump(Counter::EngineComputedRecordBailProperty);
             return Err(Unanswered::Refused);
         }
+        // A record driven from its winners alone takes its transition declarations from them. A
+        // moved display is applied after the step, as C++ applies it after the step it runs. The row
+        // carries what is decided here to the host, for a record that moves.
+        let moves_transition_declarations = if holds_no_current_cascade_state {
+            self.winner_groups
+                .semantic_delta_properties(None, state)
+                .any(property_declares_transitions)
+        } else {
+            delta
+                .properties()
+                .iter()
+                .any(|&property| property_declares_transitions(property))
+        };
+        let owes_a_transition_step = self.decide_transition_step(
+            node,
+            underlying_style_record,
+            moves_transition_declarations,
+            scratch.host_applies_animation_plans,
+            self.current_winner_groups().pseudo_states(node).next().is_some(),
+            counters,
+        )?;
         let mut inputs = self.document_style_computation_inputs;
         if let Some((root, root_inputs)) = scratch.root_element_inputs
             && root == node
@@ -641,7 +707,7 @@ impl RetainedState {
         // republished as moved.
         let old_environment = self
             .computed_group_sets
-            .style_record_custom_property_environment(old_style_record.raw());
+            .style_record_custom_property_environment(underlying_style_record.raw());
         debug_assert!(
             old_environment.is_some(),
             "an installed record was published with a custom-property environment"
@@ -683,8 +749,12 @@ impl RetainedState {
         // to declarations no winner names.
         let drive_in_full = holds_no_current_cascade_state
             || scratch.document_environment_moved
-            || (scratch.viewport_moved && self.record_reads_the_viewport(old_style_record))
+            || (scratch.viewport_moved && self.record_reads_the_viewport(underlying_style_record))
             || full_drive_reason.is_some()
+            // A composition holds what the element inherits of its parent's animations beside what
+            // its own sample: the record beneath it is driven in full, inheriting from the parent's
+            // composition, and the host samples the element's own animations over it.
+            || composes_animations
             || ((environment.is_some() || self.custom_property_registrations_changed)
                 && self.state_has_substitutions(node, state))
             || self.state_reads_beyond_environment(node, state)
@@ -736,7 +806,8 @@ impl RetainedState {
                             .republish_engine_record_with_environment(node, environment)
                             .expect("an assigned record without an overlay moves to any environment");
                         counters.bump(Counter::EngineComputedRecordUnchangedWinners);
-                        self.note_engine_computed_record(node, delta, (generation, state), false, 0, 0, counters);
+                        self.note_engine_computed_record(node, delta, (generation, state), false, 0, 0, counters)
+                            .owes_a_transition_step = owes_a_transition_step && delta.0 != delta.1;
                         return Ok(ElementAnswer::Delta(delta));
                     }
                     counters.bump(Counter::EngineComputedRecordUnchangedWinners);
@@ -796,7 +867,7 @@ impl RetainedState {
             self.state_reads_beyond_environment(node, state) || (has_registered_declarations && full_drive);
         let cohort = (!record_is_the_elements_alone).then(|| {
             (
-                old_style_record.raw(),
+                underlying_style_record.raw(),
                 state,
                 facts,
                 cohort_parent,
@@ -814,14 +885,23 @@ impl RetainedState {
             self.note_node_substitution(node, scratch, state, current_environment);
             // The mark is per node: an element taking the record owes its own parent the mark.
             scratch.element_explicitly_inherited_groups = explicitly_inherited_groups;
-            let delta = self
-                .computed_group_sets
-                .assign_engine_computed_record(node, old_style_record, new_style_record)
-                .or_refused()?;
+            let detached_composition = composes_animations
+                .then(|| self.computed_group_sets.detach_composition(node))
+                .flatten();
+            let Some(delta) =
+                self.computed_group_sets
+                    .assign_engine_computed_record(node, underlying_style_record, new_style_record)
+            else {
+                if let Some(detached) = detached_composition {
+                    self.computed_group_sets.reattach_composition(node, detached);
+                }
+                return Err(Unanswered::Refused);
+            };
+            let delta = (old_style_record, delta.1);
             if delta.0 == delta.1 {
                 counters.bump(Counter::ComputedWinnerPropagationStops);
             }
-            self.note_engine_computed_record(
+            let pending = self.note_engine_computed_record(
                 node,
                 delta,
                 (generation, state),
@@ -830,6 +910,8 @@ impl RetainedState {
                 0,
                 counters,
             );
+            pending.detached_composition = detached_composition;
+            pending.owes_a_transition_step = owes_a_transition_step && delta.0 != delta.1;
             counters.bump(Counter::EngineComputedRecordCohortHits);
             return Ok(ElementAnswer::Delta(delta));
         }
@@ -846,7 +928,10 @@ impl RetainedState {
         // The record being driven again has a view. A record without one cannot say what a
         // partial drive would leave standing: it is driven in full.
         let mut old_record_is_unreadable = false;
-        let (writing_mode, direction) = match self.computed_group_sets.style_record_view(old_style_record.raw()) {
+        let (writing_mode, direction) = match self
+            .computed_group_sets
+            .style_record_view(underlying_style_record.raw())
+        {
             Some(view) => {
                 let inherited_box = unsafe {
                     view.payloads[crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_BOX]
@@ -865,8 +950,12 @@ impl RetainedState {
             }
         };
         for &property in delta.properties() {
-            // Animations and transitions start from the C++ computation.
-            if property_starts_animation(property) {
+            // Any animation the engine cannot hand the host a plan for starts from the C++
+            // computation; a transition declaration is the step's to act on.
+            if property_starts_animation(property)
+                && !property_declares_transitions(property)
+                && !(property_declares_css_animations(property) && self.may_plan_css_animations(node, state, scratch))
+            {
                 counters.bump(Counter::EngineComputedRecordBailProperty);
                 return Err(Unanswered::Refused);
             }
@@ -988,7 +1077,7 @@ impl RetainedState {
         } else {
             Some(self.engine_driven_table(
                 node,
-                old_style_record,
+                underlying_style_record,
                 &store,
                 &selected,
                 &inputs,
@@ -1014,7 +1103,7 @@ impl RetainedState {
                 let subject = self.element_drive_subject(node, scratch.installed_ancestors.as_ref(), counters)?;
                 let mut driven = self.engine_full_drive(
                     subject,
-                    Some(old_style_record),
+                    Some(underlying_style_record),
                     &store,
                     &inputs,
                     &mut scratch.font_drive,
@@ -1053,7 +1142,7 @@ impl RetainedState {
                     self.note_node_substitution(node, scratch, state, current_environment);
                     driven = self.engine_full_drive(
                         subject,
-                        Some(old_style_record),
+                        Some(underlying_style_record),
                         &store,
                         &inputs,
                         &mut scratch.font_drive,
@@ -1080,9 +1169,12 @@ impl RetainedState {
         // The record names the counter-style registry its `content` or `list-style-type` reads,
         // which a moved `content` may have started or stopped reading.
         let counter_style_registry = self.table_counter_style_environment_identity(target, &table);
+        let detached_composition = composes_animations
+            .then(|| self.computed_group_sets.detach_composition(node))
+            .flatten();
         let assembly = self.computed_group_sets.replace_engine_computed_table(
             node,
-            old_style_record,
+            underlying_style_record,
             old_style_record,
             table,
             groups_to_rebuild,
@@ -1093,7 +1185,12 @@ impl RetainedState {
             Some(counter_style_registry),
         );
         self.settle_computed_memory();
-        let assembly = assembly.or_refused()?;
+        let Some(assembly) = assembly else {
+            if let Some(detached) = detached_composition {
+                self.computed_group_sets.reattach_composition(node, detached);
+            }
+            return Err(Unanswered::Refused);
+        };
         counters.add(
             Counter::ComputedOutputGroupsCanonicalized,
             u64::from(assembly.canonicalized_groups),
@@ -1105,7 +1202,7 @@ impl RetainedState {
         // The record reads the element's place among its siblings where its state's winners do, as
         // the store substitutes them.
         let reads_sibling_position = store.uses_tree_counting_function(self);
-        self.note_engine_computed_record(
+        let pending = self.note_engine_computed_record(
             node,
             delta,
             (generation, state),
@@ -1114,6 +1211,8 @@ impl RetainedState {
             longhand_evaluations,
             counters,
         );
+        pending.detached_composition = detached_composition;
+        pending.owes_a_transition_step = owes_a_transition_step && delta.0 != delta.1;
         // A record driven in full stands for a cohort keyed by the parent's inherited inputs only
         // when the drive was partial. One naming its tree scope's counter-style registry answers
         // for no element of another scope, and the key names no scope.
@@ -1216,7 +1315,7 @@ impl RetainedState {
         delta_property_count: u64,
         longhand_evaluations: u32,
         counters: &mut Counters,
-    ) {
+    ) -> &mut PendingEngineComputedRecord {
         counters.add(Counter::CascadeWinnerDeltaProperties, delta_property_count);
         counters.add(Counter::ComputedWinnerDeltaPropertiesConsumed, delta_property_count);
         counters.bump(Counter::EngineComputedRecordDeltas);
@@ -1226,17 +1325,19 @@ impl RetainedState {
         self.set_element_container_query_inputs(node, delta.1.raw());
         self.note_sibling_position_reads(node, u8::MAX, reads_sibling_position);
         self.note_container_unit_effects_for_host(node, false, cascade_state.1, delta.0);
-        self.engine_computed_records_pending
-            .entry(node)
-            .or_default()
-            .push(PendingEngineComputedRecord {
-                node,
-                pseudo_kind: u8::MAX,
-                old_style_record: delta.0,
-                new_style_record: delta.1,
-                cascade_state: Some(cascade_state),
-                longhand_evaluations,
-            });
+        let records = self.engine_computed_records_pending.entry(node).or_default();
+        records.push(PendingEngineComputedRecord {
+            node,
+            pseudo_kind: u8::MAX,
+            old_style_record: delta.0,
+            new_style_record: delta.1,
+            cascade_state: Some(cascade_state),
+            longhand_evaluations,
+            owes_a_transition_step: false,
+            detached_composition: None,
+        });
+        let last = records.len() - 1;
+        &mut records[last]
     }
 
     /// C++ installed the record the engine derived for `node`: the winner state it was computed
@@ -1255,6 +1356,10 @@ impl RetainedState {
                 if let Some(cascade_state) = pending.cascade_state {
                     self.computed_group_sets.bind_cascade_state(target, cascade_state);
                 }
+                // The host holds the record that replaced the composition now.
+                if let Some(detached) = pending.detached_composition {
+                    self.computed_group_sets.release_detached_composition(detached);
+                }
                 // A pseudo-element's record was computed from this very state, as the retained
                 // cascade would have observed had C++ computed it.
                 if pending.pseudo_kind != u8::MAX {
@@ -1270,11 +1375,22 @@ impl RetainedState {
         self.mark_published_answer_observed(node);
     }
 
+    /// The host computed the target's record itself: the record the engine derived for it is not
+    /// installed, and a composition the derivation detached gives way to what the host published.
     pub(super) fn forget_engine_computed_record(&mut self, target: computed::ComputedStyleTarget) {
         let Some(pending_records) = self.engine_computed_records_pending.get_mut(&target.node()) else {
             return;
         };
-        pending_records.retain(|pending| pending.pseudo_kind != target.pseudo_kind());
+        let computed_group_sets = &mut self.computed_group_sets;
+        pending_records.retain(|pending| {
+            if pending.pseudo_kind != target.pseudo_kind() {
+                return true;
+            }
+            if let Some(detached) = pending.detached_composition.take() {
+                computed_group_sets.release_detached_composition(detached);
+            }
+            false
+        });
         if pending_records.is_empty() {
             self.engine_computed_records_pending.remove(&target.node());
         }
@@ -1291,20 +1407,24 @@ impl RetainedState {
                 self.revert_engine_computed_pseudo_record(&pending, counters);
                 continue;
             }
-            self.revert_engine_computed_element_record(&pending);
+            self.revert_engine_computed_element_record(pending);
         }
     }
 
     /// Put an element back on the record it held before the engine derived one for it, unless a
-    /// publication has moved it on since, and its container query inputs back on the record the
-    /// host holds: the derived record they were read from goes with the derivation, and may be
-    /// reclaimed.
-    fn revert_engine_computed_element_record(&mut self, pending: &PendingEngineComputedRecord) {
-        self.computed_group_sets.revert_engine_computed_record(
-            pending.node,
-            pending.new_style_record,
-            pending.old_style_record,
-        );
+    /// publication has moved it on since, with the composition the derivation detached composing
+    /// over it again, and its container query inputs back on the record the host holds: the
+    /// derived record they were read from goes with the derivation, and may be reclaimed.
+    fn revert_engine_computed_element_record(&mut self, pending: PendingEngineComputedRecord) {
+        let previous = pending
+            .detached_composition
+            .as_ref()
+            .map_or(pending.old_style_record, |detached| detached.base);
+        self.computed_group_sets
+            .revert_engine_computed_record(pending.node, pending.new_style_record, previous);
+        if let Some(detached) = pending.detached_composition {
+            self.computed_group_sets.reattach_composition(pending.node, detached);
+        }
         let held_style_record = self.held_style_records.get(&pending.node).copied().unwrap_or(0);
         self.set_element_container_query_inputs(pending.node, held_style_record);
     }
@@ -1367,6 +1487,19 @@ impl RetainedState {
                 font_environment_generation: inputs.font_environment_generation,
                 root_font_inputs: RootFontInputs::from_document(&inputs),
             });
+        // A winner that starts an animation keeps the record in C++, unless it declares CSS
+        // animations and the host can be handed the plan the record decides, which is asked of every
+        // node, a shared record's too. The font-phase longhands feed no group of their own: the full
+        // drive resolves the font from them and rebuilds every group, rejecting the values the font
+        // resolution does not pass on yet.
+        for property in self.winner_groups.semantic_delta_properties(None, state) {
+            if self.first_record_winner_needs_cpp(property)
+                && !(property_declares_css_animations(property) && self.may_plan_css_animations(node, state, scratch))
+            {
+                counters.bump(Counter::EngineComputedRecordBailProperty);
+                return Err(Unanswered::Refused);
+            }
+        }
         let delta_property_count = self.winner_groups.winner_count_in_state(state) as u64;
         if !self.node_declares_custom_properties(node)
             && let Some(delta) = self.assign_cached_cold_record(
@@ -1383,16 +1516,6 @@ impl RetainedState {
             )
         {
             return Ok(ElementAnswer::Delta(delta));
-        }
-        // A winner that starts an animation or reads the counter-style environment keeps the
-        // record in C++. The font-phase longhands feed no group of their own: the full drive
-        // resolves the font from them and rebuilds every group, rejecting the values the font
-        // resolution does not pass on yet.
-        for property in self.winner_groups.semantic_delta_properties(None, state) {
-            if self.first_record_winner_needs_cpp(property) {
-                counters.bump(Counter::EngineComputedRecordBailProperty);
-                return Err(Unanswered::Refused);
-            }
         }
         // A registered name declared here computes provisionally against the parent's font until
         // the drive settles the element's own.
@@ -1746,13 +1869,6 @@ impl RetainedState {
                     derived_under_parent(self, record).then_some((record, true))
                 })
         })?;
-        // A record with transitions will need C++ on its next change. Keep its initial
-        // computation in C++ too, so that fallback retains the input record and can select
-        // only the changed groups instead of rebuilding the entire style.
-        if self.record_requires_cpp_animation(record) {
-            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
-            return None;
-        }
         self.computed_group_sets
             .set_pending_cascade_state(target, cascade_state);
         let publication = self.assign_shared_style_record(
@@ -1782,10 +1898,12 @@ impl RetainedState {
     }
 
     /// Whether a first record's winner keeps the record's computation in C++: a property that
-    /// starts an animation or transition. The font-phase longhands without a group of their own are
-    /// inputs of the font group the full drive builds.
+    /// starts an animation. A transition declaration is computed into the record like any other
+    /// value: a first record has no before-change style to start a transition from, and a record
+    /// driven in full that replaces one leaves the transition step to the host. The font-phase
+    /// longhands without a group of their own are inputs of the font group the full drive builds.
     fn first_record_winner_needs_cpp(&self, property: u16) -> bool {
-        property_starts_animation(property)
+        (property_starts_animation(property) && !property_declares_transitions(property))
             || (computed_group_dependency_mask(property).is_none() && !font_group_carries_longhand(property))
     }
 
@@ -1861,14 +1979,204 @@ impl RetainedState {
         }
     }
 
-    fn record_requires_cpp_animation(&self, record: computed::FinalStyleRecordID) -> bool {
+    /// Whether the host can be handed the animation plan of a record the engine derives for `node`
+    /// from `state`, decided from that record once it is installed: the host applies it, and the
+    /// winners say which scope the winning `animation-name` was declared in.
+    fn may_plan_css_animations(
+        &self,
+        node: StyleNodeID,
+        state: CascadeStateID,
+        scratch: &EngineComputedRecordScratch,
+    ) -> bool {
+        scratch.host_applies_animation_plans && self.animation_name_declaration_scope(node, state).is_ok()
+    }
+
+    /// The tree scope the winning `animation-name` declaration of `state` was written in, where its
+    /// `@keyframes` are looked for first, refused where the winners cannot say. An author rule's is
+    /// the scope its sheet is attached to, and for a sheet several scopes adopt, the one among them
+    /// the winner's priority places among the element's encapsulation contexts.
+    fn animation_name_declaration_scope(
+        &self,
+        node: StyleNodeID,
+        state: CascadeStateID,
+    ) -> Result<DeclarationScope, Unanswered> {
+        let Some(winner) = self
+            .winner_groups
+            .winner_in_state(state, crate::css::property_metadata::property_id::ANIMATION_NAME)
+        else {
+            return Ok(DeclarationScope::Unscoped);
+        };
+        let winner = self.winner_groups.resolved_winner(winner).ok_or(Unanswered::Refused)?;
+        let rule = match winner.source {
+            cascade::WinnerSource::Rule(rule) => rule,
+            cascade::WinnerSource::Element(_) => return Ok(DeclarationScope::Unscoped),
+            cascade::WinnerSource::ExactCascade => return Err(Unanswered::Refused),
+        };
+        let sheet = self.program.rule_sheet(rule);
+        if self.program.sheet_origin(sheet) != crate::css::cascaded_properties::CascadeOrigin::Author {
+            return Ok(DeclarationScope::Unscoped);
+        }
+        let scope = match self.program.sheet_scopes(sheet).as_slice() {
+            &[scope] => scope,
+            scopes => {
+                let depth = winner.priority.author_context_depth().ok_or(Unanswered::Refused)?;
+                *scopes
+                    .iter()
+                    .find(|&&scope| self.author_context_index(node, scope) == Some(depth))
+                    .ok_or(Unanswered::Refused)?
+            }
+        };
+        Ok(match scope {
+            TreeScopeID::DOCUMENT => DeclarationScope::Unscoped,
+            scope => DeclarationScope::Shadow(scope),
+        })
+    }
+
+    /// The scope the winning `animation-name` of the cascade state an element's record is bound to
+    /// was declared in, as [`Self::animation_name_declaration_scope`] answers it, or `None` where it
+    /// refuses or the record is bound to no state.
+    pub(crate) fn element_animation_name_declaration_scope(&self, node: StyleNodeID) -> Option<DeclarationScope> {
+        let (_, state) = self
+            .computed_group_sets
+            .cascade_state(computed::ComputedStyleTarget::new(node, u8::MAX))?;
+        self.animation_name_declaration_scope(node, state).ok()
+    }
+
+    /// Whether the host composes the record the engine settled for `node`, moving it from `old` to
+    /// `new`, before anything inherits from it: it applies the record's animation plan and samples
+    /// the element's animations over it, even over a record that does not move. The element's
+    /// pseudo-elements are settled over the composition afterwards, and its children wait for one
+    /// that moves.
+    pub(super) fn host_composes_row(&self, node: StyleNodeID, old: u64, new: u64) -> bool {
+        self.computed_group_sets.adjustment_facts(node) & bridge::element_adjustment_fact::HAS_ANIMATIONS != 0
+            || self.row_owes_an_animation_plan(node, old, new)
+    }
+
+    /// Settle the pseudo-elements of an element the engine moves along `delta` beside its record,
+    /// as `engine_pseudo_records` does, unless the host composes that record first: the host asks
+    /// for them once the composition they inherit stands.
+    #[allow(clippy::too_many_arguments)]
+    fn engine_pseudo_records_beside(
+        &mut self,
+        node: StyleNodeID,
+        delta: (computed::FinalStyleRecordID, computed::FinalStyleRecordID),
+        old_is_list_item: Option<bool>,
+        generation: u64,
+        full_drive_reason: Option<FullDriveReason>,
+        scratch: &mut EngineComputedRecordScratch,
+        counters: &mut Counters,
+    ) -> Drive<()> {
+        if self.host_composes_row(node, delta.0.raw(), delta.1.raw()) {
+            return Ok(());
+        }
+        let old_style_record = (delta.0 != computed::FinalStyleRecordID::NONE).then_some(delta.0);
+        self.engine_pseudo_records(
+            node,
+            old_style_record,
+            old_is_list_item,
+            delta.1,
+            generation,
+            full_drive_reason,
+            scratch,
+            counters,
+        )
+    }
+
+    /// Whether the host owes an element the engine settled the animation plan its record decides,
+    /// once it installs the record: the record moved the declarations, or the element runs CSS
+    /// animations, whose `@keyframes` may have moved without the declarations.
+    pub(super) fn row_owes_an_animation_plan(&self, node: StyleNodeID, old: u64, new: u64) -> bool {
+        self.record_owes_an_animation_plan(old, new) || self.css_defined_animations.node_runs_a_css_animation(node)
+    }
+
+    /// Whether installing the `new` record the engine derived for an element, in place of the
+    /// `old` one the host holds, owes the host the animation plan the new record decides: a first
+    /// record that names an animation, or a record that moves the declarations.
+    pub(super) fn record_owes_an_animation_plan(&self, old: u64, new: u64) -> bool {
+        match old {
+            0 => self.first_record_declares_animations(new),
+            old => self.animation_declarations_moved(old, new),
+        }
+    }
+
+    /// Whether a first record's `animation-name` names any animation.
+    fn first_record_declares_animations(&self, record: u64) -> bool {
+        self.computed_group_sets
+            .style_record_view(record)
+            .and_then(|view| unsafe { view.longhand_table.as_ref() })
+            .is_some_and(crate::css::style_compute::table_declares_css_animations)
+    }
+
+    /// Whether moving an element from the `old` record to the `new` one moves the `animation-*`
+    /// longhands declaring its CSS animations. Every such longhand is in the animation group; a
+    /// group that moved with only transitions in it decides a plan that changes nothing.
+    fn animation_declarations_moved(&self, old: u64, new: u64) -> bool {
+        use crate::css::table_group_builder::group_index::ANIMATION;
+        let animation_group = |record| {
+            self.computed_group_sets
+                .style_record_payloads(record)
+                .and_then(|payloads| payloads.get(ANIMATION))
+                .map(|payload| payload.as_ptr())
+        };
+        old != new && animation_group(old) != animation_group(new)
+    }
+
+    /// Whether the host composes animations over a record, which the engine cannot drive from: a
+    /// record it cannot read counts as one.
+    pub(super) fn record_holds_an_animation_overlay(&self, record: computed::FinalStyleRecordID) -> bool {
         self.computed_group_sets
             .style_record_view(record.raw())
-            .is_none_or(|view| {
-                !view.animated_overlay.is_null()
-                    || (unsafe { view.longhand_table.as_ref() })
-                        .is_none_or(crate::css::style_compute::has_active_transition_properties)
-            })
+            .is_none_or(|view| !view.animated_overlay.is_null())
+    }
+
+    /// Whether a record's transition declarations name a longhand a change of which starts a
+    /// transition.
+    pub(super) fn record_declares_transitions(&self, record: computed::FinalStyleRecordID) -> bool {
+        self.computed_group_sets
+            .style_record_view(record.raw())
+            .and_then(|view| unsafe { view.longhand_table.as_ref() })
+            .is_some_and(crate::css::style_compute::has_active_transition_properties)
+    }
+
+    /// Whether a row moving `node` off `underlying_style_record`, the record beneath any
+    /// composition, owes the host the transition step: the record declares transitions, or the row
+    /// moves their declarations. The host runs the step once it installs the new record, against
+    /// the record the row moved away from, and the step's start values reach what inherits from the
+    /// element only after the step. So a row that owes one is refused where anything inherits from
+    /// the element, an element child or, as the caller tells, a pseudo-element, and where no host
+    /// installs the record.
+    pub(super) fn decide_transition_step(
+        &self,
+        node: StyleNodeID,
+        underlying_style_record: computed::FinalStyleRecordID,
+        moves_transition_declarations: bool,
+        host_applies_animation_plans: bool,
+        pseudo_elements_inherit: bool,
+        counters: &mut Counters,
+    ) -> Result<bool, Unanswered> {
+        let owes_a_transition_step =
+            moves_transition_declarations || self.record_declares_transitions(underlying_style_record);
+        if owes_a_transition_step
+            && (!host_applies_animation_plans
+                || pseudo_elements_inherit
+                || self
+                    .tree
+                    .flat_tree_children(node)
+                    .any(|child| child.element_index().is_some()))
+        {
+            counters.bump(Counter::EngineComputedRecordBailProperty);
+            return Err(Unanswered::Refused);
+        }
+        Ok(owes_a_transition_step)
+    }
+
+    /// Whether the host owes the element the transition step once it installs the record the engine
+    /// settled for it, as deciding the row found.
+    pub(super) fn row_owes_a_transition_step(&self, node: StyleNodeID) -> bool {
+        self.engine_computed_records_pending
+            .get(&node)
+            .and_then(|records| records.iter().rev().find(|pending| pending.pseudo_kind == u8::MAX))
+            .is_some_and(|pending| pending.owes_a_transition_step)
     }
 
     /// Select the remaining-phase properties and output groups needed to derive a record from a
@@ -2107,7 +2415,7 @@ impl RetainedState {
             if pending.pseudo_kind == u8::MAX {
                 let target = computed::ComputedStyleTarget::new(node, u8::MAX);
                 self.computed_group_sets.take_pending_cascade_state(target);
-                self.revert_engine_computed_element_record(&pending);
+                self.revert_engine_computed_element_record(pending);
                 scratch.cohorts.retain(|_, (record, ..)| *record != derived);
                 scratch.cold_cohorts.retain(|_, record| record.record != derived);
                 self.engine_cold_record_cache
@@ -2179,7 +2487,7 @@ impl RetainedState {
             })
     }
 
-    fn root_font_inputs_from_record(&self, record: computed::FinalStyleRecordID) -> Option<RootFontInputs> {
+    pub(super) fn root_font_inputs_from_record(&self, record: computed::FinalStyleRecordID) -> Option<RootFontInputs> {
         use crate::css::computed_value_types::STYLE_GROUP_INDEX_FONT;
         let view = self.computed_group_sets.style_record_view(record.raw())?;
         let font = unsafe {
@@ -2220,31 +2528,11 @@ impl RetainedState {
         let parent = self
             .record_inheritance_parent(node, installed_ancestors)
             .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
-        if self.parent_composes_animations(node) {
-            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
-            return Err(Unanswered::Refused);
-        }
         Ok(DriveSubject {
             target: computed::ComputedStyleTarget::new(node, u8::MAX),
             parent,
             facts,
         })
-    }
-
-    /// Whether a node inherits values its parent's animations sample, which C++ composes over the
-    /// parent's record. An animation that settles a custom property installs an environment of its
-    /// own on the parent, and sampling moves it without a publication the engine sees.
-    fn parent_composes_animations(&self, node: StyleNodeID) -> bool {
-        self.tree
-            .inheritance_parent(node)
-            .is_some_and(|parent| self.host_composes_style(parent))
-    }
-
-    /// Whether the host composes a node's style over the record the engine holds: an element with
-    /// animations, whose effects C++ samples into its style.
-    pub(super) fn host_composes_style(&self, node: StyleNodeID) -> bool {
-        self.computed_group_sets.node_has_animation_overlay(node)
-            || self.computed_group_sets.adjustment_facts(node) & bridge::element_adjustment_fact::HAS_ANIMATIONS != 0
     }
 
     /// A later element alike in what a first record is computed from takes this record, the way a
@@ -3479,12 +3767,6 @@ impl RetainedState {
         publication
     }
 
-    /// Holds group identity to payload addresses for the span of a C++ verification pass, so
-    /// that the second copy of a record it interns to check the first decides nothing.
-    pub(crate) fn suspend_computed_group_content_identities(&mut self, suspended: bool) {
-        self.computed_group_sets.set_content_identities_suspended(suspended);
-    }
-
     /// Intern the immutable computed-group payloads of a style which has no live StyleEngine target.
     pub(crate) fn intern_computed_groups(
         &mut self,
@@ -4593,11 +4875,26 @@ impl StyleEngineState {
         if self.recording_id().is_some() {
             return None;
         }
+        // A pseudo-element inherits from its element.
+        let parent = if target.is_pseudo() {
+            Some(target.node())
+        } else {
+            self.retained.tree.inheritance_parent(target.node())
+        };
+        let parent_in_display_none_subtree = parent
+            .and_then(|parent| self.retained.computed_group_sets.assigned_style_record(parent))
+            .and_then(|record| {
+                self.retained
+                    .computed_group_sets
+                    .style_record_dependency_flags(record.raw())
+            })
+            .is_some_and(|flags| flags & computed::IN_DISPLAY_NONE_SUBTREE != 0);
         let publication = self.retained.computed_group_sets.publish_animation_overlay(
             target,
             source_identity,
             animated_overlay,
             payloads,
+            parent_in_display_none_subtree,
         )?;
         self.settle_computed_memory();
         if publication.slot_allocated {
@@ -4747,6 +5044,13 @@ pub(super) struct PendingEngineComputedRecord {
     cascade_state: Option<(u64, CascadeStateID)>,
     /// Longhands the drive evaluated for the record; counted once C++ installs it.
     longhand_evaluations: u32,
+    /// Whether the host owes the element the transition step once it installs the record: the
+    /// record moves, and either the one it replaces declares transitions or the move changes the
+    /// declarations.
+    owes_a_transition_step: bool,
+    /// The composition the element's animations laid over the record this one replaces, detached
+    /// and pinned until C++ installs the record, computes one itself, or the derivation is reverted.
+    detached_composition: Option<computed::DetachedComposition>,
 }
 
 /// What one flush accumulates while deriving engine-computed records: the record each cohort
@@ -4881,6 +5185,12 @@ pub(super) struct EngineComputedRecordScratch {
     /// through an explicit `inherit`, and those its pseudo-elements read from it, which the row
     /// carries for C++ to mark the parent with.
     pub(super) element_explicitly_inherited_groups: u32,
+    /// Whether the host applies the animation plan of a record this scratch derives once it has
+    /// installed it: a style update's batch and its retries do, a record demand does not.
+    pub(super) host_applies_animation_plans: bool,
+    /// The elements whose rows this flush settled that the host composes once it installs their
+    /// records: their animations, and those the records' plans start, sampled over them.
+    nodes_composed_by_the_host: HashSet<StyleNodeID>,
     /// The nodes whose substituted-record fact the step decided, in the order it decided them.
     /// The boundary that installs the record applies them.
     substitution_effects: Vec<(StyleNodeID, bool)>,
@@ -5049,6 +5359,9 @@ pub(super) struct DriveSubject {
 pub(crate) struct RetriedEngineRecord {
     pub(crate) style_record: u64,
     pub(crate) explicitly_inherited_groups: u32,
+    pub(crate) owes_an_animation_plan: bool,
+    pub(crate) owes_a_transition_step: bool,
+    pub(crate) composed_by_the_host: bool,
     pub(crate) pseudo_records_present: u8,
     pub(crate) pseudo_records: [u64; bridge::RETRY_PSEUDO_RECORD_SLOTS],
 }
@@ -5287,6 +5600,39 @@ fn counter_style_name_is_non_overridable(name: &[u16]) -> bool {
 enum StoreUse {
     Admission,
     Drive,
+}
+
+/// Whether the property is one of the `animation-*` longhands that declare an element's CSS
+/// animations, which the plan a record decides starts, retimes and cancels.
+fn property_declares_css_animations(property: u16) -> bool {
+    use crate::css::property_metadata::property_id as prop;
+    matches!(
+        property,
+        prop::ANIMATION_COMPOSITION
+            | prop::ANIMATION_DELAY
+            | prop::ANIMATION_DIRECTION
+            | prop::ANIMATION_DURATION
+            | prop::ANIMATION_FILL_MODE
+            | prop::ANIMATION_ITERATION_COUNT
+            | prop::ANIMATION_NAME
+            | prop::ANIMATION_PLAY_STATE
+            | prop::ANIMATION_TIMELINE
+            | prop::ANIMATION_TIMING_FUNCTION
+    )
+}
+
+/// Whether the property is one of the `transition-*` longhands that declare which changes of an
+/// element's values start transitions.
+fn property_declares_transitions(property: u16) -> bool {
+    use crate::css::property_metadata::property_id as prop;
+    matches!(
+        property,
+        prop::TRANSITION_BEHAVIOR
+            | prop::TRANSITION_DELAY
+            | prop::TRANSITION_DURATION
+            | prop::TRANSITION_PROPERTY
+            | prop::TRANSITION_TIMING_FUNCTION
+    )
 }
 
 /// Whether a winner of the property keeps its record in C++, which starts animations and
@@ -5584,6 +5930,8 @@ mod tests {
                     new_style_record: record,
                     cascade_state: None,
                     longhand_evaluations: 1,
+                    owes_a_transition_step: false,
+                    detached_composition: None,
                 });
             record
         };
@@ -5627,6 +5975,64 @@ mod tests {
         assert_eq!(
             engine.computed_group_sets.pseudo_style_record(first, 0),
             Some(first_pseudo)
+        );
+    }
+
+    #[test]
+    fn a_record_the_host_computes_instead_releases_the_detached_composition() {
+        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+        let mut raw_node = [0];
+        engine.allocate_style_nodes(&mut raw_node);
+        let node = StyleNodeID::from_raw(raw_node[0]).unwrap();
+        let target = computed::ComputedStyleTarget::new(node, u8::MAX);
+        let animated_overlay = crate::css::animated_overlay::AnimatedOverlay::default();
+        let composition = engine
+            .publish_computed_groups(
+                target,
+                &[],
+                0,
+                0,
+                computed::ComputedMetadataInput {
+                    pseudo_element_styles: 0,
+                    dependency_flags: 0,
+                    counter_style_environment_identity: 0,
+                    animation_overlay_identity: 1,
+                    animated_overlay: HostShared::new(std::ptr::from_ref(&animated_overlay)),
+                    animation_overlay_payloads: &[],
+                    longhand_table: HostShared::null(),
+                },
+            )
+            .style_record_identity;
+        let detached = engine.computed_group_sets.detach_composition(node);
+        assert!(detached.is_some());
+        assert!(
+            engine
+                .computed_group_sets
+                .underlying_style_record(composition)
+                .is_some()
+        );
+        engine
+            .engine_computed_records_pending
+            .entry(node)
+            .or_default()
+            .push(PendingEngineComputedRecord {
+                node,
+                pseudo_kind: u8::MAX,
+                old_style_record: composition,
+                new_style_record: computed::FinalStyleRecordID::NONE,
+                cascade_state: None,
+                longhand_evaluations: 0,
+                owes_a_transition_step: true,
+                detached_composition: detached,
+            });
+
+        engine.forget_engine_computed_record(target);
+        assert!(engine.engine_computed_records_pending.is_empty());
+        assert!(
+            engine
+                .computed_group_sets
+                .underlying_style_record(composition)
+                .is_none()
         );
     }
 }

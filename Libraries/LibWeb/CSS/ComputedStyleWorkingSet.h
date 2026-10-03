@@ -115,6 +115,8 @@ public:
     ComputedValuesFFI::AnimatedOverlay* prepare_animated_overlay_for_rust_finalization(Badge<StyleComputer>, CreateAnimatedOverlay);
     ComputedValuesFFI::AnimatedOverlay const* animated_overlay(Badge<StyleComputer>) const;
     void finish_animated_overlay_rust_mutation(Badge<StyleComputer>);
+    // Hold every value of `overlay` as the working set's animated values, as the computation that sampled them did.
+    void install_animated_overlay(Badge<StyleComputer>, ComputedValuesFFI::AnimatedOverlay const*);
     void did_apply_style_finalization_from_rust(u16 invalidated_longhands);
     bool requires_animated_post_compute_adjustments() const;
     void prepare_for_animated_post_compute_adjustments(Badge<StyleComputer>);
@@ -163,6 +165,8 @@ public:
 
     // The font list for text in the given tree scope, whose @font-feature-values font-variant-alternates reads.
     ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> computed_font_list(FontComputer const&, TreeScopeID) const;
+    // The platform font and font facts the font group is built from. The font list it names stays cached here.
+    ComputedValuesFFI::FfiFontGroupBuildInputs font_group_build_inputs(DOM::Document const&, TreeScopeID) const;
     ValueComparingNonnullRefPtr<Gfx::Font const> first_available_computed_font(FontComputer const&) const;
 
     int math_depth() const;

@@ -358,15 +358,11 @@ public:
 
     void run_attribute_change_steps(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_);
 
-    enum class StyleRecomputeMode {
-        Normal,
-        Verification,
-    };
     enum class PseudoElementInputs {
         Changed,
         Unchanged,
     };
-    CSS::RequiredInvalidationAfterStyleChange apply_style_engine_reaction(bool& did_change_custom_properties, StyleRecomputeMode = StyleRecomputeMode::Normal, PseudoElementInputs = PseudoElementInputs::Changed);
+    CSS::RequiredInvalidationAfterStyleChange apply_style_engine_reaction(bool& did_change_custom_properties, PseudoElementInputs = PseudoElementInputs::Changed);
     // Apply a base style record the style engine computed itself from this element's moved cascade
     // winners: no style computation runs here, only the diff against the old record and its effects.
     // The synthetic pseudo-element records the style engine settled beside an engine-computed record: a kind it
@@ -392,7 +388,29 @@ public:
         Optional<EngineRecordDamage> element;
         Array<Optional<EnginePseudoElementRecordDamage>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)> pseudo_elements {};
     };
-    CSS::RequiredInvalidationAfterStyleChange apply_engine_computed_style_record(CSS::StyleRecordID new_style_record, EnginePseudoElementRecords const&, bool uses_substitution, u8 record_reads, u32 explicitly_inherited_non_inherited_style_groups, bool& did_change_custom_properties, EngineRecordDamages const* = nullptr);
+    // Whether installing a record also applies the change of the element's display, or leaves that to a caller that
+    // first composes the element's animations over the record and runs its transition step, as a C++ computation does.
+    enum class DisplayNoneChange : u8 {
+        Apply,
+        LeftToCaller,
+    };
+    CSS::RequiredInvalidationAfterStyleChange apply_engine_computed_style_record(CSS::StyleRecordID new_style_record, EnginePseudoElementRecords const&, bool uses_substitution, u8 record_reads, u32 explicitly_inherited_non_inherited_style_groups, bool& did_change_custom_properties, DisplayNoneChange, EngineRecordDamages const* = nullptr);
+    // Whether an element's display is none, with its animations and ignoring them.
+    struct DisplayNoneState {
+        bool display_is_none { true };
+        bool display_ignoring_animations_is_none { true };
+
+        static DisplayNoneState of(CSS::ComputedValues const&);
+    };
+    // None for an element without style.
+    [[nodiscard]] Optional<DisplayNoneState> display_none_state() const;
+    // Terminates or resumes the animations of a subtree whose display, ignoring animations, left or entered none since
+    // `before`, and clears the styles of a subtree that became display:none.
+    void apply_display_none_change(DisplayNoneState before);
+    // Refreshes the pseudo-element styles of an element whose record the engine settled without them, once the host has
+    // composed the element's animations over the record, which the pseudo-elements inherit. `old_computed_values` is
+    // the style the element held before the record.
+    CSS::RequiredInvalidationAfterStyleChange refresh_pseudo_element_styles_over_composition(CSS::ComputedValues const* old_computed_values, bool& did_change_custom_properties);
     // The custom-property environment an engine-computed record was published with: the one the
     // element inherits, or one the engine resolved over it. Nothing when it cannot be installed.
     [[nodiscard]] RefPtr<CSS::CustomPropertyData const> custom_property_environment_of_engine_record(CSS::StyleRecordID, bool& installable) const;
@@ -561,9 +579,8 @@ public:
     void replace_custom_property_data(Optional<CSS::PseudoElement>, RefPtr<CSS::CustomPropertyData const>);
     [[nodiscard]] RefPtr<CSS::CustomPropertyData const> custom_property_data(Optional<CSS::PseudoElement>) const;
 
-    [[nodiscard]] bool refresh_inherited_custom_property_data();
-    // Publish the environment a refresh moved the element's custom-property data to on its record,
-    // so the engine reads the environment the element holds.
+    // Publish the environment the element's custom-property data moved to on its record, so the
+    // engine reads the environment the element holds.
     void republish_style_record_environment();
 
     // What the element's last computation was allowed to read, so a later one can ask whether any of
@@ -685,22 +702,18 @@ public:
     [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean() const;
     [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean(Compositing::AccumulatedVisualContextTree const&) const;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle);
+    // Which principal box this element asks for, before its computed style has a say.
+    virtual CSS::ElementBoxKind box_kind() const;
 
     virtual void did_receive_focus() { }
     virtual void did_lose_focus() { }
     bool should_indicate_focus() const;
     virtual bool is_focusable() const override;
 
-    static Layout::NodeWithStyle* create_layout_node_for_display_type(DOM::Document&, CSS::Display const&, CSS::LayoutStyle, Element*);
-
-    void set_synthetic_pseudo_element_node(Badge<Layout::LayoutTreeBuilderAccess>, CSS::PseudoElement, Layout::NodeWithStyle*);
-
     Layout::NodeWithStyle* pseudo_element_layout_node(CSS::PseudoElement) const;
     Layout::NodeWithStyle* pseudo_element_unsafe_layout_node(CSS::PseudoElement) const;
 
     bool has_synthetic_pseudo_elements() const;
-    void clear_synthetic_pseudo_element_layout_nodes(Badge<Layout::LayoutTreeBuilderAccess, Node>) { clear_synthetic_pseudo_element_layout_nodes(); }
 
     void serialize_children_as_json(JsonObjectSerializer<Utf16StringBuilder>&) const;
 
@@ -1021,7 +1034,6 @@ private:
 
     void register_element_reference_pseudo_element(CSS::PseudoElement type, GC::Ref<Element> element);
     SyntheticPseudoElement& ensure_synthetic_pseudo_element(CSS::PseudoElement) const;
-    void clear_synthetic_pseudo_element_layout_nodes();
 
     CSS::StyleNodeID m_style_node_id;
 

@@ -8,15 +8,20 @@ use crate::layout::LayoutNodeArena;
 use crate::painting::display_list::commands::{DisplayListCommandType, DisplayListResourceId, PaintNestedDisplayList};
 use crate::painting::host::FfiRecordingPublishCallbacks;
 use crate::painting::paint_state::PendingRecording;
+use crate::painting::record::recorder_state::RecorderState;
 use crate::painting::record::resources::RecordingResourceManifest;
 use crate::painting::record::vector_images::{
     VectorImageRenderRequest, is_vector_image_placeholder, vector_image_placeholder_index,
 };
 use crate::painting::record::{RecordingOutput, RecordingResult};
+use crate::painting::recording_slot::RecordingSlot;
+use crate::painting::svg_paint_resources::published_filter_image_frames_in;
+use crate::stage::MainThread;
 
 fn resolve_vector_image_placeholders(
     output: &mut RecordingOutput,
     requests: &[VectorImageRenderRequest],
+    main_thread: &MainThread,
     publish: &FfiRecordingPublishCallbacks,
 ) {
     if requests.is_empty() {
@@ -24,7 +29,7 @@ fn resolve_vector_image_placeholders(
     }
     let resolved_ids: Vec<u64> = requests
         .iter()
-        .map(|request| publish.resolve_vector_image_display_list(&request.to_ffi()))
+        .map(|request| publish.resolve_vector_image_display_list(main_thread, &request.to_ffi()))
         .collect();
     let display_list = std::sync::Arc::make_mut(&mut output.display_list);
     let id_field_offset = std::mem::offset_of!(PaintNestedDisplayList, display_list_id);
@@ -51,15 +56,34 @@ fn resolve_vector_image_placeholders(
     }
 }
 
+/// Publishes a pending recording from the document: hands its resources to the host and takes
+/// its output in.
 pub(crate) fn publish_recording(
     arena: &LayoutNodeArena,
+    recording: &mut RecordingSlot,
     pending: PendingRecording,
+    main_thread: &MainThread,
     publish: &FfiRecordingPublishCallbacks,
-) -> u64 {
+) {
+    let publishes_recording = pending.publishes_recording;
+    let output = publish_to_host(pending, recording.recorder(), main_thread, publish);
+    take_in_published_output(arena, recording, output, publishes_recording);
+}
+
+/// Hands a recording's resources to the host and makes its output, reading nothing but the
+/// recording and the recorder state it recorded with: what a publication does before the
+/// document takes the output in.
+pub(crate) fn publish_to_host(
+    pending: PendingRecording,
+    recorder: &RecorderState,
+    main_thread: &MainThread,
+    publish: &FfiRecordingPublishCallbacks,
+) -> RecordingOutput {
     let PendingRecording {
         recording: RecordingResult { mut output, resources },
         recording_from_scratch,
-        publishes_recording,
+        publishes_recording: _,
+        svg_paint_resources,
     } = pending;
     let RecordingResourceManifest {
         fonts,
@@ -69,22 +93,23 @@ pub(crate) fn publish_recording(
         ..
     } = resources;
     for font in fonts.values() {
-        publish.add_font(font);
+        publish.add_font(main_thread, font);
     }
     for frame in image_frames.values() {
-        publish.add_image_frame(frame);
+        publish.add_image_frame(main_thread, frame);
     }
-    for frame in arena.svg_paint_resources().published_filter_image_frames() {
-        publish.add_image_frame(&frame);
+    for frame in published_filter_image_frames_in(&svg_paint_resources) {
+        publish.add_image_frame(main_thread, &frame);
     }
     for (resource_id, sink_handle) in video_sinks {
-        publish.add_video_sink(resource_id, sink_handle);
+        publish.add_video_sink(main_thread, resource_id, sink_handle);
     }
-    resolve_vector_image_placeholders(&mut output, &vector_image_render_requests, publish);
+    resolve_vector_image_placeholders(&mut output, &vector_image_render_requests, main_thread, publish);
     if let Some(mut recording_from_scratch) = recording_from_scratch {
         resolve_vector_image_placeholders(
             &mut recording_from_scratch.output,
             &recording_from_scratch.resources.vector_image_render_requests,
+            main_thread,
             publish,
         );
         crate::painting::record::verify::verify_assembled_recording_matches_fresh(
@@ -92,16 +117,10 @@ pub(crate) fn publish_recording(
             &recording_from_scratch.output,
         );
     }
-    publish_recording_output(arena, output, publishes_recording)
-}
-
-// Resource callbacks and verification must finish before the new frame becomes the source.
-fn publish_recording_output(arena: &LayoutNodeArena, mut output: RecordingOutput, publishes_recording: bool) -> u64 {
-    let mut paint_state = arena.paint_state().borrow_mut();
-    output.is_identical_to_published_frame = paint_state
-        .published_frame
+    output.is_identical_to_published_recording = recorder
+        .published_recording
         .as_ref()
-        .zip(paint_state.published_hit_test_items.as_ref())
+        .zip(recorder.published_hit_test_items.as_ref())
         .is_some_and(|(source, item_source)| {
             std::sync::Arc::ptr_eq(&output.display_list, &source.display_list)
                 && std::sync::Arc::ptr_eq(&output.hit_test_list.items, &item_source.items)
@@ -109,34 +128,48 @@ fn publish_recording_output(arena: &LayoutNodeArena, mut output: RecordingOutput
                 && output.wheel_event_listener_state_generation == source.wheel_event_listener_state_generation
                 && output.has_blocking_wheel_event_listeners == source.has_blocking_wheel_event_listeners
         });
+    output
+}
+
+/// Takes a published recording's output in: its hit-test list, and for a recording that publishes,
+/// the source the next recording copies from and the damage it consumed. Resource callbacks and
+/// verification have finished, so the new recording may become the source. Returns the generation
+/// of the document's hit-test list.
+pub(crate) fn take_in_published_output(
+    arena: &LayoutNodeArena,
+    recording: &mut RecordingSlot,
+    mut output: RecordingOutput,
+    publishes_recording: bool,
+) -> u64 {
+    let mut paint_state = arena.paint_state().borrow_mut();
     let list = std::mem::take(&mut output.hit_test_list);
-    let mut hit_test_list = arena.hit_test_list.borrow_mut();
-    let previous_list_is_the_source = hit_test_list
+    let previous_list_is_the_source = recording
+        .hit_test_list
         .as_ref()
-        .zip(paint_state.published_hit_test_items.as_ref())
+        .zip(recording.recorder.published_hit_test_items.as_ref())
         .is_some_and(|(list, source)| std::sync::Arc::ptr_eq(&list.items, &source.items));
-    if output.is_identical_to_published_frame && previous_list_is_the_source {
+    if output.is_identical_to_published_recording && previous_list_is_the_source {
         drop(list);
     } else {
         paint_state.hit_test_list_generation += 1;
         debug_assert_eq!(list.generation, paint_state.hit_test_list_generation);
         if publishes_recording {
-            paint_state.published_hit_test_items =
+            recording.recorder.published_hit_test_items =
                 Some(std::sync::Arc::new(crate::painting::record::PublishedHitTestItems {
                     items: list.items.clone(),
                 }));
         }
-        *hit_test_list = Some(list);
+        recording.hit_test_list = Some(list);
     }
     let output = std::sync::Arc::new(output);
     if publishes_recording {
-        paint_state.published_frame = Some(output.clone());
-        // Read-only recordings publish no frame and must not consume the damage.
+        recording.recorder.published_recording = Some(output.clone());
+        // Read-only recordings publish nothing and must not consume the damage.
         arena.clear_paint_damage_consumed_by_published_recording();
         paint_state.visual_context.quarantined_slots_are_releasable = true;
     }
     paint_state.last_recording = Some(output);
-    hit_test_list.as_ref().map_or(0, |list| list.generation)
+    recording.hit_test_list.as_ref().map_or(0, |list| list.generation)
 }
 
 #[cfg(test)]
@@ -147,8 +180,9 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn read_only_publication_keeps_the_source_frame_and_the_pending_damage() {
+    fn read_only_publication_keeps_the_source_recording_and_the_pending_damage() {
         let mut arena = LayoutNodeArena::new();
+        let mut recording = RecordingSlot::default();
         let row = arena.allocate_for_test().slot;
         arena.populate_paintable_row(row);
         let mut original_source = None;
@@ -165,10 +199,10 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                publish_recording_output(&arena, output, read_write),
+                take_in_published_output(&arena, &mut recording, output, read_write),
                 hit_test_generation
             );
-            let source = arena.paint_state().borrow().published_frame.clone().unwrap();
+            let source = recording.recorder().published_recording.clone().unwrap();
             match hit_test_generation {
                 1 => {
                     original_source = Some(source);

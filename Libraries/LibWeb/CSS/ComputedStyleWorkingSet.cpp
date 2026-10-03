@@ -140,6 +140,8 @@ NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_for_anima
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Position))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Float))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::LineHeight))
+            || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::OverflowX))
+            || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::OverflowY))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::TextAlign));
         auto animated_properties = adopt_ref(*new AnimatedProperties(overlay, AnimatedProperties::InheritedOnly {}));
         working_set->m_animated_properties = move(animated_properties);
@@ -439,6 +441,8 @@ bool ComputedStyleWorkingSet::requires_animated_post_compute_adjustments() const
         || has_animated_property(PropertyID::Position)
         || has_animated_property(PropertyID::Float)
         || has_animated_property(PropertyID::LineHeight)
+        || has_animated_property(PropertyID::OverflowX)
+        || has_animated_property(PropertyID::OverflowY)
         || has_animated_property(PropertyID::TextAlign);
 }
 
@@ -465,6 +469,12 @@ void ComputedStyleWorkingSet::did_apply_style_finalization_from_rust(u16 invalid
 void ComputedStyleWorkingSet::set_animated_custom_property(Badge<StyleComputer>, Utf16FlyString name, NonnullRefPtr<StyleValue const> value)
 {
     m_animated_custom_properties.set(move(name), move(value));
+}
+
+void ComputedStyleWorkingSet::install_animated_overlay(Badge<StyleComputer>, ComputedValuesFFI::AnimatedOverlay const* overlay)
+{
+    m_animated_properties = adopt_ref(*new AnimatedProperties(overlay));
+    clear_computed_font_list_cache();
 }
 
 void ComputedStyleWorkingSet::clear_animated_properties(Badge<StyleComputer>)
@@ -1017,6 +1027,33 @@ ScrollbarColorData ComputedStyleWorkingSet::scrollbar_color(ColorResolutionConte
     }
 
     return {};
+}
+
+ComputedValuesFFI::FfiFontGroupBuildInputs ComputedStyleWorkingSet::font_group_build_inputs(DOM::Document const& document, TreeScopeID tree_scope) const
+{
+    // FIXME: A tree-scoped name is resolved in the tree of the declaration that named it, and inherits with that
+    //        tree (css-scoping). This resolves feature value names in the element's own tree scope instead.
+    auto font_list = computed_font_list(document.font_computer(), tree_scope);
+    auto const& first_available_font = font_list->first_available_font();
+    auto const metrics = first_available_font.pixel_metrics();
+    auto math_shift = keyword_to_math_shift(property(PropertyID::MathShift).to_keyword()).release_value();
+    auto math_style = keyword_to_math_style(property(PropertyID::MathStyle).to_keyword()).release_value();
+    return {
+        .font_size_raw = font_size().raw_value(),
+        .line_height_used_raw = line_height(document.font_computer()).raw_value(),
+        .font_variant_emoji = to_underlying(font_variant_emoji()),
+        .font_ascent = metrics.ascent,
+        .font_descent = metrics.descent,
+        .font_x_height = metrics.x_height,
+        .font_zero_advance = metrics.advance_of_ascii_zero,
+        .first_available_font = &first_available_font,
+        .font_cascade_list = font_list.ptr(),
+        .font_weight = font_weight(),
+        .font_width = font_width().value(),
+        .math_shift = to_underlying(math_shift),
+        .math_style = to_underlying(math_style),
+        .math_depth = math_depth(),
+    };
 }
 
 ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer, TreeScopeID tree_scope) const

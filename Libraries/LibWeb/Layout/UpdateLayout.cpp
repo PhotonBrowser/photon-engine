@@ -5,10 +5,12 @@
  */
 
 #include <AK/ScopeGuard.h>
+#include <LibGfx/FontCascadeList.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Layout/Node.h>
@@ -60,6 +62,14 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
         .note_full_layout_performed = [](void* context) { static_cast<Document*>(context)->style_invalidation_counters().relayouts_performed++; },
         .evaluate_pending_container_queries = [](void* context) { static_cast<Document*>(context)->style_computer().style_engine().evaluate_size_containers_needing_evaluation_after_layout(); },
         .record_stabilization_bound_failure = [](void* context) { ++static_cast<Document*>(context)->m_style_invalidation_counters.style_stabilization_bound_failures; },
+        .attach_style_resources = [](void* context, Compositing::RustFFI::NodeSlotId slot, bool owns_content_replacement_image) {
+            auto& document = *static_cast<Document*>(context);
+            if (Layout::attach_owed_style_resources(document, slot, owns_content_replacement_image))
+                document.m_owed_image_provider_arrived_with_image = true; },
+        .attach_generated_image = [](void* context, Compositing::RustFFI::NodeSlotId slot, u32 element_style_node, Layout::RustFFI::FfiPseudoElement pseudo_element, Layout::RustFFI::FfiGeneratedImage image) {
+            auto& document = *static_cast<Document*>(context);
+            if (Layout::attach_owed_generated_image(document, slot, element_style_node, pseudo_element, image))
+                document.m_owed_image_provider_arrived_with_image = true; },
     };
 }
 
@@ -70,13 +80,24 @@ void Document::update_layout(UpdateLayoutReason reason)
 
 void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
 {
-    update_style_and_layout_once(reason, animation_sampling_scope);
+    // An image box that owns its image's provider is handed it once the layout update that built the box is over, and
+    // the update lays it out without an image. If the image was already there, the box lays out again with it before
+    // the read goes on. Likewise, a web face a layout reached is requested once the update is over, and the update
+    // runs again in case the face is already there. Only an update that builds another such box or reaches a face no
+    // update reached before can leave one behind again, so this settles.
+    auto update_style_and_layout = [&] {
+        update_style_and_layout_once(reason, animation_sampling_scope);
+        while (exchange(m_owed_image_provider_arrived_with_image, false) || exchange(m_requested_wanted_font_faces, false))
+            update_style_and_layout_once(reason, animation_sampling_scope);
+    };
+
+    update_style_and_layout();
 
     // AD-HOC: A scroll-state() query against a container that has not been snapshotted yet reads no state. Like other
     //         engines, take such a container's first snapshot as soon as its layout is known, so that the style it
     //         decides is right before the next rendering update. Later changes of its state wait for that update.
     while (layout_is_up_to_date() && m_scroll_state_query_containers.snapshot_post_layout_state(*this, CSS::ScrollStateQueryContainers::Snapshot::NewContainersOnly))
-        update_style_and_layout_once(reason, animation_sampling_scope);
+        update_style_and_layout();
 }
 
 void Document::update_style_and_layout_once(UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
@@ -126,6 +147,25 @@ void Document::update_style_and_layout_once(UpdateLayoutReason reason, Throttled
         .reason_name = ffi_utf16_view(to_string(reason)),
     };
     Layout::RustFFI::layout_arena_update_layout(arena.handle(), &inputs);
+
+    // A pass that reached a web face still waiting on its load cannot start the fetch itself: the fetch, the
+    // font-display timer and the load-event delayer are all document state. It leaves the face's number behind
+    // instead, and the request happens here, once the pass has ended and in the same rendering update. A face that
+    // resolves as it is requested, as a local() one does, changes the fonts the pass picked.
+    if (Gfx::request_wanted_pending_faces())
+        m_requested_wanted_font_faces = true;
+
+    // An <object> showing this document is sized from its <svg> document element, whose natural size only this
+    // document's layout works out. Hand it over as it changes.
+    if (auto* object = as_if<HTML::HTMLObjectElement>(navigable->container().ptr())) {
+        Layout::RustFFI::FfiNaturalSize natural_size {};
+        if (Layout::RustFFI::layout_arena_take_changed_document_svg_root_natural_size(arena.handle(), &natural_size)) {
+            CSS::SizeWithAspectRatio size { natural_size.width, natural_size.height, {} };
+            if (natural_size.has_aspect_ratio)
+                size.aspect_ratio = CSSPixelFraction(natural_size.aspect_ratio_numerator, natural_size.aspect_ratio_denominator);
+            object->set_natural_size_of_content_document(size);
+        }
+    }
 }
 
 }

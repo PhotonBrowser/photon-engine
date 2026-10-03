@@ -194,6 +194,31 @@ void ConnectionFromClient::set_font_catalog(IPC::File file, u64 size, u64 genera
     Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(m_enable_test_mode, m_font_provider));
 }
 
+void ConnectionFromClient::set_render_side_font_service_transport(IPC::TransportHandle handle)
+{
+    // NB: A renderer cannot run without this connection: a font question from any thread but the document's would
+    //     otherwise go out on the connection the document thread owns.
+    m_render_side_font_service = MUST(Compositing::FontServiceClient::create(move(handle)));
+    if (!m_font_provider)
+        return;
+
+    // NB: There is no match_local_font: only a @font-face src: local() asks it, which is the document thread's work.
+    Gfx::SharedFontProviderCallbacks callbacks;
+    callbacks.open_font = [this](u64 generation, u64 face_id) {
+        return m_render_side_font_service->open_font(generation, face_id);
+    };
+    callbacks.match_font = [this](String const& family, u16 weight, u16 width, u8 slope) {
+        return m_render_side_font_service->match_font(family, weight, width, slope);
+    };
+    callbacks.match_font_for_code_point = [this](u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) {
+        return m_render_side_font_service->match_font_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
+    };
+    callbacks.resolve_generic_family = [this](String const& family, u16 weight, u8 slope) {
+        return m_render_side_font_service->resolve_generic_family(family, weight, slope);
+    };
+    m_font_provider->set_callbacks_for_other_threads(move(callbacks));
+}
+
 void ConnectionFromClient::initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     m_page_host->initialize(initial_page_id, move(remote_navigables), root_navigable_id, cross_process_id_allocator, move(initial_history_entry), system_visibility_state);
@@ -1027,6 +1052,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "dump-layout-tree") {
         if (auto doc = page->page().local_traversable()->active_document()) {
+            page->page().local_traversable()->update_layout_of_hosted_inclusive_descendant_documents(Web::DOM::UpdateLayoutReason::Debugging);
             if (auto* viewport = doc->layout_node())
                 Web::dump_tree(*viewport);
         }
@@ -1086,8 +1112,9 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
                 for (auto& child : node->children_as_vector())
                     nodes_to_visit.enqueue(child.ptr());
                 if (auto* element = as_if<Web::DOM::Element>(node)) {
-                    auto styles = doc->style_computer().materialize_style_record({ *element });
-                    dump_style(MUST(String::formatted("Element {}", node->debug_description())), *styles, element->custom_property_data({}));
+                    doc->update_style_for_element(Web::DOM::AbstractElement { *element });
+                    if (auto styles = element->computed_style())
+                        dump_style(MUST(String::formatted("Element {}", node->debug_description())), *styles, element->custom_property_data({}));
 
                     element->for_each_synthetic_pseudo_element([&](Web::CSS::PseudoElement pseudo_element_type, Web::DOM::PseudoElement const&) {
                         auto computed_values = element->computed_style(pseudo_element_type);
@@ -2409,7 +2436,7 @@ static void append_layout_tree(Web::Page& page, StringBuilder& builder)
         return;
     }
 
-    document->update_layout(Web::DOM::UpdateLayoutReason::Debugging);
+    page.local_traversable()->update_layout_of_hosted_inclusive_descendant_documents(Web::DOM::UpdateLayoutReason::Debugging);
 
     auto* layout_root = document->layout_node();
     if (!layout_root) {

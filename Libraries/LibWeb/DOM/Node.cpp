@@ -65,6 +65,7 @@
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLDocument.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
+#include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLLegendElement.h>
@@ -85,8 +86,11 @@
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
+#include <LibWeb/Layout/TreeBuilderRustFFI.h>
 #include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
@@ -115,8 +119,8 @@ static Utf16String generated_content_accessible_text(Element const& element, CSS
 {
     auto* arena = element.document().layout_node_arena_if_created();
     VERIFY(arena);
-    return Utf16String::adopt_raw(Layout::RustFFI::layout_arena_generated_content_accessible_text(
-        const_cast<Layout::NodeArena*>(arena)->handle(), element.style_node_id().value(), Layout::Node::encode_generated_for(pseudo_element)));
+    return Utf16String::adopt_raw(Layout::RustFFI::layout_script_generated_content_accessible_text(
+        arena->host(), element.style_node_id().value(), Layout::Node::encode_generated_for(pseudo_element)));
 }
 
 static UniqueNodeID s_next_unique_id;
@@ -287,6 +291,13 @@ UniqueNodeID Node::unique_id() const
     if (!unique_id.has_value())
         unique_id = allocate_unique_id(const_cast<Node&>(*this));
     return *unique_id;
+}
+
+Optional<UniqueNodeID> Node::unique_id_if_assigned() const
+{
+    if (!m_rare_data)
+        return {};
+    return m_rare_data->unique_id;
 }
 
 Optional<String> Node::webdriver_node_id() const
@@ -1357,6 +1368,18 @@ bool Node::list_item_box_change_renumbers_list(Element const& list_item)
     return !final_direct_list_item_does_not_renumber_existing_content(list_item);
 }
 
+// Pins the style record of the box `node`, or its pseudo-element of kind `pseudo_element`, is bound to, for its
+// readers once the node leaves the document. The row is found by the node's StyleNodeID, so no layout node is made
+// just to pin it.
+static void pin_bound_box_style_record_for_detachment(Node& node, Optional<CSS::PseudoElement> pseudo_element = {})
+{
+    auto* arena = node.document().layout_node_arena_if_created();
+    if (!arena)
+        return;
+    auto generated_for = pseudo_element.has_value() ? Layout::Node::encode_generated_for(*pseudo_element) : 0;
+    Layout::RustFFI::layout_arena_pin_bound_box_style_record_for_detachment(arena->handle(), Layout::Node::style_node_of(&node).value(), generated_for);
+}
+
 class RemovalStyleRecordPins {
 public:
     explicit RemovalStyleRecordPins(CSS::StyleComputer const& style_computer)
@@ -1374,14 +1397,12 @@ public:
         if (!was_connected)
             return;
         node.for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
-            if (auto* layout_node = inclusive_descendant.unsafe_layout_node())
-                layout_node->pin_style_record_for_detachment();
+            pin_bound_box_style_record_for_detachment(inclusive_descendant);
 
             if (auto* element = as_if<Element>(inclusive_descendant)) {
                 pin_dom_style_record(element->style_record_identity());
-                element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
-                    if (auto* layout_node = pseudo_element.unsafe_layout_node())
-                        layout_node->pin_style_record_for_detachment();
+                element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement type, SyntheticPseudoElement& pseudo_element) {
+                    pin_bound_box_style_record_for_detachment(*element, type);
                     pin_dom_style_record(pseudo_element.style_record_identity());
                 });
             }
@@ -1397,13 +1418,11 @@ public:
         // Detached subtrees do not need DOM-held record pins, but layout nodes can still outlive removing steps and
         // keep their detachment pins.
         node.for_each_shadow_including_inclusive_descendant([](Node& inclusive_descendant) {
-            if (auto* layout_node = inclusive_descendant.unsafe_layout_node())
-                layout_node->pin_style_record_for_detachment();
+            pin_bound_box_style_record_for_detachment(inclusive_descendant);
 
             if (auto* element = as_if<Element>(inclusive_descendant)) {
-                element->for_each_synthetic_pseudo_element([](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
-                    if (auto* layout_node = pseudo_element.unsafe_layout_node())
-                        layout_node->pin_style_record_for_detachment();
+                element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement type, SyntheticPseudoElement&) {
+                    pin_bound_box_style_record_for_detachment(*element, type);
                 });
             }
 
@@ -1484,7 +1503,7 @@ void Node::update_layout_tree_for_removal(Node& parent, LayoutSubtreeRemoval rem
         bool const parent_contains_removed_abspos_box = removed_box && removed_box->position() == CSS::Positioning::Absolute
             && parent_box && removed_box->containing_block() == parent_box;
         if (parent_contains_removed_abspos_box)
-            Layout::RustFFI::layout_arena_note_contained_abspos_child_removal(parent_box->arena_handle(), Layout::Node::slot_id(parent_box), Layout::Node::slot_id(layout_node));
+            Layout::RustFFI::render_state_note_contained_abspos_child_removal(parent_box->document_host(), Layout::Node::slot_id(parent_box), Layout::Node::slot_id(layout_node));
         layout_node->for_each_in_inclusive_subtree([](Layout::Node& node) {
             node.clear_committed_box();
             return TraversalDecision::Continue;
@@ -1511,23 +1530,12 @@ void Node::update_layout_tree_for_removal(Node& parent, LayoutSubtreeRemoval rem
 // engine retires their StyleNodeIDs, so anything the removal does to them has to happen before.
 void Node::detach_remaining_layout_nodes_for_removal()
 {
-    for_each_shadow_including_inclusive_descendant([](Node& node) {
-        // A pseudo-element's boxes are found through its generator's StyleNodeID, so they go while that ID still finds
-        // them. A ::backdrop box sits outside the generator's box, so no rebuild of the parent would destroy it.
-        if (auto* element = as_if<Element>(node))
-            element->clear_synthetic_pseudo_element_layout_nodes(Badge<Node> {});
-        auto* layout_node = node.unsafe_layout_node();
-        if (!layout_node)
-            return TraversalDecision::Continue;
-        // The layout node is read until the parent's rebuild detaches it, after the style engine lets go of its style.
-        layout_node->pin_style_record_for_detachment();
-        layout_node->clear_committed_box();
-        // A top layer element's box is a viewport child rather than part of the parent's box
-        // subtree, so the parent rebuild triggered by this removal can never detach it.
-        if (auto* top_layer_placement = layout_node->topmost_layout_node_of_top_layer_placement()) {
-            top_layer_placement->prepare_subtree_for_detach_from_layout_tree();
-            VERIFY(Layout::destroy_layout_subtree(*top_layer_placement));
-        }
+    auto* arena = document().layout_node_arena_if_created();
+    if (!arena)
+        return;
+    for_each_shadow_including_inclusive_descendant([&](Node& node) {
+        // The node's boxes, its pseudo-elements' and its top layer placement, are found by the node's StyleNodeID.
+        Layout::RustFFI::rust_detach_remaining_layout_rows_for_removal(arena->handle(), Layout::Node::style_node_of(&node).value());
         return TraversalDecision::Continue;
     });
 }
@@ -2128,6 +2136,12 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     old_parent->invalidate_html_collection_caches_in_ancestors(affects_elements);
     new_parent.invalidate_html_collection_caches_in_ancestors(affects_elements);
 
+    // NB: A move runs no children changed steps, which is where an <html> element publishes which child is the body.
+    for (auto* parent : { old_parent, &new_parent }) {
+        if (auto* html_element = as_if<HTML::HTMLHtmlElement>(*parent))
+            html_element->publish_body_construction_facts();
+    }
+
     old_parent->bump_dom_tree_version();
     new_parent.bump_dom_tree_version();
 
@@ -2334,6 +2348,10 @@ void Node::recompute_editable_subtree_flags_and_repaint()
         // display list, so a flip must invalidate the recorded output.
         if (node.recompute_editable_subtree_flag())
             node.set_needs_repaint();
+        // Whether an element is an editing host is one of the facts a layout row is built with, which the style
+        // mirror holds for the tree build. Only contenteditable and designMode move it, and both reach here.
+        if (auto* element = as_if<Element>(node))
+            CSS::record_element_construction_facts(*element);
         // Editing-host status and the empty-text fragment behavior of text nodes are
         // stamped into layout NodeData at layout node construction; contenteditable and
         // designMode changes reach here without a layout tree rebuild, so the stamps must
@@ -2341,8 +2359,8 @@ void Node::recompute_editable_subtree_flags_and_repaint()
         // did not, hence unconditionally for every node. A flipped stamp changes geometry
         // (an editing host gains a minimum block size, an empty editable text node gains
         // a zero-width fragment), so the affected node also needs a relayout.
+        node.publish_dom_paint_facts();
         if (auto* layout_node = node.unsafe_layout_node()) {
-            node.note_dom_paint_facts();
             auto is_editing_host = node.is_editing_host();
             if (layout_node->is_editing_host() != is_editing_host) {
                 layout_node->set_is_editing_host(is_editing_host);
@@ -2644,7 +2662,7 @@ void Node::apply_layout_tree_update_mark(Layout::Node& layout_node, SetNeedsLayo
         layout_node.set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate, Layout::LayoutUpdatePropagation::BoundarySelfOnly);
     } else if (reason == SetNeedsLayoutTreeUpdateReason::NodeInsertBefore) {
         // What an insertion invalidates depends on the boxes it attaches, which only the layout tree build knows.
-        Layout::RustFFI::layout_arena_defer_child_list_insertion_layout_update(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node));
+        Layout::RustFFI::render_state_defer_child_list_insertion_layout_update(layout_node.document_host(), Layout::Node::slot_id(&layout_node));
     } else {
         layout_node.set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate, Layout::LayoutUpdatePropagation::ThroughAncestors);
     }
@@ -2664,6 +2682,17 @@ void Node::post_connection()
 {
 }
 
+// Whether a node sits inside a blocking wheel event handler is inherited from its parents, so a
+// node that arrives somewhere new has to derive it again. Both walks that bring a node somewhere
+// new visit shadow-including inclusive descendants in tree order, so each node's parent has
+// already settled by the time this runs for it, and one step per node is enough.
+static void derive_inside_blocking_wheel_event_handler_state_after_tree_change(Node& node)
+{
+    if (!node.document().may_have_blocking_wheel_event_listener())
+        return;
+    (void)node.update_inside_blocking_wheel_event_handler_state();
+}
+
 void Node::inserted()
 {
     // NB: The DOM insertion steps visit shadow-including inclusive descendants in tree order,
@@ -2677,6 +2706,7 @@ void Node::inserted()
     if (is_connected())
         document().page().keyboard_scroll_dom_tree_changed(*this);
     recompute_editable_subtree_flag();
+    derive_inside_blocking_wheel_event_handler_state_after_tree_change(*this);
 
     // Text an element clones into its shadow tree from its own insertion steps is not covered by a
     // subtree arrival either, so it takes its identity here.
@@ -2707,6 +2737,17 @@ void Node::inserted()
         if (text)
             CSS::Invalidation::invalidate_style_after_text_change_under(*parent);
     }
+
+    // Inertness, editability and the wheel handler state are all inherited, so a node that arrives somewhere new
+    // holds what its new place gives it. The identity it publishes them under was taken above.
+    publish_dom_paint_facts();
+
+    // A node can also arrive in the shadow tree of a text control that is already focused, which is the one other
+    // inherited state a row is built with. Only the nodes of the focused control's own shadow tree hold it.
+    if (auto focused_area = document().focused_area(); is<HTML::FormAssociatedTextControlElement>(focused_area.ptr())) {
+        if (auto* shadow_root = as_if<ShadowRoot>(root()); shadow_root && shadow_root->host() == focused_area.ptr())
+            Layout::publish_is_in_focused_text_control(*this);
+    }
 }
 
 void Node::removed_from(IsSubtreeRoot, Node* old_parent, Node&)
@@ -2734,6 +2775,8 @@ void Node::moved_from(IsSubtreeRoot, GC::Ptr<Node>)
     if (is_html_body_element() || is_html_frameset_element())
         document().page().keyboard_scroll_dom_tree_changed(*this);
     recompute_editable_subtree_flag();
+    derive_inside_blocking_wheel_event_handler_state_after_tree_change(*this);
+    publish_dom_paint_facts();
 }
 
 static bool is_root_wheel_event_target(Node const& node)
@@ -2755,7 +2798,7 @@ bool Node::update_inside_blocking_wheel_event_handler_state()
     bool const was_inside_blocking_wheel_event_handler = m_inside_blocking_wheel_event_handler;
     m_inside_blocking_wheel_event_handler = false;
     if (auto* parent = parent_or_shadow_host()) {
-        // A shadow root has no layout box, so the layout tree builder never derives its state.
+        // A shadow root may not have derived its state since its host's changed, so it derives it first.
         if (is<ShadowRoot>(*parent))
             parent->update_inside_blocking_wheel_event_handler_state();
         m_inside_blocking_wheel_event_handler = parent->inside_blocking_wheel_event_handler();
@@ -2766,7 +2809,7 @@ bool Node::update_inside_blocking_wheel_event_handler_state()
 
     bool const flipped = was_inside_blocking_wheel_event_handler != m_inside_blocking_wheel_event_handler;
     if (flipped)
-        note_dom_paint_facts();
+        publish_dom_paint_facts();
     return flipped;
 }
 
@@ -3842,10 +3885,25 @@ void Node::set_needs_repaint(InvalidateDisplayList should_invalidate_display_lis
         document().invalidation_journal().note_needs_repaint(identity, should_invalidate_display_list);
 }
 
-void Node::note_dom_paint_facts()
+// The facts are published under the node's identity in the style mirror, for the rows the build has yet to stamp,
+// and journalled for the box the node already has. Neither half needs the node to have a box: the build reads the
+// published answer for a node that gains one.
+void Node::publish_dom_paint_facts()
 {
+    auto& document = this->document();
+    auto facts = Layout::Node::dom_paint_facts_of(this);
+    // A document where nothing is ever inert, editable or inside a wheel handler publishes nothing, which keeps a
+    // node's arrival free there. The flag is set before the first fact is published, so a later drop back to none is
+    // still published.
+    if (facts == 0 && !document.may_have_dom_paint_facts())
+        return;
+    if (facts != 0)
+        document.set_may_have_dom_paint_facts();
+    auto style_node = is_document() ? document.style_node_id() : Layout::Node::style_node_of(this);
+    if (style_node.value() != 0)
+        document.style_computer().style_engine().set_node_dom_paint_facts(style_node, facts);
     if (auto identity = identity_of_box_owner(*this))
-        document().invalidation_journal().note_dom_paint_facts(identity, Layout::Node::dom_paint_facts_of(this));
+        document.invalidation_journal().note_dom_paint_facts(identity, facts);
 }
 
 void Node::set_needs_layout_update(SetNeedsLayoutReason reason)

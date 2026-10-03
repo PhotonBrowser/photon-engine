@@ -22,6 +22,7 @@
 #include <LibWeb/CSS/StyleRecordID.h>
 #include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/StyleEngineRustFFI.h>
 
 namespace Web::CSS::StyleValueFFI {
@@ -87,10 +88,11 @@ public:
     // value per name.
     void element_random_base_values(StyleNodeID, Vector<u32>& name_lengths, Vector<u16>& name_units, Vector<u64>& value_bits) const;
 
-    // Identity 0 is never returned; it means "no node".
-    StyleNodeID allocate_style_node();
-    void allocate_style_nodes(Span<StyleNodeID> nodes);
-    void allocate_text_style_nodes(Span<StyleNodeID> nodes);
+    // The document's style node identities are minted here, without asking the engine, and the engine is told of each
+    // mint ahead of anything recorded about its node. Identity 0 is never minted; it means "no node".
+    StyleNodeID mint_style_node();
+    void mint_style_nodes(Span<StyleNodeID> nodes);
+    void mint_text_style_nodes(Span<StyleNodeID> nodes);
     void defer_element_initial_features(StyleNodeID style_node)
     {
         m_nodes_with_pending_initial_features.set(style_node);
@@ -107,6 +109,9 @@ public:
 
     void set_element_parts(StyleNodeID node, ReadonlySpan<StyleAtomID> names, ReadonlySpan<StyleNodeID> hosts);
     void set_element_language(StyleNodeID node, StyleAtomID language, Utf16View tag);
+    // The characters a text node holds. The engine shares the document's string rather than copying it, so this
+    // costs one reference.
+    void set_text_data(StyleNodeID node, Utf16String const& data);
     // Which longhand properties one of an element's own declarations covers, their canonical
     // specified values and their authored aliases, and whether the inventory has complete
     // continuation semantics.
@@ -135,9 +140,6 @@ public:
     [[nodiscard]] void const* style_record_payloads(StyleRecordID style_record) const;
     [[nodiscard]] StyleRecordDependencyFlag style_record_dependency_flags(StyleRecordID style_record) const;
     [[nodiscard]] u64 style_record_custom_property_environment(StyleRecordID style_record) const;
-    void begin_computed_record_verification();
-    void end_computed_record_verification();
-    [[nodiscard]] bool style_records_match_for_verification(StyleNodeID, u8 pseudo_kind, StyleRecordID, StyleRecordID) const;
     // What moving between two records changes, for no element in particular.
     [[nodiscard]] u32 compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record) const;
     // What moving the element from one record to another damages, which the engine reads from the
@@ -342,7 +344,7 @@ public:
     void publish_font_faces(FontComputer const&);
 
     // The custom-property environment each element holds is kept here; the element keeps none of its own.
-    void set_element_custom_property_data(StyleNodeID, CustomPropertyData const*);
+    void set_element_custom_property_data(DOM::Element const&, CustomPropertyData const*);
     [[nodiscard]] CustomPropertyData const* element_custom_property_data(StyleNodeID) const;
     void set_pseudo_element_custom_property_data(StyleNodeID, PseudoElement, CustomPropertyData const*);
     [[nodiscard]] CustomPropertyData const* pseudo_element_custom_property_data(StyleNodeID, PseudoElement) const;
@@ -351,6 +353,10 @@ public:
 
     // Enumerates the engine's counters. Returns false once index is past the last counter.
     bool counter(size_t index, StringView& out_name, u64& out_value) const;
+
+    // The render state that owns the engine, which the document's layout node arena shares.
+    [[nodiscard]] Layout::RenderDocument& render_document() { return *m_render_document; }
+    [[nodiscard]] Layout::RenderDocument const& render_document() const { return *m_render_document; }
 
     [[nodiscard]] void* rust_handle() { return m_impl; }
     [[nodiscard]] void const* rust_handle() const { return m_impl; }
@@ -367,7 +373,10 @@ private:
 
     Optional<StyleSheetResourceContexts> m_style_sheet_resource_contexts;
 
+    NonnullRefPtr<Layout::RenderDocument> m_render_document;
+    // The engine in the render state, which the bridge's entries still reach directly.
     void* m_impl { nullptr };
+    StyleEngineFFI::StyleNodeIdAllocator* m_style_node_ids { nullptr };
     u64 m_published_font_environment_generation { 0 };
     GC::Ptr<StyleComputer> m_style_computer;
 
@@ -391,6 +400,7 @@ private:
     Vector<StyleEngineFFI::FfiStateDelta> m_state_deltas;
     Vector<StyleEngineFFI::FfiElementDeclarationDelta> m_element_declaration_deltas;
     bool m_css_transitions_may_observe_style_changes { false };
+    mutable bool m_geometry_read_deferred_transaction { false };
 };
 
 }

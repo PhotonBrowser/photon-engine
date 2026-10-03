@@ -7002,7 +7002,7 @@ fn covered_prefix_changes_forget_only_the_covered_subtree() {
     // The walk skips the covered subtree but keeps the cache warm: only the transitions
     // that depend on the skipped node are forgotten.
     let (scope_program, _) = engine.prepare_scope_program(TreeScopeID::DOCUMENT);
-    let prefix_caches = Rc::clone(&engine.prefix_caches);
+    let prefix_caches = std::sync::Arc::clone(&engine.prefix_caches);
     let mut caches = prefix_caches.borrow_mut();
     let Lookup::Known(states) = caches.states.lookup_mut(scope_program) else {
         panic!("the document program's states survive a covered skip");
@@ -7087,7 +7087,7 @@ fn a_prefix_upquery_retains_every_transition_on_its_ancestor_chain() {
     assert!(engine.begin_cold_matching_batch(nodes[0]));
     assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
     let (scope_program, _) = engine.prepare_scope_program(TreeScopeID::DOCUMENT);
-    let prefix_caches = Rc::clone(&engine.batch_matching_traversal.as_ref().unwrap().prefix_caches);
+    let prefix_caches = std::sync::Arc::clone(&engine.batch_matching_traversal.as_ref().unwrap().prefix_caches);
     let mut caches = prefix_caches.borrow_mut();
     let states = match caches.states.lookup_mut(scope_program) {
         Lookup::Known(states) => states,
@@ -11540,7 +11540,7 @@ fn replay_ffi_reclaims_the_non_empty_recorded_atom_set() {
     }
     let reclaimable = engine.intern_atom(0x1000);
     let recorded = [reclaimable.0];
-    let engine_pointer = (&raw mut engine).cast();
+    let engine_pointer = crate::css::style::StyleEngineHandle::from_raw(&raw mut engine);
     unsafe {
         bridge::style_engine_set_replay_reclaimed_style_atoms(engine_pointer, recorded.as_ptr(), recorded.len());
     }
@@ -11552,8 +11552,9 @@ fn replay_ffi_reclaims_the_non_empty_recorded_atom_set() {
         device_pixels_per_css_pixel: 2.0,
         ..Default::default()
     };
-    let output =
-        unsafe { bridge::style_engine_take_style_transaction(engine_pointer, nodes[0].raw(), computation_inputs) };
+    let output = unsafe {
+        bridge::style_engine_take_style_transaction_for_replay(engine_pointer, nodes[0].raw(), computation_inputs)
+    };
 
     assert_eq!(engine.document_style_computation_inputs, computation_inputs);
 
@@ -12275,6 +12276,115 @@ fn a_reissued_style_node_identity_holds_no_retained_state() {
             .pending_element_style_computation_selections
             .contains_key(&leaving)
     );
+}
+
+#[test]
+fn a_reissued_identity_holds_no_construction_facts() {
+    use super::bridge::element_construction_fact::{IS_BODY, IS_EDITING_HOST, IS_IN_USER_AGENT_SHADOW_TREE};
+    let (mut engine, nodes) = linear_document();
+    let leaving = nodes[3];
+    engine.set_element_construction_facts(leaving, IS_BODY | IS_EDITING_HOST);
+    assert_eq!(engine.element_construction_facts(leaving), IS_BODY | IS_EDITING_HOST);
+
+    let mut text = [0_u32; 1];
+    engine.allocate_text_style_nodes(&mut text);
+    let text = StyleNodeID::from_raw(text[0]).unwrap();
+    engine.set_text_is_in_user_agent_shadow_tree(text, true);
+    assert_eq!(engine.element_construction_facts(text), IS_IN_USER_AGENT_SHADOW_TREE);
+
+    engine.record_tree_delta(
+        leaving,
+        Some(relations(Some(nodes[0].raw()), Some(nodes[2].raw()), None)),
+        None,
+    );
+    engine.retire_text_style_nodes([text]);
+    discard_transaction(&mut engine);
+    engine.discard_style_transaction_outputs();
+    let mut reissued = [0_u32; 1];
+    engine.allocate_style_nodes(&mut reissued);
+    assert_eq!(reissued[0], leaving.raw());
+    assert_eq!(engine.element_construction_facts(leaving), 0);
+    let mut reissued_text = [0_u32; 1];
+    engine.allocate_text_style_nodes(&mut reissued_text);
+    assert_eq!(reissued_text[0], text.raw());
+    assert_eq!(engine.element_construction_facts(text), 0);
+}
+
+#[test]
+fn a_reissued_identity_asks_for_no_particular_box() {
+    use super::bridge::ElementBoxKind;
+    let (mut engine, nodes) = linear_document();
+    let leaving = nodes[3];
+    assert_eq!(engine.element_box_kind(leaving), ElementBoxKind::FromDisplay);
+    engine.set_element_box_kind(leaving, ElementBoxKind::Image);
+    assert_eq!(engine.element_box_kind(leaving), ElementBoxKind::Image);
+
+    engine.record_tree_delta(
+        leaving,
+        Some(relations(Some(nodes[0].raw()), Some(nodes[2].raw()), None)),
+        None,
+    );
+    discard_transaction(&mut engine);
+    engine.discard_style_transaction_outputs();
+    let mut reissued = [0_u32; 1];
+    engine.allocate_style_nodes(&mut reissued);
+    assert_eq!(reissued[0], leaving.raw());
+    assert_eq!(engine.element_box_kind(leaving), ElementBoxKind::FromDisplay);
+}
+
+#[test]
+fn a_reissued_identity_has_no_replaced_content_input() {
+    use super::ReplacedContentInput;
+    let (mut engine, nodes) = linear_document();
+    let leaving = nodes[3];
+    let input = ReplacedContentInput::Canvas {
+        width: 300,
+        height: 150,
+    };
+    engine.set_element_replaced_content_input(leaving, input);
+    assert_eq!(engine.element_replaced_content_input(leaving), input);
+
+    engine.record_tree_delta(
+        leaving,
+        Some(relations(Some(nodes[0].raw()), Some(nodes[2].raw()), None)),
+        None,
+    );
+    discard_transaction(&mut engine);
+    engine.discard_style_transaction_outputs();
+    let mut reissued = [0_u32; 1];
+    engine.allocate_style_nodes(&mut reissued);
+    assert_eq!(reissued[0], leaving.raw());
+    assert_eq!(
+        engine.element_replaced_content_input(leaving),
+        ReplacedContentInput::None
+    );
+}
+
+#[test]
+fn a_text_node_holds_its_published_characters_until_its_identity_is_reissued() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut raw = [0_u32; 1];
+    engine.allocate_text_style_nodes(&mut raw);
+    let text = StyleNodeID::from_raw(raw[0]).unwrap();
+    let data = ak::Utf16String::from(ak::Utf16FlyString::from_utf16(
+        &"characters a text box renders".encode_utf16().collect::<Vec<_>>(),
+    ));
+    engine.set_text_data(text, data.clone());
+    engine.set_text_is_password_input(text, true);
+    // The mirror shares the document's string rather than copying it.
+    assert_eq!(
+        engine.tree.text_data(text).map(ak::Utf16String::raw_identity),
+        Some(data.raw_identity())
+    );
+    assert!(engine.tree.text_is_password_input(text));
+
+    engine.retire_text_style_nodes([text]);
+    engine.discard_style_transaction_outputs();
+    let mut reissued = [0_u32; 1];
+    engine.allocate_text_style_nodes(&mut reissued);
+    assert_eq!(reissued[0], text.raw());
+    assert!(engine.tree.text_data(text).is_some_and(ak::Utf16String::is_empty));
+    assert!(!engine.tree.text_is_password_input(text));
 }
 
 #[test]

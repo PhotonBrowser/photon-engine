@@ -28,11 +28,13 @@ fn assert_member_is_sync<T: Sync + ?Sized>(_member: &T) {}
 /// below. That is what keeps `assert_sync::<RetainedState>()` -- which this becomes, unchanged in
 /// meaning, once the exemptions are gone -- from being a list somebody forgets to update.
 ///
-/// Both exemptions are one thing: the prefix caches, which a single `Rc<RefCell<PrefixCaches>>`
+/// Both exemptions are one thing: the prefix caches, which a single `Arc<SharedPrefixCaches>`
 /// shares between the engine and every matching traversal that borrows it -- so
-/// `batch_matching_traversal` fails the bound for exactly the reason `prefix_caches` does.
-/// Giving a walk prefix caches of its own is what removes both. A lock here would not: the
-/// borrows nest, so it would only turn a loud re-entrant panic into a silent deadlock.
+/// `batch_matching_traversal` is exempt for exactly the reason `prefix_caches` is. Both are
+/// `Sync` by type: their borrows are checked atomically, so the engine can move to the thread its
+/// stages run on. That is not shareable in the sense meant here: two workers borrowing the caches
+/// at once would panic, and a lock that waited instead would deadlock, since the borrows nest.
+/// Giving a walk prefix caches of its own is what removes both.
 #[expect(dead_code, reason = "a compile-time witness, never called")]
 fn every_retained_member_is_shareable(state: &RetainedState) {
     let RetainedState {
@@ -83,7 +85,11 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
         children_explicitly_inherit_marks,
         host_var_reads,
         css_defined_animations,
+        animation_keyframes,
+        animation_effect_descriptions,
+        held_root_font_inputs,
         random_base_values,
+        replaced_content_inputs,
         transition_baselines,
         custom_property_registrations_changed,
         pending_element_style_computation_selections,
@@ -191,7 +197,11 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
     assert_member_is_sync(children_explicitly_inherit_marks);
     assert_member_is_sync(host_var_reads);
     assert_member_is_sync(css_defined_animations);
+    assert_member_is_sync(animation_keyframes);
+    assert_member_is_sync(animation_effect_descriptions);
+    assert_member_is_sync(held_root_font_inputs);
     assert_member_is_sync(random_base_values);
+    assert_member_is_sync(replaced_content_inputs);
     assert_member_is_sync(transition_baselines);
     assert_member_is_sync(custom_property_registrations_changed);
     assert_member_is_sync(pending_element_style_computation_selections);

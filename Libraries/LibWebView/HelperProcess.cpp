@@ -297,10 +297,6 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
     if (browser_options.headless_mode.has_value())
         arguments.append("--headless"sv);
 
-    if (web_content_options.cache_path.has_value()) {
-        arguments.append("--cache-path"sv);
-        arguments.append(web_content_options.cache_path.value());
-    }
     if (web_content_options.is_test_mode == WebView::IsTestMode::Yes)
         arguments.append("--test-mode"sv);
     if (web_content_options.log_all_js_exceptions == WebView::LogAllJSExceptions::Yes)
@@ -347,6 +343,7 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
 
     auto font_catalog = TRY(WebView::Application::font_service().clone_catalog());
     client->async_set_font_catalog(move(font_catalog.file), font_catalog.size, font_catalog.generation);
+    TRY(client->connect_render_side_font_service());
     if (auto system_font_family = WebView::Application::the().system_font_family(); system_font_family.has_value())
         client->async_set_system_font_family(system_font_family.release_value());
     return client;
@@ -437,11 +434,6 @@ ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::HTML::Age
     auto const& web_content_options = WebView::Application::web_content_options();
 
     Vector<ByteString> arguments;
-
-    if (web_content_options.cache_path.has_value()) {
-        arguments.append("--cache-path"sv);
-        arguments.append(web_content_options.cache_path.value());
-    }
 
     if (browser_options.disable_sandbox == DisableSandbox::Yes)
         arguments.append("--disable-sandbox"sv);

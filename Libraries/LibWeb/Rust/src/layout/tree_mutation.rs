@@ -5,27 +5,123 @@
  */
 
 use crate::layout::LayoutNodeArena;
-use crate::layout::node_data::NodeSlotId;
-use std::ffi::c_void;
+use crate::layout::layout_node_arena::FreedSubtree;
+use crate::layout::node_data::{NodeKind, NodeSlotId};
+use crate::painting::paintable_rows::PaintableRowReset;
+use crate::stage::MainThread;
+use std::cell::RefCell;
 
-unsafe extern "C" {
-    fn ladybird_layout_node_shell_destroy(shell: *mut c_void);
+mod host_calls;
+
+pub(crate) use host_calls::{
+    destroy_image_observers, destroy_owned_image_provider, destroy_shell, notify_owned_image_provider_of_detach,
+};
+
+/// Who answers the host calls a change to the layout tree makes: the host at once, which only a
+/// main thread caller can ask, or the host work the change owes, which its entry applies once the
+/// change is over. A tree build walk and a layout write the host waits for hold no main thread
+/// token, so they can only owe.
+#[derive(Clone, Copy)]
+pub(crate) enum HostCalls<'a> {
+    Now(&'a MainThread<'a>),
+    Owed(&'a OwedHostWork),
 }
 
-pub(crate) fn destroy_shell(shell: *mut c_void) {
-    if shell.is_null() {
-        return;
+/// One host call owed for a change made to the layout tree.
+enum OwedHostCall {
+    /// A row left the layout tree: the image observers it holds are dropped, and the image
+    /// provider it owns is told.
+    RowDetached {
+        row: NodeSlotId,
+        kind: NodeKind,
+    },
+    /// What a freed subtree's rows held that the host owns the memory of.
+    Freed(FreedSubtree),
+    PaintableRowReset(PaintableRowReset),
+    /// A kept box, whose row's style changed. Its layout node, if something made one, hears the
+    /// style the row has once the walk is over, and nothing if the row has gone by then.
+    ShellStyleChanged {
+        row: NodeSlotId,
+        attach_resources: bool,
+    },
+}
+
+/// What a tree build or a layout write owes the host, gathered while it runs and applied by its
+/// entry once it is over, in the order it came to owe it. Box presence is queued for as long.
+#[must_use = "owed host work is applied once the change is over"]
+#[derive(Default)]
+pub(crate) struct OwedHostWork {
+    owed: RefCell<Vec<OwedHostCall>>,
+}
+
+impl OwedHostWork {
+    fn owe(&self, call: OwedHostCall) {
+        self.owed.borrow_mut().push(call);
     }
-    // SAFETY: The arena has already freed the shell's slot, and destroying a shell never
-    // re-enters the arena.
-    unsafe { ladybird_layout_node_shell_destroy(shell) };
+
+    /// Makes the host calls owed, in the order they came to be owed, after telling the host which
+    /// nodes gained or lost a box. A row the build freed again, such as whitespace table fixup
+    /// removed, is owed no style change.
+    pub(crate) fn apply(self, main_thread: &MainThread, arena: &LayoutNodeArena) {
+        arena.pay_queued_box_presence(main_thread);
+        for call in self.owed.into_inner() {
+            match call {
+                OwedHostCall::RowDetached { row, kind } => {
+                    crate::layout::layout_node_arena::tell_host_of_row_detach(main_thread, row, kind);
+                }
+                OwedHostCall::Freed(freed) => freed.destroy_shells_and_invoke_callbacks(main_thread),
+                OwedHostCall::PaintableRowReset(reset) => reset.tell(main_thread),
+                OwedHostCall::ShellStyleChanged { row, attach_resources } => {
+                    arena.tell_shell_of_style_change(main_thread, row, attach_resources);
+                }
+            }
+        }
+    }
 }
 
-pub(crate) fn free_subtree_and_destroy_shells(arena: *mut LayoutNodeArena, root: NodeSlotId) {
-    // SAFETY: Callers hold no reference derived from the arena across this call, and the
-    // mutable borrow ends before the shells are destroyed.
-    let freed = unsafe { &mut *arena }.free_subtree(root);
-    freed.destroy_shells_and_invoke_callbacks();
+impl HostCalls<'_> {
+    /// Frees the subtree `root` heads, and destroys what its rows held that the host owns the
+    /// memory of: at once, or once the tree build is over.
+    pub(crate) fn free_subtree(self, arena: *mut LayoutNodeArena, root: NodeSlotId) {
+        // SAFETY: Callers hold no reference derived from the arena across this call, and the
+        // mutable borrow ends before the shells are destroyed.
+        let freed = unsafe { &mut *arena }.free_subtree(root);
+        match self {
+            HostCalls::Now(main_thread) => freed.destroy_shells_and_invoke_callbacks(main_thread),
+            HostCalls::Owed(work) => work.owe(OwedHostCall::Freed(freed)),
+        }
+    }
+
+    /// Tells the document's chrome state that a row's paint state was reset.
+    pub(crate) fn paintable_row_reset(self, reset: PaintableRowReset) {
+        match self {
+            HostCalls::Now(main_thread) => reset.tell(main_thread),
+            HostCalls::Owed(work) => work.owe(OwedHostCall::PaintableRowReset(reset)),
+        }
+    }
+
+    /// Drops the image observers a row leaving the layout tree holds, and tells the image provider
+    /// it owns.
+    pub(crate) fn row_detached(self, row: NodeSlotId, kind: NodeKind) {
+        match self {
+            HostCalls::Now(main_thread) => {
+                crate::layout::layout_node_arena::tell_host_of_row_detach(main_thread, row, kind);
+            }
+            HostCalls::Owed(work) => work.owe(OwedHostCall::RowDetached { row, kind }),
+        }
+    }
+
+    /// Tells the layout node of a row whose style changed, if something made one.
+    pub(crate) fn shell_style_changed(self, arena: &LayoutNodeArena, row: NodeSlotId, attach_resources: bool) {
+        match self {
+            HostCalls::Now(main_thread) => arena.tell_shell_of_style_change(main_thread, row, attach_resources),
+            HostCalls::Owed(work) => work.owe(OwedHostCall::ShellStyleChanged { row, attach_resources }),
+        }
+    }
+}
+
+pub(crate) fn free_subtree_and_destroy_shells(main_thread: &MainThread, arena: *mut LayoutNodeArena, root: NodeSlotId) {
+    HostCalls::Now(main_thread).free_subtree(arena, root);
 }
 
 #[must_use = "an unplaced layout node must be attached or freed"]
@@ -115,6 +211,15 @@ impl LayoutNodeArena {
 mod ffi_test_stubs {
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_layout_node_shell_destroy(_shell: *mut std::ffi::c_void) {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn ladybird_layout_owned_image_provider_destroy(_provider: *mut std::ffi::c_void) {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn ladybird_layout_image_observers_destroy(_observers: *mut std::ffi::c_void) {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn ladybird_layout_owned_image_provider_notify_detach(_provider: *mut std::ffi::c_void) {}
 }
 
 #[cfg(test)]
@@ -154,7 +259,7 @@ mod tests {
     fn free(arena: &mut LayoutNodeArena, allocation: NodeAllocation) {
         arena
             .free_subtree(allocation.slot)
-            .destroy_shells_and_invoke_callbacks();
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
     }
 
     #[test]
@@ -254,11 +359,11 @@ mod tests {
 
         let freed = arena.free_subtree(root.slot);
 
-        assert_eq!(freed.shell_count(), 4);
+        assert_eq!(freed.row_count(), 4);
         for slot in [root.slot, a.slot, b.slot, c.slot] {
             assert!(!arena.slot_is_live(slot));
         }
-        freed.destroy_shells_and_invoke_callbacks();
+        freed.destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
     }
 
     #[test]
@@ -305,31 +410,22 @@ mod tests {
         let grandparent = arena.allocate_for_test();
         let parent = arena.allocate_for_test();
         let child = arena.allocate_for_test();
-        arena.data(grandparent.slot).kind.set(NodeKind::BlockContainer);
-        arena.data(parent.slot).kind.set(NodeKind::InlineNode);
+        arena.write_shape(grandparent.slot).set_kind(NodeKind::BlockContainer);
+        arena.write_shape(parent.slot).set_kind(NodeKind::InlineNode);
         arena.attach_child(grandparent.slot, owned(parent.slot), NodeSlotId::INVALID);
         for node in [grandparent.slot, parent.slot] {
             arena.populate_paintable_row(node);
-            arena
-                .paintable_side_data(node)
-                .overflow_valid_across_recommits
-                .set(true);
+            arena.committed_side_data_mut(node).overflow_valid_across_recommits = true;
         }
 
         arena.attach_child(parent.slot, owned(child.slot), NodeSlotId::INVALID);
 
         assert!(
             !arena
-                .paintable_side_data(grandparent.slot)
+                .committed_side_data(grandparent.slot)
                 .overflow_valid_across_recommits
-                .get()
         );
-        assert!(
-            arena
-                .paintable_side_data(parent.slot)
-                .overflow_valid_across_recommits
-                .get()
-        );
+        assert!(arena.committed_side_data(parent.slot).overflow_valid_across_recommits);
 
         free(&mut arena, grandparent);
     }

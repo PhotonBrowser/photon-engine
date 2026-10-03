@@ -354,8 +354,33 @@ static bool wheel_event_scrolls_continuously(QWheelEvent const& wheel_event)
     return pointing_device && pointing_device->type() == QInputDevice::DeviceType::TouchPad;
 }
 
+static bool is_running_on_wayland()
+{
+    static bool const is_wayland = QGuiApplication::platformName().startsWith(QStringLiteral("wayland"));
+    return is_wayland;
+}
+
+// Qt on Wayland gives touchpad scroll distances in axis units, at 1 pixel per unit. This scrolls too slowly, so we
+// multiply the distance by this gain.
+static constexpr double wayland_touchpad_scroll_gain = 4;
+
+static QPointF wayland_touchpad_delta(QWheelEvent const& wheel_event)
+{
+    // NB: Qt rounds each pixel delta to whole units. After the gain, this causes visible jumps. For a touchpad, Qt's
+    //     angle delta gives the same distance with 12 times more resolution.
+    static constexpr double angle_delta_units_per_axis_unit = 12;
+    auto angle_delta = -wheel_event.angleDelta();
+    if (!angle_delta.isNull())
+        return QPointF { angle_delta } * (wayland_touchpad_scroll_gain / angle_delta_units_per_axis_unit);
+    return QPointF { -wheel_event.pixelDelta() } * wayland_touchpad_scroll_gain;
+}
+
 static WheelDelta wheel_delta_from_qt_event(QWheelEvent const& wheel_event)
 {
+    // NB: A slow touchpad movement can have a pixel delta of zero. It is still precise input, not a wheel step.
+    if (is_running_on_wayland() && wheel_event_scrolls_continuously(wheel_event))
+        return { wayland_touchpad_delta(wheel_event), Web::WheelDeltaPrecision::Precise };
+
     auto pixel_delta = -wheel_event.pixelDelta();
     // NB: macOS can report a tiny pixel delta for mouse-wheel ticks. Use it only for continuous scrolling so physical
     //     wheels continue through the line-step conversion below.
@@ -1095,7 +1120,7 @@ void WebContentView::set_crash_overlay_visible(bool visible)
         m_crash_overlay_message->setForegroundRole(QPalette::PlaceholderText);
         m_crash_overlay_message->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
-        m_crash_overlay_reload_button = new QPushButton(CrashReportReviewWidget::reload_page_text(), column);
+        m_crash_overlay_reload_button = new QPushButton(tr("Reload page"), column);
         QObject::connect(m_crash_overlay_reload_button, &QPushButton::clicked, this, [this] {
             reload();
         });
@@ -1163,25 +1188,49 @@ void WebContentView::set_crash_overlay_visible(bool visible)
     schedule_repaint();
 }
 
-void WebContentView::show_crash_report_review()
+// A report is marked as seen once it is shown, so an unseen view leaves the reports of earlier crashes pending.
+void WebContentView::show_earlier_crash_reports()
+{
+    if (!isVisible()) {
+        m_show_earlier_crash_reports_when_shown = true;
+        return;
+    }
+
+    set_crash_overlay_visible(true);
+    show_crash_report_review(CrashScreen::Earlier);
+    if (!m_crash_report_review)
+        set_crash_overlay_visible(false);
+}
+
+void WebContentView::show_crash_report_review(CrashScreen screen)
 {
     if (!m_crash_report_container || m_crash_report_review)
         return;
 
-    auto report_name = crash_report_name();
-    if (!report_name.has_value())
-        return;
+    auto is_earlier = screen == CrashScreen::Earlier;
+    Optional<ByteString> report_name;
+    if (!is_earlier) {
+        report_name = crash_report_name();
+        if (!report_name.has_value())
+            return;
+    }
 
-    m_crash_report_review = new CrashReportReviewWidget(CrashReportReviewWidget::Mode::Tab, m_crash_report_container);
-    if (auto result = m_crash_report_review->open_report(report_name, crash_report_website()); result.is_error()) {
-        warnln("Could not open crash report {}: {}", *report_name, result.error());
+    m_crash_report_review = new CrashReportReviewWidget(is_earlier ? tr("Continue") : tr("Reload page"), m_crash_report_container);
+    if (auto result = m_crash_report_review->open_report(report_name, is_earlier ? Optional<String> {} : crash_report_website()); result.is_error()) {
+        warnln("Could not open a crash report: {}", result.error());
         delete m_crash_report_review;
         m_crash_report_review = nullptr;
         return;
     }
-    m_crash_report_review->on_reload = [this] { reload(); };
-    m_crash_report_review->on_answered = [this] {
-        m_crash_overlay_message->setText(crash_screen_message());
+    m_crash_report_review->on_exit = [this, is_earlier] {
+        if (is_earlier)
+            set_crash_overlay_visible(false);
+        else
+            reload();
+    };
+    auto answered_message = is_earlier ? tr("Ladybird crashed earlier.") : crash_screen_message();
+    m_crash_report_review->on_answered = [this, answered_message] {
+        m_crash_overlay_message->setText(answered_message);
     };
 
     // The review offers reloading among its own actions, and the website among its fields. It takes text, so Return
@@ -1190,8 +1239,9 @@ void WebContentView::show_crash_report_review()
     auto reload_button_had_focus = m_crash_overlay_reload_button->hasFocus();
     m_crash_overlay_reload_button->hide();
     m_crash_overlay_url->hide();
-    m_crash_overlay_message->setText(
-        tr("This page crashed. You can send us a crash report to help fix it."));
+    m_crash_overlay_message->setText(is_earlier
+            ? tr("Ladybird crashed earlier. You can send us a crash report to help fix it.")
+            : tr("This page crashed. You can send us a crash report to help fix it."));
     m_crash_report_container->layout()->addWidget(m_crash_report_review);
     m_crash_report_container->show();
     if (reload_button_had_focus)
@@ -1205,11 +1255,12 @@ void WebContentView::resizeEvent(QResizeEvent* event)
     update_iosurface_layer_frame();
 #endif
 
+    if (m_crash_overlay)
+        m_crash_overlay->setGeometry(rect());
+
     if (!has_display_page())
         return;
 
-    if (m_crash_overlay)
-        m_crash_overlay->setGeometry(rect());
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     m_force_full_repaint = true;
 #endif
@@ -1329,6 +1380,10 @@ void WebContentView::showEvent(QShowEvent* event)
     // A frame may have arrived before this view had a native view to attach its layer to.
     present_current_paintable_as_layer_contents();
 #endif
+    if (m_show_earlier_crash_reports_when_shown) {
+        m_show_earlier_crash_reports_when_shown = false;
+        show_earlier_crash_reports();
+    }
 }
 
 void WebContentView::hideEvent(QHideEvent* event)

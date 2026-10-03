@@ -8,6 +8,8 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/Bindings/SVGImageElement.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentObserver.h>
 #include <LibWeb/DOM/Event.h>
@@ -99,10 +101,12 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
     m_load_event_delayer.emplace(document());
     unregister_with_decoded_image_data_if_needed();
     m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url);
+    CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
         [this, resource_request = GC::Root { m_resource_request }] {
             m_load_event_delayer.clear();
             register_with_decoded_image_data_if_needed();
+            CSS::record_element_replaced_content_input(*this);
             image_provider_contents_changed();
             set_needs_layout_update(DOM::SetNeedsLayoutReason::SVGImageElementFetchTheDocument);
 
@@ -123,9 +127,9 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
     }
 }
 
-Layout::Node* SVGImageElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind SVGImageElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGImageBox);
+    return CSS::ElementBoxKind::SvgImage;
 }
 
 GC::Ptr<HTML::DecodedImageData> SVGImageElement::decoded_image_data() const
@@ -133,6 +137,13 @@ GC::Ptr<HTML::DecodedImageData> SVGImageElement::decoded_image_data() const
     if (!m_resource_request)
         return nullptr;
     return m_resource_request->image_data();
+}
+
+void SVGImageElement::decoded_image_data_did_update()
+{
+    // An SVG image works out its natural size again after it redraws itself or changes color scheme.
+    CSS::record_element_replaced_content_input(*this);
+    image_provider_contents_changed();
 }
 
 }

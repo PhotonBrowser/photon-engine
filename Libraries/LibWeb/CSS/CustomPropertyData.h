@@ -6,13 +6,14 @@
 
 #pragma once
 
+#include <AK/AtomicRefCounted.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
-#include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
+#include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleEngineIdentifiers.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/Export.h>
@@ -23,7 +24,9 @@ namespace Web::CSS {
 // Chain of custom property maps with structural sharing.
 // Each node stores only the properties declared directly on its element,
 // with a parent pointer to the inherited chain.
-class WEB_API CustomPropertyData : public RefCounted<CustomPropertyData> {
+// NB: The style engine references the data elements hold, and may take and give up those references on whichever
+//     thread it runs on.
+class WEB_API CustomPropertyData : public AtomicRefCounted<CustomPropertyData> {
 public:
     static NonnullRefPtr<CustomPropertyData> create(
         OrderedHashMap<Utf16FlyString, StyleProperty> own_values,
@@ -32,12 +35,15 @@ public:
         void const* prebuilt_rust_store = nullptr,
         // The identity the style engine minted for an environment it resolved; zero mints one here.
         u64 identity = 0);
+    // The values `owner`'s animations sample over `base`, the environment it holds beneath them.
     static NonnullRefPtr<CustomPropertyData> create_animation_overlay(
         OrderedHashMap<Utf16FlyString, StyleProperty> animated_values,
-        RefPtr<CustomPropertyData const> base);
+        RefPtr<CustomPropertyData const> base, DOM::AbstractElement const& owner);
     ~CustomPropertyData();
 
-    bool is_animation_overlay() const { return m_is_animation_overlay; }
+    // Whether these are the values the element's own animations sample. A child that inherits all of its parent's
+    // custom properties holds its parent's overlay itself, which is not an animation of the child's.
+    bool is_animation_overlay_for(DOM::AbstractElement const&) const;
 
     StyleProperty const* get(Utf16FlyString const& name) const;
     RefPtr<CustomPropertyData const> inheritable_impl(RefPtr<CustomPropertyData const> inheritable_parent, AK::Function<Optional<CustomPropertyRegistration const&>(Utf16FlyString const&)> get_custom_property_registration) const;
@@ -141,7 +147,11 @@ private:
     mutable PreferredColorScheme m_cached_resolution_color_scheme { PreferredColorScheme::Auto };
     mutable RefPtr<CustomPropertyData const> m_cached_resolution;
     mutable bool m_cached_resolution_is_self { false };
-    bool m_is_animation_overlay { false };
+    struct AnimationOwner {
+        UniqueNodeID element;
+        Optional<PseudoElement> pseudo_element;
+    };
+    Optional<AnimationOwner> m_animation_owner;
     void const* m_rust_store { nullptr };
 };
 

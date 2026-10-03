@@ -88,13 +88,12 @@ public:
 
     // Materialize the complete computed view for one exact StyleEngine target and publish its
     // StyleRecord assignment.
-    enum class StyleSharingMode {
-        Enabled,
-        Disabled,
-    };
     // The document element's style installed: the metrics `rem` resolves against are its font's.
     void update_root_element_font_metrics(ComputedValues const&);
-    [[nodiscard]] NonnullRefPtr<ComputedValues const> materialize_style_record(DOM::AbstractElement, Optional<bool&> did_change_custom_properties = {}, StyleEngineMatchResult* = nullptr, Optional<StyleEngine::StyleRecordDelta&> = {}, StyleSharingMode = StyleSharingMode::Enabled) const;
+    [[nodiscard]] NonnullRefPtr<ComputedValues const> materialize_style_record(DOM::AbstractElement, Optional<bool&> did_change_custom_properties = {}, StyleEngineMatchResult* = nullptr, Optional<StyleEngine::StyleRecordDelta&> = {}) const;
+    // The style of a pseudo-element the element holds no style for, as the style engine derives it for one read alone;
+    // null where the engine leaves the read to C++.
+    [[nodiscard]] RefPtr<ComputedValues const> engine_transient_pseudo_element_style(DOM::Element const&, PseudoElement);
     [[nodiscard]] StyleRecordID try_share_computed_style_record(DOM::Element&) const;
     void remember_shared_computed_style_record(DOM::Element&, StyleRecordID) const;
     // Compute the cascade supplied by rules, presentational hints, and inheritance while excluding the element's
@@ -155,7 +154,13 @@ public:
     // Publish a computed style built outside the ordinary cascade path, such as an inherited-group
     // swap, so StyleEngine's final node-to-style relation remains authoritative.
     [[nodiscard]] StyleEngine::StyleRecordDelta publish_computed_style_inputs(DOM::AbstractElement, ComputedValues const&) const;
-    [[nodiscard]] StyleEngine::StyleRecordDelta publish_animation_overlay(DOM::AbstractElement, ComputedValues const&) const;
+    // Has the engine compose a sampled overlay over the record it was sampled on, compares it with that record, and
+    // publishes it. `before_publication` sees the comparison first.
+    struct SampledAnimationOverlayPublication {
+        StyleEngineFFI::FfiAnimationInvalidation invalidation;
+        StyleEngine::StyleRecordDelta publication;
+    };
+    [[nodiscard]] SampledAnimationOverlayPublication publish_sampled_animation_overlay(DOM::AbstractElement, ComputedStyleWorkingSet&, StyleRecordID style_record, Function<void(StyleEngineFFI::FfiAnimationInvalidation const&)> const& before_publication = {}) const;
     // Give a layout-only variant of an element or pseudo-element style an authoritative record
     // without replacing the StyleEngine assignment of its DOM target.
     [[nodiscard]] StyleRecordID intern_computed_style_inputs(DOM::AbstractElement, ComputedValues const&) const;
@@ -196,7 +201,10 @@ public:
     // see, which decides whether its answer can be offered to another element.
     [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> compute_properties(DOM::AbstractElement, CascadedProperties&, u64 matching_pseudo_element_styles, u32* explicitly_inherited_non_inherited_style_groups = nullptr, StyleRecordID previous_style_record = {}, u32 initial_computed_group_mask = ComputedValues::all_style_groups, bool use_retained_style_computation_selection = false, bool stop_after_longhand_drive = false, u32* selected_computed_group_mask = nullptr, bool* computation_reads_unkeyed_context = nullptr, bool* computation_reads_resource_context = nullptr) const;
 
-    void apply_animation_definitions(ComputedStyleWorkingSet const& computed_properties, CascadedProperties const&, DOM::AbstractElement& abstract_element, ReadonlySpan<AnimationProperties> animation_definitions, ReadonlySpan<i32> definition_matches) const;
+    void apply_animation_definitions(DOM::AbstractElement&, ReadonlySpan<ComputedValuesFFI::FfiComputedAnimation> animation_definitions, bool in_display_none_subtree) const;
+    // Applies the animation plan the record an element holds decides, for a record the style engine settled, where
+    // applying it would change anything.
+    void apply_settled_animation_plan(DOM::AbstractElement&) const;
 
     enum class DeclaredValueSource : u8 {
         PublishedEnvironment,
@@ -212,15 +220,27 @@ public:
     static NonnullRefPtr<StyleValue const> compute_font_width(NonnullRefPtr<StyleValue const> const& absolutized_value);
 
     [[nodiscard]] NonnullRefPtr<ComputedValues const> build_computed_values(ComputedStyleWorkingSet&, DOM::AbstractElement, StyleScope const&, ComputedValues const* previous_base = nullptr, u32 groups_to_apply = ComputedValues::all_style_groups) const;
-    // The animation-frame variant: keep the previous style's base and rebuild only the groups the
-    // animated properties write, falling back to the full build when a touched group is unknown.
-    [[nodiscard]] NonnullRefPtr<ComputedValues const> build_animated_computed_values(ComputedStyleWorkingSet&, DOM::AbstractElement, StyleScope const&, ComputedValues const& previous_values) const;
     [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> reconstruct_computed_properties(ComputedValues const&) const;
     void apply_animated_properties_to_reconstruction(ComputedStyleWorkingSet&, ComputedValues const&) const;
     [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> reconstruct_computed_properties_for_animation(StyleRecordID) const;
 
     void begin_transition_stabilization_epoch();
-    void record_transition_stabilization_baseline(DOM::AbstractElement) const;
+    // https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
+    // Keeps `before_change_style_record` as the style a later pass of the stabilization epoch decides the element's
+    // transitions against, unless a pass already kept one.
+    void record_transition_stabilization_baseline(DOM::AbstractElement, StyleRecordID before_change_style_record) const;
+    // Keeps `before_change_style_record` that way where the element's style scope can run a later pass at all.
+    void record_transition_baseline_for_later_passes(DOM::AbstractElement, StyleRecordID before_change_style_record) const;
+    // Whether the transition step asks for the base recomputation its published values need, or leaves that to a
+    // caller that computed the base itself and would only undo what the step published by recomputing it.
+    enum class TransitionStepFollowUp {
+        Request,
+        LeftToCaller,
+    };
+    // Runs the whole transition step for an installed record, against the record the element moved away from, which
+    // the caller keeps alive. Returns what publishing a started transition's values invalidates, which the caller
+    // reacts to like to the rest of the style change.
+    [[nodiscard]] RequiredInvalidationAfterStyleChange run_transition_step_for_installed_record(DOM::AbstractElement, StyleRecordID before_change_style_record, TransitionStepFollowUp) const;
     void commit_transition_stabilization_epoch();
     void for_each_provisional_transition_effect(DOM::AbstractElement const&, Function<void(Animations::KeyframeEffect&)> const&) const;
 
@@ -288,7 +308,6 @@ public:
     // siblings - takes the result out of the cache rather than being keyed on, so the key stays a
     // fixed size and the escape hatches stay honest.
     struct StyleSharingCandidate {
-        bool may_reuse_or_publish_shared_style { true };
         // Empty until the cascade has run; unusable when the element is not a sharing candidate.
         StyleSharingKey key;
         StyleGroupPayloadPins pinned_parent_groups;
@@ -338,13 +357,12 @@ private:
 
     [[nodiscard]] RefPtr<ComputedStyleWorkingSet> compute_style_impl(DOM::AbstractElement, ComputeStyleMode, Optional<bool&> did_change_custom_properties, StyleScope const&, IncludeInlineStyle, StyleEngineMatchResult* = nullptr, StyleSharingCandidate* = nullptr) const;
     [[nodiscard]] NonnullRefPtr<CascadedProperties> compute_cascaded_values(DOM::AbstractElement, CascadeInput const&, IncludeInlineStyle, StyleSharingCandidate* sharing = nullptr, Vector<StyleProperty> const* precomputed_presentational_hints = nullptr) const;
-    void collect_animation_effects_into(DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&) const;
-    NonnullRefPtr<StyleValue const> compute_animated_custom_property_value(Utf16FlyString const& name, NonnullRefPtr<StyleValue const> specified_value, ComputedStyleWorkingSet&, DOM::AbstractElement) const;
+    // `sampled_style_record` names the record the working set was reconstructed from, where it was.
+    void collect_animation_effects_into(DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&, StyleRecordID sampled_style_record) const;
     void publish_animated_custom_properties(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
     void invalidate_animated_custom_property_readers(DOM::AbstractElement, OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> const& animated_values) const;
-    Vector<GC::Ref<Animations::KeyframeEffect>> start_needed_transitions(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
+    void start_needed_transitions(ComputedStyleWorkingSet&, DOM::AbstractElement, StyleRecordID before_change_style_record) const;
     [[nodiscard]] bool has_provisional_transition_states(DOM::AbstractElement) const;
-    [[nodiscard]] RefPtr<ComputedStyleWorkingSet> start_needed_transitions_on_shared_style(DOM::AbstractElement, ComputedValues const& shared_values) const;
     void finalize_style(ComputedStyleWorkingSet&, DOM::AbstractElement, ComputedValuesFFI::FfiStyleFinalizationMode) const;
 
     [[nodiscard]] CSSPixelRect viewport_rect() const { return m_viewport_rect; }
@@ -529,6 +547,34 @@ private:
     HashMap<RefPtr<StyleSheetState const>, SheetID> m_constructed_sheet_ids;
     HashMap<SharedCompiledStyleSheetKey, RefPtr<SharedCompiledStyleSheet>> m_shared_compiled_style_sheets;
     HashMap<u64, WeakPtr<StyleSheetState const>> m_style_engine_sheet_sources;
+};
+
+// Keeps a style record alive for as long as it is held, as a transition step that reads the record an element moved
+// away from needs. A null record pins nothing.
+class StyleRecordPin {
+    AK_MAKE_NONCOPYABLE(StyleRecordPin);
+    AK_MAKE_NONMOVABLE(StyleRecordPin);
+
+public:
+    StyleRecordPin(StyleComputer const& style_computer, StyleRecordID style_record)
+        : m_style_computer(style_computer)
+        , m_style_record(style_record)
+    {
+        if (!!m_style_record)
+            m_style_computer->pin_style_record(m_style_record);
+    }
+
+    ~StyleRecordPin()
+    {
+        if (!!m_style_record)
+            m_style_computer->unpin_style_record(m_style_record);
+    }
+
+    StyleRecordID style_record() const { return m_style_record; }
+
+private:
+    GC::Ref<StyleComputer const> m_style_computer;
+    StyleRecordID m_style_record;
 };
 
 // Whether a custom property holds a different value under two inherited environments.
