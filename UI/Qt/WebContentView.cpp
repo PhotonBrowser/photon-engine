@@ -84,7 +84,7 @@ static QWidget* initial_web_content_view_parent([[maybe_unused]] QWidget* window
 #endif
 }
 
-WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client, Web::PageId page_index, WebContentViewInitialState initial_state)
+WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable, WebContentViewInitialState initial_state)
     : WebContentViewBase(initial_web_content_view_parent(window))
     , WebView::ViewImplementation(initial_state.is_private)
 {
@@ -103,9 +103,6 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAttribute(Qt::WA_NoSystemBackground);
 #endif
-
-    if (parent_client)
-        parent_client->register_view(page_index, *this);
 
     setAttribute(Qt::WA_InputMethodEnabled, true);
 
@@ -161,7 +158,7 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
                 this);
     });
 
-    initialize_client((parent_client == nullptr) ? CreateNewClient::Yes : CreateNewClient::No);
+    initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
 
     on_ready_to_paint = [this]() {
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
@@ -808,9 +805,6 @@ void WebContentView::update_page_focus()
     // moved to the embedded window). Instead of trusting individual events, evaluate the resulting focus state once
     // the burst has settled.
     QTimer::singleShot(0, this, [this] {
-        if (!has_display_page())
-            return;
-
         auto focused = hasFocus();
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
         if (!focused)
@@ -825,10 +819,10 @@ Optional<WebContentView::Paintable> WebContentView::current_paintable() const
     Gfx::SharedImageBuffer const* shared_image_buffer = nullptr;
     Gfx::IntSize bitmap_size;
 
-    if (m_client_state.has_usable_bitmap) {
-        VERIFY(m_client_state.front_bitmap.shared_image_buffer);
-        shared_image_buffer = m_client_state.front_bitmap.shared_image_buffer.ptr();
-        bitmap_size = m_client_state.front_bitmap.last_painted_size.to_type<int>();
+    if (m_has_usable_bitmap) {
+        VERIFY(m_front_bitmap.shared_image_buffer);
+        shared_image_buffer = m_front_bitmap.shared_image_buffer.ptr();
+        bitmap_size = m_front_bitmap.last_painted_size.to_type<int>();
     } else if (m_backup_shared_image_buffer) {
         shared_image_buffer = m_backup_shared_image_buffer.ptr();
         bitmap_size = m_backup_bitmap_size.to_type<int>();
@@ -1258,9 +1252,6 @@ void WebContentView::resizeEvent(QResizeEvent* event)
     if (m_crash_overlay)
         m_crash_overlay->setGeometry(rect());
 
-    if (!has_display_page())
-        return;
-
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     m_force_full_repaint = true;
 #endif
@@ -1277,8 +1268,6 @@ void WebContentView::resizeEvent(QResizeEvent* event)
         if (!self)
             return;
         self->m_viewport_push_pending = false;
-        if (!self->has_display_page())
-            return;
         self->update_viewport_size();
     });
 }
@@ -1327,7 +1316,7 @@ void WebContentView::set_vertical_tab_overlay_insets([[maybe_unused]] int left, 
 void WebContentView::set_zoom_level(double zoom_level)
 {
     m_zoom_level = zoom_level;
-    client().async_set_zoom_level(page_id(), m_zoom_level);
+    page().async_set_zoom_level(m_zoom_level);
     update_zoom();
 }
 
@@ -1340,14 +1329,12 @@ void WebContentView::set_display_metadata(Optional<u64> display_id, double maxim
 {
     m_display_id = display_id;
     m_maximum_frames_per_second = maximum_frames_per_second;
-    client().async_set_maximum_frames_per_second(page_id(), m_maximum_frames_per_second);
+    page().async_set_maximum_frames_per_second(m_maximum_frames_per_second);
     update_compositor_display_metadata();
 }
 
 void WebContentView::update_compositor_display_metadata()
 {
-    if (!has_display_page())
-        return;
     update_compositor_display_metadata(page());
 }
 
@@ -1450,9 +1437,6 @@ static Core::AnonymousBuffer make_system_theme_from_qt_palette(QWidget& widget, 
 void WebContentView::update_palette(PaletteMode mode)
 {
     set_page_background_color_to_system_canvas(is_using_dark_system_theme(*this));
-
-    if (!has_display_page())
-        return;
     update_palette(page(), mode);
 }
 
@@ -1463,8 +1447,6 @@ void WebContentView::update_palette(WebView::WebContentPage& page, PaletteMode m
 
 void WebContentView::update_screen_rects()
 {
-    if (!has_display_page())
-        return;
     update_screen_rects(page());
 }
 

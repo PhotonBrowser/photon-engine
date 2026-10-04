@@ -17,6 +17,7 @@
 #include <AK/QuickSort.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
+#include <LibCompositing/FontServiceClient.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
@@ -24,8 +25,6 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Color.h>
-#include <LibGfx/Font/FontDatabase.h>
-#include <LibGfx/Font/SharedFontProvider.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibIPC/Transport.h>
 #include <LibJS/Runtime/ConsoleObject.h>
@@ -56,6 +55,7 @@
 #include <LibWeb/Dump.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
+#include <LibWeb/Gamepad/GamepadRegistry.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/HTML/AutoplaySettings.h>
 #include <LibWeb/HTML/BroadcastChannel.h>
@@ -139,84 +139,10 @@ Messages::WebContentServer::InitTransportResponse ConnectionFromClient::init_tra
     VERIFY_NOT_REACHED();
 }
 
-void ConnectionFromClient::set_font_catalog(IPC::File file, u64 size, u64 generation)
+void ConnectionFromClient::set_font_service(IPC::TransportHandle handle, IPC::File catalog, u64 catalog_size, u64 generation)
 {
-    if (m_font_provider) {
-        if (auto result = m_font_provider->replace_catalog(move(file), size, generation); result.is_error())
-            dbgln("WebContent: Unable to replace font catalog: {}", result.error());
-        else
-            Web::Platform::FontPlugin::the().update_generic_fonts();
-        return;
-    }
-
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.match_local_font = [this](String const& name) {
-        auto response = send_sync_but_allow_failure<Messages::WebContentClient::MatchLocalFont>(name);
-        if (!response)
-            return Gfx::BrokeredFont {};
-        return response->take_font();
-    };
-    callbacks.open_font = [this](u64 requested_generation, u64 face_id) {
-        auto response = send_sync_but_allow_failure<Messages::WebContentClient::OpenSystemFont>(requested_generation, face_id);
-        if (!response)
-            return Gfx::BrokeredFont {};
-        return response->take_font();
-    };
-    callbacks.match_font = [this](String const& family, u16 weight, u16 width, u8 slope) {
-        auto response = send_sync_but_allow_failure<Messages::WebContentClient::MatchSystemFont>(family, weight, width, slope);
-        if (!response)
-            return Gfx::BrokeredFont {};
-        return response->take_font();
-    };
-    callbacks.match_font_for_code_point = [this](u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) {
-        auto response = send_sync_but_allow_failure<Messages::WebContentClient::MatchSystemFontForCodePoint>(code_point, weight, width, slope, prefer_color_emoji);
-        if (!response)
-            return Gfx::BrokeredFont {};
-        return response->take_font();
-    };
-    callbacks.resolve_generic_family = [this](String const& family, u16 weight, u8 slope) -> Optional<FlyString> {
-        auto response = send_sync_but_allow_failure<Messages::WebContentClient::ResolveGenericFont>(family, weight, slope);
-        if (!response)
-            return {};
-        auto resolved_family = response->take_resolved_family();
-        if (!resolved_family.has_value())
-            return {};
-        return FlyString { resolved_family.release_value() };
-    };
-
-    auto provider = Gfx::SharedFontProvider::create_from_catalog_file_or_empty(move(file), size, generation, move(callbacks));
-    if (provider.is_error()) {
-        dbgln("WebContent: Unable to install fallback font catalog: {}", provider.error());
-        return;
-    }
-    m_font_provider = provider.value().ptr();
-    Gfx::FontDatabase::the().install_system_font_provider(provider.release_value());
-    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(m_enable_test_mode, m_font_provider));
-}
-
-void ConnectionFromClient::set_render_side_font_service_transport(IPC::TransportHandle handle)
-{
-    // NB: A renderer cannot run without this connection: a font question from any thread but the document's would
-    //     otherwise go out on the connection the document thread owns.
-    m_render_side_font_service = MUST(Compositing::FontServiceClient::create(move(handle)));
-    if (!m_font_provider)
-        return;
-
-    // NB: There is no match_local_font: only a @font-face src: local() asks it, which is the document thread's work.
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.open_font = [this](u64 generation, u64 face_id) {
-        return m_render_side_font_service->open_font(generation, face_id);
-    };
-    callbacks.match_font = [this](String const& family, u16 weight, u16 width, u8 slope) {
-        return m_render_side_font_service->match_font(family, weight, width, slope);
-    };
-    callbacks.match_font_for_code_point = [this](u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) {
-        return m_render_side_font_service->match_font_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
-    };
-    callbacks.resolve_generic_family = [this](String const& family, u16 weight, u8 slope) {
-        return m_render_side_font_service->resolve_generic_family(family, weight, slope);
-    };
-    m_font_provider->set_callbacks_for_other_threads(move(callbacks));
+    auto* font_provider = MUST(Compositing::install_font_service(move(handle), move(catalog), catalog_size, generation));
+    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(m_enable_test_mode, font_provider));
 }
 
 void ConnectionFromClient::initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
@@ -371,7 +297,8 @@ void ConnectionFromClient::close_traversable_from_script(Web::PageId page_id, We
     auto page = this->page(page_id);
     if (!page.has_value())
         return;
-    auto source = page->page().navigable_with_id(source_navigable_id);
+    // The source is in another page of this process when it is in another tab.
+    auto source = Web::HTML::navigable_with_id_in_any_page(page->page(), source_navigable_id);
     if (!source)
         return;
     if (auto* traversable = as_if<Web::HTML::LocalTraversableNavigable>(page->page().navigable_with_id(navigable_id).ptr()))
@@ -405,7 +332,7 @@ void ConnectionFromClient::set_opener_of_navigable(Web::PageId page_id, Web::HTM
     if (!page.has_value())
         return;
     auto* navigable = as_if<Web::HTML::LocalNavigable>(page->page().navigable_with_id(navigable_id).ptr());
-    auto* opener = as_if<Web::HTML::RemoteNavigable>(page->page().navigable_with_id(opener_navigable_id).ptr());
+    auto opener = Web::HTML::navigable_with_id_in_any_page(page->page(), opener_navigable_id);
     if (!navigable || !navigable->active_browsing_context() || !opener)
         return;
     navigable->active_browsing_context()->set_opener_browsing_context(*opener);
@@ -3118,6 +3045,76 @@ void ConnectionFromClient::system_time_zone_changed()
 void ConnectionFromClient::set_system_font_family(String family)
 {
     Web::Platform::FontPlugin::the().set_system_font_family(FlyString { family });
+}
+
+void ConnectionFromClient::set_gamepad_state_buffer(Web::Gamepad::GamepadStateBuffer gamepad_state_buffer)
+{
+    Web::Gamepad::GamepadRegistry::the().set_shared_state_buffer(move(gamepad_state_buffer));
+}
+
+void ConnectionFromClient::gamepad_connected(Web::Gamepad::GamepadDescription description)
+{
+    dispatch_gamepad_change_event(Web::Gamepad::GamepadConnectedEvent { move(description) });
+    dispatch_changed_gamepad_states();
+}
+
+void ConnectionFromClient::gamepad_disconnected(Web::Gamepad::GamepadHandle handle)
+{
+    dispatch_gamepad_change_event(Web::Gamepad::GamepadDisconnectedEvent { handle });
+}
+
+void ConnectionFromClient::gamepad_states_changed()
+{
+    dispatch_changed_gamepad_states();
+}
+
+void ConnectionFromClient::dispatch_gamepad_change_event(Web::Gamepad::GamepadChangeEvent const& event)
+{
+    auto& registry = Web::Gamepad::GamepadRegistry::the();
+    event.visit(
+        [&](Web::Gamepad::GamepadConnectedEvent const& connected_event) {
+            registry.gamepad_connected(connected_event.description);
+            m_page_host->for_each_page([&](PageClient& page) {
+                page.page().handle_gamepad_connected(connected_event.description);
+            });
+        },
+        [&](Web::Gamepad::GamepadDisconnectedEvent const& disconnected_event) {
+            registry.gamepad_disconnected(disconnected_event.handle);
+            m_page_host->for_each_page([&](PageClient& page) {
+                page.page().handle_gamepad_disconnected(disconnected_event.handle);
+            });
+        });
+}
+
+void ConnectionFromClient::dispatch_changed_gamepad_states()
+{
+    for (auto const& state : Web::Gamepad::GamepadRegistry::the().take_changed_shared_states()) {
+        m_page_host->for_each_page([&](PageClient& page) {
+            page.page().handle_gamepad_updated(state);
+        });
+    }
+}
+
+void ConnectionFromClient::notify_started_using_gamepads()
+{
+    if (m_did_notify_started_using_gamepads)
+        return;
+    m_did_notify_started_using_gamepads = true;
+    async_did_start_using_gamepads();
+}
+
+void ConnectionFromClient::pump_and_dispatch_gamepad_events()
+{
+    auto* test_connection = this->test_connection();
+    if (!test_connection)
+        return;
+
+    auto response = test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::PumpGamepadEvents>();
+    if (!response)
+        return;
+    for (auto const& event : response->take_events())
+        dispatch_gamepad_change_event(event);
+    dispatch_changed_gamepad_states();
 }
 
 void ConnectionFromClient::set_document_cookie_version_buffer(Web::PageId page_id, Core::AnonymousBuffer document_cookie_version_buffer)

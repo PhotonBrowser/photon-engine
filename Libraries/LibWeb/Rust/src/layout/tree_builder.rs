@@ -8,9 +8,13 @@ use super::*;
 
 use crate::abort_on_panic;
 use crate::css::css_enums::{content_visibility, float, positioning, white_space_collapse};
+use crate::css::style::RecordDemand;
 use crate::css::style::StyleEngine;
-use crate::css::style::bridge::{ElementBoxKind, element_adjustment_fact};
-use crate::css::style::layout_style::{AnonymousStyleKind, AnonymousStyleOverrides, DerivedStyleRecord};
+use crate::css::style::bridge::{
+    ElementBoxKind, FfiDemandedPseudoElement, FfiPseudoElementRecordDemand, answer_record_demand,
+    element_adjustment_fact,
+};
+use crate::css::style::layout_style::{AnonymousStyleKind, AnonymousStyleOverrides, DerivedStyleRecord, LayoutStyle};
 use crate::css::style::tree::StyleNodeID;
 use crate::layout::layout_node_arena::{LayoutNodeArena, OwedImageResources, StaleWalkFacts};
 use crate::layout::node_data::{
@@ -18,10 +22,9 @@ use crate::layout::node_data::{
     GENERATED_FOR_MARKER, NodeData, NodeFlag, NodeKind, NodeSlotId, SELECTION_PSEUDO_KIND, pseudo_kind_of,
 };
 use crate::layout::text_chunker::{GraphemeSegmenter, code_point_at, code_unit_length_for_code_point};
-use crate::layout::tree_mutation::{HostCalls, OwedHostWork, UnplacedLayoutNode, free_subtree_and_destroy_shells};
+use crate::layout::tree_mutation::{HostCalls, OwedHostWork, UnplacedLayoutNode};
 use crate::layout::tree_update_marks::layout_tree_update_reuse_reason;
 use crate::layout::{ComputedValuesView, FfiDisplay};
-use std::ffi::c_void;
 
 mod main_thread_entries;
 
@@ -43,6 +46,8 @@ pub(crate) struct TreeBuilderState {
     /// The elements a finished build asks the document to rebuild. `None` asks for the whole tree:
     /// the container the box escaped into stands for no element.
     layout_tree_rebuild_requests: Vec<Option<StyleNodeID>>,
+    /// Whether the build reached an element no style update settled, which it built no box for.
+    reached_unstyled_element: bool,
     /// What the build found out that the document has to be told, in the order it found it out.
     /// Delivered when the walk ends: nothing inside the build reads any of it back.
     reports: Vec<crate::layout::commit::FfiCommitMessage>,
@@ -67,6 +72,7 @@ impl Default for TreeBuilderState {
             layout_tree_update_escaped_rebuild_roots: false,
             new_subtree_root: NodeSlotId::INVALID,
             layout_tree_rebuild_requests: Vec::new(),
+            reached_unstyled_element: false,
             reports: Vec::new(),
             pinned_style_records: Vec::new(),
             document_style: None,
@@ -122,18 +128,6 @@ enum StaleSubtreeClearScope {
     Inclusive,
     InclusiveBoundedToRoot,
     DescendantsBoundedToRoot,
-}
-
-#[repr(C)]
-pub struct FfiDomTreeBuilderCallbacks {
-    pub builder: *mut c_void,
-    /// Computes the style of an element the walk reached through a bypass path without one. The
-    /// style update before the build settles every element it walks; a top layer, slot projection
-    /// or SVG reference path can reach one it did not.
-    pub restyle_bypass_path_element: unsafe extern "C" fn(*mut c_void, u32),
-    /// The style the list marker a list-item pseudo-element nests is built from: the generator's
-    /// `::marker` style, interned as a record of its own, which the build pins.
-    pub nested_list_marker_style: unsafe extern "C" fn(*mut c_void, u32) -> u64,
 }
 
 /// What the build knows about a node when it enters it: what its marks ask for, and what layout
@@ -1202,19 +1196,17 @@ pub(crate) fn principal_node_entry_decision(
     })
 }
 
-/// The tree build walk's view of the document: the callbacks the walk still asks, the arena it
-/// builds rows in, and the host work it owes for what it changes. It holds no main thread token,
-/// so it cannot call the host for that work itself.
+/// The tree build walk's view of the document: the arena it builds rows in, and the host work it
+/// owes for what it changes. It holds no main thread token, so it cannot call the host for that
+/// work itself.
 struct DomTreeBuilderHost<'a> {
-    callbacks: &'a FfiDomTreeBuilderCallbacks,
     arena: *mut LayoutNodeArena,
     work: &'a OwedHostWork,
-    walk: &'a TreeBuildWalk<'a>,
 }
 
 impl DomTreeBuilderHost<'_> {
     fn arena(&self) -> &LayoutNodeArena {
-        // SAFETY: Entry points guarantee that the arena remains live for the duration of the build.
+        // SAFETY: The host borrows the state that holds the arena for as long as it lives.
         unsafe { &*self.arena }
     }
 
@@ -1280,7 +1272,7 @@ impl DomTreeBuilderHost<'_> {
     }
 
     fn host_calls(&self) -> HostCalls<'_> {
-        HostCalls::Owed(self.work)
+        HostCalls(self.work)
     }
 }
 
@@ -1315,20 +1307,167 @@ fn dom_child_layout_plan(host: &DomTreeBuilderHost<'_>, node: StyleNodeID) -> (b
     )
 }
 
-unsafe fn dom_tree_builder_host<'a>(
-    callbacks: *const FfiDomTreeBuilderCallbacks,
-    arena: *mut c_void,
-    work: &'a OwedHostWork,
-    walk: &'a TreeBuildWalk<'a>,
-) -> DomTreeBuilderHost<'a> {
-    assert!(!callbacks.is_null());
-    assert!(!arena.is_null());
-    // SAFETY: Each exported entry point requires the callback table to remain live for the duration of its call.
+/// A document's layout tree build, which the host sends its render state: builds or updates the
+/// tree from the document's style node, and answers what the build owes the host.
+pub(crate) struct TreeBuildJob {
+    document_style_node: StyleNodeID,
+    /// The document's style, which the host makes rather than publishes, so a build that may build
+    /// the viewport is handed it before it starts.
+    document_style_record: Option<u64>,
+}
+
+/// What a tree build owes the host once it is over, besides the host calls its walk queued, in the
+/// order the host pays it.
+pub(crate) struct TreeBuildAnswer {
+    pub(crate) outcome: FfiLayoutTreeBuildOutcome,
+    /// What the build found out that the document has to be told, in the order it found it out.
+    pub(crate) reports: Vec<crate::layout::commit::FfiCommitMessage>,
+    /// The scroll containers the build gave a style.
+    pub(crate) built_scroll_containers: Vec<super::formatting_context::FfiBuiltScrollContainer>,
+}
+
+impl TreeBuildJob {
+    pub(crate) fn new(document_style_node: StyleNodeID, document_style_record: Option<u64>) -> Self {
+        Self {
+            document_style_node,
+            document_style_record,
+        }
+    }
+
+    /// Runs the build over the arena of `state`. The host calls the walk owes go into `work`, as the
+    /// walk, holding no main thread token, can only queue them; what the host hears of the boxes
+    /// nodes gain and lose must be queued already.
+    pub(crate) fn run(self, state: &mut ArenaHandle, work: &OwedHostWork) -> TreeBuildAnswer {
+        let host = dom_tree_builder_host(state, work);
+        let document_identity = self.document_style_node;
+        host.layout().arena().set_document_style_node(document_identity);
+        let mut state = TreeBuilderState::default();
+        // The viewport's style is the document's, which the host makes rather than publishes, so a
+        // build that may build the viewport is handed it before it starts.
+        if let Some(record) = self.document_style_record {
+            state.document_style = Some(
+                host.layout()
+                    .arena()
+                    .with_style_engine(|engine| DerivedStyleRecord::pin(engine, record)),
+            );
+        }
+        let mut context = TreeBuilderContext {
+            document_needs_full_layout_tree_update: host.layout().arena().needs_full_layout_tree_update(),
+            ..Default::default()
+        };
+        // Whether the document already had a viewport, read before the build replaces it.
+        let document_had_layout_node = !host.layout().arena().layout_root().is_invalid();
+
+        update_layout_tree_from(
+            &host,
+            &mut state,
+            document_identity,
+            &mut context,
+            false,
+            FfiInsertionMode::Append,
+            true,
+        );
+
+        let document_layout_node = host.layout().arena().layout_root();
+        let rebuilt_subtrees_were_updated_individually = !document_layout_node.is_invalid()
+            && !(context.document_needs_full_layout_tree_update
+                || !document_had_layout_node
+                || state.layout_tree_update_escaped_rebuild_roots);
+        if !document_layout_node.is_invalid() {
+            let layout_host = host.layout();
+            if rebuilt_subtrees_were_updated_individually {
+                fixup_tables_in_rebuilt_subtrees(
+                    &layout_host,
+                    &state.rebuilt_subtree_roots,
+                    &state.reused_child_list_update_roots,
+                    &state.additional_table_fixup_roots,
+                );
+            } else {
+                layout_host.arena().set_needs_full_scrollable_overflow_recalculation();
+                fixup_tables(&layout_host, document_layout_node);
+            }
+
+            // https://drafts.csswg.org/css-scrollbars/#scrollbar-width
+            // UAs must apply the scrollbar-color value set on the root element to the viewport.
+            // The document element is the document's only DOM child the style mirror holds: a doctype, a
+            // comment and a processing instruction hold no place in its child sequence, and a document
+            // can have no text child.
+            let root_layout_node = host
+                .first_dom_child(document_identity)
+                .map_or(NodeSlotId::INVALID, |document_element| {
+                    layout_host.arena().bound_row(document_element)
+                });
+            if !root_layout_node.is_invalid() {
+                let scrollbar_width = layout_host
+                    .style(root_layout_node)
+                    .expect("the document element's box publishes its style during the build")
+                    .misc_reset()
+                    .scrollbar_width;
+                layout_host
+                    .arena()
+                    .update_layout_style(layout_host.host_calls(), document_layout_node, |style| {
+                        style.set_scrollbar_width(scrollbar_width);
+                    });
+            }
+        }
+
+        for &element in &state.layout_tree_rebuild_requests {
+            // A request that names no element asks for the whole tree, which the arena answers itself.
+            let Some(element) = element else {
+                host.layout().arena().set_needs_full_layout_tree_update(true);
+                continue;
+            };
+            state.reports.push(crate::layout::commit::FfiCommitMessage::new(
+                element.raw(),
+                crate::layout::commit::FfiCommitMessageKind::LayoutTreeRebuildRequested,
+            ));
+        }
+
+        let built_scroll_containers = host.arena().take_built_scroll_containers();
+        let arena = host.arena();
+        if rebuilt_subtrees_were_updated_individually {
+            let attached_roots = arena.derive_facts_after_tree_update(&state.rebuilt_subtree_roots);
+            arena.resolve_deferred_child_list_insertions(&attached_roots);
+        } else {
+            // NB: The full layout entry must derive the facts of this tree.
+            arena.record_partial_relayout_escape();
+            arena.resolve_deferred_child_list_insertions(&Default::default());
+        }
+
+        // Table fixup can free a rebuilt root after it was recorded, such as whitespace at the edge of a
+        // row group, so only the roots that are still live wait for the partial relayout plan.
+        let live_rebuilt_subtree_roots: Vec<NodeSlotId> = state
+            .rebuilt_subtree_roots
+            .iter()
+            .copied()
+            .filter(|root| arena.slot_is_live(*root))
+            .collect();
+        let rebuilt_subtree_root_count = live_rebuilt_subtree_roots.len();
+        arena.set_pending_rebuilt_subtree_roots(
+            live_rebuilt_subtree_roots,
+            state.layout_tree_update_escaped_rebuild_roots,
+        );
+        let viewport = arena.layout_root();
+        assert!(!viewport.is_invalid(), "a layout tree build places the viewport");
+        state.release_pinned_style_records(arena);
+        let outcome = FfiLayoutTreeBuildOutcome {
+            viewport,
+            rebuilt_subtree_root_count,
+            layout_tree_update_escaped_rebuild_roots: state.layout_tree_update_escaped_rebuild_roots,
+            needs_another_build_pass: !state.layout_tree_rebuild_requests.is_empty() || state.reached_unstyled_element,
+        };
+        TreeBuildAnswer {
+            outcome,
+            reports: state.reports,
+            built_scroll_containers,
+        }
+    }
+}
+
+fn dom_tree_builder_host<'a>(state: &'a mut ArenaHandle, work: &'a OwedHostWork) -> DomTreeBuilderHost<'a> {
     DomTreeBuilderHost {
-        callbacks: unsafe { &*callbacks },
-        arena: arena.cast(),
+        arena: std::ptr::from_mut(state).cast(),
         work,
-        walk,
     }
 }
 
@@ -1423,7 +1562,7 @@ impl StaleSubtreeHost<'_> {
             }
             // SAFETY: The arena handle is the one the walk was given, and the clear borrows the
             // arena for itself.
-            unsafe { crate::painting::ffi::paintable_cleared_from_node(self.host_calls, self.arena.cast(), row) };
+            unsafe { crate::painting::ffi::paintable_cleared_from_node(self.host_calls, self.arena, row) };
             super::layout_node_arena::prepare_row_for_detach(self.host_calls, self.arena(), row);
             self.arena().unbind_row(row);
             let parent = self.arena().data(row).parent.get();
@@ -1482,6 +1621,41 @@ fn node_kind_is_svg_resource_box(kind: NodeKind) -> bool {
 }
 
 /// Every pseudo-element of the element gives up the box it holds, subtree and all.
+/// Detaches what is left of the boxes of the node `node` names as the node leaves the document, while its identity
+/// still names them. Its box is read until the parent's rebuild frees it, so its style record is pinned and its
+/// committed box cleared now. Its box's top layer placement is a viewport child rather than part of the parent's box
+/// subtree, so the parent's rebuild never reaches it, and it is detached and freed here. The rows are found by
+/// identity, so this makes no shell.
+pub(crate) fn detach_remaining_rows_for_removal(
+    host_calls: HostCalls<'_>,
+    arena: *mut LayoutNodeArena,
+    node: StyleNodeID,
+) {
+    // A pseudo-element's boxes are found through its generator's identity, so they go while the identity still finds
+    // them. A ::backdrop box sits outside the generator's box, so no rebuild of the parent would free it.
+    if node.element_index().is_some() {
+        clear_synthetic_pseudo_element_boxes(host_calls, arena, node);
+    }
+    // SAFETY: The render state holds the arena, and nothing else reaches it meanwhile.
+    let row = unsafe { &*arena }.bound_row(node);
+    if row.is_invalid() {
+        return;
+    }
+    // SAFETY: As above.
+    unsafe { &*arena }.pin_style_record_for_detachment(row);
+    // SAFETY: As above; the clear borrows the arena for itself.
+    unsafe { crate::painting::ffi::paintable_cleared_from_node(host_calls, arena, row) };
+    let top_layer_placement = topmost_layout_node_of_top_layer_placement(arena, row);
+    if !top_layer_placement.is_invalid() {
+        // SAFETY: As above; the shared borrow ends before the subtree is freed.
+        super::layout_node_arena::prepare_subtree_for_detach(host_calls, unsafe { &*arena }, top_layer_placement);
+        // SAFETY: As above.
+        let was_attached = unsafe { &*arena }.detach_from_parent(top_layer_placement);
+        assert!(was_attached, "a top layer placement is a viewport child");
+        host_calls.free_subtree(arena, top_layer_placement);
+    }
+}
+
 pub(crate) fn clear_synthetic_pseudo_element_boxes(
     host_calls: HostCalls<'_>,
     arena: *mut LayoutNodeArena,
@@ -1511,7 +1685,7 @@ fn free_pseudo_element_box(
     for row in rows {
         // SAFETY: The arena handle is the one the walk was given, and the clear borrows the arena
         // for itself.
-        unsafe { crate::painting::ffi::paintable_cleared_from_node(host_calls, arena.cast(), row) };
+        unsafe { crate::painting::ffi::paintable_cleared_from_node(host_calls, arena, row) };
     }
     super::layout_node_arena::prepare_subtree_for_detach(host_calls, arena_ref, row);
     let was_attached = arena_ref.detach_from_parent(row);
@@ -2258,19 +2432,22 @@ fn construct_principal_layout_node(
             host.arena()
                 .with_style_store(|engine| engine.element_published_style_record(element))
         };
-        let mut record = published_record();
-        if should_create_layout_node && record.is_none() {
+        let Some(record) = published_record() else {
+            assert!(
+                should_create_layout_node,
+                "an element whose box stays has published its style"
+            );
             // Nothing published a style for the element, so a bypass path reached it without the
-            // style update settling it. Only the host can compute one, and the style update it runs
-            // reaches layout through FFI.
-            host.walk.reentered_by(|| {
-                // SAFETY: The builder remains live, and the identity names a live element.
-                unsafe { (host.callbacks.restyle_bypass_path_element)(host.callbacks.builder, element.raw()) };
-            });
-            record = published_record();
-        }
+            // style update settling it. It gets no box in this build: the document styles it once
+            // the build is over, and builds its box in the next one.
+            update.state.reports.push(crate::layout::commit::FfiCommitMessage::new(
+                element.raw(),
+                crate::layout::commit::FfiCommitMessageKind::UnstyledElementReached,
+            ));
+            update.state.reached_unstyled_element = true;
+            return PrincipalBoxConstruction::none();
+        };
         // The record the box is built from is held for the whole build.
-        let record = record.expect("an element the walk prepares has published its style");
         update.state.pin_style_record_for_build(host.arena(), record);
         let display = host.published_display(update.style_node);
         let generation = principal_box_generation_decision(
@@ -3056,11 +3233,25 @@ fn stamp_nested_list_marker_row(
     list_item_box: NodeSlotId,
 ) -> NodeSlotId {
     let layout_host = host.layout();
-    // SAFETY: The builder remains live, and the identity names a live element.
-    let record = unsafe { (host.callbacks.nested_list_marker_style)(host.callbacks.builder, generator.raw()) };
-    let derived = layout_host
-        .arena()
-        .with_style_engine(|engine| DerivedStyleRecord::pin(engine, record));
+    let derived = layout_host.arena().with_style_engine(|engine| {
+        // The generator's own `::marker` record, which the engine derives for this read alone where the generator
+        // holds none. It answers one for every list item; should it not, the marker takes the generator's style.
+        let record = engine
+            .pseudo_published_style_record(generator, pseudo_kind_of(GENERATED_FOR_MARKER))
+            .or_else(|| {
+                let demand = RecordDemand::PseudoElement(
+                    FfiPseudoElementRecordDemand::ReadOnly,
+                    FfiDemandedPseudoElement::Marker,
+                );
+                let record = answer_record_demand(engine, generator, demand).record.style_record;
+                (record != 0).then_some(record)
+            })
+            .or_else(|| engine.element_published_style_record(generator))
+            .expect("a list item the build reaches has published its style");
+        // NB: Republishing the generator's own `::marker` record can retire its animation record while the nested
+        //     marker still refers to it. The marker takes a record of its own, copied from it.
+        LayoutStyle::from_record(engine, record).intern(engine)
+    });
     // SAFETY: Entry points guarantee that the arena remains live, and callers hold no reference
     // derived from it across the allocation.
     let slot = unsafe { &mut *layout_host.arena }.allocate_unbound();
@@ -3818,7 +4009,7 @@ impl TreeBuilderHost<'_> {
     }
 
     fn host_calls(&self) -> HostCalls<'_> {
-        HostCalls::Owed(self.work)
+        HostCalls(self.work)
     }
 
     fn parent(&self, node: LayoutNode) -> LayoutNode {
@@ -4785,7 +4976,7 @@ fn is_tabular_container(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
 
 fn text_is_ascii_whitespace(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
     // SAFETY: Tree building owns the arena; no borrowed node data crosses the refresh.
-    unsafe { super::rendered_text::ensure_text_content(host.arena, node) };
+    super::rendered_text::ensure_text_content(unsafe { &mut *host.arena }, node);
     host.arena()
         .text_content(node)
         .expect("text was just refreshed")
@@ -5391,11 +5582,14 @@ mod tests {
         arena.set_node_flag(parent, NodeFlag::ChildrenAreInline, true);
 
         let main_thread = MainThread::for_test();
+        let work = crate::layout::tree_mutation::OwedHostWork::default();
+        arena.queue_box_presence();
         let host = super::StaleSubtreeHost {
             arena: &raw mut arena,
-            host_calls: crate::layout::tree_mutation::HostCalls::Now(&main_thread),
+            host_calls: crate::layout::tree_mutation::HostCalls(&work),
         };
         assert!(!host.clear_stale_layout_node(element, None));
+        work.resolve(&arena).pay(&main_thread);
 
         assert!(!arena.slot_is_live(element_box));
         assert!(!arena.slot_is_live(before_box));

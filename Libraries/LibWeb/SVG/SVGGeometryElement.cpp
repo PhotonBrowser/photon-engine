@@ -52,7 +52,7 @@ static CSS::StyleRecordID declared_only_style_record(CSS::StyleComputer& style_c
     }
     auto inline_style = element.inline_style();
     return CSS::StyleRecordID { CSS::StyleEngineFFI::style_engine_declared_only_record(
-        style_computer.style_engine().rust_handle(),
+        style_computer.style_engine().host(),
         document.style_node_id().value(),
         CSS::element_box_type_adjustment_facts(element),
         CSS::StyleEngineFFI::FfiElementDeclarationKind::SvgPresentationAttribute,
@@ -85,22 +85,21 @@ WebIDL::ExceptionOr<float> SVGGeometryElement::get_total_length()
     // NB: An element with no style is either in a subtree that is not rendered, which the style engine answers
     //     without installing anything, or outside the document, where no rule reaches it. The engine of the window's
     //     document computes the latter, as an element's own document may never have been styled, like the one
-    //     holding a template's contents. Where the engine leaves the computation to C++, C++ computes it.
+    //     holding a template's contents.
     auto const has_no_style_node = style_node_id() == CSS::StyleNodeID {};
     auto& style_document = has_no_style_node ? HTML::relevant_window(*this).associated_document() : document();
     auto& style_computer = style_document.style_computer();
     auto record = has_no_style_node
         ? declared_only_style_record(style_computer, style_document, *this)
-        : CSS::StyleRecordID { style_computer.style_engine().answer_record_demand(style_node_id(), { .read_only = true }).record.style_record };
+        : CSS::StyleRecordID { style_computer.style_engine().answer_record_demand(style_node_id(), CSS::StyleEngine::RecordDemand::ElementRead).record.style_record };
     ScopeGuard unpin_record = [&] {
         if (has_no_style_node && !!record)
             style_computer.unpin_style_record(record);
     };
-    if (auto view = style_computer.computed_style_record_view(record))
-        return get_path({ viewport_size.width(), viewport_size.height() }, *view).length();
-
-    auto transient_values = document().style_computer().materialize_style_record({ *this });
-    return get_path({ viewport_size.width(), viewport_size.height() }, *transient_values).length();
+    auto view = style_computer.computed_style_record_view(record);
+    if (!view)
+        return 0;
+    return get_path({ viewport_size.width(), viewport_size.height() }, *view).length();
 }
 
 GC::Ref<Geometry::DOMPoint> SVGGeometryElement::get_point_at_length(float distance)

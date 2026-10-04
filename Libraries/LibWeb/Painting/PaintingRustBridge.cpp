@@ -185,9 +185,8 @@ static Layout::NodeWithStyle::ImageObserver const* layer_image_observer(Layout::
     VERIFY_NOT_REACHED();
 }
 
-// The render side draws into a viewport it never asks about: this is published before every pass that reads it, and a
-// pass reads what was published rather than the document.
-void publish_visual_context_tree_inputs(DOM::Document& document)
+// The render side draws into a viewport it never asks about: every pass that reads it is handed this.
+static Compositing::RustFFI::FfiVisualContextTreeInputs visual_context_tree_inputs(DOM::Document& document)
 {
     Compositing::RustFFI::FfiVisualContextTreeInputs inputs {};
     inputs.device_pixels_per_css_pixel = document.page().client().device_pixels_per_css_pixel();
@@ -199,7 +198,7 @@ void publish_visual_context_tree_inputs(DOM::Document& document)
     auto viewport_overflow = overflow_values_applied_to_viewport_for_wheel_scrolling(document);
     inputs.viewport_wheel_overflow_x = static_cast<u8>(to_underlying(viewport_overflow.x));
     inputs.viewport_wheel_overflow_y = static_cast<u8>(to_underlying(viewport_overflow.y));
-    Layout::RustFFI::layout_arena_publish_visual_context_tree_inputs(document.layout_node_arena().handle(), inputs);
+    return inputs;
 }
 
 }
@@ -219,16 +218,15 @@ Optional<Gfx::Filter> filter_from_functions(ReadonlySpan<Compositing::RustFFI::F
     return Gfx::Filter { move(serialized_filter) };
 }
 
-static void* layout_arena_handle(DOM::Document const& document)
+static Layout::RustFFI::DocumentHost* document_host(DOM::Document const& document)
 {
-    return const_cast<DOM::Document&>(document).layout_node_arena().handle();
+    return const_cast<DOM::Document&>(document).layout_node_arena().host();
 }
 
 Layout::RustFFI::FfiVisualContextUpdateOutcome rust_update_accumulated_visual_contexts(DOM::Document& document)
 {
     auto update_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-    publish_visual_context_tree_inputs(document);
-    auto outcome = Layout::RustFFI::render_state_update_accumulated_visual_contexts(document.layout_node_arena().host(), viewport_row_slot(document));
+    auto outcome = Layout::RustFFI::render_state_update_accumulated_visual_contexts(document.layout_node_arena().host(), viewport_row_slot(document), visual_context_tree_inputs(document));
     if (rust_painting_timing_enabled())
         dbgln("AVC_UPDATE rust={} µs {}", update_timer.elapsed_time().to_microseconds(), outcome.performed_full_build ? "full"sv : "incremental"sv);
     return outcome;
@@ -239,11 +237,11 @@ Vector<u32> rust_owned_visual_context_node_indices(Layout::Node const& layout_no
     Vector<u32> indices;
     if (!has_committed_box(layout_node))
         return indices;
-    auto* arena = layout_node.arena_handle();
+    auto* host = layout_node.document_host();
     auto slot = committed_row_slot(layout_node);
-    indices.resize(Layout::RustFFI::layout_arena_paintable_visual_context_node_count(arena, slot, list));
+    indices.resize(Layout::RustFFI::render_state_paintable_visual_context_node_count(host, slot, list));
     if (!indices.is_empty())
-        Layout::RustFFI::layout_arena_paintable_visual_context_copy_node_indices(arena, slot, list, indices.data(), indices.size());
+        Layout::RustFFI::render_state_paintable_visual_context_copy_node_indices(host, slot, list, indices.data(), indices.size());
     return indices;
 }
 
@@ -251,20 +249,20 @@ bool rust_background_color_can_be_compositor_animated(Layout::Node const& layout
 {
     if (!has_committed_box(layout_node))
         return false;
-    return Layout::RustFFI::layout_arena_background_color_can_be_compositor_animated(
-        layout_node.arena_handle(), committed_row_slot(layout_node));
+    return Layout::RustFFI::render_state_background_color_can_be_compositor_animated(
+        layout_node.document_host(), committed_row_slot(layout_node));
 }
 
 void const* retain_rust_main_visual_context_tree(DOM::Document const& document)
 {
-    auto const* tree = Layout::RustFFI::layout_arena_main_visual_context_tree_retain(layout_arena_handle(document));
+    auto const* tree = Layout::RustFFI::render_state_main_visual_context_tree_retain(document_host(document));
     VERIFY(tree);
     return tree;
 }
 
 Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Layout::Node const& box)
 {
-    return Layout::RustFFI::layout_arena_physical_overflow_directions(box.arena_handle(), committed_row_slot(box));
+    return Layout::RustFFI::render_state_physical_overflow_directions(box.document_host(), committed_row_slot(box));
 }
 
 void register_geometry_host(Layout::NodeArena& arena)
@@ -276,13 +274,13 @@ void register_geometry_host(Layout::NodeArena& arena)
             VERIFY(layout_node);
             set_scroll_offset(*layout_node, offset); },
     };
-    Layout::RustFFI::layout_arena_set_geometry_host(arena.handle(), callbacks);
+    Layout::RustFFI::document_host_set_geometry_host(arena.host(), callbacks);
 }
 
 Layout::RustFFI::FfiRenderingPreparationOutcome rust_prepare_for_rendering(DOM::Document& document, bool visual_context_update_pending)
 {
-    publish_visual_context_tree_inputs(document);
-    return Layout::RustFFI::render_state_prepare_for_rendering(document.layout_node_arena().host(), visual_context_update_pending);
+    return Layout::RustFFI::render_state_prepare_for_rendering(document.layout_node_arena().host(), visual_context_update_pending, &document,
+        [](void* document) { return visual_context_tree_inputs(*static_cast<DOM::Document*>(document)); });
 }
 
 static CSS::PreferredColorScheme image_color_scheme(Layout::NodeWithStyle const& layout_node)
@@ -319,15 +317,13 @@ CSS::ColorResolutionContext gradient_stop_color_resolution_context(Layout::NodeW
 
 void rust_update_visual_viewport_transform(DOM::Document& document)
 {
-    publish_visual_context_tree_inputs(document);
-    Layout::RustFFI::render_state_update_visual_viewport_transform(document.layout_node_arena().host());
+    Layout::RustFFI::render_state_update_visual_viewport_transform(document.layout_node_arena().host(), visual_context_tree_inputs(document));
 }
 
 bool rust_refresh_scroll_state(DOM::Document& document, Compositing::ScrollStateSnapshot& snapshot, ForceScrollStateRefresh force)
 {
-    publish_visual_context_tree_inputs(document);
     return Layout::RustFFI::render_state_refresh_scroll_state(
-        document.layout_node_arena().host(), force == ForceScrollStateRefresh::Yes,
+        document.layout_node_arena().host(), force == ForceScrollStateRefresh::Yes, document.page().client().device_pixels_per_css_pixel(),
         &snapshot, [](void* sink, Gfx::FloatPoint const* offsets, size_t count) {
             static_cast<Compositing::ScrollStateSnapshot*>(sink)->assign_device_offsets({ offsets, count });
         });
@@ -376,7 +372,7 @@ Utf16String serialize_painting_dump(DOM::Document const& document, Compositing::
         .append_text = [](void* context_pointer, u8 const* bytes, size_t byte_count) { static_cast<DumpContext*>(context_pointer)->dump = Utf16String::from_utf8_without_validation(StringView { bytes, byte_count }); },
     };
     auto command_runs = display_list.command_runs();
-    Layout::RustFFI::painting_dump(layout_arena_handle(document), viewport_row_slot(document), visual_context_tree.rust_handle(), command_runs.data(), command_runs.size(), &display_list, callbacks);
+    Layout::RustFFI::painting_dump(document_host(document), viewport_row_slot(document), visual_context_tree.rust_handle(), command_runs.data(), command_runs.size(), &display_list, callbacks);
     return move(context.dump);
 }
 
@@ -396,8 +392,8 @@ void dump_stacking_context_tree(StringBuilder& builder, DOM::Document const& doc
         .debug_description = [](void* context_pointer, Compositing::RustFFI::NodeSlotId slot, void* description_sink) { push_debug_description(*static_cast<DumpContext*>(context_pointer)->document, slot, description_sink); },
         .append_text = [](void* context_pointer, u8 const* bytes, size_t byte_count) { static_cast<DumpContext*>(context_pointer)->builder.append(StringView { bytes, byte_count }); },
     };
-    Layout::RustFFI::layout_arena_dump_stacking_context_tree(
-        layout_arena_handle(document), viewport_row_slot(document), callbacks);
+    Layout::RustFFI::render_state_dump_stacking_context_tree(
+        document_host(document), viewport_row_slot(document), callbacks);
 }
 
 static void push_bytes_to_dump_sink(void* sink, ReadonlyBytes bytes)
@@ -452,7 +448,7 @@ static void dump_layout_tree(Layout::Node const& root, size_t initial_indent, bo
         .dump_nested_layout_tree = [](void*, void* layout_root, size_t indent, bool interactive, void* output_sink) { dump_layout_tree(*static_cast<Layout::Node const*>(layout_root), indent, interactive, output_sink, Layout::RustFFI::layout_arena_paint_push_bytes); },
         .append_text = append_text,
     };
-    Layout::RustFFI::layout_arena_dump_layout_tree(root.arena_handle(), Layout::Node::slot_id(&root), initial_indent, interactive, callbacks);
+    Layout::RustFFI::render_state_dump_layout_tree(root.document_host(), Layout::Node::slot_id(&root), initial_indent, interactive, callbacks);
 }
 
 void dump_layout_tree(StringBuilder& builder, Layout::Node const& root, bool interactive)
@@ -483,7 +479,7 @@ static Layout::RustFFI::FfiRecordingPublishCallbacks recording_publish_callbacks
             auto empty_display_list = [&] {
                 return context.resource_storage.add_display_list(Compositing::DisplayList::create(document.paint_state().visual_context_tree(document)), document.paint_state().visual_context_tree(document)).value();
             };
-            auto const* layout_node = static_cast<Layout::NodeWithStyle const*>(Layout::RustFFI::layout_arena_node_shell_if_live(layout_arena_handle(document), request->owner));
+            auto const* layout_node = static_cast<Layout::NodeWithStyle const*>(Layout::RustFFI::render_state_node_shell_if_live(document_host(document), request->owner));
             if (!layout_node)
                 return empty_display_list();
             GC::Ptr<HTML::DecodedImageData> decoded_image_data;
@@ -515,8 +511,8 @@ static void take_recording_trace_if_pending(DOM::Document& document)
         GC::Ref<DOM::Document const> document;
         StringBuilder trace;
     } context { document, {} };
-    bool has_pending_trace = Layout::RustFFI::layout_arena_take_recording_trace(
-        layout_arena_handle(document), &context,
+    bool has_pending_trace = Layout::RustFFI::render_state_take_recording_trace(
+        document_host(document), &context,
         [](void* context_pointer, Compositing::RustFFI::NodeSlotId slot, void* description_sink) { push_debug_description(*static_cast<TraceContext*>(context_pointer)->document, slot, description_sink); },
         [](void* context_pointer, u8 const* bytes, size_t byte_count) { static_cast<TraceContext*>(context_pointer)->trace.append(StringView { bytes, byte_count }); });
     if (has_pending_trace)
@@ -544,9 +540,9 @@ static OverlayLabelFonts overlay_label_fonts(float css_size, double device_pixel
 
 }
 
-RefPtr<Compositing::DisplayList> record_rust_display_list(DOM::Document& document, Compositing::DisplayList const& placeholder_display_list, Compositing::DisplayListResourceStorage& resource_storage, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs)
+Optional<DisplayListRecording> start_rust_display_list_recording(DOM::Document& document, Compositing::AccumulatedVisualContextTree visual_context_tree, NonnullRefPtr<Compositing::DisplayList> placeholder_display_list, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs, Layout::RustFFI::FfiFlightBlocker blocker)
 {
-    auto* arena = layout_arena_handle(document);
+    auto* host = document_host(document);
     auto device_pixels_per_css_pixel = document.page().client().device_pixels_per_css_pixel();
     auto device_viewport_rect = document.page().css_to_device_rect(document.viewport_rect());
     auto wheel_event_region_state = document.paint_state().collect_root_blocking_wheel_event_regions(document);
@@ -654,12 +650,30 @@ RefPtr<Compositing::DisplayList> record_rust_display_list(DOM::Document& documen
         inputs.background_color = document.background_color();
     }
     reconcile_navigable_container_paint_facts(document);
+    // The recording copies what it reads of the overlay arrays and buffers, which live until here.
+    auto start = Layout::RustFFI::render_state_record_display_list(host, viewport_row_slot(document), inputs, blocker);
+    if (start == Layout::RustFFI::FfiRecordingStart::NothingToRecord)
+        return {};
+    return DisplayListRecording {
+        .visual_context_tree = move(visual_context_tree),
+        .placeholder_display_list = move(placeholder_display_list),
+        .cache_mode = cache_mode,
+        .in_flight = start == Layout::RustFFI::FfiRecordingStart::InFlight,
+        .device_viewport_rect = device_viewport_rect,
+        .wheel_event_region_state = wheel_event_region_state,
+    };
+}
+
+RefPtr<Compositing::DisplayList> finish_rust_display_list_recording(DOM::Document& document, DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage)
+{
+    auto* host = document_host(document);
+    auto const& placeholder_display_list = *recording.placeholder_display_list;
+    auto device_viewport_rect = recording.device_viewport_rect;
+    auto wheel_event_region_state = recording.wheel_event_region_state;
     RecordingPublishContext publish_context { resource_storage, document };
     auto rust_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-    if (!Layout::RustFFI::layout_arena_record_display_list(arena, viewport_row_slot(document), inputs))
-        return nullptr;
     Layout::RustFFI::FfiPresentedRecording presented {};
-    Layout::RustFFI::layout_arena_publish_recording(arena, recording_publish_callbacks(publish_context), &presented);
+    Layout::RustFFI::render_state_publish_recording(host, recording_publish_callbacks(publish_context), &presented);
     take_recording_trace_if_pending(document);
     if (presented.has_blocking_wheel_event_listeners)
         wheel_event_region_state.has_blocking_wheel_event_listeners = true;
@@ -684,7 +698,7 @@ RefPtr<Compositing::DisplayList> record_rust_display_list(DOM::Document& documen
         }
     }
 
-    auto display_list = Compositing::DisplayList::share_rust_command_storage(document.visual_context_tree(), presented.display_list);
+    auto display_list = Compositing::DisplayList::share_rust_command_storage(recording.visual_context_tree, presented.display_list);
     if (rust_painting_timing_enabled())
         dbgln("PAINT_RECORD rust={} µs commands={} bytes", rust_timer.elapsed_time().to_microseconds(), display_list->command_bytes().size());
 

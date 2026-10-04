@@ -84,6 +84,7 @@
 #include <LibWeb/Painting/ChromeWidget.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintableTypes.h>
+#include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Platform/Timer.h>
@@ -95,6 +96,7 @@
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWeb/XHR/FormData.h>
 #include <LibWebCommon/CSS/SystemColor.h>
+#include <LibWebCommon/HTML/CrossOrigin/OpenerPolicyEnforcement.h>
 #include <LibWebCommon/HTML/HistoryHandlingBehavior.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #include <LibWebCommon/HTML/POSTResource.h>
@@ -670,6 +672,15 @@ Vector<GC::Root<LocalNavigable>> LocalNavigable::child_navigables() const
     return results;
 }
 
+struct LocalNavigable::RecordingInFlight {
+    AK_ALLOC_WITH_KMALLOC;
+
+    GC::Ref<DOM::Document> document;
+    PaintConfig paint_config;
+    Painting::DisplayListRecording recording;
+    bool held_for_testing { false };
+};
+
 LocalNavigable::LocalNavigable(
     GC::Ref<Page> page,
     bool is_svg_page,
@@ -785,6 +796,8 @@ void LocalNavigable::visit_edges(Cell::Visitor& visitor)
         visitor.visit(smooth_scroll.promises);
     for (auto& entry : m_pending_user_scrollend_targets)
         visitor.visit(entry.target);
+    if (m_recording_in_flight)
+        visitor.visit(m_recording_in_flight->document);
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-closable
@@ -1448,20 +1461,12 @@ OpenerPolicy const& LocalNavigable::active_document_opener_policy() const
     return m_active_document->opener_policy();
 }
 
-static Optional<CrossProcessId> navigable_id_of(GC::Ptr<WindowProxy> window_proxy)
-{
-    if (!window_proxy)
-        return {};
-    if (auto navigable = window_proxy->navigable())
-        return navigable->id();
-    return {};
-}
-
 ReplicatedNavigableState LocalNavigable::replicated_state() const
 {
     VERIFY(m_active_document);
     VERIFY(m_active_session_history_entry);
     auto& settings = relevant_settings_object(*m_active_document);
+    auto const& browsing_context = *m_active_document->browsing_context();
     return {
         .target_name = target_name(),
         .active_document_url = m_active_document->url(),
@@ -1473,8 +1478,7 @@ ReplicatedNavigableState LocalNavigable::replicated_state() const
         .browsing_context_group_id = browsing_context_group_id(),
         .opener_policy = m_active_document->opener_policy(),
         .active_browsing_context_is_auxiliary = active_browsing_context_is_auxiliary(),
-        .active_browsing_context_has_opener = active_browsing_context_opener_window_proxy() != nullptr,
-        .opener_navigable_id = navigable_id_of(active_browsing_context_opener_window_proxy()),
+        .opener_navigable_id = browsing_context.opener_navigable_id(),
         .active_document_is_completely_loaded = m_active_document->is_completely_loaded(),
         .is_closing = m_closing,
         .container = container_state(),
@@ -1489,11 +1493,11 @@ bool LocalNavigable::active_browsing_context_is_auxiliary() const
     return m_active_document && m_active_document->browsing_context() && m_active_document->browsing_context()->is_auxiliary();
 }
 
-GC::Ptr<WindowProxy> LocalNavigable::active_browsing_context_opener_window_proxy() const
+GC::Ptr<Navigable> LocalNavigable::active_browsing_context_opener_navigable() const
 {
     if (!m_active_document || !m_active_document->browsing_context())
         return nullptr;
-    return m_active_document->browsing_context()->opener_browsing_context_window_proxy();
+    return m_active_document->browsing_context()->opener_navigable();
 }
 
 ReplicatedContainerState LocalNavigable::container_state() const
@@ -1542,7 +1546,7 @@ void LocalNavigable::report_hosted_state()
 // The opener browsing context is reported as the navigable it is active in.
 void LocalNavigable::report_opener_browsing_context()
 {
-    page().client().page_did_set_opener_browsing_context(id(), navigable_id_of(active_browsing_context_opener_window_proxy()));
+    page().client().page_did_set_opener_browsing_context(id(), active_browsing_context()->opener_navigable_id());
 }
 
 // A container in another process reads what it asks of its content navigable from the replicated state.
@@ -2015,10 +2019,8 @@ bool LocalNavigable::is_familiar_with(Navigable& other)
 
     // 3. If B is an auxiliary browsing context and A is familiar with B's opener browsing context, then return true.
     if (B.active_browsing_context_is_auxiliary()) {
-        if (auto opener = B.active_browsing_context_opener_window_proxy()) {
-            if (auto opener_navigable = opener->navigable(); opener_navigable && A.is_familiar_with(*opener_navigable))
-                return true;
-        }
+        if (auto opener_navigable = B.active_browsing_context_opener_navigable(); opener_navigable && A.is_familiar_with(*opener_navigable))
+            return true;
     }
 
     // 4. If there exists an ancestor browsing context of B whose active document has the same origin as the active document of A, then return true.
@@ -2455,16 +2457,27 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
         state_holder->response_origin = determine_the_origin(state_holder->response->url(), state_holder->final_sandbox_flags, state_holder->initiator_origin);
 
         // 12. If navigable is a top-level traversable, then:
-        if (state_holder->navigable->is_top_level_traversable()) {
+        // AD-HOC: Skip a network error, which may have no URL to enforce an opener policy with. This algorithm returns
+        //         null for it, so the enforcement result would go unused.
+        if (!state_holder->response->is_network_error() && state_holder->navigable->is_top_level_traversable()) {
             // 1. Set responseCOOP to the result of obtaining an opener policy given response and request's reserved client.
             state_holder->response_coop = obtain_an_opener_policy(*state_holder->response, state_holder->request->reserved_client());
 
-            // FIXME: 2. Set coopEnforcementResult to the result of enforcing the response's opener policy given navigable's active browsing context,
+            // 2. Set coopEnforcementResult to the result of enforcing the response's opener policy given navigable's active browsing context,
             //    response's URL, responseOrigin, responseCOOP, coopEnforcementResult and request's referrer.
+            auto const& active_document = *state_holder->navigable->active_document();
+            state_holder->coop_enforcement_result = enforce_a_responses_opener_policy(active_document.is_initial_about_blank(), state_holder->response->url().value(), *state_holder->response_origin, state_holder->response_coop, state_holder->coop_enforcement_result);
 
-            // FIXME: 3. If finalSandboxFlags is not empty and responseCOOP's value is not "unsafe-none", then set response to an appropriate network error and break.
+            // 3. If finalSandboxFlags is not empty and responseCOOP's value is not "unsafe-none", then set response to an appropriate network error and break.
             // NOTE: This results in a network error as one cannot simultaneously provide a clean slate to a response
             //       using opener policy and sandbox the result of navigating to that response.
+            if (state_holder->final_sandbox_flags != SandboxingFlagSet {} && state_holder->response_coop.value != OpenerPolicyValue::UnsafeNone) {
+                // AD-HOC: Stop the fetch, as nothing will consume the response this replaces.
+                state_holder->fetch_controller->stop_fetch();
+                state_holder->response = Fetch::Infrastructure::Response::network_error(realm.vm(), "Opener policy on a sandboxed navigation response"_string);
+                fetch_completion_steps->function()();
+                return;
+            }
         }
 
         // 13. FIXME: If response is not a network error, navigable is a child navigable, and the result of performing a cross-origin resource policy check
@@ -3580,8 +3593,12 @@ void LocalNavigable::deliver_posted_message_from_another_process(PostedMessageDe
     //     posting to its opener's tab, or the other way round, posts from a tab another page of this process holds.
     GC::Ptr<WindowProxy> source;
     if (message.source_navigable_id.has_value()) {
-        if (auto source_navigable = navigable_with_id_in_any_page(page(), *message.source_navigable_id))
-            source = source_navigable->active_window_proxy();
+        if (auto source_navigable = navigable_with_id_in_any_page(page(), *message.source_navigable_id)) {
+            if (auto* remote_source_navigable = as_if<RemoteNavigable>(*source_navigable))
+                source = remote_source_navigable->active_window_proxy_in_realm_of(*window);
+            else
+                source = source_navigable->active_window_proxy();
+        }
     }
 
     // 8. Queue a global task on the posted message task source given targetWindow to run the following steps:
@@ -3874,6 +3891,25 @@ void LocalNavigable::run_navigation_unload_check(Utf16String const& navigation_i
             //     recorded load itself.
             if (unload_prompt_canceled != CheckIfUnloadingIsCanceledResult::Continue) {
                 stop_delaying_load_events_for_navigation(navigation_id);
+                // AD-HOC: Step 2 ends with 'Abort these steps.', which leaves navigable's ongoing navigation as
+                //         navigationId: step 24 of navigate set it ('Set the ongoing navigation for navigable to
+                //         navigationId.'), and the canceled navigation runs nothing further that would reset it. 'Each
+                //         navigable has an ongoing navigation, which is a navigation ID, "traversal", or null,
+                //         initially null. It is used to track navigation aborting and to prevent any navigations from
+                //         taking place during traversal.' So, with the id left in place, WebDriver's 'wait for
+                //         navigation to complete' would wait on the canceled navigation until the page load timeout,
+                //         after an Element Click, or a Back, that the prompt canceled: 'If there is an ongoing attempt
+                //         to navigate session's current browsing context that has not yet matured, wait for navigation
+                //         to mature.'
+                //         https://html.spec.whatwg.org/multipage/browsing-the-web.html#ongoing-navigation
+                //         https://w3c.github.io/webdriver/#dfn-wait-for-navigation-to-complete
+                //         Chromium, WebKit and Gecko drop the navigation outright when their beforeunload check says no
+                //         (Navigator::BeforeUnloadCompleted() cancels the NavigationRequest, FrameLoader::
+                //         continueLoadAfterNavigationPolicy() stops on shouldClose(), and nsDocShell::InternalLoad()
+                //         returns on PermitUnload()), so no state of the canceled attempt outlives it there either, and
+                //         none does here once the ongoing navigation is reset.
+                if (ongoing_navigation() == navigation_id)
+                    set_ongoing_navigation({});
                 completion_steps->function()(false);
                 return;
             }
@@ -6795,8 +6831,11 @@ bool LocalNavigable::force_dark_applies_to_active_document() const
     return m_force_dark_enabled && !active_document_opts_out_of_force_dark();
 }
 
-Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(PaintConfig paint_config)
+Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(PaintConfig paint_config, Layout::RustFFI::FfiFlightBlocker blocker)
 {
+    // The recording in flight has the document's recorder state, and its frame goes to the compositor before this one.
+    take_recording_in_flight_in(TakeIn::Wait);
+
     // Per-navigable state is stamped here rather than where PaintConfig is built, so no call site (the headless
     // screenshot path above all) can leave it behind; kept in the config so a change compares unequal below.
     paint_config.force_dark_enabled = force_dark_applies_to_active_document();
@@ -6822,28 +6861,47 @@ Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(Pa
         paint_config.canvas_fill_rect = Gfx::IntRect { {}, viewport_size };
     }
 
-    auto& presenter = m_presenter;
-    auto& resource_storage = presenter.display_list_resource_storage();
-    auto const& compositor_display_list_paint_config = presenter.compositor_display_list_paint_config();
+    auto const& compositor_display_list_paint_config = m_presenter.compositor_display_list_paint_config();
     auto should_record_display_list = m_needs_to_record_display_list
         || !compositor_display_list_paint_config.has_value()
         || !(compositor_display_list_paint_config.value() == paint_config);
+    if (!should_record_display_list)
+        return finish_compositor_frame(*document, paint_config, nullptr);
 
-    RefPtr<Compositing::DisplayList> display_list;
+    main_thread_event_loop().ensure_frame_completion_registered();
+    auto recording = document->start_display_list_recording(paint_config, Painting::PaintCommandCacheMode::ReadWrite, blocker);
+    if (!recording.has_value())
+        return {};
+    if (recording->in_flight) {
+        // What asks for another recording once this one has started asks for the next one.
+        m_needs_to_record_display_list = false;
+        m_recording_in_flight = make<RecordingInFlight>(*document, paint_config, recording.release_value());
+        main_thread_event_loop().did_let_recording_fly(*this);
+        return {};
+    }
+    auto display_list = document->finish_display_list_recording(*recording, m_presenter.display_list_resource_storage());
+    if (!display_list)
+        return {};
+    return finish_compositor_frame(*document, paint_config, move(display_list));
+}
+
+// Makes the frame that brings the compositor context up to date with `display_list`, the display list the document
+// just recorded, or with what changed for the one the compositor has where it recorded none.
+Optional<Compositor::CompositorFrame> LocalNavigable::finish_compositor_frame(DOM::Document& document, PaintConfig const& paint_config, RefPtr<Compositing::DisplayList> display_list)
+{
+    auto& presenter = m_presenter;
+    auto& resource_storage = presenter.display_list_resource_storage();
     Compositing::DisplayListResourceSet display_list_command_resources;
     Compositing::DisplayListResourceSet display_list_resources;
     Compositing::DisplayListResourceTransaction resource_transaction;
     Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree;
-    auto& document_paint_state = document->paint_state();
+    auto& document_paint_state = document.paint_state();
     bool compositor_display_list_is_unchanged = false;
-    if (should_record_display_list) {
-        display_list = document->record_display_list(paint_config, resource_storage, Painting::PaintCommandCacheMode::ReadWrite);
-        if (!display_list)
-            return {};
-        VERIFY(document->has_committed_viewport_box());
+    if (display_list) {
+        VERIFY(document.has_committed_viewport_box());
         compositor_display_list_is_unchanged = presenter.compositor_display_list() == display_list;
         if (!compositor_display_list_is_unchanged) {
-            visual_context_tree = document_paint_state.visual_context_tree(*document);
+            visual_context_tree = document_paint_state.visual_context_tree(document);
             display_list_command_resources = command_resources_of_display_list(resource_storage, document_paint_state, *display_list);
             display_list_resources = compositor_display_list_resources(resource_storage, document_paint_state, display_list_command_resources, *visual_context_tree);
             resource_transaction = resource_storage.create_transaction(
@@ -6852,7 +6910,7 @@ Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(Pa
         }
     }
 
-    VERIFY(document->has_committed_viewport_box());
+    VERIFY(document.has_committed_viewport_box());
     auto visual_context_tree_needs_compositor_update = document_paint_state.visual_context_tree_needs_compositor_update();
 
     Compositing::ScrollStateSnapshot scroll_state_snapshot { document_paint_state.scroll_state_snapshot() };
@@ -6869,7 +6927,7 @@ Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(Pa
     published_display_list.set_async_scrolling_metadata(move(async_scrolling_metadata));
 
     Compositor::CompositorFrame frame;
-    if (should_record_display_list && !compositor_display_list_is_unchanged) {
+    if (display_list && !compositor_display_list_is_unchanged) {
         frame.display_list_update = Compositor::CompositorFrame::DisplayListUpdate {
             .display_list = *display_list,
             .visual_context_tree = visual_context_tree.release_value(),
@@ -6887,7 +6945,7 @@ Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(Pa
                 resource_storage.retain_only(presenter.compositor_display_list_resources());
         }
         if (visual_context_tree_needs_compositor_update) {
-            auto updated_visual_context_tree = document_paint_state.visual_context_tree(*document);
+            auto updated_visual_context_tree = document_paint_state.visual_context_tree(document);
             VERIFY(updated_visual_context_tree.structural_epoch() == presenter.compositor_display_list_visual_context_tree_structural_epoch());
             auto updated_display_list_resources = compositor_display_list_resources(resource_storage, document_paint_state, presenter.compositor_display_list_command_resources(), updated_visual_context_tree);
             auto updated_resource_transaction = resource_storage.create_transaction(presenter.compositor_display_list_resources(), updated_display_list_resources);
@@ -6906,6 +6964,62 @@ Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(Pa
     return frame;
 }
 
+bool LocalNavigable::take_recording_in_flight_in(TakeIn take_in)
+{
+    if (!m_recording_in_flight)
+        return true;
+    if (take_in == TakeIn::IfFinished && m_recording_in_flight->held_for_testing)
+        return false;
+    auto* host = m_recording_in_flight->document->layout_node_arena().host();
+    auto landing = take_in == TakeIn::Wait
+        ? Layout::RustFFI::render_state_join_recording_in_flight(host)
+        : Layout::RustFFI::render_state_take_finished_recording_in(host);
+    if (landing == Layout::RustFFI::FfiRecordingLanding::StillInFlight)
+        return false;
+    auto in_flight = m_recording_in_flight.release_nonnull();
+    GC::Ref<DOM::Document> document = in_flight->document;
+
+    // The recording stands if the document's rows are still those of the frame it recorded, nothing asked for another
+    // recording since it started, its layout is still up to date (the frame's keyboard scroll state reads it), and the
+    // navigable still presents the document. A recording that does not stand is dropped unpublished, and the next
+    // rendering update records in step with the event loop, so that it presents. Asking whether layout is up to date
+    // drains the document's invalidation journal, whose marks (such as a repaint for an image that finished decoding
+    // during the flight) may ask for another recording, so that is asked before whether anything did.
+    bool const stands = landing == Layout::RustFFI::FfiRecordingLanding::Stands && !has_been_destroyed()
+        && has_compositor_context() && active_document().ptr() == document.ptr() && document->layout_is_up_to_date()
+        && !m_needs_to_record_display_list;
+    if (!stands) {
+        if (landing == Layout::RustFFI::FfiRecordingLanding::Stands)
+            Layout::RustFFI::render_state_discard_pending_recording(host);
+        m_last_recording_in_flight_stood = false;
+        m_needs_repaint = true;
+        m_needs_to_record_display_list = true;
+        if (!has_been_destroyed())
+            page().client().request_frame();
+        return true;
+    }
+
+    auto display_list = document->finish_display_list_recording(in_flight->recording, m_presenter.display_list_resource_storage());
+    if (!display_list)
+        return true;
+    auto frame = finish_compositor_frame(*document, in_flight->paint_config, move(display_list));
+    if (frame.has_value())
+        submit_painted_frame(frame.release_value());
+    return true;
+}
+
+void LocalNavigable::hold_recording_in_flight_for_testing()
+{
+    if (m_recording_in_flight)
+        m_recording_in_flight->held_for_testing = true;
+}
+
+void LocalNavigable::release_recording_in_flight_for_testing()
+{
+    if (m_recording_in_flight)
+        m_recording_in_flight->held_for_testing = false;
+}
+
 bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_config)
 {
     auto frame = record_compositor_frame(move(paint_config));
@@ -6915,7 +7029,7 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
     return true;
 }
 
-void LocalNavigable::paint_next_frame()
+void LocalNavigable::paint_next_frame(Layout::RustFFI::FfiFlightBlocker blocker)
 {
     if (has_been_destroyed())
         return;
@@ -6934,14 +7048,35 @@ void LocalNavigable::paint_next_frame()
 
     m_needs_repaint = false;
 
-    auto frame = record_compositor_frame(paint_config);
+    auto frame = record_compositor_frame(paint_config, blocker);
     if (!frame.has_value())
         return;
-    frame->present_viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
-    compositor_context().submit_frame(frame.release_value());
+    submit_painted_frame(frame.release_value());
 }
 
-bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_reason)
+void LocalNavigable::submit_painted_frame(Compositor::CompositorFrame frame)
+{
+    frame.present_viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
+    compositor_context().submit_frame(move(frame));
+}
+
+// Whether the rendering update's recording of the active document may fly beside the event loop, or what blocks it.
+Layout::RustFFI::FfiFlightBlocker LocalNavigable::recording_flight_blocker(DOM::UpdateLayoutReason layout_reason)
+{
+    if (layout_reason != DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate || main_thread_event_loop().running_synchronous_rendering_update())
+        return Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate;
+    if (!is_local_root())
+        return Layout::RustFFI::FfiFlightBlocker::NestedNavigables;
+    for (auto& navigable : all_local_navigables()) {
+        if (navigable->parent().ptr() == this)
+            return Layout::RustFFI::FfiFlightBlocker::NestedNavigables;
+    }
+    if (!exchange(m_last_recording_in_flight_stood, true))
+        return Layout::RustFFI::FfiFlightBlocker::LastFlightDidNotStand;
+    return Layout::RustFFI::FfiFlightBlocker::None;
+}
+
+bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_reason, Layout::RustFFI::FfiFlightBlocker blocker)
 {
     // The marks the document's invalidation journal holds decide what this paint has to redo.
     if (auto document = active_document())
@@ -6959,7 +7094,7 @@ bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_r
         if (document->font_computer().should_defer_initial_paint())
             return false;
     }
-    paint_next_frame();
+    paint_next_frame(blocker != Layout::RustFFI::FfiFlightBlocker::None ? blocker : recording_flight_blocker(layout_reason));
     return true;
 }
 

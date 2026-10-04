@@ -68,6 +68,13 @@ mod unicode_test_stubs {
     }
 
     #[unsafe(no_mangle)]
+    extern "C" fn ladybird_layout_code_point_category_facts(
+        _code_point: u32,
+    ) -> crate::layout::tree_builder::FfiCodePointCategoryFacts {
+        unreachable!("no unit test segments text");
+    }
+
+    #[unsafe(no_mangle)]
     extern "C" fn ladybird_layout_code_point_has_break_all_line_break_class(_code_point: u32) -> bool {
         unreachable!("no unit test segments text");
     }
@@ -132,6 +139,10 @@ pub(super) fn word_boundaries(text: &[u16], offset: usize) -> std::ops::Range<us
 pub(crate) struct IcuSegmenterHandle {
     raw: *mut c_void,
 }
+
+// SAFETY: The handle owns its segmenter, which shares nothing with another, so the thread that holds the handle may
+// change.
+unsafe impl Send for IcuSegmenterHandle {}
 
 impl IcuSegmenterHandle {
     fn next_boundary(&self, index: usize, inclusive: bool) -> Option<usize> {

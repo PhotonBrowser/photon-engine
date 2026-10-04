@@ -8,6 +8,7 @@
 
 #include <AK/Function.h>
 #include <AK/Noncopyable.h>
+#include <AK/OwnPtr.h>
 #include <AK/Queue.h>
 #include <LibCore/Forward.h>
 #include <LibGC/Ptr.h>
@@ -16,6 +17,12 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/EventLoop/TaskQueue.h>
 #include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
+
+namespace Web::Layout::RustFFI {
+
+enum class FfiFlightBlocker : uint8_t;
+
+}
 
 namespace Web::HTML {
 
@@ -136,6 +143,21 @@ public:
 
     bool running_rendering_task() const { return m_running_rendering_task; }
 
+    // A rendering update's style transaction and its recording fly beside the event loop until the event loop takes them
+    // in between two tasks. A rendering update whose style transaction flies runs its steps from its style and layout
+    // on once the transaction is taken in.
+    void did_let_recording_fly(LocalNavigable&);
+    // Called before a rendering update submits a recording, on a thread with a Core event loop.
+    void ensure_frame_completion_registered();
+    bool has_frame_in_flight() const;
+    // Runs the steps of the rendering update whose style transaction flies, which take the transaction in.
+    void finish_rendering_update_in_flight();
+    // A rendering task that would find a frame still in flight, or a rendering update not yet finished, keeps its place
+    // in the queue until the frame has been taken in, rather than wait for it.
+    bool holds_rendering_opportunity() const;
+    void hold_next_frame_for_testing() { m_holds_next_frame_for_testing = true; }
+    void release_held_frames_for_testing();
+
     RenderingSchedulerCounters const& rendering_scheduler_counters() const { return m_rendering_scheduler_counters; }
     void reset_rendering_scheduler_counters();
 
@@ -146,6 +168,11 @@ private:
 
     void process_input_events() const;
     void update_the_rendering();
+    void update_the_rendering_from_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, Layout::RustFFI::FfiFlightBlocker recording_blocker);
+    void finish_rendering_update(double update_start_time);
+    Layout::RustFFI::FfiFlightBlocker style_flight_blocker(Vector<GC::Root<DOM::Document>> const& docs) const;
+    void resume_rendering_update_in_flight();
+    void take_finished_frames_in();
 
     Type m_type { Type::Window };
 
@@ -196,12 +223,22 @@ private:
     double m_last_rendering_update_end_time { 0 };
 
     GC::Ptr<GC::Function<void()>> m_rendering_task_function;
+
+    // The navigables whose recordings fly beside the event loop.
+    Vector<GC::Ref<LocalNavigable>> m_navigables_with_recordings_in_flight;
+    bool m_frame_completion_registered { false };
+    bool m_holds_next_frame_for_testing { false };
+
+    struct RenderingUpdateInFlight;
+    OwnPtr<RenderingUpdateInFlight> m_rendering_update_in_flight;
+    // How deep the event loop is spun inside a task.
+    size_t m_spin_depth { 0 };
 };
 
 WEB_API EventLoop& main_thread_event_loop();
 WEB_API void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps);
-WEB_API TaskID queue_a_task(HTML::Task::Source, GC::Ptr<EventLoop>, GC::Ptr<DOM::Document>, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal);
-WEB_API TaskID queue_global_task(HTML::Task::Source, JS::Object&, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal);
+WEB_API TaskID queue_a_task(HTML::Task::Source, GC::Ptr<EventLoop>, GC::Ptr<DOM::Document>, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});
+WEB_API TaskID queue_global_task(HTML::Task::Source, JS::Object&, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});
 WEB_API void queue_a_microtask(GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps);
 void perform_a_microtask_checkpoint();
 

@@ -119,6 +119,7 @@ interface Internals {
     boolean hasCookieForURL(DOMString url, ByteString name, ByteString value);
 
     boolean setHttpMemoryCacheEnabled(boolean enabled);
+    boolean setDiskCacheEnabledForNavigations(boolean enabled);
     undefined simulateRequestServerConnectionLoss();
     undefined simulateWorkerRequestServerConnectionLoss();
     undefined sendBadIpcMessageForTesting(DOMString kind);
@@ -190,7 +191,7 @@ interface Internals {
     // Returns the shadow root of the element, if it has one, even if it's not normally accessible to JS.
     ShadowRoot? getShadowRoot(Element element);
 
-    undefined handleSDLInputEvents();
+    undefined pumpGamepadEvents();
 
     undefined setEnvironmentsTopLevelURL(USVString url);
     undefined setGeolocationEmulatedPosition(double latitude, double longitude, optional double accuracy = 100);
@@ -213,6 +214,12 @@ interface Internals {
     undefined resetRenderingSchedulerCounters();
     undefined setManualRenderingOpportunities(boolean enabled);
     undefined injectRenderingOpportunity(double frameTimeMs);
+    // "in-flight" while a rendering update's recording flies beside the event loop, "idle" otherwise.
+    DOMString frameSchedulerState();
+    // Keeps the next recording that flies in flight, before it reads its frame, until releaseHeldFrame(), or until a
+    // read waits for it.
+    undefined holdNextFrame();
+    undefined releaseHeldFrame();
     undefined updateCompositorAnimations();
     boolean runEmptyAnimationStyleUpdateForTesting();
     undefined armCompositorAnimationTimersForTesting();

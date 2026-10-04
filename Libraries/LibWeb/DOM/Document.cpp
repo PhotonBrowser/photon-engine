@@ -325,13 +325,32 @@ Document::HTMLCollectionAttributeInvalidationTypes Document::html_collection_att
 
 GC_DEFINE_ALLOCATOR(Document);
 
+// https://html.spec.whatwg.org/multipage/browsers.html#obtain-browsing-context-navigation
+// NB: The UI process performed this algorithm and selected this process. It names the group of the new top-level
+//     browsing context when it switched browsing context groups.
+static GC::Ref<HTML::BrowsingContext> obtain_a_browsing_context_to_use_for_a_navigation_response(HTML::NavigationParams const& navigation_params)
+{
+    // 1. Let browsingContext be navigationParams's navigable's active browsing context.
+    auto& navigable = *navigation_params.navigable;
+    auto browsing_context = navigable.active_browsing_context();
+
+    // NB: Steps 2 to 9 decide whether to switch browsing context groups, and return browsingContext otherwise.
+    if (!navigation_params.new_browsing_context_group_id.has_value())
+        return *browsing_context;
+
+    // 10. Let newBrowsingContext be the first return value of creating a new top-level browsing context and document.
+    auto new_browsing_context = HTML::BrowsingContext::create_a_new_browsing_context_and_document(navigable.page(), nullptr, nullptr).browsing_context;
+    new_browsing_context->set_browsing_context_group_id(*navigation_params.new_browsing_context_group_id);
+
+    // 15. Return newBrowsingContext.
+    return new_browsing_context;
+}
+
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
 WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type, Utf16FlyString content_type, HTML::NavigationParams const& navigation_params)
 {
     // 1. Let browsingContext be the result of obtaining a browsing context to use for a navigation response given navigationParams.
-    // NB: The UI process has already performed this algorithm and selected this WebContent process.
-    auto browsing_context = navigation_params.navigable->active_browsing_context();
-    VERIFY(browsing_context);
+    auto browsing_context = obtain_a_browsing_context_to_use_for_a_navigation_response(navigation_params);
 
     // FIXME: 2. Let permissionsPolicy be the result of creating a permissions policy from a response given navigationParams's navigable's container, navigationParams's origin, and navigationParams's response.
 
@@ -665,16 +684,16 @@ Layout::NodeArena& Document::layout_node_arena()
         m_layout_node_arena = make_ref_counted<Layout::NodeArena>(style_computer().style_engine().render_document());
         m_layout_node_arena->set_document({}, this);
         Layout::register_layout_host(*m_layout_node_arena, *this);
-        Layout::RustFFI::layout_arena_set_layout_update_host_callbacks(m_layout_node_arena->handle(), layout_update_host_callbacks());
+        Layout::RustFFI::document_host_set_layout_update_host_callbacks(m_layout_node_arena->host(), layout_update_host_callbacks());
         Layout::RustFFI::FfiStyleRecordHostCallbacks style_record_host_callbacks {
             .context = this,
             .shell_style_changed = [](void*, void* shell, u64 record, void const* payloads, bool attach_resources) {
                 as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(CSS::StyleRecordID { record }, payloads, attach_resources);
             },
         };
-        Layout::RustFFI::layout_arena_set_style_record_host_callbacks(m_layout_node_arena->handle(), style_record_host_callbacks);
+        Layout::RustFFI::document_host_set_style_record_host_callbacks(m_layout_node_arena->host(), style_record_host_callbacks);
         m_layout_node_arena->start_reporting_box_presence({});
-        Layout::RustFFI::layout_arena_set_shell_factory(m_layout_node_arena->handle(), this, [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
+        Layout::RustFFI::document_host_set_shell_factory(m_layout_node_arena->host(), this, [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
             auto& document = *static_cast<Document*>(context);
             switch (kind) {
             case Layout::RustFFI::NodeKind::InlineNode:
@@ -699,8 +718,8 @@ Layout::NodeArena& Document::layout_node_arena()
                 return;
             }
         });
-        Layout::RustFFI::layout_arena_set_chrome_state_callback(
-            m_layout_node_arena->handle(), this,
+        Layout::RustFFI::document_host_set_chrome_state_callback(
+            m_layout_node_arena->host(), this,
             [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::PaintableRowResetKind kind) {
                 auto& document = *static_cast<Document*>(context);
                 document.chrome_widget_registry().drop_widgets_for_slot(slot);
@@ -722,7 +741,7 @@ void Document::reset_style_invalidation_counters() const
 
 bool Document::needs_full_layout_tree_update() const
 {
-    return m_layout_node_arena && Layout::RustFFI::layout_arena_needs_full_layout_tree_update(m_layout_node_arena->handle());
+    return m_layout_node_arena && Layout::RustFFI::render_state_needs_full_layout_tree_update(m_layout_node_arena->host());
 }
 
 // A document without an arena has no layout nodes, so its next build creates every box anyway.
@@ -734,7 +753,7 @@ void Document::set_needs_full_layout_tree_update(bool value)
 
 bool Document::is_running_update_layout() const
 {
-    return m_layout_node_arena && Layout::RustFFI::layout_arena_update_layout_is_running(m_layout_node_arena->handle());
+    return m_layout_node_arena && Layout::RustFFI::document_host_update_layout_is_running(m_layout_node_arena->host());
 }
 
 u64 Document::partial_layout_count() const
@@ -759,11 +778,11 @@ void Document::finalize()
         m_layout_node_arena->stop_reporting_box_presence({});
     tear_down_layout_tree();
     if (m_layout_node_arena) {
-        Layout::RustFFI::layout_arena_clear_chrome_state_callback(m_layout_node_arena->handle());
-        Layout::RustFFI::layout_arena_clear_style_record_host_callbacks(m_layout_node_arena->handle());
-        Layout::RustFFI::layout_arena_clear_layout_host_callbacks(m_layout_node_arena->handle());
-        Layout::RustFFI::layout_arena_clear_layout_update_host_callbacks(m_layout_node_arena->handle());
-        Layout::RustFFI::layout_arena_clear_shell_factory(m_layout_node_arena->handle());
+        Layout::RustFFI::document_host_clear_chrome_state_callback(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_style_record_host_callbacks(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_layout_host_callbacks(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_layout_update_host_callbacks(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_shell_factory(m_layout_node_arena->host());
         VERIFY(Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()).live_slots == 0);
         m_layout_node_arena->set_document({}, nullptr);
     }
@@ -1488,7 +1507,7 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
 
     // -> If the document element is an SVG svg element
     if (is<SVG::SVGSVGElement>(document_element)) {
-        GC::Ptr<Element> element;
+        GC::Ptr<SVG::SVGTitleElement> element;
 
         // 1. If there is an SVG title element that is a child of the document element, let element be the first such
         //    element.
@@ -1499,14 +1518,14 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
         else {
             // 1. Let element be the result of creating an element given the document element's node document, "title",
             //    and the SVG namespace.
-            element = TRY(DOM::create_element(*this, HTML::TagNames::title, Namespace::SVG));
+            element = as<SVG::SVGTitleElement>(*TRY(DOM::create_element(*this, HTML::TagNames::title, Namespace::SVG)));
 
             // 2. Insert element as the first child of the document element.
             document_element->insert_before(*element, document_element->first_child());
         }
 
         // 3. String replace all with the given value within element.
-        element->string_replace_all(title);
+        element->set_text(title);
     }
 
     // -> If the document element is in the HTML namespace
@@ -1518,7 +1537,7 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
         if (title_element == nullptr && head_element == nullptr)
             return {};
 
-        GC::Ptr<Element> element;
+        GC::Ptr<HTML::HTMLTitleElement> element;
 
         // 2. If the title element is non-null, let element be the title element.
         if (title_element) {
@@ -1528,14 +1547,14 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
         else {
             // 1. Let element be the result of creating an element given the document element's node document, "title",
             //    and the HTML namespace.
-            element = TRY(DOM::create_element(*this, HTML::TagNames::title, Namespace::HTML));
+            element = as<HTML::HTMLTitleElement>(*TRY(DOM::create_element(*this, HTML::TagNames::title, Namespace::HTML)));
 
             // 2. Append element to the head element.
             TRY(head_element->append_child(*element));
         }
 
         // 4. String replace all with the given value within element.
-        element->string_replace_all(title);
+        element->set_text(title);
     }
 
     // -> Otherwise
@@ -1551,30 +1570,12 @@ Compositing::RustFFI::NodeSlotId Document::layout_root_slot() const
 {
     if (!m_layout_node_arena)
         return Compositing::RustFFI::NodeSlotId_INVALID;
-    return Layout::RustFFI::layout_arena_layout_root(m_layout_node_arena->handle());
+    return Layout::RustFFI::render_state_layout_root(m_layout_node_arena->host());
 }
 
 Layout::Node* Document::layout_root_if_live() const
 {
     return m_layout_node_arena ? m_layout_node_arena->node_if_live(layout_root_slot()) : nullptr;
-}
-
-// The build records the root it placed in the arena itself, so what is left for the document is to
-// retire the tree that was replaced and give the new one a paint state.
-Layout::RustFFI::FfiLayoutTreeBuildOutcome Document::build_layout_tree()
-{
-    m_needs_throttled_animation_style_update_check = true;
-    auto replaced_root = layout_root_slot();
-    auto outcome = Layout::build_layout_tree(*this);
-    VERIFY(is<Layout::Viewport>(layout_node_arena().node_if_live(outcome.viewport)));
-    if (replaced_root.index == outcome.viewport.index)
-        return outcome;
-    if (auto* replaced_layout_root = layout_node_arena().node_if_live(replaced_root)) {
-        replaced_layout_root->prepare_subtree_for_detach_from_layout_tree();
-        layout_node_arena().free_subtree(replaced_root);
-    }
-    m_paint_state = make<Painting::DocumentPaintState>(layout_node_arena());
-    return outcome;
 }
 
 void Document::tear_down_layout_tree()
@@ -1983,7 +1984,7 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
         // Broadcast the current viewport rect to any new committed boxes, so they know whether
         // they're visible or not. If necessary, re-collect the content-visibility:auto set.
         inform_all_viewport_clients_about_the_current_viewport_rect();
-        if (Layout::RustFFI::layout_arena_may_have_auto_content_visibility(layout_node_arena().handle()))
+        if (Layout::RustFFI::render_state_may_have_auto_content_visibility(layout_node_arena().host()))
             collect_boxes_with_auto_content_visibility();
     }
 
@@ -2009,6 +2010,9 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
 {
     if (!node.is_connected())
         return;
+
+    // NB: Whether the read finds style or layout pending is asked behind the style transaction that flew.
+    drain_flown_style_transaction();
 
     if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate)
         flush_throttled_animation_style_update_for_node(node);
@@ -2131,8 +2135,8 @@ bool Document::reconcile_stale_list_item_counters_after_tree_build()
         GC::Ref<Document> document;
         HashTable<GC::Ptr<Node const>> dom_roots;
     } rebuilt_roots { *this, {} };
-    Layout::RustFFI::layout_arena_for_each_pending_rebuilt_subtree_root(
-        layout_node_arena().handle(), &rebuilt_roots,
+    Layout::RustFFI::render_state_for_each_pending_rebuilt_subtree_root(
+        layout_node_arena().host(), &rebuilt_roots,
         [](void* context, Layout::RustFFI::FfiNodeIdentity root) {
             auto& rebuilt_roots = *static_cast<RebuiltRoots*>(context);
             if (auto dom_node = Painting::node_identity_of(root).resolve(*rebuilt_roots.document))
@@ -2170,8 +2174,8 @@ bool Document::needs_style_update_after_layout()
 void Document::collect_boxes_with_auto_content_visibility()
 {
     Vector<Compositing::RustFFI::NodeSlotId> boxes_with_auto_content_visibility;
-    Layout::RustFFI::layout_arena_collect_boxes_with_auto_content_visibility(
-        layout_node_arena().handle(), Layout::Node::slot_id(unsafe_layout_node()), &boxes_with_auto_content_visibility,
+    Layout::RustFFI::render_state_collect_boxes_with_auto_content_visibility(
+        layout_node_arena().host(), Layout::Node::slot_id(unsafe_layout_node()), &boxes_with_auto_content_visibility,
         [](void* context, Compositing::RustFFI::NodeSlotId slot) {
             static_cast<Vector<Compositing::RustFFI::NodeSlotId>*>(context)->append(slot);
         });
@@ -2199,14 +2203,13 @@ bool Document::layout_is_up_to_date() const
     // Without an arena there is no layout root either, so there is a tree to build.
     if (!m_layout_node_arena)
         return false;
-    return Layout::RustFFI::layout_arena_layout_is_up_to_date(m_layout_node_arena->handle(),
+    return Layout::RustFFI::render_state_layout_is_up_to_date(m_layout_node_arena->host(),
         needs_layout_tree_update() || child_needs_layout_tree_update());
 }
 
 void Document::update_style_computer_viewport_rect()
 {
-    // A viewport unit is resolved against this. A style input record names the viewport environment
-    // apart from the rest, so only a computation that read a viewport metric moves with it.
+    // A viewport unit is resolved against this.
     if (style_computer().viewport_rect_for_style_environment() != viewport_rect())
         style_computer().bump_viewport_environment_version();
     style_computer().set_viewport_rect({}, viewport_rect());
@@ -2564,6 +2567,16 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
     // NB: Called during paint property resolution.
     // Everything that reads paint state comes through here, so the marks that describe it go through first.
     drain_invalidation_journal();
+
+    // Nothing was written to the render state since the properties were prepared from it: every pass below would find
+    // nothing to do, so none is sent to the render owner.
+    auto* host = m_layout_node_arena ? m_layout_node_arena->host() : nullptr;
+    if (host && Layout::RustFFI::document_host_paint_preparation_is_current(host) && !m_needs_accumulated_visual_contexts_update && !m_image_map_areas_need_publication)
+        return;
+
+    // What the passes prepare stays current until something is written to the render state, from here on as well.
+    if (host)
+        Layout::RustFFI::document_host_note_paint_preparation_is_current(host);
 
     prepare_for_rendering();
     Painting::publish_image_map_area_facts_if_needed(*this);
@@ -4513,7 +4526,7 @@ WebIDL::ExceptionOr<Utf16String> Document::cookie()
             return m_cookie;
     }
 
-    auto [cookie_version, cookie] = page().client().page_did_request_cookie(m_url, HTTP::Cookie::Source::NonHttp);
+    auto [cookie_version, cookie] = page().client().page_did_request_cookie(relevant_settings_object().id, m_url, HTTP::Cookie::Source::NonHttp);
 
     if (cookie_version.has_value()) {
         m_cookie_version = *cookie_version;
@@ -4539,7 +4552,7 @@ WebIDL::ExceptionOr<void> Document::set_cookie(Utf16View cookie_string)
     // "non-HTTP" API, consisting of the new value encoded as UTF-8.
     auto cookie_string_utf8 = TRY_OR_THROW_OOM(vm(), cookie_string.to_utf8());
     if (auto cookie = HTTP::Cookie::parse_cookie(url(), cookie_string_utf8); cookie.has_value()) {
-        page().client().page_did_set_cookie(m_url, cookie.value(), HTTP::Cookie::Source::NonHttp);
+        page().client().page_did_set_cookie(relevant_settings_object().id, m_url, cookie.value(), HTTP::Cookie::Source::NonHttp);
         reset_cookie_version();
     }
 
@@ -5921,7 +5934,7 @@ void Document::set_style_node_id(CSS::StyleNodeID style_node_id)
     // The identity may have named a node that has since left, and the layout arena keys layout tree update marks by
     // identity alone, so the document starts with none.
     if (m_layout_node_arena && style_node_id != 0)
-        Layout::RustFFI::layout_arena_clear_layout_tree_update_marks(m_layout_node_arena->handle(), style_node_id.value());
+        Layout::RustFFI::render_state_clear_layout_tree_update_marks(m_layout_node_arena->host(), style_node_id.value());
 }
 
 void Document::ensure_style_engine_tracks_tree()
@@ -6823,6 +6836,11 @@ Painting::DocumentPaintState& Document::paint_state()
 {
     VERIFY(m_paint_state);
     return *m_paint_state;
+}
+
+bool Document::has_boxes_with_auto_content_visibility() const
+{
+    return m_paint_state && !m_paint_state->boxes_with_auto_content_visibility().is_empty();
 }
 
 Painting::DocumentPaintState const& Document::paint_state() const
@@ -9168,9 +9186,9 @@ void Document::publish_animation_keyframes_for_style_update()
         return;
     // NB: Read before the walk, so that a change the walk itself makes walks again next time.
     m_animation_keyframes_published_generation = m_style_sheet_set_generation;
-    auto* engine = style_computer().style_engine().rust_handle();
+    auto* host = style_computer().style_engine().host();
     for (auto const& departed : m_departed_animation_keyframes)
-        CSS::StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(engine, departed.tree_scope.value(), departed.shadow_root_identity, nullptr, nullptr, 0, nullptr, 0);
+        CSS::StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(host, departed.tree_scope.value(), departed.shadow_root_identity, nullptr, nullptr, 0, nullptr, 0);
     m_departed_animation_keyframes.clear();
     style_scope().build_rule_cache_if_needed();
     for_each_shadow_root([](DOM::ShadowRoot& shadow_root) {
@@ -9921,8 +9939,13 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
 void Document::request_frame_for_pending_repaint()
 {
     auto navigable = this->navigable();
-    if (!navigable)
+    if (!navigable) {
+        // NB: SVG image documents only have a navigable while being rendered. A resource that finishes
+        //     loading between renders must still invalidate the image's cached rendering and notify its clients.
+        if (page().client().is_svg_page_client())
+            page().client().request_frame();
         return;
+    }
 
     navigable->set_needs_repaint();
 
@@ -9980,19 +10003,19 @@ void Document::note_svg_paint_resources_changed()
 {
     if (!m_layout_node_arena)
         return;
-    if (Layout::RustFFI::layout_arena_note_svg_paint_resources_changed(m_layout_node_arena->handle()))
+    if (Layout::RustFFI::render_state_note_svg_paint_resources_changed(m_layout_node_arena->host()))
         set_needs_accumulated_visual_contexts_update(true);
 }
 
 bool Document::has_enrolled_svg_paint_resources() const
 {
-    return m_layout_node_arena && Layout::RustFFI::layout_arena_has_enrolled_svg_paint_resources(m_layout_node_arena->handle());
+    return m_layout_node_arena && Layout::RustFFI::render_state_has_enrolled_svg_paint_resources(m_layout_node_arena->host());
 }
 
 void Document::schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason reason)
 {
     if (m_layout_node_arena)
-        Layout::RustFFI::layout_arena_visual_context_request_full_rebuild(m_layout_node_arena->handle(), reason);
+        Layout::RustFFI::render_state_visual_context_request_full_rebuild(m_layout_node_arena->host(), reason);
     set_needs_accumulated_visual_contexts_update(true);
 }
 
@@ -10087,6 +10110,18 @@ void Document::set_needs_to_record_display_list_keeping_hit_test_display_list()
 
 RefPtr<Compositing::DisplayList> Document::record_display_list(HTML::PaintConfig config, Compositing::DisplayListResourceStorage& resource_storage, Painting::PaintCommandCacheMode cache_mode)
 {
+    // The host reads this recording right after it, so a recording in flight is taken in first: it has the recorder
+    // state.
+    if (auto navigable = this->navigable())
+        navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
+    auto recording = start_display_list_recording(config, cache_mode, Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate);
+    if (!recording.has_value())
+        return nullptr;
+    return finish_display_list_recording(*recording, resource_storage);
+}
+
+Optional<Painting::DisplayListRecording> Document::start_display_list_recording(HTML::PaintConfig config, Painting::PaintCommandCacheMode cache_mode, Layout::RustFFI::FfiFlightBlocker blocker)
+{
     update_paint_and_hit_testing_properties_if_needed();
     VERIFY(has_committed_viewport_box());
 
@@ -10125,15 +10160,21 @@ RefPtr<Compositing::DisplayList> Document::record_display_list(HTML::PaintConfig
     if (config.should_show_caret_hit_test_debug_overlay)
         overlay_inputs.caret_debug_rect = m_caret_hit_test_debug_rect;
 
-    auto display_list = Painting::record_rust_display_list(*this, *placeholder_display_list, resource_storage, cache_mode, config, overlay_inputs);
+    return Painting::start_rust_display_list_recording(*this, move(visual_context_tree), move(placeholder_display_list), cache_mode, config, overlay_inputs, blocker);
+}
+
+RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Painting::DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage)
+{
+    auto display_list = Painting::finish_rust_display_list_recording(*this, recording, resource_storage);
     if (!display_list)
         return nullptr;
 
+    auto& document_paint_state = paint_state();
     bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
     if (!recording_returned_the_paint_command_cache_source || !m_hit_test_display_list || !m_hit_test_display_list->is_current())
-        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
+        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(recording.visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
 
-    if (cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source) {
+    if (recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source) {
         document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, resource_storage.collect_referenced_resources(*display_list));
     }
 
@@ -10150,12 +10191,12 @@ void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
     page().client().request_frame();
 }
 
-Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
+Optional<Painting::HitTestQuery> Document::prepare_hit_test_query()
 {
     update_paint_and_hit_testing_properties_if_needed();
 
     if (!has_committed_viewport_box())
-        return nullptr;
+        return {};
 
     auto rebuild_hit_test_display_list = [&] {
         set_needs_to_record_display_list();
@@ -10170,16 +10211,37 @@ Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
         (void)record_display_list(paint_config, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
     };
 
-    if (!m_hit_test_display_list || !m_hit_test_display_list->is_current() || m_hit_test_display_list->visual_context_tree_structural_epoch() != visual_context_tree_structural_epoch())
+    // The paint properties were prepared above, and a query reads them as they were left there: preparing them again
+    // for every item a query converts would find nothing to do, but still ask the render state to do it.
+    auto hit_test_display_list_is_current = [&] {
+        return m_hit_test_display_list && m_hit_test_display_list->is_current() && m_hit_test_display_list->visual_context_tree_structural_epoch() == paint_state().visual_context_tree_structural_epoch_without_update();
+    };
+    // The recording in flight replaces the hit-test list once it lands, so a list that is not current waits for it
+    // first.
+    if (!hit_test_display_list_is_current()) {
+        if (auto navigable = this->navigable())
+            navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
+    }
+    if (!hit_test_display_list_is_current()) {
         rebuild_hit_test_display_list();
+        if (!hit_test_display_list_is_current())
+            return {};
+    }
 
-    return m_hit_test_display_list.ptr();
+    return Painting::HitTestQuery {
+        *m_hit_test_display_list,
+        paint_state().visual_context_tree_without_update(*this),
+        scroll_state_snapshot(),
+        page().client().device_pixels_per_css_pixel(),
+        page().chrome_metrics(),
+        Painting::overflow_values_applied_to_viewport_for_wheel_scrolling(*this),
+    };
 }
 
 Optional<Painting::HitTestResult> Document::hit_test(CSSPixelPoint position)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
     // https://w3c.github.io/pointerevents/#hit-test
     // 1. Let pos be the x,y coordinates relative to the viewport
@@ -10193,7 +10255,7 @@ Optional<Painting::HitTestResult> Document::hit_test(CSSPixelPoint position)
     // 2. If there is a box in the viewport that would be a target for hit testing at coordinates x,y, when applying
     //    the transforms that apply to the descendants of the viewport, return the associated element and terminate
     //    these steps.
-    auto result = hit_test_display_list->hit_test(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics());
+    auto result = query->list().hit_test(position, *query);
     if (result.has_value() && (result->chrome_widget || result->dom_node()))
         return result;
 
@@ -10206,58 +10268,58 @@ Optional<Painting::HitTestResult> Document::hit_test(CSSPixelPoint position)
 
 Optional<Painting::CaretPosition> Document::caret_position_from_point(CSSPixelPoint position)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Normal);
+    return query->list().caret_position_from_point(position, *query, Painting::CaretPositionMode::Normal);
 }
 
 Optional<Painting::CaretPosition> Document::caret_position_from_point_for_selection_start(CSSPixelPoint position)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::SelectionStart);
+    return query->list().caret_position_from_point(position, *query, Painting::CaretPositionMode::SelectionStart);
 }
 
 Optional<Painting::CaretPosition> Document::caret_position_from_point_for_selection(CSSPixelPoint position, GC::Ptr<Node const> constraint_scope)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Selection, constraint_scope);
+    return query->list().caret_position_from_point(position, *query, Painting::CaretPositionMode::Selection, constraint_scope);
 }
 
 Optional<Painting::CaretPosition> Document::caret_position_at_line_edge(Node const& node, size_t offset, TextAffinity affinity, Painting::CaretLineEdge edge)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_at_line_edge(node, offset, affinity, edge);
+    return query->list().caret_position_at_line_edge(node, offset, affinity, edge);
 }
 
 Optional<Painting::CaretPosition> Document::caret_position_on_adjacent_line(Node const& node, size_t offset, TextAffinity affinity, Painting::CaretLineDirection direction, CSSPixels inline_coordinate, Node const& scope)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_position_on_adjacent_line(node, offset, affinity, direction, inline_coordinate, scope);
+    return query->list().caret_position_on_adjacent_line(node, offset, affinity, direction, inline_coordinate, scope);
 }
 
 Optional<CSSPixels> Document::caret_line_block_coordinate(Node const& node, size_t offset, TextAffinity affinity)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return {};
-    return hit_test_display_list->caret_line_block_coordinate(node, offset, affinity);
+    return query->list().caret_line_block_coordinate(node, offset, affinity);
 }
 
 TraversalDecision Document::hit_test_all(CSSPixelPoint position, Function<TraversalDecision(Painting::HitTestResult)> const& callback)
 {
-    auto hit_test_display_list = ensure_hit_test_display_list();
-    if (!hit_test_display_list)
+    auto query = prepare_hit_test_query();
+    if (!query.has_value())
         return TraversalDecision::Continue;
-    return hit_test_display_list->hit_test_all(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), callback);
+    return query->list().hit_test_all(position, *query, callback);
 }
 
 Unicode::Segmenter& Document::grapheme_segmenter() const
@@ -10741,7 +10803,8 @@ void Document::sync_custom_property_registrations_to_rust()
         .document_base_url = document_base_url.bytes().data(),
         .document_base_url_length = document_base_url.bytes().size(),
     };
-    CSS::ComputedValuesFFI::rust_custom_property_registry_update(
+    // A style transaction may still read the registry this replaces, so the registry is made anew.
+    m_rust_custom_property_registry = CSS::ComputedValuesFFI::rust_custom_property_registry_update(
         m_rust_custom_property_registry, &context, registrations.data(), registrations.size());
 }
 

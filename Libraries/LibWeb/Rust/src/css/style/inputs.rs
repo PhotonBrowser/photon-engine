@@ -149,8 +149,9 @@ impl RetainedCustomPropertyData {
 pub(crate) struct HeldCustomPropertyEnvironment {
     /// The identity the host's object names the environment by.
     pub(crate) identity: u64,
-    /// Whether it is the element's animation overlay, over the environment its style resolves to.
-    pub(crate) is_animation_overlay: bool,
+    /// For the element's animation overlay, the environment its style resolved to, which its
+    /// animations sampled their custom properties over.
+    pub(crate) sampled_over: Option<u64>,
     /// Whether the environment the style resolves to declares custom properties of its own, over
     /// the one it inherits.
     pub(crate) declares: bool,
@@ -171,6 +172,39 @@ impl Drop for RetainedCustomPropertyData {
         // SAFETY: The row owns exactly one reference, taken in `retain`.
         unsafe { web_css_custom_property_data_unreference(self.data()) };
     }
+}
+
+/// Compile one rule's selectors, interning the names they test through `atoms`.
+pub(super) fn compile_selector_program(
+    atoms: &mut DocumentAtoms,
+    fold_id_and_class_name_case: bool,
+    html_element_namespace: StyleAtomID,
+    selectors: &[&CompiledSelector],
+    namespaces: NamespaceScope,
+    scope: &ScopeChain<'_>,
+    counters: &mut Counters,
+) -> SelectorProgram {
+    let mut intern = |raw: usize, namespace: Option<StyleAtomID>| -> StyleAtomID {
+        let local = atoms.intern_raw(raw);
+        let Some(namespace) = namespace else {
+            return local;
+        };
+        atoms.intern_qualified(namespace, local)
+    };
+    let mut compiler = SelectorCompiler::new(
+        &mut intern,
+        fold_id_and_class_name_case,
+        html_element_namespace,
+        namespaces,
+    );
+    for selector in selectors {
+        let compiled = compiler.compile_in_scope(selector, scope);
+        if let Some(counter) = compiled.marker.and_then(|marker| marker.counter()) {
+            counters.bump(counter);
+        }
+        counters.bump(Counter::ExactSelectorEntries);
+    }
+    compiler.finish()
 }
 
 impl RetainedState {
@@ -283,43 +317,16 @@ impl RetainedState {
         reusable: Option<SelectorProgramID>,
         counters: &mut Counters,
     ) -> SelectorProgramID {
-        let fold_id_and_class_name_case = self.fold_id_and_class_name_case;
-        let html_element_namespace = self.html_element_namespace;
-        let atoms = &mut self.atoms;
-        let mut intern = |raw: usize, namespace: Option<StyleAtomID>| -> StyleAtomID {
-            let local = atoms.intern_raw(raw);
-            let Some(namespace) = namespace else {
-                return local;
-            };
-            atoms.intern_qualified(namespace, local)
-        };
-
-        let mut compiler = SelectorCompiler::new(
-            &mut intern,
-            fold_id_and_class_name_case,
-            html_element_namespace,
+        let compiled = compile_selector_program(
+            &mut self.atoms,
+            self.fold_id_and_class_name_case,
+            self.html_element_namespace,
+            selectors,
             namespaces,
+            scope,
+            counters,
         );
-        for selector in selectors {
-            let compiled = compiler.compile_in_scope(selector, scope);
-            match compiled.marker {
-                Some(marker) => {
-                    if let Some(counter) = marker.counter() {
-                        counters.bump(counter);
-                    }
-                    counters.bump(Counter::ExactSelectorEntries);
-                }
-                None => counters.bump(Counter::ExactSelectorEntries),
-            }
-        }
-        let compiled = compiler.finish();
-        let mut requirements_changed = false;
-        for name in compiled.attribute_value_text_names() {
-            requirements_changed |= self.attribute_value_text_names.insert(name);
-        }
-        if requirements_changed {
-            self.attribute_value_text_requirements_version += 1;
-        }
+        self.note_attribute_value_text_names(&compiled);
         if let Some(reusable) = reusable
             && self.programs.get(reusable) == &compiled
         {
@@ -329,6 +336,17 @@ impl RetainedState {
         self.selector_programs_need_sweep |= reusable.is_some();
         self.programs.settle_memory(&mut self.memory);
         program
+    }
+
+    /// Record the attribute names whose values `program` reads as text.
+    pub(super) fn note_attribute_value_text_names(&mut self, program: &SelectorProgram) {
+        let mut requirements_changed = false;
+        for name in program.attribute_value_text_names() {
+            requirements_changed |= self.attribute_value_text_names.insert(name);
+        }
+        if requirements_changed {
+            self.attribute_value_text_requirements_version += 1;
+        }
     }
 
     /// Moves whenever an attribute name comes to require its value text: a selector's here, or an
@@ -1069,7 +1087,7 @@ impl RetainedState {
         node: StyleNodeID,
         data: Option<RetainedCustomPropertyData>,
         identity: u64,
-        is_animation_overlay: bool,
+        sampled_over: Option<u64>,
         declares: bool,
     ) {
         let Some(data) = data else {
@@ -1087,7 +1105,7 @@ impl RetainedState {
             node,
             HeldCustomPropertyEnvironment {
                 identity,
-                is_animation_overlay,
+                sampled_over,
                 declares,
                 data,
             },
@@ -1125,7 +1143,7 @@ impl RetainedState {
         };
         let held = HeldCustomPropertyEnvironment {
             identity,
-            is_animation_overlay: false,
+            sampled_over: None,
             declares: false,
             data,
         };
@@ -1176,6 +1194,31 @@ impl RetainedState {
     pub fn set_element_associated_pseudo_kind(&mut self, node: StyleNodeID, pseudo_kind_plus_one: u8) {
         self.computed_group_sets
             .set_associated_pseudo_kind(node, pseudo_kind_plus_one);
+        if pseudo_kind_plus_one != 0
+            && let Some(host) = self.tree.shadow_host_of(node)
+        {
+            let backing_elements = self.backing_elements.entry(host).or_default();
+            if !backing_elements.contains(&node) {
+                backing_elements.push(node);
+            }
+        }
+    }
+
+    /// The elements of `host`'s shadow tree that stand for one of its element-backed
+    /// pseudo-elements of `kinds`, a bit per kind.
+    pub(super) fn backing_elements(&self, host: StyleNodeID, kinds: u64) -> impl Iterator<Item = StyleNodeID> {
+        self.backing_elements
+            .get(&host)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |&node| {
+                self.tree.shadow_host_of(node) == Some(host)
+                    && self
+                        .computed_group_sets
+                        .associated_pseudo_kind(node)
+                        .is_some_and(|kind| kinds & 1_u64.checked_shl(u32::from(kind)).unwrap_or(0) != 0)
+            })
     }
 
     /// What the last layout commit and scroll state say of a container's box.
@@ -1603,16 +1646,12 @@ impl RetainedState {
     ///
     /// An element-attached declaration is a cascade component above layers: a style attribute beats
     /// every layered and unlayered rule in its context, whatever layer they are in.
-    #[allow(clippy::too_many_arguments)]
     pub fn set_element_declared_properties(
         &mut self,
         node: StyleNodeID,
         kind: ElementDeclarationKind,
-        declared: &[DeclaredProperty],
-        written_values: Vec<RetainedStyleValueData>,
-        custom_declarations: Vec<CustomDeclaration>,
-        custom_written_values: Vec<RetainedStyleValueData>,
-        declarations_are_complete: bool,
+        declarations: Vec<(DeclaredProperty, RetainedStyleValueData)>,
+        custom_declarations: Vec<(CustomDeclaration, RetainedStyleValueData)>,
         counters: &mut Counters,
     ) {
         debug_assert!(custom_declarations.is_empty() || kind == ElementDeclarationKind::InlineStyle);
@@ -1621,7 +1660,7 @@ impl RetainedState {
             ElementDeclarationKind::PresentationalHint | ElementDeclarationKind::SvgPresentationAttribute
         ) {
             verify_cascade_winners(self, |_| {
-                let mut properties: Vec<u16> = declared.iter().map(|declared| declared.property).collect();
+                let mut properties: Vec<u16> = declarations.iter().map(|(declared, _)| declared.property).collect();
                 properties.sort_unstable();
                 assert!(
                     properties.windows(2).all(|pair| pair[0] != pair[1]),
@@ -1629,15 +1668,24 @@ impl RetainedState {
                 );
             });
         }
-        let (current_declared, current_declarations_are_complete) = self.facts.element_declared_properties(node, kind);
-        if current_declarations_are_complete == declarations_are_complete
-            && current_declared == declared
-            && (kind != ElementDeclarationKind::InlineStyle
-                || self.facts.element_custom_declarations(node) == custom_declarations.as_slice())
+        let current_declared = self.facts.element_declared_properties(node, kind);
+        let current_custom_declarations = match kind {
+            ElementDeclarationKind::InlineStyle => self.facts.element_custom_declarations(node),
+            _ => &[],
+        };
+        if current_declared
+            .iter()
+            .eq(declarations.iter().map(|(declared, _)| declared))
+            && current_custom_declarations
+                .iter()
+                .eq(custom_declarations.iter().map(|(declared, _)| declared))
         {
             return;
         }
-        let repair_inputs = (declarations_are_complete && current_declarations_are_complete)
+        // Custom properties never reach the winner columns, so winners repaired from the
+        // declarations alone hold only for an element whose style declared none.
+        let repair_inputs = current_custom_declarations
+            .is_empty()
             .then(|| {
                 let previous = self
                     .current_winner_groups()
@@ -1650,20 +1698,14 @@ impl RetainedState {
                 Some((previous, retained, current_declared.to_vec()))
             })
             .flatten();
-        self.facts.set_element_declared_properties(
-            node,
-            kind,
-            declared.to_vec(),
-            written_values,
-            declarations_are_complete,
-        );
+        self.facts.set_element_declared_properties(node, kind, declarations);
         if kind == ElementDeclarationKind::InlineStyle {
-            self.facts
-                .set_element_custom_declarations(node, custom_declarations, custom_written_values);
+            self.facts.set_element_custom_declarations(node, custom_declarations);
         }
         let Some((previous, retained, previous_declared)) = repair_inputs else {
             return;
         };
+        let declared = self.facts.element_declared_properties(node, kind);
         let mut changed_properties: Vec<u16> = previous_declared
             .iter()
             .chain(declared)
@@ -1788,6 +1830,7 @@ impl StyleEngineState {
                 document_resource_contexts: Default::default(),
                 document_media: Default::default(),
                 document_functions: Default::default(),
+                custom_property_registry: None,
                 monospace_font_family: RetainedStyleValueData::from_owned(
                     crate::css::parser::value_parser::value_list(
                         vec![StyleValueData::Keyword {
@@ -1808,18 +1851,20 @@ impl StyleEngineState {
                 custom_declaration_reads: HashMap::default(),
                 nodes_with_tree_counting_records: HashMap::default(),
                 nodes_with_rolled_back_records: HashMap::default(),
+                nodes_with_element_relative_substitutions: HashMap::default(),
                 element_custom_property_data: HashMap::default(),
                 pseudo_element_custom_property_data: HashMap::default(),
                 environment_move_recompute_nodes: HashSet::default(),
                 container_effects_for_host: HashMap::default(),
                 published_container_verdicts: HashMap::default(),
                 container_gates_unheld: HashSet::default(),
-                container_input_nodes: HashSet::default(),
+                row_inputs_moved: flush::RowInputsMoved::default(),
                 container_query_inputs: Default::default(),
                 layout_style_snapshots: HashMap::default(),
                 size_container_queries: Default::default(),
                 counter_style_environment_identities: HashMap::default(),
                 held_style_records: HashMap::default(),
+                backing_elements: HashMap::default(),
                 children_explicitly_inherit_marks: HashSet::default(),
                 host_var_reads: HashMap::default(),
                 css_defined_animations: Default::default(),
@@ -1828,14 +1873,12 @@ impl StyleEngineState {
                 held_root_font_inputs: None,
                 random_base_values: Default::default(),
                 replaced_content_inputs: HashMap::default(),
+                style_groups: crate::css::computed_values::StyleGroupMasks::registered_or_none(),
                 transition_baselines: HashMap::default(),
                 custom_property_registrations_changed: false,
-                pending_element_style_computation_selections: HashMap::default(),
-                pending_pseudo_style_computation_selections: HashMap::default(),
                 engine_computed_records_pending: HashMap::default(),
                 demand_records: HashMap::default(),
                 flush_stamp: 0,
-                parent_inputs_moved_nodes: HashSet::default(),
                 engine_pseudo_record_cache: HashMap::default(),
                 batch_answers_complete_but_for_custom_properties: HashMap::default(),
                 batch_custom_property_matches: HashMap::default(),
@@ -1892,7 +1935,7 @@ impl StyleEngineState {
                 diagnostic_plan_capture: None,
             },
             host: HostState {
-                batch_moves_for_retries: Default::default(),
+                suspended_style_pass: None,
                 font_resolver: None,
                 #[cfg(feature = "style-recording")]
                 recording_id: None,
@@ -1917,11 +1960,10 @@ impl StyleEngineState {
                 ffi_style_transaction_output_memory: MemoryLease::new(MemoryCategory::BridgeBuffer),
                 ffi_style_node_query: Vec::new(),
                 ffi_style_node_query_memory: MemoryLease::new(MemoryCategory::BridgeBuffer),
-                ffi_retained_cascade_assignments: Vec::new(),
-                ffi_retained_cascade_assignments_memory: MemoryLease::new(MemoryCategory::BridgeBuffer),
                 reclaimed_style_atoms: Vec::new(),
                 style_atoms_swept: false,
-                replay_reclaimed_style_atoms: None,
+                replay_atom_sweep: None,
+                defers_atom_sweep: false,
             },
         }
     }
@@ -2118,6 +2160,13 @@ impl StyleEngineState {
             || !self.host.tree_staging.is_empty()
             || self.host.program_staging.is_dirty()
             || self.host.sheet_rule_replacement.is_some()
+            || self.host.suspended_style_pass.is_some()
+    }
+
+    /// Whether the host is installing a style pass wave by wave, between two of its waves.
+    #[must_use]
+    pub fn has_suspended_style_pass(&self) -> bool {
+        self.host.suspended_style_pass.is_some()
     }
 
     #[must_use]
@@ -2138,7 +2187,7 @@ impl StyleEngineState {
     /// can, deciding the node's gated rules again and publishing its winners anew from its
     /// retained answer where a verdict moved.
     pub fn record_container_query_input(&mut self, node: StyleNodeID) {
-        self.retained.container_input_nodes.insert(node);
+        self.retained.row_inputs_moved.note_containers_moved(node);
         self.record_derived_element_style_input(
             node,
             transaction::STYLE_REACTION_PUBLISHED_STYLE | transaction::STYLE_REACTION_RECOMPUTE_STYLE,
@@ -2233,13 +2282,10 @@ impl StyleEngineState {
     }
 
     /// Whether one element still owes a deferred style input, asked per node the way the recorded
-    /// batch is. The deferred inputs are kept sorted by key, so this is a binary search.
+    /// batch is.
     #[must_use]
     pub fn has_deferred_element_style_input(&self, node: StyleNodeID) -> bool {
-        self.host
-            .deferred_element_style_inputs
-            .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
-            .is_ok()
+        self.host.owes_element_style_input(node)
     }
 
     /// Whether settling the pending selector inputs can change geometry derived from the committed
@@ -2635,6 +2681,19 @@ impl StyleEngineState {
         scope: &ScopeChain<'_>,
         counters: &mut Counters,
     ) -> RuleID {
+        self.add_style_rule_with(sheet, before, counters, |engine, previous_program, counters| {
+            engine.compile_selectors(selectors, namespaces, scope, previous_program, counters)
+        })
+    }
+
+    /// Add a style rule whose selector program `attach` gives it, from the program of the rule it replaces, if any.
+    pub(super) fn add_style_rule_with(
+        &mut self,
+        sheet: SheetID,
+        before: Option<RuleID>,
+        counters: &mut Counters,
+        attach: impl FnOnce(&mut Self, Option<SelectorProgramID>, &mut Counters) -> SelectorProgramID,
+    ) -> RuleID {
         let rule = match before {
             Some(before) => self.insert_rule_before(before, RuleKind::Style, counters),
             None => self
@@ -2644,7 +2703,7 @@ impl StyleEngineState {
         let previous_program = self
             .replacement_rule(rule)
             .and_then(|replacement| replacement.version.selector_program);
-        let program = self.compile_selectors(selectors, namespaces, scope, previous_program, counters);
+        let program = attach(self, previous_program, counters);
         if previous_program != Some(program) {
             self.add_routing_rule(rule, program);
         }
@@ -3080,8 +3139,7 @@ impl StyleEngineState {
             .computed_group_sets
             .set_box_kind(node, super::bridge::ElementBoxKind::from_raw(arrival.box_kind));
         self.retained
-            .computed_group_sets
-            .set_associated_pseudo_kind(node, arrival.associated_pseudo_kind_plus_one);
+            .set_element_associated_pseudo_kind(node, arrival.associated_pseudo_kind_plus_one);
         for &state in custom_states {
             self.record_batched_input(
                 InputKey::LocalFeature(node, LocalFeatureKey::CustomState(state)),
@@ -3243,26 +3301,12 @@ impl StyleEngineState {
         selector_program: SelectorProgram,
         counters: &mut Counters,
     ) -> RuleID {
-        let rule = match before {
-            Some(before) => self.insert_rule_before(before, RuleKind::Style, counters),
-            None => self
-                .reuse_replaced_style_rule(sheet, counters)
-                .unwrap_or_else(|| self.append_rule(sheet, None, RuleKind::Style, counters)),
-        };
-        let previous_program = self
-            .replacement_rule(rule)
-            .and_then(|replacement| replacement.version.selector_program);
-        let program = self.retained.programs.add(selector_program);
-        self.retained.selector_programs_need_sweep |= previous_program.is_some();
-        self.retained.programs.settle_memory(&mut self.retained.memory);
-        if previous_program != Some(program) {
-            self.add_routing_rule(rule, program);
-        }
-        let mut version = self.current_rule_version(rule);
-        version.selector_program = Some(program);
-        self.replace_rule_version(rule, version, counters);
-        counters.bump(Counter::StyleRulesCompiled);
-        rule
+        self.add_style_rule_with(sheet, before, counters, |engine, previous_program, _| {
+            let program = engine.retained.programs.add(selector_program);
+            engine.retained.selector_programs_need_sweep |= previous_program.is_some();
+            engine.retained.programs.settle_memory(&mut engine.retained.memory);
+            program
+        })
     }
 
     #[cfg(feature = "style-recording")]
@@ -3314,6 +3358,7 @@ impl RetainedState {
             document_resource_contexts: _,
             document_media: _,
             document_functions: _,
+            custom_property_registry: _,
             font_resolution: _,
             monospace_font_family: _,
             layer_topology_version: _,
@@ -3326,18 +3371,20 @@ impl RetainedState {
             custom_declaration_reads,
             nodes_with_tree_counting_records,
             nodes_with_rolled_back_records,
+            nodes_with_element_relative_substitutions,
             element_custom_property_data,
             pseudo_element_custom_property_data,
             environment_move_recompute_nodes,
             container_effects_for_host,
             published_container_verdicts,
             container_gates_unheld,
-            container_input_nodes,
+            row_inputs_moved,
             container_query_inputs,
             layout_style_snapshots,
             size_container_queries,
             counter_style_environment_identities: _,
             held_style_records,
+            backing_elements,
             children_explicitly_inherit_marks,
             host_var_reads,
             css_defined_animations,
@@ -3348,17 +3395,14 @@ impl RetainedState {
             held_root_font_inputs: _,
             random_base_values,
             replaced_content_inputs,
+            style_groups: _,
             transition_baselines,
             custom_property_registrations_changed: _,
-            pending_element_style_computation_selections,
-            pending_pseudo_style_computation_selections,
             // Settled or reverted when the transaction's outputs are discarded, before identities are
             // released.
             engine_computed_records_pending: _,
             demand_records,
             flush_stamp: _,
-            // Taken by the transaction that fills them.
-            parent_inputs_moved_nodes: _,
             engine_pseudo_record_cache: _,
             // Filled and cleared within one transaction's record loop.
             batch_answers_complete_but_for_custom_properties: _,
@@ -3431,13 +3475,14 @@ impl RetainedState {
         custom_declaration_reads.remove(&node);
         nodes_with_tree_counting_records.remove(&node);
         nodes_with_rolled_back_records.remove(&node);
+        nodes_with_element_relative_substitutions.remove(&node);
         element_custom_property_data.remove(&node);
         pseudo_element_custom_property_data.remove(&node);
         environment_move_recompute_nodes.remove(&node);
         container_effects_for_host.remove(&node);
         published_container_verdicts.remove(&node);
         container_gates_unheld.remove(&node);
-        container_input_nodes.remove(&node);
+        row_inputs_moved.forget(node);
         container_query_inputs.clear(node);
         layout_style_snapshots.remove(&node);
         demand_records.retain(|target, record| {
@@ -3448,6 +3493,7 @@ impl RetainedState {
             !retired
         });
         size_container_queries.retire(node);
+        backing_elements.remove(&node);
         if let Some(style_record) = held_style_records.remove(&node) {
             computed_group_sets.unpin_style_record(style_record);
         }
@@ -3457,11 +3503,19 @@ impl RetainedState {
         animation_effect_descriptions.retire(node);
         random_base_values.retire(node);
         replaced_content_inputs.remove(&node);
-        pending_element_style_computation_selections.remove(&node);
-        pending_pseudo_style_computation_selections.remove(&node);
         // A retired identity can name another element before the epoch commits.
         for (_, style_record) in transition_baselines.remove(&node).into_iter().flatten() {
             computed_group_sets.unpin_style_record(style_record);
         }
+    }
+}
+
+impl HostState {
+    /// Whether `node` still owes a deferred style input. The deferred inputs are kept sorted by
+    /// key, so this is a binary search.
+    pub(super) fn owes_element_style_input(&self, node: StyleNodeID) -> bool {
+        self.deferred_element_style_inputs
+            .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
+            .is_ok()
     }
 }

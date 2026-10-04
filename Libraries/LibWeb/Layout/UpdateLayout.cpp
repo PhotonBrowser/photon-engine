@@ -18,6 +18,7 @@
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 
 namespace Web::DOM {
 
@@ -47,16 +48,45 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
             return {
                 .document_is_active = document_is_active,
                 .document_needs_layout_tree_build = document.needs_layout_tree_update() || document.child_needs_layout_tree_update(),
-                .container_query_evaluation_is_pending = document.has_size_containers_needing_evaluation_after_layout(),
                 .top_layer_work_pending = document.m_top_layer_needs_layout_zone_rebuild || !document.m_elements_with_pending_top_layer_membership_change.is_empty(),
                 .should_collect_devtools_layout_data = document.page().client().has_active_devtools_client(),
                 .document_in_quirks_mode = document.in_quirks_mode(),
                 .viewport_inline_size_raw = viewport_rect.width().raw_value(),
                 .viewport_block_size_raw = viewport_rect.height().raw_value(),
+                .document_style_node = document.style_node_id().value(),
+                .has_stale_list_item_counters = !document.m_list_owners_with_stale_item_counters.is_empty(),
             }; },
+        .container_query_evaluation_is_pending = [](void* context) -> bool { return static_cast<Document*>(context)->has_size_containers_needing_evaluation_after_layout(); },
         .needs_style_update_after_layout = [](void* context) -> bool { return static_cast<Document*>(context)->needs_style_update_after_layout(); },
         .prepare_for_rendering = [](void* context) { static_cast<Document*>(context)->prepare_for_rendering(); },
-        .build_layout_tree = [](void* context) -> Layout::RustFFI::FfiLayoutTreeBuildOutcome { return static_cast<Document*>(context)->build_layout_tree(); },
+        .prepare_layout_tree_build = [](void* context, bool may_create_viewport) -> u64 {
+            auto& document = *static_cast<Document*>(context);
+            document.m_needs_throttled_animation_style_update_check = true;
+            // The viewport's style is the document's, which the style computer makes rather than publishes, so a build
+            // that may build the viewport is handed it before it starts.
+            CSS::StyleRecordID document_style_record;
+            if (may_create_viewport) {
+                auto& style_computer = document.style_computer();
+                document_style_record = style_computer.intern_anonymous_layout_style(*style_computer.create_document_style());
+            }
+            // The viewport's row holds what the navigable has scrolled the viewport to, which the navigable publishes as
+            // it scrolls. A new document has not heard from it yet.
+            if (auto navigable = document.navigable())
+                Layout::RustFFI::render_state_set_viewport_scroll_offset(document.layout_node_arena().host(), navigable->viewport_scroll_offset());
+            return document_style_record.value(); },
+        // The build records the root it placed in the arena itself, so what is left for the document is to retire the
+        // tree that was replaced and give the new one a paint state.
+        .finish_layout_tree_build = [](void* context, Compositing::RustFFI::NodeSlotId replaced_root, Compositing::RustFFI::NodeSlotId viewport) {
+            auto& document = *static_cast<Document*>(context);
+            auto& arena = document.layout_node_arena();
+            VERIFY(is<Layout::Viewport>(arena.node_if_live(viewport)));
+            if (replaced_root.index == viewport.index)
+                return;
+            if (auto* replaced_layout_root = arena.node_if_live(replaced_root)) {
+                replaced_layout_root->prepare_subtree_for_detach_from_layout_tree();
+                arena.free_subtree(replaced_root);
+            }
+            document.m_paint_state = make<Painting::DocumentPaintState>(arena); },
         .reconcile_stale_list_item_counters_after_tree_build = [](void* context) -> bool { return static_cast<Document*>(context)->reconcile_stale_list_item_counters_after_tree_build(); },
         .after_layout_commit = [](void* context, bool layout_tree_changed) { static_cast<Document*>(context)->after_layout_commit(layout_tree_changed ? LayoutTreeChanged::Yes : LayoutTreeChanged::No); },
         .note_full_layout_performed = [](void* context) { static_cast<Document*>(context)->style_invalidation_counters().relayouts_performed++; },
@@ -78,8 +108,98 @@ void Document::update_layout(UpdateLayoutReason reason)
     update_layout(reason, ThrottledAnimationSamplingScope::Document);
 }
 
+// Whether a script API names the reason: a read of render state for it is then the script call's forced read, and
+// otherwise the host's own.
+static bool reason_is_script_api(UpdateLayoutReason reason)
+{
+    switch (reason) {
+    case UpdateLayoutReason::DocumentElementFromPoint:
+    case UpdateLayoutReason::DocumentElementsFromPoint:
+    case UpdateLayoutReason::DocumentCaretPositionFromPoint:
+    case UpdateLayoutReason::DocumentFindMatchingText:
+    case UpdateLayoutReason::DocumentSetDesignMode:
+    case UpdateLayoutReason::ElementCheckVisibility:
+    case UpdateLayoutReason::ElementClientHeight:
+    case UpdateLayoutReason::ElementClientWidth:
+    case UpdateLayoutReason::ElementGetClientRects:
+    case UpdateLayoutReason::ElementIsPotentiallyScrollable:
+    case UpdateLayoutReason::ElementScroll:
+    case UpdateLayoutReason::ElementScrollHeight:
+    case UpdateLayoutReason::ElementScrollIntoView:
+    case UpdateLayoutReason::ElementScrollLeft:
+    case UpdateLayoutReason::ElementScrollTop:
+    case UpdateLayoutReason::ElementScrollWidth:
+    case UpdateLayoutReason::ElementSetScrollLeft:
+    case UpdateLayoutReason::ElementSetScrollTop:
+    case UpdateLayoutReason::HTMLElementGetTheTextSteps:
+    case UpdateLayoutReason::HTMLElementOffsetHeight:
+    case UpdateLayoutReason::HTMLElementOffsetLeft:
+    case UpdateLayoutReason::HTMLElementOffsetParent:
+    case UpdateLayoutReason::HTMLElementOffsetTop:
+    case UpdateLayoutReason::HTMLElementOffsetWidth:
+    case UpdateLayoutReason::HTMLElementScrollParent:
+    case UpdateLayoutReason::HTMLImageElementHeight:
+    case UpdateLayoutReason::HTMLImageElementWidth:
+    case UpdateLayoutReason::HTMLImageElementX:
+    case UpdateLayoutReason::HTMLImageElementY:
+    case UpdateLayoutReason::HTMLInputElementHeight:
+    case UpdateLayoutReason::HTMLInputElementWidth:
+    case UpdateLayoutReason::InternalsLayoutTest:
+    case UpdateLayoutReason::InternalsHitTest:
+    case UpdateLayoutReason::MediaQueryListMatches:
+    case UpdateLayoutReason::NavigableSelectedText:
+    case UpdateLayoutReason::RangeGetClientRects:
+    case UpdateLayoutReason::ResolvedCSSStyleDeclarationProperty:
+    case UpdateLayoutReason::SVGGraphicsElementGetBBox:
+    case UpdateLayoutReason::SVGGraphicsElementGetScreenCTM:
+    case UpdateLayoutReason::SVGLengthValue:
+    case UpdateLayoutReason::SVGPathLength:
+    case UpdateLayoutReason::WindowScroll:
+        return true;
+    case UpdateLayoutReason::AutoScrollSelection:
+    case UpdateLayoutReason::ChildDocumentStyleUpdate:
+    case UpdateLayoutReason::CursorLineNavigation:
+    case UpdateLayoutReason::Debugging:
+    case UpdateLayoutReason::DocumentReadinessComplete:
+    case UpdateLayoutReason::DumpDisplayList:
+    case UpdateLayoutReason::EventHandlerDispatchChromeWidgetEvent:
+    case UpdateLayoutReason::EventHandlerHandleDragAndDrop:
+    case UpdateLayoutReason::EventHandlerHandleKeyDown:
+    case UpdateLayoutReason::EventHandlerHandleMouseDown:
+    case UpdateLayoutReason::EventHandlerHandleMouseMove:
+    case UpdateLayoutReason::EventHandlerHandleMouseUp:
+    case UpdateLayoutReason::EventHandlerHandleMouseWheel:
+    case UpdateLayoutReason::EventHandlerRunActivationBehavior:
+    case UpdateLayoutReason::EventHandlerShowContextMenu:
+    case UpdateLayoutReason::FontFaceSetReady:
+    case UpdateLayoutReason::HTMLEventLoopRenderingUpdate:
+    case UpdateLayoutReason::HTMLLabelElementActivationBehavior:
+    case UpdateLayoutReason::InspectAccessibilityTree:
+    case UpdateLayoutReason::InspectDOMTree:
+    case UpdateLayoutReason::InspectDevToolsLayoutData:
+    case UpdateLayoutReason::InputCaretRect:
+    case UpdateLayoutReason::NavigableViewportScroll:
+    case UpdateLayoutReason::NodeNameOrDescription:
+    case UpdateLayoutReason::SVGDecodedImageDataRender:
+    case UpdateLayoutReason::ScrollCursorIntoView:
+    case UpdateLayoutReason::ProcessScreenshot:
+    case UpdateLayoutReason::ViewTransitionCapture:
+        return false;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
 {
+    // The update's waits for the render state are one read, which its first style or layout job spends. An update
+    // inside a read already begun for this document belongs to that read.
+    auto* host = style_computer().style_engine().render_document().host();
+    Layout::RustFFI::document_host_begin_forced_read(host, reason_is_script_api(reason));
+    ScopeGuard end_forced_read = [&] {
+        Layout::RustFFI::document_host_end_forced_read(host);
+    };
+    drain_flown_style_transaction();
+
     // An image box that owns its image's provider is handed it once the layout update that built the box is over, and
     // the update lays it out without an image. If the image was already there, the box lays out again with it before
     // the read goes on. Likewise, a web face a layout reached is requested once the update is over, and the update
@@ -117,9 +237,9 @@ void Document::update_style_and_layout_once(UpdateLayoutReason reason, Throttled
     drain_invalidation_journal();
 
     auto& arena = layout_node_arena();
-    Layout::RustFFI::layout_arena_begin_update_layout(arena.handle());
+    Layout::RustFFI::document_host_begin_update_layout(arena.host());
     ScopeGuard guard = [&] {
-        Layout::RustFFI::layout_arena_end_update_layout(arena.handle());
+        Layout::RustFFI::document_host_end_update_layout(arena.host());
 
         if (m_needs_scroll_container_resnap) {
             if (auto navigable = this->navigable(); navigable && navigable->active_document().ptr() == this)
@@ -146,7 +266,7 @@ void Document::update_style_and_layout_once(UpdateLayoutReason reason, Throttled
         .is_template_contents_document = m_created_for_appropriate_template_contents,
         .reason_name = ffi_utf16_view(to_string(reason)),
     };
-    Layout::RustFFI::layout_arena_update_layout(arena.handle(), &inputs);
+    Layout::RustFFI::render_state_update_layout(arena.host(), &inputs);
 
     // A pass that reached a web face still waiting on its load cannot start the fetch itself: the fetch, the
     // font-display timer and the load-event delayer are all document state. It leaves the face's number behind
@@ -159,7 +279,7 @@ void Document::update_style_and_layout_once(UpdateLayoutReason reason, Throttled
     // document's layout works out. Hand it over as it changes.
     if (auto* object = as_if<HTML::HTMLObjectElement>(navigable->container().ptr())) {
         Layout::RustFFI::FfiNaturalSize natural_size {};
-        if (Layout::RustFFI::layout_arena_take_changed_document_svg_root_natural_size(arena.handle(), &natural_size)) {
+        if (Layout::RustFFI::render_state_take_changed_document_svg_root_natural_size(arena.host(), &natural_size)) {
             CSS::SizeWithAspectRatio size { natural_size.width, natural_size.height, {} };
             if (natural_size.has_aspect_ratio)
                 size.aspect_ratio = CSSPixelFraction(natural_size.aspect_ratio_numerator, natural_size.aspect_ratio_denominator);

@@ -12,28 +12,36 @@
 
 use super::StyleAtomID;
 use super::bridge::{
-    FfiElementArrival, FfiElementDeclarationDelta, FfiElementStyleInput, FfiLocalFeatureDelta, FfiRecordDemand,
-    FfiRecordDemandAnswer, FfiStateDelta, FfiStyleInputTransaction, FfiTreeDelta, borrow,
-    write_recording_element_style_inputs, write_recording_state_deltas, write_recording_tree_deltas,
+    FfiDemandedPseudoElement, FfiElementArrival, FfiElementDeclarationDelta, FfiElementStyleInput,
+    FfiLocalFeatureDelta, FfiPseudoElementRecordDemand, FfiRecordDemand, FfiRecordDemandAnswer, FfiStateDelta,
+    FfiStyleInputTransaction, FfiTreeDelta, borrow, write_recording_element_style_inputs, write_recording_state_deltas,
+    write_recording_tree_deltas,
 };
-use super::font_resolution::{FontResolutionCache, FontResolverHost, PublishedFontFaces};
+use super::font_resolution::{FontResolverHost, PublishedFontFaces};
 use super::inputs::RetainedCustomPropertyData;
+use super::instrumentation::Counter;
+use super::publication::RecordDemand;
 use super::record_replay::EventKind;
-use super::tree::StyleNodeID;
+use super::tree::{StyleNodeID, TreeScopeID};
 use super::{StyleEngine, StyleEngineHandle};
+use crate::css::transition::{FfiTransitionAction, FfiTransitionInput, TransitionDecision};
 use crate::render_state::{ArenaChange, DocumentHost};
 use std::ffi::c_void;
 
 /// One hand-written write of the host to a document's style engine.
 pub(crate) enum EngineWrite {
-    /// The document's `@font-face` table and the memo of the cascades resolved from it.
-    PublishFontFaces(PublishedFontFaces),
+    /// The document's `@font-face` table and the memo of the cascades resolved from it, and the shadow tree scopes
+    /// whose `@font-feature-values` the table carries beside the document's.
+    PublishFontFaces {
+        font_faces: PublishedFontFaces,
+        feature_values_shadow_scopes: Box<[TreeScopeID]>,
+    },
     /// The custom-property environment an element holds, or none.
     ElementCustomPropertyData {
         node: StyleNodeID,
         data: Option<RetainedCustomPropertyData>,
         identity: u64,
-        is_animation_overlay: bool,
+        sampled_over: Option<u64>,
         declares: bool,
     },
     /// The custom-property environment one of an element's synthetic pseudo-elements holds, or none.
@@ -69,20 +77,27 @@ pub(crate) struct InputTransaction {
 impl EngineWrite {
     pub(crate) fn apply(self, engine: &mut StyleEngine) {
         match self {
-            Self::PublishFontFaces(font_faces) => match &mut engine.host.font_resolver {
-                Some(resolver) => resolver.publish(font_faces),
-                None => {
-                    engine.host.font_resolver = Some(FontResolverHost::new(font_faces));
-                    engine.retained.font_resolution = Some(FontResolutionCache::default());
+            Self::PublishFontFaces {
+                font_faces,
+                feature_values_shadow_scopes,
+            } => {
+                match &mut engine.host.font_resolver {
+                    Some(resolver) => resolver.publish(font_faces),
+                    None => engine.host.font_resolver = Some(FontResolverHost::new(font_faces)),
                 }
-            },
+                engine
+                    .retained
+                    .font_resolution
+                    .get_or_insert_default()
+                    .publish_feature_values_shadow_scopes(feature_values_shadow_scopes);
+            }
             Self::ElementCustomPropertyData {
                 node,
                 data,
                 identity,
-                is_animation_overlay,
+                sampled_over,
                 declares,
-            } => engine.set_element_custom_property_data(node, data, identity, is_animation_overlay, declares),
+            } => engine.set_element_custom_property_data(node, data, identity, sampled_over, declares),
             Self::PseudoElementCustomPropertyData {
                 node,
                 pseudo,
@@ -232,26 +247,39 @@ unsafe fn owned<T: Copy>(values: *const T, count: usize) -> Box<[T]> {
 }
 
 /// Publishes the document's `@font-face` table and the memo of the cascades resolved from it, which every later font
-/// resolution of the engine reads. Takes one reference to each.
+/// resolution of the engine reads. Takes one reference to each. The shadow tree scopes that declare
+/// `@font-feature-values` are the ones whose values the table carries beside the document's.
 ///
 /// # Safety
-/// `host` must be a live document host, and `snapshot` and `memo` a live `Web::CSS::FontFaceSnapshot` and
-/// `FontCascadeMemo`.
+/// `host` must be a live document host, `snapshot` and `memo` a live `Web::CSS::FontFaceSnapshot` and
+/// `FontCascadeMemo`, and `feature_values_shadow_scopes` must point at `feature_values_shadow_scope_count` scopes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_publish_font_faces(
     host: *const DocumentHost,
     snapshot: *const c_void,
     memo: *const c_void,
+    feature_values_shadow_scopes: *const u32,
+    feature_values_shadow_scope_count: usize,
 ) {
     // SAFETY: Guaranteed by the caller.
     let font_faces = unsafe { PublishedFontFaces::adopt(snapshot, memo) };
     // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, EngineWrite::PublishFontFaces(font_faces)) };
+    let feature_values_shadow_scopes =
+        unsafe { borrow(feature_values_shadow_scopes, feature_values_shadow_scope_count) }
+            .iter()
+            .map(|&scope| TreeScopeID(scope))
+            .collect();
+    let write = EngineWrite::PublishFontFaces {
+        font_faces,
+        feature_values_shadow_scopes,
+    };
+    // SAFETY: Guaranteed by the caller.
+    unsafe { queue(host, write) };
 }
 
-/// Keeps the custom-property environment an element now holds, named by `identity`: whether it is the element's
-/// animation overlay, and whether the environment its style resolves to declares custom properties of its own. A null
-/// `data` is none.
+/// Keeps the custom-property environment an element now holds, named by `identity`: for the element's animation
+/// overlay, the environment `base` its style resolved to beneath it, and whether `base` declares custom properties of its
+/// own over the one it inherits. A null `data` is none.
 ///
 /// # Safety
 /// `host` must be a live document host, and `data` null or a live `Web::CSS::CustomPropertyData`.
@@ -263,6 +291,7 @@ pub unsafe extern "C" fn style_engine_set_element_custom_property_data(
     identity: u64,
     is_animation_overlay: bool,
     declares: bool,
+    base: u64,
 ) {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return;
@@ -273,7 +302,7 @@ pub unsafe extern "C" fn style_engine_set_element_custom_property_data(
         node,
         data,
         identity,
-        is_animation_overlay,
+        sampled_over: is_animation_overlay.then_some(base),
         declares,
     };
     // SAFETY: Guaranteed by the caller.
@@ -426,8 +455,7 @@ pub unsafe fn replay_set_element_language(engine: StyleEngineHandle, node: u32, 
     );
 }
 
-/// A read of a document's style engine the host's style code makes, which [`crate::render_state::Query::Engine`]
-/// asks.
+/// A read of a document's style engine the host's style code makes.
 pub(crate) enum StyleQuery {
     /// The custom-property environment an element holds.
     ElementCustomPropertyData(StyleNodeID),
@@ -440,21 +468,19 @@ pub(crate) enum StyleQuery {
     /// The random caching keys that name an element, with their values.
     ElementRandomBaseValues(StyleNodeID),
     /// The record of an element or one of its pseudo-elements the host reads before the next style update.
-    RecordDemand { node: StyleNodeID, demand: FfiRecordDemand },
+    RecordDemand { node: StyleNodeID, demand: RecordDemand },
     /// What a style record's values depend on.
     StyleRecordDependencyFlags(u64),
     /// The identity of the custom-property environment a style record was computed in.
     StyleRecordCustomPropertyEnvironment(u64),
-    /// The groups of a node's style that depend on `currentColor`.
-    CurrentColorDependentGroupMask { node: StyleNodeID, pseudo_kind: u8 },
     /// The engine's id of the native rule the host names by `identity`.
     NativeRuleId(u64),
     /// The engine's counter at `index`.
     Counter(usize),
     /// The end of the transaction the host took last, which answers the identities it released.
     EndTransaction,
-    /// A read the boundary generator writes.
-    Generated(super::bridge::GeneratedStyleQuery),
+    /// What a transition step's change of records does to its target's transitions.
+    DecideTransitions(crate::css::transition::TransitionDecision),
 }
 
 /// The answer to a [`StyleQuery`].
@@ -466,14 +492,14 @@ pub(crate) enum StyleAnswer {
     RandomBaseValues(Vec<(Box<[u16]>, f64)>),
     RecordDemand(FfiRecordDemandAnswer),
     Counter(Option<(&'static str, u64)>),
-    Generated(super::bridge::GeneratedStyleAnswer),
+    Transitions(Vec<crate::css::transition::DecidedTransition>),
 }
 
 impl StyleQuery {
     pub(crate) fn answer(self, engine: &mut StyleEngine) -> StyleAnswer {
         match self {
-            Self::Generated(query) => StyleAnswer::Generated(query.answer(engine)),
             Self::EndTransaction => StyleAnswer::Nodes(super::bridge::end_style_transaction(engine)),
+            Self::DecideTransitions(decision) => StyleAnswer::Transitions(decision.answer(engine)),
             Self::ElementCustomPropertyData(node) => {
                 StyleAnswer::HostObject(engine.element_custom_property_data(node).addr())
             }
@@ -483,7 +509,11 @@ impl StyleQuery {
             Self::PseudoElementsWithCustomPropertyData(node) => {
                 StyleAnswer::Number(engine.pseudo_elements_with_custom_property_data(node))
             }
-            Self::ViewportDependentNodes => StyleAnswer::Nodes(engine.computed_group_sets.viewport_dependent_nodes()),
+            Self::ViewportDependentNodes => {
+                StyleAnswer::Nodes(engine.computed_group_sets.viewport_dependent_nodes(|environment| {
+                    engine.custom_property_environments.reads_viewport(environment)
+                }))
+            }
             Self::ElementRandomBaseValues(node) => {
                 StyleAnswer::RandomBaseValues(engine.random_base_values.element_values(node).to_vec())
             }
@@ -499,16 +529,14 @@ impl StyleQuery {
                     .style_record_custom_property_environment(record)
                     .unwrap_or(0),
             ),
-            Self::CurrentColorDependentGroupMask { node, pseudo_kind } => StyleAnswer::Number(
-                engine
-                    .current_color_dependent_group_mask(node, pseudo_kind)
-                    .unwrap_or(u32::MAX)
-                    .into(),
-            ),
             Self::NativeRuleId(identity) => {
                 StyleAnswer::Number(engine.native_rule_id(identity).map_or(0, |id| u64::from(id.0) + 1))
             }
             Self::Counter(index) => {
+                let retired = engine.computed_group_sets.retired_animation_overlay_records();
+                engine
+                    .counters
+                    .set(Counter::RetiredAnimationOverlayRecords, retired as u64);
                 let counter = engine.counters().iter().nth(index);
                 engine.record_boundary_call(EventKind::Counter, |payload| {
                     payload.write_u64(u64::try_from(index).expect("counter index exceeds u64"));
@@ -532,36 +560,52 @@ pub(crate) struct EngineDoor {
 
 const ENGINE_DOOR: EngineDoor = EngineDoor { _private: () };
 
+/// The document host `host` names.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread, which outlives the borrow.
+pub(crate) unsafe fn document_host<'a>(host: *const DocumentHost) -> &'a DocumentHost {
+    assert!(!host.is_null(), "document host is null");
+    // SAFETY: Guaranteed by the caller.
+    unsafe { &*host }
+}
+
+/// The document host `host` names, for a step that writes the document's style sheets to its engine in place, behind
+/// the drain of the style transaction that flew: the step's writes do not commute with the sheet writes the host queued
+/// beside the transaction, which wait for its drain.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread, which outlives the borrow.
+pub(crate) unsafe fn sheet_writing_host<'a>(host: *const DocumentHost) -> &'a DocumentHost {
+    // SAFETY: Guaranteed by the caller.
+    let host = unsafe { document_host(host) };
+    host.drain_flown_style();
+    host
+}
+
+/// Runs `call` on the style engine of `host`'s document, waiting through the engine door, and answers what it answers.
+/// The engine is borrowed for the call alone, so a host callback that reaches the engine again runs after it.
+pub(crate) fn with_engine<R>(host: &DocumentHost, call: impl FnOnce(&mut StyleEngine) -> R) -> R {
+    crate::render_state::ask(
+        crate::render_state::LockstepProof::for_reason(&ENGINE_DOOR),
+        host,
+        crate::render_state::EngineCall(call),
+    )
+}
+
 /// Asks the style engine of `host`'s document `query`, waiting through the engine door.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread.
 pub(crate) unsafe fn ask_engine(host: *const DocumentHost, query: StyleQuery) -> StyleAnswer {
-    use crate::render_state::{Answer, LockstepProof, Query, ask};
+    use crate::render_state::{LockstepProof, ask};
     assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { &*host };
-    let Answer::Style(answer) = ask(LockstepProof::for_reason(&ENGINE_DOOR), host, Query::Engine(query)) else {
-        unreachable!("an engine question is answered by the engine");
-    };
-    answer
-}
-
-/// Asks the style engine of `host`'s document a read the boundary generator writes.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-pub(crate) unsafe fn ask_engine_generated(
-    host: *const DocumentHost,
-    query: super::bridge::GeneratedStyleQuery,
-) -> super::bridge::GeneratedStyleAnswer {
-    // SAFETY: Guaranteed by the caller.
-    let StyleAnswer::Generated(answer) = (unsafe { ask_engine(host, StyleQuery::Generated(query)) }) else {
-        unreachable!("a generated read is answered by its generated answer");
-    };
-    answer
+    ask(LockstepProof::for_reason(&ENGINE_DOOR), host, query)
 }
 
 /// # Safety
@@ -691,7 +735,7 @@ pub unsafe extern "C" fn style_engine_element_random_base_values(
     }
 }
 
-/// Answer a read of one element's style, or one of its pseudo-elements', the host makes before the next style update.
+/// Answer a read of one element's style the host makes before the next style update.
 ///
 /// # Safety
 ///
@@ -702,6 +746,30 @@ pub unsafe extern "C" fn style_engine_answer_record_demand(
     node: u32,
     demand: FfiRecordDemand,
 ) -> FfiRecordDemandAnswer {
+    // SAFETY: Guaranteed by the caller.
+    unsafe { ask_record_demand(host, node, RecordDemand::Element(demand)) }
+}
+
+/// Answer a read of one of an element's pseudo-elements the host makes before the next style update.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_answer_pseudo_element_record_demand(
+    host: *const DocumentHost,
+    node: u32,
+    demand: FfiPseudoElementRecordDemand,
+    pseudo_element: FfiDemandedPseudoElement,
+) -> FfiRecordDemandAnswer {
+    // SAFETY: Guaranteed by the caller.
+    unsafe { ask_record_demand(host, node, RecordDemand::PseudoElement(demand, pseudo_element)) }
+}
+
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+unsafe fn ask_record_demand(host: *const DocumentHost, node: u32, demand: RecordDemand) -> FfiRecordDemandAnswer {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return FfiRecordDemandAnswer::default();
     };
@@ -742,25 +810,6 @@ pub unsafe extern "C" fn style_engine_style_record_custom_property_environment(
     unsafe { ask_engine_number(host, StyleQuery::StyleRecordCustomPropertyEnvironment(style_record)) }
 }
 
-/// The groups of a node's style that depend on `currentColor`, or every group where the engine does not know.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_current_color_dependent_group_mask(
-    host: *const DocumentHost,
-    node: u32,
-    pseudo_kind: u8,
-) -> u32 {
-    let Some(node) = StyleNodeID::from_raw(node) else {
-        return u32::MAX;
-    };
-    // SAFETY: Guaranteed by the caller.
-    let mask = unsafe { ask_engine_number(host, StyleQuery::CurrentColorDependentGroupMask { node, pseudo_kind }) };
-    u32::try_from(mask).expect("a group mask fits 32 bits")
-}
-
 /// The engine's id of the native rule `identity` names, plus one, or 0 for none.
 ///
 /// # Safety
@@ -798,4 +847,51 @@ pub unsafe extern "C" fn style_engine_counter(
         out_name_length.write(name.len());
     }
     name.as_ptr()
+}
+
+/// Decides what each property `input` prepared does to the transitions of its target, as the target's style changes
+/// from the record `before` to the record `after` it installed. Writes the values each decision compared into its
+/// property, and the decision into `actions`.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread, `input` must be valid, and `actions` must point at
+/// writable storage for one action per property.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_decide_transitions(
+    host: *const DocumentHost,
+    before: u64,
+    after: u64,
+    input: *const FfiTransitionInput,
+    actions: *mut FfiTransitionAction,
+) {
+    crate::css::ffi_stats::rust_style_ffi_note_transition_decision();
+    // SAFETY: Guaranteed by the caller.
+    let input = unsafe { &*input };
+    if input.property_count == 0 {
+        return;
+    }
+    // SAFETY: As above.
+    let properties = unsafe { std::slice::from_raw_parts_mut(input.properties, input.property_count) };
+    let decision = TransitionDecision {
+        before,
+        after,
+        context: input.context,
+        element: (input.target_pseudo_kind == u8::MAX)
+            .then(|| StyleNodeID::from_raw(input.target_node))
+            .flatten(),
+        properties: crate::render_state::Lent::new(properties),
+    };
+    // SAFETY: As above.
+    let StyleAnswer::Transitions(decided) = (unsafe { ask_engine(host, StyleQuery::DecideTransitions(decision)) })
+    else {
+        unreachable!("a transition step is answered with its decisions");
+    };
+    for (index, (property, decided)) in properties.iter_mut().zip(decided).enumerate() {
+        property.before_change_value = decided.before_change_value;
+        property.after_change_value = decided.after_change_value;
+        property.current_value = decided.current_value;
+        // SAFETY: As above.
+        unsafe { actions.add(index).write(decided.action) };
+    }
 }

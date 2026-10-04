@@ -125,7 +125,7 @@ static RefPtr<CSS::StyleValue const> resolved_compositor_animation_style_value(C
         auto inheritance_parent = target.element_to_inherit_style_from();
         auto inheritance_custom_property_data = inheritance_parent.has_value() ? inheritance_parent->custom_property_data() : nullptr;
         auto const* substituted = CSS::StyleValueFFI::rust_substitute_compositor_keyframe_value(
-            target.document().style_computer().style_engine().rust_handle(),
+            target.document().style_computer().style_engine().host(),
             target.element().style_node_id().value(),
             CSS::pseudo_element_to_ffi(target.pseudo_element()),
             custom_property_data ? custom_property_data->rust_store() : nullptr,
@@ -241,9 +241,9 @@ bool CompositorAnimationKeyframes::only_translates_horizontally(Layout::Node con
     return Layout::RustFFI::compositor_animation_effect_only_translates_horizontally(&request, &host);
 }
 
-static void* layout_arena_handle(DOM::Document& document)
+static Layout::RustFFI::DocumentHost* document_host(DOM::Document& document)
 {
-    return document.layout_node_arena().handle();
+    return document.layout_node_arena().host();
 }
 
 CompositorAnimationEffectState::CompositorAnimationEffectState()
@@ -276,7 +276,7 @@ CompositorAnimationEffectState::BuildOutcome CompositorAnimationEffectState::bui
     request.timing.easing = CSS::to_ffi_easing_descriptor<Compositing::RustFFI::FfiEasingDescriptor>(effect.timing_function(), effect_easing_points);
 
     auto host = compositor_animation_host(data);
-    auto outcome = Layout::RustFFI::compositor_animation_effect_build(m_handle, layout_arena_handle(data.target.document()), &request, &host);
+    auto outcome = Layout::RustFFI::compositor_animation_effect_build(m_handle, document_host(data.target.document()), &request, &host);
     return {
         .built = outcome.built,
         .missing_visual_context_node = outcome.missing_visual_context_node,

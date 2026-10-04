@@ -145,7 +145,7 @@ public:
     virtual OpenerPolicy const& active_document_opener_policy() const override;
     virtual Optional<u64> browsing_context_group_id() const override;
     virtual bool active_browsing_context_is_auxiliary() const override;
-    virtual GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const override;
+    virtual GC::Ptr<Navigable> active_browsing_context_opener_navigable() const override;
     virtual ReplicatedContainerState container_state() const override;
     ReplicatedNavigableState replicated_state() const;
     HostedNavigableState hosted_state() const;
@@ -298,9 +298,26 @@ public:
 
     bool record_display_list_and_scroll_state(PaintConfig);
     // Records what brings the compositor context up to date: a new display list, or what changed for the one it has.
-    Optional<Compositor::CompositorFrame> record_compositor_frame(PaintConfig);
-    void paint_next_frame();
-    bool paint_next_frame_if_needed(DOM::UpdateLayoutReason);
+    // A recording that `blocker` does not block flies beside the event loop instead, which finishes its frame once it
+    // takes the recording in.
+    Optional<Compositor::CompositorFrame> record_compositor_frame(PaintConfig, Layout::RustFFI::FfiFlightBlocker = Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate);
+    void paint_next_frame(Layout::RustFFI::FfiFlightBlocker = Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate);
+    // Paints the next frame if it needs one, with its recording kept in step where `blocker` is not none.
+    bool paint_next_frame_if_needed(DOM::UpdateLayoutReason, Layout::RustFFI::FfiFlightBlocker blocker = Layout::RustFFI::FfiFlightBlocker::None);
+
+    enum class TakeIn {
+        // Between two tasks: only a recording that has finished.
+        IfFinished,
+        // Where the recording is needed now: waits for it to finish.
+        Wait,
+    };
+    // Takes the recording in flight in, and presents its frame where it still stands. Answers whether no recording is
+    // in flight any more.
+    bool take_recording_in_flight_in(TakeIn);
+    bool has_recording_in_flight() const { return m_recording_in_flight; }
+    void hold_recording_in_flight_for_testing();
+    void release_recording_in_flight_for_testing();
+
     void render_screenshot(Gfx::PaintingSurface&, PaintConfig, Function<void()>&& callback);
     Compositing::DisplayListResourceStorage& display_list_resource_storage() { return m_presenter.display_list_resource_storage(); }
     Compositing::DisplayListResourceStorage const& display_list_resource_storage() const { return m_presenter.display_list_resource_storage(); }
@@ -410,6 +427,10 @@ protected:
     Variant<Empty, Traversal, Utf16String> m_ongoing_navigation;
 
 private:
+    Layout::RustFFI::FfiFlightBlocker recording_flight_blocker(DOM::UpdateLayoutReason);
+    Optional<Compositor::CompositorFrame> finish_compositor_frame(DOM::Document&, PaintConfig const&, RefPtr<Compositing::DisplayList>);
+    void submit_painted_frame(Compositor::CompositorFrame);
+
     enum class PendingNavigationBehavior {
         Append,
         Replace
@@ -562,6 +583,12 @@ private:
     bool m_is_svg_page { false };
     bool m_needs_repaint { true };
     bool m_needs_to_record_display_list { true };
+
+    // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
+    struct RecordingInFlight;
+    OwnPtr<RecordingInFlight> m_recording_in_flight;
+    bool m_last_recording_in_flight_stood { true };
+
     bool m_pending_set_browser_zoom_request { false };
     bool m_should_show_line_box_borders { false };
     bool m_force_dark_enabled { false };

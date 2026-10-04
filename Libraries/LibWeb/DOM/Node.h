@@ -188,6 +188,16 @@ public:
     virtual bool is_svg_clip_path_element() const { return false; }
     virtual bool is_svg_image_element() const { return false; }
     virtual bool is_svg_text_content_element() const { return false; }
+    virtual bool is_svg_path_element() const { return false; }
+    virtual bool is_svg_rect_element() const { return false; }
+    virtual bool is_svg_circle_element() const { return false; }
+    virtual bool is_svg_ellipse_element() const { return false; }
+    virtual bool is_svg_polyline_element() const { return false; }
+    virtual bool is_svg_polygon_element() const { return false; }
+    virtual bool is_svg_line_element() const { return false; }
+    virtual bool is_svg_text_positioning_element() const { return false; }
+    virtual bool is_svg_text_element() const { return false; }
+    virtual bool is_svg_text_path_element() const { return false; }
 
     bool in_a_document_tree() const;
 
@@ -354,6 +364,13 @@ public:
     // whenever an element child moves relative to the element children after it.
     u32 child_index_generation() const { return m_child_index_generation; }
     bool is_tracked_by_style_engine() const;
+
+    // Whether this subtree waits to take its place in the style engine's tree, and whether a shadow-including
+    // descendant's subtree does. See CSS::take_in_pending_style_arrivals().
+    bool style_arrival_pending() const { return m_style_arrival_pending; }
+    void set_style_arrival_pending(bool value) { m_style_arrival_pending = value; }
+    bool descendant_style_arrival_pending() const { return m_descendant_style_arrival_pending; }
+    void set_descendant_style_arrival_pending(bool value) { m_descendant_style_arrival_pending = value; }
 
     // Mirrors the slottable's assigned slot; see SlottableMixin::set_assigned_slot().
     bool has_assigned_slot() const { return m_has_assigned_slot; }
@@ -616,7 +633,6 @@ protected:
         virtual void visit_edges(Cell::Visitor&);
         virtual size_t external_memory_size() const;
 
-        mutable Optional<UniqueNodeID> unique_id;
         Optional<String> webdriver_node_id;
 
         // https://dom.spec.whatwg.org/#registered-observer-list
@@ -661,9 +677,14 @@ protected:
     u32 m_associated_animation_count_in_subtree { 0 };
     bool m_in_editable_subtree { false };
     bool m_is_connected { false };
-    bool m_has_assigned_slot { false };
-    bool m_inside_blocking_wheel_event_handler { false };
+    // NB: These share a byte, which keeps every node from growing.
+    bool m_has_assigned_slot : 1 { false };
+    bool m_inside_blocking_wheel_event_handler : 1 { false };
+    bool m_style_arrival_pending : 1 { false };
+    bool m_descendant_style_arrival_pending : 1 { false };
     u32 m_child_index_generation { 1 };
+    // The slot of the node directory that names the node by its unique id, or 0 before anything asked for the id.
+    mutable u32 m_node_directory_slot { 0 };
 
     void build_accessibility_tree(AccessibilityTreeNode& parent);
 

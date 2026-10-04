@@ -628,32 +628,28 @@ Optional<StyleProperty> CSSStyleProperties::get_property_internal(PropertyNameAn
     return get_direct_property(property);
 }
 
-static bool is_pseudo_element_the_style_engine_reads(PseudoElement pseudo_element)
-{
-    return first_is_one_of(pseudo_element, PseudoElement::Before, PseudoElement::After, PseudoElement::FirstLetter, PseudoElement::Marker, PseudoElement::Backdrop);
-}
-
-// Install the style engine's record for a pseudo-element a CSSOM read asks for, settled against its element's installed
-// record as a style update settles it. False where the engine leaves the read to C++.
-static bool install_engine_pseudo_element_style(DOM::AbstractElement target)
+// Install the style engine's record for a synthetic pseudo-element a CSSOM read asks for, settled against its
+// element's installed record as a style update settles it. A pseudo-element the engine gives no answer for keeps the
+// record it holds.
+static void install_engine_pseudo_element_style(DOM::AbstractElement target)
 {
     auto pseudo_element = *target.pseudo_element();
-    if (!is_pseudo_element_the_style_engine_reads(pseudo_element))
-        return false;
     auto& element = target.element();
     auto& style_engine = element.document().style_computer().style_engine();
-    auto answer = style_engine.answer_record_demand(element.style_node_id(), { .pseudo_kind = to_underlying(pseudo_element) });
+    auto answer = style_engine.answer_pseudo_element_record_demand(element.style_node_id(), StyleEngine::PseudoElementRecordDemand::CssomRead, *StyleEngine::demanded_pseudo_element(pseudo_element));
     if (!answer.is_absent && answer.record.style_record == 0)
-        return false;
+        return;
     StyleRecordID record { answer.record.style_record };
     element.set_computed_style(pseudo_element, record);
-    // A pseudo-element that generates no box holds no environment either.
-    if (!!record)
-        element.install_engine_pseudo_element_custom_property_data(pseudo_element, record);
+    // A pseudo-element that generates no box holds the environment its rules declare, if any rule styles it.
+    auto environment = !!record ? style_engine.style_record_custom_property_environment(record) : answer.custom_property_environment;
+    if (!!record || environment != 0)
+        element.install_engine_pseudo_element_custom_property_data(pseudo_element, environment);
     else
         element.set_custom_property_data(pseudo_element, nullptr);
+    if (!!record)
+        element.document().style_computer().compose_installed_engine_record(target, {});
     style_engine.acknowledge_engine_computed_record(element.style_node_id());
-    return true;
 }
 
 static void ensure_pseudo_element_style_for_cssom(DOM::AbstractElement abstract_element)
@@ -663,9 +659,23 @@ static void ensure_pseudo_element_style_for_cssom(DOM::AbstractElement abstract_
         return;
     if (!is_synthetic_pseudo_element(*pseudo_element))
         return;
-    if (*pseudo_element != PseudoElement::Backdrop
-        && *pseudo_element != PseudoElement::Selection
-        && abstract_element.computed_style())
+    // A style update keeps current the records of the pseudo-elements an element generates boxes for: its ::before,
+    // ::after and ::first-letter, and a list item's ::marker. A read settles any other kind again.
+    auto is_kept_current = [&] {
+        switch (*pseudo_element) {
+        case PseudoElement::Before:
+        case PseudoElement::After:
+        case PseudoElement::FirstLetter:
+            return true;
+        case PseudoElement::Marker: {
+            auto element_style = abstract_element.element().computed_style();
+            return element_style && element_style->display().is_list_item();
+        }
+        default:
+            return false;
+        }
+    };
+    if (is_kept_current() && abstract_element.computed_style())
         return;
 
     auto& document = abstract_element.document();
@@ -673,17 +683,6 @@ static void ensure_pseudo_element_style_for_cssom(DOM::AbstractElement abstract_
     ScopeGuard end_stabilization_epoch = [&] {
         document.end_style_stabilization_epoch();
     };
-    auto& style_computer = abstract_element.document().style_computer();
-
-    auto compute = [&](DOM::AbstractElement target) {
-        if (install_engine_pseudo_element_style(target))
-            return;
-        bool did_change_custom_properties = false;
-        StyleEngine::StyleRecordDelta style_record_delta {};
-        auto style = style_computer.compute_pseudo_element_style_if_needed(target, did_change_custom_properties, nullptr, style_record_delta);
-        target.element().set_computed_style(*pseudo_element, style ? style_record_delta.new_style_record : StyleRecordID {});
-    };
-
     // A highlight pseudo-element inherits from its parent element's, which nothing keeps current while selection
     // styles are unobservable, so the chain is computed outermost first.
     if (is_highlight_pseudo_element(*pseudo_element) && !document.selection_styles_are_observable()) {
@@ -691,9 +690,9 @@ static void ensure_pseudo_element_style_for_cssom(DOM::AbstractElement abstract_
         for (auto ancestor = abstract_element.element().element_to_inherit_style_from({}); ancestor; ancestor = ancestor->element_to_inherit_style_from({}))
             ancestors.append({ *ancestor, pseudo_element });
         for (auto& ancestor : ancestors.in_reverse())
-            compute(ancestor);
+            install_engine_pseudo_element_style(ancestor);
     }
-    compute(abstract_element);
+    install_engine_pseudo_element_style(abstract_element);
 }
 
 static RefPtr<StyleValue const> resolve_color_style_value(StyleValue const&, Color, ColorResolutionContext const* = nullptr);
@@ -849,13 +848,16 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
             auto style_record = abstract_element.computed_style();
             RefPtr<ComputedValues const> transient_style;
             if (!style_record) {
-                // A synthetic pseudo-element without matching rules has no durable style. The style engine derives the
-                // one it would have for this read alone; where it leaves the read to C++, C++ computes it.
+                // A pseudo-element without a box has no durable style: a synthetic one without matching rules, one no
+                // element in the shadow tree backs, or a named view transition one. The style engine derives the one
+                // it would have for this read alone; a read it answers with none has no value.
                 auto& style_computer = abstract_element.document().style_computer();
-                if (auto pseudo_element = abstract_element.pseudo_element(); pseudo_element.has_value() && is_pseudo_element_the_style_engine_reads(*pseudo_element))
-                    transient_style = style_computer.engine_transient_pseudo_element_style(abstract_element.element(), *pseudo_element);
+                if (auto pseudo_element = abstract_element.pseudo_element(); pseudo_element.has_value()) {
+                    if (auto demanded_pseudo_element = StyleEngine::demanded_pseudo_element(*pseudo_element); demanded_pseudo_element.has_value())
+                        transient_style = style_computer.engine_transient_pseudo_element_style(abstract_element.element(), *demanded_pseudo_element);
+                }
                 if (!transient_style)
-                    transient_style = style_computer.materialize_style_record(abstract_element);
+                    return {};
             }
             auto const* computed_values = style_record ? &*style_record : transient_style.ptr();
             VERIFY(computed_values);

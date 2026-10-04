@@ -85,7 +85,7 @@ class WebContentView final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Web::PageId page_index = 0, WebContentViewInitialState initial_state = {});
+    WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable = {}, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
 #if !defined(LADYBIRD_QT_USE_RHI_WIDGET) && !defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
@@ -133,8 +133,6 @@ public:
     void update_palette(PaletteMode = PaletteMode::Default);
     void update_palette(WebView::WebContentPage&, PaletteMode = PaletteMode::Default);
     Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size) const;
-
-    using ViewImplementation::client;
 
     QPoint map_point_to_global_position(Gfx::IntPoint) const;
 

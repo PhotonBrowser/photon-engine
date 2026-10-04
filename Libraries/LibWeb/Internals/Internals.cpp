@@ -58,6 +58,7 @@
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
+#include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/HTML/AnimatedBitmapDecodedImageData.h>
@@ -883,16 +884,32 @@ WebIDL::ExceptionOr<bool> Internals::has_cookie_for_url(Utf16String const& url, 
     if (!parsed_url.has_value())
         return WebIDL::SimpleException { .type = WebIDL::SimpleExceptionType::TypeError, .message = Utf16String::formatted("Invalid URL: '{}'", url) };
 
-    auto cookies = page().client().page_did_request_all_cookies_webdriver(parsed_url.value());
-    return any_of(cookies, [&](auto const& cookie) {
-        return cookie.name == name && cookie.value == value;
-    });
+    // NB: Look at both the first-party cookies of the URL, as its top-level documents see them, and the cookies of the
+    //     URL under this document's top-level site, as its cross-site frames see them.
+    auto has_cookie = [&](Optional<HTTP::Cookie::PartitionContext> const& partition_context) {
+        auto cookies = page().client().page_did_request_all_cookies_webdriver(parsed_url.value(), partition_context);
+        return any_of(cookies, [&](auto const& cookie) {
+            return cookie.name == name && cookie.value == value;
+        });
+    };
+    if (has_cookie({}))
+        return true;
+
+    auto partition_key = Fetch::Infrastructure::determine_the_network_partition_key(window().associated_document().relevant_settings_object());
+    return partition_key.has_value() && has_cookie(HTTP::Cookie::PartitionContext { partition_key->top_level_site, partition_key->has_cross_site_ancestor });
 }
 
 bool Internals::set_http_memory_cache_enabled(bool enabled)
 {
     auto was_enabled = Web::Fetch::Fetching::http_memory_cache_enabled();
     Web::Fetch::Fetching::set_http_memory_cache_enabled(enabled);
+    return was_enabled;
+}
+
+bool Internals::set_disk_cache_enabled_for_navigations(bool enabled)
+{
+    auto was_enabled = Web::Fetch::Fetching::disk_cache_enabled_for_navigations_for_testing();
+    Web::Fetch::Fetching::set_disk_cache_enabled_for_navigations_for_testing(enabled);
     return was_enabled;
 }
 
@@ -988,9 +1005,9 @@ WebIDL::UnsignedLongLong Internals::full_layout_count()
 
 void Internals::begin_layout_trace()
 {
-    Layout::RustFFI::layout_arena_begin_layout_trace(window().associated_document().layout_node_arena().handle(),
-        [](void* arena, Compositing::RustFFI::NodeSlotId slot, void* sink, void (*append)(void*, u8 const*, size_t)) {
-            auto description = static_cast<Layout::Node const*>(Layout::RustFFI::layout_arena_node_shell_if_live(arena, slot))->debug_description();
+    Layout::RustFFI::render_state_begin_layout_trace(window().associated_document().layout_node_arena().host(),
+        [](Layout::RustFFI::DocumentHost const* host, Compositing::RustFFI::NodeSlotId slot, void* sink, void (*append)(void*, u8 const*, size_t)) {
+            auto description = static_cast<Layout::Node const*>(Layout::RustFFI::render_state_node_shell_if_live(host, slot))->debug_description();
             append(sink, description.bytes().data(), description.bytes().size());
         });
 }
@@ -1003,7 +1020,7 @@ void Internals::update_layout_for_testing()
 Utf16String Internals::take_layout_trace()
 {
     StringBuilder builder;
-    Layout::RustFFI::layout_arena_take_layout_trace(window().associated_document().layout_node_arena().handle(), &builder,
+    Layout::RustFFI::render_state_take_layout_trace(window().associated_document().layout_node_arena().host(), &builder,
         [](void* context, u8 const* bytes, size_t length) {
             static_cast<StringBuilder*>(context)->append(StringView { bytes, length });
         });
@@ -1037,13 +1054,13 @@ void Internals::begin_display_list_trace()
 {
     auto& document = window().associated_document();
     (void)document.paint_state().take_recording_traces();
-    Layout::RustFFI::layout_arena_set_recording_trace_enabled(document.layout_node_arena().handle(), true);
+    Layout::RustFFI::render_state_set_recording_trace_enabled(document.layout_node_arena().host(), true);
 }
 
 Utf16String Internals::take_display_list_trace()
 {
     auto& document = window().associated_document();
-    Layout::RustFFI::layout_arena_set_recording_trace_enabled(document.layout_node_arena().handle(), false);
+    Layout::RustFFI::render_state_set_recording_trace_enabled(document.layout_node_arena().host(), false);
     StringBuilder builder;
     for (auto const& trace : document.paint_state().take_recording_traces())
         builder.append(trace);
@@ -1441,14 +1458,16 @@ GC::Ptr<DOM::ShadowRoot> Internals::get_shadow_root(GC::Ref<DOM::Element> elemen
     return element->shadow_root();
 }
 
-void Internals::handle_sdl_input_events()
+void Internals::pump_gamepad_events()
 {
-    page().handle_sdl_input_events();
+    page().client().pump_gamepad_events();
 }
 
 GC::Ref<InternalGamepad> Internals::connect_virtual_gamepad()
 {
-    auto gamepad = InternalGamepad::create(*this);
+    auto virtual_gamepad = page().client().create_virtual_gamepad();
+    VERIFY(virtual_gamepad.has_value());
+    auto gamepad = InternalGamepad::create(window(), *this, virtual_gamepad.release_value());
     m_gamepads.append(gamepad);
     return gamepad;
 }
@@ -1599,6 +1618,23 @@ void Internals::inject_rendering_opportunity(double frame_time_ms)
 {
     auto frame_time = window().associated_document().relevant_settings_object().time_origin() + frame_time_ms;
     page().client().inject_rendering_opportunity(frame_time);
+}
+
+Utf16String Internals::frame_scheduler_state() const
+{
+    return HTML::main_thread_event_loop().has_frame_in_flight() ? "in-flight"_utf16 : "idle"_utf16;
+}
+
+void Internals::hold_next_frame()
+{
+    HTML::main_thread_event_loop().hold_next_frame_for_testing();
+    Layout::RustFFI::render_state_hold_next_recording_for_testing();
+}
+
+void Internals::release_held_frame()
+{
+    Layout::RustFFI::render_state_release_held_recording_for_testing();
+    HTML::main_thread_event_loop().release_held_frames_for_testing();
 }
 
 void Internals::update_compositor_animations()

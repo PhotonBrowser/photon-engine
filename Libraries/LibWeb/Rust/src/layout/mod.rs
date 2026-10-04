@@ -80,18 +80,16 @@ use crate::layout::node_data::NodeKind;
 use crate::layout::node_data::NodeSlotId;
 pub use crate::layout::node_data::STYLE_GROUP_COUNT;
 pub(crate) use abspos_inputs::{AbsposAlignment, StaticPositionAlignment};
-pub(crate) use formatting_context::MainThreadFfiEntry as LayoutMainThreadFfiEntry;
 pub(crate) use formatting_context::{
     ChildLayoutOutcome, DerivedBaselines, FfiLayoutHostCallbacks, FormattingContextRun, LayoutMode, Node, SizingAxis,
     SizingProperty,
 };
-pub(crate) use formatting_context::{LayoutStageJob, LayoutStageOutput};
 pub(crate) use fragment_tree::FragmentLink;
 pub(crate) use geometry::{
     AvailableSize, AvailableSpace, ContainingBlockConstraints, LayoutInput, ParticipationInParentFormattingContext,
     RootSizingDirectives,
 };
-pub(crate) use host_tables::{ArenaHandle, HostTables, TreeBuildWalk};
+pub(crate) use host_tables::{ArenaHandle, HostTables};
 pub(crate) use layout_pass::LayoutPass;
 pub(crate) use node_facts::NodeFacts;
 pub(crate) use rendered_text::{PublishedTextSlot, RenderedText, RenderedTextBoundary, TextFragments};
@@ -105,5 +103,5 @@ use std::ffi::c_void;
 pub(crate) use style_values::StyleValues;
 pub(crate) use tree_builder::MainThreadFfiEntry as TreeBuildMainThreadFfiEntry;
 pub(crate) use update_layout::MainThreadFfiEntry as UpdateMainThreadFfiEntry;
-pub(crate) use update_layout::{LayoutUpdate, run_style_job};
+pub(crate) use update_layout::{LayoutRoundAnswer, LayoutRoundJob, LayoutUpdateReads};
 pub(crate) use used_values::{FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, SizeConstraint, UsedValues};

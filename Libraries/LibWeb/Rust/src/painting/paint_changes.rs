@@ -89,32 +89,21 @@ pub(crate) enum PaintChange {
     InvalidateNearestSelfPaintingInlinePaintCache { node: NodeSlotId },
     /// Every row paints again.
     InvalidateAllPaintCaches,
+    /// The visual context tree is built again whole before it is published next.
+    RequestFullVisualContextRebuild(super::visual_context::dirty::VisualContextGlobalRebuildReason),
+    /// The SVG paint resources the rows enrolled may have changed: they are synced again before they are painted next.
+    SvgPaintResourcesChanged,
+    /// Whether the document's recordings are traced.
+    SetRecordingTraceEnabled(bool),
+    /// The host published the recording `output` and takes it in as the document's last.
+    TakeInRecording {
+        output: Arc<super::record::RecordingOutput>,
+        hit_test_list_changed: bool,
+        publishes_recording: bool,
+    },
 }
 
 impl PaintChange {
-    /// Whether applying the change can alter the published rows: what a paintable row paints and is hit-tested with,
-    /// and the paint facts beside the rows. Paint damage and the paint state the next frame reads alter none.
-    pub(crate) fn alters_published_rows(&self) -> bool {
-        match self {
-            Self::ApplySelection { .. }
-            | Self::ClearSelection { .. }
-            | Self::SetScrollbarEnlarged { .. }
-            | Self::SetDomPaintFacts { .. }
-            | Self::SetLayerImagePaintFacts { .. }
-            | Self::SetReplacedPaintFacts { .. } => true,
-            Self::SetViewportScrollOffset(_)
-            | Self::InvalidateScrollState
-            | Self::SyncSelectionPseudoStyle { .. }
-            | Self::PublishImageMapAreas { .. }
-            | Self::NoteVisualContextBoxDirty { .. }
-            | Self::Repaint { .. }
-            | Self::RepaintSubtree { .. }
-            | Self::InvalidatePaintCache { .. }
-            | Self::InvalidateNearestSelfPaintingInlinePaintCache { .. }
-            | Self::InvalidateAllPaintCaches => false,
-        }
-    }
-
     /// Applies the change to `arena`, the arena of the document it was queued for.
     pub(crate) fn apply(self, arena: &mut LayoutNodeArena) {
         match self {
@@ -224,6 +213,18 @@ impl PaintChange {
                 }
             }
             Self::InvalidateAllPaintCaches => arena.push_all_paint_damage(),
+            Self::RequestFullVisualContextRebuild(reason) => arena.request_full_visual_context_rebuild(reason),
+            Self::SvgPaintResourcesChanged => {
+                arena.svg_paint_resources().note_changed();
+            }
+            Self::SetRecordingTraceEnabled(enabled) => arena.paint_state().borrow_mut().trace_recordings = enabled,
+            Self::TakeInRecording {
+                output,
+                hit_test_list_changed,
+                publishes_recording,
+            } => {
+                super::record::publish::take_in_recording(arena, output, hit_test_list_changed, publishes_recording);
+            }
         }
     }
 }
@@ -233,7 +234,7 @@ impl PaintChange {
 /// # Safety
 ///
 /// `host` must come from `document_host_create` and not be destroyed yet, on the document's thread.
-unsafe fn queue(host: *const DocumentHost, change: PaintChange) {
+pub(crate) unsafe fn queue(host: *const DocumentHost, change: PaintChange) {
     assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the caller.
     unsafe { &*host }.queue_change(ArenaChange::Paint(change));
@@ -568,4 +569,40 @@ pub unsafe extern "C" fn render_state_invalidate_nearest_self_painting_inline_pa
 pub unsafe extern "C" fn render_state_invalidate_all_paint_caches(host: *const DocumentHost) {
     // SAFETY: Guaranteed by the caller.
     unsafe { queue(host, PaintChange::InvalidateAllPaintCaches) };
+}
+
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_visual_context_request_full_rebuild(
+    host: *const DocumentHost,
+    reason: crate::painting::host::FfiVisualContextGlobalRebuildReason,
+) {
+    use crate::painting::host::FfiVisualContextGlobalRebuildReason;
+    use crate::painting::visual_context::dirty::VisualContextGlobalRebuildReason;
+    let reason = match reason {
+        FfiVisualContextGlobalRebuildReason::FirstBuild => VisualContextGlobalRebuildReason::FirstBuild,
+        FfiVisualContextGlobalRebuildReason::DocumentWideStructuralChange => {
+            VisualContextGlobalRebuildReason::DocumentWideStructuralChange
+        }
+        FfiVisualContextGlobalRebuildReason::FilterResourcesChanged => {
+            VisualContextGlobalRebuildReason::FilterResourcesChanged
+        }
+        FfiVisualContextGlobalRebuildReason::ForcedForTesting => VisualContextGlobalRebuildReason::ForcedForTesting,
+        FfiVisualContextGlobalRebuildReason::CanonicalDumpRequested => {
+            VisualContextGlobalRebuildReason::CanonicalDumpRequested
+        }
+    };
+    // SAFETY: Guaranteed by the caller.
+    unsafe { queue(host, PaintChange::RequestFullVisualContextRebuild(reason)) };
+}
+
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_set_recording_trace_enabled(host: *const DocumentHost, enabled: bool) {
+    // SAFETY: Guaranteed by the caller.
+    unsafe { queue(host, PaintChange::SetRecordingTraceEnabled(enabled)) };
 }

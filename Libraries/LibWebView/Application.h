@@ -56,6 +56,7 @@
 #include <LibWebView/Settings.h>
 #include <LibWebView/StorageJar.h>
 #include <LibWebView/WebDriverSessionConfig.h>
+#include <RequestServer/SiteBinding.h>
 
 #if defined(AK_OS_MACOS)
 #    include <LibIPC/TransportBootstrapMach.h>
@@ -100,6 +101,7 @@ public:
     static RequestServerOptions const& request_server_options() { return the().m_request_server_options; }
     static WebContentOptions& web_content_options() { return the().m_web_content_options; }
     static FontService& font_service() { return *the().m_font_service; }
+    static FontServiceHost& font_service_host() { return *the().m_font_service_host; }
     JsonValue const& site_compatibility_data() const { return m_site_compatibility_data; }
     ErrorOr<void> reload_site_compatibility_data();
 
@@ -111,6 +113,7 @@ public:
 
     static Requests::RequestClient& request_server_client(IsPrivate = IsPrivate::No);
     static Requests::RequestControlClient& request_server_control_client() { return *the().m_request_server_control_client; }
+    static bool has_request_server_control_client() { return the().m_request_server_control_client; }
     static ImageDecoderClient::Client& image_decoder_client() { return *the().m_image_decoder_client; }
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     static WasmCompilerClient::Client& wasm_compiler_client() { return *the().m_wasm_compiler_client; }
@@ -168,7 +171,7 @@ public:
     static RefPtr<BrowsingSession> existing_session(IsPrivate);
 
     // A RequestServer client uses the cookies of the browsing session it was created for, whatever RequestServer says.
-    void did_connect_request_server_client(int client_id, BrowsingSession&);
+    void did_connect_request_server_client(int client_id, BrowsingSession&, RequestServer::SiteBinding);
     RefPtr<BrowsingSession> session_for_request_server_client(int client_id) const;
     Vector<int> request_server_client_ids_for_testing(BrowsingSession const&) const;
 
@@ -186,7 +189,7 @@ public:
     ErrorOr<Core::GeolocationProvider::WatchId, Core::GeolocationError> start_watching_geolocation_position(Core::GeolocationProvider::SuccessCallback on_success, Core::GeolocationProvider::ErrorCallback on_error);
     void stop_watching_geolocation_position(Core::GeolocationProvider::WatchId);
 
-    ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process(ViewImplementation&);
+    ErrorOr<NonnullRefPtr<WebContentPage>> open_page_for_new_tab(IsPrivate);
     struct ChildFrameWebContentProcess {
         NonnullRefPtr<WebContentClient> client;
         Web::PageId page_id { 0 };
@@ -387,7 +390,7 @@ protected:
     bool has_spare_web_content_process() const { return m_spare_web_content_process; }
 
 private:
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(IsPrivate, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
     ErrorOr<void> launch_compositor_process();
@@ -538,6 +541,7 @@ private:
     RequestServerOptions m_request_server_options;
     WebContentOptions m_web_content_options;
     RefPtr<FontService> m_font_service;
+    OwnPtr<FontServiceHost> m_font_service_host;
     JsonValue m_site_compatibility_data;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
     RefPtr<Core::Timer> m_content_blocker_list_update_timer;
@@ -571,7 +575,6 @@ private:
     RefPtr<WasmCompilerClient::Client> m_wasm_compiler_client;
 #endif
     RefPtr<CompositorClient> m_compositor_client;
-    RefPtr<FontServiceConnection> m_compositor_font_service_connection;
     bool m_reported_compositor_gpu_presentation_unavailable { false };
     bool m_compositor_metal_presentation_enabled { false };
     size_t m_compositor_restart_count { 0 };
@@ -594,6 +597,12 @@ private:
     RefPtr<BrowsingSession> m_default_session;
     WeakPtr<BrowsingSession> m_private_session;
     HashMap<int, WeakPtr<BrowsingSession>> m_request_server_client_sessions;
+
+    // The RequestServer clients of the UI process itself, which may use the cookies of any site.
+    HashTable<int> m_unrestricted_request_server_clients;
+
+    // Whether a RequestServer client may use cookies in the given context for a request for url.
+    bool request_server_client_may_use_cookies_in(int client_id, URL::URL const&, Optional<HTTP::Cookie::PartitionContext> const&) const;
 
     OwnPtr<Core::GeolocationProvider> m_geolocation_provider;
     OwnPtr<Core::TimeZoneWatcher> m_time_zone_watcher;

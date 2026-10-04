@@ -6,6 +6,7 @@
 
 use crate::layout::LayoutNodeArena;
 use crate::painting::display_list::commands::{DisplayListCommandType, DisplayListResourceId, PaintNestedDisplayList};
+use crate::painting::hit_test::HitTestList;
 use crate::painting::host::FfiRecordingPublishCallbacks;
 use crate::painting::paint_state::PendingRecording;
 use crate::painting::record::recorder_state::RecorderState;
@@ -14,7 +15,7 @@ use crate::painting::record::vector_images::{
     VectorImageRenderRequest, is_vector_image_placeholder, vector_image_placeholder_index,
 };
 use crate::painting::record::{RecordingOutput, RecordingResult};
-use crate::painting::recording_slot::RecordingSlot;
+use crate::painting::recording_slot::Publication;
 use crate::painting::svg_paint_resources::published_filter_image_frames_in;
 use crate::stage::MainThread;
 
@@ -59,15 +60,33 @@ fn resolve_vector_image_placeholders(
 /// Publishes a pending recording from the document: hands its resources to the host and takes
 /// its output in.
 pub(crate) fn publish_recording(
-    arena: &LayoutNodeArena,
-    recording: &mut RecordingSlot,
-    pending: PendingRecording,
+    host: &crate::render_state::DocumentHost,
+    publication: Publication<'_>,
     main_thread: &MainThread,
     publish: &FfiRecordingPublishCallbacks,
 ) {
+    let Publication {
+        pending,
+        recorder,
+        hit_test_list,
+    } = publication;
     let publishes_recording = pending.publishes_recording;
-    let output = publish_to_host(pending, recording.recorder(), main_thread, publish);
-    take_in_published_output(arena, recording, output, publishes_recording);
+    let output = publish_to_host(pending, recorder, main_thread, publish);
+    take_in_published_output(
+        recorder,
+        hit_test_list,
+        output,
+        publishes_recording,
+        |output, hit_test_list_changed| {
+            host.queue_change(crate::render_state::ArenaChange::Paint(
+                crate::painting::paint_changes::PaintChange::TakeInRecording {
+                    output,
+                    hit_test_list_changed,
+                    publishes_recording,
+                },
+            ));
+        },
+    );
 }
 
 /// Hands a recording's resources to the host and makes its output, reading nothing but the
@@ -136,53 +155,67 @@ pub(crate) fn publish_to_host(
 /// verification have finished, so the new recording may become the source. Returns the generation
 /// of the document's hit-test list.
 pub(crate) fn take_in_published_output(
-    arena: &LayoutNodeArena,
-    recording: &mut RecordingSlot,
+    recorder: &mut RecorderState,
+    hit_test_list: &mut Option<HitTestList>,
     mut output: RecordingOutput,
     publishes_recording: bool,
-) -> u64 {
-    let mut paint_state = arena.paint_state().borrow_mut();
+    take_in: impl FnOnce(std::sync::Arc<RecordingOutput>, bool),
+) {
     let list = std::mem::take(&mut output.hit_test_list);
-    let previous_list_is_the_source = recording
-        .hit_test_list
+    let previous_list_is_the_source = hit_test_list
         .as_ref()
-        .zip(recording.recorder.published_hit_test_items.as_ref())
+        .zip(recorder.published_hit_test_items.as_ref())
         .is_some_and(|(list, source)| std::sync::Arc::ptr_eq(&list.items, &source.items));
-    if output.is_identical_to_published_recording && previous_list_is_the_source {
-        drop(list);
-    } else {
-        paint_state.hit_test_list_generation += 1;
-        debug_assert_eq!(list.generation, paint_state.hit_test_list_generation);
+    let hit_test_list_changed = !(output.is_identical_to_published_recording && previous_list_is_the_source);
+    if hit_test_list_changed {
         if publishes_recording {
-            recording.recorder.published_hit_test_items =
+            recorder.published_hit_test_items =
                 Some(std::sync::Arc::new(crate::painting::record::PublishedHitTestItems {
                     items: list.items.clone(),
                 }));
         }
-        recording.hit_test_list = Some(list);
+        *hit_test_list = Some(list);
     }
     let output = std::sync::Arc::new(output);
     if publishes_recording {
-        recording.recorder.published_recording = Some(output.clone());
+        recorder.published_recording = Some(output.clone());
+    }
+    take_in(output, hit_test_list_changed);
+}
+
+/// Takes the recording `output` the host published in as the document's last, where `arena` is the document's arena:
+/// the hit-test list generation moves on where the list changed, and a recording that publishes consumes the damage it
+/// painted. Answers the hit-test list generation.
+pub(crate) fn take_in_recording(
+    arena: &LayoutNodeArena,
+    output: std::sync::Arc<RecordingOutput>,
+    hit_test_list_changed: bool,
+    publishes_recording: bool,
+) -> u64 {
+    let mut paint_state = arena.paint_state().borrow_mut();
+    if hit_test_list_changed {
+        paint_state.hit_test_list_generation += 1;
+    }
+    if publishes_recording {
         // Read-only recordings publish nothing and must not consume the damage.
         arena.clear_paint_damage_consumed_by_published_recording();
         paint_state.visual_context.quarantined_slots_are_releasable = true;
     }
     paint_state.last_recording = Some(output);
-    recording.hit_test_list.as_ref().map_or(0, |list| list.generation)
+    paint_state.hit_test_list_generation
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::painting::hit_test::HitTestList;
     use crate::painting::record::damage::PaintDamage;
     use std::sync::Arc;
 
     #[test]
     fn read_only_publication_keeps_the_source_recording_and_the_pending_damage() {
         let mut arena = LayoutNodeArena::new();
-        let mut recording = RecordingSlot::default();
+        let mut recorder = RecorderState::default();
+        let mut hit_test_list = None;
         let row = arena.allocate_for_test().slot;
         arena.populate_paintable_row(row);
         let mut original_source = None;
@@ -198,11 +231,22 @@ mod tests {
                 },
                 ..Default::default()
             };
+            let mut generation = 0;
+            take_in_published_output(
+                &mut recorder,
+                &mut hit_test_list,
+                output,
+                read_write,
+                |output, changed| {
+                    generation = take_in_recording(&arena, output, changed, read_write);
+                },
+            );
+            assert_eq!(generation, hit_test_generation);
             assert_eq!(
-                take_in_published_output(&arena, &mut recording, output, read_write),
+                hit_test_list.as_ref().map_or(0, |list| list.generation),
                 hit_test_generation
             );
-            let source = recording.recorder().published_recording.clone().unwrap();
+            let source = recorder.published_recording.clone().unwrap();
             match hit_test_generation {
                 1 => {
                     original_source = Some(source);

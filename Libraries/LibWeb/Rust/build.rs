@@ -442,12 +442,15 @@ fn write_enum_and_from_ffi(output: &mut String, enum_name: &str, variants: &[Str
     }
     writeln!(output, "}}").unwrap();
     writeln!(output).unwrap();
-    let fn_name = if enum_name == "PseudoClassType" {
-        "pseudo_class_from_ffi"
-    } else {
-        "pseudo_element_from_ffi"
-    };
-    writeln!(output, "pub(crate) fn {fn_name}(value: u8) -> {enum_name} {{").unwrap();
+    // Only the pseudo-classes cross the boundary as numbers.
+    if enum_name != "PseudoClassType" {
+        return;
+    }
+    writeln!(
+        output,
+        "pub(crate) fn pseudo_class_from_ffi(value: u8) -> {enum_name} {{"
+    )
+    .unwrap();
     writeln!(output, "    match value {{").unwrap();
     for (index, variant) in variants.iter().enumerate() {
         writeln!(output, "        {index} => {enum_name}::{variant},").unwrap();
@@ -615,10 +618,6 @@ fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result
     // the order the host made them.
     let mut style_change_variants = String::new();
     let mut style_change_arms = String::new();
-    // The reads the host asks the document's render state, which answers them from the engine.
-    let mut style_query_variants = String::new();
-    let mut style_answer_variants = String::new();
-    let mut style_query_arms = String::new();
 
     for operation in operations {
         let object = operation.as_object().ok_or("boundary operation is not an object")?;
@@ -650,6 +649,9 @@ fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result
         }
         if is_query && (return_kind == "void" || ffi.is_none()) {
             return Err(format!("the query {event} must be an FFI read that answers something").into());
+        }
+        if ffi.is_some() && !is_change && !is_query {
+            return Err(format!("the FFI operation {event} must be a change or a query of the document host").into());
         }
         if let Some(ffi) = ffi
             && !ffi_names.insert(ffi)
@@ -703,13 +705,11 @@ fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result
                 (rust_type, cpp_type, writer, reader)
             }
         };
-        let engine_type = "crate::css::style::StyleEngineHandle";
-        let engine_borrow = if receiver == "const" {
+        let replay_engine_borrow = if receiver == "const" {
             "engine.get()"
         } else {
             "engine.get_mut()"
         };
-        let replay_engine_borrow = engine_borrow;
 
         if let Some(ffi) = ffi
             && is_change
@@ -777,64 +777,31 @@ fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result
                 }
             }
             writeln!(rust, ") -> {rust_return} {{\n    abort_on_panic(|| {{")?;
-            write!(style_query_variants, "    {event} {{")?;
-            write!(style_query_arms, "            Self::{event} {{")?;
+            // A read is answered in place, while the host waits, so it borrows its arguments and names its operation
+            // directly: nothing about it is boxed, sent or dispatched on.
             for (name, kind, (rust_type, _, _, _)) in &parsed_arguments {
                 if kind.ends_with("_slice") {
                     let element_type = rust_type.trim_start_matches("*const ");
                     writeln!(
                         rust,
-                        "        let {name}: Box<[{element_type}]> = if {name}_count == 0 || {name}.is_null() {{ Box::default() }} else {{ unsafe {{ std::slice::from_raw_parts({name}, {name}_count) }}.into() }};"
+                        "        let {name}: &[{element_type}] = if {name}_count == 0 || {name}.is_null() {{ &[] }} else {{ unsafe {{ std::slice::from_raw_parts({name}, {name}_count) }} }};"
                     )?;
-                    write!(style_query_variants, " {name}: Box<[{element_type}]>,")?;
-                } else {
-                    write!(style_query_variants, " {name}: {rust_type},")?;
                 }
-                write!(style_query_arms, " {name},")?;
             }
-            style_query_variants.push_str(" },\n");
-            writeln!(style_answer_variants, "    {event}({rust_return}),")?;
             write!(
-                style_query_arms,
-                " }} => GeneratedStyleAnswer::{event}(operations::{operation_name}(engine"
-            )?;
-            for (name, kind, _) in &parsed_arguments {
-                if kind.ends_with("_slice") {
-                    write!(style_query_arms, ", &{name}")?;
-                } else {
-                    write!(style_query_arms, ", {name}")?;
-                }
-            }
-            style_query_arms.push_str(")),\n");
-            write!(rust, "        let query = GeneratedStyleQuery::{event} {{")?;
-            for (name, _, _) in &parsed_arguments {
-                write!(rust, " {name},")?;
-            }
-            writeln!(
                 rust,
-                " }};\n        let GeneratedStyleAnswer::{event}(result) = (unsafe {{ crate::css::style::engine_calls::ask_engine_generated(document_host, query) }}) else {{ unreachable!(\"a read is answered with its own result\") }};\n        result\n    }})\n}}\n"
+                "        let document_host = unsafe {{ crate::css::style::engine_calls::document_host(document_host) }};\n        crate::css::style::engine_calls::with_engine(document_host, "
             )?;
-        } else if let Some(ffi) = ffi {
-            writeln!(
-                rust,
-                "/// Generated from the StyleEngine boundary specification.\n///\n/// # Safety\n/// `engine` and every borrowed argument must be live for this call.\n#[unsafe(no_mangle)]"
-            )?;
-            write!(rust, "pub unsafe extern \"C\" fn {ffi}(engine: {engine_type}")?;
-            for (name, kind, (rust_type, _, _, _)) in &parsed_arguments {
-                write!(rust, ", {name}: {rust_type}")?;
-                if kind.ends_with("_slice") {
-                    write!(rust, ", {name}_count: usize")?;
-                }
-            }
-            if return_kind != "void" {
-                writeln!(rust, ") -> {rust_return} {{")?;
+            if parsed_arguments.is_empty() && receiver != "const" {
+                write!(rust, "operations::{operation_name}")?;
             } else {
-                rust.push_str(") {\n");
+                write!(rust, "|engine| operations::{operation_name}(engine")?;
+                for (name, _, _) in &parsed_arguments {
+                    write!(rust, ", {name}")?;
+                }
+                rust.push(')');
             }
-            writeln!(
-                rust,
-                "    abort_on_panic(|| {{\n        let engine = unsafe {{ {engine_borrow} }};"
-            )?;
+            rust.push_str(")\n    })\n}\n\n");
         }
         let native_receiver = if receiver == "const" {
             "&StyleEngine"
@@ -846,12 +813,6 @@ fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result
             if kind.ends_with("_slice") {
                 let element_type = rust_type.trim_start_matches("*const ");
                 write!(native, ", {name}: &[{element_type}]")?;
-                if ffi.is_some() && !is_change && !is_query {
-                    writeln!(
-                        rust,
-                        "        let {name}: &[{element_type}] = if {name}_count == 0 || {name}.is_null() {{ &[] }} else {{ unsafe {{ std::slice::from_raw_parts({name}, {name}_count) }} }};"
-                    )?;
-                }
             } else {
                 write!(native, ", {name}: {rust_type}")?;
             }
@@ -860,17 +821,6 @@ fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result
             native.push_str(") {\n");
         } else {
             writeln!(native, ") -> {rust_return} {{")?;
-        }
-        if ffi.is_some() && !is_change && !is_query {
-            write!(rust, "        operations::{operation_name}(engine")?;
-            for (name, _, _) in &parsed_arguments {
-                write!(rust, ", {name}")?;
-            }
-            rust.push_str(if return_kind == "void" {
-                ");\n    });\n}\n\n"
-            } else {
-                ")\n    })\n}\n\n"
-            });
         }
         for (name, _, _) in &parsed_arguments {
             writeln!(native, "        let recorded_{name} = {name};")?;
@@ -1010,11 +960,7 @@ fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result
         } else {
             cpp_definitions.push_str("    ");
         }
-        if is_change || is_query {
-            write!(cpp_definitions, "StyleEngineFFI::{ffi}(m_render_document->host()")?;
-        } else {
-            write!(cpp_definitions, "StyleEngineFFI::{ffi}(m_impl")?;
-        }
+        write!(cpp_definitions, "StyleEngineFFI::{ffi}(m_render_document->host()")?;
         for (name, kind, _) in &parsed_arguments {
             if matches!(
                 *kind,
@@ -1060,10 +1006,6 @@ fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result
     write!(
         rust,
         "\n/// A write of the host to the document's style engine, which the render state applies to it.\npub(crate) enum StyleChange {{\n{style_change_variants}}}\n\nimpl StyleChange {{\n    pub(crate) fn apply(self, engine: &mut StyleEngine) {{\n        match self {{\n{style_change_arms}        }}\n    }}\n}}\n"
-    )?;
-    write!(
-        rust,
-        "\n/// A read of the host of the document's style engine, which the render state answers from it.\npub(crate) enum GeneratedStyleQuery {{\n{style_query_variants}}}\n\n/// The answer to a [`GeneratedStyleQuery`].\npub(crate) enum GeneratedStyleAnswer {{\n{style_answer_variants}}}\n\nimpl GeneratedStyleQuery {{\n    pub(crate) fn answer(self, engine: &mut StyleEngine) -> GeneratedStyleAnswer {{\n        match self {{\n{style_query_arms}        }}\n    }}\n}}\n"
     )?;
     std::fs::write(out_dir.join("style_engine_boundary_generated.rs"), rust)?;
     std::fs::write(out_dir.join("style_engine_replay_generated.rs"), replay)?;
@@ -1466,11 +1408,8 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
             .ok_or("missing always-allowed pseudo-element property group")?,
     )?;
     let mut pseudo_property_whitelist_rows = Vec::new();
-    let mut pseudo_is_highlight_rows = Vec::new();
     for name in ordered_pseudo_element_names(&pseudo_elements)? {
         let object = pseudo_elements[&name].as_object().unwrap();
-        let is_highlight = object.get("is-highlight").and_then(serde_json::Value::as_bool) == Some(true);
-        pseudo_is_highlight_rows.push(format!("    {is_highlight},"));
         let Some(whitelist) = object.get("property-whitelist") else {
             pseudo_property_whitelist_rows.push("    None,".to_string());
             continue;
@@ -1486,7 +1425,6 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     }
     // UnknownWebKit follows the known pseudo-elements and accepts all properties.
     pseudo_property_whitelist_rows.push("    None,".to_string());
-    pseudo_is_highlight_rows.push("    false,".to_string());
 
     // NB: Must match manually_specified_computation_order in
     //     Meta/Generators/generate_libweb_css_property_id.py; the parity test enforces it.
@@ -2421,11 +2359,6 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         pseudo_property_whitelist_rows.len(),
         pseudo_property_whitelist_rows.join("\n")
     ));
-    output.push_str(&format!(
-        "pub(crate) static PSEUDO_ELEMENT_IS_HIGHLIGHT: [bool; {}] = [\n{}\n];\n",
-        pseudo_is_highlight_rows.len(),
-        pseudo_is_highlight_rows.join("\n")
-    ));
     std::fs::write(out_dir.join("property_metadata_generated.rs"), output)?;
     Ok(())
 }
@@ -3057,8 +2990,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     // an FFI call.
     let mut style_value_config = base_config.clone();
     style_value_config.namespaces = Some(vec!["Web".to_string(), "CSS".to_string(), "StyleValueFFI".to_string()]);
-    style_value_config.export.include = vec!["StyleValueData".to_string(), "RetainedGridTrackEntry".to_string()];
+    // A transition step's inputs and decisions cross through the style engine's header, which names them here.
+    style_value_config.export.include = [
+        "StyleValueData",
+        "RetainedGridTrackEntry",
+        "FfiTransitionInput",
+        "FfiTransitionPropertyInput",
+        "FfiTransitionAction",
+    ]
+    .map(String::from)
+    .to_vec();
     expose_compositing_types_as_cpp_types(&mut style_value_config);
+    // A compositor keyframe value is substituted by the document's style engine, which the document host reaches.
+    style_value_config.export.rename.insert(
+        "DocumentHost".to_string(),
+        "Web::Layout::RustFFI::DocumentHost".to_string(),
+    );
+    style_value_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::Layout::RustFFI { struct DocumentHost; }");
 
     generate_ffi_header(
         style_value_config,
@@ -3097,17 +3048,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiValueParsingContextKind".to_string(),
         "FfiUtf16View".to_string(),
         "FfiQueryHandle".to_string(),
-        "EvaluateContainerStyleFeature".to_string(),
-        "FfiContainerFacts".to_string(),
-        "FfiContainerStyleFeature".to_string(),
-        "FfiContainerStyleFeatureKind".to_string(),
-        "FfiStyleRangeValue".to_string(),
-        "FfiStyleRangeValueKind".to_string(),
         "FfiMediaEnvironment".to_string(),
         "FfiMediaFeatureValue".to_string(),
         "FfiMediaFeatureValueKind".to_string(),
         "ParseContext".to_string(),
     ];
+    // A tree scope's counter styles are queued on the document host, which the layout header declares.
+    value_parser_config.export.rename.insert(
+        "DocumentHost".to_string(),
+        "Web::Layout::RustFFI::DocumentHost".to_string(),
+    );
+    value_parser_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::Layout::RustFFI { struct DocumentHost; }");
 
     generate_ffi_header(
         value_parser_config,
@@ -3168,8 +3122,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiCompositeOperation".to_string(),
         "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
     );
-    style_engine_config.after_includes =
-        Some("namespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; }".to_string());
+    // A transition step's decision is asked of the engine in the style value header's terms.
+    for name in ["FfiTransitionInput", "FfiTransitionAction"] {
+        style_engine_config
+            .export
+            .rename
+            .insert(name.to_string(), format!("Web::CSS::StyleValueFFI::{name}"));
+    }
+    style_engine_config.after_includes = Some(
+        "namespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; struct FfiTransitionInput; struct FfiTransitionAction; }"
+            .to_string(),
+    );
     // The host queues the engine's changes on the document host, which the layout header declares.
     style_engine_config.export.rename.insert(
         "DocumentHost".to_string(),
@@ -3179,6 +3142,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .after_includes
         .get_or_insert_with(String::new)
         .push_str("\nnamespace Web::Layout::RustFFI { struct DocumentHost; }");
+    // A style transaction flies only where nothing blocks it, which the layout header names as it does for a recording.
+    style_engine_config.export.rename.insert(
+        "FfiFlightBlocker".to_string(),
+        "Web::Layout::RustFFI::FfiFlightBlocker".to_string(),
+    );
+    style_engine_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::Layout::RustFFI { enum class FfiFlightBlocker : uint8_t; }");
 
     generate_ffi_header(
         style_engine_config,
@@ -3264,6 +3236,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .as_mut()
         .unwrap()
         .push_str("\nnamespace Web::CSS::Parser::ValueParserFFI { struct DeclarationBlockData; }");
+    // An animation sample and plan read the document's style engine, which the document host reaches.
+    computed_values_config.export.rename.insert(
+        "DocumentHost".to_string(),
+        "Web::Layout::RustFFI::DocumentHost".to_string(),
+    );
+    computed_values_config
+        .after_includes
+        .as_mut()
+        .unwrap()
+        .push_str("\nnamespace Web::Layout::RustFFI { struct DocumentHost; }");
 
     let libgfx_font_source = manifest_dir.join("../../LibGfx/Rust/src/font.rs");
     println!("cargo:rerun-if-changed={}", libgfx_font_source.display());
@@ -3343,6 +3325,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/render_state.rs"),
             manifest_dir.join("src/render_state/devtools.rs"),
             manifest_dir.join("src/render_state/document_host.rs"),
+            manifest_dir.join("src/stage_thread.rs"),
             manifest_dir.join("../../RustAllocator.rs"),
         ],
         &out_dir,
@@ -3378,7 +3361,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/display.rs"),
             manifest_dir.join("src/layout/formatting_context.rs"),
             manifest_dir.join("src/layout/layout_changes.rs"),
-            manifest_dir.join("src/layout/formatting_context/main_thread_entries.rs"),
             manifest_dir.join("src/layout/viewport_propagation.rs"),
             manifest_dir.join("src/layout/update_layout.rs"),
             manifest_dir.join("src/layout/update_layout/main_thread_entries.rs"),

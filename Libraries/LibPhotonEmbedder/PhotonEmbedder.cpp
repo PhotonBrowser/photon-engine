@@ -88,8 +88,8 @@ public:
             || !view->m_callbacks.native_backing_registered
             || !view->m_callbacks.native_frame_ready)
             Application::the().notify_compositor_gpu_presentation_unavailable();
-        view->initialize_client(CreateNewClient::Yes);
-        // initialize_client() establishes the WebContent client and can
+        view->initialize_tab(Web::HTML::VisibilityState::Visible);
+        // initialize_tab() establishes the WebContent client and can
         // initialize its viewport from the platform screen before the
         // embedder's requested size has propagated. Reapply the view's actual
         // initial viewport after that setup so the first presented frame uses
@@ -260,7 +260,7 @@ private:
             auto paint_completed = std::chrono::steady_clock::now();
             static uint64_t trace_frame_id = 0;
             auto current_trace_frame_id = ++trace_frame_id;
-            auto const& front = m_client_state.front_bitmap;
+            auto const& front = m_front_bitmap;
             if (photon_frame_trace_enabled()) dbgln("[Photon] frame_callback id={} at_ns={} bitmap={} native={}", current_trace_frame_id, MonotonicTime::now().nanoseconds(), front.id,
 #if defined(AK_OS_MACOS)
                 m_callbacks.native_metal_presentation && !m_native_presentation_failed

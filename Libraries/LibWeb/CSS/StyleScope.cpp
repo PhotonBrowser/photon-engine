@@ -288,10 +288,24 @@ void SheetSetStyleCacheRegistry::visit_edges(GC::Cell::Visitor& visitor)
     }
 }
 
+StyleCache* StyleScope::style_cache() const
+{
+    if (m_reads_document_sheetless_style_cache)
+        return document().style_scope().m_sheetless_shadow_root_style_cache.ptr();
+    return m_style_cache.ptr();
+}
+
+bool StyleScope::has_valid_rule_cache() const
+{
+    auto* style_cache = this->style_cache();
+    return style_cache && style_cache->rule_cache;
+}
+
 StyleCache& StyleScope::ensure_style_cache()
 {
-    if (m_style_cache)
-        return *m_style_cache;
+    if (auto* style_cache = this->style_cache())
+        return *style_cache;
+    m_reads_document_sheetless_style_cache = false;
 
     // NB: A quirks-mode scope folds id and class name case into its bucket keys, and neither shared cache
     //     below keys on that, so such a scope keeps its own cache.
@@ -304,6 +318,18 @@ StyleCache& StyleScope::ensure_style_cache()
             else
                 sheets.append(style_sheet);
         });
+
+        // OPTIMIZATION: A scope with no stylesheets of its own, such as the user-agent shadow tree of every form
+        //               control, holds only what the user-agent origin puts in its cache. That is the same for every
+        //               such scope in the document, so they read one, which the document's scope holds and drops
+        //               along with its own.
+        if (all_sheets_are_constructed && sheets.is_empty()) {
+            auto& shared_style_cache = document().style_scope().m_sheetless_shadow_root_style_cache;
+            if (!shared_style_cache)
+                shared_style_cache = StyleCache::create();
+            m_reads_document_sheetless_style_cache = true;
+            return *shared_style_cache;
+        }
 
         if (all_sheets_are_constructed && !sheets.is_empty()) {
             if (sheets.size() == 1) {
@@ -335,8 +361,9 @@ void StyleScope::build_rule_cache()
     if (!style_cache.rule_cache) {
         ++document().style_invalidation_counters().scope_rule_cache_builds;
 
+        static u64 s_last_rule_cache_generation = 0;
         style_cache.rule_cache = make<StyleRuleCache>();
-        ++style_cache.rule_cache_generation;
+        style_cache.rule_cache_generation = ++s_last_rule_cache_generation;
         populate_rule_cache(*style_cache.rule_cache);
     }
 
@@ -375,6 +402,8 @@ void StyleScope::invalidate_style_cache()
     document().note_style_sheet_set_change();
     invalidate_counter_style_cache();
     m_style_cache = nullptr;
+    m_reads_document_sheetless_style_cache = false;
+    m_sheetless_shadow_root_style_cache = nullptr;
     m_published_layer_order_generation = 0;
     // The registered custom properties cache is built from the document's active stylesheets, so it only needs a
     // rebuild when the document scope's rule set changes.
@@ -415,7 +444,7 @@ void StyleScope::build_user_style_sheet_if_needed()
 
 void StyleScope::build_rule_cache_if_needed() const
 {
-    if (has_valid_rule_cache() && m_published_layer_order_generation == m_style_cache->rule_cache_generation)
+    if (has_valid_rule_cache() && m_published_layer_order_generation == style_cache()->rule_cache_generation)
         return;
     const_cast<StyleScope&>(*this).build_rule_cache();
 }
@@ -423,7 +452,7 @@ void StyleScope::build_rule_cache_if_needed() const
 StyleRuleCache const& StyleScope::rule_cache() const
 {
     build_rule_cache_if_needed();
-    return *m_style_cache->rule_cache;
+    return *style_cache()->rule_cache;
 }
 
 static StyleSheetState& default_stylesheet()
@@ -657,7 +686,7 @@ void StyleScope::publish_cascade_layer_order(StyleSheetState* pending_attachment
         sheets.append(pending_attachment->native_sheet().handle());
 
     m_has_published_named_layer_order = Parser::ValueParserFFI::rust_style_sheet_publish_layer_order(
-        sheets.data(), sheets.size(), document().style_computer().style_engine().rust_handle(),
+        sheets.data(), sheets.size(), document().style_computer().style_engine().host(),
         style_engine_tree_scope().value(), m_has_published_named_layer_order, &document(),
         [](void* document) { static_cast<DOM::Document*>(document)->flush_deferred_style_change_event(); });
 }
@@ -666,7 +695,7 @@ void StyleScope::publish_cascade_layer_order(StyleSheetState* pending_attachment
 // animation's keyframes from these, so it never builds a rule cache itself.
 void StyleScope::publish_animation_keyframes()
 {
-    auto const& keyframes = m_style_cache->rule_cache->rules_by_animation_keyframes;
+    auto const& keyframes = style_cache()->rule_cache->rules_by_animation_keyframes;
     Vector<u32> name_lengths;
     Vector<u16> name_units;
     Vector<size_t> keyframe_sets;
@@ -685,7 +714,7 @@ void StyleScope::publish_animation_keyframes()
     if (published.is_empty() && m_published_keyframe_sets.is_empty())
         return;
     StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(
-        document().style_computer().style_engine().rust_handle(), style_engine_tree_scope().value(),
+        document().style_computer().style_engine().host(), style_engine_tree_scope().value(),
         bit_cast<FlatPtr>(as_if<DOM::ShadowRoot>(*m_node)), name_lengths.data(), name_units.data(), name_units.size(),
         keyframe_sets.data(), name_lengths.size());
     m_published_keyframe_sets = move(published);
@@ -1162,8 +1191,8 @@ void StyleScope::publish_counter_styles_if_changed() const
         names.unchecked_append(name.to_raw_leaked());
         counter_styles.unchecked_append(counter_style->rust_counter_style());
     }
-    Parser::ValueParserFFI::rust_publish_counter_styles(
-        document().layout_node_arena().handle(),
+    Parser::ValueParserFFI::render_state_publish_counter_styles(
+        document().layout_node_arena().host(),
         style_engine_tree_scope().value(),
         parent_tree_scope.has_value() ? parent_tree_scope->value() : 0,
         parent_tree_scope.has_value(),

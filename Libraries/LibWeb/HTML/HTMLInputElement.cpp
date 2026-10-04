@@ -1268,8 +1268,12 @@ void HTMLInputElement::create_text_input_shadow_tree()
     MUST(m_placeholder_element->append_child(*m_placeholder_text_node));
 
     if (type_state() == TypeAttributeState::Number) {
+        // NB: The buttons start out with the style they have when shown, so that the style application that follows
+        //     only rewrites their declarations when appearance hides them.
+
         // Up button
         m_up_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
+        set_own_inline_style(*m_up_button_element, stepper_button_style_when_visible());
 
         auto up_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
         up_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_utf16);
@@ -1309,6 +1313,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
 
         // Down button
         m_down_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
+        set_own_inline_style(*m_down_button_element, stepper_button_style_when_visible());
 
         auto down_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
         down_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_utf16);
@@ -1851,6 +1856,10 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     request->set_use_url_credentials(true);
 
     // 4. Fetch request, with processResponseEndOfBody set to the following steps given response response:
+    // NB: Fetching the image must delay the load event of the element's node document until the task that is queued by
+    //     the networking task source once the resource has been fetched (defined below) has been run.
+    m_load_event_delayer.emplace(document());
+
     m_resource_request = SharedResourceRequest::get_or_create(document(), request->url());
     CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
@@ -1883,16 +1892,15 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
             //     now that the load failed it renders its alt text instead.
             update_image_button_alt_text_shadow_tree();
             set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
+        },
+        [this]() {
+            m_load_event_delayer.clear();
         });
 
     if (m_resource_request->needs_fetching()) {
         m_resource_request->fetch_resource(request);
     }
     update_image_button_alt_text_shadow_tree();
-
-    // Fetching the image must delay the load event of the element's node document until the task that is queued by the
-    // networking task source once the resource has been fetched (defined below) has been run.
-    m_load_event_delayer.emplace(document());
 
     return {};
 }

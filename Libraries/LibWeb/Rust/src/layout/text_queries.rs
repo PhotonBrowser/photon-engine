@@ -128,8 +128,8 @@ unsafe fn ensure_text_fragments(arena: *mut LayoutNodeArena, primary: NodeSlotId
     // SAFETY: The caller lends the live arena; the IDs do not borrow it.
     let fragments = unsafe { &*arena }.text_fragments(primary);
     for &node in fragments.as_slice() {
-        // SAFETY: No arena borrow crosses the refresh's source callback.
-        unsafe { ensure_text_content(arena, node) };
+        // SAFETY: The caller lends the live arena, which nothing else borrows meanwhile.
+        ensure_text_content(unsafe { &mut *arena }, node);
     }
 }
 
@@ -324,8 +324,7 @@ fn ensure_searchable_text(
                 if !is_searchable(text) {
                     continue;
                 }
-                // SAFETY: The arena is borrowed exclusively.
-                unsafe { ensure_text_content(arena, node) };
+                ensure_text_content(arena, node);
                 let content = arena.text_content(node).expect("search text was refreshed");
                 builder.append(node, &content.text, collapses_whitespace(arena, node));
             }
@@ -391,10 +390,12 @@ pub(crate) fn find_matching_text(
     for block in arena.searchable_text.as_ref().expect("search cache was prepared") {
         let mut offset = 0;
         while let Some(index) = find_text(&block.text, query, offset, case_sensitive) {
-            if let Some(range) = block.dom_range(arena, index..index + query.len()) {
+            if let Some(range) = block.dom_range(arena, index..index + query.len())
+                && matches.last() != Some(&range)
+            {
                 matches.push(range);
             }
-            offset = index + query.len() + 1;
+            offset = index + query.len();
             if offset >= block.text.len() {
                 break;
             }
@@ -423,13 +424,12 @@ pub unsafe extern "C" fn layout_text_word_range(
     primary: NodeSlotId,
     dom_offset: usize,
 ) -> FfiTextSourceRange {
-    use crate::render_state::{Answer, ArenaAnswer, ArenaQuery, LockstepProof, Query, ask};
+    use crate::render_state::{ArenaAnswer, ArenaQuery, LockstepProof, ask};
     assert!(!host.is_null(), "document host is null");
-    let query = Query::Arena(ArenaQuery::WordRange { primary, dom_offset });
+    let query = ArenaQuery::WordRange { primary, dom_offset };
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { &*host };
-    let Answer::Arena(ArenaAnswer::Range(range)) = ask(LockstepProof::for_reason(&INPUT_SELECTS_BY_WORD), host, query)
-    else {
+    let ArenaAnswer::Range(range) = ask(LockstepProof::for_reason(&INPUT_SELECTS_BY_WORD), host, query) else {
         unreachable!("a word range is answered with a range");
     };
     range
@@ -552,6 +552,22 @@ mod tests {
             .free_subtree(text)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
         assert!(arena.searchable_text.is_none());
+    }
+
+    #[test]
+    fn search_finds_a_match_that_starts_where_the_previous_match_ends() {
+        let mut arena = LayoutNodeArena::new();
+        let text = node(&mut arena, "foofoo", 0, 6, Vec::new());
+        let mut builder = SearchTextBuilder::default();
+        builder.append(text, &arena.text_content(text).unwrap().text, false);
+        builder.flush();
+        arena.searchable_text = Some(builder.blocks);
+        let query: Vec<u16> = "foo".encode_utf16().collect();
+        let offsets: Vec<_> = find_matching_text(&mut arena, text, &query, true, &[])
+            .iter()
+            .map(|range| (range.start_offset, range.end_offset))
+            .collect();
+        assert_eq!(offsets, [(0, 3), (3, 6)]);
     }
 
     #[test]

@@ -56,7 +56,6 @@ public:
     static Compositing::RustFFI::NodeSlotId slot_id(Node const*);
     RustFFI::NodeKind kind() const { return m_kind; }
     u32 arena_slot_index() const { return m_slot.index; }
-    void* arena_handle() const;
     NodeArena& node_arena() const { return *m_arena; }
     RustFFI::DocumentHost* document_host() const;
 
@@ -186,8 +185,8 @@ public:
         return false;
     }
 
-    bool is_anonymous() const { return has_flag(RustFFI::NodeFlag::Anonymous); }
-    bool is_document_element() const { return has_flag(RustFFI::NodeFlag::IsDocumentElement); }
+    bool is_anonymous() const { return has_identity_flag<RustFFI::NodeFlag::Anonymous>(); }
+    bool is_document_element() const { return has_identity_flag<RustFFI::NodeFlag::IsDocumentElement>(); }
     bool insets_use_anchor_functions() const { return has_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions); }
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
@@ -245,9 +244,10 @@ public:
     static CSS::StyleNodeID style_node_of(DOM::Node const*);
     static void dom_node_style_node_changed(DOM::Node&, CSS::StyleNodeID old_style_node);
 
-    void clear_committed_box();
     void prepare_for_detach_from_layout_tree();
     void prepare_subtree_for_detach_from_layout_tree();
+    // Clears the committed boxes of the subtree and prepares it for detaching, as a removal does before dropping it.
+    void prepare_subtree_for_removal();
     void pin_style_record_for_detachment();
 
     // Returns the direct viewport child above this node (the node itself or its outermost
@@ -323,6 +323,15 @@ protected:
         return (RustFFI::layout_row_flags(document_host(), m_slot) & static_cast<u32>(flag)) != 0;
     }
 
+    // A flag that says what node the row stands for, which installing a style never changes, so reading it waits for
+    // no rows to be published again after one.
+    template<RustFFI::NodeFlag flag>
+    bool has_identity_flag() const
+    {
+        static_assert(flag == RustFFI::NodeFlag::Anonymous || flag == RustFFI::NodeFlag::IsBody || flag == RustFFI::NodeFlag::IsDocumentElement);
+        return (RustFFI::layout_row_identity_flags(document_host(), m_slot) & static_cast<u32>(flag)) != 0;
+    }
+
     bool has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind kind) const
     {
         return RustFFI::layout_row_has_compositor_animation_frame(document_host(), m_slot, kind);
@@ -330,7 +339,7 @@ protected:
 
     void set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind kind, bool value)
     {
-        RustFFI::layout_arena_set_node_needs_compositor_animation_frame(m_arena->handle(), m_slot, kind, value);
+        RustFFI::render_state_set_node_needs_compositor_animation_frame(m_arena->host(), m_slot, kind, value);
     }
 
     void set_flag(RustFFI::NodeFlag flag, bool value)
@@ -650,7 +659,7 @@ public:
     Gfx::Font const& first_available_font() const;
     CSS::StyleScope const& style_scope() const;
 
-    bool is_body() const { return has_flag(RustFFI::NodeFlag::IsBody); }
+    bool is_body() const { return has_identity_flag<RustFFI::NodeFlag::IsBody>(); }
     bool is_scroll_container() const;
 
     void set_computed_values(NonnullRefPtr<CSS::ComputedValues const>);

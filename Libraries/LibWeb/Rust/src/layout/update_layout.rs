@@ -8,15 +8,19 @@
 //! answer geometry queries or paint. The steps that touch the DOM stay on the C++ host and
 //! answer through a callback table registered once per arena.
 
-use super::formatting_context::{compute_subtree_layout, run_root_layout};
+use super::commit::CommitNotifications;
+use super::formatting_context::{FfiLayoutHostCallbacks, LayoutStageFacts, lay_out_boundary, lay_out_root};
 use super::layout_node_arena::{OwedImageResources, sync_enrolled_content_for_layout};
 use super::node_data::NodeSlotId;
 use super::node_facts;
 use super::partial_relayout::FfiPartialRelayoutHostFacts;
-use super::tree_builder::{FfiGeneratedImage, FfiLayoutTreeBuildOutcome, FfiPseudoElement};
-use super::{HostTables, LayoutNodeArena};
+use super::tree_builder::{FfiGeneratedImage, FfiPseudoElement, TreeBuildAnswer, TreeBuildJob};
+use super::tree_mutation::{HostWorkDue, OwedHostWork};
+use super::{ArenaHandle, LayoutNodeArena};
 use crate::abort_on_panic;
 use crate::css::ffi_support::FfiUtf16View;
+use crate::css::style::tree::StyleNodeID;
+use crate::render_state::DocumentHost;
 use crate::stage::MainThread;
 use std::ffi::c_void;
 use std::time::Instant;
@@ -25,49 +29,56 @@ mod main_thread_entries;
 
 pub(crate) use main_thread_entries::MainThreadFfiEntry;
 
-/// The reason the host waits for its document's render state in a rendering update: the style and layout jobs it
-/// runs.
-pub(crate) struct LayoutUpdate {
+/// Runs `job`, a layout round of `host`'s document, on the document's render state, and answers what the round owes the
+/// host. The update's first round spends the read the host began, where no job took it yet, and every other round
+/// `permit`.
+fn run_layout_round_job(
+    host: &DocumentHost,
+    job: LayoutRoundJob,
+    permit: impl FnOnce() -> crate::render_state::FrameJobPermit,
+) -> LayoutRoundAnswer {
+    host.let_go_of_rows();
+    match host.take_forced_read() {
+        Some(read) => crate::render_state::force_read(read, host, job),
+        None => crate::render_state::run_job(permit(), host, job),
+    }
+}
+
+/// The reason the host's layout update reads its document's render state between rounds: whether the layout is up to
+/// date, and what the next round's build needs.
+pub(crate) struct LayoutUpdateReads {
     _private: (),
 }
 
-const LAYOUT_UPDATE: LayoutUpdate = LayoutUpdate { _private: () };
+const LAYOUT_UPDATE_READS: LayoutUpdateReads = LayoutUpdateReads { _private: () };
 
-/// Runs `job`, the style transaction of `host`'s document, on its render state, and answers what it answered.
-pub(crate) fn run_style_job(
-    host: &crate::render_state::DocumentHost,
-    job: crate::css::style::style_job::StyleJob,
-) -> crate::css::style::style_job::StyleJobAnswer {
-    let document = host.document();
-    crate::render_state::wait_for_render_state(
-        crate::render_state::LockstepProof::for_reason(&LAYOUT_UPDATE),
+/// Answers `read` from the render state of `host`'s document and `args`.
+fn read<A, R>(host: &DocumentHost, args: A, read: fn(&mut LayoutNodeArena, A) -> R) -> R {
+    crate::render_state::ask(
+        crate::render_state::LockstepProof::for_reason(&LAYOUT_UPDATE_READS),
         host,
-        |reply| crate::render_state::RenderMessage::Style { document, job, reply },
+        crate::render_state::ArenaRead::new(args, read),
     )
 }
 
-/// Runs `job`, a layout stage of the document whose arena `arena_handle` names, on the document's render state, and
-/// answers the fragments it computed. A unit test's arena has no render state, and its stage runs in place.
-///
-/// # Safety
-///
-/// `arena_handle` must be a live handle on the document thread, and what the job's inputs name must stay live and
-/// unchanged until it is over.
-pub(crate) unsafe fn run_layout_stage_job(
-    main_thread: &MainThread,
-    arena_handle: *mut c_void,
-    job: super::formatting_context::LayoutStageJob,
-) -> super::formatting_context::LayoutStageOutput {
-    let Some(host) = main_thread.host() else {
-        // SAFETY: Guaranteed by the caller.
-        return job.run(unsafe { &*arena_handle.cast::<crate::layout::ArenaHandle>() });
-    };
-    let document = host.document();
-    crate::render_state::wait_from_entry(
-        crate::render_state::LockstepProof::for_reason(&LAYOUT_UPDATE),
-        main_thread,
-        |reply| crate::render_state::RenderMessage::Layout { document, job, reply },
-    )
+impl crate::render_state::RenderJob for LayoutRoundJob {
+    type Answer = LayoutRoundAnswer;
+    type Permit = crate::render_state::FrameJobPermit;
+    const IS_STYLE: bool = false;
+
+    fn message(
+        self,
+        document: crate::render_state::DocumentId,
+        reply: crate::render_state::ReplyTo<'_, LayoutRoundAnswer>,
+        spent: crate::render_state::SpentWait,
+    ) -> crate::render_state::RenderMessage<'_> {
+        crate::render_state::RenderMessage::LayoutRound {
+            document,
+            job: self,
+            reply,
+            _spent: spent,
+        }
+    }
 }
 
 /// The document-side steps of a layout update. Each callback receives the registered
@@ -83,10 +94,17 @@ pub struct FfiLayoutUpdateHostCallbacks {
     process_pending_list_item_renumbers: unsafe extern "C" fn(*mut c_void),
     process_pending_top_layer_layout_changes: unsafe extern "C" fn(*mut c_void),
     document_facts: unsafe extern "C" fn(*mut c_void) -> FfiLayoutUpdateDocumentFacts,
+    /// True when a size container waits for its queries to be evaluated after the next full layout. Only an update
+    /// that may take the partial relayout path asks.
+    container_query_evaluation_is_pending: unsafe extern "C" fn(*mut c_void) -> bool,
     needs_style_update_after_layout: unsafe extern "C" fn(*mut c_void) -> bool,
     prepare_for_rendering: unsafe extern "C" fn(*mut c_void),
-    /// Builds or updates the layout tree and installs its viewport as the document's layout root.
-    build_layout_tree: unsafe extern "C" fn(*mut c_void) -> FfiLayoutTreeBuildOutcome,
+    /// Readies the document for a layout tree build, and answers the document's style, interned as a
+    /// record, where the flag says the build may build the viewport, and 0 otherwise.
+    prepare_layout_tree_build: unsafe extern "C" fn(*mut c_void, bool) -> u64,
+    /// Retires the tree a build replaced once the host has been paid for the build: the viewport
+    /// before the build, then the one it placed.
+    finish_layout_tree_build: unsafe extern "C" fn(*mut c_void, NodeSlotId, NodeSlotId),
     /// True when stale list-item counters marked more of the tree for a rebuild.
     reconcile_stale_list_item_counters_after_tree_build: unsafe extern "C" fn(*mut c_void) -> bool,
     /// Refreshes what derives from committed layout; the flag says whether the tree changed.
@@ -112,13 +130,17 @@ pub struct FfiLayoutUpdateDocumentFacts {
     pub document_is_active: bool,
     /// The document node or one of its descendants needs a layout tree update.
     pub document_needs_layout_tree_build: bool,
-    pub container_query_evaluation_is_pending: bool,
     /// A top layer membership change or zone rebuild is waiting for the next pass.
     pub top_layer_work_pending: bool,
     pub should_collect_devtools_layout_data: bool,
     pub document_in_quirks_mode: bool,
     pub viewport_inline_size_raw: i32,
     pub viewport_block_size_raw: i32,
+    /// The document's style node, which a layout tree build walks from.
+    pub document_style_node: u32,
+    /// The document holds list owners whose item counters went stale without changing what they
+    /// render, which it reconciles with what a layout tree build rebuilt before the tree lays out.
+    pub has_stale_list_item_counters: bool,
 }
 
 /// What one layout update was asked for.
@@ -164,6 +186,10 @@ impl FfiLayoutUpdateHostCallbacks {
         unsafe { (self.document_facts)(self.context) }
     }
 
+    fn container_query_evaluation_is_pending(&self, _: &MainThread) -> bool {
+        unsafe { (self.container_query_evaluation_is_pending)(self.context) }
+    }
+
     fn needs_style_update_after_layout(&self, _: &MainThread) -> bool {
         unsafe { (self.needs_style_update_after_layout)(self.context) }
     }
@@ -172,8 +198,13 @@ impl FfiLayoutUpdateHostCallbacks {
         unsafe { (self.prepare_for_rendering)(self.context) }
     }
 
-    fn build_layout_tree(&self, _: &MainThread) -> FfiLayoutTreeBuildOutcome {
-        unsafe { (self.build_layout_tree)(self.context) }
+    fn prepare_layout_tree_build(&self, _: &MainThread, may_create_viewport: bool) -> Option<u64> {
+        let record = unsafe { (self.prepare_layout_tree_build)(self.context, may_create_viewport) };
+        (record != 0).then_some(record)
+    }
+
+    fn finish_layout_tree_build(&self, _: &MainThread, replaced_viewport: NodeSlotId, viewport: NodeSlotId) {
+        unsafe { (self.finish_layout_tree_build)(self.context, replaced_viewport, viewport) }
     }
 
     fn reconcile_stale_list_item_counters_after_tree_build(&self, _: &MainThread) -> bool {
@@ -199,15 +230,17 @@ impl FfiLayoutUpdateHostCallbacks {
     /// Hands the boxes the tree builds of the update stamped the image resources they are owed,
     /// in the order the builds came to owe them. Until now a box that owns its image's provider
     /// had no image; one handed a provider whose image is already there lays out again.
-    fn attach_owed_image_resources(&self, _: &MainThread, arena_handle: *mut c_void) {
-        let owed = unsafe { arena(arena_handle) }.take_image_resources_owed_to_host();
-        for (row, owed) in owed {
+    fn attach_owed_image_resources(&self, _: &MainThread, host: &DocumentHost) {
+        let owed = read(host, (), |arena, ()| {
+            let mut owed = arena.take_image_resources_owed_to_host();
             // A later build of the update may have freed the row.
-            let arena = unsafe { arena(arena_handle) };
-            if !arena.slot_is_live(row) {
-                continue;
+            owed.retain(|&(row, _)| arena.slot_is_live(row));
+            for &(row, _) in &owed {
+                arena.note_owned_provider_handed_over(row);
             }
-            arena.note_owned_provider_handed_over(row);
+            owed
+        });
+        for (row, owed) in owed {
             match owed {
                 OwedImageResources::StyleResources {
                     owns_content_replacement_image,
@@ -233,7 +266,13 @@ fn layout_is_up_to_date(arena: &LayoutNodeArena, facts: &FfiLayoutUpdateDocument
     arena.layout_is_up_to_date(facts.document_needs_layout_tree_build)
 }
 
+/// Whether the layout of `host`'s document is up to date, as [`layout_is_up_to_date`] answers.
+fn host_layout_is_up_to_date(host: &DocumentHost, facts: &FfiLayoutUpdateDocumentFacts) -> bool {
+    read(host, *facts, |arena, facts| layout_is_up_to_date(arena, &facts))
+}
+
 /// The `TREEBUILD` and `LAYOUT` timing lines, off unless `LIBWEB_UPDATE_LAYOUT_TRACE` is set.
+#[derive(Clone)]
 struct UpdateLayoutTrace {
     reason: Option<String>,
 }
@@ -275,121 +314,232 @@ impl UpdateLayoutTrace {
     }
 }
 
-enum PartialRelayout {
-    NotEligible,
-    Done,
-    NeedsAnotherLayoutPass,
-}
-
 const ORDINARY_STABILIZATION_ROUND_LIMIT: u64 = 8;
 
-/// # Safety
+/// One round of a layout update past its style, which the host sends its document's render state: the layout tree
+/// build, where the tree needs one, then a partial relayout of the boundaries the round plans or else a full layout,
+/// each committed. The round reads the document's facts as they were before it, and nothing of the host.
 ///
-/// `arena_handle` must be a live handle with registered layout and layout update hosts, used on
-/// the document thread between `layout_arena_begin_update_layout` and its end.
-unsafe fn arena<'a>(arena_handle: *mut c_void) -> &'a LayoutNodeArena {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { LayoutNodeArena::from_handle(arena_handle) }
+/// The registered boundaries stay in the arena until the round's layout takes them, so a round that stops after its
+/// build leaves them to the job that goes on with it, or to the next round.
+pub(crate) struct LayoutRoundJob {
+    facts: FfiLayoutUpdateDocumentFacts,
+    build: Option<TreeBuildJob>,
+    /// The layout the round goes on with, which a round that stopped after its build had chosen.
+    layout: RoundLayout,
+    /// Whether a size container waits for its queries to be evaluated after the next full layout, which only a round
+    /// that may lay out partially reads.
+    container_query_evaluation_is_pending: bool,
+    container_length_bases: super::layout_pass::ContainerLengthBasesQuery,
+    trace: UpdateLayoutTrace,
 }
 
-/// Attempts to satisfy the pending layout update by re-laying out only the registered partial
-/// relayout boundary subtrees. Runs the incremental layout tree build itself when tree updates
-/// are pending (consuming `needs_layout_tree_rebuild`), so an ineligible update continues to
-/// the full layout path without rebuilding again.
-///
-/// # Safety
-///
-/// As for [`arena`].
-unsafe fn try_partial_relayout(
-    main_thread: &MainThread,
-    arena_handle: *mut c_void,
-    host: &FfiLayoutUpdateHostCallbacks,
-    facts: &FfiLayoutUpdateDocumentFacts,
-    registered_partial_relayout_roots: &mut Vec<NodeSlotId>,
-    needs_layout_tree_rebuild: &mut bool,
-    trace: &UpdateLayoutTrace,
-) -> PartialRelayout {
-    // SAFETY (for every derive below): Guaranteed by the caller; no borrow spans a host call.
-    let partial_relayout_facts = FfiPartialRelayoutHostFacts {
-        container_query_evaluation_is_pending: facts.container_query_evaluation_is_pending,
-        should_collect_devtools_layout_data: facts.should_collect_devtools_layout_data,
-    };
-    if !unsafe { arena(arena_handle) }.partial_relayout_may_be_attempted(
-        unsafe { arena(arena_handle) }.layout_root(),
-        registered_partial_relayout_roots,
-        partial_relayout_facts,
-    ) {
-        return PartialRelayout::NotEligible;
+/// Which layout a round lays its tree out with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoundLayout {
+    /// A partial relayout of the registered boundaries where the plan allows it, and a full layout otherwise.
+    PartialIfPlanned,
+    /// A full layout.
+    Full,
+}
+
+/// Where a layout round ended.
+enum LayoutRoundEnd {
+    /// The round built the tree and stopped before laying it out: the build asks for another pass,
+    /// or the document reconciles stale list item counters with what it rebuilt first.
+    Built {
+        needs_another_build_pass: bool,
+        layout: RoundLayout,
+    },
+    /// The registered boundaries were laid out again.
+    PartialLayout,
+    /// The whole document was laid out.
+    FullLayout,
+}
+
+/// What a layout round owes the host, which it pays in the order of the fields.
+pub(crate) struct LayoutRoundAnswer {
+    /// The viewport before the round's build, and what the build owes, where the round built the
+    /// tree.
+    build: Option<(NodeSlotId, TreeBuildAnswer)>,
+    /// The host calls the round's tree build and the styles the viewport took over owe, after what
+    /// the host hears of the boxes nodes gained and lost in the round.
+    work: HostWorkDue,
+    /// What committing each layout stage of the round owes.
+    commits: Vec<CommitNotifications>,
+    end: LayoutRoundEnd,
+}
+
+impl LayoutRoundJob {
+    /// Runs the round over `state`, and resolves what it owes the host as it ends.
+    pub(crate) fn run(self, state: &mut ArenaHandle) -> LayoutRoundAnswer {
+        let work = OwedHostWork::default();
+        let mut answer = self.run_owing(state, &work);
+        answer.work = work.resolve(state.arena());
+        answer
     }
 
-    let mut layout_tree_was_built_in_partial_branch = false;
-    if *needs_layout_tree_rebuild {
-        let tree_build_started = trace.now();
-        let outcome = host.build_layout_tree(main_thread);
-        unsafe { arena(arena_handle) }.record_layout_tree_build(&outcome);
-        *needs_layout_tree_rebuild = false;
-        if host.reconcile_stale_list_item_counters_after_tree_build(main_thread) || outcome.needs_another_build_pass {
-            return PartialRelayout::NeedsAnotherLayoutPass;
+    fn run_owing(mut self, state: &mut ArenaHandle, work: &OwedHostWork) -> LayoutRoundAnswer {
+        let facts = self.facts;
+        let mut answer = LayoutRoundAnswer {
+            build: None,
+            work: HostWorkDue::default(),
+            commits: Vec::new(),
+            end: LayoutRoundEnd::FullLayout,
+        };
+        let stage = LayoutStageFacts {
+            container_length_bases: self.container_length_bases,
+            viewport_inline_size_raw: facts.viewport_inline_size_raw,
+            viewport_block_size_raw: facts.viewport_block_size_raw,
+            document_in_quirks_mode: facts.document_in_quirks_mode,
+        };
+        // The round cannot call the host, which hears of the boxes nodes gain and lose once it is over.
+        state.arena().queue_box_presence();
+        // Attempts to satisfy the round by laying out only the registered partial relayout boundary subtrees. The
+        // build runs here when the tree needs one, so a round that is not eligible goes on to the full layout without
+        // building again.
+        let partial_relayout_facts = FfiPartialRelayoutHostFacts {
+            container_query_evaluation_is_pending: self.container_query_evaluation_is_pending,
+            should_collect_devtools_layout_data: facts.should_collect_devtools_layout_data,
+        };
+        let arena = state.arena();
+        if self.layout == RoundLayout::PartialIfPlanned
+            && arena.partial_relayout_may_be_attempted(
+                arena.layout_root(),
+                &arena.partial_relayout_boundary_roots.borrow(),
+                partial_relayout_facts,
+            )
+        {
+            if let Some(build) = self.build.take() {
+                let tree_build_started = self.trace.now();
+                let needs_another_build_pass = Self::build(state, build, work, &mut answer);
+                if needs_another_build_pass || facts.has_stale_list_item_counters {
+                    answer.end = LayoutRoundEnd::Built {
+                        needs_another_build_pass,
+                        layout: RoundLayout::PartialIfPlanned,
+                    };
+                    return answer;
+                }
+                self.trace.tree_build(tree_build_started);
+            }
+
+            let arena = state.arena();
+            // Among the boundaries are those the build registered where it invalidated what deferred child list
+            // insertions reach.
+            let boundaries = arena.take_partial_relayout_boundary_roots();
+            if let Some(planned) =
+                arena.plan_partial_relayout_with_pending_rebuilt_roots(arena.layout_root(), &boundaries)
+            {
+                for boundary in &planned {
+                    debug_assert!(node_facts::kind_is_box(arena.data(boundary.root()).kind.get()));
+                }
+                sync_enrolled_content_for_layout(state.arena_mut());
+                for boundary in planned {
+                    answer.commits.push(lay_out_boundary(state, boundary, stage));
+                }
+                state.arena().note_partial_layout();
+                answer.end = LayoutRoundEnd::PartialLayout;
+                return answer;
+            }
         }
-        layout_tree_was_built_in_partial_branch = true;
 
-        // The build invalidates what deferred child list insertions reach, which can register
-        // more boundaries.
-        registered_partial_relayout_roots.extend(unsafe { arena(arena_handle) }.take_partial_relayout_boundary_roots());
-        trace.tree_build(tree_build_started);
-    }
-
-    let layout_root = unsafe { arena(arena_handle) }.layout_root();
-    let Some(partial_relayout_roots) = unsafe { arena(arena_handle) }
-        .plan_partial_relayout_with_pending_rebuilt_roots(layout_root, registered_partial_relayout_roots)
-    else {
-        return PartialRelayout::NotEligible;
-    };
-    for boundary in &partial_relayout_roots {
-        debug_assert!(node_facts::kind_is_box(
-            unsafe { arena(arena_handle) }.data(boundary.root()).kind.get()
-        ));
-    }
-
-    // The build may have resized this document's viewport through its embedding document.
-    let facts = host.document_facts(main_thread);
-    unsafe { sync_enrolled_content_for_layout(arena_handle) };
-    for &boundary in &partial_relayout_roots {
-        unsafe {
-            compute_subtree_layout(
-                main_thread,
-                arena_handle,
-                boundary,
-                facts.viewport_inline_size_raw,
-                facts.viewport_block_size_raw,
-                facts.document_in_quirks_mode,
-            );
+        let layout_started = self.trace.now();
+        if let Some(build) = self.build.take() {
+            if Self::build(state, build, work, &mut answer) {
+                answer.end = LayoutRoundEnd::Built {
+                    needs_another_build_pass: true,
+                    layout: RoundLayout::Full,
+                };
+                return answer;
+            }
+            state.arena().set_needs_full_layout_tree_update(false);
+            self.trace.tree_build(layout_started);
+            if facts.has_stale_list_item_counters {
+                answer.end = LayoutRoundEnd::Built {
+                    needs_another_build_pass: false,
+                    layout: RoundLayout::Full,
+                };
+                return answer;
+            }
         }
+        // The full layout below covers every registered boundary, the build's among them.
+        drop(state.arena().take_partial_relayout_boundary_roots());
+
+        let layout_root = state.arena().layout_root();
+        assert!(!layout_root.is_invalid(), "a full layout pass needs a layout root");
+        let commit = lay_out_root(
+            state,
+            work,
+            layout_root,
+            stage,
+            facts.should_collect_devtools_layout_data,
+        );
+        answer.commits.push(commit);
+        state.arena().note_full_layout();
+        self.trace.layout(layout_started);
+        answer
     }
 
-    unsafe { arena(arena_handle) }.note_partial_layout();
-
-    host.after_layout_commit(main_thread, layout_tree_was_built_in_partial_branch);
-    if host.needs_style_update_after_layout(main_thread)
-        || !layout_is_up_to_date(unsafe { arena(arena_handle) }, &host.document_facts(main_thread))
-    {
-        return PartialRelayout::NeedsAnotherLayoutPass;
+    /// Runs `build`, records it, and answers whether it asks for another pass.
+    fn build(
+        state: &mut ArenaHandle,
+        build: TreeBuildJob,
+        work: &OwedHostWork,
+        answer: &mut LayoutRoundAnswer,
+    ) -> bool {
+        let replaced_viewport = state.arena().layout_root();
+        let built = build.run(state, work);
+        state.arena().record_layout_tree_build(&built.outcome);
+        let needs_another_build_pass = built.outcome.needs_another_build_pass;
+        answer.build = Some((replaced_viewport, built));
+        needs_another_build_pass
     }
-    PartialRelayout::Done
+}
+
+impl LayoutRoundAnswer {
+    /// Pays what the round owes the host, in the order it came to owe it. The boxes nodes gained
+    /// and lost and the host calls the round owes come first, then a build's commit messages and
+    /// styled scroll containers, after which the document retires the tree the build replaced; then
+    /// what the layout stages owe.
+    ///
+    /// # Safety
+    ///
+    /// The host's callbacks must answer synchronously from its live document.
+    unsafe fn pay(&mut self, main_thread: &MainThread, host: &FfiLayoutUpdateHostCallbacks) {
+        let layout_host = FfiLayoutHostCallbacks::of(main_thread);
+        // SAFETY (for every call below): Guaranteed by the caller.
+        std::mem::take(&mut self.work).pay(main_thread);
+        if let Some((replaced_viewport, built)) = self.build.take() {
+            unsafe {
+                layout_host.deliver_commit_messages(main_thread, &built.reports);
+                layout_host.take_built_scroll_containers(main_thread, &built.built_scroll_containers);
+            }
+            host.finish_layout_tree_build(main_thread, replaced_viewport, built.outcome.viewport);
+        }
+        if self.commits.is_empty() {
+            return;
+        }
+        for commit in self.commits.drain(..) {
+            unsafe { commit.notify_host(main_thread, &layout_host) };
+        }
+        super::trace::name_layout_trace_owners(main_thread);
+    }
 }
 
 /// # Safety
 ///
-/// As for [`arena`], and `inputs` must satisfy [`UpdateLayoutTrace::new`]'s requirements.
-unsafe fn update_layout(main_thread: &MainThread, arena_handle: *mut c_void, inputs: &FfiLayoutUpdateInputs) {
-    // SAFETY (for every derive below): Guaranteed by the caller; no borrow spans a host call.
-    let host = main_thread
+/// The layout update host's callbacks must answer synchronously from the live document, and `inputs` must satisfy
+/// [`UpdateLayoutTrace::new`]'s requirements.
+unsafe fn update_layout(main_thread: &MainThread, document_host: &DocumentHost, inputs: &FfiLayoutUpdateInputs) {
+    let host = document_host
         .host_tables()
-        .and_then(|host_tables| host_tables.layout_update_host.get())
-        .expect("layout node arena has no layout update host");
+        .layout_update_host
+        .get()
+        .expect("the document has no layout update host");
+    let layout_host = FfiLayoutHostCallbacks::of(main_thread);
     assert!(
-        unsafe { arena(arena_handle) }.update_layout_is_running(),
-        "the layout update runs between layout_arena_begin_update_layout and its end"
+        document_host.host_tables().update_layout_running.get(),
+        "the layout update runs between document_host_begin_update_layout and its end"
     );
     let trace = unsafe { UpdateLayoutTrace::new(inputs.reason_name) };
 
@@ -397,9 +547,13 @@ unsafe fn update_layout(main_thread: &MainThread, arena_handle: *mut c_void, inp
     // therefore acyclic, and a coherent style/layout pass can settle at least one more level of
     // a nested dependency chain. One pass per connected element is a conservative exact bound.
     // Recompute it after each pass because an initial style update can enroll the elements of a
-    // freshly parsed document after the layout update has already started.
+    // freshly parsed document after the layout update has already started. The bound is at least
+    // the ordinary limit, so the passes within it do not ask for the count.
     let mut layout_pass: u64 = 0;
-    while layout_pass < ORDINARY_STABILIZATION_ROUND_LIMIT + u64::from(host.connected_element_count(main_thread)) + 1 {
+    let mut first_job = true;
+    while layout_pass <= ORDINARY_STABILIZATION_ROUND_LIMIT
+        || layout_pass < ORDINARY_STABILIZATION_ROUND_LIMIT + u64::from(host.connected_element_count(main_thread)) + 1
+    {
         layout_pass += 1;
 
         host.update_style(main_thread);
@@ -410,83 +564,98 @@ unsafe fn update_layout(main_thread: &MainThread, arena_handle: *mut c_void, inp
         let force_devtools_layout_data_collection =
             facts.should_collect_devtools_layout_data && inputs.reason_is_inspect_devtools_layout_data;
 
-        if layout_is_up_to_date(unsafe { arena(arena_handle) }, &facts) && !force_devtools_layout_data_collection {
+        if host_layout_is_up_to_date(document_host, &facts) && !force_devtools_layout_data_collection {
             host.prepare_for_rendering(main_thread);
             return;
         }
-
-        let mut registered_partial_relayout_roots =
-            unsafe { arena(arena_handle) }.take_partial_relayout_boundary_roots();
 
         // NOTE: If this is a document hosting <template> contents, layout is unnecessary.
         if inputs.is_template_contents_document {
             return;
         }
 
-        let mut needs_layout_tree_rebuild = unsafe { arena(arena_handle) }.layout_root().is_invalid()
-            || facts.document_needs_layout_tree_build
-            || unsafe { arena(arena_handle) }.needs_full_layout_tree_update();
-
-        match unsafe {
-            try_partial_relayout(
-                main_thread,
-                arena_handle,
-                &host,
-                &facts,
-                &mut registered_partial_relayout_roots,
-                &mut needs_layout_tree_rebuild,
-                &trace,
+        let needs_layout_tree_rebuild = facts.document_needs_layout_tree_build
+            || read(document_host, (), |arena, ()| {
+                arena.layout_root().is_invalid() || arena.needs_full_layout_tree_update()
+            });
+        let build = needs_layout_tree_rebuild.then(|| {
+            let document_style_node = StyleNodeID::from_raw(facts.document_style_node)
+                .expect("a document that lays out is named in the style mirror");
+            let may_create_viewport = read(document_host, document_style_node, |arena, document_style_node| {
+                arena.tree_build_may_create_viewport(Some(document_style_node))
+            });
+            TreeBuildJob::new(
+                document_style_node,
+                host.prepare_layout_tree_build(main_thread, may_create_viewport),
             )
-        } {
-            PartialRelayout::Done => return,
-            PartialRelayout::NeedsAnotherLayoutPass => continue,
-            PartialRelayout::NotEligible => {}
-        }
-        drop(registered_partial_relayout_roots);
-
-        // A build in the partial branch may have resized this document's viewport through its
-        // embedding document.
-        let facts = host.document_facts(main_thread);
-        let layout_started = trace.now();
-
-        if needs_layout_tree_rebuild {
-            let outcome = host.build_layout_tree(main_thread);
-            unsafe { arena(arena_handle) }.record_layout_tree_build(&outcome);
-
-            if outcome.needs_another_build_pass {
-                continue;
+        });
+        let mut job = LayoutRoundJob {
+            facts,
+            build,
+            layout: RoundLayout::PartialIfPlanned,
+            container_query_evaluation_is_pending: host.container_query_evaluation_is_pending(main_thread),
+            container_length_bases: layout_host.container_length_bases_query(main_thread),
+            trace: trace.clone(),
+        };
+        let end = loop {
+            // The update's first job spends the read the host began; one that finds it spent lays the read out again.
+            // Every job after it in the update is another round's.
+            let permit = || {
+                if first_job {
+                    crate::render_state::FrameJobPermit::read_lays_out_again()
+                } else {
+                    crate::render_state::FrameJobPermit::for_next_round()
+                }
+            };
+            let mut answer = run_layout_round_job(document_host, job, permit);
+            first_job = false;
+            unsafe { answer.pay(main_thread, &host) };
+            let built = matches!(answer.end, LayoutRoundEnd::Built { .. });
+            if needs_layout_tree_rebuild && host.reconcile_stale_list_item_counters_after_tree_build(main_thread) {
+                // The stale counters marked more of the tree for a rebuild, which the next round runs.
+                debug_assert!(
+                    built,
+                    "only a round that stops after its build reconciles counters that matter"
+                );
+                break None;
             }
+            let LayoutRoundEnd::Built {
+                needs_another_build_pass: false,
+                layout,
+            } = answer.end
+            else {
+                break Some(answer.end);
+            };
+            // The round goes on to lay out what it built, as of the document's facts now: paying for the build may
+            // have resized this document's viewport through its embedding document.
+            job = LayoutRoundJob {
+                facts: host.document_facts(main_thread),
+                build: None,
+                layout,
+                container_query_evaluation_is_pending: layout == RoundLayout::PartialIfPlanned
+                    && host.container_query_evaluation_is_pending(main_thread),
+                container_length_bases: layout_host.container_length_bases_query(main_thread),
+                trace: trace.clone(),
+            };
+        };
 
-            // The full layout below covers every boundary the build's invalidation registered.
-            drop(unsafe { arena(arena_handle) }.take_partial_relayout_boundary_roots());
-
-            unsafe { arena(arena_handle) }.set_needs_full_layout_tree_update(false);
-            trace.tree_build(layout_started);
-
-            if host.reconcile_stale_list_item_counters_after_tree_build(main_thread) {
-                continue;
+        match end {
+            None | Some(LayoutRoundEnd::Built { .. }) => continue,
+            Some(LayoutRoundEnd::PartialLayout) => {
+                // A round that built the tree changed it, whichever of its jobs ran the build.
+                host.after_layout_commit(main_thread, needs_layout_tree_rebuild);
+                if host.needs_style_update_after_layout(main_thread)
+                    || !host_layout_is_up_to_date(document_host, &host.document_facts(main_thread))
+                {
+                    continue;
+                }
+                return;
             }
-        }
-
-        let layout_root = unsafe { arena(arena_handle) }.layout_root();
-        assert!(!layout_root.is_invalid(), "a full layout pass needs a layout root");
-        unsafe {
-            run_root_layout(
-                main_thread,
-                arena_handle,
-                layout_root,
-                facts.viewport_inline_size_raw,
-                facts.viewport_block_size_raw,
-                facts.document_in_quirks_mode,
-                facts.should_collect_devtools_layout_data,
-            );
+            Some(LayoutRoundEnd::FullLayout) => {}
         }
 
         host.note_full_layout_performed(main_thread);
-        unsafe { arena(arena_handle) }.note_full_layout();
-
         host.after_layout_commit(main_thread, true);
-        trace.layout(layout_started);
 
         host.evaluate_pending_container_queries(main_thread);
 
@@ -501,13 +670,13 @@ unsafe fn update_layout(main_thread: &MainThread, arena_handle: *mut c_void, inp
         }
 
         // Layout-only invalidations still need to be flushed before we can exit.
-        if layout_is_up_to_date(unsafe { arena(arena_handle) }, &facts) {
+        if host_layout_is_up_to_date(document_host, &facts) {
             break;
         }
     }
 
     if host.needs_style_update_after_layout(main_thread)
-        || !layout_is_up_to_date(unsafe { arena(arena_handle) }, &host.document_facts(main_thread))
+        || !host_layout_is_up_to_date(document_host, &host.document_facts(main_thread))
     {
         host.record_stabilization_bound_failure(main_thread);
         unreachable!("the layout update did not stabilize within its exact bound");
@@ -516,72 +685,77 @@ unsafe fn update_layout(main_thread: &MainThread, arena_handle: *mut c_void, inp
 
 /// # Safety
 ///
-/// `arena` must be a live handle on the document thread. The callbacks must remain valid until
-/// they are cleared or the arena is destroyed.
+/// `host` must be a live document host, on its document's thread. The callbacks must remain valid until they are
+/// cleared or the host is destroyed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_set_layout_update_host_callbacks(
-    arena: *mut c_void,
+pub unsafe extern "C" fn document_host_set_layout_update_host_callbacks(
+    host: *const DocumentHost,
     callbacks: FfiLayoutUpdateHostCallbacks,
 ) {
-    // SAFETY: The caller keeps the arena alive for this synchronous call.
-    unsafe { HostTables::from_handle(arena) }
-        .layout_update_host
-        .set(Some(callbacks));
+    assert!(!host.is_null(), "document host is null");
+    // SAFETY: Guaranteed by the caller.
+    unsafe { &*host }.host_tables().layout_update_host.set(Some(callbacks));
 }
 
 /// # Safety
 ///
-/// `arena` must be a live handle on the document thread.
+/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_clear_layout_update_host_callbacks(arena: *mut c_void) {
-    // SAFETY: As above.
-    unsafe { HostTables::from_handle(arena) }.layout_update_host.set(None);
+pub unsafe extern "C" fn document_host_clear_layout_update_host_callbacks(host: *const DocumentHost) {
+    assert!(!host.is_null(), "document host is null");
+    // SAFETY: Guaranteed by the caller.
+    unsafe { &*host }.host_tables().layout_update_host.set(None);
 }
 
 /// # Safety
 ///
-/// `arena` must be a live handle on the document thread, with no layout update running.
+/// `host` must be a live document host, on its document's thread, with no layout update running. A document runs
+/// one layout update at a time; a nested request is a caller bug.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_begin_update_layout(arena: *mut c_void) {
-    assert!(!arena.is_null(), "layout node arena handle is null");
-    // SAFETY: As above.
-    unsafe { LayoutNodeArena::from_handle(arena) }.begin_update_layout();
+pub unsafe extern "C" fn document_host_begin_update_layout(host: *const DocumentHost) {
+    assert!(!host.is_null(), "document host is null");
+    // SAFETY: Guaranteed by the caller.
+    let running = &unsafe { &*host }.host_tables().update_layout_running;
+    assert!(!running.replace(true), "a layout update is already running");
 }
 
 /// # Safety
 ///
-/// `arena` must be a live handle on the document thread, with a layout update running.
+/// `host` must be a live document host, on its document's thread, with a layout update running.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_end_update_layout(arena: *mut c_void) {
-    assert!(!arena.is_null(), "layout node arena handle is null");
-    // SAFETY: As above.
-    unsafe { LayoutNodeArena::from_handle(arena) }.end_update_layout();
+pub unsafe extern "C" fn document_host_end_update_layout(host: *const DocumentHost) {
+    assert!(!host.is_null(), "document host is null");
+    // SAFETY: Guaranteed by the caller.
+    let running = &unsafe { &*host }.host_tables().update_layout_running;
+    assert!(running.replace(false), "no layout update is running");
 }
 
 /// # Safety
 ///
-/// `arena` must be a live handle on the document thread.
+/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_update_layout_is_running(arena: *mut c_void) -> bool {
-    assert!(!arena.is_null(), "layout node arena handle is null");
-    // SAFETY: As above.
-    unsafe { LayoutNodeArena::from_handle(arena) }.update_layout_is_running()
+pub unsafe extern "C" fn document_host_update_layout_is_running(host: *const DocumentHost) -> bool {
+    assert!(!host.is_null(), "document host is null");
+    // SAFETY: Guaranteed by the caller.
+    unsafe { &*host }.host_tables().update_layout_running.get()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::tree_builder::FfiLayoutTreeBuildOutcome;
 
     fn facts_for() -> FfiLayoutUpdateDocumentFacts {
         FfiLayoutUpdateDocumentFacts {
             document_is_active: true,
             document_needs_layout_tree_build: false,
-            container_query_evaluation_is_pending: false,
             top_layer_work_pending: false,
             should_collect_devtools_layout_data: false,
             document_in_quirks_mode: false,
             viewport_inline_size_raw: 0,
             viewport_block_size_raw: 0,
+            document_style_node: 0,
+            has_stale_list_item_counters: false,
         }
     }
 
