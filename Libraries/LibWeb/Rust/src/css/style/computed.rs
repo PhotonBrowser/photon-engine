@@ -2988,11 +2988,11 @@ impl ComputedGroupSets {
             .map(|identity| *self.custom_property_environments.get(identity))
     }
 
-    /// The raw custom-property environment identity a record was published with.
+    /// The raw custom-property environment identity a base or animated style record was
+    /// published with. Animation overlays keep the environment of the base record they compose.
     pub fn style_record_custom_property_environment(&self, raw_style_record: u64) -> Option<u64> {
-        let record = self
-            .style_records
-            .get_index(FinalStyleRecordID(raw_style_record).base_record()?.index())?;
+        let underlying = self.underlying_style_record(FinalStyleRecordID(raw_style_record))?;
+        let record = self.style_records.get_index(underlying.base_record()?.index())?;
         Some(self.custom_property_environments[record.custom_properties])
     }
 
