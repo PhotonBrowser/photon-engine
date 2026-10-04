@@ -60,6 +60,10 @@ public:
 private:
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions& content) override
     {
+        // GPUI presents pages as GPU surfaces, so don't burn the engine's
+        // persistent viewport scrollbar into the page on macOS.
+        content.paint_viewport_scrollbars = PaintViewportScrollbars::No;
+
         // Deprecated diagnostic fallback. Normal Photon painting uses Vulkan;
         // remove this option once the GPU path is reliable on supported devices.
         if (std::getenv("PHOTON_FORCE_CPU_PAINTING"))
@@ -268,7 +272,6 @@ private:
             if (m_callbacks.native_metal_presentation && m_native_metal_presentation && !m_native_presentation_failed
                 && m_callbacks.native_backing_registered
                 && m_callbacks.native_frame_ready
-                && front.presentation_signal_value != 0
                 && front.shared_image_buffer) {
                 auto backing_id = static_cast<uint64_t>(front.id) + 1;
                 auto generation = m_native_generation;
