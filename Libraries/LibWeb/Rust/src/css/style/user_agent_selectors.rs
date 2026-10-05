@@ -8,11 +8,11 @@
 //! of their rules are compiled once per process. Every document that records the sheets attaches
 //! the programs the first one compiled.
 
-use super::compiler::{NamespaceScope, ScopeChain};
+use super::compiler::ScopeChain;
 use super::inputs::compile_selector_program;
+use super::rule_writes::NamespaceTexts;
 use super::selector::ProcessSelectorProgram;
 use super::*;
-use crate::css::rule::NativeRuleList;
 use std::collections::hash_map::Entry;
 use std::sync::{MutexGuard, OnceLock};
 
@@ -48,13 +48,8 @@ fn user_agent_selector_programs() -> MutexGuard<'static, UserAgentSelectorProgra
 
 impl StyleEngineState {
     /// Whether this engine attaches the selector programs the process compiled for the user-agent
-    /// sheets. One that records compiles its own, so the recording sees each program arrive; one
-    /// whose atoms are its own cannot read programs that name the process's.
+    /// sheets. One whose atoms are its own cannot read programs that name the process's.
     pub(super) fn shares_user_agent_selector_programs(&self) -> bool {
-        #[cfg(feature = "style-recording")]
-        if self.host.recording_id.is_some() {
-            return false;
-        }
         self.atoms.is_process_global()
     }
 
@@ -66,7 +61,7 @@ impl StyleEngineState {
         before: Option<RuleID>,
         rule_identity: u64,
         selectors: &[&CompiledSelector],
-        rules: &NativeRuleList,
+        namespaces: Option<&NamespaceTexts>,
         counters: &mut Counters,
     ) -> RuleID {
         debug_assert!(self.program.sheet_origin(sheet) == CascadeOrigin::UserAgent);
@@ -81,7 +76,7 @@ impl StyleEngineState {
             match programs.entry(key) {
                 Entry::Occupied(entry) => entry.get().clone(),
                 Entry::Vacant(entry) => {
-                    let namespaces = NamespaceScope::from_rule_list(rules, |text| {
+                    let namespaces = NamespaceTexts::scope(namespaces, |text| {
                         atoms.intern_raw(ak::Utf16FlyString::from_utf16(text).raw_identity())
                     });
                     let compiled = compile_selector_program(

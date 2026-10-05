@@ -82,6 +82,13 @@ FindInPageWidget::FindInPageWidget(Tab* tab, WebContentView* content_view)
         close_bar();
     });
 
+    m_highlight_all = new QCheckBox(this);
+    m_highlight_all->setText("Highlight &All");
+    m_highlight_all->setChecked(false);
+    connect(m_highlight_all, &QCheckBox::checkStateChanged, this, [this] {
+        find_text_changed();
+    });
+
     m_match_case = new QCheckBox(this);
     m_match_case->setText("Match &Case");
     m_match_case->setChecked(false);
@@ -96,6 +103,7 @@ FindInPageWidget::FindInPageWidget(Tab* tab, WebContentView* content_view)
     layout->addWidget(m_find_text, 1);
     layout->addWidget(m_previous_button);
     layout->addWidget(m_next_button);
+    layout->addWidget(m_highlight_all);
     layout->addWidget(m_match_case);
     layout->addWidget(m_result_label);
     layout->addStretch(1);
@@ -133,7 +141,7 @@ void FindInPageWidget::find_text_changed()
         set_dynamic_property_if_needed(*m_find_text, FIND_TEXT_NO_RESULTS_PROPERTY, false);
 
     auto case_sensitive = m_match_case->isChecked() ? CaseSensitivity::CaseSensitive : CaseSensitivity::CaseInsensitive;
-    m_content_view->find_in_page(query, case_sensitive);
+    m_content_view->find_in_page(query, case_sensitive, m_highlight_all->isChecked());
 }
 
 void FindInPageWidget::keyPressEvent(QKeyEvent* event)
@@ -156,6 +164,8 @@ void FindInPageWidget::keyPressEvent(QKeyEvent* event)
 
 void FindInPageWidget::close_bar()
 {
+    ++m_selected_text_request_id;
+    m_content_view->find_in_page_end();
     setVisible(false);
     m_content_view->setFocus();
 }
@@ -169,8 +179,11 @@ void FindInPageWidget::focusInEvent(QFocusEvent* event)
     m_content_view->selected_text()->when_resolved([guarded_this = QPointer<FindInPageWidget> { this }, request_id, find_text_before_request = AK::move(find_text_before_request)](auto& selected_text) {
         if (!guarded_this || request_id != guarded_this->m_selected_text_request_id || guarded_this->m_find_text->text() != find_text_before_request)
             return;
-        if (!selected_text.is_empty())
+        if (!selected_text.is_empty()) {
             guarded_this->m_find_text->setText(qstring_from_ak_string(selected_text));
+            if (guarded_this->m_find_text->text() == find_text_before_request)
+                guarded_this->find_text_changed();
+        }
         guarded_this->m_find_text->selectAll();
     });
     m_find_text->selectAll();

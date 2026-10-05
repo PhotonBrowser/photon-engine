@@ -330,7 +330,7 @@ fn share_rule_declarations(
     for values in [&data.written_values, &data.custom_written_values] {
         values.len().hash(&mut hasher);
         for value in values {
-            // SAFETY: The handle retains a live value or a registered replay token.
+            // SAFETY: The handle retains a live value.
             let hash = unsafe { crate::css::style_value::style_value_content_hash(value.pointer()) };
             hash.hash(&mut hasher);
         }
@@ -1974,9 +1974,7 @@ mod tests {
 
     #[test]
     fn program_bytes_are_charged_to_tier_two() {
-        use super::super::memory::DeviceClass;
-
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let (mut program, sheet) = program_with_sheet();
         for _ in 0..100 {
             program.append_rule(sheet, None, RuleKind::Style);

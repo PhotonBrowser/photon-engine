@@ -305,11 +305,8 @@ void Animatable::cancel_css_animations_and_transitions()
 
 static void const* installed_longhand_table(DOM::Element const& element, Optional<CSS::PseudoElement> pseudo_element)
 {
-    auto style_record = element.style_record_identity(pseudo_element);
-    if (!style_record)
-        return nullptr;
-    auto style = element.document().style_computer().style_engine().style_record_view(style_record);
-    return style.present ? style.longhand_table : nullptr;
+    auto const& style = element.installed_style(pseudo_element);
+    return style ? style.view().longhand_table : nullptr;
 }
 
 // A declaration whose delay and duration are each the single value 0s starts nothing, so it gives no longhand a
@@ -343,6 +340,12 @@ Vector<CSS::PropertyID> Animatable::property_ids_with_matching_transition_proper
         property_ids.unchecked_append(static_cast<CSS::PropertyID>(entry.property_id));
     CSS::StyleValueFFI::rust_transition_entries_release(entries);
     return property_ids;
+}
+
+bool Animatable::has_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
+{
+    auto const* transition = transition_if_exists(pseudo_element);
+    return transition && !transition->associated_transitions.is_empty();
 }
 
 Vector<CSS::PropertyID> Animatable::property_ids_with_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const

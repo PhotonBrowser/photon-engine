@@ -39,6 +39,9 @@ pub(crate) struct RowSnapshot {
     version: RowsVersion,
     /// Whether every row's scrollable overflow was measured when the rows were published.
     overflow_is_measured: bool,
+    /// The text rows that waited for their text to be rendered again when the rows were published, by slot index:
+    /// every other text row carries the text it renders.
+    text_awaiting_render: Box<[NodeSlotId]>,
 }
 
 // The host reads a snapshot while the render state writes the arena it was published from: it holds no cell, no
@@ -49,6 +52,11 @@ const _: () = {
 };
 
 impl RowSnapshot {
+    /// How far the arena's rows had been written when they were published.
+    pub(crate) fn version(&self) -> RowsVersion {
+        self.version
+    }
+
     /// Whether the rows read as the arena's do at `version`.
     pub(crate) fn reads_as(&self, version: RowsVersion) -> bool {
         self.version == version
@@ -58,6 +66,21 @@ impl RowSnapshot {
     /// version `identity` (see [`LayoutNodeArena::rows_identity_version`]).
     pub(crate) fn reads_identity_as(&self, identity: u64) -> bool {
         self.version.has_identity_version(identity)
+    }
+
+    /// Whether the rows answer which rows are populated as the arena's do at `version`.
+    pub(crate) fn reads_population_as(&self, version: RowsVersion) -> bool {
+        self.version.has_population_of(version)
+    }
+
+    /// Whether the rows answer what each row is, and the style record it has, as the arena's do at `version`.
+    pub(crate) fn reads_styles_as(&self, version: RowsVersion) -> bool {
+        self.version.has_styles_of(version)
+    }
+
+    /// The text rows that do not carry the text they render, by slot index, which a read of rendered text asks for.
+    pub(crate) fn text_awaiting_render(&self) -> &[NodeSlotId] {
+        &self.text_awaiting_render
     }
 
     /// Whether every row's scrollable overflow was measured when the rows were published, which a read of overflow
@@ -112,6 +135,11 @@ impl RowSnapshot {
         self.live_node(id).style
     }
 
+    /// Whether the arena derived the row's style record.
+    pub(crate) fn style_is_derived(&self, id: NodeSlotId) -> bool {
+        self.live_node(id).style_is_derived
+    }
+
     pub(crate) fn is_atomic_inline(&self, id: NodeSlotId) -> bool {
         let node = self.live_node(id);
         node_facts::node_is_atomic_inline(node, node.style())
@@ -152,6 +180,29 @@ impl RowSnapshot {
     pub(crate) fn shell_facts(&self, id: NodeSlotId) -> Option<ShellFacts> {
         let kind = self.node(id)?.kind;
         (kind != NodeKind::Unset).then_some(ShellFacts { id, kind })
+    }
+}
+
+/// The style record each row of a document's layout has, and the payloads it keeps, read from published rows, which
+/// the host reads from rows published before the writes it made since that give no row a style record (see
+/// [`crate::render_state::DocumentHost::row_styles_of`]), and nothing else of those rows.
+pub(crate) struct RowStyles(Rc<RowSnapshot>);
+
+impl RowStyles {
+    pub(crate) fn of(rows: Rc<RowSnapshot>) -> Self {
+        Self(rows)
+    }
+
+    pub(crate) fn style_record(&self, id: NodeSlotId) -> u64 {
+        self.0.style_record(id)
+    }
+
+    pub(crate) fn style_payloads(&self, id: NodeSlotId) -> StylePayloadsRef {
+        self.0.style_payloads(id)
+    }
+
+    pub(crate) fn style_is_derived(&self, id: NodeSlotId) -> bool {
+        self.0.style_is_derived(id)
     }
 }
 
@@ -212,6 +263,7 @@ impl LayoutNodeArena {
             visual_context_tree: self.paint_state().borrow().visual_context.tree.clone(),
             version: self.rows_version(),
             overflow_is_measured: self.scrollable_overflow_is_measured(),
+            text_awaiting_render: self.text_rows_awaiting_sync(),
         }
     }
 }

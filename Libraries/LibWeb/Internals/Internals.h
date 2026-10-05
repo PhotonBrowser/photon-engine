@@ -110,6 +110,11 @@ public:
     Utf16String current_cursor();
 
     Utf16String selected_text_for_clipboard();
+
+    void find_in_page(Utf16String const& query, bool highlight_all);
+    void find_in_page_next_match();
+    void find_in_page_end();
+
     WebIDL::ExceptionOr<void> set_clipboard_file(Utf16String const& name, Utf16String const& mime_type, Utf16String const& data);
 
     void set_marked_text_from_input_method(Utf16String const& text);
@@ -223,7 +228,12 @@ public:
     void set_manual_rendering_opportunities(bool enabled);
     void inject_rendering_opportunity(double frame_time_ms);
     Utf16String frame_scheduler_state() const;
-    void hold_next_frame();
+    void hold_next_frame(Utf16String const& hold);
+    Utf16String last_frame_presented_by(DOM::Document&);
+    void inject_clock_tick(double frame_time_ms);
+    Utf16String clock_lease_state(DOM::Document&);
+    GC::Ptr<Geometry::DOMRect> presented_border_box(DOM::Element&);
+    bool last_frame_keyboard_scroll_state_is_current();
     void release_held_frame();
     void update_compositor_animations();
     bool run_empty_animation_style_update_for_testing();

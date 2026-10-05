@@ -22,7 +22,7 @@ use super::selector::{
     AttributeSelector, CompiledSelector, CompoundSelector, NameSelector, PseudoClassSelector, PseudoElementSelector,
     PseudoElementValue, QualifiedName, SelectorList, SimpleSelector,
 };
-use super::selector::{FfiStringView, RustSelector};
+use super::selector::{FfiStringView, RustSelector, search_text_match_filter};
 
 const MAXIMUM_SELECTOR_NESTING_DEPTH: usize = 128;
 
@@ -311,6 +311,8 @@ struct SelectorParser<'a> {
     declared_namespaces: Option<&'a [TokenizerInput<'a>]>,
     pseudo_class_context: Vec<PseudoClassType>,
     nesting_limit_exceeded: bool,
+    compound_pseudo_element: Option<PseudoElementType>,
+    bare_current_allowed: bool,
 }
 
 impl<'a> SelectorParser<'a> {
@@ -319,6 +321,8 @@ impl<'a> SelectorParser<'a> {
             declared_namespaces,
             pseudo_class_context: Vec::new(),
             nesting_limit_exceeded: false,
+            compound_pseudo_element: None,
+            bare_current_allowed: false,
         }
     }
 
@@ -447,6 +451,18 @@ impl<'a> SelectorParser<'a> {
                 && pseudo_elements[1] != PseudoElementType::Part)
         {
             return Err(());
+        }
+        for compound in &compounds {
+            if !matches!(compound.simple_selectors.first(), Some(SimpleSelector::PseudoElement(pseudo_element))
+                if pseudo_element.pseudo_element == PseudoElementType::SearchText)
+            {
+                continue;
+            }
+            match &compound.simple_selectors[1..] {
+                [] => {}
+                [filter] if search_text_match_filter(filter).is_some() => {}
+                _ => return Err(()),
+            }
         }
         Ok(CompiledSelector::new(compounds.into_boxed_slice()))
     }
@@ -674,6 +690,12 @@ impl<'a> SelectorParser<'a> {
             if !pseudo_class.metadata().is_valid_as_identifier {
                 return Err(());
             }
+            if pseudo_class == PseudoClassType::Current
+                && self.compound_pseudo_element != Some(PseudoElementType::SearchText)
+                && !self.bare_current_allowed
+            {
+                return Err(());
+            }
             return Ok(SimpleSelector::PseudoClass(Box::new(pseudo_class_selector(
                 pseudo_class,
             ))));
@@ -693,9 +715,14 @@ impl<'a> SelectorParser<'a> {
             return Err(());
         }
 
+        let bare_current_allowed = std::mem::replace(
+            &mut self.bare_current_allowed,
+            pseudo_class == PseudoClassType::Not && self.compound_pseudo_element == Some(PseudoElementType::SearchText),
+        );
         self.pseudo_class_context.push(pseudo_class);
         let result = self.parse_pseudo_class_function(pseudo_class, metadata.parameter_type, function_values);
         self.pseudo_class_context.pop();
+        self.bare_current_allowed = bare_current_allowed;
         result.map(|selector| SimpleSelector::PseudoClass(Box::new(selector)))
     }
 
@@ -834,6 +861,14 @@ impl<'a> SelectorParser<'a> {
                 };
                 selector.argument_selector_list =
                     self.parse_selector_list(values, selector_type, SelectorParsingMode::Standard)?;
+                if parameter_type == PseudoClassParameterType::SelectorList
+                    && selector
+                        .argument_selector_list
+                        .iter()
+                        .any(|argument| contains_pseudo_element(argument))
+                {
+                    return Err(());
+                }
             }
             PseudoClassParameterType::None => return Err(()),
         }
@@ -972,18 +1007,28 @@ impl<'a> SelectorParser<'a> {
     }
 
     fn parse_compound_selector(&mut self, stream: &mut Stream<'_>) -> Result<CompoundSelector, ()> {
+        let outer_pseudo_element = self.compound_pseudo_element.take();
+        let simple_selectors = self.parse_compound_simple_selectors(stream);
+        self.compound_pseudo_element = outer_pseudo_element;
+        Ok(CompoundSelector {
+            combinator: Combinator::None,
+            is_implicit_universal_anchor: false,
+            simple_selectors: simple_selectors?.into_boxed_slice(),
+        })
+    }
+
+    fn parse_compound_simple_selectors(&mut self, stream: &mut Stream<'_>) -> Result<Vec<SimpleSelector>, ()> {
         let mut simple_selectors = Vec::new();
         while let Some(simple_selector) = self.parse_simple_selector(stream)? {
             if matches!(simple_selector, SimpleSelector::TagName(_)) && !simple_selectors.is_empty() {
                 return Err(());
             }
+            if let SimpleSelector::PseudoElement(pseudo_element) = &simple_selector {
+                self.compound_pseudo_element = Some(pseudo_element.pseudo_element);
+            }
             simple_selectors.push(simple_selector);
         }
-        Ok(CompoundSelector {
-            combinator: Combinator::None,
-            is_implicit_universal_anchor: false,
-            simple_selectors: simple_selectors.into_boxed_slice(),
-        })
+        Ok(simple_selectors)
     }
 
     fn parse_combinator(&self, stream: &mut Stream<'_>) -> Option<Combinator> {
@@ -1015,6 +1060,15 @@ impl<'a> SelectorParser<'a> {
         }
         combinator
     }
+}
+
+fn contains_pseudo_element(selector: &CompiledSelector) -> bool {
+    selector.compound_selectors.iter().any(|compound| {
+        compound
+            .simple_selectors
+            .iter()
+            .any(|simple| matches!(simple, SimpleSelector::PseudoElement(_)))
+    })
 }
 
 fn normalize_pseudo_element_transitions(compounds: Vec<CompoundSelector>) -> Vec<CompoundSelector> {

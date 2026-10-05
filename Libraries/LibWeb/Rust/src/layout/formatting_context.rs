@@ -776,7 +776,6 @@ pub(crate) fn baseline_of_child(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormattingContextType {
     Block,
-    Inline,
     Flex,
     Grid,
     Table,
@@ -924,12 +923,14 @@ pub struct FfiLayoutHostCallbacks {
     context: *mut c_void,
     /// The commit messages a finished commit leaves for the document, in the order it produced
     /// them.
-    deliver_commit_messages: unsafe extern "C" fn(*mut c_void, *const commit::FfiCommitMessage, usize),
+    deliver_commit_messages:
+        unsafe extern "C" fn(*mut c_void, &crate::render_state::BegunRead, *const commit::FfiCommitMessage, usize),
     /// What a container-relative length on the element with the given identity resolves against.
     container_length_bases: unsafe extern "C" fn(*mut c_void, u32) -> svg_formatting_context::FfiContainerLengthBases,
     /// The scroll containers a finished layout tree build gave a style, each with whether it is a
     /// scroll snap container.
-    take_built_scroll_containers: unsafe extern "C" fn(*mut c_void, *const FfiBuiltScrollContainer, usize),
+    take_built_scroll_containers:
+        unsafe extern "C" fn(*mut c_void, &crate::render_state::BegunRead, *const FfiBuiltScrollContainer, usize),
 }
 
 /// A scroll container a layout tree build gave a style, with whether it was a scroll snap
@@ -950,34 +951,40 @@ impl FfiLayoutHostCallbacks {
             .expect("layout node arena has no layout host")
     }
 
+    /// Delivers `messages` to the document, in `read`.
+    ///
     /// # Safety
     ///
     /// The document may re-enter the arena, so no arena borrow may be held across this call.
     pub(crate) unsafe fn deliver_commit_messages(
         &self,
         _: &crate::stage::MainThread,
+        read: &crate::render_state::BegunRead,
         messages: &[commit::FfiCommitMessage],
     ) {
         if messages.is_empty() {
             return;
         }
         // SAFETY: The document registered the host with the arena and outlives this call.
-        unsafe { (self.deliver_commit_messages)(self.context, messages.as_ptr(), messages.len()) };
+        unsafe { (self.deliver_commit_messages)(self.context, read, messages.as_ptr(), messages.len()) };
     }
 
+    /// Hands the document the scroll containers a build gave a style, in `read`.
+    ///
     /// # Safety
     ///
     /// The document may re-enter the arena, so no arena borrow may be held across this call.
     pub(crate) unsafe fn take_built_scroll_containers(
         &self,
         _: &crate::stage::MainThread,
+        read: &crate::render_state::BegunRead,
         built: &[FfiBuiltScrollContainer],
     ) {
         if built.is_empty() {
             return;
         }
         // SAFETY: The document registered the host with the arena and outlives this call.
-        unsafe { (self.take_built_scroll_containers)(self.context, built.as_ptr(), built.len()) };
+        unsafe { (self.take_built_scroll_containers)(self.context, read, built.as_ptr(), built.len()) };
     }
 
     /// The one question a layout pass may ask the document while it runs.
@@ -1166,14 +1173,11 @@ fn create_formatting_context_implementation<'pass>(
         FormattingContextType::ReplacedWithChildren => FormattingContextImplementation::ReplacedWithChildren,
         FormattingContextType::InternalReplaced => FormattingContextImplementation::InternalReplaced,
         FormattingContextType::InternalDummy => FormattingContextImplementation::InternalDummy,
-        FormattingContextType::Inline => panic!("no Rust implementation for inline formatting contexts"),
     }
 }
 
 fn register_table_abspos_descendants(run: &FormattingContextRun, parent: Node) {
-    let mut child = run.callbacks.first_child(parent);
-    while !child.is_invalid() {
-        let next = run.callbacks.next_sibling(child);
+    for child in run.callbacks.children(parent) {
         let facts = NodeFacts::new(&run.callbacks, child);
         if facts.is_box() {
             if facts.is_absolutely_positioned() {
@@ -1198,7 +1202,6 @@ fn register_table_abspos_descendants(run: &FormattingContextRun, parent: Node) {
         } else {
             register_table_abspos_descendants(run, child);
         }
-        child = next;
     }
 }
 
@@ -1313,8 +1316,7 @@ fn apply_root_sizing_directives(
         ParticipationInParentFormattingContext::AtomicInline => {
             let run_cache_may_store_this_block_formatting_context_run = fc_type == FormattingContextType::Block
                 && run.layout_mode == LayoutMode::Normal
-                && !run.purpose.is_measurement()
-                && fc_run_cache::fc_run_cache_mode_from_environment() != fc_run_cache::FcRunCacheMode::Disabled;
+                && !run.purpose.is_measurement();
             atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above = run.sizing().dimension_atomic_root(
                 run.box_,
                 input.available_space,
@@ -1435,8 +1437,7 @@ fn in_flow_children_margin_box_block_extent(
 ) -> Option<CssPixels> {
     let mut block_start = CssPixels::default();
     let mut block_end = CssPixels::default();
-    let mut child = callbacks.first_child(node);
-    while !child.is_invalid() {
+    for child in callbacks.children(node) {
         let facts = NodeFacts::new(callbacks, child);
         if facts.is_box() && !facts.is_absolutely_positioned() {
             let used = records.used_values_if_owned(child)?;
@@ -1449,7 +1450,6 @@ fn in_flow_children_margin_box_block_extent(
             block_end =
                 block_end.max(content_block_offset + used.content_block_size.get() + used.margin_box_bottom(collapsed));
         }
-        child = callbacks.next_sibling(child);
     }
     Some(block_end - block_start)
 }
@@ -2180,7 +2180,6 @@ pub(crate) fn run_table_cell_ahead_of_its_intrinsic_block_padding(
     ));
     if run.purpose != LayoutPurpose::Commit
         || run.layout_mode != LayoutMode::Normal
-        || fc_run_cache::fc_run_cache_mode_from_environment() == fc_run_cache::FcRunCacheMode::Disabled
         || formatting_context_type_created_by_box(NodeFacts::new(&run.callbacks, cell))
             != Some(FormattingContextType::Block)
         || !fc_run_cache::table_cell_contents_never_observe_intrinsic_block_padding(&run.callbacks, cell)
@@ -2613,7 +2612,6 @@ fn compute_subtree_layout_fragments(input: LayoutStageInput<'_>, containing_bloc
     // the incremental tree build created; derive the facts of the whole subtree.
     arena.derive_facts_in_subtree(root);
 
-    let read_scope = arena.enter_read_scope(root);
     // Abspos boundaries recompute their size and position in their containing block's space.
     // In-flow SVG boundaries keep their committed geometry and lay out only their contents.
     let root_is_absolutely_positioned = NodeFacts::new(&callbacks, root).is_absolutely_positioned();
@@ -2650,7 +2648,6 @@ fn compute_subtree_layout_fragments(input: LayoutStageInput<'_>, containing_bloc
             finish_entry_pass(entry_records, &entry_fragments, &callbacks, false)
         },
     );
-    drop(read_scope);
     LayoutStageOutput(pass_fragments)
 }
 

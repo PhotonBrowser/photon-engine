@@ -16,10 +16,13 @@ use crate::painting::dump::{
 };
 use crate::painting::host::FfiNodeIdentity;
 use crate::painting::node_painting;
+use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::paintable_data::FfiPixelBox;
 use crate::painting::paintable_geometry;
 use crate::stage::MainThread;
 use std::ffi::c_void;
+
+crate::render_state::held_node_entries!();
 
 /// Mints the main thread token for this module's FFI entry points; only this module can make one.
 pub(crate) struct MainThreadFfiEntry {
@@ -150,8 +153,9 @@ pub unsafe extern "C" fn render_state_dump_layout_tree(
     let main_thread = unsafe { crate::stage::from_ffi_entry(&MAIN_THREAD_FFI_ENTRY, host) };
     // SAFETY: As above.
     let plan = unsafe {
-        crate::painting::ffi::read(
+        crate::painting::ffi::read_arena(
             host,
+            node_read(),
             (root, initial_indent, interactive),
             |arena, (root, initial_indent, interactive)| {
                 arena.measure_scrollable_overflow();
@@ -576,9 +580,7 @@ fn plan_layout_node(
     if has_committed_box && node_painting::is_fragmented_inline(arena, slot) {
         dump_inline_piece_fragments(&mut plan.text, &rows, slot, indent, interactive);
     }
-    let mut child = arena.node_first_child_if_live(slot);
-    while let Some(current) = child {
-        plan_layout_node(plan, arena, current, indent + 1, palette, interactive);
-        child = arena.node_next_sibling_if_live(current);
+    for child in arena.children(slot) {
+        plan_layout_node(plan, arena, child, indent + 1, palette, interactive);
     }
 }

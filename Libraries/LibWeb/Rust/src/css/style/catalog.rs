@@ -1728,7 +1728,7 @@ pub(super) struct BatchMatchingTraversal {
     pub(super) root: StyleNodeID,
     pub(super) batch: Option<MatchingFactBatch>,
     pub(super) topology: Option<TransactionTopology>,
-    pub(super) reuse_retained_match_answers: bool,
+    /// The dispatch a retained answer is read through, when the traversal reuses retained answers.
     pub(super) retained_answer_dispatch: Option<Arc<RuleDispatch>>,
     pub(super) ancestor_requirements: AncestorRequirementsCache,
     pub(super) prefix_caches: std::sync::Arc<SharedPrefixCaches>,
@@ -2057,9 +2057,4 @@ pub(super) struct SheetRuleReplacement {
 pub(super) struct DiagnosticPlanCapture {
     pub(super) nodes: Vec<u32>,
     pub(super) scoped: bool,
-}
-
-pub(crate) struct RecordedAtomMappings {
-    pub atoms: Vec<(u64, u32)>,
-    pub qualified_atoms: Vec<(u32, u32, u32)>,
 }

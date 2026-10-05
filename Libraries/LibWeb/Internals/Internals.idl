@@ -87,6 +87,10 @@ interface Internals {
     // Excludes nodes whose used value of user-select is 'none' — mirroring what browsers actually copy.
     DOMString selectedTextForClipboard();
 
+    undefined findInPage(DOMString query, optional boolean highlightAll = false);
+    undefined findInPageNextMatch();
+    undefined findInPageEnd();
+
     undefined setClipboardFile(DOMString name, DOMString mimeType, DOMString data);
 
     // Drive marked/preedit-text composition via the same path platform input methods use. setMarkedTextFromInputMethod
@@ -214,11 +218,24 @@ interface Internals {
     undefined resetRenderingSchedulerCounters();
     undefined setManualRenderingOpportunities(boolean enabled);
     undefined injectRenderingOpportunity(double frameTimeMs);
-    // "in-flight" while a rendering update's recording flies beside the event loop, "idle" otherwise.
+    // Hands the clock lease of the current document, if one runs, a tick at the given time, and waits until it has run.
+    undefined injectClockTick(double frameTimeMs);
+    // "none" where no clock lease of the document runs, "ticking" while one does, and "parked" once a tick parked it.
+    DOMString clockLeaseState(Document document);
+    // The border box of the element in the last frame a clock tick presented, which ends the lease that runs.
+    DOMRect? presentedBorderBox(Element element);
+    // "in-flight" while a rendering update's frame or recording flies beside the event loop, "landed" once the event
+    // loop took the frame in and the update has not run its steps from its style and layout on yet, "idle" otherwise.
     DOMString frameSchedulerState();
     // Keeps the next recording that flies in flight, before it reads its frame, until releaseHeldFrame(), or until a
-    // read waits for it.
-    undefined holdNextFrame();
+    // read waits for it. With "before-present", the recording also leaves its frame for the host to present once it
+    // lands.
+    undefined holdNextFrame(optional DOMString hold = "");
+    // What presented the last frame of the document's navigable: "main", "flight" for the recording that flew, or "clock"
+    // for a tick of the document's clock lease.
+    DOMString lastFramePresentedBy(Document document);
+    // Whether the last frame of the page handed the compositor the keyboard scroll state the page holds now.
+    boolean lastFrameKeyboardScrollStateIsCurrent();
     undefined releaseHeldFrame();
     undefined updateCompositorAnimations();
     boolean runEmptyAnimationStyleUpdateForTesting();

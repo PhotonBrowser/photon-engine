@@ -10,7 +10,7 @@
 
 use super::*;
 use crate::painting::host::FfiVisualContextTreeInputs;
-use crate::painting::paint_passes::{PaintPass, PaintPassAnswer, pending_preparation, run as run_paint_pass};
+use crate::painting::paint_passes::{PassEffect, pending_preparation, run as run_paint_pass};
 
 /// Mints the main thread token for this module's FFI entry points; only this module can make one.
 pub(crate) struct MainThreadFfiEntry {
@@ -19,52 +19,20 @@ pub(crate) struct MainThreadFfiEntry {
 
 const MAIN_THREAD_FFI_ENTRY: MainThreadFfiEntry = MainThreadFfiEntry { _private: () };
 
-/// The reason the host waits for its document's rows as input or chrome reads boxes: scroll limits, wheel targets and
-/// scrollbars, which are read with the overflow every row's commit left measured.
-pub(crate) struct InputReadsBoxes {
-    _private: (),
-}
-
-const INPUT_READS_BOXES: InputReadsBoxes = InputReadsBoxes { _private: () };
-
-/// The reason the host waits for its document's rows as it snaps a scroll container to its snap areas.
-pub(crate) struct ScrollSnaps {
-    _private: (),
-}
-
-const SCROLL_SNAPS: ScrollSnaps = ScrollSnaps { _private: () };
-
-/// Answers `read` from the rows of `host`'s document as of every write the host made, with every row's overflow
-/// measured, as input reads boxes.
+/// Answers `read` from the rows of `host`'s document as of every write the host made, spending `wait`, with every
+/// row's overflow measured, as input and chrome read boxes: scroll limits, wheel targets, scrollbars and snap areas.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread.
-unsafe fn with_measured_rows<R>(
-    host: *mut crate::render_state::DocumentHost,
-    read: impl FnOnce(&crate::painting::paint_read::PaintSource<'_>) -> R,
-) -> R {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { read_measured_rows(host, input_reads_boxes(), read) }
-}
-
-/// Like [`with_measured_rows`], spending `wait`.
-///
-/// # Safety
-///
-/// As for [`with_measured_rows`].
 unsafe fn read_measured_rows<R>(
     host: *mut crate::render_state::DocumentHost,
-    wait: crate::render_state::LockstepProof,
+    wait: impl crate::render_state::RenderWait,
     read: impl FnOnce(&crate::painting::paint_read::PaintSource<'_>) -> R,
 ) -> R {
     assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the caller.
     unsafe { &*host }.read_rows(wait, true, read)
-}
-
-fn input_reads_boxes() -> crate::render_state::LockstepProof {
-    crate::render_state::LockstepProof::for_reason(&INPUT_READS_BOXES)
 }
 
 /// # Safety
@@ -77,7 +45,7 @@ pub unsafe extern "C" fn layout_row_paintable_physical_resize_axes(
 ) -> FfiPhysicalResizeAxes {
     // SAFETY: Guaranteed by the caller.
     let axes = unsafe {
-        read_measured_rows(host, input_reads_boxes(), |rows| {
+        read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::chrome_geometry::physical_resize_axes(rows, slot)
         })
     };
@@ -105,7 +73,7 @@ pub unsafe extern "C" fn layout_row_paintable_compute_scrollbar_data(
 ) -> FfiOptionalScrollbarData {
     // SAFETY: Guaranteed by the caller.
     let data = unsafe {
-        read_measured_rows(host, input_reads_boxes(), |rows| {
+        read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::chrome_geometry::ChromeGeometry {
                 arena: rows,
                 metrics,
@@ -147,7 +115,7 @@ pub unsafe extern "C" fn layout_row_paintable_minimum_scroll_offset(
 ) -> FfiCssPixelPoint {
     // SAFETY: Guaranteed by the caller.
     unsafe {
-        read_measured_rows(host, input_reads_boxes(), |rows| {
+        read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::chrome_geometry::minimum_scroll_offset(rows, slot)
         })
     }
@@ -164,7 +132,7 @@ pub unsafe extern "C" fn layout_row_paintable_maximum_scroll_offset(
 ) -> FfiCssPixelPoint {
     // SAFETY: Guaranteed by the caller.
     unsafe {
-        read_measured_rows(host, input_reads_boxes(), |rows| {
+        read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::chrome_geometry::maximum_scroll_offset(rows, slot)
         })
     }
@@ -183,7 +151,7 @@ pub unsafe extern "C" fn layout_row_paintable_wheel_scrollable_axes(
 ) -> FfiPhysicalResizeAxes {
     // SAFETY: Guaranteed by the caller.
     let axes = unsafe {
-        read_measured_rows(host, input_reads_boxes(), |rows| {
+        read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::chrome_geometry::wheel_scrollable_axes(
                 rows,
                 slot,
@@ -207,10 +175,9 @@ pub unsafe extern "C" fn layout_row_snap_container_geometry(
     snap_container: NodeSlotId,
     out_geometry: *mut crate::painting::host::FfiSnapContainerGeometry,
 ) -> bool {
-    let wait = crate::render_state::LockstepProof::for_reason(&SCROLL_SNAPS);
     // SAFETY: Guaranteed by the caller.
     let geometry = unsafe {
-        read_measured_rows(host, wait, |rows| {
+        read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::scroll_snap::snap_container_geometry(rows, snap_container)
         })
     };
@@ -231,10 +198,9 @@ pub unsafe extern "C" fn layout_row_scroll_snapport_rect(
     snap_container: NodeSlotId,
     scrollport: FfiCssPixelRect,
 ) -> FfiCssPixelRect {
-    let wait = crate::render_state::LockstepProof::for_reason(&SCROLL_SNAPS);
     // SAFETY: Guaranteed by the caller.
     unsafe {
-        read_measured_rows(host, wait, |rows| {
+        read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::scroll_snap::scroll_snapport_rect(rows, snap_container, scrollport.into())
         })
     }
@@ -249,10 +215,9 @@ pub unsafe extern "C" fn layout_row_scroll_snap_axes(
     host: *mut crate::render_state::DocumentHost,
     snap_container: NodeSlotId,
 ) -> crate::painting::host::FfiSnapAxes {
-    let wait = crate::render_state::LockstepProof::for_reason(&SCROLL_SNAPS);
     // SAFETY: Guaranteed by the caller.
     unsafe {
-        read_measured_rows(host, wait, |rows| {
+        read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::scroll_snap::snap_axes_of_scroll_container(rows, snap_container)
         })
     }
@@ -276,8 +241,9 @@ pub unsafe extern "C" fn render_state_scrolling_box_for_scroll_step(
     };
     // SAFETY: Guaranteed by the caller.
     unsafe {
-        read(
+        read_arena(
             host,
+            super::node_read(),
             (target, viewport, delta, overflow),
             |arena, (target, viewport, delta, overflow)| {
                 arena.measure_scrollable_overflow();
@@ -313,8 +279,9 @@ pub unsafe extern "C" fn render_state_for_each_wheel_scrollable_box_in_containin
     };
     // SAFETY: Guaranteed by the caller.
     let boxes = unsafe {
-        read(
+        read_arena(
             host,
+            super::node_read(),
             (start, wheel_delta_x, wheel_delta_y, overflow),
             |arena, (start, wheel_delta_x, wheel_delta_y, overflow)| {
                 arena.measure_scrollable_overflow();
@@ -353,7 +320,7 @@ pub unsafe extern "C" fn render_state_first_wheel_scrollable_box_in_containing_b
     };
     // SAFETY: Guaranteed by the caller.
     unsafe {
-        read(host, (start, overflow), |arena, (start, overflow)| {
+        read_arena(host, node_read(), (start, overflow), |arena, (start, overflow)| {
             arena.measure_scrollable_overflow();
             crate::painting::scroll_chain::first_wheel_scrollable_box_in_containing_block_chain(
                 &arena.paintable_rows(),
@@ -374,33 +341,28 @@ pub unsafe extern "C" fn render_state_first_wheel_scrollable_box_in_containing_b
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_prepare_for_rendering(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     visual_context_update_pending: bool,
     document: *mut c_void,
     inputs_of: unsafe extern "C" fn(*mut c_void) -> FfiVisualContextTreeInputs,
 ) -> crate::painting::paint_passes::FfiRenderingPreparationOutcome {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { &*host };
-    let Some(pending) = pending_preparation(host) else {
+    let Some(pending) = pending_preparation(read, host) else {
         return Default::default();
     };
-    let PaintPassAnswer::Prepared(prepared) = run_paint_pass(
-        host,
-        PaintPass::PrepareForRendering {
-            pending,
-            visual_context_update_pending,
-            // SAFETY: Guaranteed by the caller.
-            inputs: unsafe { inputs_of(document) },
-        },
-    ) else {
-        unreachable!("preparing for rendering answers what it prepared");
-    };
+    // SAFETY: Guaranteed by the caller.
+    let inputs = unsafe { inputs_of(document) };
+    let prepared = run_paint_pass(read, host, PassEffect::RewritesRows, move |arena| {
+        pending.prepare(arena, visual_context_update_pending, &inputs)
+    });
     if !prepared.clamped_scroll_offsets.is_empty() {
         // SAFETY: Guaranteed by the caller.
         let main_thread = unsafe { crate::stage::from_ffi_entry(&MAIN_THREAD_FFI_ENTRY, host) };
         if let Some(geometry_host) = host.host_tables().geometry_host.get() {
             for (slot, offset) in prepared.clamped_scroll_offsets {
                 // SAFETY: The pass clamped the offsets of live rows, and the host holds no borrow of the arena.
-                unsafe { geometry_host.set_scroll_offset(&main_thread, slot, offset.into()) };
+                unsafe { geometry_host.set_scroll_offset(&main_thread, read, slot, offset.into()) };
             }
         }
     }
@@ -413,17 +375,14 @@ pub unsafe extern "C" fn render_state_prepare_for_rendering(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_update_accumulated_visual_contexts(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
     inputs: FfiVisualContextTreeInputs,
 ) -> crate::painting::host::FfiVisualContextUpdateOutcome {
     // SAFETY: Guaranteed by the caller.
-    let PaintPassAnswer::VisualContexts(outcome) = run_paint_pass(
-        unsafe { &*host },
-        PaintPass::UpdateAccumulatedVisualContexts { viewport, inputs },
-    ) else {
-        unreachable!("a visual context update answers its outcome");
-    };
-    outcome
+    run_paint_pass(read, unsafe { &*host }, PassEffect::RewritesRows, |arena| {
+        crate::painting::paint_passes::update_accumulated_visual_contexts(arena, viewport, inputs)
+    })
 }
 
 /// # Safety
@@ -432,10 +391,13 @@ pub unsafe extern "C" fn render_state_update_accumulated_visual_contexts(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_update_visual_viewport_transform(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     inputs: FfiVisualContextTreeInputs,
 ) {
     // SAFETY: Guaranteed by the caller.
-    run_paint_pass(unsafe { &*host }, PaintPass::UpdateVisualViewportTransform(inputs));
+    run_paint_pass(read, unsafe { &*host }, PassEffect::StalesPaintPreparation, |arena| {
+        crate::painting::paint_passes::update_visual_viewport_transform(arena, &inputs);
+    });
 }
 
 /// Starts an update pass of the compositor animations of `host`'s document, with none published.
@@ -479,6 +441,7 @@ pub unsafe extern "C" fn compositor_animation_effect_publish_pending(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_publish_compositor_animations(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     publish_pending: bool,
 ) -> crate::painting::host::FfiCompositorAnimationPublishOutcome {
     // SAFETY: Guaranteed by the caller.
@@ -487,12 +450,12 @@ pub unsafe extern "C" fn render_state_publish_compositor_animations(
     if !publish_pending {
         animations.clear();
     }
-    let PaintPassAnswer::CompositorAnimationsPublished(outcome) =
-        run_paint_pass(host, PaintPass::PublishCompositorAnimations(animations))
-    else {
-        unreachable!("publishing compositor animations answers what changed");
-    };
-    outcome
+    run_paint_pass(read, host, PassEffect::KeepsPaintPreparation, |arena| {
+        crate::painting::visual_context::publish_compositor_animations(
+            &mut arena.paint_state().borrow_mut().visual_context,
+            animations,
+        )
+    })
 }
 
 /// Resolves the SVG paint resources the enrolled rows of `host`'s document name: the render state answers what to
@@ -506,6 +469,7 @@ pub unsafe extern "C" fn render_state_publish_compositor_animations(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_sync_svg_paint_resources(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     context: *mut c_void,
     resolve_filter: unsafe extern "C" fn(*mut c_void, NodeSlotId, *const c_void, *mut c_void) -> bool,
     resolve_paint_server: unsafe extern "C" fn(*mut c_void, NodeSlotId, bool, *mut c_void),
@@ -513,11 +477,9 @@ pub unsafe extern "C" fn render_state_sync_svg_paint_resources(
     use crate::painting::paint_passes::{ResolvedSvgPaintResource, SvgPaintResourceRequest};
     use crate::painting::svg_paint_resources::{PublishedSvgFilter, PublishedSvgPaintServer, SvgPaintResourceKind};
     // SAFETY: Guaranteed by the caller.
-    let PaintPassAnswer::SvgPaintResourceRequests(requests) =
-        run_paint_pass(unsafe { &*host }, PaintPass::SvgPaintResourceRequests)
-    else {
-        unreachable!("the SVG paint resources answer what to resolve");
-    };
+    let requests = run_paint_pass(read, unsafe { &*host }, PassEffect::KeepsPaintPreparation, |arena| {
+        crate::painting::paint_passes::svg_paint_resource_requests(arena)
+    });
     let Some(requests) = requests else {
         return false;
     };
@@ -558,18 +520,14 @@ pub unsafe extern "C" fn render_state_sync_svg_paint_resources(
         })
         .collect();
     // SAFETY: Guaranteed by the caller.
-    let PaintPassAnswer::SvgPaintResourcesPublished(changed) =
-        run_paint_pass(unsafe { &*host }, PaintPass::PublishSvgPaintResources(resolved))
-    else {
-        unreachable!("publishing the SVG paint resources answers whether they changed");
-    };
-    changed
+    run_paint_pass(read, unsafe { &*host }, PassEffect::StalesPaintPreparation, |arena| {
+        crate::painting::paint_passes::publish_resolved_svg_paint_resources(arena, resolved)
+    })
 }
 
 /// Re-reads the scroll containers' offsets when something invalidated them since the last refresh, resolves the
-/// sticky nodes' offsets on top of them, and hands the dense device-pixel snapshot to `publish`. Returns whether that
-/// happened, so the caller keeps its copy otherwise; `force` re-derives the snapshot even when nothing invalidated it,
-/// for verification.
+/// sticky nodes' offsets on top of them, and hands the dense device-pixel snapshot to `publish`; otherwise the caller
+/// keeps its copy.
 ///
 /// # Safety
 ///
@@ -578,27 +536,19 @@ pub unsafe extern "C" fn render_state_sync_svg_paint_resources(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_refresh_scroll_state(
     host: *mut crate::render_state::DocumentHost,
-    force: bool,
+    read: &crate::render_state::BegunRead,
     device_pixels_per_css_pixel: f64,
     sink: *mut c_void,
     publish: unsafe extern "C" fn(*mut c_void, *const libgfx_rust::FloatPoint, usize),
-) -> bool {
+) {
     // SAFETY: Guaranteed by the caller.
-    let PaintPassAnswer::ScrollState(snapshot) = run_paint_pass(
-        unsafe { &*host },
-        PaintPass::RefreshScrollState {
-            force,
-            device_pixels_per_css_pixel,
-        },
-    ) else {
-        unreachable!("a scroll state refresh answers its snapshot");
-    };
-    let Some(snapshot) = snapshot else {
-        return false;
-    };
-    // SAFETY: The C++ sink copies the offsets synchronously.
-    unsafe { publish(sink, snapshot.as_ptr(), snapshot.len()) };
-    true
+    let snapshot = run_paint_pass(read, unsafe { &*host }, PassEffect::RewritesRows, |arena| {
+        crate::painting::paint_passes::refresh_scroll_state(arena, device_pixels_per_css_pixel)
+    });
+    if let Some(snapshot) = snapshot {
+        // SAFETY: The C++ sink copies the offsets synchronously.
+        unsafe { publish(sink, snapshot.as_ptr(), snapshot.len()) };
+    }
 }
 
 /// # Safety
@@ -614,7 +564,7 @@ pub unsafe extern "C" fn render_state_for_each_snap_area(
 ) {
     // SAFETY: Guaranteed by the caller.
     let areas = unsafe {
-        read(host, snap_container, |arena, snap_container| {
+        read_arena(host, super::node_read(), snap_container, |arena, snap_container| {
             let mut areas = Vec::new();
             crate::painting::scroll_snap::for_each_snap_area(
                 &arena.paintable_rows(),
@@ -642,6 +592,7 @@ pub unsafe extern "C" fn render_state_for_each_snap_area(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_publish_recording(
     host: *const crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     publish: crate::painting::host::FfiRecordingPublishCallbacks,
     out: *mut crate::painting::ffi::FfiPresentedRecording,
 ) {
@@ -656,7 +607,7 @@ pub unsafe extern "C" fn render_state_publish_recording(
     }
     drop(recording);
     let presented = unsafe {
-        read(host, (), |arena, ()| {
+        read_arena(host, read, (), |arena, ()| {
             crate::painting::ffi::FfiPresentedRecording::of_last_recording(arena)
         })
     };
@@ -671,6 +622,7 @@ pub unsafe extern "C" fn render_state_publish_recording(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_take_recording_trace(
     host: *const crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     context: *mut c_void,
     describe_node: unsafe extern "C" fn(*mut c_void, NodeSlotId, *mut c_void),
     append_text: unsafe extern "C" fn(*mut c_void, *const u8, usize),
@@ -682,14 +634,14 @@ pub unsafe extern "C" fn render_state_take_recording_trace(
     };
     // SAFETY: As above.
     let recording = unsafe {
-        read(host, (), |arena, ()| {
+        read_arena(host, read, (), |arena, ()| {
             arena.paint_state().borrow().last_recording.clone()
         })
     };
     let Some(recording) = recording else {
         return false;
     };
-    let Some(log) = recording.capture_log_for_verification.as_ref() else {
+    let Some(log) = recording.capture_log.as_ref() else {
         return false;
     };
     let mut name = |slot| {
@@ -723,7 +675,7 @@ pub unsafe extern "C" fn render_state_for_each_subtree_fragment_rect(
 ) {
     // SAFETY: Guaranteed by the caller.
     let rects = unsafe {
-        read(host, root, |arena, root| {
+        read_arena(host, super::node_read(), root, |arena, root| {
             let paintable_rows = arena.paintable_rows();
             let mut rects = Vec::new();
             if !paintable_rows.paintable_row_is_populated(root) {
@@ -747,23 +699,29 @@ pub unsafe extern "C" fn render_state_for_each_subtree_fragment_rect(
 }
 
 /// Records `host`'s document's viewport with `inputs` on the Paint thread: in step with the host, or beside the event
-/// loop where `blocker` is none, until the host takes it in. Answers how the recording started, which it does not
-/// where the viewport has no box to record.
+/// loop where `blocker` is none, until the host takes it in. A recording that flies takes the presentation `presentation`
+/// names, if any, to present its frame with, and nulls it there; any other leaves it with the host. Answers how the
+/// recording started, which it does not where the viewport has no box to record.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread. Input arrays and byte buffers must be valid and
-/// immutable for this call; fonts for enabled overlays must be live `Gfx::Font`s.
+/// immutable for this call; fonts for enabled overlays must be live `Gfx::Font`s. `presentation` must be valid for
+/// reads and writes, and name a presentation the host gives up where the recording takes it, or none.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_record_display_list(
     host: *const crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
     inputs: crate::painting::host::FfiRecordingInputs,
     blocker: FfiFlightBlocker,
+    presentation: *mut crate::painting::ffi::FfiPresentation,
 ) -> FfiRecordingStart {
     assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { &*host };
+    // The recording takes the recorder state, which a clock lease brings back.
+    host.end_clock_lease_waiting(read);
     let mut recording = host.recording();
     debug_assert!(
         !recording.has_pending_recording() && !recording.has_recording_in_flight(),
@@ -771,7 +729,7 @@ pub unsafe extern "C" fn render_state_record_display_list(
     );
     recording.discard_pending_recording();
     let recorder = recording.take_recorder();
-    let frame_inputs = FrameInputs {
+    let frame_inputs = crate::painting::recording_slot::FrameInputs {
         viewport,
         css_viewport_rect: inputs.css_viewport_rect.into(),
         publishes_recording: inputs.publishes_recording,
@@ -782,7 +740,14 @@ pub unsafe extern "C" fn render_state_record_display_list(
         hit_test_item_capacity_hint: recording.hit_test_item_capacity_hint(),
     };
     // SAFETY: As above.
-    let Some(frame) = (unsafe { read(host, frame_inputs, freeze_recording_frame) }) else {
+    let Some(frame) = (unsafe {
+        read_arena(
+            host,
+            read,
+            frame_inputs,
+            crate::painting::recording_slot::freeze_recording_frame,
+        )
+    }) else {
         recording.give_back_recorder(recorder);
         return FfiRecordingStart::NothingToRecord;
     };
@@ -792,11 +757,13 @@ pub unsafe extern "C" fn render_state_record_display_list(
         crate::painting::recording_slot::RecordingJob::new(frame.frame, recorder, viewport, frame.trace_recordings);
     match crate::painting::recording_slot::FlightLicense::for_blocker(blocker) {
         Some(license) => {
-            recording.fly(job.fly(inputs, license), frame.rows_version);
+            // SAFETY: Guaranteed by the caller.
+            let presentation = unsafe { crate::painting::presentation::Presentation::take(&mut *presentation) };
+            recording.fly(job.fly(inputs, presentation, license), frame.rows_version);
             FfiRecordingStart::InFlight
         }
         None => {
-            let answer = job.run_on_paint_thread(&inputs);
+            let answer = job.run_on_paint_thread(inputs);
             recording.accept_recording_answer(answer);
             FfiRecordingStart::Recorded
         }
@@ -816,149 +783,136 @@ pub extern "C" fn render_state_release_held_recording_for_testing() {
 }
 
 /// Takes the recording in flight of `host`'s document in where it has finished, and answers how it landed. The event
-/// loop calls it between two tasks, so it never waits.
+/// loop calls it between two tasks, so it never waits. A recording that landed gives back the presentation it took, if
+/// any, through `presentation`.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread, and the event loop must call this between two tasks.
+/// `presentation` must be valid for writes; the host takes over what it names.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_take_finished_recording_in(
     host: *const crate::render_state::DocumentHost,
+    presentation: *mut crate::painting::ffi::FfiPresentation,
 ) -> FfiRecordingLanding {
     assert!(!host.is_null(), "document host is null");
     let boundary = crate::render_state::TaskBoundary::at_event_loop_entry(&TAKES_FINISHED_RECORDING_IN);
     // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }
-        .recording()
-        .take_finished_recording_in(&boundary, |rows_version| {
-            // SAFETY: As above.
-            unsafe { landed_recording_stands(host, rows_version) }
-        })
+    let host = unsafe { &*host };
+    let landing = host.recording().take_finished_recording_in(
+        &boundary,
+        |rows_version| landed_recording_stands(host, rows_version),
+        &mut |output, hit_test_list_changed, publishes_recording| {
+            take_in_presented_recording(host, output, hit_test_list_changed, publishes_recording);
+        },
+    );
+    // SAFETY: As above.
+    unsafe { recording_landing(landing, presentation) }
 }
 
-/// Waits for the recording in flight of `host`'s document and takes it in, and answers how it landed.
+/// Waits for the recording in flight of `host`'s document and takes it in, and answers how it landed (see
+/// [`render_state_take_finished_recording_in`]).
 ///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread.
+/// `host` must be a live document host, on its document's thread. `presentation` must be valid for writes; the host
+/// takes over what it names.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_join_recording_in_flight(
     host: *const crate::render_state::DocumentHost,
+    presentation: *mut crate::painting::ffi::FfiPresentation,
 ) -> FfiRecordingLanding {
     assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.recording().join_recording_in_flight(|rows_version| {
-        // SAFETY: As above.
-        unsafe { landed_recording_stands(host, rows_version) }
-    })
+    let host = unsafe { &*host };
+    let landing = host.recording().join_recording_in_flight(
+        |rows_version| landed_recording_stands(host, rows_version),
+        &mut |output, hit_test_list_changed, publishes_recording| {
+            take_in_presented_recording(host, output, hit_test_list_changed, publishes_recording);
+        },
+    );
+    // SAFETY: As above.
+    unsafe { recording_landing(landing, presentation) }
 }
 
-/// Whether the rows of `host`'s document are still at `version`, so that a recording that landed with a frame frozen
-/// there still stands for it. The recording dropped its frame and the lease it held, so the style engine frees what it
-/// kept for that lease here too, however idle the document stays.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-unsafe fn landed_recording_stands(
-    host: *const crate::render_state::DocumentHost,
-    version: crate::layout::RowsVersion,
-) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read(host, version, |arena, version| {
-            arena.with_style_engine(|engine| engine.free_style_records_kept_for_leases());
-            arena.rows_version() == version
-        })
-    }
-}
-
-/// Drops the recording pending for `host`'s document to publish unpublished, as the host does with a recording that
-/// landed for a document it no longer presents.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_discard_pending_recording(host: *const crate::render_state::DocumentHost) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.recording().discard_pending_recording();
-}
-
-/// What the host knows that freezing a document's frame for a recording reads.
-struct FrameInputs {
-    viewport: NodeSlotId,
-    css_viewport_rect: crate::css::css_pixels::CssPixelRect,
+/// Takes the output of a recording that presented itself in as the document's last.
+fn take_in_presented_recording(
+    host: &crate::render_state::DocumentHost,
+    output: std::sync::Arc<crate::painting::record::RecordingOutput>,
+    hit_test_list_changed: bool,
     publishes_recording: bool,
-    /// The canvas rect the root background painted in the recording published last, if any.
-    published_root_background_canvas_rect: Option<crate::css::css_pixels::CssPixelRect>,
-    hit_test_item_capacity_hint: usize,
+) {
+    host.queue_change(crate::render_state::ArenaChange::Paint(
+        crate::painting::paint_changes::PaintChange::TakeInRecording {
+            output,
+            hit_test_list_changed,
+            publishes_recording,
+        },
+    ));
 }
 
-/// A document's frame, frozen for a recording, with what the recording reads beside it, and the rows version it was
-/// frozen at.
-struct FrozenFrame {
-    frame: crate::painting::published_frame::PublishedFrame,
-    tree_inputs: crate::painting::host::FfiVisualContextTreeInputs,
-    root_background_source: crate::painting::host::RootBackgroundSource,
-    trace_recordings: bool,
-    rows_version: crate::layout::RowsVersion,
-}
-
-/// Freezes the frame of the document whose arena `arena` is for a recording of its viewport, or none where the
-/// viewport has no box to paint.
-fn freeze_recording_frame(arena: &mut LayoutNodeArena, inputs: FrameInputs) -> Option<FrozenFrame> {
-    // Recording reads overflow, and reading overflow never measures it.
-    arena.measure_scrollable_overflow();
-    if !arena.paintable_row_is_populated(inputs.viewport) || arena.stacking_context_entries(inputs.viewport).is_none() {
-        return None;
-    }
-    // The root background paints the union of the viewport and the root's overflow, so it is the
-    // one output a viewport move can change. Drop its caches before the frame is published instead
-    // of treating the viewport position as a frame-wide input.
-    if let Some(published_canvas_rect) = inputs.published_root_background_canvas_rect {
-        let root = arena
-            .paint_state()
-            .borrow()
-            .root_background_source
-            .expect("a recording follows paint preparation")
-            .root_layout_node;
-        let canvas_rect = crate::painting::record::paint::background_resolution::root_background_canvas_rect(
-            &arena.paintable_rows(),
-            root,
-            inputs.css_viewport_rect,
-        );
-        if canvas_rect != published_canvas_rect {
-            arena.push_paint_damage(root, crate::painting::record::damage::PaintDamage::DRAW_BACKGROUND);
+/// Answers how a recording landed, and writes the presentation it gave back to `presentation`.
+///
+/// # Safety
+///
+/// `presentation` must be valid for writes.
+unsafe fn recording_landing(
+    landing: crate::painting::recording_slot::RecordingLanding,
+    presentation: *mut crate::painting::ffi::FfiPresentation,
+) -> FfiRecordingLanding {
+    use crate::painting::recording_slot::RecordingLanding;
+    match landing {
+        RecordingLanding::NoneInFlight => FfiRecordingLanding::NoneInFlight,
+        RecordingLanding::StillInFlight => FfiRecordingLanding::StillInFlight,
+        RecordingLanding::Landed(given_back) => {
+            // SAFETY: Guaranteed by the caller.
+            unsafe { give_back(given_back, presentation) };
+            FfiRecordingLanding::Landed
+        }
+        RecordingLanding::LandedBehindRows(given_back) => {
+            // SAFETY: Guaranteed by the caller.
+            unsafe { give_back(given_back, presentation) };
+            FfiRecordingLanding::LandedBehindRows
         }
     }
-    if inputs.publishes_recording {
-        arena.note_publishing_paint_recording_started();
-    }
-    // The recording reads the document as it is now: what the host writes after this goes to the next frame.
-    let frame = arena.freeze_frame(inputs.hit_test_item_capacity_hint);
-    let rows_version = arena.rows_version();
-    let paint_state = arena.paint_state().borrow();
-    Some(FrozenFrame {
-        frame,
-        rows_version,
-        tree_inputs: paint_state
-            .visual_context
-            .last_tree_inputs
-            .expect("a recording follows a visual context update"),
-        root_background_source: paint_state
-            .root_background_source
-            .expect("a recording follows paint preparation"),
-        trace_recordings: paint_state.trace_recordings,
+}
+
+/// Writes the presentation a recording gave back, if any, to `presentation`.
+///
+/// # Safety
+///
+/// `presentation` must be valid for writes.
+unsafe fn give_back(
+    given_back: Option<crate::painting::presentation::Presentation>,
+    presentation: *mut crate::painting::ffi::FfiPresentation,
+) {
+    let given_back = given_back.map_or_else(Default::default, crate::painting::presentation::Presentation::into_ffi);
+    // SAFETY: Guaranteed by the caller.
+    unsafe { presentation.write(given_back) };
+}
+
+/// Whether the rows of `host`'s document are still at `version`, so that the hit-test list of a recording that landed
+/// with a frame frozen there still stands for it. The recording dropped its frame and the lease it held, so the style
+/// engine frees what it kept for that lease here too, however idle the document stays.
+fn landed_recording_stands(host: &crate::render_state::DocumentHost, version: crate::layout::RowsVersion) -> bool {
+    // A frame in flight, or a round that flew and is not paid yet, writes the rows, which then stand for no recording
+    // made before it.
+    let Some(here) = host.layout_waits_for_no_frame() else {
+        return false;
+    };
+    host.ask(here, |state| {
+        let arena = state.arena_mut();
+        arena.with_style_engine(|engine| engine.free_style_records_kept_for_leases());
+        arena.rows_version() == version
     })
 }
 
 /// Answers `query` from the hit-test list of the last recording `host`'s document published, built up by `build`, and
-/// the rows as of every write the host made, with every row's overflow measured. Answers `default` where no recording
+/// the rows as of every write the host made, with every row's overflow measured, in `read`. Answers `default` where no recording
 /// was published. Every entry that hits tests is called with a live document host, on its document's thread.
 fn with_hit_test_list<R>(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     default: R,
     build: impl FnOnce(&mut crate::painting::hit_test::HitTestList, &crate::painting::paint_read::PaintSource<'_>),
     query: impl FnOnce(
@@ -970,7 +924,7 @@ fn with_hit_test_list<R>(
     assert!(!host.is_null(), "document host is null");
     // SAFETY: The host is live.
     let host = unsafe { &*host };
-    let rows = host.fresh_measured_rows(input_reads_boxes());
+    let rows = host.fresh_measured_rows(read);
     let absolute_rects = std::cell::RefCell::default();
     let source = crate::painting::paint_read::PaintSource::over_rows(&rows.paintable, &absolute_rects);
     let mut recording = host.recording();
@@ -983,19 +937,22 @@ fn with_hit_test_list<R>(
 
 fn with_hit_test_list_items_only<R>(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     default: R,
     query: impl FnOnce(&crate::painting::hit_test::HitTestList, &crate::painting::paint_read::PaintSource<'_>) -> R,
 ) -> R {
-    with_hit_test_list(host, default, |_, _| {}, |list, _, source| query(list, source))
+    with_hit_test_list(host, read, default, |_, _| {}, |list, _, source| query(list, source))
 }
 
 fn with_hit_test_list_and_caret_lines<R>(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     default: R,
     query: impl FnOnce(&crate::painting::hit_test::HitTestList, &crate::painting::paint_read::PaintSource<'_>) -> R,
 ) -> R {
     with_hit_test_list(
         host,
+        read,
         default,
         |list, source| list.build_caret_lines_if_needed(source),
         |list, _, source| query(list, source),
@@ -1004,6 +961,7 @@ fn with_hit_test_list_and_caret_lines<R>(
 
 fn with_hit_test_list_spatial_indexes_and_visual_context_tree<R>(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     needs_caret_lines: bool,
     default: R,
     query: impl FnOnce(
@@ -1014,6 +972,7 @@ fn with_hit_test_list_spatial_indexes_and_visual_context_tree<R>(
 ) -> R {
     with_hit_test_list(
         host,
+        read,
         None,
         |list, source| {
             list.build_spatial_indexes_if_needed();
@@ -1047,10 +1006,11 @@ fn ffi_topmost(item: Option<crate::painting::hit_test::query::TopmostItem>) -> c
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_visit_chrome_widgets(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     sink: *mut c_void,
     visit: unsafe extern "C" fn(*mut c_void, NodeSlotId, u8),
 ) {
-    with_hit_test_list_items_only(host, (), |list, _arena| {
+    with_hit_test_list_items_only(host, read, (), |list, _arena| {
         for item in list.items.iter() {
             if item.chrome_widget_kind == crate::painting::hit_test::CHROME_WIDGET_NONE {
                 continue;
@@ -1068,11 +1028,12 @@ pub unsafe extern "C" fn layout_hit_test_visit_chrome_widgets(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_caret_line_for_position(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     query: crate::painting::host::FfiCaretPositionQuery,
     offset: usize,
     affinity_is_downstream: bool,
 ) -> crate::painting::host::FfiCaretLineForPosition {
-    with_hit_test_list_and_caret_lines(host, Default::default(), |list, arena| {
+    with_hit_test_list_and_caret_lines(host, read, Default::default(), |list, arena| {
         match list.caret_line_for_position(arena, &query, offset, affinity_is_downstream) {
             Some(line_index) => crate::painting::host::FfiCaretLineForPosition {
                 has_line: true,
@@ -1089,9 +1050,10 @@ pub unsafe extern "C" fn layout_hit_test_caret_line_for_position(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_caret_line(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     line_index: usize,
 ) -> crate::painting::host::FfiCaretLineExport {
-    with_hit_test_list_and_caret_lines(host, Default::default(), |list, _| {
+    with_hit_test_list_and_caret_lines(host, read, Default::default(), |list, _| {
         let line = &list.caret_lines[line_index];
         crate::painting::host::FfiCaretLineExport {
             rect: line.rect.into(),
@@ -1121,11 +1083,12 @@ pub unsafe extern "C" fn layout_hit_test_list_generation(host: *mut crate::rende
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_paintable_event_dispatch_target(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     slot: NodeSlotId,
 ) -> crate::painting::host::FfiNodeIdentity {
     // SAFETY: Guaranteed by the caller.
     unsafe {
-        with_measured_rows(host, |rows| {
+        read_measured_rows(host, read, |rows| {
             crate::painting::hit_test::resolve::event_dispatch_target_of_paintable(rows, slot)
         })
     }
@@ -1138,9 +1101,10 @@ pub unsafe extern "C" fn layout_paintable_event_dispatch_target(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_item_facts(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     index: usize,
 ) -> crate::painting::host::FfiHitTestItemExport {
-    with_hit_test_list_items_only(host, None, |list, arena| {
+    with_hit_test_list_items_only(host, read, None, |list, arena| {
         let item = &list.items[index];
         assert!(
             arena.paintable_row_is_populated(item.paintable),
@@ -1171,9 +1135,10 @@ pub unsafe extern "C" fn layout_hit_test_item_facts(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_item_target(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     item_index: usize,
 ) -> crate::painting::host::FfiNodeIdentity {
-    with_hit_test_list_items_only(host, Default::default(), |list, arena| {
+    with_hit_test_list_items_only(host, read, Default::default(), |list, arena| {
         list.item_target(arena, item_index)
     })
 }
@@ -1187,9 +1152,10 @@ pub unsafe extern "C" fn layout_hit_test_item_target(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_item_dispatch_target(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     item_index: usize,
 ) -> crate::painting::host::FfiNodeIdentity {
-    with_hit_test_list_items_only(host, Default::default(), |list, arena| {
+    with_hit_test_list_items_only(host, read, Default::default(), |list, arena| {
         list.item_dispatch_target(arena, item_index)
     })
 }
@@ -1201,10 +1167,11 @@ pub unsafe extern "C" fn layout_hit_test_item_dispatch_target(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_resolve_hit(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     item_index: usize,
     local_point: FfiCssPixelPoint,
 ) -> crate::painting::host::FfiResolvedHit {
-    with_hit_test_list_items_only(host, Default::default(), |list, arena| {
+    with_hit_test_list_items_only(host, read, Default::default(), |list, arena| {
         list.resolve_hit(arena, item_index, local_point.into())
     })
 }
@@ -1216,11 +1183,12 @@ pub unsafe extern "C" fn layout_hit_test_resolve_hit(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_resolve_caret(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     item_index: usize,
     local_point: FfiCssPixelPoint,
     position_type: u8,
 ) -> crate::painting::host::FfiResolvedCaret {
-    with_hit_test_list_items_only(host, Default::default(), |list, arena| {
+    with_hit_test_list_items_only(host, read, Default::default(), |list, arena| {
         list.resolve_caret(
             arena,
             item_index,
@@ -1236,12 +1204,17 @@ pub unsafe extern "C" fn layout_hit_test_resolve_caret(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_find_topmost_item(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
     point: FfiCssPixelPoint,
 ) -> crate::painting::host::FfiTopmostItem {
-    with_hit_test_list_spatial_indexes_and_visual_context_tree(host, false, Default::default(), |list, tree, arena| {
-        ffi_topmost(list.find_topmost_item(arena, tree, &callbacks, point.into()))
-    })
+    with_hit_test_list_spatial_indexes_and_visual_context_tree(
+        host,
+        read,
+        false,
+        Default::default(),
+        |list, tree, arena| ffi_topmost(list.find_topmost_item(arena, tree, &callbacks, point.into())),
+    )
 }
 
 /// # Safety
@@ -1250,16 +1223,23 @@ pub unsafe extern "C" fn layout_hit_test_find_topmost_item(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_find_topmost_items_for_caret(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
     point: FfiCssPixelPoint,
 ) -> crate::painting::host::FfiTopmostItemsForCaret {
-    with_hit_test_list_spatial_indexes_and_visual_context_tree(host, false, Default::default(), |list, tree, arena| {
-        let (caret_item, hit_item) = list.find_topmost_items_for_caret(arena, tree, &callbacks, point.into());
-        crate::painting::host::FfiTopmostItemsForCaret {
-            caret_item: ffi_topmost(caret_item),
-            hit_item: ffi_topmost(hit_item),
-        }
-    })
+    with_hit_test_list_spatial_indexes_and_visual_context_tree(
+        host,
+        read,
+        false,
+        Default::default(),
+        |list, tree, arena| {
+            let (caret_item, hit_item) = list.find_topmost_items_for_caret(arena, tree, &callbacks, point.into());
+            crate::painting::host::FfiTopmostItemsForCaret {
+                caret_item: ffi_topmost(caret_item),
+                hit_item: ffi_topmost(hit_item),
+            }
+        },
+    )
 }
 
 /// # Safety
@@ -1268,15 +1248,19 @@ pub unsafe extern "C" fn layout_hit_test_find_topmost_items_for_caret(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_all(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
     point: FfiCssPixelPoint,
     push_context: *mut c_void,
     push: unsafe extern "C" fn(*mut c_void, usize),
 ) {
-    let indices =
-        with_hit_test_list_spatial_indexes_and_visual_context_tree(host, false, Vec::new(), |list, tree, arena| {
-            list.hit_test_all(arena, tree, &callbacks, point.into())
-        });
+    let indices = with_hit_test_list_spatial_indexes_and_visual_context_tree(
+        host,
+        read,
+        false,
+        Vec::new(),
+        |list, tree, arena| list.hit_test_all(arena, tree, &callbacks, point.into()),
+    );
     for index in indices {
         // SAFETY: The C++ sink consumes the index synchronously.
         unsafe { push(push_context, index) };
@@ -1289,11 +1273,12 @@ pub unsafe extern "C" fn layout_hit_test_all(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_item_at_line_edge(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     line_index: usize,
     position_type: u8,
 ) -> usize {
     let position_type = crate::painting::hit_test::caret::CaretPositionType::from_u8(position_type);
-    with_hit_test_list_and_caret_lines(host, usize::MAX, |list, _| {
+    with_hit_test_list_and_caret_lines(host, read, usize::MAX, |list, _| {
         list.item_at_line_edge(line_index, position_type)
     })
 }
@@ -1304,11 +1289,12 @@ pub unsafe extern "C" fn layout_hit_test_item_at_line_edge(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_caret_item_for_line(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     line_index: usize,
     point: FfiCssPixelPoint,
     mode: u8,
 ) -> crate::painting::host::FfiCaretItemForLine {
-    with_hit_test_list_and_caret_lines(host, Default::default(), |list, arena| {
+    with_hit_test_list_and_caret_lines(host, read, Default::default(), |list, arena| {
         match list.caret_item_for_line(
             arena,
             line_index,
@@ -1331,9 +1317,12 @@ pub unsafe extern "C" fn layout_hit_test_caret_item_for_line(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_line_block_coordinate(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     line_index: usize,
 ) -> i32 {
-    with_hit_test_list_and_caret_lines(host, 0, |list, _| list.line_block_coordinate(line_index).raw_value())
+    with_hit_test_list_and_caret_lines(host, read, 0, |list, _| {
+        list.line_block_coordinate(line_index).raw_value()
+    })
 }
 
 /// # Safety
@@ -1342,10 +1331,11 @@ pub unsafe extern "C" fn layout_hit_test_line_block_coordinate(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_item_is_inline_adjacent_to_line(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     item_index: usize,
     line_index: usize,
 ) -> bool {
-    with_hit_test_list_and_caret_lines(host, false, |list, _| {
+    with_hit_test_list_and_caret_lines(host, read, false, |list, _| {
         list.item_is_inline_adjacent_to_line(item_index, line_index)
     })
 }
@@ -1366,7 +1356,7 @@ pub unsafe extern "C" fn layout_image_map_area_for_point(
     assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the caller.
     unsafe { &*host }
-        .fresh_rows(input_reads_boxes())
+        .fresh_rows(super::node_read())
         .image_map_area_for_point(slot, x, y)
 }
 
@@ -1376,6 +1366,7 @@ pub unsafe extern "C" fn layout_image_map_area_for_point(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_find_closest_line(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
     point: FfiCssPixelPoint,
     mode: u8,
@@ -1384,29 +1375,35 @@ pub unsafe extern "C" fn layout_hit_test_find_closest_line(
 ) -> crate::painting::host::FfiClosestLine {
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { crate::stage::from_ffi_entry(&MAIN_THREAD_FFI_ENTRY, &*host) };
-    with_hit_test_list_spatial_indexes_and_visual_context_tree(host, true, Default::default(), |list, tree, arena| {
-        let closest = list.find_closest_line(
-            &main_thread,
-            arena,
-            tree,
-            &callbacks,
-            point.into(),
-            crate::painting::hit_test::caret::CaretPositionMode::from_u8(mode),
-            scoped,
-            respect_clip,
-        );
-        crate::painting::host::FfiClosestLine {
-            has_index: closest.index.is_some(),
-            index: closest.index.unwrap_or(0),
-            local_x: closest.local_point.x.raw_value(),
-            local_y: closest.local_point.y.raw_value(),
-            block_distance: closest.block_distance.raw_value(),
-            block_start_distance: closest.block_start_distance.raw_value(),
-            inline_distance: closest.inline_distance.raw_value(),
-            is_before_point: closest.is_before_point,
-            contains_point_in_block_axis: closest.contains_point_in_block_axis,
-        }
-    })
+    with_hit_test_list_spatial_indexes_and_visual_context_tree(
+        host,
+        read,
+        true,
+        Default::default(),
+        |list, tree, arena| {
+            let closest = list.find_closest_line(
+                &main_thread,
+                arena,
+                tree,
+                &callbacks,
+                point.into(),
+                crate::painting::hit_test::caret::CaretPositionMode::from_u8(mode),
+                scoped,
+                respect_clip,
+            );
+            crate::painting::host::FfiClosestLine {
+                has_index: closest.index.is_some(),
+                index: closest.index.unwrap_or(0),
+                local_x: closest.local_point.x.raw_value(),
+                local_y: closest.local_point.y.raw_value(),
+                block_distance: closest.block_distance.raw_value(),
+                block_start_distance: closest.block_start_distance.raw_value(),
+                inline_distance: closest.inline_distance.raw_value(),
+                is_before_point: closest.is_before_point,
+                contains_point_in_block_axis: closest.contains_point_in_block_axis,
+            }
+        },
+    )
 }
 
 /// # Safety
@@ -1415,6 +1412,7 @@ pub unsafe extern "C" fn layout_hit_test_find_closest_line(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_adjacent_line(
     host: *mut crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
     current_line_index: usize,
     direction: u8,
@@ -1427,7 +1425,7 @@ pub unsafe extern "C" fn layout_hit_test_adjacent_line(
     };
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { crate::stage::from_ffi_entry(&MAIN_THREAD_FFI_ENTRY, &*host) };
-    with_hit_test_list_and_caret_lines(host, Default::default(), |list, arena| {
+    with_hit_test_list_and_caret_lines(host, read, Default::default(), |list, arena| {
         match list.adjacent_line(
             &main_thread,
             arena,

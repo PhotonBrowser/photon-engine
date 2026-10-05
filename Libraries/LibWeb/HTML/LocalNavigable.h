@@ -59,6 +59,12 @@
 #include <LibWebCommon/HTML/VisibilityState.h>
 #include <LibWebCommon/PixelUnits.h>
 
+namespace Web::Painting {
+
+struct DisplayListRecording;
+
+}
+
 namespace Web::HTML {
 
 struct PopulateSessionHistoryEntryDocumentOutput;
@@ -312,16 +318,22 @@ public:
         // Where the recording is needed now: waits for it to finish.
         Wait,
     };
-    // Takes the recording in flight in, and presents its frame where it still stands. Answers whether no recording is
-    // in flight any more.
+    // Takes the recording in flight in, and hands the presentation queue its frame where the recording did not present
+    // it. Answers whether no recording is in flight any more.
     bool take_recording_in_flight_in(TakeIn);
     bool has_recording_in_flight() const { return m_recording_in_flight; }
-    void hold_recording_in_flight_for_testing();
-    void release_recording_in_flight_for_testing();
 
     void render_screenshot(Gfx::PaintingSurface&, PaintConfig, Function<void()>&& callback);
-    Compositing::DisplayListResourceStorage& display_list_resource_storage() { return m_presenter.display_list_resource_storage(); }
-    Compositing::DisplayListResourceStorage const& display_list_resource_storage() const { return m_presenter.display_list_resource_storage(); }
+    Compositing::DisplayListResourceStorage& display_list_resource_storage() { return presenter().display_list_resource_storage(); }
+
+    // Leases the active document's render state to the render clock as a task begins, where the last rendering update
+    // left a plan for that.
+    void lease_clock_for_task();
+
+    // What this navigable presents to its compositor context from. Only the holder of the presenter presents, so frames
+    // reach the compositor in the order they were made: a frame of the active document that holds it is taken in first,
+    // which gives it back.
+    Compositor::NavigablePresenter& presenter();
 
     bool needs_repaint() const { return m_needs_repaint; }
     void set_needs_repaint() { m_needs_repaint = true; }
@@ -400,12 +412,12 @@ public:
     bool perform_a_scroll_step_for_key_input(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type);
     bool perform_a_snapped_momentum_scroll(Layout::Node&, CSSPixelPoint momentum_delta);
     Layout::Node* layout_node_for_async_scroll_node_stable_id(Web::AsyncScrollNodeStableID);
-    void re_snap_scroll_containers_after_layout_change();
+    void re_snap_scroll_containers_after_layout_change(Layout::BegunRead const& read);
     void abort_in_flight_smooth_scrolls(Web::AsyncScrollNodeStableID, SmoothScrollAbortCause);
     void abort_in_flight_smooth_scrolls_taken_over_by_user_input(Web::AsyncScrollNodeStableID, CSSPixelPoint scroll_offset_at_gesture_start);
     void queue_scrollend_event_after_user_scroll(GC::Ref<DOM::EventTarget>, Optional<Web::AsyncScrollNodeStableID>, Optional<CSSPixelPoint> scroll_offset_before_scroll = {}, SnapPositionSelection = SnapPositionSelection::AtGestureEnd);
     void note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type);
-    RefPtr<Painting::Scrollbar> scrollbar_dragged_by_compositor(Web::ScrollbarDraggedByCompositor const&);
+    RefPtr<Painting::Scrollbar> scrollbar_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const&);
     void note_user_scroll_gesture_phase(Web::ScrollGesturePhase);
     void defer_user_scroll_settlement();
     void snap_user_scroll_gestures_that_awaited_layout();
@@ -428,9 +440,17 @@ protected:
     Variant<Empty, Traversal, Utf16String> m_ongoing_navigation;
 
 private:
+    // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
+    struct RecordingInFlight;
+
     Layout::RustFFI::FfiFlightBlocker recording_flight_blocker(DOM::UpdateLayoutReason);
-    Optional<Compositor::CompositorFrame> finish_compositor_frame(DOM::Document&, PaintConfig const&, RefPtr<Compositing::DisplayList>);
+    PaintConfig stamp_paint_config(PaintConfig) const;
+    Compositor::SealedPresentation seal_presentation(DOM::Document&, PaintConfig const&, bool records_display_list);
+    void unseal_presentation(DOM::Document&, Compositor::SealedPresentation const&);
+    Optional<Compositor::CompositorFrame> finish_recording(Layout::BegunRead const&, DOM::Document&, Compositor::SealedPresentation const&, Painting::DisplayListRecording const&, Painting::HitTestListStands = Painting::HitTestListStands::Yes);
+    Optional<Compositor::CompositorFrame> finish_recording_in_flight(RecordingInFlight&, Layout::RustFFI::FfiRecordingLanding, Layout::RustFFI::FfiPresentation);
     void submit_painted_frame(Compositor::CompositorFrame);
+    Gfx::IntRect present_viewport_rect() const;
 
     enum class PendingNavigationBehavior {
         Append,
@@ -585,10 +605,7 @@ private:
     bool m_needs_repaint { true };
     bool m_needs_to_record_display_list { true };
 
-    // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
-    struct RecordingInFlight;
     OwnPtr<RecordingInFlight> m_recording_in_flight;
-    bool m_last_recording_in_flight_stood { true };
 
     bool m_pending_set_browser_zoom_request { false };
     bool m_should_show_line_box_borders { false };
@@ -596,7 +613,9 @@ private:
     i32 m_force_dark_foreground_threshold { default_force_dark_foreground_threshold };
     i32 m_force_dark_background_threshold { default_force_dark_background_threshold };
     bool m_should_show_caret_hit_test_debug_overlay { false };
-    Compositor::NavigablePresenter m_presenter;
+    // The navigable's presenter, here or held by a frame of the document that presents with it.
+    using PresenterSlot = Variant<NonnullOwnPtr<Compositor::NavigablePresenter>, GC::Ref<DOM::Document>>;
+    PresenterSlot m_presenter_slot { make<Compositor::NavigablePresenter>() };
     OwnPtr<Compositor::CompositorContextHandle> m_compositor_context;
     RefPtr<Core::Timer> m_async_scroll_hover_update_timer;
     Vector<PendingUserScrollendTarget> m_pending_user_scrollend_targets;

@@ -11,6 +11,12 @@
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/Forward.h>
 
+namespace Web::CSS {
+
+class InstalledStyle;
+
+}
+
 namespace Web::DOM {
 
 // Either an Element or a PseudoElement
@@ -26,11 +32,11 @@ public:
     Element const& element() const { return m_element; }
     Optional<CSS::PseudoElement> pseudo_element() const { return m_pseudo_element; }
 
-    Layout::NodeWithStyle* layout_node();
-    Layout::NodeWithStyle const* layout_node() const { return const_cast<AbstractElement*>(this)->layout_node(); }
+    Layout::NodeWithStyle* layout_node(Layout::BegunRead const& read);
+    Layout::NodeWithStyle const* layout_node(Layout::BegunRead const& read) const { return const_cast<AbstractElement*>(this)->layout_node(read); }
 
-    Layout::NodeWithStyle* unsafe_layout_node();
-    Layout::NodeWithStyle const* unsafe_layout_node() const { return const_cast<AbstractElement*>(this)->unsafe_layout_node(); }
+    Layout::NodeWithStyle* unsafe_layout_node(Layout::BegunRead const& read);
+    Layout::NodeWithStyle const* unsafe_layout_node(Layout::BegunRead const& read) const { return const_cast<AbstractElement*>(this)->unsafe_layout_node(read); }
 
     struct TreeCountingFunctionResolutionContext {
         size_t sibling_count;
@@ -46,6 +52,7 @@ public:
 
     [[nodiscard]] CSS::ComputedStyleRecordView computed_style() const;
     [[nodiscard]] CSS::StyleRecordID style_record_identity() const;
+    [[nodiscard]] CSS::InstalledStyle const& installed_style() const;
     [[nodiscard]] bool has_style() const { return !!style_record_identity(); }
     [[nodiscard]] void const* style_record_payloads() const;
     template<typename StyleGroup>

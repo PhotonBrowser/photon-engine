@@ -21,13 +21,11 @@ use std::sync::{Arc, OnceLock};
 
 use crate::abort_on_panic;
 use crate::css::animated_overlay::{AnimatedOverlay, overlay_wins};
-use crate::css::cascaded_properties::{
-    CascadeOrigin, CascadedPropertyStore, FfiCustomPropertyDriveInput, FfiResolvedCustomProperties,
-};
+use crate::css::cascaded_properties::{CascadeOrigin, CascadedPropertyStore};
 use crate::css::computed_longhand_table::{
     ComputedLonghandTable, HIGHLIGHT_COLOR_IS_CURRENT_COLOR, HIGHLIGHT_COLORS_AUTHORED,
 };
-use crate::css::css_pixels::CssPixels;
+use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::css::display::FfiDisplay;
 use crate::css::property_metadata::longhands_for_shorthand;
 use crate::css::property_metadata::property_id;
@@ -2674,33 +2672,6 @@ const COMPUTED_KIND_DISPLAY: u8 = 9;
 /// A complete Rust-owned style value transferred through `computed_data`.
 const COMPUTED_KIND_STYLE_VALUE: u8 = 10;
 
-#[repr(C)]
-pub struct FfiLonghandDriveInput {
-    pub longhand_table: *mut ComputedLonghandTable,
-    pub animated_overlay: *mut AnimatedOverlay,
-    pub store: *const CascadedPropertyStore,
-    pub environment: *const FfiStyleComputationEnvironment,
-    pub computed_group_mask: u32,
-    pub computed_property_words: *const u64,
-    pub font_length_resolution_context: FfiLengthResolutionContext,
-    pub callback_context: *mut c_void,
-    pub prepare_phase_context: unsafe extern "C" fn(*mut c_void, u8, *mut FfiLonghandPhaseContext),
-}
-
-#[repr(C)]
-pub struct FfiLonghandPhaseContext {
-    pub length_resolution_context: FfiLengthResolutionContext,
-    pub input_line_height_metrics: FfiInputLineHeightMetrics,
-    pub line_height_before_adjustments: *const c_void,
-    pub custom_property_input: FfiCustomPropertyDriveInput,
-}
-
-#[repr(C)]
-pub struct FfiLonghandDriveResult {
-    pub driver_results: FfiLonghandDriverResults,
-    pub custom_properties: FfiResolvedCustomProperties,
-}
-
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum FfiAnimationTimelineKind {
@@ -3056,15 +3027,6 @@ impl<'a> ParentSnapshot<'a> {
         self.table.get(property_id).map(RetainedStyleValueData::data)
     }
 
-    fn effective_value(&self, property_id: u16) -> Option<&StyleValueData> {
-        if let Some(entry) = self.animated_property(property_id)
-            && overlay_wins(entry, self.is_important(property_id))
-        {
-            return Some(entry.value());
-        }
-        self.value(property_id)
-    }
-
     fn animated_property(&self, property_id: u16) -> Option<&crate::css::animated_overlay::FfiAnimatedOverlayEntry> {
         self.inherited_value_overlay
             .or(self.stored_animated_overlay)
@@ -3133,11 +3095,6 @@ pub struct FfiLonghandDriverResults {
 #[derive(Clone, Copy)]
 struct PostComputeAdjustment {
     display_before: FfiDisplay,
-    float_before: u16,
-    overflow_x_before: u16,
-    overflow_y_before: u16,
-    text_align_before: u16,
-    position_before: u16,
     box_type_transformation: FfiBoxTypeTransformation,
     element_style_adjustment: FfiElementStyleAdjustment,
 }
@@ -3165,8 +3122,6 @@ pub const LONGHAND_DRIVE_PHASE_FONT: u8 = 0;
 pub const LONGHAND_DRIVE_PHASE_LINE_HEIGHT: u8 = 1;
 pub const LONGHAND_DRIVE_PHASE_COLOR_SCHEME: u8 = 2;
 pub const LONGHAND_DRIVE_PHASE_REMAINING: u8 = 3;
-pub const LONGHAND_PHASE_CONTEXT_AFTER_FONT: u8 = 0;
-pub const LONGHAND_PHASE_CONTEXT_AFTER_LINE_HEIGHT: u8 = 1;
 
 pub(crate) fn property_computation_order_for_phase(phase: u8) -> &'static [u16] {
     use crate::css::property_metadata::{property_computation_order, property_id as prop};
@@ -3243,10 +3198,6 @@ fn retained_new(value: StyleValueData) -> RetainedStyleValueData {
 fn needs_computed_style_sheet_context(value: *const StyleValueData) -> bool {
     if value.is_null() {
         return false;
-    }
-    #[cfg(any(test, feature = "style-replay"))]
-    if crate::css::style_value::replay_style_value_token(value).is_some() {
-        return true;
     }
     // NB: Keep this traversal aligned with StyleValue::set_style_sheet(). Only image
     //     wrappers consume the context; container wrappers forward it to their children.
@@ -3339,9 +3290,8 @@ fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: &Comp
 /// `environment` at valid element and document facts,
 /// `length_resolution_context` at the context for this stage or null for the
 /// color-scheme stage, `input_line_height_metrics` at the metrics for the
-/// remaining stage or null when post-compute adjustments are not wanted,
-/// `line_height_before_adjustments` at its effective value for that stage or
-/// null with the metrics, and `results` at a valid results block.
+/// remaining stage or null when post-compute adjustments are not wanted, and
+/// `results` at a valid results block.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn drive_property_computation(
     longhand_table: *mut ComputedLonghandTable,
@@ -3355,7 +3305,6 @@ pub(crate) unsafe fn drive_property_computation(
     phase: u8,
     length_resolution_context: *const FfiLengthResolutionContext,
     input_line_height_metrics: *const FfiInputLineHeightMetrics,
-    line_height_before_adjustments: *const c_void,
     results: *mut FfiLonghandDriverResults,
     effective_color_scheme: &mut i16,
     coordinate_overflow_keywords: bool,
@@ -3423,7 +3372,6 @@ pub(crate) unsafe fn drive_property_computation(
         let mut computed_direction: Option<u8> = None;
         let mut computed_overflow_x: Option<u16> = None;
         let mut computed_overflow_y: Option<u16> = None;
-        let mut computed_text_align_before_adjustment: Option<u16> = None;
         let mut computed_text_align: Option<u16> = None;
         let mut computed_display: Option<FfiDisplay> = None;
         let mut computed_float: Option<u16> = None;
@@ -4449,7 +4397,6 @@ pub(crate) unsafe fn drive_property_computation(
             } else if property_id == prop::TEXT_ALIGN
                 && let StyleValueData::Keyword { keyword: text_align } = value_data
             {
-                computed_text_align_before_adjustment = Some(*text_align);
                 let (has_parent_with_computed_values, parent_text_align, parent_direction_is_ltr) =
                     if let Some(snapshot) = snapshot {
                         let parent_text_align = match snapshot.value(prop::TEXT_ALIGN) {
@@ -4559,8 +4506,7 @@ pub(crate) unsafe fn drive_property_computation(
         longhand_table.set_overflow_before_adjustment(overflow_before);
         let mut box_type_input = *box_type_input;
         box_type_input.display = display_before;
-        let float_before = computed_float.expect("float must be computed by the longhand driver");
-        box_type_input.float_value = float_before;
+        box_type_input.float_value = computed_float.expect("float must be computed by the longhand driver");
         box_type_input.position = computed_position.expect("position must be computed by the longhand driver");
         let overlay = unsafe { animated_overlay.as_ref() };
         box_type_input.webkit_box_layout_transformation_applies =
@@ -4571,61 +4517,10 @@ pub(crate) unsafe fn drive_property_computation(
         let element_adjustment = adjustments.element_style;
         let post_compute_adjustment = PostComputeAdjustment {
             display_before,
-            float_before,
-            overflow_x_before: overflow_before[0],
-            overflow_y_before: overflow_before[1],
-            text_align_before: computed_text_align_before_adjustment
-                .expect("text-align must be computed by the longhand driver"),
-            position_before: box_type_input.position,
             box_type_transformation: transformation,
             element_style_adjustment: element_adjustment,
         };
         if !input_line_height_metrics.is_null() {
-            assert!(!line_height_before_adjustments.is_null());
-            let line_height_before = unsafe {
-                RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
-                    line_height_before_adjustments.cast(),
-                ))
-            };
-            longhand_table.set_post_compute_restore_values([
-                (
-                    prop::DISPLAY,
-                    retained_new(StyleValueData::Display {
-                        raw: post_compute_adjustment.display_before.encoded(),
-                    }),
-                ),
-                (
-                    prop::FLOAT,
-                    retained_new(StyleValueData::Keyword {
-                        keyword: post_compute_adjustment.float_before,
-                    }),
-                ),
-                (
-                    prop::OVERFLOW_X,
-                    retained_new(StyleValueData::Keyword {
-                        keyword: post_compute_adjustment.overflow_x_before,
-                    }),
-                ),
-                (
-                    prop::OVERFLOW_Y,
-                    retained_new(StyleValueData::Keyword {
-                        keyword: post_compute_adjustment.overflow_y_before,
-                    }),
-                ),
-                (
-                    prop::TEXT_ALIGN,
-                    retained_new(StyleValueData::Keyword {
-                        keyword: post_compute_adjustment.text_align_before,
-                    }),
-                ),
-                (
-                    prop::POSITION,
-                    retained_new(StyleValueData::Keyword {
-                        keyword: post_compute_adjustment.position_before,
-                    }),
-                ),
-                (prop::LINE_HEIGHT, line_height_before),
-            ]);
             results.post_adjusted_longhands =
                 apply_post_compute_adjustments(longhand_table, &post_compute_adjustment, unsafe {
                     &*input_line_height_metrics
@@ -4996,26 +4891,41 @@ fn settled_animation_plan(
 ///
 /// # Safety
 /// `host` must be a live document host, on its document's thread, `record` must be the record the
-/// element or pseudo-element holds, and `apply` must not retain the definitions it is handed.
+/// element or pseudo-element holds, `has_animations` whether it holds CSS-defined animations, and
+/// `apply` must not retain the definitions it is handed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_settled_animation_plan(
     host: *const crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     pseudo_kind: u8,
     record: u64,
+    has_animations: bool,
     context: *mut c_void,
     apply: unsafe extern "C" fn(*mut c_void, *const FfiComputedAnimation, usize, bool),
 ) {
     let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(node) else {
         return;
     };
-    // Applying the plan publishes the element's animations to the engine, so nothing of the
-    // engine is borrowed while the host applies it: the definitions only point into the record.
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { crate::css::style::engine_calls::document_host(host) };
-    let Some((definitions, in_display_none_subtree)) = crate::css::style::engine_calls::with_engine(host, |engine| {
-        settled_animation_plan(engine, node, pseudo_kind, record)
-    }) else {
+    // A record that names no animation plans none for an element that holds none, which the host reads off a record it
+    // has the view of without asking.
+    if !has_animations
+        && let Some(view) = crate::css::style::engine_calls::known_style_record_view(host, record)
+        // SAFETY: A published record's table lives as long as the record.
+        && let Some(table) = unsafe { view.longhand_table.cast::<ComputedLonghandTable>().as_ref() }
+        && !table_declares_css_animations(table)
+    {
+        return;
+    }
+    // Applying the plan publishes the element's animations to the engine, so nothing of the
+    // engine is borrowed while the host applies it: the definitions only point into the record.
+    let Some((definitions, in_display_none_subtree)) =
+        crate::css::style::engine_calls::with_engine(read, host, |engine| {
+            settled_animation_plan(engine, node, pseudo_kind, record)
+        })
+    else {
         return;
     };
     unsafe {
@@ -5231,7 +5141,6 @@ pub unsafe extern "C" fn rust_create_document_longhand_table(
                 std::ptr::null(),
                 phase,
                 length_resolution_context,
-                std::ptr::null(),
                 std::ptr::null(),
                 &raw mut results,
                 &mut effective_color_scheme,
@@ -5478,7 +5387,6 @@ pub unsafe extern "C" fn rust_compute_animation_keyframe_longhands(
                     phase,
                     length_resolution_context,
                     std::ptr::null(),
-                    std::ptr::null(),
                     &raw mut results,
                     &mut effective_color_scheme,
                     false,
@@ -5520,12 +5428,48 @@ pub const SUBSTITUTION_MARK_IF: u8 = 1 << 2;
 pub const SUBSTITUTION_MARK_INHERIT: u8 = 1 << 3;
 pub const SUBSTITUTION_MARK_CUSTOM_FUNCTION: u8 = 1 << 4;
 
+/// One animation effect's timing as the host holds it when it samples the effect: what its
+/// animation contributes, the effect's own timing, and the time its timeline was sampled at. Every
+/// time is in milliseconds. The host describes an effect whose times are not, or whose local time is
+/// overridden for observation, as one the engine cannot decide.
+///
+/// Its easing travels beside it, as a descriptor the call borrows.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FfiEffectTiming {
+    pub decidable: bool,
+    pub has_timeline_time: bool,
+    /// The effect's animation runs on a document timeline, whose time is a timestamp less this origin
+    /// time.
+    pub has_timeline_origin_time: bool,
+    pub has_start_time: bool,
+    pub has_hold_time: bool,
+    /// `Bindings::FillMode`, in IDL order.
+    pub fill_mode: u8,
+    /// `Bindings::PlaybackDirection`, in IDL order.
+    pub playback_direction: u8,
+    pub timeline_time: f64,
+    pub timeline_origin_time: f64,
+    pub start_time: f64,
+    pub hold_time: f64,
+    pub playback_rate: f64,
+    pub start_delay: f64,
+    pub end_delay: f64,
+    pub iteration_duration: f64,
+    pub iteration_count: f64,
+    pub iteration_start: f64,
+}
+
 /// One effect the host samples: which of the element's described effects it is, which version of
-/// it, and how far along it is on the scale the host keys keyframes by.
+/// it, and its timing, from which the engine computes how far along it is on the scale the host keys
+/// keyframes by. Where the engine cannot decide the timing, the host computes that key itself.
 #[repr(C)]
 pub struct FfiSampledAnimationEffect {
     pub identity: u64,
     pub generation: u64,
+    pub timing: FfiEffectTiming,
+    pub easing: crate::css::easing::FfiEasingDescriptor,
+    /// The host's key, for a timing the engine cannot decide.
     pub current_key: f64,
 }
 
@@ -5570,9 +5514,9 @@ pub struct FfiHostAnimationSample {
     /// The document's side of the environment keyframes compute in. The engine fills in the
     /// element's own: its place among its siblings and its random bases.
     pub environment: *const FfiStyleComputationEnvironment,
-    pub has_transform_reference_box: bool,
-    pub transform_reference_box_width: f64,
-    pub transform_reference_box_height: f64,
+    /// The slot of the row of the box of the sampled element, a `NodeSlotId`'s index, invalid where it has none: the
+    /// render owner reads the transform reference box transforms interpolate against from it.
+    pub element_box_slot: u32,
     pub callback_context: *mut c_void,
     /// Makes the working set's overlay writable and hands it over, the moment a value is written.
     pub prepare_overlay_for_mutation: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
@@ -5689,17 +5633,18 @@ impl FfiHostAnimationSample {
     }
 
     /// The context the effects evaluate in, resolving lengths against `length_resolution_context`
-    /// where there is one.
+    /// where there is one, and transforms against `reference_box`.
     ///
     /// # Safety
     /// As for [`Self::working_set`].
     unsafe fn animation_context(
         &self,
         length_resolution_context: Option<&FfiLengthResolutionContext>,
+        reference_box: Option<CssPixelRect>,
     ) -> crate::css::animation::FfiAnimationContext {
         // SAFETY: Guaranteed by the caller.
         let (table, overlay) = unsafe { self.working_set() };
-        crate::css::animation::FfiAnimationContext {
+        let mut context = crate::css::animation::FfiAnimationContext {
             allow_discrete: length_resolution_context.is_some(),
             current_color: table
                 .effective_value(overlay, crate::css::property_metadata::property_id::COLOR, true)
@@ -5709,10 +5654,12 @@ impl FfiHostAnimationSample {
             length_resolution_context: length_resolution_context
                 .map(animation_length_resolution_context)
                 .unwrap_or_default(),
-            has_transform_reference_box: self.has_transform_reference_box,
-            transform_reference_box_width: self.transform_reference_box_width,
-            transform_reference_box_height: self.transform_reference_box_height,
-        }
+            has_transform_reference_box: false,
+            transform_reference_box_width: 0.0,
+            transform_reference_box_height: 0.0,
+        };
+        context.set_transform_reference_box(reference_box);
+        context
     }
 }
 
@@ -5729,22 +5676,119 @@ impl FfiHostAnimationSample {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_sample_animation_effects(
     input: *const FfiHostAnimationSample,
+    read: &crate::render_state::BegunRead,
 ) -> FfiHostAnimationSampleResult {
-    use crate::css::style::engine_calls::{document_host, with_engine};
+    use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
 
     // SAFETY: Guaranteed by the caller.
     let input = unsafe { &*input };
     // SAFETY: As above.
     let host = unsafe { document_host(input.host) };
+    // The first sample of the transitions a step just started rides the style job that decided the step.
     // SAFETY: As above.
-    let sample = match with_engine(host, |engine| unsafe { begin_animation_sample(input, engine) }) {
-        AnimationSampleStep::Sampled(result) => return result,
-        AnimationSampleStep::NeedsHostLengthContexts(sample) => sample,
+    if let Some(result) = unsafe { host.answer_fresh_transition_sample(input) } {
+        return result;
+    }
+    // SAFETY: As above.
+    let step = with_engine_and_arena(read, host, |engine, arena| unsafe {
+        sample_in_engine(input, engine, arena)
+    });
+    // SAFETY: As above.
+    unsafe { finish_sample_with_host(input, read, step) }
+}
+
+/// Sample each of `count` elements' animation effects onto its working set's overlay, as
+/// [`rust_sample_animation_effects`] samples one, in one call of the style engine, and write what
+/// each sample found to `results`. Every element is one of the same document's.
+///
+/// # Safety
+/// As for [`rust_sample_animation_effects`], for each of the `count` inputs, and `results` must
+/// have room for `count` results.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_sample_animation_effects_each(
+    inputs: *const FfiHostAnimationSample,
+    count: usize,
+    read: &crate::render_state::BegunRead,
+    results: *mut FfiHostAnimationSampleResult,
+) {
+    use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
+
+    // SAFETY: Guaranteed by the caller.
+    let inputs = unsafe { crate::css::custom_properties::ffi_slice(inputs, count) };
+    let Some(first) = inputs.first() else {
+        return;
     };
-    // Building the length contexts may read the engine, so the host builds them between two calls
-    // of it, over what the first one resolved.
+    debug_assert!(
+        inputs.iter().all(|input| input.host == first.host),
+        "a batch samples one document"
+    );
+    // SAFETY: As above.
+    let host = unsafe { document_host(first.host) };
+    // SAFETY: As above.
+    let steps: Vec<_> = with_engine_and_arena(read, host, |engine, arena| {
+        inputs
+            .iter()
+            .map(|input| unsafe { sample_in_engine(input, engine, arena) })
+            .collect()
+    });
+    for (index, (input, step)) in inputs.iter().zip(steps).enumerate() {
+        // SAFETY: As above.
+        unsafe { results.add(index).write(finish_sample_with_host(input, read, step)) };
+    }
+}
+
+/// Take the sample `input` asks for as far as one call of the engine goes: to its end, or to the
+/// length contexts the host builds.
+///
+/// # Safety
+/// As for [`rust_sample_animation_effects`].
+unsafe fn sample_in_engine(
+    input: &FfiHostAnimationSample,
+    engine: &mut crate::css::style::StyleEngine,
+    arena: &crate::layout::LayoutNodeArena,
+) -> AnimationSampleStep {
+    // Transforms interpolate against the transform reference box of the element's box, which the render owner reads.
+    let element_box = crate::layout::node_data::NodeSlotId {
+        index: input.element_box_slot,
+    };
+    let reference_box = crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
+    // SAFETY: Guaranteed by the caller.
+    unsafe {
+        let composed = host_sampled_effects(input, engine);
+        match begin_animation_sample(input, engine, described_effects(input, engine), composed, reference_box) {
+            AnimationSampleStep::Resolved(sample) => match engine_length_contexts(input, engine, &sample) {
+                Some(length_contexts) => AnimationSampleStep::Sampled(finish_animation_sample(
+                    input,
+                    engine,
+                    sample,
+                    &length_contexts,
+                    reference_box,
+                )),
+                None => AnimationSampleStep::Resolved(sample),
+            },
+            sampled => sampled,
+        }
+    }
+}
+
+/// Finish a sample one call of the engine took to `step`: building the length contexts may read
+/// the engine, so the host builds them between two calls of it, over what the first one resolved.
+///
+/// # Safety
+/// As for [`rust_sample_animation_effects`].
+unsafe fn finish_sample_with_host(
+    input: &FfiHostAnimationSample,
+    read: &crate::render_state::BegunRead,
+    step: AnimationSampleStep,
+) -> FfiHostAnimationSampleResult {
+    use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
+
+    let sample = match step {
+        AnimationSampleStep::Sampled(result) => return result,
+        AnimationSampleStep::Resolved(sample) => sample,
+    };
     let mut length_contexts = std::mem::MaybeUninit::<FfiAnimationLengthContexts>::uninit();
-    // SAFETY: As above. The host writes every context.
+    // SAFETY: Guaranteed by the caller. The host writes every context.
     let length_contexts = unsafe {
         (input.length_contexts)(
             input.callback_context,
@@ -5753,37 +5797,126 @@ pub unsafe extern "C" fn rust_sample_animation_effects(
         );
         length_contexts.assume_init()
     };
+    let element_box = crate::layout::node_data::NodeSlotId {
+        index: input.element_box_slot,
+    };
     // SAFETY: As above.
-    with_engine(host, |engine| unsafe {
-        finish_animation_sample(input, engine, sample, &length_contexts)
+    with_engine_and_arena(read, unsafe { document_host(input.host) }, |engine, arena| unsafe {
+        let reference_box =
+            crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
+        finish_animation_sample(input, engine, sample, &length_contexts, reference_box)
     })
 }
 
-/// How far one call of the style engine took a sample.
+/// How far one call of the style engine took a sample. It lives for one call, so the resolved
+/// sample stays inline rather than taking an allocation.
+#[allow(clippy::large_enum_variant)]
 enum AnimationSampleStep {
     Sampled(FfiHostAnimationSampleResult),
-    /// The keyframes compute over length contexts only the host builds.
-    NeedsHostLengthContexts(ResolvedAnimationSample),
+    /// The declarations are resolved, and the keyframes compute over the element's length contexts.
+    Resolved(ResolvedAnimationSample),
+}
+
+/// The length contexts a resolved sample's keyframes compute over, where the engine builds them: over
+/// a record the host holds. The host builds them over a working set it is computing, and wherever they
+/// need a container base: resolving one marks the container asked about and, before layout, has it
+/// evaluated again after.
+fn engine_length_contexts(
+    input: &FfiHostAnimationSample,
+    engine: &crate::css::style::StyleEngine,
+    sample: &ResolvedAnimationSample,
+) -> Option<FfiAnimationLengthContexts> {
+    if input.style_record == 0 || sample.resolved.container_relative_length_unit_mask != 0 {
+        return None;
+    }
+    let pseudo = (input.pseudo_kind != crate::css::cascaded_properties::NO_PSEUDO_ELEMENT).then_some(input.pseudo_kind);
+    engine.animation_sample_length_contexts(sample.node, pseudo, input.style_record)
 }
 
 /// A sample whose declarations are resolved, which computes its keyframe values over the element's
 /// length contexts. It owns what it holds, so it holds nothing of the engine between two calls.
 struct ResolvedAnimationSample {
     node: crate::css::style::tree::StyleNodeID,
-    composed: smallvec::SmallVec<[crate::css::animation::FfiSampledAnimationEffect; 4]>,
+    composed: SampledEffects,
     resolved: Box<crate::css::animation::ResolvedAnimationDeclarations>,
     custom_properties: crate::css::animation::AnimatedCustomProperties,
     result: FfiHostAnimationSampleResult,
 }
 
-/// Take a sample as far as the style engine goes without the host: to its end where the engine
-/// builds the element's length contexts, and up to them where the host does.
+/// The effects the host samples that the sample composes, each at the key its timing gives at the time
+/// the host sampled its timeline, keeping each timing for a sample at another time.
+///
+/// # Safety
+/// As for [`rust_sample_animation_effects`].
+unsafe fn host_sampled_effects(
+    input: &FfiHostAnimationSample,
+    engine: &mut crate::css::style::StyleEngine,
+) -> SampledEffects {
+    use crate::css::animation as anim;
+
+    let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(input.style_node) else {
+        return SampledEffects::new();
+    };
+    let slot = animation_slot(input.pseudo_kind);
+    let sampled = unsafe { crate::css::custom_properties::ffi_slice(input.effects, input.effect_count) };
+    sampled
+        .iter()
+        .filter_map(|effect| {
+            // SAFETY: The host's easings are live for the call.
+            let key = unsafe {
+                engine.time_element_animation_effect(
+                    node,
+                    slot,
+                    effect.identity,
+                    &effect.timing,
+                    &effect.easing,
+                    effect.current_key,
+                )
+            };
+            let description = engine
+                .element_animation_effects(node, slot)
+                .iter()
+                .find(|description| description.identity == effect.identity);
+            debug_assert!(description.is_some(), "the host describes every effect it samples");
+            description
+                .is_some_and(|description| {
+                    description.generation == effect.generation && description.keyframes.len() >= 2
+                })
+                .then_some(anim::FfiSampledAnimationEffect {
+                    effect: anim::FfiAnimationPreparationEffect {
+                        identity: effect.identity,
+                        generation: effect.generation,
+                    },
+                    current_key: key?,
+                })
+        })
+        .collect()
+}
+
+/// The effects the engine describes for the element or pseudo-element `input` samples.
+fn described_effects<'a>(
+    input: &FfiHostAnimationSample,
+    engine: &'a crate::css::style::StyleEngine,
+) -> &'a [crate::css::style::effect_descriptions::PublishedEffect] {
+    crate::css::style::tree::StyleNodeID::from_raw(input.style_node).map_or(&[], |node| {
+        engine.element_animation_effects(node, animation_slot(input.pseudo_kind))
+    })
+}
+
+/// The effects a sample composes, in composite order, each at the key it samples its keyframes at.
+pub(crate) type SampledEffects = smallvec::SmallVec<[crate::css::animation::FfiSampledAnimationEffect; 4]>;
+
+/// Take a sample of `composed`, effects `descriptions` describes, as far as the style engine goes
+/// without the host: to its end, or to the length contexts its keyframes compute over.
 ///
 /// # Safety
 /// As for [`rust_sample_animation_effects`].
 unsafe fn begin_animation_sample(
     input: &FfiHostAnimationSample,
-    engine: &mut crate::css::style::StyleEngine,
+    engine: &crate::css::style::StyleEngine,
+    descriptions: &[crate::css::style::effect_descriptions::PublishedEffect],
+    composed: SampledEffects,
+    reference_box: Option<CssPixelRect>,
 ) -> AnimationSampleStep {
     use crate::css::animation as anim;
     use FfiHostAnimationSampleOutcome::{Cleared, Evaluated, Unchanged};
@@ -5793,30 +5926,8 @@ unsafe fn begin_animation_sample(
         return finished(Cleared);
     };
     let pseudo = (input.pseudo_kind != crate::css::cascaded_properties::NO_PSEUDO_ELEMENT).then_some(input.pseudo_kind);
-    let sampled = unsafe { crate::css::custom_properties::ffi_slice(input.effects, input.effect_count) };
     let (table, overlay) = unsafe { input.working_set() };
-
-    let descriptions = engine.element_animation_effects(node, animation_slot(input.pseudo_kind));
-    let description = |identity| {
-        let description = descriptions.iter().find(|description| description.identity == identity);
-        debug_assert!(description.is_some(), "the host describes every effect it samples");
-        description
-    };
-    let composed: smallvec::SmallVec<[anim::FfiSampledAnimationEffect; 4]> = sampled
-        .iter()
-        .filter(|effect| {
-            description(effect.identity).is_some_and(|description| {
-                description.generation == effect.generation && description.keyframes.len() >= 2
-            })
-        })
-        .map(|effect| anim::FfiSampledAnimationEffect {
-            effect: anim::FfiAnimationPreparationEffect {
-                identity: effect.identity,
-                generation: effect.generation,
-            },
-            current_key: effect.current_key,
-        })
-        .collect();
+    let description = |identity| descriptions.iter().find(|description| description.identity == identity);
     if composed.is_empty() {
         return finished(Cleared);
     }
@@ -5825,7 +5936,7 @@ unsafe fn begin_animation_sample(
     // no keyframe values at all.
     if anim::animation_preparation_matches(overlay, &composed, input.custom_property_environments) {
         let batch = anim::FfiComputedAnimationBatch {
-            context: unsafe { input.animation_context(None) },
+            context: unsafe { input.animation_context(None, reference_box) },
             sampled_effects: composed.as_ptr(),
             sampled_effect_count: composed.len(),
             custom_property_environments: input.custom_property_environments,
@@ -5901,26 +6012,13 @@ unsafe fn begin_animation_sample(
                 .map_or(u32::MAX, |index| 1 << index);
     }
 
-    // Over a record the host holds, the engine builds the length contexts itself. The host builds
-    // them over a working set it is computing, and wherever they need a container base: resolving
-    // one marks the container asked about and, before layout, has it evaluated again after.
-    let length_contexts = (input.style_record != 0 && resolved.container_relative_length_unit_mask == 0)
-        .then(|| engine.animation_sample_length_contexts(node, pseudo, input.style_record))
-        .flatten();
-    let sample = ResolvedAnimationSample {
+    AnimationSampleStep::Resolved(ResolvedAnimationSample {
         node,
         composed,
         resolved,
         custom_properties,
         result,
-    };
-    match length_contexts {
-        // SAFETY: As above.
-        Some(length_contexts) => {
-            AnimationSampleStep::Sampled(unsafe { finish_animation_sample(input, engine, sample, &length_contexts) })
-        }
-        None => AnimationSampleStep::NeedsHostLengthContexts(sample),
-    }
+    })
 }
 
 /// Compute a resolved sample's keyframe values over the element's length contexts, and evaluate its
@@ -5933,6 +6031,7 @@ unsafe fn finish_animation_sample(
     engine: &mut crate::css::style::StyleEngine,
     sample: ResolvedAnimationSample,
     length_contexts: &FfiAnimationLengthContexts,
+    reference_box: Option<CssPixelRect>,
 ) -> FfiHostAnimationSampleResult {
     use crate::css::animation as anim;
 
@@ -6043,7 +6142,7 @@ unsafe fn finish_animation_sample(
         && !resolved.needs_document_base_url
         && resolved.unfixed_random_sharings.is_empty();
     let batch = anim::FfiComputedAnimationBatch {
-        context: unsafe { input.animation_context(Some(&length_contexts.remaining)) },
+        context: unsafe { input.animation_context(Some(&length_contexts.remaining), reference_box) },
         sampled_effects: composed.as_ptr(),
         sampled_effect_count: composed.len(),
         custom_property_environments: input.custom_property_environments,
@@ -6088,6 +6187,58 @@ unsafe fn finish_animation_sample(
         result.animated_custom_properties_storage = Box::into_raw(storage).cast();
     }
     result
+}
+
+/// Samples `composed` onto the overlay `input` names, as far as the engine goes without the host, and
+/// answers what the sample found: for an element whose length contexts the engine builds over the
+/// record it holds, and whose keyframes read nothing else only the host knows, such as a container's
+/// size, a style query, an animated custom property, a document URL or a random base value. The effects
+/// are the element's, or `fresh` ones the engine does not describe yet. What a keyframe substitutes the
+/// host notes as its own sample substitutes it again.
+///
+/// # Safety
+/// As for [`rust_sample_animation_effects`], with `input` naming no callback but the overlay's.
+pub(crate) unsafe fn sample_without_host(
+    input: &FfiHostAnimationSample,
+    engine: &mut crate::css::style::StyleEngine,
+    fresh: Option<&[crate::css::style::effect_descriptions::PublishedEffect]>,
+    composed: SampledEffects,
+    reference_box: Option<CssPixelRect>,
+) -> Result<FfiHostAnimationSampleResult, crate::css::style::engine_sample::NeedsHost> {
+    use crate::css::style::engine_sample::NeedsHost;
+
+    let descriptions = fresh.unwrap_or_else(|| described_effects(input, engine));
+    // SAFETY: Guaranteed by the caller.
+    let sample = match unsafe { begin_animation_sample(input, engine, descriptions, composed, reference_box) } {
+        AnimationSampleStep::Sampled(result) => return Ok(result),
+        AnimationSampleStep::Resolved(sample) => sample,
+    };
+    if !sample.result.style_query_dependencies.is_null() {
+        // SAFETY: The sample transferred the dependencies it resolved to its result.
+        drop(unsafe {
+            Box::from_raw(
+                sample
+                    .result
+                    .style_query_dependencies
+                    .cast::<crate::css::custom_properties::StyleQueryDependencies>(),
+            )
+        });
+        return Err(NeedsHost);
+    }
+    let resolved = &sample.resolved;
+    let Some(length_contexts) = engine_length_contexts(input, engine, &sample) else {
+        return Err(NeedsHost);
+    };
+    if !sample.custom_properties.is_empty()
+        || resolved.needs_document_base_url
+        || !resolved.unfixed_random_sharings.is_empty()
+    {
+        return Err(NeedsHost);
+    }
+    // SAFETY: As above.
+    let result = unsafe { finish_animation_sample(input, engine, sample, &length_contexts, reference_box) };
+    debug_assert!(result.animated_custom_properties_storage.is_null());
+    Ok(result)
 }
 
 /// # Safety
@@ -6425,6 +6576,7 @@ pub extern "C" fn rust_box_type_transformation_input(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_animated_box_type_transformation_input(
     host: *const crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     node: u32,
     pseudo_kind: u8,
 ) -> FfiBoxTypeTransformationInput {
@@ -6432,7 +6584,7 @@ pub unsafe extern "C" fn rust_animated_box_type_transformation_input(
         Some(node) => {
             // SAFETY: Guaranteed by the caller.
             let host = unsafe { crate::css::style::engine_calls::document_host(host) };
-            crate::css::style::engine_calls::with_engine(host, |engine| {
+            crate::css::style::engine_calls::with_engine(read, host, |engine| {
                 engine.composition_box_type_transformation_input(node, pseudo_kind)
             })
         }
@@ -6469,48 +6621,6 @@ pub struct FfiElementStyleAdjustment {
 pub struct FfiElementStyleAdjustments {
     pub box_type: FfiBoxTypeTransformation,
     pub element_style: FfiElementStyleAdjustment,
-}
-
-/// Everything Rust can decide while finalizing a computed style once C++ has
-/// marshalled the DOM-dependent inputs.
-#[repr(C)]
-pub struct FfiStyleFinalizationInput {
-    pub mode: FfiStyleFinalizationMode,
-    pub box_type: FfiBoxTypeTransformationInput,
-    pub overflow_x: u16,
-    pub overflow_y: u16,
-    pub text_align: u16,
-    pub is_th_element: bool,
-    pub has_parent_with_computed_values: bool,
-    pub parent_text_align: u16,
-    pub parent_direction_is_ltr: bool,
-}
-
-#[repr(C)]
-pub struct FfiStyleFinalization {
-    pub element_style: FfiElementStyleAdjustments,
-    pub overflow: FfiEffectiveOverflow,
-    pub text_align: FfiTextAlignAdjustment,
-    pub invalidated_longhands: u16,
-}
-
-pub const FINALIZED_FLOAT: u16 = 1 << 0;
-pub const FINALIZED_DISPLAY: u16 = 1 << 1;
-pub const FINALIZED_LINE_HEIGHT: u16 = 1 << 2;
-pub const FINALIZED_POSITION: u16 = 1 << 3;
-pub const FINALIZED_TEXT_ALIGN: u16 = 1 << 4;
-pub const FINALIZED_OVERFLOW_X: u16 = 1 << 5;
-pub const FINALIZED_OVERFLOW_Y: u16 = 1 << 6;
-
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FfiStyleFinalizationMode {
-    BoxType,
-    AnimatedBoxType,
-    TextAlign,
-    All,
-    RestorePostCompute,
-    RestorePostComputeTextAlign,
 }
 
 #[repr(C)]
@@ -6903,417 +7013,113 @@ fn compute_text_align_adjustment(
     unchanged
 }
 
-fn restore_post_compute_values(longhand_table: &mut ComputedLonghandTable, only_text_align: bool) -> u16 {
-    use crate::css::property_metadata::property_id as prop;
-
-    let restored = longhand_table.restore_post_compute_values(only_text_align.then_some(prop::TEXT_ALIGN));
-    restored.properties[..restored.count]
-        .iter()
-        .fold(0, |invalidated, &property_id| {
-            invalidated
-                | match property_id {
-                    prop::FLOAT => FINALIZED_FLOAT,
-                    prop::DISPLAY => FINALIZED_DISPLAY,
-                    prop::LINE_HEIGHT => FINALIZED_LINE_HEIGHT,
-                    prop::POSITION => FINALIZED_POSITION,
-                    prop::TEXT_ALIGN => FINALIZED_TEXT_ALIGN,
-                    prop::OVERFLOW_X => FINALIZED_OVERFLOW_X,
-                    prop::OVERFLOW_Y => FINALIZED_OVERFLOW_Y,
-                    _ => unreachable!("only post-compute inputs are restorable"),
-                }
-        })
-}
-
-fn finalize_computed_style(
-    mode: FfiStyleFinalizationMode,
+/// Applies the box type transformation and element adjustments to an animated composition, in its overlay, over a base
+/// that stays as computed: what the transformation changes about the animated display, position, float, line-height and
+/// overflow is what the overlay holds.
+fn finalize_animated_box_type(
     mut box_type: FfiBoxTypeTransformationInput,
-    is_th_element: bool,
-    parent_snapshot: Option<&ParentSnapshot<'_>>,
-    longhand_table: &mut ComputedLonghandTable,
-    animated_overlay: Option<&mut AnimatedOverlay>,
+    longhand_table: &ComputedLonghandTable,
+    overlay: &mut AnimatedOverlay,
     input_line_height_metrics: Option<&FfiInputLineHeightMetrics>,
-) -> FfiStyleFinalization {
+) {
     use crate::css::property_metadata::property_id as prop;
 
-    let overlay = animated_overlay.as_deref();
-    let text_align = effective_keyword(longhand_table, overlay, prop::TEXT_ALIGN);
-    let finalize_box_type = matches!(
-        mode,
-        FfiStyleFinalizationMode::BoxType | FfiStyleFinalizationMode::AnimatedBoxType | FfiStyleFinalizationMode::All
-    );
-    if finalize_box_type {
-        let animated_display_missing = mode == FfiStyleFinalizationMode::AnimatedBoxType
-            && overlay.is_none_or(|overlay| overlay.get(prop::DISPLAY).is_none());
-        box_type.display = if animated_display_missing {
-            FfiDisplay::from_raw(longhand_table.display_before_box_type_transformation())
-        } else {
-            effective_display(longhand_table, overlay)
-        };
-        box_type.position = effective_keyword(longhand_table, overlay, prop::POSITION);
-        box_type.float_value = effective_keyword(longhand_table, overlay, prop::FLOAT);
-        box_type.webkit_box_layout_transformation_applies =
-            webkit_box_layout_transformation_applies(longhand_table, overlay);
-        if mode != FfiStyleFinalizationMode::AnimatedBoxType {
-            longhand_table.set_display_before_box_type_transformation(box_type.display.encoded());
+    let view = Some(&*overlay);
+    let text_align = effective_keyword(longhand_table, view, prop::TEXT_ALIGN);
+    let animated_display_missing = overlay.get(prop::DISPLAY).is_none();
+    box_type.display = if animated_display_missing {
+        FfiDisplay::from_raw(longhand_table.display_before_box_type_transformation())
+    } else {
+        effective_display(longhand_table, view)
+    };
+    box_type.position = effective_keyword(longhand_table, view, prop::POSITION);
+    box_type.float_value = effective_keyword(longhand_table, view, prop::FLOAT);
+    box_type.webkit_box_layout_transformation_applies = webkit_box_layout_transformation_applies(longhand_table, view);
+    // An axis the overlay does not animate is adjusted from its keyword before the base adjusted it against the other
+    // axis, which the overlay may animate out of that adjustment.
+    let before = longhand_table.overflow_before_adjustment();
+    let unadjusted = |property: u16, axis: usize| match before {
+        Some(before) if overlay.get(property).is_none() => before[axis],
+        _ => effective_keyword(longhand_table, view, property),
+    };
+    let overflow =
+        resolve_effective_overflow_keywords(unadjusted(prop::OVERFLOW_X, 0), unadjusted(prop::OVERFLOW_Y, 1));
+    let adjustments = compute_element_style_adjustments(&box_type, text_align);
+
+    // A value the overlay animates keeps its animation's place; one it does not is adjusted over the base value.
+    let mut adjust = |property_id: u16, keyword_or_display: StyleValueData| {
+        let value = retained_new(keyword_or_display);
+        let effective = longhand_table.effective_value(Some(&*overlay), property_id, true);
+        if unsafe { &*effective.value.cast::<StyleValueData>() } == value.data() {
+            return;
         }
+        match overlay
+            .get(property_id)
+            .map(|entry| (entry.inherited, entry.result_of_transition))
+        {
+            Some((inherited, result_of_transition)) => {
+                overlay.set_owned(property_id, value, inherited, result_of_transition);
+            }
+            None if property_id == prop::OVERFLOW_X || property_id == prop::OVERFLOW_Y => {
+                overlay.set_adjusted(property_id, value);
+            }
+            None => overlay.set_owned(property_id, value, false, false),
+        }
+    };
+    let display = |display: FfiDisplay| StyleValueData::Display { raw: display.encoded() };
+    let keyword = |keyword: u16| StyleValueData::Keyword { keyword };
+    if animated_display_missing {
+        adjust(prop::DISPLAY, display(box_type.display));
     }
-    let (overflow_x, overflow_y) = match mode {
-        FfiStyleFinalizationMode::All => (
-            effective_keyword(longhand_table, overlay, prop::OVERFLOW_X),
-            effective_keyword(longhand_table, overlay, prop::OVERFLOW_Y),
-        ),
-        // An axis the overlay does not animate is adjusted from its keyword before the base
-        // adjusted it against the other axis, which the overlay may animate out of that adjustment.
-        FfiStyleFinalizationMode::AnimatedBoxType => {
-            let before = longhand_table.overflow_before_adjustment();
-            let unadjusted = |property: u16, axis: usize| match before {
-                Some(before) if overlay.is_none_or(|overlay| overlay.get(property).is_none()) => before[axis],
-                _ => effective_keyword(longhand_table, overlay, property),
-            };
-            (unadjusted(prop::OVERFLOW_X, 0), unadjusted(prop::OVERFLOW_Y, 1))
-        }
-        _ => (0, 0),
-    };
-    let (has_parent_with_computed_values, parent_text_align, parent_direction_is_ltr) =
-        parent_snapshot.map_or((false, 0, true), |snapshot| {
-            let parent_text_align = snapshot
-                .effective_value(prop::TEXT_ALIGN)
-                .map(keyword_from_style_value)
-                .unwrap_or(keyword::START);
-            let parent_direction_is_ltr = snapshot
-                .effective_value(prop::DIRECTION)
-                .map(keyword_from_style_value)
-                .unwrap_or(keyword::LTR)
-                == keyword::LTR;
-            (true, parent_text_align, parent_direction_is_ltr)
-        });
-    finalize_style(
-        &FfiStyleFinalizationInput {
-            mode,
-            box_type,
-            overflow_x,
-            overflow_y,
-            text_align,
-            is_th_element,
-            has_parent_with_computed_values,
-            parent_text_align,
-            parent_direction_is_ltr,
-        },
-        Some(longhand_table),
-        animated_overlay,
-        input_line_height_metrics,
-    )
-}
-
-fn finalize_style(
-    input: &FfiStyleFinalizationInput,
-    longhand_table: Option<&mut ComputedLonghandTable>,
-    mut animated_overlay: Option<&mut AnimatedOverlay>,
-    input_line_height_metrics: Option<&FfiInputLineHeightMetrics>,
-) -> FfiStyleFinalization {
-    use crate::css::property_metadata::property_id as prop;
-
-    let element_style = if matches!(
-        input.mode,
-        FfiStyleFinalizationMode::BoxType | FfiStyleFinalizationMode::AnimatedBoxType | FfiStyleFinalizationMode::All
-    ) {
-        compute_element_style_adjustments(&input.box_type, input.text_align)
-    } else {
-        FfiElementStyleAdjustments {
-            box_type: FfiBoxTypeTransformation {
-                set_float_none: false,
-                changed_display: false,
-                display: input.box_type.display,
-            },
-            element_style: FfiElementStyleAdjustment {
-                changed_display: false,
-                display: input.box_type.display,
-                set_line_height_normal: false,
-                check_input_line_height: false,
-                set_position_static: false,
-                changed_text_align: false,
-                text_align: input.text_align,
-            },
-        }
-    };
-    let overflow = if matches!(
-        input.mode,
-        FfiStyleFinalizationMode::All | FfiStyleFinalizationMode::AnimatedBoxType
-    ) {
-        resolve_effective_overflow_keywords(input.overflow_x, input.overflow_y)
-    } else {
-        FfiEffectiveOverflow {
-            changed_x: false,
-            x_keyword: input.overflow_x,
-            changed_y: false,
-            y_keyword: input.overflow_y,
-        }
-    };
-    let text_align = if matches!(
-        input.mode,
-        FfiStyleFinalizationMode::TextAlign | FfiStyleFinalizationMode::All
-    ) {
-        compute_text_align_adjustment(
-            input.text_align,
-            input.is_th_element,
-            input.has_parent_with_computed_values,
-            input.parent_text_align,
-            input.parent_direction_is_ltr,
-        )
-    } else {
-        FfiTextAlignAdjustment {
-            changed: false,
-            keyword: input.text_align,
-            inherited: false,
-        }
-    };
-    let mut finalization = FfiStyleFinalization {
-        element_style,
-        overflow,
-        text_align,
-        invalidated_longhands: 0,
-    };
-    let Some(longhand_table) = longhand_table else {
-        return finalization;
-    };
-
-    if matches!(
-        input.mode,
-        FfiStyleFinalizationMode::RestorePostCompute | FfiStyleFinalizationMode::RestorePostComputeTextAlign
-    ) {
-        finalization.invalidated_longhands = restore_post_compute_values(
-            longhand_table,
-            input.mode == FfiStyleFinalizationMode::RestorePostComputeTextAlign,
-        );
-        return finalization;
+    if adjustments.box_type.set_float_none {
+        adjust(prop::FLOAT, keyword(keyword::NONE));
     }
-    let animated_box_type = input.mode == FfiStyleFinalizationMode::AnimatedBoxType;
-    let animated_display_missing = animated_box_type
-        && animated_overlay
-            .as_deref()
-            .is_none_or(|overlay| overlay.get(prop::DISPLAY).is_none());
-    let mut invalidated_longhands = 0;
+    if adjustments.box_type.changed_display {
+        adjust(prop::DISPLAY, display(adjustments.box_type.display));
+    }
+    let element_style = adjustments.element_style;
+    if element_style.changed_display {
+        adjust(prop::DISPLAY, display(element_style.display));
+    }
+    if element_style.set_position_static {
+        adjust(prop::POSITION, keyword(keyword::STATIC));
+    }
+    if element_style.changed_text_align {
+        adjust(prop::TEXT_ALIGN, keyword(element_style.text_align));
+    }
+    if element_style.set_line_height_normal
+        || (element_style.check_input_line_height
+            && should_clamp_input_line_height(
+                &element_style,
+                input_line_height_metrics.expect("input line-height adjustment requires font metrics"),
+            ))
     {
-        let mut set_adjusted_property = |property_id: u16, value: RetainedStyleValueData, flag: u16| {
-            let animated_metadata = animated_overlay
-                .as_deref()
-                .and_then(|overlay| overlay.get(property_id))
-                .map(|entry| (entry.inherited, entry.result_of_transition));
-            if animated_box_type {
-                let effective = longhand_table.effective_value(animated_overlay.as_deref(), property_id, true);
-                let effective_value = unsafe { &*effective.value.cast::<StyleValueData>() };
-                if effective_value == value.data() {
-                    return;
-                }
-                let (inherited, result_of_transition) = animated_metadata.unwrap_or((false, false));
-                animated_overlay
-                    .as_deref_mut()
-                    .expect("animated box-type finalization requires an overlay")
-                    .set_owned(property_id, value, inherited, result_of_transition);
-                return;
-            }
-            if let Some((inherited, result_of_transition)) = animated_metadata {
-                animated_overlay.as_deref_mut().unwrap().set_owned(
-                    property_id,
-                    value.clone(),
-                    inherited,
-                    result_of_transition,
-                );
-            }
-            longhand_table.set(property_id, value, -1);
-            longhand_table.set_important(property_id, false);
-            longhand_table.set_inherited(property_id, false);
-            invalidated_longhands |= flag;
-        };
-
-        if matches!(
-            input.mode,
-            FfiStyleFinalizationMode::BoxType
-                | FfiStyleFinalizationMode::AnimatedBoxType
-                | FfiStyleFinalizationMode::All
-        ) {
-            if animated_display_missing {
-                set_adjusted_property(
-                    prop::DISPLAY,
-                    retained_new(StyleValueData::Display {
-                        raw: input.box_type.display.encoded(),
-                    }),
-                    FINALIZED_DISPLAY,
-                );
-            }
-            if finalization.element_style.box_type.set_float_none {
-                set_adjusted_property(
-                    prop::FLOAT,
-                    retained_new(StyleValueData::Keyword { keyword: keyword::NONE }),
-                    FINALIZED_FLOAT,
-                );
-            }
-            if finalization.element_style.box_type.changed_display {
-                set_adjusted_property(
-                    prop::DISPLAY,
-                    retained_new(StyleValueData::Display {
-                        raw: finalization.element_style.box_type.display.encoded(),
-                    }),
-                    FINALIZED_DISPLAY,
-                );
-            }
-            let element_style = finalization.element_style.element_style;
-            if element_style.changed_display {
-                set_adjusted_property(
-                    prop::DISPLAY,
-                    retained_new(StyleValueData::Display {
-                        raw: element_style.display.encoded(),
-                    }),
-                    FINALIZED_DISPLAY,
-                );
-            }
-            if element_style.set_position_static {
-                set_adjusted_property(
-                    prop::POSITION,
-                    retained_new(StyleValueData::Keyword {
-                        keyword: keyword::STATIC,
-                    }),
-                    FINALIZED_POSITION,
-                );
-            }
-            if element_style.changed_text_align {
-                set_adjusted_property(
-                    prop::TEXT_ALIGN,
-                    retained_new(StyleValueData::Keyword {
-                        keyword: element_style.text_align,
-                    }),
-                    FINALIZED_TEXT_ALIGN,
-                );
-            }
-            if element_style.set_line_height_normal
-                || (element_style.check_input_line_height
-                    && should_clamp_input_line_height(
-                        &element_style,
-                        input_line_height_metrics.expect("input line-height adjustment requires font metrics"),
-                    ))
-            {
-                set_adjusted_property(
-                    prop::LINE_HEIGHT,
-                    retained_new(StyleValueData::Keyword {
-                        keyword: keyword::NORMAL,
-                    }),
-                    FINALIZED_LINE_HEIGHT,
-                );
-            }
-        }
+        adjust(prop::LINE_HEIGHT, keyword(keyword::NORMAL));
     }
-    finalization.invalidated_longhands = invalidated_longhands;
-
-    // An animated composition is adjusted in its overlay, over a base that stays as computed.
-    if animated_box_type {
-        let overlay = animated_overlay.expect("animated box-type finalization requires an overlay");
-        for (property, keyword) in [
-            (prop::OVERFLOW_X, finalization.overflow.x_keyword),
-            (prop::OVERFLOW_Y, finalization.overflow.y_keyword),
-        ] {
-            let value = retained_new(StyleValueData::Keyword { keyword });
-            let effective = longhand_table.effective_value(Some(overlay), property, true);
-            if unsafe { &*effective.value.cast::<StyleValueData>() } == value.data() {
-                continue;
-            }
-            // An axis the overlay animates keeps its animation's place; one it does not is adjusted
-            // over the base value.
-            match overlay
-                .get(property)
-                .map(|entry| (entry.inherited, entry.result_of_transition))
-            {
-                Some((inherited, result_of_transition)) => {
-                    overlay.set_owned(property, value, inherited, result_of_transition);
-                }
-                None => overlay.set_adjusted(property, value),
-            }
-        }
-        return finalization;
-    }
-    if finalization.overflow.changed_x {
-        longhand_table.set(
-            prop::OVERFLOW_X,
-            retained_new(StyleValueData::Keyword {
-                keyword: finalization.overflow.x_keyword,
-            }),
-            -1,
-        );
-        longhand_table.set_important(prop::OVERFLOW_X, false);
-        longhand_table.set_inherited(prop::OVERFLOW_X, false);
-        finalization.invalidated_longhands |= FINALIZED_OVERFLOW_X;
-    }
-    if finalization.overflow.changed_y {
-        longhand_table.set(
-            prop::OVERFLOW_Y,
-            retained_new(StyleValueData::Keyword {
-                keyword: finalization.overflow.y_keyword,
-            }),
-            -1,
-        );
-        longhand_table.set_important(prop::OVERFLOW_Y, false);
-        longhand_table.set_inherited(prop::OVERFLOW_Y, false);
-        finalization.invalidated_longhands |= FINALIZED_OVERFLOW_Y;
-    }
-    if matches!(
-        input.mode,
-        FfiStyleFinalizationMode::TextAlign | FfiStyleFinalizationMode::All
-    ) && matches!(
-        input.text_align,
-        keyword::MATCH_PARENT | keyword::_LIBWEB_INHERIT_OR_CENTER
-    ) {
-        longhand_table.add_inheritance_dependent_value(
-            prop::TEXT_ALIGN,
-            retained_new(StyleValueData::Keyword {
-                keyword: input.text_align,
-            }),
-        );
-        finalization.invalidated_longhands |= FINALIZED_TEXT_ALIGN;
-    }
-    if finalization.text_align.changed {
-        longhand_table.set(
-            prop::TEXT_ALIGN,
-            retained_new(StyleValueData::Keyword {
-                keyword: finalization.text_align.keyword,
-            }),
-            -1,
-        );
-        longhand_table.set_important(prop::TEXT_ALIGN, false);
-        longhand_table.set_inherited(prop::TEXT_ALIGN, finalization.text_align.inherited);
-        finalization.invalidated_longhands |= FINALIZED_TEXT_ALIGN;
-    }
-    finalization
+    adjust(prop::OVERFLOW_X, keyword(overflow.x_keyword));
+    adjust(prop::OVERFLOW_Y, keyword(overflow.y_keyword));
 }
 
-/// Runs the independent finalization decisions that remain after property
-/// computation. Callers select the decisions whose results they need.
+/// Applies the box type transformation and element adjustments to the animated composition `animated_overlay` holds
+/// over `longhand_table`.
 ///
 /// # Safety
-/// `input` must point at a live `FfiStyleFinalizationInput`. `longhand_table`
-/// may be null for a decision-only query; otherwise it must be a live mutable
-/// table, `animated_overlay` null or a live mutable overlay, and
-/// `input_line_height_metrics` a live metrics snapshot when adjustments use it.
+/// `longhand_table` and `animated_overlay` must be live, and `input_line_height_metrics` a live metrics snapshot when
+/// `box_type` asks to check an input's line-height.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_finalize_style(
-    input: *const FfiStyleFinalizationInput,
-    longhand_table: *mut ComputedLonghandTable,
+pub unsafe extern "C" fn rust_finalize_animated_box_type(
+    box_type: FfiBoxTypeTransformationInput,
+    longhand_table: *const ComputedLonghandTable,
     animated_overlay: *mut AnimatedOverlay,
     input_line_height_metrics: *const FfiInputLineHeightMetrics,
-) -> FfiStyleFinalization {
+) {
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::NestedPropertyComputeEntry);
-    let input = unsafe { &*input };
-    if let Some(longhand_table) = unsafe { longhand_table.as_mut() } {
-        finalize_computed_style(
-            input.mode,
-            input.box_type,
-            input.is_th_element,
-            None,
-            longhand_table,
-            unsafe { animated_overlay.as_mut() },
-            unsafe { input_line_height_metrics.as_ref() },
-        )
-    } else {
-        finalize_style(input, None, None, None)
-    }
+    finalize_animated_box_type(
+        box_type,
+        unsafe { &*longhand_table },
+        unsafe { &mut *animated_overlay },
+        unsafe { input_line_height_metrics.as_ref() },
+    );
 }
 
 /// Computes the font-weight property from its absolutized value.
@@ -7714,56 +7520,6 @@ mod tests {
         assert!(adjustments.box_type.display.is_block_outside());
         assert!(adjustments.element_style.changed_display);
         assert!(adjustments.element_style.display.is_flow_root_inside());
-    }
-
-    #[test]
-    fn style_finalization_batches_selected_decisions() {
-        let mut box_type = element_adjustment_input();
-        box_type.is_button_element = true;
-        box_type.position = keyword::ABSOLUTE;
-        let input = FfiStyleFinalizationInput {
-            mode: FfiStyleFinalizationMode::All,
-            box_type,
-            overflow_x: keyword::VISIBLE,
-            overflow_y: keyword::AUTO,
-            text_align: keyword::MATCH_PARENT,
-            is_th_element: false,
-            has_parent_with_computed_values: true,
-            parent_text_align: keyword::END,
-            parent_direction_is_ltr: true,
-        };
-
-        let finalization =
-            unsafe { rust_finalize_style(&input, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
-        assert!(finalization.element_style.box_type.changed_display);
-        assert!(finalization.element_style.box_type.display.is_block_outside());
-        assert!(finalization.element_style.element_style.changed_display);
-        assert!(finalization.element_style.element_style.display.is_flow_root_inside());
-        assert!(finalization.overflow.changed_x);
-        assert_eq!(finalization.overflow.x_keyword, keyword::AUTO);
-        assert!(finalization.text_align.changed);
-        assert_eq!(finalization.text_align.keyword, keyword::RIGHT);
-    }
-
-    #[test]
-    fn style_finalization_does_not_require_unused_line_height_metrics() {
-        let input = FfiStyleFinalizationInput {
-            mode: FfiStyleFinalizationMode::BoxType,
-            box_type: element_adjustment_input(),
-            overflow_x: keyword::VISIBLE,
-            overflow_y: keyword::VISIBLE,
-            text_align: keyword::START,
-            is_th_element: false,
-            has_parent_with_computed_values: false,
-            parent_text_align: keyword::START,
-            parent_direction_is_ltr: true,
-        };
-        let longhand_table = crate::css::computed_longhand_table::rust_computed_longhand_table_create();
-
-        let finalization = finalize_style(&input, Some(unsafe { &mut *longhand_table }), None, None);
-
-        assert_eq!(finalization.invalidated_longhands, 0);
-        unsafe { crate::css::computed_longhand_table::rust_computed_longhand_table_release(longhand_table) };
     }
 
     fn test_context() -> FfiLengthResolutionContext {

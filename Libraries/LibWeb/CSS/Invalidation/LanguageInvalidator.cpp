@@ -18,39 +18,33 @@
 
 namespace Web::CSS::Invalidation {
 
-// Where any of the text is cased by its language, the root lays out again.
-static void enroll_language_dependent_text(Layout::Node& root)
-{
-    Layout::RustFFI::render_state_enroll_text_after_language_change(root.document_host(), Layout::Node::slot_id(&root));
-}
-
 // `lang` and `dir` both inherit, so a change on one element changes what every element under it
 // resolves to. Each of them publishes the value it now has, and the rules that name a language or a
 // direction reach their subjects from that rather than from the walk.
 static void publish_language_and_directionality(DOM::Element& element, bool is_directionality_change)
 {
-    element.for_each_shadow_including_inclusive_descendant([is_directionality_change](auto& node) {
+    // Language is a DOM input outside the computed style groups, so the boxes of the text under the element, its
+    // generated content's included, are marked: the render state checks the styles of every slice and refreshes their
+    // text without rebuilding the source ranges, which depend on the untransformed text.
+    Layout::RustFFI::FfiBoxMarks marks {};
+    marks.language_changed = true;
+    auto* arena = element.document().layout_node_arena_if_created();
+    element.for_each_shadow_including_inclusive_descendant([&](auto& node) {
         if (auto* descendant = as_if<DOM::Element>(node)) {
             if (is_directionality_change) {
                 record_element_directionality(*descendant);
-            } else {
-                descendant->invalidate_lang_value();
-                record_element_language_and_directionality(*descendant);
-                descendant->for_each_synthetic_pseudo_element([](CSS::PseudoElement, DOM::SyntheticPseudoElement const& pseudo) {
-                    if (auto* layout_node = pseudo.unsafe_layout_node())
-                        enroll_language_dependent_text(*layout_node);
-                });
+                return TraversalDecision::Continue;
             }
-            return TraversalDecision::Continue;
+            descendant->invalidate_lang_value();
+            record_element_language_and_directionality(*descendant);
+            if (!arena)
+                return TraversalDecision::Continue;
+            descendant->for_each_synthetic_pseudo_element([&](CSS::PseudoElement pseudo_element, DOM::SyntheticPseudoElement const&) {
+                Layout::RustFFI::render_state_mark_pseudo_element_box(arena->host(), descendant->style_node_id().value(), Layout::Node::encode_generated_for(pseudo_element), marks);
+            });
+        } else if (!is_directionality_change && is<DOM::Text>(node)) {
+            node.mark_box(marks);
         }
-        if (is_directionality_change)
-            return TraversalDecision::Continue;
-        // Language is a DOM input outside the computed style groups. Rust checks
-        // the styles of every slice and refreshes their text without rebuilding
-        // the source ranges, which depend on the untransformed text.
-        auto* text_layout_node = as_if<Layout::TextNode>(node.unsafe_layout_node());
-        if (text_layout_node)
-            enroll_language_dependent_text(*text_layout_node);
         return TraversalDecision::Continue;
     });
 }

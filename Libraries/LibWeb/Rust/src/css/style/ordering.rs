@@ -2189,6 +2189,7 @@ impl StyleEngineState {
 
     /// Merge one element style input into the deferred inputs, which are kept sorted by key.
     pub(crate) fn defer_element_style_input(&mut self, node: StyleNodeID, reaction: u8, inherited_style_groups: u8) {
+        self.host.deferred_element_style_inputs_moved = true;
         let key = InputKey::ElementStyleInput(node);
         match self
             .host
@@ -2238,7 +2239,6 @@ impl StyleEngineState {
             .resize_required_to(&mut self.retained.memory, 0);
         self.retained.facts.release_staging(&mut self.retained.memory);
         self.host.program_staging.clear();
-        self.host.environment_move_changed_names.clear();
         self.sweep_selector_programs();
         self.shed_routing_for_detached_sheets();
     }
@@ -2257,12 +2257,6 @@ impl StyleEngineState {
         visited += self.retained.facts.collect_atoms(&mut atoms);
         visited += self.retained.program.collect_atoms(&mut atoms);
         visited += self.retained.programs.collect_atoms(&mut atoms);
-        for reads in self.retained.host_var_reads.values() {
-            if let inputs::HostVarReads::Names(names) = reads {
-                atoms.extend(names.iter().copied());
-                visited += names.len() as u64;
-            }
-        }
         if !self.retained.html_element_namespace.is_none() {
             atoms.insert(self.retained.html_element_namespace);
         }
@@ -2270,17 +2264,13 @@ impl StyleEngineState {
     }
 
     pub(super) fn sweep_style_atoms(&mut self, counters: &mut Counters) {
-        let replay_reclaimed = match self.host.replay_atom_sweep.take() {
-            Some(ReplayAtomSweep::Skip) => return,
-            Some(ReplayAtomSweep::Reclaim(atoms)) => Some(atoms),
-            None if self.retained.atoms.should_sweep() && !self.host.defers_atom_sweep => None,
-            None => return,
-        };
+        if !self.retained.atoms.should_sweep() || self.host.defers_atom_sweep {
+            return;
+        }
         if self.retained.batch_matching_traversal.is_some() {
             counters.bump(Counter::AtomSweepsDeferredForActiveTraversal);
             return;
         }
-        self.host.style_atoms_swept = true;
         self.retained.facts.sweep_auxiliary_catalogs_without_sync();
         let (mut live, visited) = self.collect_live_style_atoms();
         self.retained.atoms.mark_sweep_dependencies(&mut live);
@@ -2292,22 +2282,12 @@ impl StyleEngineState {
                 break;
             }
         }
-        let mut reclaimable = self.retained.atoms.reclaimable_for_sweep(&live);
-        if let Some(recorded) = replay_reclaimed {
-            assert!(
-                recorded.iter().all(|atom| reclaimable.binary_search(atom).is_ok()),
-                "a recorded atom release still has a semantic replay owner"
-            );
-            reclaimable = recorded;
-            reclaimable.sort_unstable();
-        }
+        let reclaimable = self.retained.atoms.reclaimable_for_sweep(&live);
         self.retained.facts.forget_atoms(&reclaimable);
         self.retained.custom_property_environments.forget_names(&reclaimable);
-        let requirement_count = self.retained.attribute_value_text_names.len();
-        self.retained
-            .attribute_value_text_names
-            .retain(|atom| reclaimable.binary_search(atom).is_err());
-        if self.retained.attribute_value_text_names.len() != requirement_count {
+        let is_reclaimed = |atom: &StyleAtomID| reclaimable.binary_search(atom).is_ok();
+        if self.retained.attribute_value_text_names.iter().any(is_reclaimed) {
+            Arc::make_mut(&mut self.retained.attribute_value_text_names).retain(|atom| !is_reclaimed(atom));
             self.retained.attribute_value_text_requirements_version += 1;
         }
         let reclaimed = self.retained.atoms.finish_sweep(&reclaimable);
@@ -2363,12 +2343,11 @@ impl StyleEngineState {
         }
     }
 
-    /// The document budget is written in connected elements and compact program bytes, so it has to
-    /// follow the live element count rather than a high-water mark.
+    /// The document budget is written in connected elements, so it has to follow the live element
+    /// count rather than a high-water mark.
     pub(super) fn publish_budget_inputs(&mut self) {
         let inputs = BudgetInputs {
             connected_element_count: self.retained.tree.connected_element_count(),
-            ..BudgetInputs::default()
         };
         self.retained.memory.set_budget_inputs(inputs);
         self.host

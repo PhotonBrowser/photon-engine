@@ -24,7 +24,6 @@ pub mod svg_resources;
 pub mod trace;
 pub mod traversal;
 pub(crate) mod vector_images;
-pub(crate) mod verify;
 
 use crate::css::css_enums;
 use crate::css::css_pixels::CssPixelRect;
@@ -41,6 +40,7 @@ use crate::painting::hit_test::HitTestList;
 use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData};
 use crate::painting::record::frame_inputs::FrameInputs;
 use crate::painting::record::svg_resources::SvgResourceWalk;
+use crate::painting::selection::HighlightPseudoElement;
 use std::sync::Arc;
 
 pub(crate) use inputs::RecordingInputs;
@@ -59,7 +59,7 @@ pub struct RecordingOutput {
     pub has_blocking_wheel_event_listeners: bool,
     pub wheel_event_listener_state_generation: u64,
     pub is_identical_to_published_recording: bool,
-    pub(crate) capture_log_for_verification: Option<verify::CaptureLog>,
+    pub(crate) capture_log: Option<trace::CaptureLog>,
 }
 
 pub(crate) struct RecordingResult {
@@ -110,9 +110,6 @@ pub struct PaintRecorder<'a, O: Observer> {
     pub(crate) source_items: Option<Arc<PublishedHitTestItems>>,
     // Set while a producer records output that must record again every frame.
     live_producer: bool,
-    // The verification recording plans from current style instead of the prepared per-row
-    // inputs, so a snapshot that went stale shows up as a difference.
-    pub(crate) plan_from_prepared_inputs: bool,
     // Rows of the layout subtrees whose root moved: every producer of theirs records again.
     pub(crate) moved_expansion: FastSet<NodeSlotId>,
     pub(crate) blocking_wheel_event_region_count: u32,
@@ -260,10 +257,10 @@ impl<O: Observer> PaintRecorder<'_, O> {
             return answer.clone();
         }
         let style_source = self.source.node_parent_if_live(node).unwrap_or(NodeSlotId::INVALID);
-        let committed = self
-            .first_non_anonymous_ancestor_row(node)
-            .and_then(|element_row| self.committed_selection_pseudo_style(node, element_row));
-        let answer = self.selection_style_answer(committed, node, style_source);
+        let committed = self.first_non_anonymous_ancestor_row(node).and_then(|element_row| {
+            self.committed_highlight_pseudo_style(HighlightPseudoElement::Selection, node, element_row)
+        });
+        let answer = Self::highlight_style_answer(committed, || self.default_selection_style(node, style_source));
         self.scratch.selection_style_cache.insert(key, answer.clone());
         answer
     }
@@ -276,27 +273,58 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if let Some(answer) = self.scratch.selection_style_cache.get(&key) {
             return answer.clone();
         }
-        let committed = self.committed_selection_pseudo_style(element_row, element_row);
-        let answer = self.selection_style_answer(committed, element_row, element_row);
+        let committed =
+            self.committed_highlight_pseudo_style(HighlightPseudoElement::Selection, element_row, element_row);
+        let answer = Self::highlight_style_answer(committed, || self.default_selection_style(element_row, element_row));
         self.scratch.selection_style_cache.insert(key, answer.clone());
         answer
     }
 
-    /// A committed style that authored neither color takes the paired default background and
-    /// keeps its shadows and decorations.
-    fn selection_style_answer(
-        &self,
-        committed: Option<Arc<paint::text::SelectionStyleAnswer>>,
+    pub(crate) fn search_text_style(
+        &mut self,
         node: crate::layout::node_data::NodeSlotId,
-        style_source: crate::layout::node_data::NodeSlotId,
+        highlight: HighlightPseudoElement,
+    ) -> Arc<paint::text::SelectionStyleAnswer> {
+        let key = node.index;
+        let is_current = highlight == HighlightPseudoElement::SearchTextCurrent;
+        let cached = if is_current {
+            self.scratch.search_text_current_style_cache.get(&key)
+        } else {
+            self.scratch.search_text_style_cache.get(&key)
+        };
+        if let Some(answer) = cached {
+            return answer.clone();
+        }
+        let style_source = self.source.node_parent_if_live(node).unwrap_or(NodeSlotId::INVALID);
+        let committed = self
+            .first_non_anonymous_ancestor_row(node)
+            .and_then(|element_row| self.committed_highlight_pseudo_style(highlight, node, element_row));
+        let answer = Self::highlight_style_answer(committed, || {
+            self.default_search_text_style(node, style_source, highlight)
+        });
+        let cache = if is_current {
+            &mut self.scratch.search_text_current_style_cache
+        } else {
+            &mut self.scratch.search_text_style_cache
+        };
+        cache.insert(key, answer.clone());
+        answer
+    }
+
+    /// A committed style that authored neither color takes the paired default colors and keeps
+    /// its shadows and decorations.
+    fn highlight_style_answer(
+        committed: Option<Arc<paint::text::SelectionStyleAnswer>>,
+        defaults: impl FnOnce() -> paint::text::SelectionStyleAnswer,
     ) -> Arc<paint::text::SelectionStyleAnswer> {
         match committed {
             Some(answer) if answer.facts.colors_authored => answer,
-            None => Arc::new(self.default_selection_style(node, style_source)),
+            None => Arc::new(defaults()),
             Some(answer) => {
-                let mut defaults = self.default_selection_style(node, style_source);
+                let mut defaults = defaults();
                 defaults.facts = crate::painting::host::FfiSelectionStyleFacts {
                     background_color: defaults.facts.background_color,
+                    background_color_is_current_color: defaults.facts.background_color_is_current_color,
                     wash_color: defaults.facts.wash_color,
                     ..answer.facts
                 };
@@ -306,12 +334,13 @@ impl<O: Observer> PaintRecorder<'_, O> {
         }
     }
 
-    fn committed_selection_pseudo_style(
+    fn committed_highlight_pseudo_style(
         &self,
+        highlight: HighlightPseudoElement,
         node: crate::layout::node_data::NodeSlotId,
         element_row: crate::layout::node_data::NodeSlotId,
     ) -> Option<Arc<paint::text::SelectionStyleAnswer>> {
-        let styles = &self.paint_state.selection_pseudo_styles;
+        let styles = self.paint_state.highlight_pseudo_styles(highlight);
         if let Some(answer) = styles.get(&node) {
             return Some(answer.clone());
         }
@@ -347,6 +376,52 @@ impl<O: Observer> PaintRecorder<'_, O> {
         node: crate::layout::node_data::NodeSlotId,
         style_source: crate::layout::node_data::NodeSlotId,
     ) -> paint::text::SelectionStyleAnswer {
+        let background_color = self.default_selection_background(node, style_source, self.inputs.window_is_focused);
+        paint::text::SelectionStyleAnswer {
+            facts: crate::painting::host::FfiSelectionStyleFacts {
+                background_color,
+                wash_color: background_color,
+                ..Default::default()
+            },
+            shadows: Vec::new(),
+        }
+    }
+
+    fn default_search_text_style(
+        &self,
+        node: crate::layout::node_data::NodeSlotId,
+        style_source: crate::layout::node_data::NodeSlotId,
+        highlight: HighlightPseudoElement,
+    ) -> paint::text::SelectionStyleAnswer {
+        if highlight == HighlightPseudoElement::SearchTextCurrent {
+            let background_color = self.default_selection_background(node, style_source, true);
+            return paint::text::SelectionStyleAnswer {
+                facts: crate::painting::host::FfiSelectionStyleFacts {
+                    background_color,
+                    wash_color: background_color,
+                    ..Default::default()
+                },
+                shadows: Vec::new(),
+            };
+        }
+        let background_color = libgfx_rust::Color::from_rgb(255, 255, 0);
+        paint::text::SelectionStyleAnswer {
+            facts: crate::painting::host::FfiSelectionStyleFacts {
+                background_color,
+                text_color: Some(libgfx_rust::Color::from_rgb(0, 0, 0)).into(),
+                wash_color: background_color,
+                ..Default::default()
+            },
+            shadows: Vec::new(),
+        }
+    }
+
+    fn default_selection_background(
+        &self,
+        node: crate::layout::node_data::NodeSlotId,
+        style_source: crate::layout::node_data::NodeSlotId,
+        window_is_focused: bool,
+    ) -> libgfx_rust::Color {
         use crate::css::color_resolution::{PREFERRED_COLOR_SCHEME_DARK, PREFERRED_COLOR_SCHEME_LIGHT};
         let inputs = self.inputs;
         let (color_scheme, color_scheme_is_normal) =
@@ -361,20 +436,25 @@ impl<O: Observer> PaintRecorder<'_, O> {
         } else {
             PREFERRED_COLOR_SCHEME_LIGHT
         };
-        let background_color = if color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme {
-            inputs.selection_background_from_palette
-        } else if color_scheme == PREFERRED_COLOR_SCHEME_DARK {
-            inputs.selection_background_dark
+        let (from_palette, light, dark) = if window_is_focused {
+            (
+                inputs.selection_background_from_palette,
+                inputs.selection_background_light,
+                inputs.selection_background_dark,
+            )
         } else {
-            inputs.selection_background_light
+            (
+                inputs.inactive_selection_background_from_palette,
+                inputs.inactive_selection_background_light,
+                inputs.inactive_selection_background_dark,
+            )
         };
-        paint::text::SelectionStyleAnswer {
-            facts: crate::painting::host::FfiSelectionStyleFacts {
-                background_color,
-                wash_color: background_color,
-                ..Default::default()
-            },
-            shadows: Vec::new(),
+        if color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme {
+            from_palette
+        } else if color_scheme == PREFERRED_COLOR_SCHEME_DARK {
+            dark
+        } else {
+            light
         }
     }
 

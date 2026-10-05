@@ -31,6 +31,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Infra/SerializedURL.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 

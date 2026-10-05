@@ -232,6 +232,7 @@ public:
     void set_enable_primary_paste(bool b) { m_enable_primary_paste = b; }
 
     u64 wheel_event_listener_state_generation() const { return m_wheel_event_listener_state_generation; }
+    u64 keyboard_scroll_state_generation() const { return m_keyboard_scroll_state_generation; }
     void invalidate_compositor_wheel_event_listener_state();
     void invalidate_compositor_keyboard_scroll_state();
     void invalidate_compositor_keyboard_scroll_state_for_document(DOM::Document const&);
@@ -372,19 +373,10 @@ public:
 
     void clear_selection();
 
-    enum class WrapAround {
-        Yes,
-        No,
-    };
-    enum class ClearSelectionOnNoMatch {
-        Yes,
-        No,
-    };
     struct FindInPageQuery {
         Utf16String string {};
         CaseSensitivity case_sensitivity { CaseSensitivity::CaseInsensitive };
-        WrapAround wrap_around { WrapAround::Yes };
-        ClearSelectionOnNoMatch clear_selection_on_no_match { ClearSelectionOnNoMatch::Yes };
+        bool highlight_all_matches { false };
     };
     struct FindInPageResult {
         size_t current_match_index { 0 };
@@ -393,7 +385,8 @@ public:
     FindInPageResult find_in_page(FindInPageQuery const&);
     FindInPageResult find_in_page_next_match();
     FindInPageResult find_in_page_previous_match();
-    Optional<FindInPageQuery> last_find_in_page_query() const { return m_last_find_in_page_query; }
+    void find_in_page_end();
+    void clear_find_in_page_active_match();
 
     bool listen_for_dom_mutations() const { return m_listen_for_dom_mutations; }
     void set_listen_for_dom_mutations(bool listen_for_dom_mutations) { m_listen_for_dom_mutations = listen_for_dom_mutations; }
@@ -429,7 +422,11 @@ private:
         Backward,
     };
     FindInPageResult perform_find_in_page_query(FindInPageQuery const&, Optional<SearchDirection> = {});
-    void update_find_in_page_selection(Vector<GC::Root<DOM::Range>> matches, ClearSelectionOnNoMatch);
+    void update_find_in_page_active_match(Vector<GC::Root<DOM::Range>> const& matches);
+    void update_find_in_page_highlighted_matches(Vector<GC::Root<DOM::Range>> const& matches, bool highlight_all_matches);
+    void clear_find_in_page_highlighted_matches();
+    GC::Ptr<DOM::Range> find_in_page_active_match();
+    void set_find_in_page_active_match(GC::Ptr<DOM::Range>);
 
     void on_pending_dialog_closed();
 
@@ -531,6 +528,8 @@ private:
     size_t m_find_in_page_match_index { 0 };
     Optional<FindInPageQuery> m_last_find_in_page_query;
     URL::URL m_last_find_in_page_url;
+    GC::Weak<DOM::Document> m_find_in_page_active_match_document;
+    Vector<GC::Weak<DOM::Document>> m_find_in_page_highlighted_documents;
 
     bool m_listen_for_dom_mutations { false };
     Optional<CSS::PreferredColorScheme> m_preferred_color_scheme_override_for_testing;

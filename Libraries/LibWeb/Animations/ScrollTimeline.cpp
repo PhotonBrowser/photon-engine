@@ -11,6 +11,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/BoxViews.h>
 
@@ -119,7 +120,9 @@ static Optional<ScrollOffsetData> compute_scroll_offset_data(Variant<GC::Ptr<DOM
     if (propagated_source.visit([](auto const& source) { return source == nullptr; }))
         return {};
 
-    auto const& layout_node = propagated_source.visit([](auto const& source) -> Layout::NodeWithStyle const* { return source->unsafe_layout_node(); });
+    Layout::ForcedReadScope read { propagated_source.visit([](auto const& source) -> DOM::Document const& { return source->document(); }) };
+
+    auto const& layout_node = propagated_source.visit([&read](auto const& source) -> Layout::NodeWithStyle const* { return source->unsafe_layout_node(read); });
 
     if (!layout_node || !layout_node->is_scroll_container())
         return {};

@@ -127,13 +127,6 @@ impl RuleMatches {
         &self.matches[start..end]
     }
 
-    pub fn clear(&mut self) {
-        self.matches.clear();
-        if let Some(truth) = self.selector_truth.as_mut() {
-            truth.clear();
-        }
-    }
-
     pub(super) fn enable_selector_truth(&mut self) {
         self.selector_truth.get_or_insert_default();
     }
@@ -1656,7 +1649,6 @@ mod tests {
     use super::super::index::AttributeFact;
     use super::super::index::StateSet;
     use super::super::index::StyleAtomID;
-    use super::super::memory::DeviceClass;
     use super::super::planning::SelectorTruthChanges;
     use super::super::planning::record_match_set_difference;
     use super::super::program::CascadeOrigin;
@@ -1689,7 +1681,7 @@ mod tests {
 
     impl Document {
         fn new() -> Self {
-            let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+            let mut memory = MemoryController::new();
             let mut tree = StyleNodeTree::new(&mut memory);
             let nodes: Vec<StyleNodeID> = (0..4).map(|_| tree.allocate_element(&mut memory)).collect();
             tree.set_first_element_child(nodes[0], Some(nodes[1]));

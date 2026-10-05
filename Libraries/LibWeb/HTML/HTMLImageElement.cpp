@@ -47,9 +47,11 @@
 #include <LibWeb/HTML/SupportedImageTypes.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
@@ -95,71 +97,28 @@ static BatchingDispatcher& batching_dispatcher()
     return *dispatcher;
 }
 
-static bool image_element_dimensions_may_depend_on_intrinsic_size(Layout::Box const& image_box)
-{
-    auto size_is_definite = [](CSS::Size const& size) {
-        return size.is_length() || (size.is_calculated() && !size.contains_percentage());
-    };
-    auto size_constraint_is_definite_or_none = [&](CSS::Size const& size) {
-        return size.is_none() || size_is_definite(size);
-    };
-
-    auto const& width = image_box.width();
-    auto const& height = image_box.height();
-    if (!size_is_definite(width) || !size_is_definite(height))
-        return true;
-
-    auto const& min_width = image_box.min_width();
-    auto const& min_height = image_box.min_height();
-    if (!size_is_definite(min_width) || !size_is_definite(min_height))
-        return true;
-
-    auto const& max_width = image_box.max_width();
-    auto const& max_height = image_box.max_height();
-    if (!size_constraint_is_definite_or_none(max_width) || !size_constraint_is_definite_or_none(max_height))
-        return true;
-
-    return false;
-}
-
-static void reset_intrinsic_size_caches_after_image_data_change(Layout::Box& image_box)
-{
-    image_box.reset_cached_intrinsic_sizes_of_self_and_ancestors();
-}
-
-void HTMLImageElement::set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason reason)
+void HTMLImageElement::set_needs_layout_update_or_repaint_after_image_data_change()
 {
     CSS::record_element_replaced_content_input(*this);
     update_alt_text_shadow_tree();
+    Painting::push_replaced_image_paint_facts(*this, *this);
+    // What the new data changes of the image's box, the render state finds as it applies the mark: the data may arrive
+    // in a task beside a frame in flight, which holds the boxes.
+    Layout::RustFFI::FfiBoxMarks marks {};
+    marks.image_data_changed = true;
+    mark_box(marks);
+}
 
-    auto layout_node = unsafe_layout_node();
-    auto* image_box = layout_node && layout_node->kind() == Layout::RustFFI::NodeKind::ImageBox ? static_cast<Layout::Box*>(layout_node) : nullptr;
-
-    // The request state change may have flipped which kind of box box_kind()
-    // asks for (ImageBox vs. non-replaced alt text container); if the existing node no longer
-    // matches, it has to be rebuilt, not just laid out again. (An img whose box comes from
-    // `content: url(...)` reads as a mismatch here and takes a wasted rebuild — harmless.)
-    if (layout_node && (image_box != nullptr) == (renders_as_alt_text() && !alt().is_empty())) {
+// Publishes which box the image asks for. A box of the kind it asked for before is built again.
+void HTMLImageElement::record_box_kind()
+{
+    CSS::record_element_box_kind(*this);
+    auto box_kind = this->box_kind();
+    if (exchange(m_recorded_box_kind, box_kind) != box_kind)
         set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLImageElementUpdateTheImageData);
-        return;
-    }
-
-    if (!image_box || image_element_dimensions_may_depend_on_intrinsic_size(*image_box)) {
-        image_provider_contents_changed();
-        set_needs_layout_update(reason);
-        return;
-    }
-
-    reset_intrinsic_size_caches_after_image_data_change(*image_box);
-    image_provider_contents_changed();
 }
 
 GC_DEFINE_ALLOCATOR(HTMLImageElement);
-
-Layout::Node const* HTMLImageElement::image_provider_layout_node() const
-{
-    return unsafe_layout_node();
-}
 
 static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name)
 {
@@ -342,7 +301,7 @@ void HTMLImageElement::create_alt_text_shadow_tree()
 void HTMLImageElement::remove_alt_text_shadow_tree()
 {
     // A new request can stop the image rendering as its alternative text, which changes the box it asks for.
-    CSS::record_element_box_kind(*this);
+    record_box_kind();
     if (!m_alt_text_node)
         return;
 
@@ -353,7 +312,7 @@ void HTMLImageElement::remove_alt_text_shadow_tree()
 void HTMLImageElement::update_alt_text_shadow_tree()
 {
     // Whether the image renders as its alternative text decides which box it asks for.
-    CSS::record_element_box_kind(*this);
+    record_box_kind();
     auto alt_text = alt();
     if (!renders_as_alt_text() || alt_text.is_empty()) {
         remove_alt_text_shadow_tree();
@@ -371,10 +330,11 @@ void HTMLImageElement::update_alt_text_shadow_tree()
 // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-width
 WebIDL::UnsignedLong HTMLImageElement::width() const
 {
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementWidth);
 
     // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+    if (auto const* layout_node = this->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
         return Painting::content_width(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -402,10 +362,11 @@ void HTMLImageElement::set_width(WebIDL::UnsignedLong width)
 // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-height
 WebIDL::UnsignedLong HTMLImageElement::height() const
 {
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementHeight);
 
     // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+    if (auto const* layout_node = this->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
         return Painting::content_height(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -478,9 +439,10 @@ int HTMLImageElement::x() const
     // The x attribute, on getting, must return the scaled x-coordinate of the left border edge of the first box
     // associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
     // to the element and its ancestors, or zero if there is no box.
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementX);
 
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -497,9 +459,10 @@ int HTMLImageElement::y() const
     // The y attribute, on getting, must return the scaled y-coordinate of the top border edge of the first box
     // associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
     // to the element and its ancestors, or zero if there is no box.
+    Layout::ForcedReadScope read { document() };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementY);
 
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
@@ -838,7 +801,7 @@ void HTMLImageElement::update_the_image_data_impl(bool restart_animations, bool 
 
             // AD-HOC: Invalidate synchronously here. The image data is already available — so a paint taken before the
             //         task below runs must still reflect it (otherwise, reftest screenshots can capture the old image).
-            set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
+            set_needs_layout_update_or_repaint_after_image_data_change();
 
             // 7. Queue an element task on the DOM manipulation task source given the img element and following steps:
             queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, restart_animations, maybe_omit_events, url_string, previous_url, update_the_image_data_count] {
@@ -922,7 +885,7 @@ after_step_7:
 
             // AD-HOC: The element may have been rendering as blank space while a load was pending;
             //         now that the current request is broken it renders its alt text instead.
-            set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
+            set_needs_layout_update_or_repaint_after_image_data_change();
 
             // 2. Queue an element task on the DOM manipulation task source given the img element and the following steps:
             queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, maybe_omit_events, previous_url] {
@@ -968,7 +931,7 @@ after_step_7:
 
             // AD-HOC: The element may have been rendering as blank space while a load was pending;
             //         now that the current request is broken it renders its alt text instead.
-            set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
+            set_needs_layout_update_or_repaint_after_image_data_change();
 
             // 4. Queue an element task on the DOM manipulation task source given the img element and the following steps:
             queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, selected_source, maybe_omit_events, previous_url] {
@@ -1015,7 +978,7 @@ after_step_7:
             register_with_decoded_image_data_if_needed();
             m_current_request->prepare_for_presentation(*this);
 
-            set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
+            set_needs_layout_update_or_repaint_after_image_data_change();
 
             queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, restart_animations, maybe_omit_events, url_string, previous_url, update_the_image_data_count] {
                 if (update_the_image_data_count != m_update_the_image_data_count)
@@ -1192,7 +1155,7 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
                 originating_document->list_of_available_images().add(cache_key, *image_data, true);
                 originating_document->prune_image_resource_caches();
 
-                set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
+                set_needs_layout_update_or_repaint_after_image_data_change();
 
                 // 4. If maybe omit events is not set or previousURL is not equal to urlString, then fire an event named load at the img element.
                 if (!maybe_omit_events || previous_url != url_string)
@@ -1235,7 +1198,7 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
 
             // AD-HOC: The element may have been rendering as blank space while the load was pending;
             //         now that the current request is broken it renders its alt text instead.
-            set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
+            set_needs_layout_update_or_repaint_after_image_data_change();
 
             // and then, if maybe omit events is not set or previousURL is not equal to urlString,
             // queue an element task on the DOM manipulation task source given the img element
@@ -1352,7 +1315,7 @@ void HTMLImageElement::react_to_changes_in_the_environment()
             // 6. Prepare image request for presentation given the img element.
             image_request->prepare_for_presentation(*this);
             // FIXME: This is ad-hoc, updating the layout here should probably be handled by prepare_for_presentation().
-            set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementReactToChangesInTheEnvironment);
+            set_needs_layout_update_or_repaint_after_image_data_change();
 
             // 7. Fire an event named load at the img element.
             dispatch_event(create_event_for_element(*this, HTML::EventNames::load));
@@ -1637,7 +1600,7 @@ void HTMLImageElement::decoded_image_data_did_update()
 {
     // An SVG image works out its natural size again after it redraws itself or changes color scheme.
     CSS::record_element_replaced_content_input(*this);
-    image_provider_contents_changed();
+    Painting::push_replaced_image_paint_facts(*this, *this);
 }
 
 bool HTMLImageElement::is_image_pending() const

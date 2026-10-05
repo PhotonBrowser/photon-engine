@@ -10,61 +10,36 @@
 use crate::css::css_pixels::CssPixelPoint;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
-use crate::painting::host::{
-    FfiCompositorAnimationPublishOutcome, FfiVisualContextTreeInputs, FfiVisualContextUpdateOutcome,
-    RootBackgroundSource,
-};
+use crate::painting::host::{FfiVisualContextTreeInputs, FfiVisualContextUpdateOutcome, RootBackgroundSource};
+use crate::painting::paint_read::PaintRead;
+use crate::painting::presentation::Presentation;
 use crate::painting::svg_paint_resources::{PublishedSvgFilter, PublishedSvgPaintServer, SvgPaintResourceKind};
-use crate::painting::visual_animation::VisualAnimation;
-use crate::painting::visual_context::VisualContextState;
-use crate::painting::visual_context::dirty::{VisualContextGlobalRebuildReason, VisualContextUpdateScope};
+use crate::painting::visual_context::dirty::VisualContextUpdateScope;
 use crate::painting::visual_context::incremental::{
     IncrementalUpdateResult, debug_assert_every_live_node_is_owned, update_visual_context_tree,
 };
-use crate::render_state::{DocumentHost, LockstepProof, PreparationPending, RenderMessage, ask, wait_for_render_state};
+use crate::painting::visual_context::{VisualContextState, VisualContextTree};
+use crate::render_state::{BegunRead, DocumentHost};
 use libgfx_rust::FloatPoint;
+use std::sync::Arc;
 
-/// One step of paint preparation over a document's render state. A pass that reads the viewport the render side draws
-/// into carries what the host knows of it, so the host hands it over only to a pass that runs.
-pub(crate) enum PaintPass {
-    /// Settles the scrollable overflow left unmeasured, and with it the root background and the sticky constraints.
-    PrepareForRendering {
-        pending: PendingPreparation,
-        visual_context_update_pending: bool,
-        inputs: FfiVisualContextTreeInputs,
-    },
-    /// Brings the visual context tree up to date with the rows, rebuilding what the dirty boxes name.
-    UpdateAccumulatedVisualContexts {
-        viewport: NodeSlotId,
-        inputs: FfiVisualContextTreeInputs,
-    },
-    /// Gives the visual context tree the transform of the visual viewport.
-    UpdateVisualViewportTransform(FfiVisualContextTreeInputs),
-    /// Re-reads the scroll containers' offsets, when something invalidated them or `force` asks.
-    RefreshScrollState {
-        force: bool,
-        device_pixels_per_css_pixel: f64,
-    },
-    /// Answers the SVG paint resources of the enrolled rows the host resolves from the DOM, if they changed since they
-    /// were resolved last.
-    SvgPaintResourceRequests,
-    /// Publishes the SVG paint resources the host resolved.
-    PublishSvgPaintResources(Vec<ResolvedSvgPaintResource>),
-    /// Gives the visual context tree the compositor animations of an update pass, or none where it was discarded.
-    PublishCompositorAnimations(Vec<VisualAnimation>),
+/// What a paint pass writes, which decides what the host lets go of before it sends the pass, and whether the paint and
+/// hit testing properties the host prepared stay current.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassEffect {
+    /// Writes the rows throughout: measures every unmeasured overflow, or brings the visual context of every dirty box
+    /// up to date. Such a pass is one of those that prepare the paint and hit testing properties.
+    RewritesRows,
+    /// Changes nothing the paint and hit testing properties are prepared from.
+    KeepsPaintPreparation,
+    /// Changes what the paint and hit testing properties are prepared from.
+    StalesPaintPreparation,
 }
 
-/// What a paint pass answers.
-pub(crate) enum PaintPassAnswer {
-    Prepared(RenderingPreparation),
-    VisualContexts(FfiVisualContextUpdateOutcome),
-    VisualViewportTransform,
-    /// The dense device-pixel offsets of every scroll container, or none where nothing was refreshed.
-    ScrollState(Option<Vec<FloatPoint>>),
-    SvgPaintResourceRequests(Option<Vec<SvgPaintResourceRequest>>),
-    /// Whether a published SVG paint resource changed.
-    SvgPaintResourcesPublished(bool),
-    CompositorAnimationsPublished(FfiCompositorAnimationPublishOutcome),
+impl PassEffect {
+    pub(crate) fn leaves_paint_preparation_current(self) -> bool {
+        self != Self::StalesPaintPreparation
+    }
 }
 
 #[derive(Default)]
@@ -82,83 +57,93 @@ pub(crate) struct RenderingPreparation {
     pub(crate) clamped_scroll_offsets: Vec<(NodeSlotId, CssPixelPoint)>,
 }
 
-impl PaintPass {
-    /// Whether the pass writes the rows throughout: it measures every unmeasured overflow, or brings the visual
-    /// context of every dirty box up to date.
-    fn rewrites_rows(&self) -> bool {
-        matches!(
-            self,
-            Self::PrepareForRendering { .. }
-                | Self::UpdateAccumulatedVisualContexts { .. }
-                | Self::RefreshScrollState { .. }
-        )
-    }
+/// What a clock tick's round changed that only the host settles: a root background, scrollability or SVG paint
+/// resource, a visual context tree built anew, or a compositor animation whose node went away.
+pub(crate) struct VisualContextsNeedHost;
 
-    /// Whether the pass leaves the paint and hit testing properties the host prepared current: it is one of the passes
-    /// that prepare them, or changes nothing they are prepared from.
-    pub(crate) fn leaves_paint_preparation_current(&self) -> bool {
-        self.rewrites_rows()
-            || matches!(
-                self,
-                Self::SvgPaintResourceRequests | Self::PublishCompositorAnimations(_)
-            )
-    }
+/// The visual context tree a clock tick's frame takes to the compositor, with the scroll offsets of its nodes where its
+/// structure is not the one the compositor has.
+pub(crate) struct ClockTickVisualContexts {
+    pub(crate) tree: Arc<VisualContextTree>,
+    pub(crate) restructured_scroll_offsets: Option<Vec<FloatPoint>>,
+}
 
-    /// Runs the pass over `arena`.
-    pub(crate) fn run(self, arena: &mut LayoutNodeArena) -> PaintPassAnswer {
-        match self {
-            Self::PrepareForRendering {
-                pending,
-                visual_context_update_pending,
-                inputs,
-            } => PaintPassAnswer::Prepared(prepare_for_rendering(
-                arena,
-                pending.root_background_source,
-                visual_context_update_pending,
-                &inputs,
-            )),
-            Self::UpdateAccumulatedVisualContexts { viewport, inputs } => {
-                PaintPassAnswer::VisualContexts(update_accumulated_visual_contexts(arena, viewport, inputs))
-            }
-            Self::UpdateVisualViewportTransform(inputs) => {
-                update_visual_viewport_transform(arena, &inputs);
-                PaintPassAnswer::VisualViewportTransform
-            }
-            Self::RefreshScrollState {
-                force,
-                device_pixels_per_css_pixel,
-            } => PaintPassAnswer::ScrollState(refresh_scroll_state(arena, force, device_pixels_per_css_pixel)),
-            Self::SvgPaintResourceRequests => {
-                PaintPassAnswer::SvgPaintResourceRequests(svg_paint_resource_requests(arena))
-            }
-            Self::PublishSvgPaintResources(resolved) => {
-                PaintPassAnswer::SvgPaintResourcesPublished(publish_resolved_svg_paint_resources(arena, resolved))
-            }
-            Self::PublishCompositorAnimations(animations) => PaintPassAnswer::CompositorAnimationsPublished(
-                crate::painting::visual_context::publish_compositor_animations(
-                    &mut arena.paint_state().borrow_mut().visual_context,
-                    animations,
-                ),
-            ),
+/// Brings the paint state of `arena` up to date with what a clock tick's round laid out, for the tick's frame, as the
+/// host's rendering update does before it records, where the round moved no root background, flipped no scrollability
+/// and asks the host to resolve no SVG paint resource, and the update changes the tree incrementally. Answers the tree
+/// where the update ran, which `presentation` notes at once: the host records the document again where the tick parks
+/// before presenting it. A tree of a new structure takes over the compositor animations the host published for the old
+/// one, whose nodes it holds still. The rest of paint preparation, the scroll offsets new overflow clamps above all, is
+/// the host's, once the lease lands.
+pub(crate) fn prepare_for_clock_tick(
+    arena: &mut LayoutNodeArena,
+    viewport: NodeSlotId,
+    presentation: &mut Presentation,
+) -> Result<Option<ClockTickVisualContexts>, VisualContextsNeedHost> {
+    // Recording reads overflow, and measuring it notes a flip in scrollability for the check below.
+    arena.measure_scrollable_overflow();
+    if arena.svg_paint_resources().needs_sync()
+        || arena.paint_state().borrow().root_background_source
+            != Some(crate::layout::viewport_propagation::root_background_source(arena))
+    {
+        return Err(VisualContextsNeedHost);
+    }
+    let (inputs, compositor_animations) = {
+        let paint_state = arena.paint_state().borrow();
+        let state = &paint_state.visual_context;
+        let (Some(inputs), Some(tree)) = (state.last_tree_inputs, state.tree.as_deref()) else {
+            return Err(VisualContextsNeedHost);
+        };
+        if state.dirty_boxes.scope.rebuilds_every_box() {
+            return Err(VisualContextsNeedHost);
         }
+        if state.dirty_boxes.boxes.is_empty() && state.dirty_boxes.removed.is_empty() {
+            return Ok(None);
+        }
+        (inputs, tree.shared_visual_animations())
+    };
+    let outcome = update_accumulated_visual_contexts(arena, viewport, inputs);
+    presentation.note_visual_context_tree_changed();
+    if outcome.performed_full_build {
+        return Err(VisualContextsNeedHost);
     }
+    let paintable_rows = arena.paintable_rows();
+    let mut paint_state = arena.paint_state().borrow_mut();
+    let state = &mut paint_state.visual_context;
+    let tree = state.tree.as_mut().expect("an incremental update keeps the tree");
+    if !outcome.structural_epoch_changed {
+        return Ok(Some(ClockTickVisualContexts {
+            tree: tree.clone(),
+            restructured_scroll_offsets: None,
+        }));
+    }
+    // The update dropped the animations, which name nodes of the old structure: the host publishes them again in its
+    // rendering update, and an animation whose node went away needs it to.
+    if !Arc::make_mut(tree).carry_visual_animations_over(compositor_animations) {
+        return Err(VisualContextsNeedHost);
+    }
+    let tree = tree.clone();
+    // The host refreshes its own copy of the scroll state still.
+    let scroll_offsets = scroll_state_snapshot(&paintable_rows, state, inputs.device_pixels_per_css_pixel);
+    Ok(Some(ClockTickVisualContexts {
+        tree,
+        restructured_scroll_offsets: Some(scroll_offsets),
+    }))
 }
 
-/// The reason the host waits for its document's render state as it prepares to paint.
-pub(crate) struct HostPaintStep {
-    _private: (),
-}
-
-const HOST_PAINT_STEP: HostPaintStep = HostPaintStep { _private: () };
-
-/// Runs `pass` on the render state of `host`'s document, and answers what it answered.
-pub(crate) fn run(host: &DocumentHost, pass: PaintPass) -> PaintPassAnswer {
-    let document = host.document();
-    if pass.rewrites_rows() {
+/// Runs `pass` over the render state of `host`'s document in `read`, as the host prepares to paint, and answers what it
+/// answered.
+pub(crate) fn run<R>(
+    read: &BegunRead,
+    host: &DocumentHost,
+    effect: PassEffect,
+    pass: impl FnOnce(&mut LayoutNodeArena) -> R,
+) -> R {
+    if effect == PassEffect::RewritesRows {
         host.let_go_of_rows();
     }
-    wait_for_render_state(LockstepProof::for_reason(&HOST_PAINT_STEP), host, |reply| {
-        RenderMessage::Paint { document, pass, reply }
+    host.run(read, !effect.leaves_paint_preparation_current(), move |state| {
+        pass(state.arena_mut())
     })
 }
 
@@ -167,6 +152,23 @@ pub(crate) fn run(host: &DocumentHost, pass: PaintPass) -> PaintPassAnswer {
 /// source it was found with, for the preparation to take over.
 pub(crate) struct PendingPreparation {
     root_background_source: RootBackgroundSource,
+}
+
+impl PendingPreparation {
+    /// Settles the scrollable overflow left unmeasured, and with it the root background and the sticky constraints.
+    pub(crate) fn prepare(
+        self,
+        arena: &LayoutNodeArena,
+        visual_context_update_pending: bool,
+        inputs: &FfiVisualContextTreeInputs,
+    ) -> RenderingPreparation {
+        prepare_for_rendering(
+            arena,
+            self.root_background_source,
+            visual_context_update_pending,
+            inputs,
+        )
+    }
 }
 
 /// Whether preparing `arena` for rendering would change anything: its root background source moved, or scrollable
@@ -182,9 +184,16 @@ pub(crate) fn rendering_preparation_pending(arena: &LayoutNodeArena) -> Option<P
     pending.then_some(PendingPreparation { root_background_source })
 }
 
-/// Asks the render state of `host`'s document whether preparing it for rendering has something to do.
-pub(crate) fn pending_preparation(host: &DocumentHost) -> Option<PendingPreparation> {
-    ask(LockstepProof::for_reason(&HOST_PAINT_STEP), host, PreparationPending)
+/// Asks the render state of `host`'s document in `read` whether preparing it for rendering has something to do, unless
+/// the host knows it has nothing.
+pub(crate) fn pending_preparation(read: &BegunRead, host: &DocumentHost) -> Option<PendingPreparation> {
+    if host
+        .known_arena_facts()
+        .is_some_and(|facts| !facts.rendering_preparation_pending)
+    {
+        return None;
+    }
+    host.ask(read, |state| rendering_preparation_pending(state.arena_mut()))
 }
 
 pub(crate) fn prepare_for_rendering(
@@ -228,29 +237,40 @@ pub(crate) fn prepare_for_rendering(
     }
 }
 
-fn refresh_scroll_state(
+pub(crate) fn refresh_scroll_state(
     arena: &LayoutNodeArena,
-    force: bool,
     device_pixels_per_css_pixel: f64,
 ) -> Option<Vec<FloatPoint>> {
     arena.measure_scrollable_overflow();
     let paintable_rows = arena.paintable_rows();
     let mut paint_state = arena.paint_state().borrow_mut();
     let state = &mut paint_state.visual_context;
-    if !force && !state.needs_to_refresh_scroll_state {
+    if !state.needs_to_refresh_scroll_state {
         return None;
     }
+    let snapshot = scroll_state_snapshot(&paintable_rows, state, device_pixels_per_css_pixel);
     state.needs_to_refresh_scroll_state = false;
-    crate::painting::visual_context::refresh::refresh_scroll_state(&paintable_rows, &mut state.scroll_state);
+    Some(snapshot)
+}
+
+/// The device scroll offsets of the nodes of `state`'s tree, refreshed from the rows where they may have moved.
+fn scroll_state_snapshot(
+    paintable_rows: &impl crate::painting::paintable_rows::PaintableRowsRead,
+    state: &mut VisualContextState,
+    device_pixels_per_css_pixel: f64,
+) -> Vec<FloatPoint> {
+    if state.needs_to_refresh_scroll_state {
+        crate::painting::visual_context::refresh::refresh_scroll_state(paintable_rows, &mut state.scroll_state);
+    }
     let mut snapshot = state.scroll_state.snapshot(device_pixels_per_css_pixel);
     // https://drafts.csswg.org/css-position/#sticky-pos
     if let Some(tree) = state.tree.as_deref() {
         tree.resolve_sticky_offsets_in_place(&mut snapshot);
     }
-    Some(snapshot)
+    snapshot
 }
 
-fn update_visual_viewport_transform(arena: &LayoutNodeArena, inputs: &FfiVisualContextTreeInputs) {
+pub(crate) fn update_visual_viewport_transform(arena: &LayoutNodeArena, inputs: &FfiVisualContextTreeInputs) {
     let mut paint_state = arena.paint_state().borrow_mut();
     if let Some(tree) = &mut paint_state.visual_context.tree {
         std::sync::Arc::make_mut(tree).set_visual_viewport_transform(
@@ -259,7 +279,7 @@ fn update_visual_viewport_transform(arena: &LayoutNodeArena, inputs: &FfiVisualC
     }
 }
 
-fn update_accumulated_visual_contexts(
+pub(crate) fn update_accumulated_visual_contexts(
     arena: &mut LayoutNodeArena,
     viewport: NodeSlotId,
     inputs: FfiVisualContextTreeInputs,
@@ -271,26 +291,22 @@ fn update_accumulated_visual_contexts(
     let mut state = std::mem::take(&mut arena.paint_state().borrow_mut().visual_context);
     state.release_quarantined_slots_while_no_handle_is_retained();
 
-    let mut reason = state.dirty_boxes.global_reason;
+    let mut scope = state.dirty_boxes.scope;
     if state.tree.is_none() {
-        reason = reason.max(VisualContextGlobalRebuildReason::FirstBuild);
+        scope = VisualContextUpdateScope::FreshTree;
     }
     if state.last_tree_inputs.is_some_and(|last| {
         last.device_pixels_per_css_pixel != inputs.device_pixels_per_css_pixel
             || last.viewport_wheel_overflow_x != inputs.viewport_wheel_overflow_x
             || last.viewport_wheel_overflow_y != inputs.viewport_wheel_overflow_y
     }) {
-        reason = reason.max(VisualContextGlobalRebuildReason::TreeInputsChanged);
+        scope = scope.max(VisualContextUpdateScope::EveryBox);
     }
     if state.tree.as_deref().is_some_and(|tree| tree.should_compact()) {
-        reason = reason.max(VisualContextGlobalRebuildReason::Compaction);
+        scope = VisualContextUpdateScope::FreshTree;
     }
 
-    loop {
-        let scope = VisualContextUpdateScope::for_reason(reason);
-        if scope == VisualContextUpdateScope::FreshTree {
-            break;
-        }
+    while scope != VisualContextUpdateScope::FreshTree {
         let result = update_visual_context_tree(&arena.paintable_rows(), viewport, inputs, scope, &mut state);
         match result {
             IncrementalUpdateResult::Applied(mut outcome) => {
@@ -299,15 +315,11 @@ fn update_accumulated_visual_contexts(
                 crate::painting::fragment_ownership::assign_fragment_ownership_for_pending_line_roots(arena);
                 let performed_full_build = scope == VisualContextUpdateScope::EveryBox;
                 if performed_full_build {
-                    state.build_count += 1;
-                    state.last_full_build_reason = reason;
                     debug_assert_every_live_node_is_owned(
                         &arena.paintable_rows(),
                         state.tree.as_deref().expect("an applied walk keeps the tree"),
                         viewport,
                     );
-                } else {
-                    state.incremental_update_count += 1;
                 }
                 state.dirty_boxes.clear();
                 state.last_tree_inputs = Some(inputs);
@@ -320,17 +332,13 @@ fn update_accumulated_visual_contexts(
                 arena.paint_state().borrow_mut().visual_context = state;
                 return outcome;
             }
-            IncrementalUpdateResult::NeedsFullBuild(fallback_reason) => {
-                assert!(
-                    VisualContextUpdateScope::for_reason(fallback_reason) > scope,
-                    "a fallback widens the update scope"
-                );
-                reason = fallback_reason;
+            IncrementalUpdateResult::NeedsFullBuild(fallback_scope) => {
+                assert!(fallback_scope > scope, "a fallback widens the update scope");
+                scope = fallback_scope;
             }
         }
     }
 
-    state.last_full_build_reason = reason;
     let outcome = fresh_visual_context_tree_build(arena, viewport, inputs, &mut state);
     state.last_tree_inputs = Some(inputs);
     arena.paint_state().borrow_mut().visual_context = state;
@@ -356,7 +364,6 @@ fn fresh_visual_context_tree_build(
     }
     state.tree = Some(std::sync::Arc::new(fresh_tree.tree));
     state.dirty_boxes.clear();
-    state.build_count += 1;
     let mut outcome = match update_visual_context_tree(
         &arena.paintable_rows(),
         viewport,

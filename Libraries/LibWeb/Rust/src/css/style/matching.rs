@@ -56,7 +56,7 @@ impl Default for SharedDispatches {
     fn default() -> Self {
         Self {
             templates: HashMap::default(),
-            memory: memory::MemoryController::new(memory::DeviceClass::ForegroundDesktop),
+            memory: memory::MemoryController::new(),
         }
     }
 }
@@ -85,18 +85,6 @@ fn verify_match_answer_against_cold(
 ) {
     verify_style_answer_patch(engine, counters, |verifier| {
         verifier.verify_match_answer(answer, node, description);
-    });
-}
-
-fn verify_cascade_answer_against_cold(
-    engine: &mut RetainedState,
-    answer: &[RuleMatch],
-    node: StyleNodeID,
-    description: &str,
-    counters: &mut Counters,
-) {
-    verify_style_answer_patch(engine, counters, |verifier| {
-        verifier.verify_cascade_answer(answer, node, description);
     });
 }
 
@@ -131,10 +119,10 @@ impl RetainedState {
 
     /// The pseudo-element winner states a node settled this flush for the kinds the engine
     /// settles pseudo-elements from, to travel with the node's winner state: ::before, ::after,
-    /// ::first-letter, ::marker, ::selection and ::backdrop. The user agent's rules for ::marker
-    /// and ::backdrop match every element, and a row for each of them on every element would cost
-    /// the memory the winner groups have, so those travel only from a node holding a record for
-    /// that pseudo-element: a list item's marker, or a backdrop in the top layer.
+    /// ::first-letter, ::marker, both ::search-text kinds, ::selection and ::backdrop. The user agent's rules
+    /// for ::marker and ::backdrop match every element, and a row for each of them on every element
+    /// would cost the memory the winner groups have, so those travel only from a node holding a
+    /// record for that pseudo-element: a list item's marker, or a backdrop in the top layer.
     fn settled_pseudo_winner_states(
         &self,
         effects: &AnswerEffects,
@@ -146,7 +134,7 @@ impl RetainedState {
             .pseudo_states(node)
             .filter(|&(pseudo, version, _, priority_current)| {
                 let travels = match pseudo.kind.0 {
-                    0 | 2 | 3 | 6 => true,
+                    0 | 2 | 3 | 6 | 7 | 8 => true,
                     kind @ (1 | 5) => self.computed_group_sets.pseudo_style_record(node, kind as u8).is_some(),
                     _ => false,
                 };
@@ -433,7 +421,6 @@ impl RetainedState {
             root,
             batch,
             topology: None,
-            reuse_retained_match_answers: false,
             retained_answer_dispatch: None,
             ancestor_requirements,
             prefix_caches: std::sync::Arc::clone(&self.prefix_caches),
@@ -524,7 +511,6 @@ impl RetainedState {
             root,
             batch: Some(batch),
             topology,
-            reuse_retained_match_answers,
             retained_answer_dispatch,
             ancestor_requirements,
             prefix_caches: std::sync::Arc::clone(&self.prefix_caches),
@@ -624,7 +610,6 @@ impl RetainedState {
             root,
             batch: None,
             topology,
-            reuse_retained_match_answers,
             retained_answer_dispatch,
             ancestor_requirements: AncestorRequirementsCache::default(),
             prefix_caches: std::sync::Arc::clone(&self.prefix_caches),
@@ -4256,31 +4241,7 @@ impl RetainedState {
         }
     }
 
-    pub fn consume_published_match_answer(
-        &mut self,
-        node: StyleNodeID,
-        counters: &mut Counters,
-    ) -> Option<Vec<RuleMatch>> {
-        let mut traversal = self.batch_matching_traversal.take();
-        let mut effects = traversal
-            .as_mut()
-            .map(|traversal| std::mem::take(&mut traversal.answer_effects))
-            .unwrap_or_else(|| std::mem::take(&mut self.published_match_answers.answer_effects));
-        let result = self
-            .consume_published_match_answer_in_traversal(&mut effects, node, traversal.as_deref(), counters)
-            .or_else(|| {
-                self.consume_retained_match_answer_in_traversal(&mut effects, node, traversal.as_deref(), counters)
-            });
-        if let Some(traversal) = traversal.as_mut() {
-            traversal.answer_effects = effects;
-        } else {
-            self.published_match_answers.answer_effects = effects;
-        }
-        self.batch_matching_traversal = traversal;
-        result
-    }
-
-    fn consume_published_match_answer_in_traversal(
+    pub(super) fn consume_published_match_answer_in_traversal(
         &mut self,
         effects: &mut AnswerEffects,
         node: StyleNodeID,
@@ -4326,63 +4287,6 @@ impl RetainedState {
             return Some(matches);
         }
         None
-    }
-
-    fn consume_retained_match_answer_in_traversal(
-        &mut self,
-        effects: &mut AnswerEffects,
-        node: StyleNodeID,
-        traversal: Option<&BatchMatchingTraversal>,
-        counters: &mut Counters,
-    ) -> Option<Vec<RuleMatch>> {
-        if !traversal.is_some_and(|traversal| traversal.reuse_retained_match_answers) {
-            return None;
-        }
-        let exact_answer = self
-            .retained_match_answer_with_effects(effects, node)
-            .sparse()
-            .ok()
-            .and_then(|answer| {
-                let dispatch = traversal
-                    .expect("a retained answer is consumed only inside a traversal")
-                    .retained_answer_dispatch
-                    .as_deref()?;
-                answer
-                    .iter()
-                    .copied()
-                    .map(|entry| {
-                        let cascade_order = dispatch.cascade_order_for_entry(entry.rule, entry.program, entry.entry)?;
-                        entry.materialize(node, &self.programs, cascade_order)
-                    })
-                    .collect::<Option<Vec<_>>>()
-            });
-        let Some(exact_answer) = exact_answer else {
-            effects.forget_answer(node, &mut self.match_answers, &mut self.memory);
-            return None;
-        };
-        let answer = self.matches_for_cascade(effects, exact_answer, false, Some(node), counters);
-        verify_cascade_answer_against_cold(self, &answer, node, "a retained match answer", counters);
-        self.remember_cascade_input_with_effects(effects, node, &answer, counters);
-        counters.bump(Counter::RetainedMatchAnswerReuses);
-        counters.bump(Counter::PublishedMatchAnswerConsumptions);
-        Some(answer)
-    }
-
-    /// Read the shareable identity of one answer from the immediately preceding style transaction.
-    ///
-    /// A contextual answer has no identity and must still consume its complete payload. A shared
-    /// identity lets a downstream cache answer before copying that payload across the bridge.
-    pub fn published_match_answer_signature(&mut self, node: StyleNodeID, counters: &mut Counters) -> Option<u32> {
-        let cascade_input = Self::published_answer_lookup(
-            &self.published_match_answers,
-            self.batch_matching_traversal.as_deref(),
-            node,
-        )?
-        .1
-        .cascade_input?;
-        self.mark_published_answer_observed(node);
-        counters.bump(Counter::PublishedMatchAnswerIdentityReads);
-        Some(cascade_input.0)
     }
 
     pub(super) fn current_winner_groups(&self) -> super::cascade::WinnerView<'_> {
@@ -4448,7 +4352,7 @@ impl RetainedState {
             && winner_groups
                 .pseudo_states(node)
                 .filter(|(pseudo, _, _, _)| {
-                    matches!(pseudo.kind.0, 0 | 2 | 3 | 6)
+                    matches!(pseudo.kind.0, 0 | 2 | 3 | 6 | 7 | 8)
                         || u8::try_from(pseudo.kind.0).ok().is_some_and(|kind| {
                             self.computed_group_sets
                                 .assigned_pseudo_kinds(node)

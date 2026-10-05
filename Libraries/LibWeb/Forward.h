@@ -48,7 +48,6 @@ namespace Web::Compositor {
 class CompositorConnection;
 class CompositorContextHandle;
 class CompositorHost;
-class CompositorHostBase;
 class NavigablePresenter;
 struct CompositorFrame;
 
@@ -92,8 +91,6 @@ namespace Web::Bindings {
 
 class Intrinsics;
 enum class NamedPropertyDeletionResult : u8;
-class OptionConstructor;
-class PlatformObject;
 class Wrappable;
 class WrapperWorld;
 
@@ -532,7 +529,6 @@ class EventHandler;
 class EventTarget;
 class HTMLCollection;
 class IDLEventListener;
-class InvalidationJournal;
 class LiveNodeList;
 class MutationObserver;
 class MutationRecord;
@@ -956,15 +952,24 @@ class IntersectionObserverEntry;
 
 }
 
+namespace Web::Layout::RustFFI {
+
+struct BegunRead;
+
+}
+
 namespace Web::Layout {
 
 class ImageProvider;
 class Box;
+class ForcedReadScope;
 class Node;
 class NodeArena;
 class NodeWithStyle;
 class TextNode;
 class Viewport;
+
+using BegunRead = RustFFI::BegunRead;
 
 }
 
@@ -1250,7 +1255,6 @@ class Instance;
 class Memory;
 class Module;
 class Table;
-class WebAssemblyModule;
 
 namespace Detail {
 

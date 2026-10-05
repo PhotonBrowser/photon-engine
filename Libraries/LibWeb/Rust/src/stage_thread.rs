@@ -11,19 +11,24 @@
 //! document it hosts on its one main thread, so a thread per process is also a thread per event loop. The host waits
 //! for a job it hands a thread with [`StageThread::run`], which may borrow from the host's frame. A job it submits
 //! with [`StageThread::submit`] owns everything it reads instead, and runs beside the host: the host goes on, and
-//! takes the job's answer in from its [`InFlight`] once it has finished.
+//! takes the job's answer in from its [`InFlight`] once it has finished. A job it posts with [`StageThread::post`] owns
+//! what it reads too, and nobody takes it in.
+//!
+//! A host can also lease a value to a thread with [`StageThread::lease`]: the value starts landed in a flight the host
+//! takes back like a submitted job's answer, and a [`Ticker`] runs jobs on it in place, one at a time, between which it
+//! stays parked in the flight. Taking it back waits for at most the one job that runs on it.
 //!
 //! A thread waiting on the other side of a hand-off sleeps until that side wakes it: a stage thread for its next job,
 //! a host for the answer of a job it handed out. Nothing spins or polls, so a waiting thread takes no CPU from the
 //! threads that run.
 
-use crate::render_state::{RenderWait, TaskBoundary, render_state_died};
+use crate::render_state::TaskBoundary;
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::thread::Thread;
 
 // This crate is not instrumented by ThreadSanitizer, so TSan cannot see the ordering the hand-off gives between the
@@ -65,9 +70,8 @@ struct Shared {
     /// The jobs handed to the thread and not taken yet, the last one handed first, each linked to the one handed
     /// before it.
     handed: AtomicPtr<JobHeader>,
-    /// Whether the thread runs a job, rather than waiting for the next one. Its address names the thread to
-    /// ThreadSanitizer.
-    busy: AtomicBool,
+    /// What names the thread to ThreadSanitizer, which sees the ordering the hand-off gives only through it.
+    tsan_key: AtomicBool,
 }
 
 static THREAD_SETUP: OnceLock<extern "C" fn()> = OnceLock::new();
@@ -96,7 +100,7 @@ impl StageThread {
     fn spawn(name: &str) -> Self {
         let shared: &'static Shared = Box::leak(Box::new(Shared {
             handed: AtomicPtr::new(std::ptr::null_mut()),
-            busy: AtomicBool::new(false),
+            tsan_key: AtomicBool::new(false),
         }));
         let spawned = std::thread::Builder::new()
             .name(name.into())
@@ -107,7 +111,7 @@ impl StageThread {
                 }
                 loop {
                     let last = wait_for(|| NonNull::new(shared.handed.swap(std::ptr::null_mut(), Ordering::Acquire)));
-                    tsan::acquire(&shared.busy);
+                    tsan::acquire(&shared.tsan_key);
                     let mut next = Some(in_handed_order(last));
                     while let Some(job) = next {
                         // SAFETY: `StageThread::run` keeps the job it hands out live until it is done, and
@@ -115,8 +119,7 @@ impl StageThread {
                         // it runs, as the thread that handed it may leave the frame it is in once it is done.
                         unsafe {
                             next = job.as_ref().next.get();
-                            shared.busy.store(true, Ordering::Relaxed);
-                            (job.as_ref().run)(job, &shared.busy);
+                            (job.as_ref().run)(job, &shared.tsan_key);
                         }
                     }
                 }
@@ -144,21 +147,21 @@ impl StageThread {
         let job = JobInFrame::new(|| answer = Some(std::panic::catch_unwind(AssertUnwindSafe(job))));
         self.hand(NonNull::from(&job).cast());
         wait_for(|| job.done.load(Ordering::Acquire).then_some(()));
-        tsan::acquire(&self.shared.busy);
+        tsan::acquire(&self.shared.tsan_key);
         drop(job);
-        match answer {
-            Some(Ok(answer)) => answer,
-            Some(Err(panic)) => std::panic::resume_unwind(panic),
-            None => render_state_died(),
+        match answer.expect("a job handed out runs before it is done") {
+            Ok(answer) => answer,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 
     /// Submits `job` to this thread and goes on: the job owns what it reads, and runs after the jobs handed to the
     /// thread before it. The calling thread takes what the job answers in from the flight once it has finished, and a
     /// job that panics panics there.
-    pub(crate) fn submit<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static) -> InFlight<R> {
+    pub(crate) fn submit<R: Send + 'static>(&self, job: impl FnOnce(&StopWord) -> R + Send + 'static) -> InFlight<R> {
         let flight = Arc::new(Flight {
             finished: AtomicBool::new(false),
+            stop: StopWord::default(),
             landing: Mutex::default(),
         });
         self.hand(SubmittedJob::give_up(job, Arc::clone(&flight)));
@@ -168,9 +171,39 @@ impl StageThread {
         }
     }
 
+    /// Leases `value` to this thread: it lands at once in the flight the host takes it back from, and the ticker runs
+    /// jobs on it there, on this thread, beside the host.
+    pub(crate) fn lease<R: Send + 'static>(&'static self, value: R) -> (InFlight<R>, Ticker<R>) {
+        let flight = Arc::new(Flight {
+            finished: AtomicBool::new(true),
+            stop: StopWord::default(),
+            landing: Mutex::new(Landing {
+                answer: Some(Ok(value)),
+                joining: None,
+            }),
+        });
+        let ticker = Ticker {
+            flight: Arc::downgrade(&flight),
+            thread: self,
+        };
+        (
+            InFlight {
+                flight,
+                not_send_or_sync: PhantomData,
+            },
+            ticker,
+        )
+    }
+
+    /// Posts `job` to this thread and goes on: the job owns what it reads, runs after the jobs handed to the thread
+    /// before it, and answers nothing. A job posted from this thread runs once the job it is posted from is done.
+    pub(crate) fn post(&self, job: impl FnOnce() + Send + 'static) {
+        self.hand(PostedJob::give_up(job));
+    }
+
     /// Hands the job `header` heads to this thread, which runs it after the jobs handed to it before.
     fn hand(&self, header: NonNull<JobHeader>) {
-        tsan::release(&self.shared.busy);
+        tsan::release(&self.shared.tsan_key);
         let before = self
             .shared
             .handed
@@ -201,18 +234,12 @@ fn in_handed_order(last: NonNull<JobHeader>) -> NonNull<JobHeader> {
 
 /// What a stage thread knows of a job handed to it: how to run it, which the job's kind says.
 struct JobHeader {
-    /// Runs the job this header heads, and tells whoever takes its answer that it is done, after it has stored
-    /// `false` to the thread's busy flag it is handed.
+    /// Runs the job this header heads, and tells whoever takes its answer that it is done, after it has released the
+    /// thread's ThreadSanitizer key it is handed.
     run: unsafe fn(NonNull<JobHeader>, &AtomicBool),
     /// Until the stage thread takes the job, the job handed to it before this one and not taken yet; then, the job it
     /// runs after this one.
     next: Cell<Option<NonNull<JobHeader>>>,
-}
-
-/// Stores that the stage thread whose busy flag `busy` is has run its job.
-fn ran(busy: &AtomicBool) {
-    busy.store(false, Ordering::Release);
-    tsan::release(busy);
 }
 
 /// A job a thread hands a stage thread, in the frame of the thread that handed it.
@@ -246,7 +273,7 @@ impl<F: FnOnce() + Send> JobInFrame<F> {
     ///
     /// `header` must head a live `JobInFrame<F>` that was handed out to the calling thread and is not done yet, which
     /// nothing else reaches meanwhile.
-    unsafe fn run_handed(header: NonNull<JobHeader>, busy: &AtomicBool) {
+    unsafe fn run_handed(header: NonNull<JobHeader>, tsan_key: &AtomicBool) {
         let job = header.cast::<Self>();
         // SAFETY: Guaranteed by the caller: the thread that handed the job out reaches none of it until `done`.
         let waiting = unsafe {
@@ -255,7 +282,7 @@ impl<F: FnOnce() + Send> JobInFrame<F> {
             }
             (*job.as_ref().waiting.get()).take()
         };
-        ran(busy);
+        tsan::release(tsan_key);
         // SAFETY: As above. The waiting thread may leave the frame the job is in as soon as it sees `done`.
         unsafe { job.as_ref() }.done.store(true, Ordering::Release);
         if let Some(waiting) = waiting {
@@ -273,7 +300,7 @@ struct SubmittedJob<F, R> {
     flight: Arc<Flight<R>>,
 }
 
-impl<F: FnOnce() -> R + Send, R: Send> SubmittedJob<F, R> {
+impl<F: FnOnce(&StopWord) -> R + Send, R: Send> SubmittedJob<F, R> {
     /// The header of `job` on the heap, which the stage thread it is handed to frees, and lands in `flight`.
     fn give_up(job: F, flight: Arc<Flight<R>>) -> NonNull<JobHeader> {
         let job = Box::new(Self {
@@ -292,12 +319,12 @@ impl<F: FnOnce() -> R + Send, R: Send> SubmittedJob<F, R> {
     /// # Safety
     ///
     /// `header` must come from [`Self::give_up`], and be handed out to the calling thread only.
-    unsafe fn run_submitted(header: NonNull<JobHeader>, busy: &AtomicBool) {
+    unsafe fn run_submitted(header: NonNull<JobHeader>, tsan_key: &AtomicBool) {
         // SAFETY: Guaranteed by the caller: the submitting thread gave the job up.
         let job = unsafe { Box::from_raw(header.cast::<Self>().as_ptr()) };
         let Self { job, flight, .. } = *job;
-        let answer = std::panic::catch_unwind(AssertUnwindSafe(job));
-        ran(busy);
+        let answer = std::panic::catch_unwind(AssertUnwindSafe(|| job(&flight.stop)));
+        tsan::release(tsan_key);
         flight.land(answer);
         if let Some(finished) = FLIGHT_FINISHED.get() {
             finished();
@@ -305,11 +332,103 @@ impl<F: FnOnce() -> R + Send, R: Send> SubmittedJob<F, R> {
     }
 }
 
+/// A job a thread posts to a stage thread, on the heap, which the stage thread frees once it has run it.
+#[repr(C)]
+struct PostedJob<F> {
+    // First, so that a pointer to the header points to the job.
+    header: JobHeader,
+    job: F,
+}
+
+impl<F: FnOnce() + Send> PostedJob<F> {
+    /// The header of `job` on the heap, which the stage thread it is handed to frees.
+    fn give_up(job: F) -> NonNull<JobHeader> {
+        let job = Box::new(Self {
+            header: JobHeader {
+                run: Self::run_posted,
+                next: Cell::new(None),
+            },
+            job,
+        });
+        NonNull::from(Box::leak(job)).cast()
+    }
+
+    /// Runs the job `header` heads and frees it. A job that panics ends the process, as nobody takes its panic in.
+    ///
+    /// # Safety
+    ///
+    /// `header` must come from [`Self::give_up`], and be handed out to the calling thread only.
+    unsafe fn run_posted(header: NonNull<JobHeader>, tsan_key: &AtomicBool) {
+        // SAFETY: Guaranteed by the caller: the posting thread gave the job up.
+        let job = unsafe { Box::from_raw(header.cast::<Self>().as_ptr()) };
+        if std::panic::catch_unwind(AssertUnwindSafe(job.job)).is_err() {
+            std::process::abort();
+        }
+        tsan::release(tsan_key);
+    }
+}
+
+/// What runs jobs on a value a host leased to a stage thread, in place, while the value is parked in the flight the host
+/// takes it back from. It never moves the value out, and it does nothing once the flight is gone.
+pub(crate) struct Ticker<R> {
+    flight: Weak<Flight<R>>,
+    thread: &'static StageThread,
+}
+
+impl<R: Send + 'static> Ticker<R> {
+    /// Whether the flight it runs jobs in is still there.
+    pub(crate) fn is_live(&self) -> bool {
+        self.flight.strong_count() > 0
+    }
+
+    /// Posts `job`, which runs on the leased value on the stage thread, unless the host has said the stop word by then:
+    /// the job takes the value out of the flight, so that taking it back waits for the job, and parks it there again.
+    pub(crate) fn run(&self, job: impl FnOnce(&mut R, &StopWord) + Send + 'static) {
+        let flight = self.flight.clone();
+        self.thread.post(move || {
+            let Some(flight) = flight.upgrade() else {
+                return;
+            };
+            let mut value = {
+                let mut landing = flight.landing();
+                if flight.stop.is_said() {
+                    return;
+                }
+                // A tick that panicked left its panic in place of the value, for the host to take in.
+                let value = match landing.answer.take() {
+                    Some(Ok(value)) => value,
+                    answer => {
+                        landing.answer = answer;
+                        return;
+                    }
+                };
+                flight.finished.store(false, Ordering::Relaxed);
+                value
+            };
+            let ran = std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut value, &flight.stop)));
+            flight.land(ran.map(|()| value));
+        });
+    }
+}
+
 /// What a submitted job shares with the thread that submitted it.
 struct Flight<R> {
     /// Whether the job has finished, and its answer has landed.
     finished: AtomicBool,
+    stop: StopWord,
     landing: Mutex<Landing<R>>,
+}
+
+/// What the thread that submitted a job tells it once it waits for it: the job skips what it may leave undone, to
+/// answer sooner.
+#[derive(Default)]
+pub(crate) struct StopWord(AtomicBool);
+
+impl StopWord {
+    /// Whether the thread that submitted the job waits for it.
+    pub(crate) fn is_said(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// Where a submitted job's answer lands, and the thread that waits for it, if one does.
@@ -332,6 +451,26 @@ impl<R> Flight<R> {
         self.landing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Waits for the job to finish, and takes what it answered.
+    fn wait_for_answer(&self) -> R {
+        {
+            let mut landing = self.landing();
+            if landing.answer.is_none() {
+                landing.joining = Some(std::thread::current());
+            }
+        }
+        wait_for(|| self.finished.load(Ordering::Acquire).then_some(()));
+        self.take_answer()
+    }
+
+    fn take_answer(&self) -> R {
+        tsan::acquire(&self.finished);
+        match self.landing().answer.take().expect("a finished flight has its answer") {
+            Ok(answer) => answer,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     /// Lands `answer`, and wakes the thread that waits for it, if one does. It marks the flight finished before it lets
     /// go of the landing, so a joiner that sees the answer there, and so does not wait to be woken, sees it finished.
     fn land(&self, answer: std::thread::Result<R>) {
@@ -348,9 +487,14 @@ impl<R> Flight<R> {
     }
 }
 
-/// A job a stage thread runs beside the thread that submitted it, until that thread takes its answer in, which only it
-/// does: the flight stays on its thread. The submitting thread never waits for a flight at the top of its event loop,
-/// and waits for one elsewhere only by spending the right to.
+/// What a job that flies answers, and the right the thread that submitted it spends to wait for it.
+pub(crate) trait Flown {
+    type JoinRight;
+}
+
+/// A job a stage thread runs beside the thread that submitted it, or a value it leased to one, until that thread takes its
+/// answer in, which only it does: the flight stays on its thread. The submitting thread never waits for a flight at the
+/// top of its event loop, and waits for one elsewhere only by spending the right to.
 pub(crate) struct InFlight<R> {
     flight: Arc<Flight<R>>,
     not_send_or_sync: PhantomData<*const ()>,
@@ -363,6 +507,7 @@ impl<R> InFlight<R> {
         Self {
             flight: Arc::new(Flight {
                 finished: AtomicBool::new(true),
+                stop: StopWord::default(),
                 landing: Mutex::new(Landing {
                     answer: Some(Ok(answer)),
                     joining: None,
@@ -383,28 +528,64 @@ impl<R> InFlight<R> {
         if !self.has_finished() {
             return Err(self);
         }
-        Ok(self.take_answer())
+        Ok(self.flight.take_answer())
     }
 
-    /// Waits for the job to finish, spending `_wait`, and answers what it answered.
-    pub(crate) fn join(self, _wait: impl RenderWait) -> R {
-        {
-            let mut landing = self.flight.landing();
-            if landing.answer.is_none() {
-                landing.joining = Some(std::thread::current());
-            }
-        }
-        wait_for(|| self.has_finished().then_some(()));
-        self.take_answer()
+    /// Waits for the job to finish, spending `_right`, and answers what it answered. The job hears the stop word first.
+    pub(crate) fn join(self, _right: R::JoinRight) -> R
+    where
+        R: Flown,
+    {
+        self.say_stop();
+        self.flight.wait_for_answer()
     }
 
-    fn take_answer(self) -> R {
-        tsan::acquire(&self.flight.finished);
-        match self.flight.landing().answer.take() {
-            Some(Ok(answer)) => answer,
-            Some(Err(panic)) => std::panic::resume_unwind(panic),
-            None => render_state_died(),
+    /// Tells the job that the thread that submitted it waits for it.
+    fn say_stop(&self) {
+        self.flight.stop.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A job a stage thread runs beside a value another thread leased out, which owns it: its answer rides with the value,
+/// and whichever thread holds the value then waits for it, as the recording of the frame a clock tick presents rides
+/// with the lease beside the next tick. The job hears no stop word, and nothing wakes the host's event loop for it.
+pub(crate) struct Riding<R> {
+    flight: Arc<Flight<R>>,
+}
+
+impl StageThread {
+    /// Hands `job` to this thread, which runs it after the jobs handed to it before, beside whoever holds the ride.
+    pub(crate) fn ride<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static) -> Riding<R> {
+        let flight = Arc::new(Flight {
+            finished: AtomicBool::new(false),
+            stop: StopWord::default(),
+            landing: Mutex::default(),
+        });
+        let landing = Arc::clone(&flight);
+        self.post(move || landing.land(std::panic::catch_unwind(AssertUnwindSafe(job))));
+        Riding { flight }
+    }
+}
+
+impl<R: Flown> Riding<R> {
+    /// A ride whose job has already answered `answer`.
+    pub(crate) fn landed(answer: R) -> Self {
+        Self {
+            flight: Arc::new(Flight {
+                finished: AtomicBool::new(true),
+                stop: StopWord::default(),
+                landing: Mutex::new(Landing {
+                    answer: Some(Ok(answer)),
+                    joining: None,
+                }),
+            }),
         }
+    }
+
+    /// Waits for the job to finish, spending `_right`, and answers what it answered. A ride answers once: the holder
+    /// puts a new ride in its place.
+    pub(crate) fn take(&mut self, _right: R::JoinRight) -> R {
+        self.flight.wait_for_answer()
     }
 }
 
@@ -427,14 +608,6 @@ pub(crate) fn style_layout_thread() -> &'static StageThread {
     STYLE_LAYOUT_THREAD.get_or_init(|| StageThread::spawn("StyleLayout"))
 }
 
-/// Whether the calling thread may reach what the render states hold: it is the StyleLayout thread, or that thread
-/// waits for its next job, as it does whenever the host runs.
-pub(crate) fn may_reach_render_states() -> bool {
-    STYLE_LAYOUT_THREAD
-        .get()
-        .is_none_or(|thread| thread.is_current() || !thread.shared.busy.load(Ordering::Acquire))
-}
-
 /// The Paint thread, which records display lists from the frames the render states publish.
 pub(crate) fn paint_thread() -> &'static StageThread {
     static PAINT_THREAD: OnceLock<StageThread> = OnceLock::new();
@@ -449,6 +622,18 @@ mod tests {
     fn test_thread() -> &'static StageThread {
         static THREAD: OnceLock<StageThread> = OnceLock::new();
         THREAD.get_or_init(|| StageThread::spawn("Test"))
+    }
+
+    impl Flown for std::thread::ThreadId {
+        type JoinRight = ();
+    }
+
+    impl Flown for u32 {
+        type JoinRight = ();
+    }
+
+    impl Flown for usize {
+        type JoinRight = ();
     }
 
     #[test]
@@ -497,6 +682,16 @@ mod tests {
     }
 
     #[test]
+    fn a_posted_job_runs_before_the_jobs_handed_after_it() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let posted = Arc::clone(&ran);
+        test_thread().post(move || {
+            posted.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(test_thread().run(|| ran.load(Ordering::Relaxed)), 1);
+    }
+
+    #[test]
     fn a_job_that_panics_panics_in_the_thread_that_waits_for_it() {
         let panicked = std::panic::catch_unwind(|| test_thread().run(|| panic!("the job panicked")));
         assert!(panicked.is_err());
@@ -517,7 +712,7 @@ mod tests {
     #[test]
     fn a_submitted_job_runs_beside_the_thread_that_submitted_it() {
         let (open, wait) = gate();
-        let mut flight = test_thread().submit(move || {
+        let mut flight = test_thread().submit(move |_| {
             wait();
             std::thread::current().id()
         });
@@ -528,13 +723,13 @@ mod tests {
             };
         }
         open.store(true, Ordering::Release);
-        let ran_on = flight.join(crate::render_state::ScriptForcedRead::for_test());
+        let ran_on = flight.join(());
         assert_eq!(ran_on, test_thread().thread.id());
     }
 
     #[test]
     fn a_finished_flight_is_taken_in_at_a_task_boundary() {
-        let flight = test_thread().submit(|| 7);
+        let flight = test_thread().submit(|_| 7);
         // A job handed after the flight runs after it.
         test_thread().run(|| ());
         assert!(flight.has_finished());
@@ -544,28 +739,23 @@ mod tests {
     #[test]
     fn jobs_handed_while_the_thread_is_busy_run_in_the_order_they_were_handed() {
         let (open, wait) = gate();
-        drop(test_thread().submit(wait));
+        drop(test_thread().submit(move |_| wait()));
         let ran = Arc::new(AtomicUsize::new(0));
         let flights: Vec<_> = (0..8)
             .map(|_| {
                 let ran = Arc::clone(&ran);
-                test_thread().submit(move || ran.fetch_add(1, Ordering::Relaxed))
+                test_thread().submit(move |_| ran.fetch_add(1, Ordering::Relaxed))
             })
             .collect();
         open.store(true, Ordering::Release);
-        let order: Vec<_> = flights
-            .into_iter()
-            .map(|flight| flight.join(crate::render_state::ScriptForcedRead::for_test()))
-            .collect();
+        let order: Vec<_> = flights.into_iter().map(|flight| flight.join(())).collect();
         assert_eq!(order, (0..8).collect::<Vec<_>>());
     }
 
     #[test]
     fn a_submitted_job_that_panics_panics_where_it_is_taken_in() {
-        let flight = test_thread().submit(|| -> u32 { panic!("the job panicked") });
-        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            flight.join(crate::render_state::ScriptForcedRead::for_test())
-        }));
+        let flight = test_thread().submit(|_| -> u32 { panic!("the job panicked") });
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| flight.join(())));
         assert!(panicked.is_err());
         assert_eq!(test_thread().run(|| 7), 7, "the stage thread goes on");
     }
@@ -575,13 +765,83 @@ mod tests {
         let (open, wait) = gate();
         let answer = Arc::new(());
         let held = Arc::clone(&answer);
-        drop(test_thread().submit(move || {
+        drop(test_thread().submit(move |_| {
             wait();
             held
         }));
         open.store(true, Ordering::Release);
         test_thread().run(|| ());
         assert_eq!(Arc::strong_count(&answer), 1, "the answer nobody took in is dropped");
+    }
+
+    impl Flown for bool {
+        type JoinRight = ();
+    }
+
+    #[test]
+    fn a_tick_runs_on_a_leased_value_beside_the_host() {
+        let (lease, ticker) = test_thread().lease(1_u32);
+        ticker.run(|value, _| *value += 1);
+        ticker.run(|value, _| *value *= 10);
+        // A job handed after the ticks runs after them.
+        test_thread().run(|| ());
+        assert!(lease.has_finished(), "the value is parked between ticks");
+        assert_eq!(lease.join(()), 20);
+    }
+
+    #[test]
+    fn taking_a_parked_lease_back_waits_for_nothing() {
+        let (lease, _ticker) = test_thread().lease(7_u32);
+        assert!(lease.has_finished());
+        assert_eq!(lease.join(()), 7);
+    }
+
+    #[test]
+    fn taking_a_lease_back_waits_for_the_tick_that_runs_and_no_other() {
+        let (lease, ticker) = test_thread().lease(0_u32);
+        let (started, wait_for_start) = std::sync::mpsc::channel();
+        let (go, wait_for_go) = std::sync::mpsc::channel::<()>();
+        ticker.run(move |value, _| {
+            started.send(()).ok();
+            wait_for_go.recv().ok();
+            *value += 1;
+        });
+        ticker.run(|value, _| *value += 100);
+        wait_for_start.recv().ok();
+        assert!(!lease.has_finished(), "the running tick has the value");
+        lease.say_stop();
+        go.send(()).ok();
+        assert_eq!(
+            lease.join(()),
+            1,
+            "the tick queued behind the running one hears the stop word"
+        );
+    }
+
+    #[test]
+    fn a_ticker_outliving_its_lease_does_nothing() {
+        let (lease, ticker) = test_thread().lease(0_u32);
+        assert_eq!(lease.join(()), 0);
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_tick = Arc::clone(&ran);
+        ticker.run(move |_, _| ran_in_tick.store(true, Ordering::Relaxed));
+        test_thread().run(|| ());
+        assert!(!ran.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_flight_hears_the_stop_word_its_join_says() {
+        let (go, wait) = std::sync::mpsc::channel();
+        let flight = test_thread().submit(move |stop| {
+            wait.recv().ok();
+            stop.is_said()
+        });
+        flight.say_stop();
+        go.send(()).ok();
+        assert!(flight.join(()));
+        let unstopped = test_thread().submit(|stop| stop.is_said());
+        test_thread().run(|| ());
+        assert!(matches!(unstopped.try_take(&TaskBoundary::for_test()), Ok(false)));
     }
 
     trait AmbiguousIfSend<A> {

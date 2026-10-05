@@ -14,9 +14,7 @@ use crate::painting::paintable_data::*;
 use crate::painting::published_frame::PublishedRows;
 use crate::painting::record::damage::{DamageSet, PaintDamage, RowPaintState};
 use crate::painting::stacking_context::entries::{StackingContextEntryColumn, drop_table};
-use crate::painting::visual_context::dirty::{
-    RemovedBoxBlocks, VisualContextBoxDirtyKind, VisualContextGlobalRebuildReason,
-};
+use crate::painting::visual_context::dirty::{RemovedBoxBlocks, VisualContextBoxDirtyKind, VisualContextUpdateScope};
 use crate::painting::visual_context::{
     BoxVisualContextNodeHandles, EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES, PaintableVisualContextRecord,
 };
@@ -329,6 +327,8 @@ pub(crate) struct PaintableRowStore {
     committed_fragment_links: RefCell<CowColumn<CommittedFragmentLinkSlot, PAINTABLE_SLOTS_PER_CHUNK>>,
     image_map_areas: crate::painting::image_map_areas::ImageMapAreaColumn,
     unique_node_ids: UniqueNodeIdColumn,
+    /// How many times a row was populated or reset, which moves whether a row is populated.
+    population_writes: u64,
 }
 
 pub(crate) type VisualContextNodeHandleColumn =
@@ -415,10 +415,6 @@ impl<Arena> PaintableRows<Arena>
 where
     Arena: Deref<Target = LayoutNodeArena>,
 {
-    pub(crate) fn paintable_data_ptr(&self, id: NodeSlotId) -> *const PaintableData {
-        self.arena.live_paintable_data(id)
-    }
-
     pub(crate) fn clear_cached_overflow_data(&self, id: NodeSlotId) {
         if !self.paintable_row_is_populated(id) {
             return;
@@ -447,7 +443,7 @@ where
                 child = crate::painting::paint_order::next_paint_sibling(self, child_slot);
             }
         }
-        if node_painting::is_inline(self, id) {
+        if node_painting::is_fragmented_inline(self, id) {
             let mut ancestor = crate::painting::paint_order::paint_parent(self, id);
             while let Some(current) = ancestor {
                 repaint(current);
@@ -478,7 +474,7 @@ where
             if crate::painting::style_queries::is_text_decoration_propagation_boundary(self.arena.deref(), current) {
                 continue;
             }
-            if node_painting::has_lines(self, current) || node_painting::is_inline(self, current) {
+            if node_painting::has_lines(self, current) || node_painting::is_fragmented_inline(self, current) {
                 self.arena.push_paint_damage(current, PaintDamage::DRAW_FOREGROUND);
             }
             if let Some(first_child) = crate::painting::paint_order::first_paint_child(self, current) {
@@ -761,6 +757,11 @@ impl LayoutNodeArena {
 
     /// How far the paintable rows and the columns published beside them have been written. See
     /// [`crate::cow_column::CowColumn::version`].
+    /// How far which rows are populated has been written since the arena was made.
+    pub(crate) fn paintable_population_version(&self) -> u64 {
+        self.paintable_rows.population_writes
+    }
+
     pub(crate) fn paintable_rows_version(&self) -> u64 {
         let store = &self.paintable_rows;
         store.rows.version()
@@ -849,6 +850,7 @@ impl LayoutNodeArena {
             visual_context_records.push(None);
         }
 
+        store.population_writes += 1;
         store.rows.set(
             index,
             PaintableData {
@@ -904,6 +906,7 @@ impl LayoutNodeArena {
         self.clear_absolute_rect_memo();
         let store = &mut self.paintable_rows;
         let index = id.slot_index() as usize;
+        store.population_writes += 1;
         store.rows.set(index, PaintableData::default());
         store.side_data.borrow_mut()[index] = PaintableSideData::default();
         store
@@ -1098,12 +1101,12 @@ impl LayoutNodeArena {
             .note_box(id, kind, pending_box_limit);
     }
 
-    pub(crate) fn request_full_visual_context_rebuild(&self, reason: VisualContextGlobalRebuildReason) {
+    pub(crate) fn request_full_visual_context_rebuild(&self, scope: VisualContextUpdateScope) {
         self.paint_state()
             .borrow_mut()
             .visual_context
             .dirty_boxes
-            .request_full_rebuild(reason);
+            .request_full_rebuild(scope);
     }
 
     pub(crate) fn prepare_paintable_row_freed_reset(&self, layout_slot_index: u32) -> Option<PaintableRowReset> {

@@ -13,15 +13,16 @@
 //! depend on the element, a value or an easing still to be substituted against it, travels as
 //! written.
 
-use super::animations::AnimationSlot;
+use super::animations::{AnimationSlot, EffectTiming};
 use super::bridge::{
     FfiAnimationEffectVersion, FfiPublishedAnimationCustomDeclaration, FfiPublishedAnimationDeclaration,
     FfiPublishedAnimationEffect, FfiPublishedAnimationKeyframe, FfiPublishedEasingKind, FfiPublishedLinearEasingPoint,
 };
 use super::tree::StyleNodeID;
 use crate::css::animation::FfiCompositeOperation;
-use crate::css::easing::{Easing, FfiLinearEasingPoint};
+use crate::css::easing::{Easing, FfiEasingDescriptor, FfiEasingKind, FfiLinearEasingPoint};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
+use crate::css::style_compute::FfiEffectTiming;
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -186,9 +187,43 @@ pub(crate) struct PublishedEffect {
     pub(crate) keyframes: Box<[PublishedKeyframe]>,
     declarations: Box<[PublishedDeclaration]>,
     custom_declarations: Box<[PublishedCustomDeclaration]>,
+    /// The timing the host last sampled the effect with, which moves without the description.
+    pub(crate) timing: Option<EffectTiming>,
 }
 
 impl PublishedEffect {
+    /// The effect of a CSS transition of `property_id` from `start` to `end`, as the host describes one:
+    /// two keyframes, each running the linear easing, that replace the value beneath them.
+    pub(crate) fn transition(
+        identity: u64,
+        property_id: u16,
+        start: RetainedStyleValueData,
+        end: RetainedStyleValueData,
+    ) -> Self {
+        let keyframe = |key, index| PublishedKeyframe {
+            key,
+            easing: Easing::default(),
+            easing_value: None,
+            composite: FfiCompositeOperation::Replace,
+            declarations: index..index + 1,
+            custom_declarations: 0..0,
+        };
+        Self {
+            identity,
+            generation: 0,
+            is_transition: true,
+            resource_context: None,
+            // `KeyframeEffect::AnimationKeyFrameKeyScaleFactor` keys the end at 100%.
+            keyframes: Box::new([keyframe(0, 0), keyframe(100 * 1000, 1)]),
+            declarations: Box::new([start, end].map(|value| PublishedDeclaration {
+                property_id,
+                value: PublishedValue::Declared(value),
+            })),
+            custom_declarations: Box::new([]),
+            timing: None,
+        }
+    }
+
     #[must_use]
     pub(crate) fn declarations_of(&self, keyframe: &PublishedKeyframe) -> &[PublishedDeclaration] {
         &self.declarations[keyframe.declarations.clone()]
@@ -220,7 +255,7 @@ impl PublishedEffectBuffers<'_> {
     ///
     /// # Safety
     /// Every value and custom-property name the buffers name must be live.
-    unsafe fn effects(self) -> Box<[PublishedEffect]> {
+    pub(crate) unsafe fn effects(self) -> Box<[PublishedEffect]> {
         self.effects
             .iter()
             .map(|effect| {
@@ -270,6 +305,7 @@ impl PublishedEffectBuffers<'_> {
                     keyframes,
                     declarations: declarations.into(),
                     custom_declarations: custom_declarations.into(),
+                    timing: None,
                 }
             })
             .collect()
@@ -314,11 +350,7 @@ pub(crate) struct AnimationEffectDescriptions {
 
 impl AnimationEffectDescriptions {
     /// Replace one list. An empty list drops it.
-    ///
-    /// # Safety
-    /// Every value and custom-property name the buffers name must be live.
-    pub(crate) unsafe fn set(&mut self, node: StyleNodeID, slot: AnimationSlot, buffers: PublishedEffectBuffers<'_>) {
-        let effects = unsafe { buffers.effects() };
+    pub(crate) fn set(&mut self, node: StyleNodeID, slot: AnimationSlot, effects: Box<[PublishedEffect]>) {
         let lists = self.rows.entry(node).or_default();
         let existing = lists.iter().position(|(list_slot, _)| *list_slot == slot);
         match (existing, effects.is_empty()) {
@@ -345,6 +377,7 @@ impl AnimationEffectDescriptions {
 
     /// Whether one of an element's lists describes exactly these versions of the effects, in this
     /// order. Every change that moves what a description says moves its effect's generation.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn describe(
         &self,
@@ -360,10 +393,149 @@ impl AnimationEffectDescriptions {
                 .all(|(effect, version)| effect.identity == version.identity && effect.generation == version.generation)
     }
 
+    /// Keeps `timing` and `easing`, what the host samples one of an element's described effects with, and
+    /// answers the key the effect samples its keyframes at as the host samples it: the one its timing
+    /// gives at the time the host sampled its timeline, or `host_key` where the engine cannot decide the
+    /// timing, or none for an unresolved progress, which samples nothing. An effect the list does not
+    /// describe keeps nothing, and samples nothing either.
+    ///
+    /// # Safety
+    /// The linear points `easing` names must be live.
+    pub(crate) unsafe fn time_effect(
+        &mut self,
+        node: StyleNodeID,
+        slot: AnimationSlot,
+        identity: u64,
+        timing: &FfiEffectTiming,
+        easing: &FfiEasingDescriptor,
+        host_key: f64,
+    ) -> Option<f64> {
+        let effect = self
+            .rows
+            .get_mut(&node)
+            .and_then(|lists| lists.iter_mut().find(|(list_slot, _)| *list_slot == slot))
+            .and_then(|(_, effects)| effects.iter_mut().find(|effect| effect.identity == identity));
+        let effect = effect?;
+        // A timing that has not moved keeps the easing it holds, so a sample allocates nothing.
+        let unchanged = effect
+            .timing
+            .as_ref()
+            .is_some_and(|kept| kept.timing == *timing && unsafe { easing_is(&kept.easing, easing) });
+        if !unchanged {
+            effect.timing = Some(EffectTiming {
+                timing: *timing,
+                easing: unsafe { Easing::from_descriptor(easing) },
+            });
+        }
+        effect.timing.as_ref().expect("the timing was kept above").key(host_key)
+    }
+
+    /// Keeps `timing`, what the host sampled one of an element's described effects with where it sampled
+    /// without asking the engine. An effect the list does not describe keeps nothing.
+    pub(crate) fn keep_timing(&mut self, node: StyleNodeID, slot: AnimationSlot, identity: u64, timing: EffectTiming) {
+        if let Some(effect) = self
+            .rows
+            .get_mut(&node)
+            .and_then(|lists| lists.iter_mut().find(|(list_slot, _)| *list_slot == slot))
+            .and_then(|(_, effects)| effects.iter_mut().find(|effect| effect.identity == identity))
+        {
+            effect.timing = Some(timing);
+        }
+    }
+
     /// Give up the lists of an identity that retires. An identity can be minted again for another
     /// element, so a list left behind would be read as that element's.
     pub(crate) fn retire(&mut self, node: StyleNodeID) {
         self.rows.remove(&node);
+    }
+}
+
+/// The versions of the effects each of an element's lists holds as the host described them to the engine, which the
+/// host follows over every description it writes and every identity a transaction releases, as the engine retires the
+/// node's lists then, so it knows without asking whether the engine describes a list already.
+#[derive(Default)]
+pub(crate) struct DescribedVersions {
+    rows: HashMap<StyleNodeID, Vec<DescribedList>>,
+}
+
+/// The identity and generation of each effect one of an element's lists holds, in composite order.
+type DescribedList = (AnimationSlot, Box<[(u64, u64)]>);
+
+impl DescribedVersions {
+    /// Follows the host describing `effects` as one of `node`'s lists.
+    pub(crate) fn follow(&mut self, node: StyleNodeID, slot: AnimationSlot, effects: &[PublishedEffect]) {
+        let lists = self.rows.entry(node).or_default();
+        lists.retain(|(list_slot, _)| *list_slot != slot);
+        if !effects.is_empty() {
+            lists.push((
+                slot,
+                effects
+                    .iter()
+                    .map(|effect| (effect.identity, effect.generation))
+                    .collect(),
+            ));
+        }
+        if lists.is_empty() {
+            self.rows.remove(&node);
+        }
+    }
+
+    /// Whether the engine describes one of `node`'s lists as exactly these versions: every change that moves what a
+    /// description says moves its effect's generation.
+    pub(crate) fn describe(
+        &self,
+        node: StyleNodeID,
+        slot: AnimationSlot,
+        versions: &[FfiAnimationEffectVersion],
+    ) -> bool {
+        let described = self
+            .rows
+            .get(&node)
+            .and_then(|lists| lists.iter().find(|(list_slot, _)| *list_slot == slot))
+            .map_or(&[][..], |(_, described)| described);
+        described.len() == versions.len()
+            && described
+                .iter()
+                .zip(versions)
+                .all(|(&(identity, generation), version)| {
+                    identity == version.identity && generation == version.generation
+                })
+    }
+
+    /// Forgets the lists of the nodes a transaction retired, whose identities it `released`.
+    pub(crate) fn forget(&mut self, released: &[u32]) {
+        if self.rows.is_empty() {
+            return;
+        }
+        for node in released.iter().filter_map(|&node| StyleNodeID::from_raw(node)) {
+            self.rows.remove(&node);
+        }
+    }
+}
+
+/// Whether `easing` is the function `descriptor` describes.
+///
+/// # Safety
+/// The linear points `descriptor` names must be live.
+unsafe fn easing_is(easing: &Easing, descriptor: &FfiEasingDescriptor) -> bool {
+    match (easing, descriptor.kind) {
+        (Easing::Linear(points), FfiEasingKind::Linear) => {
+            points.len() == descriptor.linear_point_count
+                && (points.is_empty()
+                    || points.as_slice()
+                        == unsafe { std::slice::from_raw_parts(descriptor.linear_points, points.len()) })
+        }
+        (Easing::CubicBezier { x1, y1, x2, y2 }, FfiEasingKind::CubicBezier) => {
+            [*x1, *y1, *x2, *y2] == [descriptor.x1, descriptor.y1, descriptor.x2, descriptor.y2]
+        }
+        (
+            Easing::Steps {
+                interval_count,
+                position,
+            },
+            FfiEasingKind::Steps,
+        ) => *interval_count == descriptor.interval_count && *position == descriptor.step_position,
+        _ => false,
     }
 }
 
@@ -385,8 +557,32 @@ mod tests {
         }
     }
 
+    /// The engine's descriptions, and the host's record of what it described, which must answer alike.
+    #[derive(Default)]
+    struct Described {
+        rows: AnimationEffectDescriptions,
+        host: DescribedVersions,
+    }
+
+    impl Described {
+        fn describe(&self, node: StyleNodeID, slot: AnimationSlot, versions: &[FfiAnimationEffectVersion]) -> bool {
+            let described = self.rows.describe(node, slot, versions);
+            assert_eq!(described, self.host.describe(node, slot, versions));
+            described
+        }
+
+        fn effects(&self, node: StyleNodeID, slot: AnimationSlot) -> &[PublishedEffect] {
+            self.rows.effects(node, slot)
+        }
+
+        fn retire(&mut self, node: StyleNodeID) {
+            self.rows.retire(node);
+            self.host.forget(&[node.raw()]);
+        }
+    }
+
     fn set(
-        descriptions: &mut AnimationEffectDescriptions,
+        descriptions: &mut Described,
         node: StyleNodeID,
         slot: AnimationSlot,
         effects: &[FfiPublishedAnimationEffect],
@@ -399,7 +595,9 @@ mod tests {
             linear_points: &[],
             base_url_bytes: &[],
         };
-        unsafe { descriptions.set(node, slot, buffers) };
+        let effects = unsafe { buffers.effects() };
+        descriptions.host.follow(node, slot, &effects);
+        descriptions.rows.set(node, slot, effects);
     }
 
     fn version(identity: u64, generation: u64) -> FfiAnimationEffectVersion {
@@ -409,7 +607,7 @@ mod tests {
     #[test]
     fn a_list_describes_the_versions_it_was_published_for() {
         let node = StyleNodeID::from_raw(1).unwrap();
-        let mut descriptions = AnimationEffectDescriptions::default();
+        let mut descriptions = Described::default();
         set(&mut descriptions, node, 0, &[effect(7, 1), effect(9, 3)]);
         assert!(descriptions.describe(node, 0, &[version(7, 1), version(9, 3)]));
         assert!(!descriptions.describe(node, 0, &[version(7, 2), version(9, 3)]));
@@ -419,19 +617,21 @@ mod tests {
         assert!(descriptions.describe(node, 2, &[]));
 
         set(&mut descriptions, node, 0, &[]);
-        assert!(descriptions.rows.is_empty());
+        assert!(descriptions.rows.rows.is_empty());
+        assert!(descriptions.host.rows.is_empty());
     }
 
     #[test]
     fn a_retired_identity_holds_no_descriptions_when_reissued() {
         let node = StyleNodeID::from_raw(1).unwrap();
-        let mut descriptions = AnimationEffectDescriptions::default();
+        let mut descriptions = Described::default();
         set(&mut descriptions, node, 0, &[effect(7, 1)]);
         set(&mut descriptions, node, 3, &[effect(8, 1)]);
         descriptions.retire(node);
         assert!(descriptions.effects(node, 0).is_empty());
         assert!(descriptions.effects(node, 3).is_empty());
-        assert!(descriptions.rows.is_empty());
+        assert!(descriptions.rows.rows.is_empty());
+        assert!(descriptions.host.rows.is_empty());
         assert!(descriptions.describe(node, 0, &[]));
     }
 }

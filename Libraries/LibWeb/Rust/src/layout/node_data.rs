@@ -17,10 +17,16 @@ pub const GENERATED_FOR_FIRST_LETTER: u8 = 4;
 pub const GENERATED_FOR_MARKER: u8 = 6;
 /// The last pseudo-element an element holds a box for in its own right; the ones from
 /// `GENERATED_FOR_AFTER` up to it are an element's synthetic pseudo-elements.
-pub const GENERATED_FOR_LAST_SYNTHETIC: u8 = 8;
+pub const GENERATED_FOR_LAST_SYNTHETIC: u8 = 10;
 /// `CSS::PseudoElement::Selection`, as the style engine numbers an element's pseudo-element
 /// records. It generates no box, so no row names it.
-pub const SELECTION_PSEUDO_KIND: u8 = 6;
+pub const SELECTION_PSEUDO_KIND: u8 = 8;
+/// `CSS::PseudoElement::SearchText`, as the style engine numbers an element's pseudo-element
+/// records. It generates no box either.
+pub const SEARCH_TEXT_PSEUDO_KIND: u8 = 6;
+/// The current find-in-page match's `::search-text`, as the style engine numbers an element's
+/// pseudo-element records. It generates no box either.
+pub const SEARCH_TEXT_CURRENT_PSEUDO_KIND: u8 = 7;
 
 /// The pseudo-element a row generated for `generated_for` stands for, as the style engine numbers
 /// an element's pseudo-element records. `Layout::Node::encode_generated_for` is its inverse.
@@ -257,9 +263,9 @@ pub enum DomPaintFact {
     NestedNavigableContainer = 1 << 3,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiNodeConstructionFacts {
+pub(crate) struct NodeConstructionFacts {
     pub kind: NodeKind,
     pub is_anonymous: bool,
     pub is_html_input_element: bool,
@@ -344,6 +350,8 @@ pub(crate) struct PaintNode {
     pub(crate) style_record: u64,
     /// The node whose style the row carries.
     pub(crate) style_node: Option<crate::css::style::tree::StyleNodeID>,
+    /// Whether the arena derived the row's style record: an anonymous box's, or a style layout adjusted.
+    pub(crate) style_is_derived: bool,
 }
 
 impl Default for PaintNode {
@@ -363,16 +371,19 @@ impl Default for PaintNode {
             style: StylePayloadsRef::null(),
             style_record: 0,
             style_node: None,
+            style_is_derived: false,
         }
     }
 }
 
 impl PaintNode {
-    /// The node's row as `data` holds it, with the style record and node the arena keeps beside it.
+    /// The node's row as `data` holds it, with the style record and node the arena keeps beside it, and whether it
+    /// derived the record.
     pub(crate) fn of(
         data: &NodeData,
         style_record: u64,
         style_node: Option<crate::css::style::tree::StyleNodeID>,
+        style_is_derived: bool,
     ) -> Self {
         Self {
             generation: data.slot_generation.get(),
@@ -389,6 +400,7 @@ impl PaintNode {
             style: data.style.get(),
             style_record,
             style_node,
+            style_is_derived,
         }
     }
 

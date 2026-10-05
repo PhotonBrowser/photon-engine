@@ -442,6 +442,7 @@ impl StyleEngineState {
                 && self.host.tree_staging.is_empty()
                 && !self.host.program_staging.is_dirty()
                 && self.host.sheet_rule_replacement.is_none();
+        self.host.deferred_element_style_inputs_moved |= !self.host.deferred_element_style_inputs.is_empty();
         for input in std::mem::take(&mut self.host.deferred_element_style_inputs) {
             self.record_input(input.key, input.old, input.new, counters);
         }
@@ -1515,7 +1516,7 @@ impl StyleEngineState {
                                 && !has_direct_action
                                 && !patch.has_non_selector_inputs
                                 && patch.always_emit_nodes.binary_search(&node).is_err()
-                                && let Some(deferred) = self.retained.deferred_pseudo_element
+                                && self.retained.deferred_pseudo_elements != 0
                                 && let Lookup::Known(previous) = self.retained.retained_match_answers.lookup(node)
                                 && let Some(previous) = self.retained.match_answers.answer(*previous)
                                 && let Some(current) = published_match_answers
@@ -1526,7 +1527,9 @@ impl StyleEngineState {
                                 let is_observable = |entry: &&RetainedRuleMatch| {
                                     self.retained.programs.get(entry.program).entries()[entry.entry as usize]
                                         .pseudo_element
-                                        .is_none_or(|target| target.kind != deferred)
+                                        .is_none_or(|target| {
+                                            !self.retained.pseudo_element_style_is_deferred(target.kind)
+                                        })
                                 };
                                 let previous = previous.iter().filter(is_observable);
                                 let current = current.iter().filter(is_observable);
@@ -2380,7 +2383,11 @@ impl StyleEngineState {
                     && !resuming_font
                     && !hidden
                     && !answer_was_taken
-                    && !self.retained.published_container_verdicts.contains_key(&node))
+                    && !self.retained.published_container_verdicts.contains_key(&node)
+                    && !self.retained.declares_custom_property_registered_with_syntax(
+                        node,
+                        &self.retained.document_style_computation_inputs,
+                    ))
                 .then(|| self.retained.tree.inheritance_parent(node))
                 .flatten()
                 .filter(|&parent| {

@@ -26,7 +26,9 @@ pub(super) fn synthetic_text_atom_key(hash: u64) -> usize {
 enum RawAtomLifetime {
     RetainedFlyString,
     SyntheticTextKey,
-    OpaqueReplayToken,
+    /// A test's stand-in for a fly string, which nothing retains.
+    #[cfg(test)]
+    OpaqueTestToken,
 }
 
 impl RawAtomLifetime {
@@ -71,7 +73,7 @@ impl GlobalAtoms {
             assert_eq!(
                 entry.raw_lifetime,
                 Some(lifetime),
-                "one raw atom cannot mix live and replay identity"
+                "one raw atom cannot mix live and test identity"
             );
             entry.document_references += 1;
             return entry.atom;
@@ -143,6 +145,70 @@ impl GlobalAtoms {
     }
 }
 
+/// What a reference to a process-global atom is the reference to: the raw atom of a name, or a qualified name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AtomKey {
+    Raw(usize),
+    Qualified(StyleAtomID, StyleAtomID),
+}
+
+/// A document host's reference to a process-global atom, which it takes as it interns a name beside its document's
+/// engine, and which keeps the atom's number from being handed out again until the engine has adopted the name. It is
+/// the reference itself, so it is neither `Clone` nor `Copy`, and dropping it releases it.
+pub(crate) struct AtomLease {
+    key: AtomKey,
+    atom: StyleAtomID,
+}
+
+impl AtomLease {
+    /// Takes a reference to the global atom of the name whose raw identity is `raw`.
+    ///
+    /// # Safety
+    /// `raw` must be the raw identity of a live `AK::Utf16FlyString`.
+    pub(crate) unsafe fn acquire_raw(raw: usize) -> Self {
+        let atom = global_atoms()
+            .lock()
+            .expect("process-global style atom lock is poisoned")
+            .acquire_raw(raw, RawAtomLifetime::RetainedFlyString);
+        Self {
+            key: AtomKey::Raw(raw),
+            atom,
+        }
+    }
+
+    /// Takes a reference to the global atom of `name` qualified by `namespace`.
+    pub(crate) fn acquire_qualified(namespace: StyleAtomID, name: StyleAtomID) -> Self {
+        let atom = global_atoms()
+            .lock()
+            .expect("process-global style atom lock is poisoned")
+            .acquire_qualified(namespace, name);
+        Self {
+            key: AtomKey::Qualified(namespace, name),
+            atom,
+        }
+    }
+
+    pub(crate) fn atom(&self) -> StyleAtomID {
+        self.atom
+    }
+
+    pub(super) fn key(&self) -> AtomKey {
+        self.key
+    }
+}
+
+impl Drop for AtomLease {
+    fn drop(&mut self) {
+        let mut global = global_atoms()
+            .lock()
+            .expect("process-global style atom lock is poisoned");
+        match self.key {
+            AtomKey::Raw(raw) => global.release_raw(raw, self.atom),
+            AtomKey::Qualified(namespace, name) => global.release_qualified((namespace.0, name.0), self.atom),
+        }
+    }
+}
+
 fn global_atoms() -> &'static Mutex<GlobalAtoms> {
     // The mutex supplies the `Sync` required by a process-global static. It does not make a
     // `DocumentAtoms` owner, or the StyleEngine containing it, safe to use from multiple threads.
@@ -191,8 +257,9 @@ impl DocumentAtoms {
         Self::new(scope)
     }
 
-    pub(super) fn for_replay() -> Self {
-        Self::new(AtomScope::Process(RawAtomLifetime::OpaqueReplayToken))
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        Self::new(AtomScope::Process(RawAtomLifetime::OpaqueTestToken))
     }
 
     fn new(scope: AtomScope) -> Self {
@@ -224,11 +291,6 @@ impl DocumentAtoms {
         };
         self.raw.insert(raw, atom);
         atom
-    }
-
-    /// The atom a raw atom was interned as, if it was.
-    pub(super) fn interned_raw(&self, raw: usize) -> Option<StyleAtomID> {
-        self.raw.get(&raw).copied()
     }
 
     pub(super) fn intern_cpp_raw(&mut self, raw: usize) -> StyleAtomID {
@@ -392,16 +454,6 @@ impl DocumentAtoms {
         reclaimed.sort_unstable_by_key(|entry| entry.atom.0);
         reclaimed
     }
-
-    #[cfg(feature = "style-recording")]
-    pub(super) fn raw(&self) -> &HashMap<usize, StyleAtomID> {
-        &self.raw
-    }
-
-    #[cfg(feature = "style-recording")]
-    pub(super) fn qualified(&self) -> &HashMap<(u32, u32), StyleAtomID> {
-        &self.qualified
-    }
 }
 
 impl Drop for DocumentAtoms {
@@ -449,21 +501,21 @@ mod tests {
         let _test_lock = GLOBAL_ATOM_TEST_LOCK.lock().unwrap();
         let first_atom;
         {
-            let mut first = DocumentAtoms::for_replay();
-            let mut second = DocumentAtoms::for_replay();
+            let mut first = DocumentAtoms::for_test();
+            let mut second = DocumentAtoms::for_test();
             first_atom = first.intern_raw(0x1234);
             assert_eq!(second.intern_raw(0x1234), first_atom);
             assert_ne!(second.intern_raw(0x5678), first_atom);
         }
-        let mut later = DocumentAtoms::for_replay();
+        let mut later = DocumentAtoms::for_test();
         assert_eq!(later.intern_raw(0x9abc), first_atom);
     }
 
     #[test]
     fn process_atoms_wait_for_every_raw_and_qualified_owner() {
         let _test_lock = GLOBAL_ATOM_TEST_LOCK.lock().unwrap();
-        let mut first = DocumentAtoms::for_replay();
-        let mut second = DocumentAtoms::for_replay();
+        let mut first = DocumentAtoms::for_test();
+        let mut second = DocumentAtoms::for_test();
         let namespace = first.intern_raw(0x1000);
         let name = first.intern_raw(0x2000);
         let qualified = first.intern_qualified(namespace, name);
@@ -478,7 +530,7 @@ mod tests {
 
         let second_reclaimable = prepare_sweep(&second, &mut HashSet::new());
         second.finish_sweep(&second_reclaimable);
-        let mut later = DocumentAtoms::for_replay();
+        let mut later = DocumentAtoms::for_test();
         assert_eq!(later.intern_raw(0x3000), namespace);
         assert_eq!(later.intern_raw(0x4000), name);
         assert_eq!(later.intern_qualified(namespace, name), qualified);
@@ -487,8 +539,8 @@ mod tests {
     #[test]
     fn qualified_atoms_share_the_global_identity_space() {
         let _test_lock = GLOBAL_ATOM_TEST_LOCK.lock().unwrap();
-        let mut first = DocumentAtoms::for_replay();
-        let mut second = DocumentAtoms::for_replay();
+        let mut first = DocumentAtoms::for_test();
+        let mut second = DocumentAtoms::for_test();
         let namespace = first.intern_raw(0x1000);
         let name = first.intern_raw(0x2000);
         assert_eq!(second.intern_raw(0x1000), namespace);

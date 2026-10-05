@@ -23,7 +23,6 @@ use super::index::FeatureValue;
 use super::index::LocalFeatureKey;
 use super::index::StyleAtomID;
 use super::instrumentation::Counters;
-use super::memory::DeviceClass;
 use super::partial_view::Lookup;
 use super::program::CascadeOrigin;
 use super::program::DeclarationBlockID;
@@ -94,7 +93,7 @@ struct Workload {
 
 impl Workload {
     fn new(seed: u64) -> Self {
-        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+        let mut engine = StyleEngine::new();
         let mut raw = vec![0; 1 + CONTAINERS + CONTAINERS * CHILDREN];
         engine.allocate_style_nodes(&mut raw);
         let nodes: Vec<_> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -651,7 +650,10 @@ fn budget_histories_preserve_answers_winners_and_records_across_mutations() {
             workload.engine.end_cold_matching_batch();
         }
         assert_eq!(warm_answers, pressured_answers, "step {step}");
-        saw_pressure |= pressured.engine.memory.refusals(MemoryCategory::RetainedMatchAnswer) > 0;
+        saw_pressure |= !pressured
+            .engine
+            .memory
+            .is_tier3_admitting(MemoryCategory::RetainedMatchAnswer);
         saw_retention_difference |= warm.engine.memory.bytes_in_tier(Tier::Acceleration)
             != pressured.engine.memory.bytes_in_tier(Tier::Acceleration);
         assert_eq!(warm.mutate(&mut warm_rng), pressured.mutate(&mut pressured_rng));
@@ -711,7 +713,14 @@ fn incomplete_answer_batches_preserve_pending_lookups_and_release_ownership() {
                 normalized_rows(workload.engine.consume_published_match_answer(nodes[index]).unwrap()),
                 expected[index]
             );
-            assert!(workload.engine.published_match_answer_signature(nodes[index]).is_some());
+            assert!(
+                super::RetainedState::published_answer_lookup(
+                    &workload.engine.published_match_answers,
+                    workload.engine.batch_matching_traversal.as_deref(),
+                    nodes[index],
+                )
+                .is_some_and(|(_, answer)| answer.cascade_input.is_some())
+            );
             let key = WinnerGroupKey::current(nodes[index], workload.engine.program.version());
             assert!(matches!(workload.engine.winner_groups.lookup(key), Lookup::Missing(_)));
             assert!(matches!(

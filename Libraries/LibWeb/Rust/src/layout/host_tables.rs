@@ -121,15 +121,11 @@ impl HostTables {
     }
 }
 
-/// The arena of a document's render state, first, so that a pointer to the state is also one to the arena, and the
-/// layout stage's scratch beside it.
-#[repr(C)]
+/// The arena of a document's render state, and the layout stage's scratch beside it.
 pub(crate) struct ArenaHandle {
     arena: LayoutNodeArena,
     layout_scratch: super::run_records::LayoutScratch,
 }
-
-const _: () = assert!(std::mem::offset_of!(ArenaHandle, arena) == 0);
 
 impl ArenaHandle {
     pub(crate) fn new() -> Self {
@@ -223,7 +219,7 @@ mod tests {
         host_tables.attach_shell(freed, object(8));
 
         // A walk frees the row and stamps another in its slot before its host work is applied.
-        HostCalls(&work).free_subtree(&raw mut arena, freed);
+        HostCalls(&work).free_subtree(&mut arena, freed);
         let reused = arena.allocate_for_test().slot;
         assert_eq!(reused.slot_index(), freed.slot_index());
         assert!(host_tables.shells.borrow().get(&reused).is_none());
@@ -290,7 +286,7 @@ mod tests {
 
         let host_calls = HostCalls(&work);
         super::super::layout_node_arena::prepare_subtree_for_detach(host_calls, &arena, freed);
-        host_calls.free_subtree(&raw mut arena, freed);
+        host_calls.free_subtree(&mut arena, freed);
         // The walk owes the host the observers it let go of, so they stay until the walk is over.
         assert_eq!(host_tables.image_observers(freed), object(8));
 

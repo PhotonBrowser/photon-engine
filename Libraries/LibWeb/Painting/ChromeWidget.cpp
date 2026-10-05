@@ -91,7 +91,8 @@ ChromeWidget::ChromeWidget(Layout::NodeArena& arena, Compositing::RustFFI::NodeS
 
 Layout::Node* ChromeWidget::layout_node() const
 {
-    return layout_node_for_committed_slot(*m_arena, m_slot);
+    Layout::ForcedReadScope read { m_arena->render_document() };
+    return layout_node_for_committed_slot(read, *m_arena, m_slot);
 }
 
 void ChromeWidget::detach(Badge<ChromeWidgetRegistry>)

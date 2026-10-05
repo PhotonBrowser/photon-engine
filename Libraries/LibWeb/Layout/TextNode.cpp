@@ -10,7 +10,6 @@
 #include <AK/CharacterTypes.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/InvalidationJournal.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -24,28 +23,6 @@ namespace Web::Layout {
 TextNode::TextNode(DOM::Document& document, BindToPreparedArenaSlot bind, Compositing::RustFFI::NodeSlotId slot, RustFFI::NodeKind kind)
     : Node(document, bind, slot, kind)
 {
-}
-
-bool TextNode::update_produces_line_box_fragment_when_empty_flag()
-{
-    // Text controls and editing hosts rely on their text node producing a zero-width fragment even
-    // when it has no text: the fragment keeps the line box alive with real font metrics, giving the
-    // caret an anchor to paint at and the control its baseline. Stamping this as a node flag keeps
-    // layout itself unaware of editing state.
-    auto produces_line_box_fragment_when_empty = [&] {
-        auto const* dom_text = this->dom_text();
-        if (!dom_text)
-            return false;
-        if (auto const* shadow_root = as_if<DOM::ShadowRoot>(dom_text->root())) {
-            if (as_if<HTML::FormAssociatedTextControlElement>(shadow_root->host()))
-                return true;
-        }
-        return dom_text->parent() && dom_text->parent()->is_editing_host();
-    }();
-    if (has_flag(RustFFI::NodeFlag::ProducesLineBoxFragmentWhenEmpty) == produces_line_box_fragment_when_empty)
-        return false;
-    set_flag(RustFFI::NodeFlag::ProducesLineBoxFragmentWhenEmpty, produces_line_box_fragment_when_empty);
-    return true;
 }
 
 TextNode::~TextNode() = default;
@@ -72,11 +49,6 @@ Utf16String TextNode::rendered_text_for_dom(bool collapse_whitespace) const
 RustFFI::FfiTextSourceRange TextNode::word_range_at(size_t dom_offset) const
 {
     return RustFFI::layout_text_word_range(document_host(), slot_id(this), dom_offset);
-}
-
-void TextNode::invalidate_text_for_rendering()
-{
-    RustFFI::render_state_invalidate_text_content(document_host(), slot_id(this));
 }
 
 Utf16View TextNode::text_for_rendering() const
@@ -158,10 +130,7 @@ Gfx::GlyphRun::TextType text_type_for_code_point(u32 code_point)
 
 void TextNode::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list) const
 {
-    if (auto identity = Painting::journal_identity_of(*this))
-        const_cast<DOM::Document&>(document()).invalidation_journal().note_needs_repaint(identity, should_invalidate_display_list);
-    else
-        Painting::apply_text_repaint_damage(*this, should_invalidate_display_list);
+    Painting::mark_box(*this, Painting::repaint_marks(should_invalidate_display_list));
 }
 
 }

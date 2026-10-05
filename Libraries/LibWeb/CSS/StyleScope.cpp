@@ -756,7 +756,7 @@ void StyleScope::invalidate_counter_style_cache()
     });
 }
 
-void StyleScope::build_counter_style_cache()
+void StyleScope::build_counter_style_cache(Layout::BegunRead const& read)
 {
     m_is_doing_counter_style_cache_update = true;
 
@@ -994,7 +994,7 @@ void StyleScope::build_counter_style_cache()
             auto const layer = qualified_layer_name.is_empty() ? 0 : style_engine.intern_atom(qualified_layer_name).value();
             CounterStylePriority priority {
                 .origin = origin_priority,
-                .layer = style_engine.layer_index(tree_scope, layer),
+                .layer = StyleEngineFFI::style_engine_layer_index(style_engine.host(), &read, tree_scope, layer),
             };
             if (auto existing = counter_style_priorities.get(name); existing.has_value()) {
                 if (existing->origin > priority.origin || (existing->origin == priority.origin && existing->layer > priority.layer))
@@ -1025,7 +1025,7 @@ void StyleScope::build_counter_style_cache()
         if (counter_style_environment_changed) {
             m_counter_style_environment_identity = document().next_counter_style_environment_identity();
             // The style engine names the same registry on every record it computes against it.
-            document().style_computer().style_engine().set_counter_style_environment_identity(style_engine_tree_scope(), m_counter_style_environment_identity);
+            StyleEngineFFI::style_engine_set_counter_style_environment_identity(document().style_computer().style_engine().host(), style_engine_tree_scope(), m_counter_style_environment_identity);
         }
 
         m_is_doing_counter_style_cache_update = false;
@@ -1094,7 +1094,7 @@ void StyleScope::build_counter_style_cache()
         // NB: We don't need to wait for this counter style's extended counter style to be registered since it doesn't
         //     have one - register it immediately.
         if (definition.algorithm().has<CSS::CounterStyleAlgorithm>()) {
-            register_counter_style(name, CSS::CounterStyle::from_counter_style_definition(definition, *this));
+            register_counter_style(name, CSS::CounterStyle::from_counter_style_definition(read, definition, *this));
             continue;
         }
 
@@ -1119,7 +1119,7 @@ void StyleScope::build_counter_style_cache()
             if (!m_registered_counter_styles.contains(extends_name) && counter_style_definitions.contains(extends_name))
                 continue;
 
-            register_counter_style(definition.name(), CSS::CounterStyle::from_counter_style_definition(definition, *this));
+            register_counter_style(definition.name(), CSS::CounterStyle::from_counter_style_definition(read, definition, *this));
             extending_counter_styles.remove(i);
             --i;
         }
@@ -1131,15 +1131,15 @@ void StyleScope::build_counter_style_cache()
     finish_counter_style_cache_update();
 }
 
-u64 StyleScope::counter_style_environment_identity() const
+u64 StyleScope::counter_style_environment_identity(Layout::BegunRead const& read) const
 {
     if (m_needs_counter_style_cache_update && !m_is_doing_counter_style_cache_update)
-        const_cast<StyleScope*>(this)->build_counter_style_cache();
+        const_cast<StyleScope*>(this)->build_counter_style_cache(read);
     // NB: This is asked for whenever a style that depends on the counter style environment is published, which is
     //     what the layout tree build and the generated content counter style comparison resolve counter styles
     //     for, against the published registry.
     if (!m_is_doing_counter_style_cache_update)
-        publish_counter_style_lookup_chain();
+        publish_counter_style_lookup_chain(read);
     return m_counter_style_environment_identity;
 }
 
@@ -1167,11 +1167,11 @@ StyleScope* StyleScope::parent_counter_style_scope() const
 
 // Settles every scope a counter style name used in this scope may be looked up in, and publishes what each registers
 // to the layout node arena, so that the arena answers every lookup the way get_registered_counter_style() would.
-void StyleScope::publish_counter_style_lookup_chain() const
+void StyleScope::publish_counter_style_lookup_chain(Layout::BegunRead const& read) const
 {
     for (auto const* scope = this; scope; scope = scope->parent_counter_style_scope()) {
         if (scope->m_needs_counter_style_cache_update && !scope->m_is_doing_counter_style_cache_update)
-            const_cast<StyleScope*>(scope)->build_counter_style_cache();
+            const_cast<StyleScope*>(scope)->build_counter_style_cache(read);
         scope->publish_counter_styles_if_changed();
     }
 }
@@ -1217,18 +1217,18 @@ void StyleScope::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetSt
     }
 }
 
-RefPtr<CSS::CounterStyle const> StyleScope::get_registered_counter_style(Utf16FlyString const& name) const
+RefPtr<CSS::CounterStyle const> StyleScope::get_registered_counter_style(Layout::BegunRead const& read, Utf16FlyString const& name) const
 {
     return dereference_global_tree_scoped_reference<CSS::CounterStyle const*>([&](StyleScope const& scope) {
         if (scope.m_needs_counter_style_cache_update && !scope.m_is_doing_counter_style_cache_update)
-            const_cast<StyleScope&>(scope).build_counter_style_cache();
+            const_cast<StyleScope&>(scope).build_counter_style_cache(read);
 
         return scope.m_registered_counter_styles.get(name);
     })
         .value_or(nullptr);
 }
 
-Optional<StyleScope::FunctionDefinitionAndScope> StyleScope::get_function_definition(Utf16FlyString const& name) const
+Optional<StyleScope::FunctionDefinitionAndScope> StyleScope::get_function_definition(Layout::BegunRead const& read, Utf16FlyString const& name) const
 {
     return dereference_global_tree_scoped_reference<FunctionDefinitionAndScope>([&](StyleScope const& scope) -> Optional<FunctionDefinitionAndScope> {
         auto const get_function_definition_for_cascade_origin = [&](CSS::CascadeOrigin cascade_origin) {
@@ -1238,7 +1238,7 @@ Optional<StyleScope::FunctionDefinitionAndScope> StyleScope::get_function_defini
             auto const tree_scope = scope.style_engine_tree_scope();
             auto layer_index_of = [&](Utf16FlyString const& qualified_layer_name) {
                 auto const layer = qualified_layer_name.is_empty() ? 0 : style_engine.intern_atom(qualified_layer_name);
-                return style_engine.layer_index(tree_scope, layer.value());
+                return StyleEngineFFI::style_engine_layer_index(style_engine.host(), &read, tree_scope, layer.value());
             };
 
             auto cached_rules = scope.rule_cache().function_rules_by_name.get(name);
@@ -1279,7 +1279,7 @@ Optional<StyleScope::FunctionDefinitionAndScope> StyleScope::get_function_defini
     });
 }
 
-void StyleScope::for_each_visible_function_definition(Function<void(FunctionDefinitionAndScope const&)> const& callback) const
+void StyleScope::for_each_visible_function_definition(Layout::BegunRead const& read, Function<void(FunctionDefinitionAndScope const&)> const& callback) const
 {
     HashTable<Utf16FlyString> names;
     Function<void(StyleScope const&)> collect_names = [&](StyleScope const& scope) {
@@ -1306,7 +1306,7 @@ void StyleScope::for_each_visible_function_definition(Function<void(FunctionDefi
     collect_names(*this);
 
     for (auto const& name : names) {
-        if (auto definition = get_function_definition(name); definition.has_value())
+        if (auto definition = get_function_definition(read, name); definition.has_value())
             callback(*definition);
     }
 }

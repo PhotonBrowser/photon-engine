@@ -153,17 +153,17 @@ public:
     void for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const;
 
     void invalidate_counter_style_cache();
-    void build_counter_style_cache();
-    u64 counter_style_environment_identity() const;
-    RefPtr<CSS::CounterStyle const> get_registered_counter_style(Utf16FlyString const& name) const;
-    void publish_counter_style_lookup_chain() const;
+    void build_counter_style_cache(Layout::BegunRead const& read);
+    u64 counter_style_environment_identity(Layout::BegunRead const& read) const;
+    RefPtr<CSS::CounterStyle const> get_registered_counter_style(Layout::BegunRead const& read, Utf16FlyString const& name) const;
+    void publish_counter_style_lookup_chain(Layout::BegunRead const& read) const;
 
     struct FunctionDefinitionAndScope {
         RustCompiledFunction function;
         StyleScope const& scope;
     };
-    Optional<FunctionDefinitionAndScope> get_function_definition(Utf16FlyString const& name) const;
-    void for_each_visible_function_definition(Function<void(FunctionDefinitionAndScope const&)> const&) const;
+    Optional<FunctionDefinitionAndScope> get_function_definition(Layout::BegunRead const& read, Utf16FlyString const& name) const;
+    void for_each_visible_function_definition(Layout::BegunRead const& read, Function<void(FunctionDefinitionAndScope const&)> const&) const;
 
     template<typename T>
     Optional<T> dereference_global_tree_scoped_reference(Function<Optional<T>(StyleScope const&)> const& callback) const;

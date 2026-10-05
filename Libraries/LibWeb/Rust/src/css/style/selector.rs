@@ -85,16 +85,6 @@ use super::tree::TreeScopeID;
 use crate::css::css_tokenizer::TokenizerInput;
 pub use crate::css::selector::Specificity;
 
-#[cfg(feature = "style-recording")]
-pub mod replay;
-#[cfg(not(feature = "style-recording"))]
-pub mod replay {
-    use super::SelectorProgram;
-    use crate::css::style::record_replay::PayloadWriter;
-
-    pub fn write(_program: &SelectorProgram, _payload: &mut PayloadWriter) {}
-}
-
 define_id! {
     /// Index into one program's node arena.
     pub struct SelectorNodeID(pub);
@@ -911,18 +901,6 @@ impl<A: AtomSpace> SelectorProgram<A> {
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
-    }
-
-    /// The compact byte length of the program, which is what the document memory budget is written
-    /// in. Allocator padding and optional acceleration are excluded on purpose.
-    #[must_use]
-    pub fn compact_bytes(&self) -> u64 {
-        (self.nodes.len() * size_of::<SelectorOp>()
-            + self.operands.len() * size_of::<SelectorNodeID>()
-            + self.text.len() * size_of::<u16>()
-            + self.entries.len() * size_of::<SelectorEntry>()
-            + self.relative_queries.len() * size_of::<RelativeQuery>()
-            + size_of::<bool>()) as u64
     }
 
     #[must_use]
@@ -2833,7 +2811,9 @@ impl SelectorPrograms {
         }
     }
 
-    pub(super) fn for_replay() -> Self {
+    /// Programs shared with every other document's, as a live engine's are outside tests.
+    #[cfg(test)]
+    pub(super) fn shared_across_documents() -> Self {
         Self {
             scope: SelectorProgramScope::Process,
             ..Self::default()
@@ -3077,18 +3057,6 @@ impl SelectorPrograms {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.programs.len() == self.vacant_programs.len()
-    }
-
-    /// Compact program bytes, which is the stylesheet term of the document memory budget. It
-    /// deliberately measures the minimal encoding rather than the allocated capacity, so
-    /// acceleration overhead can never inflate its own allowance.
-    #[must_use]
-    pub fn compact_bytes(&self) -> u64 {
-        self.programs
-            .iter()
-            .flatten()
-            .map(|program| program.program().compact_bytes())
-            .sum()
     }
 
     #[must_use]
@@ -6520,7 +6488,6 @@ mod tests {
     use super::super::index::LocalFeatureKey;
     use super::super::index::StateSet;
     use super::super::instrumentation::Counter;
-    use super::super::memory::DeviceClass;
     use super::super::memory::MemoryController;
     use super::super::relative_selector::RelativeAxis;
     use super::*;
@@ -6828,7 +6795,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+            let mut memory = MemoryController::new();
             let mut tree = StyleNodeTree::new(&mut memory);
             let nodes: Vec<StyleNodeID> = (0..4).map(|_| tree.allocate_element(&mut memory)).collect();
             tree.set_first_element_child(nodes[0], Some(nodes[1]));
@@ -7168,7 +7135,7 @@ mod tests {
     #[test]
     fn a_missing_fact_below_a_sibling_names_its_descendant_range() {
         let mut fixture = Fixture::new();
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let child = fixture.tree.allocate_element(&mut memory);
         fixture.tree.set_parent(child, Some(fixture.nodes[1]));
         fixture.tree.set_first_element_child(fixture.nodes[1], Some(child));
@@ -7651,7 +7618,7 @@ mod tests {
 
     #[test]
     fn the_registry_returns_only_the_routes_that_mention_an_input() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut registry = RoutingRegistry::new();
         let mut programs = SelectorPrograms::new();
 
@@ -7870,7 +7837,7 @@ mod tests {
 
     #[test]
     fn the_running_program_total_tracks_what_the_programs_reserve() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut programs = SelectorPrograms::new();
         // Enough programs, of differing sizes, to reallocate the list several times over.
         for index in 0..64_u32 {
@@ -7914,7 +7881,7 @@ mod tests {
         let make_program = |atom| single_entry(|builder| builder.push_feature(FeatureTest::Class(StyleAtomID(atom))));
         let mut first = SelectorPrograms::new();
         let mut second = SelectorPrograms::new();
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         for programs in [&mut first, &mut second] {
             programs.add(make_program(7));
             programs.add(make_program(8));
@@ -7987,7 +7954,7 @@ mod tests {
                     .sum::<usize>()
             );
         };
-        for mut programs in [SelectorPrograms::new(), SelectorPrograms::for_replay()] {
+        for mut programs in [SelectorPrograms::new(), SelectorPrograms::shared_across_documents()] {
             check(&programs);
             let first = programs.add(make_program(1, 5));
             let retained = programs.add(make_program(10, 2));
@@ -8015,8 +7982,8 @@ mod tests {
         let make_program = || single_entry(|builder| builder.push_feature(FeatureTest::Class(StyleAtomID(91))));
         let expected_bytes = make_program().capacity_bytes();
         let program_hash = SelectorPrograms::program_hash(&make_program());
-        let mut first = SelectorPrograms::for_replay();
-        let mut second = SelectorPrograms::for_replay();
+        let mut first = SelectorPrograms::shared_across_documents();
+        let mut second = SelectorPrograms::shared_across_documents();
         let first_id = first.add(make_program());
         let second_id = second.add(make_program());
 
@@ -8024,7 +7991,7 @@ mod tests {
             first.programs[first_id.0 as usize].as_ref().unwrap(),
             second.programs[second_id.0 as usize].as_ref().unwrap(),
         ) else {
-            panic!("replay selector programs must have process storage");
+            panic!("shared selector programs must have process storage");
         };
         assert!(Arc::ptr_eq(first_program, second_program));
         // The pool is shared with every other test running in the process, so this test only

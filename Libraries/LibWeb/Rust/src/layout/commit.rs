@@ -5,6 +5,7 @@
  */
 
 use super::*;
+use crate::css::style::tree::StyleNodeID;
 
 /// What a commit message tells the document.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -14,8 +15,6 @@ pub enum FfiCommitMessageKind {
     ContentSizeChangedForContainerQueries,
     /// The node is a navigable container whose viewport committed.
     NavigableContainerViewportCommitted,
-    /// The node is an inline box that reached atomic inline layout without line box fragments.
-    UnexpectedFragmentedInline,
     /// The node is the element a box escaped its rebuild root under, so its layout tree has to be
     /// built again.
     LayoutTreeRebuildRequested,
@@ -64,16 +63,29 @@ pub(crate) struct CommitNotifications {
 }
 
 impl CommitNotifications {
+    /// The size query containers whose content size the commit changed.
+    pub(crate) fn resized_size_containers(&self) -> impl Iterator<Item = StyleNodeID> + '_ {
+        self.messages
+            .iter()
+            .filter(|message| message.kind == FfiCommitMessageKind::ContentSizeChangedForContainerQueries)
+            .filter_map(|message| StyleNodeID::from_raw(message.style_node))
+    }
+
     /// # Safety
     ///
     /// The host must keep the document and node shells alive until these synchronous
     /// notifications return. No mutable arena borrow may be active.
-    pub(crate) unsafe fn notify_host(self, main_thread: &crate::stage::MainThread, host: &FfiLayoutHostCallbacks) {
+    pub(crate) unsafe fn notify_host(
+        self,
+        main_thread: &crate::stage::MainThread,
+        read: &crate::render_state::BegunRead,
+        host: &FfiLayoutHostCallbacks,
+    ) {
         for reset in self.row_resets {
             reset.tell(main_thread);
         }
         // SAFETY: Guaranteed by the caller.
-        unsafe { host.deliver_commit_messages(main_thread, &self.messages) };
+        unsafe { host.deliver_commit_messages(main_thread, read, &self.messages) };
     }
 }
 
@@ -110,10 +122,7 @@ fn commit_subtree(
         let fragment = &link.fragment;
         debug_assert!(
             fragment.computed_svg_path.is_some()
-                || !matches!(
-                    paintables.arena().data(node).kind.get(),
-                    NodeKind::SVGGeometryBox | NodeKind::SVGTextBox | NodeKind::SVGTextPathBox
-                ),
+                || !crate::painting::node_painting::is_svg_path(paintables.arena().data(node).kind.get()),
             "committed path-like fragment carries no computed SVG path"
         );
         let replaced = paintables.replace_committed_fragment_link(
@@ -205,8 +214,7 @@ pub(crate) fn commit_replacing(
     let links_by_slot = pass_fragments.links_by_slot();
     let mut paintables = crate::painting::paintable_build::PaintableCommit::new(arena, root);
     paintables.begin_commit();
-    // What the pass itself found out comes before what committing it finds out.
-    let mut messages = paintables.arena().take_messages_reported_during_pass();
+    let mut messages = Vec::new();
     commit_subtree(
         root,
         &mut messages,

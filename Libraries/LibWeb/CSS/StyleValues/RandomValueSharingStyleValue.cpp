@@ -44,7 +44,8 @@ ValueComparingNonnullRefPtr<StyleValue const> RandomValueSharingStyleValue::abso
     auto name = this->name().value();
     auto const& element = computation_context.abstract_element->element();
     auto& style_engine = const_cast<StyleEngine&>(element.document().style_computer().style_engine());
-    auto random_base_value = style_engine.ensure_random_base_value(element.style_node_id(), name.view(), element_shared() || !is_auto());
+    Layout::ForcedReadScope read { element.document() };
+    auto random_base_value = style_engine.ensure_random_base_value(read, element.style_node_id(), name.view(), element_shared() || !is_auto());
 
     return RandomValueSharingStyleValue::create_fixed(NumberStyleValue::create(random_base_value));
 }

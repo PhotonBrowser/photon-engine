@@ -15,6 +15,7 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
+#include <LibWeb/CSS/StyleUpdateInputs.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -47,49 +48,57 @@ enum class DocumentWithoutBrowsingContext {
     Skip,
     Update,
 };
-// Where a style update's first transaction comes from.
-enum class FirstStyleTransaction : u8 {
-    // What was recorded since the last transaction.
-    Recorded,
-    // The transaction that flew beside the event loop, whose reactions are drained against the inputs it was sealed with.
-    Flown,
+// Where a style update's first transaction comes from: what was recorded since the last transaction, whose inputs the
+// update brings up to date first, unless the document has no browsing context to render it...
+struct RecordedStyleTransaction {
+    DocumentWithoutBrowsingContext document_without_browsing_context { DocumentWithoutBrowsingContext::Skip };
+};
+// ...or the transaction that flew beside the event loop, whose reactions are drained against the inputs it was sealed
+// with.
+struct FlownStyleTransaction {
+    StyleUpdateInputs sealed_inputs;
 };
 
-template<FirstStyleTransaction = FirstStyleTransaction::Recorded>
-static void update_style(DOM::Document&, DocumentWithoutBrowsingContext = DocumentWithoutBrowsingContext::Skip);
-static bool update_style_for_element(DOM::Document&, DOM::AbstractElement const&, StyleUpdateMode);
+template<typename FirstTransaction = RecordedStyleTransaction>
+static void update_style(Layout::BegunRead const&, DOM::Document&, FirstTransaction = {});
+static bool update_style_for_element(Layout::BegunRead const&, DOM::Document&, DOM::AbstractElement const&, StyleUpdateMode);
 static bool embedding_document_chain_has_no_pending_style_or_layout_work(DOM::Document const&);
 
-static void apply_element_style_invalidation_after_style_change(DOM::Element& element, RequiredInvalidationAfterStyleChange const& invalidation)
+static void apply_element_style_invalidation_after_style_change(Layout::BegunRead const& read, DOM::Element& element, RequiredInvalidationAfterStyleChange const& invalidation)
 {
     if (invalidation.accumulated_visual_contexts() == AccumulatedVisualContextInvalidation::UpdateValues)
-        element.document().schedule_accumulated_visual_context_update(element, DOM::Document::AccumulatedVisualContextUpdateScope::Values);
+        element.document().schedule_accumulated_visual_context_update(read, element, DOM::Document::AccumulatedVisualContextUpdateScope::Values);
     else if (invalidation.accumulated_visual_contexts() == AccumulatedVisualContextInvalidation::Rebuild)
-        element.document().schedule_accumulated_visual_context_update(element, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
+        element.document().schedule_accumulated_visual_context_update(read, element, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
 
     if (invalidation.needs_scroll_container_resnap)
         element.document().schedule_scroll_container_resnap();
 
+    // A frame applied the element's record to its box ahead of this install, and marked the relayout the move asks
+    // for, which the frame's layout round, or the host's next one, runs.
+    bool const needs_relayout = invalidation.needs_relayout()
+        && !element.document().style_computer().style_engine().frame_marked_relayout(element.style_node_id(), element.style_record_identity());
+
     // Only a full layout pass applies viewport propagation again, so a relayout of an element the viewport takes its
     // overflow, writing mode, or direction from must not finish as a partial relayout of that element.
     bool const element_is_viewport_propagation_source = element.is_viewport_propagation_source();
-    if (invalidation.needs_relayout() && element_is_viewport_propagation_source)
+    if (needs_relayout && element_is_viewport_propagation_source)
         element.document().record_partial_relayout_escape(DOM::PartialRelayoutEscapeReason::ViewportPropagationSourceChangedByStyleChange);
 
-    if (invalidation.needs_relayout()) {
+    if (needs_relayout) {
         // A relayout-only style change on an absolutely positioned partial relayout boundary
         // stays confined to it: the box contributes nothing to ancestor layout, and partial
         // relayout re-resolves the boundary's own size and position. A rendered ::backdrop
         // disqualifies the element, because pseudo-element style diffs are merged into the
         // element's invalidation while the ::backdrop box is a sibling of the element's box,
         // outside the subtree a boundary-self relayout covers.
-        auto* box = as_if<Layout::Box>(element.unsafe_layout_node());
+        auto* box = as_if<Layout::Box>(element.unsafe_layout_node(read));
         if (!invalidation.needs_layout_tree_rebuild()
             && !element_is_viewport_propagation_source
             && box
             && box->is_absolutely_positioned()
             && box->is_partial_relayout_boundary()
-            && !element.pseudo_element_unsafe_layout_node(CSS::PseudoElement::Backdrop)) {
+            && !element.pseudo_element_unsafe_layout_node(read, CSS::PseudoElement::Backdrop)) {
             box->set_needs_own_geometry_update();
             element.set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange, Layout::LayoutUpdatePropagation::BoundarySelfOnly);
         } else {
@@ -97,7 +106,7 @@ static void apply_element_style_invalidation_after_style_change(DOM::Element& el
         }
     }
     if (invalidation.needs_layout_tree_rebuild())
-        element.set_needs_layout_tree_rebuild(DOM::SetNeedsLayoutTreeUpdateReason::StyleChange, invalidation.layout_tree_rebuild_root());
+        element.set_needs_layout_tree_rebuild(read, DOM::SetNeedsLayoutTreeUpdateReason::StyleChange, invalidation.layout_tree_rebuild_root());
 }
 
 static void apply_document_style_invalidation_after_style_change(DOM::Document& document, RequiredInvalidationAfterStyleChange const& invalidation)
@@ -156,7 +165,7 @@ static StyleEngineTransaction accept_style_engine_transaction(DOM::Document& doc
     return transaction;
 }
 
-static StyleEngineTransaction take_style_engine_transaction(DOM::Document& document)
+static StyleEngineTransaction take_style_engine_transaction(Layout::BegunRead const& read, DOM::Document& document, StyleUpdateInputs const&)
 {
     auto& style_computer = document.style_computer();
     // One element's computed style answers for another only while the inputs it was keyed on still
@@ -177,13 +186,13 @@ static StyleEngineTransaction take_style_engine_transaction(DOM::Document& docum
         return {};
     }
 
-    return accept_style_engine_transaction(document, style_computer.style_engine().take_style_transaction(root->style_node_id()));
+    return accept_style_engine_transaction(document, style_computer.style_engine().take_style_transaction(read, root->style_node_id()));
 }
 
 // The style transaction that flew beside the event loop, taken in to drain its reactions.
-static StyleEngineTransaction take_flown_style_engine_transaction(DOM::Document& document)
+static StyleEngineTransaction take_flown_style_engine_transaction(Layout::BegunRead const& read, DOM::Document& document)
 {
-    return accept_style_engine_transaction(document, document.style_computer().style_engine().take_flown_style_transaction());
+    return accept_style_engine_transaction(document, document.style_computer().style_engine().take_flown_style_transaction(read));
 }
 
 static StyleEngine::PublishedStyleDelta make_materialize_gap_delta(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups = 0)
@@ -222,12 +231,12 @@ static bool parent_style_has_animated_values(DOM::Element& element)
 // A C++ computation collects an element's animations into the style it computes. For a record the engine derived
 // beneath them, the host samples them over the record once it is installed, as an animation update samples them over
 // the record an element holds, and publishes what they compose.
-static void sample_animations_for_installed_record(DOM::AbstractElement abstract_element)
+static void sample_animations_for_installed_record(Layout::BegunRead const& read, DOM::AbstractElement abstract_element)
 {
     auto style_record = abstract_element.style_record_identity();
     if (!style_record)
         return;
-    Animations::AnimationUpdateContext::ElementData element_data { style_record, abstract_element.document().style_computer().reconstruct_computed_properties_for_animation(style_record) };
+    Animations::AnimationUpdateContext::ElementData element_data { style_record, abstract_element.document().style_computer().reconstruct_computed_properties_for_animation(read, style_record) };
     element_data.base_is_current = true;
     Animations::AnimationUpdateContext context;
     context.elements.set(abstract_element, move(element_data));
@@ -237,10 +246,10 @@ static void sample_animations_for_installed_record(DOM::AbstractElement abstract
 // Whether the custom-property environment an engine-computed record was published with can be
 // installed: the one the element inherits - the parent's inheritable data, which is the parent's
 // own unless a registration made some of it non-inherited - or one the engine resolved over it.
-static bool engine_computed_record_environment_is_installable(DOM::Element& element, StyleRecordID style_record)
+static bool engine_computed_record_environment_is_installable(Layout::BegunRead const& read, DOM::Element& element, StyleRecordID style_record)
 {
     bool installable = false;
-    (void)element.custom_property_environment_of_engine_record(style_record, installable);
+    (void)element.custom_property_environment_of_engine_record(read, style_record, installable);
     return installable;
 }
 
@@ -262,9 +271,9 @@ static void record_environment_move_recompute(StyleEngine& style_engine, DOM::El
 // The environments a moved element's pseudo-elements held: one that held the element's own takes the
 // moved one, and one that held what the element hands down takes what the moved one hands down. A
 // pseudo-element that resolved its own computes the element again.
-static void move_pseudo_element_environments(DOM::Document& document, DOM::Element& element, CustomPropertyData const* existing, CustomPropertyData const* existing_inheritable, RefPtr<CustomPropertyData const> const& moved)
+static void move_pseudo_element_environments(Layout::BegunRead const& read, DOM::Document& document, DOM::Element& element, CustomPropertyData const* existing, CustomPropertyData const* existing_inheritable, RefPtr<CustomPropertyData const> const& moved)
 {
-    auto moved_inheritable = moved ? moved->inheritable(document) : nullptr;
+    auto moved_inheritable = moved ? moved->inheritable(read, document) : nullptr;
     auto& style_engine = document.style_computer().style_engine();
     for (auto kind = 0; kind < to_underlying(PseudoElement::KnownPseudoElementCount); ++kind) {
         auto pseudo_element = static_cast<PseudoElement>(kind);
@@ -280,12 +289,12 @@ static void move_pseudo_element_environments(DOM::Document& document, DOM::Eleme
     }
 }
 
-static void move_custom_property_environment_below(DOM::Document&, DOM::Element&, RefPtr<CustomPropertyData const> const& old_base, RefPtr<CustomPropertyData const> const& new_base, CustomPropertyData const* changed_old_base, CustomPropertyData const* changed_new_base);
+static void move_custom_property_environment_below(Layout::BegunRead const&, DOM::Document&, DOM::Element&, RefPtr<CustomPropertyData const> const& old_base, RefPtr<CustomPropertyData const> const& new_base);
 
 // An element declaring custom properties of its own over the environment it inherits, whose
 // declared values stand because it reads nothing that changed: they are built again over the moved
 // environment, and the move goes on below the element.
-static void rebuild_custom_property_environment(DOM::Document& document, DOM::Element& element, RefPtr<CustomPropertyData const> const& new_parent_inheritable, CustomPropertyData const* changed_old_base, CustomPropertyData const* changed_new_base)
+static void rebuild_custom_property_environment(Layout::BegunRead const& read, DOM::Document& document, DOM::Element& element, RefPtr<CustomPropertyData const> const& new_parent_inheritable)
 {
     auto existing_base = custom_property_environment_base(element, element.custom_property_data({}));
     VERIFY(existing_base && existing_base->declared_count() > 0);
@@ -299,11 +308,11 @@ static void rebuild_custom_property_environment(DOM::Document& document, DOM::El
         own_values.set(name, property);
     }
     RefPtr<CustomPropertyData const> moved = CustomPropertyData::create(move(own_values), new_parent_inheritable);
-    auto existing_inheritable = existing_base->inheritable(document);
-    move_pseudo_element_environments(document, element, existing_base.ptr(), existing_inheritable.ptr(), moved);
+    auto existing_inheritable = existing_base->inheritable(read, document);
+    move_pseudo_element_environments(read, document, element, existing_base.ptr(), existing_inheritable.ptr(), moved);
     element.set_custom_property_data({}, moved);
-    element.republish_style_record_environment();
-    move_custom_property_environment_below(document, element, existing_base, moved, changed_old_base, changed_new_base);
+    element.republish_style_record_environment(read);
+    move_custom_property_environment_below(read, document, element, existing_base, moved);
 }
 
 // An element's custom properties moved. Every styled descendant holds the environment it inherits
@@ -311,27 +320,24 @@ static void rebuild_custom_property_environment(DOM::Document& document, DOM::El
 // descendants that hold the one the element handed down before, with their records, and answers
 // what is left here. That is installing those records, the environments of element-backed
 // pseudo-elements, which the engine does not keep, and the custom properties a descendant declares
-// itself, built again over the moved environment. A descendant whose style reads a name whose value
-// differs between `changed_old_base` and `changed_new_base`, or reads the environment another way,
+// itself, built again over the moved environment. A descendant whose style reads the environment
 // computes again.
-static void move_custom_property_environment_below(DOM::Document& document, DOM::Element& element, RefPtr<CustomPropertyData const> const& old_base, RefPtr<CustomPropertyData const> const& new_base, CustomPropertyData const* changed_old_base, CustomPropertyData const* changed_new_base)
+static void move_custom_property_environment_below(Layout::BegunRead const& read, DOM::Document& document, DOM::Element& element, RefPtr<CustomPropertyData const> const& old_base, RefPtr<CustomPropertyData const> const& new_base)
 {
     auto& style_computer = document.style_computer();
     auto& style_engine = style_computer.style_engine();
-    auto old_inheritable = old_base ? old_base->inheritable(document) : nullptr;
-    auto new_inheritable = new_base ? new_base->inheritable(document) : nullptr;
+    auto old_inheritable = old_base ? old_base->inheritable(read, document) : nullptr;
+    auto new_inheritable = new_base ? new_base->inheritable(read, document) : nullptr;
     auto named = [](CustomPropertyData const* data) -> StyleEngineFFI::FfiNamedEnvironment {
         return { .identity = data ? data->identity() : 0, .store = data ? data->rust_store() : nullptr };
     };
     StyleEngineFFI::FfiEnvironmentMove const moved {
-        .old_base = named(changed_old_base),
-        .new_base = named(changed_new_base),
         .old_inheritable = old_inheritable ? old_inheritable->identity() : 0,
         .new_inheritable = named(new_inheritable.ptr()),
         .new_inheritable_data = new_inheritable.ptr(),
         .new_inheritable_declares = new_inheritable && new_inheritable->declared_count() > 0,
     };
-    auto answer = StyleEngineFFI::style_engine_move_custom_property_environment(style_engine.host(), element.style_node_id().value(), moved);
+    auto answer = StyleEngineFFI::style_engine_move_custom_property_environment(style_engine.host(), &read, element.style_node_id().value(), moved);
     // The answer lives until the engine is next called, which acting on it does.
     Vector<StyleEngineFFI::FfiEnvironmentMoveAction> actions;
     actions.append(answer.actions, answer.count);
@@ -356,7 +362,7 @@ static void move_custom_property_environment_below(DOM::Document& document, DOM:
                 descendant->refresh_computed_style({}, StyleRecordID { action.style_record });
             break;
         case StyleEngineFFI::FfiEnvironmentMoveActionKind::Rebuild:
-            rebuild_custom_property_environment(document, *descendant, new_inheritable, changed_old_base, changed_new_base);
+            rebuild_custom_property_environment(read, document, *descendant, new_inheritable);
             break;
         case StyleEngineFFI::FfiEnvironmentMoveActionKind::Recompute:
             record_environment_move_recompute(style_engine, *descendant);
@@ -365,14 +371,14 @@ static void move_custom_property_environment_below(DOM::Document& document, DOM:
     }
 }
 
-static void propagate_custom_property_environment_move(DOM::Document& document, DOM::Element& origin, RefPtr<CustomPropertyData const> old_origin_data)
+static void propagate_custom_property_environment_move(Layout::BegunRead const& read, DOM::Document& document, DOM::Element& origin, RefPtr<CustomPropertyData const> old_origin_data)
 {
     // Nothing inherits from an element with nothing below it in the flat tree.
     if (!origin.first_element_child() && !origin.shadow_root() && !is<HTML::HTMLSlotElement>(origin))
         return;
     auto old_origin_base = custom_property_environment_base(origin, move(old_origin_data));
     auto new_origin_base = custom_property_environment_base(origin, origin.custom_property_data({}));
-    move_custom_property_environment_below(document, origin, old_origin_base, new_origin_base, old_origin_base.ptr(), new_origin_base.ptr());
+    move_custom_property_environment_below(read, document, origin, old_origin_base, new_origin_base);
 }
 
 // A record the engine settled for a row it published unsettled, by a demand: the row installs it as one the engine
@@ -400,7 +406,7 @@ static DOM::Element::EnginePseudoElementRecords take_engine_record(StyleEngine::
 // the animation plan it decided beside the record it computed and collected the element's animations, those the plan
 // starts among them, into that record; the host composes them over the record the engine settled once it is installed,
 // and runs the transition step the row owes.
-static RequiredInvalidationAfterStyleChange install_engine_computed_records(DOM::Element& element, StyleEngine::PublishedStyleDelta const& reaction, DOM::Element::EnginePseudoElementRecords const& pseudo_element_records, DOM::Element::EngineRecordDamages const& engine_record_damages, bool acknowledge, bool& did_change_custom_properties)
+static RequiredInvalidationAfterStyleChange install_engine_computed_records(Layout::BegunRead const& read, DOM::Element& element, StyleEngine::PublishedStyleDelta const& reaction, DOM::Element::EnginePseudoElementRecords const& pseudo_element_records, DOM::Element::EngineRecordDamages const& engine_record_damages, bool acknowledge, bool& did_change_custom_properties)
 {
     auto& document = element.document();
     auto& style_engine = document.style_computer().style_engine();
@@ -413,13 +419,14 @@ static RequiredInvalidationAfterStyleChange install_engine_computed_records(DOM:
     // the old record has to outlive its replacement until the step has read it.
     // NB: Earlier rows can replace the element's composition after this row was planned. Pin the record it holds now,
     //     which is the before-change style for this installation, rather than the row's possibly reclaimed old record.
-    StyleRecordPin const before_change { document.style_computer(), reaction.owes_a_transition_step ? element.style_record_identity() : StyleRecordID {} };
+    bool const owes_a_transition_step = reaction.owes_a_transition_step || element.has_existing_transitions({});
+    StyleRecordPin const before_change { document.style_computer(), owes_a_transition_step ? element.style_record_identity() : StyleRecordID {} };
     // The record answers any style input the element owes, as the C++ computation it equals would: nothing is left for
     // a later transaction to plan.
-    style_engine.consume_recorded_element_style_input_change(reaction.style_node);
-    auto invalidation = element.apply_engine_computed_style_record(StyleRecordID { reaction.new_style_record }, pseudo_element_records, reaction.uses_substitution, reaction.record_reads, reaction.explicitly_inherited_groups, did_change_custom_properties, DOM::Element::DisplayNoneChange::LeftToCaller, &engine_record_damages);
+    StyleEngineFFI::style_engine_consume_element_style_input(style_engine.host(), reaction.style_node);
+    auto invalidation = element.apply_engine_computed_style_record(read, StyleRecordID { reaction.new_style_record }, pseudo_element_records, reaction.uses_substitution, reaction.record_reads, reaction.explicitly_inherited_groups, did_change_custom_properties, DOM::Element::DisplayNoneChange::LeftToCaller, &engine_record_damages);
     if (acknowledge)
-        style_engine.acknowledge_engine_computed_record(StyleNodeID { reaction.style_node });
+        StyleEngineFFI::style_engine_acknowledge_engine_computed_record(style_engine.host(), StyleNodeID { reaction.style_node });
     // The engine asks for the element's children only after the host composed the record. Which rows the host composes
     // is the engine's to say, since it settles the pseudo-elements of every other row beside the record, and every
     // element with animations is among them.
@@ -427,47 +434,47 @@ static RequiredInvalidationAfterStyleChange install_engine_computed_records(DOM:
     if (reaction.composed_by_the_host) {
         DOM::AbstractElement abstract_element { element };
         if (reaction.owes_an_animation_plan)
-            document.style_computer().apply_settled_animation_plan(abstract_element);
+            document.style_computer().apply_settled_animation_plan(read, abstract_element);
         // https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
         // Sampling the installed record can keep the epoch's before-change style, and the record the element holds by
         // then is the after-change one. A row that owes the step keeps the record it moved away from first.
         if (!!before_change.style_record() && document.is_in_style_stabilization_epoch())
             document.style_computer().record_transition_stabilization_baseline(abstract_element, before_change.style_record());
         if (element.has_relevant_animations() || element.has_associated_animations())
-            sample_animations_for_installed_record(abstract_element);
+            sample_animations_for_installed_record(read, abstract_element);
     }
     if (!!before_change.style_record())
-        invalidation |= document.style_computer().run_transition_step_for_installed_record({ element }, before_change.style_record());
+        invalidation |= document.style_computer().run_transition_step_for_installed_record(read, { element }, before_change.style_record());
     if (old_computed_values)
-        element.apply_display_none_change(DOM::Element::DisplayNoneState::of(*old_computed_values));
+        element.apply_display_none_change(read, DOM::Element::DisplayNoneState::of(*old_computed_values));
     // The pseudo-elements of a record the host composes inherit the composition, so the engine settles them only now.
     if (reaction.composed_by_the_host)
-        invalidation |= element.refresh_pseudo_element_styles_over_composition(old_computed_values ? &*old_computed_values : nullptr, did_change_custom_properties);
+        invalidation |= element.refresh_pseudo_element_styles_over_composition(read, old_computed_values ? &*old_computed_values : nullptr, did_change_custom_properties);
     return invalidation;
 }
 
 // The engine's answer to a targeted demand for the element's record, where the host can install it. The engine
 // resolved the record's environment over the parent's own; where the parent's inheritable environment differs, it
 // takes back what the demand derived.
-static Optional<StyleEngineFFI::FfiEngineComputedRecord> answer_targeted_record_demand(DOM::Element& element)
+static Optional<StyleEngineFFI::FfiEngineComputedRecord> answer_targeted_record_demand(Layout::BegunRead const& read, DOM::Element& element)
 {
     auto& style_engine = element.document().style_computer().style_engine();
-    auto answer = style_engine.answer_record_demand(element.style_node_id(), StyleEngine::RecordDemand::TargetedElement).record;
+    auto answer = style_engine.answer_record_demand(read, element.style_node_id(), StyleEngine::RecordDemand::TargetedElement).record;
     if (answer.style_record == 0)
         return {};
-    if (!engine_computed_record_environment_is_installable(element, StyleRecordID { answer.style_record })) {
-        style_engine.abandon_demanded_records(element.style_node_id());
+    if (!engine_computed_record_environment_is_installable(read, element, StyleRecordID { answer.style_record })) {
+        StyleEngineFFI::style_engine_abandon_demanded_records(style_engine.host(), element.style_node_id());
         return {};
     }
     return answer;
 }
 
 // Whether an element the element inherits from owes a style input, which the next transaction answers.
-static bool inheritance_ancestor_owes_style_input(DOM::Element& element)
+static bool inheritance_ancestor_owes_style_input(Layout::BegunRead const& read, DOM::Element& element)
 {
     auto const& style_engine = element.document().style_computer().style_engine();
     for (auto ancestor = DOM::AbstractElement { element }.element_to_inherit_style_from(); ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
-        if (style_engine.has_deferred_element_style_input(ancestor->element().style_node_id()))
+        if (StyleEngineFFI::style_engine_has_deferred_element_style_input(style_engine.host(), &read, ancestor->element().style_node_id().value()))
             return true;
     }
     return false;
@@ -477,14 +484,14 @@ static bool inheritance_ancestor_owes_style_input(DOM::Element& element)
 // no demand below an ancestor that owes a style input, such as one whose custom-property animations published new
 // values as an earlier row of the batch installed its record. That ancestor's style moves in the next transaction, so
 // the row is owed to it too, which plans the row after the ancestor's.
-static RequiredInvalidationAfterStyleChange refuse_style_row(DOM::Element& element, u8 row_reaction, u8 row_inherited_style_groups)
+static RequiredInvalidationAfterStyleChange refuse_style_row(Layout::BegunRead const& read, DOM::Element& element, u8 row_reaction, u8 row_inherited_style_groups)
 {
     auto& style_engine = element.document().style_computer().style_engine();
-    if (inheritance_ancestor_owes_style_input(element)) {
+    if (inheritance_ancestor_owes_style_input(read, element)) {
         style_engine.record_derived_element_style_input_change(element.style_node_id(), row_reaction, row_inherited_style_groups);
         return {};
     }
-    style_engine.consume_recorded_element_style_input_change(element.style_node_id());
+    StyleEngineFFI::style_engine_consume_element_style_input(style_engine.host(), element.style_node_id());
     if (!element.has_style())
         dbgln("StyleEngine: refused the first style of <{}> (style node {})", element.local_name(), element.style_node_id().value());
     return {};
@@ -492,19 +499,19 @@ static RequiredInvalidationAfterStyleChange refuse_style_row(DOM::Element& eleme
 
 // A row the engine did not settle in its transaction, or a targeted update: ask the engine for the element's record
 // now, and install it as one the engine computed, moving the element from the record it holds.
-static RequiredInvalidationAfterStyleChange apply_engine_record_demand(DOM::Element& element, u8 row_reaction, u8 row_inherited_style_groups, bool& did_change_custom_properties)
+static RequiredInvalidationAfterStyleChange apply_engine_record_demand(Layout::BegunRead const& read, DOM::Element& element, u8 row_reaction, u8 row_inherited_style_groups, bool& did_change_custom_properties)
 {
-    auto answer = answer_targeted_record_demand(element);
+    auto answer = answer_targeted_record_demand(read, element);
     if (!answer.has_value())
-        return refuse_style_row(element, row_reaction, row_inherited_style_groups);
+        return refuse_style_row(read, element, row_reaction, row_inherited_style_groups);
     StyleEngine::PublishedStyleDelta reaction {};
     reaction.style_node = element.style_node_id().value();
     reaction.old_style_record = element.style_record_identity().value();
     auto pseudo_element_records = take_engine_record(reaction, *answer);
-    return install_engine_computed_records(element, reaction, pseudo_element_records, {}, true, did_change_custom_properties);
+    return install_engine_computed_records(read, element, reaction, pseudo_element_records, {}, true, did_change_custom_properties);
 }
 
-static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Document& document, Vector<StyleEngine::PublishedStyleDelta> const& reactions)
+static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(Layout::BegunRead const& read, DOM::Document& document, Vector<StyleEngine::PublishedStyleDelta> const& reactions)
 {
     // Reactions are applied in preorder, so every element's inheritance inputs are ready when it is
     // applied. What an applied element's change means for its (flat-tree) children is the
@@ -554,8 +561,8 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             // A reaction the engine derived for this element while applying an earlier one in
             // this batch joins the element's own reaction where it covers it, which a demand for
             // the element's record always does.
-            if (auto absorbed = document.style_computer().style_engine().absorb_element_style_input(
-                    StyleNodeID { reaction.style_node }, reaction.reaction, reaction.inherited_style_groups,
+            if (auto absorbed = StyleEngineFFI::style_engine_absorb_element_style_input(document.style_computer().style_engine().host(),
+                    &read, reaction.style_node, reaction.reaction, reaction.inherited_style_groups,
                     reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize);
                 absorbed != 0) {
                 reaction.reaction = static_cast<u8>(absorbed & 0xff);
@@ -578,15 +585,16 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             bool const needs_inherited_style_recompute = reaction.reaction & StyleEngine::InheritedStyle;
             // An element declaring custom properties of its own layers them over the environment it
             // inherits, which its cascade decides.
-            bool const cascade_declares_custom_properties = document.style_computer().style_engine().node_declares_custom_properties(reaction.style_node);
-            bool const needs_full_custom_property_recompute = needs_custom_property_recompute && (element->style_uses_var_css_function() || element->style_uses_inherit_css_function() || cascade_declares_custom_properties);
+            bool const needs_full_custom_property_recompute = needs_custom_property_recompute
+                && (element->style_uses_var_css_function() || element->style_uses_inherit_css_function()
+                    || StyleEngineFFI::style_engine_node_declares_custom_properties(document.style_computer().style_engine().host(), &read, reaction.style_node));
 
             bool answered_by_demand = false;
             // A row the engine did not settle in its transaction, and that computes the element's style, is answered
             // from its record demand, as a targeted update of the element is: the record installs as one the engine
             // computed, moving the element from the record it holds.
             if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize && (needs_regular_style_recompute || needs_inherited_style_recompute || needs_full_custom_property_recompute)) {
-                if (auto answer = answer_targeted_record_demand(*element); answer.has_value()) {
+                if (auto answer = answer_targeted_record_demand(read, *element); answer.has_value()) {
                     reaction.old_style_record = element->style_record_identity().value();
                     reaction.record_damage = 0;
                     settled_pseudo_element_records = take_engine_record(reaction, *answer);
@@ -647,9 +655,9 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 // the engine swapped, which the element inherits in place of the base ones: the
                 // row is answered from its demand.
                 if (parent_style_has_animated_values(*element))
-                    invalidation = apply_engine_record_demand(*element, reaction.reaction, reaction.inherited_style_groups, did_change_custom_properties);
+                    invalidation = apply_engine_record_demand(read, *element, reaction.reaction, reaction.inherited_style_groups, did_change_custom_properties);
                 else
-                    invalidation = install_engine_computed_records(*element, reaction, {}, engine_record_damages, false, did_change_custom_properties);
+                    invalidation = install_engine_computed_records(read, *element, reaction, {}, engine_record_damages, false, did_change_custom_properties);
             } else if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Computed) {
                 // The engine computed the new record from this element's moved cascade winners,
                 // from its parent's moved inherited style or display, or from its moved
@@ -669,16 +677,16 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                         };
                     }
                 }
-                if (!engine_computed_record_environment_is_installable(*element, StyleRecordID { reaction.new_style_record })) {
+                if (!engine_computed_record_environment_is_installable(read, *element, StyleRecordID { reaction.new_style_record })) {
                     // The engine resolved the record's environment over the parent's own, which an earlier row of the
                     // batch moved: the row is answered from a fresh demand.
-                    invalidation = apply_engine_record_demand(*element, reaction.reaction, reaction.inherited_style_groups, did_change_custom_properties);
+                    invalidation = apply_engine_record_demand(read, *element, reaction.reaction, reaction.inherited_style_groups, did_change_custom_properties);
                 } else {
-                    invalidation = install_engine_computed_records(*element, reaction, pseudo_element_records, engine_record_damages, true, did_change_custom_properties);
+                    invalidation = install_engine_computed_records(read, *element, reaction, pseudo_element_records, engine_record_damages, true, did_change_custom_properties);
                 }
             } else if (needs_regular_style_recompute || needs_inherited_style_recompute || needs_full_custom_property_recompute) {
                 // The engine declined the row's demand above.
-                invalidation = refuse_style_row(*element, reaction.reaction, reaction.inherited_style_groups);
+                invalidation = refuse_style_row(read, *element, reaction.reaction, reaction.inherited_style_groups);
             }
             // A row that owes only a moved inherited environment on an element whose style reads none
             // has nothing left for the host: the engine moved the element's environment, and the
@@ -690,7 +698,7 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 document.throttled_animation_visibility_changed();
             }
 
-            apply_element_style_invalidation_after_style_change(*element, invalidation);
+            apply_element_style_invalidation_after_style_change(read, *element, invalidation);
             transaction_invalidation |= invalidation;
 
             auto& style_engine = document.style_computer().style_engine();
@@ -700,7 +708,7 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             // a moved name are recorded for their own computation. The engine derives no reactions
             // for the move.
             if (did_change_custom_properties)
-                propagate_custom_property_environment_move(document, *element, old_custom_property_data);
+                propagate_custom_property_environment_move(read, document, *element, old_custom_property_data);
             // A counter-style rebuild moves no style, so it is not what the children react to.
             if (invalidation.style_change_is_none())
                 facts |= StyleEngine::InvalidationIsNone;
@@ -727,18 +735,75 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             } else {
                 VERIFY(was_unstyled);
             }
-            style_engine.note_style_reaction_applied(reaction.style_node, reaction.reaction, invalidation.inherited_style_groups_changed(), facts);
+            StyleEngineFFI::style_engine_note_style_reaction_applied(style_engine.host(), reaction.style_node, reaction.reaction, invalidation.inherited_style_groups_changed(), facts);
         }
     }
 
     return transaction_invalidation;
 }
 
-template<FirstStyleTransaction first_transaction>
-static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWithoutBrowsingContext document_without_browsing_context)
+ContainerLayoutUpToDate lay_out_container_for_style_update(DOM::Document& document)
+{
+    // NOTE: If our parent document needs a relayout, we must do that *first*. This is required as it may cause the
+    // viewport to change which will can affect media query evaluation and the value of the `vw` unit.
+    // OPTIMIZATION: A settled embedding chain has no relayout to do, and finding that out by laying it out publishes
+    //               its whole style environment.
+    if (auto navigable = document.navigable(); navigable && navigable->container() && &navigable->container()->document() != &document
+        && !embedding_document_chain_has_no_pending_style_or_layout_work(document))
+        navigable->container()->document().update_layout(DOM::UpdateLayoutReason::ChildDocumentStyleUpdate);
+    return {};
+}
+
+Optional<StyleUpdateInputs> begin_style_update_inputs(Layout::BegunRead const& read, DOM::Document& document, ContainerLayoutUpToDate)
+{
+    auto submission_started_at = MonotonicTime::now();
+    document.synchronize_dirty_style_attributes();
+
+    // Fetch the viewport rect once, instead of repeatedly, during style computation.
+    document.update_style_computer_viewport_rect();
+
+    // An element may have rendering-only descendants that must join the transaction which first styles it. Prepare
+    // those descendants before selector inputs cross the transaction boundary.
+    document.style_computer().prepare_elements_for_style_computation();
+
+    // Media rules are evaluated before the transaction boundary below, because evaluating them is
+    // itself a source of inputs: a rule that starts or stops applying publishes its activation. A
+    // transaction taken ahead of that would leave those inputs for the next flush, so the flush that made
+    // a rule apply would not be the flush that recomputed the elements it applies to.
+    if (document.needs_media_rule_evaluation())
+        document.evaluate_media_rules_for_style_update();
+
+    // The user-agent and user sheets have no author-sheet attachment event, so compare their
+    // identities before deciding whether there is a transaction to take. Rendering opportunities
+    // call update_style() even for quiescent documents, and animation ticks do not themselves
+    // change selector or cascade inputs. Apply an animation-only update first, then take a
+    // transaction only if the resulting inherited-style feedback requires one.
+    record_non_author_stylesheets(document);
+    document.style_invalidation_counters().style_update_submission_microseconds += (MonotonicTime::now() - submission_started_at).to_truncated_microseconds();
+    if (document.has_completed_style_update()
+        && !document.style_computer().style_engine().has_pending_transaction(read)) {
+        if (!document.needs_animated_style_update())
+            return {};
+        document.sample_animation_effects_needing_style_update();
+        if (!document.style_computer().style_engine().has_pending_transaction(read))
+            return {};
+    }
+
+    // Settle each tree scope's counter-style registry before the engine answers any row: a record
+    // naming a counter style names the registry it was computed against, and a shadow tree can
+    // define its own. None of it depends on layout.
+    (void)document.style_scope().counter_style_environment_identity(read);
+    document.for_each_shadow_root([&read](DOM::ShadowRoot& shadow_root) {
+        (void)shadow_root.style_scope().counter_style_environment_identity(read);
+    });
+    return StyleUpdateInputs {};
+}
+
+template<typename FirstTransaction>
+static void update_style(Layout::BegunRead const& read, DOM::Document& document, FirstTransaction first_transaction)
 {
     // NB: The style update of a read with no transaction in flight is compiled without the drain's steps.
-    constexpr bool drains_flown_transaction = first_transaction == FirstStyleTransaction::Flown;
+    constexpr bool drains_flown_transaction = IsSame<FirstTransaction, FlownStyleTransaction>;
     auto style_update_started_at = MonotonicTime::now();
     auto& timing_counters = document.style_invalidation_counters();
     auto const submission_before = timing_counters.style_update_submission_microseconds;
@@ -757,18 +822,15 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
     StyleValueFFI::rust_style_ffi_complete_style_update_begin();
     ScopeGuard leave_complete_style_update = finish_complete_style_update;
 
-    // NB: The drain of a transaction that flew installs what was computed from the inputs it was sealed with, which
-    //     settled the parent document's layout, and is due whatever became of the document since.
+    // NB: The drain of a transaction that flew reads the container's layout its seal read.
+    [[maybe_unused]] auto container_layout = [&] {
+        if constexpr (drains_flown_transaction)
+            return Empty {};
+        else
+            return lay_out_container_for_style_update(document);
+    }();
     if constexpr (!drains_flown_transaction) {
-        // NOTE: If our parent document needs a relayout, we must do that *first*. This is required as it may cause the
-        // viewport to change which will can affect media query evaluation and the value of the `vw` unit.
-        // OPTIMIZATION: A settled embedding chain has no relayout to do, and finding that out by laying it out publishes
-        //               its whole style environment.
-        if (auto navigable = document.navigable(); navigable && navigable->container() && &navigable->container()->document() != &document
-            && !embedding_document_chain_has_no_pending_style_or_layout_work(document))
-            navigable->container()->document().update_layout(DOM::UpdateLayoutReason::ChildDocumentStyleUpdate);
-
-        if (!document.browsing_context() && document_without_browsing_context == DocumentWithoutBrowsingContext::Skip)
+        if (!document.browsing_context() && first_transaction.document_without_browsing_context == DocumentWithoutBrowsingContext::Skip)
             return;
 
         // NOTE: If this is a document hosting <template> contents, style update is unnecessary.
@@ -776,7 +838,6 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
             return;
     }
 
-    [[maybe_unused]] auto submission_started_at = MonotonicTime::now();
     // What publishes by identity below (animations, the elements prepared for style) finds the nodes that connected
     // since the last update under the identities they take here.
     // NB: What connected beside the transaction that flew is the next transaction's.
@@ -792,61 +853,30 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
         document.style_computer().end_style_record_view_epoch();
     };
 
-    // NB: What was recorded beside the transaction that flew is the next transaction's.
-    if constexpr (!drains_flown_transaction)
-        document.synchronize_dirty_style_attributes();
-
     document.begin_style_stabilization_epoch();
     ScopeGuard end_stabilization_epoch = [&] {
         document.end_style_stabilization_epoch();
     };
 
-    // Fetch the viewport rect once, instead of repeatedly, during style computation.
-    document.update_style_computer_viewport_rect();
-
-    if constexpr (!drains_flown_transaction) {
-        // An element may have rendering-only descendants that must join the transaction which first styles it. Prepare
-        // those descendants before selector inputs cross the transaction boundary.
-        document.style_computer().prepare_elements_for_style_computation();
-
-        // Media rules are evaluated before the transaction boundary below, because evaluating them is
-        // itself a source of inputs: a rule that starts or stops applying publishes its activation. A
-        // transaction taken ahead of that would leave those inputs for the next flush, so the flush that made
-        // a rule apply would not be the flush that recomputed the elements it applies to.
-        if (document.needs_media_rule_evaluation())
-            document.evaluate_media_rules_for_style_update();
-
-        // The user-agent and user sheets have no author-sheet attachment event, so compare their
-        // identities before deciding whether there is a transaction to take. Rendering opportunities
-        // call update_style() even for quiescent documents, and animation ticks do not themselves
-        // change selector or cascade inputs. Apply an animation-only update first, then take a
-        // transaction only if the resulting inherited-style feedback requires one.
-        record_non_author_stylesheets(document);
-        timing_counters.style_update_submission_microseconds += (MonotonicTime::now() - submission_started_at).to_truncated_microseconds();
-        if (document.has_completed_style_update()
-            && !document.style_computer().style_engine().has_pending_transaction()) {
-            if (!document.needs_animated_style_update())
-                return;
-            document.sample_animation_effects_needing_style_update();
-            if (!document.style_computer().style_engine().has_pending_transaction())
-                return;
+    // NB: The drain of a transaction that flew installs what was computed from the inputs it was sealed with, and is
+    //     due whatever became of the document since: what was recorded beside it is the next transaction's.
+    auto inputs = [&] {
+        if constexpr (drains_flown_transaction) {
+            document.update_style_computer_viewport_rect();
+            return Optional<StyleUpdateInputs> { move(first_transaction.sealed_inputs) };
+        } else {
+            return begin_style_update_inputs(read, document, container_layout);
         }
-
-        // Settle each tree scope's counter-style registry before the engine answers any row: a record
-        // naming a counter style names the registry it was computed against, and a shadow tree can
-        // define its own. None of it depends on layout.
-        (void)document.style_scope().counter_style_environment_identity();
-        document.for_each_shadow_root([](DOM::ShadowRoot& shadow_root) {
-            (void)shadow_root.style_scope().counter_style_environment_identity();
-        });
-    }
+    }();
+    if (!inputs.has_value())
+        return;
 
     // A style flush is a transaction boundary. Everything recorded since the last one crosses into
     // StyleEngine as one flat batch, is normalized there, and is routed into the region its
     // transpose programs reach. A transaction that could not be proven narrower publishes a
     // complete document reaction batch. Only a transaction that cannot complete its answers falls
     // back to document invalidation.
-    auto style_engine_transaction = drains_flown_transaction ? take_flown_style_engine_transaction(document) : take_style_engine_transaction(document);
+    auto style_engine_transaction = drains_flown_transaction ? take_flown_style_engine_transaction(read, document) : take_style_engine_transaction(read, document, *inputs);
     // What was written beside the transaction that flew reaches the engine once the drain of its reactions has ended,
     // as the next transaction's input.
     ScopeGuard end_flown_style_drain = [&] {
@@ -854,22 +884,19 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
             document.style_computer().style_engine().end_flown_style_drain();
     };
     ScopeGuard discard_style_engine_transaction_outputs = [&] {
-        document.style_computer().style_engine().discard_style_transaction_outputs();
+        document.style_computer().style_engine().discard_style_transaction_outputs(read);
     };
 
     if (!style_engine_transaction.reactions.is_empty())
         document.note_style_stabilization_has_style_reactions();
-    // NB: A transaction flies only while the document runs no animation, so one that runs now started beside it: the
-    //     next transaction samples it.
-    if constexpr (!drains_flown_transaction)
-        document.sample_animation_effects_needing_style_update();
+    document.sample_animation_effects_needing_style_update();
 
     auto style_engine_reactions = move(style_engine_transaction.reactions);
     auto prefers_broad_matching_batch = style_engine_transaction.prefers_broad_matching_batch;
     auto transaction_only_derived_child_reactions = style_engine_transaction.only_derived_child_reactions;
     if (style_engine_reactions.is_empty()
-        && document.style_computer().style_engine().has_pending_transaction()) {
-        auto feedback_transaction = take_style_engine_transaction(document);
+        && document.style_computer().style_engine().has_pending_transaction(read)) {
+        auto feedback_transaction = take_style_engine_transaction(read, document, *inputs);
         style_engine_reactions = move(feedback_transaction.reactions);
         prefers_broad_matching_batch = feedback_transaction.prefers_broad_matching_batch;
         transaction_only_derived_child_reactions = feedback_transaction.only_derived_child_reactions;
@@ -879,23 +906,22 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
 
     // This pass belongs to the current style change event. The outer stabilization epoch advanced
     // the transition generation once, before any style, animation, or layout feedback ran.
-    document.record_style_stabilization_pass();
+    document.record_style_stabilization_pass(read);
 
     if (style_engine_reactions.is_empty())
         return;
 
-    bool has_cold_matching_traversal = false;
-    if (auto* root = document.document_element(); root && root->style_node_id() != 0) {
-        if (prefers_broad_matching_batch) {
-            has_cold_matching_traversal = document.style_computer().style_engine().begin_cold_matching_batch(root->style_node_id());
-        } else {
-            document.style_computer().style_engine().begin_adaptive_cold_matching_batch(root->style_node_id());
-            has_cold_matching_traversal = true;
-        }
+    auto* root = document.document_element();
+    bool const has_cold_matching_traversal = root && root->style_node_id() != 0;
+    if (has_cold_matching_traversal) {
+        if (prefers_broad_matching_batch)
+            StyleEngineFFI::style_engine_begin_cold_matching_batch(document.style_computer().style_engine().host(), root->style_node_id());
+        else
+            StyleEngineFFI::style_engine_begin_adaptive_cold_matching_batch(document.style_computer().style_engine().host(), root->style_node_id());
     }
     ScopeGuard end_cold_matching_batch = [&] {
         if (has_cold_matching_traversal)
-            document.style_computer().style_engine().end_cold_matching_batch();
+            StyleEngineFFI::style_engine_end_cold_matching_batch(document.style_computer().style_engine().host());
     };
 
     RequiredInvalidationAfterStyleChange invalidation;
@@ -909,7 +935,7 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
         };
         // One more tree generation of the same style change is not a new pass of it.
         if (style_reaction_pass++ > 0 && !transaction_only_derived_child_reactions)
-            document.record_style_stabilization_pass();
+            document.record_style_stabilization_pass(read);
 
         size_t published_reaction_count = 0;
         for (auto const& reaction : style_engine_reactions) {
@@ -987,6 +1013,10 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
             for (auto ancestor = DOM::AbstractElement { *element }.element_to_inherit_style_from(); ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
                 auto ancestor_style_node = ancestor->element().style_node_id();
                 VERIFY(ancestor_style_node != 0);
+                // NB: The transaction that flew knows nothing of a node that arrived beside it, nor of the descendants
+                //     the node took in. The next transaction styles them under it.
+                if (drains_flown_transaction && document.style_computer().style_engine().style_node_arrived_or_retired_beside_flown_transaction(ancestor_style_node))
+                    break;
                 if (reaction_set.contains(ancestor_style_node)) {
                     for (auto style_node : inheritance_gap) {
                         if (reaction_set.set(style_node) == AK::HashSetResult::InsertedNewEntry) {
@@ -1000,7 +1030,7 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
             }
         }
         if (!inheritance_closure.is_empty())
-            VERIFY(document.style_computer().style_engine().complete_published_match_answers_for_closure(inheritance_closure));
+            VERIFY(StyleEngineFFI::style_engine_complete_published_match_answers_for_closure(document.style_computer().style_engine().host(), &read, inheritance_closure));
 
         Vector<StyleEngine::PublishedStyleDelta> applicable_style_engine_reactions;
         for (auto const& reaction : style_engine_reactions) {
@@ -1015,14 +1045,16 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
         if (!applicable_style_engine_reactions.is_empty()) {
             // Apply each inheritance branch contiguously in preorder. Besides making every parent
             // ready before its descendants, this lets a parent's derived reaction merge into an
-            // unconsumed child reaction in the same batch.
-            document.style_computer().style_engine().sort_style_deltas_for_direct_application(applicable_style_engine_reactions);
+            // unconsumed child reaction in the same batch. The engine answers a transaction's
+            // reactions in that order, so only the gap deltas closed over here need the engine's sort.
+            if (!inheritance_closure.is_empty())
+                document.style_computer().style_engine().sort_style_deltas_for_direct_application(read, applicable_style_engine_reactions);
             auto& counters = document.style_invalidation_counters();
             if (published_reaction_count > 0) {
                 ++counters.style_engine_reaction_batch_runs;
                 counters.style_engine_reaction_elements += published_reaction_count;
             }
-            invalidation |= apply_style_engine_reactions(document, applicable_style_engine_reactions);
+            invalidation |= apply_style_engine_reactions(read, document, applicable_style_engine_reactions);
         }
 
         timing_counters.style_update_apply_microseconds += (MonotonicTime::now() - apply_started_at).to_truncated_microseconds();
@@ -1031,8 +1063,8 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
         // Exact consequences produced while recomputing become the next transaction in this
         // stabilization epoch. Take it only after consuming the current published answers, since
         // a new transaction retires their scratch.
-        if (document.style_computer().style_engine().has_pending_transaction()) {
-            auto next_transaction = take_style_engine_transaction(document);
+        if (document.style_computer().style_engine().has_pending_transaction(read)) {
+            auto next_transaction = take_style_engine_transaction(read, document, *inputs);
             style_engine_reactions = move(next_transaction.reactions);
             transaction_only_derived_child_reactions = next_transaction.only_derived_child_reactions;
         }
@@ -1042,39 +1074,38 @@ static void update_style(DOM::Document& document, [[maybe_unused]] DocumentWitho
 
     document.set_has_completed_style_update();
     apply_document_style_invalidation_after_style_change(document, invalidation);
-    if constexpr (!drains_flown_transaction)
-        document.sample_animation_effects_needing_style_update();
+    document.sample_animation_effects_needing_style_update();
 }
 
 // Records what update_style() records before it takes the document's style transaction, and lets the transaction fly
-// beside the event loop where `blocker` is none: the next update_style() takes its reactions in, once it has landed.
-static bool let_style_update_fly(DOM::Document& document, Layout::RustFFI::FfiFlightBlocker blocker)
+// beside the event loop where `blocker` is none: the next update_style() takes its reactions in, once it has landed,
+// against the inputs this answers.
+static Optional<StyleUpdateInputs> let_style_update_fly(Layout::BegunRead const& read, DOM::Document& document, Layout::RustFFI::FfiFlightBlocker blocker)
 {
     if (!document.browsing_context() || document.created_for_appropriate_template_contents())
-        return false;
+        return {};
     auto* root = document.document_element();
     if (!root || root->style_node_id() == 0)
-        return false;
+        return {};
+    auto container_layout = lay_out_container_for_style_update(document);
     auto& style_computer = document.style_computer();
     style_computer.begin_style_update();
     ScopeGuard end_style_update = [&] {
         style_computer.end_style_update();
     };
-    document.synchronize_dirty_style_attributes();
-    document.update_style_computer_viewport_rect();
-    style_computer.prepare_elements_for_style_computation();
-    if (document.needs_media_rule_evaluation())
-        document.evaluate_media_rules_for_style_update();
-    record_non_author_stylesheets(document);
-    if (!style_computer.style_engine().has_pending_transaction())
-        return false;
-    (void)document.style_scope().counter_style_environment_identity();
-    document.for_each_shadow_root([](DOM::ShadowRoot& shadow_root) {
-        (void)shadow_root.style_scope().counter_style_environment_identity();
-    });
+    auto inputs = begin_style_update_inputs(read, document, container_layout);
+    if (!inputs.has_value())
+        return {};
+    // The animations the update ticked are sampled ahead of the seal, so that their values, and the inherited style
+    // they feed back, fly with the transaction.
+    document.sample_animation_effects_needing_style_update();
+    if (!style_computer.style_engine().has_pending_transaction(read))
+        return {};
     document.build_registered_properties_cache_for_style_update();
     style_computer.prepare_for_style_engine_transaction();
-    return style_computer.style_engine().let_style_transaction_fly(root->style_node_id(), blocker);
+    if (!style_computer.style_engine().let_style_transaction_fly(read, *inputs, root->style_node_id(), blocker))
+        return {};
+    return inputs;
 }
 
 // What a targeted materialization of one element found, reported to the engine the way a reaction
@@ -1104,14 +1135,14 @@ static void note_targeted_style_reaction_applied(DOM::Element& element, Required
         facts |= StyleEngine::WasDisplayNone;
     if (display_changed)
         facts |= StyleEngine::DisplayChanged;
-    style_engine.note_style_reaction_applied(element.style_node_id(), reaction, invalidation.inherited_style_groups_changed(), facts);
+    StyleEngineFFI::style_engine_note_style_reaction_applied(style_engine.host(), element.style_node_id(), reaction, invalidation.inherited_style_groups_changed(), facts);
 }
 
-static void apply_targeted_style_invalidation(DOM::Element& element, RequiredInvalidationAfterStyleChange const& invalidation, bool did_change_custom_properties, bool descendant_style_recompute_needed, bool was_unstyled, bool was_display_none, bool display_changed)
+static void apply_targeted_style_invalidation(Layout::BegunRead const& read, DOM::Element& element, RequiredInvalidationAfterStyleChange const& invalidation, bool did_change_custom_properties, bool descendant_style_recompute_needed, bool was_unstyled, bool was_display_none, bool display_changed)
 {
     if (!invalidation.is_none() || did_change_custom_properties)
         Invalidation::invalidate_assigned_slottables_after_slot_style_change(element);
-    apply_element_style_invalidation_after_style_change(element, invalidation);
+    apply_element_style_invalidation_after_style_change(read, element, invalidation);
     note_targeted_style_reaction_applied(element, invalidation, did_change_custom_properties, descendant_style_recompute_needed, was_unstyled, was_display_none, display_changed);
     apply_document_style_invalidation_after_style_change(element.document(), invalidation);
 }
@@ -1119,13 +1150,13 @@ static void apply_targeted_style_invalidation(DOM::Element& element, RequiredInv
 // A targeted style update has nothing to do when every source of style work in the document is settled: A full style
 // update has completed, no style engine transaction or recorded input is pending, no media rule evaluation is queued,
 // and no animated style refresh is due.
-static bool document_has_no_pending_style_work(DOM::Document const& document)
+static bool document_has_no_pending_style_work(Layout::BegunRead const& read, DOM::Document const& document)
 {
     // A rootless flush drains the journal but preserves element style inputs for the first transaction with a document
     // root — so has_pending_transaction() alone would report a settled engine still owing an element its recomputation.
     return document.has_completed_style_update()
-        && !document.style_computer().style_engine().has_pending_transaction()
-        && !document.style_computer().style_engine().has_deferred_element_style_inputs()
+        && !document.style_computer().style_engine().has_pending_transaction(read)
+        && !document.style_computer().style_engine().has_deferred_element_style_inputs(read)
         && !document.needs_media_rule_evaluation()
         && !document.needs_animated_style_update();
 }
@@ -1140,7 +1171,9 @@ static bool embedding_document_chain_has_no_pending_style_or_layout_work(DOM::Do
         if (!container || &container->document() == embedded_document)
             return true;
         auto& embedding_document = container->document();
-        if (!document_has_no_pending_style_work(embedding_document)
+        // The embedding document's state is that document's own read.
+        Layout::ForcedReadScope embedding_read { embedding_document };
+        if (!document_has_no_pending_style_work(embedding_read, embedding_document)
             || !embedding_document.layout_is_up_to_date()
             || !container->has_style())
             return false;
@@ -1149,7 +1182,7 @@ static bool embedding_document_chain_has_no_pending_style_or_layout_work(DOM::Do
     return true;
 }
 
-static bool update_style_for_element(DOM::Document& document, DOM::AbstractElement const& abstract_element, StyleUpdateMode mode)
+static bool update_style_for_element(Layout::BegunRead const& read, DOM::Document& document, DOM::AbstractElement const& abstract_element, StyleUpdateMode mode)
 {
     if (!abstract_element.element().is_connected())
         return false;
@@ -1162,7 +1195,7 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
     // element that has no style yet, so that is answered directly too.
     if ((mode == StyleUpdateMode::OnlyIfNeeded || mode == StyleUpdateMode::StopAtDisplayNone)
         && !abstract_element.pseudo_element().has_value()
-        && document_has_no_pending_style_work(document)
+        && document_has_no_pending_style_work(read, document)
         && embedding_document_chain_has_no_pending_style_or_layout_work(document)) {
         Optional<size_t> topmost_element_without_style;
         Optional<size_t> topmost_display_none_element;
@@ -1212,7 +1245,11 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
         && !embedding_document_chain_has_no_pending_style_or_layout_work(document)) {
         auto& container = *navigable->container();
         auto& embedding_document = container.document();
-        update_style_for_element(embedding_document, DOM::AbstractElement { container }, StyleUpdateMode::OnlyIfNeeded);
+        // The container's style is the embedding document's own read, in which the style transaction that flew for the
+        // embedding document lands first.
+        Layout::ForcedReadScope embedding_read { embedding_document };
+        embedding_document.drain_flown_style_transaction(embedding_read);
+        update_style_for_element(embedding_read, embedding_document, DOM::AbstractElement { container }, StyleUpdateMode::OnlyIfNeeded);
         embedding_document_layout_was_stale = !embedding_document.layout_is_up_to_date();
         embedding_document.update_layout(DOM::UpdateLayoutReason::ChildDocumentStyleUpdate);
     }
@@ -1232,7 +1269,7 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
         entered_stabilization_epoch = true;
         document.update_style_computer_viewport_rect();
 
-        if (document.style_computer().style_engine().has_pending_transaction() || document.needs_media_rule_evaluation())
+        if (document.style_computer().style_engine().has_pending_transaction(read) || document.needs_media_rule_evaluation())
             document.note_style_stabilization_has_style_reactions();
 
         // Media query evaluation can enqueue normal style invalidations, so do it before deciding what pending
@@ -1242,15 +1279,15 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
 
         auto const can_run_regular_style_update = !document.is_running_update_layout()
             && (!document.has_completed_style_update()
-                || document.style_computer().style_engine().has_pending_transaction());
+                || document.style_computer().style_engine().has_pending_transaction(read));
         if (can_run_regular_style_update) {
-            update_style(document, DocumentWithoutBrowsingContext::Update);
+            update_style(read, document, RecordedStyleTransaction { DocumentWithoutBrowsingContext::Update });
             ran_regular_style_update = true;
         } else {
             document.sample_animation_effects_needing_style_update();
             if (!document.is_running_update_layout()
-                && document.style_computer().style_engine().has_pending_transaction()) {
-                update_style(document, DocumentWithoutBrowsingContext::Update);
+                && document.style_computer().style_engine().has_pending_transaction(read)) {
+                update_style(read, document, RecordedStyleTransaction { DocumentWithoutBrowsingContext::Update });
                 ran_regular_style_update = true;
             }
         }
@@ -1263,14 +1300,14 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
     if (abstract_element.pseudo_element().has_value() && is_element_reference_pseudo_element(*abstract_element.pseudo_element())) {
         if (auto pseudo_element = abstract_element.element().get_pseudo_element(*abstract_element.pseudo_element()); pseudo_element.has_value()) {
             if (auto const* element_reference = as_if<DOM::ElementReferencePseudoElement>(*pseudo_element))
-                return update_style_for_element(document, DOM::AbstractElement { element_reference->referenced_element() }, mode);
+                return update_style_for_element(read, document, DOM::AbstractElement { element_reference->referenced_element() }, mode);
         }
     }
 
     if (ran_regular_style_update && mode != StyleUpdateMode::OnlyIfNeeded) {
         auto style_record = abstract_element.style_record_identity();
         if (!!style_record
-            && !has_flag(document.style_computer().style_engine().style_record_dependency_flags(style_record), StyleRecordDependencyFlag::InDisplayNoneSubtree))
+            && !has_flag(document.style_computer().style_engine().style_record_dependency_flags(read, style_record), StyleRecordDependencyFlag::InDisplayNoneSubtree))
             return true;
     }
 
@@ -1291,7 +1328,7 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
     for (size_t i = inheritance_chain.size(); i > 0; --i) {
         auto& ancestor = inheritance_chain[i - 1];
         if (!topmost_element_requiring_style.has_value()
-            && (document.style_computer().style_engine().has_deferred_element_style_input(ancestor->style_node_id())
+            && (StyleEngineFFI::style_engine_has_deferred_element_style_input(document.style_computer().style_engine().host(), &read, ancestor->style_node_id().value())
                 || !ancestor->has_style())) {
             topmost_element_requiring_style = i - 1;
         }
@@ -1325,10 +1362,10 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
         auto const* previous_box_values = element->style_group<ComputedValues::BoxValues>();
         bool const was_display_none = previous_box_values && display_from_ffi_display(previous_box_values->display).is_none();
         auto const previous_display = previous_box_values ? Optional<Display> { display_from_ffi_display(previous_box_values->display) } : Optional<Display> {};
-        auto invalidation = apply_engine_record_demand(element, StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle, 0, did_change_custom_properties);
+        auto invalidation = apply_engine_record_demand(read, element, StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle, 0, did_change_custom_properties);
         auto const* current_box_values = element->style_group<ComputedValues::BoxValues>();
         bool const display_changed = previous_display.has_value() && current_box_values && *previous_display != display_from_ffi_display(current_box_values->display);
-        apply_targeted_style_invalidation(element, invalidation, did_change_custom_properties, descendant_style_recompute_needed, was_unstyled, was_display_none, display_changed);
+        apply_targeted_style_invalidation(read, element, invalidation, did_change_custom_properties, descendant_style_recompute_needed, was_unstyled, was_display_none, display_changed);
 
         descendant_style_recompute_needed |= invalidation.recompute_descendant_styles;
 
@@ -1354,75 +1391,134 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
 
 namespace Web::DOM {
 
-void Document::update_selection_style_observability()
+Document::HighlightStyleObservability& Document::highlight_style_observability(CSS::PseudoElement pseudo_element)
+{
+    VERIFY(CSS::is_highlight_pseudo_element(pseudo_element));
+    return m_highlight_style_observability[pseudo_element == CSS::PseudoElement::Selection ? 0 : 1];
+}
+
+bool Document::highlight_styles_are_observable(CSS::PseudoElement pseudo_element) const
+{
+    return const_cast<Document&>(*this).highlight_style_observability(pseudo_element).observable;
+}
+
+void Document::set_needs_highlight_style_update(CSS::PseudoElement pseudo_element)
+{
+    highlight_style_observability(pseudo_element).needs_update = true;
+}
+
+static void record_highlight_style_inputs(Document& document, Node& root, Range const* range)
+{
+    auto record_element = [&](Node& node) {
+        if (auto* element = as_if<Element>(node); element && element->has_style()) {
+            document.style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(),
+                CSS::StyleEngine::PseudoInputsMayHaveChanged);
+        }
+    };
+
+    // NB: Ancestors supply inherited highlight styles, and text controls paint through
+    //     their internal shadow trees. Neither requires visiting unrelated subtrees.
+    for (auto* ancestor = root.flat_tree_parent(); ancestor; ancestor = ancestor->flat_tree_parent())
+        record_element(*ancestor);
+    root.for_each_shadow_including_inclusive_descendant([&](Node& node) {
+        if (range && &node.root() == &range->start_container()->root() && !range->intersects_node(node))
+            return TraversalDecision::SkipChildrenAndContinue;
+        record_element(node);
+        return TraversalDecision::Continue;
+    });
+}
+
+struct HighlightStyleInput {
+    GC::Ref<Node> root;
+    GC::Ptr<Range> range;
+};
+
+static Vector<HighlightStyleInput, 2> selection_style_inputs(Document& document)
+{
+    Vector<HighlightStyleInput, 2> inputs;
+    if (auto selection = document.get_selection(); selection && !selection->is_collapsed()) {
+        auto range = selection->range();
+        inputs.append({ range->common_ancestor_container(), range });
+    }
+    if (auto* text_control = as_if<HTML::FormAssociatedTextControlElement>(document.focused_area().ptr()); text_control && text_control->selection_start() != text_control->selection_end())
+        inputs.append({ *document.focused_area(), nullptr });
+    return inputs;
+}
+
+static Vector<HighlightStyleInput, 2> search_text_style_inputs(Document& document)
+{
+    Vector<HighlightStyleInput, 2> inputs;
+    if (auto active_match = document.find_in_page_active_match(); active_match && !active_match->collapsed())
+        inputs.append({ active_match->common_ancestor_container(), active_match });
+    HashTable<Node*> highlighted_roots;
+    for (auto const& match : document.find_in_page_highlighted_matches()) {
+        if (match->collapsed())
+            continue;
+        auto root = match->common_ancestor_container();
+        if (highlighted_roots.set(root.ptr()) == HashSetResult::InsertedNewEntry)
+            inputs.append({ root, nullptr });
+    }
+    return inputs;
+}
+
+void Document::update_highlight_style_observability(CSS::PseudoElement pseudo_element)
 {
     // NB: Editing commands temporarily select content to restore its formatting. Style reads
     //     during the action must not activate selection styles throughout the document for these
     //     intermediate ranges. Observe the final selection after the action, including in input
     //     event handlers. Explicit ::selection queries can still compute their style on demand.
-    if (m_running_editing_command_action)
+    if (pseudo_element == CSS::PseudoElement::Selection && m_running_editing_command_action)
         return;
 
-    auto selection = get_selection();
-    auto* text_control = as_if<HTML::FormAssociatedTextControlElement>(focused_area().ptr());
-    bool observable = selection && !selection->is_collapsed();
-    bool text_control_selection_is_observable = text_control && text_control->selection_start() != text_control->selection_end();
-    observable |= text_control_selection_is_observable;
-    if (observable == m_selection_styles_are_observable && !m_needs_selection_style_update)
+    auto inputs = pseudo_element == CSS::PseudoElement::Selection ? selection_style_inputs(*this) : search_text_style_inputs(*this);
+    auto& state = highlight_style_observability(pseudo_element);
+    bool observable = !inputs.is_empty();
+    if (observable == state.observable && !state.needs_update)
         return;
-    m_needs_selection_style_update = false;
-    m_selection_styles_are_observable = observable;
-    style_computer().style_engine().set_pseudo_element_style_deferred(to_underlying(CSS::PseudoElement::Selection), !observable);
-    if (!observable)
-        return;
-
-    auto record_element = [&](Node& node) {
-        if (auto* element = as_if<Element>(node); element && element->has_style()) {
-            style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(),
-                CSS::StyleEngine::PseudoInputsMayHaveChanged);
-        }
-    };
-    auto record_subtree = [&](Node& root, Range const* range) {
-        // NB: Ancestors supply inherited highlight styles, and text controls paint through
-        //     their internal shadow trees. Neither requires visiting unrelated subtrees.
-        for (auto* ancestor = root.parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host())
-            record_element(*ancestor);
-        root.for_each_shadow_including_inclusive_descendant([&](Node& node) {
-            if (range && &node.root() == &range->start_container()->root() && !range->intersects_node(node))
-                return TraversalDecision::SkipChildrenAndContinue;
-            record_element(node);
-            return TraversalDecision::Continue;
-        });
-    };
-    if (selection && !selection->is_collapsed()) {
-        auto range = selection->range();
-        auto root = range->common_ancestor_container();
-        record_subtree(root, range.ptr());
-    }
-    if (text_control_selection_is_observable)
-        record_subtree(*focused_area(), nullptr);
+    state = { .observable = observable, .needs_update = false };
+    CSS::StyleEngineFFI::style_engine_set_pseudo_element_style_deferred(style_computer().style_engine().host(), to_underlying(pseudo_element), !observable);
+    if (pseudo_element == CSS::PseudoElement::SearchText)
+        CSS::StyleEngineFFI::style_engine_set_pseudo_element_style_deferred(style_computer().style_engine().host(), to_underlying(CSS::PseudoElement::SearchTextCurrent), !observable);
+    for (auto const& input : inputs)
+        record_highlight_style_inputs(*this, input.root, input.range.ptr());
 }
 
-void Document::drain_style_transaction_that_flew()
+void Document::update_highlight_style_observability()
 {
-    m_has_flown_style_transaction = false;
-    CSS::update_style<CSS::FirstStyleTransaction::Flown>(*this);
+    update_highlight_style_observability(CSS::PseudoElement::Selection);
+    update_highlight_style_observability(CSS::PseudoElement::SearchText);
+}
+
+void Document::drain_style_transaction_that_flew(Layout::BegunRead const& read)
+{
+    // The animations dirtied beside the transaction are the next style update's, as are the writes made beside it: the
+    // drain samples those its own reactions create.
+    auto effects_beside = exchange(m_effects_needing_animated_style_update, {});
+    bool needed_beside = exchange(m_needs_animated_style_update, false);
+    bool forced_beside = exchange(m_force_throttled_animation_style_update, false);
+    CSS::update_style(read, *this, CSS::FlownStyleTransaction { m_flown_style_update_inputs.release_value() });
+    for (auto& effect : effects_beside)
+        m_effects_needing_animated_style_update.set(effect);
+    m_needs_animated_style_update |= needed_beside;
+    m_force_throttled_animation_style_update |= forced_beside;
 }
 
 void Document::update_style()
 {
-    drain_flown_style_transaction();
-    update_selection_style_observability();
-    CSS::update_style(*this);
+    Layout::ForcedReadScope read { style_computer().style_engine().render_document() };
+    drain_flown_style_transaction(read);
+    update_highlight_style_observability();
+    CSS::update_style(read, *this);
 }
 
 bool Document::let_style_update_fly(Layout::RustFFI::FfiFlightBlocker blocker)
 {
-    if (blocker != Layout::RustFFI::FfiFlightBlocker::None || m_has_flown_style_transaction)
+    if (blocker != Layout::RustFFI::FfiFlightBlocker::None || m_flown_style_update_inputs.has_value())
         return false;
-    update_selection_style_observability();
-    m_has_flown_style_transaction = CSS::let_style_update_fly(*this, blocker);
-    return m_has_flown_style_transaction;
+    Layout::ForcedReadScope read { *this };
+    update_highlight_style_observability();
+    m_flown_style_update_inputs = CSS::let_style_update_fly(read, *this, blocker);
+    return m_flown_style_update_inputs.has_value();
 }
 
 bool Document::update_style_for_element(AbstractElement const& abstract_element)
@@ -1432,16 +1528,11 @@ bool Document::update_style_for_element(AbstractElement const& abstract_element)
 
 bool Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
 {
-    // A script API reads the element's style: its waits for the render state are one forced read.
-    auto* host = style_computer().style_engine().render_document().host();
-    Layout::RustFFI::document_host_begin_forced_read(host, true);
-    ScopeGuard end_forced_read = [&] {
-        Layout::RustFFI::document_host_end_forced_read(host);
-    };
-    drain_flown_style_transaction();
-    update_selection_style_observability();
+    Layout::ForcedReadScope read { style_computer().style_engine().render_document() };
+    drain_flown_style_transaction(read);
+    update_highlight_style_observability();
     flush_throttled_animation_style_update_for_node(abstract_element.element());
-    return CSS::update_style_for_element(*this, abstract_element, mode);
+    return CSS::update_style_for_element(read, *this, abstract_element, mode);
 }
 
 }

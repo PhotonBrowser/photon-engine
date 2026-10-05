@@ -33,8 +33,8 @@ set(SOURCES
     Clipboard/ClipboardItem.cpp
     Compositor/CompositorConnection.cpp
     Compositor/CompositorHost.cpp
-    Compositor/CompositorHostBase.cpp
     Compositor/NavigablePresenter.cpp
+    Compositor/RenderClock.cpp
     Compression/CompressionStream.cpp
     Compression/DecompressionStream.cpp
     ContentSecurityPolicy/BlockingAlgorithms.cpp
@@ -320,7 +320,6 @@ set(SOURCES
     DOM/EventTarget.cpp
     DOM/HTMLCollection.cpp
     DOM/IDLEventListener.cpp
-    DOM/InvalidationJournal.cpp
     DOM/LiveNodeList.cpp
     DOM/MutationObserver.cpp
     DOM/MutationRecord.cpp
@@ -509,8 +508,10 @@ set(SOURCES
     HTML/ErrorEvent.cpp
     HTML/ErrorInformation.cpp
     HTML/EventHandler.cpp
+    HTML/EventLoop/ClockPlan.cpp
     HTML/EventLoop/EventLoop.cpp
     HTML/EventLoop/FrameCompletion.cpp
+    HTML/EventLoop/PresentationQueue.cpp
     HTML/EventLoop/Task.cpp
     HTML/EventLoop/TaskQueue.cpp
     HTML/EventNames.cpp
@@ -765,6 +766,7 @@ set(SOURCES
     Layout/LayoutRustBridge.cpp
     Layout/Node.cpp
     Layout/NodeArena.cpp
+    Layout/RenderDocument.cpp
     Layout/TextNode.cpp
     Layout/TreeBuilder.cpp
     Layout/UpdateLayout.cpp
@@ -1208,7 +1210,7 @@ foreach(angle_target IN LISTS ANGLE_TARGETS)
     target_compile_options(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_OPTIONS>)
 endforeach()
 
-set(libweb_rust_features style-recording)
+set(libweb_rust_features)
 if (ENABLE_THREAD_SANITIZER)
     list(APPEND libweb_rust_features thread-sanitizer)
 endif()
@@ -1225,24 +1227,11 @@ import_rust_crate(
         ValueParserRustFFI.h
         ComputedValuesRustFFI.h
         StyleEngineRustFFI.h
-        StyleEngineBridgeGenerated.h
-        StyleEngineBridgeGenerated.inc
         StyleEngineStateFactsGenerated.inc
         SelectorStateFactsGenerated.inc
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
 )
-build_rust_binary(
-    MANIFEST_PATH Rust/Cargo.toml
-    CRATE_NAME libweb_rust
-    BINARY_NAME style-replay
-    FEATURES style-replay
-)
-# The replay tool currently requires POSIX memory mapping.
-if (UNIX)
-    add_custom_target(style-replay ALL)
-    add_dependencies(style-replay style-replay-build)
-endif()
 target_link_libraries(libweb_rust INTERFACE LibGfx)
 test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)
 

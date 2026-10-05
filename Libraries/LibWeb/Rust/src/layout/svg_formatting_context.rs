@@ -235,13 +235,6 @@ fn kind_is_svg_container_element(kind: NodeKind) -> bool {
     )
 }
 
-fn kind_is_svg_resource_box(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::SVGMaskBox | NodeKind::SVGClipBox | NodeKind::SVGPatternBox
-    )
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SvgCssPixelRect {
     x: CssPixels,
@@ -890,12 +883,10 @@ impl<'pass> SvgFormattingContext<'pass> {
     /// would lay out, so this reads the source text the row kept beside its rendering.
     fn svg_text_contents(&self, node: Node) -> Vec<u16> {
         let mut text: Vec<u16> = Vec::new();
-        let mut child = self.first_child(node);
-        while !child.is_invalid() {
+        for child in self.callbacks.children(node) {
             if node_facts::kind_is_text(self.node_kind(child)) {
                 self.append_svg_source_text(child, &mut text);
             }
-            child = self.next_sibling(child);
         }
         trim_ascii_whitespace(&mut text);
         text
@@ -1442,23 +1433,10 @@ impl<'pass> SvgFormattingContext<'pass> {
         formatting_context::place_child(&self.formatting_context_run(), node, FfiCssPixelPoint { x, y }, None);
     }
 
-    fn for_each_child(&self, node: Node, mut callback: impl FnMut(Node)) {
-        let mut child = self.first_child(node);
-        while !child.is_invalid() {
-            let next = self.next_sibling(child);
-            callback(child);
-            child = next;
-        }
-    }
-
     fn first_child_of_kind(&self, node: Node, kind: NodeKind) -> Option<Node> {
-        let mut result = None;
-        self.for_each_child(node, |child| {
-            if result.is_none() && self.node_kind(child) == kind {
-                result = Some(child);
-            }
-        });
-        result
+        self.callbacks
+            .children(node)
+            .find(|&child| self.node_kind(child) == kind)
     }
 
     pub(super) fn run(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput) {
@@ -1591,13 +1569,10 @@ impl<'pass> SvgFormattingContext<'pass> {
             .containing_block_constraints
             .quirks_mode_percentage_basis_block_size;
 
-        let mut child = self.first_child(self.box_);
-        while !child.is_invalid() {
-            let next = self.next_sibling(child);
+        for child in self.callbacks.children(self.box_) {
             if NodeFacts::new(&self.callbacks, child).is_box() {
                 self.layout_svg_element(run, child, input);
             }
-            child = next;
         }
     }
 
@@ -1717,13 +1692,10 @@ impl<'pass> SvgFormattingContext<'pass> {
         if let Some(clip) = self.first_child_of_kind(graphics_box, NodeKind::SVGClipBox) {
             self.layout_mask_or_clip(run, clip);
         }
-        let mut child = self.first_child(graphics_box);
-        while !child.is_invalid() {
-            let next = self.next_sibling(child);
+        for child in self.callbacks.children(graphics_box) {
             if self.node_kind(child) == NodeKind::SVGPatternBox {
                 self.layout_mask_or_clip(run, child);
             }
-            child = next;
         }
     }
 
@@ -1745,13 +1717,10 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         if self.node_kind(graphics_box) == NodeKind::SVGTextBox {
             // <text> and <tspan> elements can contain more text elements.
-            let mut child = self.first_child(graphics_box);
-            while !child.is_invalid() {
-                let next = self.next_sibling(child);
+            for child in self.callbacks.children(graphics_box) {
                 if matches!(self.node_kind(child), NodeKind::SVGTextBox | NodeKind::SVGTextPathBox) {
                     self.layout_graphics_element(run, child, input);
                 }
-                child = next;
             }
         }
         let [x, y, width, height] = path.bounding_box();
@@ -1830,7 +1799,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         let kind = self.node_kind(resource);
         let facts = self.svg_facts(resource);
         let attributes = self.svg_attributes(resource);
-        assert!(kind_is_svg_resource_box(kind));
+        assert!(node_facts::kind_is_svg_resource_box(kind));
         // FIXME: Somehow limit <clipPath> contents to: shape elements, <text>, and <use>.
         let used_pointer = self.create_used_values(resource);
         self.commit_svg_element_facts(resource, facts, attributes);
@@ -1893,11 +1862,11 @@ impl<'pass> SvgFormattingContext<'pass> {
         let mut min_y = CssPixels::default();
         let mut max_x = CssPixels::default();
         let mut max_y = CssPixels::default();
-        let mut child = self.first_child(container);
-        while !child.is_invalid() {
-            let next = self.next_sibling(child);
+        for child in self.callbacks.children(container) {
             // Masks/clips/patterns do not change the bounding box of their parents.
-            if NodeFacts::new(&self.callbacks, child).is_box() && !kind_is_svg_resource_box(self.node_kind(child)) {
+            if NodeFacts::new(&self.callbacks, child).is_box()
+                && !node_facts::kind_is_svg_resource_box(self.node_kind(child))
+            {
                 self.layout_svg_element(run, child, input);
                 let child_used_pointer = self.used_values(child);
                 let child_used = child_used_pointer;
@@ -1926,7 +1895,6 @@ impl<'pass> SvgFormattingContext<'pass> {
                     has_points = true;
                 }
             }
-            child = next;
         }
 
         let used_pointer = self.used_values(container);
@@ -1983,14 +1951,21 @@ fn length_resolution_context(
     let viewport_width = callbacks.initial_containing_block_inline_size.to_double();
     let viewport_height = callbacks.initial_containing_block_block_size.to_double();
     // A container unit resolves against the nearest size query container on its axis, or the small viewport size
-    // without one. Finding that container is style's business, so it is asked only for a length that needs it.
-    let container_bases = crate::css::style_compute::length_unit_is_container_relative(unit).then(|| {
+    // without one. Finding that container is style's business, so it is asked only for a length that needs it. A pass
+    // that cannot ask resolves it against the viewport, and leaves the layout to the host to lay out again.
+    let container_bases = if crate::css::style_compute::length_unit_is_container_relative(unit) {
         let element = callbacks
             .arena()
             .dom_node_style_node(node)
             .expect("an SVG element's attribute length is resolved for the element's own box");
-        callbacks.container_length_bases.bases(element)
-    });
+        let bases = callbacks.container_length_bases.bases(element);
+        if bases.is_none() {
+            callbacks.arena().note_unresolved_container_lengths();
+        }
+        bases
+    } else {
+        None
+    };
     crate::css::style_compute::FfiLengthResolutionContext {
         viewport_width,
         viewport_height,

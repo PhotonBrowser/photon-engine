@@ -8,6 +8,8 @@
 
 #include <AK/Noncopyable.h>
 #include <AK/RefCounted.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/Forward.h>
 #include <LibWeb/Layout/TreeBuilderRustFFI.h>
 
 namespace Web::Layout {
@@ -15,30 +17,59 @@ namespace Web::Layout {
 // A document's render state as the host holds it: the DocumentHost that names the state. The state owns the document's
 // style engine and layout arena, so the style engine bridge and the layout node arena both keep it alive, and it goes
 // when the last of them does.
-class RenderDocument : public RefCounted<RenderDocument> {
+class WEB_API RenderDocument : public RefCounted<RenderDocument> {
     AK_MAKE_NONCOPYABLE(RenderDocument);
     AK_MAKE_NONMOVABLE(RenderDocument);
 
 public:
-    static NonnullRefPtr<RenderDocument> create(u8 device_class)
+    static NonnullRefPtr<RenderDocument> create()
     {
-        return adopt_ref(*new RenderDocument(device_class));
+        return adopt_ref(*new RenderDocument());
     }
 
-    ~RenderDocument()
-    {
-        RustFFI::document_host_destroy(m_host);
-    }
+    ~RenderDocument();
 
     RustFFI::DocumentHost* host() const { return m_host; }
 
+    // Whether the host waits for the document's frame: it flies beside the host, or a layout round it flew with or the
+    // ticks of a clock lease ran is not paid yet. The host keeps it up to date, so asking costs a load.
+    bool waits_for_frame() const { return *m_read_scope_view.waits_for_frame; }
+
+    // Whether the document's frame flies beside the host, which has not taken it in yet.
+    bool frame_flies() const;
+
 private:
-    explicit RenderDocument(u8 device_class)
-        : m_host(RustFFI::document_host_create(device_class))
+    friend class ForcedReadScope;
+
+    RenderDocument();
+
+    RustFFI::DocumentHost* m_host { nullptr };
+    RustFFI::FfiReadScopeView m_read_scope_view;
+};
+
+// A scope of a read of a document's render state that the host waits for, which takes a frame in flight in.
+//
+// The scope lends its read, a BegunRead, to the calls it makes. An entry that reaches the render state where the host
+// is takes one, and only a scope hands one out, so code that reaches the render state without a begun read does not
+// compile.
+class WEB_API ForcedReadScope {
+    AK_MAKE_NONCOPYABLE(ForcedReadScope);
+    AK_MAKE_NONMOVABLE(ForcedReadScope);
+
+public:
+    explicit ForcedReadScope(RenderDocument const& render_document)
+        : m_render_document(render_document)
     {
     }
 
-    RustFFI::DocumentHost* m_host { nullptr };
+    // A read of the render state of `document`.
+    explicit ForcedReadScope(DOM::Document const& document);
+
+    operator BegunRead const&() const { return *m_render_document.m_read_scope_view.read; }
+    operator BegunRead const*() const { return m_render_document.m_read_scope_view.read; }
+
+private:
+    RenderDocument const& m_render_document;
 };
 
 }

@@ -40,11 +40,8 @@ public:
     Utf16View text_for_rendering() const;
     Utf16String rendered_text_for_dom(bool collapse_whitespace) const;
     RustFFI::FfiTextSourceRange word_range_at(size_t dom_offset) const;
-    void invalidate_text_for_rendering();
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList) const;
-
-    bool update_produces_line_box_fragment_when_empty_flag();
 
 private:
     virtual bool is_text_node() const final { return true; }

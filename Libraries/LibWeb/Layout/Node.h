@@ -26,7 +26,14 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TreeBuilderRustFFI.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/TreeTraversal.h>
+
+namespace Web::CSS {
+
+class InstalledStyle;
+
+}
 
 namespace Web::Layout {
 
@@ -58,9 +65,11 @@ public:
     u32 arena_slot_index() const { return m_slot.index; }
     NodeArena& node_arena() const { return *m_arena; }
     RustFFI::DocumentHost* document_host() const;
+    // The read this node was reached in, which it lends the calls the host makes about its document: a layout node is
+    // reached only through an entry that takes a read, which took the document's frame in.
+    BegunRead const& held_read() const { return *RustFFI::layout_row_read_of_held_node(document_host()); }
 
     Compositing::RustFFI::NodeSlotId linked_slot(RustFFI::FfiNodeLink link) const { return RustFFI::layout_row_link_slot(document_host(), m_slot, link); }
-    bool has_parent() const { return linked_slot(RustFFI::FfiNodeLink::Parent).index != Compositing::RustFFI::INVALID_NODE_SLOT_INDEX; }
     Node* parent_ptr() { return linked_node(RustFFI::FfiNodeLink::Parent); }
     Node const* parent_ptr() const { return linked_node(RustFFI::FfiNodeLink::Parent); }
     Node* first_child_ptr() { return linked_node(RustFFI::FfiNodeLink::FirstChild); }
@@ -187,7 +196,6 @@ public:
 
     bool is_anonymous() const { return has_identity_flag<RustFFI::NodeFlag::Anonymous>(); }
     bool is_document_element() const { return has_identity_flag<RustFFI::NodeFlag::IsDocumentElement>(); }
-    bool insets_use_anchor_functions() const { return has_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions); }
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
     // The identity of the DOM node this row belongs to, which names nothing for an anonymous row
@@ -246,8 +254,6 @@ public:
 
     void prepare_for_detach_from_layout_tree();
     void prepare_subtree_for_detach_from_layout_tree();
-    // Clears the committed boxes of the subtree and prepares it for detaching, as a removal does before dropping it.
-    void prepare_subtree_for_removal();
     void pin_style_record_for_detachment();
 
     // Returns the direct viewport child above this node (the node itself or its outermost
@@ -279,14 +285,8 @@ public:
 
     bool is_inline_node() const { return kind() == RustFFI::NodeKind::InlineNode; }
     bool is_svg_box() const { return RustFFI::layout_node_kind_is_svg_box(kind()); }
-    bool is_svg_geometry_box() const { return kind() == RustFFI::NodeKind::SVGGeometryBox; }
-    bool is_svg_clip_box() const { return kind() == RustFFI::NodeKind::SVGClipBox; }
-    bool is_svg_mask_box() const { return kind() == RustFFI::NodeKind::SVGMaskBox; }
     bool is_svg_pattern_box() const { return kind() == RustFFI::NodeKind::SVGPatternBox; }
-    bool is_svg_graphics_box() const { return RustFFI::layout_node_kind_is_svg_graphics_box(kind()); }
     bool is_replaced_box() const { return RustFFI::layout_node_kind_is_replaced_box(kind()); }
-    bool is_list_item_box() const { return kind() == RustFFI::NodeKind::ListItemBox; }
-    bool is_list_item_marker_box() const { return kind() == RustFFI::NodeKind::ListItemMarkerBox; }
     bool is_table_wrapper() const { return kind() == RustFFI::NodeKind::TableWrapper; }
 
     template<typename T>
@@ -304,12 +304,8 @@ public:
     NodeWithStyle const* parent() const;
 
     bool children_are_inline() const { return has_flag(RustFFI::NodeFlag::ChildrenAreInline); }
-    void set_children_are_inline(bool value) { set_flag(RustFFI::NodeFlag::ChildrenAreInline, value); }
-
-    void set_list_marker_is_inside(bool value) { set_flag(RustFFI::NodeFlag::ListMarkerIsInside, value); }
 
     bool is_editing_host() const { return has_flag(RustFFI::NodeFlag::IsEditingHost); }
-    void set_is_editing_host(bool value) { set_flag(RustFFI::NodeFlag::IsEditingHost, value); }
     static u8 dom_paint_facts_of(DOM::Node const*);
 
     // https://drafts.csswg.org/css-ui/#propdef-user-select
@@ -490,19 +486,6 @@ public:
         }
         VERIFY_NOT_REACHED();
     }
-    bool block_axis_is_reverse() const
-    {
-        switch (writing_mode()) {
-        case CSS::WritingMode::HorizontalTb:
-        case CSS::WritingMode::VerticalLr:
-        case CSS::WritingMode::SidewaysLr:
-            return false;
-        case CSS::WritingMode::VerticalRl:
-        case CSS::WritingMode::SidewaysRl:
-            return true;
-        }
-        VERIFY_NOT_REACHED();
-    }
     CSS::Visibility visibility() const { return static_cast<CSS::Visibility>(style_group<CSS::ComputedValues::InheritedBoxValues>().visibility); }
     CSS::ImageRendering image_rendering() const { return static_cast<CSS::ImageRendering>(style_group<CSS::ComputedValues::InheritedBoxValues>().image_rendering); }
     Color caret_color() const { return style_group<CSS::ComputedValues::InheritedUIValues>().caret_color_value(); }
@@ -516,8 +499,6 @@ public:
     CSS::Appearance appearance() const { return static_cast<CSS::Appearance>(style_group<CSS::ComputedValues::MiscResetValues>().appearance); }
     CSS::WillChange will_change() const { return style_group<CSS::ComputedValues::MiscResetValues>().will_change_value(); }
     CSS::LengthBox scroll_margin() const { return length_box(style_group<CSS::ComputedValues::MiscResetValues>().scroll_margin); }
-    CSS::LengthBox scroll_padding() const { return length_box(style_group<CSS::ComputedValues::MiscResetValues>().scroll_padding); }
-    CSS::ScrollSnapAlignData scroll_snap_align() const { return style_group<CSS::ComputedValues::MiscResetValues>().scroll_snap_align_value(); }
     CSS::ScrollSnapStop scroll_snap_stop() const { return static_cast<CSS::ScrollSnapStop>(style_group<CSS::ComputedValues::MiscResetValues>().scroll_snap_stop); }
     CSS::ScrollSnapType scroll_snap_type() const { return style_group<CSS::ComputedValues::MiscResetValues>().scroll_snap_type_value(); }
     CSS::ScrollbarWidth scrollbar_width() const { return static_cast<CSS::ScrollbarWidth>(style_group<CSS::ComputedValues::MiscResetValues>().scrollbar_width); }
@@ -525,7 +506,6 @@ public:
     Optional<Utf16FlyString> view_transition_name() const { return style_group<CSS::ComputedValues::MiscResetValues>().view_transition_name_value(); }
     Color outline_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::MiscResetValues>().outline_color); }
     Color column_rule_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::MiscResetValues>().column_rule_color); }
-    CSSPixels outline_offset() const { return style_group<CSS::ComputedValues::MiscResetValues>().outline_offset; }
     CSS::OutlineStyle outline_style() const { return static_cast<CSS::OutlineStyle>(style_group<CSS::ComputedValues::MiscResetValues>().outline_style); }
     CSSPixels outline_width() const { return style_group<CSS::ComputedValues::MiscResetValues>().outline_width; }
     Color background_color() const { return style_group<CSS::ComputedValues::BackgroundValues>().background_color_value(); }
@@ -641,10 +621,6 @@ public:
     bool is_fixed_position() const;
     bool is_sticky_position() const;
 
-    // An element is called out of flow if it is floated, absolutely positioned, or is the root element.
-    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
-    bool is_out_of_flow() const { return is_floating() || is_absolutely_positioned(); }
-
     bool establishes_an_absolute_positioning_containing_block() const;
     bool establishes_a_fixed_positioning_containing_block() const;
 
@@ -653,6 +629,8 @@ public:
     void clear_image_observers();
     void apply_style(CSS::StyleRecordID);
     void attach_style_resources();
+    // Like attach_style_resources(), where the style engine answered whether `style_record` holds image values.
+    void attach_style_resources(CSS::StyleRecordID style_record, Painting::StyleHoldsImageValues);
     // Gives the row the spans its element published again; where they moved, the row lays out again.
     void synchronize_table_span_data();
 
@@ -662,9 +640,11 @@ public:
     bool is_body() const { return has_identity_flag<RustFFI::NodeFlag::IsBody>(); }
     bool is_scroll_container() const;
 
-    void set_computed_values(NonnullRefPtr<CSS::ComputedValues const>);
-    void set_style_record_identity(CSS::StyleRecordID);
-    void refresh_style_from_arena(CSS::StyleRecordID, void const* payloads, bool should_attach_resources);
+    void set_computed_values(Layout::BegunRead const& read, NonnullRefPtr<CSS::ComputedValues const>);
+    // Takes the record its DOM target installed, `installed`, where it followed the target's record. `held_before` is
+    // the record the target held before and still holds, or none.
+    void set_style_record_identity(CSS::InstalledStyle const& installed, CSS::InstalledStyle const& held_before);
+    void refresh_style_from_arena(CSS::StyleRecordID, void const* payloads, bool derived, bool should_attach_resources);
     // The pin lives on the node's arena row and is released with it, so
     // Document::tear_down_layout_tree() must free the layout root before the document's style
     // engine goes away. Every document destruction path goes through that teardown.
@@ -684,7 +664,11 @@ private:
     void rebuild_image_observers(Vector<RefPtr<CSS::CursorStyleValue const>>);
     ImageObserverSlots const* image_observers() const;
     void const* m_style_payloads { nullptr };
-    bool has_layout_derived_style() const;
+    // Whether the row holds a pin of its style record for C++'s readers, which only this layout node takes and drops.
+    bool m_style_record_pinned_for_cxx_consumers { false };
+    // Whether the arena derived the row's style record. Only this layout node publishes a record of its node to the row
+    // or has the arena adopt one it derived, and a job that derives one tells the layout node.
+    bool m_has_layout_derived_style { false };
     CSS::StyleRecordID m_style_record_identity;
     mutable Optional<Vector<CSS::BackgroundLayerData>> m_background_layers;
     mutable Optional<Vector<CSS::BackgroundLayerData>> m_mask_layers;

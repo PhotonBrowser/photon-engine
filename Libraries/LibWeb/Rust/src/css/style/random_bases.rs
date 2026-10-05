@@ -11,8 +11,8 @@ use super::RetainedState;
 use super::fast_hash::FastMap as HashMap;
 use super::tree::StyleNodeID;
 use std::hash::BuildHasher;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The random base values a document's random functions have drawn, by random caching key. The
 /// key's document is the engine's own; its element is the node, or none for an `element-shared`
@@ -31,7 +31,12 @@ pub(crate) struct RandomBaseValues {
 }
 
 /// A name's base value in an element's row.
-type NamedBaseValue = (Box<[u16]>, f64);
+pub(crate) type NamedBaseValue = (Box<[u16]>, f64);
+
+/// The row of an element that has no style node, which the element holds: the engine moves the row in as the element
+/// loses its node, and out to the node it gets next. Whichever of the element and the engine lets go of it last frees
+/// it, so an element that never gets a node again takes its keys with it.
+pub(crate) type ParkedBaseValues = Arc<Mutex<Vec<NamedBaseValue>>>;
 
 /// A uniform pseudo-random source: a randomly keyed hash of a draw counter.
 #[derive(Default)]
@@ -84,32 +89,15 @@ impl RandomBaseValues {
             .map(|(_, value)| *value)
     }
 
-    /// Take a key's value as given, for a replay that reproduces what a recorded draw gave.
-    #[cfg(feature = "style-recording")]
-    pub(crate) fn set(&mut self, node: Option<StyleNodeID>, name: &[u16], element_shared: bool, value: f64) {
-        if element_shared {
-            self.document.insert(name.into(), value);
-            return;
-        }
-        let Some(node) = node else {
-            return;
-        };
-        let row = self.row_mut(node);
-        match row.iter_mut().find(|(row_name, _)| **row_name == *name) {
-            Some((_, row_value)) => *row_value = value,
-            None => row.push((name.into(), value)),
-        }
-    }
-
     /// An element's row, which may be new.
     fn row_mut(&mut self, node: StyleNodeID) -> &mut Vec<NamedBaseValue> {
         self.element_rows_exist.store(true, Ordering::Relaxed);
         self.elements.entry(node).or_default()
     }
 
-    /// The keys that name an element, with their values.
-    pub(crate) fn element_values(&self, node: StyleNodeID) -> &[(Box<[u16]>, f64)] {
-        self.elements.get(&node).map_or(&[], Vec::as_slice)
+    /// Takes the keys that name an element, with their values, as the element loses its identity.
+    pub(crate) fn take_element_values(&mut self, node: StyleNodeID) -> Vec<NamedBaseValue> {
+        self.elements.remove(&node).unwrap_or_default()
     }
 
     /// Give up the keys of an identity that retires. An identity can be minted again for another
@@ -121,40 +109,18 @@ impl RandomBaseValues {
 }
 
 impl RetainedState {
-    /// Give an element's new style node the keys the element kept while it had none, as one buffer
-    /// of name code units with a length and a value per name.
-    pub fn set_element_random_base_values(
-        &mut self,
-        node: StyleNodeID,
-        name_lengths: &[u32],
-        name_units: &[u16],
-        value_bits: &[u64],
-    ) {
-        assert_eq!(
-            name_lengths.len(),
-            value_bits.len(),
-            "every random base value has one name"
-        );
-        let mut rest = name_units;
-        let row = name_lengths
-            .iter()
-            .zip(value_bits)
-            .map(|(&length, &bits)| {
-                let (name, after) = rest
-                    .split_at_checked(length as usize)
-                    .expect("random base value names overrun their code units");
-                rest = after;
-                (Box::from(name), f64::from_bits(bits))
-            })
-            .collect::<Vec<_>>();
+    /// Give an element's new style node the keys the element kept while it had none.
+    pub(crate) fn set_element_random_base_values(&mut self, node: StyleNodeID, row: Vec<NamedBaseValue>) {
         if !row.is_empty() {
             *self.random_base_values.row_mut(node) = row;
         }
     }
 
-    /// Whether any element has had random base values, as a flag that stays raised once it is.
-    pub(crate) fn element_random_base_values_exist(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.random_base_values.element_rows_exist)
+    /// Raises `flag`, which the document's host reads, once any element has random base values, rather than a flag
+    /// of the engine's own. The engine has none yet.
+    pub(crate) fn share_element_random_base_values_exist(&mut self, flag: Arc<AtomicBool>) {
+        debug_assert!(!self.random_base_values.element_rows_exist.load(Ordering::Relaxed));
+        self.random_base_values.element_rows_exist = flag;
     }
 
     /// The random base value of the random caching key for a node's style and a sharing name.

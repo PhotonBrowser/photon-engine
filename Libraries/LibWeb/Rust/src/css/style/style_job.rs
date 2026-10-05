@@ -13,7 +13,7 @@ use super::bridge::{
     FfiCustomFunctionEntry, FfiDocumentStyleComputationInputs, FfiHostHandle, FfiStyleSheetResourceContextEntry,
     FfiStyleTransactionOutput, FfiStyleTransactionView, take_style_transaction,
 };
-use super::engine_calls::{StyleAnswer, StyleQuery, ask_engine};
+use super::engine_calls::with_engine;
 use super::identities::StyleNodeIdAllocator;
 use super::tree::StyleNodeID;
 use crate::css::custom_properties::{CustomPropertyRegistry, retain_custom_property_registry};
@@ -22,11 +22,7 @@ use crate::css::rule::CompiledFunction;
 use crate::css::style_compute::FfiLengthResolutionContext;
 use crate::painting::ffi::FfiFlightBlocker;
 use crate::painting::recording_slot::FlightLicense;
-use crate::render_state::{
-    DocumentHost, DocumentId, RenderJob, RenderMessage, ReplyTo, SpentWait, StyleJobPermit, TaskBoundary, fly,
-    force_read, force_read_flown_style, run_job,
-};
-use std::ffi::c_void;
+use crate::render_state::{BegunRead, DocumentHost, TaskBoundary, fly};
 use std::sync::Arc;
 
 /// Takes the pending style transaction under `root`, with the document computation inputs the host sealed for it.
@@ -197,20 +193,62 @@ unsafe fn lent_bytes<'a>(bytes: FfiHostHandle, length: usize) -> &'a [u8] {
 
 /// What a style job answers: the reactions of the transaction, owned, which the host keeps until it ends the
 /// transaction.
-pub(crate) struct StyleJobAnswer(FfiStyleTransactionOutput);
+pub(crate) struct StyleJobAnswer {
+    output: FfiStyleTransactionOutput,
+    records: NamedRecords,
+    /// The synthetic pseudo-elements each element whose row the host composes has rules for, as a C++ record's
+    /// pseudo-style mask, and those among them that no settle generates or changes, by element, which the host reads as
+    /// it settles the element's pseudo-elements over the composition.
+    composed_pseudo_styles: Box<[(u32, ComposedPseudoStyles)]>,
+    /// The transition steps the transaction decided beside the rows that owe them, by element, which the host's steps
+    /// read rather than ask.
+    decided_transition_steps: Box<[crate::css::transition::DecidedTransitionStep]>,
+}
 
-impl RenderJob for StyleJob {
-    type Answer = StyleJobAnswer;
-    type Permit = StyleJobPermit;
-    const IS_STYLE: bool = true;
+/// What a style transaction answers of the pseudo-elements of an element whose row the host composes.
+#[derive(Clone, Copy)]
+pub(crate) struct ComposedPseudoStyles {
+    /// The synthetic pseudo-elements with rules, as a C++ record's pseudo-style mask.
+    pub(crate) mask: u64,
+    /// The pseudo-elements in `mask` that a settle over any composition of the element leaves alone.
+    pub(crate) inert: u64,
+}
 
-    fn message(self, document: DocumentId, reply: ReplyTo<'_, StyleJobAnswer>, spent: SpentWait) -> RenderMessage<'_> {
-        RenderMessage::Style {
-            document,
-            job: self,
-            reply,
-            _spent: spent,
-        }
+/// The view of each record a transaction's rows name and the custom-property environment it was computed in, by record,
+/// which the host's drain reads without asking.
+struct NamedRecords(Box<[(u64, super::bridge::FfiStyleRecordView, Option<u64>)]>);
+
+// SAFETY: A view points into a published record, which never changes while it is live, and the host reads one only for
+// a record it installs from the transaction, which keeps it live, or one a row replaces, which the engine reclaims no
+// sooner than its next transaction.
+unsafe impl Send for NamedRecords {}
+
+impl StyleJobAnswer {
+    /// The rows the transaction answered.
+    pub(crate) fn rows(&self) -> &[super::bridge::FfiStyleDelta] {
+        self.output.answers()
+    }
+
+    /// The view of `record`, one the rows name, and the custom-property environment it was computed in.
+    pub(crate) fn record(&self, record: u64) -> Option<(super::bridge::FfiStyleRecordView, Option<u64>)> {
+        let records = &self.records.0;
+        let index = records.binary_search_by_key(&record, |&(record, ..)| record).ok()?;
+        let (_, view, environment) = records[index];
+        Some((view, environment))
+    }
+
+    /// What the transaction answered of the pseudo-elements of `node`, where the host composes its row.
+    pub(crate) fn composed_pseudo_styles(&self, node: u32) -> Option<ComposedPseudoStyles> {
+        let styles = &self.composed_pseudo_styles;
+        let index = styles.binary_search_by_key(&node, |&(node, _)| node).ok()?;
+        Some(styles[index].1)
+    }
+
+    /// The transition step the transaction decided beside the row of `node`, if it decided one.
+    pub(crate) fn decided_transition_step(&self, node: u32) -> Option<&crate::css::transition::DecidedTransitionStep> {
+        let steps = &self.decided_transition_steps;
+        let index = steps.binary_search_by_key(&node, |step| step.node()).ok()?;
+        Some(&steps[index])
     }
 }
 
@@ -221,7 +259,65 @@ impl StyleJob {
         // SAFETY: The sealed inputs name only what they own, and live until the transaction has taken them in.
         let output = unsafe { take_style_transaction(engine, self.root, self.computation_inputs.inputs) };
         engine.defer_atom_sweep(false);
-        StyleJobAnswer(output)
+        // The host reads the record each row replaces as well, as it compares a box's old style with its new one. Only a
+        // live base record comes along: the host asks about a replaced overlay record itself.
+        let mut records: Vec<u64> = output
+            .answers()
+            .iter()
+            .flat_map(|row| {
+                let old = Some(row.old_style_record)
+                    .filter(|&old| engine.computed_group_sets.final_style_record_is_live(old));
+                [old, Some(row.new_style_record)]
+            })
+            .flatten()
+            .filter(|&record| record != 0)
+            .collect();
+        records.sort_unstable();
+        records.dedup();
+        let records = records
+            .into_iter()
+            .filter_map(|record| {
+                // SAFETY: The view points into the record, which stays live while the rows name it.
+                let view = unsafe { super::bridge::style_record_view(engine, record) };
+                view.present.then(|| {
+                    let environment = engine
+                        .computed_group_sets
+                        .style_record_custom_property_environment(record);
+                    (record, view, environment)
+                })
+            })
+            .collect();
+        // The host settles the pseudo-elements of a row it composes only once it has composed the row, which asks
+        // which of them have rules, and which of those the settle leaves alone: the transaction that matched the
+        // element answers it beside the row.
+        let mut composed_pseudo_styles: Vec<_> = output
+            .answers()
+            .iter()
+            .filter(|row| row.composed_by_the_host)
+            .filter_map(|row| {
+                let node = StyleNodeID::from_raw(row.style_node)?;
+                let styles = ComposedPseudoStyles {
+                    mask: engine.published_pseudo_style_mask(node),
+                    inert: engine.inert_pseudo_kinds(node),
+                };
+                Some((row.style_node, styles))
+            })
+            .collect();
+        composed_pseudo_styles.sort_unstable_by_key(|&(node, _)| node);
+        // The host's transition step for a row that owes one asks how the row's move starts the element's transitions,
+        // which the transaction answers beside the row where nothing but the engine's records decides it.
+        let mut decided_transition_steps: Vec<_> = output
+            .answers()
+            .iter()
+            .filter_map(|row| crate::css::transition::DecidedTransitionStep::of_row(&mut *engine, row))
+            .collect();
+        decided_transition_steps.sort_unstable_by_key(crate::css::transition::DecidedTransitionStep::node);
+        StyleJobAnswer {
+            output,
+            records: NamedRecords(records),
+            composed_pseudo_styles: composed_pseudo_styles.into_boxed_slice(),
+            decided_transition_steps: decided_transition_steps.into_boxed_slice(),
+        }
     }
 }
 
@@ -234,63 +330,44 @@ impl StyleJob {
 /// live for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_take_style_transaction(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
+    read: &BegunRead,
     root: u32,
     computation_inputs: FfiDocumentStyleComputationInputs,
 ) -> FfiStyleTransactionView {
     let Some(root) = StyleNodeID::from_raw(root) else {
         return FfiStyleTransactionView::default();
     };
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
     let job = StyleJob {
         root,
         // SAFETY: Guaranteed by the caller.
         computation_inputs: unsafe { SealedStyleInputs::seal(computation_inputs) },
         flies: false,
     };
-    // The first style transaction of a read the host waits for is the read's first job; any other, a rendering
-    // update's or a later wave's, is a style update's.
-    let answer = match host.take_unstyled_read() {
-        Some(read) => force_read(read, host, job),
-        None => run_job(StyleJobPermit::of_style_update(), host, job),
-    };
-    host.keep_style_transaction(answer).0.view()
-}
-
-/// How a document drains the reactions of its style transaction that flew: `drain` called with `document`, which does
-/// nothing where the drain has begun. The host calls it where it writes the document's style sheets in place.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct FfiFlownStyleDrain {
-    pub drain: unsafe extern "C" fn(document: *mut c_void),
-    pub document: *mut c_void,
+    let answer = host.run(read, true, move |state| job.run(state.engine_mut()));
+    host.keep_style_transaction(answer).output.view()
 }
 
 /// Lets the pending style transaction under `root` fly beside the host, with the document computation inputs the host
 /// gathered, where `blocker` is none and no transaction the host let fly before waits to be drained. The host's next
-/// style update drains its reactions first, as does `drain` where the host writes the document's style sheets in place
-/// before it. Answers whether the transaction flies.
+/// style update drains its reactions first. Answers whether the transaction flies.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread, and the buffers `computation_inputs` names must be
-/// live for this call. `drain` must stay callable on the document's thread for as long as the host lives.
+/// live for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_let_style_transaction_fly(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
     root: u32,
     computation_inputs: FfiDocumentStyleComputationInputs,
     blocker: FfiFlightBlocker,
-    drain: FfiFlownStyleDrain,
 ) -> bool {
+    // The round the host sealed for the frame flies with it, or not at all.
+    let round = host.take_sealed_round();
     let (Some(root), Some(license)) = (StyleNodeID::from_raw(root), FlightLicense::for_blocker(blocker)) else {
         return false;
     };
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
     if host.has_flown_style() {
         return false;
     }
@@ -300,7 +377,7 @@ pub unsafe extern "C" fn style_engine_let_style_transaction_fly(
         computation_inputs: unsafe { SealedStyleInputs::seal(computation_inputs) },
         flies: true,
     };
-    fly(host, job, drain, &license);
+    fly(host, job, round, &license);
     true
 }
 
@@ -313,17 +390,12 @@ pub unsafe extern "C" fn style_engine_let_style_transaction_fly(
 /// `host` must be a live document host, on its document's thread, that let a style transaction fly.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_take_flown_style_transaction(
-    host: *const DocumentHost,
+    host: &DocumentHost,
+    read: &BegunRead,
 ) -> FfiStyleTransactionView {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
-    let answer = host.begin_style_drain();
-    // A read that joins the transaction spends itself on it, as on the first job it would have sent.
-    if let Some(read) = host.take_unstyled_read() {
-        force_read_flown_style(read, host);
-    }
-    host.keep_style_transaction(answer).0.view()
+    // The read takes the frame in where it still flies.
+    let answer = host.begin_style_drain(read);
+    host.keep_style_transaction(answer).output.view()
 }
 
 /// Ends the drain of the style transaction of `host`'s document that flew, behind which the writes the host made beside
@@ -333,10 +405,24 @@ pub unsafe extern "C" fn style_engine_take_flown_style_transaction(
 ///
 /// `host` must be a live document host, on its document's thread, that drains a style transaction that flew.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_end_flown_style_drain(host: *const DocumentHost) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.end_style_drain();
+pub unsafe extern "C" fn style_engine_end_flown_style_drain(host: &DocumentHost) {
+    host.end_style_drain();
+}
+
+/// Whether the frame whose style transaction `host`'s document drains applied the element `style_node` names its record
+/// `style_record` ahead of the host, and marked the relayout the move asks for: the host's install of the row marks none
+/// then.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_frame_marked_relayout(
+    host: &DocumentHost,
+    style_node: u32,
+    style_record: u64,
+) -> bool {
+    StyleNodeID::from_raw(style_node).is_some_and(|style_node| host.frame_marked_relayout(style_node, style_record))
 }
 
 /// Whether the style transaction of `host`'s document the host let fly still flies; one that has landed is taken in.
@@ -346,11 +432,9 @@ pub unsafe extern "C" fn style_engine_end_flown_style_drain(host: *const Documen
 ///
 /// `host` must be a live document host, on its document's thread, and the event loop must call this between two tasks.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_style_transaction_flies(host: *const DocumentHost) -> bool {
-    assert!(!host.is_null(), "document host is null");
+pub unsafe extern "C" fn style_engine_style_transaction_flies(host: &DocumentHost) -> bool {
     let boundary = TaskBoundary::at_event_loop_entry(&TAKES_FINISHED_STYLE_IN);
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.style_flies(&boundary)
+    host.frame_still_flies(&boundary)
 }
 
 /// The entry the event loop calls between two tasks to take a document's style transaction in where it has landed.
@@ -367,16 +451,17 @@ const TAKES_FINISHED_STYLE_IN: TakesFinishedStyleIn = TakesFinishedStyleIn { _pr
 /// `host` must be a live document host, on its document's thread, and `allocator` its document's allocator.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_end_style_transaction(
-    host: *mut DocumentHost,
+    host: &DocumentHost,
+    read: &crate::render_state::BegunRead,
     allocator: *mut StyleNodeIdAllocator,
 ) {
-    assert!(!host.is_null() && !allocator.is_null());
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.end_style_transaction();
-    // SAFETY: As above.
-    let StyleAnswer::Nodes(released) = (unsafe { ask_engine(host, StyleQuery::EndTransaction) }) else {
-        unreachable!("the end of a transaction is answered with the identities it released");
-    };
+    assert!(!allocator.is_null());
+    host.end_style_transaction();
+    let released = with_engine(read, host, |engine| engine.discard_style_transaction_outputs());
+    let memo = host.engine_memo();
+    memo.held.borrow_mut().forget(&released);
+    memo.described.borrow_mut().forget(&released);
+    memo.baselines.borrow_mut().forget(&released);
     // SAFETY: As above.
     unsafe { &mut *allocator }.release(&released);
 }

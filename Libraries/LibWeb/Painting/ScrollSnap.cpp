@@ -86,12 +86,15 @@ bool is_scroll_snap_container(Layout::Node const& node)
     auto const* node_with_style = as_if<Layout::NodeWithStyle>(node);
     if (!node_with_style || !node_with_style->is_scroll_container())
         return false;
+    // Only the viewport takes its snap type from another box's style, so any other box without one snaps nothing.
+    if (!node.is_viewport() && node_with_style->scroll_snap_type().strictness == CSS::ScrollSnapStrictness::None)
+        return false;
     return !snap_axes_of_scroll_container(node).is_empty();
 }
 
-void take_built_scroll_container(DOM::Document& document, Compositing::RustFFI::NodeSlotId slot, bool is_scroll_snap_container)
+void take_built_scroll_container(Layout::BegunRead const& read, DOM::Document& document, Compositing::RustFFI::NodeSlotId slot, bool is_scroll_snap_container)
 {
-    auto const* scroll_container = document.layout_node_arena().node_if_live(slot);
+    auto const* scroll_container = document.layout_node_arena().node_if_live(read, slot);
     if (!scroll_container)
         return;
     if (is_scroll_snap_container) {

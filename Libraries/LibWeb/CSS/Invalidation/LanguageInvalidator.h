@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <LibWeb/Forward.h>
+
 namespace Web::DOM {
 
 class CharacterData;

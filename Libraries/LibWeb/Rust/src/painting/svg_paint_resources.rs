@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::css::computed_value_types::ComputedResolvedTransform;
 use crate::layout::node_data::NodeSlotId;
@@ -125,6 +126,9 @@ pub(crate) type SvgPaintResourceRows = HashMap<NodeSlotId, SvgPaintResourceRow>;
 pub(crate) struct SvgPaintResources {
     rows: RefCell<Arc<SvgPaintResourceRows>>,
     needs_sync: Cell<bool>,
+    /// Whether any row enrolled a resource, which the document's host reads beside a frame in flight. A row the frame
+    /// enrolls asks for its resources to be resolved again itself.
+    enrolled: Arc<AtomicBool>,
 }
 
 /// The published filter of a kind in a slot's row of `rows`.
@@ -200,6 +204,7 @@ impl SvgPaintResources {
         let row = rows.entry(slot).or_default();
         let previous_kinds = std::mem::replace(&mut row.enrolled_kinds, kinds);
         row.forget_published(previous_kinds & !kinds);
+        self.enrolled.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn withdraw(&self, slot: NodeSlotId, kind: SvgPaintResourceKind) {
@@ -214,13 +219,23 @@ impl SvgPaintResources {
         row.forget_published(kind.bit());
         if row.enrolled_kinds == 0 {
             rows.remove(&slot);
+            self.enrolled.store(!rows.is_empty(), Ordering::Relaxed);
         }
     }
 
     pub(crate) fn forget_slot(&self, slot: NodeSlotId) {
         if self.rows.borrow().contains_key(&slot) {
-            self.rows_mut().remove(&slot);
+            let mut rows = self.rows_mut();
+            rows.remove(&slot);
+            self.enrolled.store(!rows.is_empty(), Ordering::Relaxed);
         }
+    }
+
+    /// Raises `flag`, which the document's host reads, while any row enrolled a resource, rather than a flag of its
+    /// own. No row has enrolled one yet.
+    pub(crate) fn share_enrolled_flag(&mut self, flag: Arc<AtomicBool>) {
+        debug_assert!(!self.enrolled.load(Ordering::Relaxed));
+        self.enrolled = flag;
     }
 
     pub(crate) fn has_enrolled_entries(&self) -> bool {
@@ -233,6 +248,11 @@ impl SvgPaintResources {
         }
         self.needs_sync.set(true);
         true
+    }
+
+    /// Whether the host is to resolve the enrolled resources again.
+    pub(crate) fn needs_sync(&self) -> bool {
+        self.needs_sync.get()
     }
 
     pub(crate) fn take_needs_sync(&self) -> bool {

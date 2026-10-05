@@ -8,8 +8,6 @@ use super::bridge::{
     FfiElementArrival, FfiElementDeclarationDelta, FfiElementStyleInput, FfiLocalFeatureDelta, FfiStateDelta,
     FfiTreeDelta,
 };
-#[cfg(feature = "style-recording")]
-use super::publication::ExactCascadeDonor;
 use super::*;
 use crate::css::declaration_block;
 
@@ -43,17 +41,10 @@ impl std::ops::DerefMut for StyleEngine {
 
 impl StyleEngine {
     #[must_use]
-    pub fn new(device_class: DeviceClass) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             counters: Counters::new(),
-            state: StyleEngineState::new(device_class),
-        }
-    }
-
-    pub(crate) fn new_for_replay(device_class: DeviceClass) -> Self {
-        Self {
-            counters: Counters::new(),
-            state: StyleEngineState::new_for_replay(device_class),
+            state: StyleEngineState::new(),
         }
     }
 
@@ -133,29 +124,10 @@ impl StyleEngine {
         before: Option<RuleID>,
         rule_identity: u64,
         selectors: &[&CompiledSelector],
-        rules: &crate::css::rule::NativeRuleList,
+        namespaces: Option<&super::rule_writes::NamespaceTexts>,
     ) -> RuleID {
         self.state
-            .add_user_agent_style_rule(sheet, before, rule_identity, selectors, rules, &mut self.counters)
-    }
-
-    #[cfg(feature = "style-recording")]
-    #[inline]
-    pub(crate) fn add_replayed_style_rule(
-        &mut self,
-        sheet: SheetID,
-        before: Option<RuleID>,
-        selector_program: SelectorProgram,
-    ) -> RuleID {
-        self.state
-            .add_replayed_style_rule(sheet, before, selector_program, &mut self.counters)
-    }
-
-    #[cfg(feature = "style-recording")]
-    #[inline]
-    pub(crate) fn replace_replayed_style_rule_selectors(&mut self, rule: RuleID, selector_program: SelectorProgram) {
-        self.state
-            .replace_replayed_style_rule_selectors(rule, selector_program, &mut self.counters);
+            .add_user_agent_style_rule(sheet, before, rule_identity, selectors, namespaces, &mut self.counters)
     }
 
     /// Record that a sheet declared or gave up a cascade layer.
@@ -919,24 +891,6 @@ impl StyleEngine {
             .complete_published_match_answers_for_closure(nodes, &mut self.counters)
     }
 
-    /// Consume the complete current answer which the immediately preceding style plan retained.
-    ///
-    /// A miss is not an incomplete selector answer. It means this transaction did not publish an
-    /// answer for the node, so the caller may ask the ordinary exact matcher instead.
-    #[inline]
-    pub fn consume_published_match_answer(&mut self, node: StyleNodeID) -> Option<Vec<RuleMatch>> {
-        self.state.consume_published_match_answer(node, &mut self.counters)
-    }
-
-    /// Read the shareable identity of one answer from the immediately preceding style transaction.
-    ///
-    /// A contextual answer has no identity and must still consume its complete payload. A shared
-    /// identity lets a downstream cache answer before copying that payload across the bridge.
-    #[inline]
-    pub fn published_match_answer_signature(&mut self, node: StyleNodeID) -> Option<u32> {
-        self.state.published_match_answer_signature(node, &mut self.counters)
-    }
-
     /// Match one element from committed facts without consulting derived matching state.
     #[cfg(test)]
     #[inline]
@@ -1098,24 +1052,6 @@ impl StyleEngine {
             source_identity,
             animated_overlay,
             payloads,
-            &mut self.counters,
-        )
-    }
-
-    #[cfg(feature = "style-recording")]
-    #[inline]
-    pub(crate) fn publish_exact_cascade_winners(
-        &mut self,
-        target: computed::ComputedStyleTarget,
-        exact_winners: &[(u16, SpecifiedWinnerKey)],
-        inherited_style_groups: u8,
-        donor: Option<ExactCascadeDonor>,
-    ) -> (bridge::FfiExactCascadePublication, bool) {
-        self.state.publish_exact_cascade_winners(
-            target,
-            exact_winners,
-            inherited_style_groups,
-            donor,
             &mut self.counters,
         )
     }

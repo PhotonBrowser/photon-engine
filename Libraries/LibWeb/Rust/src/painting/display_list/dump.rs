@@ -14,6 +14,7 @@ use crate::painting::dump::{
     format_float_like_ak, push_affine_transform, push_float_like_ak, push_float_point, push_float_rect,
     push_float_size, push_int_point, push_int_rect, push_int_size,
 };
+use crate::painting::paint_read::PaintRead;
 #[cfg(test)]
 use crate::painting::visual_context::VisualContextTree;
 use crate::painting::visual_context::VisualContextTreeDump;
@@ -127,11 +128,7 @@ impl VisualContextNodeOwners {
                     owners.effect.insert(effect.0, slot);
                 }
             });
-            let mut child = arena.node_first_child_if_live(slot);
-            while let Some(current) = child {
-                pending.push(current);
-                child = arena.node_next_sibling_if_live(current);
-            }
+            pending.extend(arena.children(slot));
         }
         owners
     }
@@ -156,6 +153,7 @@ impl VisualContextNodeOwners {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn painting_dump(
     host: *const crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
     visual_context_tree: *const c_void,
     command_runs: *const DisplayListCommandRun,
@@ -171,7 +169,7 @@ pub unsafe extern "C" fn painting_dump(
     let command_runs = unsafe { libcompositing_rust::ffi::ffi_slice(command_runs, command_run_count) };
     // SAFETY: Guaranteed by the caller.
     let owners = unsafe {
-        crate::painting::ffi::read(host, viewport, |arena, viewport| {
+        crate::painting::ffi::read_arena(host, read, viewport, |arena, viewport| {
             let mut owners = VisualContextNodeOwners::collect(arena, viewport);
             for owners in [&mut owners.spatial, &mut owners.clip, &mut owners.effect] {
                 owners.retain(|_, &mut owner| arena.slot_is_live(owner));

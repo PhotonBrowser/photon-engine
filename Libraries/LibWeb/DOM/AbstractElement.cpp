@@ -74,18 +74,18 @@ AbstractElement::TreeCountingFunctionResolutionContext AbstractElement::tree_cou
     };
 }
 
-Layout::NodeWithStyle* AbstractElement::layout_node()
+Layout::NodeWithStyle* AbstractElement::layout_node(Layout::BegunRead const& read)
 {
     if (m_pseudo_element.has_value())
-        return m_element->pseudo_element_layout_node(*m_pseudo_element);
-    return m_element->layout_node();
+        return m_element->pseudo_element_layout_node(read, *m_pseudo_element);
+    return m_element->layout_node(read);
 }
 
-Layout::NodeWithStyle* AbstractElement::unsafe_layout_node()
+Layout::NodeWithStyle* AbstractElement::unsafe_layout_node(Layout::BegunRead const& read)
 {
     if (m_pseudo_element.has_value())
-        return m_element->pseudo_element_unsafe_layout_node(*m_pseudo_element);
-    return m_element->unsafe_layout_node();
+        return m_element->pseudo_element_unsafe_layout_node(read, *m_pseudo_element);
+    return m_element->unsafe_layout_node(read);
 }
 
 GC::Ptr<Element const> AbstractElement::parent_element() const
@@ -150,6 +150,11 @@ CSS::ComputedStyleRecordView AbstractElement::computed_style() const
 CSS::StyleRecordID AbstractElement::style_record_identity() const
 {
     return m_element->style_record_identity(m_pseudo_element);
+}
+
+CSS::InstalledStyle const& AbstractElement::installed_style() const
+{
+    return m_element->installed_style(m_pseudo_element);
 }
 
 void const* AbstractElement::style_record_payloads() const

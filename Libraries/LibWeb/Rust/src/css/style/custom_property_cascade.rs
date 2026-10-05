@@ -375,13 +375,6 @@ fn engine_resolution_context(
     }
 }
 
-#[cfg(feature = "style-recording")]
-/// Whether a token stream is a substitution the engine resolves itself: one that substitutes no
-/// `attr()`.
-pub(super) fn value_is_engine_resolvable_substitution(value: &StyleValueData) -> bool {
-    matches!(value, StyleValueData::Unresolved { .. }) && !value_reads_attributes(value)
-}
-
 /// The token stream a written value substitutes: itself, or the shorthand a longhand pending its
 /// substitution takes its part of.
 fn substituted_tokens(value: &StyleValueData) -> &StyleValueData {
@@ -1133,6 +1126,23 @@ impl RetainedState {
             })
     }
 
+    pub(super) fn declares_custom_property_registered_with_syntax(
+        &self,
+        node: StyleNodeID,
+        inputs: &bridge::FfiDocumentStyleComputationInputs,
+    ) -> bool {
+        let registry = inputs.custom_property_registry();
+        registry.has_registrations()
+            && self
+                .cascaded_custom_declarations_of(node, None)
+                .is_some_and(|cascaded| {
+                    cascaded.iter().any(|(declared, _)| {
+                        self.declared_custom_property_name(declared.name)
+                            .is_some_and(|name| registry.name_has_syntax(&name.text))
+                    })
+                })
+    }
+
     /// What a registered custom property computes against in a record's element: the record's
     /// lengths, and the color scheme its table settled. `None` for a record without a font.
     pub(super) fn record_registered_value_context(
@@ -1281,9 +1291,7 @@ impl RetainedState {
 
     /// The name a cascaded custom declaration names, as its store entry keys it. A block's
     /// publication notes every custom property name it declares before the block is set, so a
-    /// live declaration's name is always known. A replay notes names without their fly strings,
-    /// and a name without one keys no store entry: `None` there, and the declaration declares
-    /// nothing.
+    /// live declaration's name is always known.
     fn declared_custom_property_name(&self, name: StyleAtomID) -> Option<&CustomPropertyName> {
         let noted = self.custom_property_environments.name(name);
         debug_assert!(

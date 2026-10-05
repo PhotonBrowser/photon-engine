@@ -47,7 +47,6 @@ ENVIRONMENT_SWITCH = "read-once environment switch; every thread sees the same a
 IDENTITY = "process-wide atomic counter handing out unique identities"
 BUILT_ONCE = "built once and read-only after; every thread shares the same table"
 LOCKED = "process-wide and behind a mutex or a lock"
-REPLAY = "style replay capture; replay builds only, or off unless an environment variable turns it on"
 TEST_ONLY = "test only"
 
 
@@ -97,9 +96,6 @@ RENDER_STATE_ALLOWED = {
             "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION",
             "css/style/mod.rs:STYLE_ANSWER_PATCH",
             "css/style/mod.rs:STYLE_PLAN_PROVENANCE",
-            "layout/fc_run_cache.rs:MODE",
-            "layout/update_layout.rs:ENABLED",
-            "painting/record/verify.rs:ENABLED",
         ],
     ),
     **render_state_entries(
@@ -112,8 +108,12 @@ RENDER_STATE_ALLOWED = {
             "css/style/prefix.rs:NEXT",
             "css/style_sheet.rs:NEXT_SHEET_IDENTITY",
             "layout/fragment_tree.rs:NEXT_IDENTITY",
-            "render_state.rs:NEXT",
+            "render_state/owner.rs:NEXT",
         ],
+    ),
+    **render_state_entries(
+        "the render owner's own states; only the owner's thread reaches its documents' render states",
+        ["render_state/owner.rs:STATES"],
     ),
     **render_state_entries(
         BUILT_ONCE,
@@ -144,15 +144,6 @@ RENDER_STATE_ALLOWED = {
         ],
     ),
     **render_state_entries(
-        REPLAY,
-        [
-            "css/computed_values.rs:REPLAY_STYLE_GROUPS",
-            "css/computed_values.rs:REPLAY_STYLE_GROUP_SIZES",
-            "css/style/record_replay.rs:CAPTURE",
-            "css/style_value.rs:REPLAY_STYLE_VALUES",
-        ],
-    ),
-    **render_state_entries(
         TEST_ONLY,
         [
             "css/computed_values.rs:GROUPS",
@@ -171,7 +162,6 @@ RENDER_STATE_ALLOWED = {
     f"{RENDER_STATE_CRATE}/src/css/style_value.rs:VALUES": "built-once keyword values, and a replay-only table of the same name",
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD": "a test's hold on the next recording that flies, behind a mutex; only internals arms it",
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD_RELEASED": "wakes the recording a test held once it lets it go",
-    f"{RENDER_STATE_CRATE}/src/render_state.rs:STATES": "the render states of the documents whose messages this thread handles; only it reaches them",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD_SETUP": "set once before the first stage thread starts, which runs it; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:FLIGHT_FINISHED": "set once before the first job is submitted, which a stage thread calls when one finishes; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:STYLE_LAYOUT_THREAD": "the process's one StyleLayout thread, which every thread hands its jobs to",

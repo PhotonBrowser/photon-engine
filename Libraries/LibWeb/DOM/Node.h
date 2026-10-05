@@ -47,6 +47,12 @@ enum class LayoutUpdatePropagation : u8;
 
 }
 
+namespace Web::Layout::RustFFI {
+
+struct FfiBoxMarks;
+
+}
+
 namespace Web::Bindings {
 
 struct GetRootNodeOptions;
@@ -213,8 +219,8 @@ public:
     bool in_editable_subtree() const { return m_in_editable_subtree; }
     bool recompute_editable_subtree_flag();
     void recompute_editable_subtree_flags_and_repaint();
+    // Brings the editing-host and empty-text stamps of the boxes in the subtree to the nodes' editability.
 
-    virtual bool is_dom_node() const final { return true; }
     virtual bool is_html_element() const { return false; }
     virtual bool is_html_html_element() const { return false; }
     virtual bool is_html_anchor_element() const { return false; }
@@ -342,7 +348,6 @@ public:
 
     HTML::HTMLHyperlinkElementUtils const* enclosing_link_element() const;
     HTML::HTMLElement const* enclosing_html_element() const;
-    HTML::HTMLElement const* enclosing_html_element_with_attribute(Utf16FlyString const&) const;
 
     Utf16String child_text_content() const;
 
@@ -424,11 +429,11 @@ public:
     virtual void adopted_from(Document&) { }
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const { return {}; }
 
-    Layout::Node const* layout_node() const;
-    Layout::Node* layout_node();
+    Layout::Node const* layout_node(Layout::BegunRead const& read) const;
+    Layout::Node* layout_node(Layout::BegunRead const& read);
 
-    Layout::Node const* unsafe_layout_node() const;
-    Layout::Node* unsafe_layout_node() { return const_cast<Layout::Node*>(static_cast<Node const*>(this)->unsafe_layout_node()); }
+    Layout::Node const* unsafe_layout_node(Layout::BegunRead const& read) const;
+    Layout::Node* unsafe_layout_node(Layout::BegunRead const& read) { return const_cast<Layout::Node*>(static_cast<Node const*>(this)->unsafe_layout_node(read)); }
     // Whether the last layout tree build gave this node a box, and whether layout committed geometry for it. Code
     // that only needs to know whether there is a box should ask these instead of reaching for the box. The layout
     // node arena writes both as it changes the boxes they describe, so asking reads the node, not the arena.
@@ -439,13 +444,16 @@ public:
         m_has_layout_box = has_layout_box;
         m_has_committed_box = has_committed_box;
     }
-    Element const* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const;
-    Element* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor)
+    Element const* first_letter_owner_for_layout_subtree_from(Layout::BegunRead const& read, Node const& inclusive_ancestor) const;
+    Element* first_letter_owner_for_layout_subtree_from(Layout::BegunRead const& read, Node const& inclusive_ancestor)
     {
-        return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(inclusive_ancestor));
+        return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(read, inclusive_ancestor));
     }
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
+    // Queues `marks` for the node's box, which the render state finds as it applies them: the marks may be made beside a
+    // frame in flight, which holds the boxes.
+    void mark_box(Layout::RustFFI::FfiBoxMarks);
     // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
     void publish_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
@@ -453,7 +461,7 @@ public:
 
     // Whether the node's layout subtree can leave the parent's box without restructuring the
     // anonymous boxes around it, so the parent's subtree keeps its layout tree.
-    static bool can_detach_layout_subtree_in_place(Node const& node, Node const& parent, bool box_is_block_level);
+    static bool can_detach_layout_subtree_in_place(Layout::BegunRead const& read, Element const& element, Element const& parent, bool box_is_block_level);
     // Whether a list item's box appearing or disappearing changes the list-item counter value of
     // some item that stays in the list.
     static bool list_item_box_change_renumbers_list(Element const& list_item);
@@ -468,10 +476,8 @@ public:
     // the style mirror has not named holds none.
     [[nodiscard]] bool needs_layout_tree_update() const;
     void set_needs_layout_tree_update(bool, SetNeedsLayoutTreeUpdateReason);
-    // The half of a layout tree update mark that reads the layout tree: whether the node's box relays out alone, defers
-    // to the insertion, or dirties its ancestors, and whether the rebuild has to climb past anonymous parents. The
-    // invalidation journal holds it back until it drains, and hands in the box it found bound to the node.
-    void apply_layout_tree_update_mark(Layout::Node&, SetNeedsLayoutTreeUpdateReason);
+    // Which narrower rebuild a layout tree update mark made for `reason` permits.
+    static u8 layout_tree_update_reuse_reason(SetNeedsLayoutTreeUpdateReason);
 
     [[nodiscard]] bool needs_pseudo_element_layout_tree_update() const { return layout_tree_update_reuse_reasons() & PseudoElementChange; }
     [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return layout_tree_update_reuse_reasons() & ChildListInsertion; }
@@ -688,7 +694,7 @@ protected:
 
     void build_accessibility_tree(AccessibilityTreeNode& parent);
 
-    ErrorOr<Utf16String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
+    ErrorOr<Utf16String> name_or_description(Layout::BegunRead const& read, NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
 
 private:
     enum class LayoutSubtreeRemoval {
@@ -703,7 +709,7 @@ private:
     void run_node_iterator_pre_removing_steps();
     bool schedule_list_item_renumber_for_removal();
     void report_removal_to_style_engine(Node& parent);
-    void update_layout_tree_for_removal(Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
+    void update_layout_tree_for_removal(Layout::BegunRead const& read, Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
     void assign_slottables_after_removal(Node& parent, Node& parent_root);
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);
     void add_transient_registered_observers_for_removal(Node& parent);

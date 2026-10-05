@@ -222,6 +222,17 @@ pub struct FfiAnimationContext {
     pub transform_reference_box_height: f64,
 }
 
+impl FfiAnimationContext {
+    /// Has transforms interpolate against `reference_box`, where there is one.
+    pub(crate) fn set_transform_reference_box(&mut self, reference_box: Option<crate::css::css_pixels::CssPixelRect>) {
+        if let Some(reference_box) = reference_box {
+            self.has_transform_reference_box = true;
+            self.transform_reference_box_width = reference_box.width.to_double();
+            self.transform_reference_box_height = reference_box.height.to_double();
+        }
+    }
+}
+
 #[repr(C)]
 pub struct FfiAnimationKeyframeValue {
     pub key: i64,
@@ -7067,6 +7078,7 @@ pub(crate) struct PublishedAnimationDeclarations {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_substitute_compositor_keyframe_value(
     host: *const crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     style_node: u32,
     pseudo_kind: u8,
     custom_property_store: *const std::ffi::c_void,
@@ -7076,7 +7088,7 @@ pub unsafe extern "C" fn rust_substitute_compositor_keyframe_value(
 ) -> *const StyleValueData {
     // SAFETY: Guaranteed by the caller.
     let host = unsafe { crate::css::style::engine_calls::document_host(host) };
-    crate::css::style::engine_calls::with_engine(host, |engine| {
+    crate::css::style::engine_calls::with_engine(read, host, |engine| {
         let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(style_node) else {
             return std::ptr::null();
         };

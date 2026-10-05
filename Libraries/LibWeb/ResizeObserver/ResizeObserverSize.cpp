@@ -18,6 +18,7 @@ GC_DEFINE_ALLOCATOR(ResizeObserverSize);
 // https://drafts.csswg.org/resize-observer-1/#calculate-box-size
 ResizeObserverSize::RawSize ResizeObserverSize::compute_box_size(DOM::Element& target, ObservedBox observed_box)
 {
+    Layout::ForcedReadScope read { target.document() };
     RawSize size;
 
     // FIXME: If target is an SVGGraphicsElement that does not have an associated CSS layout box:
@@ -25,7 +26,7 @@ ResizeObserverSize::RawSize ResizeObserverSize::compute_box_size(DOM::Element& t
     // NB: Layout was up to date when observations were gathered, but a previous
     //     observer's callback may have invalidated it before we get here.
     //     This matches the behavior of all major browsers.
-    auto const* layout_node = target.unsafe_layout_node();
+    auto const* layout_node = target.unsafe_layout_node(read);
     if (layout_node && Painting::has_committed_box(*layout_node)) {
         switch (observed_box) {
         case ObservedBox::BorderBox:
