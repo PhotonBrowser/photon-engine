@@ -264,8 +264,12 @@ impl RetainedState {
         let element_environment = self
             .computed_group_sets
             .style_record_custom_property_environment(new_element_record.raw());
-        debug_assert!(element_environment.is_some(), "an element record holds an environment");
-        let element_environment = element_environment.unwrap_or(0);
+        // The host record can become stale before generated pseudos settle. Refuse this
+        // settlement so the caller can retry with the current record; environment zero is
+        // not a valid substitute for a missing record.
+        let Some(element_environment) = element_environment else {
+            return Err(Unanswered::Refused);
+        };
         // The kinds the node's match answer has rules for: a winner row is published for each
         // the engine cascaded itself, and a kind with rules but no row is not decided.
         let kinds_with_rules = self.pseudo_kinds_with_rules(node, settlement, counters)?;
