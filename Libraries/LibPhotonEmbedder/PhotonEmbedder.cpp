@@ -60,9 +60,8 @@ public:
 private:
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions& content) override
     {
-        // GPUI presents pages as GPU surfaces, so don't burn the engine's
-        // persistent viewport scrollbar into the page on macOS.
-        content.paint_viewport_scrollbars = PaintViewportScrollbars::No;
+        // Viewport scrollbars are painted into the page's shared GPU surface.
+        content.paint_viewport_scrollbars = PaintViewportScrollbars::Yes;
 
         // Deprecated diagnostic fallback. Normal Photon painting uses Vulkan;
         // remove this option once the GPU path is reliable on supported devices.

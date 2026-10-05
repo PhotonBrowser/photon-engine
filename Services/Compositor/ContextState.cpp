@@ -2036,6 +2036,9 @@ void ContextState::paint_current_display_list(Compositing::DisplayListPlayerSkia
     // CPU-readback backing stores should be painted directly. Routing them
     // through an intermediate GPU snapshot can leave an uninstantiated Skia
     // image proxy on the readback path and also adds a full-size GPU copy.
+    // macOS renders directly into the shared IOSurface. Apply the damage clip
+    // there instead of snapshotting an intermediate texture back into it.
+#ifndef AK_OS_MACOS
     if (damage_rect.has_value() && !damage_rect->is_empty() && presents_to_client() && damage_rect->size() != surface.size() && surface.skia_backend_context() && !surface.on_flush) {
         if (!m_damage_surface || m_damage_surface->size() != damage_rect->size()) {
             m_damage_surface = Gfx::PaintingSurface::create_with_size(
@@ -2066,6 +2069,7 @@ void ContextState::paint_current_display_list(Compositing::DisplayListPlayerSkia
             SkCanvas::kStrict_SrcRectConstraint);
         return;
     }
+#endif
 
     auto& canvas = surface.canvas();
     auto save_count = canvas.save();
