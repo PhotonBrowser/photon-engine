@@ -75,7 +75,9 @@ struct CompositorFrameProfile {
 
     void record_frame(Clock::time_point frame_started_at, u64 paint_microseconds, u64 submit_microseconds, u64 gpu_completion_microseconds, u64 readback_microseconds)
     {
-        if (!std::getenv("PHOTON_VERBOSE"))
+        // Keep low-volume frame timing available without enabling the much
+        // noisier per-operation diagnostics used by PHOTON_VERBOSE.
+        if (!std::getenv("PHOTON_VERBOSE") && !std::getenv("PHOTON_FRAME_PROFILE"))
             return;
         auto now = Clock::now();
         ++frames;
