@@ -345,6 +345,7 @@ public:
     FileDownloader& file_downloader() { return m_file_downloader; }
 
     void apply_view_options(Badge<ViewImplementation>, ViewImplementation&, WebContentPage&);
+    void set_system_reduced_motion_preference(bool);
 
     ErrorOr<void> toggle_devtools_enabled();
     ErrorOr<void> launch_devtools_client();
@@ -635,6 +636,7 @@ private:
 
     RefPtr<Menu> m_motion_menu;
     Web::CSS::PreferredMotion m_motion { Web::CSS::PreferredMotion::Auto };
+    Web::CSS::PreferredMotion m_system_preferred_motion { Web::CSS::PreferredMotion::NoPreference };
 
     RefPtr<Action> m_toggle_vertical_tabs_expanded_action;
 

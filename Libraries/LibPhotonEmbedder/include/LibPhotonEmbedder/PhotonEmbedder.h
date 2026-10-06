@@ -137,6 +137,9 @@ public:
     void set_native_release_drain_callback(void*, NativeReleaseDrainCallback);
     void schedule_native_release_drain();
 #endif
+    // Set the host system's reduced-motion preference used by the app's Auto
+    // setting. Call again when the system accessibility setting changes.
+    void set_system_reduced_motion_preference(bool reduce_motion);
     std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks);
 
 private:

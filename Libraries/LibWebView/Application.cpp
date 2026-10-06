@@ -2540,7 +2540,10 @@ void Application::initialize_actions()
             m_motion = motion;
 
             ViewImplementation::for_each_view([&](ViewImplementation& view) {
-                view.set_preferred_motion(m_motion);
+                auto preferred_motion = m_motion;
+                if (preferred_motion == Web::CSS::PreferredMotion::Auto)
+                    preferred_motion = m_system_preferred_motion;
+                view.set_preferred_motion(preferred_motion);
                 return IterationDecision::Continue;
             });
         };
@@ -2742,12 +2745,32 @@ void Application::initialize_actions()
     create_platform_actions();
 }
 
+void Application::set_system_reduced_motion_preference(bool reduce_motion)
+{
+    auto system_preferred_motion = reduce_motion
+        ? Web::CSS::PreferredMotion::Reduce
+        : Web::CSS::PreferredMotion::NoPreference;
+    if (m_system_preferred_motion == system_preferred_motion)
+        return;
+    m_system_preferred_motion = system_preferred_motion;
+    if (m_motion != Web::CSS::PreferredMotion::Auto)
+        return;
+
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.set_preferred_motion(m_system_preferred_motion);
+        return IterationDecision::Continue;
+    });
+}
+
 // The options every page hosting the tab's document runs with.
 void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementation& view, WebContentPage& page)
 {
     view.set_preferred_color_scheme(m_color_scheme);
     view.set_preferred_contrast(m_contrast);
-    view.set_preferred_motion(m_motion);
+    auto preferred_motion = m_motion;
+    if (preferred_motion == Web::CSS::PreferredMotion::Auto)
+        preferred_motion = m_system_preferred_motion;
+    view.set_preferred_motion(preferred_motion);
 
     page.async_debug_request("set-line-box-borders"sv, m_show_line_box_borders_action->checked() ? "on"sv : "off"sv);
     page.async_debug_request("set-caret-hit-test-debug-overlay"sv, m_show_caret_hit_test_debug_overlay_action->checked() ? "on"sv : "off"sv);

@@ -496,6 +496,11 @@ void Runtime::pump()
     (void)Core::EventLoop::current().pump(Core::EventLoop::WaitMode::PollForEvents);
 }
 
+void Runtime::set_system_reduced_motion_preference(bool reduce_motion)
+{
+    m_impl->application->set_system_reduced_motion_preference(reduce_motion);
+}
+
 #if defined(__APPLE__)
 void Runtime::set_native_release_drain_callback(void* context, NativeReleaseDrainCallback callback)
 {
