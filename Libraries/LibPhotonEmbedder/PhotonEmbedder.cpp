@@ -9,6 +9,7 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/MachPort.h>
 #include <LibGfx/Bitmap.h>
+#include <LibGfx/Palette.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
@@ -17,6 +18,7 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/HeadlessWebView.h>
+#include <LibWebView/PlatformColors.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibPhotonEmbedder/PhotonEmbedder.h>
@@ -79,6 +81,14 @@ public:
         auto theme = Gfx::load_system_theme(theme_path.string());
         if (theme.is_error())
             return nullptr;
+#if defined(__APPLE__)
+        // Match the Qt and AppKit embedders: page selections use the macOS colors
+        // rather than the theme file's.
+        Gfx::Palette palette(Gfx::PaletteImpl::create_with_anonymous_buffer(theme.value()));
+        palette.set_color(Gfx::ColorRole::Selection, macos_web_selection_color());
+        palette.set_color(Gfx::ColorRole::InactiveSelection, macos_web_inactive_selection_color());
+        palette.set_color(Gfx::ColorRole::InactiveSelectionText, macos_web_inactive_selection_text_color());
+#endif
 
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
