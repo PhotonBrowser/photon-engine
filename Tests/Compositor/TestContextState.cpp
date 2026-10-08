@@ -91,7 +91,7 @@ struct TestCompositorClient final : public Compositor::CompositorStateClient {
         retired_bitmap_ids.extend(move(bitmap_ids));
     }
 
-    virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id) override
+    virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, u64) override
     {
         presented_frames.append({ content_rect, damage_rect, bitmap_id });
     }
