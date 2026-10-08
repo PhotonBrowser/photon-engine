@@ -115,6 +115,8 @@ CrashReportReviewWidget::CrashReportReviewWidget(QString exit_text, QWidget* par
     : QWidget(parent)
     , m_review(store)
 {
+    auto const submission_enabled = WebView::CrashReportSubmission::is_enabled;
+
     setObjectName("LadybirdCrashReportReview");
 
     m_pages = new QStackedWidget(this);
@@ -135,6 +137,7 @@ CrashReportReviewWidget::CrashReportReviewWidget(QString exit_text, QWidget* par
     m_description_edit->setPlaceholderText(tr("A few words about what you were doing can help us reproduce it."));
     m_description_edit->setTabChangesFocus(true);
     m_description_edit->setFixedHeight(m_description_edit->fontMetrics().lineSpacing() * 5);
+    description->setVisible(submission_enabled);
     description_layout->addWidget(m_description_edit);
     review_layout->addWidget(description);
 
@@ -155,11 +158,15 @@ CrashReportReviewWidget::CrashReportReviewWidget(QString exit_text, QWidget* par
     website_row->addWidget(m_website);
     website_layout->addWidget(m_include_website);
     website_layout->addLayout(website_row);
+    m_website_option->setVisible(submission_enabled);
     review_layout->addWidget(m_website_option);
 
     auto* contents = new QWidget(m_review_page);
     auto* contents_layout = create_group_layout(contents);
-    auto* contents_summary = create_label(tr("Includes technical crash details, your Ladybird version and platform."), contents);
+    auto* contents_summary = create_label(submission_enabled
+            ? tr("Includes technical crash details, your Ladybird version and platform.")
+            : tr("Crash reports stay on this device. Sending reports is disabled in this build."),
+        contents);
     contents_summary->setForegroundRole(QPalette::PlaceholderText);
     contents_layout->addWidget(contents_summary);
     m_details = new QFrame(contents);
@@ -196,8 +203,10 @@ CrashReportReviewWidget::CrashReportReviewWidget(QString exit_text, QWidget* par
     auto* send_button = new QPushButton(tr("Send report"), m_review_page);
     send_button->setObjectName("CrashReportSendButton");
     send_button->setDefault(true);
+    send_button->setVisible(submission_enabled);
     auto* decline_button = new QPushButton(tr("Don’t send"), m_review_page);
     decline_button->setObjectName("CrashReportDeclineButton");
+    decline_button->setVisible(submission_enabled);
     auto* review_buttons = new QHBoxLayout;
     review_buttons->setSpacing(BUTTON_SPACING);
     review_buttons->addWidget(send_button);
@@ -349,7 +358,7 @@ ErrorOr<void> CrashReportReviewWidget::open_report(Optional<ByteString> const& n
         add_field(*m_fields, field, m_details);
 
     // Without a website to offer, the option has nothing to include.
-    m_website_option->setVisible(website.has_value());
+    m_website_option->setVisible(WebView::CrashReportSubmission::is_enabled && website.has_value());
     m_website->setText(website.has_value() ? qstring_from_ak_string(*website) : QString {});
     m_include_website->setChecked(false);
     m_website->setEnabled(false);
@@ -449,6 +458,11 @@ void CrashReportReviewWidget::show_declined()
 void CrashReportReviewWidget::show_failure(WebView::CrashReportSubmission::Failure failure, String const& reason)
 {
     m_progress->hide();
+
+    if (failure == WebView::CrashReportSubmission::Failure::Disabled) {
+        show_outcome(tr("Crash report stays on this device"), qstring_from_ak_string(reason));
+        return;
+    }
 
     // Only sending can succeed on another attempt. A report that could not be prepared would fail the same way again.
     if (failure == WebView::CrashReportSubmission::Failure::Sending) {

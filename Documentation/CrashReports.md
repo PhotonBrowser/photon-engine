@@ -16,14 +16,17 @@ Hyphens in the time keep filenames compatible with Windows; the random suffix
 avoids collisions. Retention includes reports saved with the older filenames.
 Nothing is uploaded automatically.
 
+Sending crash reports is disabled in the current build. Reports can still be
+reviewed and opened locally, but the report server is never contacted.
+
 Once the report of a WebContent crash is saved, the crash screen shows a review
-of it, with sending it as the main action and **Reload page** next to it. After
-the report is answered, reloading is what the screen offers. A browser-process
-report is recovered on the next launch, which shows the same crash screen with
-every report still awaiting review: in the first tab when the window opens only
-the new tab page, otherwise in a background tab that is opened once it is first
+of its local details with **Reload page** next to it. After the report is
+reviewed, reloading is what the screen offers. A browser-process report is
+recovered on the next launch, which shows the same crash screen with every
+report still awaiting review: in the first tab when the window opens only the
+new tab page, otherwise in a background tab that is opened once it is first
 shown. Browsers driven by WebDriver never ask. Ladybird automatically offers
-each report at most once; leaving the crash screen without answering keeps the
+each report at most once; leaving the crash screen without reviewing keeps the
 report on the device without offering it again on a later launch. A report of a
 crash from more than 14 days ago, or from before October 2, 2026 20:00 UTC, is
 never offered, but stays in the folder. Reports that have been offered move into
@@ -33,17 +36,18 @@ crashed. Reload restores the failed page without adding a crash-screen history
 entry; Back and Forward continue to use the original session history. The crash
 screen is native browser UI, so it does not depend on a web content process.
 
-The review asks what the user was doing and lets them choose whether to send the
-report. Report details lists its main fields, such as the failure, signal,
-version and commit, and opens the full report, exactly as it would be attached,
-in the system's text viewer. Submissions omit the website URL by default; when
-the crashed page had one, the user can explicitly include it and edit it first.
-Ladybird does not collect contact information. Network errors, timeouts, rate
-limits and server errors are retried a few times, honoring the server's
-`Retry-After`; a report the server rejects is not. A report that changed on disk
-after it was reviewed is not sent. A successful submission removes the local
-copy. A report that is declined or could not be sent stays on the device, but is
-not offered again.
+The review shows what the user was doing and the report's main fields, such as
+the failure, signal, version and commit. It can open the full report in the
+system's text viewer. Sending is disabled in the current build, so reports stay
+on the device and no request reaches the report server. The submission code is
+retained behind `CrashReportSubmission::is_enabled` for builds that deliberately
+enable it. When enabled, submissions omit the website URL by default, and the
+user must explicitly include and edit it first. Ladybird does not collect
+contact information. Network errors, timeouts, rate limits and server errors
+are retried a few times, honoring the server's `Retry-After`; a report the
+server rejects is not. A report that changed on disk after it was reviewed is
+not sent. A successful submission removes the local copy. A report that is
+declined or could not be sent stays on the device, but is not offered again.
 
 Reports and filenames identify the process type. Build information includes the
 full Git commit, tracked-source modification state, C++ compiler identity and
@@ -83,9 +87,9 @@ After a WebContent crash, the browser displays a native crash screen and retains
 the failed URL, title and committed history entry. The replacement WebContent
 process remains dormant until the user chooses a recovery action. The crash
 screen provides reload and report review actions directly in the browser
-process. LibWebView's `CrashReportReview` prepares a report for display and
-validates the user's choices, and `CrashReportSubmission` sends it to the report
-server; the Qt UI only presents them.
+process. LibWebView's `CrashReportReview` prepares a report for display, and
+`CrashReportSubmission` retains the report-server protocol behind its disabled
+build switch; the Qt UI only presents the review.
 
 The browser creates an unlinked temporary file before spawning each helper and
 passes a descriptor to the child. The child cannot access the report directory.

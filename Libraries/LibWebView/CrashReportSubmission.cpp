@@ -201,6 +201,12 @@ CrashReportSubmission::~CrashReportSubmission()
 
 void CrashReportSubmission::start()
 {
+    if (!is_enabled) {
+        if (on_failed)
+            on_failed(Failure::Disabled, "Crash report sending is disabled in this build."_string);
+        return;
+    }
+
     begin_attempt();
 }
 

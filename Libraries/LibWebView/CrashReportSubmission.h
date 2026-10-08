@@ -26,6 +26,9 @@ class WEBVIEW_API CrashReportSubmission
 public:
     AK_ALLOC_WITH_KMALLOC;
 
+    // Keep crash reports local unless submissions are deliberately enabled for a build.
+    static constexpr bool is_enabled = false;
+
     enum class Stage : u8 {
         Preparing,
         RequestingChallenge,
@@ -34,6 +37,7 @@ public:
     };
 
     enum class Failure : u8 {
+        Disabled,
         Preparation,
         Sending,
     };
