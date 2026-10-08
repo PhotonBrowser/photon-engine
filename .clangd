@@ -1,5 +1,5 @@
 CompileFlags:
-  CompilationDatabase: Build/release
+  CompilationDatabase: ../build/engine-debug
 
 Diagnostics:
   UnusedIncludes: None

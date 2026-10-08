@@ -20,6 +20,8 @@
 
 namespace WebView {
 
+class CrashReportStore;
+
 class WEBVIEW_API CrashReportSubmission
     : public RefCounted<CrashReportSubmission>
     , public Weakable<CrashReportSubmission> {
