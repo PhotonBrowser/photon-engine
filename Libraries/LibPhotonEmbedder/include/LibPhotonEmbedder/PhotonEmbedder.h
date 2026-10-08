@@ -177,6 +177,11 @@ public:
     void resize(int logical_width, int logical_height, double device_pixel_ratio);
     void set_visible(bool visible);
     void set_performance_monitor_enabled(bool enabled);
+    // Tell the engine which display shows this view and how often it refreshes.
+    // Pace page rendering and compositor vsync from them. Call again when the
+    // view moves to another display or the refresh rate changes. A display_id
+    // of 0 means unknown, which falls back to a timer at refresh_rate.
+    void set_display_metadata(uint64_t display_id, double refresh_rate);
 #if defined(__APPLE__)
     void release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id);
     void set_native_metal_presentation(bool enabled);

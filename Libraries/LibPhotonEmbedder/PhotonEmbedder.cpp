@@ -218,7 +218,32 @@ public:
         set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
     }
 
+    void set_display_metadata(Optional<u64> display_id, double refresh_rate)
+    {
+        if (!std::isfinite(refresh_rate) || refresh_rate <= 0)
+            return;
+        if (m_display_id == display_id && m_maximum_frames_per_second == refresh_rate)
+            return;
+        m_display_id = display_id;
+        m_maximum_frames_per_second = refresh_rate;
+        page().async_set_maximum_frames_per_second(m_maximum_frames_per_second);
+        update_compositor_display_metadata(page());
+    }
+
 private:
+    // A tab can move to a page in another WebContent process; its compositor
+    // context needs the display metadata as well.
+    virtual void prepare_page_for_tab(WebContentPage& page) override
+    {
+        HeadlessWebView::prepare_page_for_tab(page);
+        update_compositor_display_metadata(page);
+    }
+
+    void update_compositor_display_metadata(WebContentPage& page)
+    {
+        Application::the().update_compositor_display_metadata(page.compositor_context_id(), m_display_id, m_maximum_frames_per_second);
+    }
+
 #if defined(AK_OS_MACOS)
     uint64_t native_backing_id(i32 bitmap_id)
     {
@@ -622,6 +647,11 @@ void View::set_performance_monitor_enabled(bool enabled)
 {
     VERIFY(m_impl && m_impl->view);
     m_impl->view->set_performance_monitor_enabled(enabled);
+}
+void View::set_display_metadata(uint64_t display_id, double refresh_rate)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->set_display_metadata(display_id == 0 ? Optional<u64> {} : Optional<u64> { display_id }, refresh_rate);
 }
 void View::set_visible(bool visible)
 {
