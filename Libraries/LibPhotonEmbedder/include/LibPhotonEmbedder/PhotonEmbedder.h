@@ -61,6 +61,17 @@ struct ViewState {
     bool can_go_forward { false };
 };
 
+struct PerformanceStats {
+    bool has_cpu_percent { false };
+    double cpu_percent { 0 };
+    bool has_memory_bytes { false };
+    uint64_t memory_bytes { 0 };
+    uint64_t download_bytes_per_second { 0 };
+    uint64_t upload_bytes_per_second { 0 };
+    bool has_frames_per_second { false };
+    double frames_per_second { 0 };
+};
+
 enum class Cursor : uint8_t {
     Arrow, Hidden, Crosshair, IBeam, ResizeHorizontal, ResizeVertical,
     ResizeDiagonalTLBR, ResizeDiagonalBLTR, ResizeColumn, ResizeRow, Hand,
@@ -70,6 +81,7 @@ enum class Cursor : uint8_t {
 struct ViewCallbacks {
     std::function<void(ViewState const&)> state_changed;
     std::function<void(std::shared_ptr<PresentedFrame const>)> frame_ready;
+    std::function<void(PerformanceStats const&)> performance_stats_changed;
 #if defined(__APPLE__)
     // Enable only after the shell has an operational native surface consumer.
     bool native_metal_presentation { false };
@@ -78,6 +90,7 @@ struct ViewCallbacks {
 #endif
     std::function<void(Cursor)> cursor_changed;
     std::function<void(std::string const&)> failed;
+    std::function<void(std::string const&)> crashed;
 };
 
 enum class PointerType { Move, Leave, Press, Release, Wheel };
@@ -162,6 +175,8 @@ public:
     void go_back();
     void go_forward();
     void resize(int logical_width, int logical_height, double device_pixel_ratio);
+    void set_visible(bool visible);
+    void set_performance_monitor_enabled(bool enabled);
 #if defined(__APPLE__)
     void release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id);
     void set_native_metal_presentation(bool enabled);

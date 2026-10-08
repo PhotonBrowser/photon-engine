@@ -19,6 +19,7 @@
 #include <LibWebView/Menu.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/PlatformColors.h>
+#include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibPhotonEmbedder/PhotonEmbedder.h>
@@ -28,11 +29,13 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -48,6 +51,12 @@ static bool external_image_lease_trace_enabled()
 {
     static bool enabled = std::getenv("EXTERNAL_IMAGE_LEASE_TRACE") != nullptr;
     return enabled;
+}
+
+static uint64_t next_native_backing_id()
+{
+    static std::atomic<uint64_t> next_id { 1 };
+    return next_id.fetch_add(1, std::memory_order_relaxed);
 }
 
 class PhotonApplication final : public Application {
@@ -105,6 +114,7 @@ public:
         // the requested bounds.
         view->resize(width, height, dpr);
         view->notify_state();
+        (void)TabPerformanceMonitor::the();
         return view;
     }
 
@@ -137,6 +147,9 @@ public:
         VERIFY(it != m_native_leases.end());
         VERIFY(it->second.first == backing_id && it->second.second == generation);
         m_native_leases.erase(it);
+        auto backing = m_native_backing_to_bitmap.find(backing_id);
+        VERIFY(backing != m_native_backing_to_bitmap.end());
+        auto bitmap_id = backing->second;
         bool backing_still_leased = false;
         for (auto const& lease : m_native_leases) {
             if (lease.second.first == backing_id && lease.second.second == generation) {
@@ -145,9 +158,8 @@ public:
             }
         }
         if (external_image_lease_trace_enabled())
-            dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} state=RELEASE_RECEIVED remaining_leases={} backing_still_leased={} deferred_release={}", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id, m_native_leases.size(), backing_still_leased, m_deferred_backing_releases.contains(static_cast<i32>(backing_id - 1)));
+            dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} state=RELEASE_RECEIVED remaining_leases={} backing_still_leased={} deferred_release={}", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id, m_native_leases.size(), backing_still_leased, m_deferred_backing_releases.contains(bitmap_id));
         if (!backing_still_leased) {
-            auto bitmap_id = static_cast<i32>(backing_id - 1);
             m_native_leased_backings.erase(bitmap_id);
             if (m_deferred_backing_releases.erase(bitmap_id) > 0) {
                 if (external_image_lease_trace_enabled())
@@ -196,7 +208,30 @@ public:
             Application::the().notify_compositor_gpu_presentation_unavailable();
     }
 
+    void set_performance_monitor_enabled(bool enabled)
+    {
+        TabPerformanceMonitor::set_view_enabled(view_id(), enabled);
+    }
+
+    void set_visible(bool visible)
+    {
+        set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+    }
+
 private:
+#if defined(AK_OS_MACOS)
+    uint64_t native_backing_id(i32 bitmap_id)
+    {
+        auto existing = m_native_backing_ids.find(bitmap_id);
+        if (existing != m_native_backing_ids.end())
+            return existing->second;
+        auto backing_id = next_native_backing_id();
+        m_native_backing_ids.emplace(bitmap_id, backing_id);
+        m_native_backing_to_bitmap.emplace(backing_id, bitmap_id);
+        return backing_id;
+    }
+#endif
+
     PhotonHeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize size, double dpr, Photon::ViewCallbacks callbacks)
         : HeadlessWebView(move(theme), size)
         , m_callbacks(move(callbacks))
@@ -227,6 +262,21 @@ private:
 #endif
         on_title_change = [this](Utf16String const&) { notify_state(); };
         on_loading_state_change = [this](bool) { notify_state(); };
+        on_performance_stats = [this](WebView::TabPerformanceStats const& stats) {
+            if (!m_callbacks.performance_stats_changed)
+                return;
+            Photon::PerformanceStats snapshot {
+                .has_cpu_percent = stats.cpu_percent.has_value(),
+                .cpu_percent = stats.cpu_percent.value_or(0),
+                .has_memory_bytes = stats.memory_bytes.has_value(),
+                .memory_bytes = stats.memory_bytes.value_or(0),
+                .download_bytes_per_second = stats.download_bytes_per_second,
+                .upload_bytes_per_second = stats.upload_bytes_per_second,
+                .has_frames_per_second = stats.frames_per_second.has_value(),
+                .frames_per_second = stats.frames_per_second.value_or(0),
+            };
+            m_callbacks.performance_stats_changed(snapshot);
+        };
         on_cursor_change = [this](Gfx::Cursor const& cursor) {
             if (!m_callbacks.cursor_changed)
                 return;
@@ -262,8 +312,13 @@ private:
         };
         on_browser_history_traversal_complete = [this] { notify_state(); };
         on_web_content_crashed = [this](auto) {
-            if (m_callbacks.failed)
-                m_callbacks.failed("WebContent process crashed");
+            if (!m_callbacks.crashed)
+                return;
+            auto serialized_url = url().serialize().bytes_as_string_view();
+            std::string crashed_url(
+                serialized_url.characters_without_null_termination(),
+                serialized_url.length());
+            m_callbacks.crashed(crashed_url);
         };
         on_ready_to_paint = [this] {
             auto paint_completed = std::chrono::steady_clock::now();
@@ -282,7 +337,7 @@ private:
                 && m_callbacks.native_backing_registered
                 && m_callbacks.native_frame_ready
                 && front.shared_image_buffer) {
-                auto backing_id = static_cast<uint64_t>(front.id) + 1;
+                auto backing_id = native_backing_id(front.id);
                 auto generation = m_native_generation;
                 VERIFY(backing_id != 0 && generation != 0);
                 if (!m_registered_native_backings.contains({ backing_id, generation })) {
@@ -364,12 +419,12 @@ private:
     {
         if (!m_native_leased_backings.contains(bitmap_id)) {
             if (external_image_lease_trace_enabled())
-                dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id=not-available state=BACKING_RELEASE_NOT_DEFERRED reason=no_active_native_lease", MonotonicTime::now().nanoseconds(), static_cast<u64>(bitmap_id) + 1, m_native_generation);
+                dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id=not-available state=BACKING_RELEASE_NOT_DEFERRED reason=no_active_native_lease", MonotonicTime::now().nanoseconds(), native_backing_id(bitmap_id), m_native_generation);
             return false;
         }
         m_deferred_backing_releases.emplace(bitmap_id);
         if (external_image_lease_trace_enabled())
-            dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id=active state=BACKING_RELEASE_DEFERRED native_leases={} deferred_backings={}", MonotonicTime::now().nanoseconds(), static_cast<u64>(bitmap_id) + 1, m_native_generation, m_native_leases.size(), m_deferred_backing_releases.size());
+            dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id=active state=BACKING_RELEASE_DEFERRED native_leases={} deferred_backings={}", MonotonicTime::now().nanoseconds(), native_backing_id(bitmap_id), m_native_generation, m_native_leases.size(), m_deferred_backing_releases.size());
         return true;
     }
 
@@ -378,6 +433,8 @@ private:
     int m_native_width { 0 };
     int m_native_height { 0 };
     std::set<std::pair<uint64_t, uint64_t>> m_registered_native_backings;
+    std::unordered_map<i32, uint64_t> m_native_backing_ids;
+    std::unordered_map<uint64_t, i32> m_native_backing_to_bitmap;
     std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> m_native_leases;
     std::unordered_set<i32> m_native_leased_backings;
     std::unordered_set<i32> m_deferred_backing_releases;
@@ -560,6 +617,16 @@ void View::resize(int width, int height, double dpr)
     m_impl->last_viewport_height = physical_height;
     m_impl->last_device_pixel_ratio = dpr;
     m_impl->view->resize(width, height, dpr);
+}
+void View::set_performance_monitor_enabled(bool enabled)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->set_performance_monitor_enabled(enabled);
+}
+void View::set_visible(bool visible)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->set_visible(visible);
 }
 #if defined(AK_OS_MACOS)
 void View::release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id)
