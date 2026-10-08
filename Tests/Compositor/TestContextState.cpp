@@ -363,6 +363,19 @@ TEST_CASE(backing_store_padding_is_reused_during_live_resize)
 }
 
 #ifdef AK_OS_MACOS
+TEST_CASE(a_client_that_samples_backing_stores_on_its_gpu_gets_a_fourth_store)
+{
+    Compositor::BackingStoreManager manager;
+    auto allocation = manager.resize_backing_stores_if_needed({ 4, 4 }, Compositing::WindowResizingInProgress::No, true, Compositor::BackingStoreManager::ClientSamplesOnGpu::Yes);
+    VERIFY(allocation.has_value());
+    EXPECT_EQ(allocation->bitmap_ids.size(), 4u);
+
+    Compositor::BackingStoreManager copying_manager;
+    auto copying_allocation = copying_manager.resize_backing_stores_if_needed({ 4, 4 }, Compositing::WindowResizingInProgress::No, true, Compositor::BackingStoreManager::ClientSamplesOnGpu::No);
+    VERIFY(copying_allocation.has_value());
+    EXPECT_EQ(copying_allocation->bitmap_ids.size(), 3u);
+}
+
 TEST_CASE(a_released_backing_store_is_not_reused_while_its_surface_is_in_use)
 {
     Compositor::BackingStoreManager manager;

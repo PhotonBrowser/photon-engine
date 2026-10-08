@@ -173,7 +173,7 @@ public:
     bool should_shrink_backing_stores_after_resize() const;
     void schedule_backing_store_shrink(Function<void()>);
     void finish_window_resize();
-    Optional<BackingStoreManager::Publication> resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const&, BackingStoreManager::GpuSharing);
+    Optional<BackingStoreManager::Publication> resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const&, BackingStoreManager::GpuSharing, BackingStoreManager::ClientSamplesOnGpu = BackingStoreManager::ClientSamplesOnGpu::No);
     void invalidate_backing_stores();
     Optional<BackingStoreManager::Publication> add_backing_store_for_pending_frame_if_needed(RefPtr<Gfx::SkiaBackendContext> const&);
     bool has_surplus_backing_stores() const { return m_backing_store_manager.has_surplus_backing_stores(); }

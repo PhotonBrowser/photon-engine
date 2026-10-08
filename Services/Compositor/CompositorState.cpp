@@ -1284,7 +1284,10 @@ Compositing::CompositedContextSurface CompositorState::resolve_composited_contex
 
 void CompositorState::resize_backing_stores_if_needed(Web::CompositorContextId context_id, ContextState& context)
 {
-    if (auto publication = context.resize_backing_stores_if_needed(m_skia_backend_context, gpu_sharing_for_client()); publication.has_value()) {
+    auto client_samples_on_gpu = m_client_gpu_presentation_supported.value_or(false)
+        ? BackingStoreManager::ClientSamplesOnGpu::Yes
+        : BackingStoreManager::ClientSamplesOnGpu::No;
+    if (auto publication = context.resize_backing_stores_if_needed(m_skia_backend_context, gpu_sharing_for_client(), client_samples_on_gpu); publication.has_value()) {
         publish_backing_stores(context_id, context, publication.release_value());
         present_current_frame(context_id, context);
     }

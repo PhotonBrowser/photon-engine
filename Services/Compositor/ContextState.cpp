@@ -1281,7 +1281,7 @@ void ContextState::finish_window_resize()
     m_window_resize_in_progress = Compositing::WindowResizingInProgress::No;
 }
 
-Optional<BackingStoreManager::Publication> ContextState::resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, BackingStoreManager::GpuSharing gpu_sharing)
+Optional<BackingStoreManager::Publication> ContextState::resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, BackingStoreManager::GpuSharing gpu_sharing, BackingStoreManager::ClientSamplesOnGpu client_samples_on_gpu)
 {
     if (m_backing_store_manager.is_rendering())
         return {};
@@ -1295,7 +1295,7 @@ Optional<BackingStoreManager::Publication> ContextState::resize_backing_stores_i
             m_last_rasterized_frame.clear();
         }
     }
-    auto allocation = m_backing_store_manager.resize_backing_stores_if_needed(raster_size(), m_window_resize_in_progress, presents_to_client());
+    auto allocation = m_backing_store_manager.resize_backing_stores_if_needed(raster_size(), m_window_resize_in_progress, presents_to_client(), client_samples_on_gpu);
     if (!allocation.has_value())
         return {};
     m_latest_rendered_surface = nullptr;
