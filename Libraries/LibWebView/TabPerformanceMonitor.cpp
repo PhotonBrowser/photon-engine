@@ -28,13 +28,26 @@ TabPerformanceMonitor& TabPerformanceMonitor::the()
 void TabPerformanceMonitor::request_server_did_restart()
 {
     if (s_monitor && s_monitor->m_enabled)
-        s_monitor->config_variable_changed(ConfigVariableID::ShowTabPerformanceMonitor);
+        s_monitor->update_monitoring(true);
 }
 
 void TabPerformanceMonitor::forget_view(u64 view_id)
 {
-    if (s_monitor)
+    if (s_monitor) {
+        s_monitor->m_explicitly_enabled_views.remove(view_id);
         s_monitor->m_tabs.remove(view_id);
+        s_monitor->update_monitoring();
+    }
+}
+
+void TabPerformanceMonitor::set_view_enabled(u64 view_id, bool enabled)
+{
+    auto& monitor = the();
+    if (enabled)
+        monitor.m_explicitly_enabled_views.set(view_id);
+    else
+        monitor.m_explicitly_enabled_views.remove(view_id);
+    monitor.update_monitoring();
 }
 
 TabPerformanceMonitor::TabPerformanceMonitor()
@@ -46,13 +59,26 @@ void TabPerformanceMonitor::config_variable_changed(ConfigVariableID id)
 {
     if (id != ConfigVariableID::ShowTabPerformanceMonitor)
         return;
-    m_enabled = Application::settings().config_variable_as_bool(id);
+    m_setting_enabled = Application::settings().config_variable_as_bool(id);
+    update_monitoring();
+}
+
+void TabPerformanceMonitor::update_monitoring(bool restart)
+{
+    auto should_enable = m_setting_enabled || !m_explicitly_enabled_views.is_empty();
+    if (!restart && should_enable == m_enabled)
+        return;
+
     auto& requests = Application::request_server_control_client();
+    if (m_enabled) {
+        m_timer = nullptr;
+        requests.on_network_usage = nullptr;
+        requests.async_set_performance_monitor_enabled(false);
+    }
+    m_enabled = should_enable;
     requests.async_set_performance_monitor_enabled(m_enabled);
     if (!m_enabled) {
-        m_timer = nullptr;
         m_tabs.clear();
-        requests.on_network_usage = nullptr;
         return;
     }
     requests.on_network_usage = [this](Vector<Requests::NetworkUsage> usage, u64 interval_microseconds) {
@@ -104,7 +130,7 @@ void TabPerformanceMonitor::sample()
     auto now = MonotonicTime::now();
     ViewImplementation::for_each_view([&](ViewImplementation& view) {
         auto stats = m_tabs.ensure(view.view_id()).sample(now, processes.ensure(view.view_id()));
-        if (view.on_performance_stats)
+        if ((m_setting_enabled || m_explicitly_enabled_views.contains(view.view_id())) && view.on_performance_stats)
             view.on_performance_stats(stats);
         return IterationDecision::Continue;
     });
