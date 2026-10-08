@@ -583,15 +583,15 @@ void Runtime::schedule_native_release_drain()
 }
 #endif
 
-std::unique_ptr<View> Runtime::create_view(int width, int height, double dpr, ViewCallbacks callbacks)
+std::unique_ptr<View> Runtime::create_view(int width, int height, double device_pixel_ratio, ViewCallbacks callbacks)
 {
     auto impl = std::make_unique<View::Impl>();
-    impl->view = WebView::PhotonHeadlessWebView::create(width, height, dpr, move(callbacks));
+    impl->view = WebView::PhotonHeadlessWebView::create(width, height, device_pixel_ratio, move(callbacks));
     if (!impl->view)
         return {};
-    impl->last_viewport_width = max(1, static_cast<int>(std::lround(width * dpr)));
-    impl->last_viewport_height = max(1, static_cast<int>(std::lround(height * dpr)));
-    impl->last_device_pixel_ratio = dpr;
+    impl->last_viewport_width = max(1, static_cast<int>(std::lround(width * device_pixel_ratio)));
+    impl->last_viewport_height = max(1, static_cast<int>(std::lround(height * device_pixel_ratio)));
+    impl->last_device_pixel_ratio = device_pixel_ratio;
     return std::unique_ptr<View>(new View(move(impl)));
 }
 
@@ -607,16 +607,16 @@ void View::reload() { m_impl->view->reload(); }
 void View::stop_loading() { m_impl->view->stop_loading(); }
 void View::go_back() { m_impl->view->traverse_the_history_by_delta(-1); }
 void View::go_forward() { m_impl->view->traverse_the_history_by_delta(1); }
-void View::resize(int width, int height, double dpr)
+void View::resize(int width, int height, double device_pixel_ratio)
 {
-    auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
-    auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
-    if (m_impl->last_viewport_width == physical_width && m_impl->last_viewport_height == physical_height && m_impl->last_device_pixel_ratio == dpr)
+    auto physical_width = max(1, static_cast<int>(std::lround(width * device_pixel_ratio)));
+    auto physical_height = max(1, static_cast<int>(std::lround(height * device_pixel_ratio)));
+    if (m_impl->last_viewport_width == physical_width && m_impl->last_viewport_height == physical_height && m_impl->last_device_pixel_ratio == device_pixel_ratio)
         return;
     m_impl->last_viewport_width = physical_width;
     m_impl->last_viewport_height = physical_height;
-    m_impl->last_device_pixel_ratio = dpr;
-    m_impl->view->resize(width, height, dpr);
+    m_impl->last_device_pixel_ratio = device_pixel_ratio;
+    m_impl->view->resize(width, height, device_pixel_ratio);
 }
 void View::set_performance_monitor_enabled(bool enabled)
 {
