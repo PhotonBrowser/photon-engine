@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<style>
+    @property --amount {
+        syntax: "<number>";
+        initial-value: 0;
+        inherits: true;
+    }
+    @property --angle {
+        syntax: "<angle>";
+        initial-value: 0deg;
+        inherits: true;
+    }
+    @keyframes grow {
+        to {
+            --amount: 1;
+            --angle: 360deg;
+        }
+    }
+    #host {
+        animation: grow 1000ms linear paused;
+    }
+    #host::after {
+        content: "";
+        opacity: var(--amount);
+        rotate: var(--angle);
+    }
+</style>
+<div id="host"></div>
+<script src="../include.js"></script>
+<script>
+    promiseTest(async () => {
+        const animation = host.getAnimations()[0];
+        await animation.ready;
+        for (const time of [250, 750]) {
+            animation.currentTime = time;
+            await animationFrame();
+            const style = getComputedStyle(host, "::after");
+            println(`${time}ms: opacity=${style.opacity} rotate=${style.rotate}`);
+        }
+    });
+</script>

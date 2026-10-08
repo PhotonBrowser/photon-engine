@@ -228,9 +228,11 @@ impl RetainedState {
         let facts = self.computed_group_sets.adjustment_facts(node) & PSEUDO_ELEMENT_ADJUSTMENT_FACTS;
         // A read-only read derives its record afresh, as does a reaction that drives its element
         // in full: an element revealed from display:none holds no pseudo-element styles, and a
-        // pseudo-element resolves a font cascade and named rules of its own.
+        // pseudo-element resolves a font cascade and named rules of its own. What the element's
+        // animations sample into its custom properties moves without moving its record.
         let originating_inputs_unchanged = !matches!(settlement, PseudoSettlement::Computed(_))
             && inherited_inputs_unchanged
+            && !self.element_samples_custom_properties(node)
             && full_drive_reason.is_none()
             && !scratch.root_font_inputs_changed
             && !scratch.document_environment_moved
@@ -269,6 +271,8 @@ impl RetainedState {
         let Some(element_environment) = element_environment else {
             return Err(Unanswered::Refused);
         };
+        // Pseudo-elements inherit what the element's animations sample, as its children do.
+        let element_environment = self.sampled_custom_property_environment(node, element_environment);
         // The kinds the node's match answer has rules for: a winner row is published for each
         // the engine cascaded itself, and a kind with rules but no row is not decided.
         let kinds_with_rules = self.pseudo_kinds_with_rules(node, settlement, counters)?;

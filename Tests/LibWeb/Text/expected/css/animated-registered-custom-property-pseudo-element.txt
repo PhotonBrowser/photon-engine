@@ -1,0 +1,2 @@
+250ms: opacity=0.25 rotate=90deg
+750ms: opacity=0.75 rotate=270deg
