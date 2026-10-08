@@ -81,23 +81,12 @@ static constexpr u64 SHIFTED_INT32_TAG = INT32_TAG << GC::TAG_SHIFT;
 // 0b1111111111111xxx yyy... xxx = pointer type, yyy = pointer value
 // 0b0111111111111xxx yyy... xxx = non-pointer type, yyy = value or 0 if just type
 
-// Future expansion: We are not fully utilizing all the possible bit patterns
-// yet, these choices were made to make it easy to implement and understand.
-// We can for example drop the always 1 top bit of the mantissa expanding our
-// options from 8 tags to 15 but since we currently only use 5 for both sign bits
-// this is not needed.
-
+// The Rust runtime encodes its values with exactly these bits, so a Value crosses the embedding ABI unchanged.
 class JS_API Value : public GC::NanBoxedValue {
     template<typename T>
     static constexpr bool HasForbiddenDirectJSValueConversion = requires { typename RemoveCV<T>::JSValueConversionIsForbidden; };
 
 public:
-    enum class PreferredType {
-        Default,
-        String,
-        Number,
-    };
-
     [[nodiscard]] u16 tag() const { return m_value.tag; }
 
     bool is_special_empty_value() const { return m_value.encoded == (EMPTY_TAG << GC::TAG_SHIFT); }
@@ -114,7 +103,6 @@ public:
     ThrowCompletionOr<bool> is_array(VM&) const;
     bool is_function() const;
     bool is_constructor() const;
-    ThrowCompletionOr<bool> is_regexp(VM&) const;
 
     bool is_infinity() const
     {
@@ -130,11 +118,6 @@ public:
     bool is_negative_infinity() const
     {
         return m_value.encoded == GC::NEGATIVE_INFINITY_BITS;
-    }
-
-    bool is_positive_zero() const
-    {
-        return m_value.encoded == 0 || (is_int32() && as_i32() == 0);
     }
 
     bool is_negative_zero() const
@@ -215,13 +198,6 @@ public:
     {
     }
 
-    enum class CannotFitInInt32 { Indeed };
-    Value(i64 value, CannotFitInInt32)
-    {
-        ASSERT(value < static_cast<i64>(NumericLimits<i32>::min()) || value > static_cast<i64>(NumericLimits<i32>::max()));
-        m_value.as_double = static_cast<double>(value);
-    }
-
     explicit Value(double value)
     {
         bool is_negative_zero = bit_cast<u64>(value) == NEGATIVE_ZERO_BITS;
@@ -234,11 +210,6 @@ public:
             else
                 m_value.as_double = value;
         }
-    }
-
-    explicit Value(f16 value)
-        : Value(static_cast<double>(value))
-    {
     }
 
     // NOTE: A couple of integral types are excluded here:
@@ -294,11 +265,6 @@ public:
     {
     }
 
-    Value(Accessor const* accessor)
-        : Value(ACCESSOR_TAG << GC::TAG_SHIFT, reinterpret_cast<void const*>(accessor))
-    {
-    }
-
     Value(BigInt const* bigint)
         : Value(BIGINT_TAG << GC::TAG_SHIFT, reinterpret_cast<void const*>(bigint))
     {
@@ -332,11 +298,12 @@ public:
     requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Root<T> const&) = delete;
 
     // Confirms the class of the cell this Value points at. The tag alone cannot do that: every
-    // cell-backed tag names a different C++ class, but a forged Value can carry an honest tag and
-    // a pointer to a cell of some other class.
+    // cell-backed tag names a different class, but a forged Value can carry an honest tag and
+    // a pointer to a cell of some other class. The Rust runtime's cells keep their kind where
+    // C++ cells do.
     ALWAYS_INLINE void verify_cell_kind(GC::CellKind kind) const
     {
-        VERIFY(extract_pointer<GC::Cell>()->cell_kind() == kind);
+        VERIFY(extract_pointer<GC::ForeignCell>()->cell_kind() == kind);
     }
 
     Cell& as_cell()
@@ -407,13 +374,6 @@ public:
         return *extract_pointer<Symbol>();
     }
 
-    Accessor& as_accessor()
-    {
-        VERIFY(is_accessor());
-        verify_cell_kind(GC::CellKind::Accessor);
-        return *extract_pointer<Accessor>();
-    }
-
     BigInt const& as_bigint() const
     {
         VERIFY(is_bigint());
@@ -428,56 +388,37 @@ public:
         return *extract_pointer<BigInt>();
     }
 
-    Array& as_array_exotic_object();
     FunctionObject& as_function();
     FunctionObject const& as_function() const;
 
     u64 encoded() const { return m_value.encoded; }
 
     ThrowCompletionOr<Utf16String> to_utf16_string(VM&) const;
-    ThrowCompletionOr<GC::Ref<PrimitiveString>> to_primitive_string(VM&);
-    ThrowCompletionOr<Value> to_primitive(VM&, PreferredType preferred_type = PreferredType::Default) const;
     ThrowCompletionOr<GC::Ref<Object>> to_object(VM&) const;
     ThrowCompletionOr<GC::Ref<Object>> to_object_slow(VM&) const;
-    ThrowCompletionOr<Value> to_numeric(VM&) const;
     ThrowCompletionOr<Value> to_number(VM&) const;
     ThrowCompletionOr<GC::Ref<BigInt>> to_bigint(VM&) const;
-    ThrowCompletionOr<i64> to_bigint_int64(VM&) const;
     ThrowCompletionOr<u64> to_bigint_uint64(VM&) const;
     ThrowCompletionOr<double> to_double(VM&) const;
-    ThrowCompletionOr<PropertyKey> to_property_key(VM&) const;
     ThrowCompletionOr<i32> to_i32(VM&) const;
     ThrowCompletionOr<u32> to_u32(VM&) const;
-    ThrowCompletionOr<i16> to_i16(VM&) const;
     ThrowCompletionOr<u16> to_u16(VM&) const;
-    ThrowCompletionOr<i8> to_i8(VM&) const;
     ThrowCompletionOr<u8> to_u8(VM&) const;
-    ThrowCompletionOr<u8> to_u8_clamp(VM&) const;
     ThrowCompletionOr<size_t> to_length(VM&) const;
-    ThrowCompletionOr<size_t> to_index(VM&) const;
-    ThrowCompletionOr<double> to_integer_or_infinity(VM&) const;
     bool to_boolean() const;
 
     ThrowCompletionOr<Value> get(VM&, PropertyKey const&) const;
-    ThrowCompletionOr<Value> get(VM&, PropertyKey const&, Bytecode::StaticPropertyLookupCache&) const;
 
     ThrowCompletionOr<GC::Ptr<FunctionObject>> get_method(VM&, PropertyKey const&) const;
-    ThrowCompletionOr<GC::Ptr<FunctionObject>> get_method(VM&, PropertyKey const&, Bytecode::StaticPropertyLookupCache&) const;
 
     [[nodiscard]] Utf16String to_utf16_string_without_side_effects() const;
 
-    [[nodiscard]] GC::Ref<PrimitiveString> typeof_(VM&) const;
-
     bool operator==(Value const&) const;
-
-    template<typename... Args>
-    [[nodiscard]] ALWAYS_INLINE ThrowCompletionOr<Value> invoke(VM&, PropertyKey const& property_key, Args... args);
 
     // A double is any Value which does not have the full exponent and top mantissa bit set or has
     // exactly only those bits set.
     bool is_double() const { return (m_value.encoded & GC::CANON_NAN_BITS) != GC::CANON_NAN_BITS || (m_value.encoded == GC::CANON_NAN_BITS); }
     bool is_int32() const { return m_value.tag == INT32_TAG; }
-    [[nodiscard]] bool is_non_negative_int32() const { return (m_value.encoded & (GC::TAG_EXTRACTION | 0x80000000u)) == SHIFTED_INT32_TAG; }
 
     i32 as_i32() const
     {
@@ -485,25 +426,10 @@ public:
         return static_cast<i32>(m_value.encoded & 0xFFFFFFFF);
     }
 
-    i32 as_i32_clamped_integral_number() const
-    {
-        ASSERT(is_int32() || is_finite_number());
-        if (is_int32())
-            return as_i32();
-        double value = trunc(as_double());
-        if (value > INT32_MAX)
-            return INT32_MAX;
-        if (value < INT32_MIN)
-            return INT32_MIN;
-        return static_cast<i32>(value);
-    }
-
     bool to_boolean_slow_case() const;
 
 private:
     ThrowCompletionOr<Value> to_number_slow_case(VM&) const;
-    COLD ThrowCompletionOr<Value> to_numeric_slow_case(VM&) const;
-    ThrowCompletionOr<Value> to_primitive_slow_case(VM&, PreferredType) const;
 
     enum class EmptyTag { Empty };
 
@@ -530,19 +456,9 @@ private:
         m_value.encoded = tag | GC::NanBoxedValue::encode_pointer_bits(ptr);
     }
 
-    [[nodiscard]] ThrowCompletionOr<Value> invoke_internal(VM&, PropertyKey const&, Optional<GC::RootVector<Value>> arguments);
-
-    ThrowCompletionOr<i32> to_i32_slow_case(VM&) const;
-
     friend constexpr Value js_undefined();
     friend constexpr Value js_null();
     friend constexpr Value js_special_empty_value();
-    friend ThrowCompletionOr<bool> greater_than(VM&, Value lhs, Value rhs);
-    friend ThrowCompletionOr<bool> greater_than_equals(VM&, Value lhs, Value rhs);
-    friend ThrowCompletionOr<bool> less_than(VM&, Value lhs, Value rhs);
-    friend ThrowCompletionOr<bool> less_than_equals(VM&, Value lhs, Value rhs);
-    friend ThrowCompletionOr<Value> add(VM&, Value lhs, Value rhs);
-    friend bool same_value_non_number(Value lhs, Value rhs);
 };
 
 inline constexpr Value js_undefined()
@@ -560,52 +476,8 @@ inline constexpr Value js_special_empty_value()
     return Value(Value::EmptyTag::Empty);
 }
 
-inline Value js_nan()
-{
-    return Value(NAN);
-}
-
-inline Value js_infinity()
-{
-    return Value(INFINITY);
-}
-
-inline Value js_negative_infinity()
-{
-    return Value(-INFINITY);
-}
-
-COLD ThrowCompletionOr<bool> greater_than(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<bool> greater_than_equals(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<bool> less_than(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<bool> less_than_equals(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> bitwise_and(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> bitwise_or(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> bitwise_xor(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> bitwise_not(VM&, Value);
-COLD ThrowCompletionOr<Value> unary_plus(VM&, Value);
-COLD ThrowCompletionOr<Value> unary_minus(VM&, Value);
-COLD ThrowCompletionOr<Value> add(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> sub(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> mul(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> div(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> mod(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> exp(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> in(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> instance_of(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> ordinary_has_instance(VM&, Value lhs, Value rhs);
-
-COLD ThrowCompletionOr<Value> left_shift(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> right_shift(VM&, Value lhs, Value rhs);
-COLD ThrowCompletionOr<Value> unsigned_right_shift(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<bool> is_loosely_equal(VM&, Value lhs, Value rhs);
-bool is_strictly_equal(Value lhs, Value rhs);
 JS_API bool same_value(Value lhs, Value rhs);
 JS_API bool same_value_zero(Value lhs, Value rhs);
-bool same_value_non_number(Value lhs, Value rhs);
-ThrowCompletionOr<TriState> is_less_than(VM&, Value lhs, Value rhs, bool left_first);
-
-double to_integer_or_infinity(double);
 
 enum class NumberToStringMode {
     WithExponent,
@@ -613,14 +485,6 @@ enum class NumberToStringMode {
 };
 JS_API void number_to_string(StringBuilder&, double, NumberToStringMode = NumberToStringMode::WithExponent);
 [[nodiscard]] JS_API Utf16String number_to_utf16_string(double, NumberToStringMode = NumberToStringMode::WithExponent);
-
-struct StringNumericLiteral {
-    Utf16View literal;
-    u8 base { 10 };
-};
-
-JS_API Optional<StringNumericLiteral> parse_string_numeric_literal(Utf16View);
-double string_to_number(Utf16View);
 
 inline bool Value::operator==(Value const& value) const { return same_value(*this, value); }
 

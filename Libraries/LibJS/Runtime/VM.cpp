@@ -6,52 +6,289 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Array.h>
-#include <AK/ByteBuffer.h>
-#include <AK/Debug.h>
-#include <AK/LexicalPath.h>
-#include <AK/ScopeGuard.h>
-#include <AK/String.h>
-#include <AK/StringBuilder.h>
-#include <AK/Time.h>
-#include <LibCore/ImmutableBytes.h>
-#include <LibFileSystem/FileSystem.h>
-#include <LibGC/BlockAllocator.h>
-#include <LibGC/Heap.h>
-#include <LibGC/PrimitiveStorage.h>
-#include <LibJS/Bytecode/Executable.h>
-#include <LibJS/Debugger.h>
-#include <LibJS/Runtime/AbstractOperations.h>
-#include <LibJS/Runtime/Array.h>
-#include <LibJS/Runtime/ArrayBuffer.h>
-#include <LibJS/Runtime/BoundFunction.h>
-#include <LibJS/Runtime/Completion.h>
-#include <LibJS/Runtime/ECMAScriptFunctionObject.h>
-#include <LibJS/Runtime/Error.h>
+#include <LibGC/RootVector.h>
+#include <LibJS/CyclicModule.h>
+#include <LibJS/EmbeddingABIConversions.h>
+#include <LibJS/Runtime/ArrayBufferABIConversions.h>
+#include <LibJS/Runtime/Environment.h>
+#include <LibJS/Runtime/ExecutionContext.h>
 #include <LibJS/Runtime/FinalizationRegistry.h>
-#include <LibJS/Runtime/FunctionEnvironment.h>
-#include <LibJS/Runtime/Iterator.h>
-#include <LibJS/Runtime/NativeFunction.h>
-#include <LibJS/Runtime/NativeJavaScriptBackedFunction.h>
+#include <LibJS/Runtime/JobCallback.h>
+#include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/PromiseCapability.h>
 #include <LibJS/Runtime/Reference.h>
-#include <LibJS/Runtime/Symbol.h>
-#include <LibJS/Runtime/Temporal/Instant.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibJS/SourceCode.h>
+#include <LibJS/Script.h>
+#include <LibJS/ScriptAndModuleABIConversions.h>
 #include <LibJS/SourceTextModule.h>
-#include <LibJS/SyntheticModule.h>
-#include <LibTextCodec/Decoder.h>
 
 namespace JS {
+
+using namespace EmbeddingABI;
+
+static_assert(to_underlying(EngineErrorKind::Error) == JS_ERROR_KIND_ERROR);
+static_assert(to_underlying(EngineErrorKind::EvalError) == JS_ERROR_KIND_EVAL_ERROR);
+static_assert(to_underlying(EngineErrorKind::InternalError) == JS_ERROR_KIND_INTERNAL_ERROR);
+static_assert(to_underlying(EngineErrorKind::RangeError) == JS_ERROR_KIND_RANGE_ERROR);
+static_assert(to_underlying(EngineErrorKind::ReferenceError) == JS_ERROR_KIND_REFERENCE_ERROR);
+static_assert(to_underlying(EngineErrorKind::SyntaxError) == JS_ERROR_KIND_SYNTAX_ERROR);
+static_assert(to_underlying(EngineErrorKind::TypeError) == JS_ERROR_KIND_TYPE_ERROR);
+static_assert(to_underlying(EngineErrorKind::URIError) == JS_ERROR_KIND_URI_ERROR);
+static_assert(to_underlying(EngineErrorKind::AggregateError) == JS_ERROR_KIND_AGGREGATE_ERROR);
+static_assert(to_underlying(EngineErrorKind::SuppressedError) == JS_ERROR_KIND_SUPPRESSED_ERROR);
+
+static_assert(to_underlying(HandledByHost::Handled) == JS_HANDLED_BY_HOST_HANDLED);
+static_assert(to_underlying(HandledByHost::Unhandled) == JS_HANDLED_BY_HOST_UNHANDLED);
+
+static_assert(to_underlying(CompilationType::DirectEval) == JS_COMPILATION_TYPE_DIRECT_EVAL);
+static_assert(to_underlying(CompilationType::IndirectEval) == JS_COMPILATION_TYPE_INDIRECT_EVAL);
+static_assert(to_underlying(CompilationType::Function) == JS_COMPILATION_TYPE_FUNCTION);
+static_assert(to_underlying(CompilationType::Timer) == JS_COMPILATION_TYPE_TIMER);
+
+static_assert(to_underlying(Promise::RejectionOperation::Reject) == JS_PROMISE_REJECTION_OPERATION_REJECT);
+static_assert(to_underlying(Promise::RejectionOperation::Handle) == JS_PROMISE_REJECTION_OPERATION_HANDLE);
+
+static_assert(sizeof(Value) == sizeof(JSValue));
+static_assert(sizeof(JSScriptOrModule) == sizeof(ScriptOrModule));
 
 VM* VM::s_the = nullptr;
 static size_t s_vm_count = 0;
 
+static JSVM* vm_abi(VM const& vm)
+{
+    return vm_to_abi(const_cast<VM&>(vm));
+}
+
+static JSExecutionContext* execution_context_to_abi(ExecutionContext& execution_context)
+{
+    return reinterpret_cast<JSExecutionContext*>(&execution_context);
+}
+
+static ExecutionContext* execution_context_from_abi(JSExecutionContext* execution_context)
+{
+    return reinterpret_cast<ExecutionContext*>(execution_context);
+}
+
+static Realm* realm_from_abi(JSRealm* realm)
+{
+    return cell_from_abi<Realm>(realm);
+}
+
+static ReadonlySpan<Value> values_from_abi(JSValue const* values, size_t count)
+{
+    if (count == 0)
+        return {};
+    return { reinterpret_cast<Value const*>(values), count };
+}
+
+// The runtime lends the source code of a frame for the call, and the SourceRange takes its own reference to it.
+static Optional<SourceRange> source_range_from_abi(JSDebuggerSourceRange const& source_range)
+{
+    if (!source_range.source_code)
+        return {};
+    auto const& source_code = *reinterpret_cast<SourceCode const*>(source_range.source_code);
+    return SourceRange { source_code, Position { source_range.line, source_range.column } };
+}
+
+static StackTraceElement stack_trace_element_from_abi(JSDebuggerStackFrame const& stack_frame)
+{
+    return { execution_context_from_abi(stack_frame.execution_context), source_range_from_abi(stack_frame.source_range) };
+}
+
+static ImportedModuleReferrer imported_module_referrer_from_abi(JSImportedModuleReferrer referrer)
+{
+    switch (referrer.kind) {
+    case JS_IMPORTED_MODULE_REFERRER_SCRIPT:
+        return script_from_abi(static_cast<JSScript*>(referrer.record));
+    case JS_IMPORTED_MODULE_REFERRER_CYCLIC_MODULE:
+        return module_from_abi<CyclicModule>(static_cast<JSModule*>(referrer.record));
+    case JS_IMPORTED_MODULE_REFERRER_REALM:
+        return GC::Ref { cell_ref_from_abi<Realm>(static_cast<JSRealm*>(referrer.record)) };
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
+static ImportedModulePayload imported_module_payload_from_abi(JSImportedModulePayload payload)
+{
+    switch (payload.kind) {
+    case JS_IMPORTED_MODULE_PAYLOAD_GRAPH_LOADING_STATE:
+        return GC::Ref { cell_ref_from_abi<GraphLoadingState>(payload.record) };
+    case JS_IMPORTED_MODULE_PAYLOAD_PROMISE_CAPABILITY:
+        return GC::Ref { cell_ref_from_abi<PromiseCapability>(payload.record) };
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
+static void append_utf16_string_to_sink(JSStringSink const& sink, Utf16View string)
+{
+    if (!string.has_ascii_storage()) {
+        sink.append(sink.context, reinterpret_cast<u16 const*>(string.utf16_span().data()), string.length_in_code_units());
+        return;
+    }
+    Vector<u16> code_units;
+    code_units.ensure_capacity(string.length_in_code_units());
+    for (size_t index = 0; index < string.length_in_code_units(); ++index)
+        code_units.unchecked_append(string.code_unit_at(index));
+    sink.append(sink.context, code_units.data(), code_units.size());
+}
+
+// The runtime calls the VM's host hooks and its agent through these, each with the facade's VM or agent as its data.
+struct HostHookThunks {
+    static VM& vm_of(void* data)
+    {
+        return *static_cast<VM*>(data);
+    }
+
+    static JSCompletion ensure_can_add_private_element(void* data, JSVM*, JSObject* object)
+    {
+        return completion_to_abi(vm_of(data).host_ensure_can_add_private_element(object_from_abi(object)));
+    }
+
+    static JSCompletion ensure_can_compile_strings(void* data, JSVM*, JSEnsureCanCompileStringsArguments const* arguments)
+    {
+        Vector<Utf16String> parameter_strings;
+        parameter_strings.ensure_capacity(arguments->parameter_string_count);
+        for (size_t index = 0; index < arguments->parameter_string_count; ++index)
+            parameter_strings.unchecked_append(Utf16String::from_utf16(utf16_view_from_abi(arguments->parameter_strings[index])));
+
+        return completion_to_abi(vm_of(data).host_ensure_can_compile_strings(
+            cell_ref_from_abi<Realm>(arguments->callee_realm),
+            parameter_strings,
+            utf16_view_from_abi(arguments->body_string),
+            utf16_view_from_abi(arguments->code_string),
+            static_cast<CompilationType>(arguments->compilation_type),
+            values_from_abi(arguments->parameter_args, arguments->parameter_arg_count),
+            value_from_abi(arguments->body_arg)));
+    }
+
+    static bool get_code_for_eval(void* data, JSVM*, JSObject* argument, JSValue* code)
+    {
+        auto code_string = vm_of(data).host_get_code_for_eval(object_from_abi(argument));
+        if (!code_string)
+            return false;
+        *code = value_to_abi(Value { code_string.ptr() });
+        return true;
+    }
+
+    static void promise_rejection_tracker(void* data, JSVM*, JSObject* promise, u8 operation)
+    {
+        vm_of(data).host_promise_rejection_tracker(cell_ref_from_abi<Promise>(promise), static_cast<Promise::RejectionOperation>(operation));
+    }
+
+    static JSCompletion call_job_callback(void* data, JSVM*, JSJobCallback* job_callback, JSValue this_value, JSValue const* arguments, size_t argument_count)
+    {
+        return completion_to_abi(vm_of(data).host_call_job_callback(cell_ref_from_abi<JobCallback>(job_callback), value_from_abi(this_value), values_from_abi(arguments, argument_count)));
+    }
+
+    static void enqueue_finalization_registry_cleanup_job(void* data, JSVM*, JSObject* finalization_registry)
+    {
+        vm_of(data).host_enqueue_finalization_registry_cleanup_job(cell_ref_from_abi<FinalizationRegistry>(finalization_registry));
+    }
+
+    static void enqueue_promise_job(void* data, JSVM*, JSPromiseJob* job, JSRealm* realm)
+    {
+        VERIFY(job);
+        vm_of(data).host_enqueue_promise_job(PromiseJob { *reinterpret_cast<GC::Cell*>(job) }, realm ? realm_from_abi(realm) : nullptr);
+    }
+
+    static bool promise_job_queue_is_empty(void* data, JSVM*)
+    {
+        return vm_of(data).host_promise_job_queue_is_empty();
+    }
+
+    static JSJobCallback* make_job_callback(void* data, JSVM*, JSObject* callable)
+    {
+        return cell_to_abi<JSJobCallback>(*vm_of(data).host_make_job_callback(cell_ref_from_abi<FunctionObject>(callable)));
+    }
+
+    static void get_import_meta_properties(void* data, JSVM*, JSModule* module, JSImportMetaPropertySink* properties)
+    {
+        auto& vm = vm_of(data);
+        auto import_meta_properties = vm.host_get_import_meta_properties(module_from_abi<SourceTextModule>(module));
+
+        // The values have to stay alive until they are appended, and appending one can collect garbage.
+        GC::RootVector<Value> values_being_appended;
+        for (auto const& property : import_meta_properties)
+            values_being_appended.append(property.value);
+
+        for (auto const& property : import_meta_properties)
+            properties->append(properties->context, *property_key_to_abi(property.key), value_to_abi(property.value));
+    }
+
+    static void get_supported_import_attributes(void* data, JSVM*, JSStringSink* attribute_keys)
+    {
+        for (auto const& key : vm_of(data).host_get_supported_import_attributes())
+            append_utf16_string_to_sink(*attribute_keys, key.utf16_view());
+    }
+
+    static void load_imported_module(void* data, JSVM*, JSImportedModuleReferrer referrer, JSModuleRequest const* module_request, void* host_defined, JSImportedModulePayload payload)
+    {
+        vm_of(data).host_load_imported_module(
+            imported_module_referrer_from_abi(referrer),
+            module_request_from_abi(*module_request),
+            static_cast<GC::Cell*>(host_defined),
+            imported_module_payload_from_abi(payload));
+    }
+
+    static void unrecognized_date_string(void* data, JSVM*, JSUtf16View date_string)
+    {
+        vm_of(data).host_unrecognized_date_string(utf16_view_from_abi(date_string));
+    }
+
+    static JSCompletion resize_array_buffer(void* data, JSVM*, JSObject* buffer, size_t new_byte_length)
+    {
+        return completion_to_abi(vm_of(data).host_resize_array_buffer(array_buffer_from_abi(buffer), new_byte_length));
+    }
+
+    static JSCompletion grow_shared_array_buffer(void* data, JSVM*, JSObject* buffer, size_t new_byte_length)
+    {
+        return completion_to_abi(vm_of(data).host_grow_shared_array_buffer(array_buffer_from_abi(buffer), new_byte_length));
+    }
+
+    static void on_unimplemented_property_access(void* data, JSVM*, JSObject* object, JSPropertyKey key)
+    {
+        auto& vm = vm_of(data);
+        if (vm.on_unimplemented_property_access)
+            vm.on_unimplemented_property_access(object_from_abi(object), lent_property_key_from_abi(key));
+    }
+
+    static void spin_event_loop_until(void* data, JSVM*, JSGoalCondition goal_condition, void* goal_context)
+    {
+        auto& agent = *static_cast<Agent*>(data);
+        agent.spin_event_loop_until(GC::create_function(VM::the().heap(), [goal_condition, goal_context] {
+            return goal_condition(goal_context);
+        }));
+    }
+};
+
+// The hooks that VM has no member for keep the runtime's own behavior.
+static constexpr JSVmHostHooks s_host_hook_thunks {
+    .ensure_can_add_private_element = HostHookThunks::ensure_can_add_private_element,
+    .ensure_can_compile_strings = HostHookThunks::ensure_can_compile_strings,
+    .get_code_for_eval = HostHookThunks::get_code_for_eval,
+    .promise_rejection_tracker = HostHookThunks::promise_rejection_tracker,
+    .call_job_callback = HostHookThunks::call_job_callback,
+    .enqueue_finalization_registry_cleanup_job = HostHookThunks::enqueue_finalization_registry_cleanup_job,
+    .enqueue_promise_job = HostHookThunks::enqueue_promise_job,
+    .promise_job_queue_is_empty = HostHookThunks::promise_job_queue_is_empty,
+    .make_job_callback = HostHookThunks::make_job_callback,
+    .get_import_meta_properties = HostHookThunks::get_import_meta_properties,
+    .finalize_import_meta = nullptr,
+    .get_supported_import_attributes = HostHookThunks::get_supported_import_attributes,
+    .load_imported_module = HostHookThunks::load_imported_module,
+    .unrecognized_date_string = HostHookThunks::unrecognized_date_string,
+    .resize_array_buffer = HostHookThunks::resize_array_buffer,
+    .grow_shared_array_buffer = HostHookThunks::grow_shared_array_buffer,
+    .system_utc_epoch_nanoseconds = nullptr,
+    .on_unimplemented_property_access = HostHookThunks::on_unimplemented_property_access,
+};
+
 NonnullRefPtr<VM> VM::create()
 {
     // NOTE: We only allow a single VM instance per process.
-    //       However, test262-runner needs to create and destroy VMs repeatedly,
+    //       However, test runners need to create and destroy VMs repeatedly,
     //       so we allow recreating the VM as long as the previous one was destroyed.
     VERIFY(s_vm_count == 0);
     ++s_vm_count;
@@ -59,249 +296,185 @@ NonnullRefPtr<VM> VM::create()
     ErrorMessages error_messages {};
     error_messages[to_underlying(ErrorMessage::OutOfMemory)] = Utf16String::from_utf16(ErrorType::OutOfMemory.message());
 
-    auto vm = adopt_ref(*new VM(move(error_messages)));
-
-    WellKnownSymbols well_known_symbols {
-#define __JS_ENUMERATE(SymbolName, snake_name) \
-    Symbol::create(*vm, "Symbol." #SymbolName##_utf16),
-        JS_ENUMERATE_WELL_KNOWN_SYMBOLS
-#undef __JS_ENUMERATE
-    };
-
-    vm->set_well_known_symbols(move(well_known_symbols));
-    return vm;
+    return adopt_ref(*new VM(move(error_messages)));
 }
 
-template<size_t... code_points>
-static constexpr auto make_single_ascii_character_strings(IndexSequence<code_points...>)
-{
-    return AK::Array { (Utf16String::from_ascii_character(static_cast<u8>(code_points)))... };
-}
-
-static constexpr auto single_ascii_character_strings = make_single_ascii_character_strings(MakeIndexSequence<128>());
 VM::VM(ErrorMessages error_messages)
-    : m_heap([this](HashMap<GC::Cell*, GC::HeapRoot>& roots) {
-        gather_roots(roots);
-    })
-    , m_error_messages(move(error_messages))
+    : m_error_messages(move(error_messages))
 {
+    VERIFY(static_cast<void*>(m_engine_storage) == static_cast<void*>(this));
+
+    // The embedder's C++ cells live in the VM's heap, and a SharedArrayBuffer of a fixed length lives in memory that
+    // other processes can map.
+    JSVmOptions options {
+        .become_process_default_heap = true,
+        .shared_memory_shared_array_buffers = true,
+    };
+    VERIFY(js_vm_construct_at(m_engine_storage, sizeof(m_engine_storage), alignof(VM), &options));
+
+    m_heap = reinterpret_cast<GC::Heap*>(js_vm_heap(vm_abi(*this)));
     s_the = this;
-    MUST(GC::PrimitiveStorage::the().ensure_cage());
-    m_primitive_storage_cage_base = js_primitive_storage_cage_base;
-    VERIFY(m_primitive_storage_cage_base != 0);
-    m_heap_region_base = GC::BlockAllocator::heap_region_start();
-    VERIFY(m_heap_region_base != 0);
 
-    m_keyed_property_lookup_cache = make<Bytecode::KeyedPropertyLookupCache>();
-    m_heap.register_sweep_callback([this] {
-        Bytecode::StaticPropertyLookupCache::sweep_all();
-        m_keyed_property_lookup_cache->remove_dead_entries();
-    });
-
-    m_empty_string = m_heap.allocate<PrimitiveString>(Utf16String {});
-
-    cached_strings = {
-        .number = m_heap.allocate<PrimitiveString>("number"_utf16),
-        .undefined = m_heap.allocate<PrimitiveString>("undefined"_utf16),
-        .object = m_heap.allocate<PrimitiveString>("object"_utf16),
-        .string = m_heap.allocate<PrimitiveString>("string"_utf16),
-        .symbol = m_heap.allocate<PrimitiveString>("symbol"_utf16),
-        .boolean = m_heap.allocate<PrimitiveString>("boolean"_utf16),
-        .bigint = m_heap.allocate<PrimitiveString>("bigint"_utf16),
-        .function = m_heap.allocate<PrimitiveString>("function"_utf16),
-        .object_Object = m_heap.allocate<PrimitiveString>("[object Object]"_utf16),
-    };
-
-    for (size_t i = 0; i < single_ascii_character_strings.size(); ++i)
-        m_single_ascii_character_strings[i] = m_heap.allocate<PrimitiveString>(single_ascii_character_strings[i]);
-
-    // Default hook implementations. These can be overridden by the host, for example, LibWeb overrides the default hooks to place promise jobs on the microtask queue.
-    host_promise_rejection_tracker = [this](Promise& promise, Promise::RejectionOperation operation) {
-        promise_rejection_tracker(promise, operation);
-    };
-
-    host_call_job_callback = [this](JobCallback& job_callback, Value this_value, ReadonlySpan<Value> arguments) {
-        return call_job_callback(*this, job_callback, this_value, arguments);
-    };
-
-    host_enqueue_finalization_registry_cleanup_job = [this](FinalizationRegistry& finalization_registry) {
-        enqueue_finalization_registry_cleanup_job(finalization_registry);
-    };
-
-    host_enqueue_promise_job = [this](PromiseJob job, GC::Ptr<Realm> realm) {
-        enqueue_promise_job(job, realm);
-    };
-
-    host_promise_job_queue_is_empty = [this]() -> bool {
-        return m_promise_jobs.is_empty();
-    };
-
-    host_make_job_callback = [](FunctionObject& function_object) {
-        return make_job_callback(function_object);
-    };
-
-    host_load_imported_module = [this](ImportedModuleReferrer referrer, ModuleRequest const& module_request, GC::Ptr<GC::Cell> load_state, ImportedModulePayload payload) -> void {
-        return load_imported_module(referrer, module_request, load_state, move(payload));
-    };
-
-    host_get_import_meta_properties = [&](SourceTextModule const&) -> HashMap<PropertyKey, Value> {
-        return {};
-    };
-
-    host_finalize_import_meta = [&](Object*, SourceTextModule const&) {
-    };
-
-    host_get_supported_import_attributes = [&] {
-        return Vector<Utf16String> { "type"_utf16 };
-    };
-
-    // 1 HostGetCodeForEval ( argument ), https://tc39.es/proposal-dynamic-code-brand-checks/#sec-hostgetcodeforeval
-    host_get_code_for_eval = [](Object const&) -> GC::Ptr<PrimitiveString> {
-        // The host-defined abstract operation HostGetCodeForEval takes argument argument (an Object) and returns a
-        // String or NO-CODE. It allows host environments to return a String of code from argument to be used by eval,
-        // rather than eval returning argument.
-        //
-        // argument represents the Object to be checked for code.
-        //
-        // The default implementation of HostGetCodeForEval is to return NO-CODE.
-        return {};
-    };
-
-    // 2 HostEnsureCanCompileStrings ( calleeRealm, parameterStrings, bodyString, codeString, compilationType, parameterArgs, bodyArg ), https://tc39.es/proposal-dynamic-code-brand-checks/#sec-hostensurecancompilestrings
-    host_ensure_can_compile_strings = [](Realm&, ReadonlySpan<Utf16String>, Utf16View, Utf16View, CompilationType, ReadonlySpan<Value>, Value) -> ThrowCompletionOr<void> {
-        // The host-defined abstract operation HostEnsureCanCompileStrings takes arguments calleeRealm (a Realm Record),
-        // parameterStrings (a List of Strings), bodyString (a String), and direct (a Boolean) and returns either a normal
-        // completion containing unused or a throw completion.
-        //
-        // It allows host environments to block certain ECMAScript functions which allow developers to compile strings into ECMAScript code.
-        // An implementation of HostEnsureCanCompileStrings must conform to the following requirements:
-        //   - If the returned Completion Record is a normal completion, it must be a normal completion containing unused.
-        // The default implementation of HostEnsureCanCompileStrings is to return NormalCompletion(unused).
-        return {};
-    };
-
-    host_ensure_can_add_private_element = [](Object&) -> ThrowCompletionOr<void> {
-        // The host-defined abstract operation HostEnsureCanAddPrivateElement takes argument O (an Object)
-        // and returns either a normal completion containing unused or a throw completion.
-        // It allows host environments to prevent the addition of private elements to particular host-defined exotic objects.
-        // An implementation of HostEnsureCanAddPrivateElement must conform to the following requirements:
-        // - If O is not a host-defined exotic object, this abstract operation must return NormalCompletion(unused) and perform no other steps.
-        // - Any two calls of this abstract operation with the same argument must return the same kind of Completion Record.
-        // The default implementation of HostEnsureCanAddPrivateElement is to return NormalCompletion(unused).
-        return {};
-
-        // This abstract operation is only invoked by ECMAScript hosts that are web browsers.
-        // NOTE: Since LibJS has no way of knowing whether the current environment is a browser we always
-        //       call HostEnsureCanAddPrivateElement when needed.
-    };
-
-    // 25.1.3.8 HostResizeArrayBuffer ( buffer, newByteLength ), https://tc39.es/ecma262/#sec-hostresizearraybuffer
-    host_resize_array_buffer = [this](ArrayBuffer& buffer, size_t new_byte_length) -> ThrowCompletionOr<HandledByHost> {
-        // The host-defined abstract operation HostResizeArrayBuffer takes arguments buffer (an ArrayBuffer) and
-        // newByteLength (a non-negative integer) and returns either a normal completion containing either handled or
-        // unhandled, or a throw completion. It gives the host an opportunity to perform implementation-defined resizing
-        // of buffer. If the host chooses not to handle resizing of buffer, it may return unhandled for the default behaviour.
-
-        // The implementation of HostResizeArrayBuffer must conform to the following requirements:
-        // - The abstract operation does not detach buffer.
-        // - If the abstract operation completes normally with handled, buffer.[[ArrayBufferByteLength]] is newByteLength.
-
-        // The default implementation of HostResizeArrayBuffer is to return NormalCompletion(unhandled).
-
-        if (auto result = buffer.try_resize(new_byte_length, DataBlock::ZeroFillNewBytes::Yes); result.is_error())
-            return throw_completion<RangeError>(ErrorType::NotEnoughMemoryToAllocate, new_byte_length);
-
-        return HandledByHost::Handled;
-    };
-
-    // 25.2.2.4 HostGrowSharedArrayBuffer ( buffer, newByteLength ), https://tc39.es/ecma262/#sec-hostgrowsharedarraybuffer
-    host_grow_shared_array_buffer = [](ArrayBuffer&, size_t) -> ThrowCompletionOr<HandledByHost> {
-        // The host-defined abstract operation HostGrowSharedArrayBuffer takes arguments buffer (a SharedArrayBuffer)
-        // and newByteLength (a non-negative integer) and returns either a normal completion containing either handled
-        // or unhandled, or a throw completion. It gives the host an opportunity to perform implementation-defined
-        // growing of buffer. If the host chooses not to handle growing of buffer, it may return unhandled for the default behaviour.
-
-        // The implementation of HostGrowSharedArrayBuffer must conform to the following requirements:
-        // - If the abstract operation does not complete normally with unhandled, and newByteLength < the current byte length of the buffer or newByteLength > buffer.[[ArrayBufferMaxByteLength]], throw a RangeError exception.
-        // - Let AR be the Agent Record of the surrounding agent. Let isLittleEndian be AR.[[LittleEndian]]. If the abstract operation completes normally with handled, a WriteSharedMemory or ReadModifyWriteSharedMemory event whose [[Order]] is seq-cst, [[Payload]] is NumericToRawBytes(biguint64, newByteLength, isLittleEndian), [[Block]] is buffer.[[ArrayBufferByteLengthData]], [[ByteIndex]] is 0, and [[ElementSize]] is 8 is added to the surrounding agent's candidate execution such that racing calls to SharedArrayBuffer.prototype.grow ( newLength ) are not "lost", i.e. silently do nothing.
-
-        // The default implementation of HostGrowSharedArrayBuffer is to return NormalCompletion(unhandled).
-        return HandledByHost::Unhandled;
-    };
-
-    // 2.3.1 HostSystemUTCEpochNanoseconds ( global ), https://tc39.es/proposal-temporal/#sec-hostsystemutcepochnanoseconds
-    host_system_utc_epoch_nanoseconds = [](Object const&) {
-        // 1. Let ns be the approximate current UTC date and time, in nanoseconds since the epoch.
-        Crypto::SignedBigInteger nanoseconds { AK::UnixDateTime::now().nanoseconds_since_epoch() };
-
-        // 2. Return the result of clamping ns between nsMinInstant and nsMaxInstant.
-        if (nanoseconds < Temporal::NANOSECONDS_MIN_INSTANT)
-            nanoseconds = Temporal::NANOSECONDS_MIN_INSTANT;
-        if (nanoseconds > Temporal::NANOSECONDS_MAX_INSTANT)
-            nanoseconds = Temporal::NANOSECONDS_MAX_INSTANT;
-
-        return nanoseconds;
-    };
-
-    // AD-HOC: Inform the host that we received a date string we were unable to parse.
-    host_unrecognized_date_string = [](Utf16View) {
-    };
-}
-
-u32 VM::register_native_function(NativeFunctionPointer function, NativeFunctionType type)
-{
-    VERIFY(function);
-
-    NativeFunctionTableEntry entry { function, type };
-    if (auto it = m_native_function_indices.find(entry); it != m_native_function_indices.end())
-        return it->value;
-
-    VERIFY(m_native_function_table.size() < NumericLimits<u32>::max());
-    auto index = static_cast<u32>(m_native_function_table.size());
-    m_native_function_table.append(entry);
-    m_native_function_indices.set(entry, index);
-    m_native_function_table_data = m_native_function_table.data();
-    return index;
-}
-
-NativeFunctionPointer VM::native_function(u32 index, NativeFunctionType expected_type) const
-{
-    VERIFY(index < m_native_function_table.size());
-    auto const& entry = m_native_function_table[index];
-    VERIFY(entry.type == expected_type);
-    VERIFY(entry.function);
-    return entry.function;
+    install_default_host_hooks();
+    js_vm_set_embedder(vm_abi(*this), &s_host_hook_thunks, this);
 }
 
 VM::~VM()
 {
+    // The hooks and the agent may hold roots, which have to go before the heap does.
+    js_vm_set_agent(vm_abi(*this), nullptr);
+    js_vm_set_embedder(vm_abi(*this), nullptr, nullptr);
+    m_agent = nullptr;
+    clear_host_hooks();
+    on_unimplemented_property_access = nullptr;
+
+    js_vm_destroy_at(vm_abi(*this));
+
+    if (s_the == this)
+        s_the = nullptr;
     --s_vm_count;
     VERIFY(s_vm_count == 0);
 }
 
+void VM::unref() const
+{
+    VERIFY(m_reference_count > 0);
+    if (--m_reference_count == 0)
+        delete const_cast<VM*>(this);
+}
+
+void VM::install_default_host_hooks()
+{
+    host_load_imported_module = [this](ImportedModuleReferrer referrer, ModuleRequest const& module_request, GC::Ptr<GC::Cell> load_state, ImportedModulePayload payload) {
+        ModuleRequestForABI abi_module_request { module_request };
+        js_vm_default_host_load_imported_module(vm_abi(*this), imported_module_referrer_to_abi(referrer), abi_module_request.ptr(), load_state.ptr(), imported_module_payload_to_abi(payload));
+    };
+
+    host_get_import_meta_properties = [](SourceTextModule&) -> HashMap<PropertyKey, Value> {
+        return {};
+    };
+
+    host_get_supported_import_attributes = [] {
+        return Vector<Utf16String> { "type"_utf16 };
+    };
+
+    // The runtime tracks no rejections for an embedder by itself.
+    host_promise_rejection_tracker = [](Promise&, Promise::RejectionOperation) {
+    };
+
+    host_call_job_callback = [this](JobCallback& job_callback, Value this_value, ReadonlySpan<Value> arguments) -> ThrowCompletionOr<Value> {
+        return completion_from_abi<Value>(js_vm_default_host_call_job_callback(vm_abi(*this), cell_to_abi<JSJobCallback>(job_callback), value_to_abi(this_value), reinterpret_cast<JSValue const*>(arguments.data()), arguments.size()));
+    };
+
+    host_enqueue_finalization_registry_cleanup_job = [this](FinalizationRegistry& finalization_registry) {
+        js_vm_default_host_enqueue_finalization_registry_cleanup_job(vm_abi(*this), object_to_abi(finalization_registry));
+    };
+
+    host_enqueue_promise_job = [this](PromiseJob job, GC::Ptr<Realm> realm) {
+        js_vm_default_host_enqueue_promise_job(vm_abi(*this), reinterpret_cast<JSPromiseJob*>(job.m_job.ptr()), realm ? realm_to_abi(*realm) : nullptr);
+    };
+
+    host_promise_job_queue_is_empty = [this] {
+        return js_vm_default_host_promise_job_queue_is_empty(vm_abi(*this));
+    };
+
+    host_make_job_callback = [this](FunctionObject& function_object) {
+        return JobCallback::create(*this, function_object, nullptr);
+    };
+
+    host_get_code_for_eval = [](Object const&) -> GC::Ptr<PrimitiveString> {
+        return {};
+    };
+
+    host_ensure_can_compile_strings = [](Realm&, ReadonlySpan<Utf16String>, Utf16View, Utf16View, CompilationType, ReadonlySpan<Value>, Value) -> ThrowCompletionOr<void> {
+        return {};
+    };
+
+    host_ensure_can_add_private_element = [](Object&) -> ThrowCompletionOr<void> {
+        return {};
+    };
+
+    host_resize_array_buffer = [this](ArrayBuffer& buffer, size_t new_byte_length) -> ThrowCompletionOr<HandledByHost> {
+        return completion_from_abi<HandledByHost>(js_vm_default_host_resize_array_buffer(vm_abi(*this), array_buffer_to_abi(buffer), new_byte_length));
+    };
+
+    host_grow_shared_array_buffer = [this](ArrayBuffer& buffer, size_t new_byte_length) -> ThrowCompletionOr<HandledByHost> {
+        return completion_from_abi<HandledByHost>(js_vm_default_host_grow_shared_array_buffer(vm_abi(*this), array_buffer_to_abi(buffer), new_byte_length));
+    };
+
+    host_unrecognized_date_string = [](Utf16View) {
+    };
+}
+
+void VM::clear_host_hooks()
+{
+    host_load_imported_module = nullptr;
+    host_get_import_meta_properties = nullptr;
+    host_get_supported_import_attributes = nullptr;
+    host_promise_rejection_tracker = nullptr;
+    host_call_job_callback = nullptr;
+    host_enqueue_finalization_registry_cleanup_job = nullptr;
+    host_enqueue_promise_job = nullptr;
+    host_make_job_callback = nullptr;
+    host_get_code_for_eval = nullptr;
+    host_ensure_can_compile_strings = nullptr;
+    host_ensure_can_add_private_element = nullptr;
+    host_resize_array_buffer = nullptr;
+    host_grow_shared_array_buffer = nullptr;
+    host_unrecognized_date_string = nullptr;
+    host_promise_job_queue_is_empty = nullptr;
+}
+
+ThrowCompletionOr<Value> VM::run(Script& script, GC::Ptr<Environment> lexical_environment_override)
+{
+    auto* abi_lexical_environment_override = lexical_environment_override ? cell_to_abi<JSEnvironment>(*lexical_environment_override) : nullptr;
+    return completion_from_abi<Value>(js_script_run(vm_abi(*this), cell_to_abi<JSScript>(script), abi_lexical_environment_override));
+}
+
 void VM::enable_debugging()
 {
-    if (!m_debugger)
-        m_debugger = make<Debugger>();
+    js_debugger_enable(vm_abi(*this));
 }
 
 void VM::disable_debugging()
 {
-    if (m_debugger)
-        VERIFY(!m_debugger->is_paused());
-    m_debugger = nullptr;
+    js_debugger_disable(vm_abi(*this));
 }
 
-SharedFunctionInstanceData* VM::active_shared_function_data()
+bool VM::debugging_enabled() const
 {
-    auto* function = active_function_object();
-    if (!function)
+    return js_debugger_is_enabled(vm_abi(*this));
+}
+
+Debugger* VM::debugger()
+{
+    if (!debugging_enabled())
         return nullptr;
-    if (auto* ecmascript_function = as_if<ECMAScriptFunctionObject>(*function))
-        return &ecmascript_function->shared_data();
-    if (auto* native_javascript_backed_function = as_if<NativeJavaScriptBackedFunction>(*function))
-        return &native_javascript_backed_function->shared_data();
-    return nullptr;
+    return reinterpret_cast<Debugger*>(this);
+}
+
+Debugger const* VM::debugger() const
+{
+    if (!debugging_enabled())
+        return nullptr;
+    return reinterpret_cast<Debugger const*>(this);
+}
+
+GC::Ref<Symbol> VM::well_known_symbol(WellKnownSymbol symbol) const
+{
+    static_assert(to_underlying(WellKnownSymbol::async_dispose) == JS_WELL_KNOWN_SYMBOL_ASYNC_DISPOSE);
+    static_assert(to_underlying(WellKnownSymbol::iterator) == JS_WELL_KNOWN_SYMBOL_ITERATOR);
+    static_assert(to_underlying(WellKnownSymbol::to_string_tag) == JS_WELL_KNOWN_SYMBOL_TO_STRING_TAG);
+    static_assert(to_underlying(WellKnownSymbol::unscopables) == JS_WELL_KNOWN_SYMBOL_UNSCOPABLES);
+    auto* well_known_symbol = js_symbol_well_known(vm_abi(*this), to_underlying(symbol));
+    VERIFY(well_known_symbol);
+    return cell_ref_from_abi<Symbol>(well_known_symbol);
+}
+
+PrimitiveString& VM::empty_string()
+{
+    // The runtime hands out the one empty string it keeps.
+    return cell_ref_from_abi<PrimitiveString>(js_string_create_from_utf16_view(vm_abi(*this), utf16_view_to_abi(Utf16View {})));
 }
 
 Utf16String const& VM::error_message(ErrorMessage type) const
@@ -314,354 +487,97 @@ Utf16String const& VM::error_message(ErrorMessage type) const
     return message;
 }
 
-struct ExecutionContextRootsCollector : public Cell::Visitor {
-    virtual void visit_impl(GC::Cell& cell) override
-    {
-        roots.set(&cell);
-    }
-
-    virtual void visit_impl(ReadonlySpan<GC::NanBoxedValue> values) override
-    {
-        for (auto const& value : values) {
-            if (value.is_cell())
-                roots.set(value.as_cell());
-        }
-    }
-
-    virtual void visit_possible_values(ReadonlyBytes) override
-    {
-        VERIFY_NOT_REACHED();
-    }
-
-    HashTable<GC::Ptr<GC::Cell>> roots;
-};
-
-void VM::gather_roots(HashMap<GC::Cell*, GC::HeapRoot>& roots)
+bool VM::did_reach_stack_space_limit() const
 {
-    roots.set(m_empty_string.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    for (auto string : m_single_ascii_character_strings)
-        roots.set(string.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
+    return js_vm_did_reach_stack_space_limit(vm_abi(*this));
+}
 
-    for (auto string : m_numeric_string_cache) {
-        // The numeric string cache is populated lazily, so skip null entries.
-        if (!string)
-            continue;
-        roots.set(string.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    }
+void VM::push_execution_context_growing_the_stack(ExecutionContext& execution_context)
+{
+    js_execution_context_push(vm_abi(*this), execution_context_to_abi(execution_context));
+}
 
-    for (auto const& entry : m_large_numeric_string_cache) {
-        if (entry.string)
-            roots.set(entry.string.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    }
+void VM::finish_execution_generation()
+{
+    js_vm_finish_execution_generation(vm_abi(*this));
+}
 
-    roots.set(cached_strings.number.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    roots.set(cached_strings.undefined.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    roots.set(cached_strings.object.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    roots.set(cached_strings.string.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    roots.set(cached_strings.symbol.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    roots.set(cached_strings.boolean.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    roots.set(cached_strings.bigint.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    roots.set(cached_strings.function.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    roots.set(cached_strings.object_Object.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-
-#define __JS_ENUMERATE(SymbolName, snake_name) \
-    roots.set(m_well_known_symbols.snake_name.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    JS_ENUMERATE_WELL_KNOWN_SYMBOLS
-#undef __JS_ENUMERATE
-
-    for (auto& symbol : m_global_symbol_registry)
-        roots.set(symbol.value.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-
-    for (auto finalization_registry : m_finalization_registry_cleanup_jobs)
-        roots.set(finalization_registry.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-
-    auto gather_roots_from_execution_context_stack = [&roots](Vector<ExecutionContext*> const& stack, Vector<ExecutionContext*> const& previous_running_contexts, ExecutionContext* running_execution_context) {
-        for_each_execution_context_top_to_bottom(stack, previous_running_contexts, running_execution_context, [&](ExecutionContext& execution_context) {
-            ExecutionContextRootsCollector visitor;
-            execution_context.visit_edges(visitor);
-            for (auto cell : visitor.roots)
-                roots.set(cell.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-            return true;
-        });
+Vector<StackTraceElement> VM::stack_trace() const
+{
+    Vector<StackTraceElement> stack_trace;
+    JSStackTraceSink stack_trace_sink {
+        .context = &stack_trace,
+        .append = [](void* context, JSDebuggerStackFrame const* stack_frame) {
+            static_cast<Vector<StackTraceElement>*>(context)->append(stack_trace_element_from_abi(*stack_frame));
+        },
     };
-    gather_roots_from_execution_context_stack(m_execution_context_stack, m_execution_context_stack_previous_running_contexts, m_running_execution_context);
-    for (auto const& saved_stack : m_saved_execution_context_stacks)
-        gather_roots_from_execution_context_stack(saved_stack.stack, saved_stack.previous_running_contexts, saved_stack.running_execution_context);
-
-    if (m_type_error_realm_override)
-        roots.set(m_type_error_realm_override.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    for (auto const& saved_stack : m_saved_execution_context_stacks) {
-        if (saved_stack.type_error_realm_override)
-            roots.set(saved_stack.type_error_realm_override.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
-    }
-
-    for (auto& job : m_promise_jobs)
-        roots.set(job.m_steps.ptr(), GC::HeapRoot { .type = GC::HeapRoot::Type::VM });
+    js_vm_stack_trace(vm_abi(*this), &stack_trace_sink);
+    return stack_trace;
 }
 
-// 9.1.2.1 GetIdentifierReference ( env, name, strict ), https://tc39.es/ecma262/#sec-getidentifierreference
-ThrowCompletionOr<Reference> VM::get_identifier_reference(Environment* environment, Utf16FlyString name, Strict strict, size_t hops)
-{
-    // 1. If env is the value null, then
-    if (!environment) {
-        // a. Return the Reference Record { [[Base]]: unresolvable, [[ReferencedName]]: name, [[Strict]]: strict, [[ThisValue]]: empty }.
-        return Reference { Reference::BaseType::Unresolvable, move(name), strict };
-    }
-
-    // 2. Let exists be ? env.HasBinding(name).
-    Optional<size_t> index;
-    auto exists = TRY(environment->has_binding(name, &index));
-
-    // Note: This is an optimization for looking up the same reference.
-    Optional<EnvironmentCoordinate> environment_coordinate;
-    if (index.has_value()) {
-        VERIFY(hops <= NumericLimits<u32>::max());
-        VERIFY(index.value() <= NumericLimits<u32>::max());
-        environment_coordinate = EnvironmentCoordinate { .hops = static_cast<u32>(hops), .index = static_cast<u32>(index.value()) };
-    }
-
-    // 3. If exists is true, then
-    if (exists) {
-        // a. Return the Reference Record { [[Base]]: env, [[ReferencedName]]: name, [[Strict]]: strict, [[ThisValue]]: empty }.
-        return Reference { *environment, move(name), strict, environment_coordinate };
-    }
-    // 4. Else,
-    else {
-        // a. Let outer be env.[[OuterEnv]].
-        // b. Return ? GetIdentifierReference(outer, name, strict).
-        return get_identifier_reference(environment->outer_environment(), move(name), strict, hops + 1);
-    }
-}
-
-// 9.4.2 ResolveBinding ( name [ , env ] ), https://tc39.es/ecma262/#sec-resolvebinding
 ThrowCompletionOr<Reference> VM::resolve_binding(Utf16FlyString const& name, Strict strict, GC::Ptr<Environment> environment)
 {
     // 1. If env is not present or if env is undefined, then
-    if (!environment) {
-        // a. Set env to the running execution context's LexicalEnvironment.
+    //    a. Set env to the running execution context's LexicalEnvironment.
+    if (!environment)
         environment = running_execution_context().lexical_environment;
-    }
 
     // 2. Assert: env is an Environment Record.
     VERIFY(environment);
 
-    // 3. If the source text matched by the syntactic production that is being evaluated is contained in strict mode code, let strict be true; else let strict be false.
-    // NOTE: We take this as a parameter.
-
     // 4. Return ? GetIdentifierReference(env, name, strict).
-    return get_identifier_reference(environment.ptr(), name, strict);
-
-    // NOTE: The spec says:
-    //       Note: The result of ResolveBinding is always a Reference Record whose [[ReferencedName]] field is name.
-    //       But this is not actually correct as GetIdentifierReference (or really the methods it calls) can throw.
+    auto base_environment = TRY(completion_from_abi<GC::Ptr<Environment>>(js_environment_resolve_binding(vm_abi(*this), utf16_view_to_abi(name.view()), strict == Strict::Yes, cell_to_abi<JSEnvironment>(*environment))));
+    if (!base_environment)
+        return Reference { Reference::BaseType::Unresolvable, name, strict };
+    return Reference { *base_environment, name, strict };
 }
 
-// 9.4.4 ResolveThisBinding ( ), https://tc39.es/ecma262/#sec-resolvethisbinding
-ThrowCompletionOr<Value> VM::resolve_this_binding()
+Completion VM::throw_engine_error(EngineErrorKind kind, Utf16View message)
 {
-    auto& vm = *this;
-
-    // 1. Let envRec be GetThisEnvironment().
-    auto environment = get_this_environment(vm);
-
-    // 2. Return ? envRec.GetThisBinding().
-    return TRY(environment->get_this_binding(vm));
+    return throw_completion_from_abi(js_error_throw(vm_abi(*this), to_underlying(kind), utf16_view_to_abi(message)));
 }
 
-// 9.4.5 GetNewTarget ( ), https://tc39.es/ecma262/#sec-getnewtarget
-Value VM::get_new_target()
+Completion VM::throw_engine_error(EngineErrorKind kind, Utf16String message)
 {
-    // 1. Let envRec be GetThisEnvironment().
-    auto env = get_this_environment(*this);
-
-    // 2. Assert: envRec has a [[NewTarget]] field.
-    // 3. Return envRec.[[NewTarget]].
-    return as<FunctionEnvironment>(*env).new_target();
+    return throw_completion_from_abi(js_error_throw_with_owned_message(vm_abi(*this), to_underlying(kind), owned_utf16_string_to_abi(move(message))));
 }
 
-// 13.3.12.1 Runtime Semantics: Evaluation, https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation
-// ImportMeta branch only
-GC::Ref<Object> VM::get_import_meta()
+void VM::set_agent(OwnPtr<Agent> agent)
 {
-    // 1. Let module be GetActiveScriptOrModule().
-    auto script_or_module = get_active_script_or_module();
-
-    // 2. Assert: module is a Source Text Module Record.
-    auto& module = as<SourceTextModule>(*script_or_module.get<GC::Ref<Module>>());
-
-    // 3. Let importMeta be module.[[ImportMeta]].
-    GC::Ptr<Object> import_meta = module.import_meta();
-
-    // 4. If importMeta is empty, then
-    if (import_meta == nullptr) {
-        // a. Set importMeta to OrdinaryObjectCreate(null).
-        import_meta = Object::create(*current_realm(), nullptr);
-
-        // b. Let importMetaValues be HostGetImportMetaProperties(module).
-        auto import_meta_values = host_get_import_meta_properties(module);
-
-        // c. For each Record { [[Key]], [[Value]] } p of importMetaValues, do
-        for (auto& entry : import_meta_values) {
-            // i. Perform ! CreateDataPropertyOrThrow(importMeta, p.[[Key]], p.[[Value]]).
-            MUST(import_meta->create_data_property_or_throw(entry.key, entry.value));
-        }
-
-        // d. Perform HostFinalizeImportMeta(importMeta, module).
-        host_finalize_import_meta(import_meta.ptr(), module);
-
-        // e. Set module.[[ImportMeta]] to importMeta.
-        module.set_import_meta({}, import_meta.ptr());
-
-        // f. Return importMeta.
-        return import_meta.as_nonnull();
+    m_agent = move(agent);
+    if (!m_agent) {
+        js_vm_set_agent(vm_abi(*this), nullptr);
+        return;
     }
-    // 5. Else,
-    else {
-        // a. Assert: Type(importMeta) is Object.
-        // Note: This is always true by the type.
 
-        // b. Return importMeta.
-        return import_meta.as_nonnull();
-    }
-}
-
-// 9.4.5 GetGlobalObject ( ), https://tc39.es/ecma262/#sec-getglobalobject
-Object& VM::get_global_object()
-{
-    // 1. Let currentRealm be the current Realm Record.
-    auto& current_realm = *this->current_realm();
-
-    // 2. Return currentRealm.[[GlobalObject]].
-    return current_realm.global_object();
-}
-
-void VM::run_queued_promise_jobs_impl()
-{
-    dbgln_if(PROMISE_DEBUG, "Running queued promise jobs");
-
-    while (!m_promise_jobs.is_empty()) {
-        auto job = m_promise_jobs.take_first();
-        dbgln_if(PROMISE_DEBUG, "Calling promise job function");
-
-        [[maybe_unused]] auto result = job.run();
-    }
-}
-
-// 9.5.4 HostEnqueuePromiseJob ( job, realm ), https://tc39.es/ecma262/#sec-hostenqueuepromisejob
-void VM::enqueue_promise_job(PromiseJob job, GC::Ptr<Realm>)
-{
-    // An implementation of HostEnqueuePromiseJob must conform to the requirements in 9.5 as well as the following:
-    // - FIXME: If realm is not null, each time job is invoked the implementation must perform implementation-defined steps such that execution is prepared to evaluate ECMAScript code at the time of job's invocation.
-    // - FIXME: Let scriptOrModule be GetActiveScriptOrModule() at the time HostEnqueuePromiseJob is invoked. If realm is not null, each time job is invoked the implementation must perform implementation-defined steps
-    //          such that scriptOrModule is the active script or module at the time of job's invocation.
-    // - Jobs must run in the same order as the HostEnqueuePromiseJob invocations that scheduled them.
-    m_promise_jobs.append(job);
-}
-
-void VM::run_queued_finalization_registry_cleanup_jobs()
-{
-    while (!m_finalization_registry_cleanup_jobs.is_empty()) {
-        auto registry = m_finalization_registry_cleanup_jobs.take_last();
-        // FIXME: Handle any uncatched exceptions here.
-        auto result = registry->cleanup();
-        if (result.is_error() && registry->has_empty_cells())
-            m_finalization_registry_cleanup_jobs.append(registry);
-    }
-}
-
-// 9.10.4.1 HostEnqueueFinalizationRegistryCleanupJob ( finalizationRegistry ), https://tc39.es/ecma262/#sec-host-cleanup-finalization-registry
-void VM::enqueue_finalization_registry_cleanup_job(FinalizationRegistry& registry)
-{
-    m_finalization_registry_cleanup_jobs.append(registry);
-}
-
-// 27.2.1.9 HostPromiseRejectionTracker ( promise, operation ), https://tc39.es/ecma262/#sec-host-promise-rejection-tracker
-void VM::promise_rejection_tracker(Promise& promise, Promise::RejectionOperation operation) const
-{
-    switch (operation) {
-    case Promise::RejectionOperation::Reject:
-        // A promise was rejected without any handlers
-        if (on_promise_unhandled_rejection)
-            on_promise_unhandled_rejection(promise);
-        break;
-    case Promise::RejectionOperation::Handle:
-        // A handler was added to an already rejected promise
-        if (on_promise_rejection_handled)
-            on_promise_rejection_handled(promise);
-        break;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-}
-
-void VM::dump_backtrace() const
-{
-    for_each_execution_context_top_to_bottom([&](ExecutionContext const& frame) {
-        if (frame.executable) {
-            if (auto source_range = frame.executable->source_range_at(frame.program_counter); source_range.has_value())
-                dbgln("-> {} @ {}:{},{}", frame.function ? frame.function->name_for_call_stack() : ""_utf16, source_range->filename(), source_range->start.line, source_range->start.column);
-            else
-                dbgln("-> {}", frame.function ? frame.function->name_for_call_stack() : ""_utf16);
-        } else {
-            dbgln("-> {}", frame.function ? frame.function->name_for_call_stack() : ""_utf16);
-        }
-        return true;
-    });
+    JSAgent abi_agent {
+        .can_block = m_agent->can_block() == Agent::CanBlock::Yes,
+        .spin_event_loop_until = HostHookThunks::spin_event_loop_until,
+        .data = m_agent.ptr(),
+    };
+    js_vm_set_agent(vm_abi(*this), &abi_agent);
 }
 
 void VM::save_execution_context_stack()
 {
-    m_saved_execution_context_stacks.append({
-        .stack = move(m_execution_context_stack),
-        .previous_running_contexts = move(m_execution_context_stack_previous_running_contexts),
-        .running_execution_context = m_running_execution_context,
-        .type_error_realm_override = m_type_error_realm_override,
-        .type_error_realm_override_depth = m_type_error_realm_override_depth,
-    });
-    m_running_execution_context = nullptr;
-    m_type_error_realm_override = nullptr;
-    m_type_error_realm_override_depth = 0;
+    js_execution_context_save_stack(vm_abi(*this));
 }
 
 void VM::clear_execution_context_stack()
 {
-    m_execution_context_stack.clear_with_capacity();
-    m_execution_context_stack_previous_running_contexts.clear_with_capacity();
-    m_running_execution_context = nullptr;
-    m_type_error_realm_override = nullptr;
-    m_type_error_realm_override_depth = 0;
+    js_execution_context_clear_stack(vm_abi(*this));
 }
 
 void VM::restore_execution_context_stack()
 {
-    auto saved_stack = m_saved_execution_context_stacks.take_last();
-    m_execution_context_stack = move(saved_stack.stack);
-    m_execution_context_stack_previous_running_contexts = move(saved_stack.previous_running_contexts);
-    m_running_execution_context = saved_stack.running_execution_context;
-    m_type_error_realm_override = saved_stack.type_error_realm_override;
-    m_type_error_realm_override_depth = saved_stack.type_error_realm_override_depth;
-}
-
-ExecutionContext* VM::previous_execution_context() const
-{
-    ExecutionContext* previous_execution_context = nullptr;
-    bool found_running_execution_context = false;
-    for_each_execution_context_top_to_bottom([&](ExecutionContext const& execution_context) {
-        if (!found_running_execution_context) {
-            found_running_execution_context = true;
-            return true;
-        }
-        previous_execution_context = const_cast<ExecutionContext*>(&execution_context);
-        return false;
-    });
-    return previous_execution_context;
+    js_execution_context_restore_stack(vm_abi(*this));
 }
 
 // 9.4.1 GetActiveScriptOrModule ( ), https://tc39.es/ecma262/#sec-getactivescriptormodule
 ScriptOrModule VM::get_active_script_or_module() const
 {
     // 1. If the execution context stack is empty, return null.
-    if (!m_running_execution_context)
+    if (!running_execution_context_or_null())
         return Empty {};
 
     // 2. Let ec be the topmost execution context on the execution context stack whose ScriptOrModule component is not null.
@@ -677,279 +593,20 @@ ScriptOrModule VM::get_active_script_or_module() const
     return script_or_module;
 }
 
-VM::StoredModule* VM::get_stored_module(ImportedModuleReferrer const&, ByteString const& filename, Utf16String const&)
+void* InterpreterStack::top() const
 {
-    // Note the spec says:
-    // If this operation is called multiple times with the same (referrer, specifier) pair and it performs
-    // FinishLoadingImportedModule(referrer, specifier, payload, result) where result is a normal completion,
-    // then it must perform FinishLoadingImportedModule(referrer, specifier, payload, result) with the same result each time.
-
-    // Editor's Note from https://tc39.es/ecma262/#sec-hostresolveimportedmodule
-    // The above text requires that hosts support JSON modules when imported with type: "json" (and HostLoadImportedModule
-    // completes normally), but it does not prohibit hosts from supporting JSON modules when imported without type: "json".
-
-    // FIXME: This should probably check referrer as well.
-    auto end_or_module = m_loaded_modules.find_if([&](StoredModule const& stored_module) {
-        return stored_module.filename == filename;
-    });
-    if (end_or_module.is_end())
-        return nullptr;
-    return &(*end_or_module);
+    static_assert(JS_LAYOUT_VM_INTERPRETER_STACK_TOP_SIZE == sizeof(void*));
+    return m_vm.engine_head_field<void*>(JS_LAYOUT_VM_INTERPRETER_STACK_TOP_OFFSET);
 }
 
-static ByteString resolve_module_filename(StringView filename, Utf16View const& module_type);
-
-static StringView utf8_path_view(Utf16View path, Optional<ByteBuffer>& utf8_storage)
+ExecutionContext* InterpreterStack::allocate(u32 registers_and_locals_count, ReadonlySpan<Value> constants, u32 arguments_count)
 {
-    if (path.has_ascii_storage())
-        return { path.bytes() };
-
-    StringBuilder builder;
-    builder.append(path);
-    utf8_storage = MUST(builder.to_byte_buffer());
-    return { utf8_storage->bytes() };
+    return execution_context_from_abi(js_execution_context_interpreter_stack_allocate(vm_abi(m_vm), registers_and_locals_count, constants.size(), arguments_count));
 }
 
-ThrowCompletionOr<void> VM::link_and_eval_module(SourceTextModule& module)
+void InterpreterStack::deallocate(void* mark)
 {
-    return link_and_eval_module(static_cast<CyclicModule&>(module));
-}
-
-ThrowCompletionOr<void> VM::link_and_eval_module(CyclicModule& module)
-{
-    auto filename = module.filename();
-    if (!filename.is_empty()) {
-        auto absolute_filename = resolve_module_filename(LexicalPath::absolute_path("."sv, filename), {});
-        if (!get_stored_module(GC::Ref { module }, absolute_filename, {})) {
-            // Register the entry module before loading dependencies so self-imports resolve to this Module Record.
-            m_loaded_modules.empend(
-                GC::Ref { module },
-                move(absolute_filename),
-                String {},
-                make_root(static_cast<Module&>(module)),
-                true);
-        }
-    }
-
-    auto& promise_capability = module.load_requested_modules(nullptr);
-
-    if (auto const& promise = as<Promise>(*promise_capability.promise()); promise.state() == Promise::State::Rejected)
-        return JS::throw_completion(promise.result());
-
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] Linking module {}", filename);
-    auto linked_or_error = module.link(*this);
-    if (linked_or_error.is_error())
-        return linked_or_error.throw_completion();
-
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] Linking passed, now evaluating module {}", filename);
-    auto evaluated_or_error = module.evaluate(*this);
-
-    if (evaluated_or_error.is_error())
-        return evaluated_or_error.throw_completion();
-
-    auto const& evaluated_value = static_cast<Promise&>(*evaluated_or_error.value()->promise());
-
-    run_queued_promise_jobs();
-    VERIFY(m_promise_jobs.is_empty());
-
-    // FIXME: This will break if we start doing promises actually asynchronously.
-    VERIFY(evaluated_value.state() != Promise::State::Pending);
-
-    if (evaluated_value.state() == Promise::State::Rejected)
-        return JS::throw_completion(evaluated_value.result());
-
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] Evaluating passed for module {}", module.filename());
-    return {};
-}
-
-static ByteString resolve_module_filename(StringView filename, Utf16View const& module_type)
-{
-    auto extensions = Vector<StringView, 2> { "js"sv, "mjs"sv };
-    if (module_type == "json"sv)
-        extensions = { "json"sv };
-    if (!FileSystem::exists(filename)) {
-        for (auto extension : extensions) {
-            // import "./foo" -> import "./foo.ext"
-            auto resolved_filepath = ByteString::formatted("{}.{}", filename, extension);
-            if (FileSystem::exists(resolved_filepath))
-                return resolved_filepath;
-        }
-    } else if (FileSystem::is_directory(filename)) {
-        for (auto extension : extensions) {
-            // import "./foo" -> import "./foo/index.ext"
-            auto resolved_filepath = LexicalPath::join(filename, ByteString::formatted("index.{}", extension)).string();
-            if (FileSystem::exists(resolved_filepath))
-                return resolved_filepath;
-        }
-    }
-    return filename;
-}
-
-// 16.2.1.8 HostLoadImportedModule ( referrer, specifier, hostDefined, payload ), https://tc39.es/ecma262/#sec-HostLoadImportedModule
-void VM::load_imported_module(ImportedModuleReferrer referrer, ModuleRequest const& module_request, GC::Ptr<GC::Cell>, ImportedModulePayload payload)
-{
-    // An implementation of HostLoadImportedModule must conform to the following requirements:
-    //
-    // - The host environment must perform FinishLoadingImportedModule(referrer, specifier, payload, result),
-    //   where result is either a normal completion containing the loaded Module Record or a throw completion,
-    //   either synchronously or asynchronously.
-    // - If this operation is called multiple times with the same (referrer, specifier) pair and it performs
-    //   FinishLoadingImportedModule(referrer, specifier, payload, result) where result is a normal completion,
-    //   then it must perform FinishLoadingImportedModule(referrer, specifier, payload, result) with the same result each time.
-    // - If moduleRequest.[[Attributes]] has an entry entry such that entry.[[Key]] is "type" and entry.[[Value]] is "json",
-    //   when the host environment performs FinishLoadingImportedModule(referrer, moduleRequest, payload, result), result
-    //   must either be the Completion Record returned by an invocation of ParseJSONModule or a throw completion.
-    // - The operation must treat payload as an opaque value to be passed through to FinishLoadingImportedModule.
-    //
-    // The actual process performed is host-defined, but typically consists of performing whatever I/O operations are necessary to
-    // load the appropriate Module Record. Multiple different (referrer, specifier) pairs may map to the same Module Record instance.
-    // The actual mapping semantics is host-defined but typically a normalization process is applied to specifier as part of the
-    // mapping process. A typical normalization process would include actions such as expansion of relative and abbreviated path specifiers.
-
-    // Here we check, against the spec, if payload is a promise capability, meaning that this was called for a dynamic import
-    if (payload.has<GC::Ref<PromiseCapability>>() && !m_dynamic_imports_allowed) {
-        // If you are here because you want to enable dynamic module importing make sure it won't be a security problem
-        // by checking the default implementation of HostImportModuleDynamically and creating your own hook or calling
-        // vm.allow_dynamic_imports().
-        finish_loading_imported_module(referrer, module_request, payload, throw_completion<InternalError>(ErrorType::DynamicImportNotAllowed, module_request.module_specifier));
-        return;
-    }
-
-    Utf16String module_type;
-    for (auto& attribute : module_request.attributes) {
-        if (attribute.key == "type"sv) {
-            module_type = attribute.value;
-            break;
-        }
-    }
-
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] module at {} has type {}", module_request.module_specifier, module_type);
-
-    StringView const base_filename = referrer.visit(
-        [&](GC::Ref<Realm> const&) {
-            // Generally within ECMA262 we always get a referencing_script_or_module. However, ShadowRealm gives an explicit null.
-            // To get around this is we attempt to get the active script_or_module otherwise we might start loading "random" files from the working directory.
-            return get_active_script_or_module().visit(
-                [](Empty) {
-                    return "."sv;
-                },
-                [](auto const& script_or_module) {
-                    return script_or_module->filename();
-                });
-        },
-        [&](auto const& script_or_module) {
-            return script_or_module->filename();
-        });
-
-    LexicalPath base_path { base_filename };
-    Optional<ByteBuffer> module_specifier_utf8_storage;
-    auto module_specifier_path = utf8_path_view(module_request.module_specifier.view(), module_specifier_utf8_storage);
-    auto filename = LexicalPath::absolute_path(base_path.dirname(), module_specifier_path);
-
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] base path: '{}'", base_path);
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] initial filename: '{}'", filename);
-
-    filename = resolve_module_filename(filename, module_type);
-
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] resolved filename: '{}'", filename);
-
-#if JS_MODULE_DEBUG
-    referrer.visit(
-        [&](GC::Ref<Script> const& script) {
-            dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module(Script @ {}, {})", script.ptr(), filename);
-        },
-        [&](GC::Ref<CyclicModule> const& module) {
-            dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module(Module @ {}, {})", module.ptr(), filename);
-        },
-        [&](GC::Ref<Realm> const& realm) {
-            dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module(Realm @ {}, {})", realm.ptr(), filename);
-        });
-
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE]     resolved {} + {} -> {}", base_path, module_request.module_specifier, filename);
-#endif
-
-    if (auto* loaded_module = get_stored_module(referrer, filename, module_type)) {
-        dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module({}) already loaded at {}", filename, loaded_module->module.ptr());
-        finish_loading_imported_module(referrer, module_request, payload, *loaded_module->module);
-        return;
-    }
-
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] reading and parsing module {}", filename);
-
-    auto file_or_error = Core::File::open(filename, Core::File::OpenMode::Read);
-
-    if (file_or_error.is_error()) {
-        finish_loading_imported_module(referrer, module_request, payload, throw_completion<SyntaxError>(ErrorType::ModuleNotFound, module_request.module_specifier));
-        return;
-    }
-
-    // FIXME: Don't read the file in one go.
-    auto file_content_or_error = file_or_error.value()->read_until_eof();
-
-    if (file_content_or_error.is_error()) {
-        if (file_content_or_error.error().code() == ENOMEM) {
-            finish_loading_imported_module(referrer, module_request, payload, throw_completion<JS::InternalError>(error_message(::JS::VM::ErrorMessage::OutOfMemory)));
-            return;
-        }
-        finish_loading_imported_module(referrer, module_request, payload, throw_completion<SyntaxError>(ErrorType::ModuleNotFound, module_request.module_specifier));
-        return;
-    }
-
-    auto source_bytes = Core::ImmutableBytes::adopt(file_content_or_error.release_value());
-    auto decoder = TextCodec::decoder_for("UTF-8"sv);
-    VERIFY(decoder.has_value());
-    auto source_length = TextCodec::convert_input_to_utf16_length_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, StringView { source_bytes.bytes() }).release_value_but_fixme_should_propagate_errors();
-    auto display_filename = Utf16String::from_utf8(filename);
-    auto source_code = SourceCode::create(move(display_filename), source_length, "UTF-8"sv, move(source_bytes));
-
-    auto module = [&, source_code = move(source_code)]() mutable -> ThrowCompletionOr<GC::Ref<Module>> {
-        // If moduleRequest.[[Attributes]] has an entry entry such that entry.[[Key]] is "type" and entry.[[Value]] is "json",
-        // when the host environment performs FinishLoadingImportedModule(referrer, moduleRequest, payload, result), result
-        // must either be the Completion Record returned by an invocation of ParseJSONModule or a throw completion.
-        if (module_type == "json"sv) {
-            dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] reading and parsing JSON module {}", filename);
-            return TRY(parse_json_module(*current_realm(), source_code->code_view(), filename));
-        }
-
-        dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] reading and parsing as SourceTextModule module {}", filename);
-        // Note: We treat all files as module, so if a script does not have exports it just runs it.
-        auto module_or_errors = SourceTextModule::parse(move(source_code), *current_realm(), filename);
-
-        if (module_or_errors.is_error()) {
-            VERIFY(module_or_errors.error().size() > 0);
-            return throw_completion<SyntaxError>(module_or_errors.error().first().to_utf16_string());
-        }
-
-        return module_or_errors.release_value();
-    }();
-
-    if (!module.is_error()) {
-        m_loaded_modules.empend(
-            referrer,
-            module.value()->filename(),
-            String {}, // Null type
-            make_root(module.value()),
-            true);
-    }
-
-    finish_loading_imported_module(referrer, module_request, payload, module);
-}
-
-Vector<StackTraceElement> VM::stack_trace() const
-{
-    Vector<StackTraceElement> stack_trace;
-    for_each_execution_context_top_to_bottom([&](ExecutionContext const& context) {
-        Optional<SourceRange> source_range;
-        if (context.executable)
-            source_range = context.executable->get_source_range(context.program_counter);
-        stack_trace.append({
-            .execution_context = const_cast<ExecutionContext*>(&context),
-            .source_range = move(source_range),
-        });
-        return true;
-    });
-
-    return stack_trace;
+    js_execution_context_interpreter_stack_deallocate(vm_abi(m_vm), mark);
 }
 
 }

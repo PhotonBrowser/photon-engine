@@ -6,10 +6,15 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <AK/Vector.h>
+#include <LibJS/Embedding/Layout.h>
 #include <LibJS/Export.h>
+#include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/Object.h>
+#include <LibJS/Runtime/Value.h>
 
 namespace JS {
 
@@ -31,36 +36,15 @@ struct JSONParseRecord {
 };
 
 class JS_API JSONObject final : public Object {
-    JS_OBJECT(JSONObject, Object);
-    GC_DECLARE_ALLOCATOR(JSONObject);
-
 public:
-    virtual void initialize(Realm&) override;
-    virtual ~JSONObject() override = default;
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_JSON_OBJECT; }
 
-    // The base implementation of stringify is exposed because it is used by
-    // test-js to communicate between the JS tests and the C++ test runner.
+    // The base implementation of stringify is exposed because it is used by LibTest's
+    // JavaScriptTestRunner to communicate between the JS tests and the C++ test runner.
     static ThrowCompletionOr<Optional<Utf16String>> stringify_impl(VM&, Value value, Value replacer, Value space);
 
+    // The runtime keeps no parse records for the embedder, so `root_record` must be null.
     static ThrowCompletionOr<Value> parse_json(VM&, Utf16View text, JSONParseRecord* root_record = nullptr);
-
-private:
-    explicit JSONObject(Realm&);
-
-    struct StringifyState;
-
-    // Stringify helpers
-    static ThrowCompletionOr<bool> serialize_json_property(VM&, StringifyState&, PropertyKey const& key, GC::Ref<Object> holder);
-    static ThrowCompletionOr<bool> serialize_json_value(VM&, StringifyState&, PropertyKey const& key, GC::Ref<Object> holder, Value value);
-    static ThrowCompletionOr<void> serialize_json_object(VM&, StringifyState&, Object&);
-    static ThrowCompletionOr<void> serialize_json_array(VM&, StringifyState&, Object&);
-    // Parse helpers
-    static ThrowCompletionOr<Value> internalize_json_property(VM&, GC::Ref<Object> holder, PropertyKey const& name, FunctionObject& reviver, JSONParseRecord const* parse_record);
-
-    JS_DECLARE_NATIVE_FUNCTION(stringify);
-    JS_DECLARE_NATIVE_FUNCTION(parse);
-    JS_DECLARE_NATIVE_FUNCTION(raw_json);
-    JS_DECLARE_NATIVE_FUNCTION(is_raw_json);
 };
 
 }

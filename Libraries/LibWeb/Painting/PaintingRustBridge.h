@@ -11,6 +11,7 @@
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibGfx/Filter.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
+#include <LibWeb/Compositor/NavigablePresenter.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/PaintConfig.h>
@@ -63,7 +64,15 @@ struct InspectorOverlayInputs {
 
 // Starts recording the document's viewport against `visual_context_tree`, unless it has no box to record. The recording
 // flies where `blocker` is none, and takes `flight`, if any, to present its frame with beside the event loop.
-WEB_API Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&, Compositing::AccumulatedVisualContextTree, NonnullRefPtr<Compositing::DisplayList> placeholder_display_list, PaintCommandCacheMode, HTML::PaintConfig const&, InspectorOverlayInputs const&, Layout::RustFFI::FfiFlightBlocker, Optional<Compositor::FlightPresentation>* flight = nullptr);
+// Records the document's viewport for the host to publish, or, given `committed`, the presentation of the navigable's
+// next frame, commits the frame to the render owner, which presents it beside the event loop.
+WEB_API Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&, Compositing::AccumulatedVisualContextTree, NonnullRefPtr<Compositing::DisplayList> placeholder_display_list, PaintCommandCacheMode, HTML::PaintConfig const&, InspectorOverlayInputs const&, Optional<Compositor::FlightPresentation> committed = {});
+// Commits the navigable's next frame, which keeps the display list the compositor has, to the render owner, which
+// presents it with `presentation` beside the event loop.
+WEB_API void commit_unrecorded_frame(Layout::BegunRead const&, DOM::Document&, Compositor::FlightPresentation presentation);
+// Renders the SVG images of the committed frame of `recording` that waits for them, which only the main thread renders,
+// into a resource storage of their own, and hands the frame back to the Paint thread, which presents it with them.
+WEB_API void render_vector_images(Layout::BegunRead const&, DOM::Document&, DisplayListRecording const& recording);
 // Publishes the recording, which has landed and stands, and makes its display list from what was sealed where it began.
 WEB_API RefPtr<Compositing::DisplayList> finish_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&, DisplayListRecording const&, Compositing::DisplayListResourceStorage&);
 // Hands the document the trace the recording it took in last left, if it left one.
@@ -78,5 +87,7 @@ WEB_API CSS::ColorResolutionContext gradient_stop_color_resolution_context(Layou
 WEB_API Optional<Gfx::Filter> filter_from_functions(ReadonlySpan<Compositing::RustFFI::FfiFilterFunction>);
 
 WEB_API Compositing::DisplayListResource record_image_paint_display_list(ImagePaint const&, ImagePaintRequest const&, double device_pixels_per_css_pixel);
+// Records one image frame drawn into the destination rectangle, in device pixels.
+WEB_API Compositing::DisplayListResource record_image_frame_display_list(Gfx::DecodedImageFrame const&, Gfx::FloatRect const& dest_rect, Gfx::ScalingMode, Compositing::DisplayListResourceStorage&);
 
 }

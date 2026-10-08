@@ -31,7 +31,9 @@ use super::intern_table::InternTable;
 use super::memory::MemoryCategory;
 use super::memory::MemoryController;
 use super::memory::MemoryLease;
+#[cfg(test)]
 use super::tree::PseudoElementKind;
+#[cfg(test)]
 use super::tree::PseudoElementTarget;
 use super::tree::StyleNodeID;
 use crate::css::computed_longhand_table::{
@@ -78,59 +80,35 @@ pub(super) struct EngineComputedAssembly {
     pub(super) canonicalized_groups: u32,
     /// Whether the node's group tuple identity stayed put, so nothing propagates from it.
     pub(super) group_set_unchanged: bool,
+    /// What the record took the place of, for reverting it.
+    pub(super) replaced: ReplacedColumns,
+}
+
+/// What an element's columns held before an engine derivation put its record there, which
+/// reverting the derivation puts back. The swap eligibility is the element's, as the host
+/// published it, and not its record's. A composition detached for the derivation is not held
+/// here: `reattach_composition` puts it back.
+#[derive(Clone, Copy)]
+pub(super) struct ReplacedColumns {
+    inputs: Option<PublishedComputedInputs>,
+    inherited_group_swap_eligible: bool,
 }
 const COMPUTED_VALUE_DEPENDENCY_FLAGS: u8 = (INHERITED_GROUP_SWAP_ELIGIBLE - 1)
     | HOLDS_IMAGE_VALUES
     | HIGHLIGHT_COLORS_AUTHORED
     | HIGHLIGHT_COLOR_IS_CURRENT_COLOR;
 
-define_id! { pub struct ComputedGroupID(); }
+define_id! { interned pub struct ComputedGroupID(); }
 
-impl InternIdentity for ComputedGroupID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+define_id! { interned pub struct ComputedGroupSetID(); }
 
-define_id! { pub struct ComputedGroupSetID(); }
+define_id! { interned pub struct InheritedGroupSetID(); }
 
-impl InternIdentity for ComputedGroupSetID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+define_id! { interned pub struct CustomPropertyEnvironmentID(); }
 
-define_id! { pub struct InheritedGroupSetID(); }
+define_id! { interned pub struct ComputedFixedMetadataID(); }
 
-impl InternIdentity for InheritedGroupSetID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-define_id! { pub struct CustomPropertyEnvironmentID(); }
-
-impl InternIdentity for CustomPropertyEnvironmentID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-define_id! { pub struct ComputedFixedMetadataID(); }
-
-impl InternIdentity for ComputedFixedMetadataID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-define_id! { pub struct ComputedLonghandTableID(); }
-
-impl InternIdentity for ComputedLonghandTableID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+define_id! { interned pub struct ComputedLonghandTableID(); }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StyleRecordID(NonZeroU32);
@@ -169,6 +147,17 @@ impl RetainedLonghandTable {
     fn table(&self) -> &ComputedLonghandTable {
         // SAFETY: The handle owns one reference to a live frozen table.
         unsafe { self.table.deref() }
+    }
+}
+
+/// A fork's table holds its own strong reference.
+impl Clone for RetainedLonghandTable {
+    fn clone(&self) -> Self {
+        if !self.table.is_null() {
+            // SAFETY: The table is a live strong reference, and an interned table is frozen.
+            unsafe { crate::css::computed_longhand_table::rust_computed_longhand_table_retain(self.table.as_ptr()) };
+        }
+        Self { table: self.table }
     }
 }
 
@@ -291,14 +280,27 @@ impl FinalStyleRecordID {
 /// The composition of an element or pseudo-element, which `ComputedGroupSets::detach_composition`
 /// took off the record its winners decided so that a record derived beneath it can take that
 /// record's place. It stays
-/// pinned until it is reattached or released, each of which consumes it, so it cannot be copied.
-/// Dropping it any other way would leave the pin behind, which debug builds catch.
+/// pinned until it is reattached or released, each of which consumes it. Dropping it any other way
+/// would leave the pin behind, which debug builds catch, but for the copy a fork of the render
+/// state holds, which goes with the fork's group sets where the fork does not consume it.
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct DetachedComposition {
     record: FinalStyleRecordID,
     /// The record the composition is laid over.
     pub(crate) base: FinalStyleRecordID,
+    /// Whether this is a fork's copy, whose pin is the fork's group sets'.
+    forked: bool,
+}
+
+impl Clone for DetachedComposition {
+    fn clone(&self) -> Self {
+        Self {
+            record: self.record,
+            base: self.base,
+            forked: true,
+        }
+    }
 }
 
 impl DetachedComposition {
@@ -313,7 +315,7 @@ impl DetachedComposition {
 impl Drop for DetachedComposition {
     fn drop(&mut self) {
         debug_assert!(
-            std::thread::panicking(),
+            self.forked || std::thread::panicking(),
             "a detached composition was dropped without being reattached or released"
         );
     }
@@ -322,7 +324,14 @@ impl Drop for DetachedComposition {
 /// A reader's hold on the payloads of every style record published so far: while one is held, the
 /// engine frees no record's payloads, which a reader on another thread may be reading.
 pub(crate) struct StyleRecordLease {
-    _lease: std::sync::Arc<()>,
+    leases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for StyleRecordLease {
+    fn drop(&mut self) {
+        // NB: Releases the reads made under the lease to the engine that frees the payloads once it sees none held.
+        self.leases.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 struct AnimationOverlayRecord {
@@ -331,14 +340,35 @@ struct AnimationOverlayRecord {
     base_style_record: StyleRecordID,
     source_identity: u64,
     final_style_record: FinalStyleRecordID,
-    animated_overlay: Box<crate::css::animated_overlay::AnimatedOverlay>,
-    payloads: Box<[SharedPayload]>,
+    /// NB: Shared with a copy of the record, as its address is handed out.
+    animated_overlay: std::sync::Arc<crate::css::animated_overlay::AnimatedOverlay>,
+    /// NB: Shared with a fork of the render state, whose boxes name this array as the host's do.
+    payloads: std::sync::Arc<[SharedPayload]>,
     /// The base's flags, with an `<image>` a layout node loads, which a sampled value can hold
     /// where the base does not, and with the display:none subtree a sampled display puts the
     /// record in.
     dependency_flags: u8,
     pin_count: u64,
     is_assigned: bool,
+}
+
+/// A fork's overlay record holds its own reference to each of its payloads.
+impl Clone for AnimationOverlayRecord {
+    fn clone(&self) -> Self {
+        for (index, payload) in self.payloads.iter().enumerate() {
+            retain_group_payload(index, payload.as_ptr());
+        }
+        Self {
+            base_style_record: self.base_style_record,
+            source_identity: self.source_identity,
+            final_style_record: self.final_style_record,
+            animated_overlay: self.animated_overlay.clone(),
+            payloads: self.payloads.clone(),
+            dependency_flags: self.dependency_flags,
+            pin_count: self.pin_count,
+            is_assigned: self.is_assigned,
+        }
+    }
 }
 
 impl Drop for AnimationOverlayRecord {
@@ -355,7 +385,7 @@ mod animation_overlay_slots {
 
     /// The animation-overlay records by slot. A record leaves its slot only to be retired, never dropped, so that a
     /// reader holding a style-record lease keeps reading its payloads until the owner frees the retired records.
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     pub(super) struct AnimationOverlaySlots {
         slots: Vec<Option<AnimationOverlayRecord>>,
         free: Vec<u32>,
@@ -455,6 +485,8 @@ pub(super) struct IdentityMints {
     pub style_records: u64,
 }
 
+#[derive(Clone)]
+
 struct ComputedGroup {
     index: usize,
     payload: SharedPayload,
@@ -463,9 +495,12 @@ struct ComputedGroup {
     content_hash: u64,
 }
 
+#[derive(Clone)]
+
 struct ComputedGroupSet {
     identity_hash: u64,
-    payloads: Box<[SharedPayload]>,
+    /// NB: Shared with a fork of the render state, whose boxes name this array as the host's do.
+    payloads: std::sync::Arc<[SharedPayload]>,
     groups: Box<[ComputedGroupID]>,
     canonical_longhand_table: Option<ComputedLonghandTableID>,
 }
@@ -489,7 +524,7 @@ struct PseudoComputedRow {
     cascade_states: [CascadeStateID; 3],
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PublishedComputedColumns {
     groups: Vec<u32>,
     inherited_groups: Vec<u32>,
@@ -600,16 +635,6 @@ impl PublishedComputedColumns {
             self.flags[index] |= Self::INCOMPLETE_ANSWER;
         } else {
             self.flags[index] &= !Self::INCOMPLETE_ANSWER;
-        }
-    }
-
-    fn set_inherited_group_swap_eligible(&mut self, index: usize, eligible: bool) {
-        if let Some(flags) = self.flags.get_mut(index) {
-            if eligible {
-                *flags |= Self::INHERITED_GROUP_SWAP_ELIGIBLE;
-            } else {
-                *flags &= !Self::INHERITED_GROUP_SWAP_ELIGIBLE;
-            }
         }
     }
 
@@ -820,6 +845,7 @@ impl ComputedStyleTarget {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(super) fn pseudo_element_target(self) -> Option<PseudoElementTarget> {
         self.is_pseudo()
             .then(|| PseudoElementTarget::new(PseudoElementKind(u16::from(self.pseudo_kind))))
@@ -852,12 +878,12 @@ pub struct ComputedGroupSets {
     // above. Dense element assignments and sparse pseudo assignments pin at most one slot each.
     animation_overlay_slots: animation_overlay_slots::AnimationOverlaySlots,
     animation_overlay_slots_by_record: HashMap<FinalStyleRecordID, u32>,
-    /// Shared with every lease held.
-    leases: std::sync::Arc<()>,
+    /// How many leases are held, shared with every copy of the sets: a copy holds no lease of its own.
+    leases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     live_animation_overlay_assignments: usize,
     next_animation_overlay_generation: u64,
     pending_cascade_states: HashMap<StyleNodeID, (u64, CascadeStateID)>,
-    pseudo_rows_by_node: HashMap<StyleNodeID, Box<[PseudoComputedRow]>>,
+    pseudo_rows_by_node: crate::fork::ForkShared<HashMap<StyleNodeID, Box<[PseudoComputedRow]>>>,
     group_set_nested_memory: MemoryLease,
     longhand_table_nested_memory: MemoryLease,
     animation_overlay_nested_memory: MemoryLease,
@@ -890,7 +916,7 @@ impl Default for ComputedGroupSets {
             live_animation_overlay_assignments: 0,
             next_animation_overlay_generation: 0,
             pending_cascade_states: HashMap::default(),
-            pseudo_rows_by_node: HashMap::default(),
+            pseudo_rows_by_node: Default::default(),
             group_set_nested_memory: MemoryLease::new(MemoryCategory::ComputedGroupSet),
             longhand_table_nested_memory: MemoryLease::new(MemoryCategory::ComputedLonghandTable),
             animation_overlay_nested_memory: MemoryLease::new(MemoryCategory::AnimationOverlayRecord),
@@ -911,13 +937,14 @@ impl ComputedGroupSets {
     }
 
     pub(crate) fn lease_style_records(&self) -> StyleRecordLease {
+        self.leases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         StyleRecordLease {
-            _lease: std::sync::Arc::clone(&self.leases),
+            leases: std::sync::Arc::clone(&self.leases),
         }
     }
 
-    fn style_records_are_leased(&mut self) -> bool {
-        std::sync::Arc::get_mut(&mut self.leases).is_none()
+    fn style_records_are_leased(&self) -> bool {
+        self.leases.load(std::sync::atomic::Ordering::Acquire) != 0
     }
 
     /// Frees the retired overlay records, if no lease is held, and answers whether it freed any.
@@ -1026,7 +1053,7 @@ impl ComputedGroupSets {
                 nodes.push(u32::try_from(index).expect("computed style node identity exceeds u32"));
             }
         }
-        for (&node, rows) in &self.pseudo_rows_by_node {
+        for (&node, rows) in self.pseudo_rows_by_node.iter() {
             if rows.iter().any(|row| {
                 row.assignment.is_some_and(|assignment| {
                     depends_on_viewport(assignment.fixed_metadata, assignment.custom_properties)
@@ -1104,7 +1131,7 @@ impl ComputedGroupSets {
             identity,
             ComputedGroupSet {
                 identity_hash: hash,
-                payloads,
+                payloads: payloads.into(),
                 groups: groups.into(),
                 canonical_longhand_table: None,
             },
@@ -1189,9 +1216,13 @@ impl ComputedGroupSets {
         if record.base_record().is_some() {
             return Some(record);
         }
-        let slot = *self.animation_overlay_slots_by_record.get(&record)?;
-        let overlay = self.animation_overlay_slots.get(slot)?;
-        Some(self.final_base_style_record(overlay.base_style_record))
+        Some(self.final_base_style_record(self.overlay_base_style_record(record)?))
+    }
+
+    /// The base record an animation overlay record composes over.
+    fn overlay_base_style_record(&self, overlay: FinalStyleRecordID) -> Option<StyleRecordID> {
+        let slot = *self.animation_overlay_slots_by_record.get(&overlay)?;
+        Some(self.animation_overlay_slots.get(slot)?.base_style_record)
     }
 
     /// The record a target holds beneath its composition, and the composition's slot.
@@ -1237,6 +1268,7 @@ impl ComputedGroupSets {
         let detached = DetachedComposition {
             record: overlay.final_style_record,
             base: self.final_base_style_record(overlay.base_style_record),
+            forked: false,
         };
         self.pin_style_record(detached.record.raw());
         self.release_animation_overlay_assignment(slot);
@@ -1757,6 +1789,7 @@ impl ComputedGroupSets {
             longhand_table: Some(longhand_table),
         };
         let new_style_record = self.intern_style_record(new_record).0;
+        let replaced = self.replaced_columns(node);
         // Descendant swaps read the node's inherited groups from their own column.
         self.columns.publish(
             index,
@@ -1778,16 +1811,36 @@ impl ComputedGroupSets {
             delta: (previous_style_record, self.final_base_style_record(new_style_record)),
             canonicalized_groups,
             group_set_unchanged: group_set == old_record.groups,
+            replaced,
         })
     }
 
-    /// Put a node back on the record it held before an engine derivation C++ never installed,
-    /// unless a publication has moved it on since.
+    /// What `node`'s columns hold now, for an engine derivation about to replace its record.
+    pub(super) fn replaced_columns(&self, node: StyleNodeID) -> ReplacedColumns {
+        let index = node.element_index().map(|index| index as usize);
+        let inputs = index.and_then(|index| {
+            Some(PublishedComputedInputs {
+                groups: self.columns.groups(index)?,
+                inherited_groups: self.columns.inherited_groups(index)?,
+                custom_properties: self.columns.custom_properties(index)?,
+                fixed_metadata: self.columns.fixed_metadata(index)?,
+                style_record: (*self.style_record_column.get(index)?)?,
+                animation_overlay_slot: None,
+            })
+        });
+        ReplacedColumns {
+            inputs,
+            inherited_group_swap_eligible: index.is_some_and(|index| self.columns.inherited_group_swap_eligible(index)),
+        }
+    }
+
+    /// Put a node back on what its columns held before an engine derivation C++ never installed,
+    /// `replaced`, unless a publication has moved it on since.
     pub(super) fn revert_engine_computed_record(
         &mut self,
         node: StyleNodeID,
         derived_style_record: FinalStyleRecordID,
-        previous_style_record: FinalStyleRecordID,
+        replaced: ReplacedColumns,
     ) {
         let Some(index) = node.element_index().map(|index| index as usize) else {
             return;
@@ -1801,21 +1854,13 @@ impl ComputedGroupSets {
         // A first record never installed leaves the node the way it was: unassigned, with what
         // the host and its match answer published for it, which the layout tree and the next
         // derivation read.
-        if previous_style_record == FinalStyleRecordID::NONE {
+        let Some(inputs) = replaced.inputs else {
             self.unassign(node);
             return;
-        }
-        let Some(previous_base) = previous_style_record.base_record() else {
-            return;
         };
-        let Some(record) = self.style_records.get_index(previous_base.index()).copied() else {
-            return;
-        };
-        let inherited_identity = record.inherited_groups;
-        self.columns.groups[index] = record.groups.0;
-        self.columns.inherited_groups[index] = inherited_identity.0;
-        self.columns.custom_properties[index] = record.custom_properties.0;
-        self.style_record_column[index] = Some(previous_base);
+        self.columns
+            .publish(index, inputs, replaced.inherited_group_swap_eligible);
+        self.style_record_column[index] = Some(inputs.style_record);
     }
 
     fn intern_fixed_metadata(&mut self, metadata: ComputedFixedMetadata) -> (ComputedFixedMetadataID, bool) {
@@ -1838,19 +1883,23 @@ impl ComputedGroupSets {
 
     /// Assign a node the record another node of its cohort already derived this flush: the same
     /// old record moved to the same new winner state produces the same new record, so only the
-    /// node's columns move.
+    /// node's columns move. An `old_style_record` of `NONE` assigns a node that holds no record.
+    /// Answers what the record took the place of, for reverting it.
     pub(super) fn assign_engine_computed_record(
         &mut self,
         node: StyleNodeID,
         old_style_record: FinalStyleRecordID,
         new_style_record: FinalStyleRecordID,
-    ) -> Option<(FinalStyleRecordID, FinalStyleRecordID)> {
+    ) -> Option<ReplacedColumns> {
         let index = node.element_index()? as usize;
         if self.columns.animation_overlay_slot(index).is_some() {
             return None;
         }
-        let current = *self.style_record_column.get(index)?.as_ref()?;
-        if self.final_base_style_record(current) != old_style_record {
+        let current = self.style_record_column.get(index).copied().flatten();
+        if current.map_or(FinalStyleRecordID::NONE, |current| {
+            self.final_base_style_record(current)
+        }) != old_style_record
+        {
             return None;
         }
         let new_base_record = new_style_record.base_record()?;
@@ -1859,13 +1908,24 @@ impl ComputedGroupSets {
             .longhand_table
             .and_then(|table| self.computed_longhand_tables.get_index(table.index()))
             .is_some_and(|retained| table_inherited_group_swap_eligible(retained.table()));
-        let inherited_identity = new_record.inherited_groups;
-        self.columns.groups[index] = new_record.groups.0;
-        self.columns.inherited_groups[index] = inherited_identity.0;
-        self.columns.custom_properties[index] = new_record.custom_properties.0;
-        self.columns.set_inherited_group_swap_eligible(index, swap_eligible);
+        let replaced = self.replaced_columns(node);
+        self.columns.publish(
+            index,
+            PublishedComputedInputs {
+                groups: new_record.groups,
+                inherited_groups: new_record.inherited_groups,
+                custom_properties: new_record.custom_properties,
+                fixed_metadata: new_record.fixed_metadata,
+                style_record: new_base_record,
+                animation_overlay_slot: None,
+            },
+            swap_eligible,
+        );
+        if self.style_record_column.len() <= index {
+            self.style_record_column.resize(index + 1, None);
+        }
         self.style_record_column[index] = Some(new_base_record);
-        Some((old_style_record, new_style_record))
+        Some(replaced)
     }
 
     /// The identity of a record's inherited groups, the way a node assigned it would hold them.
@@ -1911,7 +1971,7 @@ impl ComputedGroupSets {
             base_style_record,
             source_identity,
             final_style_record: self.next_animation_overlay_record(),
-            animated_overlay,
+            animated_overlay: animated_overlay.into(),
             dependency_flags,
             payloads: payloads.into(),
             pin_count: 0,
@@ -2575,7 +2635,7 @@ impl ComputedGroupSets {
             if first_groups.len() != second_groups.len()
                 || first_groups
                     .iter()
-                    .zip(second_groups)
+                    .zip(second_groups.iter())
                     .enumerate()
                     .any(|(index, (&first, &second))| {
                         first != second && !style_group_payloads_equal(index, first.as_ptr(), second.as_ptr())
@@ -2684,6 +2744,36 @@ impl ComputedGroupSets {
         }))
     }
 
+    /// Whether what a record gives its element's pseudo-elements to inherit is the inherited groups
+    /// of its base record: always for a base record, and for an animation overlay whose sampled
+    /// values left those groups as they were.
+    #[must_use]
+    pub(super) fn record_inherits_as_its_base(&self, record: FinalStyleRecordID) -> bool {
+        if record.base_record().is_some() {
+            return true;
+        }
+        let Some(overlay) = self
+            .animation_overlay_slots_by_record
+            .get(&record)
+            .and_then(|&slot| self.animation_overlay_slots.get(slot))
+        else {
+            return false;
+        };
+        let Some(base) = self.style_records.get_index(overlay.base_style_record.index()) else {
+            return false;
+        };
+        let base_groups = &self.sets[base.groups].payloads;
+        (0..ENGINE_INHERITED_GROUP_COUNT).all(|group| {
+            let sampled = overlay.payloads[group];
+            sampled == base_groups[group]
+                || crate::css::computed_values::style_group_payloads_equal(
+                    group,
+                    sampled.as_ptr(),
+                    base_groups[group].as_ptr(),
+                )
+        })
+    }
+
     /// Whether a record's inherited groups, past the ones in `own_groups` that its own
     /// declarations rebuild, are the node's own inherited groups: what a record derived under the
     /// node as its parent must hold, whatever identities the two were keyed by when the record
@@ -2729,6 +2819,19 @@ impl ComputedGroupSets {
     pub fn pseudo_style_record(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<FinalStyleRecordID> {
         let assignment = self.pseudo_row(node, pseudo_kind)?.assignment.as_ref()?;
         Some(self.final_style_record(assignment.style_record, assignment.animation_overlay_slot))
+    }
+
+    /// Each record a pseudo-element holds, with the node it belongs to.
+    pub(super) fn pseudo_style_records(&self) -> impl Iterator<Item = (StyleNodeID, FinalStyleRecordID)> + '_ {
+        self.pseudo_rows_by_node.iter().flat_map(move |(&node, rows)| {
+            rows.iter().filter_map(move |row| {
+                let assignment = row.assignment.as_ref()?;
+                Some((
+                    node,
+                    self.final_style_record(assignment.style_record, assignment.animation_overlay_slot),
+                ))
+            })
+        })
     }
 
     /// The pseudo-element kinds this node holds published computed styles for.
@@ -3378,7 +3481,7 @@ impl ComputedGroupSets {
                 self.sets.get_mut(identity),
                 ComputedGroupSet {
                     identity_hash: 0,
-                    payloads: Box::default(),
+                    payloads: std::sync::Arc::default(),
                     groups: Box::default(),
                     canonical_longhand_table: None,
                 },
@@ -3690,6 +3793,48 @@ impl ComputedGroupSets {
     }
 }
 
+/// A copy of the group sets holds its own reference to every payload, and shares the leases on its records.
+impl Clone for ComputedGroupSets {
+    fn clone(&self) -> Self {
+        let copy = Self {
+            identity_mints: self.identity_mints,
+            groups: self.groups.clone(),
+            groups_by_content: self.groups_by_content.clone(),
+            sets: self.sets.clone(),
+            inherited_sets: self.inherited_sets.clone(),
+            custom_property_environments: self.custom_property_environments.clone(),
+            computed_fixed_metadata: self.computed_fixed_metadata.clone(),
+            computed_longhand_tables: self.computed_longhand_tables.clone(),
+            style_records: self.style_records.clone(),
+            style_record_liveness: self.style_record_liveness.clone(),
+            style_record_generations: self.style_record_generations.clone(),
+            style_record_column: self.style_record_column.clone(),
+            base_style_record_pins: self.base_style_record_pins.clone(),
+            columns: self.columns.clone(),
+            animation_overlay_slots: self.animation_overlay_slots.clone(),
+            animation_overlay_slots_by_record: self.animation_overlay_slots_by_record.clone(),
+            // NB: Either copy may be the host's, whose published frames hold their leases here.
+            leases: self.leases.clone(),
+            live_animation_overlay_assignments: self.live_animation_overlay_assignments,
+            next_animation_overlay_generation: self.next_animation_overlay_generation,
+            pending_cascade_states: self.pending_cascade_states.clone(),
+            pseudo_rows_by_node: self.pseudo_rows_by_node.clone(),
+            group_set_nested_memory: self.group_set_nested_memory.clone(),
+            longhand_table_nested_memory: self.longhand_table_nested_memory.clone(),
+            animation_overlay_nested_memory: self.animation_overlay_nested_memory.clone(),
+            pseudo_assignment_nested_memory: self.pseudo_assignment_nested_memory.clone(),
+            style_records_interned_since_reclamation: self.style_records_interned_since_reclamation,
+            next_reclamation_after: self.next_reclamation_after,
+            style_record_view_epoch_depth: self.style_record_view_epoch_depth,
+        };
+        for identity in copy.groups.live_identities() {
+            let group = copy.groups.get(identity);
+            retain_group_payload(group.index, group.payload.as_ptr());
+        }
+        copy
+    }
+}
+
 impl Drop for ComputedGroupSets {
     fn drop(&mut self) {
         for identity in self.groups.live_identities() {
@@ -3748,14 +3893,13 @@ mod tests {
         }
     }
 
-    /// One owned payload per group, each a fresh clone of the group's registered default: an
-    /// allocation the caller holds the only reference to, which is what a drive hands `publish`.
+    /// One owned payload per group, each a fresh clone of the group's default: an allocation the
+    /// caller holds the only reference to, which is what a drive hands `publish`.
     fn owned_payloads(group_count: usize) -> Vec<SharedPayload> {
-        crate::css::computed_values::registered_test_style_groups();
         (0..group_count)
             .map(|index| {
                 let default = crate::css::computed_values::default_group_payload(index);
-                // SAFETY: The default payload is a live payload of its registered group.
+                // SAFETY: The default payload is a live payload of its group.
                 SharedPayload::new(
                     unsafe { crate::css::computed_values::clone_group_payload(index, default) }.cast_const(),
                 )
@@ -4170,6 +4314,38 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_of_the_sets_holds_no_lease_and_shares_the_leases_held() {
+        let sets = ComputedGroupSets::default();
+        let copy = sets.clone();
+        assert!(!sets.style_records_are_leased());
+        assert!(!copy.style_records_are_leased());
+        let lease = copy.lease_style_records();
+        assert!(sets.style_records_are_leased());
+        assert!(copy.style_records_are_leased());
+        drop(lease);
+        assert!(!sets.style_records_are_leased());
+    }
+
+    #[test]
+    fn a_dropped_record_restores_the_metadata_and_swap_eligibility_it_replaced() {
+        let mut sets = ComputedGroupSets::default();
+        let node = StyleNodeID::element(1);
+        let target = Some(ComputedStyleTarget::new(node, u8::MAX));
+        let host = sets.publish_unowned(target, &[], 0, 0, metadata(0, 0, 0));
+        let index = node.element_index().unwrap() as usize;
+        let host_metadata = sets.columns.fixed_metadata(index);
+        let replaced = sets.replaced_columns(node);
+        let derived = sets.publish_unowned(target, &[], 0, 0, metadata(0, 1 | INHERITED_GROUP_SWAP_ELIGIBLE, 0));
+        assert_ne!(sets.columns.fixed_metadata(index), host_metadata);
+        assert!(sets.node_inherited_group_swap_eligible(node));
+
+        sets.revert_engine_computed_record(node, derived.style_record_identity, replaced);
+        assert_eq!(sets.assigned_style_record(node), Some(host.style_record_identity));
+        assert_eq!(sets.columns.fixed_metadata(index), host_metadata);
+        assert!(!sets.node_inherited_group_swap_eligible(node));
+    }
+
+    #[test]
     fn a_dropped_first_record_keeps_what_the_host_and_the_answer_published() {
         let mut sets = ComputedGroupSets::default();
         let node = StyleNodeID::element(1);
@@ -4177,6 +4353,7 @@ mod tests {
         sets.set_associated_pseudo_kind(node, 3);
         sets.set_node_answer_incomplete(node, true);
         sets.set_node_pseudo_style_mask(node, Some(1 << 2));
+        let replaced = sets.replaced_columns(node);
         let derived = sets.publish_unowned(
             Some(ComputedStyleTarget::new(node, u8::MAX)),
             &[],
@@ -4185,7 +4362,7 @@ mod tests {
             metadata(0, 0, 0),
         );
 
-        sets.revert_engine_computed_record(node, derived.style_record_identity, FinalStyleRecordID::NONE);
+        sets.revert_engine_computed_record(node, derived.style_record_identity, replaced);
         assert!(sets.assigned_style_record(node).is_none());
         assert_eq!(sets.adjustment_facts(node), 1 << 29);
         assert_eq!(

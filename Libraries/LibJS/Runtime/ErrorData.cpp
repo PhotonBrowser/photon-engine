@@ -1,24 +1,25 @@
 /*
- * Copyright (c) 2020-2025, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2021-2023, Linus Groh <linusg@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <AK/NeverDestroyed.h>
-#include <AK/Utf16StringBuilder.h>
+#include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/ErrorData.h>
-#include <LibJS/Runtime/ExecutionContext.h>
-#include <LibJS/Runtime/ExternalMemory.h>
-#include <LibJS/Runtime/FunctionObject.h>
-#include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibJS/ScriptAndModuleABIConversions.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(ErrorDataCell);
+using namespace EmbeddingABI;
 
-static auto& dummy_source_range()
+static JSErrorData const* error_data_to_abi(ErrorData const& error_data)
+{
+    return reinterpret_cast<JSErrorData const*>(&error_data);
+}
+
+static SourceRange const& source_range_of_a_frame_without_one()
 {
     static NeverDestroyed<SourceRange> source_range { SourceRange { SourceCode::create({}, Utf16String {}), {} } };
     return *source_range;
@@ -27,123 +28,39 @@ static auto& dummy_source_range()
 SourceRange const& TracebackFrame::source_range() const
 {
     if (!cached_source_range.has_value())
-        return dummy_source_range();
+        return source_range_of_a_frame_without_one();
     return *cached_source_range;
-}
-
-ErrorData::ErrorData(VM& vm)
-{
-    populate_stack(vm);
-}
-
-void ErrorData::visit_edges(Cell::Visitor& visitor)
-{
-    visitor.visit(m_cached_string);
-}
-
-size_t ErrorData::external_memory_size() const
-{
-    size_t size = vector_external_memory_size(m_traceback);
-    for (auto const& frame : m_traceback)
-        size = saturating_add_external_memory_size(size, utf16_string_external_memory_size(frame.function_name));
-    return size;
-}
-
-GC::Ref<ErrorDataCell> ErrorDataCell::capture(VM& vm)
-{
-    return vm.heap().allocate<ErrorDataCell>(vm);
-}
-
-ErrorDataCell::ErrorDataCell(VM& vm)
-    : ErrorData(vm)
-{
-}
-
-void ErrorDataCell::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    ErrorData::visit_edges(visitor);
-}
-
-size_t ErrorDataCell::external_memory_size() const
-{
-    return Base::external_memory_size() + ErrorData::external_memory_size();
-}
-
-void ErrorData::populate_stack(VM& vm)
-{
-    auto stack_trace = vm.stack_trace();
-    m_traceback.ensure_capacity(stack_trace.size());
-    for (auto& element : stack_trace) {
-        auto* context = element.execution_context;
-        m_traceback.append({
-            .function_name = context->function ? context->function->name_for_call_stack() : ""_utf16,
-            .cached_source_range = move(element.source_range),
-        });
-    }
 }
 
 Utf16String ErrorData::stack_string(CompactTraceback compact) const
 {
-    if (m_traceback.is_empty())
-        return {};
+    return owned_utf16_string_from_abi(js_error_data_stack_string(error_data_to_abi(*this), compact == CompactTraceback::Yes));
+}
 
-    Utf16StringBuilder stack_string_builder;
+Vector<TracebackFrame, 32> ErrorData::traceback() const
+{
+    auto const* error_data = error_data_to_abi(*this);
+    auto frame_count = js_error_data_traceback_length(error_data);
 
-    // Note: We roughly follow V8's formatting
-    auto append_frame = [&](TracebackFrame const& frame) {
-        auto const& function_name = frame.function_name;
-        auto const& source_range = frame.source_range();
-        // Note: Since we don't know whether we have a valid SourceRange here we just check for some default values.
-        if (!source_range.filename().is_empty() || source_range.start.line != 0 || source_range.start.column != 0) {
+    Vector<TracebackFrame, 32> traceback;
+    traceback.ensure_capacity(frame_count);
+    for (size_t index = 0; index < frame_count; ++index) {
+        JSTracebackFrame frame;
+        js_error_data_traceback_frame(error_data, index, &frame);
 
-            if (function_name.is_empty())
-                stack_string_builder.append(Utf16String::formatted("    at {}:{}:{}\n", source_range.filename(), source_range.start.line, source_range.start.column));
-            else
-                stack_string_builder.append(Utf16String::formatted("    at {} ({}:{}:{})\n", function_name, source_range.filename(), source_range.start.line, source_range.start.column));
-        } else {
-            stack_string_builder.append(Utf16String::formatted("    at {}\n", function_name.is_empty() ? "<unknown>"_utf16 : function_name));
-        }
-    };
-
-    auto is_same_frame = [](TracebackFrame const& a, TracebackFrame const& b) {
-        if (a.function_name.is_empty() && b.function_name.is_empty()) {
-            auto const& source_range_a = a.source_range();
-            auto const& source_range_b = b.source_range();
-            return source_range_a.filename() == source_range_b.filename() && source_range_a.start.line == source_range_b.start.line;
-        }
-        return a.function_name == b.function_name;
-    };
-
-    // Note: We don't want to capture the global execution context, so we omit the last frame
-    // Note: The error's name and message get prepended by Error.prototype.stack
-    unsigned repetitions = 0;
-    size_t used_frames = m_traceback.size() - 1;
-    for (size_t i = 0; i < used_frames; ++i) {
-        auto const& frame = m_traceback[i];
-        if (compact == CompactTraceback::Yes && i + 1 < used_frames) {
-            auto const& next_traceback_frame = m_traceback[i + 1];
-            if (is_same_frame(frame, next_traceback_frame)) {
-                repetitions++;
-                continue;
-            }
-        }
-        if (repetitions > 4) {
-            // If more than 5 (1 + >4) consecutive function calls with the same name, print
-            // the name only once and show the number of repetitions instead. This prevents
-            // printing ridiculously large call stacks of recursive functions.
-            append_frame(frame);
-            stack_string_builder.append(Utf16String::formatted("    {} more calls\n", repetitions));
-        } else {
-            for (size_t j = 0; j < repetitions + 1; j++)
-                append_frame(frame);
-        }
-        repetitions = 0;
+        Optional<SourceRange> source_range;
+        if (frame.has_source_range)
+            source_range = SourceRange { source_code_from_abi(frame.source_code).release_nonnull(), { frame.line, frame.column } };
+        traceback.unchecked_append({ Utf16String::from_utf16(utf16_view_from_abi(frame.function_name)), move(source_range) });
     }
-    for (size_t j = 0; j < repetitions; j++)
-        append_frame(m_traceback[used_frames - 1]);
+    return traceback;
+}
 
-    return stack_string_builder.to_string();
+GC::Ref<ErrorDataCell> ErrorDataCell::capture(VM& vm)
+{
+    auto* cell = js_error_data_cell_capture(vm_to_abi(vm));
+    VERIFY(cell);
+    return cell_ref_from_abi<ErrorDataCell>(cell);
 }
 
 }

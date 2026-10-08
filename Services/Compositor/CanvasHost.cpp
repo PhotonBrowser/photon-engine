@@ -54,7 +54,7 @@ OwnPtr<Gfx::CanvasCommandPlayer> CanvasHost::create_2d_command_player(Gfx::IntSi
         display_list_glyphs.ensure_capacity(glyphs.size());
         for (auto const& glyph : glyphs)
             display_list_glyphs.unchecked_append({ .position = glyph.position, .glyph_id = glyph.glyph_id });
-        return m_text_resources.text_blob(Compositing::FontResourceId { font_id }, 1, display_list_glyphs, 0, Compositing::TextRasterizationMode::Unhinted);
+        return m_text_blobs.text_blob(m_text_resources, Compositing::FontResourceId { font_id }, 1, display_list_glyphs, 0, TextRasterizationMode::Unhinted);
     };
     auto player = make<Gfx::CanvasCommandPlayer>(m_skia_backend_context, size, format, Gfx::AlphaType::Premultiplied, move(canvas_surface_resolver), move(text_blob_resolver));
 
@@ -153,7 +153,7 @@ void CanvasHost::execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStr
             m_text_resources.set_font(font.id, font.font);
         resources.fonts.set(font.id);
     }
-    m_text_resources.retain_only(resources);
+    m_text_blobs.evict(m_text_resources.retain_only(resources));
     for (auto const& segment : segments) {
         // The canvas may have been destroyed while this segment was pending in
         // WebContent, so a missing context is not a protocol violation.
@@ -248,13 +248,16 @@ void CanvasHost::clear_webgl_drawing_buffer(Compositing::CanvasId canvas_id)
     as_webgl(*context).clear_drawing_buffer();
 }
 
-Gfx::ShareableBitmap CanvasHost::read_back_surface(Gfx::PaintingSurface& surface, Gfx::IntRect rect)
+Gfx::ShareableBitmap CanvasHost::read_back_surface(Gfx::PaintingSurface& surface, Gfx::IntRect rect, Gfx::AlphaType alpha_type)
 {
     auto clipped_rect = rect.intersected(surface.rect());
     if (clipped_rect.is_empty())
         return {};
 
-    auto bitmap_or_error = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, clipped_rect.size());
+    // Unpremultiplied pixels are for ImageData, which stores them as RGBA8888. Reading into that format lets the
+    // surface do the conversion.
+    auto format = alpha_type == Gfx::AlphaType::Unpremultiplied ? Gfx::BitmapFormat::RGBA8888 : Gfx::BitmapFormat::BGRA8888;
+    auto bitmap_or_error = Gfx::Bitmap::create_shareable(format, alpha_type, clipped_rect.size());
     if (bitmap_or_error.is_error())
         return {};
 
@@ -279,17 +282,19 @@ RefPtr<Gfx::PaintingSurface> CanvasHost::presented_surface(Compositing::CanvasId
         });
 }
 
-Gfx::ShareableBitmap CanvasHost::read_back_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect)
+Gfx::ShareableBitmap CanvasHost::read_back_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect, Gfx::AlphaType alpha_type)
 {
     auto* context = this->context(canvas_id);
     if (!context)
         return {};
 
     return context->visit(
-        [rect](Canvas2DContext& canvas_context) {
-            return read_back_surface(canvas_context.command_player->surface(), rect);
+        [rect, alpha_type](Canvas2DContext& canvas_context) {
+            return read_back_surface(canvas_context.command_player->surface(), rect, alpha_type);
         },
-        [rect](WebGLContext& webgl_context) {
+        [rect, alpha_type](WebGLContext& webgl_context) -> Gfx::ShareableBitmap {
+            if (alpha_type != Gfx::AlphaType::Premultiplied)
+                return {};
             return webgl_context->read_back_drawing_buffer(rect);
         });
 }

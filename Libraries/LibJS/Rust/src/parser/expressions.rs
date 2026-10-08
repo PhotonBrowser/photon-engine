@@ -243,7 +243,7 @@ impl Parser<'_> {
         let original_forbidden = forbidden;
         let mut lhs_is_parenthesized = self.last_primary_was_parenthesized;
         self.last_primary_was_parenthesized = false;
-        while self.match_secondary_expression(&forbidden) {
+        while !self.recursion_limit_reached && self.match_secondary_expression(&forbidden) {
             let new_precedence = Self::operator_precedence(self.current_token_type());
             if new_precedence < min_precedence {
                 break;
@@ -660,7 +660,7 @@ impl Parser<'_> {
             Vec::new()
         };
         self.validate_regex_flags(&flags);
-        let compiled_regex = match crate::bytecode::ffi::compile_regex(&pattern, &flags) {
+        let compiled_regex = match crate::host::compile_regex(&pattern, &flags) {
             Ok(handle) => Arc::new(CompiledRegex::new(handle)),
             Err(msg) => {
                 self.syntax_error_at_position(&String::from_utf16_lossy(&msg), start);

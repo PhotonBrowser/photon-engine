@@ -1,217 +1,100 @@
 /*
- * Copyright (c) 2021-2025, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2022, David Tuin <davidot@serenityos.org>
- * Copyright (c) 2023, networkException <networkexception@serenityos.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/GenericShorthands.h>
-#include <LibGC/RootHashTable.h>
-#include <LibGC/RootVector.h>
 #include <LibJS/CyclicModule.h>
 #include <LibJS/Module.h>
-#include <LibJS/Runtime/ExternalMemory.h>
-#include <LibJS/Runtime/ModuleEnvironment.h>
-#include <LibJS/Runtime/ModuleNamespaceObject.h>
-#include <LibJS/Runtime/ModuleRequest.h>
-#include <LibJS/Runtime/Promise.h>
-#include <LibJS/Runtime/PromiseCapability.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibJS/ScriptAndModuleABIConversions.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(Module);
-GC_DEFINE_ALLOCATOR(GraphLoadingState);
+using namespace EmbeddingABI;
 
-Module::Module(Realm& realm, ByteString filename, GC::Ptr<GC::Cell> host_defined)
-    : m_realm(realm)
-    , m_host_defined(host_defined)
-    , m_filename(move(filename))
+static_assert(static_cast<int>(ResolvedBinding::BindingName) == JS_RESOLVED_BINDING_BINDING_NAME);
+static_assert(static_cast<int>(ResolvedBinding::Namespace) == JS_RESOLVED_BINDING_NAMESPACE);
+static_assert(static_cast<int>(ResolvedBinding::Ambiguous) == JS_RESOLVED_BINDING_AMBIGUOUS);
+static_assert(static_cast<int>(ResolvedBinding::Null) == JS_RESOLVED_BINDING_NULL);
+
+static void set_utf16_fly_string(void* context, u16 const* code_units, size_t length_in_code_units)
 {
+    auto& string = *static_cast<Utf16FlyString*>(context);
+    string = Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(code_units), length_in_code_units });
 }
 
-Module::~Module() = default;
-
-void Module::visit_edges(Cell::Visitor& visitor)
+Realm& Module::realm()
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_realm);
-    visitor.visit(m_environment);
-    visitor.visit(m_namespace);
-    visitor.visit(m_host_defined);
+    return cell_ref_from_abi<Realm>(js_module_realm(module_to_abi(*this)));
 }
 
-size_t Module::external_memory_size() const
+Realm const& Module::realm() const
 {
-    return byte_string_external_memory_size(m_filename);
+    return cell_ref_from_abi<Realm>(js_module_realm(module_to_abi(*this)));
 }
 
-// 16.2.1.5.1 EvaluateModuleSync ( module ), https://tc39.es/ecma262/#sec-EvaluateModuleSync
-ThrowCompletionOr<void> Module::evaluate_module_sync(VM& vm)
+GC::Ptr<ModuleEnvironment> Module::environment()
 {
-    // 1. Assert: module is not a Cyclic Module Record.
-    // 2. Let promise be module.Evaluate().
-    auto& promise = static_cast<JS::Promise&>(*TRY(evaluate(vm))->promise());
-
-    // 3. Assert: promise.[[PromiseState]] is either FULFILLED or REJECTED.
-    VERIFY(first_is_one_of(promise.state(), Promise::State::Fulfilled, Promise::State::Rejected));
-
-    // 4. If promise.[[PromiseState]] is REJECTED, then
-    if (promise.state() == Promise::State::Rejected) {
-        // a. If promise.[[PromiseIsHandled]] is false, perform HostPromiseRejectionTracker(promise, "handle").
-        if (!promise.is_handled())
-            vm.host_promise_rejection_tracker(promise, Promise::RejectionOperation::Handle);
-
-        // b. Set promise.[[PromiseIsHandled]] to true.
-        promise.set_is_handled();
-
-        // c. Return ThrowCompletion(promise.[[PromiseResult]]).
-        return throw_completion(promise.result());
-    }
-
-    // 5. Return UNUSED.
-    return {};
+    return reinterpret_cast<ModuleEnvironment*>(js_module_environment(module_to_abi(*this)));
 }
 
-// 16.2.1.5.1.1 InnerModuleLinking ( module, stack, index ), https://tc39.es/ecma262/#sec-InnerModuleLinking
-ThrowCompletionOr<u32> Module::inner_module_linking(VM& vm, GC::RootVector<GC::Ref<Module>>&, u32 index)
+GC::Ptr<GC::Cell> Module::host_defined() const
 {
-    // 1. If module is not a Cyclic Module Record, then
-    // a. Perform ? module.Link().
-    TRY(link(vm));
-    // b. Return index.
-    return index;
+    return static_cast<GC::Cell*>(js_module_host_defined(module_to_abi(*this)));
 }
 
-// 16.2.1.5.2.1 InnerModuleEvaluation ( module, stack, index ), https://tc39.es/ecma262/#sec-innermoduleevaluation
-ThrowCompletionOr<u32> Module::inner_module_evaluation(VM& vm, GC::RootVector<GC::Ref<Module>>&, u32 index)
+ThrowCompletionOr<void> Module::link(VM& vm)
 {
-    // 1. If module is not a Cyclic Module Record, then
-    // a. Perform ? EvaluateModuleSync(module).
-    TRY(evaluate_module_sync(vm));
-
-    // b. Return index.
-    return index;
+    return completion_from_abi<void>(js_module_link(vm_to_abi(vm), module_to_abi(*this)));
 }
 
-// 16.2.1.9 FinishLoadingImportedModule ( referrer, specifier, payload, result ), https://tc39.es/ecma262/#sec-FinishLoadingImportedModule
+ThrowCompletionOr<GC::Ref<PromiseCapability>> Module::evaluate(VM& vm)
+{
+    return completion_from_abi<GC::Ref<PromiseCapability>>(js_module_evaluate(vm_to_abi(vm), module_to_abi(*this)));
+}
+
+ResolvedBinding Module::resolve_export(VM& vm, Utf16FlyString const& export_name, Vector<ResolvedBinding> resolve_set)
+{
+    VERIFY(resolve_set.is_empty());
+
+    Utf16FlyString binding_name;
+    JSResolvedBinding abi_binding {
+        .module = nullptr,
+        .binding_name = { .context = &binding_name, .append = set_utf16_fly_string },
+        .type = JS_RESOLVED_BINDING_NULL,
+    };
+    js_module_resolve_export(vm_to_abi(vm), module_to_abi(*this), utf16_view_to_abi(export_name.view()), &abi_binding);
+
+    ResolvedBinding binding;
+    binding.type = static_cast<ResolvedBinding::Type>(abi_binding.type);
+    binding.module = cell_from_abi<Module>(abi_binding.module);
+    binding.export_name = move(binding_name);
+    return binding;
+}
+
+PromiseCapability& Module::load_requested_modules(GC::Ptr<GC::Cell> host_defined)
+{
+    auto* capability = js_module_load_requested_modules(vm_to_abi(vm()), module_to_abi(*this), host_defined.ptr());
+    VERIFY(capability);
+    return *reinterpret_cast<PromiseCapability*>(capability);
+}
+
+void Module::set_environment(GC::Ref<ModuleEnvironment> environment)
+{
+    js_host_module_set_environment(module_to_abi(*this), reinterpret_cast<JSEnvironment*>(environment.ptr()));
+}
+
+// 16.2.1.10 FinishLoadingImportedModule ( referrer, moduleRequest, payload, result ), https://tc39.es/ecma262/#sec-FinishLoadingImportedModule
 void finish_loading_imported_module(ImportedModuleReferrer referrer, ModuleRequest const& module_request, ImportedModulePayload payload, ThrowCompletionOr<GC::Ref<Module>> const& result)
 {
-    // 1. If result is a normal completion, then
-    if (!result.is_error()) {
-        // NOTE: Only Script and CyclicModule referrers have the [[LoadedModules]] internal slot.
-        if (referrer.has<GC::Ref<Script>>() || referrer.has<GC::Ref<CyclicModule>>()) {
-            auto& loaded_modules = referrer.visit(
-                [](GC::Ref<JS::Realm>&) -> Vector<LoadedModuleRequest>& {
-                    VERIFY_NOT_REACHED();
-                    __builtin_unreachable();
-                },
-                [](auto& script_or_module) -> Vector<LoadedModuleRequest>& {
-                    return script_or_module->loaded_modules();
-                });
-
-            bool found_record = false;
-
-            // a. If referrer.[[LoadedModules]] contains a LoadedModuleRequest Record record such that ModuleRequestsEqual(record, moduleRequest) is true, then
-            for (auto const& record : loaded_modules) {
-                if (module_requests_equal(record, module_request)) {
-                    // i. Assert: record.[[Module]] and result.[[Value]] are the same Module Record.
-                    VERIFY(record.module == result.value());
-                    found_record = true;
-                }
-            }
-
-            // b. Else,
-            if (!found_record) {
-                auto module = result.value();
-
-                // i. Append the LoadedModuleRequest Record { [[Specifier]]: moduleRequest.[[Specifier]], [[Attributes]]: moduleRequest.[[Attributes]], [[Module]]: result.[[Value]] } to referrer.[[LoadedModules]].
-                loaded_modules.append(LoadedModuleRequest {
-                    .specifier = module_request.module_specifier.to_utf16_string(),
-                    .attributes = module_request.attributes,
-                    .module = GC::Ref<Module>(*module) });
-            }
-        }
-    }
-
-    // 2. If payload is a GraphLoadingState Record, then
-    if (payload.has<GC::Ref<GraphLoadingState>>()) {
-        // a. Perform ContinueModuleLoading(payload, result)
-        continue_module_loading(payload.get<GC::Ref<GraphLoadingState>>(), result);
-    }
-    // 3. Else,
-    else {
-        // a. Perform ContinueDynamicImport(payload, result).
-        continue_dynamic_import(payload.get<GC::Ref<PromiseCapability>>(), result);
-    }
-
-    // 4. Return unused.
-}
-
-// 16.2.1.10 GetModuleNamespace ( module ), https://tc39.es/ecma262/#sec-getmodulenamespace
-GC::Ref<Object> Module::get_module_namespace(VM& vm)
-{
-    // 1. Assert: If module is a Cyclic Module Record, then module.[[Status]] is not NEW or UNLINKED.
-    // FIXME: Spec bug: https://github.com/tc39/ecma262/issues/3114
-
-    // 2. Let namespace be module.[[Namespace]].
-    auto namespace_ = m_namespace;
-
-    // 3. If namespace is EMPTY, then
-    if (!namespace_) {
-        // a. Let exportedNames be module.GetExportedNames().
-        auto exported_names = get_exported_names(vm);
-
-        // b. Let unambiguousNames be a new empty List.
-        Vector<Utf16FlyString> unambiguous_names;
-
-        // c. For each element name of exportedNames, do
-        for (auto& name : exported_names) {
-            // i. Let resolution be module.ResolveExport(name).
-            auto resolution = resolve_export(vm, name);
-
-            // ii. If resolution is a ResolvedBinding Record, append name to unambiguousNames.
-            if (resolution.is_valid())
-                unambiguous_names.append(name);
-        }
-
-        // d. Set namespace to ModuleNamespaceCreate(module, unambiguousNames).
-        namespace_ = module_namespace_create(unambiguous_names);
-    }
-
-    // 4. Return namespace.
-    return *namespace_;
-}
-
-Vector<Utf16FlyString> Module::get_exported_names(VM& vm)
-{
-    GC::RootHashTable<GC::Ref<Module const>> export_star_set;
-    return get_exported_names(vm, export_star_set);
-}
-
-// 10.4.6.12 ModuleNamespaceCreate ( module, exports ), https://tc39.es/ecma262/#sec-modulenamespacecreate
-GC::Ref<Object> Module::module_namespace_create(Vector<Utf16FlyString> unambiguous_names)
-{
-    auto& realm = this->realm();
-
-    // 1. Assert: module.[[Namespace]] is empty.
-    VERIFY(!m_namespace);
-
-    // 2. Let internalSlotsList be the internal slots listed in Table 34.
-    // 3. Let M be MakeBasicObject(internalSlotsList).
-    // 4. Set M's essential internal methods to the definitions specified in 10.4.6.
-    // 5. Set M.[[Module]] to module.
-    // 6. Let sortedExports be a List whose elements are the elements of exports ordered as if an Array of the same values had been sorted using %Array.prototype.sort% using undefined as comparefn.
-    // 7. Set M.[[Exports]] to sortedExports.
-    // 8. Create own properties of M corresponding to the definitions in 28.3.
-    auto module_namespace = realm.create<ModuleNamespaceObject>(realm, this, move(unambiguous_names));
-
-    // 9. Set module.[[Namespace]] to M.
-    m_namespace = module_namespace;
-
-    // 10. Return M.
-    return module_namespace;
+    ModuleRequestForABI abi_module_request { module_request };
+    js_module_finish_loading_imported_module(
+        vm_to_abi(VM::the()),
+        imported_module_referrer_to_abi(referrer),
+        abi_module_request.ptr(),
+        imported_module_payload_to_abi(payload),
+        module_completion_to_abi(result));
 }
 
 }

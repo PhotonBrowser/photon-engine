@@ -6,7 +6,6 @@
 
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
-#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Position.h>
@@ -30,7 +29,6 @@
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
-#include <LibWebCommon/CSS/SystemColor.h>
 
 namespace Web::Painting {
 
@@ -236,7 +234,7 @@ bool is_paintable_with_lines(Layout::Node const& node)
     }
 }
 
-bool is_inline_paintable(Layout::Node const& node)
+static bool is_inline_paintable(Layout::Node const& node)
 {
     return has_committed_box(node) && node.is_fragmented_inline();
 }
@@ -264,7 +262,7 @@ Compositing::ContextRef accumulated_visual_context_for_descendants(Layout::Node 
     return row.has_value() ? row->accumulated_visual_context_for_descendants : Compositing::ContextRef {};
 }
 
-Compositing::SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const& node)
+static Compositing::SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const& node)
 {
     auto row = committed_row(node);
     return row.has_value() ? row->enclosing_scroll_node_index : Compositing::VISUAL_VIEWPORT_NODE_INDEX;
@@ -293,6 +291,12 @@ Optional<Gfx::AffineTransform> svg_viewport_transform(Layout::Node const& node)
         return {};
     auto const& transform = result.transform;
     return Gfx::AffineTransform { transform.a, transform.b, transform.c, transform.d, transform.e, transform.f };
+}
+
+Gfx::AffineTransform svg_element_transform(Layout::Node const& node)
+{
+    auto transform = Layout::RustFFI::render_state_paintable_svg_element_transform(node.document_host(), committed_row_slot(node));
+    return { transform.a, transform.b, transform.c, transform.d, transform.e, transform.f };
 }
 
 CSS::RustStyleValueHandle used_value_for_grid_template(Layout::Node const& node, CSS::PropertyID property)
@@ -580,9 +584,6 @@ Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::Begu
     auto area_computed_values = area_element->computed_style();
     if (!area_computed_values || area_computed_values->outline_style() != CSS::OutlineStyle::Auto)
         return outline;
-    auto outline_data = Painting::outline_data(*layout_node, *area_computed_values);
-    if (!outline_data.has_value())
-        return outline;
     auto path = area_element->shape_path(absolute_rect(*layout_node).size());
     if (!path.has_value())
         return outline;
@@ -590,43 +591,7 @@ Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::Begu
     outline.image = committed_row_slot(*layout_node);
     outline.path_bytes = path_bytes.data();
     outline.path_byte_count = path_bytes.size();
-    outline.color = outline_data->color;
-    outline.width = outline_data->width;
     return outline;
-}
-
-static Optional<CSS::BorderData> border_data_for_outline(Layout::Node const& layout_node, Color outline_color, CSS::OutlineStyle outline_style, CSSPixels outline_width)
-{
-    CSS::LineStyle line_style;
-    if (outline_style == CSS::OutlineStyle::Auto) {
-        line_style = CSS::LineStyle::Solid;
-        outline_color = CSS::KeywordStyleValue::create(CSS::Keyword::Accentcolor)->to_color(CSS::ColorResolutionContext::for_layout_node_with_style(*static_cast<Layout::NodeWithStyle const*>(&layout_node))).value();
-        outline_width = 2;
-    } else {
-        line_style = CSS::keyword_to_line_style(CSS::to_keyword(outline_style)).value_or(CSS::LineStyle::None);
-    }
-
-    if (outline_color.alpha() == 0 || line_style == CSS::LineStyle::None || outline_width == 0)
-        return {};
-
-    return CSS::BorderData {
-        .color = outline_color,
-        .line_style = line_style,
-        .width = outline_width,
-    };
-}
-
-Optional<CSS::BorderData> outline_data(Layout::Node const& node, CSS::ComputedValues const& computed_values)
-{
-    if (!has_committed_box(node))
-        return {};
-
-    // The `auto` outline is the UA focus ring; like native controls, it is only shown while the window has focus.
-    auto navigable = node.document().navigable();
-    if (computed_values.outline_style() == CSS::OutlineStyle::Auto && (!navigable || !navigable->is_focused()))
-        return {};
-
-    return border_data_for_outline(node, computed_values.outline_color(), computed_values.outline_style(), computed_values.outline_width());
 }
 
 CSSPixelRect transform_reference_box(Layout::Node const& node)
@@ -649,7 +614,7 @@ CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect c
     return (result * (1.f / pixel_ratio)).to_type<CSSPixels>();
 }
 
-Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const& node, CSSPixelPoint position)
+static Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const& node, CSSPixelPoint position)
 {
     auto row = committed_row(node);
     if (!row.has_value())
@@ -779,7 +744,7 @@ void set_needs_repaint_in_subtree(Layout::Node const& node)
     mark_box(node, marks);
 }
 
-void invalidate_propagated_text_decoration_caches(Layout::Node const& node)
+static void invalidate_propagated_text_decoration_caches(Layout::Node const& node)
 {
     Layout::RustFFI::FfiBoxMarks marks {};
     marks.propagated_text_decorations = true;

@@ -34,9 +34,9 @@ struct AK::Traits<Web::CSS::ComputedFontCacheKey> : public AK::DefaultTraits<Web
         hash = pair_int_hash(hash, key.font_slope);
         hash = pair_int_hash(hash, Traits<double>::hash(key.font_weight));
         hash = pair_int_hash(hash, Traits<double>::hash(key.font_width.value()));
-        for (auto const& [variation_name, variation_value] : key.font_variation_settings)
-            hash = pair_int_hash(hash, pair_int_hash(variation_name.hash(), Traits<double>::hash(variation_value)));
-        hash = pair_int_hash(hash, Traits<Web::CSS::FontFeatureData>::hash(key.font_feature_data));
+        // NB: Which feature values a request names is enough to tell most requests apart, and equality compares them.
+        for (auto const& value : key.feature_values)
+            hash = pair_int_hash(hash, value ? 1 : 0);
         hash = pair_int_hash(hash, key.font_feature_values_scope.value());
 
         return hash;
@@ -55,12 +55,8 @@ using FontFeatureValuesProvider = Function<FontFeatureValues const&(Utf16FlyStri
 // The font-family list as font matching wants it: generic families kept apart from names, and a name's syntax kept.
 [[nodiscard]] Vector<ComputedFontFamily> computed_font_families_from_style_value(StyleValue const& font_family);
 
-// The computed values a style engine resolution request names beside the family, by FontResolutionFeatureInput; a
-// null one has its property's initial value.
 using FontResolutionFeatureInput = StyleEngineFFI::FontResolutionFeatureInput;
-using FontResolutionFeatureValues = Array<RefPtr<StyleValue const>, StyleEngineFFI::FONT_RESOLUTION_FEATURE_INPUT_COUNT>;
-[[nodiscard]] FontFeatureData font_feature_data_from_style_values(FontResolutionFeatureValues const&);
-[[nodiscard]] HashMap<Utf16FlyString, double> font_variation_settings_from_style_values(FontResolutionFeatureValues const&);
+static_assert(font_resolution_feature_input_count == StyleEngineFFI::FONT_RESOLUTION_FEATURE_INPUT_COUNT);
 
 // Resolve a request against a document's @font-face table, through the cascades it has resolved before. Outside a
 // style update, the web faces the resolution selects start loading here.
@@ -76,6 +72,10 @@ public:
 
     // NB: A memo of a pure function, so filling it does not change what it answers.
     [[nodiscard]] NonnullRefPtr<Gfx::FontCascadeList const> resolve(FontFaceSnapshot const&, ComputedFontCacheKey const&, FontFeatureValuesProvider const&) const;
+    // Resolves as resolve() does for a fork of a document's render state, which holds a reference to every cascade it
+    // names: an answer against an older table than the memo's is the fork's alone, which neither the retired cascades
+    // nor the bookkeeping of answers against older tables take in.
+    [[nodiscard]] NonnullRefPtr<Gfx::FontCascadeList const> resolve_for_fork(FontFaceSnapshot const&, ComputedFontCacheKey const&, FontFeatureValuesProvider const&) const;
     // NB: Only under a font environment generation newer than any resolved against: the style engine names the memo's
     //     cascades without holding a reference to them for as long as a generation stands, so the forgotten ones are
     //     retired, not released, as a style transaction that flew may still name them.

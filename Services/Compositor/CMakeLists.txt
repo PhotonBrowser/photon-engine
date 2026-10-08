@@ -3,15 +3,19 @@ set(SOURCES
     CanvasHost.cpp
     CompositorState.cpp
     ContextState.cpp
+    DisplayListPlayerSkia.cpp
+    DisplayListRasterCache.cpp
     ConnectionFromClient.cpp
     ConnectionFromWebContent.cpp
     FramePacer.cpp
     HostWebGLContext.cpp
     OpenGLContext.cpp
     PausedDebuggerOverlay.cpp
+    RasterizeDisplayList.cpp
     RenderClockConnection.cpp
     ScrollSnapController.cpp
     ScrollbarController.cpp
+    VideoFrameSkia.cpp
     VSyncScheduler.cpp
     WebGLObjectMap.cpp
 )
@@ -59,6 +63,7 @@ target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSa
 target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibCompositing ${ANGLE_TARGETS} skia)
 
 if (APPLE)
+    target_sources(compositorservice PRIVATE VideoFrameSkia.mm)
     target_link_libraries(compositorservice PUBLIC "-framework CoreGraphics" "-framework CoreVideo")
 endif()
 

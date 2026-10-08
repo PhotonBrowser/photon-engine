@@ -79,7 +79,7 @@ public:
     virtual Media::DecoderErrorOr<AK::Duration> total_duration() override { return AK::Duration::zero(); }
 
     virtual Media::DemuxerScanState const& scan_state() const LIFETIME_BOUND override { return m_scan_state; }
-    virtual void set_scan_state_change_handler(Function<void()>) override { }
+    virtual void set_scan_state_change_handler(ScanStateChangeHandler) override { }
 
     virtual void set_blocking_reads_aborted_for_track(Media::Track const&) override { }
     virtual void reset_blocking_reads_aborted_for_track(Media::Track const&) override { }
@@ -141,7 +141,7 @@ public:
     virtual Media::DecoderErrorOr<AK::Duration> duration_of_track(Media::Track const& track) override { return m_inner->duration_of_track(track); }
     virtual Media::DecoderErrorOr<AK::Duration> total_duration() override { return m_inner->total_duration(); }
     virtual Media::DemuxerScanState const& scan_state() const LIFETIME_BOUND override { return m_inner->scan_state(); }
-    virtual void set_scan_state_change_handler(Function<void()> handler) override { m_inner->set_scan_state_change_handler(move(handler)); }
+    virtual void set_scan_state_change_handler(ScanStateChangeHandler handler) override { m_inner->set_scan_state_change_handler(move(handler)); }
     virtual void set_blocking_reads_aborted_for_track(Media::Track const& track) override { m_inner->set_blocking_reads_aborted_for_track(track); }
     virtual void reset_blocking_reads_aborted_for_track(Media::Track const& track) override { m_inner->reset_blocking_reads_aborted_for_track(track); }
     virtual void set_read_blocked_change_handler_for_track(Media::Track const& track, Media::ReadBlockedChangeHandler handler) override { m_inner->set_read_blocked_change_handler_for_track(track, move(handler)); }
@@ -319,6 +319,34 @@ TEST_CASE(a_codec_change_drains_the_previous_decoder)
     EXPECT(switching_demuxer->first_frame_count() > 0);
     EXPECT(switching_demuxer->second_frame_count() > 0);
     EXPECT_EQ(decoded_frame_count, switching_demuxer->first_frame_count() + switching_demuxer->second_frame_count());
+}
+
+// A seek can resolve on a frame that the previous decoder outputs while it drains for a codec change. The frame that
+// changed the codec has to wait for that drain to finish before decoding continues.
+TEST_CASE(a_seek_that_resolves_while_the_decoder_drains_for_a_codec_change_keeps_decoding)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto [av1_demuxer, av1_track] = demuxer_and_video_track_for("./av1_in_webm.webm"sv);
+    auto [vp9_demuxer, vp9_track] = demuxer_and_video_track_for("./vp9_in_webm.webm"sv);
+    auto av1_duration = TRY_OR_FAIL(av1_demuxer->duration_of_track(av1_track));
+
+    auto switching_demuxer = SwitchingDemuxer::create(av1_demuxer, av1_track, vp9_demuxer, vp9_track);
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, switching_demuxer, av1_track));
+    producer->set_error_handler([&](Media::DecoderError&& error) {
+        FAIL(ByteString::formatted("An error occurred while decoding: {}", error.description()));
+    });
+    producer->seek(av1_duration - AK::Duration::from_milliseconds(1));
+    producer->start();
+
+    auto time_limit = AK::Duration::from_seconds(10);
+    for (size_t frame_count = 0; frame_count < 3; frame_count++) {
+        if (take_frame_within_time_limit(*producer, loop, time_limit) == nullptr) {
+            FAIL(ByteString::formatted("Timed out waiting for frame {}", frame_count));
+            return;
+        }
+    }
+    EXPECT(switching_demuxer->second_frame_count() > 0);
 }
 
 // A stream can move to a format the decoder in use has no support for, and only the first frame after a seek carries

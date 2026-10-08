@@ -483,9 +483,6 @@ impl ValueStateTestKind {
 pub enum ValueStateKind {
     /// `:dir()`
     Directionality,
-    /// `:lang()`. Every `:lang()` routes under this one key, because a range is not a name: this
-    /// kind names the input, not a value, and no selector operator carries it.
-    Language,
     /// `:state()`, a custom element's state.
     CustomState,
 }
@@ -788,6 +785,21 @@ impl<A: AtomSpace> SelectorProgram<A> {
         visited
     }
 
+    /// The names of the attributes the program tests, by any operator.
+    pub fn tested_attribute_names(&self) -> impl Iterator<Item = StyleAtomID> + '_ {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node {
+                SelectorOp::Feature(FeatureTest::Attribute(test)) => Some(test),
+                _ => None,
+            })
+            .flat_map(|test| {
+                [Some(test.name), (test.folded != test.name).then_some(test.folded)]
+                    .into_iter()
+                    .flatten()
+            })
+    }
+
     /// Attribute names whose tests cannot be answered from the value atom alone.
     pub fn attribute_value_text_names(&self) -> impl Iterator<Item = StyleAtomID> + '_ {
         self.nodes
@@ -944,6 +956,7 @@ pub struct SelectorProgramBuilder<A: AtomSpace = EngineAtoms> {
 
 impl SelectorProgramBuilder {
     #[must_use]
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -1046,6 +1059,7 @@ impl<A: AtomSpace> SelectorProgramBuilder<A> {
     }
 
     /// Add an ancestor step: the subject has an ancestor satisfying `inner`.
+    #[cfg(test)]
     pub fn push_ancestor(&mut self, inner: SelectorNodeID) -> SelectorNodeID {
         self.push(SelectorOp::Ancestor(inner))
     }
@@ -2753,6 +2767,7 @@ fn selector_program_pools() -> MutexGuard<'static, SelectorProgramPools> {
 ///
 /// The immutable program payloads are interned in the process's pool. Entry identities,
 /// attached rules, and every selector-result materialization remain document-local.
+#[derive(Clone)]
 pub struct SelectorPrograms {
     programs: SharedVector<Option<SelectorProgramStorage>>,
     vacant_programs: Vec<SelectorProgramID>,
@@ -2799,6 +2814,7 @@ impl SelectorPrograms {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -3050,13 +3066,9 @@ impl SelectorPrograms {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.programs.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.programs.len() == self.vacant_programs.len()
     }
 
     #[must_use]
@@ -3107,14 +3119,6 @@ pub enum InverseStep {
     FollowingSiblings,
     /// A change inside a positional argument moves indices within the whole child sequence.
     SiblingSequence,
-    /// From a possible `:has()` witness to its possible anchors: the element parent.
-    AnchorParent,
-    /// From a possible witness to its ancestors, up to the query's scope boundary.
-    AnchorAncestors,
-    /// From a possible witness to the immediately preceding element sibling.
-    AnchorPreviousSibling,
-    /// From a possible witness to the preceding element siblings in the same child sequence.
-    AnchorPrecedingSiblings,
     /// From a shadow host to the tree it hosts. Deliberately not a descendant step: a generic
     /// descendant walk does not pierce a shadow root.
     HostedTree,
@@ -3249,6 +3253,8 @@ fn share_flat_route_directory(
     pool.insert(hash, &shared);
     Some(shared)
 }
+
+#[derive(Clone)]
 
 enum RouteDirectory {
     BuildingAfterIdle(HashMap<RoutingKey, Vec<RouteID>>),
@@ -3444,6 +3450,7 @@ impl Hash for RouteColumnData {
 // Route columns contain immutable selector descriptors and integer identities. Equal contents
 // can be shared even when documents interpret the identities through different selector programs.
 // A later stylesheet edit detaches the columns before appending routes.
+#[derive(Clone)]
 enum RouteColumns {
     Owned(Box<RouteColumnData>),
     Shared(Arc<SharedRouteColumns>),
@@ -3936,7 +3943,6 @@ impl<A: AtomSpace> SelectorProgram<A> {
                     match kind.routing_kind() {
                         ValueStateKind::Directionality => RoutingKey::Directionality(value),
                         ValueStateKind::CustomState => RoutingKey::CustomState(value),
-                        ValueStateKind::Language => unreachable!("language has its own selector operator"),
                     },
                     visit,
                 );
@@ -4067,6 +4073,8 @@ fn state_is_published_on_arrival(fact: StateFact) -> bool {
 /// changes which routes run.
 const LIVENESS_LOCK: &str = "the routing liveness view is never held across a panic";
 
+#[derive(Clone)]
+
 pub struct RoutingRegistry {
     routes: RouteColumns,
     /// Sibling-first routes indexed by a distinguishing feature of their left compound.
@@ -4082,8 +4090,8 @@ pub struct RoutingRegistry {
     live_sequence_entries: Vec<SequenceEntry>,
     /// The two members of the view a routing pass mutates as it runs. Each is taken once per
     /// pass, never per route, so the lock is a formality that makes the registry shareable.
-    live_sibling_workspace: Mutex<SiblingCandidateWorkspace>,
-    live_sequence_index: Mutex<SequenceEntryIndex>,
+    live_sibling_workspace: crate::fork::ForkLocked<SiblingCandidateWorkspace>,
+    live_sequence_index: crate::fork::ForkLocked<SequenceEntryIndex>,
     /// The live routes whose rules may move layout geometry, part of the liveness view.
     geometry_routes: BitColumn,
     route_liveness_version: Option<u64>,
@@ -4102,11 +4110,11 @@ impl Default for RoutingRegistry {
             live_relational_routes: Vec::new(),
             live_sibling_entries: Vec::new(),
             live_sequence_entries: Vec::new(),
-            live_sibling_workspace: Mutex::new(SiblingCandidateWorkspace::new(
+            live_sibling_workspace: crate::fork::ForkLocked::new(SiblingCandidateWorkspace::new(
                 &[],
                 &mut routing_pools().sibling_entry_maps,
             )),
-            live_sequence_index: Mutex::new(SequenceEntryIndex::default()),
+            live_sequence_index: crate::fork::ForkLocked::new(SequenceEntryIndex::default()),
             geometry_routes: BitColumn::default(),
             route_liveness_version: None,
             memory: MemoryLease::new(MemoryCategory::RoutingRegistry),
@@ -4541,13 +4549,9 @@ impl RoutingRegistry {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.routes.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
     }
 
     #[must_use]
@@ -4712,6 +4716,7 @@ impl RoutingRegistry {
 
 /// Why a match evaluation could not produce an exact answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(clippy::enum_variant_names, reason = "each variant names the facts that are missing")]
 pub enum Incomplete {
     /// The fact batch does not cover a style node the evaluation had to read. This is never a
     /// negative answer: the caller widens the batch or asks a different question.
@@ -4974,14 +4979,14 @@ pub(crate) type MatchEvaluator<'a> = SelectorEvaluator<EngineSubject<'a>>;
 /// Exact invalidation evaluates the same selector entry over a region. In tree order, an ancestor
 /// or preceding-sibling relation differs from the preceding candidate by one edge, so retaining
 /// that answer turns repeated prefix walks into a dynamic program.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MatchRelationCache {
     answers: MatchRelationAnswers,
     preceding_sibling_parent_ids: HashMap<StyleNodeID, PrecedingSiblingParentID>,
     preceding_sibling_prefixes: PrecedingSiblingPrefixes,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MatchRelationAnswers {
     columns: ProgramRelationColumns<RelationAnswerColumn>,
 }
@@ -4998,7 +5003,7 @@ struct MatchRelationAnswerGap {
 /// Only a small subset of document parents normally owns a sibling sequence under evaluation.
 /// Intern those parents once at the cache boundary, then keep every compiled relation's repeatedly
 /// updated prefix state in a direct column rather than repeating the three identities in a hash key.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PrecedingSiblingPrefixes {
     columns: ProgramRelationColumns<PrecedingSiblingPrefixColumn>,
 }
@@ -5006,6 +5011,8 @@ struct PrecedingSiblingPrefixes {
 define_id! { pub(crate) struct PrecedingSiblingParentID(); }
 
 type PrecedingSiblingPrefix = super::selector_evaluation::PrecedingSiblingPrefix<StyleNodeID>;
+
+#[derive(Clone)]
 
 struct ProgramRelationColumns<C> {
     programs: Column<Option<Box<ProgramColumns<C>>>>,
@@ -5021,7 +5028,7 @@ impl<C> Default for ProgramRelationColumns<C> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ProgramColumns<C> {
     relations: Column<Option<C>>,
 }
@@ -5078,7 +5085,7 @@ const RELATION_ANSWER_PAGE_WORDS: usize = RELATION_ANSWER_PAGE_BITS / u64::BITS 
 /// in every answer.
 type RelationAnswerColumn = PagedColumn<RelationAnswerPage>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RelationAnswerPage {
     known: [u64; RELATION_ANSWER_PAGE_WORDS],
     answers: [u64; RELATION_ANSWER_PAGE_WORDS],
@@ -5217,6 +5224,8 @@ struct SiblingSequenceMembership {
 const VALUE_PAGE_SHIFT: usize = 6;
 const VALUE_PAGE_SIZE: usize = 1 << VALUE_PAGE_SHIFT;
 
+#[derive(Clone)]
+
 struct ValuePage<T: Copy + Default> {
     known: u64,
     values: [T; VALUE_PAGE_SIZE],
@@ -5250,7 +5259,7 @@ type PrecedingSiblingPrefixColumn = PagedColumn<ValuePage<PrecedingSiblingPrefix
 type SiblingPositionColumn = PagedColumn<ValuePage<SiblingPositions>>;
 type SiblingSequenceMembershipColumn = PagedColumn<ValuePage<SiblingSequenceMembership>>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SiblingSequenceGeometry {
     sequences: Vec<Arc<[StyleNodeID]>>,
     memberships: SiblingSequenceMembershipColumn,
@@ -5334,7 +5343,7 @@ impl MatchEvaluationSide {
 /// old-fact matching share the current sequence positions; the old-tree side has its own. Type
 /// positions and selector answers additionally depend on the fact side and therefore remain
 /// distinct.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MatchScratch {
     relations_by_evaluation_side: [MatchRelationCache; 3],
     sibling_geometry_by_tree_side: [SiblingSequenceGeometry; 2],
@@ -5343,7 +5352,7 @@ pub struct MatchScratch {
     positional_answers_by_evaluation_side: [PositionalAnswers; 3],
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PositionalAnswers {
     by_test: Vec<(NthPosition, HashMap<StyleNodeID, bool>)>,
     answer_capacity_bytes: u64,
@@ -5666,7 +5675,7 @@ impl<'a> MatchEvaluator<'a> {
         program: &SelectorProgram,
         entry: &SelectorEntry,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<u32, Incomplete> {
         let Some(scope_root) = entry.scope_root else {
             return Ok(u32::MAX);
@@ -5693,7 +5702,7 @@ impl<'a> MatchEvaluator<'a> {
         &mut self,
         program: &SelectorProgram,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<Option<SelectorEntry>, Incomplete> {
         let mut best: Option<SelectorEntry> = None;
         for entry in program.entries() {
@@ -5714,7 +5723,7 @@ impl<'a> MatchEvaluator<'a> {
         program: &SelectorProgram,
         entry: &SelectorEntry,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         self.matches_node(program, entry.root, node, counters)
     }
@@ -5729,7 +5738,7 @@ impl<'a> MatchEvaluator<'a> {
         entry: &SelectorEntry,
         known: DispatchKey,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let is_known_operand = |operand| {
             matches!(program.node(operand), SelectorOp::Feature(_) | SelectorOp::State(_))
@@ -5763,39 +5772,12 @@ impl<'a> MatchEvaluator<'a> {
         program: &SelectorProgram,
         entry: &SelectorEntry,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let previous = self.subject.transitive_relation_program.replace(program_id);
         let result = self.matches_node(program, entry.root, node, counters);
         self.subject.transitive_relation_program = previous;
         result
-    }
-
-    /// Evaluate one entry without admitting its primitive and transitive relation answers to the
-    /// shared program caches. Narrow exact comparisons consume the answer once, so they keep the
-    /// workspace's positional geometry but avoid canonicalization and sparse-column traffic.
-    #[inline]
-    pub(super) fn matches_entry_without_program_caches(
-        &mut self,
-        program: &SelectorProgram,
-        entry: &SelectorEntry,
-        node: StyleNodeID,
-        counters: &mut Counters,
-    ) -> Result<bool, Incomplete> {
-        self.matches_node(program, entry.root, node, counters)
-    }
-
-    /// Whether `node` matches one selector IR node. Routing's retained-witness check uses this to
-    /// re-evaluate a simple query's compound on the one retained witness.
-    #[inline]
-    pub(super) fn matches_selector_node(
-        &mut self,
-        program: &SelectorProgram,
-        id: SelectorNodeID,
-        node: StyleNodeID,
-        counters: &mut Counters,
-    ) -> Result<bool, Incomplete> {
-        self.matches_node(program, id, node, counters)
     }
 
     /// Match the local half of one top-down selector-prefix step.
@@ -5805,7 +5787,7 @@ impl<'a> MatchEvaluator<'a> {
         program: &SelectorProgram,
         local: SelectorPrefixLocal,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let previous = self.subject.transitive_relation_program.replace(program_id);
         let result = match program.node(local.root) {
@@ -6669,7 +6651,7 @@ mod tests {
 
     #[test]
     fn positional_answers_are_shared_across_programs() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let first = single_entry(|builder| {
             builder.push(SelectorOp::NthPosition(NthPosition {
                 step: 2,
@@ -6694,12 +6676,12 @@ mod tests {
 
         assert!(
             !evaluator
-                .matches_entry(&first, &first.entries()[0], fixture.nodes[1], &mut fixture.counters)
+                .matches_entry(&first, &first.entries()[0], fixture.nodes[1], &fixture.counters)
                 .unwrap()
         );
         assert!(
             !evaluator
-                .matches_entry(&second, &second.entries()[0], fixture.nodes[1], &mut fixture.counters)
+                .matches_entry(&second, &second.entries()[0], fixture.nodes[1], &fixture.counters)
                 .unwrap()
         );
         assert_eq!(fixture.counters.get(Counter::StructuralTests), 1);
@@ -6707,7 +6689,7 @@ mod tests {
 
     #[test]
     fn feature_answers_are_recomputed_across_programs() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let first = single_entry(|builder| builder.push_feature(FeatureTest::Class(CLASS_ITEM)));
         let second = single_entry(|builder| builder.push_feature(FeatureTest::Class(CLASS_ITEM)));
         let mut workspace = MatchScratch::default();
@@ -6721,7 +6703,7 @@ mod tests {
                     &first,
                     &first.entries()[0],
                     fixture.nodes[1],
-                    &mut fixture.counters,
+                    &fixture.counters,
                 )
                 .unwrap()
         );
@@ -6732,7 +6714,7 @@ mod tests {
                     &second,
                     &second.entries()[0],
                     fixture.nodes[1],
-                    &mut fixture.counters,
+                    &fixture.counters,
                 )
                 .unwrap()
         );
@@ -6754,6 +6736,7 @@ mod tests {
     const CLASS_THEME: StyleAtomID = StyleAtomID(11);
     const ID_TARGET: StyleAtomID = StyleAtomID(20);
     const ATTR_HREF: StyleAtomID = StyleAtomID(30);
+    const VALUE_HREF: StyleAtomID = StyleAtomID(41);
     const ATTR_TYPE: StyleAtomID = StyleAtomID(31);
     const VALUE_TEXT: StyleAtomID = StyleAtomID(40);
 
@@ -6807,7 +6790,7 @@ mod tests {
 
             let mut facts = StyleNodeFacts::new();
             let href: Vec<u16> = "https://example.com/a".encode_utf16().collect();
-            let (offset, length) = facts.push_text(&href);
+            facts.set_attribute_value_text_for_test(VALUE_HREF, &href);
             facts.push_row(
                 nodes[0],
                 TAG_DIV,
@@ -6824,9 +6807,7 @@ mod tests {
                 &[CLASS_ITEM],
                 &[AttributeFact {
                     name: ATTR_HREF,
-                    value: StyleAtomID::NONE,
-                    text_offset: offset,
-                    text_length: length,
+                    value: VALUE_HREF,
                 }],
             );
             let mut hovered = StateSet::default();
@@ -6840,8 +6821,6 @@ mod tests {
                 &[AttributeFact {
                     name: ATTR_TYPE,
                     value: VALUE_TEXT,
-                    text_offset: u32::MAX,
-                    text_length: 0,
                 }],
             );
             let row = facts.row_of(nodes[2]).unwrap();
@@ -6860,7 +6839,7 @@ mod tests {
         fn matches(&mut self, program: &SelectorProgram, node: usize) -> bool {
             let mut evaluator = MatchEvaluator::new(&self.tree, &self.facts);
             evaluator
-                .matches_entry(program, &program.entries()[0], self.nodes[node], &mut self.counters)
+                .matches_entry(program, &program.entries()[0], self.nodes[node], &self.counters)
                 .unwrap()
         }
 
@@ -6869,7 +6848,7 @@ mod tests {
             let shadow_root = self.nodes[shadow_root];
             let mut evaluator = MatchEvaluator::new(&self.tree, &self.facts).in_shadow_tree(shadow_root);
             evaluator
-                .matches_entry(program, &program.entries()[0], self.nodes[node], &mut self.counters)
+                .matches_entry(program, &program.entries()[0], self.nodes[node], &self.counters)
                 .unwrap()
         }
     }
@@ -7066,13 +7045,13 @@ mod tests {
 
         assert!(
             !MatchEvaluator::new(&fixture.tree, &fixture.facts)
-                .matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters,)
+                .matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters,)
                 .unwrap()
         );
         assert!(
             MatchEvaluator::new(&fixture.tree, &fixture.facts)
                 .with_transaction_fact_view(&view, TransactionFactSide::Before)
-                .matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters,)
+                .matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters,)
                 .unwrap()
         );
     }
@@ -7085,7 +7064,7 @@ mod tests {
             let div = builder.push_feature(FeatureTest::TagName(TagTest::exact(TAG_DIV)));
             builder.push_compound(&[div, preceding])
         });
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut sparse = StyleNodeFacts::new();
         sparse.push_row(
             fixture.nodes[3],
@@ -7098,7 +7077,7 @@ mod tests {
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &sparse);
 
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters),
             Err(Incomplete::MissingSiblingFacts {
                 first: fixture.nodes[1],
                 last_exclusive: Some(fixture.nodes[3]),
@@ -7114,7 +7093,7 @@ mod tests {
             let div = builder.push_feature(FeatureTest::TagName(TagTest::exact(TAG_DIV)));
             builder.push_compound(&[div, previous])
         });
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut sparse = StyleNodeFacts::new();
         sparse.push_row(
             fixture.nodes[3],
@@ -7127,7 +7106,7 @@ mod tests {
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &sparse);
 
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters),
             Err(Incomplete::MissingFacts(fixture.nodes[2]))
         );
     }
@@ -7156,7 +7135,7 @@ mod tests {
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts);
 
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[3], &fixture.counters),
             Err(Incomplete::MissingDescendantFacts {
                 root: fixture.nodes[1],
                 first: child,
@@ -7177,7 +7156,7 @@ mod tests {
                 match_in_shadow_tree: false,
             })
         });
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut sparse = StyleNodeFacts::new();
         sparse.push_row(
             fixture.nodes[1],
@@ -7190,7 +7169,7 @@ mod tests {
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &sparse);
 
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[1], &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], fixture.nodes[1], &fixture.counters),
             Err(Incomplete::MissingSiblingFacts {
                 first: fixture.nodes[2],
                 last_exclusive: None,
@@ -7288,18 +7267,18 @@ mod tests {
             builder.push_compound(&[scope, item])
         });
 
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts).with_scope_root(fixture.nodes[0]);
         assert!(
             evaluator
-                .matches_entry(&program, &program.entries()[0], fixture.nodes[1], &mut fixture.counters)
+                .matches_entry(&program, &program.entries()[0], fixture.nodes[1], &fixture.counters)
                 .unwrap()
         );
 
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts).with_scope_root(fixture.nodes[1]);
         assert!(
             !evaluator
-                .matches_entry(&program, &program.entries()[0], fixture.nodes[1], &mut fixture.counters)
+                .matches_entry(&program, &program.entries()[0], fixture.nodes[1], &fixture.counters)
                 .unwrap()
         );
     }
@@ -7383,7 +7362,7 @@ mod tests {
                 of_type: true,
             }))
         });
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut first_only = StyleNodeFacts::new();
         first_only.push_row(
             fixture.nodes[1],
@@ -7395,12 +7374,7 @@ mod tests {
         );
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &first_only);
         assert_eq!(
-            evaluator.matches_entry(
-                &from_end,
-                &from_end.entries()[0],
-                fixture.nodes[1],
-                &mut fixture.counters
-            ),
+            evaluator.matches_entry(&from_end, &from_end.entries()[0], fixture.nodes[1], &fixture.counters),
             Err(Incomplete::MissingSiblingFacts {
                 first: fixture.nodes[2],
                 last_exclusive: None,
@@ -7422,7 +7396,7 @@ mod tests {
                 &from_start,
                 &from_start.entries()[0],
                 fixture.nodes[3],
-                &mut fixture.counters
+                &fixture.counters
             ),
             Err(Incomplete::MissingSiblingFacts {
                 first: fixture.nodes[1],
@@ -7454,10 +7428,10 @@ mod tests {
         );
         let program = builder.finish();
 
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts);
         let matched = evaluator
-            .match_entries(&program, fixture.nodes[2], &mut fixture.counters)
+            .match_entries(&program, fixture.nodes[2], &fixture.counters)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -7473,11 +7447,11 @@ mod tests {
     #[test]
     fn a_missing_fact_row_is_reported_rather_than_answered() {
         let program = single_entry(|builder| builder.push_feature(FeatureTest::Class(CLASS_ITEM)));
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let missing = StyleNodeID::element(99);
         let mut evaluator = MatchEvaluator::new(&fixture.tree, &fixture.facts);
         assert_eq!(
-            evaluator.matches_entry(&program, &program.entries()[0], missing, &mut fixture.counters),
+            evaluator.matches_entry(&program, &program.entries()[0], missing, &fixture.counters),
             Err(Incomplete::MissingFacts(missing))
         );
     }

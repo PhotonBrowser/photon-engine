@@ -87,15 +87,12 @@ set(SOURCES
     Crypto/SubtleCrypto.cpp
     CSS/Angle.cpp
     CSS/AnimationEvent.cpp
-    CSS/Clip.cpp
     CSS/ComputedStyleWorkingSet.cpp
     CSS/ComputedValues.cpp
     CSS/RustDeclarationBlock.cpp
     CSS/RustDescriptorBlock.cpp
     CSS/ContainerQuery.cpp
     CSS/CountersSet.cpp
-    CSS/CounterStyle.cpp
-    CSS/CounterStyleDefinition.cpp
     CSS/CustomPropertyRegistration.cpp
     CSS/GeneratedContent.cpp
     CSS/CSS.cpp
@@ -164,7 +161,6 @@ set(SOURCES
     CSS/Descriptor.cpp
     CSS/Display.cpp
     CSS/EasingFunction.cpp
-    CSS/EdgeRect.cpp
     CSS/Fetch.cpp
     CSS/Flex.cpp
     CSS/FontComputer.cpp
@@ -173,7 +169,6 @@ set(SOURCES
     CSS/FontResolution.cpp
     CSS/FontFaceSet.cpp
     CSS/FontFaceSetLoadEvent.cpp
-    CSS/FontFeatureData.cpp
     CSS/Frequency.cpp
     CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
@@ -191,12 +186,10 @@ set(SOURCES
     CSS/Length.cpp
     CSS/LengthBox.cpp
     CSS/MediaList.cpp
-    CSS/MediaQuery.cpp
     CSS/MediaQueryList.cpp
     CSS/MediaQueryListEvent.cpp
     CSS/Number.cpp
     CSS/NumericType.cpp
-    CSS/ParsedFontFace.cpp
     CSS/Parser/ErrorReporter.cpp
     CSS/Parser/Helpers.cpp
     CSS/Parser/Parser.cpp
@@ -231,25 +224,16 @@ set(SOURCES
     CSS/StyleSheetList.cpp
     CSS/StyleSheetState.cpp
     CSS/StyleValues/AbstractImageStyleValue.cpp
-    CSS/StyleValues/AnchorStyleValue.cpp
     CSS/StyleValues/AngleStyleValue.cpp
-    CSS/StyleValues/BackgroundSizeStyleValue.cpp
-    CSS/StyleValues/BorderRadiusStyleValue.cpp
-    CSS/StyleValues/BorderRadiusRectStyleValue.cpp
     CSS/StyleValues/CalculatedStyleValue.cpp
     CSS/StyleValues/ColorFunctionStyleValue.cpp
     CSS/StyleValues/ColorStyleValue.cpp
-    CSS/StyleValues/ConicGradientStyleValue.cpp
     CSS/StyleValues/ContentStyleValue.cpp
     CSS/StyleValues/CounterDefinitionsStyleValue.cpp
-    CSS/StyleValues/CounterStyleSystemStyleValue.cpp
-    CSS/StyleValues/CounterStyleValue.cpp
-    CSS/StyleValues/CounterStyleStyleValue.cpp
     CSS/StyleValues/CursorStyleValue.cpp
     CSS/StyleValues/CustomIdentStyleValue.cpp
     CSS/StyleValues/DimensionStyleValue.cpp
     CSS/StyleValues/DisplayStyleValue.cpp
-    CSS/StyleValues/EdgeStyleValue.cpp
     CSS/StyleValues/FilterStyleValue.cpp
     CSS/StyleValues/FunctionStyleValue.cpp
     CSS/StyleValues/FontSourceStyleValue.cpp
@@ -259,26 +243,15 @@ set(SOURCES
     CSS/StyleValues/IntegerStyleValue.cpp
     CSS/StyleValues/KeywordStyleValue.cpp
     CSS/StyleValues/LengthStyleValue.cpp
-    CSS/StyleValues/LinearGradientStyleValue.cpp
     CSS/StyleValues/NumberStyleValue.cpp
     CSS/StyleValues/OpacityValueStyleValue.cpp
     CSS/StyleValues/OpenTypeTaggedStyleValue.cpp
-    CSS/StyleValues/OverflowClipMarginStyleValue.cpp
-    CSS/StyleValues/PositionStyleValue.cpp
-    CSS/StyleValues/RadialGradientStyleValue.cpp
-    CSS/StyleValues/RadialSizeStyleValue.cpp
-    CSS/StyleValues/RandomValueSharingStyleValue.cpp
     CSS/StyleValues/RatioStyleValue.cpp
-    CSS/StyleValues/RectStyleValue.cpp
-    CSS/StyleValues/ScrollbarColorStyleValue.cpp
     CSS/StyleValues/ShadowStyleValue.cpp
     CSS/StyleValues/ShorthandStyleValue.cpp
     CSS/StyleValues/StyleValue.cpp
     CSS/StyleValues/StyleValueList.cpp
-    CSS/StyleValues/SuperellipseStyleValue.cpp
-    CSS/StyleValues/TextIndentStyleValue.cpp
     CSS/StyleValues/TransformationStyleValue.cpp
-    CSS/StyleValues/TreeCountingFunctionStyleValue.cpp
     CSS/StyleValues/UnresolvedStyleValue.cpp
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
@@ -511,7 +484,6 @@ set(SOURCES
     HTML/EventLoop/ClockPlan.cpp
     HTML/EventLoop/EventLoop.cpp
     HTML/EventLoop/FrameCompletion.cpp
-    HTML/EventLoop/PresentationQueue.cpp
     HTML/EventLoop/Task.cpp
     HTML/EventLoop/TaskQueue.cpp
     HTML/EventNames.cpp
@@ -810,6 +782,7 @@ set(SOURCES
     Page/EventHandler.cpp
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
+    Page/PageCursor.cpp
     Page/ScreenWakeLockHandle.cpp
     Painting/Blending.cpp
     Painting/BoxModelMetrics.cpp
@@ -1185,7 +1158,7 @@ set(GENERATED_SOURCES
     CSS/PseudoClass.h
     CSS/PseudoElement.cpp
     CSS/QuirksModeStyleSheetSource.cpp
-    CSS/TransformFunctions.cpp
+    CSS/TransformFunctions.h
     CSS/Units.cpp
     MathML/MathMLStyleSheetSource.cpp
     SVG/SVGStyleSheetSource.cpp
@@ -1197,7 +1170,7 @@ set(GENERATED_SOURCES
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibWeb PUBLIC LibCompositing LibWebCommon)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibMediaClient LibWasm LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading skia LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibMediaClient LibWasm LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibXml2::LibXml2)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile
@@ -1210,7 +1183,7 @@ foreach(angle_target IN LISTS ANGLE_TARGETS)
     target_compile_options(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_OPTIONS>)
 endforeach()
 
-set(libweb_rust_features)
+set(libweb_rust_features allocator)
 if (ENABLE_THREAD_SANITIZER)
     list(APPEND libweb_rust_features thread-sanitizer)
 endif()
@@ -1231,6 +1204,8 @@ import_rust_crate(
         SelectorStateFactsGenerated.inc
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
+    # The copy of libgfx_rust in this crate, which TestRustCrateCopies reaches by name.
+    KEEP_SYMBOLS ladybird_gfx_register_rust_crate_copy
 )
 target_link_libraries(libweb_rust INTERFACE LibGfx)
 test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)

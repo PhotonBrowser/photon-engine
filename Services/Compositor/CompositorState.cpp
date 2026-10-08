@@ -120,7 +120,7 @@ NonnullRefPtr<CompositorState> CompositorState::create(RefPtr<Gfx::SkiaBackendCo
 
 CompositorState::CompositorState(RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
     : m_skia_backend_context(move(skia_backend_context))
-    , m_display_list_player(make<Compositing::DisplayListPlayerSkia>(m_skia_backend_context))
+    , m_display_list_player(make<DisplayListPlayerSkia>(m_skia_backend_context))
 {
 }
 
@@ -1016,6 +1016,8 @@ bool CompositorState::try_present_frame_during_resize(Web::CompositorContextId c
     // Rasterize resize frames as soon as a backing store is available, so the previous size does not
     // remain visible for another display tick. prepare_frame() owns requeuing any blocked frame.
     present_frame(context_id, context, *pending_frame);
+    // The display tick does more than present frames, such as updating the video sinks that are painted.
+    vsync_scheduler_for_display(display_id_for_context(context)).schedule(display_refresh_rate_for_context(context));
     return true;
 }
 
@@ -1064,26 +1066,31 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id, 
             }
         }
 
-        // A render clock tick goes to the process's render clock thread, beside what its main thread is doing.
+        auto has_active_animation_on_display = context.needs_animation_frames() && display_id_for_context(context) == display_id;
+        auto presents_on_display = context.has_pending_present_frame_scheduled_on(display_id) || has_active_animation_on_display;
+        if (presents_on_display) {
+            if (display_id_for_context(context) == display_id)
+                dispatch_scroll_fling_step(context_id, context, context.take_scroll_fling_step(frame_time));
+            if (auto animation_frame = context.advance_smooth_scroll_animations(frame_time); animation_frame.has_value())
+                context.queue_present_frame(ContextState::PendingFrame::repainting_changes(*animation_frame));
+        }
+
+        // A render clock tick goes to the process's render clock thread, beside what its main thread is doing, with
+        // where the compositor has scrolled to for this vsync, which that main thread may not have taken in yet.
         if (context.clock_tick_requested() && display_id_for_context(context) == display_id) {
             auto display_refresh_rate = display_refresh_rate_for_context(context);
             if (context.clock_tick_is_due(frame_time, display_refresh_rate)) {
                 auto frame_interval = context.clock_tick_interval(display_refresh_rate);
                 context.did_deliver_clock_tick(frame_time);
-                context.web_content_client().clock_tick(context_id, frame_time.nanoseconds(), frame_interval);
+                context.web_content_client().clock_tick(context_id, frame_time.nanoseconds(), frame_interval, context.scroll_offsets());
             } else {
                 vsync_scheduler_for_display(display_id).schedule(display_refresh_rate);
             }
         }
 
-        auto has_active_animation_on_display = context.needs_animation_frames() && display_id_for_context(context) == display_id;
-        if (!context.has_pending_present_frame_scheduled_on(display_id) && !has_active_animation_on_display)
+        if (!presents_on_display)
             continue;
 
-        if (display_id_for_context(context) == display_id)
-            dispatch_scroll_fling_step(context_id, context, context.take_scroll_fling_step(frame_time));
-        if (auto animation_frame = context.advance_smooth_scroll_animations(frame_time); animation_frame.has_value())
-            context.queue_present_frame(ContextState::PendingFrame::repainting_changes(*animation_frame));
         publish_pending_async_scroll_updates(context_id, context);
         if (context.visual_animations_need_frame()) {
             context.advance_visual_animations(frame_time);
@@ -1275,7 +1282,7 @@ Compositing::CompositedContextSurface CompositorState::resolve_composited_contex
 
     if (child_context->needs_rasterization()) {
         auto composited_context_resolver = resolver_for(child_context_id);
-        Compositing::DisplayListPlayerSkia display_list_player { m_skia_backend_context };
+        DisplayListPlayerSkia display_list_player { m_skia_backend_context };
         child_context->present_synchronously(display_list_player, &composited_context_resolver);
     }
 

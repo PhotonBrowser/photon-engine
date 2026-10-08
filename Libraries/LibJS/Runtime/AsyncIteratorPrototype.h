@@ -6,22 +6,17 @@
 
 #pragma once
 
-#include <LibJS/Runtime/PrototypeObject.h>
+#include <AK/StringView.h>
+#include <AK/TypeCasts.h>
+#include <LibJS/Runtime/Completion.h>
+#include <LibJS/Runtime/GlobalObject.h>
+#include <LibJS/Runtime/Object.h>
+#include <LibJS/Runtime/ValueInlines.h>
 
 namespace JS {
 
+// %AsyncIteratorPrototype%, which LibJS's users reach through Intrinsics::async_iterator_prototype().
 class AsyncIteratorPrototype final : public Object {
-    JS_OBJECT(AsyncIteratorPrototype, Object)
-    GC_DECLARE_ALLOCATOR(AsyncIteratorPrototype);
-
-public:
-    virtual void initialize(Realm&) override;
-    virtual ~AsyncIteratorPrototype() override = default;
-
-private:
-    explicit AsyncIteratorPrototype(Realm&);
-
-    JS_DECLARE_NATIVE_FUNCTION(symbol_async_iterator);
 };
 
 }

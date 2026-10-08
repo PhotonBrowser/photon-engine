@@ -25,6 +25,7 @@ struct TextPosition {
 
 // A run normally maps linearly into one rendered snapshot. A collapsed space
 // instead covers the entire whitespace range, which can cross text nodes.
+#[derive(Clone)]
 struct TextRun {
     text: Range<usize>,
     start: TextPosition,
@@ -39,7 +40,7 @@ impl TextRun {
 
 /// Text assembled from rendered snapshots. Runs retain rendered offsets, so
 /// all DOM conversion continues to use the snapshots' transform edit maps.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct MappedText {
     text: Vec<u16>,
     runs: Vec<TextRun>,
@@ -448,13 +449,10 @@ pub(crate) fn find_matching_text(
 /// with styled parents.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_text_word_range(
-    host: *mut crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     primary: NodeSlotId,
     dom_offset: usize,
 ) -> FfiTextSourceRange {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
     host.ask(node_read(), |state| {
         text_word_range(state.arena_mut(), primary, dom_offset)
     })

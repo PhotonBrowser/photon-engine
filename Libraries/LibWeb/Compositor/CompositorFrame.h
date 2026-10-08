@@ -15,6 +15,7 @@
 #include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibCompositing/Types.h>
 #include <LibGfx/Rect.h>
+#include <LibGfx/ShareableBitmap.h>
 #include <LibWeb/Export.h>
 #include <LibWebCommon/Page/CompositorContextId.h>
 
@@ -23,6 +24,8 @@ namespace Web::Compositor {
 // What a navigable hands its compositor context for one frame. The frame owns everything its messages carry, so it
 // can be handed to the compositor from any thread.
 struct CompositorFrame {
+    AK_ALLOC_WITH_KMALLOC;
+
     // A newly recorded display list, with the visual context tree, resources and scroll state it paints with.
     struct DisplayListUpdate {
         NonnullRefPtr<Compositing::DisplayList> display_list;
@@ -50,14 +53,29 @@ struct CompositorFrame {
     Optional<ScrollStateUpdate> scroll_state_update;
     // Set when the frame is presented once the compositor has applied it.
     Optional<Gfx::IntRect> present_viewport_rect;
+
+    // A screenshot the compositor takes of the context once it has applied the frame, and of every frame before it.
+    struct ScreenshotRequest {
+        Compositing::ScreenshotRequestId id;
+        Gfx::ShareableBitmap target;
+    };
+    Optional<ScreenshotRequest> screenshot_request;
 };
+
+struct FrameSinkFFI;
+struct PresenterFFI;
 
 // Hands finished frames to the compositor. Unlike the rest of a compositor connection, which belongs to the thread that
 // made it, a frame sink takes frames from any thread. The messages of one frame reach the compositor together, and
-// frames reach it in the order they were submitted.
+// frames reach it in the order they were submitted. Only what presents frames submits them.
 class WEB_API CompositorFrameSink : public AtomicRefCounted<CompositorFrameSink> {
 public:
     virtual ~CompositorFrameSink() = default;
+
+private:
+    // Only the Paint thread presents, through these.
+    friend struct FrameSinkFFI;
+    friend struct PresenterFFI;
 
     // Returns false once the compositor can no longer be reached.
     virtual bool submit(CompositorFrame&&) = 0;

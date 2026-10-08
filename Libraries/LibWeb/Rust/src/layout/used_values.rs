@@ -145,6 +145,7 @@ impl<T: Copy> SealableCell<T> {
 pub(crate) struct LineData {
     pub(crate) line_boxes: Vec<line_box::LineBoxData>,
     pub(crate) inline_box_pieces: Vec<inline_formatting_context::InlineBoxPieceData>,
+    pub(crate) lines_after_clamp_point_rect: Option<Box<FfiCssPixelRect>>,
 }
 
 #[derive(Default)]
@@ -330,6 +331,7 @@ pub(crate) struct UsedValues {
     pub is_collapsed_borders_table_box: Cell<bool>,
     pub has_line_clamp_point: Cell<bool>,
     pub is_invisible_for_line_clamp: Cell<bool>,
+    pub clamped_content_is_scrollable_overflow: Cell<bool>,
 
     // For table cells and table-column(-group) boxes: the first grid column the box occupies and the number of grid
     // columns it spans, so painting can find the cells that originate in a column (CSS 2.2 §17.5.1).
@@ -392,6 +394,7 @@ impl Default for UsedValues {
             is_collapsed_borders_table_box: Cell::new(false),
             has_line_clamp_point: Cell::new(false),
             is_invisible_for_line_clamp: Cell::new(false),
+            clamped_content_is_scrollable_overflow: Cell::new(false),
             table_column_index: Cell::new(0),
             table_column_span: Cell::new(0),
             hidden_by_collapsed_columns: Cell::new(false),
@@ -413,6 +416,32 @@ impl Default for UsedValues {
 }
 
 impl UsedValues {
+    /// Resolves the left and right margins, borders and padding of `style`, with percentages against `basis`.
+    pub(crate) fn resolve_horizontal_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+        self.margin_left.set(style.margin_left().to_px(basis));
+        self.margin_right.set(style.margin_right().to_px(basis));
+        self.border_left.set(style.border_left_width());
+        self.border_right.set(style.border_right_width());
+        self.padding_left.set(style.padding_left().to_px(basis));
+        self.padding_right.set(style.padding_right().to_px(basis));
+    }
+
+    /// Resolves the top and bottom margins, borders and padding of `style`, with percentages against `basis`.
+    pub(crate) fn resolve_vertical_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+        self.margin_top.set(style.margin_top().to_px(basis));
+        self.margin_bottom.set(style.margin_bottom().to_px(basis));
+        self.border_top.set(style.border_top_width());
+        self.border_bottom.set(style.border_bottom_width());
+        self.padding_top.set(style.padding_top().to_px(basis));
+        self.padding_bottom.set(style.padding_bottom().to_px(basis));
+    }
+
+    /// Resolves every margin, border and padding of `style`, with percentages against `basis`.
+    pub(crate) fn resolve_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+        self.resolve_horizontal_box_model(style, basis);
+        self.resolve_vertical_box_model(style, basis);
+    }
+
     pub(crate) fn rare_data_mut(&self) -> RefMut<'_, UsedValuesRareData> {
         self.rare_data.get_or_init(UsedValuesRareData::default).borrow_mut()
     }
@@ -565,6 +594,7 @@ used_values_cell_state! {
     is_collapsed_borders_table_box: bool,
     has_line_clamp_point: bool,
     is_invisible_for_line_clamp: bool,
+    clamped_content_is_scrollable_overflow: bool,
     table_column_index: u32,
     table_column_span: u32,
     hidden_by_collapsed_columns: bool,

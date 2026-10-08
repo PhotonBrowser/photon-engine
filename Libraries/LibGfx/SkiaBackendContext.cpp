@@ -12,6 +12,7 @@
 #include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibGfx/Bitmap.h>
+#include <LibGfx/PaintingSurface.h>
 #ifdef USE_DIRECTX
 #    include <LibGfx/Direct3DContext.h>
 #endif
@@ -64,6 +65,14 @@ static auto& main_thread_context()
     return *context;
 }
 
+static SkiaBackendContext::SurfaceAccess surface_access_for(PaintingSurface const& surface)
+{
+    // Keep both contracts: Photon can require external access, and upstream marks images shared with another process.
+    return surface.requires_external_access() || surface.wraps_shared_image()
+        ? SkiaBackendContext::SurfaceAccess::External
+        : SkiaBackendContext::SurfaceAccess::Internal;
+}
+
 #if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
 static void invoke_async_flush_callback(void* context)
 {
@@ -104,6 +113,16 @@ void SkiaBackendContext::check_async_work_completion()
 {
     if (auto* context = sk_context())
         context->checkAsyncWorkCompletion();
+}
+
+void SkiaBackendContext::flush_and_submit(PaintingSurface& surface)
+{
+    flush_and_submit(&surface.sk_surface(), surface_access_for(surface));
+}
+
+void SkiaBackendContext::flush_and_submit_async(PaintingSurface& surface, Function<void()>&& callback, uint64_t presentation_signal_value)
+{
+    flush_and_submit_async(&surface.sk_surface(), surface_access_for(surface), move(callback), presentation_signal_value);
 }
 
 void SkiaBackendContext::flush_and_submit(SkSurface* surface, SurfaceAccess access)

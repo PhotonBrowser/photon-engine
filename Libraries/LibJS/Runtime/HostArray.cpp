@@ -4,76 +4,47 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/HostClassBuilder.h>
+#include <LibJS/ObjectEmbeddingABIConversions.h>
 #include <LibJS/Runtime/HostArray.h>
-#include <LibJS/Runtime/HostClassInternals.h>
+#include <LibJS/Runtime/HostObject.h>
 #include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
-using namespace HostABI;
+using namespace EmbeddingABI;
 
 GC::Ref<HostArray> HostArray::create(Realm& realm, JSHostClass const& host_class, GC::Ptr<Object> prototype, GC::Ptr<GC::Cell> host_data)
 {
-    if (!prototype)
-        prototype = realm.intrinsics().array_prototype();
-    auto array = realm.heap().allocate_with_descriptor(cell_allocator_for_host_class<HostArray>(host_class), realm, host_class, *prototype, host_data);
-    static_cast<Cell&>(*array).initialize(realm);
-    return array;
+    auto* array = js_host_array_create(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), &host_class, optional_object_to_abi(prototype.ptr()), host_data.ptr());
+    return static_cast<HostArray&>(object_from_abi(array));
 }
 
-HostArray::HostArray(Realm& realm, JSHostClass const& host_class, Object& prototype, GC::Ptr<GC::Cell> host_data)
-    : Array(realm, prototype)
-    , m_host_class(&host_class)
-    , m_host_data(host_data)
+JSHostClass const& HostArray::host_class() const
 {
-    VERIFY(host_class.abi_version == JS_HOST_ABI_VERSION && host_class.kind == JS_HOST_CLASS_ARRAY);
-    copy_host_class_flags_into_object(host_class, *this);
+    auto const* host_class = host_class_of(*this);
+    VERIFY(host_class);
+    return *host_class;
 }
 
-void HostArray::visit_edges(Cell::Visitor& visitor)
+GC::Ptr<GC::Cell> HostArray::host_data() const
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_host_data);
+    return host_data_of(*this);
 }
 
-JSHostArrayHooks const& HostArray::hooks() const
+void HostArray::set_host_data(GC::Ptr<GC::Cell> host_data)
 {
-    static constexpr JSHostArrayHooks array_hooks {};
-    if (!m_host_class->hooks)
-        return array_hooks;
-    return *static_cast<JSHostArrayHooks const*>(m_host_class->hooks);
+    js_host_object_set_host_data(object_to_abi(*this), host_data.ptr());
 }
 
-StringView HostArray::class_name() const
+ThrowCompletionOr<bool> HostArray::array_set(PropertyKey const& property_key, Value value, Value receiver, CacheableSetPropertyMetadata* cacheable_metadata, PropertyLookupPhase phase)
 {
-    return { m_host_class->name, m_host_class->name_length };
-}
-
-ThrowCompletionOr<bool> HostArray::internal_set(PropertyKey const& property_key, Value value, Value receiver, CacheableSetPropertyMetadata* metadata, PropertyLookupPhase phase)
-{
-    auto hook = hooks().set;
-    if (!hook)
-        return array_set(property_key, value, receiver, metadata, phase);
-    return completion_from_abi<bool>(hook(object_to_abi(this), property_key_to_abi(property_key), value_to_abi(value), value_to_abi(receiver), set_cache_metadata_to_abi(metadata), lookup_phase_to_abi(phase)));
-}
-
-ThrowCompletionOr<bool> HostArray::internal_delete(PropertyKey const& property_key)
-{
-    auto hook = hooks().delete_property;
-    if (!hook)
-        return array_delete(property_key);
-    return completion_from_abi<bool>(hook(object_to_abi(this), property_key_to_abi(property_key)));
-}
-
-ThrowCompletionOr<bool> HostArray::array_set(PropertyKey const& property_key, Value value, Value receiver, CacheableSetPropertyMetadata* metadata, PropertyLookupPhase phase)
-{
-    return Array::internal_set(property_key, value, receiver, metadata, phase);
+    return completion_from_abi<bool>(js_host_array_array_set(vm_to_abi(vm()), object_to_abi(*this), property_key_to_abi(property_key), value_to_abi(value), value_to_abi(receiver), set_cache_metadata_to_abi(cacheable_metadata), lookup_phase_to_abi(phase)));
 }
 
 ThrowCompletionOr<bool> HostArray::array_delete(PropertyKey const& property_key)
 {
-    return Array::internal_delete(property_key);
+    return completion_from_abi<bool>(js_host_array_array_delete(vm_to_abi(vm()), object_to_abi(*this), property_key_to_abi(property_key)));
 }
 
 }

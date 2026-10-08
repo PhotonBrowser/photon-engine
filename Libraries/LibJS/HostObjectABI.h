@@ -11,8 +11,7 @@
 #include <stdint.h>
 
 // The tables through which an embedder defines objects whose internal methods it implements itself. They are plain C
-// with a fixed layout so that an engine other than LibJS's C++ one could read the same structures, which makes the
-// layout part of the ABI.
+// with a fixed layout so that the Rust runtime reads the same structures, which makes the layout part of the ABI.
 //
 // An embedder describes each class of host object with a JSHostClass and a hook table of the kind's struct. Both are
 // static constant data with exactly one definition, because the engine identifies a class by the address of its
@@ -54,8 +53,8 @@ enum {
     JS_COMPLETION_THROW = 1,
 };
 
-// A normal completion carries its result in the payload: a JSValue, a bool as 0 or 1, or a pointer. A throw completion
-// carries the thrown JSValue.
+// A normal completion carries its result in the payload: a JSValue, a bool as 0 or 1, an enumerator of the ABI, or a
+// pointer. A throw completion carries the thrown JSValue.
 typedef struct JSCompletion {
     uint64_t payload;
     uint8_t variant;

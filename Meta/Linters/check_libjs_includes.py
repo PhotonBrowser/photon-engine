@@ -85,7 +85,6 @@ ALLOWED_HEADERS = {
     "LibJS/Runtime/SetIterator.h",
     "LibJS/Runtime/SharedArrayBufferConstructor.h",
     "LibJS/Runtime/StringObject.h",
-    "LibJS/Runtime/Symbol.h",
     "LibJS/Runtime/TypedArray.h",
     "LibJS/Runtime/Value.h",
     "LibJS/Runtime/ValueInlines.h",
@@ -97,6 +96,7 @@ ALLOWED_HEADERS = {
     "LibJS/SyntaxHighlighter.h",
     "LibJS/SyntheticModule.h",
     "LibJS/Token.h",
+    "LibJS/ToolEntryPoints.h",
 }
 
 ENGINE_INTERNAL_HEADER_DIRECTORIES = (
@@ -129,8 +129,6 @@ EXEMPT_PATHS = (
     "Meta/Fuzzers/FuzzJs.cpp",
     "Tests/ClangPlugins/",
     "Tests/LibJS/",
-    "Utilities/js.cpp",
-    "Utilities/test262-runner.cpp",
 )
 
 CPP_SUFFIXES = {".c", ".cpp", ".h", ".ipc", ".mm"}

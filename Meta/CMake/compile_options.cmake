@@ -15,6 +15,15 @@ macro(add_cxx_compile_options)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX,ASM>:${args}>)
 endmacro()
 
+# For options that only mean something to C++, some of which GCC rejects when it compiles C.
+macro(add_cxx_only_compile_options)
+    set(args "")
+    foreach(arg ${ARGN})
+        string(APPEND args ${arg}$<SEMICOLON>)
+    endforeach()
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:${args}>)
+endmacro()
+
 macro(add_cxx_compile_definitions)
     set(args "")
     foreach(arg ${ARGN})
@@ -47,14 +56,18 @@ function(add_cxx_link_option_if_supported option)
     cmake_pop_check_state()
 endfunction()
 
+# RUSTC_TARGET_CPU_FLAGS names the same CPU for rustc, so that Rust code runs on the instruction set C++ code does.
 if (ENABLE_CI_BASELINE_CPU)
     # In CI, we want to target a common architecture so different runners can share ccache caches effectively.
     if (APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
         add_cxx_compile_options(-mcpu=apple-m1)
+        set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=apple-m1)
     elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
         add_cxx_compile_options(-march=armv8.2-a)
+        set(RUSTC_TARGET_CPU_FLAGS -Ctarget-feature=+v8.2a)
     elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
         add_cxx_compile_options(-march=x86-64-v3)
+        set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=x86-64-v3)
     endif()
 elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
     # On RISC-V the generic -march=native is not yet supported and both gcc and clang require an explicit
@@ -64,6 +77,7 @@ elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
 elseif (NOT CMAKE_CROSSCOMPILING)
     # In all other cases, compile for the native architecture of the host system.
     add_cxx_compile_options(-march=native)
+    set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=native)
 endif()
 
 add_cxx_compile_options(-Wcast-qual)
@@ -76,15 +90,15 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     # Apple Clang does not include this diagnostic in -Wmissing-field-initializers as upstream Clang does.
     add_cxx_compile_options(-Wmissing-designated-field-initializers)
 endif()
-add_cxx_compile_options(-Wsuggest-override)
+add_cxx_only_compile_options(-Wsuggest-override)
 
 add_cxx_compile_options(-Wno-expansion-to-defined)
-add_cxx_compile_options(-Wno-invalid-offsetof)
+add_cxx_only_compile_options(-Wno-invalid-offsetof)
 add_cxx_compile_options(-Wno-maybe-uninitialized)
 add_cxx_compile_options(-Wno-shorten-64-to-32)
 add_cxx_compile_options(-Wno-unknown-warning-option)
 add_cxx_compile_options(-Wno-unused-command-line-argument)
-add_cxx_compile_options(-Wno-user-defined-literals)
+add_cxx_only_compile_options(-Wno-user-defined-literals)
 
 add_cxx_compile_options(-Werror)
 
@@ -104,19 +118,19 @@ if (NOT MSVC)
     add_cxx_link_options(-fstack-protector-strong)
     if (UNIX AND NOT APPLE AND NOT ENABLE_FUZZERS)
         add_cxx_compile_options(-fno-semantic-interposition)
-        add_cxx_compile_options(-fvisibility-inlines-hidden)
+        add_cxx_only_compile_options(-fvisibility-inlines-hidden)
     endif()
 endif()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_SIMULATE_ID  MATCHES "MSVC")
     # Clang's default constexpr-steps limit is 1048576(2^20), GCC doesn't have one
-    add_cxx_compile_options(-fconstexpr-steps=16777216)
+    add_cxx_only_compile_options(-fconstexpr-steps=16777216)
 
     add_cxx_compile_options(-Wmissing-prototypes)
 
     add_cxx_compile_options(-Wno-implicit-const-int-float-conversion)
-    add_cxx_compile_options(-Wno-user-defined-literals)
-    add_cxx_compile_options(-Wno-unqualified-std-cast-call)
+    add_cxx_only_compile_options(-Wno-user-defined-literals)
+    add_cxx_only_compile_options(-Wno-unqualified-std-cast-call)
 
     # Used for the #embed directive.
     # FIXME: Remove this once #embed is no longer an extension.
@@ -124,8 +138,8 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_SIMULATE_ID  MATCHES
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # Only ignore expansion-to-defined for g++, clang's implementation doesn't complain about function-like macros
     add_cxx_compile_options(-Wno-expansion-to-defined)
-    add_cxx_compile_options(-Wno-literal-suffix)
-    add_cxx_compile_options(-Wno-unqualified-std-cast-call)
+    add_cxx_only_compile_options(-Wno-literal-suffix)
+    add_cxx_only_compile_options(-Wno-unqualified-std-cast-call)
     add_cxx_compile_options(-Wvla)
 
     # FIXME: These warnings trigger on Function and ByteBuffer in GCC (only when LTO is disabled...)
@@ -134,11 +148,11 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_cxx_compile_options(-Wno-stringop-overflow)
 
     # FIXME: This warning seems useful but has too many false positives with GCC 13.
-    add_cxx_compile_options(-Wno-dangling-reference)
+    add_cxx_only_compile_options(-Wno-dangling-reference)
     if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16")
         # GCC 16 diagnoses the interpreter's intentional tail-call dispatch as
         # a possible escaping local address. Keep other warnings fatal.
-        add_cxx_compile_options(-Wno-error=maybe-musttail-local-addr)
+        add_cxx_only_compile_options(-Wno-error=maybe-musttail-local-addr)
     endif()
 elseif (MSVC)
     # Warning options and defines

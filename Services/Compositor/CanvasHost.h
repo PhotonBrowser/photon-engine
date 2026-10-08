@@ -19,6 +19,7 @@
 #include <AK/String.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
+#include <Compositor/DisplayListRasterCache.h>
 #include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCompositing/Forward.h>
 #include <LibCompositing/Types.h>
@@ -64,10 +65,10 @@ public:
 
     void present_webgl_canvas(Compositing::CanvasId, bool preserve_drawing_buffer);
     void clear_webgl_drawing_buffer(Compositing::CanvasId);
-    Gfx::ShareableBitmap read_back_pixels(Compositing::CanvasId, Gfx::IntRect);
+    Gfx::ShareableBitmap read_back_pixels(Compositing::CanvasId, Gfx::IntRect, Gfx::AlphaType);
     RefPtr<Gfx::PaintingSurface> presented_surface(Compositing::CanvasId);
 
-    static Gfx::ShareableBitmap read_back_surface(Gfx::PaintingSurface&, Gfx::IntRect);
+    static Gfx::ShareableBitmap read_back_surface(Gfx::PaintingSurface&, Gfx::IntRect, Gfx::AlphaType = Gfx::AlphaType::Premultiplied);
 
 private:
     struct Canvas2DContext {
@@ -87,6 +88,7 @@ private:
     Compositing::CanvasSurfaceRegistry& m_canvas_surface_registry;
     HashMap<Compositing::CanvasId, Context> m_contexts;
     Compositing::DisplayListResourceStorage m_text_resources;
+    DisplayListRasterCache m_text_blobs;
 };
 
 }

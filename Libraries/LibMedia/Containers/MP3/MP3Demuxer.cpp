@@ -94,9 +94,6 @@ void MP3Demuxer::start_buffered_scan_thread()
     auto scan_cursor = m_stream->create_cursor();
     scan_cursor->set_is_blocking(false);
 
-    Vector<Track> tracks;
-    tracks.append(m_track);
-
     DemuxerScanState initial_state;
     initial_state.duration = m_reader.duration();
 
@@ -105,14 +102,13 @@ void MP3Demuxer::start_buffered_scan_thread()
         BufferedScanPayload {
             .timeline = make<FrameScanTimeline>(make<FrameScanSource>(), m_reader.first_audio_frame_position(), m_reader.duration(), duration_source, m_reader.declared_audio_byte_count()),
             .scan_cursor = move(scan_cursor),
-            .tracks = move(tracks),
         },
         [](MediaStream& stream, BufferedScanPayload& payload) {
             auto byte_ranges = stream.available_byte_ranges();
-            HashMap<u64, BufferedRangesScan> scans_by_track_identifier;
+            BufferedRangesScan scan;
             if (!byte_ranges.is_empty())
-                scans_by_track_identifier.set(payload.tracks[0].identifier(), payload.timeline->buffered_time_ranges(payload.scan_cursor, byte_ranges, stream.expected_size()));
-            return DemuxerScanState::create_from_track_scans(payload.tracks, move(scans_by_track_identifier), payload.timeline->duration(), stream.closing_bytes_are_available());
+                scan = payload.timeline->buffered_time_ranges(payload.scan_cursor, byte_ranges, stream.expected_size());
+            return DemuxerScanState::create_from_track_scans({ move(scan) }, payload.timeline->duration(), stream.closing_bytes_are_available());
         });
 }
 
@@ -218,9 +214,12 @@ DemuxerScanState const& MP3Demuxer::scan_state() const
     return m_buffered_scan_thread->main_thread_state();
 }
 
-void MP3Demuxer::set_scan_state_change_handler(Function<void()> handler)
+void MP3Demuxer::set_scan_state_change_handler(ScanStateChangeHandler handler)
 {
-    m_buffered_scan_thread->set_change_handler(move(handler));
+    m_buffered_scan_thread->set_change_handler([handler = move(handler)] {
+        if (handler)
+            handler(TimeRanges {});
+    });
 }
 
 void MP3Demuxer::set_blocking_reads_aborted_for_track(Track const&)

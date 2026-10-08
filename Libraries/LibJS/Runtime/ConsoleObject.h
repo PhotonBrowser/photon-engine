@@ -6,45 +6,16 @@
 
 #pragma once
 
+#include <LibJS/Embedding/Layout.h>
 #include <LibJS/Runtime/Object.h>
 
 namespace JS {
 
 class JS_API ConsoleObject final : public Object {
-    JS_OBJECT(ConsoleObject, Object);
-    GC_DECLARE_ALLOCATOR(ConsoleObject);
-
 public:
-    virtual void initialize(Realm&) override;
-    virtual ~ConsoleObject() override;
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_CONSOLE_OBJECT; }
 
-    Console& console() { return *m_console; }
-
-private:
-    explicit ConsoleObject(Realm&);
-    virtual void visit_edges(Visitor&) override;
-
-    JS_DECLARE_NATIVE_FUNCTION(assert_);
-    JS_DECLARE_NATIVE_FUNCTION(clear);
-    JS_DECLARE_NATIVE_FUNCTION(debug);
-    JS_DECLARE_NATIVE_FUNCTION(error);
-    JS_DECLARE_NATIVE_FUNCTION(info);
-    JS_DECLARE_NATIVE_FUNCTION(log);
-    JS_DECLARE_NATIVE_FUNCTION(trace);
-    JS_DECLARE_NATIVE_FUNCTION(warn);
-    JS_DECLARE_NATIVE_FUNCTION(table);
-    JS_DECLARE_NATIVE_FUNCTION(dir);
-    JS_DECLARE_NATIVE_FUNCTION(dirxml);
-    JS_DECLARE_NATIVE_FUNCTION(count);
-    JS_DECLARE_NATIVE_FUNCTION(count_reset);
-    JS_DECLARE_NATIVE_FUNCTION(group);
-    JS_DECLARE_NATIVE_FUNCTION(group_collapsed);
-    JS_DECLARE_NATIVE_FUNCTION(group_end);
-    JS_DECLARE_NATIVE_FUNCTION(time);
-    JS_DECLARE_NATIVE_FUNCTION(time_log);
-    JS_DECLARE_NATIVE_FUNCTION(time_end);
-
-    GC::Ptr<Console> m_console;
+    Console& console();
 };
 
 }

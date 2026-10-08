@@ -53,10 +53,11 @@ use crate::css::style_value::{
     RetainedPropertyIdList, RetainedRequestUrlModifier, RetainedRequestUrlModifierList, RetainedString,
     RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData, shared_style_value,
 };
+use crate::css::value_codes::*;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-include!(concat!(env!("OUT_DIR"), "/dimension_units_generated.rs"));
+pub(crate) use crate::css::dimension_units::*;
 
 pub(crate) fn is_dimension_unit(unit: &[u16]) -> bool {
     LENGTH_UNIT_NAMES
@@ -70,24 +71,6 @@ pub(crate) fn is_dimension_unit(unit: &[u16]) -> bool {
 }
 
 // NB: Keep these in the order of the C++ ValueType enum.
-pub(crate) const VALUE_TYPE_ANGLE: u8 = 2;
-const VALUE_TYPE_COLOR: u8 = 6;
-const VALUE_TYPE_CUSTOM_IDENT: u8 = 10;
-const VALUE_TYPE_DASHED_IDENT: u8 = 11;
-pub(crate) const VALUE_TYPE_FLEX: u8 = 15;
-const VALUE_TYPE_FREQUENCY: u8 = 21;
-const VALUE_TYPE_IMAGE: u8 = 23;
-pub(crate) const VALUE_TYPE_INTEGER: u8 = 24;
-pub(crate) const VALUE_TYPE_LENGTH: u8 = 25;
-const VALUE_TYPE_LENGTH_PERCENTAGE: u8 = 26;
-pub(crate) const VALUE_TYPE_NUMBER: u8 = 27;
-const VALUE_TYPE_OPACITY_VALUE: u8 = 28;
-pub(crate) const VALUE_TYPE_PERCENTAGE: u8 = 31;
-const VALUE_TYPE_RATIO: u8 = 33;
-const VALUE_TYPE_RESOLUTION: u8 = 35;
-const VALUE_TYPE_STRING: u8 = 37;
-const VALUE_TYPE_TIME: u8 = 38;
-const VALUE_TYPE_URL: u8 = 42;
 
 const PORTED_TEXT_VALUE_TYPES: [u8; 4] = [
     VALUE_TYPE_CUSTOM_IDENT,
@@ -113,7 +96,6 @@ const PORTED_NUMERIC_VALUE_TYPES: [u8; 11] = [
 /// The C++ value-parsing contexts which affect grammar decisions.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum FfiValueParsingContextKind {
     Property,
     Function,
@@ -3722,6 +3704,47 @@ fn parse_positional_value_list_shorthand(
             expanded.into_iter().map(RetainedStyleValueData::from_owned).collect(),
         ),
     }))
+}
+
+/// A longhand's initial value from Properties.json, parsed as a value of that property outside any
+/// document.
+pub(crate) fn parse_initial_value(property: u16) -> Option<Arc<StyleValueData>> {
+    let property_context = FfiValueParsingContext {
+        kind: FfiValueParsingContextKind::Property,
+        value: property,
+        secondary_value: 0,
+        name: FfiUtf16View {
+            ascii: std::ptr::null(),
+            utf16: std::ptr::null(),
+            length: 0,
+        },
+    };
+    let context = ParseContext {
+        in_quirks_mode: false,
+        is_svg_presentation_attribute: false,
+        is_substituted_value: false,
+        contains_attr_tainted_values: false,
+        is_ua_style_sheet: false,
+        value_contexts: &raw const property_context,
+        value_context_count: 1,
+        declared_namespaces: std::ptr::null(),
+        document_url: std::ptr::null(),
+        document_url_length: 0,
+        document_base_url: std::ptr::null(),
+        document_base_url_length: 0,
+        length_resolution_context: std::ptr::null(),
+        random_function_index: std::ptr::null_mut(),
+    };
+    let values = component_values_from_source(property_initial_value(property).as_bytes()).ok()?;
+    let presence = SubstitutionFunctionsPresence::default();
+    match parse_css_value_after_substitution_scan(&context, property, &values, &[], &[], presence) {
+        // A keyword is the shared value of that keyword, which C++ keyword values hold too.
+        ParseOutcome::Parsed(value) => match *value {
+            StyleValueData::Keyword { keyword } => Some(shared_style_value(StyleValueData::Keyword { keyword })),
+            _ => Some(value),
+        },
+        ParseOutcome::Invalid | ParseOutcome::NotHandled => None,
+    }
 }
 
 fn parse_initial_longhand(context: &ParseContext, property: u16) -> Option<StyleValueData> {

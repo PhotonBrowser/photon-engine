@@ -12,14 +12,15 @@ use crate::layout::node_data::NodeSlotId;
 use crate::painting::host::FfiCompositorAnimationPublishOutcome;
 use crate::painting::visual_animation::VisualAnimation;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct VisualContextState {
     pub tree: Option<std::sync::Arc<VisualContextTree>>,
-    pub paintables_with_mask_nodes: Vec<crate::layout::node_data::NodeSlotId>,
     pub scroll_state: scroll_state::ScrollState,
     pub needs_to_refresh_scroll_state: bool,
     pub dirty_boxes: dirty::VisualContextDirtySet,
     pub last_tree_inputs: Option<crate::painting::host::FfiVisualContextTreeInputs>,
+    // The viewport's overflow when the tree was last updated. A sticky box finds its scrolling box by it.
+    pub last_viewport_overflow: (u8, u8),
     pub quarantined_slots_are_releasable: bool,
     // The list the tree was last given, which the next pass compares its own against.
     pub published_compositor_animations: Vec<VisualAnimation>,
@@ -153,8 +154,6 @@ pub(crate) struct DescendantVisualContexts {
 pub(crate) struct PaintableVisualContextRecord {
     pub inherited_input: DescendantVisualContexts,
     pub output_for_descendants: DescendantVisualContexts,
-    pub has_mask_nodes: bool,
-    pub may_be_root_element: bool,
     pub owns_geometry_dependent_nodes: bool,
     pub subtree_may_own_geometry_dependent_nodes: bool,
     pub stacking_context: crate::painting::stacking_context::StackingContextFacts,

@@ -9,7 +9,9 @@
 #include <AK/Optional.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCore/Promise.h>
 #include <LibGC/Heap.h>
+#include <LibGC/WeakHashSet.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/HTML/DecodedImageData.h>
@@ -25,7 +27,8 @@ class SVGDecodedImageData final : public HTML::DecodedImageData {
 
 public:
     class SVGPageClient;
-    static ErrorOr<GC::Ref<SVGDecodedImageData>> create(GC::Ref<Page>, URL::URL const&, ReadonlyBytes encoded_svg);
+    using DecodePromise = Core::Promise<GC::Root<SVGDecodedImageData>>;
+    static NonnullRefPtr<DecodePromise> decode(GC::Ref<Page>, URL::URL const&, ReadonlyBytes encoded_svg);
     virtual ~SVGDecodedImageData() override;
 
     virtual Optional<Gfx::DecodedImageFrame> default_frame(Gfx::IntSize = {}) const override;
@@ -55,10 +58,12 @@ public:
     CSS::PreferredColorScheme color_scheme() const { return m_color_scheme; }
 
 private:
+    static GC::Ref<SVGDecodedImageData> create(GC::Ref<Page>, GC::Ref<SVGPageClient>, GC::Ref<DOM::Document>, GC::Ref<SVG::SVGSVGElement>);
     SVGDecodedImageData(GC::Ref<Page>, GC::Ref<SVGPageClient>, GC::Ref<DOM::Document>, GC::Ref<SVG::SVGSVGElement>);
 
     CSS::SizeWithAspectRatio const& natural_size() const;
-    RefPtr<Gfx::PaintingSurface> render_to_surface(Gfx::IntSize) const;
+    Compositor::CompositorHost* host_compositor() const;
+    RefPtr<Gfx::Bitmap> render_frame(Gfx::IntSize) const;
     void prune_cached_display_list_resources() const;
     void append_cached_display_list_resources(Compositing::DisplayListResourceSet&) const;
     void append_paint_command_cache_source_resources(Compositing::DisplayListResourceSet&) const;
@@ -66,11 +71,9 @@ private:
     void invalidate_cached_rendering();
     static u64 next_vector_content_identity();
 
-    // FIXME: Remove this once everything is using surfaces instead.
     mutable HashMap<Gfx::IntSize, Gfx::DecodedImageFrame> m_cached_rendered_frames;
 
     mutable CSS::PreferredColorScheme m_color_scheme { CSS::PreferredColorScheme::Auto };
-    mutable HashMap<Gfx::IntSize, NonnullRefPtr<Gfx::PaintingSurface>> m_cached_rendered_surfaces;
 
     struct CachedDisplayList {
         NonnullRefPtr<Compositing::DisplayList> display_list;
@@ -112,6 +115,8 @@ private:
 class SVGDecodedImageData::SVGPageClient final : public PageClient {
     GC_CELL(SVGDecodedImageData::SVGPageClient, PageClient);
     GC_DECLARE_ALLOCATOR(SVGDecodedImageData::SVGPageClient);
+
+    friend class ScopedSVGImageDocument;
 
 public:
     static GC::Ref<SVGPageClient> create(Page& page)
@@ -179,6 +184,31 @@ private:
     size_t m_frame_request_suppression_count { 0 };
     size_t m_display_list_recording_count { 0 };
     mutable bool m_has_pending_display_list_resource_prune { false };
+};
+
+class WEB_API ScopedSVGImageDocument {
+    AK_MAKE_NONCOPYABLE(ScopedSVGImageDocument);
+
+public:
+    enum class FrameRequests : u8 {
+        Suppress,
+        RouteToCurrentImage
+    };
+
+    ScopedSVGImageDocument(DOM::Document&, FrameRequests);
+    ScopedSVGImageDocument(ScopedSVGImageDocument&&);
+    ~ScopedSVGImageDocument();
+
+    [[nodiscard]] static Optional<ScopedSVGImageDocument> create_if_needed(GC::Ptr<DOM::Document const>, FrameRequests);
+
+private:
+    GC::Ref<SVGDecodedImageData::SVGPageClient> m_page_client;
+    GC::Ref<HTML::LocalNavigable> m_navigable;
+    GC::Ref<HTML::Window> m_window;
+    GC::Ref<DOM::Document> m_previous_document;
+    GC::Weak<SVGDecodedImageData> m_previous_current_image_data;
+    bool m_should_unsuppress_frame_requests { false };
+    bool m_is_active { true };
 };
 
 }

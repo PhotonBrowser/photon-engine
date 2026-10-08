@@ -112,11 +112,8 @@ StringView Node::class_name() const
         LAYOUT_NODE_KIND_NAME_CASE(ListItemMarkerBox)
         LAYOUT_NODE_KIND_NAME_CASE(NavigableContainerViewport)
         LAYOUT_NODE_KIND_NAME_CASE(Node)
-        LAYOUT_NODE_KIND_NAME_CASE(NodeWithStyle)
         LAYOUT_NODE_KIND_NAME_CASE(RadioButton)
         LAYOUT_NODE_KIND_NAME_CASE(RangeInputBox)
-        LAYOUT_NODE_KIND_NAME_CASE(ReplacedBox)
-        LAYOUT_NODE_KIND_NAME_CASE(SVGBox)
         LAYOUT_NODE_KIND_NAME_CASE(SVGClipBox)
         LAYOUT_NODE_KIND_NAME_CASE(SVGForeignObjectBox)
         LAYOUT_NODE_KIND_NAME_CASE(SVGGeometryBox)
@@ -166,11 +163,6 @@ void Node::pin_style_record_for_detachment()
         node_with_style->pin_style_record_for_cxx_consumers();
 }
 
-void Node::prepare_for_detach_from_layout_tree()
-{
-    RustFFI::render_state_prepare_node_for_detach(document_host(), slot_id(this));
-}
-
 void Node::prepare_subtree_for_detach_from_layout_tree()
 {
     RustFFI::render_state_prepare_subtree_for_detach(document_host(), slot_id(this));
@@ -184,13 +176,6 @@ Node* Node::topmost_layout_node_of_top_layer_placement()
     if (!direct_viewport_child_candidate->parent() || !direct_viewport_child_candidate->parent()->is_viewport())
         return nullptr;
     return direct_viewport_child_candidate;
-}
-
-// The flag is set on the box a pseudo-element is bound to and cleared when that binding moves, so
-// it answers without resolving the generator on the DOM side.
-bool Node::is_pseudo_element_principal_box() const
-{
-    return has_flag(RustFFI::NodeFlag::IsPseudoElementPrincipalBox);
 }
 
 bool NodeWithStyle::establishes_an_absolute_positioning_containing_block() const
@@ -219,14 +204,6 @@ Viewport& Node::root()
     // NB: Called during layout, which is in progress.
     VERIFY(document().unsafe_layout_node(read));
     return *document().unsafe_layout_node(read);
-}
-
-bool NodeWithStyle::is_floating() const
-{
-    // flex-items don't float.
-    if (is_flex_item())
-        return false;
-    return float_() != CSS::Float::None;
 }
 
 bool NodeWithStyle::is_positioned() const
@@ -263,20 +240,6 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, BindToPreparedArenaSlot bi
     m_style_payloads = RustFFI::layout_row_style_payloads(document_host(), slot);
     VERIFY(m_style_payloads);
     m_has_layout_derived_style = RustFFI::layout_row_style_is_derived(document_host(), slot);
-}
-
-NonnullRefPtr<CSS::ComputedValues const> NodeWithStyle::copy_computed_values() const
-{
-    auto record_view = computed_style_record_view();
-    VERIFY(record_view);
-    return CSS::ComputedValues::Builder { *record_view }.build();
-}
-
-CSS::ComputedStyleRecordView NodeWithStyle::computed_style_record_view() const
-{
-    auto const& read = held_read();
-    VERIFY(m_style_record_identity);
-    return document().style_computer().computed_style_record_view(read, m_style_record_identity);
 }
 
 NodeWithStyle::ImageObserver::ImageObserver(NodeWithStyle& owner, NonnullRefPtr<CSS::ImageStyleValue const> image)
@@ -321,13 +284,13 @@ void NodeWithStyle::rebuild_image_observers(Vector<RefPtr<CSS::CursorStyleValue 
     };
 
     auto new_observers = make<ImageObserverSlots>();
-    for (auto const& layer : background_layers())
-        new_observers->background_layers.append(observer_for(layer.background_image.ptr()));
-    for (auto const& layer : mask_layers())
-        new_observers->mask_layers.append(observer_for(layer.background_image.ptr()));
+    for (auto const& image : background_images())
+        new_observers->background_layers.append(observer_for(image.ptr()));
+    for (auto const& image : mask_images())
+        new_observers->mask_layers.append(observer_for(image.ptr()));
     for (auto const& cursor_style_value : cursor_style_values)
         new_observers->cursors.append(cursor_style_value ? observer_for(&cursor_style_value->image()) : nullptr);
-    new_observers->border_image_source = observer_for(border_image().source.ptr());
+    new_observers->border_image_source = observer_for(border_image_source());
     new_observers->list_style_image = observer_for(list_style_image());
     new_observers->cursor_style_values = move(cursor_style_values);
     // TODO: Observe other <image> accepting properties once we support them.
@@ -386,10 +349,9 @@ namespace Web::Layout {
 void NodeWithStyle::apply_style(CSS::StyleRecordID style_record_identity)
 {
     release_pinned_style_record();
-    m_background_layers.clear();
-    m_mask_layers.clear();
-    m_border_image.clear();
-    m_list_style_type.clear();
+    m_background_images.clear();
+    m_mask_images.clear();
+    m_border_image_source.clear();
     m_list_style_image.clear();
     m_style_record_identity = style_record_identity;
     publish_style_record_to_node_data();
@@ -435,11 +397,11 @@ void NodeWithStyle::attach_style_resources(CSS::StyleRecordID style_record, Pain
             const_cast<CSS::AbstractImageStyleValue&>(*image).load_any_resources(*this);
     };
 
-    for (auto const& layer : background_layers())
-        load_image(layer.background_image.ptr());
-    for (auto const& layer : mask_layers())
-        load_image(layer.background_image.ptr());
-    load_image(border_image().source.ptr());
+    for (auto const& image : background_images())
+        load_image(image.ptr());
+    for (auto const& image : mask_images())
+        load_image(image.ptr());
+    load_image(border_image_source());
     Vector<RefPtr<CSS::CursorStyleValue const>> cursor_style_values;
     cursor_style_values.ensure_capacity(cursor().size());
     for (auto const& cursor_data : cursor()) {
@@ -474,21 +436,13 @@ void NodeWithStyle::refresh_style_from_arena(CSS::StyleRecordID record, void con
     m_style_record_identity = record;
     m_style_payloads = payloads;
     m_has_layout_derived_style = derived;
-    m_background_layers.clear();
-    m_mask_layers.clear();
-    m_border_image.clear();
-    m_list_style_type.clear();
+    m_background_images.clear();
+    m_mask_images.clear();
+    m_border_image_source.clear();
     m_list_style_image.clear();
     did_update_style_record();
     if (should_attach_resources)
         attach_style_resources();
-}
-
-bool Node::is_root_element() const
-{
-    if (is_anonymous())
-        return false;
-    return is<HTML::HTMLHtmlElement>(*dom_node());
 }
 
 String Node::debug_description() const
@@ -510,18 +464,6 @@ String Node::debug_description() const
     return MUST(builder.to_string());
 }
 
-bool NodeWithStyle::is_inline_block() const
-{
-    auto display = this->display();
-    return display.is_inline_outside() && display.is_flow_root_inside();
-}
-
-bool NodeWithStyle::is_inline_table() const
-{
-    auto display = this->display();
-    return display.is_inline_outside() && display.is_table_inside();
-}
-
 bool Node::is_atomic_inline() const
 {
     return RustFFI::layout_row_is_atomic_inline(document_host(), slot_id(this));
@@ -530,23 +472,6 @@ bool Node::is_atomic_inline() const
 bool Node::is_fragmented_inline() const
 {
     return RustFFI::layout_row_is_fragmented_inline(document_host(), slot_id(this));
-}
-
-// https://drafts.csswg.org/css-transforms-1/#transformable-element
-// The used transform of an SVG element in its own user space, for bounding box computation:
-// style transforms in property-application order plus the element's additional transform, without
-// transform-origin conjugation. Percentages resolve against an empty reference box because the
-// box is not available at layout time, so such transforms under-report the bounding box.
-Gfx::AffineTransform NodeWithStyle::used_svg_element_transform() const
-{
-    auto matrix = Gfx::FloatMatrix4x4::identity();
-    for_each_resolved_transform([&](auto const& transform) {
-        matrix = matrix * transform.to_matrix({}, {});
-    });
-    auto transform = Gfx::extract_2d_affine_transform(matrix);
-    if (auto const* graphics_element = as_if<SVG::SVGGraphicsElement>(dom_node()))
-        transform.multiply(graphics_element->additional_element_transform());
-    return transform;
 }
 
 void NodeWithStyle::set_computed_values(Layout::BegunRead const& read, NonnullRefPtr<CSS::ComputedValues const> computed_values)
@@ -594,10 +519,9 @@ void NodeWithStyle::set_style_record_identity(CSS::InstalledStyle const& install
         || CSS::ComputedValues::layout_affecting_group_payloads_differ(old_record_view.payloads, new_record_view.payloads);
 
     release_pinned_style_record();
-    m_background_layers.clear();
-    m_mask_layers.clear();
-    m_border_image.clear();
-    m_list_style_type.clear();
+    m_background_images.clear();
+    m_mask_images.clear();
+    m_border_image_source.clear();
     m_list_style_image.clear();
     m_style_record_identity = style_record_identity;
     publish_style_record_to_node_data();
@@ -653,7 +577,7 @@ void NodeWithStyle::did_update_style_record()
     if (auto const* element = as_if<DOM::Element>(dom_node()); element && (element->has_style(CSS::PseudoElement::Selection) || element->has_style(CSS::PseudoElement::SearchText) || element->has_style(CSS::PseudoElement::SearchTextCurrent)))
         Painting::push_highlight_pseudo_styles(*element);
 
-    if (scroll_snap_type().strictness != CSS::ScrollSnapStrictness::None)
+    if (style_group<CSS::ComputedValues::MiscResetValues>().scroll_snap_strictness_value() != CSS::ScrollSnapStrictness::None)
         document().set_may_have_scroll_snap_areas();
 
     // NB: The root element's style can be published before the layout tree gives the document a viewport to snap
@@ -677,12 +601,6 @@ void NodeWithStyle::did_update_style_record()
 void NodeWithStyle::synchronize_table_span_data()
 {
     RustFFI::render_state_restamp_table_spans(document_host(), slot_id(this));
-}
-
-void NodeWithStyle::set_display(CSS::Display display)
-{
-    VERIFY(!RustFFI::render_state_layout_pass_is_running(document_host()));
-    RustFFI::render_state_set_layout_display(document_host(), slot_id(this), bit_cast<u32>(display));
 }
 
 bool overflow_value_makes_box_a_scroll_container(CSS::Overflow overflow)

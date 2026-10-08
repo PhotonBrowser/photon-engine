@@ -7,11 +7,11 @@
 //! Recording the elements whose style a size query container's new box moves.
 
 use super::fast_hash::FastSet as HashSet;
-use super::{RetainedState, StyleEngineState, StyleNodeID};
+use super::{RetainedState, StyleEngine, StyleNodeID};
 
 /// What the host learned about size container queries while it computed styles: which elements
 /// were asked about, which elements asked, and which containers had no box to answer with yet.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SizeContainerQueryFacts {
     /// Elements some size query or container-relative unit resolved against. `container-type` is
     /// set far more widely than it is asked about, so a container outside this set has no
@@ -42,7 +42,7 @@ fn set_contains(set: &mut HashSet<StyleNodeID>, node: StyleNodeID, contains: boo
     }
 }
 
-impl StyleEngineState {
+impl StyleEngine {
     /// The host's two facts about an element: whether a size query or container-relative unit
     /// resolved against it, and whether one decided its style.
     pub fn set_element_size_container_query_facts(

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="frame-in-flight.js"></script>
+<div id="box" style="width: 10px; height: 0px; background: green"></div>
+<script>
+    // Whatever reaches the document's render state beside the lane of the presented frame leaves the lane ticking: a
+    // style write and the computed style read after it reach the host's state, and the lane ticks a fork of the state
+    // as the frame left it.
+    asyncTest(async done => {
+        const result = await whileLaneAnimates(() => {
+            return box.animate([{ height: "0px" }, { height: "100px" }], { duration: 10000, easing: "linear" });
+        }, frameTime => {
+            internals.injectClockTick(frameTime + 500);
+            const before = internals.clockLaneState(document);
+            box.style.backgroundColor = "blue";
+            const color = getComputedStyle(box).backgroundColor;
+            return { before, color, after: internals.clockLaneState(document) };
+        });
+        println(`lane before the write: ${result.before}`);
+        println(`color: ${result.color}`);
+        println(`lane after the read: ${result.after}`);
+        done();
+    });
+</script>

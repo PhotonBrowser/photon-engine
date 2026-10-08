@@ -7,36 +7,24 @@
 #pragma once
 
 #include <AK/Forward.h>
+#include <LibGC/Ptr.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
+#include <LibJS/Heap/EngineCell.h>
 #include <LibJS/Runtime/AbstractOperations.h>
+#include <LibJS/Runtime/Completion.h>
+#include <LibJS/Runtime/Value.h>
 
 namespace JS {
 
 // 27.2.1.1 PromiseCapability Records, https://tc39.es/ecma262/#sec-promisecapability-records
-class JS_API PromiseCapability final : public Cell {
-    GC_CELL(PromiseCapability, Cell);
-    GC_DECLARE_ALLOCATOR(PromiseCapability);
-
+class JS_API PromiseCapability final : public EngineCell {
 public:
-    static GC::Ref<PromiseCapability> create(VM& vm, GC::Ref<Object> promise, GC::Ref<FunctionObject> resolve, GC::Ref<FunctionObject> reject);
+    [[nodiscard]] GC::Ref<Object> promise() const;
 
-    virtual ~PromiseCapability() = default;
+    [[nodiscard]] GC::Ref<FunctionObject> resolve() const;
 
-    [[nodiscard]] GC::Ref<Object> promise() const { return m_promise; }
-
-    [[nodiscard]] GC::Ref<FunctionObject> resolve() const { return m_resolve; }
-
-    [[nodiscard]] GC::Ref<FunctionObject> reject() const { return m_reject; }
-
-private:
-    PromiseCapability(GC::Ref<Object>, GC::Ref<FunctionObject>, GC::Ref<FunctionObject>);
-
-    virtual void visit_edges(Visitor&) override;
-
-    GC::Ref<Object> m_promise;
-    GC::Ref<FunctionObject> m_resolve;
-    GC::Ref<FunctionObject> m_reject;
+    [[nodiscard]] GC::Ref<FunctionObject> reject() const;
 };
 
 // 27.2.1.1.1 IfAbruptRejectPromise ( value, capability ), https://tc39.es/ecma262/#sec-ifabruptrejectpromise

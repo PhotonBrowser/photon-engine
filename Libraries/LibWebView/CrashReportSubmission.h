@@ -16,6 +16,7 @@
 #include <LibCore/Forward.h>
 #include <LibRequests/Forward.h>
 #include <LibThreading/Forward.h>
+#include <LibWebView/CrashReportStore.h>
 #include <LibWebView/Forward.h>
 
 namespace WebView {
@@ -57,7 +58,7 @@ public:
         ByteString manifest;
     };
 
-    static NonnullRefPtr<CrashReportSubmission> create(CrashReportStore&, Options);
+    static NonnullRefPtr<CrashReportSubmission> create(CrashReportStore const&, Options);
     ~CrashReportSubmission();
 
     void start();
@@ -79,7 +80,7 @@ private:
         Yes,
     };
 
-    CrashReportSubmission(CrashReportStore&, Options);
+    CrashReportSubmission(CrashReportStore const&, Options);
 
     void begin_attempt();
     void fail_preparation(String reason);
@@ -92,7 +93,7 @@ private:
     void post(StringView path, StringView activity, StringView content_type, ByteString body, Optional<ProofOfWork>,
         Function<void(ByteString body)> on_success);
 
-    CrashReportStore& m_store;
+    CrashReportStore m_store;
     Options m_options;
     ByteString m_report_text;
     ByteString m_manifest;
@@ -101,6 +102,8 @@ private:
     RefPtr<Requests::Request> m_request;
     RefPtr<Core::Timer> m_request_timeout;
     RefPtr<Core::Timer> m_retry_timer;
+
+    RefPtr<CrashReportSubmission> m_self_while_in_flight;
 
     RefPtr<Threading::Thread> m_proof_thread;
     Atomic<bool> m_proof_cancelled { false };

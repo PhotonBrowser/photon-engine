@@ -82,12 +82,10 @@ pub fn origin_importance_rank(origin: CascadeOrigin, important: bool) -> u8 {
         (CascadeOrigin::User, false) => 1,
         (CascadeOrigin::AuthorPresentationalHint, false) => 2,
         (CascadeOrigin::Author, false) => 3,
-        (CascadeOrigin::Animation, _) => 4,
         (CascadeOrigin::Author, true) => 5,
         (CascadeOrigin::AuthorPresentationalHint, true) => 6,
         (CascadeOrigin::User, true) => 7,
         (CascadeOrigin::UserAgent, true) => 8,
-        (CascadeOrigin::Transition, _) => 9,
     }
 }
 
@@ -318,8 +316,6 @@ impl CascadeStratum {
             CascadeOrigin::UserAgent => 0,
             CascadeOrigin::User => 1,
             CascadeOrigin::Author | CascadeOrigin::AuthorPresentationalHint => 2,
-            CascadeOrigin::Animation => 3,
-            CascadeOrigin::Transition => 4,
         };
         Self {
             origin: origin as u8,
@@ -433,11 +429,14 @@ pub struct PropertyWinnerUpdate {
 /// Inputs may arrive in selector-dispatch order or as a complete declaration batch. An index gives
 /// both plans constant-time top-1 reduction and lookup, while one deferred sort preserves ordered
 /// publication without retaining any losing declaration.
+#[derive(Clone)]
 pub(super) struct Top1Cascade<Key, Priority, Payload> {
     winners: Vec<Top1Winner<Key, Priority, Payload>>,
     winner_by_key: HashMap<Key, usize>,
     sorted: bool,
 }
+
+#[derive(Clone)]
 
 pub(super) struct Top1Winner<Key, Priority, Payload> {
     pub(super) key: Key,
@@ -519,7 +518,7 @@ where
 
 define_id! {
     /// Identity of an interned winner group.
-    pub struct WinnerGroupID(pub);
+    interned pub struct WinnerGroupID(pub);
 }
 
 define_id! {
@@ -529,43 +528,19 @@ define_id! {
     default pub struct CustomDeclarationListID(pub);
 }
 
-impl InternIdentity for WinnerGroupID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
 define_id! {
     /// Identity of provenance parallel to one interned winner group.
-    struct WinnerProvenanceGroupID(pub);
-}
-
-impl InternIdentity for WinnerProvenanceGroupID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
+    interned struct WinnerProvenanceGroupID(pub);
 }
 
 define_id! {
     /// Identity of one exact priority retained by winner provenance.
-    struct CascadePriorityID(pub);
-}
-
-impl InternIdentity for CascadePriorityID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
+    interned struct CascadePriorityID(pub);
 }
 
 define_id! {
     /// Identity of one factorized sparse cascade state.
-    pub struct CascadeStateID(pub);
-}
-
-impl InternIdentity for CascadeStateID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
+    interned pub struct CascadeStateID(pub);
 }
 
 /// Whether a winner-group lookup requires topology-dependent priorities to still be current.
@@ -870,6 +845,7 @@ impl ShallowCapacityBytes for WinnerRuleReferences {
 /// One context's winner-row replacements. The catalog identities remain eager,
 /// but columns and rule postings stay unchanged until installation.
 /// NB: The owner explicitly installs or releases every pending reference.
+#[derive(Clone)]
 pub(super) struct WinnerEffects {
     entries: Vec<PendingWinnerNode>,
     writes: Vec<WinnerNodeWrite>,
@@ -885,6 +861,8 @@ enum WinnerReference {
     Pending,
 }
 
+#[derive(Clone)]
+
 enum WinnerNodeWrite {
     Set {
         node: StyleNodeID,
@@ -895,6 +873,8 @@ enum WinnerNodeWrite {
     },
     Remove(StyleNodeID),
 }
+
+#[derive(Clone)]
 
 struct PendingWinnerNode {
     element: Option<(CascadeStateID, ProgramVersion)>,
@@ -1438,6 +1418,7 @@ const STATE_READS_DECIDED: u8 = 1 << 7;
 /// identity, and states share property-range winner groups. The whole structure is Tier-3, so
 /// evicting it changes no semantic version and a later observer reconstructs a state from the
 /// node's cascade input or from the exact cold cascade.
+#[derive(Clone)]
 pub struct WinnerGroups {
     states: InternTable<CascadeStateID, Box<[WinnerGroupRef]>>,
     /// What a state holds beside its longhand winners: the target's custom declarations. Two
@@ -1451,7 +1432,7 @@ pub struct WinnerGroups {
     /// What each state's winners read beyond the cascade, as `STATE_READS_*` bits, decided the
     /// first time it is asked and `STATE_READS_DECIDED` from then on. A state's winners never
     /// change, and neither does what they read.
-    state_reads: Vec<AtomicU8>,
+    state_reads: Vec<crate::fork::ForkCopied<AtomicU8>>,
     groups: InternTable<WinnerGroupID, Box<[SemanticPropertyWinner]>>,
     provenance_groups: InternTable<WinnerProvenanceGroupID, Box<[WinnerProvenance]>>,
     priorities: InternTable<CascadePriorityID, CascadePriority>,
@@ -1463,7 +1444,7 @@ pub struct WinnerGroups {
     /// cascade of the node's current answer.
     stamps: Column<u64>,
     stamp: u64,
-    pseudo_rows_by_node: Column<Vec<PseudoWinnerRow>>,
+    pseudo_rows_by_node: crate::fork::ForkShared<Column<Vec<PseudoWinnerRow>>>,
     pseudo_row_capacity_bytes: u64,
     priority_current: BitColumn,
     row_count: usize,
@@ -1528,7 +1509,7 @@ impl Default for WinnerGroups {
             column: Column::default(),
             stamps: Column::default(),
             stamp: 0,
-            pseudo_rows_by_node: Column::default(),
+            pseudo_rows_by_node: Default::default(),
             pseudo_row_capacity_bytes: 0,
             priority_current: BitColumn::default(),
             row_count: 0,
@@ -1568,7 +1549,7 @@ impl WinnerGroups {
             state_reads: self
                 .state_reads
                 .iter()
-                .map(|reads| AtomicU8::new(reads.load(Ordering::Relaxed)))
+                .map(|reads| crate::fork::ForkCopied::new(AtomicU8::new(reads.load(Ordering::Relaxed))))
                 .collect(),
             groups: self.groups.clone(),
             provenance_groups: self.provenance_groups.clone(),
@@ -1777,7 +1758,7 @@ impl WinnerGroups {
         self.state_reference_counts.push(0);
         self.state_pending_reference_counts.push(0);
         self.state_winning_rules.push(winning_rules);
-        self.state_reads.push(AtomicU8::new(0));
+        self.state_reads.push(crate::fork::ForkCopied::new(AtomicU8::new(0)));
         id
     }
 
@@ -2606,7 +2587,7 @@ impl WinnerGroups {
         self.winner_rule_references = WinnerRuleReferences::default();
         self.column = Column::default();
         self.stamps = Column::default();
-        self.pseudo_rows_by_node = Column::default();
+        *self.pseudo_rows_by_node = Column::default();
         self.pseudo_row_capacity_bytes = 0;
         self.priority_current = BitColumn::default();
         self.row_count = 0;
@@ -2846,22 +2827,18 @@ mod tests {
         let normal_user = CascadePriority::new(inputs(CascadeOrigin::User, false));
         let hint = CascadePriority::new(inputs(CascadeOrigin::AuthorPresentationalHint, false));
         let normal_author = CascadePriority::new(inputs(CascadeOrigin::Author, false));
-        let animation = CascadePriority::new(inputs(CascadeOrigin::Animation, false));
         let important_author = CascadePriority::new(inputs(CascadeOrigin::Author, true));
         let important_user = CascadePriority::new(inputs(CascadeOrigin::User, true));
         let important_ua = CascadePriority::new(inputs(CascadeOrigin::UserAgent, true));
-        let transition = CascadePriority::new(inputs(CascadeOrigin::Transition, false));
 
         let ladder = [
             normal_ua,
             normal_user,
             hint,
             normal_author,
-            animation,
             important_author,
             important_user,
             important_ua,
-            transition,
         ];
         assert!(ladder.windows(2).all(|pair| pair[0] < pair[1]));
 

@@ -29,12 +29,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write;
 
-/// Mints the main thread token for this module's FFI entry points; only this module can make one.
-pub(crate) struct MainThreadFfiEntry {
-    _private: (),
-}
-
-const MAIN_THREAD_FFI_ENTRY: MainThreadFfiEntry = MainThreadFfiEntry { _private: () };
+crate::stage::main_thread_ffi_entries!();
 
 /// What a display list dump asks the document. The fields are private: the callbacks are reached
 /// only through the methods below, which take the main thread token.
@@ -152,7 +147,7 @@ impl VisualContextNodeOwners {
 /// fills through `layout_arena_paint_push_bytes`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn painting_dump(
-    host: *const crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
     visual_context_tree: *const c_void,
@@ -162,9 +157,8 @@ pub unsafe extern "C" fn painting_dump(
     callbacks: FfiPaintingDumpCallbacks,
 ) {
     assert!(!display_list.is_null());
-    assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the entry point's contract.
-    let main_thread = unsafe { crate::stage::from_ffi_entry(&MAIN_THREAD_FFI_ENTRY, &*host) };
+    let main_thread = unsafe { main_thread(host) };
     let visual_context_tree = unsafe { libcompositing_rust::ffi::tree_from_handle(visual_context_tree) };
     let command_runs = unsafe { libcompositing_rust::ffi::ffi_slice(command_runs, command_run_count) };
     // SAFETY: Guaranteed by the caller.
@@ -473,16 +467,28 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
         }
         DisplayListCommandType::PaintTextShadow => {
             let command = read_command::<PaintTextShadow>(payload);
-            write_field(output, "shadow_rect", command.shadow_bounding_rect);
+            write_field(output, "shadows_rect", command.shadows_bounding_rect);
             write_field(output, "rect", command.rect);
             write_field(output, "translation", command.translation);
-            write!(output, " blur_radius={}", command.blur_radius).unwrap();
-            write_field(output, "color", command.color);
             let orientation = match command.orientation {
                 libgfx_rust::Orientation::Horizontal => "Horizontal",
                 libgfx_rust::Orientation::Vertical => "Vertical",
             };
             write!(output, " orientation={orientation}").unwrap();
+            output.push_str(" layers=[");
+            let (layer_chunks, _) =
+                span_bytes(payload, command.layers).as_chunks::<{ std::mem::size_of::<TextShadowLayer>() }>();
+            for (index, layer_bytes) in layer_chunks.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                let layer = read_command::<TextShadowLayer>(layer_bytes);
+                output.push_str("offset=");
+                layer.offset.push_dump(output);
+                write!(output, " blur_radius={}", layer.blur_radius).unwrap();
+                write_field(output, "color", layer.color);
+            }
+            output.push(']');
         }
         DisplayListCommandType::FillRectWithRoundedCorners => {
             let command = read_command::<FillRectWithRoundedCorners>(payload);

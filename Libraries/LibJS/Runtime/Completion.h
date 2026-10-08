@@ -31,21 +31,6 @@ namespace JS {
         _temporary_result.release_value();                                                                            \
     })
 
-#define MUST_OR_THROW_INTERNAL_ERROR(...)                                                            \
-    ({                                                                                               \
-        /* Ignore -Wshadow to allow nesting the macro. */                                            \
-        AK_IGNORE_DIAGNOSTIC("-Wshadow",                                                             \
-            auto&& _temporary_result = (__VA_ARGS__));                                               \
-        if (_temporary_result.is_error()) {                                                          \
-            auto _completion = _temporary_result.release_error();                                    \
-            VERIFY(_completion.value().is<JS::InternalError>());                                     \
-            return _completion;                                                                      \
-        }                                                                                            \
-        static_assert(!::AK::Detail::IsLvalueReference<decltype(_temporary_result.release_value())>, \
-            "Do not return a reference from a fallible expression");                                 \
-        _temporary_result.release_value();                                                           \
-    })
-
 // 6.2.3 The Completion Record Specification Type, https://tc39.es/ecma262/#sec-completion-record-specification-type
 class [[nodiscard]] JS_API Completion {
 public:
@@ -245,6 +230,8 @@ public:
     }
 
 private:
+    friend struct RawNativeFunctionResultLayout;
+
     Variant<ValueType, ErrorValue> m_value_or_error;
 };
 
@@ -290,8 +277,6 @@ public:
 private:
     Value m_value;
 };
-
-ThrowCompletionOr<Value> await(VM&, Value);
 
 // 6.2.4.1 NormalCompletion ( value ), https://tc39.es/ecma262/#sec-normalcompletion
 inline Completion normal_completion(Value value)

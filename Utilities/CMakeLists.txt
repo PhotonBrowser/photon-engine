@@ -1,9 +1,8 @@
 ladybird_utility(js SOURCES js.cpp LIBS LibCrypto LibJS LibMain LibTextCodec LibGC)
-ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibMain LibJS LibCrypto LibGC)
-
 if (NOT WIN32 AND NOT ANDROID AND LIBEDIT_FOUND)
     target_link_libraries(js PRIVATE PkgConfig::LIBEDIT)
 endif()
+ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibMain LibJS LibCrypto LibGC)
 
 ladybird_utility(xml SOURCES xml.cpp LIBS LibFileSystem LibMain LibXML LibURL)
 ladybird_utility(dns SOURCES dns.cpp LIBS LibDNS LibMain LibTLS LibCrypto)
@@ -17,7 +16,7 @@ if (WIN32)
     return()
 endif()
 
-ladybird_utility(test262-runner SOURCES test262-runner.cpp LIBS LibJS LibFileSystem LibGC LibMain)
+ladybird_utility(test262-runner SOURCES test262-runner.cpp LIBS LibJS LibMain)
 ladybird_utility(dump-html-tokens SOURCES dump-html-tokens.cpp LIBS LibMain LibWeb)
 ladybird_utility(dump-html-tree SOURCES dump-html-tree.cpp LIBS LibMain LibWeb LibJS LibGC LibGfx LibIPC LibURL)
 
@@ -33,7 +32,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     )
 endif()
 
-if (ASSERT_FAIL_HAS_INT)
+if (ASSERT_FAIL_HAS_INT AND TARGET test262-runner)
     target_compile_definitions(test262-runner PRIVATE ASSERT_FAIL_HAS_INT)
 endif()
 
@@ -54,7 +53,9 @@ set(GIT_COMMIT_FILE "${CMAKE_BINARY_DIR}/COMMIT")
 file(WRITE "${GIT_COMMIT_FILE}" "${GIT_COMMIT_HASH}\n")
 
 if (NOT CMAKE_SKIP_INSTALL_RULES)
-    install(TARGETS js COMPONENT js)
+    if (TARGET js)
+        install(TARGETS js COMPONENT js)
+    endif()
     install(FILES "${GIT_COMMIT_FILE}" COMPONENT js DESTINATION .)
 
     install(TARGETS wasm COMPONENT wasm)

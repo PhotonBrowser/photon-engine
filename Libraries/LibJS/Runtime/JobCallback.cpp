@@ -1,42 +1,30 @@
 /*
- * Copyright (c) 2021-2022, Linus Groh <linusg@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/AbstractOperations.h>
+#include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/JobCallback.h>
+#include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(JobCallback);
+using namespace EmbeddingABI;
 
-GC::Ref<JobCallback> JobCallback::create(JS::VM& vm, FunctionObject& callback, GC::Ptr<GC::Cell> custom_data)
+GC::Ref<JobCallback> JobCallback::create(VM& vm, FunctionObject& callback, GC::Ptr<GC::Cell> custom_data)
 {
-    return vm.heap().allocate<JobCallback>(callback, custom_data);
+    return cell_ref_from_abi<JobCallback>(js_realm_job_callback_create(vm_to_abi(vm), object_to_abi(callback), custom_data.ptr()));
 }
 
-void JobCallback::visit_edges(Visitor& visitor)
+FunctionObject& JobCallback::callback()
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_callback);
-    visitor.visit(m_custom_data);
+    return cell_ref_from_abi<FunctionObject>(js_realm_job_callback_callback(cell_to_abi<JSJobCallback>(*this)));
 }
 
-// 9.5.2 HostMakeJobCallback ( callback ), https://tc39.es/ecma262/#sec-hostmakejobcallback
-GC::Ref<JobCallback> make_job_callback(FunctionObject& callback)
+GC::Ptr<GC::Cell> JobCallback::custom_data() const
 {
-    // 1. Return the JobCallback Record { [[Callback]]: callback, [[HostDefined]]: empty }.
-    return JobCallback::create(callback.vm(), callback, {});
-}
-
-// 9.5.3 HostCallJobCallback ( jobCallback, V, argumentsList ), https://tc39.es/ecma262/#sec-hostcalljobcallback
-ThrowCompletionOr<Value> call_job_callback(VM& vm, GC::Ref<JobCallback> job_callback, Value this_value, ReadonlySpan<Value> arguments_list)
-{
-    // 1. Assert: IsCallable(jobCallback.[[Callback]]) is true.
-
-    // 2. Return ? Call(jobCallback.[[Callback]], V, argumentsList).
-    return call(vm, job_callback->callback(), this_value, arguments_list);
+    return static_cast<GC::Cell*>(js_realm_job_callback_custom_data(cell_to_abi<JSJobCallback>(*this)));
 }
 
 }

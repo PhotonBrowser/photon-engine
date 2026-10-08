@@ -14,7 +14,6 @@ use super::node_data::{GENERATED_FOR_BACKDROP, GENERATED_FOR_FIRST_LETTER, NodeF
 use crate::css::computed_value_types::ComputedSize;
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::style::bridge::element_adjustment_fact;
-use crate::css::style::engine_calls::document_host;
 use crate::css::style::tree::StyleNodeID;
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::record::damage::PaintDamage;
@@ -36,7 +35,7 @@ const CHILD_NEEDS: u8 = 1 << 3;
 
 /// One byte of marks per identity, in the element and the text index spaces apart. The low bits
 /// are the reuse reasons, so no reason ever needs translating.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct LayoutTreeUpdateMarks {
     elements: Vec<u8>,
     text: Vec<u8>,
@@ -129,6 +128,38 @@ impl LayoutTreeUpdateMarks {
     pub(crate) fn clear(&mut self, node: StyleNodeID) {
         self.update(node, |_| 0);
     }
+
+    /// Fold in `other`, marks made from none by merges and child marks alone, as if each of them
+    /// had been made to these: a node's reuse reasons combine the same in any order.
+    pub(crate) fn fold(&mut self, other: Self) {
+        fold_column(&mut self.elements, other.elements);
+        fold_column(&mut self.text, other.text);
+    }
+}
+
+fn fold_column(column: &mut Vec<u8>, other: Vec<u8>) {
+    if column.len() < other.len() {
+        column.resize(other.len(), 0);
+    }
+    for (marks, other) in column.iter_mut().zip(other) {
+        *marks = fold_marks(*marks, other);
+    }
+}
+
+/// The marks of a node with `marks` once the merges and child marks that made `other` are made to them.
+fn fold_marks(marks: u8, other: u8) -> u8 {
+    use layout_tree_update_reuse_reason::ALL;
+    let mut folded = marks | (other & CHILD_NEEDS);
+    if other & NEEDS != 0 {
+        let (own, reasons) = (marks & ALL, other & ALL);
+        let merged = match marks & NEEDS != 0 {
+            true if own == 0 || reasons == 0 => 0,
+            true => own | reasons,
+            false => reasons,
+        };
+        folded = (folded & !ALL) | NEEDS | merged;
+    }
+    folded
 }
 
 /// A write of one node's layout tree update marks.
@@ -163,15 +194,14 @@ impl LayoutTreeUpdateMarkWrite {
 ///
 /// `host` must be a live document host, on its document's thread.
 unsafe fn read_marks<R: Default>(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     style_node: u32,
     read: fn(&LayoutTreeUpdateMarks, StyleNodeID) -> R,
 ) -> R {
     let Some(style_node) = StyleNodeID::from_raw(style_node) else {
         return R::default();
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { document_host(host) }.read_marks(|marks| read(marks, style_node))
+    host.read_marks(|marks| read(marks, style_node))
 }
 
 /// Makes `write` to the layout tree update marks of `host`'s document, which the host holds, answering what it answers.
@@ -179,9 +209,8 @@ unsafe fn read_marks<R: Default>(
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread.
-unsafe fn write_marks(host: *const DocumentHost, write: LayoutTreeUpdateMarkWrite) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { document_host(host) }.write_marks(write)
+unsafe fn write_marks(host: &DocumentHost, write: LayoutTreeUpdateMarkWrite) -> bool {
+    host.write_marks(write)
 }
 
 /// Whether the node `style_node` names holds a layout tree update mark of its own.
@@ -190,7 +219,7 @@ unsafe fn write_marks(host: *const DocumentHost, write: LayoutTreeUpdateMarkWrit
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_needs_layout_tree_update(host: *const DocumentHost, style_node: u32) -> bool {
+pub unsafe extern "C" fn render_state_needs_layout_tree_update(host: &DocumentHost, style_node: u32) -> bool {
     // SAFETY: Guaranteed by the caller.
     unsafe { read_marks(host, style_node, LayoutTreeUpdateMarks::needs) }
 }
@@ -201,10 +230,7 @@ pub unsafe extern "C" fn render_state_needs_layout_tree_update(host: *const Docu
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_layout_tree_update_reuse_reasons(
-    host: *const DocumentHost,
-    style_node: u32,
-) -> u8 {
+pub unsafe extern "C" fn render_state_layout_tree_update_reuse_reasons(host: &DocumentHost, style_node: u32) -> u8 {
     // SAFETY: Guaranteed by the caller.
     unsafe { read_marks(host, style_node, LayoutTreeUpdateMarks::reuse_reasons) }
 }
@@ -215,10 +241,7 @@ pub unsafe extern "C" fn render_state_layout_tree_update_reuse_reasons(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_child_needs_layout_tree_update(
-    host: *const DocumentHost,
-    style_node: u32,
-) -> bool {
+pub unsafe extern "C" fn render_state_child_needs_layout_tree_update(host: &DocumentHost, style_node: u32) -> bool {
     // SAFETY: Guaranteed by the caller.
     unsafe { read_marks(host, style_node, LayoutTreeUpdateMarks::child_needs) }
 }
@@ -231,7 +254,7 @@ pub unsafe extern "C" fn render_state_child_needs_layout_tree_update(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_merge_layout_tree_update_mark(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     style_node: u32,
     value: bool,
     reuse_reason: u8,
@@ -251,7 +274,7 @@ pub unsafe extern "C" fn render_state_merge_layout_tree_update_mark(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_set_child_needs_layout_tree_update(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     style_node: u32,
     value: bool,
 ) -> bool {
@@ -269,7 +292,7 @@ pub unsafe extern "C" fn render_state_set_child_needs_layout_tree_update(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_clear_layout_tree_update_marks(host: *const DocumentHost, style_node: u32) {
+pub unsafe extern "C" fn render_state_clear_layout_tree_update_marks(host: &DocumentHost, style_node: u32) {
     let Some(style_node) = StyleNodeID::from_raw(style_node) else {
         return;
     };
@@ -293,6 +316,19 @@ pub struct FfiLayoutTreeUpdateMark {
 impl FfiLayoutTreeUpdateMark {
     /// What a node removal marks its parent with.
     pub(crate) const NODE_REMOVE: Self = Self {
+        reuse_reason: 0,
+        is_child_list_insertion: false,
+        is_structural_boundary_self_rebuild: true,
+    };
+
+    /// What a node insertion marks the node and its parent with.
+    pub(crate) const NODE_INSERT: Self = Self {
+        reuse_reason: layout_tree_update_reuse_reason::CHILD_LIST_INSERTION,
+        is_child_list_insertion: true,
+        is_structural_boundary_self_rebuild: true,
+    };
+
+    pub(crate) const CHARACTER_DATA_REPLACE_DATA: Self = Self {
         reuse_reason: 0,
         is_child_list_insertion: false,
         is_structural_boundary_self_rebuild: true,
@@ -423,7 +459,7 @@ impl LayoutNodeArena {
 /// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_apply_layout_tree_update_mark(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     style_node: u32,
     mark: FfiLayoutTreeUpdateMark,
 ) {
@@ -455,7 +491,8 @@ pub struct FfiBoxMarks {
     pub has_dom_paint_facts: bool,
     pub dom_paint_facts: u8,
     /// The data of the text node changed: its text box renders it again, and lays out again with its ancestors. A box
-    /// that renders a range of the text, as the first letter splits it, is built again instead, as the host marked.
+    /// that renders a range of the text, as the first letter splits it, is built again instead by its `::first-letter`
+    /// owner.
     pub text_data_changed: bool,
     /// The image data of the image element changed: its image box drops the intrinsic sizes of itself and its ancestors
     /// where the image's natural size cannot change the box's own, and any other box lays out again with its
@@ -473,7 +510,7 @@ pub struct FfiBoxMarks {
 }
 
 /// The box a mark names.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MarkedBox {
     /// The box bound to the DOM node the identity names, or the document's for `None`, found as the mark is applied: a
     /// mark made beside a frame in flight, which holds the boxes, names the node alone.
@@ -534,15 +571,50 @@ impl FfiBoxMarks {
             || self.has_editing_facts
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        let Self {
+            layout_update,
+            layout_update_through_ancestors: _,
+            repaint,
+            repaint_hit_testing,
+            repaint_subtree,
+            repaint_backdrop,
+            propagated_text_decorations,
+            has_dom_paint_facts,
+            dom_paint_facts: _,
+            text_data_changed,
+            image_data_changed,
+            language_changed,
+            has_editing_facts,
+            is_editing_host: _,
+            produces_line_box_fragment_when_empty: _,
+        } = *self;
+        !(layout_update
+            || repaint
+            || repaint_hit_testing
+            || repaint_subtree
+            || repaint_backdrop
+            || propagated_text_decorations
+            || has_dom_paint_facts
+            || text_data_changed
+            || image_data_changed
+            || language_changed
+            || has_editing_facts)
+    }
+
     pub(crate) fn apply(self, arena: &mut LayoutNodeArena, target: MarkedBox) {
         let row = target.row(arena);
         let Some(kind) = arena.node_kind_if_live(row) else {
             return;
         };
         let is_text = super::node_facts::kind_is_text(kind);
-        if self.text_data_changed && is_text && !arena.text_has_source_range(row) {
-            arena.invalidate_text_content(row);
-            arena.set_needs_layout_update(row, true);
+        if self.text_data_changed && is_text {
+            if !arena.text_has_source_range(row) {
+                arena.invalidate_text_content(row);
+                arena.set_needs_layout_update(row, true);
+            } else if let Some(owner) = arena.first_letter_owner_of_split_text(row) {
+                arena.mark_layout_tree_update(Some(owner), FfiLayoutTreeUpdateMark::CHARACTER_DATA_REPLACE_DATA);
+            }
         }
         if self.image_data_changed {
             if kind == NodeKind::ImageBox && arena.node_style_if_live(row).is_some_and(size_is_independent_of_image) {
@@ -652,16 +724,27 @@ fn repaint(arena: &mut LayoutNodeArena, row: NodeSlotId, includes_hit_testing: b
     }
 }
 
+/// # Safety
+///
+/// `host` must be a live document host, on the document's thread.
+unsafe fn queue_marks(host: &DocumentHost, target: MarkedBox, marks: FfiBoxMarks) {
+    if marks.is_empty() {
+        return;
+    }
+    // SAFETY: Guaranteed by the caller.
+    unsafe { super::layout_changes::queue(host, super::layout_changes::LayoutChange::MarkBox { target, marks }) };
+}
+
 /// Marks the box bound to the node with `style_node`, or the document's for 0.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_mark_node_box(host: *const DocumentHost, style_node: u32, marks: FfiBoxMarks) {
+pub unsafe extern "C" fn render_state_mark_node_box(host: &DocumentHost, style_node: u32, marks: FfiBoxMarks) {
     let target = MarkedBox::Node(StyleNodeID::from_raw(style_node));
     // SAFETY: Guaranteed by the caller.
-    unsafe { super::layout_changes::queue(host, super::layout_changes::LayoutChange::MarkBox { target, marks }) };
+    unsafe { queue_marks(host, target, marks) };
 }
 
 /// Marks the box bound to the pseudo-element of kind `generated_for` on the element with `generator`.
@@ -671,7 +754,7 @@ pub unsafe extern "C" fn render_state_mark_node_box(host: *const DocumentHost, s
 /// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_mark_pseudo_element_box(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     generator: u32,
     generated_for: u8,
     marks: FfiBoxMarks,
@@ -684,7 +767,7 @@ pub unsafe extern "C" fn render_state_mark_pseudo_element_box(
         generated_for,
     };
     // SAFETY: Guaranteed by the caller.
-    unsafe { super::layout_changes::queue(host, super::layout_changes::LayoutChange::MarkBox { target, marks }) };
+    unsafe { queue_marks(host, target, marks) };
 }
 
 /// Marks the box of the row `row`.
@@ -693,10 +776,10 @@ pub unsafe extern "C" fn render_state_mark_pseudo_element_box(
 ///
 /// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_mark_row_box(host: *const DocumentHost, row: NodeSlotId, marks: FfiBoxMarks) {
+pub unsafe extern "C" fn render_state_mark_row_box(host: &DocumentHost, row: NodeSlotId, marks: FfiBoxMarks) {
     let target = MarkedBox::Row(row);
     // SAFETY: Guaranteed by the caller.
-    unsafe { super::layout_changes::queue(host, super::layout_changes::LayoutChange::MarkBox { target, marks }) };
+    unsafe { queue_marks(host, target, marks) };
 }
 
 #[cfg(test)]
@@ -736,5 +819,49 @@ mod tests {
         marks.clear(element);
         assert!(!marks.child_needs(element));
         assert!(marks.needs(text));
+    }
+
+    #[test]
+    fn marks_made_apart_and_folded_in_are_the_marks_made_in_place() {
+        let reasons = [0, CHILD_LIST_INSERTION, PSEUDO_ELEMENT_CHANGE];
+        let make_held = |marks: &mut LayoutTreeUpdateMarks, held: usize| {
+            if held > 0 {
+                marks.merge(StyleNodeID::element(1), true, reasons[held - 1]);
+            }
+            marks.set_child_needs(StyleNodeID::element(2), held % 2 == 0);
+        };
+        let make_apart = |marks: &mut LayoutTreeUpdateMarks, first: u8, second: u8| {
+            marks.merge(StyleNodeID::element(1), true, first);
+            marks.merge(StyleNodeID::element(1), true, second);
+            marks.set_child_needs(StyleNodeID::element(4), true);
+            marks.merge(StyleNodeID::text(7), true, 0);
+        };
+        for held in 0..=reasons.len() {
+            for first in reasons {
+                for second in reasons {
+                    let mut in_place = LayoutTreeUpdateMarks::default();
+                    make_held(&mut in_place, held);
+                    make_apart(&mut in_place, first, second);
+
+                    let mut apart = LayoutTreeUpdateMarks::default();
+                    make_apart(&mut apart, first, second);
+                    let mut folded = LayoutTreeUpdateMarks::default();
+                    make_held(&mut folded, held);
+                    folded.fold(apart);
+
+                    for node in [1, 2, 4, 7]
+                        .map(StyleNodeID::element)
+                        .into_iter()
+                        .chain([StyleNodeID::text(7)])
+                    {
+                        assert_eq!(
+                            folded.get(node),
+                            in_place.get(node),
+                            "held {held}, apart {first} then {second}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -121,6 +121,7 @@ public:
     double current_time() const;
     void set_current_time(double);
     void fast_seek(double);
+    void seek_from_media_controls(double);
 
     double current_playback_position() const;
     void set_official_playback_position(double);
@@ -171,6 +172,7 @@ public:
     void update_ready_state();
 
     void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration) { set_duration(duration); }
+    void media_source_metadata_available(Badge<MediaSourceExtensions::SourceBuffer>) { on_metadata_parsed(SourceType::Local); }
 
     MediaClient::RemotePlaybackManager& playback_manager()
     {
@@ -243,6 +245,7 @@ private:
     void set_up_playback_manager_for_remote();
     void set_up_playback_manager_for_local(Function<void(Utf16String)> failure_callback);
     void set_up_playback_manager_error_handler(Function<void(Utf16String)> failure_callback);
+    void handle_playback_manager_error(Media::DecoderError&&);
     enum class FetchingStatus : u8 {
         Ongoing,
         Complete,
@@ -277,6 +280,7 @@ private:
     void set_paused(bool);
     void set_duration(double);
     void set_ended(bool);
+    void update_ended_attribute();
 
     void volume_or_muted_attribute_changed();
     void update_volume();
@@ -297,7 +301,11 @@ private:
     };
     PlaybackDirection direction_of_playback() const;
 
-    bool has_ended_playback() const;
+    enum class IgnoreLoopAttribute : u8 {
+        No,
+        Yes,
+    };
+    bool has_ended_playback(IgnoreLoopAttribute) const;
     void upon_has_ended_playback_possibly_changed();
     void reached_end_of_media_playback();
 
@@ -352,6 +360,7 @@ private:
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-seeking
     bool m_seeking { false };
+    bool m_prevent_next_loop_while_paused { false };
 
     // The current playback position as of the last possible-change check; empty until the first check
     // for each media resource.
@@ -427,6 +436,7 @@ private:
     bool m_current_resource_selection_is_explicit { false };
 
     OwnPtr<MediaClient::RemotePlaybackManager> m_playback_manager;
+    Function<void(Utf16String)> m_playback_manager_failure_callback;
 
     RefPtr<Core::Timer> m_playback_position_update_timer;
     GC::Ptr<VideoTrack> m_selected_video_track;
@@ -434,8 +444,6 @@ private:
     mutable bool m_video_frame_was_recently_captured { false };
     mutable RefPtr<Core::Timer> m_video_frame_capture_keepalive_timer;
     Optional<ScreenWakeLockHandle> m_screen_wake_lock;
-
-    bool m_loop_was_specified_when_reaching_end_of_media_resource { false };
 
     Optional<MediaControls> m_controls;
 

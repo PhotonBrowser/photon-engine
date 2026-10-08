@@ -13,13 +13,12 @@
 
 namespace JS {
 
+// The base of the embedder's own C++ cells. The engine's cells are named through EngineCell instead.
 class JS_API Cell : public GC::Cell {
     GC_CELL(Cell, GC::Cell);
 
 public:
     MUST_UPCALL virtual void initialize(Realm&);
-
-    virtual bool is_environment() const { return false; }
 
     ALWAYS_INLINE VM& vm() const;
 

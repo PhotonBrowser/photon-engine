@@ -841,7 +841,16 @@ void Application::start_next_content_blocker_list_update()
         return;
     }
 
-    auto timeout = Core::Timer::create_single_shot(30 * 1000, [this] {
+    auto timeout_ms = []() {
+        if (auto value = Core::Environment::get("LADYBIRD_CONTENT_BLOCKER_LIST_UPDATE_TIMEOUT_MS"sv); value.has_value()) {
+            if (auto parsed = value->to_number<int>(); parsed.has_value() && *parsed > 0)
+                return *parsed;
+        }
+
+        return 30 * 1000;
+    }();
+
+    auto timeout = Core::Timer::create_single_shot(timeout_ms, [this] {
         warnln("Content blocker list download timed out");
         stop_current_content_blocker_list_update_and_continue();
     });
@@ -2136,6 +2145,9 @@ void Application::process_did_exit(Process&& process, Optional<int>)
 
     dbgln_if(WEBVIEW_PROCESS_DEBUG, "Process {} died, type: {}", process.pid(), process_name_from_type(process.type()));
 
+    auto const& report_name = process.saved_crash_report_name();
+    auto crash_is_shown_in_tab = false;
+
     switch (process.type()) {
     case ProcessType::Compositor:
         if (auto client = process.client<CompositorClient>()) {
@@ -2169,15 +2181,9 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>()) {
             client->did_lose_process();
-            if (auto const& report_name = process.saved_crash_report_name(); !report_name.is_empty()) {
+            if (!report_name.is_empty()) {
                 client->did_save_crash_report(report_name);
-
-                // The tab's crash screen is this report's one automatic prompt, so the next launch does not ask about
-                // it again. Other helpers have no crash screen and stay unanswered until then.
-                if (client->has_crashed_views() && !browser_options().headless_mode.has_value()) {
-                    if (auto result = CrashReportStore::the().mark_seen(report_name); result.is_error())
-                        warnln("Could not mark crash report as seen: {}", result.error());
-                }
+                crash_is_shown_in_tab = client->has_crashed_views();
             }
             m_web_content_clients.remove(client.release_nonnull());
         }
@@ -2189,6 +2195,31 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         dbgln("Invalid process type to be dying: Browser");
         VERIFY_NOT_REACHED();
     }
+
+    if (report_name.is_empty())
+        return;
+
+    // The tab's crash screen is this report's one automatic prompt, so it is not offered again. Every other crash is
+    // hidden from the user, so its report is offered right away.
+    if (!crash_is_shown_in_tab) {
+        offer_crash_report(report_name);
+    } else if (!browser_options().headless_mode.has_value()) {
+        if (auto result = CrashReportStore::the().mark_seen(report_name); result.is_error())
+            warnln("Could not mark crash report as seen: {}", result.error());
+    }
+}
+
+void Application::offer_newest_pending_crash_report()
+{
+    if (auto names = CrashReportStore::the().pending_report_names(); !names.is_error() && !names.value().is_empty())
+        offer_crash_report(names.value().first());
+}
+
+void Application::offer_crash_report(ByteString const& report_name)
+{
+    if (browser_options().headless_mode.has_value() || browser_options().webdriver_browser_endpoint.has_value())
+        return;
+    display_crash_report_notification(report_name);
 }
 
 static bool download_path_is_available(LexicalPath const& path)
@@ -2592,8 +2623,10 @@ void Application::initialize_actions()
 
         auto default_title = MUST(UnixDateTime::now().to_string("Saved Tabs %Y-%m-%d"sv));
         display_add_bookmark_folder_dialog(default_title)
-            ->when_resolved([this, bookmarks = move(bookmarks)](BookmarkItem::Folder folder) mutable {
-                auto folder_id = m_bookmark_store->add_folder(move(folder.title));
+            ->when_resolved([this, bookmarks = move(bookmarks)](BookmarkDialogResult result) mutable {
+                auto& folder = result.data.get<BookmarkItem::Folder>();
+                auto folder_id = m_bookmark_store->add_folder(move(folder.title), result.target_folder_id);
+
                 for (auto& bookmark : bookmarks)
                     m_bookmark_store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), folder_id);
             });
@@ -2887,8 +2920,9 @@ void Application::toggle_bookmark_for_view(ViewImplementation& view)
     }
 
     display_add_bookmark_dialog()
-        ->when_resolved([this](AddBookmarkDialogResult result) {
-            m_bookmark_store->add_bookmark(move(result.bookmark.url), move(result.bookmark.title), move(result.bookmark.favicon_hash), move(result.target_folder_id));
+        ->when_resolved([this](BookmarkDialogResult result) {
+            auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
+            m_bookmark_store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), result.target_folder_id);
         });
 }
 
@@ -2966,8 +3000,10 @@ void Application::create_bookmark_menu_items(Optional<MenuData> data)
 
                 action->add_property("id"sv, item.id);
                 action->add_property("type"sv, "bookmark"_string);
-                if (target_folder_id.has_value())
+                if (target_folder_id.has_value()) {
                     action->add_property("target_folder_id"sv, *target_folder_id);
+                    action->add_property("parent_folder_id"sv, *target_folder_id);
+                }
 
                 menu.add_action(move(action));
             },
@@ -2985,6 +3021,8 @@ void Application::create_bookmark_menu_items(Optional<MenuData> data)
                 submenu->add_property("id"sv, item.id);
                 submenu->add_property("type"sv, "folder"_string);
                 submenu->add_property("target_folder_id"sv, item.id);
+                if (target_folder_id.has_value())
+                    submenu->add_property("parent_folder_id"sv, *target_folder_id);
 
                 submenu->set_render_group_icon(true);
                 menu.add_submenu(move(submenu));
@@ -3015,24 +3053,24 @@ static NonnullRefPtr<T> create_unsupported_rejection()
     return promise;
 }
 
-NonnullRefPtr<Application::AddBookmarkPromise> Application::display_add_bookmark_dialog(Optional<String const&>) const
-{
-    return create_unsupported_rejection<AddBookmarkPromise>();
-}
-
-NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_dialog(BookmarkItem::Bookmark const&) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_dialog(Optional<String const&>) const
 {
     return create_unsupported_rejection<BookmarkPromise>();
 }
 
-NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_add_bookmark_folder_dialog(Optional<String const&>) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_dialog(BookmarkItem const&, Optional<String const&>) const
 {
-    return create_unsupported_rejection<BookmarkFolderPromise>();
+    return create_unsupported_rejection<BookmarkPromise>();
 }
 
-NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_edit_bookmark_folder_dialog(BookmarkItem::Folder const&) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_folder_dialog(Optional<String const&>, Optional<String const&>) const
 {
-    return create_unsupported_rejection<BookmarkFolderPromise>();
+    return create_unsupported_rejection<BookmarkPromise>();
+}
+
+NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_folder_dialog(BookmarkItem const&, Optional<String const&>) const
+{
+    return create_unsupported_rejection<BookmarkPromise>();
 }
 
 ErrorOr<void> Application::toggle_devtools_enabled()

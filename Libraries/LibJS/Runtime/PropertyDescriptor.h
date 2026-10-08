@@ -7,8 +7,10 @@
 #pragma once
 
 #include <AK/Optional.h>
-#include <AK/String.h>
+#include <AK/Utf16String.h>
+#include <AK/Vector.h>
 #include <LibGC/Cell.h>
+#include <LibGC/Ptr.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Runtime/Value.h>
@@ -17,18 +19,11 @@ namespace JS {
 
 // 6.2.5 The Property Descriptor Specification Type, https://tc39.es/ecma262/#sec-property-descriptor-specification-type
 
-Value from_property_descriptor(VM&, Optional<PropertyDescriptor> const&);
-ThrowCompletionOr<PropertyDescriptor> to_property_descriptor(VM&, Value);
-
 class JS_API PropertyDescriptor {
 public:
     [[nodiscard]] bool is_accessor_descriptor() const;
     [[nodiscard]] bool is_data_descriptor() const;
     [[nodiscard]] bool is_generic_descriptor() const;
-
-    [[nodiscard]] PropertyAttributes attributes() const;
-
-    void complete();
 
     // Not a standard abstract operation, but "If every field in Desc is absent".
     [[nodiscard]] bool is_empty() const
@@ -44,6 +39,7 @@ public:
     Optional<bool> writable {};
     Optional<bool> enumerable {};
     Optional<bool> configurable {};
+    // The property's slot in its object's storage, which the runtime's inline caches are filled from.
     Optional<u32> property_offset {};
 };
 

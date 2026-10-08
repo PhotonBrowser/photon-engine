@@ -410,34 +410,16 @@ static NonnullRefPtr<StyleValue const> resolve_filter_style_value(NonnullRefPtr<
     return StyleValueList::create(move(filters), StyleValueList::Separator::Space, StyleValueList::Collapsible::No);
 }
 
-// The canonical serialization of the computed touch-action flags; notably, allowing exactly
-// panning and pinch-zoom serializes as `manipulation`, whatever form specified it.
-static NonnullRefPtr<StyleValue const> style_value_for_touch_action(TouchActionData const& action)
+// Allowing exactly panning and pinch-zoom serializes as `manipulation`, whatever form specified it. The parser
+// orders a list as horizontal, vertical, pinch-zoom, with at most one of each.
+static NonnullRefPtr<StyleValue const> resolve_touch_action_style_value(NonnullRefPtr<StyleValue const> value)
 {
-    if (action.allow_left && action.allow_right && action.allow_up && action.allow_down && action.allow_pinch_zoom) {
-        if (action.allow_other)
-            return KeywordStyleValue::create(Keyword::Auto);
-        return KeywordStyleValue::create(Keyword::Manipulation);
+    if (value->is_value_list()) {
+        auto const& values = value->as_value_list().values();
+        if (values.size() == 3 && values[0]->to_keyword() == Keyword::PanX && values[1]->to_keyword() == Keyword::PanY)
+            return KeywordStyleValue::create(Keyword::Manipulation);
     }
-    if (!action.allow_left && !action.allow_right && !action.allow_up && !action.allow_down && !action.allow_pinch_zoom)
-        return KeywordStyleValue::create(Keyword::None);
-
-    StyleValueVector values;
-    if (action.allow_left && action.allow_right)
-        values.append(KeywordStyleValue::create(Keyword::PanX));
-    else if (action.allow_left)
-        values.append(KeywordStyleValue::create(Keyword::PanLeft));
-    else if (action.allow_right)
-        values.append(KeywordStyleValue::create(Keyword::PanRight));
-    if (action.allow_up && action.allow_down)
-        values.append(KeywordStyleValue::create(Keyword::PanY));
-    else if (action.allow_up)
-        values.append(KeywordStyleValue::create(Keyword::PanUp));
-    else if (action.allow_down)
-        values.append(KeywordStyleValue::create(Keyword::PanDown));
-    if (action.allow_pinch_zoom)
-        values.append(KeywordStyleValue::create(Keyword::PinchZoom));
-    return StyleValueList::create(move(values), StyleValueList::Separator::Space);
+    return value;
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-getpropertyvalue
@@ -637,7 +619,7 @@ static void install_engine_pseudo_element_style(Layout::BegunRead const& read, D
     auto pseudo_element = *target.pseudo_element();
     auto& element = target.element();
     auto& style_engine = element.document().style_computer().style_engine();
-    auto answer = style_engine.answer_pseudo_element_record_demand(read, element.style_node_id(), StyleEngine::PseudoElementRecordDemand::CssomRead, *StyleEngine::demanded_pseudo_element(pseudo_element));
+    auto answer = StyleEngineFFI::style_engine_answer_pseudo_element_record_demand(style_engine.host(), &read, element.style_node_id().value(), StyleEngine::PseudoElementRecordDemand::CssomRead, *StyleEngine::demanded_pseudo_element(pseudo_element));
     if (!answer.is_absent && answer.record.style_record == 0)
         return;
     StyleRecordID record { answer.record.style_record };
@@ -914,7 +896,7 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
                 case PropertyID::Filter:
                     return resolve_filter_style_value(move(computed_value), computed_values->color());
                 case PropertyID::TouchAction:
-                    return style_value_for_touch_action(computed_values->touch_action());
+                    return resolve_touch_action_style_value(move(computed_value));
                 case PropertyID::TransformOrigin:
                     return style_value_for_transform_origin(computed_values->transform_origin(), {});
                 default:
@@ -1048,11 +1030,12 @@ static RefPtr<StyleValue const> resolve_color_style_value(StyleValue const& styl
     if (color_resolution_context && style_value.is_color_function()) {
         auto const& color_function = as<ColorFunctionStyleValue>(style_value);
         if (color_function.origin_color() && color_function.color_type().has_value()) {
-            auto resolved = color_function.resolve_relative_form(*color_resolution_context);
+            Optional<ComputedValuesFFI::FfiLengthResolutionContext> length_storage;
+            auto input = make_rust_color_resolution_input(*color_resolution_context, length_storage);
+            auto const* resolved = StyleValueFFI::rust_relative_color_resolved_value(style_value.rust_style_value_data(), &input);
             if (!resolved)
                 return style_value;
-
-            return as<ColorFunctionStyleValue>(*resolved).computed_value_form();
+            return StyleValue::adopt_rust_style_value_data(static_cast<StyleValueFFI::StyleValueData const*>(resolved));
         }
     }
 
@@ -1185,7 +1168,7 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
     case PropertyID::Filter:
         return resolve_filter_style_value(*get_computed_value(property_id), layout_node.color());
     case PropertyID::TouchAction:
-        return style_value_for_touch_action(layout_node.style_group<ComputedValues::MiscResetValues>().touch_action_value());
+        return resolve_touch_action_style_value(get_computed_value(property_id));
 
         // -> line-height
         //    The resolved value is normal if the computed value is normal, or the used value otherwise.
@@ -1324,9 +1307,14 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
         auto transform = FloatMatrix4x4::identity();
 
         // 2. Post-multiply all <transform-function>s in <transform-list> to transform.
+        //    NB: The resolved transforms start with those of the translate, rotate and scale properties.
         VERIFY(Painting::has_committed_box(layout_node));
-        layout_node.for_each_transformation([&](auto const& transformation) {
-            transform = transform * transformation.to_matrix(&layout_node);
+        auto reference_box = Painting::transform_reference_box(layout_node);
+        size_t individual_transform_count = layout_node.has_translate() + layout_node.has_rotate() + layout_node.has_scale();
+        size_t index = 0;
+        layout_node.for_each_resolved_transform([&](auto const& resolved_transform) {
+            if (index++ >= individual_transform_count)
+                transform = transform * resolved_transform.to_matrix(reference_box.width(), reference_box.height());
         });
 
         // https://drafts.csswg.org/css-transforms-1/#2d-matrix
@@ -1884,43 +1872,6 @@ void CSSStyleProperties::set_declarations_from_text(Utf16View css_text)
 void CSSStyleProperties::set_declarations_from(CSSStyleProperties const& source)
 {
     m_declarations.replace(source.m_declarations);
-}
-
-CSSStyleProperties::CustomPropertyReferences const& CSSStyleProperties::custom_property_references() const
-{
-    if (m_custom_property_references && m_custom_property_references_revision == revision())
-        return *m_custom_property_references;
-
-    auto references = make<CustomPropertyReferences>();
-    auto visit = [](void* context, u16 const* name, size_t name_length) {
-        static_cast<Vector<Utf16FlyString>*>(context)->append(Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(name), name_length }));
-    };
-    auto visit_value = [&](StyleValue const& value) {
-        if (!value.is_unresolved() || !value.as_unresolved().includes_var_function())
-            return;
-        if (!StyleValueFFI::rust_unresolved_style_value_visit_custom_property_references(value.rust_style_value_data(), &references->names, visit))
-            references->all_references_visible = false;
-    };
-    for (auto const& property : properties())
-        visit_value(*property.value);
-    for (auto const& [name, property] : custom_properties()) {
-        visit_value(*property.value);
-        // `--x: inherit` (or `unset`, `revert`) takes the parent's value of the same name, which is a
-        // read of that name.
-        if (property.value->is_css_wide_keyword() && !property.value->is_initial())
-            references->names.append(name);
-    }
-    quick_sort(references->names);
-    size_t unique_count = 0;
-    for (size_t index = 0; index < references->names.size(); ++index) {
-        if (index == 0 || references->names[index] != references->names[unique_count - 1])
-            references->names[unique_count++] = references->names[index];
-    }
-    references->names.shrink(unique_count);
-
-    m_custom_property_references = move(references);
-    m_custom_property_references_revision = revision();
-    return *m_custom_property_references;
 }
 
 }

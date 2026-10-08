@@ -21,16 +21,22 @@ reviewed and opened locally, but the report server is never contacted.
 
 Once the report of a WebContent crash is saved, the crash screen shows a review
 of its local details with **Reload page** next to it. After the report is
-reviewed, reloading is what the screen offers. A browser-process report is
-recovered on the next launch, which shows the same crash screen with every
-report still awaiting review: in the first tab when the window opens only the
-new tab page, otherwise in a background tab that is opened once it is first
-shown. Browsers driven by WebDriver never ask. Ladybird automatically offers
-each report at most once; leaving the crash screen without reviewing keeps the
-report on the device without offering it again on a later launch. A report of a
-crash from more than 14 days ago, or from before October 2, 2026 20:00 UTC, is
-never offered, but stays in the folder. Reports that have been offered move into
-a `Seen/` subdirectory, where the newest 20 are kept for reference. **Settings >
+of its local details with **Reload page** next to it. After the report is
+reviewed, reloading is what the screen offers. Any other crash, such as one of
+the Compositor or RequestServer, shows a popover below the menu button as soon as
+its report is saved. A newer crash takes the place of a popover still on screen,
+and the popover closes when its tab goes out of view. It offers to review the
+report on the same crash screen in a new blank tab, which **Close tab** closes.
+When sending is enabled, a submission continues after the screen that showed its
+review is closed or lost. A browser-process report is recovered on the next
+launch, which shows the same popover for the newest report still awaiting review.
+While no browser window is active, the popover waits until one is. Browsers driven
+by WebDriver never ask. Ladybird automatically offers each report at most once;
+leaving the crash screen or the popover without reviewing keeps the report on the
+device without offering it again on a later launch. A report of a crash from
+more than 14 days ago, or from before October 2, 2026 20:00 UTC, is never
+offered, but stays in the folder. Reports that have been offered move into a
+`Seen/` subdirectory, where the newest 20 are kept for reference. **Settings >
 Advanced > Crash reports > Open folder** remains available even when nothing has
 crashed. Reload restores the failed page without adding a crash-screen history
 entry; Back and Forward continue to use the original session history. The crash

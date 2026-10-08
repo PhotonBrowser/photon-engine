@@ -1,31 +1,33 @@
 /*
- * Copyright (c) 2020-2023, Linus Groh <linusg@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/BigIntObject.h>
-#include <LibJS/Runtime/GlobalObject.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(BigIntObject);
+using namespace EmbeddingABI;
 
 GC::Ref<BigIntObject> BigIntObject::create(Realm& realm, BigInt& bigint)
 {
-    return realm.create<BigIntObject>(bigint, realm.intrinsics().bigint_prototype());
+    return static_cast<BigIntObject&>(object_from_abi(js_primitive_wrapper_create_bigint(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), bigint_to_abi(bigint))));
 }
 
-BigIntObject::BigIntObject(BigInt& bigint, Object& prototype)
-    : Object(ConstructWithPrototypeTag::Tag, prototype)
-    , m_bigint(bigint)
+BigInt const& BigIntObject::bigint() const
 {
+    return const_cast<BigIntObject&>(*this).bigint();
 }
 
-void BigIntObject::visit_edges(Cell::Visitor& visitor)
+BigInt& BigIntObject::bigint()
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_bigint);
+    auto* bigint = js_primitive_wrapper_bigint(object_to_abi(*this));
+    VERIFY(bigint);
+    return cell_ref_from_abi<BigInt>(bigint);
 }
 
 }

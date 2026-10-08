@@ -9,36 +9,25 @@
 #include <AK/Error.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
+#include <AK/Utf16String.h>
 #include <LibCrypto/BigInt/SignedBigInteger.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/Ptr.h>
 #include <LibJS/Export.h>
+#include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibJS/Heap/EngineCell.h>
 
 namespace JS {
 
-class JS_API BigInt final : public Cell {
-    GC_CELL(BigInt, Cell);
-    GC_DECLARE_ALLOCATOR(BigInt);
-
+class JS_API BigInt final : public EngineCell {
 public:
-    static constexpr GC::CellKind cell_kind_for_class = GC::CellKind::BigInt;
-
     [[nodiscard]] static GC::Ref<BigInt> create(VM&, Crypto::SignedBigInteger);
 
-    virtual ~BigInt() override = default;
-
-    Crypto::SignedBigInteger const& big_integer() const { return m_big_integer; }
+    // The integer lives in the Rust runtime's cell, so this returns a copy rather than a reference to it.
+    Crypto::SignedBigInteger big_integer() const;
 
     Utf16String to_utf16_string() const;
-
-private:
-    virtual size_t external_memory_size() const override;
-
-    explicit BigInt(Crypto::SignedBigInteger);
-
-    Crypto::SignedBigInteger m_big_integer;
 };
-
-ThrowCompletionOr<GC::Ref<BigInt>> number_to_bigint(VM&, Value);
 
 }

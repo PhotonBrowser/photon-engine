@@ -181,11 +181,11 @@ static GC::Ptr<HTML::DecodedImageData> decoded_image_data_of(Layout::NodeWithSty
 
 static void push_layer_image_paint_facts_onto(Layout::NodeWithStyle const& layout_node)
 {
-    auto const& background_layers = layout_node.background_layers();
-    auto const& mask_layers = layout_node.mask_layers();
+    auto background_images = layout_node.background_images();
+    auto mask_images = layout_node.mask_images();
     Vector<Layout::RustFFI::FfiLayerImagePaintFactsEntry> entries;
     Vector<Optional<Gfx::DecodedImageFrame>> current_frames;
-    current_frames.ensure_capacity(background_layers.size() + mask_layers.size() + 1);
+    current_frames.ensure_capacity(background_images.size() + mask_images.size() + 1);
     auto append_entry = [&](Layout::RustFFI::FfiLayerImageList list, size_t computed_index, CSS::AbstractImageStyleValue const* image, Layout::NodeWithStyle::ImageObserver const* observer) {
         if (!image)
             return;
@@ -196,11 +196,11 @@ static void push_layer_image_paint_facts_onto(Layout::NodeWithStyle const& layou
             .facts = layer_image_paint_facts_for(*image, decoded_image_data_of(observer), current_frames.last()),
         });
     };
-    for (size_t layer_index = 0; layer_index < background_layers.size(); ++layer_index)
-        append_entry(Layout::RustFFI::FfiLayerImageList::Background, layer_index, background_layers[layer_index].background_image.ptr(), layout_node.background_image_observer(layer_index));
-    for (size_t layer_index = 0; layer_index < mask_layers.size(); ++layer_index)
-        append_entry(Layout::RustFFI::FfiLayerImageList::Mask, layer_index, mask_layers[layer_index].background_image.ptr(), layout_node.mask_image_observer(layer_index));
-    append_entry(Layout::RustFFI::FfiLayerImageList::BorderImageSource, 0, layout_node.border_image().source.ptr(), layout_node.border_image_source_observer());
+    for (size_t layer_index = 0; layer_index < background_images.size(); ++layer_index)
+        append_entry(Layout::RustFFI::FfiLayerImageList::Background, layer_index, background_images[layer_index].ptr(), layout_node.background_image_observer(layer_index));
+    for (size_t layer_index = 0; layer_index < mask_images.size(); ++layer_index)
+        append_entry(Layout::RustFFI::FfiLayerImageList::Mask, layer_index, mask_images[layer_index].ptr(), layout_node.mask_image_observer(layer_index));
+    append_entry(Layout::RustFFI::FfiLayerImageList::BorderImageSource, 0, layout_node.border_image_source(), layout_node.border_image_source_observer());
     Layout::RustFFI::render_state_set_layer_image_paint_facts(layout_node.document_host(), Layout::Node::slot_id(&layout_node), entries.data(), entries.size());
 }
 
@@ -255,9 +255,9 @@ static bool paints_replaced_image_from_facts(Layout::Node const& layout_node)
 
 static void queue_box_image_paint_facts(Layout::Node const& layout_node)
 {
-    auto const* image_provider = layout_node.kind() == Layout::RustFFI::NodeKind::ImageBox
+    Layout::ImageProvider const* image_provider = layout_node.kind() == Layout::RustFFI::NodeKind::ImageBox
         ? static_cast<Layout::Box const&>(layout_node).image_provider_if_any()
-        : &as<SVG::SVGImageElement>(*layout_node.dom_node());
+        : as_if<SVG::SVGImageElement>(layout_node.dom_node());
     if (!image_provider)
         return;
     with_replaced_image_paint_facts(*image_provider, [&](auto const& facts) {
@@ -362,13 +362,18 @@ void push_paint_facts_after_style_attach(Layout::NodeWithStyle& layout_node, Sty
         push_layer_image_paint_facts_onto(layout_node);
     else
         Layout::RustFFI::render_state_set_layer_image_paint_facts(layout_node.document_host(), Layout::Node::slot_id(&layout_node), nullptr, 0);
+    // NB: A box a layout built beside the removal of its element has no DOM node left to take facts from. It paints from
+    //     its style until the removal takes it away.
+    auto* dom_node = layout_node.dom_node();
     switch (layout_node.kind()) {
     case Layout::RustFFI::NodeKind::CheckBox:
     case Layout::RustFFI::NodeKind::RadioButton:
-        queue_form_control_paint_facts(as<HTML::HTMLInputElement>(*layout_node.dom_node()));
+        if (dom_node)
+            queue_form_control_paint_facts(as<HTML::HTMLInputElement>(*dom_node));
         break;
     case Layout::RustFFI::NodeKind::CanvasBox:
-        queue_canvas_paint_facts(as<HTML::HTMLCanvasElement>(*layout_node.dom_node()));
+        if (dom_node)
+            queue_canvas_paint_facts(as<HTML::HTMLCanvasElement>(*dom_node));
         break;
     case Layout::RustFFI::NodeKind::ImageBox:
     case Layout::RustFFI::NodeKind::SVGImageBox:
@@ -376,7 +381,9 @@ void push_paint_facts_after_style_attach(Layout::NodeWithStyle& layout_node, Sty
         request_document_repaint(layout_node.document(), InvalidateDisplayList::PaintCommands);
         break;
     case Layout::RustFFI::NodeKind::VideoBox:
-        queue_video_paint_facts(as<HTML::HTMLVideoElement>(*layout_node.dom_node()));
+        if (!dom_node)
+            break;
+        queue_video_paint_facts(as<HTML::HTMLVideoElement>(*dom_node));
         request_document_repaint(layout_node.document(), InvalidateDisplayList::PaintCommands);
         break;
     default:

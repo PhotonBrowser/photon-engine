@@ -4,105 +4,59 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/TypeCasts.h>
-#include <LibJS/HostClassBuilder.h>
-#include <LibJS/Runtime/HostClassInternals.h>
 #include <LibJS/Runtime/HostModule.h>
-#include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/VM.h>
+#include <LibJS/ScriptAndModuleABIConversions.h>
 
 namespace JS {
 
-using namespace HostABI;
+using namespace EmbeddingABI;
 
 GC::Ref<HostModule> HostModule::create(Realm& realm, JSHostClass const& host_class, StringView filename, Vector<ModuleRequest> requested_modules, GC::Ptr<GC::Cell> host_defined, GC::Ptr<GC::Cell> host_data)
 {
-    auto module = realm.heap().allocate_with_descriptor(cell_allocator_for_host_class<HostModule>(host_class), realm, host_class, filename, move(requested_modules), host_defined, host_data);
-    static_cast<Cell&>(*module).initialize(realm);
-    return module;
+    Vector<NonnullOwnPtr<ModuleRequestForABI>> abi_requested_modules;
+    Vector<JSModuleRequest const*> abi_requested_module_pointers;
+    abi_requested_modules.ensure_capacity(requested_modules.size());
+    abi_requested_module_pointers.ensure_capacity(requested_modules.size());
+    for (auto const& request : requested_modules) {
+        abi_requested_modules.unchecked_append(make<ModuleRequestForABI>(request));
+        abi_requested_module_pointers.unchecked_append(abi_requested_modules.last()->ptr());
+    }
+
+    auto utf16_filename = filename_to_utf16(filename);
+    auto* module = js_host_module_create(
+        vm_to_abi(realm.vm()),
+        realm_to_abi(realm),
+        &host_class,
+        utf16_view_to_abi(utf16_filename.utf16_view()),
+        abi_requested_module_pointers.data(),
+        abi_requested_module_pointers.size(),
+        host_defined.ptr(),
+        host_data.ptr());
+    return module_from_abi<HostModule>(module);
 }
 
-HostModule::HostModule(Realm& realm, JSHostClass const& host_class, StringView filename, Vector<ModuleRequest> requested_modules, GC::Ptr<GC::Cell> host_defined, GC::Ptr<GC::Cell> host_data)
-    : CyclicModule(realm, filename, false, move(requested_modules), host_defined)
-    , m_host_class(&host_class)
-    , m_host_data(host_data)
+JSHostClass const& HostModule::host_class() const
 {
-    VERIFY(host_class.abi_version == JS_HOST_ABI_VERSION && host_class.kind == JS_HOST_CLASS_MODULE);
-    VERIFY(host_class.hooks);
-    auto const& hooks = this->hooks();
-    VERIFY(hooks.get_exported_names && hooks.resolve_export && hooks.initialize_environment && hooks.execute_module);
+    auto const* host_class = js_host_module_host_class(module_to_abi(*this));
+    VERIFY(host_class);
+    return *host_class;
 }
 
-void HostModule::visit_edges(Cell::Visitor& visitor)
+GC::Ptr<GC::Cell> HostModule::host_data() const
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_host_data);
-}
-
-JSHostModuleHooks const& HostModule::hooks() const
-{
-    return *static_cast<JSHostModuleHooks const*>(m_host_class->hooks);
+    return static_cast<GC::Cell*>(js_host_module_host_data(module_to_abi(*this)));
 }
 
 StringView HostModule::class_name() const
 {
-    return { m_host_class->name, m_host_class->name_length };
-}
-
-Vector<Utf16FlyString> HostModule::get_exported_names(VM&, GC::RootHashTable<GC::Ref<Module const>>&)
-{
-    Vector<Utf16FlyString> exported_names;
-    JSStringSink sink {
-        .context = &exported_names,
-        .append = [](void* context, u16 const* code_units, size_t length_in_code_units) {
-            static_cast<Vector<Utf16FlyString>*>(context)->append(string_from_abi(code_units, length_in_code_units));
-        },
-    };
-    hooks().get_exported_names(module_to_abi(this), &sink);
-    return exported_names;
-}
-
-ResolvedBinding HostModule::resolve_export(VM&, Utf16FlyString const& export_name, Vector<ResolvedBinding>)
-{
-    Optional<Utf16FlyString> binding_name;
-    JSResolvedBinding abi_binding {
-        .module = nullptr,
-        .binding_name = {
-            .context = &binding_name,
-            .append = [](void* context, u16 const* code_units, size_t length_in_code_units) {
-                auto& binding_name = *static_cast<Optional<Utf16FlyString>*>(context);
-                VERIFY(!binding_name.has_value());
-                binding_name = string_from_abi(code_units, length_in_code_units);
-            },
-        },
-        .type = JS_RESOLVED_BINDING_NULL,
-    };
-    with_string_as_abi(export_name, [&](u16 const* code_units, size_t length_in_code_units) {
-        hooks().resolve_export(module_to_abi(this), code_units, length_in_code_units, &abi_binding);
-    });
-
-    ResolvedBinding binding;
-    binding.type = resolved_binding_type_from_abi(abi_binding.type);
-    binding.module = module_from_abi(abi_binding.module);
-    if (binding.type == ResolvedBinding::BindingName)
-        binding.export_name = binding_name.release_value();
-    return binding;
-}
-
-ThrowCompletionOr<void> HostModule::initialize_environment(VM&)
-{
-    return completion_from_abi<void>(hooks().initialize_environment(module_to_abi(this)));
-}
-
-ThrowCompletionOr<void> HostModule::execute_module(VM&, GC::Ptr<PromiseCapability> capability)
-{
-    return completion_from_abi<void>(hooks().execute_module(module_to_abi(this), promise_capability_to_abi(capability)));
+    auto const& host_class = this->host_class();
+    return { host_class.name, host_class.name_length };
 }
 
 JSHostClass const* host_class_of(Module const& module)
 {
-    if (auto const* host_module = as_if<HostModule>(module))
-        return &host_module->host_class();
-    return nullptr;
+    return js_host_module_host_class(module_to_abi(module));
 }
 
 bool is_host_instance_of(Module const& module, JSHostClass const& host_class)

@@ -14,6 +14,7 @@
 #include <AK/LexicalPath.h>
 #include <AK/NonnullRawPtr.h>
 #include <AK/Optional.h>
+#include <AK/Variant.h>
 #include <LibCompositing/Types.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
@@ -144,23 +145,22 @@ public:
     struct BookmarkID {
         String id;
         Optional<String> target_folder_id;
+        Optional<String> parent_folder_id;
     };
     virtual Optional<BookmarkID> bookmark_item_id_for_context_menu() const { return {}; }
-    virtual void show_bookmark_context_menu(Gfx::IntPoint, Optional<BookmarkItem const&>, [[maybe_unused]] Optional<String const&> target_folder_id) { }
+    virtual void show_bookmark_context_menu(Gfx::IntPoint, Optional<BookmarkItem const&>, [[maybe_unused]] Optional<String const&> target_folder_id, [[maybe_unused]] Optional<String const&> parent_folder_id) { }
 
-    struct AddBookmarkDialogResult {
-        BookmarkItem::Bookmark bookmark;
+    struct BookmarkDialogResult {
+        Variant<BookmarkItem::Bookmark, BookmarkItem::Folder> data;
         Optional<String> target_folder_id;
     };
-    using AddBookmarkPromise = Core::Promise<AddBookmarkDialogResult>;
-    virtual NonnullRefPtr<AddBookmarkPromise> display_add_bookmark_dialog(Optional<String const&> target_folder_id = {}) const;
+    using BookmarkPromise = Core::Promise<BookmarkDialogResult>;
 
-    using BookmarkPromise = Core::Promise<BookmarkItem::Bookmark>;
-    virtual NonnullRefPtr<BookmarkPromise> display_edit_bookmark_dialog([[maybe_unused]] BookmarkItem::Bookmark const& current_bookmark) const;
+    virtual NonnullRefPtr<BookmarkPromise> display_add_bookmark_dialog(Optional<String const&> target_folder_id = {}) const;
+    virtual NonnullRefPtr<BookmarkPromise> display_edit_bookmark_dialog([[maybe_unused]] BookmarkItem const& current_bookmark, Optional<String const&> parent_folder_id) const;
 
-    using BookmarkFolderPromise = Core::Promise<BookmarkItem::Folder>;
-    virtual NonnullRefPtr<BookmarkFolderPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}) const;
-    virtual NonnullRefPtr<BookmarkFolderPromise> display_edit_bookmark_folder_dialog([[maybe_unused]] BookmarkItem::Folder const& current_folder) const;
+    virtual NonnullRefPtr<BookmarkPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}, Optional<String const&> target_folder_id = {}) const;
+    virtual NonnullRefPtr<BookmarkPromise> display_edit_bookmark_folder_dialog([[maybe_unused]] BookmarkItem const& current_folder, Optional<String const&> parent_folder_id) const;
 
     static BrowsingSession& default_session() { return *the().m_default_session; }
 
@@ -266,6 +266,8 @@ public:
     ErrorOr<String> download_directory_path_for_frontend_action(FileDownloader::Download const&) const;
     virtual void open_download(FileDownloader::Download const&) const;
     virtual void show_download_in_folder(FileDownloader::Download const&) const;
+
+    void offer_newest_pending_crash_report();
 
     // FIXME: We should implement UI-agnostic platform APIs to interact with the system clipboard.
     enum class ClipboardType : u8 {
@@ -378,6 +380,8 @@ protected:
 
     virtual Optional<ByteString> ask_user_for_download_path([[maybe_unused]] ByteString const& file) const { return {}; }
 
+    virtual void display_crash_report_notification([[maybe_unused]] ByteString const& report_name) { }
+
     virtual void update_tabs_display() const { }
 
     virtual void rebuild_bookmarks_menu() const { }
@@ -399,6 +403,7 @@ private:
     void handle_compositor_process_death();
     void recover_compositor_process();
     void crash_compositor_process();
+    void offer_crash_report(ByteString const& report_name);
     ErrorOr<void> launch_request_server();
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     ErrorOr<void> launch_wasm_compiler_server();

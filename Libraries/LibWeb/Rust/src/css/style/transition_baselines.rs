@@ -20,7 +20,7 @@ use smallvec::SmallVec;
 /// pinned until the epoch commits, and the host follows every baseline it records for the engine, the commit that
 /// releases them, and every identity a transaction releases, as the engine drops a retired node's baselines, so it
 /// knows each without asking.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct TransitionBaselines {
     baselines: HashMap<StyleNodeID, SmallVec<[(u8, u64); 1]>>,
 }
@@ -94,11 +94,6 @@ pub(crate) enum InheritedAnimatedValue<'a> {
 }
 
 impl RetainedState {
-    /// An epoch begins: the one before it committed and released every style it pinned.
-    pub(crate) fn begin_transition_baselines(&self) {
-        debug_assert!(self.transition_baselines.baselines.is_empty());
-    }
-
     /// Style, layout or animation feedback can give a target a transition in any later pass of
     /// the epoch, and that transition starts from the style the target held before the epoch's
     /// first pass. The first record named for a target is that style: it is kept, pinned, until

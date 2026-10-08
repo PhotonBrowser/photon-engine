@@ -16,7 +16,9 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/TextTrackList.h>
 #include <LibWeb/HTML/TimeRanges.h>
+#include <LibWeb/HTML/TrackEvent.h>
 #include <LibWeb/HTML/VideoTrackList.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/MediaSourceExtensions/EventNames.h>
 #include <LibWeb/MediaSourceExtensions/MediaSource.h>
 #include <LibWeb/MediaSourceExtensions/SourceBuffer.h>
@@ -26,6 +28,14 @@
 #include <LibWebCommon/MimeSniff/MimeType.h>
 
 namespace Web::MediaSourceExtensions {
+
+static void dispatch_addtrack_event(JS::Object& global_object, DOM::EventTarget& track_list, HTML::NullableTrackType const& track)
+{
+    HTML::TrackEventInit event_init {};
+    event_init.track = track;
+    auto event = HTML::TrackEvent::create(HTML::EventNames::addtrack, event_init, HighResolutionTime::current_high_resolution_time(global_object));
+    track_list.dispatch_event(event);
+}
 
 GC_DEFINE_ALLOCATOR(SourceBuffer);
 
@@ -324,10 +334,10 @@ GC::Ref<HTML::TimeRanges> SourceBuffer::buffered()
     // FIXME: 1. If this object has been removed from the sourceBuffers attribute of the parent media source then throw
     //           an InvalidStateError exception and abort these steps.
 
-    // NB: Further steps to intersect the buffered ranges of the track buffers are implemented within
-    //     SourceBufferProcessor::buffered_ranges(), since it has access to the track buffers. Its result is
-    //     published after each command rather than computed here, so this read never observes a partial append.
-    auto ranges = m_remote_source_buffer->published_state().buffered_ranges;
+    // NB: The remaining steps are implemented by DemuxerScanState::buffered_ranges(), which the media server also uses
+    //     to limit playback. The track buffer ranges are published after each command, so this read never observes a
+    //     partial append, and the end of the stream is tracked here, so readyState changes take effect at once.
+    auto ranges = m_remote_source_buffer->scan_state().buffered_ranges();
     for (auto const& range : ranges)
         time_ranges->add_range(range.start.to_seconds_f64(), range.end.to_seconds_f64());
 
@@ -383,7 +393,7 @@ WebIDL::ExceptionOr<void> SourceBuffer::set_mode(Bindings::AppendMode bindings_m
 }
 
 // https://w3c.github.io/media-source/#sourcebuffer-prepare-append
-WebIDL::ExceptionOr<void> SourceBuffer::prepare_append()
+WebIDL::ExceptionOr<void> SourceBuffer::prepare_append(size_t new_data_size)
 {
     // 1. If the SourceBuffer has been removed from the sourceBuffers attribute of the parent media source then throw an
     //    InvalidStateError exception and abort these steps.
@@ -428,8 +438,25 @@ WebIDL::ExceptionOr<void> SourceBuffer::prepare_append()
     }
 
     // 6. Run the coded frame eviction algorithm.
-    // NB: The media server runs it as the appended data reaches it, against its own playback position, and reports
-    //     the buffer full flag with the append's outcome. So the flag checked below is the one the last append left.
+    // AD-HOC: Decide whether to run the eviction synchronously. The estimate here errs on the side of synchronous
+    //         eviction, so that the [[buffer full flag]], which we opt to set proactively during an eviction that
+    //         cannot free enough space, will be updated before we decide whether to throw the QuotaExceededError.
+    auto const& state = m_remote_source_buffer->published_state();
+    auto must_wait_for_eviction = [&] {
+        if (state.buffer_full)
+            return true;
+        // NB: Before the first initialization segment, there are no track buffers to fill or evict from.
+        if (state.capacity_bytes == 0)
+            return false;
+        return state.buffered_bytes - state.evictable_bytes + new_data_size > state.capacity_bytes;
+    }();
+    if (must_wait_for_eviction) {
+        dbgln("SourceBuffer: Waiting for coded frame eviction (buffer full: {}, buffered: {}, evictable: {}, new: {}, capacity: {})",
+            state.buffer_full, state.buffered_bytes, state.evictable_bytes, new_data_size, state.capacity_bytes);
+        m_remote_source_buffer->run_coded_frame_eviction_synchronously(new_data_size);
+    } else {
+        m_remote_source_buffer->run_coded_frame_eviction(new_data_size);
+    }
 
     // 7. If the [[buffer full flag]] equals true, then throw a QuotaExceededError exception and abort these steps.
     if (m_remote_source_buffer->published_state().buffer_full)
@@ -444,7 +471,7 @@ WebIDL::ExceptionOr<void> SourceBuffer::append_buffer(WebIDL::BufferSourceVarian
     WebIDL::BufferSource buffer_source { data };
 
     // 1. Run the prepare append algorithm.
-    TRY(prepare_append());
+    TRY(prepare_append(buffer_source.byte_length()));
 
     // 2. Add data to the end of the [[input buffer]].
     // NB: The bytes are copied here because the array buffer may be detached before the buffer
@@ -816,6 +843,12 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
 
                 // 8. Add new audio track to the audioTracks attribute on this SourceBuffer object.
                 m_audio_tracks->add_track(new_audio_track);
+                // NOTE: This should trigger AudioTrackList [HTML] logic to queue a task to fire an event named
+                //       addtrack using TrackEvent with the track attribute initialized to new audio track, at the
+                //       AudioTrackList object referenced by the audioTracks attribute on this SourceBuffer object.
+                m_media_source->queue_a_media_source_task(GC::create_function(heap(), [media_source = m_media_source, audio_tracks = m_audio_tracks, new_audio_track] {
+                    dispatch_addtrack_event(media_source->relevant_global_object(), audio_tracks, new_audio_track);
+                }));
 
                 // 9. If the parent media source was constructed in a DedicatedWorkerGlobalScope:
                 if (!m_media_source->media_element_assigned_to()) {
@@ -825,6 +858,13 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
                 // Otherwise:
                 // Add new audio track to the audioTracks attribute on the HTMLMediaElement.
                 m_media_source->media_element_assigned_to()->audio_tracks()->add_track(new_audio_track);
+                // NOTE: This should trigger AudioTrackList [HTML] logic to queue a task to fire an event named
+                //       addtrack using TrackEvent with the track attribute initialized to mirrored audio track or new
+                //       audio track, at the AudioTrackList object referenced by the audioTracks attribute on the
+                //       HTMLMediaElement.
+                m_media_source->media_element_assigned_to()->queue_a_media_element_task([new_audio_track](HTML::HTMLMediaElement& media_element) {
+                    dispatch_addtrack_event(HTML::relevant_global_object(media_element), media_element.audio_tracks(), new_audio_track);
+                });
             }
 
             // 7. Create a new track buffer to store coded frames for this track.
@@ -874,6 +914,12 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
 
                 // 8. Add new video track to the videoTracks attribute on this SourceBuffer object.
                 m_video_tracks->add_track(new_video_track);
+                // NOTE: This should trigger VideoTrackList [HTML] logic to queue a task to fire an event named addtrack
+                //       using TrackEvent with the track attribute initialized to new video track, at the VideoTrackList
+                //       object referenced by the videoTracks attribute on this SourceBuffer object.
+                m_media_source->queue_a_media_source_task(GC::create_function(heap(), [media_source = m_media_source, video_tracks = m_video_tracks, new_video_track] {
+                    dispatch_addtrack_event(media_source->relevant_global_object(), video_tracks, new_video_track);
+                }));
 
                 // 9. If the parent media source was constructed in a DedicatedWorkerGlobalScope:
                 if (!m_media_source->media_element_assigned_to()) {
@@ -883,6 +929,13 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
                 // Otherwise:
                 // Add new video track to the videoTracks attribute on the HTMLMediaElement.
                 m_media_source->media_element_assigned_to()->video_tracks()->add_track(new_video_track);
+                // NOTE: This should trigger VideoTrackList [HTML] logic to queue a task to fire an event named addtrack
+                //       using TrackEvent with the track attribute initialized to mirrored video track or new video
+                //       track, at the VideoTrackList object referenced by the videoTracks attribute on the
+                //       HTMLMediaElement.
+                m_media_source->media_element_assigned_to()->queue_a_media_element_task([new_video_track](HTML::HTMLMediaElement& media_element) {
+                    dispatch_addtrack_event(HTML::relevant_global_object(media_element), media_element.video_tracks(), new_video_track);
+                });
             }
 
             // 7. Create a new track buffer to store coded frames for this track.
@@ -937,6 +990,12 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
 
                 // 9. Add new text track to the textTracks attribute on this SourceBuffer object.
                 m_text_tracks->add_track(new_text_track);
+                // NOTE: This should trigger TextTrackList [HTML] logic to queue a task to fire an event named addtrack
+                //       using TrackEvent with the track attribute initialized to new text track, at the TextTrackList
+                //       object referenced by the textTracks attribute on this SourceBuffer object.
+                m_media_source->queue_a_media_source_task(GC::create_function(heap(), [media_source = m_media_source, text_tracks = m_text_tracks, new_text_track] {
+                    dispatch_addtrack_event(media_source->relevant_global_object(), text_tracks, new_text_track);
+                }));
 
                 // 10. If the parent media source was constructed in a DedicatedWorkerGlobalScope:
                 if (!m_media_source->media_element_assigned_to()) {
@@ -946,6 +1005,12 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
                 // Otherwise:
                 // Add new text track to the textTracks attribute on the HTMLMediaElement.
                 m_media_source->media_element_assigned_to()->text_tracks()->add_track(new_text_track);
+                // NOTE: This should trigger TextTrackList [HTML] logic to queue a task to fire an event named addtrack
+                //       using TrackEvent with the track attribute initialized to mirrored text track or new text track,
+                //       at the TextTrackList object referenced by the textTracks attribute on the HTMLMediaElement.
+                m_media_source->media_element_assigned_to()->queue_a_media_element_task([new_text_track](HTML::HTMLMediaElement& media_element) {
+                    dispatch_addtrack_event(HTML::relevant_global_object(media_element), media_element.text_tracks(), new_text_track);
+                });
             }
 
             // 7. Create a new track buffer to store coded frames for this track.
@@ -966,31 +1031,47 @@ void SourceBuffer::on_first_initialization_segment_processed(Vector<Media::Track
         }
 
         // 6. Set [[first initialization segment received flag]] to true.
-        // AD-HOC: This is handled within SourceBufferProcessor, since it's observable immediately in the processing
-        //         loop.
+        m_first_initialization_segment_received = true;
     }
 
     // 6. Set [[pending initialization segment for changeType flag]] to false.
     // AD-HOC: This is handled within SourceBufferProcessor, same as the above inner step 6.
 
-    // 7. If the active track flag equals true, then run the following steps:
-    if (!active_track_flag)
-        return;
-
     // FIXME: Mirror the following steps to the Window when workers are supported.
     auto& media_element = *m_media_source->media_element_assigned_to();
 
-    // 8. Use the parent media source's mirror if necessary algorithm to run the following step in Window:
-    //        If the HTMLMediaElement's readyState attribute is greater than HAVE_CURRENT_DATA, then set
-    //        the HTMLMediaElement's readyState attribute to HAVE_METADATA.
+    // 7. If the active track flag equals true, then run the following steps:
+    // AD-HOC: The spec lists step 8 after this one, but it is meant to be its only substep.
+    //         See https://github.com/w3c/media-source/issues/380
+    if (active_track_flag) {
+        // 8. Use the parent media source's mirror if necessary algorithm to run the following step in Window:
+        //        If the HTMLMediaElement's readyState attribute is greater than HAVE_CURRENT_DATA, then set
+        //        the HTMLMediaElement's readyState attribute to HAVE_METADATA.
+        // NB: This step is handled by the unified readyState update method on HTMLMediaElement, based on conditions
+        //     that Media Source Extensions requires.
+        media_element.update_ready_state();
+    }
+
     // 9. If each object in sourceBuffers of the parent media source has [[first initialization segment received
     //    flag]] equal to true, then use the parent media source's mirror if necessary algorithm to run the
     //    following step in Window:
-    //        If the HTMLMediaElement's readyState attribute is HAVE_NOTHING, then set the HTMLMediaElement's
-    //        readyState attribute to HAVE_METADATA.
-    // NB: These steps are handled by the unified readyState update method on HTMLMediaElement, based on conditions
-    //     that Media Source Extensions requires.
-    media_element.update_ready_state();
+    auto all_source_buffers_received_first_initialization_segment = [&] {
+        auto& source_buffers = *m_media_source->source_buffers();
+        for (size_t i = 0; i < source_buffers.length(); i++) {
+            if (!source_buffers.item(i)->first_initialization_segment_received())
+                return false;
+        }
+        return true;
+    }();
+    if (all_source_buffers_received_first_initialization_segment) {
+        //    If the HTMLMediaElement's readyState attribute is HAVE_NOTHING, then set the HTMLMediaElement's
+        //    readyState attribute to HAVE_METADATA.
+        // NB: The media data processing steps for when "enough of the media data has been fetched to determine the
+        //     duration of the media resource, its dimensions, and other metadata" set the readyState, and also apply
+        //     to a media source.
+        if (media_element.ready_state() == HTML::HTMLMediaElement::ReadyState::HaveNothing)
+            media_element.media_source_metadata_available({});
+    }
 }
 
 // https://w3c.github.io/media-source/#sourcebuffer-buffer-append

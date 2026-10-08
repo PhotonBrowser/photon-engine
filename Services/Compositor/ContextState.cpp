@@ -9,9 +9,9 @@
 #include <AK/StdLibExtras.h>
 #include <Compositor/CompositorState.h>
 #include <Compositor/ContextState.h>
+#include <Compositor/DisplayListPlayerSkia.h>
 #include <Compositor/PausedDebuggerOverlay.h>
 #include <LibCompositing/DisplayList/DisplayListDamage.h>
-#include <LibCompositing/DisplayList/DisplayListPlayerSkia.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
@@ -148,6 +148,18 @@ void ContextState::dispatch_mouse_event_to_web_content(Web::MouseEvent const& ev
 {
     VERIFY(m_page_id.has_value());
     m_web_content_client.dispatch_mouse_event_to_web_content(*m_page_id, event);
+
+    // The render clock hears where the pointer went too, without waiting for WebContent's main thread, so that hover
+    // can follow the pointer while that thread runs a task.
+    if (event.type == Web::MouseEvent::Type::MouseMove)
+        m_web_content_client.pointer_moved(m_context_id, event.position, to_underlying(event.buttons), scrolled_since_last_frame());
+    else if (event.type == Web::MouseEvent::Type::MouseLeave)
+        m_web_content_client.pointer_left(m_context_id);
+}
+
+bool ContextState::scrolled_since_last_frame() const
+{
+    return has_pending_async_scroll_updates() || !m_unreconciled_async_scroll_offsets.is_empty() || has_active_smooth_scroll_animations() || has_active_scroll_fling();
 }
 
 void ContextState::dispatch_key_event_to_web_content(Web::KeyEvent const& event)
@@ -177,7 +189,7 @@ void ContextState::set_parent_context(Optional<Web::CompositorContextId> parent_
 
 void ContextState::apply_display_list_resource_transaction(Compositing::DisplayListResourceTransaction&& resource_transaction)
 {
-    m_display_list_resource_storage.apply_transaction(move(resource_transaction));
+    m_raster_cache.evict(m_display_list_resource_storage.apply_transaction(move(resource_transaction)));
 }
 
 void ContextState::install_display_list_update(
@@ -1448,6 +1460,18 @@ void ContextState::did_deliver_clock_tick(MonotonicTime frame_time)
     m_clock_tick_pacer.did_deliver(frame_time);
 }
 
+Vector<Web::CompositorScrollOffset> ContextState::scroll_offsets() const
+{
+    auto scroll_nodes = m_async_scroll_tree.scroll_nodes();
+    Vector<Web::CompositorScrollOffset> scroll_offsets;
+    scroll_offsets.ensure_capacity(scroll_nodes.size());
+    for (auto const& node : scroll_nodes) {
+        if (auto offset = m_async_scroll_tree.css_scroll_offset_for_node(node.node_id, m_scroll_state_snapshot); offset.has_value())
+            scroll_offsets.unchecked_append({ node.stable_node_id, *offset });
+    }
+    return scroll_offsets;
+}
+
 Optional<Gfx::IntRect> ContextState::pending_present_frame_viewport_rect() const
 {
     if (!m_pending_present_frame.has_value())
@@ -1529,7 +1553,7 @@ bool ContextState::draws_canvas(Compositing::CanvasId canvas_id) const
     return m_last_rasterized_frame.has_value() && m_last_rasterized_frame->canvas_content_generations.contains(canvas_id);
 }
 
-Optional<ContextState::PreparedFrame> ContextState::prepare_frame(Compositing::DisplayListPlayerSkia& display_list_player, PendingFrame pending_frame, CompositedContextResolver const* composited_context_resolver)
+Optional<ContextState::PreparedFrame> ContextState::prepare_frame(DisplayListPlayerSkia& display_list_player, PendingFrame pending_frame, CompositedContextResolver const* composited_context_resolver)
 {
     if (is_present_blocked()) {
         queue_present_frame(pending_frame);
@@ -1568,7 +1592,7 @@ void ContextState::did_submit_prepared_frame(Gfx::IntRect viewport_rect)
     m_presented_frame = viewport_rect;
 }
 
-bool ContextState::present_synchronously(Compositing::DisplayListPlayerSkia& display_list_player, CompositedContextResolver const* composited_context_resolver)
+bool ContextState::present_synchronously(DisplayListPlayerSkia& display_list_player, CompositedContextResolver const* composited_context_resolver)
 {
     if (!can_render_frame())
         return false;
@@ -1602,7 +1626,7 @@ bool ContextState::can_paint_screenshot(Gfx::ShareableBitmap& target_bitmap) con
     return m_display_list && target_bitmap.is_valid() && target_bitmap.bitmap();
 }
 
-void ContextState::paint_screenshot(Compositing::DisplayListPlayerSkia& display_list_player, Gfx::ShareableBitmap& target_bitmap, CompositedContextResolver const* composited_context_resolver)
+void ContextState::paint_screenshot(DisplayListPlayerSkia& display_list_player, Gfx::ShareableBitmap& target_bitmap, CompositedContextResolver const* composited_context_resolver)
 {
     VERIFY(can_paint_screenshot(target_bitmap));
 
@@ -2028,7 +2052,7 @@ bool ContextState::advance_visual_animations(MonotonicTime now)
     return m_has_active_visual_animations;
 }
 
-void ContextState::paint_current_display_list(Compositing::DisplayListPlayerSkia& display_list_player, Gfx::PaintingSurface& surface, CompositedContextResolver const* composited_context_resolver, Optional<Gfx::IntRect> damage_rect, PaintUIOverlay paint_ui_overlay, bool apply_raster_transform)
+void ContextState::paint_current_display_list(DisplayListPlayerSkia& display_list_player, Gfx::PaintingSurface& surface, CompositedContextResolver const* composited_context_resolver, Optional<Gfx::IntRect> damage_rect, PaintUIOverlay paint_ui_overlay, bool apply_raster_transform)
 {
     VERIFY(m_display_list);
     auto surface_clear_color = Gfx::to_skia_color(m_display_list->surface_clear_color().value_or(Gfx::Color::Transparent));
@@ -2037,6 +2061,7 @@ void ContextState::paint_current_display_list(Compositing::DisplayListPlayerSkia
             *m_display_list,
             visual_context_tree_for_compositing(),
             m_display_list_resource_storage,
+            m_raster_cache,
             m_scroll_state_snapshot,
             target_surface,
             &m_canvas_surface_registry,

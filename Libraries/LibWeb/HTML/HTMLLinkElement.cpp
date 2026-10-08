@@ -183,7 +183,7 @@ void HTMLLinkElement::finished_loading_critical_style_subresources(AnyFailed)
 
 bool HTMLLinkElement::has_loaded_icon() const
 {
-    return m_relationship & Relationship::Icon && m_loaded_icon.has_value();
+    return m_relationship & Relationship::Icon && m_loaded_icon;
 }
 
 bool HTMLLinkElement::has_icon_keyword() const
@@ -511,6 +511,9 @@ void HTMLLinkElement::default_fetch_and_process_linked_resource(u64 fetch_genera
             return;
         m_fetch_controller = nullptr;
 
+        // NB: The unsafe response below is always CORS-same-origin, so determine the origin-clean flag beforehand.
+        auto origin_clean = response->is_cors_same_origin() ? CSS::StyleScope::OriginClean::Yes : CSS::StyleScope::OriginClean::No;
+
         // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
         //        https://github.com/whatwg/html/issues/9355
         response = response->unsafe_response();
@@ -535,7 +538,7 @@ void HTMLLinkElement::default_fetch_and_process_linked_resource(u64 fetch_genera
         // FIXME: 3. Otherwise, wait for the link resource's critical subresources to finish loading.
 
         // 4. Process the linked resource given el, success, response, and bodyBytes.
-        process_linked_resource(success, response, successful_body_bytes);
+        process_linked_resource(success, response, origin_clean, successful_body_bytes);
     };
 
     m_fetch_controller = Fetch::Fetching::fetch(HTML::relevant_realm(*this), *request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
@@ -610,15 +613,7 @@ void HTMLLinkElement::fetch_and_process_linked_preload_resource()
 
 static bool media_attribute_matches_environment(DOM::Document const& document, Utf16View media)
 {
-    if (media.is_empty())
-        return true;
-
-    auto media_queries = parse_media_query_list(media);
-    for (auto const& media_query : media_queries) {
-        if (media_query->evaluate(document))
-            return true;
-    }
-    return false;
+    return CSS::RustMediaList::parse(media).evaluate(document);
 }
 
 static Optional<Fetch::Infrastructure::Request::Destination> module_preload_destination_from_as_attribute(Utf16View as_attribute)
@@ -980,7 +975,7 @@ void HTMLLinkElement::preload(LinkProcessingOptions& options, Function<void(Fetc
 }
 
 // https://html.spec.whatwg.org/multipage/semantics.html#process-the-linked-resource
-void HTMLLinkElement::process_linked_resource(bool success, Fetch::Infrastructure::Response const& response, Core::ImmutableBytes const* body_bytes)
+void HTMLLinkElement::process_linked_resource(bool success, Fetch::Infrastructure::Response const& response, CSS::StyleScope::OriginClean origin_clean, Core::ImmutableBytes const* body_bytes)
 {
     if (success)
         VERIFY(body_bytes);
@@ -991,8 +986,49 @@ void HTMLLinkElement::process_linked_resource(bool success, Fetch::Infrastructur
             icon_bytes = body_bytes->copy_to_byte_buffer().release_value_but_fixme_should_propagate_errors();
         process_icon_resource(success, response, move(icon_bytes));
     } else if (m_relationship & Relationship::Stylesheet) {
-        process_stylesheet_resource(success, response, success ? body_bytes->bytes() : ReadonlyBytes {});
+        process_stylesheet_resource(success, response, origin_clean, success ? body_bytes->bytes() : ReadonlyBytes {});
     }
+}
+
+static NonnullRefPtr<Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>> decode_favicon(ReadonlyBytes favicon_data, URL::URL const& favicon_url, Optional<MimeSniff::MimeType> mime_type, GC::Ref<DOM::Document> document)
+{
+    auto promise = Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>::construct();
+
+    auto is_svg_icon = (mime_type.has_value() && mime_type.value().essence() == "image/svg+xml"sv) || favicon_url.basename().ends_with(".svg"sv);
+
+    if (is_svg_icon) {
+        SVG::SVGDecodedImageData::decode(document->page(), favicon_url, favicon_data)
+            ->when_resolved([promise](auto& image_data) {
+                // FIXME: Calculate size based on device pixel ratio
+                auto decoded_frame = image_data->default_frame({ 32, 32 });
+                if (!decoded_frame.has_value()) {
+                    promise->reject(Error::from_string_view("Failed to get bitmap from SVG favicon"sv));
+                    return;
+                }
+                promise->resolve(decoded_frame->bitmap_ref());
+            })
+            .when_rejected([promise](Error& error) {
+                promise->reject(move(error));
+            });
+        return promise;
+    }
+
+    auto on_failed_decode = [favicon_url, promise]([[maybe_unused]] Error& error) {
+        dbgln_if(IMAGE_DECODER_DEBUG, "Failed to decode favicon {}: {}", favicon_url, error);
+        promise->reject(move(error));
+    };
+
+    auto on_successful_decode = [document = GC::Root(document), promise](Web::Platform::DecodedImage& decoded_image) -> ErrorOr<void> {
+        auto favicon_bitmap = decoded_image.frames[0].bitmap;
+        dbgln_if(IMAGE_DECODER_DEBUG, "Decoded favicon, {}", favicon_bitmap->size());
+
+        promise->resolve(favicon_bitmap.release_nonnull());
+        return {};
+    };
+
+    (void)Platform::ImageCodecPlugin::the().decode_image(favicon_data, move(on_successful_decode), move(on_failed_decode));
+
+    return promise;
 }
 
 // AD-HOC: The spec is underspecified for fetching and processing rel="icon" See:
@@ -1002,12 +1038,26 @@ void HTMLLinkElement::process_icon_resource(bool success, Fetch::Infrastructure:
     if (!success)
         return;
 
-    m_loaded_icon = { response.url().value_or({}), move(body_bytes) };
-    document().check_favicon_after_loading_link_resource();
+    auto generation = m_current_fetch_generation;
+    decode_favicon(body_bytes.span(), response.url().value_or({}), Fetch::Infrastructure::extract_mime_type(response.header_list()), document())
+        ->when_resolved(GC::weak_callback(*this, [generation](HTMLLinkElement& element, NonnullRefPtr<Gfx::Bitmap const>& favicon) {
+            if (element.m_current_fetch_generation != generation || !element.document().is_fully_active())
+                return;
+
+            element.m_loaded_icon = favicon;
+            element.document().check_favicon_after_loading_link_resource();
+        }))
+        .when_rejected(GC::weak_callback(*this, [generation](HTMLLinkElement& element, Error&) {
+            if (element.m_current_fetch_generation != generation || !element.document().is_fully_active())
+                return;
+
+            element.m_loaded_icon = nullptr;
+            element.document().check_favicon_after_loading_link_resource();
+        }));
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet:process-the-linked-resource
-void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastructure::Response const& response, ReadonlyBytes body_bytes)
+void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastructure::Response const& response, CSS::StyleScope::OriginClean origin_clean, ReadonlyBytes body_bytes)
 {
     if (!document().is_fully_active())
         return;
@@ -1076,13 +1126,14 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
         auto maybe_decoded_string = css_decode_bytes(environment_encoding, mime_type_charset, body_bytes);
         if (maybe_decoded_string.is_error()) {
             dbgln("Failed to decode CSS file: {}", response.url().value_or(URL::URL()));
+            associate_empty_style_sheet(response, origin_clean);
             dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
         } else {
             VERIFY(!response.url_list().is_empty());
             m_stylesheet_processing_pending = true;
             CSS::Parser::Parser::parse_stylesheet_off_thread(
                 CSS::Parser::ParsingParams { document() }, maybe_decoded_string.release_value(),
-                [link = GC::make_root(*this), loaded_document = GC::make_root(document()), fetch_generation = m_current_fetch_generation, location = response.url_list().first()](CSS::Parser::RustStyleSheetParse parsed) mutable {
+                [link = GC::make_root(*this), loaded_document = GC::make_root(document()), fetch_generation = m_current_fetch_generation, location = response.url_list().first(), origin_clean](CSS::Parser::RustStyleSheetParse parsed) mutable {
                     if (fetch_generation != link->m_current_fetch_generation || !link->m_stylesheet_processing_pending)
                         return;
                     // NB: An inactive document's element tasks cannot run. Release its result here.
@@ -1092,7 +1143,7 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
                         return;
                     }
                     link->queue_an_element_task(Task::Source::Networking,
-                        [link = move(link), loaded_document = move(loaded_document), fetch_generation, location = move(location), parsed = move(parsed)] {
+                        [link = move(link), loaded_document = move(loaded_document), fetch_generation, location = move(location), parsed = move(parsed), origin_clean] {
                             if (fetch_generation != link->m_current_fetch_generation || !link->m_stylesheet_processing_pending)
                                 return;
                             if (&link->document() != loaded_document.ptr() || !loaded_document->is_fully_active()
@@ -1104,18 +1155,7 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
 
                             CSS::Parser::Parser parser { CSS::Parser::ParsingParams { *loaded_document } };
                             auto sheet = parser.create_css_stylesheet(parsed, location);
-                            auto media = link->attribute(HTML::AttributeNames::media);
-                            auto title = link->in_a_document_tree() ? link->attribute(HTML::AttributeNames::title) : Optional<Utf16String> {};
-                            link->document_or_shadow_root_style_scope().initialize_a_css_style_sheet(
-                                *sheet, link.ptr(), media.has_value() ? media->utf16_view() : u""sv,
-                                title.has_value() ? title.release_value() : Utf16String {},
-                                (link->m_relationship & Relationship::Alternate && !link->m_explicitly_enabled) ? CSS::StyleScope::Alternate::Yes : CSS::StyleScope::Alternate::No,
-                                CSS::StyleScope::OriginClean::Yes, nullptr, nullptr);
-                            link->m_loaded_style_sheet = sheet;
-
-                            // NB: Removing disabled explicitly enables the sheet, even if its title would disable it.
-                            if (link->m_explicitly_enabled)
-                                sheet->set_disabled(false);
+                            link->associate_style_sheet(*sheet, origin_clean);
 
                             // 2. Fire an event named load at el.
                             link->dispatch_event(create_event_for_element(*link, HTML::EventNames::load));
@@ -1127,10 +1167,40 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
     }
     // 5. Otherwise, fire an event named error at el.
     else {
+        associate_empty_style_sheet(response, origin_clean);
         dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
     }
 
     finish_processing_stylesheet_resource(fetch_generation);
+}
+
+void HTMLLinkElement::associate_style_sheet(CSS::StyleSheetState& sheet, CSS::StyleScope::OriginClean origin_clean)
+{
+    auto media = attribute(HTML::AttributeNames::media);
+    auto title = in_a_document_tree() ? attribute(HTML::AttributeNames::title) : Optional<Utf16String> {};
+    document_or_shadow_root_style_scope().initialize_a_css_style_sheet(
+        sheet, this, media.has_value() ? media->utf16_view() : u""sv,
+        title.has_value() ? title.release_value() : Utf16String {},
+        (m_relationship & Relationship::Alternate && !m_explicitly_enabled) ? CSS::StyleScope::Alternate::Yes : CSS::StyleScope::Alternate::No,
+        origin_clean, nullptr, nullptr);
+    m_loaded_style_sheet = sheet;
+
+    // NB: Removing disabled explicitly enables the sheet, even if its title would disable it.
+    if (m_explicitly_enabled)
+        sheet.set_disabled(false);
+}
+
+// AD-HOC: The spec creates no style sheet for a link whose resource failed to load, but all major engines associate an
+//         empty one with it. Its origin-clean flag is still set only if the response was CORS-same-origin, which a
+//         network error never is.
+void HTMLLinkElement::associate_empty_style_sheet(Fetch::Infrastructure::Response const& response, CSS::StyleScope::OriginClean origin_clean)
+{
+    // NB: A link that was removed while its resource was being fetched no longer contributes a style sheet.
+    if (!is_browsing_context_connected())
+        return;
+
+    auto location = response.url_list().is_empty() ? document().encoding_parse_url(href()) : response.url_list().first();
+    associate_style_sheet(*parse_css_stylesheet(CSS::Parser::ParsingParams { document() }, u""sv, move(location)), origin_clean);
 }
 
 void HTMLLinkElement::cancel_pending_stylesheet_processing()
@@ -1170,60 +1240,6 @@ void HTMLLinkElement::finish_processing_stylesheet_resource(u64 fetch_generation
     } else {
         m_document_load_event_delayer.clear();
     }
-}
-
-static NonnullRefPtr<Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>> decode_favicon(ReadonlyBytes favicon_data, URL::URL const& favicon_url, GC::Ref<DOM::Document> document)
-{
-    auto promise = Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>::construct();
-
-    if (favicon_url.basename().ends_with(".svg"sv)) {
-        auto result = SVG::SVGDecodedImageData::create(document->page(), favicon_url, favicon_data);
-        if (result.is_error()) {
-            promise->reject(Error::from_string_view("Failed to decode SVG favicon"sv));
-            return promise;
-        }
-
-        // FIXME: Calculate size based on device pixel ratio
-        Gfx::IntSize size { 32, 32 };
-        auto decoded_frame = result.release_value()->default_frame(size);
-        if (!decoded_frame.has_value()) {
-            promise->reject(Error::from_string_view("Failed to get bitmap from SVG favicon"sv));
-            return promise;
-        }
-
-        promise->resolve(decoded_frame->bitmap_ref());
-        return promise;
-    }
-
-    auto on_failed_decode = [favicon_url, promise]([[maybe_unused]] Error& error) {
-        dbgln_if(IMAGE_DECODER_DEBUG, "Failed to decode favicon {}: {}", favicon_url, error);
-        promise->reject(move(error));
-    };
-
-    auto on_successful_decode = [document = GC::Root(document), promise](Web::Platform::DecodedImage& decoded_image) -> ErrorOr<void> {
-        auto favicon_bitmap = decoded_image.frames[0].bitmap;
-        dbgln_if(IMAGE_DECODER_DEBUG, "Decoded favicon, {}", favicon_bitmap->size());
-
-        promise->resolve(favicon_bitmap.release_nonnull());
-        return {};
-    };
-
-    (void)Platform::ImageCodecPlugin::the().decode_image(favicon_data, move(on_successful_decode), move(on_failed_decode));
-
-    return promise;
-}
-
-RefPtr<Gfx::Bitmap const> HTMLLinkElement::load_favicon_if_window_is_active()
-{
-    if (!has_loaded_icon())
-        return {};
-
-    // FIXME: Refactor the caller(s) to handle the async nature of image loading
-    auto promise = decode_favicon(m_loaded_icon->icon, m_loaded_icon->url, document());
-
-    if (auto result = promise->await(); !result.is_error())
-        return result.release_value();
-    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#rel-icon:the-link-element-3
@@ -1274,8 +1290,11 @@ void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> doc
         auto& realm = document->relevant_settings_object().realm();
         auto global = GC::Ref { realm.global_object() };
 
-        auto process_body = GC::create_function(GC::Heap::the(), [document, request](ByteBuffer body) {
-            decode_favicon(body, request->url(), document)
+        auto mime_type = Fetch::Infrastructure::extract_mime_type(response->header_list());
+
+        auto process_body = GC::create_function(GC::Heap::the(), [document, request, mime_type](ByteBuffer body) {
+            // FIXME: We should use the response URL to account for redirects when determining if this is an SVG icon.
+            decode_favicon(body, request->url(), mime_type, document)
                 ->when_resolved(GC::weak_callback(*document, [](DOM::Document& document, NonnullRefPtr<Gfx::Bitmap const>& favicon) {
                     if (auto navigable = document.navigable(); navigable && navigable->is_traversable())
                         navigable->page().client().page_did_change_favicon(*favicon);

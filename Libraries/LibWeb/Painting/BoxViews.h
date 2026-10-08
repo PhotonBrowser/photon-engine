@@ -41,7 +41,6 @@ WEB_API CSSPixels content_height(Layout::Node const&);
 WEB_API CSSPixels border_box_width(Layout::Node const&);
 WEB_API CSSPixels border_box_height(Layout::Node const&);
 WEB_API BoxModelMetrics box_model(Layout::Node const&);
-WEB_API Optional<CSS::BorderData> outline_data(Layout::Node const&, CSS::ComputedValues const&);
 WEB_API CSSPixelRect transform_reference_box(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
 WEB_API bool has_scrollable_overflow(Layout::Node const&);
@@ -55,23 +54,21 @@ WEB_API CSS::StyleRecordID style_record_identity(Layout::Node const&);
 WEB_API bool is_navigable_container_viewport_paintable(Layout::Node const&);
 WEB_API bool is_viewport_paintable(Layout::Node const&);
 WEB_API bool is_paintable_with_lines(Layout::Node const&);
-WEB_API bool is_inline_paintable(Layout::Node const&);
 WEB_API bool is_svg_svg_paintable(Layout::Node const&);
 
 WEB_API CSSPixelRect transform_rect_to_viewport(Layout::Node const&, CSSPixelRect const&, Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform = Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::Yes);
-WEB_API Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const&, CSSPixelPoint);
 WEB_API CSSPixelPoint inverse_transform_point(Layout::Node const&, CSSPixelPoint);
 WEB_API CSSPixelPoint transform_to_local_coordinates(Layout::Node const&, CSSPixelPoint);
 
 WEB_API bool has_accumulated_visual_context(Layout::Node const&);
 WEB_API Compositing::ContextRef accumulated_visual_context(Layout::Node const&);
 WEB_API Compositing::ContextRef accumulated_visual_context_for_descendants(Layout::Node const&);
-WEB_API Compositing::SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const&);
 WEB_API Compositing::SpatialNodeIndex own_scroll_node_index(Layout::Node const&);
 
 WEB_API Gfx::Path const* committed_svg_path(Layout::Node const&);
 WEB_API CSSPixelSize svg_viewport_size(Layout::Node const&);
 WEB_API Optional<Gfx::AffineTransform> svg_viewport_transform(Layout::Node const&);
+WEB_API Gfx::AffineTransform svg_element_transform(Layout::Node const&);
 WEB_API CSS::RustStyleValueHandle used_value_for_grid_template(Layout::Node const&, CSS::PropertyID);
 WEB_API Optional<String> grid_layout_json(Layout::Node const&, UniqueNodeID);
 WEB_API Optional<String> flex_layout_json(Layout::Node const&, UniqueNodeID);
@@ -101,7 +98,6 @@ WEB_API void set_needs_repaint_in_subtree(Layout::Node const&);
 // changes itself.
 WEB_API void request_document_repaint(DOM::Document const&, InvalidateDisplayList);
 
-WEB_API void invalidate_propagated_text_decoration_caches(Layout::Node const&);
 WEB_API void repaint_after_style_change(Layout::Node const&, CSS::RequiredInvalidationAfterStyleChange const&);
 
 WEB_API Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform();

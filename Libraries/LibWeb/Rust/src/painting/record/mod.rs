@@ -70,6 +70,8 @@ pub(crate) struct RecordingResult {
 /// The hit-test items of the published recording, shared with the list that hit testing reads.
 pub struct PublishedHitTestItems {
     pub items: Arc<Vec<HitTestItem>>,
+    /// The structural epoch of the visual context tree the items were recorded against, whose nodes they name.
+    pub structural_epoch: u64,
 }
 
 // What a recording shares with hit testing and with later recordings.
@@ -148,7 +150,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if let Some(facts) = self.scratch.hit_test_facts(paintable) {
             return facts;
         }
-        let facts = hit_test_items::hit_test_facts(self.source, paintable, self.inputs);
+        let facts = hit_test_items::hit_test_facts(self.source, paintable);
         self.scratch.set_hit_test_facts(paintable, facts);
         facts
     }

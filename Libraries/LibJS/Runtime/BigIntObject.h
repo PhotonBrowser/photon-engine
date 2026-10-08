@@ -13,28 +13,13 @@
 namespace JS {
 
 class JS_API BigIntObject final : public Object {
-    JS_OBJECT(BigIntObject, Object);
-    GC_DECLARE_ALLOCATOR(BigIntObject);
-
 public:
     static GC::Ref<BigIntObject> create(Realm&, BigInt&);
 
-    virtual ~BigIntObject() override = default;
+    BigInt const& bigint() const;
+    BigInt& bigint();
 
-    BigInt const& bigint() const { return m_bigint; }
-    BigInt& bigint() { return m_bigint; }
-
-private:
-    BigIntObject(BigInt&, Object& prototype);
-
-    virtual bool is_bigint_object() const final { return true; }
-
-    virtual void visit_edges(Visitor&) override;
-
-    GC::Ref<BigInt> m_bigint;
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_BIG_INT_OBJECT; }
 };
-
-template<>
-inline bool Object::fast_is<BigIntObject>() const { return is_bigint_object(); }
 
 }

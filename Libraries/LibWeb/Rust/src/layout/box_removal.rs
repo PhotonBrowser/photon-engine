@@ -26,9 +26,9 @@ use crate::render_state::{ArenaChange, DocumentHost};
 /// and has swapped its style already, the level the change names.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiDetachedBoxLevel {
     // Only the host names a level, and only a removal names this one.
-    #[allow(dead_code)]
     FromStyle,
     Block,
     AtomicInline,
@@ -171,6 +171,62 @@ impl LayoutNodeArena {
     }
 }
 
+impl LayoutNodeArena {
+    /// Whether the box of the element `node`, whose style stops generating it, can leave the box of its parent `parent`
+    /// in place, as the host finds before it builds the element alone again for such a style: the build then takes the
+    /// box out of its parent's, and builds nothing around it. Boxes that number what comes after them, a list item's
+    /// or one moving a counter or a quote, leave their parent's to a build of it.
+    pub(crate) fn can_take_box_away_in_place(&self, parent: StyleNodeID, node: StyleNodeID) -> bool {
+        use crate::css::style::bridge::element_adjustment_fact::IS_HTML_BODY_ELEMENT;
+        let (parent_row, row) = (self.bound_row(parent), self.bound_row(node));
+        if parent_row.is_invalid() || row.is_invalid() {
+            return false;
+        }
+        // The box's own style still says what it was, so its level comes from where it sits: a block container with
+        // block-level children holds block-level boxes, one with inline-level children inline-level ones, of which
+        // only an atomic inline leaves in place.
+        let box_is_block_level = !has_flag(self.data(parent_row), NodeFlag::ChildrenAreInline);
+        if !box_is_block_level && self.data(row).kind.get() == super::node_data::NodeKind::InlineNode {
+            return false;
+        }
+        let facts = self.with_style_store(|engine| {
+            let sibling = |sibling: Option<StyleNodeID>| FfiDetachedBoxSibling {
+                style_node: sibling.map_or(0, StyleNodeID::raw),
+                is_direct_without_box: sibling
+                    .and_then(|sibling| engine.element_published_box_facts(sibling))
+                    .is_none_or(|facts| !facts.display.is_contents()),
+            };
+            FfiDetachedBoxFacts {
+                parent_is_body: engine.element_adjustment_facts(parent) & IS_HTML_BODY_ELEMENT != 0,
+                previous_sibling: sibling(engine.tree().previous_sibling_in_dom_order(node)),
+                next_sibling: sibling(engine.tree().next_sibling_in_dom_order(node)),
+                level: match box_is_block_level {
+                    true => FfiDetachedBoxLevel::Block,
+                    false => FfiDetachedBoxLevel::AtomicInline,
+                },
+            }
+        });
+        self.can_detach_box_in_place(parent, parent_row, row, &facts) && !self.box_subtree_numbers_what_follows(row)
+    }
+
+    /// Whether a box in the subtree of `root` is a list item, or moves a counter or a quote depth.
+    fn box_subtree_numbers_what_follows(&self, root: NodeSlotId) -> bool {
+        let next_in_subtree = |row: NodeSlotId| {
+            let mut current = row;
+            let mut next = self.data(row).first_child.get();
+            while next.is_invalid() && current != root {
+                next = self.data(current).next_sibling.get();
+                current = self.data(current).parent.get();
+            }
+            (!next.is_invalid()).then_some(next)
+        };
+        std::iter::successors(Some(root), |&row| next_in_subtree(row)).any(|row| {
+            self.node_style_if_live(row)
+                .is_some_and(|style| style.display().is_list_item() || style.affects_generated_content_state())
+        })
+    }
+}
+
 impl BoxRemoval {
     /// Detaches the removed node's box from its parent's box in place where it can, owing the host what dropping the
     /// subtree owes it, and marks the parent for the layout tree build to rebuild otherwise.
@@ -218,17 +274,14 @@ impl BoxRemoval {
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_remove_box(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     parent: u32,
     child: u32,
     facts: FfiDetachedBoxFacts,
 ) {
-    assert!(!host.is_null(), "document host is null");
     let (Some(parent), Some(child)) = (StyleNodeID::from_raw(parent), StyleNodeID::from_raw(child)) else {
         panic!("a removed box and its parent are named by their identities");
     };
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
     // The rows stop reading as the arena once the box leaves, so the host reads none of them again, and the drop writes
     // the chunks in place rather than copies of those the host would still share.
     host.let_go_of_rows();
@@ -243,7 +296,7 @@ pub unsafe extern "C" fn render_state_remove_box(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_can_detach_box_in_place(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     parent: u32,
     child: u32,

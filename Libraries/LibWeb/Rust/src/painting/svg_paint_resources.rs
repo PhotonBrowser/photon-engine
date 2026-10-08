@@ -122,7 +122,7 @@ impl SvgPaintResourceRow {
 /// copies it only while a publication still holds it.
 pub(crate) type SvgPaintResourceRows = HashMap<NodeSlotId, SvgPaintResourceRow>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SvgPaintResources {
     rows: RefCell<Arc<SvgPaintResourceRows>>,
     needs_sync: Cell<bool>,
@@ -236,6 +236,11 @@ impl SvgPaintResources {
     pub(crate) fn share_enrolled_flag(&mut self, flag: Arc<AtomicBool>) {
         debug_assert!(!self.enrolled.load(Ordering::Relaxed));
         self.enrolled = flag;
+    }
+
+    /// Gives a fork a flag of its own, holding what the shared one holds now.
+    pub(crate) fn detach_enrolled_flag_for_fork(&mut self) {
+        self.enrolled = Arc::new(AtomicBool::new(self.enrolled.load(Ordering::Relaxed)));
     }
 
     pub(crate) fn has_enrolled_entries(&self) -> bool {

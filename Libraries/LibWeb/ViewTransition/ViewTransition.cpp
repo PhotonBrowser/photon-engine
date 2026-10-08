@@ -342,7 +342,7 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
         capture->old_mix_blend_mode = element.layout_node(read)->mix_blend_mode();
 
         // 11. Set capture’s old backdrop-filter to the computed value of backdrop-filter on element.
-        capture->old_backdrop_filter = element.layout_node(read)->backdrop_filter().materialize();
+        capture->old_backdrop_filter = element.layout_node(read)->backdrop_filter().filter_list();
 
         // 12. Set capture’s old color-scheme to the computed value of color-scheme on element.
         capture->old_color_scheme = element.layout_node(read)->color_scheme();
@@ -827,6 +827,8 @@ void ViewTransition::handle_transition_frame()
 ErrorOr<void> ViewTransition::update_pseudo_element_styles()
 {
     Layout::ForcedReadScope read { *m_document };
+    // NB: Ensure layout is up to date before reading the new elements' boxes.
+    m_document->update_layout(DOM::UpdateLayoutReason::ViewTransitionPseudoElementStyles);
     // To update pseudo-element styles for a ViewTransition transition:
 
     // 1. For each transitionName → capturedElement of transition’s named elements:
@@ -840,7 +842,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
         Optional<CSS::Direction> direction = {};
         // FIXME: Implement this once we have text-orientation.
         Optional<CSS::MixBlendMode> mix_blend_mode = {};
-        Optional<CSS::Filter> backdrop_filter = {};
+        CSS::RustStyleValueHandle backdrop_filter;
         Optional<CSS::PreferredColorScheme> color_scheme = {};
 
         // 2. If capturedElement’s new element is null, then:
@@ -877,15 +879,16 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
         else {
             // 1. Return failure if any of the following conditions is true:
 
+            //    - capturedElement’s new element is not rendered.
+            // NB: This is checked first, as ancestors of an element that is not rendered may have no computed style.
+            if (captured_element->new_element->not_rendered(read))
+                return Error::from_string_literal("capturedElement’s new element is not rendered.");
+
             //    - capturedElement’s new element has a flat tree ancestor that skips its contents.
             for (auto ancestor = captured_element->new_element->flat_tree_parent_element(); ancestor; ancestor = ancestor->flat_tree_parent_element()) {
                 if (ancestor->skips_its_contents())
                     return Error::from_string_literal("capturedElement’s new element has a flat tree ancestor that skips its contents.");
             }
-
-            //    - capturedElement’s new element is not rendered.
-            if (captured_element->new_element->not_rendered(read))
-                return Error::from_string_literal("capturedElement’s new element is not rendered.");
 
             //    - capturedElement has more than one box fragment.
             // FIXME: Implement this once we have fragments.
@@ -927,7 +930,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
             mix_blend_mode = captured_element->new_element->layout_node(read)->mix_blend_mode();
 
             // 10. Set backdropFilter to the computed value of backdrop-filter on capturedElement’s new element.
-            backdrop_filter = captured_element->new_element->layout_node(read)->backdrop_filter().materialize();
+            backdrop_filter = captured_element->new_element->layout_node(read)->backdrop_filter().filter_list();
 
             // 11. Set colorScheme to the computed value of color-scheme on capturedElement’s new element.
             color_scheme = captured_element->new_element->layout_node(read)->color_scheme();

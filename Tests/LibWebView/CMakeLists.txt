@@ -1,4 +1,5 @@
 set(TEST_SOURCES
+    TestAccessibilityTreeManager.cpp
     TestApplyHistoryStep.cpp
     TestBackgroundNetworking.cpp
     TestAutocompleteMuxer.cpp
@@ -72,8 +73,6 @@ if (APPLE OR LINUX)
     foreach(panic_strategy abort unwind)
         set(rust_test_library "${CMAKE_CURRENT_BINARY_DIR}/librust_crash_report_${panic_strategy}.a")
         set(ARG_CRATE_NAME "rust_crash_report_${panic_strategy}")
-        configure_file("${LADYBIRD_SOURCE_DIR}/Meta/CMake/RustPanicInit.cpp.in"
-            "${CMAKE_CURRENT_BINARY_DIR}/${ARG_CRATE_NAME}_init.cpp" @ONLY)
         add_custom_command(OUTPUT "${rust_test_library}"
             COMMAND ${CMAKE_COMMAND} -E env "CARGO_PKG_NAME=${ARG_CRATE_NAME}"
                 ${RUST_RUSTC} --edition=2024 --crate-type=staticlib --crate-name=${ARG_CRATE_NAME}
@@ -86,9 +85,11 @@ if (APPLE OR LINUX)
             LIBS LibWebView "${rust_test_library}")
         set_tests_properties(TestRustCrashReport_${panic_strategy} PROPERTIES TIMEOUT 60)
         add_dependencies(TestRustCrashReport_${panic_strategy} ${ARG_CRATE_NAME}_build)
-        target_sources(TestRustCrashReport_${panic_strategy} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${ARG_CRATE_NAME}_init.cpp")
         if (panic_strategy STREQUAL "unwind")
             target_compile_definitions(TestRustCrashReport_${panic_strategy} PRIVATE TEST_RUST_UNWIND=1)
+        endif()
+        if (cpptrace_FOUND AND LADYBIRD_ENABLE_CPPTRACE)
+            target_compile_definitions(TestRustCrashReport_${panic_strategy} PRIVATE TEST_HAS_CPPTRACE=1)
         endif()
     endforeach()
 endif()
@@ -106,6 +107,13 @@ if (NOT WIN32)
     target_link_libraries(TestAutocomplete PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
     if (APPLE)
         target_compile_definitions(TestAutocomplete PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
+    add_executable(TestFavicon TestFavicon.cpp)
+    add_dependencies(TestFavicon ${ladybird_helper_processes})
+    target_link_libraries(TestFavicon PRIVATE AK LibCore LibFileSystem LibGfx LibIPC LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestFavicon PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
     add_executable(TestFileDownloader TestFileDownloader.cpp)
@@ -281,6 +289,9 @@ if (BUILD_TESTING AND NOT WIN32)
 
     add_test(NAME TestAutocomplete COMMAND $<TARGET_FILE:TestAutocomplete>)
     set_tests_properties(TestAutocomplete PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+
+    add_test(NAME TestFavicon COMMAND $<TARGET_FILE:TestFavicon>)
+    set_tests_properties(TestFavicon PROPERTIES TIMEOUT 120 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
     add_test(NAME TestFileDownloader COMMAND $<TARGET_FILE:TestFileDownloader>)
     set_tests_properties(TestFileDownloader PROPERTIES TIMEOUT 120 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})

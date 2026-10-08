@@ -309,25 +309,14 @@ WEB_API Optional<PropertyID> property_id_from_string(Utf16View);
 [[nodiscard]] WEB_API Utf16FlyString const& string_from_property_id(PropertyID);
 [[nodiscard]] Utf16FlyString const& camel_case_string_from_property_id(PropertyID);
 WEB_API bool is_inherited_property(PropertyID);
-// The ComputedValues style group this longhand's computed value is declared to live in, by name,
-// or nothing when the property declares no group. Checked at style group registration against the
-// bindings derived from what actually builds the groups.
-WEB_API Optional<StringView> style_group_name_of_property(PropertyID);
 WEB_API NonnullRefPtr<StyleValue const> property_initial_value(PropertyID);
 
-enum class PropertyMultiplicity {{
-    Single,
-    List,
-    CoordinatingList,
-}};
-PropertyMultiplicity property_multiplicity(PropertyID);
 bool property_is_single_valued(PropertyID);
 bool property_is_list_valued(PropertyID);
 
 bool property_accepts_type(PropertyID, ValueType);
 WEB_API NumericRangesByValueType property_accepted_ranges_by_value_type(PropertyID);
 bool property_accepts_keyword(PropertyID, Keyword);
-Optional<Keyword> resolve_legacy_value_alias(PropertyID, Keyword);
 Optional<ValueType> property_resolves_percentages_relative_to(PropertyID);
 
 // These perform range-checking, but are also safe to call with properties that don't accept that type. (They'll just return false.)
@@ -347,16 +336,8 @@ WEB_API Vector<PropertyID> const& longhands_for_shorthand(PropertyID);
 Vector<PropertyID> const& expanded_longhands_for_shorthand(PropertyID);
 bool property_maps_to_shorthand(PropertyID);
 Vector<PropertyID> const& shorthands_for_longhand(PropertyID);
-WEB_API Vector<PropertyID> const& property_computation_order();
 bool property_is_positional_value_list_shorthand(PropertyID);
 
-
-size_t property_maximum_value_count(PropertyID);
-
-bool property_affects_layout(PropertyID);
-bool property_affects_stacking_context(PropertyID);
-bool property_affects_accumulated_visual_contexts(PropertyID);
-bool property_affects_scrollable_overflow(PropertyID);
 bool property_needs_layout_for_getcomputedstyle(PropertyID);
 bool property_needs_layout_node_for_resolved_value(PropertyID);
 
@@ -368,14 +349,6 @@ constexpr PropertyID first_longhand_property_id = PropertyID::{title_casify(firs
 constexpr PropertyID last_longhand_property_id = PropertyID::{title_casify(last_longhand_property_id)};
 constexpr size_t number_of_longhand_properties = to_underlying(last_longhand_property_id) - to_underlying(first_longhand_property_id) + 1;
 
-enum class Quirk {{
-    // https://quirks.spec.whatwg.org/#the-hashless-hex-color-quirk
-    HashlessHexColor,
-    // https://quirks.spec.whatwg.org/#the-unitless-length-quirk
-    UnitlessLength,
-}};
-bool property_has_quirk(PropertyID, Quirk);
-
 struct LogicalAliasMappingContext {{
     WritingMode writing_mode;
     Direction direction;
@@ -383,7 +356,6 @@ struct LogicalAliasMappingContext {{
 }};
 WEB_API bool property_is_logical_alias(PropertyID);
 WEB_API PropertyID map_logical_alias_to_physical_property(PropertyID logical_property_id, LogicalAliasMappingContext const&);
-WEB_API PropertyID map_physical_property_to_logical_alias(PropertyID physical_property_id, LogicalAliasMappingContext const&);
 
 enum class LogicalPropertyGroup : {logical_property_group_underlying_type} {{
 """)
@@ -425,6 +397,8 @@ def write_implementation_file(out: TextIO, properties: dict, logical_property_gr
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/CSS/StyleValues/TimeStyleValue.h>
+#include <LibWeb/ComputedValuesRustFFI.h>
+#include <LibWeb/StyleValueRustFFI.h>
 #include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::CSS {
@@ -558,102 +532,6 @@ bool is_inherited_property(PropertyID property_id)
     return false;
 }
 
-Optional<StringView> style_group_name_of_property(PropertyID property_id)
-{
-    switch (property_id) {
-""")
-
-    style_groups: dict[str, list[str]] = {}
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        # A logical alias inherits its physical template's fields, but its computed value lives in
-        # the physical property's group field, so it declares no group of its own.
-        if "logical-alias-for" in value:
-            continue
-        if style_group := value.get("style-group"):
-            style_groups.setdefault(style_group, []).append(name)
-    for style_group, group_properties in style_groups.items():
-        for name in group_properties:
-            out.write(f"    case PropertyID::{title_casify(name)}:\n")
-        out.write(f'        return "{style_group}"sv;\n')
-
-    out.write("""
-    default:
-        return {};
-    }
-}
-
-bool property_affects_layout(PropertyID property_id)
-{
-    switch (property_id) {
-""")
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        affects_layout = value.get("affects-layout", True)
-        if affects_layout:
-            out.write(f"    case PropertyID::{title_casify(name)}:\n")
-
-    out.write("""
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool property_affects_stacking_context(PropertyID property_id)
-{
-    switch (property_id) {
-""")
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        if value.get("affects-stacking-context", False):
-            out.write(f"    case PropertyID::{title_casify(name)}:\n")
-    out.write("""
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool property_affects_accumulated_visual_contexts(PropertyID property_id)
-{
-    switch (property_id) {
-""")
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        if value.get("affects-accumulated-visual-contexts", False):
-            out.write(f"    case PropertyID::{title_casify(name)}:\n")
-    out.write("""
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool property_affects_scrollable_overflow(PropertyID property_id)
-{
-    switch (property_id) {
-""")
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        if value.get("affects-scrollable-overflow", False):
-            out.write(f"    case PropertyID::{title_casify(name)}:\n")
-    out.write("""
-        return true;
-    default:
-        return false;
-    }
-}
-
 bool property_needs_layout_for_getcomputedstyle(PropertyID property_id)
 {
     switch (property_id) {
@@ -696,10 +574,15 @@ NonnullRefPtr<StyleValue const> property_initial_value(PropertyID property_id)
     if (auto initial_value = (*initial_values)[to_underlying(property_id)])
         return initial_value.release_nonnull();
 
-    // Lazily parse initial values as needed.
-    // This ensures the shorthands will always be able to get the initial values of their longhands.
-    // This also now allows a longhand have its own longhand (like background-position-x).
+    // A longhand's initial value is the one style computation selects, which Rust parses.
+    if (property_id >= first_longhand_property_id && property_id <= last_longhand_property_id) {
+        auto const* data = static_cast<StyleValueFFI::StyleValueData const*>(ComputedValuesFFI::rust_style_metadata_initial_value(to_underlying(property_id)));
+        auto initial_value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(data));
+        (*initial_values)[to_underlying(property_id)] = initial_value;
+        return initial_value;
+    }
 
+    // Lazily parse shorthand initial values as needed.
     Parser::ParsingParams parsing_params;
     switch (property_id) {
 """)
@@ -710,6 +593,8 @@ NonnullRefPtr<StyleValue const> property_initial_value(PropertyID property_id)
         if "initial" not in value:
             print(f"No initial value specified for property '{name}'", file=sys.stderr)
             sys.exit(1)
+        if "longhands" not in value:
+            continue
         initial_value_string = value["initial"]
         title = title_casify(name)
         out.write(f"""        case PropertyID::{title}:
@@ -724,32 +609,6 @@ NonnullRefPtr<StyleValue const> property_initial_value(PropertyID property_id)
 
     out.write("""        default: VERIFY_NOT_REACHED();
     }
-    VERIFY_NOT_REACHED();
-}
-
-PropertyMultiplicity property_multiplicity(PropertyID property_id)
-{
-    switch (property_id) {
-""")
-
-    for name, value in properties.items():
-        multiplicity = value.get("multiplicity")
-        if multiplicity is not None and multiplicity != "single":
-            if multiplicity not in ("single", "list", "coordinating-list"):
-                print(
-                    f"'{multiplicity}' is not a valid value for 'multiplicity'. "
-                    "Accepted values are: 'single', 'list', 'coordinating-list'",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            out.write(f"    case PropertyID::{title_casify(name)}:\n")
-            out.write(f"        return PropertyMultiplicity::{title_casify(multiplicity)};\n")
-
-    out.write("""
-    default:
-        return PropertyMultiplicity::Single;
-    }
-
     VERIFY_NOT_REACHED();
 }
 
@@ -777,40 +636,6 @@ bool property_is_list_valued(PropertyID property_id)
 
     out.write("""
         return true;
-    default:
-        return false;
-    }
-}
-
-bool property_has_quirk(PropertyID property_id, Quirk quirk)
-{
-    switch (property_id) {
-""")
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        quirks = value.get("quirks")
-        if quirks:
-            out.write(f"""
-    case PropertyID::{title_casify(name)}: {{
-        switch (quirk) {{
-""")
-            out.writelines(
-                f"""
-        case Quirk::{title_casify(quirk)}:
-            return true;
-"""
-                for quirk in quirks
-            )
-            out.write("""
-        default:
-            return false;
-        }
-    }
-""")
-
-    out.write("""
     default:
         return false;
     }
@@ -945,45 +770,6 @@ bool property_accepts_keyword(PropertyID property_id, Keyword keyword)
     }
 }
 
-Optional<Keyword> resolve_legacy_value_alias(PropertyID property_id, Keyword keyword)
-{
-    switch (property_id) {
-""")
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        valid_identifiers = value.get("valid-identifiers")
-        if not valid_identifiers:
-            continue
-        has_any_legacy_value_aliases = any(">" in k for k in valid_identifiers)
-        if not has_any_legacy_value_aliases:
-            continue
-
-        out.write(f"""
-    case PropertyID::{title_casify(name)}:
-        switch (keyword) {{""")
-        for keyword_string in valid_identifiers:
-            if ">" not in keyword_string:
-                continue
-            parts = keyword_string.split(">", 1)
-            out.write(f"""
-        case Keyword::{title_casify(parts[0])}:
-            return Keyword::{title_casify(parts[1])};""")
-        out.write("""
-        default:
-            break;
-        }
-        break;
-""")
-
-    out.write("""
-    default:
-        break;
-    }
-    return {};
-}
-
 Optional<ValueType> property_resolves_percentages_relative_to(PropertyID property_id)
 {
     switch (property_id) {
@@ -1005,27 +791,7 @@ Optional<ValueType> property_resolves_percentages_relative_to(PropertyID propert
         return {};
     }
 }
-
-size_t property_maximum_value_count(PropertyID property_id)
-{
-    switch (property_id) {
 """)
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        if "max-values" in value:
-            max_values = value["max-values"]
-            out.write(f"""
-    case PropertyID::{title_casify(name)}:
-        return {max_values};
-""")
-
-    out.write("""
-    default:
-        return 1;
-    }
-}""")
 
     generate_bounds_checking_function(out, properties, "angle", "Angle", "value.raw_value()")
     generate_bounds_checking_function(out, properties, "flex", "Flex", "value.raw_value()")
@@ -1214,59 +980,7 @@ Vector<PropertyID> const& shorthands_for_longhand(PropertyID property_id)
 }
 """)
 
-    manually_specified_computation_order = [
-        # math-depth is required to compute font-size
-        "MathDepth",
-        # Font properties are required to absolutize font-relative units used in other properties, including line-height.
-        "FontFamily",
-        "FontFeatureSettings",
-        "FontKerning",
-        "FontOpticalSizing",
-        "FontSize",
-        "FontStyle",
-        "FontVariantAlternates",
-        "FontVariantCaps",
-        "FontVariantEastAsian",
-        "FontVariantEmoji",
-        "FontVariantLigatures",
-        "FontVariantNumeric",
-        "FontVariantPosition",
-        "FontVariationSettings",
-        "FontWeight",
-        "FontWidth",
-        "TextRendering",
-        # line-height is required to absolutize `lh` units used in other properties.
-        "LineHeight",
-        # color-scheme is included in the generic computation context in order to compute light-dark() color functions
-        "ColorScheme",
-        # background-image is required to compute the other background-* properties
-        "BackgroundImage",
-        # text direction and writing mode properties are required to map logical properties to their physical counterparts
-        "Direction",
-        "WritingMode",
-    ]
-
     out.write("""
-Vector<PropertyID> const& property_computation_order() {
-    static auto const& order = *new Vector<PropertyID> {
-""")
-    out.writelines(f"        PropertyID::{property_name},\n" for property_name in manually_specified_computation_order)
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        if "longhands" in value:
-            continue
-        if title_casify(name) in manually_specified_computation_order:
-            continue
-        out.write(f"        PropertyID::{title_casify(name)},\n")
-
-    out.write("""
-    };
-
-    return order;
-}
-
 bool property_is_positional_value_list_shorthand(PropertyID property_id)
 {
     switch (property_id)
@@ -1524,33 +1238,6 @@ PropertyID map_logical_alias_to_physical_property(PropertyID property_id, Logica
     default:
         VERIFY(!property_is_logical_alias(property_id));
         return property_id;
-    }
-}
-
-PropertyID map_physical_property_to_logical_alias(PropertyID property_id, LogicalAliasMappingContext const& mapping_context)
-{
-    switch (property_id) {
-""")
-
-    for group in logical_property_groups.values():
-        physical_properties = group["physical"]
-        logical_properties = group["logical"]
-
-        for physical_property_name in physical_properties.values():
-            out.write(f"        case PropertyID::{title_casify(physical_property_name)}:\n")
-            out.writelines(
-                f"""
-            if (map_logical_alias_to_physical_property(PropertyID::{title_casify(logical_property_name)}, mapping_context) == property_id)
-                return PropertyID::{title_casify(logical_property_name)};
-"""
-                for logical_property_name in logical_properties.values()
-            )
-            out.write("            VERIFY_NOT_REACHED();\n")
-
-    out.write("""
-        default:
-            VERIFY(!logical_property_group_for_property(property_id).has_value() || property_is_logical_alias(property_id));
-            return property_id;
     }
 }
 

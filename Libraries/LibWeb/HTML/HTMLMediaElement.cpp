@@ -279,6 +279,10 @@ void HTMLMediaElement::attribute_changed(Utf16FlyString const& name, Optional<Ut
             create_controls();
         else
             destroy_controls();
+    } else if (name == HTML::AttributeNames::loop) {
+        // AD-HOC: Other browsers reflect the loop attribute in the ended attribute immediately, rather than once the
+        //         event loop reaches step 1.
+        update_ended_attribute();
     } else if (name == HTML::AttributeNames::preload || name == HTML::AttributeNames::autoplay) {
         if (m_waiting_for_an_implementation_defined_event_to_fetch_the_resource
             && !should_wait_for_an_implementation_defined_event_before_fetching_the_resource()) {
@@ -531,12 +535,7 @@ void HTMLMediaElement::set_current_time(double current_time)
     if (m_ready_state == ReadyState::HaveNothing) {
         m_default_playback_start_position = current_time;
     } else {
-        // AD-HOC: Don't set the official playback position here, as seek_element() will set it according to the seekable
-        //         ranges. We return the value passed to the setter to ensure that chained assignments like
-        //             videoA.currentTime = videoB.currentTime = Number.MAX_VALUE;
-        //         will seek both videoA and videoB to their corresponding ending positions.
-        //         See https://github.com/whatwg/html/issues/11773
-
+        // AD-HOC: seek_element() sets the official playback position, once the playback manager has begun seeking.
         seek_element(current_time);
     }
 }
@@ -546,6 +545,12 @@ void HTMLMediaElement::fast_seek(double time)
 {
     // The fastSeek(time) method must seek to the time given by time, with the approximate-for-speed flag set.
     seek_element(time, MediaSeekMode::ApproximateForSpeed);
+}
+
+void HTMLMediaElement::seek_from_media_controls(double time)
+{
+    set_current_time(time);
+    m_prevent_next_loop_while_paused = true;
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#current-playback-position
@@ -560,6 +565,11 @@ void HTMLMediaElement::set_official_playback_position(double position)
 {
     m_official_playback_position = position;
     m_official_playback_position_task_generation = main_thread_event_loop().task_generation();
+
+    // AD-HOC: Other browsers keep the ended attribute in line with the official playback position, so that a seek or
+    //         load within a task is reflected by both, rather than only once the event loop reaches step 1.
+    //         See https://github.com/whatwg/html/issues/11773
+    update_ended_attribute();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#dom-media-duration
@@ -2167,20 +2177,6 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
     //     https://html.spec.whatwg.org/multipage/media.html#media-elements
     //     Therefore, we enumerate all the available tracks into our VideoTrackList and AudioTrackList.
 
-    // -> If the media resource is found to have an audio track
-    // -> If the media resource is found to have a video track
-    m_playback_manager->on_track_added = GC::weak_callback(*this, [](auto& self, auto& track) {
-        if (track.type() == Media::TrackType::Audio)
-            self.on_audio_track_added(track);
-        else
-            self.on_video_track_added(track);
-    });
-
-    // -> Once enough of the media data has been fetched to determine the duration of the media resource, its dimensions, and other metadata
-    m_playback_manager->on_metadata_parsed = GC::weak_callback(*this, [](auto& self) {
-        self.on_metadata_parsed(SourceType::Remote);
-    });
-
     set_up_playback_manager_error_handler(GC::weak_callback(*this, [](auto& self, Utf16String error_message) {
         // 1. The user agent should cancel the fetching process.
         VERIFY(self.m_remote_fetch_data);
@@ -2191,7 +2187,22 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
         failure_callback(move(error_message));
     }));
 
-    m_playback_manager->add_media_source(*m_remote_fetch_data->stream);
+    m_playback_manager->add_media_source(*m_remote_fetch_data->stream)
+        ->when_resolved(GC::weak_callback(*this, [](auto& self, MediaClient::RemotePlaybackManager::AddedTracks& added_tracks) {
+            // -> If the media resource is found to have an audio track
+            for (auto const& track : added_tracks.audio_tracks)
+                self.on_audio_track_added(track);
+
+            // -> If the media resource is found to have a video track
+            for (auto const& track : added_tracks.video_tracks)
+                self.on_video_track_added(track);
+
+            // -> Once enough of the media data has been fetched to determine the duration of the media resource, its dimensions, and other metadata
+            self.on_metadata_parsed(SourceType::Remote);
+        }))
+        .when_rejected(GC::weak_callback(*this, [](auto& self, Media::DecoderError& error) {
+            self.handle_playback_manager_error(move(error));
+        }));
 
     m_playback_manager->on_playback_state_change = GC::weak_callback(*this, [](auto& self) {
         self.on_playback_manager_state_change();
@@ -2207,30 +2218,39 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
 // https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
 void HTMLMediaElement::set_up_playback_manager_error_handler(Function<void(Utf16String)> failure_callback)
 {
-    m_playback_manager->on_error = GC::weak_callback(*this, [failure_callback = move(failure_callback)](auto& self, Media::DecoderError&& error) mutable {
-        auto const* playback_manager_ptr = self.m_playback_manager.ptr();
+    m_playback_manager_failure_callback = move(failure_callback);
+    m_playback_manager->on_error = GC::weak_callback(*this, [](auto& self, Media::DecoderError&& error) {
+        self.handle_playback_manager_error(move(error));
+    });
+}
 
-        // NB: Queue a task for this so that we don't destroy the PlaybackManager within one of its callbacks when we
-        //     call forget_media_resource_specific_tracks().
-        self.queue_a_media_element_task([error = move(error), playback_manager_ptr, failure_callback = move(failure_callback)](HTMLMediaElement& self) {
-            if (self.m_error)
-                return;
-            if (playback_manager_ptr != self.m_playback_manager.ptr())
-                return;
+// https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
+void HTMLMediaElement::handle_playback_manager_error(Media::DecoderError&& error)
+{
+    auto const* playback_manager_ptr = m_playback_manager.ptr();
 
-            // NB: The playback manager reports every failure through one callback, so the ready state decides which of the
-            //     failure steps below apply: until metadata arrives the resource was never established as usable.
+    // NB: Queue a task for this so that we don't destroy the PlaybackManager within one of its callbacks when we
+    //     call forget_media_resource_specific_tracks().
+    queue_a_media_element_task([error = move(error), playback_manager_ptr](HTMLMediaElement& self) {
+        if (self.m_error)
+            return;
+        if (playback_manager_ptr != self.m_playback_manager.ptr())
+            return;
 
-            // -> If the media data is corrupted
-            if (self.m_ready_state != ReadyState::HaveNothing) {
-                self.set_decoder_error(Utf16String::from_utf8(error.description()));
-                return;
-            }
+        // NB: Failures to add a media source and failures during playback are both handled here, so the ready state
+        //     decides which of the failure steps below apply: until metadata arrives the resource was never established
+        //     as usable.
 
-            // -> If the media data can be fetched but is found by inspection to be in an unsupported format, or can otherwise not be rendered at all
-            VERIFY(failure_callback);
-            failure_callback(Utf16String::from_utf8(error.description()));
-        });
+        // -> If the media data is corrupted
+        if (self.m_ready_state != ReadyState::HaveNothing) {
+            self.set_decoder_error(Utf16String::from_utf8(error.description()));
+            return;
+        }
+
+        // -> If the media data can be fetched but is found by inspection to be in an unsupported format, or can otherwise not be rendered at all
+        VERIFY(self.m_playback_manager_failure_callback);
+        auto failure_callback = move(self.m_playback_manager_failure_callback);
+        failure_callback(Utf16String::from_utf8(error.description()));
     });
 }
 
@@ -2244,44 +2264,8 @@ void HTMLMediaElement::set_up_playback_manager_for_local(Function<void(Utf16Stri
     m_has_enabled_preferred_audio_track = false;
     m_has_selected_preferred_video_track = false;
 
-    // NB: The spec is unclear on whether the following media resource track conditions should trigger multiple
-    //     times on one media resource, but it is implied to be possible by the start of the "Media elements"
-    //     section, where it says that a "media resource can have multiple audio and video tracks."
-    //     https://html.spec.whatwg.org/multipage/media.html#media-elements
-    //     Therefore, we enumerate all the available tracks into our VideoTrackList and AudioTrackList.
-
-    // AD-HOC: Enable the tracks in PlaybackManager if MediaSource already enabled them in the DOM.
-    //         Note that we do not want to call on_(audio/video)_track_added() here, since the MSE spec takes care
-    //         of setting up the tracks.
-    m_playback_manager->on_track_added = GC::weak_callback(*this, [](auto& self, auto& track) {
-        if (track.type() == Media::TrackType::Audio) {
-            self.m_audio_tracks->for_each_track([&](auto& element_track) {
-                if (!element_track.enabled())
-                    return IterationDecision::Continue;
-                if (element_track.track_in_playback_manager() == track) {
-                    self.m_playback_manager->enable_an_audio_track(track);
-                    return IterationDecision::Break;
-                }
-                return IterationDecision::Continue;
-            });
-        } else if (track.type() == Media::TrackType::Video) {
-            self.m_video_tracks->for_each_track([&](auto& element_track) {
-                if (!element_track.selected())
-                    return IterationDecision::Continue;
-                if (element_track.track_in_playback_manager() == track) {
-                    self.m_selected_video_track = element_track;
-                    self.attach_selected_video_track_sink(track);
-                    return IterationDecision::Break;
-                }
-                return IterationDecision::Continue;
-            });
-        }
-    });
-
-    // -> Once enough of the media data has been fetched to determine the duration of the media resource, its dimensions, and other metadata
-    m_playback_manager->on_metadata_parsed = GC::weak_callback(*this, [](auto& self) {
-        self.on_metadata_parsed(SourceType::Local);
-    });
+    // NB: The Media Source Extensions spec creates the tracks in its initialization segment received algorithm, and
+    //     SourceBuffer runs the steps once enough of the media data has been fetched to determine its metadata.
 
     set_up_playback_manager_error_handler(GC::weak_callback(*this, [failure_callback = move(failure_callback)](auto& self, Utf16String error_message) {
         // 1. The user agent should cancel the fetching process.
@@ -2743,23 +2727,26 @@ void HTMLMediaElement::note_frame_captured() const
 
 void HTMLMediaElement::on_playback_manager_state_change()
 {
-    VERIFY(m_playback_manager);
-    auto state = m_playback_manager->state();
-    if (seeking() && state != Media::PlaybackState::Seeking)
-        finish_seeking_element();
-    if (state == Media::PlaybackState::Ended && !m_error) {
-        upon_current_playback_position_possibly_changed();
-        reached_end_of_media_playback();
-    }
-
-    start_or_stop_playback_position_update_timer();
-
     // NB: Queue the readyState update as a task so that it will never run before the durationchange and loadedmetadata
     //     events are fired. This ensures that readyState has a deterministic value in those events.
     queue_a_media_element_task([](HTMLMediaElement& self) {
         if (self.m_ready_state >= ReadyState::HaveMetadata)
             self.update_ready_state();
     });
+
+    VERIFY(m_playback_manager);
+    auto state = m_playback_manager->state();
+    if (seeking() && state != Media::PlaybackState::Seeking)
+        finish_seeking_element();
+
+    start_or_stop_playback_position_update_timer();
+
+    if (state == Media::PlaybackState::Ended && !m_error) {
+        upon_current_playback_position_possibly_changed();
+        reached_end_of_media_playback();
+    }
+
+    upon_has_ended_playback_possibly_changed();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#internal-play-steps
@@ -2778,7 +2765,10 @@ void HTMLMediaElement::play_element()
 
     // 2. If the playback has ended and the direction of playback is forwards, seek to the earliest possible position
     //    of the media resource.
-    if (has_ended_playback() && direction_of_playback() == PlaybackDirection::Forwards)
+    // AD-HOC: Ignore the loop attribute here, so that playback restarts from the beginning if it was specified after
+    //         playback ended.
+    //         See https://github.com/whatwg/html/issues/4487
+    if (has_ended_playback(IgnoreLoopAttribute::Yes) && direction_of_playback() == PlaybackDirection::Forwards)
         seek_element(0);
 
     // 3. If the media element's paused attribute is true, then:
@@ -2808,13 +2798,6 @@ void HTMLMediaElement::play_element()
         //    notify about playing for the element.
         else {
             notify_about_playing();
-
-            // AD-HOC: If the official playback position is at the end of the media data here, that means that we haven't
-            //         run the reached the end of media playback steps. This can happen if we seeked to the end while paused
-            //         and looping.
-            //         See https://github.com/whatwg/html/issues/11774
-            if (m_official_playback_position == m_duration)
-                reached_end_of_media_playback();
         }
     }
 
@@ -2867,6 +2850,8 @@ void HTMLMediaElement::pause_element()
 // https://html.spec.whatwg.org/multipage/media.html#dom-media-seek
 void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek_mode)
 {
+    m_prevent_next_loop_while_paused = false;
+
     // 1. Set the media element's show poster flag to false.
     set_show_poster(false);
 
@@ -2888,15 +2873,17 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
     // NOTE: We implement the async nature of seeking through PlaybackManager, and the steps here are implemented as options
     //       that define how PlaybackManager's seeking behaves.
 
+    auto new_playback_position = playback_position;
+
     // 6. If the new playback position is later than the end of the media resource, then let it be the end of the media resource instead.
-    playback_position = min(playback_position, m_duration);
+    new_playback_position = min(new_playback_position, m_duration);
 
     // 7. If the new playback position is less than the earliest possible position, let it be that position instead.
-    playback_position = max(playback_position, 0);
+    new_playback_position = max(new_playback_position, 0);
 
     // 8. If the (possibly now changed) new playback position is not in one of the ranges given in the seekable attribute,
     auto time_ranges = seekable();
-    if (!time_ranges->in_range(playback_position)) {
+    if (!time_ranges->in_range(new_playback_position)) {
         // then let it be the position in one of the ranges given in the seekable attribute that is the nearest to the new
         // playback position.
 
@@ -2911,7 +2898,7 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
         double distance = INFINITY;
         for (size_t i = 0; i < time_ranges->length(); i++) {
             for (double point : { MUST(time_ranges->start(i)), MUST(time_ranges->end(i)) }) {
-                auto point_distance = abs(playback_position - point);
+                auto point_distance = abs(new_playback_position - point);
                 if (point_distance < distance) {
                     nearest_point = point;
                     other_nearest_point = {};
@@ -2929,9 +2916,9 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
             auto nearest_point_distance = abs(current_position - nearest_point);
             auto other_nearest_point_distance = abs(current_position - other_nearest_point.value());
             if (nearest_point_distance < other_nearest_point_distance) {
-                playback_position = nearest_point;
+                new_playback_position = nearest_point;
             } else {
-                playback_position = other_nearest_point.value();
+                new_playback_position = other_nearest_point.value();
             }
         }
     }
@@ -2942,9 +2929,9 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
     //    playback position, then the adjusted new playback position must also be after the current playback position.
     auto manager_seek_mode = Media::SeekMode::Accurate;
     if (seek_mode == MediaSeekMode::ApproximateForSpeed) {
-        if (playback_position < current_playback_position())
+        if (new_playback_position < current_playback_position())
             manager_seek_mode = Media::SeekMode::FastBefore;
-        else if (playback_position > current_playback_position())
+        else if (new_playback_position > current_playback_position())
             manager_seek_mode = Media::SeekMode::FastAfter;
     }
 
@@ -2956,17 +2943,18 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
     // 11. Set the current playback position to the new playback position.
     if (m_playback_manager) {
         AK::Duration new_playback_position_as_duration;
-        if (playback_position == m_duration)
+        if (new_playback_position == m_duration)
             new_playback_position_as_duration = m_playback_manager->duration();
         else
-            new_playback_position_as_duration = AK::Duration::from_seconds_f64(playback_position);
+            new_playback_position_as_duration = AK::Duration::from_seconds_f64(new_playback_position);
         m_playback_manager->seek(new_playback_position_as_duration, manager_seek_mode);
     }
 
-    // AD-HOC: Ensure that currentTime returns the new playback position on the timeline immediately, as other
-    //         browsers do.
+    // AD-HOC: Set the official playback position to the requested position, as the currentTime setter would. Doing it
+    //         here also covers fastSeek(), which other browsers reflect in currentTime immediately, and ensures the
+    //         ended attribute is updated after the playback manager has left its ended state.
     //         See https://github.com/whatwg/html/issues/11773
-    set_official_playback_position(current_playback_position());
+    set_official_playback_position(playback_position);
 
     // 12. Wait until the user agent has established whether or not the media data for the new playback position is
     //     available, and, if it is, until it has decoded enough data to play back that position.
@@ -3225,7 +3213,7 @@ HTMLMediaElement::PlaybackDirection HTMLMediaElement::direction_of_playback() co
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#ended-playback
-bool HTMLMediaElement::has_ended_playback() const
+bool HTMLMediaElement::has_ended_playback(IgnoreLoopAttribute ignore_loop_attribute) const
 {
     // A media element is said to have ended playback when:
 
@@ -3245,11 +3233,7 @@ bool HTMLMediaElement::has_ended_playback() const
         direction_of_playback() == PlaybackDirection::Forwards &&
 
         // The media element does not have a loop attribute specified.
-        // AD-HOC: Use the value of the loop attribute from the last time we reached end of playback.
-        //         Without this change, the ended attribute changes when enabling the loop attribute after
-        //         playback has ended, and playback will not restart when playing the element.
-        //         See https://github.com/whatwg/html/issues/11775
-        !m_loop_was_specified_when_reaching_end_of_media_resource) {
+        (ignore_loop_attribute == IgnoreLoopAttribute::Yes || !has_attribute(HTML::AttributeNames::loop))) {
         return true;
     }
 
@@ -3271,21 +3255,35 @@ void HTMLMediaElement::upon_has_ended_playback_possibly_changed()
     run_when_event_loop_reaches_step_1(GC::Function<void()>::create(GC::Heap::the(), [&] {
         // The ended attribute must return true if, the last time the event loop reached step 1, the media element had ended
         // playback and the direction of playback was forwards, and false otherwise.
-        set_ended(has_ended_playback() && direction_of_playback() == PlaybackDirection::Forwards);
+        update_ended_attribute();
     }));
+}
+
+void HTMLMediaElement::update_ended_attribute()
+{
+    // NB: Forgetting the media resource releases the playback manager before the readyState returns to HAVE_NOTHING.
+    if (!m_playback_manager) {
+        set_ended(false);
+        return;
+    }
+    set_ended(has_ended_playback(IgnoreLoopAttribute::No) && direction_of_playback() == PlaybackDirection::Forwards);
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#reaches-the-end
 void HTMLMediaElement::reached_end_of_media_playback()
 {
     // 1. If the media element has a loop attribute specified,
-    m_loop_was_specified_when_reaching_end_of_media_resource = has_attribute(HTML::AttributeNames::loop);
-    if (m_loop_was_specified_when_reaching_end_of_media_resource) {
+    if (has_attribute(HTML::AttributeNames::loop)) {
         // then seek to the earliest possible position of the media resource and return.
-        // AD-HOC: We don't want to loop back to the start if we're paused.
-        //         See https://github.com/whatwg/html/issues/11774
-        if (!paused())
-            seek_element(0);
+
+        // AD-HOC: Don't seek back to the start while scrubbing from the media controls. Playing will restart it.
+        if (m_prevent_next_loop_while_paused) {
+            if (paused())
+                return;
+            m_prevent_next_loop_while_paused = false;
+        }
+
+        seek_element(0);
         // FIXME: Tell PlaybackManager that we're looping to allow data providers to decode frames ahead when looping
         //        and remove any delay in displaying the first frame again.
         return;
@@ -3294,23 +3292,33 @@ void HTMLMediaElement::reached_end_of_media_playback()
     // 2. As defined above, the ended IDL attribute starts returning true once the event loop returns to step 1.
 
     // 3. Queue a media element task given the media element and the following steps:
+    // AD-HOC: Queue each step in its own task, so that loading a new resource in the timeupdate or pause handlers
+    //         removes the remaining tasks instead of firing ended at the new resource.
+
     queue_a_media_element_task([](HTMLMediaElement& self) {
         // 1. Fire an event named timeupdate at the media element.
         self.dispatch_time_update_event();
+    });
 
+    queue_a_media_element_task([](HTMLMediaElement& self) {
         // 2. If the media element has ended playback, the direction of playback is forwards, and paused is false, then:
-        if (self.has_ended_playback() && self.direction_of_playback() == PlaybackDirection::Forwards && !self.paused()) {
+        if (self.has_ended_playback(IgnoreLoopAttribute::No) && self.direction_of_playback() == PlaybackDirection::Forwards && !self.paused()) {
             // 1. Set the paused attribute to true.
             self.set_paused(true);
+
+            // AD-HOC: Take the pending play promises before firing pause, so that play() calls in the pause handler
+            //         are not rejected.
+            auto promises = self.take_pending_play_promises();
 
             // 2. Fire an event named pause at the media element.
             self.dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::pause));
 
             // 3. Take pending play promises and reject pending play promises with the result and an "AbortError" DOMException.
-            auto promises = self.take_pending_play_promises();
             self.reject_pending_play_promises<WebIDL::AbortError>(promises, "Media playback has ended"_utf16);
         }
+    });
 
+    queue_a_media_element_task([](HTMLMediaElement& self) {
         // 3. Fire an event named ended at the media element.
         self.dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::ended));
     });

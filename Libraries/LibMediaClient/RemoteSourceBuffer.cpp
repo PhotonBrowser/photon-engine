@@ -43,6 +43,27 @@ bool RemoteSourceBuffer::can_send() const
     return m_client && m_client->is_open();
 }
 
+Media::DemuxerScanState RemoteSourceBuffer::scan_state() const
+{
+    return {
+        .track_buffered_ranges = m_published_state.track_buffered_ranges,
+        .reached_end_of_stream = m_reached_end_of_stream,
+        .duration = m_published_state.highest_end_time,
+    };
+}
+
+void RemoteSourceBuffer::set_published_state(Media::MediaSourceExtensions::PublishedState state)
+{
+    m_published_state = move(state);
+    notify_playback_manager_of_state_change();
+}
+
+void RemoteSourceBuffer::notify_playback_manager_of_state_change()
+{
+    if (m_playback_manager)
+        m_playback_manager->source_buffer_state_changed({});
+}
+
 void RemoteSourceBuffer::set_content_type_subtype(StringView subtype)
 {
     if (can_send())
@@ -94,6 +115,25 @@ void RemoteSourceBuffer::remove_coded_frames(AK::Duration start, AK::Duration en
         m_client->async_remove_source_buffer_coded_frames(m_session_id, m_id, start, end);
 }
 
+void RemoteSourceBuffer::run_coded_frame_eviction(size_t new_data_size)
+{
+    if (can_send())
+        m_client->async_run_source_buffer_coded_frame_eviction(m_session_id, m_id, new_data_size);
+}
+
+void RemoteSourceBuffer::run_coded_frame_eviction_synchronously(size_t new_data_size)
+{
+    if (!can_send())
+        return;
+    auto response = m_client->send_sync_but_allow_failure<Messages::MediaServer::RunSourceBufferCodedFrameEvictionSynchronously>(m_session_id, m_id, new_data_size);
+    if (!response)
+        return;
+    auto state = response->take_state();
+    if (!state.has_value())
+        return;
+    set_published_state(state.release_value());
+}
+
 void RemoteSourceBuffer::set_mode(Media::MediaSourceExtensions::AppendMode mode)
 {
     m_published_state.mode = mode;
@@ -129,6 +169,8 @@ void RemoteSourceBuffer::set_pending_initialization_segment_for_change_type_flag
 
 void RemoteSourceBuffer::set_reached_end_of_stream(bool reached)
 {
+    m_reached_end_of_stream = reached;
+    notify_playback_manager_of_state_change();
     if (can_send())
         m_client->async_set_source_buffer_reached_end_of_stream(m_session_id, m_id, reached);
 }
@@ -146,6 +188,8 @@ void RemoteSourceBuffer::duration_received(Badge<RemotePlaybackManager>, double 
 
 void RemoteSourceBuffer::first_initialization_segment_received(Badge<RemotePlaybackManager>, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Vector<Media::Track> text_tracks)
 {
+    m_audio_tracks = audio_tracks;
+    m_video_tracks = video_tracks;
     if (on_first_initialization_segment_received)
         on_first_initialization_segment_received(move(audio_tracks), move(video_tracks), move(text_tracks));
 }
@@ -159,7 +203,7 @@ void RemoteSourceBuffer::coded_frames_processed(Badge<RemotePlaybackManager>, AK
 void RemoteSourceBuffer::append_completed(Badge<RemotePlaybackManager>, u64 append_generation, Media::MediaSourceExtensions::PublishedState state)
 {
     m_append_generation_awaiting_outcome.clear();
-    m_published_state = move(state);
+    set_published_state(move(state));
     if (on_append_completed)
         on_append_completed(append_generation);
 }
@@ -167,7 +211,7 @@ void RemoteSourceBuffer::append_completed(Badge<RemotePlaybackManager>, u64 appe
 void RemoteSourceBuffer::append_failed(Badge<RemotePlaybackManager>, u64 append_generation, Media::MediaSourceExtensions::PublishedState state)
 {
     m_append_generation_awaiting_outcome.clear();
-    m_published_state = move(state);
+    set_published_state(move(state));
     if (on_append_failed)
         on_append_failed(append_generation);
 }
@@ -184,7 +228,7 @@ void RemoteSourceBuffer::connection_lost(Badge<RemotePlaybackManager>)
 
 void RemoteSourceBuffer::removal_completed(Badge<RemotePlaybackManager>, Media::MediaSourceExtensions::PublishedState state)
 {
-    m_published_state = move(state);
+    set_published_state(move(state));
     if (on_removal_completed)
         on_removal_completed();
 }

@@ -12,47 +12,23 @@
 namespace JS {
 
 class ErrorConstructor final : public NativeFunction {
-    JS_OBJECT(ErrorConstructor, NativeFunction);
-    GC_DECLARE_ALLOCATOR(ErrorConstructor);
-
 public:
-    virtual void initialize(Realm&) override;
-    virtual ~ErrorConstructor() override = default;
-
-    virtual ThrowCompletionOr<Value> call() override;
-    virtual ThrowCompletionOr<GC::Ref<Object>> construct(FunctionObject& new_target) override;
-
-private:
-    explicit ErrorConstructor(Realm&);
-
-    virtual bool has_constructor() const override { return true; }
-
-    JS_DECLARE_NATIVE_FUNCTION(is_error);
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_ERROR_CONSTRUCTOR; }
 };
 
-#define DECLARE_NATIVE_ERROR_CONSTRUCTOR(ClassName, snake_name, PrototypeName, ConstructorName)    \
-    class ConstructorName final : public NativeFunction {                                          \
-        JS_OBJECT(ConstructorName, NativeFunction);                                                \
-        GC_DECLARE_ALLOCATOR(ConstructorName);                                                     \
-                                                                                                   \
-    public:                                                                                        \
-        virtual void initialize(Realm&) override;                                                  \
-        virtual ~ConstructorName() override;                                                       \
-        virtual ThrowCompletionOr<Value> call() override;                                          \
-        virtual ThrowCompletionOr<GC::Ref<Object>> construct(FunctionObject& new_target) override; \
-                                                                                                   \
-    private:                                                                                       \
-        explicit ConstructorName(Realm&);                                                          \
-                                                                                                   \
-        virtual bool has_constructor() const override                                              \
-        {                                                                                          \
-            return true;                                                                           \
-        }                                                                                          \
+#define DECLARE_NATIVE_ERROR_CONSTRUCTOR(ConstructorName, layout_class_id)                                           \
+    class ConstructorName final : public NativeFunction {                                                            \
+    public:                                                                                                          \
+        static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == layout_class_id; } \
     };
 
-#define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
-    DECLARE_NATIVE_ERROR_CONSTRUCTOR(ClassName, snake_name, PrototypeName, ConstructorName)
-JS_ENUMERATE_NATIVE_ERRORS
-#undef __JS_ENUMERATE
+DECLARE_NATIVE_ERROR_CONSTRUCTOR(EvalErrorConstructor, JS_LAYOUT_CLASS_ID_EVAL_ERROR_CONSTRUCTOR)
+DECLARE_NATIVE_ERROR_CONSTRUCTOR(InternalErrorConstructor, JS_LAYOUT_CLASS_ID_INTERNAL_ERROR_CONSTRUCTOR)
+DECLARE_NATIVE_ERROR_CONSTRUCTOR(RangeErrorConstructor, JS_LAYOUT_CLASS_ID_RANGE_ERROR_CONSTRUCTOR)
+DECLARE_NATIVE_ERROR_CONSTRUCTOR(ReferenceErrorConstructor, JS_LAYOUT_CLASS_ID_REFERENCE_ERROR_CONSTRUCTOR)
+DECLARE_NATIVE_ERROR_CONSTRUCTOR(SyntaxErrorConstructor, JS_LAYOUT_CLASS_ID_SYNTAX_ERROR_CONSTRUCTOR)
+DECLARE_NATIVE_ERROR_CONSTRUCTOR(TypeErrorConstructor, JS_LAYOUT_CLASS_ID_TYPE_ERROR_CONSTRUCTOR)
+DECLARE_NATIVE_ERROR_CONSTRUCTOR(URIErrorConstructor, JS_LAYOUT_CLASS_ID_URI_ERROR_CONSTRUCTOR)
+#undef DECLARE_NATIVE_ERROR_CONSTRUCTOR
 
 }

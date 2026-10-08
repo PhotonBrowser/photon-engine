@@ -29,7 +29,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::css::animated_overlay::AnimatedOverlay;
 use crate::css::animated_overlay::overlay_wins;
-use crate::css::ffi_stats::{self, FfiOp};
+use crate::css::ffi_stats;
 use crate::css::host_shared::{HostShared, SharedPayload};
 use crate::css::property_metadata::{
     FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID, property_id, property_is_inherited,
@@ -57,7 +57,6 @@ pub(crate) fn longhand_slot_hash(slot: usize, value: *const c_void) -> u64 {
     if value.is_null() {
         return mix_slot_hash(slot, 0);
     }
-    ffi_stats::bump(FfiOp::LonghandTableSlotHash);
     let content = unsafe { crate::css::style_value::style_value_content_hash(value.cast()) };
     mix_slot_hash(slot, content)
 }
@@ -71,10 +70,10 @@ pub(crate) fn longhand_slot_hash(slot: usize, value: *const c_void) -> u64 {
 /// has to be spelled with atomics for the compiler to agree, and it is cheaper than the `Cell`
 /// pair it replaces was: `adjust_slot_hash_sum` runs per slot write, and a relaxed store is one
 /// instruction.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MemoizedHashSum {
-    sum: AtomicU64,
-    known: AtomicBool,
+    sum: crate::fork::ForkCopied<AtomicU64>,
+    known: crate::fork::ForkCopied<AtomicBool>,
 }
 
 impl MemoizedHashSum {
@@ -99,6 +98,7 @@ impl MemoizedHashSum {
 /// One sparse inheritance-dependent specified value, exposed to C++ as the
 /// borrowed span behind a style's inheritance-dependent value view.
 #[repr(C)]
+#[derive(Clone)]
 pub struct FfiTableInheritanceDependentValue {
     pub property: u16,
     pub value: *const c_void,
@@ -158,7 +158,6 @@ struct DenseSlotStorage {
 impl Clone for DenseSlotStorage {
     fn clone(&self) -> Self {
         // NB: Only copying an unfrozen host working table can share mutable dense storage.
-        ffi_stats::bump(FfiOp::LonghandTableStorageAllocations);
         ffi_stats::count_table_copy(|| {
             (
                 LONGHAND_COUNT as u64,
@@ -199,7 +198,6 @@ impl DenseSlotStorage {
     }
 
     fn new_shared() -> Arc<Self> {
-        ffi_stats::bump(FfiOp::LonghandTableStorageAllocations);
         let mut storage = Arc::<Self>::new_uninit();
         let pointer = Arc::get_mut(&mut storage).unwrap().as_mut_ptr();
         // SAFETY: Every field is initialized in place below, so the allocation holds a complete value
@@ -218,6 +216,7 @@ impl DenseSlotStorage {
 /// A working table borrows unchanged slots through one owner of a flat base.
 /// The base is always dense, so even a seed made from another working delta
 /// cannot introduce a chain. Publication materializes only a unique result.
+#[derive(Clone)]
 struct ChangedSlot {
     index: u16,
     // None keeps the base value; Some(none()) represents an empty slot.
@@ -227,6 +226,7 @@ struct ChangedSlot {
 
 // NB: Inline changes avoid a separate allocation for each sparse drive.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 enum SlotStorage {
     Dense(Arc<DenseSlotStorage>),
     Delta {
@@ -513,6 +513,8 @@ impl SlotStorage {
     }
 }
 
+#[derive(Clone)]
+
 pub struct ComputedLonghandTable {
     storage: SlotStorage,
     /// Whether the longhand's winning declaration was `!important`, in the
@@ -717,7 +719,6 @@ impl ComputedLonghandTable {
         if let Some(sum) = self.slot_hash_sum.get() {
             return sum;
         }
-        ffi_stats::bump(FfiOp::LonghandTableFullHash);
         let sum = self.recomputed_slot_hash_sum();
         self.slot_hash_sum.set(Some(sum));
         sum
@@ -878,7 +879,6 @@ impl ComputedLonghandTable {
             !self.frozen,
             "the computed longhand table is immutable once its style is created"
         );
-        ffi_stats::bump(FfiOp::LonghandTableClone);
         self.slot_hash_sum.set(source.slot_hash_sum.get());
         self.important_bits = source.important_bits;
         self.inherited_bits = source.inherited_bits;
@@ -1488,22 +1488,6 @@ pub unsafe extern "C" fn rust_computed_longhand_table_raw_cascaded_font_size(
     unsafe { &*table }.raw_cascaded_font_size()
 }
 
-/// Replaces the retained raw cascaded font-size data.
-///
-/// # Safety
-/// `table` must be a valid, unfrozen, uniquely owned table. `data` must be
-/// null or point at live `StyleValueData`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_computed_longhand_table_set_raw_cascaded_font_size(
-    table: *mut ComputedLonghandTable,
-    data: *const c_void,
-) {
-    let value = (!data.is_null()).then(|| unsafe {
-        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(data.cast()))
-    });
-    unsafe { &mut *table }.set_raw_cascaded_font_size(value);
-}
-
 /// Marks a longhand's stored value `!important` (or not).
 ///
 /// # Safety
@@ -1538,16 +1522,6 @@ pub unsafe extern "C" fn rust_computed_longhand_table_is_important(
     property_id: u16,
 ) -> bool {
     unsafe { &*table }.is_important(property_id)
-}
-
-/// # Safety
-/// `table` must be a valid table.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_computed_longhand_table_is_inherited(
-    table: *const ComputedLonghandTable,
-    property_id: u16,
-) -> bool {
-    unsafe { &*table }.is_inherited(property_id)
 }
 
 /// The importance bitmap, in the C++ `FixedBitmap` byte layout. The pointer

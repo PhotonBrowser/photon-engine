@@ -164,7 +164,7 @@ impl InlineBoxPieceRecord {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PaintableSideData {
     // Invalidation also runs while paint geometry is borrowed. Keep this
     // mutable cache state out of the plain-data row shared with C++.
@@ -234,6 +234,11 @@ impl CommittedSideData {
 
     pub(crate) fn lines(&self) -> &[crate::layout::inline_content::LineRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.lines)
+    }
+    pub(crate) fn lines_after_clamp_point_rect(&self) -> Option<used_values::FfiCssPixelRect> {
+        self.inline_content
+            .as_ref()
+            .and_then(|content| content.lines_after_clamp_point_rect.as_deref().copied())
     }
     pub(crate) fn fragments(&self) -> &[FragmentRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.fragments)

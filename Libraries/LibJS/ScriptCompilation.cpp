@@ -4,86 +4,123 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/AtomicRefCounted.h>
-#include <LibJS/Bytecode/Executable.h>
-#include <LibJS/Runtime/ECMAScriptFunctionObject.h>
-#include <LibJS/Runtime/SharedFunctionInstanceData.h>
+#include <LibCore/EventLoop.h>
+#include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibJS/RustIntegration.h>
+#include <LibJS/ScriptAndModuleABIConversions.h>
 #include <LibJS/ScriptCompilation.h>
 #include <LibJS/SourceTextModule.h>
 
 namespace JS {
 
-CompiledDynamicFunction::CompiledDynamicFunction(GC::Ref<SharedFunctionInstanceData> function_data)
+using namespace EmbeddingABI;
+
+static_assert(to_underlying(FunctionKind::Normal) == JS_FUNCTION_KIND_NORMAL);
+static_assert(to_underlying(FunctionKind::Generator) == JS_FUNCTION_KIND_GENERATOR);
+static_assert(to_underlying(FunctionKind::Async) == JS_FUNCTION_KIND_ASYNC);
+static_assert(to_underlying(FunctionKind::AsyncGenerator) == JS_FUNCTION_KIND_ASYNC_GENERATOR);
+static_assert(sizeof(ScriptOrModule) == sizeof(JSScriptOrModule));
+static_assert(sizeof(Position) == sizeof(JSPosition));
+static_assert(offsetof(Position, line) == offsetof(JSPosition, line));
+static_assert(offsetof(Position, column) == offsetof(JSPosition, column));
+
+static JSParsedProgram* parsed_program_to_abi(FFI::ParsedProgram* program)
+{
+    return reinterpret_cast<JSParsedProgram*>(program);
+}
+
+static FFI::ParsedProgram* parsed_program_from_abi(JSParsedProgram* program)
+{
+    return reinterpret_cast<FFI::ParsedProgram*>(program);
+}
+
+static JSCompiledProgram* compiled_program_to_abi(FFI::CompiledProgram* program)
+{
+    return reinterpret_cast<JSCompiledProgram*>(program);
+}
+
+static FFI::CompiledProgram* compiled_program_from_abi(JSCompiledProgram* program)
+{
+    return reinterpret_cast<FFI::CompiledProgram*>(program);
+}
+
+CompiledDynamicFunction::CompiledDynamicFunction(GC::Ref<FunctionData> function_data)
     : m_function_data(function_data)
 {
 }
 
 Result<CompiledDynamicFunction, Utf16String> CompiledDynamicFunction::compile(VM& vm, Utf16View source_text, Utf16View parameters_string, Utf16View body_parse_string, FunctionKind kind)
 {
-    auto compilation = RustIntegration::compile_dynamic_function(vm, source_text, parameters_string, body_parse_string, kind);
-    if (!compilation.has_value())
-        return "Failed to compile dynamic function"_utf16;
-    if (compilation->is_error())
-        return compilation->release_error();
-    return CompiledDynamicFunction { compilation->value() };
+    JSOwnedUtf16String error_message {};
+    auto* function_data = js_function_compile_dynamic(vm_to_abi(vm), utf16_view_to_abi(source_text), utf16_view_to_abi(parameters_string), utf16_view_to_abi(body_parse_string), to_underlying(kind), &error_message);
+    if (!function_data)
+        return owned_utf16_string_from_abi(error_message);
+    return CompiledDynamicFunction { *reinterpret_cast<FunctionData*>(function_data) };
 }
 
 GC::Ref<FunctionObject> CompiledDynamicFunction::instantiate(Realm& realm, Environment& scope, GC::Ptr<PrivateEnvironment> private_environment, ScriptOrModule script_or_module) const
 {
-    auto function = ECMAScriptFunctionObject::create_from_function_data(realm, *m_function_data, scope, private_environment);
-    function->set_script_or_module(move(script_or_module));
-    return function;
+    auto* function = js_function_instantiate_dynamic(
+        vm_to_abi(realm.vm()),
+        realm_to_abi(realm),
+        reinterpret_cast<JSSharedFunctionData*>(m_function_data.ptr()),
+        reinterpret_cast<JSEnvironment*>(&scope),
+        reinterpret_cast<JSPrivateEnvironment*>(private_environment.ptr()),
+        bit_cast<JSScriptOrModule>(script_or_module));
+    return static_cast<FunctionObject&>(object_from_abi(function));
 }
 
-Vector<Position> breakpoint_positions_for_source(SourceCode const& source_code, ProgramType type, size_t line_number_offset)
+Vector<Position> breakpoint_positions_for_source(SourceCode const& source_code, ProgramType program_type, size_t line_number_offset)
 {
-    return RustIntegration::breakpoint_positions_for_source(source_code, type, line_number_offset);
+    Vector<Position> positions;
+    JSPositionSink sink {
+        .context = &positions,
+        .append = [](void* context, JSPosition const* abi_positions, size_t count) {
+            static_cast<Vector<Position>*>(context)->append(reinterpret_cast<Position const*>(abi_positions), count);
+        },
+    };
+    js_compile_breakpoint_positions_for_source(utf16_view_to_abi(source_code.code().utf16_view()), program_type_to_abi(program_type), line_number_offset, &sink);
+    return positions;
 }
 
-ParsedProgram::ParsedProgram(FFI::ParsedProgram* program, size_t source_length_in_code_units)
+ParsedProgram::ParsedProgram(FFI::ParsedProgram* program)
     : m_program(program)
-    , m_source_length_in_code_units(source_length_in_code_units)
 {
 }
 
 ParsedProgram::ParsedProgram(ParsedProgram&& other)
     : m_program(exchange(other.m_program, nullptr))
-    , m_source_length_in_code_units(other.m_source_length_in_code_units)
 {
 }
 
 ParsedProgram& ParsedProgram::operator=(ParsedProgram&& other)
 {
     if (this != &other) {
-        if (m_program)
-            RustIntegration::free_parsed_program(m_program);
+        js_compile_parsed_program_destroy(parsed_program_to_abi(m_program));
         m_program = exchange(other.m_program, nullptr);
-        m_source_length_in_code_units = other.m_source_length_in_code_units;
     }
     return *this;
 }
 
 ParsedProgram::~ParsedProgram()
 {
-    if (m_program)
-        RustIntegration::free_parsed_program(m_program);
+    js_compile_parsed_program_destroy(parsed_program_to_abi(m_program));
 }
 
-ParsedProgram ParsedProgram::parse(ReadonlySpan<u16> source_text, ProgramType type, size_t line_number_offset)
+ParsedProgram ParsedProgram::parse(ReadonlySpan<u16> source_text, ProgramType program_type, size_t line_number_offset)
 {
-    return { RustIntegration::parse_program(source_text.data(), source_text.size(), type, line_number_offset), source_text.size() };
+    JSUtf16View source { source_text.data(), source_text.size(), false };
+    return ParsedProgram { parsed_program_from_abi(js_compile_parse(source, program_type_to_abi(program_type), line_number_offset)) };
 }
 
 bool ParsedProgram::has_errors() const
 {
-    return RustIntegration::parsed_program_has_errors(m_program);
+    return js_compile_parsed_program_has_errors(parsed_program_to_abi(m_program));
 }
 
 ParsedProgram ParsedProgram::clone() const
 {
-    return { RustIntegration::clone_parsed_program(m_program), m_source_length_in_code_units };
+    return ParsedProgram { parsed_program_from_abi(js_compile_parsed_program_clone(parsed_program_to_abi(m_program))) };
 }
 
 CompiledProgram::CompiledProgram(FFI::CompiledProgram* program)
@@ -99,8 +136,7 @@ CompiledProgram::CompiledProgram(CompiledProgram&& other)
 CompiledProgram& CompiledProgram::operator=(CompiledProgram&& other)
 {
     if (this != &other) {
-        if (m_program)
-            RustIntegration::free_compiled_program(m_program);
+        js_compile_compiled_program_destroy(compiled_program_to_abi(m_program));
         m_program = exchange(other.m_program, nullptr);
     }
     return *this;
@@ -108,175 +144,143 @@ CompiledProgram& CompiledProgram::operator=(CompiledProgram&& other)
 
 CompiledProgram::~CompiledProgram()
 {
-    if (m_program)
-        RustIntegration::free_compiled_program(m_program);
+    js_compile_compiled_program_destroy(compiled_program_to_abi(m_program));
 }
 
 CompiledProgram CompiledProgram::compile(ParsedProgram parsed)
 {
-    return CompiledProgram { RustIntegration::compile_parsed_program_off_thread(exchange(parsed.m_program, nullptr), parsed.m_source_length_in_code_units) };
+    auto* program = parsed_program_to_abi(exchange(parsed.m_program, nullptr));
+    return CompiledProgram { compiled_program_from_abi(js_compile_parsed_program(program)) };
 }
 
 CompiledProgram CompiledProgram::compile_all_functions(ParsedProgram parsed)
 {
-    return CompiledProgram { RustIntegration::compile_parsed_program_fully_off_thread(exchange(parsed.m_program, nullptr), parsed.m_source_length_in_code_units) };
+    auto* program = parsed_program_to_abi(exchange(parsed.m_program, nullptr));
+    return CompiledProgram { compiled_program_from_abi(js_compile_parsed_program_with_all_functions(program)) };
 }
 
-ByteBuffer CompiledProgram::serialize_for_bytecode_cache(ProgramType type, ReadonlyBytes source_hash) const
+ByteBuffer CompiledProgram::serialize_for_bytecode_cache(ProgramType program_type, ReadonlyBytes source_hash) const
 {
-    return RustIntegration::serialize_compiled_program_for_bytecode_cache(*m_program, type, source_hash);
+    ByteBuffer blob;
+    JSByteSink sink {
+        .context = &blob,
+        .append = [](void* context, u8 const* bytes, size_t length) {
+            return !static_cast<ByteBuffer*>(context)->try_append(bytes, length).is_error();
+        },
+    };
+    if (!js_bytecode_cache_serialize(compiled_program_to_abi(m_program), program_type_to_abi(program_type), source_hash.data(), source_hash.size(), &sink))
+        return {};
+    return blob;
 }
 
 Result<GC::Ref<Script>, Vector<ParserError>> create_script(ParsedProgram parsed, NonnullRefPtr<SourceCode const> source_code, Realm& realm, StringView filename, GC::Ptr<GC::Cell> host_defined)
 {
-    return Script::create_from_parsed(exchange(parsed.m_program, nullptr), move(source_code), realm, filename, host_defined);
+    ParserErrorCollector errors;
+    auto utf16_filename = filename_to_utf16(filename);
+    auto* script = js_compile_create_script_from_parsed_program(
+        vm_to_abi(realm.vm()),
+        parsed_program_to_abi(exchange(parsed.m_program, nullptr)),
+        source_code_to_abi(*source_code),
+        realm_to_abi(realm),
+        utf16_view_to_abi(utf16_filename.utf16_view()),
+        host_defined.ptr(),
+        errors.sink());
+    return record_or_parser_errors_from_abi<Script>(script, errors);
 }
 
 Result<GC::Ref<Script>, Vector<ParserError>> create_script(CompiledProgram compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm, StringView filename, GC::Ptr<GC::Cell> host_defined)
 {
-    return Script::create_from_compiled(exchange(compiled.m_program, nullptr), move(source_code), realm, filename, host_defined);
+    auto utf16_filename = filename_to_utf16(filename);
+    auto* script = js_compile_create_script_from_compiled_program(
+        vm_to_abi(realm.vm()),
+        compiled_program_to_abi(exchange(compiled.m_program, nullptr)),
+        source_code_to_abi(*source_code),
+        realm_to_abi(realm),
+        utf16_view_to_abi(utf16_filename.utf16_view()),
+        host_defined.ptr());
+    return script_from_abi(script);
 }
 
 Result<GC::Ref<SourceTextModule>, Vector<ParserError>> create_module(ParsedProgram parsed, NonnullRefPtr<SourceCode const> source_code, Realm& realm, StringView filename, GC::Ptr<GC::Cell> host_defined)
 {
-    return SourceTextModule::parse_from_pre_parsed(exchange(parsed.m_program, nullptr), move(source_code), realm, filename, host_defined);
+    ParserErrorCollector errors;
+    auto utf16_filename = filename_to_utf16(filename);
+    auto* module = js_compile_create_module_from_parsed_program(
+        vm_to_abi(realm.vm()),
+        parsed_program_to_abi(exchange(parsed.m_program, nullptr)),
+        source_code_to_abi(*source_code),
+        realm_to_abi(realm),
+        utf16_view_to_abi(utf16_filename.utf16_view()),
+        host_defined.ptr(),
+        errors.sink());
+    return record_or_parser_errors_from_abi<SourceTextModule>(module, errors);
 }
 
 Result<GC::Ref<SourceTextModule>, Vector<ParserError>> create_module(CompiledProgram compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm, StringView filename, GC::Ptr<GC::Cell> host_defined)
 {
-    return SourceTextModule::parse_from_pre_compiled(exchange(compiled.m_program, nullptr), move(source_code), realm, filename, host_defined);
+    auto utf16_filename = filename_to_utf16(filename);
+    auto* module = js_compile_create_module_from_compiled_program(
+        vm_to_abi(realm.vm()),
+        compiled_program_to_abi(exchange(compiled.m_program, nullptr)),
+        source_code_to_abi(*source_code),
+        realm_to_abi(realm),
+        utf16_view_to_abi(utf16_filename.utf16_view()),
+        host_defined.ptr());
+    return module_from_abi<SourceTextModule>(module);
 }
 
-RefPtr<DecodedBytecodeCache> decode_and_validate_bytecode_cache(Core::ImmutableBytes bytes, ProgramType type, ReadonlyBytes source_hash, size_t source_length_in_code_units, Core::EventLoop& main_thread_event_loop)
+RefPtr<DecodedBytecodeCache> decode_and_validate_bytecode_cache(Core::ImmutableBytes bytes, ProgramType program_type, ReadonlyBytes source_hash, size_t source_length_in_code_units, Core::EventLoop& main_thread_event_loop)
 {
-    auto* blob = RustIntegration::decode_bytecode_cache_blob(move(bytes), type, source_hash, main_thread_event_loop);
-    if (!blob)
-        return {};
-    if (!RustIntegration::validate_decoded_bytecode_cache_blob(blob, source_length_in_code_units)) {
-        RustIntegration::free_decoded_bytecode_cache_blob(blob);
-        return {};
-    }
-    return DecodedBytecodeCache::create(blob);
+    // The runtime may release the bytes on this thread, so their last reference goes on the main thread.
+    struct BlobBytesOwner {
+        AK_ALLOC_WITH_KMALLOC;
+
+        Core::ImmutableBytes bytes;
+        Core::EventLoop& main_thread_event_loop;
+    };
+    auto* bytes_owner = new BlobBytesOwner { move(bytes), main_thread_event_loop };
+    JSBytecodeCacheBlobOwner owner {
+        .owner = bytes_owner,
+        .release = [](void* owner) {
+            auto* bytes_owner = static_cast<BlobBytesOwner*>(owner);
+            bytes_owner->main_thread_event_loop.deferred_invoke([bytes_owner] { delete bytes_owner; });
+        },
+    };
+    auto blob = bytes_owner->bytes.bytes();
+    return adopt_decoded_bytecode_cache_from_abi(js_bytecode_cache_decode_and_validate(blob.data(), blob.size(), program_type_to_abi(program_type), source_hash.data(), source_hash.size(), source_length_in_code_units, owner));
 }
 
-// The worker can still be inside post_to_main_thread() when the main thread runs the posted task and moves on, so each
-// side holds its own reference to the callbacks.
-class SharedOffThreadCompilationCallbacks final : public AtomicRefCounted<SharedOffThreadCompilationCallbacks> {
-public:
-    explicit SharedOffThreadCompilationCallbacks(OffThreadCompilationCallbacks callbacks)
-        : callbacks(move(callbacks))
-    {
-    }
-
-    OffThreadCompilationCallbacks callbacks;
-};
-
-struct LazyFunctionsToCompile {
-    Vector<GC::Root<SharedFunctionInstanceData>> shared_function_data;
-    Vector<void*> function_asts;
-};
-
-static LazyFunctionsToCompile lazy_functions_to_compile(Bytecode::Executable const& executable)
+// The host's callbacks, which the runtime shares between the main thread and the workers until it releases them.
+static JSOffThreadCompilationCallbacks off_thread_compilation_callbacks_to_abi(OffThreadCompilationCallbacks callbacks)
 {
-    LazyFunctionsToCompile functions;
-    for (auto& shared_data : executable.shared_function_data) {
-        if (!shared_data || shared_data->m_executable || !shared_data->m_rust_function_ast)
-            continue;
-
-        auto* cloned_ast = RustIntegration::clone_function_ast(shared_data->m_rust_function_ast);
-        if (!cloned_ast)
-            continue;
-
-        functions.shared_function_data.append(GC::make_root(*shared_data));
-        functions.function_asts.append(cloned_ast);
-    }
-    return functions;
+    return JSOffThreadCompilationCallbacks {
+        .context = new OffThreadCompilationCallbacks(move(callbacks)),
+        .submit_work = [](void* context, JSOffThreadTask task) { static_cast<OffThreadCompilationCallbacks*>(context)->submit_work([task] { task.run(task.data); }); },
+        .post_to_main_thread = [](void* context, JSOffThreadTask task) { static_cast<OffThreadCompilationCallbacks*>(context)->post_to_main_thread([task] { task.run(task.data); }); },
+        .release = [](void* context) { delete static_cast<OffThreadCompilationCallbacks*>(context); },
+    };
 }
 
-static void compile_lazy_functions_off_thread(VM& vm, LazyFunctionsToCompile functions, NonnullRefPtr<SourceCode const> source_code, NonnullRefPtr<SharedOffThreadCompilationCallbacks> shared_callbacks)
+void compile_remaining_functions_off_thread(Script& script, NonnullRefPtr<SourceCode const>, OffThreadCompilationCallbacks callbacks)
 {
-    auto length = source_code->length_in_code_units();
-
-    // NB: The GC roots must only be touched on the main thread, so the worker only carries a pointer to them.
-    auto* on_compiled = new Function<void(Vector<FFI::CompiledFunction*>)>(
-        [&vm, shared_function_data = move(functions.shared_function_data), source_code = move(source_code), shared_callbacks](Vector<FFI::CompiledFunction*> compiled_functions) mutable {
-            VERIFY(compiled_functions.size() == shared_function_data.size());
-            for (size_t i = 0; i < compiled_functions.size(); ++i) {
-                auto* compiled_function = compiled_functions[i];
-                if (!compiled_function)
-                    continue;
-
-                auto& shared_data = *shared_function_data[i];
-                if (shared_data.m_executable) {
-                    auto nested_functions = lazy_functions_to_compile(*shared_data.m_executable);
-                    if (!nested_functions.function_asts.is_empty())
-                        compile_lazy_functions_off_thread(vm, move(nested_functions), source_code, shared_callbacks);
-                    RustIntegration::free_compiled_function(compiled_function);
-                    continue;
-                }
-
-                // Bytecode-cache installation may have cleared this while the worker compiled an AST clone.
-                if (!shared_data.m_rust_function_ast) {
-                    RustIntegration::free_compiled_function(compiled_function);
-                    continue;
-                }
-
-                RustIntegration::materialize_compiled_function(compiled_function, vm, *source_code, shared_data);
-            }
-        });
-
-    shared_callbacks->callbacks.submit_work([function_asts = move(functions.function_asts), length, on_compiled, shared_callbacks]() mutable {
-        Vector<FFI::CompiledFunction*> compiled_functions;
-        compiled_functions.ensure_capacity(function_asts.size());
-        for (auto* function_ast : function_asts)
-            compiled_functions.append(RustIntegration::compile_function_off_thread(function_ast, length, false));
-
-        shared_callbacks->callbacks.post_to_main_thread([compiled_functions = move(compiled_functions), on_compiled]() mutable {
-            (*on_compiled)(move(compiled_functions));
-            delete on_compiled;
-        });
-    });
+    auto abi_callbacks = off_thread_compilation_callbacks_to_abi(move(callbacks));
+    js_compile_remaining_functions_of_script_off_thread(vm_to_abi(script.vm()), script_to_abi(script), &abi_callbacks);
 }
 
-static void compile_remaining_functions_off_thread(VM& vm, Bytecode::Executable const& executable, NonnullRefPtr<SourceCode const> source_code, OffThreadCompilationCallbacks callbacks)
+void compile_remaining_functions_off_thread(SourceTextModule& module, NonnullRefPtr<SourceCode const>, OffThreadCompilationCallbacks callbacks)
 {
-    auto functions = lazy_functions_to_compile(executable);
-    if (functions.function_asts.is_empty())
-        return;
-    compile_lazy_functions_off_thread(vm, move(functions), move(source_code), adopt_ref(*new SharedOffThreadCompilationCallbacks(move(callbacks))));
-}
-
-void compile_remaining_functions_off_thread(Script& script, NonnullRefPtr<SourceCode const> source_code, OffThreadCompilationCallbacks callbacks)
-{
-    if (auto* executable = script.cached_executable())
-        compile_remaining_functions_off_thread(script.realm().vm(), *executable, move(source_code), move(callbacks));
-}
-
-void compile_remaining_functions_off_thread(SourceTextModule& module, NonnullRefPtr<SourceCode const> source_code, OffThreadCompilationCallbacks callbacks)
-{
-    if (auto* executable = module.cached_executable()) {
-        compile_remaining_functions_off_thread(module.realm().vm(), *executable, move(source_code), move(callbacks));
-        return;
-    }
-
-    auto* top_level_await_shared_data = module.top_level_await_shared_data();
-    if (!top_level_await_shared_data || !top_level_await_shared_data->m_executable)
-        return;
-    compile_remaining_functions_off_thread(module.realm().vm(), *top_level_await_shared_data->m_executable, move(source_code), move(callbacks));
+    auto abi_callbacks = off_thread_compilation_callbacks_to_abi(move(callbacks));
+    js_compile_remaining_functions_of_module_off_thread(vm_to_abi(module.vm()), module_to_abi(module), &abi_callbacks);
 }
 
 RefPtr<SourceCode const> top_level_source_code(Script const& script)
 {
-    if (auto* executable = script.cached_executable())
-        return executable->source_code;
-    return {};
+    return source_code_from_abi(js_compile_top_level_source_code_of_script(script_to_abi(script)));
 }
 
 RefPtr<SourceCode const> top_level_source_code(SourceTextModule const& module)
 {
-    if (auto* executable = module.cached_executable())
-        return executable->source_code;
-    return {};
+    return source_code_from_abi(js_compile_top_level_source_code_of_module(module_to_abi(module)));
 }
 
 }

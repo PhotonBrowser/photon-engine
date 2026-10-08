@@ -9,6 +9,7 @@ set(SOURCES
     Color.cpp
     ColorConversion.cpp
     ColorSpace.cpp
+    ColorSpaceSkia.cpp
     CornerRadii.cpp
     Cursor.cpp
     Filter.cpp
@@ -37,7 +38,6 @@ set(SOURCES
     ImageFormats/WebPWriter.cpp
     ImageFormats/WebPWriterLossless.cpp
     PaintStyle.cpp
-    Painter.cpp
     PainterSkia.cpp
     PaintingSurface.cpp
     PhotonGaneshPersistentCache.cpp
@@ -56,7 +56,6 @@ set(SOURCES
     SystemTheme.cpp
     TextLayout.cpp
     Triangle.cpp
-    VectorGraphic.cpp
     YUVData.cpp
 )
 
@@ -82,7 +81,13 @@ target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem
 
 target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG PNG::PNG skia harfbuzz)
 
-import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libgfx_rust FEATURES allocator FFI_HEADER RustFFI.h)
+import_rust_crate(
+    MANIFEST_PATH Rust/Cargo.toml
+    CRATE_NAME libgfx_rust
+    FEATURES allocator
+    FFI_HEADER RustFFI.h
+    KEEP_SYMBOLS ladybird_gfx_register_rust_crate_copy
+)
 target_link_libraries(LibGfx PRIVATE libgfx_rust)
 
 if (HAS_FONTCONFIG)
@@ -100,8 +105,7 @@ if (NOT ANDROID)
 endif()
 
 if (APPLE)
-    target_link_libraries(LibCore PUBLIC "-framework Metal")
-    target_link_libraries(LibCore PUBLIC "-framework Accelerate")
+    target_link_libraries(LibGfx PRIVATE "-framework Metal" "-framework Accelerate")
 endif()
 
 if (HAS_DIRECTX)
@@ -109,8 +113,9 @@ if (HAS_DIRECTX)
 endif()
 
 if (HAS_VULKAN)
-    target_link_libraries(LibCore PUBLIC Vulkan::Vulkan Vulkan::Headers)
-    target_link_libraries(LibGfx PRIVATE GPUOpen::VulkanMemoryAllocator)
+    # Public LibGfx headers include <vulkan/vulkan.h>. Only LibGfx calls the Vulkan loader.
+    target_link_libraries(LibGfx PUBLIC Vulkan::Headers)
+    target_link_libraries(LibGfx PRIVATE Vulkan::Vulkan GPUOpen::VulkanMemoryAllocator)
 
     if (USE_VULKAN_DMABUF_IMAGES)
         pkg_check_modules(LibDRM REQUIRED libdrm)

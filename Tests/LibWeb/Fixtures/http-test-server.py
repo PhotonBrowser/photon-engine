@@ -102,6 +102,7 @@ class WPTContext:
         localpaths.repo_root = os.path.abspath(wpt_directory)
 
         from wptserve.config import ConfigBuilder
+        from wptserve.handlers import AsIsHandler
         from wptserve.handlers import FileHandler
         from wptserve.handlers import python_script_handler
         from wptserve.request import Request
@@ -117,12 +118,25 @@ class WPTContext:
         self.request_class = Request
         self.response_class = Response
         self.file_handler_class = FileHandler
+        self.as_is_handler_class = AsIsHandler
         self.python_script_handler = python_script_handler
         self.http_exception = HTTPException
         self.stash_class = Stash
         self.stash_manager, self.stash_address, self.stash_authkey = start_stash_server()
 
-    def configure_server(self, port):
+    def create_file_handler(self, base_path, url_base="/"):
+        file_handler = self.file_handler_class(base_path=base_path, url_base=url_base)
+        as_is_handler = self.as_is_handler_class(base_path=base_path, url_base=url_base)
+
+        def handler(request, response):
+            # Like upstream wptserve, send .asis files without generating any response headers.
+            if request.url_parts.path.endswith(".asis"):
+                return as_is_handler(request, response)
+            return file_handler(request, response)
+
+        return handler
+
+    def configure_server(self, http_ports):
         def make_subdomains_product(subdomains, depth=2):
             return {
                 ".".join(labels)
@@ -137,7 +151,7 @@ class WPTContext:
             logger,
             browser_host="web-platform.localhost",
             alternate_hosts={"alt": "not-localhost.localhost"},
-            ports={"http": [port]},
+            ports={"http": http_ports},
             subdomains=subdomains,
             not_subdomains=not_subdomains,
             check_subdomains=False,
@@ -904,12 +918,23 @@ def start_server(port, static_directory, ca_cert_output=None):
     httpd.scheme = "http"
     httpd.router = SimpleNamespace(doc_root=TestHTTPRequestHandler.wpt_directory)
     httpd.wpt = WPTContext(TestHTTPRequestHandler.wpt_directory)
-    httpd.wpt.configure_server(httpd.socket.getsockname()[1])
-    httpd.wpt_file_handler = httpd.wpt.file_handler_class(base_path=TestHTTPRequestHandler.wpt_directory)
-    httpd.static_file_handler = httpd.wpt.file_handler_class(
+    httpd.wpt_file_handler = httpd.wpt.create_file_handler(base_path=TestHTTPRequestHandler.wpt_directory)
+    httpd.static_file_handler = httpd.wpt.create_file_handler(
         base_path=TestHTTPRequestHandler.static_directory,
         url_base="/static/",
     )
+
+    # WPT tests reach a second HTTP origin through {{ports[http][1]}}, so serve the same content on another port.
+    alternate_httpd = TestHTTPServer(("127.0.0.1", 0), TestHTTPRequestHandler)
+    alternate_httpd.daemon_threads = True
+    alternate_httpd.scheme = httpd.scheme
+    alternate_httpd.router = httpd.router
+    alternate_httpd.wpt = httpd.wpt
+    alternate_httpd.wpt_file_handler = httpd.wpt_file_handler
+    alternate_httpd.static_file_handler = httpd.static_file_handler
+    threading.Thread(target=alternate_httpd.serve_forever, daemon=True).start()
+
+    httpd.wpt.configure_server([httpd.socket.getsockname()[1], alternate_httpd.socket.getsockname()[1]])
 
     if ca_cert_output:
         # Setup below can fail or be skipped (no 'cryptography'), and it is the only writer of this fixed path. A PEM
@@ -934,6 +959,7 @@ def start_server(port, static_directory, ca_cert_output=None):
         pass
     finally:
         httpd.wpt.close()
+        alternate_httpd.server_close()
         httpd.server_close()
 
 

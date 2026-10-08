@@ -7,7 +7,6 @@
  */
 
 #include <AK/Platform.h>
-#include <AK/QuickSort.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/SystemFallbackFonts.h>
@@ -22,6 +21,7 @@
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/StyleEngineRustFFI.h>
 #include <LibWeb/StyleValueRustFFI.h>
+#include <LibWeb/ValueParserRustFFI.h>
 
 namespace Web::CSS {
 
@@ -107,10 +107,8 @@ struct MatchingFontCandidate {
     unsigned width { Gfx::FontWidth::Normal };
     Gfx::Typeface const* system_typeface { nullptr };
 
-    [[nodiscard]] RefPtr<Gfx::FontCascadeList const> font_with_point_size(FontFaceSnapshot const& snapshot, float point_size, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, FontFeatureValues const& font_feature_values) const
+    [[nodiscard]] RefPtr<Gfx::FontCascadeList const> font_with_point_size(FontFaceSnapshot const& snapshot, float point_size, Gfx::FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features) const
     {
-        auto const& shape_features = font_feature_data.to_shape_features(font_feature_values);
-
         if (system_typeface) {
             auto font_list = Gfx::FontCascadeList::create();
             font_list->add(system_typeface->font(point_size, variations, shape_features));
@@ -153,35 +151,9 @@ struct MatchingFontCandidate {
     }
 };
 
-static RefPtr<Gfx::FontCascadeList const> find_matching_font_weight_ascending(FontFaceSnapshot const& snapshot, Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, FontFeatureValues const& font_feature_values, bool inclusive)
-{
-    using Fn = AK::Function<bool(MatchingFontCandidate const&)>;
-    auto pred = inclusive ? Fn([&](auto const& matching_font_candidate) { return matching_font_candidate.key.weight.min >= target_weight; })
-                          : Fn([&](auto const& matching_font_candidate) { return matching_font_candidate.key.weight.min > target_weight; });
-    auto it = find_if(candidates.begin(), candidates.end(), pred);
-    for (; it != candidates.end(); ++it) {
-        if (auto found_font = it->font_with_point_size(snapshot, font_size_in_pt, variations, font_feature_data, font_feature_values))
-            return found_font;
-    }
-    return {};
-}
-
-static RefPtr<Gfx::FontCascadeList const> find_matching_font_weight_descending(FontFaceSnapshot const& snapshot, Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, FontFeatureValues const& font_feature_values, bool inclusive)
-{
-    using Fn = AK::Function<bool(MatchingFontCandidate const&)>;
-    auto pred = inclusive ? Fn([&](auto const& matching_font_candidate) { return matching_font_candidate.key.weight.max <= target_weight; })
-                          : Fn([&](auto const& matching_font_candidate) { return matching_font_candidate.key.weight.max < target_weight; });
-    auto it = find_if(candidates.rbegin(), candidates.rend(), pred);
-    for (; it != candidates.rend(); ++it) {
-        if (auto found_font = it->font_with_point_size(snapshot, font_size_in_pt, variations, font_feature_data, font_feature_values))
-            return found_font;
-    }
-    return {};
-}
-
 // Partial implementation of the font-matching algorithm: https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm
 // FIXME: This should be replaced by the full CSS font selection algorithm.
-static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapshot const& snapshot, Utf16FlyString const& family_name, int weight, Percentage const& font_width, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, FontFeatureValues const& font_feature_values)
+static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapshot const& snapshot, Utf16FlyString const& family_name, int weight, Percentage const& font_width, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features)
 {
     // If a font family match occurs, the user agent assembles the set of font faces in that family and then
     // narrows the set to a single face using other font properties in the order given below.
@@ -210,84 +182,48 @@ static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapsh
     if (matching_family_fonts.is_empty())
         return {};
 
-    // 1. font-width is tried first.
-    auto desired_width = font_width_bucket_from_percentage(font_width.value());
-    auto width_it = find_if(matching_family_fonts.begin(), matching_family_fonts.end(),
-        [&](auto const& matching_font_candidate) { return matching_font_candidate.width == desired_width; });
-    if (width_it != matching_family_fonts.end()) {
-        matching_family_fonts.remove_all_matching([&](auto const& matching_font_candidate) {
-            return matching_font_candidate.width != desired_width;
-        });
-    }
-
-    quick_sort(matching_family_fonts, [](auto const& a, auto const& b) {
-        return a.key.weight.min < b.key.weight.min;
-    });
-    // 2. font-style is tried next.
-    // We don't have complete support of italic and oblique fonts, so matching on font-style can be simplified to:
-    // If a matching slope is found, all faces which don't have that matching slope are excluded from the matching set.
-    auto style_it = find_if(matching_family_fonts.begin(), matching_family_fonts.end(),
-        [&](auto const& matching_font_candidate) { return matching_font_candidate.key.slope == slope; });
-    if (style_it != matching_family_fonts.end()) {
-        matching_family_fonts.remove_all_matching([&](auto const& matching_font_candidate) {
-            return matching_font_candidate.key.slope != slope;
-        });
-    }
-    // 3. font-weight is matched next.
-    // If a font does not have any concept of varying strengths of weights, its weight is mapped according list in the
-    // property definition. If bolder/lighter relative weights are used, the effective weight is calculated based on
-    // the inherited weight value, as described in the definition of the font-weight property.
-    // FIXME: "varying strengths of weights"
-    // If the matching set after performing the steps above includes faces with weight values containing the
-    // font-weight desired value, faces with weight values which do not include the desired font-weight value are
-    // removed from the matching set.
-
-    // FIXME: This whole function currently just returns the first match instead of progressing further, so we'll do that here too.
-    auto matching_weight_it = matching_family_fonts.find_if([weight](auto const& candidate) {
-        return candidate.key.weight.contains_inclusive(weight);
-    });
-    for (; matching_weight_it != matching_family_fonts.end(); ++matching_weight_it) {
-        if (auto found_font = matching_weight_it->font_with_point_size(snapshot, font_size_in_pt, variations, font_feature_data, font_feature_values))
+    Vector<Parser::ValueParserFFI::FfiFontMatchingCandidate> weighed_candidates;
+    weighed_candidates.ensure_capacity(matching_family_fonts.size());
+    for (auto const& candidate : matching_family_fonts)
+        weighed_candidates.unchecked_append({ candidate.key.weight.min, candidate.key.weight.max, candidate.key.slope, candidate.width });
+    Vector<size_t> order;
+    order.resize(matching_family_fonts.size());
+    auto order_length = Parser::ValueParserFFI::rust_font_matching_order(weighed_candidates.data(), weighed_candidates.size(), weight, font_width_bucket_from_percentage(font_width.value()), slope, order.data());
+    for (auto index : order.span().trim(order_length)) {
+        if (auto found_font = matching_family_fonts[index].font_with_point_size(snapshot, font_size_in_pt, variations, shape_features))
             return found_font;
     }
-
-    // If there is no face which contains the desired value, a weight value is chosen using the rules below:
-
-    // - If the desired weight is inclusively between 400 and 500, weights greater than or equal to the target weight
-    //   are checked in ascending order until 500 is hit and checked, followed by weights less than the target weight
-    //   in descending order, followed by weights greater than 500, until a match is found.
-    if (weight >= 400 && weight <= 500) {
-        auto it = find_if(matching_family_fonts.begin(), matching_family_fonts.end(),
-            [&](auto const& matching_font_candidate) { return matching_font_candidate.key.weight.min >= weight; });
-        for (; it != matching_family_fonts.end() && it->key.weight.min <= 500; ++it) {
-            if (auto found_font = it->font_with_point_size(snapshot, font_size_in_pt, variations, font_feature_data, font_feature_values))
-                return found_font;
-        }
-        if (auto found_font = find_matching_font_weight_descending(snapshot, matching_family_fonts, weight, font_size_in_pt, variations, font_feature_data, font_feature_values, false))
-            return found_font;
-        for (; it != matching_family_fonts.end(); ++it) {
-            if (auto found_font = it->font_with_point_size(snapshot, font_size_in_pt, variations, font_feature_data, font_feature_values))
-                return found_font;
-        }
-    }
-    // - If the desired weight is less than 400, weights less than or equal to the desired weight are checked in
-    //   descending order followed by weights above the desired weight in ascending order until a match is found.
-    if (weight < 400) {
-        if (auto found_font = find_matching_font_weight_descending(snapshot, matching_family_fonts, weight, font_size_in_pt, variations, font_feature_data, font_feature_values, true))
-            return found_font;
-        if (auto found_font = find_matching_font_weight_ascending(snapshot, matching_family_fonts, weight, font_size_in_pt, variations, font_feature_data, font_feature_values, false))
-            return found_font;
-    }
-    // - If the desired weight is greater than 500, weights greater than or equal to the desired weight are checked in
-    //   ascending order followed by weights below the desired weight in descending order until a match is found.
-    if (weight > 500) {
-        if (auto found_font = find_matching_font_weight_ascending(snapshot, matching_family_fonts, weight, font_size_in_pt, variations, font_feature_data, font_feature_values, true))
-            return found_font;
-        if (auto found_font = find_matching_font_weight_descending(snapshot, matching_family_fonts, weight, font_size_in_pt, variations, font_feature_data, font_feature_values, false))
-            return found_font;
-    }
-
     return {};
+}
+
+static void const* feature_value_data(ComputedFontCacheKey const& key, FontResolutionFeatureInput input)
+{
+    auto const& value = key.feature_values[to_underlying(input)];
+    return value ? value->rust_style_value_data() : nullptr;
+}
+
+// The OpenType features a request asks of the fonts of a family, with the family's @font-feature-values, if any.
+static Gfx::ShapeFeatures shape_features_for(ComputedFontCacheKey const& key, FontFeatureValues const* family_feature_values)
+{
+    Array<void const*, font_resolution_feature_input_count> values;
+    for (size_t index = 0; index < values.size(); ++index)
+        values[index] = feature_value_data(key, static_cast<FontResolutionFeatureInput>(index));
+    Gfx::ShapeFeatures features;
+    Parser::ValueParserFFI::rust_font_shape_features(
+        values.data(), family_feature_values,
+        [](void const* family_feature_values, Parser::ValueParserFFI::FontFeatureValuesRuleKind kind, Parser::ValueParserFFI::FfiUtf16View name, size_t* count) -> u32 const* {
+            auto values = static_cast<FontFeatureValues const*>(family_feature_values)->get({ kind, Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(name.utf16), name.length }) });
+            if (!values.has_value())
+                return nullptr;
+            *count = values->size();
+            return values->data();
+        },
+        &features,
+        [](void* features, u32 tag, u32 value) {
+            auto four_cc = Gfx::FourCC::from_u32(tag);
+            static_cast<Gfx::ShapeFeatures*>(features)->append({ { four_cc.cc[0], four_cc.cc[1], four_cc.cc[2], four_cc.cc[3] }, value });
+        });
+    return features;
 }
 
 NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot const& snapshot, ComputedFontCacheKey const& key, FontFeatureValuesProvider const& font_feature_values_for_family)
@@ -298,8 +234,6 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
     auto font_weight = key.font_weight;
     auto const& font_width = key.font_width;
     auto font_optical_sizing = key.font_optical_sizing;
-    auto const& font_variation_settings = key.font_variation_settings;
-    auto const& font_feature_data = key.font_feature_data;
 
     // FIXME: We round to int here as that is what is expected by our font infrastructure below
     auto weight = round_to<int>(font_weight);
@@ -318,21 +252,16 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
     if (font_optical_sizing == FontOpticalSizing::Auto)
         variation.set_optical_sizing(font_size_used_value);
 
-    for (auto const& [tag_string, value] : font_variation_settings) {
-        auto tag = open_type_tag_to_four_cc(tag_string);
-        if (!tag.has_value())
-            continue;
-
-        variation.axes.set(*tag, value);
-    }
+    Parser::ValueParserFFI::rust_font_variation_axes(feature_value_data(key, FontResolutionFeatureInput::FontVariationSettings), &variation, [](void* variation, u32 tag, double value) {
+        static_cast<Gfx::FontVariationSettings*>(variation)->axes.set(Gfx::FourCC::from_u32(tag), value);
+    });
 
     // FIXME: Implement the full font-matching algorithm: https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm
     float const font_size_in_pt = font_size_used_value * 0.75f;
 
 #ifdef AK_OS_MACOS
     auto find_macos_system_ui_font = [&](Gfx::SystemUIFontKind kind, Utf16FlyString const& family) -> RefPtr<Gfx::FontCascadeList const> {
-        auto const& font_feature_values = font_feature_values_for_family(family);
-        auto shape_features = font_feature_data.to_shape_features(font_feature_values);
+        auto shape_features = shape_features_for(key, &font_feature_values_for_family(family));
         auto typeface = Gfx::TypefaceSkia::match_system_ui(kind, font_size_used_value, weight, font_width_bucket_from_percentage(font_width.value()), slope);
         if (typeface.is_error() || !typeface.value())
             return {};
@@ -344,7 +273,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
 #endif
 
     auto find_font = [&](Utf16FlyString const& family) -> RefPtr<Gfx::FontCascadeList const> {
-        auto const& font_feature_values = font_feature_values_for_family(family);
+        auto const shape_features = shape_features_for(key, &font_feature_values_for_family(family));
 
         // OPTIMIZATION: Look for an exact match in loaded fonts first.
         // FIXME: Respect the other font-* descriptors
@@ -355,7 +284,6 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
             .width = static_cast<int>(font_width.value()),
         };
         if (auto const* faces = snapshot.faces(lookup_key)) {
-            auto shape_features = font_feature_data.to_shape_features(font_feature_values);
             auto result = Gfx::FontCascadeList::create();
             for (auto const& face : *faces) {
                 if (auto face_fonts = font_for_face(face, font_size_in_pt, variation, shape_features))
@@ -373,7 +301,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
         }
 #endif
 
-        if (auto found_font = font_matching_algorithm(snapshot, family, weight, font_width, slope, font_size_in_pt, variation, font_feature_data, font_feature_values); found_font && !found_font->is_empty())
+        if (auto found_font = font_matching_algorithm(snapshot, family, weight, font_width, slope, font_size_in_pt, variation, shape_features); found_font && !found_font->is_empty())
             return found_font;
 
         return {};
@@ -440,7 +368,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
     }
 
     // NB: @font-feature-values can't apply to the default font since it's not loaded from CSS
-    auto default_font = Platform::FontPlugin::the().default_font(font_size_in_pt, variation, font_feature_data.to_shape_features({}));
+    auto default_font = Platform::FontPlugin::the().default_font(font_size_in_pt, variation, shape_features_for(key, nullptr));
     if (font_list->is_empty()) {
         if (auto fallback_font_list = find_font(Utf16FlyString::from_fly_string(Platform::FontPlugin::the().generic_font_name(Platform::GenericFont::UiSansSerif))))
             font_list->extend(*fallback_font_list);
@@ -500,42 +428,11 @@ Vector<ComputedFontFamily> computed_font_families_from_style_value(StyleValue co
     return font_families;
 }
 
-FontFeatureData font_feature_data_from_style_values(FontResolutionFeatureValues const& values)
-{
-    auto keyword_of = [&](FontResolutionFeatureInput input, Keyword initial) {
-        auto const& value = values[to_underlying(input)];
-        return value ? value->to_keyword() : initial;
-    };
-    auto convert = [&]<typename T>(FontResolutionFeatureInput input, T (*converter)(StyleValue const&)) -> T {
-        auto const& value = values[to_underlying(input)];
-        return value ? converter(*value) : T {};
-    };
-    return {
-        .font_variant_alternates = convert(FontResolutionFeatureInput::FontVariantAlternates, font_variant_alternates_from_style_value),
-        .font_variant_caps = keyword_to_font_variant_caps(keyword_of(FontResolutionFeatureInput::FontVariantCaps, Keyword::Normal)).release_value(),
-        .font_variant_east_asian = convert(FontResolutionFeatureInput::FontVariantEastAsian, font_variant_east_asian_from_style_value),
-        .font_variant_emoji = keyword_to_font_variant_emoji(keyword_of(FontResolutionFeatureInput::FontVariantEmoji, Keyword::Normal)).release_value(),
-        .font_variant_ligatures = convert(FontResolutionFeatureInput::FontVariantLigatures, font_variant_ligatures_from_style_value),
-        .font_variant_numeric = convert(FontResolutionFeatureInput::FontVariantNumeric, font_variant_numeric_from_style_value),
-        .font_variant_position = keyword_to_font_variant_position(keyword_of(FontResolutionFeatureInput::FontVariantPosition, Keyword::Normal)).release_value(),
-        .font_feature_settings = convert(FontResolutionFeatureInput::FontFeatureSettings, font_feature_settings_from_style_value),
-        .font_kerning = keyword_to_font_kerning(keyword_of(FontResolutionFeatureInput::FontKerning, Keyword::Auto)).release_value(),
-        .text_rendering = keyword_to_text_rendering(keyword_of(FontResolutionFeatureInput::TextRendering, Keyword::Auto)).release_value(),
-    };
-}
-
-HashMap<Utf16FlyString, double> font_variation_settings_from_style_values(FontResolutionFeatureValues const& values)
-{
-    auto const& value = values[to_underlying(FontResolutionFeatureInput::FontVariationSettings)];
-    return value ? font_variation_settings_from_style_value(*value) : HashMap<Utf16FlyString, double> {};
-}
-
 NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_for_style_values(FontComputer const& font_computer, ComputedFontCacheKey key)
 {
-    // Only font-variant-alternates that name feature values read the tree scope's @font-feature-values, so every
-    // other request resolves once for all scopes.
-    auto const& alternates = key.font_feature_data.font_variant_alternates;
-    if (!alternates.has_value() || alternates->font_feature_value_entries.is_empty())
+    // Only font-variant-alternates read the tree scope's @font-feature-values, so every other request resolves once for
+    // all scopes.
+    if (!key.feature_values[to_underlying(FontResolutionFeatureInput::FontVariantAlternates)])
         key.font_feature_values_scope = {};
     auto font_list = font_computer.font_cascade_memo().resolve(font_computer.font_face_snapshot(), key, font_computer.font_feature_values_provider(key.font_feature_values_scope));
     // Inside a style update the loads wait for its end; everywhere else, such as canvas, they happen right here.
@@ -555,6 +452,17 @@ NonnullRefPtr<Gfx::FontCascadeList const> FontCascadeMemo::resolve(FontFaceSnaps
         m_resolutions_against_older_tables.append({ key, font_list });
         return font_list;
     }
+    m_generation = snapshot.generation();
+    return m_cascades.ensure(key, [&] {
+        return resolve_font_cascade(snapshot, key, font_feature_values_for_family);
+    });
+}
+
+NonnullRefPtr<Gfx::FontCascadeList const> FontCascadeMemo::resolve_for_fork(FontFaceSnapshot const& snapshot, ComputedFontCacheKey const& key, FontFeatureValuesProvider const& font_feature_values_for_family) const
+{
+    MutexLocker locker(m_mutex);
+    if (snapshot.generation() < m_generation)
+        return resolve_font_cascade(snapshot, key, font_feature_values_for_family);
     m_generation = snapshot.generation();
     return m_cascades.ensure(key, [&] {
         return resolve_font_cascade(snapshot, key, font_feature_values_for_family);
@@ -594,22 +502,19 @@ Vector<FontCascadeMemo::ResolutionAgainstOlderTable> FontCascadeMemo::take_resol
 
 }
 
-// The style engine resolves a font through this, with nothing but the table and memo it was given and the request: the
-// request's family is an opaque handle the engine holds, which becomes a value again here.
-extern "C" Web::CSS::StyleEngineFFI::FfiResolvedFont web_css_resolve_font(void const* memo, void const* snapshot, Web::CSS::StyleEngineFFI::FfiFontResolutionRequest request)
+namespace Web::CSS {
+
+enum class ResolvedFor : u8 {
+    Engine,
+    Fork,
+};
+
+static StyleEngineFFI::FfiResolvedFont resolve_font_for_style_engine(void const* memo, void const* snapshot, StyleEngineFFI::FfiFontResolutionRequest request, ResolvedFor resolved_for)
 {
-    using namespace Web;
-    using namespace Web::CSS;
     auto value_of = [](StyleEngineFFI::FfiHostHandle handle) {
         return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(reinterpret_cast<StyleValueFFI::StyleValueData const*>(handle)));
     };
     auto font_family = value_of(request.font_family);
-    // The engine names a value for each feature input whose property does not have its initial value.
-    FontResolutionFeatureValues feature_values;
-    for (size_t index = 0; index < feature_values.size(); ++index) {
-        if (auto handle = request.font_feature_values[index])
-            feature_values[index] = value_of(handle);
-    }
     ComputedFontCacheKey key {
         .font_families = computed_font_families_from_style_value(*font_family),
         .font_optical_sizing = static_cast<FontOpticalSizing>(request.font_optical_sizing),
@@ -617,17 +522,28 @@ extern "C" Web::CSS::StyleEngineFFI::FfiResolvedFont web_css_resolve_font(void c
         .font_slope = request.font_slope,
         .font_weight = request.font_weight,
         .font_width = Percentage(request.font_width),
-        .font_variation_settings = font_variation_settings_from_style_values(feature_values),
-        .font_feature_data = font_feature_data_from_style_values(feature_values),
+        .feature_values = {},
         .font_feature_values_scope = TreeScopeID { request.font_feature_values_scope },
     };
+    // The engine names a value for each feature input whose property does not have its initial value.
+    for (size_t index = 0; index < key.feature_values.size(); ++index) {
+        if (auto handle = request.font_feature_values[index])
+            key.feature_values[index] = value_of(handle);
+    }
     auto const& font_faces = *static_cast<FontFaceSnapshot const*>(snapshot);
-    auto font_list = static_cast<FontCascadeMemo const*>(memo)->resolve(font_faces, key, [&](Utf16FlyString const& family) -> FontFeatureValues const& { return font_faces.font_feature_values(key.font_feature_values_scope, family); });
+    auto const& cascade_memo = *static_cast<FontCascadeMemo const*>(memo);
+    FontFeatureValuesProvider font_feature_values_for_family = [&](Utf16FlyString const& family) -> FontFeatureValues const& { return font_faces.font_feature_values(key.font_feature_values_scope, family); };
+    auto font_list = resolved_for == ResolvedFor::Fork
+        ? cascade_memo.resolve_for_fork(font_faces, key, font_feature_values_for_family)
+        : cascade_memo.resolve(font_faces, key, font_feature_values_for_family);
     // The metric probe must not load a face: the first available font answers without one.
     auto const& first_available_font = font_list->first_available_font();
     auto const metrics = first_available_font.pixel_metrics();
     // NB: The engine takes no reference. The memo keeps the cascade alive until the font environment generation
-    //     changes, and the engine's resolver cache answers only for the generation it was filled at.
+    //     changes, and the engine's resolver cache answers only for the generation it was filled at. A fork of the
+    //     render state, which sees no generation change, takes the reference it is handed instead.
+    if (resolved_for == ResolvedFor::Fork)
+        font_list->ref();
     return {
         // Handles, not pointers: the engine names these host objects and hands them back here.
         .first_available_font = reinterpret_cast<StyleEngineFFI::FfiHostHandle>(&first_available_font),
@@ -637,6 +553,37 @@ extern "C" Web::CSS::StyleEngineFFI::FfiResolvedFont web_css_resolve_font(void c
         .x_height = metrics.x_height,
         .zero_advance = metrics.advance_of_ascii_zero,
     };
+}
+
+}
+
+// The style engine resolves a font through this, with nothing but the table and memo it was given and the request: the
+// request's family is an opaque handle the engine holds, which becomes a value again here.
+extern "C" Web::CSS::StyleEngineFFI::FfiResolvedFont web_css_resolve_font(void const* memo, void const* snapshot, Web::CSS::StyleEngineFFI::FfiFontResolutionRequest request)
+{
+    return Web::CSS::resolve_font_for_style_engine(memo, snapshot, request, Web::CSS::ResolvedFor::Engine);
+}
+
+// A fork of the render state resolves a font through this, as the engine does, taking over a reference to the cascade.
+extern "C" WEB_API Web::CSS::StyleEngineFFI::FfiResolvedFont web_css_resolve_font_for_fork(void const* memo, void const* snapshot, Web::CSS::StyleEngineFFI::FfiFontResolutionRequest request);
+
+extern "C" Web::CSS::StyleEngineFFI::FfiResolvedFont web_css_resolve_font_for_fork(void const* memo, void const* snapshot, Web::CSS::StyleEngineFFI::FfiFontResolutionRequest request)
+{
+    return Web::CSS::resolve_font_for_style_engine(memo, snapshot, request, Web::CSS::ResolvedFor::Fork);
+}
+
+// A fork of the render state takes its own reference to the font objects the style engine holds.
+extern "C" WEB_API void web_css_font_face_snapshot_reference(void const*);
+extern "C" WEB_API void web_css_font_cascade_memo_reference(void const*);
+
+extern "C" void web_css_font_face_snapshot_reference(void const* snapshot)
+{
+    static_cast<Web::CSS::FontFaceSnapshot const*>(snapshot)->ref();
+}
+
+extern "C" void web_css_font_cascade_memo_reference(void const* memo)
+{
+    static_cast<Web::CSS::FontCascadeMemo const*>(memo)->ref();
 }
 
 extern "C" void web_css_font_face_snapshot_unreference(void const* snapshot)

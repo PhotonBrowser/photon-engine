@@ -7,45 +7,20 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/Utf16String.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/Ptr.h>
 #include <LibJS/Export.h>
+#include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibJS/Heap/EngineCell.h>
 
 namespace JS {
 
-class JS_API Symbol final : public Cell {
-    GC_CELL(Symbol, Cell);
-    GC_DECLARE_ALLOCATOR(Symbol);
-
+class JS_API Symbol final : public EngineCell {
 public:
-    static constexpr GC::CellKind cell_kind_for_class = GC::CellKind::Symbol;
-
-    enum class Kind {
-        Unique,
-        Global,
-        Private,
-    };
-
-    [[nodiscard]] static GC::Ref<Symbol> create(VM&, Optional<Utf16String> description = {}, Kind = Kind::Unique);
-    [[nodiscard]] static GC::Ref<Symbol> create_private(VM& vm) { return create(vm, {}, Kind::Private); }
-
-    virtual ~Symbol() = default;
-
-    Optional<Utf16String> const& description() const { return m_description; }
-    bool is_global() const { return m_kind == Kind::Global; }
-    bool is_private() const { return m_kind == Kind::Private; }
-
     Utf16String descriptive_string() const;
-    Optional<Utf16String> key() const;
-
-private:
-    virtual size_t external_memory_size() const override;
-
-    Symbol(Optional<Utf16String>, Kind);
-
-    Optional<Utf16String> m_description;
-    Kind m_kind;
 };
 
 }

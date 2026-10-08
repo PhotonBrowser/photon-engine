@@ -16,7 +16,6 @@
 #include <LibWeb/CSS/Display.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/DOM/AbstractElement.h>
@@ -137,13 +136,6 @@ static CSS::StyleAtomID svg_style_reference_fragment_atom(DOM::Element& element,
     return element.document().style_computer().style_engine().intern_atom(Utf16FlyString::from_utf16(fragment.utf16_view()));
 }
 
-static Optional<CSS::URL> svg_paint_url(Optional<CSS::SVGPaint> const& paint)
-{
-    if (!paint.has_value() || !paint->is_url())
-        return {};
-    return paint->as_url();
-}
-
 // The four resources `mask`, `clip-path`, `fill` and `stroke` name. Read from the record's group payloads rather than
 // through a materialized view: this runs for every SVG graphics element whose style record is replaced, and pinning a
 // record to look at four properties is most of the cost of looking at them.
@@ -158,12 +150,11 @@ static Array<CSS::StyleAtomID, 4> svg_style_reference_atoms(DOM::Element& elemen
     auto const* svg_payload = static_cast<CSS::ComputedValues::InheritedSVGValues const*>(payloads[CSS::ComputedValues::InheritedSVGValues::style_group_index]);
     if (!mask_payload || !svg_payload)
         return {};
-    auto const& mask = mask_payload->mask_value();
     return {
-        svg_style_reference_fragment_atom(element, mask.has_value() ? Optional<CSS::URL> { mask->url() } : OptionalNone {}),
+        svg_style_reference_fragment_atom(element, mask_payload->mask_url_value()),
         svg_style_reference_fragment_atom(element, mask_payload->clip_path_value()),
-        svg_style_reference_fragment_atom(element, svg_paint_url(svg_payload->fill_value())),
-        svg_style_reference_fragment_atom(element, svg_paint_url(svg_payload->stroke_value())),
+        svg_style_reference_fragment_atom(element, svg_payload->fill_url_value()),
+        svg_style_reference_fragment_atom(element, svg_payload->stroke_url_value()),
     };
 }
 
@@ -450,39 +441,6 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
     RustFFI::render_state_set_document_is_decoded_svg(arena.host(), document.is_decoded_svg());
 }
 
-}
-
-extern "C" WEB_API u8 ladybird_layout_text_type_for_code_point(u32 code_point)
-{
-    return static_cast<u8>(to_underlying(Web::Layout::text_type_for_code_point(code_point)));
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_break_all_line_break_class(u32 code_point)
-{
-    return first_is_one_of(Unicode::line_break_class(code_point),
-        Unicode::LineBreakClass::Alphabetic,
-        Unicode::LineBreakClass::Numeric,
-        Unicode::LineBreakClass::ComplexContext,
-        Unicode::LineBreakClass::Ideographic);
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_keep_all_line_break_class(u32 code_point)
-{
-    return first_is_one_of(Unicode::line_break_class(code_point),
-        Unicode::LineBreakClass::Alphabetic,
-        Unicode::LineBreakClass::Numeric,
-        Unicode::LineBreakClass::Ambiguous,
-        Unicode::LineBreakClass::Ideographic);
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_combining_mark_line_break_class(u32 code_point)
-{
-    return Unicode::line_break_class(code_point) == Unicode::LineBreakClass::CombiningMark;
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_emoji_property(u32 code_point)
-{
-    return Unicode::code_point_has_emoji_property(code_point);
 }
 
 extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layout_code_point_category_facts(u32 code_point)

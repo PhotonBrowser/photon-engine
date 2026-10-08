@@ -125,7 +125,7 @@ pub(super) struct AlreadyPlannedSelectorTruthCandidate {
 }
 
 /// A transaction batch whose common singleton form neither allocates nor sorts.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) enum DeltaBatch<T> {
     #[default]
     Empty,
@@ -182,7 +182,7 @@ impl<T: Ord> DeltaBatch<T> {
 /// An exact change is both the retained-answer maintenance payload and its provenance. A route
 /// records a refresh only when it cannot preserve that old/new pair. Nodes reached through broad
 /// impact regions need no entry here because the region itself is already the refresh request.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SelectorTruthChanges {
     pub(super) deltas: DeltaBatch<SelectorTruthDelta>,
     pub(super) refreshes: DeltaBatch<SelectorTruthRefresh>,
@@ -304,7 +304,6 @@ impl RetainedState {
         &mut self,
         regions: &ImpactRegions,
         coarse_cover: Option<&ImpactRegionBatch>,
-        counters: &mut Counters,
     ) {
         let candidates = std::mem::take(&mut self.already_planned_selector_truth);
         let candidate_bytes = candidates.capacity_bytes();
@@ -326,7 +325,7 @@ impl RetainedState {
                 exact_tree_evaluation: candidate.exact_tree_evaluation,
                 refresh_rule: None,
             };
-            let result = self.candidate_changes_exact_entry(candidate.node, &site, counters);
+            let result = self.candidate_changes_exact_entry(candidate.node, &site);
             self.record_exact_selector_truth_change(candidate.node, &site, result);
         }
         let workspace_after = self.match_workspace.capacity_bytes();
@@ -473,7 +472,7 @@ pub(super) fn repaired_selector_truth_deltas(
 }
 
 impl SelectorTruthChanges {
-    pub(super) fn consolidate(&mut self, counters: &mut Counters) {
+    pub(super) fn consolidate(&mut self, counters: &Counters) {
         match &mut self.deltas {
             DeltaBatch::Empty => {}
             DeltaBatch::One(delta) => {
@@ -1112,6 +1111,8 @@ impl SequenceChanges {
     }
 }
 
+#[derive(Clone)]
+
 pub(super) struct SiblingCandidateWorkspace {
     entry_by_route: SharedVector<u32>,
     pub(super) candidate_epochs: EpochColumn,
@@ -1253,6 +1254,8 @@ impl SequenceEntrySelection<'_> {
     }
 }
 
+#[derive(Clone)]
+
 pub(super) struct NthSequenceEntryIndex {
     pub(super) nth: NthPosition,
     pub(super) unindexed: Vec<usize>,
@@ -1262,7 +1265,7 @@ pub(super) struct NthSequenceEntryIndex {
     pub(super) epoch: u32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SequenceEntryIndex {
     pub(super) empty: Vec<usize>,
     pub(super) nth: Vec<NthSequenceEntryIndex>,
@@ -1471,29 +1474,28 @@ impl ExactTreeEvaluation {
         old_matches: Option<bool>,
         transaction_fact_view: Option<&TransactionFactView>,
         match_workspace: &mut MatchScratch,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<ExactEntryResult, Incomplete> {
         let (compiled, entry) = program;
         // The new side reads the authoritative tree, which every candidate of this transaction
         // shares. The workspace's current tree side was reset when the transaction began, so the
         // sibling positions it memoizes were all measured in this topology, and a sequence that
         // several positional entries ask about is counted once rather than once per candidate.
-        let evaluate_new = |match_workspace: &mut MatchScratch, counters: &mut Counters| {
+        let evaluate_new = |match_workspace: &mut MatchScratch, counters: &Counters| {
             MatchEvaluator::new(tree, facts)
                 .with_match_workspace(match_workspace, MatchEvaluationSide::Current)
                 .indexing_stepped_positions_only()
-                .matches_entry_without_program_caches(compiled, entry, node, counters)
+                .matches_entry(compiled, entry, node, counters)
         };
-        let evaluate_old =
-            |match_workspace: &mut MatchScratch, view: &TransactionFactView, counters: &mut Counters| match view
-                .is_present(tree, TransactionFactSide::Before, node)
-            {
+        let evaluate_old = |match_workspace: &mut MatchScratch, view: &TransactionFactView, counters: &Counters| {
+            match view.is_present(tree, TransactionFactSide::Before, node) {
                 false => Ok(false),
                 true => MatchEvaluator::new(tree, facts)
                     .with_transaction_fact_view(view, TransactionFactSide::Before)
                     .with_match_workspace(match_workspace, MatchEvaluationSide::OldTree)
-                    .matches_entry_without_program_caches(compiled, entry, node, counters),
-            };
+                    .matches_entry(compiled, entry, node, counters),
+            }
+        };
         match self {
             Self::Arrival => match evaluate_new(match_workspace, counters)? {
                 true => Ok(Lookup::Known(SetChange::Added)),

@@ -1,0 +1,207 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! The Paint thread, and the stage it presents frames on: the frame sink frames reach the compositor through.
+//!
+//! Presenting a frame takes a [`Presenting`], which only the jobs this module hands the Paint thread are lent, there,
+//! and which alone reaches the frame sink. The Paint thread runs its jobs one at a time and in the order they were
+//! handed to it, so frames reach the compositor in the order their jobs were handed out, and code that runs anywhere
+//! else cannot present a frame: it has no [`Presenting`] to present with.
+
+use crate::render_state::SampledFrame;
+use crate::stage_thread::{InFlight, Relay, Riding, StageThread};
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
+use std::sync::OnceLock;
+
+unsafe extern "C" {
+    fn web_frame_sink_release(sink: *mut c_void);
+    fn web_frame_sink_request_screenshot(sink: *mut c_void, request: *mut c_void);
+    fn web_screenshot_request_destroy(request: *mut c_void);
+}
+
+/// The Paint thread, which records display lists from the frames the render states publish, and presents frames.
+struct PaintThread {
+    thread: StageThread,
+    stage: StageCell,
+}
+
+/// The stage, which only the jobs that are lent a [`Presenting`] reach, on the Paint thread.
+struct StageCell(RefCell<PaintStage>);
+
+// SAFETY: The stage is made empty on whichever thread first reaches the Paint thread, and from then on only the Paint
+// thread reaches it, in the jobs it runs one at a time.
+unsafe impl Send for StageCell {}
+unsafe impl Sync for StageCell {}
+
+/// What the Paint thread presents with.
+#[derive(Default)]
+struct PaintStage {
+    /// The frame sink of the connection to the compositor, while there is one.
+    sink: Option<FrameSinkBox>,
+}
+
+fn the_paint_thread() -> &'static PaintThread {
+    static PAINT_THREAD: OnceLock<PaintThread> = OnceLock::new();
+    PAINT_THREAD.get_or_init(|| PaintThread {
+        thread: StageThread::spawn("Paint"),
+        stage: StageCell(RefCell::default()),
+    })
+}
+
+/// The Paint thread, for jobs that present nothing.
+pub(crate) fn paint_thread() -> &'static StageThread {
+    &the_paint_thread().thread
+}
+
+/// A reference to a `Web::Compositor::CompositorFrameSink`, which only the Paint stage holds. The pointer makes it
+/// neither [`Send`] nor [`Sync`]: it never leaves the Paint thread.
+struct FrameSinkBox(NonNull<c_void>);
+
+impl Drop for FrameSinkBox {
+    fn drop(&mut self) {
+        // SAFETY: The box holds a reference to the sink.
+        unsafe { web_frame_sink_release(self.0.as_ptr()) };
+    }
+}
+
+/// A reference to a frame sink on its way to the Paint stage.
+struct IncomingFrameSink(FrameSinkBox);
+
+// SAFETY: A frame sink takes frames from any thread, and nothing reaches this reference on the way.
+unsafe impl Send for IncomingFrameSink {}
+
+impl IncomingFrameSink {
+    fn arrive(self) -> FrameSinkBox {
+        self.0
+    }
+}
+
+/// What a job on the Paint thread presents with. Only this module makes one, on the Paint thread, for one job at a time.
+/// The raw pointer marker makes it neither [`Send`] nor [`Sync`], so it cannot leave the job it is lent to.
+pub(crate) struct Presenting<'stage> {
+    stage: &'stage mut PaintStage,
+    not_send_or_sync: PhantomData<*const ()>,
+}
+
+impl Presenting<'_> {
+    /// Lends `job` what it presents with. Only a job running on the Paint thread may call this.
+    fn lend<R>(job: impl FnOnce(&mut Presenting) -> R) -> R {
+        let paint_thread = the_paint_thread();
+        debug_assert!(paint_thread.thread.is_current(), "only the Paint thread presents");
+        let mut stage = paint_thread.stage.0.borrow_mut();
+        job(&mut Presenting {
+            stage: &mut stage,
+            not_send_or_sync: PhantomData,
+        })
+    }
+
+    /// The frame sink frames are presented through, as C++ takes it, or null while the compositor cannot be reached.
+    pub(crate) fn sink(&self) -> *mut c_void {
+        self.stage
+            .sink
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |sink| sink.0.as_ptr())
+    }
+}
+
+/// Hands `job` to the Paint thread with `frame`, which the render owner sampled: the Paint thread runs it after the jobs
+/// handed to it before, beside whoever holds the ride, and lends it what it presents with. A job that presents is only
+/// ever handed a sampled frame, so the Paint thread presents frames in the order the render owner sampled them.
+pub(crate) fn ride_presenting<T: Send + 'static, R: Send + 'static>(
+    frame: SampledFrame<T>,
+    job: impl FnOnce(SampledFrame<T>, &mut Presenting) -> R + Send + 'static,
+) -> Riding<R> {
+    paint_thread().ride(move || Presenting::lend(|presenting| job(frame, presenting)))
+}
+
+/// Hands `job` on to the Paint thread with `frame`, which the render owner sampled, and `relay`, the relay of the job
+/// submitted to the render owner that sampled it, which lands what `job` answers (see [`ride_presenting`]).
+pub(crate) fn relay_presenting<T: Send + 'static, R: Send + 'static>(
+    relay: Relay<R>,
+    frame: SampledFrame<T>,
+    job: impl FnOnce(SampledFrame<T>, &mut Presenting) -> R + Send + 'static,
+) {
+    relay.hand_on(paint_thread(), move |_| {
+        Presenting::lend(|presenting| job(frame, presenting))
+    });
+}
+
+/// Submits `job` to the Paint thread with `frame`, which the render owner sampled (see [`ride_presenting`]), and answers
+/// the flight of what it answers.
+pub(crate) fn submit_presenting<T: Send + 'static, R: Send + 'static>(
+    frame: SampledFrame<T>,
+    job: impl FnOnce(SampledFrame<T>, &mut Presenting) -> R + Send + 'static,
+) -> InFlight<R> {
+    paint_thread().submit(move |_| Presenting::lend(|presenting| job(frame, presenting)))
+}
+
+/// Has the Paint stage present frames through `sink`, a reference to the frame sink of a new connection to the
+/// compositor, which the stage takes over, from the frames handed to the Paint thread after this on. Only the
+/// connection calls this, which declares it.
+///
+/// # Safety
+///
+/// `sink` must be a reference to a frame sink, which the caller gives up.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paint_stage_adopt_frame_sink(sink: NonNull<c_void>) {
+    let incoming = IncomingFrameSink(FrameSinkBox(sink));
+    paint_thread().post(move || {
+        Presenting::lend(|presenting| presenting.stage.sink = Some(incoming.arrive()));
+    });
+}
+
+/// A screenshot of what the compositor composes for a context (a `Web::Compositor::ScreenshotRequestForPaintThread`), on
+/// its way to the Paint thread, which asks the compositor for it after the frames handed to it before.
+struct ScreenshotRequest(NonNull<c_void>);
+
+// SAFETY: A request owns everything it carries, and nothing else reaches it on the way.
+unsafe impl Send for ScreenshotRequest {}
+
+impl Drop for ScreenshotRequest {
+    fn drop(&mut self) {
+        // SAFETY: The box owns the request.
+        unsafe { web_screenshot_request_destroy(self.0.as_ptr()) };
+    }
+}
+
+/// Asks the compositor for the screenshot `request` names after the frames handed to the Paint thread before it. Only
+/// the connection calls this, which declares it.
+///
+/// # Safety
+///
+/// `request` must be a `Web::Compositor::ScreenshotRequestForPaintThread`, which the caller gives up.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paint_stage_request_screenshot(request: NonNull<c_void>) {
+    let request = ScreenshotRequest(request);
+    paint_thread().post(move || {
+        Presenting::lend(|presenting| {
+            let sink = presenting.sink();
+            if sink.is_null() {
+                return;
+            }
+            let request = std::mem::ManuallyDrop::new(request);
+            // SAFETY: The stage holds the sink, and the sink takes the request over.
+            unsafe { web_frame_sink_request_screenshot(sink, request.0.as_ptr()) };
+        });
+    });
+}
+
+#[cfg(test)]
+mod ffi_test_stubs {
+    use std::ffi::c_void;
+
+    #[unsafe(no_mangle)]
+    extern "C" fn web_frame_sink_release(_: *mut c_void) {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn web_frame_sink_request_screenshot(_: *mut c_void, _: *mut c_void) {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn web_screenshot_request_destroy(_: *mut c_void) {}
+}

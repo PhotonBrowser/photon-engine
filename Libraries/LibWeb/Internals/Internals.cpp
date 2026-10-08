@@ -49,6 +49,7 @@
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/EventTarget.h>
@@ -65,7 +66,6 @@
 #include <LibWeb/HTML/AutoplaySettings.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
-#include <LibWeb/HTML/EventLoop/PresentationQueue.h>
 #include <LibWeb/HTML/EventLoop/TaskQueue.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
@@ -84,6 +84,7 @@
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Internals/InternalGamepad.h>
 #include <LibWeb/Internals/Internals.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -302,21 +303,15 @@ void Internals::send_mismatched_visual_context_tree_update_to_compositor()
         return;
     if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree(read))
         return;
-    auto& document_paint_state = document.paint_state();
 
     // Force a fresh, incompatible rebuild — so the tree is minted with a new structural epoch that the Compositor's installed
     // display list was never recorded against.
     document.schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
     document.update_paint_and_hit_testing_properties_if_needed();
 
-    // Send a bare visual-context-tree update carrying that new structural epoch *without* re-recording the display list —
+    // Send a visual-context-tree update carrying that new structural epoch *without* re-recording the display list —
     // deliberately reproducing the peer inconsistency behind issue #10368.
-    Compositor::CompositorFrame frame;
-    frame.visual_context_tree_update = Compositor::CompositorFrame::VisualContextTreeUpdate {
-        .visual_context_tree = document_paint_state.visual_context_tree(document),
-        .resource_transaction = {},
-    };
-    HTML::main_thread_event_loop().presentation_queue().submit(*navigable, move(frame));
+    navigable->commit_mismatched_visual_context_tree_for_testing();
 }
 
 // https://web-platform-tests.org/writing-tests/reftests.html#components-of-a-reftest
@@ -594,6 +589,19 @@ void Internals::click_through_ui_process(double x, double y)
         event.click_count = 1;
         page.client().page_did_request_webdriver_mouse_event(local_root_id, move(event), GC::create_function(heap(), [] { }));
     }
+}
+
+// A mouse move the UI process routes, as it would a user's, through the compositor, which tells the render clock of it
+// too.
+void Internals::mouse_move_through_ui_process(double x, double y)
+{
+    auto& page = this->page();
+    auto position = page.css_to_device_point(window().navigable()->to_page_position({ x, y }));
+    Web::MouseEvent event;
+    event.type = Web::MouseEvent::Type::MouseMove;
+    event.position = position;
+    event.screen_position = position;
+    page.client().page_did_request_webdriver_mouse_event(window().navigable()->local_root()->id(), move(event), GC::create_function(heap(), [] { }));
 }
 
 void Internals::wheel_through_ui_process(double x, double y, double delta_x, double delta_y)
@@ -1152,6 +1160,11 @@ Utf16String Internals::get_computed_aria_level(DOM::Element& element)
     return MUST(ARIA::state_or_property_to_string_value(ARIA::StateAndProperties::AriaLevel, *aria_data));
 }
 
+void Internals::set_accessibility_focus_target(DOM::Element& element)
+{
+    element.document().set_accessibility_focus_target(&element);
+}
+
 u16 Internals::get_echo_server_port()
 {
     return s_echo_server_port;
@@ -1212,6 +1225,11 @@ void Internals::set_browser_zoom(double factor)
 void Internals::set_device_pixel_ratio(double ratio)
 {
     page().client().page_did_set_device_pixel_ratio_for_testing(ratio);
+}
+
+void Internals::resize_window(i32 width, i32 height)
+{
+    page().client().page_did_request_resize_window({ width, height }, 0);
 }
 
 bool Internals::headless()
@@ -1652,24 +1670,47 @@ void Internals::reset_rendering_scheduler_counters()
     HTML::main_thread_event_loop().reset_rendering_scheduler_counters();
 }
 
-void Internals::inject_clock_tick(double frame_time_ms)
+void Internals::inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y)
 {
     auto& document = window().associated_document();
     auto frame_time = document.relevant_settings_object().time_origin() + frame_time_ms;
-    Layout::RustFFI::document_host_inject_clock_tick(document.layout_node_arena().host(), static_cast<i64>(frame_time * 1'000'000.0));
+    auto scroll_offset = viewport_scroll_y.map([&](double y) { return Layout::RustFFI::FfiScrollOffset { document.unique_id().value(), 0, y }; });
+    Layout::RustFFI::document_host_inject_clock_tick(document.layout_node_arena().host(), static_cast<i64>(frame_time * 1'000'000.0), scroll_offset.has_value() ? &*scroll_offset : nullptr);
 }
 
-Utf16String Internals::clock_lease_state(DOM::Document& document)
+void Internals::inject_hover_pointer(double x, double y, Optional<double> frame_time_ms)
 {
-    switch (Layout::RustFFI::document_host_clock_lease_state(document.layout_node_arena().host())) {
-    case Layout::RustFFI::FfiClockLeaseState::None:
+    auto& document = window().associated_document();
+    auto device_pixels_per_css_pixel = page().client().device_pixels_per_css_pixel();
+    auto frame_time = frame_time_ms.has_value() ? document.relevant_settings_object().time_origin() + *frame_time_ms : HighResolutionTime::unsafe_shared_current_time();
+    Layout::RustFFI::document_host_inject_pointer(document.layout_node_arena().host(), static_cast<float>(x * device_pixels_per_css_pixel), static_cast<float>(y * device_pixels_per_css_pixel), static_cast<i64>(frame_time * 1'000'000.0));
+}
+
+void Internals::move_hover_pointer(double x, double y)
+{
+    auto& document = window().associated_document();
+    auto device_pixels_per_css_pixel = page().client().device_pixels_per_css_pixel();
+    Layout::RustFFI::document_host_move_pointer(document.layout_node_arena().host(), static_cast<float>(x * device_pixels_per_css_pixel), static_cast<float>(y * device_pixels_per_css_pixel));
+}
+
+Utf16String Internals::clock_lane_state(DOM::Document& document)
+{
+    switch (Layout::RustFFI::document_host_clock_lane_state(document.layout_node_arena().host())) {
+    case Layout::RustFFI::FfiClockLaneState::None:
         return "none"_utf16;
-    case Layout::RustFFI::FfiClockLeaseState::Ticking:
+    case Layout::RustFFI::FfiClockLaneState::Ticking:
         return "ticking"_utf16;
-    case Layout::RustFFI::FfiClockLeaseState::Parked:
+    case Layout::RustFFI::FfiClockLaneState::Parked:
         return "parked"_utf16;
+    case Layout::RustFFI::FfiClockLaneState::Hovering:
+        return "hovering"_utf16;
     }
     VERIFY_NOT_REACHED();
+}
+
+bool Internals::clock_lane_is_coming(DOM::Document& document)
+{
+    return Layout::RustFFI::document_host_clock_lane_is_coming(document.layout_node_arena().host());
 }
 
 GC::Ptr<Geometry::DOMRect> Internals::presented_border_box(DOM::Element& element)
@@ -1680,12 +1721,22 @@ GC::Ptr<Geometry::DOMRect> Internals::presented_border_box(DOM::Element& element
     return Geometry::DOMRect::create(rect.x().to_double(), rect.y().to_double(), rect.width().to_double(), rect.height().to_double());
 }
 
+Optional<String> Internals::presented_color(DOM::Element& element)
+{
+    u32 argb = 0;
+    if (!element.style_node_id() || !Layout::RustFFI::document_host_presented_color(element.document().layout_node_arena().host(), element.style_node_id().value(), &argb))
+        return {};
+    return Color::from_bgra(argb).serialize_a_srgb_value();
+}
+
 void Internals::set_manual_rendering_opportunities(bool enabled)
 {
-    // A test that injects its rendering opportunities injects its clock ticks too: the clock lease that runs now ends,
-    // and no later one ticks with the display.
+    // A test that injects its rendering opportunities injects its clock ticks too: the clock lanes tick with the display
+    // no more, and the frame in flight reaches the compositor first.
     HTML::main_thread_event_loop().set_render_clock_is_manual_for_testing(enabled);
     if (enabled) {
+        // A lane armed before ticks with the display until it declines a tick, at the compositor's own scroll offsets.
+        Compositor::RenderClock::the().disarm_all_for_testing();
         if (auto* navigable = as_if<HTML::LocalNavigable>(window().associated_document().navigable().ptr()))
             (void)navigable->presenter();
     }
@@ -1701,6 +1752,8 @@ void Internals::inject_rendering_opportunity(double frame_time_ms)
 Utf16String Internals::frame_scheduler_state() const
 {
     auto const& event_loop = HTML::main_thread_event_loop();
+    if (event_loop.lays_out_rendering_update_in_flight())
+        return "laying-out"_utf16;
     if (event_loop.has_frame_in_flight())
         return "in-flight"_utf16;
     if (event_loop.has_rendering_update_in_flight())
@@ -1710,10 +1763,10 @@ Utf16String Internals::frame_scheduler_state() const
 
 void Internals::hold_next_frame(Utf16String const& hold)
 {
-    HTML::main_thread_event_loop().hold_next_frame_for_testing();
     Layout::RustFFI::render_state_hold_next_recording_for_testing();
-    if (hold == "before-present"sv)
-        HTML::main_thread_event_loop().hold_next_frame_before_present_for_testing();
+    if (hold == "layout"sv)
+        return;
+    HTML::main_thread_event_loop().hold_next_frame_for_testing();
 }
 
 bool Internals::last_frame_keyboard_scroll_state_is_current()
@@ -1729,11 +1782,12 @@ Utf16String Internals::last_frame_presented_by(DOM::Document& document)
     auto* navigable = as_if<HTML::LocalNavigable>(document.navigable().ptr());
     if (!navigable)
         return {};
-    switch (navigable->presenter().last_frame_presented_by()) {
-    case Compositor::PresentedBy::Main:
-        return "main"_utf16;
-    case Compositor::PresentedBy::Flight:
-        return "flight"_utf16;
+    auto presented_by = navigable->presenter().last_frame_presented_by();
+    if (!presented_by.has_value())
+        return "none"_utf16;
+    switch (*presented_by) {
+    case Compositor::PresentedBy::Commit:
+        return "commit"_utf16;
     case Compositor::PresentedBy::Clock:
         return "clock"_utf16;
     }
@@ -2467,7 +2521,6 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
     object->define_direct_property("committedTransitionsStarted"_utf16_fly_string, JS::Value(counters.committed_transitions_started), JS::default_attributes);
     object->define_direct_property("mediaRuleEvaluations"_utf16_fly_string, JS::Value(counters.media_rule_evaluations), JS::default_attributes);
     object->define_direct_property("registeredPropertiesCacheRebuilds"_utf16_fly_string, JS::Value(counters.registered_properties_cache_rebuilds), JS::default_attributes);
-    object->define_direct_property("scopeRuleCacheBuilds"_utf16_fly_string, JS::Value(counters.scope_rule_cache_builds), JS::default_attributes);
     object->define_direct_property("styleQueryContainerScans"_utf16_fly_string, JS::Value(counters.style_query_container_scans), JS::default_attributes);
     object->define_direct_property("sizeQueryContainerScanVisits"_utf16_fly_string, JS::Value(CSS::StyleEngineFFI::style_engine_size_query_container_scan_visits(document.style_computer().style_engine().host(), read, false)), JS::default_attributes);
     object->define_direct_property("styleEngineTransactionSetups"_utf16_fly_string, JS::Value(counters.style_engine_transaction_setups), JS::default_attributes);

@@ -16,7 +16,6 @@
 #include <LibGC/CellAllocator.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibWeb/CSS/Fetch.h>
-#include <LibWeb/CSS/FontFeatureData.h>
 #include <LibWeb/CSS/Percentage.h>
 #include <LibWeb/CSS/StyleEngineIdentifiers.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
@@ -25,6 +24,12 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWebCommon/PixelUnits.h>
+
+namespace Web::CSS::Parser::ValueParserFFI {
+
+enum class FontFeatureValuesRuleKind : uint8_t;
+
+}
 
 namespace Web::CSS {
 
@@ -37,7 +42,6 @@ struct FontWeightRange {
     int max { 0 };
     [[nodiscard]] u32 hash() const { return pair_int_hash(min, max); }
     [[nodiscard]] bool operator==(FontWeightRange const&) const = default;
-    [[nodiscard]] bool contains_inclusive(int weight) const { return min <= weight && weight <= max; }
 };
 
 struct FontFaceKey {
@@ -78,6 +82,11 @@ struct ComputedFontFamilyName {
 
 using ComputedFontFamily = Variant<GenericFontFamily, ComputedFontFamilyName>;
 
+// The computed values a font resolution reads beside the family, by StyleEngineFFI::FontResolutionFeatureInput; a null
+// one has its property's initial value. They select the OpenType features and the variations of the fonts.
+static constexpr size_t font_resolution_feature_input_count = 11;
+using FontResolutionFeatureValues = Array<ValueComparingRefPtr<StyleValue const>, font_resolution_feature_input_count>;
+
 struct ComputedFontCacheKey {
     Vector<ComputedFontFamily> font_families;
     FontOpticalSizing font_optical_sizing;
@@ -85,14 +94,29 @@ struct ComputedFontCacheKey {
     int font_slope;
     double font_weight;
     Percentage font_width;
-    HashMap<Utf16FlyString, double> font_variation_settings;
-    FontFeatureData font_feature_data;
+    FontResolutionFeatureValues feature_values;
     // The tree scope whose @font-feature-values the request reads, or the document's when its
     // font-variant-alternates name no feature values, so that alike requests share one answer.
     TreeScopeID font_feature_values_scope;
 
     [[nodiscard]] bool operator==(ComputedFontCacheKey const& other) const = default;
 };
+
+struct FontFeatureValueKey {
+    Parser::ValueParserFFI::FontFeatureValuesRuleKind kind;
+    Utf16FlyString name;
+
+    bool operator==(FontFeatureValueKey const&) const = default;
+};
+
+}
+
+template<>
+struct AK::Traits<Web::CSS::FontFeatureValueKey> : public AK::DefaultTraits<Web::CSS::FontFeatureValueKey> {
+    static unsigned hash(Web::CSS::FontFeatureValueKey const& key) { return pair_int_hash(to_underlying(key.kind), key.name.hash()); }
+};
+
+namespace Web::CSS {
 
 using FontFeatureValues = HashMap<FontFeatureValueKey, Vector<u32>>;
 
@@ -179,7 +203,7 @@ public:
     void unregister_font_face(NonnullRefPtr<FontFaceState>);
     void synchronize_font_face_order(Vector<NonnullRefPtr<FontFaceState>> const&);
 
-    GC::Ptr<FontLoader> load_font_face(ParsedFontFace const&, RefPtr<StyleSheetState>, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
+    GC::Ptr<FontLoader> load_font_face(ReadonlySpan<FontLoader::Source>, RefPtr<StyleSheetState>, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
 
     void load_fonts_from_sheet(StyleSheetState&);
     void unload_fonts_from_sheet(StyleSheetState&);
@@ -207,8 +231,7 @@ private:
     void begin_font_face_change_batch();
     void end_font_face_change_batch();
     void clear_computed_font_cache_for_families(Vector<Utf16FlyString> const& family_names);
-    using ElementUsesChangedFonts = Function<bool(DOM::Element const&)>;
-    void record_font_input_changes(ElementUsesChangedFonts);
+    void record_font_input_changes(ReadonlySpan<Utf16FlyString> family_names, ReadonlySpan<Gfx::FontCascadeList const*> font_lists);
 
     FontFeatureValues const& font_feature_values_for_family(Utf16FlyString const& family_name, TreeScopeID) const;
     FontFeatureValues font_feature_values_in_scope(Utf16FlyString const& family_name, TreeScopeID) const;
@@ -233,7 +256,8 @@ private:
     Vector<Utf16FlyString> m_batched_font_face_change_families;
     // What font resolution answers changed beside a style transaction that flew, which computed styles from the old
     // answers: the elements that use the changed fonts are found once the transaction's drain installed them.
-    Vector<ElementUsesChangedFonts> m_font_changes_beside_flown_transaction;
+    Vector<Utf16FlyString> m_font_families_changed_beside_flown_transaction;
+    Vector<Gfx::FontCascadeList const*> m_font_lists_changed_beside_flown_transaction;
 };
 
 }

@@ -16,8 +16,10 @@ use std::rc::Rc;
 
 use super::basic_block::BasicBlock;
 use super::basic_block::SourceMapEntry;
-use super::ffi::AbstractOperationKind;
-use super::ffi::WellKnownSymbolKind;
+use super::constant::AbstractOperationKind;
+use super::constant::WellKnownSymbolKind;
+use super::executable_data::CompiledRegexHandle;
+use super::executable_data::ExecutableData;
 use super::instruction::{Instruction, specialize_instruction_sequence};
 use super::operand::*;
 use crate::ast::AstArena;
@@ -74,8 +76,7 @@ pub struct FunctionSfdMetadata {
 
 /// GC-free compiled bytecode for a function that top-level code will immediately invoke.
 pub struct PrecompiledFunction {
-    pub generator: Box<Generator>,
-    pub assembled: AssembledBytecode,
+    pub executable: ExecutableData,
     pub metadata: FunctionSfdMetadata,
 }
 
@@ -194,8 +195,8 @@ enum EnvironmentCoordinateScopeKind {
     Dynamic,
 }
 
-const ENVIRONMENT_MODE_LEXICAL: u32 = 0;
-const ENVIRONMENT_MODE_VAR: u32 = 1;
+const ENVIRONMENT_MODE_LEXICAL: u32 = libjs_abi::EnvironmentMode::Lexical as u32;
+const ENVIRONMENT_MODE_VAR: u32 = libjs_abi::EnvironmentMode::Var as u32;
 
 fn should_verify_environment_coordinates() -> bool {
     static SHOULD_VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -339,7 +340,7 @@ pub struct Generator {
     identifier_table_index: HashMap<ak::Utf16FlyString, IdentifierTableIndex>,
     pub property_key_table: Vec<ak::Utf16FlyString>,
     property_key_table_index: HashMap<ak::Utf16FlyString, PropertyKeyTableIndex>,
-    pub compiled_regexes: Vec<*mut std::ffi::c_void>,
+    pub compiled_regexes: Vec<CompiledRegexHandle>,
 
     // --- Scope/unwind state ---
     pub boundaries: Vec<BlockBoundaryType>,
@@ -405,7 +406,7 @@ pub struct Generator {
 
     // --- Shared function data ---
     // Pending descriptors for SharedFunctionInstanceData objects. These are
-    // materialized at the C++ boundary so bytecode generation can run without
+    // materialized by the runtime so bytecode generation can run without
     // allocating GC cells.
     pub shared_function_data: Vec<PendingSharedFunctionData>,
     pub eager_compile_function_ids: HashSet<FunctionId>,
@@ -435,11 +436,7 @@ pub struct Generator {
     // Used for builtin JS files.
     pub builtin_abstract_operations_enabled: bool,
 
-    // --- FFI context ---
-    // These are set by the top-level compiler and passed through for
-    // creating SharedFunctionInstanceData via FFI callbacks.
-    pub vm_ptr: *mut std::ffi::c_void,
-    pub source_code_ptr: *const std::ffi::c_void,
+    // --- Source ---
     pub source_len: usize,
 
     // --- Function table ---
@@ -590,8 +587,6 @@ impl Generator {
             catch_handler_labels: HashSet::new(),
             annexb_function_names: HashSet::new(),
             builtin_abstract_operations_enabled: false,
-            vm_ptr: std::ptr::null_mut(),
-            source_code_ptr: std::ptr::null(),
             source_len: 0,
             function_table: crate::ast::FunctionTable::new(),
             arena: Arc::new(AstArena::new()),
@@ -864,7 +859,7 @@ impl Generator {
 
     pub fn intern_regex(&mut self, compiled: *mut std::ffi::c_void) -> RegexTableIndex {
         let index = u32_from_usize(self.compiled_regexes.len());
-        self.compiled_regexes.push(compiled);
+        self.compiled_regexes.push(CompiledRegexHandle::new(compiled));
         RegexTableIndex(index)
     }
 

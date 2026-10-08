@@ -40,7 +40,7 @@ public:
     virtual DecoderErrorOr<AK::Duration> total_duration() override;
 
     virtual DemuxerScanState const& scan_state() const LIFETIME_BOUND override;
-    virtual void set_scan_state_change_handler(Function<void()>) override;
+    virtual void set_scan_state_change_handler(ScanStateChangeHandler) override;
 
     virtual void set_blocking_reads_aborted_for_track(Track const&) override;
     virtual void reset_blocking_reads_aborted_for_track(Track const&) override;
@@ -50,7 +50,6 @@ private:
     struct BufferedScanPayload {
         NonnullOwnPtr<FrameScanTimeline> timeline;
         NonnullRefPtr<MediaStreamCursor> scan_cursor;
-        Vector<Track> tracks;
     };
 
     struct TrackStatus {

@@ -10,6 +10,7 @@
 #include <LibGC/Ptr.h>
 #include <LibGC/WeakContainer.h>
 #include <LibJS/Export.h>
+#include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/GlobalObject.h>
 #include <LibJS/Runtime/JobCallback.h>
@@ -18,43 +19,18 @@
 
 namespace JS {
 
-class JS_API FinalizationRegistry final
-    : public Object
-    , public GC::WeakContainer {
-    JS_OBJECT(FinalizationRegistry, Object);
-    GC_DECLARE_ALLOCATOR(FinalizationRegistry);
-
+class JS_API FinalizationRegistry final : public Object {
 public:
-    virtual ~FinalizationRegistry() override = default;
-
-    void add_finalization_record(Cell& target, Value held_value, Cell* unregister_token);
-    bool remove_by_token(Cell& unregister_token);
+    // CleanupFinalizationRegistry ( finalizationRegistry ), with the callback in place of [[CleanupCallback]] unless it
+    // is null.
     ThrowCompletionOr<void> cleanup(GC::Ptr<JobCallback> = {});
-    bool has_empty_cells() const;
 
-    virtual Cell const& owner_cell(Badge<GC::Heap>) const override { return *this; }
-    virtual void remove_dead_cells(Badge<GC::Heap>) override;
+    Realm& realm();
+    Realm const& realm() const;
+    JobCallback& cleanup_callback();
+    JobCallback const& cleanup_callback() const;
 
-    Realm& realm() { return *m_realm; }
-    Realm const& realm() const { return *m_realm; }
-
-    JobCallback& cleanup_callback() { return *m_cleanup_callback; }
-    JobCallback const& cleanup_callback() const { return *m_cleanup_callback; }
-
-private:
-    FinalizationRegistry(Realm&, GC::Ref<JobCallback>, Object& prototype);
-
-    virtual void visit_edges(Visitor& visitor) override;
-
-    GC::Ref<Realm> m_realm;
-    GC::Ref<JobCallback> m_cleanup_callback;
-
-    struct FinalizationRecord {
-        GC::Ptr<Cell> target;
-        Value held_value;
-        GC::Ptr<Cell> unregister_token;
-    };
-    SinglyLinkedList<FinalizationRecord> m_records;
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_FINALIZATION_REGISTRY; }
 };
 
 }

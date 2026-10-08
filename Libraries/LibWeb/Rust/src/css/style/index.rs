@@ -192,8 +192,6 @@ impl StateSet {
 pub struct AttributeFact {
     pub name: StyleAtomID,
     pub value: StyleAtomID,
-    pub text_offset: u32,
-    pub text_length: u32,
 }
 
 /// The other names one attribute-name atom answers to.
@@ -482,6 +480,8 @@ pub struct StyleNodeFacts {
     text: Vec<u16>,
 }
 
+#[derive(Clone)]
+
 pub(super) struct MatchingFactBatch {
     facts: Arc<StyleNodeFacts>,
     charged_bytes: u64,
@@ -608,17 +608,7 @@ impl StyleNodeFacts {
             source.classes_of(source_row),
         ));
         let attribute_start = u32::try_from(self.attributes.len()).expect("attribute payload offset overflow");
-        for &attribute in source.attributes_of(source_row) {
-            let (text_offset, text_length) = match source.local_text_of(attribute) {
-                Some(text) => self.push_text(text),
-                None => (u32::MAX, 0),
-            };
-            self.attributes.push(AttributeFact {
-                text_offset,
-                text_length,
-                ..attribute
-            });
-        }
+        self.attributes.extend_from_slice(source.attributes_of(source_row));
         self.attribute_handles.push(PayloadHandle {
             offset: attribute_start,
             length: u32::try_from(self.attributes.len()).expect("attribute payload overflow") - attribute_start,
@@ -671,13 +661,6 @@ impl StyleNodeFacts {
             rare_facts.custom_states.slice(&source.custom_states),
             rare_facts.parts.slice(&source.parts),
         );
-    }
-
-    /// Append UTF-16 text whose value has no atom and return its batch-local range.
-    pub fn push_text(&mut self, text: &[u16]) -> (u32, u32) {
-        let offset = u32::try_from(self.text.len()).expect("text payload overflow");
-        self.text.extend_from_slice(text);
-        (offset, u32::try_from(text.len()).expect("text payload overflow"))
     }
 
     fn map_row(&mut self, node: StyleNodeID, row: u32) {
@@ -750,6 +733,7 @@ impl StyleNodeFacts {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn stale_rows(&self) -> u32 {
         if self.primary { 0 } else { self.stale_rows }
     }
@@ -885,13 +869,12 @@ impl StyleNodeFacts {
             stale_payload_bytes +=
                 old_attribute_handle.map_or(0, |old| size_of_val(old.slice(&self.attributes)) as u64);
             let offset = u32::try_from(self.attributes.len()).expect("fact payload offset overflow");
-            self.attributes
-                .extend(facts.attributes.iter().map(|&(name, value)| AttributeFact {
-                    name,
-                    value,
-                    text_offset: u32::MAX,
-                    text_length: 0,
-                }));
+            self.attributes.extend(
+                facts
+                    .attributes
+                    .iter()
+                    .map(|&(name, value)| AttributeFact { name, value }),
+            );
             self.attribute_handles[row] = PayloadHandle {
                 offset,
                 length: u32::try_from(facts.attributes.len()).expect("fact payload length overflow"),
@@ -1181,24 +1164,19 @@ impl StyleNodeFacts {
         }
     }
 
+    #[cfg(test)]
+    pub fn set_attribute_value_text_for_test(&mut self, value: StyleAtomID, text: &[u16]) {
+        Arc::make_mut(&mut self.attribute_catalogs)
+            .value_texts
+            .insert(value.0 as usize, Some(text.into()));
+    }
+
     #[must_use]
     pub fn text_of(&self, attribute: AttributeFact) -> Option<&[u16]> {
-        if let Some(text) = self.local_text_of(attribute) {
-            return Some(text);
-        }
         self.attribute_catalogs
             .value_texts
             .get(attribute.value.0 as usize)
             .and_then(Option::as_deref)
-    }
-
-    fn local_text_of(&self, attribute: AttributeFact) -> Option<&[u16]> {
-        if attribute.text_length == 0 && attribute.text_offset == u32::MAX {
-            return None;
-        }
-        let start = attribute.text_offset as usize;
-        let end = start + attribute.text_length as usize;
-        self.text.get(start..end)
     }
 
     #[must_use]
@@ -1239,12 +1217,7 @@ impl StyleNodeFacts {
             + size_of_val(self.custom_states_of(row))
             + size_of_val(self.parts_of(row))
             + size_of_val(self.classes_of(row))
-            + size_of_val(self.attributes_of(row))
-            + self
-                .attributes_of(row)
-                .iter()
-                .map(|attribute| attribute.text_length as usize * size_of::<u16>())
-                .sum::<usize>()) as u64
+            + size_of_val(self.attributes_of(row))) as u64
     }
 
     fn payload_bytes_of_row(&self, row: u32) -> u64 {
@@ -1365,7 +1338,7 @@ impl StyleNodeFacts {
 const MAX_POSTING_CHUNK: usize = 256;
 
 /// One feature's candidate set: chunked and sorted by `StyleNodeID`.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Posting {
     chunks: Vec<Vec<StyleNodeID>>,
     length: usize,
@@ -1602,6 +1575,7 @@ pub type PostingKey = FeatureKey;
 /// them. This global arrangement avoids program-lifetime registration and first-use fact scans;
 /// per-key missing coverage confines eviction fallout to the acceleration that was actually
 /// removed.
+#[derive(Clone)]
 pub struct FeaturePostings {
     postings: HashMap<PostingKey, Posting>,
     residency: MemoryLease,
@@ -1613,7 +1587,7 @@ pub struct FeaturePostings {
     /// Packed and atomic rather than two `Cell`s because the fact store is on the read side an
     /// evaluation step borrows, which has to be `Sync`; relaxed, because this is a memory-policy
     /// ratio and no semantic decision reads it.
-    benefit_lookups: AtomicU64,
+    benefit_lookups: crate::fork::ForkCopied<AtomicU64>,
 }
 
 /// Mask of the miss half of `FeaturePostings::benefit_lookups`.
@@ -1628,7 +1602,7 @@ impl Default for FeaturePostings {
             cardinality_limited: HashSet::default(),
             grown_selector_postings: HashSet::default(),
             selector_posting_limit: usize::MAX,
-            benefit_lookups: AtomicU64::new(0),
+            benefit_lookups: crate::fork::ForkCopied::new(AtomicU64::new(0)),
         }
     }
 }
@@ -2083,7 +2057,7 @@ struct CascadeEntryData {
 }
 
 /// Transaction-local duplicate suppression for candidate dispatch.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DispatchCandidateWorkspace {
     seen_at_epoch: EpochColumn,
     candidates: Vec<DispatchRow>,
@@ -2362,6 +2336,8 @@ impl Default for AncestorDispatchTopology {
     }
 }
 
+#[derive(Clone)]
+
 struct RuleDispatchTopology {
     /// Mutable construction form, consumed when the directory is finalized.
     buckets: HashMap<DispatchKey, Vec<DispatchRow>>,
@@ -2523,7 +2499,7 @@ impl RuleDispatch {
     }
 
     fn topology_mut(&mut self) -> &mut RuleDispatchTopology {
-        Arc::get_mut(&mut self.topology).expect("a shared selector topology is immutable")
+        Arc::make_mut(&mut self.topology)
     }
 
     fn entries_mut(&mut self) -> &mut Vec<DispatchEntryMetadata> {
@@ -2646,7 +2622,7 @@ impl RuleDispatch {
         );
         entry.required_ancestor_index = entry.required_ancestor.map(|required| {
             let topology = self.topology_mut();
-            let ancestors = Arc::get_mut(&mut topology.ancestors).expect("a shared ancestor topology is immutable");
+            let ancestors = Arc::make_mut(&mut topology.ancestors);
             let next = u32::try_from(ancestors.key_indices.len()).expect("ancestor requirement space exhausted");
             *ancestors.key_indices.entry(required).or_insert(next)
         });
@@ -3043,6 +3019,7 @@ impl RuleDispatch {
         self.topology.universal_by_parent.get(&key).map_or(&[], Vec::as_slice)
     }
 
+    #[cfg(test)]
     pub fn bucket(&self, key: DispatchKey) -> impl ExactSizeIterator<Item = DispatchEntry> + '_ {
         self.bucket_ids(key, CandidateEntries::All)
             .iter()
@@ -3261,6 +3238,7 @@ impl RuleDispatch {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn capacity_bytes(&self) -> u64 {
         self.scope_capacity_bytes()
             + self.entries.capacity_bytes()
@@ -3272,7 +3250,7 @@ impl RuleDispatch {
 /// One kind of an element's own declarations: what each covers, the value it was written with,
 /// and what the drive checks of that value. They are built from one list of pairs, so every
 /// declaration has its written value.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ElementDeclarations {
     declared: Box<[DeclaredProperty]>,
     written: Box<[RetainedStyleValueData]>,
@@ -3357,6 +3335,7 @@ pub(super) fn unwritten_declarations(declared: &[DeclaredProperty]) -> Vec<(Decl
 
 /// The custom properties an element's inline style declares, in declaration order, each with
 /// the value it was written with.
+#[derive(Clone)]
 pub struct ElementCustomDeclarations {
     declared: Box<[CustomDeclaration]>,
     written: Box<[RetainedStyleValueData]>,
@@ -3377,7 +3356,7 @@ impl ElementCustomDeclarations {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ElementDeclarationRow {
     by_kind: [ElementDeclarations; ElementDeclarationKind::COUNT],
     /// Only the `style` attribute declares custom properties.
@@ -3411,7 +3390,7 @@ impl ElementDeclarationRow {
 ///
 /// Each directory slot costs one pointer. A populated slot contains the fixed declaration-kind
 /// columns, and each property list owns one exact-sized allocation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ElementDeclarationRows {
     rows: Column<Option<Box<ElementDeclarationRow>>>,
     payload_bytes: u64,
@@ -3551,6 +3530,7 @@ impl super::intern_table::InternIdentity for CustomPropertyNameSetID {
 /// exactly because a mutation published it. The store's [`StyleNodeFacts`] is both the input-side
 /// projection and the current-side evaluation arrangement; bounded batches are temporary views of
 /// selected rows.
+#[derive(Clone)]
 pub struct ElementFactStore {
     /// Required primary arrangement. Element identity selects its fixed column slots directly;
     /// variable facts are append-only payloads reached through the slots' handles.
@@ -3568,7 +3548,7 @@ pub struct ElementFactStore {
     primary_stale_payload_bytes: u64,
     /// Candidate sets over the same facts. A rule arriving needs to find the elements it could
     /// match without walking the document, and this is what answers that.
-    postings: FeaturePostings,
+    postings: crate::fork::ForkShared<FeaturePostings>,
     /// Tier-3 headroom when admission last closed during a full rebuild. Until more headroom
     /// appears, another scan can only reach the same closure.
     posting_rebuild_closed_at_headroom: Option<u64>,
@@ -3599,10 +3579,10 @@ pub struct ElementFactStore {
     /// The longhand properties each element declares itself, by the kind of declaration they came
     /// from. An element-attached declaration beats every rule in its context, so the cascade needs
     /// to know which properties one covers just as it does for a rule.
-    element_declared_properties: ElementDeclarationRows,
+    element_declared_properties: crate::fork::ForkShared<ElementDeclarationRows>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct StagedFactRow {
     tag: StyleAtomID,
     /// The ASCII-lowercase folding of `tag`, held only when it differs from it. Type selectors
@@ -3654,7 +3634,7 @@ impl StagedFactRow {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FactStaging {
     rows: PagedColumn<FactStagingPage>,
     entries: Vec<Option<StagedFactRowPair>>,
@@ -3667,6 +3647,8 @@ struct FactStaging {
 
 const FACT_STAGING_PAGE_SHIFT: usize = 6;
 const FACT_STAGING_PAGE_SIZE: usize = 1 << FACT_STAGING_PAGE_SHIFT;
+
+#[derive(Clone)]
 
 struct FactStagingPage {
     entries: [u32; FACT_STAGING_PAGE_SIZE],
@@ -3700,6 +3682,8 @@ impl RemovablePagedColumnPage for FactStagingPage {
         (previous != NO_ROW).then_some(previous)
     }
 }
+
+#[derive(Clone)]
 
 struct StagedFactRowPair {
     before: Option<PrimaryFactSnapshot>,
@@ -3904,7 +3888,7 @@ impl FactStaging {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ElementFactMetadata {
     /// The animation names this element's computed style references, sorted.
     animation_names: Vec<StyleAtomID>,
@@ -3948,7 +3932,7 @@ impl Default for ElementFactStore {
             primary_live_bytes: 0,
             primary_live_payload_bytes: 0,
             primary_stale_payload_bytes: 0,
-            postings: FeaturePostings::default(),
+            postings: Default::default(),
             posting_rebuild_closed_at_headroom: None,
             memory: MemoryLease::new(MemoryCategory::StyleNodeMapping),
             memory_dirty: false,
@@ -3961,7 +3945,7 @@ impl Default for ElementFactStore {
             attribute_name_live_counts: PagedCopyColumn::default(),
             attribute_value_live_counts: PagedCopyColumn::default(),
             custom_property_set_live_counts: vec![0],
-            element_declared_properties: ElementDeclarationRows::default(),
+            element_declared_properties: Default::default(),
         };
         store.settled_non_apply_capacity_bytes = store.capacity_bytes() - store.apply_capacity_bytes();
         store
@@ -4966,7 +4950,7 @@ impl ElementFactStore {
         node: StyleNodeID,
     ) -> Option<HiddenInlineDeclarations> {
         let index = node.element_index()? as usize;
-        let rows = &mut self.element_declared_properties;
+        let rows = &mut *self.element_declared_properties;
         let row = rows.rows.get_mut(index)?.as_mut()?;
         let before = row.storage_bytes();
         let kind = ElementDeclarationKind::InlineStyle.index();
@@ -4988,7 +4972,7 @@ impl ElementFactStore {
         hidden: HiddenInlineDeclarations,
     ) {
         let index = node.element_index().expect("only an element has an inline declaration") as usize;
-        let rows = &mut self.element_declared_properties;
+        let rows = &mut *self.element_declared_properties;
         let row = rows.rows[index]
             .as_mut()
             .expect("a private demand keeps the element's declaration row");
@@ -5105,6 +5089,7 @@ impl ElementFactStore {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn has_attribute_value_text(&self, value: StyleAtomID) -> bool {
         self.attribute_catalogs
             .value_texts
@@ -5215,9 +5200,7 @@ impl ElementFactStore {
                 self.postings.remove(SelectorPostingKey::AttributeName(key), node);
             }
         }
-        Arc::get_mut(&mut self.rows)
-            .expect("forgetting a fact row requires unique primary rows")
-            .forget_row(node);
+        Arc::make_mut(&mut self.rows).forget_row(node);
         self.primary_live_bytes = self
             .primary_live_bytes
             .checked_sub(row_bytes)
@@ -5266,12 +5249,9 @@ impl ElementFactStore {
         Arc::strong_count(&self.rows) != 1
     }
 
+    /// NB: A retained traversal or a fork of the store may share the primary rows. The sweep writes only the store's
+    ///     own catalogs, and `prepare_attribute_catalogs` copies the rows where they are shared.
     pub(super) fn sweep_auxiliary_catalogs_without_sync(&mut self) {
-        assert_eq!(
-            Arc::strong_count(&self.rows),
-            1,
-            "auxiliary catalog sweeping requires unique primary rows"
-        );
         self.memory_dirty = true;
         let attribute_catalogs = Arc::make_mut(&mut self.attribute_catalogs);
         // Language spellings and attribute-name forms are retained until their atom is reclaimed;
@@ -5588,9 +5568,7 @@ impl ElementFactStore {
     pub fn release_staging(&mut self, memory: &mut MemoryController) {
         self.staging.clear();
         if self.primary_stale_payload_bytes > self.primary_live_payload_bytes {
-            Arc::get_mut(&mut self.rows)
-                .expect("compacting fact payloads requires unique primary rows")
-                .compact_primary_payloads();
+            Arc::make_mut(&mut self.rows).compact_primary_payloads();
             self.primary_stale_payload_bytes = 0;
         }
         let current = self.capacity_bytes();
@@ -5967,6 +5945,41 @@ mod tests {
         let mut atoms = HashSet::default();
         facts.collect_atoms(&mut atoms);
         assert!(atoms.is_empty());
+    }
+
+    #[test]
+    fn a_copy_of_the_store_sweeps_its_catalogs_apart_from_the_store() {
+        let mut memory = MemoryController::new();
+        let mut facts = ElementFactStore::new();
+        let node = StyleNodeID::element(1);
+        let attribute_name = StyleAtomID(1);
+        let attribute_value = StyleAtomID(2);
+        facts.note_attribute_name_forms(
+            attribute_name,
+            AttributeNameForms {
+                local: StyleAtomID(3),
+                folded_name: StyleAtomID(4),
+                folded_local: StyleAtomID(5),
+            },
+        );
+        facts.set_attribute_value_text(attribute_value, &[1]);
+        facts.set_attribute(node, attribute_name, attribute_value, true, &mut memory);
+        facts.apply_staged(&mut memory);
+
+        // A fork of the render state copies the store, which then shares the primary rows with it.
+        let mut copy = facts.clone();
+        facts.sweep_auxiliary_catalogs();
+        copy.sweep_auxiliary_catalogs();
+        for store in [&facts, &copy] {
+            assert_eq!(
+                store
+                    .rows
+                    .attribute_catalogs
+                    .value_texts
+                    .get(attribute_value.0 as usize),
+                Some(&Some(Box::from([1_u16])))
+            );
+        }
     }
 
     #[test]
@@ -6464,8 +6477,6 @@ mod tests {
             &[AttributeFact {
                 name: StyleAtomID(30),
                 value: StyleAtomID::NONE,
-                text_offset: u32::MAX,
-                text_length: 0,
             }],
         );
 
@@ -6537,14 +6548,10 @@ mod tests {
                 AttributeFact {
                     name: StyleAtomID(31),
                     value: StyleAtomID(41),
-                    text_offset: u32::MAX,
-                    text_length: 0,
                 },
                 AttributeFact {
                     name: StyleAtomID(32),
                     value: matching_value,
-                    text_offset: u32::MAX,
-                    text_length: 0,
                 },
             ],
         );
@@ -6753,45 +6760,6 @@ mod tests {
         // A node the batch does not cover is a miss, never a negative answer.
         assert_eq!(facts.row_of(StyleNodeID::element(2)), None);
         assert_eq!(facts.row_of(StyleNodeID::element(99)), None);
-    }
-
-    #[test]
-    fn attribute_text_is_carried_only_where_a_string_operator_needs_it() {
-        let mut facts = StyleNodeFacts::new();
-        let href: Vec<u16> = "https://example.com".encode_utf16().collect();
-        let (offset, length) = facts.push_text(&href);
-        facts.push_row(
-            StyleNodeID::element(1),
-            StyleAtomID(10),
-            StyleAtomID::NONE,
-            StateSet::default(),
-            &[],
-            &[
-                AttributeFact {
-                    name: StyleAtomID(40),
-                    value: StyleAtomID::NONE,
-                    text_offset: offset,
-                    text_length: length,
-                },
-                AttributeFact {
-                    name: StyleAtomID(41),
-                    value: StyleAtomID(50),
-                    text_offset: u32::MAX,
-                    text_length: 0,
-                },
-            ],
-        );
-
-        let row = facts.row_of(StyleNodeID::element(1)).unwrap();
-        let with_text = facts.attribute_of(row, StyleAtomID(40)).unwrap();
-        assert_eq!(facts.text_of(with_text), Some(href.as_slice()));
-
-        // An attribute answered by an atom carries no text at all.
-        let interned = facts.attribute_of(row, StyleAtomID(41)).unwrap();
-        assert_eq!(facts.text_of(interned), None);
-        assert_eq!(interned.value, StyleAtomID(50));
-
-        assert_eq!(facts.attribute_of(row, StyleAtomID(42)), None);
     }
 
     #[test]
@@ -7117,8 +7085,8 @@ mod tests {
     }
 
     #[test]
-    fn attribute_facts_keep_only_identity_and_an_optional_text_handle() {
-        assert_eq!(size_of::<AttributeFact>(), 16);
+    fn attribute_facts_keep_only_their_name_and_value_atoms() {
+        assert_eq!(size_of::<AttributeFact>(), 8);
     }
 
     #[test]

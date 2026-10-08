@@ -1,15 +1,22 @@
-# import_rust_crate(MANIFEST_PATH path/to/Cargo.toml CRATE_NAME name [PANIC_UNWIND])
+set_property(GLOBAL PROPERTY JOB_POOLS "${JOB_POOLS};cargo=1")
+
+# Compiler flags shared by Rust libraries, binaries, and tests.
+set(RUSTC_TARGET_FLAGS -Dwarnings ${RUSTC_TARGET_CPU_FLAGS})
+list(JOIN RUSTC_TARGET_FLAGS " " RUSTC_TARGET_FLAGS)
+
+# import_rust_crate(MANIFEST_PATH path/to/Cargo.toml CRATE_NAME name [PANIC_UNWIND] [KEEP_SYMBOLS symbol...])
 #
 # Builds a Rust static library crate using cargo and creates an IMPORTED target.
 # MANIFEST_PATH is relative to CMAKE_CURRENT_SOURCE_DIR.
+# KEEP_SYMBOLS names entry points that only dlsym() reaches. A link only takes the archive members
+# something references, and a debug build gives a lone function a member of its own, so these have
+# to be asked for or they are left out.
 #
 # When corrosion supports dependency tracking, we can use corrosion_import_crate() instead of this function. See:
 # https://github.com/corrosion-rs/corrosion/issues/206
 # https://github.com/corrosion-rs/corrosion/issues/624
-set_property(GLOBAL PROPERTY JOB_POOLS "${JOB_POOLS};cargo=1")
-
 function(import_rust_crate)
-    cmake_parse_arguments(PARSE_ARGV 0 ARG "PANIC_UNWIND" "MANIFEST_PATH;CRATE_NAME;FFI_OUTPUT_DIR;FFI_HEADER" "FEATURES;FFI_HEADERS")
+    cmake_parse_arguments(PARSE_ARGV 0 ARG "PANIC_UNWIND" "MANIFEST_PATH;CRATE_NAME;FFI_OUTPUT_DIR;FFI_HEADER" "FEATURES;FFI_HEADERS;KEEP_SYMBOLS")
 
     if (NOT ARG_FFI_OUTPUT_DIR)
         set(ARG_FFI_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
@@ -104,10 +111,23 @@ function(import_rust_crate)
     )
     add_dependencies(${ARG_CRATE_NAME} ${ARG_CRATE_NAME}-build)
 
-    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RustPanicInit.cpp.in"
-        "${CMAKE_CURRENT_BINARY_DIR}/${ARG_CRATE_NAME}_panic_init.cpp" @ONLY)
-    target_sources(${ARG_CRATE_NAME} INTERFACE
-        "${CMAKE_CURRENT_BINARY_DIR}/${ARG_CRATE_NAME}_panic_init.cpp")
+    foreach(symbol IN LISTS ARG_KEEP_SYMBOLS)
+        if (APPLE)
+            target_link_options(${ARG_CRATE_NAME} INTERFACE "LINKER:-u,_${symbol}")
+        elseif (WIN32)
+            target_link_options(${ARG_CRATE_NAME} INTERFACE "LINKER:/INCLUDE:${symbol}")
+        else()
+            target_link_options(${ARG_CRATE_NAME} INTERFACE "LINKER:-u,${symbol}")
+        endif()
+    endforeach()
+
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RustCrateInit.cpp.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/${ARG_CRATE_NAME}_init.cpp" @ONLY)
+
+    # A static library only links in the objects that something references, and nothing references the initializer.
+    # Putting its object on the link line runs it in whatever executable or shared library links the crate.
+    add_library(${ARG_CRATE_NAME}_init OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${ARG_CRATE_NAME}_init.cpp")
+    target_link_libraries(${ARG_CRATE_NAME} INTERFACE $<TARGET_OBJECTS:${ARG_CRATE_NAME}_init>)
 
     # Rust allocations go through AK so allocator overrides also apply across the FFI boundary.
     target_link_libraries(${ARG_CRATE_NAME} INTERFACE AK)
@@ -261,6 +281,8 @@ function(_rust_crate_common_setup)
         "CARGO_BUILD_RUSTC=${RUST_RUSTC}"
     )
 
+    list(APPEND cargo_env "CARGO_TARGET_${target_upper}_RUSTFLAGS=${RUSTC_TARGET_FLAGS}")
+
     if (RUSTC_WRAPPER)
         list(APPEND cargo_env
             "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
@@ -293,7 +315,6 @@ function(_rust_crate_common_setup)
         ${cargo_profile_flag}
         --
         -Cdefault-linker-libraries=yes
-        -D warnings
         --emit=dep-info
     )
 

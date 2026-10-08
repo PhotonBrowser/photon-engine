@@ -54,6 +54,8 @@ Client::~Client() = default;
 void Client::die()
 {
     verify_event_loop();
+    // NB: Forgetting this client below, or running its on_death callback, can drop the last reference to it.
+    NonnullRefPtr keep_client_alive_until_death_is_handled = *this;
     if (*s_client == this)
         *s_client = nullptr;
 
@@ -249,10 +251,16 @@ void Client::playback_session_clock_changed(u64 session_id, Media::MediaTimeRead
         playback_manager->clock_changed({}, move(time_reader));
 }
 
-void Client::playback_session_metadata_parsed(u64 session_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<UnixDateTime> start_time_realtime)
+void Client::playback_session_media_source_added(u64 session_id, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<UnixDateTime> start_time_realtime, Media::DemuxerScanState scan_state)
 {
     if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->metadata_parsed({}, audio_tracks, video_tracks, move(preferred_audio_track), move(preferred_video_track), start_time_realtime);
+        playback_manager->media_source_added({}, stream_id, move(audio_tracks), move(video_tracks), move(preferred_audio_track), move(preferred_video_track), start_time_realtime, move(scan_state));
+}
+
+void Client::playback_session_media_stream_source_failed(u64 session_id, u64 stream_id, Media::DecoderError error)
+{
+    if (auto* playback_manager = find_playback_manager(session_id))
+        playback_manager->media_stream_source_failed({}, stream_id, move(error));
 }
 
 void Client::playback_session_duration_changed(u64 session_id, AK::Duration duration)
@@ -271,10 +279,10 @@ void Client::playback_session_state_changed(u64 session_id, u64 applied_seek_req
         playback_manager->state_changed({}, applied_seek_request_id, state, is_playing, available_data, current_time);
 }
 
-void Client::playback_session_buffered_ranges_changed(u64 session_id, Media::TimeRanges buffered_ranges)
+void Client::playback_session_media_stream_scan_state_changed(u64 session_id, u64 stream_id, Media::DemuxerScanState scan_state)
 {
     if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->buffered_ranges_changed({}, buffered_ranges);
+        playback_manager->media_stream_scan_state_changed({}, stream_id, move(scan_state));
 }
 
 void Client::playback_session_error(u64 session_id, Media::DecoderError error)

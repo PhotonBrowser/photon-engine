@@ -264,6 +264,7 @@
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebCommon/WebDriver/UserPrompt.h>
+#include <LibWebCommon/WebView/AccessibilityNodeData.h>
 
 namespace Web::DOM {
 
@@ -668,7 +669,21 @@ void Document::mark_style_attribute_dirty(Element& element)
 
 void Document::synchronize_dirty_style_attributes()
 {
+    // OPTIMIZATION: A style update synchronizes the style attribute of an element whose declarations script changed
+    //               only for the selectors and attr()s of the style engine. Where none reads the attribute, it is
+    //               synchronized as the DOM reads it, which tells the engine then, and the elements left out are
+    //               synchronized at the first style update that something of the engine reads it at.
+    auto& style_engine = style_computer().style_engine();
+    if (style_engine.attribute_is_known_unread(style_engine.intern_attribute_name(HTML::AttributeNames::style, {}))) {
+        for (auto& element : m_elements_with_dirty_style_attributes)
+            m_elements_with_unreported_style_attributes.set(element);
+        m_elements_with_dirty_style_attributes.clear();
+        return;
+    }
     auto elements = move(m_elements_with_dirty_style_attributes);
+    for (auto& element : m_elements_with_unreported_style_attributes)
+        elements.set(element);
+    m_elements_with_unreported_style_attributes.clear();
     for (auto& element : elements) {
         if (element.is_connected() && &element.document() == this)
             element.synchronize_all_attributes();
@@ -710,7 +725,6 @@ Layout::NodeArena& Document::layout_node_arena()
                 return;
             case Layout::RustFFI::NodeKind::Unset:
             case Layout::RustFFI::NodeKind::Node:
-            case Layout::RustFFI::NodeKind::NodeWithStyle:
                 VERIFY_NOT_REACHED();
             default:
                 Layout::allocate_layout_node<Layout::Box>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
@@ -777,11 +791,7 @@ void Document::finalize()
         m_layout_node_arena->stop_reporting_box_presence({});
     tear_down_layout_tree();
     if (m_layout_node_arena) {
-        Layout::RustFFI::document_host_clear_chrome_state_callback(m_layout_node_arena->host());
-        Layout::RustFFI::document_host_clear_style_record_host_callbacks(m_layout_node_arena->host());
-        Layout::RustFFI::document_host_clear_layout_host_callbacks(m_layout_node_arena->host());
-        Layout::RustFFI::document_host_clear_layout_update_host_callbacks(m_layout_node_arena->host());
-        Layout::RustFFI::document_host_clear_shell_factory(m_layout_node_arena->host());
+        Layout::RustFFI::document_host_clear_callbacks(m_layout_node_arena->host());
         VERIFY(Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()).live_slots == 0);
         m_layout_node_arena->set_document({}, nullptr);
     }
@@ -849,6 +859,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_active_element);
     visitor.visit(m_target_element);
     visitor.visit(m_autofocus_candidates);
+    visitor.visit(m_accessibility_focus_target);
     visitor.visit(m_implementation);
     visitor.visit(m_current_script);
     visitor.visit(m_associated_inert_template_document);
@@ -928,7 +939,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     visitor.visit(m_adopted_style_sheets);
     visitor.visit(m_script_blocking_style_sheet_set);
-    m_sheet_set_style_cache_registry.visit_edges(visitor);
 
     visitor.visit(m_active_view_transition);
     visitor.visit(m_dynamic_view_transition_style_sheet);
@@ -1761,20 +1771,6 @@ CSS::PreferredColorScheme Document::canvas_color_scheme(Layout::BegunRead const&
     return color_scheme;
 }
 
-CSS::ImageRendering Document::background_image_rendering(Layout::BegunRead const& read) const
-{
-    auto* body_element = body();
-    if (!body_element)
-        return CSS::ImageRendering::Auto;
-
-    // NB: Called during painting inside update_layout().
-    auto body_layout_node = body_element->unsafe_layout_node(read);
-    if (!body_layout_node)
-        return CSS::ImageRendering::Auto;
-
-    return body_layout_node->image_rendering();
-}
-
 void Document::update_base_element(Badge<HTML::HTMLBaseElement>)
 {
     GC::Ptr<HTML::HTMLBaseElement> base_element_with_href = nullptr;
@@ -2080,12 +2076,15 @@ void Document::end_style_stabilization_epoch()
 void Document::after_layout_commit(Layout::BegunRead const& read, LayoutTreeChanged layout_tree_changed)
 {
     // NB: Called during layout update.
+    // Read before anything below writes the render state, while the main thread knows it from the round.
+    bool const collects_boxes_with_auto_content_visibility = layout_tree_changed == LayoutTreeChanged::Yes
+        && Layout::RustFFI::render_state_may_have_auto_content_visibility(layout_node_arena().host(), &read);
     Layout::RustFFI::render_state_invalidate_searchable_text(layout_node_arena().host());
 
     set_needs_to_record_display_list();
 
+    // The round that committed the layout prepared it for rendering, but for the visual contexts, which update next.
     set_needs_accumulated_visual_contexts_update(true);
-    prepare_for_rendering(read);
 
     // A tree update can replace layout nodes referenced by selection state.
     if (auto range = get_selection()->range())
@@ -2098,7 +2097,7 @@ void Document::after_layout_commit(Layout::BegunRead const& read, LayoutTreeChan
         // Broadcast the current viewport rect to any new committed boxes, so they know whether
         // they're visible or not. If necessary, re-collect the content-visibility:auto set.
         inform_all_viewport_clients_about_the_current_viewport_rect();
-        if (Layout::RustFFI::render_state_may_have_auto_content_visibility(layout_node_arena().host(), &read))
+        if (collects_boxes_with_auto_content_visibility)
             collect_boxes_with_auto_content_visibility(read);
     }
 
@@ -2244,7 +2243,7 @@ void Document::did_render_list_item_counter_value(Element& element)
     }
 }
 
-bool Document::reconcile_stale_list_item_counters_after_tree_build(Layout::BegunRead const& read)
+bool Document::reconcile_stale_list_item_counters_after_tree_build(ReadonlySpan<Layout::RustFFI::FfiNodeIdentity> rebuilt_roots)
 {
     if (m_list_owners_with_stale_item_counters.is_empty()) {
         m_stale_list_item_counter_rendered = false;
@@ -2253,22 +2252,16 @@ bool Document::reconcile_stale_list_item_counters_after_tree_build(Layout::Begun
 
     // A rebuilt subtree has re-resolved the counters sets of any stale owner inside it, and an owner that has left
     // the document renders nothing.
-    struct RebuiltRoots {
-        GC::Ref<Document> document;
-        HashTable<GC::Ptr<Node const>> dom_roots;
-    } rebuilt_roots { *this, {} };
-    Layout::RustFFI::render_state_for_each_pending_rebuilt_subtree_root(
-        layout_node_arena().host(), &read, &rebuilt_roots,
-        [](void* context, Layout::RustFFI::FfiNodeIdentity root) {
-            auto& rebuilt_roots = *static_cast<RebuiltRoots*>(context);
-            if (auto dom_node = Painting::node_identity_of(root).resolve(*rebuilt_roots.document))
-                rebuilt_roots.dom_roots.set(dom_node);
-        });
+    HashTable<GC::Ptr<Node const>> rebuilt_dom_roots;
+    for (auto root : rebuilt_roots) {
+        if (auto dom_node = Painting::node_identity_of(root).resolve(*this))
+            rebuilt_dom_roots.set(dom_node);
+    }
     m_list_owners_with_stale_item_counters.remove_all_matching([&](GC::Ref<Element> const& list_owner) {
         if (!list_owner->is_connected())
             return true;
         for (Node const* node = list_owner.ptr(); node; node = node->parent()) {
-            if (rebuilt_roots.dom_roots.contains(node))
+            if (rebuilt_dom_roots.contains(node))
                 return true;
         }
         return false;
@@ -2314,15 +2307,31 @@ bool Document::layout_is_up_to_date() const
 {
     if (!navigable() || navigable()->active_document().ptr() != this)
         return true;
-    // A frame in flight, or a round that flew or a clock lease ran and is not paid yet, brings layout the host waits
-    // for, which the host knows without reading the render state. So does style that flew, which is pending until a read
-    // of the document drains it: a read of a document it embeds asks here, and lays the document out to drain it.
+    if (m_reads_layout_as_it_flew)
+        return true;
+    // A frame in flight, or a round that flew and is not paid yet, brings layout the host waits for, which the host
+    // knows without reading the render state. So does style that flew, which is pending until a read of the document
+    // drains it: a read of a document it embeds asks here, and lays the document out to drain it.
     if (has_flown_style_transaction() || (m_layout_node_arena && m_layout_node_arena->render_document().waits_for_frame()))
         return false;
     // Without an arena there is no layout root either, so there is a tree to build.
     if (!m_layout_node_arena)
         return false;
     return Layout::RustFFI::render_state_layout_is_up_to_date(m_layout_node_arena->host(), style_node_id().value());
+}
+
+// Whether the document's layout is not up to date, as far as the host knows without reading the render state.
+bool Document::layout_is_known_stale() const
+{
+    if (!navigable() || navigable()->active_document().ptr() != this)
+        return false;
+    if (m_reads_layout_as_it_flew)
+        return false;
+    if (has_flown_style_transaction() || (m_layout_node_arena && m_layout_node_arena->render_document().waits_for_frame()))
+        return true;
+    if (!m_layout_node_arena)
+        return true;
+    return Layout::RustFFI::render_state_layout_is_known_stale(m_layout_node_arena->host(), style_node_id().value());
 }
 
 void Document::update_style_computer_viewport_rect()
@@ -2465,13 +2474,16 @@ void Document::sample_animation_effects_needing_style_update()
         return static_cast<Animations::KeyframeEffect&>(*animation->effect()).observation_sample_requested();
     });
 
+    // A timeline script observed ahead of its current time in this task is sampled at that time too, so that a style
+    // read agrees with the time script read, however many reads the task makes.
     GC::RootVector<GC::Ref<Animations::AnimationTimeline>> timelines_with_current_time_override;
-    if (m_force_throttled_animation_style_update || has_requested_observation_sample) {
-        for (auto& timeline : m_associated_animation_timelines)
+    bool const samples_at_observed_time = m_force_throttled_animation_style_update || has_requested_observation_sample;
+    for (auto& timeline : m_associated_animation_timelines) {
+        if (samples_at_observed_time || timeline->was_observed_ahead_in_current_task())
             timelines_with_current_time_override.append(timeline);
-        for (auto& timeline : timelines_with_current_time_override)
-            timeline->set_current_time_override_for_style_sampling(timeline->current_time_for_observation());
     }
+    for (auto& timeline : timelines_with_current_time_override)
+        timeline->set_current_time_override_for_style_sampling(timeline->current_time_for_observation());
     ScopeGuard clear_current_time_overrides = [&] {
         for (auto& timeline : timelines_with_current_time_override)
             timeline->clear_current_time_override_for_style_sampling();
@@ -2822,8 +2834,7 @@ void Document::obtain_theme_color(Layout::BegunRead const& read)
             auto context = CSS::Parser::ParsingParams { document() };
             auto media = element.attribute(HTML::AttributeNames::media);
             if (media.has_value()) {
-                auto query = parse_media_query(media.value());
-                if (query.is_null() || !query->evaluate(*this))
+                if (!CSS::RustMediaList::parse(media.value()).evaluate(*this))
                     return TraversalDecision::Continue;
             }
 
@@ -3085,6 +3096,9 @@ static void mark_mouse_transition_event_as_trusted_if_needed(Event& event, Optio
 void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hover_event_data)
 {
     Layout::ForcedReadScope read { *this };
+    // The style's hover follows the node the events hover. A hover beside the host may have moved it already, while
+    // the hovered node of the events stayed.
+    CSS::move_style_hover(*this, node);
     if (m_hovered_node == node)
         return;
 
@@ -3131,8 +3145,6 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
         for (auto target = node; target && target.ptr() != common_ancestor; target = target->parent_or_shadow_host())
             entered_ancestors.append(make_hover_event_target(*target));
     }
-
-    CSS::Invalidation::invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass::Hover, old_hovered_node, node);
 
     m_hovered_node = node;
 
@@ -3928,6 +3940,36 @@ void Document::set_active_element(GC::Ptr<Element> element)
     m_active_element = element;
 
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
+
+    // Tell the accessibility tree which node has the focus — once an assistive technology reads the tree. The first
+    // tree it gets already marks the focused node (AccessibilityNodeData::is_focused), so staying quiet until then
+    // loses nothing. Gecko, WebKit, and Blink also skip this until an assistive technology turns accessibility on:
+    // nsFocusManager::FireFocusOrBlurEvent() checks GetAccService(), Document::setFocusedElement() checks
+    // existingAXObjectCache(), and Document::NotifyFocusedElementChanged() checks ExistingAXObjectCache().
+    if (!page().accessibility_interested())
+        return;
+
+    // The node with the focus is the active element while an element has it (retargeted out of any shadow tree, which
+    // the tree doesn't descend into), and the document element — the tree's root — once nothing does. activeElement
+    // falls back to body then, but body isn't focused; Gecko, WebKit, and Blink all put the focus on the document
+    // instead (FocusManager::FocusedDOMNode(), AXObjectCache::focusedObjectForPage(), AXObjectCacheImpl::
+    // FocusedNode()), and the bridges hand the AT the document root when no node is focused.
+    Element const* focused_node = document_element();
+    if (as_if<Element>(m_focused_area.ptr()) && m_active_element)
+        focused_node = m_active_element.ptr();
+    // Only the top-level traversable's active document reports: the accessibility tree is built from that document
+    // alone (it doesn't descend into iframes yet), so a same-process iframe document's focused element — or its
+    // root, once nothing in it is focused — would name a node the tree doesn't have, and the bridges would drop the
+    // focus altogether. Focus moving into an iframe reports the iframe element instead, which the focus update steps
+    // focus in the top-level document in the same pass. Gecko (FocusManager::FocusedDOMNode()) and WebKit
+    // (AXObjectCache::focusedObjectForPage() asks the focused frame) report the innermost focused node, since their
+    // trees include the child documents; Blink gives each document its own AXObjectCacheImpl, and the browser
+    // stitches the iframe's tree under the iframe element.
+    if (focused_node) {
+        auto navigable = this->navigable();
+        if (navigable && navigable->is_top_level_traversable() && navigable->active_document().ptr() == this)
+            page().client().page_did_change_accessibility_focus(focused_node->unique_id());
+    }
 }
 
 void Document::set_target_element(GC::Ptr<Element> element)
@@ -4044,6 +4086,25 @@ void Document::flush_autofocus_candidates()
             HTML::run_focusing_steps(target.ptr());
         }
     }
+}
+
+void Document::set_accessibility_focus_target(GC::Ptr<Element> element)
+{
+    if (m_accessibility_focus_target == element)
+        return;
+
+    // The AT focus ring is a paint-time browser overlay (see outline_data_for_paint). So, moving it between elements
+    // only requires a repaint — not a style recomputation. Cached paint commands capture the ring, though — so both
+    // the element losing it and the element gaining it must invalidate their caches, and re-record.
+    if (m_accessibility_focus_target)
+        m_accessibility_focus_target->set_needs_repaint();
+
+    m_accessibility_focus_target = element;
+
+    if (m_accessibility_focus_target)
+        m_accessibility_focus_target->set_needs_repaint();
+
+    set_needs_repaint();
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#the-indicated-part-of-the-document
@@ -5397,7 +5458,7 @@ void Document::check_favicon_after_loading_link_resource()
         // If the user agent tries to use an icon but that icon is determined, upon closer examination, to in fact be
         // inappropriate (e.g. because it uses an unsupported format), then the user agent must try the
         // next-most-appropriate icon as determined by the attributes.
-        if (auto icon = link_element->load_favicon_if_window_is_active()) {
+        if (auto icon = link_element->associated_favicon()) {
             if (!largest_icon || icon->size().area() > largest_icon->size().area()) {
                 m_active_favicon = link_element;
                 largest_icon = move(icon);
@@ -6324,6 +6385,27 @@ Utf16String Document::dump_accessibility_tree_as_json()
 
     MUST(json.finish());
     return builder.to_string();
+}
+
+Vector<WebView::AccessibilityNodeData> Document::build_accessibility_node_data()
+{
+    Vector<WebView::AccessibilityNodeData> nodes;
+    auto accessibility_tree = AccessibilityTreeNode::create(nullptr);
+    build_accessibility_tree(*&accessibility_tree);
+
+    if (accessibility_tree->value()) {
+        // The tree reads what renders, as the caller's own read of the render state.
+        Layout::ForcedReadScope read { *this };
+        accessibility_tree->serialize_tree_as_node_data(nodes, *this, read);
+    } else {
+        // Empty document: synthesize a root document node.
+        WebView::AccessibilityNodeData root;
+        root.id = static_cast<i64>(unique_id().value());
+        root.role = "document"_string;
+        nodes.append(move(root));
+    }
+
+    return nodes;
 }
 
 // https://dom.spec.whatwg.org/#dom-document-createattribute
@@ -7643,14 +7725,9 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
             return false;
 
         auto matrix = Gfx::FloatMatrix4x4::identity();
-        if (auto translate = layout_node.translate())
-            matrix = matrix * translate->to_matrix(&layout_node);
-        if (auto rotate = layout_node.rotate())
-            matrix = matrix * rotate->to_matrix(&layout_node);
-        if (auto scale = layout_node.scale())
-            matrix = matrix * scale->to_matrix(&layout_node);
-        layout_node.for_each_transformation([&](auto const& transformation) {
-            matrix = matrix * transformation.to_matrix(&layout_node);
+        auto reference_box = Painting::transform_reference_box(layout_node);
+        layout_node.for_each_resolved_transform([&](auto const& transform) {
+            matrix = matrix * transform.to_matrix(reference_box.width(), reference_box.height());
         });
 
         constexpr auto epsilon = AK::NumericLimits<float>::epsilon();
@@ -10245,19 +10322,37 @@ RefPtr<Compositing::DisplayList> Document::record_display_list(Layout::BegunRead
 {
     // The host reads this recording right after it, so a recording in flight is taken in first: it has the recorder
     // state.
+    // The navigable's resource storage is the Paint thread's while the document's clock lane presents: a recording
+    // that adds to it holds the lane meanwhile.
+    auto* host = layout_node_arena().host();
+    bool holds_clock_lane = false;
     if (auto navigable = this->navigable()) {
         navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
-        // What a clock lease's ticks published, the recording copies from, which the document takes in with the
-        // presenter.
-        (void)navigable->presenter();
+        holds_clock_lane = &resource_storage == &navigable->display_list_resource_storage();
     }
-    auto recording = start_display_list_recording(read, config, cache_mode, Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate);
+    if (holds_clock_lane)
+        Layout::RustFFI::document_host_hold_clock_lane(host);
+    ScopeGuard release_clock_lane = [&] {
+        if (holds_clock_lane)
+            Layout::RustFFI::document_host_release_clock_lane(host);
+    };
+    auto recording = start_display_list_recording(read, config, cache_mode);
     if (!recording.has_value())
         return nullptr;
     return finish_display_list_recording(read, *recording, resource_storage);
 }
 
-Optional<Painting::DisplayListRecording> Document::start_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig config, Painting::PaintCommandCacheMode cache_mode, Layout::RustFFI::FfiFlightBlocker blocker, Optional<Compositor::FlightPresentation>* flight)
+Optional<Painting::DisplayListRecording> Document::start_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig config, Painting::PaintCommandCacheMode cache_mode)
+{
+    return start_recording(read, config, cache_mode, {});
+}
+
+Painting::DisplayListRecording Document::commit_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig config, Compositor::FlightPresentation&& presentation)
+{
+    return start_recording(read, config, Painting::PaintCommandCacheMode::ReadWrite, move(presentation)).release_value();
+}
+
+Optional<Painting::DisplayListRecording> Document::start_recording(Layout::BegunRead const& read, HTML::PaintConfig config, Painting::PaintCommandCacheMode cache_mode, Optional<Compositor::FlightPresentation>&& committed)
 {
     update_paint_and_hit_testing_properties_if_needed();
     VERIFY(has_committed_viewport_box());
@@ -10297,7 +10392,7 @@ Optional<Painting::DisplayListRecording> Document::start_display_list_recording(
     if (config.should_show_caret_hit_test_debug_overlay)
         overlay_inputs.caret_debug_rect = m_caret_hit_test_debug_rect;
 
-    return Painting::start_rust_display_list_recording(read, *this, move(visual_context_tree), move(placeholder_display_list), cache_mode, config, overlay_inputs, blocker, flight);
+    return Painting::start_rust_display_list_recording(read, *this, move(visual_context_tree), move(placeholder_display_list), cache_mode, config, overlay_inputs, move(committed));
 }
 
 RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage, Painting::HitTestListStands hit_test_list_stands)
@@ -10305,11 +10400,11 @@ RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Layout:
     auto display_list = Painting::finish_rust_display_list_recording(read, *this, recording, resource_storage);
     if (!display_list)
         return nullptr;
-    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording, *display_list, resource_storage);
+    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording, *display_list, resource_storage.collect_referenced_resources(*display_list));
     return display_list;
 }
 
-void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Compositing::DisplayListResourceStorage& resource_storage)
+void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Compositing::DisplayListResourceSet referenced_resources)
 {
     auto& document_paint_state = paint_state();
     bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
@@ -10319,7 +10414,7 @@ void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_
         m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(*hit_test_list_read, recording.visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
 
     if (recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source)
-        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, resource_storage.collect_referenced_resources(*display_list));
+        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, move(referenced_resources));
 }
 
 void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
@@ -10339,17 +10434,12 @@ Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunR
     if (!has_committed_viewport_box())
         return {};
 
+    // A hit test only reads a recording of the document as it is now: it presents nothing, so the compositor never
+    // shows a frame a hit test made in place of one the render clock sampled later. The next frame records again.
     auto rebuild_hit_test_display_list = [&] {
         set_needs_to_record_display_list();
-        HTML::PaintConfig paint_config { .paint_overlay = true };
-        if (auto navigable = this->navigable()) {
-            if (navigable->record_display_list_and_scroll_state(paint_config))
-                return;
-            (void)record_display_list(read, paint_config, navigable->display_list_resource_storage(), Painting::PaintCommandCacheMode::ReadWrite);
-            return;
-        }
         Compositing::DisplayListResourceStorage throwaway_resource_storage_for_hit_test_only_recording;
-        (void)record_display_list(read, paint_config, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
+        (void)record_display_list(read, HTML::PaintConfig { .paint_overlay = true }, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
     };
 
     // The paint properties were prepared above, and a query reads them as they were left there: preparing them again
@@ -10375,7 +10465,6 @@ Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunR
         scroll_state_snapshot(),
         page().client().device_pixels_per_css_pixel(),
         page().chrome_metrics(),
-        Painting::overflow_values_applied_to_viewport_for_wheel_scrolling(*this),
     };
 }
 
@@ -10824,6 +10913,11 @@ Utf16String Document::dump_display_list()
     if (paint_state().has_visual_context_tree(read))
         schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
 
+    // The dump reads the navigable's resource storage after the recording adds to it, which the Paint thread owns while
+    // the document's clock lane presents: the dump holds the lane until it is done.
+    auto* host = layout_node_arena().host();
+    Layout::RustFFI::document_host_hold_clock_lane(host);
+    ScopeGuard release_clock_lane = [&] { Layout::RustFFI::document_host_release_clock_lane(host); };
     auto& resource_storage = navigable()->display_list_resource_storage();
     auto display_list = record_display_list(read, HTML::PaintConfig {}, resource_storage, Painting::PaintCommandCacheMode::ReadOnly);
     if (!display_list)

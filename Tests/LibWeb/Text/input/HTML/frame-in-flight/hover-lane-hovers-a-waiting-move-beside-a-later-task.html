@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="frame-in-flight.js"></script>
+<style>
+    body { margin: 0; }
+    #box { width: 100px; height: 100px; outline: 1px solid rgb(0, 0, 255); }
+    #box:hover { width: 150px; outline-color: rgb(0, 128, 0); }
+</style>
+<div id="box"></div>
+<script>
+    // A pointer move waits for the next tick for the render clock to hover it. A task that reads the layout beside it
+    // writes nothing the screen does not show, and the lane hovers the move at its next tick, beside a later task.
+    asyncTest(async done => {
+        const width = await whileLaneHovers(async frameTime => {
+            internals.moveHoverPointer(50, 50);
+            box.offsetWidth;
+            await nextTask();
+            internals.injectClockTick(frameTime + 32);
+            return internals.presentedBorderBox(box)?.width;
+        });
+        println(`box width on screen: ${width}`);
+        done();
+    });
+</script>

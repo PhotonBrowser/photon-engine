@@ -47,7 +47,7 @@ pub(crate) fn environment_variable_is_known(name: &[u16]) -> bool {
 const MAX_ANCESTOR_COUNT: u8 = 32;
 const ABSORB_THRESHOLD: usize = 8;
 
-trait Utf16SliceExt {
+pub(crate) trait Utf16SliceExt {
     fn eq_ignore_ascii_case(&self, expected: &str) -> bool;
     fn eq_ignore_ascii_case_utf16(&self, expected: &[u16]) -> bool;
     fn starts_with_ascii(&self, expected: &str) -> bool;
@@ -3908,7 +3908,6 @@ pub unsafe extern "C" fn rust_custom_property_store_create(
     parent: *const c_void,
     inheritance_parent: *const c_void,
 ) -> *const c_void {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CustomPropertyStoreLifecycleEntry);
     let entries = if entry_count == 0 {
         &[]
     } else {
@@ -3972,7 +3971,6 @@ pub unsafe extern "C" fn rust_custom_property_store_create_animation_overlay(
     entry_count: usize,
     base: *const c_void,
 ) -> *const c_void {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CustomPropertyStoreLifecycleEntry);
     let entries = if entry_count == 0 {
         &[]
     } else {
@@ -4003,21 +4001,7 @@ pub unsafe extern "C" fn rust_custom_property_store_create_animation_overlay(
 /// not already been released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_custom_property_store_destroy(store: *const c_void) {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CustomPropertyStoreLifecycleEntry);
     drop(unsafe { Arc::from_raw(store.cast::<CustomPropertyStore>()) });
-}
-
-/// Which names a store declares that the registry registers with a syntax, whose values its
-/// element's lengths compute.
-#[repr(u8)]
-pub enum FfiRegisteredValueDeclarations {
-    None,
-    /// Every registered value parses as declared, so the lengths it reads are known before it is
-    /// computed.
-    Parsed,
-    /// A registered value substitutes, so the container-relative lengths it reads are known only
-    /// once it is substituted.
-    Substituted,
 }
 
 /// Hands every custom property a store declares itself to `callback`, in declaration order, with

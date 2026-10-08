@@ -223,7 +223,7 @@ void Animatable::associate_with_animation(GC::Ref<Animation> animation)
     impl.associated_animations.append(animation);
     impl.is_sorted_by_composite_order = false;
     // The style engine computes no record for an element whose animations compose its style.
-    CSS::record_element_adjustment_facts(as<DOM::Element>(*this));
+    CSS::record_element_animations_changed(as<DOM::Element>(*this));
 
     as<DOM::Element>(*this).change_associated_animation_count_in_subtree(1);
 
@@ -236,7 +236,7 @@ void Animatable::disassociate_with_animation(GC::Ref<Animation> animation)
     auto& impl = *m_impl;
     auto was_associated = impl.associated_animations.remove_first_matching([&](auto element) { return animation == element; });
     impl.is_sorted_by_composite_order = false;
-    CSS::record_element_adjustment_facts(as<DOM::Element>(*this));
+    CSS::record_element_animations_changed(as<DOM::Element>(*this));
 
     if (was_associated)
         as<DOM::Element>(*this).change_associated_animation_count_in_subtree(-1);
@@ -303,43 +303,10 @@ void Animatable::cancel_css_animations_and_transitions()
         animation->cancel(Animation::ShouldInvalidate::No);
 }
 
-static void const* installed_longhand_table(DOM::Element const& element, Optional<CSS::PseudoElement> pseudo_element)
-{
-    auto const& style = element.installed_style(pseudo_element);
-    return style ? style.view().longhand_table : nullptr;
-}
-
-// A declaration whose delay and duration are each the single value 0s starts nothing, so it gives no longhand a
-// matching entry unless the element already holds a transition, which such an entry could still cancel.
-bool Animatable::has_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element, void const* longhand_table) const
-{
-    if (!longhand_table)
-        return false;
-    if (CSS::StyleValueFFI::rust_transition_delay_and_duration_are_single_zero(longhand_table)
-        && property_ids_with_existing_transitions(pseudo_element).is_empty())
-        return false;
-    return CSS::StyleValueFFI::rust_transition_has_entries(longhand_table);
-}
-
 bool Animatable::has_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    return has_matching_transition_property_entry(pseudo_element, installed_longhand_table(static_cast<DOM::Element const&>(*this), pseudo_element));
-}
-
-// The longhands the element's installed style gives a matching transition-property entry, read from
-// the style's transition longhands.
-Vector<CSS::PropertyID> Animatable::property_ids_with_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element) const
-{
-    auto const* longhand_table = installed_longhand_table(static_cast<DOM::Element const&>(*this), pseudo_element);
-    if (!has_matching_transition_property_entry(pseudo_element, longhand_table))
-        return {};
-    auto entries = CSS::StyleValueFFI::rust_transition_entries(longhand_table);
-    Vector<CSS::PropertyID> property_ids;
-    property_ids.ensure_capacity(entries.count);
-    for (auto const& entry : ReadonlySpan<CSS::StyleValueFFI::FfiTransitionEntry> { entries.entries, entries.count })
-        property_ids.unchecked_append(static_cast<CSS::PropertyID>(entry.property_id));
-    CSS::StyleValueFFI::rust_transition_entries_release(entries);
-    return property_ids;
+    auto const& style = static_cast<DOM::Element const&>(*this).installed_style(pseudo_element);
+    return style && CSS::StyleValueFFI::rust_transition_has_matching_entries(style.view().longhand_table, has_existing_transitions(pseudo_element));
 }
 
 bool Animatable::has_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
@@ -348,14 +315,10 @@ bool Animatable::has_existing_transitions(Optional<CSS::PseudoElement> pseudo_el
     return transition && !transition->associated_transitions.is_empty();
 }
 
-Vector<CSS::PropertyID> Animatable::property_ids_with_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
+HashMap<CSS::PropertyID, GC::Ref<CSS::CSSTransition>> const* Animatable::existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    auto const* maybe_transition = transition_if_exists(pseudo_element);
-
-    if (!maybe_transition)
-        return {};
-
-    return maybe_transition->associated_transitions.keys();
+    auto const* transition = transition_if_exists(pseudo_element);
+    return transition ? &transition->associated_transitions : nullptr;
 }
 
 GC::Ptr<CSS::CSSTransition> Animatable::property_transition(Optional<CSS::PseudoElement> pseudo_element, CSS::PropertyID property) const

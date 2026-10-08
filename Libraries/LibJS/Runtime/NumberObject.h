@@ -11,27 +11,14 @@
 
 namespace JS {
 
+// Number.prototype is a NumberObject too, as it has a [[NumberData]] internal slot.
 class JS_API NumberObject : public Object {
-    JS_OBJECT(NumberObject, Object);
-    GC_DECLARE_ALLOCATOR(NumberObject);
-
 public:
     static GC::Ref<NumberObject> create(Realm&, double);
 
-    virtual ~NumberObject() override = default;
+    double number() const;
 
-    double number() const { return m_value; }
-
-protected:
-    NumberObject(double, Object& prototype);
-
-private:
-    virtual bool is_number_object() const final { return true; }
-
-    double m_value { 0 };
+    static bool is_engine_class_of(Object const& object) { return object.is_of_engine_class_or_subclass(JS_LAYOUT_CLASS_ID_NUMBER_OBJECT); }
 };
-
-template<>
-inline bool Object::fast_is<NumberObject>() const { return is_number_object(); }
 
 }

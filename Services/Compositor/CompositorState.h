@@ -13,11 +13,11 @@
 #include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
 #include <Compositor/ContextState.h>
+#include <Compositor/DisplayListPlayerSkia.h>
 #include <Compositor/VSyncScheduler.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/CanvasSurfaceRegistry.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
-#include <LibCompositing/DisplayList/DisplayListPlayerSkia.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/Forward.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
@@ -59,7 +59,9 @@ public:
     virtual void dispatch_key_event_to_web_content(u64 page_id, Web::KeyEvent const&) = 0;
     virtual void request_rendering_update() = 0;
     virtual void rendering_opportunity(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) = 0;
-    virtual void clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) = 0;
+    virtual void clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds, Vector<Web::CompositorScrollOffset> const& scroll_offsets) = 0;
+    virtual void pointer_moved(Web::CompositorContextId, Web::DevicePixelPoint, u32 /* buttons */, bool /* scrolled_since_frame */) { }
+    virtual void pointer_left(Web::CompositorContextId) { }
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) = 0;
     virtual void create_video_edge(Media::VideoSinkHandle) = 0;
     virtual void release_video_edge(Media::VideoSinkHandle) = 0;
@@ -240,7 +242,7 @@ private:
     DoublyLinkedList<PendingAsyncPresent> m_pending_async_presents;
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
     Compositing::CanvasSurfaceRegistry m_canvas_surface_registry;
-    OwnPtr<Compositing::DisplayListPlayerSkia> m_display_list_player;
+    OwnPtr<DisplayListPlayerSkia> m_display_list_player;
     HashMap<Optional<u64>, OwnPtr<VSyncScheduler>> m_vsync_schedulers_by_display;
     RefPtr<Core::Timer> m_gpu_completion_timer;
     CompositorStateClient* m_client { nullptr };

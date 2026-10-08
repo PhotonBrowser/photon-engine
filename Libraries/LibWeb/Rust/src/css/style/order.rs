@@ -26,7 +26,7 @@ impl OrderToken {}
 
 /// One totally ordered axis: stylesheet order within a tree context, nested rule order within a
 /// sheet, or layer order within an origin.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct OrderMaintenance {
     labels: Vec<u64>,
     free_entries: Vec<u32>,
@@ -40,11 +40,13 @@ impl OrderMaintenance {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.order.len()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
@@ -93,6 +95,7 @@ impl OrderMaintenance {
         }
     }
 
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = OrderToken> + '_ {
         self.order.iter().copied()
     }

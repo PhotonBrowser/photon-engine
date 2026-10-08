@@ -123,26 +123,6 @@ impl ImpactRegion {
             (Self::Node(node), InverseStep::FollowingSiblings) => Self::FollowingSiblings(node),
             (Self::Node(node), InverseStep::SiblingSequence) => Self::SiblingSequence(node),
 
-            // Relational anchors: from a possible witness back to the elements whose `:has()`
-            // Boolean it can flip.
-            (Self::Node(node), InverseStep::AnchorParent) => match tree.parent(node) {
-                Some(parent) => Self::Node(parent),
-                None => Self::Node(node),
-            },
-            (Self::Node(node), InverseStep::AnchorAncestors) => Self::Ancestors(node),
-            (Self::Node(node), InverseStep::AnchorPreviousSibling) => Self::PreviousSibling(node),
-            (Self::Node(node), InverseStep::AnchorPrecedingSiblings) => Self::PrecedingSiblings(node),
-
-            // From anything wider, an anchor step can reach any ancestor of the region, so it
-            // widens to the enclosing scope rather than guessing a narrower one.
-            (
-                _,
-                InverseStep::AnchorParent
-                | InverseStep::AnchorAncestors
-                | InverseStep::AnchorPreviousSibling
-                | InverseStep::AnchorPrecedingSiblings,
-            ) => Self::Document,
-
             // Children of a node's children, and everything below them, stay inside its subtree.
             (Self::Children(node), InverseStep::Descendants | InverseStep::Children) => Self::Subtree(node),
             (Self::Subtree(node), InverseStep::Descendants | InverseStep::Children) => Self::Subtree(node),
@@ -665,6 +645,7 @@ impl ImpactRegionBatch {
 /// The live tree deliberately retains no document-order label. Once a transaction asks enough
 /// region-membership questions to justify one pass over the tree, this workspace turns subtree
 /// membership into an interval comparison without adding anything to the mandatory per-node state.
+#[derive(Clone)]
 pub(super) struct TransactionTopology {
     nodes: Vec<StyleNodeID>,
     preorder_by_element_index: Vec<u32>,
@@ -1387,7 +1368,7 @@ impl ImpactRegions {
         self.rebuild_indexes();
     }
 
-    pub fn widen_to_document(&mut self, counters: &mut Counters) {
+    pub fn widen_to_document(&mut self, counters: &Counters) {
         counters.bump(Counter::DocumentWidenings);
         self.regions.clear();
         self.region_index.clear();
@@ -1960,10 +1941,10 @@ mod tests {
 
     #[test]
     fn widening_replaces_the_plan_rather_than_adding_to_it() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut regions = ImpactRegions::new();
         regions.add(ImpactRegion::Node(fixture.nodes[4]));
-        regions.widen_to_document(&mut fixture.counters);
+        regions.widen_to_document(&fixture.counters);
         assert_eq!(regions.regions(), &[ImpactRegion::Document]);
         assert_eq!(fixture.counters.get(Counter::DocumentWidenings), 1);
     }

@@ -18,6 +18,8 @@ type AppendText = unsafe extern "C" fn(*mut c_void, *const u8, usize);
 pub(crate) type DescribeNode =
     unsafe extern "C" fn(*const DocumentHost, &crate::render_state::BegunRead, NodeSlotId, *mut c_void, AppendText);
 
+#[derive(Clone)]
+
 struct Trace {
     lines: Vec<Line>,
     depth: usize,
@@ -25,6 +27,7 @@ struct Trace {
 
 /// One traced event: what it says, and the box it names, if any. The box is named once the pass is
 /// over, since naming it asks the document, which a pass cannot do.
+#[derive(Clone)]
 struct Line {
     depth: usize,
     prefix: &'static str,
@@ -35,7 +38,7 @@ struct Line {
 
 /// Observation belongs to the document, not to a single pass: geometry reads and
 /// style stabilization can cause several passes within one measured mutation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct LayoutTrace(RefCell<Option<Trace>>);
 
 pub(super) struct Scope<'a>(&'a LayoutTrace);
@@ -249,10 +252,7 @@ impl LayoutNodeArena {
 /// `host` must be a live document host, on its document's thread. The callback must remain valid until tracing stops
 /// and must synchronously describe the live row it is handed without mutating layout.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_begin_layout_trace(host: *const DocumentHost, describe_node: DescribeNode) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
+pub unsafe extern "C" fn render_state_begin_layout_trace(host: &DocumentHost, describe_node: DescribeNode) {
     host.host_tables().layout_trace_describe_node.set(Some(describe_node));
     // SAFETY: As above.
     unsafe { super::layout_changes::queue(host, super::layout_changes::LayoutChange::BeginLayoutTrace) };
@@ -264,7 +264,7 @@ pub unsafe extern "C" fn render_state_begin_layout_trace(host: *const DocumentHo
 /// supplied bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_take_layout_trace(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     context: *mut c_void,
     append_text: AppendText,

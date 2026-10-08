@@ -15,31 +15,18 @@
 namespace JS {
 
 class JS_API DataView : public Object {
-    JS_OBJECT(DataView, Object);
-    GC_DECLARE_ALLOCATOR(DataView);
-
 public:
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_DATA_VIEW; }
+
     static GC::Ref<DataView> create(Realm&, ArrayBuffer*, ByteLength byte_length, size_t byte_offset);
 
-    virtual ~DataView() override = default;
+    ArrayBuffer* viewed_array_buffer() const;
 
-    ArrayBuffer* viewed_array_buffer() const { return m_viewed_array_buffer.ptr(); }
-    ByteLength const& byte_length() const { return m_byte_length; }
-    u32 byte_offset() const { return m_byte_offset; }
+    // The runtime keeps [[ByteLength]] where only it reads it, so this returns a copy.
+    ByteLength byte_length() const;
 
-private:
-    DataView(GC::Ptr<ArrayBuffer>, ByteLength byte_length, size_t byte_offset, Object& prototype);
-
-    virtual bool is_data_view() const final { return true; }
-    virtual void visit_edges(Visitor& visitor) override;
-
-    GC::Ptr<ArrayBuffer> m_viewed_array_buffer;
-    ByteLength m_byte_length { 0 };
-    size_t m_byte_offset { 0 };
+    u32 byte_offset() const;
 };
-
-template<>
-inline bool Object::fast_is<DataView>() const { return is_data_view(); }
 
 // 25.3.1.1 DataView With Buffer Witness Records, https://tc39.es/ecma262/#sec-dataview-with-buffer-witness-records
 struct DataViewWithBufferWitness {

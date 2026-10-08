@@ -7,10 +7,14 @@
 
 #pragma once
 
+#include <AK/Concepts.h>
 #include <AK/Utf16FlyString.h>
+#include <AK/Vector.h>
 #include <LibGC/Ptr.h>
 #include <LibJS/Export.h>
+#include <LibJS/Heap/EngineCell.h>
 #include <LibJS/ModuleLoading.h>
+#include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/Environment.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibJS/Script.h>
@@ -58,93 +62,35 @@ struct ResolvedBinding {
 };
 
 // https://tc39.es/ecma262/#graphloadingstate-record
-struct GraphLoadingState : public Cell {
-    GC_CELL(GraphLoadingState, Cell);
-    GC_DECLARE_ALLOCATOR(GraphLoadingState);
-
-public:
-    GC::Ptr<PromiseCapability> promise_capability; // [[PromiseCapability]]
-    bool is_loading { false };                     // [[IsLoading]]
-    size_t pending_module_count { 0 };             // [[PendingModulesCount]]
-    HashTable<GC::Ptr<CyclicModule>> visited;      // [[Visited]]
-    GC::Ptr<GC::Cell> host_defined;                // [[HostDefined]]
-
-private:
-    GraphLoadingState(GC::Ptr<PromiseCapability> promise_capability, bool is_loading, size_t pending_module_count, HashTable<GC::Ptr<CyclicModule>> visited, GC::Ptr<GC::Cell> host_defined)
-        : promise_capability(move(promise_capability))
-        , is_loading(is_loading)
-        , pending_module_count(pending_module_count)
-        , visited(move(visited))
-        , host_defined(move(host_defined))
-    {
-    }
-    virtual void visit_edges(Cell::Visitor&) override;
-    virtual size_t external_memory_size() const override;
+// The state of loading a module graph, which the runtime keeps to itself; a host only passes it back to
+// finish_loading_imported_module() in the payload it received.
+struct GraphLoadingState final : public EngineCell {
 };
 
 // 16.2.1.4 Abstract Module Records, https://tc39.es/ecma262/#sec-abstract-module-records
-class JS_API Module : public Cell {
-    GC_CELL(Module, Cell);
-    GC_DECLARE_ALLOCATOR(Module);
-
+// A Module Record of the Rust runtime. The facade types of its kinds derive from Module. The abstract methods dispatch
+// to the record's kind inside the runtime.
+class JS_API Module : public EngineCell {
 public:
-    virtual ~Module() override;
+    Realm& realm();
+    Realm const& realm() const;
 
-    Realm& realm() { return *m_realm; }
-    Realm const& realm() const { return *m_realm; }
+    GC::Ptr<ModuleEnvironment> environment();
 
-    StringView filename() const LIFETIME_BOUND { return m_filename; }
+    GC::Ptr<GC::Cell> host_defined() const;
 
-    GC::Ptr<ModuleEnvironment> environment() { return m_environment; }
+    ThrowCompletionOr<void> link(VM& vm);
+    ThrowCompletionOr<GC::Ref<PromiseCapability>> evaluate(VM& vm);
 
-    GC::Ptr<GC::Cell> host_defined() const { return m_host_defined; }
+    // The runtime resolves an export with a resolve set of its own, so a host passes none.
+    ResolvedBinding resolve_export(VM& vm, Utf16FlyString const& export_name, Vector<ResolvedBinding> resolve_set = {});
 
-    GC::Ref<Object> get_module_namespace(VM& vm);
-
-    virtual ThrowCompletionOr<void> link(VM& vm) = 0;
-    virtual ThrowCompletionOr<GC::Ref<PromiseCapability>> evaluate(VM& vm) = 0;
-
-    Vector<Utf16FlyString> get_exported_names(VM& vm);
-    virtual Vector<Utf16FlyString> get_exported_names(VM& vm, GC::RootHashTable<GC::Ref<Module const>>& export_star_set) = 0;
-
-    virtual ResolvedBinding resolve_export(VM& vm, Utf16FlyString const& export_name, Vector<ResolvedBinding> resolve_set = {}) = 0;
-
-    virtual ThrowCompletionOr<u32> inner_module_linking(VM& vm, GC::RootVector<GC::Ref<Module>>& stack, u32 index);
-    virtual ThrowCompletionOr<u32> inner_module_evaluation(VM& vm, GC::RootVector<GC::Ref<Module>>& stack, u32 index);
-
-    virtual PromiseCapability& load_requested_modules(GC::Ptr<GC::Cell> host_defined) = 0;
+    PromiseCapability& load_requested_modules(GC::Ptr<GC::Cell> host_defined);
 
 protected:
-    Module(Realm&, ByteString filename, GC::Ptr<GC::Cell> host_defined = nullptr);
-
-    virtual void visit_edges(Cell::Visitor&) override;
-    virtual size_t external_memory_size() const override;
-
-    void set_environment(GC::Ref<ModuleEnvironment> environment)
-    {
-        m_environment = environment;
-    }
-
-private:
-    GC::Ref<Object> module_namespace_create(Vector<Utf16FlyString> unambiguous_names);
-    ThrowCompletionOr<void> evaluate_module_sync(VM&);
-
-    // These handles are only safe as long as the VM they live in is valid.
-    // But evaluated modules SHOULD be stored in the VM so unless you intentionally
-    // destroy the VM but keep the modules this should not happen. Because VM
-    // stores modules with a RefPtr we cannot just store the VM as that leads to
-    // cycles.
-    GC::Ptr<Realm> m_realm;                   // [[Realm]]
-    GC::Ptr<ModuleEnvironment> m_environment; // [[Environment]]
-    GC::Ptr<Object> m_namespace;              // [[Namespace]]
-    GC::Ptr<GC::Cell> m_host_defined;         // [[HostDefined]]
-
-    // Needed for potential lookups of modules.
-    ByteString m_filename;
+    // Only for host modules, whose initialize_environment hook creates their environment.
+    void set_environment(GC::Ref<ModuleEnvironment> environment);
 };
-
-class CyclicModule;
-struct GraphLoadingState;
 
 JS_API void finish_loading_imported_module(ImportedModuleReferrer, ModuleRequest const&, ImportedModulePayload, ThrowCompletionOr<GC::Ref<Module>> const&);
 

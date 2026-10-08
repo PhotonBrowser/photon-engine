@@ -189,6 +189,7 @@ enum class InvalidateLayoutTreeReason {
     X(SVGLengthValue, false)                        \
     X(SVGPathLength, false)                         \
     X(ViewTransitionCapture, false)                 \
+    X(ViewTransitionPseudoElementStyles, false)     \
     X(WindowScroll, false)
 
 enum class UpdateLayoutReason {
@@ -410,7 +411,6 @@ public:
     GC::Ptr<Node const> inspected_node() const { return m_inspected_node; }
 
     void set_highlighted_node(GC::Ptr<Node>, Optional<CSS::PseudoElement>);
-    GC::Ptr<Node const> highlighted_node() const { return m_highlighted_node; }
     Layout::Node* highlighted_layout_node(Layout::BegunRead const& read);
     Layout::Node const* highlighted_layout_node(Layout::BegunRead const& read) const { return const_cast<Document*>(this)->highlighted_layout_node(read); }
     void set_flexbox_highlighted_node(GC::Ptr<Node>, Painting::FlexboxInspectorOverlayOptions);
@@ -477,7 +477,6 @@ public:
     Color background_color(Layout::BegunRead const& read) const;
     Color canvas_background_color(Layout::BegunRead const& read) const;
     CSS::PreferredColorScheme canvas_color_scheme(Layout::BegunRead const& read) const;
-    CSS::ImageRendering background_image_rendering(Layout::BegunRead const& read) const;
 
     Optional<Color> normal_link_color() const;
     void set_normal_link_color(Optional<Color>);
@@ -515,6 +514,26 @@ public:
     bool let_style_update_fly(Layout::RustFFI::FfiFlightBlocker blocker);
     // Seals the first round of a rendering update's layout for the frame its style flies in.
     void seal_first_layout_round(Layout::BegunRead const&);
+    // Brings the style up to date, and lets the first round of the rendering update's layout fly beside the event loop
+    // where `blocker` is none and the layout is not up to date. The next layout update takes it in. Answers whether the
+    // round flies.
+    bool let_layout_fly(Layout::RustFFI::FfiFlightBlocker blocker);
+    // Takes in the layout round that flew, as the frame it flew in left the document, and answers whether that laid the
+    // document out: no other round runs, so what was written since the round flew is the next layout update's.
+    bool take_flown_layout_in();
+    // While one lives, the document reads as the layout that flew left it: the writes made since wait behind those made
+    // meanwhile, and its layout is up to date as of the frame.
+    class [[nodiscard]] LayoutAsItFlew {
+        AK_MAKE_NONCOPYABLE(LayoutAsItFlew);
+        AK_MAKE_NONMOVABLE(LayoutAsItFlew);
+
+    public:
+        explicit LayoutAsItFlew(Document&);
+        ~LayoutAsItFlew();
+
+    private:
+        GC::Ref<Document> m_document;
+    };
     void note_throttled_animation_style_update() { m_has_throttled_animation_style_update = true; }
     void note_animations_that_can_skip_per_frame_style_updates();
     void flush_throttled_animation_style_update();
@@ -551,6 +570,7 @@ public:
     [[nodiscard]] u64 partial_layout_count() const;
     [[nodiscard]] u64 full_layout_count() const;
     [[nodiscard]] bool layout_is_up_to_date() const;
+    [[nodiscard]] bool layout_is_known_stale() const;
     void clear_devtools_layout_inspection_data();
     void prepare_for_rendering(Layout::BegunRead const& read);
     void update_paint_and_hit_testing_properties_if_needed();
@@ -726,6 +746,9 @@ public:
     Vector<GC::Ref<Element>>& autofocus_candidates() { return m_autofocus_candidates; }
     bool autofocus_processed_flag() const { return m_autofocus_processed_flag; }
     void flush_autofocus_candidates();
+
+    Element const* accessibility_focus_target() const { return m_accessibility_focus_target.ptr(); }
+    void set_accessibility_focus_target(GC::Ptr<Element>);
 
     void try_to_scroll_to_the_fragment();
     void scroll_to_the_fragment();
@@ -1030,6 +1053,7 @@ public:
     void did_stop_being_active_document_in_navigable();
 
     Utf16String dump_accessibility_tree_as_json();
+    Vector<WebView::AccessibilityNodeData> build_accessibility_node_data();
 
     void make_active();
 
@@ -1143,8 +1167,6 @@ public:
 
     void set_needs_animated_style_update(Animations::KeyframeEffect&);
 
-    CSS::SheetSetStyleCacheRegistry& sheet_set_style_cache_registry() { return m_sheet_set_style_cache_registry; }
-
     // Test-only counters for observing style invalidation and recomputation work. See Internals.idl.
     struct StyleInvalidationCounters {
         // A run consumes one non-empty semantic reaction batch. The element count includes derived
@@ -1205,7 +1227,6 @@ public:
         u64 committed_transitions_started { 0 };
         u64 media_rule_evaluations { 0 };
         u64 registered_properties_cache_rebuilds { 0 };
-        u64 scope_rule_cache_builds { 0 };
         u64 style_query_container_scans { 0 };
         u64 style_engine_transaction_setups { 0 };
         u64 style_engine_transaction_setup_microseconds { 0 };
@@ -1319,6 +1340,9 @@ public:
     void set_top_layer_needs_layout_zone_rebuild() { m_top_layer_needs_layout_zone_rebuild = true; }
 
     OrderedHashTable<GC::Ref<Element>> const& top_layer_elements() const { return m_top_layer_elements; }
+    // Only a member of the top layer, or an element whose membership changed since the top layer boxes were built, can
+    // have a box placed in the top layer.
+    bool may_have_boxes_placed_in_top_layer() const { return !m_top_layer_elements.is_empty() || !m_elements_with_pending_top_layer_membership_change.is_empty(); }
     bool top_layer_pending_removals_contains(GC::Ref<Element> element) const { return m_top_layer_pending_removals.contains(element); }
 
     // AD-HOC: These lists are managed dynamically instead of being generated as needed.
@@ -1383,11 +1407,14 @@ public:
     // Starts recording the document's display list as the document is now, beside the event loop where `blocker` is
     // none, taking `flight`, if any, to present its frame with, and makes the display list of a recording that has
     // landed.
-    Optional<Painting::DisplayListRecording> start_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig, Painting::PaintCommandCacheMode, Layout::RustFFI::FfiFlightBlocker, Optional<Compositor::FlightPresentation>* flight = nullptr);
+    Optional<Painting::DisplayListRecording> start_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig, Painting::PaintCommandCacheMode);
+    // Commits the navigable's next frame, a recording of the document, to the render owner, which presents it with
+    // `presentation` beside the event loop.
+    Painting::DisplayListRecording commit_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig, Compositor::FlightPresentation&& presentation);
     RefPtr<Compositing::DisplayList> finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const&, Compositing::DisplayListResourceStorage&, Painting::HitTestListStands = Painting::HitTestListStands::Yes);
     // Takes in `display_list`, which `recording` published: the paint command cache source, and the hit-test list it made,
     // read in `hit_test_list_read`, where that still stands for the document's boxes. Where none does, nothing is read.
-    void adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&, NonnullRefPtr<Compositing::DisplayList>, Compositing::DisplayListResourceStorage&);
+    void adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&, NonnullRefPtr<Compositing::DisplayList>, Compositing::DisplayListResourceSet referenced_resources);
     Optional<Painting::HitTestQuery> prepare_hit_test_query(Layout::BegunRead const& read);
     Optional<Painting::HitTestResult> hit_test(Layout::BegunRead const& read, CSSPixelPoint);
     Optional<Painting::CaretPosition> caret_position_from_point(Layout::BegunRead const& read, CSSPixelPoint);
@@ -1577,6 +1604,13 @@ protected:
     void initialize_document();
 
 private:
+    // Records the document's viewport for the host to publish, or, given `committed`, commits the recording.
+    Optional<Painting::DisplayListRecording> start_recording(Layout::BegunRead const&, HTML::PaintConfig, Painting::PaintCommandCacheMode, Optional<Compositor::FlightPresentation>&& committed);
+
+    // Whether the first round of a rendering update's layout may be sealed: list items that wait to be renumbered and top
+    // layer work are the layout update's to do first.
+    bool may_seal_first_layout_round() const;
+    Layout::RustFFI::FfiLayoutUpdateInputs first_layout_round_inputs() const;
     // Whether nothing this document has pending could change layout geometry: style, layout and every input
     // that feeds them are settled.
     [[nodiscard]] bool is_clean_for_layout_geometry_read(Layout::BegunRead const& read) const;
@@ -1616,7 +1650,7 @@ private:
     Layout::RustFFI::FfiLayoutUpdateHostCallbacks layout_update_host_callbacks();
 
     void process_pending_list_item_renumbers();
-    bool reconcile_stale_list_item_counters_after_tree_build(Layout::BegunRead const& read);
+    bool reconcile_stale_list_item_counters_after_tree_build(ReadonlySpan<Layout::RustFFI::FfiNodeIdentity> rebuilt_roots);
     enum class LayoutTreeChanged : u8 {
         No,
         Yes,
@@ -1758,6 +1792,7 @@ private:
 
     GC::Ptr<Element> m_active_element;
     GC::Ptr<Element> m_target_element;
+    GC::Ptr<Element> m_accessibility_focus_target;
 
     // https://html.spec.whatwg.org/multipage/interaction.html#autofocus-candidates
     Vector<GC::Ref<Element>> m_autofocus_candidates;
@@ -1836,6 +1871,9 @@ private:
     bool m_style_engine_tracks_tree { false };
     CSS::StyleNodeID m_style_node_id;
     GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
+    // Elements whose style attribute a style update left out of sync with their inline style, as nothing of the style
+    // engine read it then.
+    GC::WeakHashSet<Element> m_elements_with_unreported_style_attributes;
     GC::WeakHashSet<Element> m_elements_with_viewport_dependent_style;
     bool m_suppresses_attribute_style_invalidation { false };
     CSS::ScrollStateQueryContainers m_scroll_state_query_containers;
@@ -1843,6 +1881,7 @@ private:
     bool m_is_decoded_svg { false };
 
     bool m_needs_animated_style_update { false };
+    bool m_reads_layout_as_it_flew { false };
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update;
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update_after_current_update;
     bool m_is_updating_animated_style { false };
@@ -2060,7 +2099,6 @@ private:
     HashTable<GC::Ref<Element>> m_list_owners_pending_item_renumber;
     HashTable<GC::Ref<Element>> m_list_owners_with_stale_item_counters;
     bool m_stale_list_item_counter_rendered { false };
-    CSS::SheetSetStyleCacheRegistry m_sheet_set_style_cache_registry;
     RefPtr<Painting::HitTestDisplayList> m_hit_test_display_list;
     // The previous recording's list, retained so cached per-paintable item ranges can be spliced into
     // the next recording. Rotated only by cache-read-write recordings; survives display list invalidation.

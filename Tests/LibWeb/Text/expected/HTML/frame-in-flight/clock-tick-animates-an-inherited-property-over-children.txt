@@ -1,0 +1,4 @@
+lane after the tick: ticking
+the card's presented color moved: true
+the label shows the card's color: true
+last frame presented by: clock

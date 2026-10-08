@@ -21,7 +21,6 @@ pub struct FfiRecordingInputs {
     pub force_dark_foreground_threshold: i32,
     pub force_dark_background_threshold: i32,
     pub should_paint_overlay: bool,
-    pub is_recording_async_scrolling_metadata: bool,
     pub document_id: i64,
     pub has_blocking_wheel_event_region_covering_viewport: bool,
     pub wheel_event_listener_state_generation: u64,
@@ -45,6 +44,7 @@ pub struct FfiRecordingInputs {
     pub inactive_selection_background_dark: Color,
     pub palette_is_dark: bool,
     pub document_has_supported_color_schemes: bool,
+    pub accessibility_focus_target: crate::layout::node_data::NodeSlotId,
     pub has_inspector_highlight: bool,
     pub inspector_highlight_paintable: crate::layout::node_data::NodeSlotId,
     pub tooltip_color: Color,
@@ -64,22 +64,19 @@ pub struct FfiRecordingInputs {
 }
 
 impl FfiRecordingInputs {
-    /// The inputs of a recording, which copy what they read of the arrays and byte buffers.
+    /// The inputs of a recording, but for what the frame it records decides, which copy what they read of the arrays
+    /// and byte buffers.
     ///
     /// # Safety
     ///
     /// Nonempty arrays and byte buffers must be aligned, valid and immutable for this call. Fonts
     /// for enabled overlays must point to live `Gfx::Font`s.
-    pub(crate) unsafe fn recording_inputs(
-        &self,
-        tree_inputs: super::FfiVisualContextTreeInputs,
-        root_background_source: super::RootBackgroundSource,
-    ) -> crate::painting::record::inputs::RecordingInputs {
+    pub(crate) unsafe fn recording_inputs(&self) -> crate::painting::record::inputs::UnframedRecordingInputs {
         use crate::painting::display_list::commands::UniqueNodeId;
         use crate::painting::force_dark::ForceDarkSettings;
         use crate::painting::record::inputs::{
             CaretPaint, CaretTarget, FocusedAreaOutline, FocusedTextControlSelection, GridOverlays, InspectorHighlight,
-            RecordingInputs,
+            RecordingInputs, UnframedRecordingInputs,
         };
         use libcompositing_rust::ffi::ffi_slice;
 
@@ -104,17 +101,14 @@ impl FfiRecordingInputs {
             FfiCaretPaintKind::EmptyInline => Some(CaretTarget::EmptyInline(caret.block)),
         };
         let control = self.focused_text_control;
-        RecordingInputs {
-            device_pixels_per_css_pixel: tree_inputs.device_pixels_per_css_pixel,
+        UnframedRecordingInputs(RecordingInputs {
+            device_pixels_per_css_pixel: 0.0,
             uncaptured: crate::painting::record::inputs::UncapturedContentInputs {
-                viewport_wheel_overflow_x: tree_inputs.viewport_wheel_overflow_x,
-                viewport_wheel_overflow_y: tree_inputs.viewport_wheel_overflow_y,
-                root_background_source,
+                root_background_source: Default::default(),
                 device_viewport_size: libgfx_rust::IntSize {
                     width: self.device_viewport_rect.width,
                     height: self.device_viewport_rect.height,
                 },
-                is_recording_async_scrolling_metadata: self.is_recording_async_scrolling_metadata,
                 document_id: UniqueNodeId(self.document_id),
                 has_blocking_wheel_event_region_covering_viewport: self
                     .has_blocking_wheel_event_region_covering_viewport,
@@ -149,6 +143,8 @@ impl FfiRecordingInputs {
             inactive_selection_background_dark: self.inactive_selection_background_dark,
             palette_is_dark: self.palette_is_dark,
             document_has_supported_color_schemes: self.document_has_supported_color_schemes,
+            accessibility_focus_target: (!self.accessibility_focus_target.is_invalid())
+                .then_some(self.accessibility_focus_target),
             inspector_highlight: self.has_inspector_highlight.then(|| {
                 // SAFETY: The caller lends the label bytes and supplies live fonts for this overlay.
                 let (text, fonts) = unsafe {
@@ -194,15 +190,14 @@ impl FfiRecordingInputs {
             focused_area_outline: (!outline_path.is_empty()).then(|| FocusedAreaOutline {
                 image: self.focused_area_outline.image,
                 path_bytes: outline_path.into(),
-                color: self.focused_area_outline.color,
-                width: self.focused_area_outline.width,
             }),
-        }
+        })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiCaretPaintKind {
     None,
     /// `block` paints the caret, in the fragment run owned by the self-painting inline `owner`
@@ -244,8 +239,6 @@ pub struct FfiFocusedAreaOutline {
     /// A serialised `Gfx::Path` in the image's own coordinate space, live for the recording call.
     pub path_bytes: *const u8,
     pub path_byte_count: usize,
-    pub color: Color,
-    pub width: crate::css::css_pixels::CssPixels,
 }
 
 /// The platform default font at an overlay label's CSS size and at that size in device pixels.
@@ -303,6 +296,7 @@ pub struct FfiFlexOverlayInput {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiImageContentKind {
     #[default]
     None,
@@ -350,6 +344,7 @@ pub struct FfiLayerImagePaintFactsEntry {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiVideoRepresentation {
     #[default]
     VideoFrame,
@@ -378,6 +373,7 @@ pub struct FfiVideoPaintFacts {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiSvgGradientSpreadMethod {
     #[default]
     Pad,
@@ -387,6 +383,7 @@ pub enum FfiSvgGradientSpreadMethod {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiSvgGradientKind {
     #[default]
     Linear,
@@ -463,8 +460,6 @@ pub struct FfiVectorImageRenderRequest {
     pub css_height: crate::css::css_pixels::CssPixels,
     pub raster_scale: f32,
 }
-
-pub use crate::painting::display_list::storage::FfiRecordedDisplayList;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]

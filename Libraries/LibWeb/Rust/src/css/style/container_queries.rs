@@ -608,6 +608,15 @@ impl RetainedState {
         self.container_effects_for_host.set(node, None)
     }
 
+    /// See [`Self::detach_host_flags_for_fork`].
+    pub(super) fn detach_container_effects_held_for_fork(&mut self) {
+        let held = self
+            .container_effects_for_host
+            .held
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.container_effects_for_host.held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(held));
+    }
+
     /// Raises `flag`, which the document's host reads, while the engine keeps any row's container effects for the
     /// host, rather than a flag of the engine's own. The engine keeps none yet.
     pub(crate) fn share_container_effects_held(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
@@ -665,7 +674,6 @@ impl RetainedState {
         &mut self,
         rule_program_is_changing: bool,
         republication: super::publication::WinnerRepublication,
-        counters: &mut Counters,
     ) {
         if self.published_container_verdicts.is_empty() {
             return;
@@ -677,11 +685,7 @@ impl RetainedState {
             .filter(|&node| self.container_verdicts_moved(node))
             .collect();
         for node in moved {
-            if rule_program_is_changing
-                || self
-                    .republish_winners_from_answer(node, republication, counters)
-                    .is_none()
-            {
+            if rule_program_is_changing || self.republish_winners_from_answer(node, republication).is_none() {
                 self.published_container_verdicts.remove(&node);
                 self.winner_groups.remove(node);
             }
@@ -850,7 +854,7 @@ impl RetainedState {
 /// What the container conditions of the rows the engine answered read of their containers, per element, kept for the
 /// host until it takes each as it installs the element's record, and a flag the host reads, without asking, for whether
 /// any is kept.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct ContainerEffectsForHost {
     effects: HashMap<StyleNodeID, ContainerVerdict>,
     held: std::sync::Arc<std::sync::atomic::AtomicBool>,

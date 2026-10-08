@@ -44,8 +44,8 @@ public:
     virtual void resume() override;
     virtual void pause() override;
     virtual void seek(AK::Duration) override;
-
-    void invalidate_status_changes_in_flight();
+    // Replaces the queued output with data read again from the input, without moving the clock.
+    void reseek_input_keeping_clock();
 
     virtual void set_playback_rate(float) override;
 

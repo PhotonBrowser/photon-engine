@@ -11,8 +11,6 @@ use crate::css::css_enums::text_transform;
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 
-crate::render_state::held_node_entries!();
-
 /// Selects the beginning or end of a transformed span for offsets inside it.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -79,10 +77,10 @@ impl PartialEq for PublishedTextSlot {
 }
 
 /// A text row's rendered text, with what layout caches beside it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct TextContent {
     rendered: Arc<RenderedText>,
-    grapheme_segmenter: OnceCell<super::text_chunker::GraphemeSegmenter>,
+    grapheme_segmenter: crate::fork::ForkReset<OnceCell<super::text_chunker::GraphemeSegmenter>>,
     chunks: RefCell<Option<Arc<CachedTextChunks>>>,
     pub(super) rendering_key: Option<TextRenderingKey>,
 }
@@ -337,34 +335,12 @@ impl TextFragments {
     }
 }
 
-#[repr(C)]
-pub struct FfiRenderedTextView {
-    pub text: *const u16,
-    pub length_in_code_units: usize,
-}
-
 /// The code units a published string spells, without widening ASCII storage to count them.
 pub(super) fn length_in_code_units(text: &ak::Utf16String) -> usize {
     match text.as_units() {
         ak::Utf16StringUnits::Ascii(units) => units.len(),
         ak::Utf16StringUnits::Utf16(units) => units.len(),
     }
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_text_has_source_range(
-    host: *const crate::render_state::DocumentHost,
-    id: NodeSlotId,
-) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    if unsafe { &*host }.known_no_text_source_ranges() {
-        return false;
-    }
-    // SAFETY: Guaranteed by the caller.
-    unsafe { super::shell_reads::read_arena(host, node_read(), id, |arena, id| arena.text_has_source_range(id)) }
 }
 
 /// Publishes the rendered text of `id`, a live text node with a styled parent, where what it renders changed.
@@ -418,37 +394,13 @@ fn sync_text_content(arena: &mut LayoutNodeArena, id: NodeSlotId) {
                 dom_length_in_code_units: source_range.length,
                 edits: rendered.edits,
             }),
-            grapheme_segmenter: OnceCell::new(),
+            grapheme_segmenter: crate::fork::ForkReset::default(),
             chunks: RefCell::default(),
             rendering_key: Some(key),
         };
         arena.set_text_content(id, content);
     }
     arena.finish_text_content_sync(id);
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, and `id` must name a live text node with a styled
-/// parent. The returned view lasts until the text is published again or the row is freed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_text_for_rendering(
-    host: *const crate::render_state::DocumentHost,
-    id: NodeSlotId,
-) -> FfiRenderedTextView {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        super::shell_reads::read_arena(host, node_read(), id, |arena, id| {
-            ensure_text_content(arena, id);
-            let content = arena
-                .text_content(id)
-                .expect("text must be published before borrowing its rendered view");
-            FfiRenderedTextView {
-                text: content.text.as_ptr(),
-                length_in_code_units: content.text.len(),
-            }
-        })
-    }
 }
 
 #[cfg(test)]

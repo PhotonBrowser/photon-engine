@@ -197,6 +197,11 @@ QColor chrome_border(QPalette const& palette)
     return mix(dark ? chrome_surface(palette) : chrome_background(palette), material_color_anchors(dark).border, 0.22);
 }
 
+QColor chrome_separator(QPalette const& palette)
+{
+    return mix(chrome_surface(palette), chrome_border(palette), is_dark(palette) ? 0.42 : 0.54);
+}
+
 QColor chrome_window_outline(QPalette const& palette)
 {
     auto dark = is_dark(palette);
@@ -260,7 +265,7 @@ QString application_style_sheet(QPalette const& palette)
     auto hover = style_sheet_color(chrome_control_surface_hover(palette));
     auto pressed = style_sheet_color(chrome_control_surface_pressed(palette));
     auto border = style_sheet_color(chrome_border(palette));
-    auto separator = style_sheet_color(mix(chrome_surface(palette), chrome_border(palette), is_dark(palette) ? 0.42 : 0.54));
+    auto separator = style_sheet_color(chrome_separator(palette));
     auto text = style_sheet_color(text_color);
     auto disabled_text = style_sheet_color(mix(text_color, surface_color, is_dark(palette) ? 0.58 : 0.48));
 
@@ -278,7 +283,7 @@ QMenu::item {{
     background: transparent;
     border-radius: 5px;
     min-height: 20px;
-    padding: 5px 14px;
+    padding: 5px 24px 5px 14px;
 }}
 
 QMenu::item:selected {{
@@ -903,6 +908,109 @@ QFrame#LadybirdJavaScriptDialogPanel QScrollBar::sub-page:vertical {{
         scrim_color, surface, recessed, hover, pressed, control_border, accent, text, muted);
 }
 
+QString bookmark_dialog_style_sheet(QPalette const& palette)
+{
+    auto surface = style_sheet_color(chrome_surface(palette));
+    auto recessed = style_sheet_color(chrome_surface_recessed(palette));
+    auto hover = style_sheet_color(chrome_control_surface_hover(palette));
+    auto pressed = style_sheet_color(chrome_control_surface_pressed(palette));
+    auto control_border = style_sheet_color(chrome_control_border(palette));
+    auto accent = style_sheet_color(chrome_accent(palette));
+    auto text = style_sheet_color(chrome_text(palette));
+
+    return qformatted(R"(
+QDialog#LadybirdBookmarkDialog {{
+    color: {6};
+    background: {0};
+}}
+
+QDialog#LadybirdBookmarkDialog QLabel {{
+    color: {6};
+    background: transparent;
+    border: 0;
+}}
+
+QDialog#LadybirdBookmarkDialog QLineEdit,
+QDialog#LadybirdBookmarkDialog QComboBox {{
+    color: {6};
+    background: {1};
+    border: 1px solid {4};
+    border-radius: 8px;
+    min-height: 26px;
+    padding: 2px 9px;
+    selection-background-color: {5};
+}}
+
+QDialog#LadybirdBookmarkDialog QLineEdit:focus,
+QDialog#LadybirdBookmarkDialog QComboBox:focus {{
+    border-color: {5};
+}}
+
+QDialog#LadybirdBookmarkDialog QComboBox {{
+    padding-right: 24px;
+    /* Use the list popup so its rows can be styled on macOS. */
+    combobox-popup: 0;
+}}
+
+QDialog#LadybirdBookmarkDialog QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 24px;
+    border: 0;
+}}
+
+QDialog#LadybirdBookmarkDialog QComboBox::down-arrow {{
+    image: none;
+}}
+
+QDialog#LadybirdBookmarkDialog QComboBox QAbstractItemView {{
+    color: {6};
+    background: {0};
+    border: 1px solid {4};
+    border-radius: 8px;
+    padding: 4px;
+    outline: 0;
+}}
+
+QDialog#LadybirdBookmarkDialog QComboBox QAbstractItemView::item {{
+    min-height: 26px;
+    padding: 2px 9px;
+    border-radius: 6px;
+}}
+
+QDialog#LadybirdBookmarkDialog QComboBox QAbstractItemView::item:selected {{
+    color: {6};
+    background: {2};
+}}
+
+QDialog#LadybirdBookmarkDialog QPushButton {{
+    color: {6};
+    background: {1};
+    border: 1px solid {4};
+    border-radius: 7px;
+    min-height: 26px;
+    min-width: 72px;
+    padding: 2px 12px;
+}}
+
+QDialog#LadybirdBookmarkDialog QPushButton:hover {{
+    background: {2};
+    border-color: {4};
+}}
+
+QDialog#LadybirdBookmarkDialog QPushButton:pressed {{
+    background: {3};
+    border-color: {4};
+}}
+
+QDialog#LadybirdBookmarkDialog QPushButton:default,
+QDialog#LadybirdBookmarkDialog QPushButton:focus {{
+    border-color: {5};
+}}
+)",
+        surface, recessed, hover, pressed, control_border, accent, text);
+}
+
 QString crash_report_review_style_sheet(QPalette const& palette)
 {
     auto recessed = style_sheet_color(chrome_surface_recessed(palette));
@@ -973,6 +1081,13 @@ QWidget#LadybirdDevToolsBanner QLabel,
 QWidget#LadybirdDevToolsBanner QPushButton {{
     background: transparent;
     color: {5};
+}}
+
+QWidget#LadybirdDevToolsBanner QPushButton {{
+    border: 1px solid transparent;
+    border-radius: 7px;
+    min-height: 26px;
+    padding: 2px 9px;
 }}
 
 QWidget#LadybirdDevToolsBanner QPushButton:hover {{
@@ -1238,7 +1353,7 @@ QProgressBar#LadybirdDownloadProgress::chunk {{
         surface, recessed_surface, hover_surface, border, text, muted_text, accent);
 }
 
-QString private_session_popover_style_sheet(QPalette const& palette)
+QString message_popover_style_sheet(QPalette const& palette)
 {
     auto text = ChromeStyle::style_sheet_color(ChromeStyle::chrome_text(palette));
     auto surface = ChromeStyle::style_sheet_color(ChromeStyle::chrome_surface(palette));
@@ -1254,23 +1369,23 @@ QString private_session_popover_style_sheet(QPalette const& palette)
     auto accent_pressed = ChromeStyle::style_sheet_color(ChromeStyle::mix(accent, QColor(Qt::black), 0.22));
 
     return qformatted(R"(
-QFrame#LadybirdPrivateSessionPopover {{
+QFrame#LadybirdMessagePopover {{
     color: {0};
     background: {1};
     border: 1px solid {2};
     border-radius: 8px;
 }}
 
-QLabel#LadybirdPrivateSessionPopoverTitle {{
+QLabel#LadybirdMessagePopoverTitle {{
     color: {0};
     font-weight: 600;
 }}
 
-QLabel#LadybirdPrivateSessionPopoverBody {{
+QLabel#LadybirdMessagePopoverBody {{
     color: {3};
 }}
 
-QPushButton#LadybirdPrivateSessionCancelButton {{
+QPushButton#LadybirdMessagePopoverDismissButton {{
     color: {0};
     background: {1};
     border: 1px solid {4};
@@ -1278,15 +1393,15 @@ QPushButton#LadybirdPrivateSessionCancelButton {{
     padding: 5px 12px;
 }}
 
-QPushButton#LadybirdPrivateSessionCancelButton:hover {{
+QPushButton#LadybirdMessagePopoverDismissButton:hover {{
     background: {5};
 }}
 
-QPushButton#LadybirdPrivateSessionCancelButton:pressed {{
+QPushButton#LadybirdMessagePopoverDismissButton:pressed {{
     background: {6};
 }}
 
-QPushButton#LadybirdPrivateSessionRestartButton {{
+QPushButton#LadybirdMessagePopoverAcceptButton {{
     color: #ffffff;
     background: {7};
     border: 1px solid {7};
@@ -1295,12 +1410,12 @@ QPushButton#LadybirdPrivateSessionRestartButton {{
     font-weight: 600;
 }}
 
-QPushButton#LadybirdPrivateSessionRestartButton:hover {{
+QPushButton#LadybirdMessagePopoverAcceptButton:hover {{
     background: {8};
     border-color: {8};
 }}
 
-QPushButton#LadybirdPrivateSessionRestartButton:pressed {{
+QPushButton#LadybirdMessagePopoverAcceptButton:pressed {{
     background: {9};
     border-color: {9};
 }}

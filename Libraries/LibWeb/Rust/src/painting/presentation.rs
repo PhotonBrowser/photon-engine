@@ -11,16 +11,19 @@
 //! the owner of a navigable's presenter presents to its compositor context, so frames reach the compositor in the order
 //! their presenter's owners presented them.
 
+use crate::paint_stage::Presenting;
 use crate::painting::ffi::{FfiPresentation, FfiPresentedRecording};
 use crate::painting::paint_passes::ClockTickVisualContexts;
 use crate::painting::record::publish::RecordingResourceSink;
+use crate::painting::visual_context::VisualContextTree;
 use libgfx_rust::FloatPoint;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 unsafe extern "C" {
-    fn web_navigable_presenter_destroy(presenter: *mut c_void);
+    fn web_navigable_presenter_unref(presenter: *mut c_void);
+    fn web_navigable_presenter_seal_for_clock_lane(presenter: *mut c_void, committed: *const c_void) -> *mut c_void;
     fn web_sealed_presentation_destroy(sealed: *mut c_void);
     fn web_sealed_presentation_take_visual_context_tree(
         sealed: *mut c_void,
@@ -28,7 +31,6 @@ unsafe extern "C" {
         scroll_offsets: *const FloatPoint,
         scroll_offset_count: usize,
     );
-    fn web_sealed_presentation_note_visual_context_tree_changed(sealed: *mut c_void);
     fn web_navigable_presenter_add_font(presenter: *mut c_void, font: *const c_void);
     fn web_navigable_presenter_add_image_frame(presenter: *mut c_void, frame: *const c_void);
     fn web_navigable_presenter_add_video_sink(presenter: *mut c_void, resource_id: u64, sink_handle: u64);
@@ -36,10 +38,19 @@ unsafe extern "C" {
         presenter: *mut c_void,
         sealed: *mut c_void,
         presented: *const FfiPresentedRecording,
+        sink: *mut c_void,
+    );
+    fn web_navigable_presenter_present_unrecorded(presenter: *mut c_void, sealed: *mut c_void, sink: *mut c_void);
+    fn web_vector_image_resources_destroy(resources: *mut c_void);
+    fn web_navigable_presenter_take_vector_image_resources(
+        presenter: *mut c_void,
+        resources: *mut c_void,
+        display_list_ids: *const u64,
+        display_list_id_count: usize,
     );
 }
 
-/// A `Web::Compositor::NavigablePresenter`, owned.
+/// A reference to a `Web::Compositor::NavigablePresenter`, which its navigable shares.
 pub(crate) struct PresenterBox(NonNull<c_void>);
 
 /// A `Web::Compositor::SealedPresentation`, owned.
@@ -52,8 +63,8 @@ unsafe impl Send for SealedPresentationBox {}
 
 impl Drop for PresenterBox {
     fn drop(&mut self) {
-        // SAFETY: The box owns the presenter.
-        unsafe { web_navigable_presenter_destroy(self.0.as_ptr()) };
+        // SAFETY: The box holds a reference to the presenter.
+        unsafe { web_navigable_presenter_unref(self.0.as_ptr()) };
     }
 }
 
@@ -81,6 +92,44 @@ impl RecordingResourceSink for PresenterBox {
     }
 }
 
+/// The SVG images a frame renders, which the host rendered for it: a `Web::Compositor::VectorImageResources`, owned.
+pub(crate) struct VectorImageResources(NonNull<c_void>);
+
+// SAFETY: The box owns its object, which reaches nothing of the thread that made it.
+unsafe impl Send for VectorImageResources {}
+
+impl VectorImageResources {
+    /// Takes over what `resources` names, which the host gives up.
+    ///
+    /// # Safety
+    /// `resources` must be a `Web::Compositor::VectorImageResources` the host gives up.
+    pub(crate) unsafe fn adopt(resources: NonNull<c_void>) -> Self {
+        Self(resources)
+    }
+}
+
+impl Drop for VectorImageResources {
+    fn drop(&mut self) {
+        // SAFETY: The box owns the resources.
+        unsafe { web_vector_image_resources_destroy(self.0.as_ptr()) };
+    }
+}
+
+impl PresenterBox {
+    /// Takes over the display lists `display_list_ids` names in `resources`, with what they reference.
+    pub(crate) fn take_vector_image_resources(&mut self, resources: VectorImageResources, display_list_ids: &[u64]) {
+        // SAFETY: The box owns the presenter, and `resources` the storage the presenter copies from.
+        unsafe {
+            web_navigable_presenter_take_vector_image_resources(
+                self.0.as_ptr(),
+                resources.0.as_ptr(),
+                display_list_ids.as_ptr(),
+                display_list_ids.len(),
+            );
+        }
+    }
+}
+
 /// What presents one frame of a navigable beside the event loop: the navigable's presenter, and what the frame is built
 /// from.
 pub(crate) struct Presentation {
@@ -100,13 +149,18 @@ impl Presentation {
         })
     }
 
-    /// Takes over what `ffi` names, which the host gives up, leaving it naming nothing.
-    ///
-    /// # Safety
-    /// See [`Self::adopt`].
-    pub(crate) unsafe fn take(ffi: &mut FfiPresentation) -> Option<Self> {
-        // SAFETY: Guaranteed by the caller.
-        unsafe { Self::adopt(std::mem::take(ffi)) }
+    /// What the clock lane of the frame this presented presents its frames with: the presenter, and a seal of frames
+    /// that start from this one, or none where the compositor shows another display list than this frame records from.
+    /// On the Paint thread, once this presented.
+    pub(crate) fn for_clock_lane(&self) -> Option<Self> {
+        // SAFETY: The presentation owns both objects. A seal the call answers comes with a reference to the presenter.
+        let sealed = NonNull::new(unsafe {
+            web_navigable_presenter_seal_for_clock_lane(self.presenter.0.as_ptr(), self.sealed.0.as_ptr())
+        })?;
+        Some(Self {
+            presenter: PresenterBox(self.presenter.0),
+            sealed: SealedPresentationBox(sealed),
+        })
     }
 
     /// Gives the presenter and the seal back to the host, which takes them over.
@@ -137,17 +191,41 @@ impl Presentation {
         }
     }
 
-    /// Has the host record the document again as it takes the presentation back, for a clock tick that changed the
-    /// document's visual context tree: a tick that parks before presenting takes the tree to no frame.
-    pub(crate) fn note_visual_context_tree_changed(&mut self) {
-        // SAFETY: The presentation owns the seal.
-        unsafe { web_sealed_presentation_note_visual_context_tree_changed(self.sealed.0.as_ptr()) };
+    /// Presents the sealed frame without a recording: the display list the compositor has stands, with
+    /// `visual_context_tree`, the render state's tree, where the seal sends one.
+    pub(crate) fn present_unrecorded(
+        &mut self,
+        visual_context_tree: Option<Arc<VisualContextTree>>,
+        presenting: &mut Presenting,
+    ) {
+        if let Some(tree) = visual_context_tree {
+            self.take_visual_context_tree(ClockTickVisualContexts {
+                tree,
+                restructured_scroll_offsets: None,
+            });
+        }
+        // SAFETY: The presentation owns both objects, and the stage holds the sink.
+        unsafe {
+            web_navigable_presenter_present_unrecorded(
+                self.presenter.0.as_ptr(),
+                self.sealed.0.as_ptr(),
+                presenting.sink(),
+            );
+        }
     }
 
     /// Presents the sealed frame with the recording `presented` describes, whose resources the presenter took already.
-    pub(crate) fn present(&mut self, presented: &FfiPresentedRecording) {
-        // SAFETY: The presentation owns both objects, and the recording's display list is live for the call.
-        unsafe { web_navigable_presenter_present(self.presenter.0.as_ptr(), self.sealed.0.as_ptr(), presented) };
+    pub(crate) fn present(&mut self, presented: &FfiPresentedRecording, presenting: &mut Presenting) {
+        // SAFETY: The presentation owns both objects, the recording's display list is live for the call, and the stage
+        // holds the sink.
+        unsafe {
+            web_navigable_presenter_present(
+                self.presenter.0.as_ptr(),
+                self.sealed.0.as_ptr(),
+                presented,
+                presenting.sink(),
+            );
+        }
     }
 }
 
@@ -157,7 +235,12 @@ mod ffi_test_stubs {
     use std::ffi::c_void;
 
     #[unsafe(no_mangle)]
-    extern "C" fn web_navigable_presenter_destroy(_: *mut c_void) {}
+    extern "C" fn web_navigable_presenter_unref(_: *mut c_void) {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn web_navigable_presenter_seal_for_clock_lane(_: *mut c_void, _: *const c_void) -> *mut c_void {
+        std::ptr::null_mut()
+    }
 
     #[unsafe(no_mangle)]
     extern "C" fn web_sealed_presentation_destroy(_: *mut c_void) {}
@@ -172,9 +255,6 @@ mod ffi_test_stubs {
     }
 
     #[unsafe(no_mangle)]
-    extern "C" fn web_sealed_presentation_note_visual_context_tree_changed(_: *mut c_void) {}
-
-    #[unsafe(no_mangle)]
     extern "C" fn web_navigable_presenter_add_font(_: *mut c_void, _: *const c_void) {}
 
     #[unsafe(no_mangle)]
@@ -184,5 +264,26 @@ mod ffi_test_stubs {
     extern "C" fn web_navigable_presenter_add_video_sink(_: *mut c_void, _: u64, _: u64) {}
 
     #[unsafe(no_mangle)]
-    extern "C" fn web_navigable_presenter_present(_: *mut c_void, _: *mut c_void, _: *const FfiPresentedRecording) {}
+    extern "C" fn web_navigable_presenter_present(
+        _: *mut c_void,
+        _: *mut c_void,
+        _: *const FfiPresentedRecording,
+        _: *mut c_void,
+    ) {
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn web_navigable_presenter_present_unrecorded(_: *mut c_void, _: *mut c_void, _: *mut c_void) {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn web_vector_image_resources_destroy(_: *mut c_void) {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn web_navigable_presenter_take_vector_image_resources(
+        _: *mut c_void,
+        _: *mut c_void,
+        _: *const u64,
+        _: usize,
+    ) {
+    }
 }

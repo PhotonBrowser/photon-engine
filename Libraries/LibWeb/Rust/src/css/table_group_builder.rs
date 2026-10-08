@@ -22,7 +22,7 @@ use crate::css::animated_overlay::AnimatedOverlay;
 use crate::css::calc::{resolve_calculated_flex_without_context, resolve_calculated_integer_without_context};
 use crate::css::color_resolution::{
     ColorResolutionInput, FfiColorResolutionInput, PREFERRED_COLOR_SCHEME_DARK, Rgba, accent_color,
-    relative_color_context_from_ffi, resolution_input_from_ffi, to_color,
+    resolution_input_from_ffi, to_color,
 };
 use crate::css::computed_longhand_table::ComputedLonghandTable;
 use crate::css::computed_value_types::{
@@ -40,11 +40,9 @@ use crate::css::computed_value_types::{
     RetainedPositionTryFallbackList, SVGResetValues, TransformValues,
 };
 use crate::css::computed_values::{
-    FfiGroupValueEntry, GROUP_FIELD_COLOR, GROUP_FIELD_COLOR_OR_KEYWORD, GROUP_FIELD_RESOLVED_F32,
-    GROUP_FIELD_RESOLVED_F64, GROUP_FIELD_RESOLVED_U8, MAX_GROUP_FIELD_COUNT, build_svg_reset_group_payload,
-    registered_group_field_descriptors, rust_build_alignment_group, rust_build_grid_group,
-    rust_build_inherited_box_group, rust_build_inherited_table_group, rust_build_sizing_group, rust_build_style_group,
-    rust_build_surround_group, rust_build_text_reset_group,
+    GroupFieldKind, GroupValueEntry, MAX_GROUP_FIELD_COUNT, build_inherited_box_group, build_inherited_table_group,
+    build_sizing_group, build_style_group, build_svg_reset_group_payload, group_field_descriptors,
+    rust_build_alignment_group, rust_build_grid_group, rust_build_surround_group, rust_build_text_reset_group,
 };
 use crate::css::css_enums::keyword;
 use crate::css::css_pixels::CssPixels;
@@ -129,7 +127,7 @@ struct EffectiveValues<'a> {
 }
 
 struct GroupValueEntries {
-    entries: [std::mem::MaybeUninit<FfiGroupValueEntry>; MAX_GROUP_FIELD_COUNT],
+    entries: [std::mem::MaybeUninit<GroupValueEntry>; MAX_GROUP_FIELD_COUNT],
     len: usize,
 }
 
@@ -141,7 +139,7 @@ impl GroupValueEntries {
         }
     }
 
-    fn push(&mut self, entry: FfiGroupValueEntry) {
+    fn push(&mut self, entry: GroupValueEntry) {
         assert!(
             self.len < self.entries.len(),
             "a computed style group has too many fields"
@@ -152,10 +150,10 @@ impl GroupValueEntries {
 }
 
 impl std::ops::Deref for GroupValueEntries {
-    type Target = [FfiGroupValueEntry];
+    type Target = [GroupValueEntry];
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: push initializes every entry below len and FfiGroupValueEntry has no drop glue.
+        // SAFETY: push initializes every entry below len and GroupValueEntry has no drop glue.
         unsafe { std::slice::from_raw_parts(self.entries.as_ptr().cast(), self.len) }
     }
 }
@@ -227,13 +225,13 @@ unsafe fn gather_group_entries(
     input: &ColorResolutionInput,
     used_color_scheme: u8,
 ) -> Option<GroupValueEntries> {
-    let descriptors = registered_group_field_descriptors(group_index)?;
+    let descriptors = group_field_descriptors(group_index);
     assert!(descriptors.len() <= MAX_GROUP_FIELD_COUNT);
     let mut entries = GroupValueEntries::new();
     for descriptor in descriptors {
         let data_pointer = values.pointer(descriptor.property_id);
         let data = unsafe { data_pointer.cast::<StyleValueData>().as_ref() }?;
-        let mut entry = FfiGroupValueEntry {
+        let mut entry = GroupValueEntry {
             data: data_pointer,
             resolved_color: 0,
             has_resolved_color: false,
@@ -241,19 +239,19 @@ unsafe fn gather_group_entries(
             has_resolved_number: false,
         };
         match descriptor.kind {
-            GROUP_FIELD_COLOR | GROUP_FIELD_COLOR_OR_KEYWORD => {
+            GroupFieldKind::Color | GroupFieldKind::ColorOrKeyword(_) => {
                 if let Some(color) = resolved_color(input, descriptor.property_id, data) {
                     entry.resolved_color = color;
                     entry.has_resolved_color = true;
                 }
             }
-            GROUP_FIELD_RESOLVED_F32 | GROUP_FIELD_RESOLVED_F64 => {
+            GroupFieldKind::ResolvedF32 | GroupFieldKind::ResolvedF64 => {
                 if let Some(number) = resolved_wrapped_number(data) {
                     entry.resolved_number = number;
                     entry.has_resolved_number = true;
                 }
             }
-            GROUP_FIELD_RESOLVED_U8 => {
+            GroupFieldKind::ResolvedU8 => {
                 // The only resolved-u8 field is the used color-scheme.
                 entry.resolved_number = f64::from(used_color_scheme);
                 entry.has_resolved_number = true;
@@ -265,7 +263,7 @@ unsafe fn gather_group_entries(
     Some(entries)
 }
 
-/// Builds one descriptor-driven group through `rust_build_style_group`,
+/// Builds one descriptor-driven group through `build_style_group`,
 /// gathering the entries from the table instead of a marshalled span.
 unsafe fn build_generic_group(
     group_index: usize,
@@ -279,7 +277,7 @@ unsafe fn build_generic_group(
     };
     // SAFETY: The entries hold live value data gathered above and the caller
     // warrants the parent payload.
-    unsafe { rust_build_style_group(group_index, entries.as_ptr(), entries.len(), parent_payload) }
+    unsafe { build_style_group(group_index, &entries, parent_payload) }
 }
 
 unsafe fn build_surround_group(values: &EffectiveValues, parent_payload: *const c_void) -> *const c_void {
@@ -855,7 +853,7 @@ fn value_contains_percentage(data: &StyleValueData) -> bool {
         StyleValueData::Calculated { .. } => {
             // SAFETY: The calculated style value outlives the query.
             unsafe {
-                let root = crate::css::calc::rust_calc_root_from_calculated(std::ptr::from_ref(data).cast());
+                let root = crate::css::calc::calc_root_from_calculated(std::ptr::from_ref(data).cast());
                 assert!(!root.is_null());
                 crate::css::calc::rust_calc_node_contains_percentage(root)
             }
@@ -917,9 +915,9 @@ fn matrix_rotation(axis: [f32; 3], angle: f32) -> [f32; 16] {
     std::array::from_fn(|index| rows[index / 4][index % 4])
 }
 
-/// The TransformationStyleValue::to_matrix port for computed values, which
-/// never carry reference-box percentages here: the translate family's
-/// percentage-bearing values lower into per-axis slots instead.
+/// The matrix of one transform function whose values resolve without a box: computed values,
+/// whose percentage-bearing translate values lower into per-axis slots instead, or the absolute
+/// values DOMMatrix accepts.
 pub(crate) fn transformation_to_matrix(
     function: u8,
     values: &[crate::css::style_value::RetainedStyleValueData],
@@ -1093,9 +1091,102 @@ pub(crate) fn transformation_to_matrix(
         }
         _ => {}
     }
-    // The C++ to_matrix logs and falls back to the identity for unhandled
-    // function and argument-count combinations.
+    // An unhandled function and argument-count combination is the identity.
     matrix_identity()
+}
+
+/// The abstract matrix of a parsed `transform` value or of one transform function, as DOMMatrix
+/// parses a string into one: the product of the functions' matrices, and whether every function is
+/// two-dimensional. False when a function needs a box or a font to resolve: a relative length, a
+/// percentage of a length, a calculation that does not simplify, or a tree-counting function.
+/// https://drafts.fxtf.org/geometry/#parse-a-string-into-an-abstract-matrix
+///
+/// # Safety
+/// `value` must be a live style value, and `out_matrix` must point at 16 writable floats, row by
+/// row.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_transform_list_to_abstract_matrix(
+    value: *const c_void,
+    out_matrix: *mut f32,
+    out_is_2d: *mut bool,
+) -> bool {
+    use crate::css::serialize::transform_function as functions;
+
+    let value = unsafe { &*value.cast::<StyleValueData>() };
+    // The keyword none is no function at all.
+    let transform_list = match value {
+        StyleValueData::ValueList { values, .. } => values.as_slice(),
+        _ => &[],
+    };
+    let single_function = matches!(value, StyleValueData::Transformation { .. }).then_some(value);
+    let mut matrix = libgfx_rust::FloatMatrix4x4::identity();
+    let mut is_2d = true;
+    for function in transform_list
+        .iter()
+        .map(|function| function.data())
+        .chain(single_function)
+    {
+        let StyleValueData::Transformation {
+            transform_function,
+            values,
+            ..
+        } = function
+        else {
+            return false;
+        };
+        let values = values.as_slice();
+        let parameters = crate::css::serialize::TRANSFORM_FUNCTION_PARAMETER_TYPES[*transform_function as usize];
+        if !values
+            .iter()
+            .zip(parameters)
+            .all(|(value, &parameter)| resolves_without_a_box(parameter, value.data()))
+        {
+            return false;
+        }
+        // https://drafts.csswg.org/css-transforms-1/#two-d-transform-functions
+        is_2d &= matches!(
+            *transform_function,
+            functions::MATRIX
+                | functions::TRANSLATE
+                | functions::TRANSLATE_X
+                | functions::TRANSLATE_Y
+                | functions::SCALE
+                | functions::SCALE_X
+                | functions::SCALE_Y
+                | functions::ROTATE
+                | functions::SKEW
+                | functions::SKEW_X
+                | functions::SKEW_Y
+        );
+        let function_matrix = transformation_to_matrix(*transform_function, values);
+        matrix = matrix.multiplied(libgfx_rust::FloatMatrix4x4 {
+            elements: std::array::from_fn(|row| std::array::from_fn(|column| function_matrix[row * 4 + column])),
+        });
+    }
+    // SAFETY: The caller provides room for the 16 elements and the flag.
+    unsafe {
+        std::ptr::copy_nonoverlapping(matrix.elements.as_flattened().as_ptr(), out_matrix, 16);
+        *out_is_2d = is_2d;
+    }
+    true
+}
+
+fn resolves_without_a_box(parameter: u8, value: &StyleValueData) -> bool {
+    match value {
+        StyleValueData::Length { value, unit } => {
+            crate::css::style_compute::absolute_length_to_px(*value, *unit).is_some()
+        }
+        StyleValueData::Percentage { .. } => parameter != TRANSFORM_PARAMETER_LENGTH_PERCENTAGE,
+        StyleValueData::Calculated { .. } => {
+            crate::css::calc::resolve_calculated_canonically(value, None).is_some()
+                && !(parameter == TRANSFORM_PARAMETER_LENGTH_PERCENTAGE && value_contains_percentage(value))
+        }
+        StyleValueData::TreeCountingFunction { .. } => !matches!(
+            parameter,
+            TRANSFORM_PARAMETER_NUMBER | TRANSFORM_PARAMETER_NUMBER_PERCENTAGE
+        ),
+        _ => true,
+    }
 }
 
 fn baked_matrix_entry(matrix: [f32; 16]) -> ComputedResolvedTransform {
@@ -1302,13 +1393,8 @@ fn color_base_of(data: &StyleValueData) -> Option<&crate::css::style_value::Colo
 /// the named color-function types split into the legacy rgb/hsl/hwb family
 /// and the modern rest, and untyped colors carry their own syntax flag.
 fn shadow_color_syntax(color: Option<&StyleValueData>) -> u8 {
-    const COLOR_SYNTAX_LEGACY: u8 = 0;
-    const COLOR_SYNTAX_MODERN: u8 = 1;
     // The C++ ColorStyleValue::ColorType codes, pinned by static asserts in
     // ComputedValues.cpp.
-    const COLOR_TYPE_RGB: u8 = 0;
-    const COLOR_TYPE_HSL: u8 = 4;
-    const COLOR_TYPE_HWB: u8 = 5;
 
     let Some(base) = color.and_then(color_base_of) else {
         return COLOR_SYNTAX_LEGACY;
@@ -1838,6 +1924,7 @@ unsafe fn build_border_group(
 // --- SVG, list and content lowering -----------------------------------------
 
 use crate::css::computed_value_types::{SVG_PAINT_COLOR, SVG_PAINT_NONE, SVG_PAINT_URL};
+use crate::css::value_codes::*;
 
 fn lower_svg_paint(values: &EffectiveValues, property: u16, input: &ColorResolutionInput) -> ComputedSvgPaint {
     let mut paint = ComputedSvgPaint {
@@ -2405,39 +2492,6 @@ unsafe fn build_misc_reset_group(
         ComputedStyleValueHandle::retained(offset.pointer())
     };
 
-    // touch-action, with the extractor's keyword fan-out.
-    let mut allow = [true; 6];
-    match values.value(property_id::TOUCH_ACTION) {
-        Some(StyleValueData::Keyword { keyword: code }) => match *code {
-            keyword::AUTO => {}
-            keyword::NONE => allow = [false; 6],
-            keyword::MANIPULATION => allow[5] = false,
-            _ => unreachable!("a computed single-keyword touch-action is auto, none or manipulation"),
-        },
-        Some(StyleValueData::ValueList { values: list, .. }) => {
-            allow = [false, false, false, false, false, false];
-            for item in list.as_slice() {
-                match keyword_of(item.data()).expect("a computed touch-action item is a keyword") {
-                    keyword::PAN_X => {
-                        allow[0] = true;
-                        allow[1] = true;
-                    }
-                    keyword::PAN_LEFT => allow[0] = true,
-                    keyword::PAN_RIGHT => allow[1] = true,
-                    keyword::PAN_Y => {
-                        allow[2] = true;
-                        allow[3] = true;
-                    }
-                    keyword::PAN_UP => allow[2] = true,
-                    keyword::PAN_DOWN => allow[3] = true,
-                    keyword::PINCH_ZOOM => allow[4] = true,
-                    _ => unreachable!("the touch-action keywords cover every list item"),
-                }
-            }
-        }
-        _ => {}
-    }
-
     let Some(StyleValueData::ScrollbarGutter {
         value: scrollbar_gutter,
     }) = values.value(property_id::SCROLLBAR_GUTTER)
@@ -2543,12 +2597,6 @@ unsafe fn build_misc_reset_group(
                 payload.object_position_x = position_offset(edge_x);
                 payload.object_position_y = position_offset(edge_y);
                 payload.view_transition_name = retained(property_id::VIEW_TRANSITION_NAME);
-                payload.touch_action_allow_left = allow[0];
-                payload.touch_action_allow_right = allow[1];
-                payload.touch_action_allow_up = allow[2];
-                payload.touch_action_allow_down = allow[3];
-                payload.touch_action_allow_pinch_zoom = allow[4];
-                payload.touch_action_allow_other = allow[5];
                 payload.scroll_snap_align_block = scroll_snap_align_block;
                 payload.scroll_snap_align_inline = scroll_snap_align_inline;
                 payload.scroll_snap_axis = scroll_snap_axis;
@@ -3425,7 +3473,7 @@ pub(crate) unsafe fn rebuild_group_from_table(
             group_index::BOX => {
                 build_box_group(&values, table.display_before_box_type_transformation(), parent_payload)
             }
-            group_index::INHERITED_TABLE => rust_build_inherited_table_group(
+            group_index::INHERITED_TABLE => build_inherited_table_group(
                 group,
                 values.pointer(property_id::BORDER_COLLAPSE),
                 values.pointer(property_id::CAPTION_SIDE),
@@ -3433,7 +3481,7 @@ pub(crate) unsafe fn rebuild_group_from_table(
                 values.pointer(property_id::BORDER_SPACING),
                 parent_payload,
             ),
-            group_index::INHERITED_BOX => rust_build_inherited_box_group(
+            group_index::INHERITED_BOX => build_inherited_box_group(
                 group,
                 values.pointer(property_id::VISIBILITY),
                 values.pointer(property_id::DIRECTION),
@@ -3442,7 +3490,7 @@ pub(crate) unsafe fn rebuild_group_from_table(
                 values.pointer(property_id::IMAGE_RENDERING),
                 parent_payload,
             ),
-            group_index::SIZING => rust_build_sizing_group(
+            group_index::SIZING => build_sizing_group(
                 group,
                 values.pointer(property_id::WIDTH),
                 values.pointer(property_id::MIN_WIDTH),
@@ -3513,9 +3561,8 @@ pub unsafe extern "C" fn rust_build_group_payloads_from_table(
         animated_overlay: unsafe { inputs.animated_overlay.as_ref() },
     };
     let color_input = unsafe { &*inputs.color_input.cast::<FfiColorResolutionInput>() };
-    let channels = relative_color_context_from_ffi(color_input);
     // SAFETY: The caller keeps the input's pointers live across the call.
-    let input = unsafe { resolution_input_from_ffi(color_input, &channels) };
+    let input = unsafe { resolution_input_from_ffi(color_input) };
 
     for group in 0..group_count {
         out[group] = std::ptr::null();
@@ -3538,7 +3585,7 @@ pub unsafe extern "C" fn rust_build_group_payloads_from_table(
                 group_index::BOX => {
                     build_box_group(&values, inputs.box_display_before_transformation_raw, parent_payload)
                 }
-                group_index::INHERITED_TABLE => rust_build_inherited_table_group(
+                group_index::INHERITED_TABLE => build_inherited_table_group(
                     group,
                     values.pointer(property_id::BORDER_COLLAPSE),
                     values.pointer(property_id::CAPTION_SIDE),
@@ -3546,7 +3593,7 @@ pub unsafe extern "C" fn rust_build_group_payloads_from_table(
                     values.pointer(property_id::BORDER_SPACING),
                     parent_payload,
                 ),
-                group_index::INHERITED_BOX => rust_build_inherited_box_group(
+                group_index::INHERITED_BOX => build_inherited_box_group(
                     group,
                     values.pointer(property_id::VISIBILITY),
                     values.pointer(property_id::DIRECTION),
@@ -3555,7 +3602,7 @@ pub unsafe extern "C" fn rust_build_group_payloads_from_table(
                     values.pointer(property_id::IMAGE_RENDERING),
                     parent_payload,
                 ),
-                group_index::SIZING => rust_build_sizing_group(
+                group_index::SIZING => build_sizing_group(
                     group,
                     values.pointer(property_id::WIDTH),
                     values.pointer(property_id::MIN_WIDTH),

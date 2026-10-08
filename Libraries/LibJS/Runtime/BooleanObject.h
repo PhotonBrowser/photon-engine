@@ -11,27 +11,14 @@
 
 namespace JS {
 
+// Boolean.prototype is a BooleanObject too, as it has a [[BooleanData]] internal slot.
 class JS_API BooleanObject : public Object {
-    JS_OBJECT(BooleanObject, Object);
-    GC_DECLARE_ALLOCATOR(BooleanObject);
-
 public:
     static GC::Ref<BooleanObject> create(Realm&, bool);
 
-    virtual ~BooleanObject() override = default;
+    bool boolean() const;
 
-    bool boolean() const { return m_value; }
-
-protected:
-    BooleanObject(bool, Object& prototype);
-
-private:
-    virtual bool is_boolean_object() const final { return true; }
-
-    bool m_value { false };
+    static bool is_engine_class_of(Object const& object) { return object.is_of_engine_class_or_subclass(JS_LAYOUT_CLASS_ID_BOOLEAN_OBJECT); }
 };
-
-template<>
-inline bool Object::fast_is<BooleanObject>() const { return is_boolean_object(); }
 
 }

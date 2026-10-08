@@ -5,7 +5,6 @@ set(SOURCES
     DisplayList/Canvas2DCommandStream.cpp
     DisplayList/DisplayList.cpp
     DisplayList/DisplayListDamage.cpp
-    DisplayList/DisplayListPlayerSkia.cpp
     DisplayList/DisplayListResourceStorage.cpp
     DisplayList/DisplayListResourceTransaction.cpp
     DisplayList/RustFFIAssertions.cpp
@@ -61,7 +60,7 @@ test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libcompositing_rust)
 
 ladybird_lib(LibCompositing compositing EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibCompositing PUBLIC LibWebCommon)
-target_link_libraries(LibCompositing PRIVATE LibCore LibGfx LibIPC LibMedia LibThreading skia libcompositing_rust)
+target_link_libraries(LibCompositing PRIVATE LibCore LibGfx LibIPC LibMedia LibThreading libcompositing_rust)
 
 # The WebGL command stream headers include ANGLE's GLES headers for the GL constants and types,
 # but the GL entry points live in the Compositor. Hand out only ANGLE's compile interface, to this

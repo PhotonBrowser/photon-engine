@@ -14,6 +14,11 @@
 
 namespace MediaClient {
 
+static Media::DecoderError media_server_gone_error()
+{
+    return Media::DecoderError::with_description(Media::DecoderErrorCategory::Unknown, "The media server is gone"sv);
+}
+
 NonnullOwnPtr<RemotePlaybackManager> RemotePlaybackManager::create(Media::AudioOutput audio_output)
 {
     auto client_or_error = Client::acquire();
@@ -86,11 +91,12 @@ AK::Duration RemotePlaybackManager::current_time() const
 Media::VideoSinkHandle RemotePlaybackManager::reserve_video_sink_handle(Media::Track const& track)
 {
     auto handle = Media::allocate_video_sink_handle();
-    m_video_sinks.set(handle, VideoSink {});
+    m_video_sinks.set(handle, VideoSink { track });
     bool resume_ended_playback = m_state != Media::PlaybackState::Ended;
     m_latest_seek_request_id++;
     if (can_send())
         m_client->async_reserve_video_sink(m_session_id, m_latest_seek_request_id, track, handle, resume_ended_playback);
+    dispatch_buffered_ranges_change();
     return handle;
 }
 
@@ -100,6 +106,7 @@ void RemotePlaybackManager::disable_video_sink_by_handle(Media::VideoSinkHandle 
     m_latest_seek_request_id++;
     if (can_send())
         m_client->async_disable_video_sink(m_session_id, m_latest_seek_request_id, handle);
+    dispatch_buffered_ranges_change();
 }
 
 void RemotePlaybackManager::forget_presented_frame_page(Media::VideoSinkHandle handle)
@@ -148,22 +155,32 @@ void RemotePlaybackManager::enable_an_audio_track(Media::Track const& track)
 {
     // Once the end has been observed here, the element is paused at the duration, so the server must not resume.
     bool resume_ended_playback = m_state != Media::PlaybackState::Ended;
+    m_enabled_audio_tracks.set(track);
     m_latest_seek_request_id++;
     if (can_send())
         m_client->async_set_audio_track_enabled(m_session_id, m_latest_seek_request_id, track, true, resume_ended_playback);
+    dispatch_buffered_ranges_change();
 }
 
 void RemotePlaybackManager::disable_an_audio_track(Media::Track const& track)
 {
+    m_enabled_audio_tracks.remove(track);
     m_latest_seek_request_id++;
     if (can_send())
         m_client->async_set_audio_track_enabled(m_session_id, m_latest_seek_request_id, track, false, false);
+    dispatch_buffered_ranges_change();
 }
 
-void RemotePlaybackManager::add_media_source(RemoteMediaStream& stream)
+NonnullRefPtr<RemotePlaybackManager::AddMediaSourcePromise> RemotePlaybackManager::add_media_source(RemoteMediaStream& stream)
 {
-    if (can_send())
-        m_client->async_add_media_stream_source(m_session_id, stream.id());
+    auto promise = AddMediaSourcePromise::construct();
+    if (!can_send()) {
+        promise->reject(media_server_gone_error());
+        return promise;
+    }
+    m_pending_media_stream_sources.set(stream.id(), promise);
+    m_client->async_add_media_stream_source(m_session_id, stream.id());
+    return promise;
 }
 
 void RemotePlaybackManager::start()
@@ -188,6 +205,8 @@ void RemotePlaybackManager::seek(AK::Duration timestamp, Media::SeekMode mode)
 {
     m_seek_timestamp = timestamp;
     m_latest_seek_request_id++;
+    for (auto& [id, source_buffer] : m_source_buffers)
+        source_buffer->invalidate_evictable_bytes({});
     dbgln_if(PLAYBACK_MANAGER_DEBUG, "RemotePlaybackManager({}): Requesting seek {} to {} ({}) in {}", m_session_id, m_latest_seek_request_id, timestamp, mode, m_state);
     if (can_send())
         m_client->async_seek(m_session_id, m_latest_seek_request_id, timestamp, mode);
@@ -216,6 +235,41 @@ void RemotePlaybackManager::dispatch_state_change() const
         on_playback_state_change();
 }
 
+void RemotePlaybackManager::dispatch_buffered_ranges_change() const
+{
+    if (on_buffered_ranges_change)
+        on_buffered_ranges_change();
+}
+
+bool RemotePlaybackManager::source_has_enabled_track(ReadonlySpan<Media::Track> audio_tracks, ReadonlySpan<Media::Track> video_tracks) const
+{
+    for (auto const& track : audio_tracks) {
+        if (m_enabled_audio_tracks.contains(track))
+            return true;
+    }
+    for (auto const& [handle, sink] : m_video_sinks) {
+        if (video_tracks.contains_slow(sink.track))
+            return true;
+    }
+    return false;
+}
+
+// The ranges are calculated here from the state of each source, so that enabling or disabling tracks and reaching the
+// end of a source buffer's stream are reflected at once.
+Media::TimeRanges RemotePlaybackManager::buffered_time_ranges() const
+{
+    Vector<Media::DemuxerScanState> active_sources;
+    for (auto const& [stream_id, source] : m_media_stream_sources) {
+        if (source_has_enabled_track(source.audio_tracks, source.video_tracks))
+            active_sources.append(source.scan_state);
+    }
+    for (auto const& [source_buffer_id, source_buffer] : m_source_buffers) {
+        if (source_has_enabled_track(source_buffer->audio_tracks(), source_buffer->video_tracks()))
+            active_sources.append(source_buffer->scan_state());
+    }
+    return Media::DemuxerScanState::buffered_ranges_of_sources(active_sources);
+}
+
 void RemotePlaybackManager::register_source_buffer(Badge<RemoteSourceBuffer>, RemoteSourceBuffer& source_buffer)
 {
     m_source_buffers.set(source_buffer.id(), &source_buffer);
@@ -236,7 +290,13 @@ void RemotePlaybackManager::handle_connection_lost()
     m_client = nullptr;
     for (auto& [id, source_buffer] : m_source_buffers)
         source_buffer->connection_lost({});
-    dispatch_error(Media::DecoderError::with_description(Media::DecoderErrorCategory::Unknown, "The media server is gone"sv));
+    auto pending_media_stream_sources = move(m_pending_media_stream_sources);
+    if (!pending_media_stream_sources.is_empty()) {
+        for (auto& [id, promise] : pending_media_stream_sources)
+            promise->reject(media_server_gone_error());
+        return;
+    }
+    dispatch_error(media_server_gone_error());
 }
 
 void RemotePlaybackManager::dispatch_error(Media::DecoderError&& error)
@@ -253,7 +313,7 @@ void RemotePlaybackManager::clock_changed(Badge<Client>, Media::MediaTimeReader 
     m_time_reader = move(time_reader);
 }
 
-void RemotePlaybackManager::metadata_parsed(Badge<Client>, Vector<Media::Track> const& audio_tracks, Vector<Media::Track> const& video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<AK::UnixDateTime> start_time_realtime)
+void RemotePlaybackManager::media_source_added(Badge<Client>, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<AK::UnixDateTime> start_time_realtime, Media::DemuxerScanState scan_state)
 {
     m_audio_tracks.extend(audio_tracks);
     m_video_tracks.extend(video_tracks);
@@ -263,14 +323,18 @@ void RemotePlaybackManager::metadata_parsed(Badge<Client>, Vector<Media::Track> 
         m_preferred_video_track = preferred_video_track;
     m_start_time_realtime = start_time_realtime;
 
-    if (on_track_added) {
-        for (auto const& track : audio_tracks)
-            on_track_added(track);
-        for (auto const& track : video_tracks)
-            on_track_added(track);
-    }
-    if (on_metadata_parsed)
-        on_metadata_parsed();
+    // Sources the server added on its own, such as a source buffer's track buffers, have no promise here.
+    if (!stream_id.has_value())
+        return;
+    m_media_stream_sources.set(stream_id.value(), { audio_tracks, video_tracks, move(scan_state) });
+    if (auto promise = m_pending_media_stream_sources.take(stream_id.value()); promise.has_value())
+        promise.value()->resolve(AddedTracks { move(audio_tracks), move(video_tracks) });
+}
+
+void RemotePlaybackManager::media_stream_source_failed(Badge<Client>, u64 stream_id, Media::DecoderError error)
+{
+    if (auto promise = m_pending_media_stream_sources.take(stream_id); promise.has_value())
+        promise.value()->reject(move(error));
 }
 
 void RemotePlaybackManager::duration_changed(Badge<Client>, AK::Duration duration)
@@ -300,11 +364,13 @@ void RemotePlaybackManager::state_changed(Badge<Client>, u64 applied_seek_reques
     dispatch_state_change();
 }
 
-void RemotePlaybackManager::buffered_ranges_changed(Badge<Client>, Media::TimeRanges const& buffered_ranges)
+void RemotePlaybackManager::media_stream_scan_state_changed(Badge<Client>, u64 stream_id, Media::DemuxerScanState scan_state)
 {
-    m_buffered_ranges = buffered_ranges;
-    if (on_buffered_ranges_change)
-        on_buffered_ranges_change();
+    auto source = m_media_stream_sources.get(stream_id);
+    if (!source.has_value())
+        return;
+    source.value().scan_state = move(scan_state);
+    dispatch_buffered_ranges_change();
 }
 
 void RemotePlaybackManager::error(Badge<Client>, Media::DecoderError error)

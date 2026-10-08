@@ -11,6 +11,29 @@ use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::paint_read::PaintRead;
 
+/// The boxes registered as roots of a partial relayout since a layout last took them, in the order they were
+/// registered, each once.
+#[derive(Clone, Default)]
+pub(crate) struct PartialRelayoutBoundaryRoots {
+    roots: Vec<NodeSlotId>,
+    registered: crate::css::style::fast_hash::FastSet<NodeSlotId>,
+    /// How many registered roots were freed since a registration last pruned the freed ones.
+    freed: usize,
+}
+
+impl PartialRelayoutBoundaryRoots {
+    pub(crate) fn roots(&self) -> &[NodeSlotId] {
+        &self.roots
+    }
+
+    /// Notes that the node `node` names is freed, which the next registration prunes where it is a registered root.
+    pub(crate) fn note_freed(&mut self, node: NodeSlotId) {
+        if self.registered.contains(&node) {
+            self.freed += 1;
+        }
+    }
+}
+
 crate::render_state::held_node_entries!();
 
 pub(crate) struct LayoutTreeUpdateClassification {
@@ -181,22 +204,25 @@ impl LayoutNodeArena {
         let kind = self.data(node).kind.get();
         assert!(node_facts::kind_is_box(kind));
         let mut roots = self.partial_relayout_boundary_roots.borrow_mut();
-        roots.retain(|candidate| self.slot_is_live(*candidate));
-        if roots.contains(&node) {
-            return;
+        if roots.freed != 0 {
+            roots.roots.retain(|candidate| self.slot_is_live(*candidate));
+            roots.registered.retain(|candidate| self.slot_is_live(*candidate));
+            roots.freed = 0;
         }
-        roots.push(node);
+        if roots.registered.insert(node) {
+            roots.roots.push(node);
+        }
     }
 
     /// Counts stale entries for freed nodes on purpose: the C++ side treats a nonempty
     /// root set as "layout is not up to date", and a freed boundary still attributes a
     /// pending update, exactly as a nulled-out weak pointer did.
     pub(crate) fn has_partial_relayout_boundary_roots(&self) -> bool {
-        !self.partial_relayout_boundary_roots.borrow().is_empty()
+        !self.partial_relayout_boundary_roots.borrow().roots.is_empty()
     }
 
     pub(crate) fn take_partial_relayout_boundary_roots(&self) -> Vec<NodeSlotId> {
-        std::mem::take(&mut *self.partial_relayout_boundary_roots.borrow_mut())
+        std::mem::take(&mut *self.partial_relayout_boundary_roots.borrow_mut()).roots
     }
 
     pub(crate) fn record_partial_relayout_escape(&self) {
@@ -746,7 +772,7 @@ impl LayoutNodeArena {
 /// `host` must be a live document host, on its document's thread, and `node` must name a live row of its document.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_node_is_partial_relayout_boundary(
-    host: *const crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     node: NodeSlotId,
 ) -> bool {
     // SAFETY: Guaranteed by the caller.
@@ -1087,6 +1113,23 @@ mod tests {
         assert!(node_is_dirty(&arena, &child));
         assert!(!node_is_dirty(&arena, &parent));
         assert_eq!(arena.take_partial_relayout_boundary_roots(), vec![child.slot]);
+        free_node(&mut arena, &parent);
+    }
+
+    #[test]
+    fn a_length_resolved_without_its_container_marks_its_node_and_ancestors_for_layout_once() {
+        let mut arena = LayoutNodeArena::new();
+        let parent = allocate_box_with_a_dummy_shell(&mut arena);
+        let child = allocate_box_with_a_dummy_shell(&mut arena);
+        arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);
+
+        arena.note_unresolved_container_lengths(child.slot);
+        arena.note_unresolved_container_lengths(child.slot);
+
+        assert!(arena.mark_unresolved_container_lengths_for_layout());
+        assert!(node_is_dirty(&arena, &child));
+        assert!(node_is_dirty(&arena, &parent));
+        assert!(!arena.mark_unresolved_container_lengths_for_layout());
         free_node(&mut arena, &parent);
     }
 }

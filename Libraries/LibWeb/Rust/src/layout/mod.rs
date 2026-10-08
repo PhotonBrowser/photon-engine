@@ -68,7 +68,9 @@ use crate::layout::layout_node_arena::IntrinsicInlineSizeMeasurement;
 use crate::layout::layout_node_arena::IntrinsicSizeCacheKey;
 use crate::layout::layout_node_arena::IntrinsicSizeCacheKind;
 pub(crate) use crate::layout::layout_node_arena::MainThreadFfiEntry as ArenaMainThreadFfiEntry;
-pub(crate) use crate::layout::layout_node_arena::{HostStyle, LayoutNodeArena, LiveRow, RowsVersion, SLOTS_PER_CHUNK};
+pub(crate) use crate::layout::layout_node_arena::{
+    HostStyle, LayoutNodeArena, LiveRow, RowsVersion, SLOTS_PER_CHUNK, SampleKind,
+};
 use crate::layout::layout_node_arena::{TableCellMeasurement, TableCellMeasurementKey};
 use crate::layout::node_data::AncestorFact;
 pub use crate::layout::node_data::FfiReplacedContentFacts;
@@ -77,7 +79,6 @@ use crate::layout::node_data::NodeData;
 use crate::layout::node_data::NodeFlag;
 use crate::layout::node_data::NodeKind;
 use crate::layout::node_data::NodeSlotId;
-pub use crate::layout::node_data::STYLE_GROUP_COUNT;
 pub(crate) use abspos_inputs::{AbsposAlignment, StaticPositionAlignment};
 pub(crate) use formatting_context::{
     ChildLayoutOutcome, DerivedBaselines, FfiLayoutHostCallbacks, FormattingContextRun, LayoutMode, Node, SizingAxis,
@@ -102,6 +103,7 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::ffi::c_void;
 pub(crate) use style_values::StyleValues;
+pub(crate) use tree_builder::build_keeps_box;
 pub(crate) use update_layout::MainThreadFfiEntry as UpdateMainThreadFfiEntry;
-pub(crate) use update_layout::{ClockRound, ClockRoundDeclined, FlownRound, LayoutRoundAnswer, SealedRound};
+pub(crate) use update_layout::{ClockRound, ClockRoundDeclined, FlownRound, SealedRound};
 pub(crate) use used_values::{FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, SizeConstraint, UsedValues};

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 /// The random base values a document's random functions have drawn, by random caching key. The
 /// key's document is the engine's own; its element is the node, or none for an `element-shared`
 /// sharing.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RandomBaseValues {
     /// The keys whose element is null, by name.
     document: HashMap<Box<[u16]>, f64>,
@@ -39,7 +39,7 @@ pub(crate) type NamedBaseValue = (Box<[u16]>, f64);
 pub(crate) type ParkedBaseValues = Arc<Mutex<Vec<NamedBaseValue>>>;
 
 /// A uniform pseudo-random source: a randomly keyed hash of a draw counter.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RandomSource {
     state: std::collections::hash_map::RandomState,
     draws: u64,
@@ -113,6 +113,20 @@ impl RetainedState {
     pub(crate) fn set_element_random_base_values(&mut self, node: StyleNodeID, row: Vec<NamedBaseValue>) {
         if !row.is_empty() {
             *self.random_base_values.row_mut(node) = row;
+        }
+    }
+
+    /// Gives a fork of the engine flags of its own in place of those it shares with the host, holding what they hold
+    /// now.
+    pub(crate) fn detach_host_flags_for_fork(&mut self) {
+        let exist = self.random_base_values.element_rows_exist.load(Ordering::Relaxed);
+        self.random_base_values.element_rows_exist = Arc::new(AtomicBool::new(exist));
+        self.detach_container_effects_held_for_fork();
+        // The prefix caches hold the answers of the engine's own match answer catalog, which the fork copies as either
+        // writes it: the fork starts with caches of its own.
+        self.prefix_caches = Default::default();
+        if let Some(font_resolution) = self.font_resolution.as_mut() {
+            font_resolution.start_over_for_fork();
         }
     }
 

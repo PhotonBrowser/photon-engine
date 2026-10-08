@@ -22,7 +22,10 @@ mod document_host;
 mod owner;
 mod wait;
 
-pub(crate) use clock::ClockPlan;
+pub use clock::FfiPlannedScrollTimeline;
+pub use clock::hover::FfiHoverPlanInputs;
+pub(crate) use clock::hover::HoverPlan;
+pub(crate) use clock::{ClockPlan, CommittedContent, CommittedFrame, LaneDelivery, SampledFrame};
 pub use document_host::DocumentHost;
 pub(crate) use document_host::OwedWorkPayment;
 #[cfg(test)]
@@ -42,6 +45,11 @@ pub(crate) struct RenderState {
     /// What the writes the state applied since the host's last job ended owe the host, which the host pays once it has
     /// the job back.
     owed: Vec<crate::layout::tree_mutation::HostWorkDue>,
+    /// The layout tree update marks the writes the host streamed since its last job made, apart from the marks the host
+    /// holds, which the host's next job folds into those it is lent.
+    streamed_marks: Option<crate::layout::tree_update_marks::LayoutTreeUpdateMarks>,
+    /// The times the document's frames are sampled at.
+    sample_clock: clock::SampleClock,
 }
 
 impl RenderState {
@@ -62,27 +70,60 @@ impl RenderState {
             arena,
             engine,
             owed: Vec::new(),
+            streamed_marks: None,
+            sample_clock: clock::SampleClock::default(),
         }
     }
 
     /// Runs `job` on the state with `marks`, the layout tree update marks the document's host lends it, if it lends
-    /// them, and answers them back.
+    /// them, and answers them back, with the marks the writes it streamed made since folded in.
     fn with_marks<R>(
         &mut self,
         marks: Option<crate::layout::tree_update_marks::LayoutTreeUpdateMarks>,
         job: impl FnOnce(&mut Self) -> R,
     ) -> (R, Option<crate::layout::tree_update_marks::LayoutTreeUpdateMarks>) {
-        let Some(marks) = marks else {
+        let Some(mut marks) = marks else {
             return (job(self), None);
         };
+        if let Some(streamed) = self.streamed_marks.take() {
+            marks.fold(streamed);
+        }
         *self.arena.arena().layout_tree_update_marks().borrow_mut() = marks;
         let answer = job(self);
         (answer, Some(self.arena.arena().layout_tree_update_marks().take()))
     }
 
+    /// Applies `changes`, writes the host streamed to the state beside its task, into marks of their own, which the
+    /// host's next job folds into the marks it is lent: the host keeps its marks, and reads them as it reads them while
+    /// its writes wait in its queue.
+    fn apply_streamed(&mut self, changes: Vec<ArenaChange>) {
+        let streamed = self.streamed_marks.take().unwrap_or_default();
+        *self.arena.arena().layout_tree_update_marks().borrow_mut() = streamed;
+        self.apply(changes);
+        self.streamed_marks = Some(self.arena.arena().layout_tree_update_marks().take());
+    }
+
+    /// A fork of the state, as it is now: a copy of it that the render clock may write and present from while the host
+    /// goes on writing the state, which neither sees the other's writes. See [`crate::fork`].
+    pub(crate) fn fork(&self) -> RenderFork {
+        let mut engine = Box::new(self.engine_ref().clone());
+        engine.detach_host_flags_for_fork();
+        let engine = StyleEngineHandle::create(engine);
+        let arena = Box::new(self.arena.fork(engine));
+        RenderFork(std::mem::ManuallyDrop::new(Self {
+            arena,
+            engine,
+            owed: Vec::new(),
+            streamed_marks: None,
+            sample_clock: self.sample_clock.clone(),
+        }))
+    }
+
     /// Drops the state, which must hold no layout node any more.
     fn retire(self) {
-        let Self { arena, engine, owed } = self;
+        let Self {
+            arena, engine, owed, ..
+        } = self;
         assert!(owed.is_empty(), "every job's host pays what its writes owe it");
         assert_eq!(
             arena.arena().live_slot_count(),
@@ -126,23 +167,24 @@ impl RenderState {
                 layout_is_up_to_date_unless_built: arena.layout_is_up_to_date(false),
                 rendering_preparation_pending: crate::painting::paint_passes::rendering_preparation_pending(arena)
                     .is_some(),
+                may_have_auto_content_visibility: arena.may_have_auto_content_visibility(),
             },
-            owes_image_resources: arena.owes_image_resources_to_host(),
-            may_have_text_source_ranges: arena.may_have_text_source_ranges(),
             selector_attribute_value_text_requirements_version: engine
                 .selector_attribute_value_text_requirements_version(),
         };
         let selector_value_text_names = std::sync::Arc::clone(engine.selector_attribute_value_text_names());
+        let selector_tested_attribute_names = std::sync::Arc::clone(engine.selector_tested_attribute_names());
         Owed {
             work: std::mem::take(&mut self.owed),
             deferred_inputs: self.engine_mut().take_moved_deferred_element_style_inputs(),
             facts,
             selector_value_text_names,
+            selector_tested_attribute_names,
         }
     }
 
     /// The style engine, to read.
-    fn engine_ref(&self) -> &crate::css::style::StyleEngine {
+    pub(crate) fn engine_ref(&self) -> &crate::css::style::StyleEngine {
         // SAFETY: The engine lives as long as the state, and is borrowed mutably only through a mutable borrow of it.
         unsafe { self.engine.get() }
     }
@@ -191,18 +233,27 @@ impl RenderState {
         let Ok(applied) = self.arena.arena().apply_flight_style_rows(HostCalls(&work), rows) else {
             return (Vec::new(), None);
         };
-        let round = round
+        (applied, self.run_round(round, work))
+    }
+
+    /// Runs `round` in a frame, owing the host `work` besides what the round owes it. Answers what the round owes with
+    /// the rows it published after it, where it laid anything out.
+    fn run_round(
+        &mut self,
+        round: crate::layout::SealedRound,
+        work: crate::layout::tree_mutation::OwedHostWork,
+    ) -> Option<(crate::layout::FlownRound, crate::layout::row_reads::RowSnapshot)> {
+        round
             .run(&mut self.arena, work)
-            .map(|round| (round, self.arena.arena_mut().publish_row_snapshot(false)));
-        (applied, round)
+            .map(|round| (round, self.arena.arena_mut().publish_row_snapshot(false)))
     }
 }
 
-/// What a frame that flew brings its host back: what its style transaction answered, the rows of the transaction it
-/// applied to the boxes itself, by element, what its first layout round owes with the rows it published after it, where
-/// it ran one, and the emptied buffer of the writes it took, which the host's queue keeps.
+/// What a frame that flew brings its host back: what its style transaction answered, where it flew with one, the rows of
+/// the transaction it applied to the boxes itself, by element, what its first layout round owes with the rows it
+/// published after it, where it ran one, and the emptied buffer of the writes it took, which the host's queue keeps.
 pub(crate) struct Landing {
-    style: crate::css::style::style_job::StyleJobAnswer,
+    style: Option<crate::css::style::style_job::StyleJobAnswer>,
     applied: Vec<crate::css::style::flight_style_rows::FlightStyleRow>,
     round: Option<(crate::layout::FlownRound, crate::layout::row_reads::RowSnapshot)>,
     changes: Vec<ArenaChange>,
@@ -219,7 +270,9 @@ pub(crate) struct Owed {
     deferred_inputs: Option<Vec<crate::css::style::engine_calls::DeferredInput>>,
     facts: StateFacts,
     /// The attribute names whose value text the engine's selectors read, as of `facts`.
-    selector_value_text_names: crate::css::style::SelectorValueTextNames,
+    selector_value_text_names: crate::css::style::SelectorAttributeNames,
+    /// The attribute names the engine's selectors test in any way, as the job left them.
+    selector_tested_attribute_names: crate::css::style::SelectorAttributeNames,
 }
 
 /// What a document's render state answers of itself as a job or a frame leaves it, which the host reads in place for as
@@ -230,12 +283,6 @@ pub(crate) struct StateFacts {
     pub(crate) rows_version: crate::layout::RowsVersion,
     pub(crate) engine: EngineFacts,
     pub(crate) arena: ArenaFacts,
-    /// Whether the layout tree builds owe the host image resources, which no write moves (see
-    /// [`DocumentHost::known_owed_image_resources`]).
-    pub(crate) owes_image_resources: bool,
-    /// Whether a text box may have a source range, which only a build gives one, never a write (see
-    /// [`DocumentHost::known_no_text_source_ranges`]).
-    pub(crate) may_have_text_source_ranges: bool,
     /// Where the engine's selectors' requirements of attribute value text are.
     pub(crate) selector_attribute_value_text_requirements_version: u64,
 }
@@ -257,6 +304,8 @@ pub(crate) struct ArenaFacts {
     pub(crate) layout_is_up_to_date_unless_built: bool,
     /// Whether preparing the document for rendering has something to do.
     pub(crate) rendering_preparation_pending: bool,
+    /// Whether a row has ever been given a style with `content-visibility: auto`.
+    pub(crate) may_have_auto_content_visibility: bool,
 }
 
 // Every write the host makes is moved through its queue and into the render state, so a variant that carries a large
@@ -291,6 +340,18 @@ pub(crate) enum ArenaChange {
 }
 
 impl ArenaChange {
+    /// Whether the change leaves the render state showing what the frame sampled last showed: it takes in the recording
+    /// of that frame, which a lane's fork takes in too, or only keeps the engine from reclaiming records.
+    pub(crate) fn keeps_the_presented_frame(&self) -> bool {
+        match self {
+            Self::Paint(crate::painting::paint_changes::PaintChange::TakeInRecording { .. }) => true,
+            Self::Style(change) => change.only_keeps_records_alive(),
+            _ => false,
+        }
+    }
+}
+
+impl ArenaChange {
     /// # Safety
     ///
     /// `engine` must name the live style engine `arena` links, which nothing else borrows meanwhile.
@@ -301,7 +362,12 @@ impl ArenaChange {
         owed: &mut Vec<crate::layout::tree_mutation::HostWorkDue>,
     ) {
         match self {
-            Self::Layout(change) => change.apply(arena),
+            Self::Layout(change) => {
+                let host_work = change.apply_owing(arena);
+                if !host_work.is_empty() {
+                    owed.push(host_work);
+                }
+            }
             Self::DetachForRemoval(nodes) => owed.push(
                 crate::layout::layout_changes::LayoutWrite::DetachRemainingRowsForRemoval(&nodes)
                     .apply(arena)
@@ -329,11 +395,17 @@ impl ArenaChange {
     }
 
     /// Whether the change writes what the document's style engine computes from. A mint of style node identities does
-    /// not: it makes them live, in the order the host minted them.
+    /// not: it makes them live, in the order the host minted them. Nor does a note of what an attribute name's forms
+    /// are, or what an `attr()` reads it as: what the name is, which no style transaction can answer differently, so it
+    /// need not wait for the drain of one that flew.
     fn writes_style(&self) -> bool {
+        use crate::css::style::engine_calls::EngineWrite;
         match self {
-            Self::Style(change) => !change.notes_attribute_name(),
-            Self::Engine(write) => !matches!(write, crate::css::style::engine_calls::EngineWrite::MintStyleNodes(_)),
+            Self::Style(_) => true,
+            Self::Engine(write) => !matches!(
+                write,
+                EngineWrite::MintStyleNodes(_) | EngineWrite::AttributeNameForms { .. }
+            ),
             Self::Rule(_) => true,
             Self::Layout(_)
             | Self::Paint(_)
@@ -368,7 +440,7 @@ impl ArenaChange {
     fn row_write(&self) -> RowWrite {
         match self {
             Self::Layout(change) => change.row_write(),
-            Self::Paint(_) => RowWrite::Rows,
+            Self::Paint(change) => change.row_write(),
             Self::DetachForRemoval(_) | Self::RemoveBox(_) => RowWrite::Identities,
             Self::ReinheritAnonymousDescendants(_) => RowWrite::NamedStyles,
             Self::Style(_) | Self::Engine(_) | Self::Rule(_) => RowWrite::None,
@@ -416,6 +488,30 @@ struct ChangeQueue {
     styled_rows: RefCell<crate::css::style::fast_hash::FastSet<crate::layout::node_data::NodeSlotId>>,
     /// Whether the writes queued give anonymous rows their parent's style again.
     restyles_anonymous_rows: Cell<bool>,
+    replaced_paint_facts_positions: RefCell<
+        crate::css::style::fast_hash::FastMap<
+            (
+                crate::layout::tree_update_marks::MarkedBox,
+                std::mem::Discriminant<crate::painting::replaced_paint_facts::ReplacedPaintFacts>,
+            ),
+            usize,
+        >,
+    >,
+    /// The writes set aside while the host reads the render state as it was before them.
+    set_aside: RefCell<Vec<ArenaChange>>,
+    /// Whether the host reads the render state as it was before the writes set aside.
+    sets_writes_aside: Cell<bool>,
+}
+
+/// A style write as it joins the writes the render state applies next, in the order it applies them: one the host
+/// queues beside a style transaction that flew joins them only behind the drain of its reactions. Only the change queue
+/// makes one, so what follows the engine as it applies the host's writes cannot follow them as the host makes them.
+pub(crate) struct QueuedStyleChange<'a>(&'a crate::css::style::boundary::StyleChange);
+
+impl QueuedStyleChange<'_> {
+    pub(crate) fn change(&self) -> &crate::css::style::boundary::StyleChange {
+        self.0
+    }
 }
 
 /// What writes may move of what the host knows of the render state (see [`StateFacts`]).
@@ -432,9 +528,19 @@ struct Moves {
 }
 
 impl ChangeQueue {
-    /// Whether no write waits, queued or held.
+    /// Whether no write waits, queued or set aside, not counting the held style writes.
     fn is_empty(&self) -> bool {
-        self.queued.borrow().is_empty() && self.held_style.borrow().is_empty()
+        self.queued.borrow().is_empty() && self.set_aside.borrow().is_empty()
+    }
+
+    /// How many writes are queued, not counting those held or set aside.
+    fn len(&self) -> usize {
+        self.queued.borrow().len()
+    }
+
+    /// Whether the host reads the render state as it was before the writes it set aside.
+    fn sets_writes_aside(&self) -> bool {
+        self.sets_writes_aside.get()
     }
 
     fn moves(&self) -> Moves {
@@ -459,14 +565,27 @@ impl ChangeQueue {
         });
     }
 
-    fn push(&self, change: ArenaChange) {
+    /// Notes `change` as it joins the writes the render state applies next, handing a style write to `follow`.
+    fn enqueue(&self, change: &ArenaChange, follow: impl FnOnce(QueuedStyleChange<'_>)) {
+        self.note(change);
+        if let ArenaChange::Style(change) = change {
+            follow(QueuedStyleChange(change));
+        }
+    }
+
+    /// Whether `change`, queued now, is held behind the drain of the reactions of the style transaction that flew.
+    fn holds(&self, change: &ArenaChange) -> bool {
+        self.holds_style.get() && change.writes_style()
+    }
+
+    fn push(&self, change: ArenaChange, follow: impl FnOnce(QueuedStyleChange<'_>)) {
         use crate::css::style::boundary::StyleChange;
         use crate::layout::layout_changes::LayoutChange;
         use crate::painting::paint_changes::PaintChange;
-        let mut queued = if self.holds_style.get() && change.writes_style() {
+        let mut queued = if self.holds(&change) {
             self.held_style.borrow_mut()
         } else {
-            self.note(&change);
+            self.enqueue(&change, follow);
             self.queued.borrow_mut()
         };
         // An epoch of style record views that ends before anything else is queued or applied in it views nothing.
@@ -490,24 +609,32 @@ impl ChangeQueue {
             last_marks.merge(*marks);
             return;
         }
-        // Replaced content facts for the box the last write gave facts of the same kind replace those.
-        if let ArenaChange::Paint(PaintChange::SetReplacedPaintFacts { target, facts }) = &change
-            && let Some(ArenaChange::Paint(PaintChange::SetReplacedPaintFacts {
-                target: last_target,
-                facts: last_facts,
-            })) = queued.last()
-            && last_target == target
-            && std::mem::discriminant(last_facts) == std::mem::discriminant(facts)
-        {
-            queued.pop();
+        // Replaced content facts replace those of the same kind queued for the same box since the last write that may
+        // rebind it. The earlier entry becomes a no-op rather than taking the new facts, as facts queued between them
+        // may name the same box another way.
+        let mut positions = self.replaced_paint_facts_positions.borrow_mut();
+        if change.row_write() == RowWrite::Identities {
+            positions.clear();
+        } else if let ArenaChange::Paint(PaintChange::SetReplacedPaintFacts { target, facts }) = &change {
+            let key = (*target, std::mem::discriminant(facts));
+            if let Some(earlier) = positions.remove(&key) {
+                debug_assert!(
+                    matches!(
+                        &queued[earlier],
+                        ArenaChange::Paint(PaintChange::SetReplacedPaintFacts { target: earlier_target, .. })
+                            if earlier_target == target
+                    ),
+                    "the queue knows where the facts it queued for a box sit"
+                );
+                if earlier + 1 == queued.len() {
+                    queued.pop();
+                } else {
+                    queued[earlier] = ArenaChange::Paint(PaintChange::SupersededReplacedPaintFacts);
+                }
+            }
+            positions.insert(key, queued.len());
         }
         queued.push(change);
-    }
-
-    /// Queues `change` ahead of every write queued before it.
-    fn push_front(&self, change: ArenaChange) {
-        self.note(&change);
-        self.queued.borrow_mut().insert(0, change);
     }
 
     /// Whether the writes queued may write the style record of the row `id`, which `rows`, published before them, has.
@@ -534,6 +661,7 @@ impl ChangeQueue {
             self.styled_rows.borrow_mut().clear();
             self.restyles_anonymous_rows.set(false);
         }
+        self.replaced_paint_facts_positions.borrow_mut().clear();
     }
 
     /// Lends the queued writes to `apply`, which applies them, and keeps their emptied buffer as the spare. A write the
@@ -546,11 +674,11 @@ impl ChangeQueue {
         answer
     }
 
-    /// Takes the queued writes, for a style transaction that flies with them, and holds the style writes queued after,
-    /// until stop_holding_style(). Their buffer comes back with give_back().
-    fn take_for_flight(&self) -> Vec<ArenaChange> {
+    /// Takes the queued writes, for a frame that flies with them, and holds the style writes queued after, until
+    /// stop_holding_style(), where the frame flies `with_style`. Their buffer comes back with give_back().
+    fn take_for_flight(&self, with_style: bool) -> Vec<ArenaChange> {
         self.forget_moves();
-        self.holds_style.set(true);
+        self.holds_style.set(with_style);
         self.queued.replace(self.spare.take())
     }
 
@@ -561,10 +689,37 @@ impl ChangeQueue {
     }
 
     /// Queues the style writes held beside the transaction that flew behind the writes queued meanwhile.
-    fn queue_held_style(&self) {
+    fn queue_held_style(&self, mut follow: impl FnMut(QueuedStyleChange<'_>)) {
         let mut held = self.held_style.borrow_mut();
-        held.iter().for_each(|change| self.note(change));
+        held.iter().for_each(|change| self.enqueue(change, &mut follow));
         self.queued.borrow_mut().append(&mut held);
+    }
+
+    /// Takes the queued writes, for the host to stream them to the render state, leaving room for as many again. What
+    /// they may move stays noted: the host learns what they moved only from its next job.
+    fn take_for_stream(&self) -> Vec<ArenaChange> {
+        self.replaced_paint_facts_positions.borrow_mut().clear();
+        let capacity = self.len();
+        self.queued.replace(Vec::with_capacity(capacity))
+    }
+
+    /// Sets the queued writes aside, until queue_set_aside(): the render state reads as it was before them meanwhile.
+    fn set_aside(&self) {
+        debug_assert!(
+            self.set_aside.borrow().is_empty(),
+            "one set of writes is set aside at a time"
+        );
+        self.forget_moves();
+        self.sets_writes_aside.set(true);
+        *self.set_aside.borrow_mut() = self.queued.take();
+    }
+
+    /// Queues the writes set aside behind the writes queued meanwhile.
+    fn queue_set_aside(&self) {
+        self.sets_writes_aside.set(false);
+        let mut set_aside = self.set_aside.take();
+        set_aside.iter().for_each(|change| self.note(change));
+        self.queued.borrow_mut().append(&mut set_aside);
     }
 
     /// Keeps `buffer`, emptied by the render side, as the spare.
@@ -593,32 +748,39 @@ fn post_to_render_side(job: impl FnOnce() + Send + 'static) {
     crate::stage_thread::style_layout_thread().post(job);
 }
 
-/// Submits `job`, a style transaction of `host`'s document, to the render owner, with the writes the host queued and
-/// `round`, the layout round the host sealed, and goes on: the frame flies beside the host until the host takes it in
-/// and drains the transaction's reactions. Only a transaction that `_license` lets fly is submitted.
+/// Submits `job`, a style transaction of `host`'s document, if any, to the render owner, with the writes the host
+/// queued and `round`, the layout round the host sealed, and goes on: the frame flies beside the host until the host
+/// takes it in and drains the transaction's reactions, or pays the round. Only a frame that `_license` lets fly is
+/// submitted.
 ///
-/// The frame applies the transaction's rows to the boxes itself before the round, where it can: otherwise the round is
-/// left unrun, and the host lays out after it installs the rows.
+/// After a style transaction, the frame applies the transaction's rows to the boxes itself before the round, where it
+/// can: otherwise the round is left unrun, and the host lays out after it installs the rows.
 pub(crate) fn fly(
     host: &DocumentHost,
-    job: crate::css::style::style_job::StyleJob,
+    job: Option<crate::css::style::style_job::StyleJob>,
     round: Option<crate::layout::SealedRound>,
     _license: &crate::painting::recording_slot::FlightLicense,
 ) {
-    let mut changes = host.take_queued_changes_for_flight();
+    let mut changes = host.take_queued_changes_for_flight(job.is_some());
     // The round writes the rows the host has, which it copies rather than writes in place while the host holds them.
     if round.is_some() {
         host.let_go_of_rows();
     }
+    #[cfg(not(test))]
+    let lays_out_alone = job.is_none();
     host.let_frame_fly(|document, seed, marks| {
         // A host that waits for the frame says the stop word, and the frame comes back with its style alone.
         let run = move |stop: &crate::stage_thread::StopWord| {
+            clock::note_host_write(document);
             owner::with_state(document, seed, |state| {
                 let ((style, applied, round), marks) = state.with_marks(marks, |state| {
                     state.apply(changes.drain(..));
-                    let style = job.run(state.engine_mut());
-                    let (applied, round) = match round {
-                        Some(round) if !stop.is_said() => state.fly_round(&style, round),
+                    let style = job.map(|job| job.run(state.engine_mut()));
+                    let (applied, round) = match (round, &style) {
+                        (Some(round), Some(style)) if !stop.is_said() => state.fly_round(style, round),
+                        (Some(round), None) if !stop.is_said() => {
+                            (Vec::new(), state.run_round(round, Default::default()))
+                        }
                         _ => (Vec::new(), None),
                     };
                     (style, applied, round)
@@ -635,9 +797,17 @@ pub(crate) fn fly(
             })
         };
         #[cfg(test)]
-        return crate::stage_thread::InFlight::landed(run(&crate::stage_thread::StopWord::default()));
+        return (
+            crate::stage_thread::InFlight::landed(run(&crate::stage_thread::StopWord::default())),
+            false,
+        );
+        // A test may hold a frame that lays out alone before it reads anything, as it holds a recording.
         #[cfg(not(test))]
-        crate::stage_thread::style_layout_thread().submit(run)
+        if lays_out_alone {
+            crate::painting::recording_slot::submit_layout(run)
+        } else {
+            (crate::stage_thread::style_layout_thread().submit(run), false)
+        }
     });
 }
 
@@ -681,22 +851,79 @@ mod tests {
         let mut buffers = [std::ptr::null(); 4];
         for buffer in &mut buffers {
             for _ in 0..8 {
-                queue.push(write());
+                queue.push(write(), |_| {});
             }
             *buffer = queue.queued.borrow().as_ptr();
             queue.drain(|changes| assert_eq!(changes.count(), 8));
         }
         assert_eq!(buffers[0], buffers[2]);
         assert_eq!(buffers[1], buffers[3]);
-        queue.push(write());
+        queue.push(write(), |_| {});
         queue.drain(|changes| {
             assert_eq!(changes.count(), 1);
-            queue.push(write());
+            queue.push(write(), |_| {});
         });
         assert_eq!(
             queue.queued.borrow().len(),
             1,
             "a write queued meanwhile waits for the next application"
+        );
+    }
+
+    #[test]
+    fn replaced_paint_facts_replace_the_facts_queued_for_their_box() {
+        use crate::css::style::tree::StyleNodeID;
+        use crate::layout::node_data::NodeSlotId;
+        use crate::layout::tree_update_marks::MarkedBox;
+        use crate::painting::host::FfiCanvasPaintFacts;
+        use crate::painting::paint_changes::PaintChange;
+        use crate::painting::replaced_paint_facts::ReplacedPaintFacts;
+        let element = MarkedBox::Node(StyleNodeID::from_raw(1));
+        let row = MarkedBox::Row(NodeSlotId::new(1, 1));
+        let canvas = |content_generation| {
+            ReplacedPaintFacts::Canvas(FfiCanvasPaintFacts {
+                content_generation,
+                ..Default::default()
+            })
+        };
+        let form_control = || ReplacedPaintFacts::FormControl(Default::default());
+        let queue = ChangeQueue::default();
+        let push = |target, facts| {
+            queue.push(
+                ArenaChange::Paint(PaintChange::SetReplacedPaintFacts { target, facts }),
+                |_| {},
+            )
+        };
+        let queued_facts = || -> Vec<ReplacedPaintFacts> {
+            queue
+                .queued
+                .borrow()
+                .iter()
+                .filter_map(|change| match change {
+                    ArenaChange::Paint(PaintChange::SetReplacedPaintFacts { facts, .. }) => Some(facts.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        push(element, canvas(1));
+        push(element, form_control());
+        push(row, canvas(2));
+        push(element, canvas(3));
+        assert_eq!(
+            queued_facts(),
+            [form_control(), canvas(2), canvas(3)],
+            "facts replace the earlier facts of their kind for their box"
+        );
+        queue.drain(|_| {});
+        push(element, canvas(4));
+        assert_eq!(queued_facts(), [canvas(4)], "facts applied before are not replaced");
+        queue.push(ArenaChange::DetachForRemoval(Box::new([1])), |_| {});
+        push(element, canvas(5));
+        assert_eq!(
+            queued_facts(),
+            [canvas(4), canvas(5)],
+            "a write that may rebind the box keeps the facts before it"
         );
     }
 
@@ -776,7 +1003,7 @@ mod tests {
         use crate::layout::layout_changes::{LayoutWrite, write};
         let test_host = TestHost::new();
         // SAFETY: The host lives as long as the test host.
-        let host = unsafe { &*test_host.host() };
+        let host = test_host.host();
         // SAFETY: The arena lives as long as the host's render state, and the test reaches it only between jobs.
         let arena = unsafe { &mut *host.arena_for_test() };
         let parent = arena.allocate_for_test().slot;
@@ -801,7 +1028,7 @@ mod tests {
         };
         let test_host = TestHost::new();
         // SAFETY: The host lives as long as the test host.
-        let host = unsafe { &*test_host.host() };
+        let host = test_host.host();
         // SAFETY: The arena lives as long as the host's render state, and the test reaches it only between jobs.
         let arena = unsafe { &mut *host.arena_for_test() };
         let viewport = arena.allocate_for_test().slot;
@@ -837,6 +1064,22 @@ mod tests {
         arena
             .free_subtree(viewport)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
+    }
+
+    #[test]
+    fn a_mark_that_asks_nothing_of_the_box_leaves_the_paint_preparation_current() {
+        use crate::layout::tree_update_marks::{FfiBoxMarks, render_state_mark_node_box};
+        use document_host::{
+            document_host_note_paint_preparation_is_current, document_host_paint_preparation_is_current,
+        };
+        let test_host = TestHost::new();
+        let host = test_host.host();
+        // SAFETY: The host is live, on this thread.
+        unsafe {
+            document_host_note_paint_preparation_is_current(host);
+            render_state_mark_node_box(host, 1, FfiBoxMarks::default());
+        }
+        assert!(unsafe { document_host_paint_preparation_is_current(host) });
     }
 
     #[test]
@@ -882,5 +1125,33 @@ mod tests {
         );
         // SAFETY: The host is destroyed once, and nothing reaches it after.
         unsafe { document_host::document_host_destroy(pointer) };
+    }
+}
+
+/// A fork of a document's render state. See [`RenderState::fork`]. Nothing the host holds names it, so it drops whatever
+/// it holds.
+pub(crate) struct RenderFork(std::mem::ManuallyDrop<RenderState>);
+
+impl std::ops::Deref for RenderFork {
+    type Target = RenderState;
+
+    fn deref(&self) -> &RenderState {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RenderFork {
+    fn deref_mut(&mut self) -> &mut RenderState {
+        &mut self.0
+    }
+}
+
+impl Drop for RenderFork {
+    fn drop(&mut self) {
+        // SAFETY: The fork is not used again.
+        let RenderState { arena, engine, .. } = unsafe { std::mem::ManuallyDrop::take(&mut self.0) };
+        drop(arena);
+        // SAFETY: The fork made the handle, and the arena that linked it is gone.
+        drop(unsafe { engine.destroy() });
     }
 }

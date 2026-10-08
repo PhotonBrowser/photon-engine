@@ -15,23 +15,27 @@
 
 namespace JS {
 
+struct HostHookThunks;
+
 // The job HostEnqueuePromiseJob hands to the host. The host keeps it alive until it runs it, by capturing it in a GC
 // function or visiting it; how the engine represents the job stays private to the engine.
 class JS_API PromiseJob {
 public:
-    explicit PromiseJob(GC::Ref<GC::Function<ThrowCompletionOr<Value>()>> steps)
-        : m_steps(steps)
-    {
-    }
-
     ThrowCompletionOr<Value> run() const;
 
-    void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(m_steps); }
+    void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(m_job); }
 
 private:
     friend class VM;
+    friend struct HostHookThunks;
 
-    GC::Ref<GC::Cell> m_steps;
+    // The runtime's job, a cell of LibGC's heap that only the runtime looks into.
+    explicit PromiseJob(GC::Ref<GC::Cell> job)
+        : m_job(job)
+    {
+    }
+
+    GC::Ref<GC::Cell> m_job;
 };
 
 }

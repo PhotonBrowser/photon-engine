@@ -315,17 +315,6 @@ static bool parent_element_for_event_dispatch(Layout::Node& target_layout_node, 
     return node && layout_node;
 }
 
-static void set_page_cursor(Page& page, Gfx::Cursor cursor)
-{
-    // FIXME: This check is only approximate. ImageCursors from the same CursorStyleValue share bitmaps, but may
-    //        repaint them. So comparing them does not tell you if they are the same image. Also, the image may
-    //        change even if the hovered node does not.
-    if (page.current_cursor() != cursor) {
-        page.client().page_did_request_cursor_change(cursor);
-        page.set_current_cursor(cursor);
-    }
-}
-
 EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 button, u32 buttons, u32 modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const& scrollbar_dragged_by_compositor, Optional<RemoteInputEventTarget>* remote_target)
 {
     if (should_ignore_device_input_event())
@@ -510,7 +499,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
 #endif
 
             if (result == EventResult::Handled) {
-                set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Drag);
+                m_navigable->page().cursor().request(Gfx::StandardCursor::Drag);
                 stop_updating_selection();
 
                 return EventResult::Handled;
@@ -580,6 +569,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
 
         if (found_parent_element) {
             update_cursor(read, target_layout_node, *node, chrome_widget, hit_text_fragment);
+            m_cursor_resolved_before_hover = true;
             clear_cursor.disarm();
 
             auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *layout_node);
@@ -658,7 +648,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
             auto result = handle_drag_and_drop_event(DragEvent::Type::Drop, visual_viewport_position, screen_position, button, buttons, modifiers, {});
             if (result == EventResult::Dropped && should_ignore_device_input_event())
                 return cancel_drag_and_drop_event(visual_viewport_position, screen_position, button, buttons, modifiers);
-            set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Arrow);
+            m_navigable->page().cursor().request(Gfx::StandardCursor::Arrow);
             return result;
         }
 
@@ -1187,6 +1177,44 @@ void EventHandler::update_hover_after_scroll()
     update_hover_after_scroll(*m_last_known_mouse_visual_viewport_position, m_last_known_mouse_screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers);
 }
 
+void EventHandler::update_hover_at(CSSPixelPoint visual_viewport_position)
+{
+    // The pointer is where the compositor saw it last, which is as far from where the host last heard of it on screen.
+    auto screen_position = visual_viewport_position;
+    if (m_last_known_mouse_visual_viewport_position.has_value())
+        screen_position = m_last_known_mouse_screen_position + (visual_viewport_position - *m_last_known_mouse_visual_viewport_position);
+    record_last_known_mouse_position(visual_viewport_position, screen_position, m_last_known_mouse_buttons, m_last_known_mouse_modifiers);
+    update_hover_after_scroll(visual_viewport_position, screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers);
+}
+
+// AD-HOC: A move resolves the cursor before it hovers what is under the pointer, which the style of the hover (a :hover
+//         rule, or a style a handler of the move's events set) then gives a cursor of its own. Blink resolves the
+//         cursor again on a timer once a style change moved a box's cursor. Here the rendering update after the move
+//         resolves it again, once.
+void EventHandler::update_cursor_after_rendering_update()
+{
+    if (!exchange(m_cursor_resolved_before_hover, false))
+        return;
+    if (!m_last_known_mouse_visual_viewport_position.has_value() || should_ignore_device_input_event())
+        return;
+    auto document = m_navigable->active_document();
+    if (!document || !document->is_fully_active() || !has_committed_root_box())
+        return;
+    Layout::ForcedReadScope read { *document };
+    auto target = target_for_mouse_position(*m_last_known_mouse_visual_viewport_position);
+    if (!target.has_value())
+        return;
+    auto node = target->dom_node();
+    auto* target_layout_node = target->layout_node(read);
+    // A nested navigable's own event handler shows the cursor over its content.
+    if (!node || !target_layout_node || Painting::is_navigable_container_viewport_paintable(*target_layout_node))
+        return;
+    Layout::Node* layout_node = nullptr;
+    if (!parent_element_for_event_dispatch(*target_layout_node, node, layout_node))
+        return;
+    update_cursor(read, target_layout_node, *node, target->chrome_widget, target->is_text_fragment);
+}
+
 void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers)
 {
     auto document = m_navigable->active_document();
@@ -1242,6 +1270,7 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
 
     update_hovered_chrome_widget(chrome_widget);
     update_cursor(read, target_layout_node, *node, chrome_widget, hit_text_fragment);
+    m_cursor_resolved_before_hover = true;
 
     auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *layout_node);
     track_the_effective_position_of_the_legacy_mouse_pointer(node, DOM::HoverEventData {
@@ -1834,7 +1863,7 @@ EventResult EventHandler::cancel_drag_and_drop_event(CSSPixelPoint visual_viewpo
     auto result = m_drag_and_drop_event_handler->handle_drag_cancel(HTML::relevant_global_object(*document), screen_position, page_offset, viewport_position, {}, button, buttons, modifiers);
     if (was_dragging != should_ignore_device_input_event())
         document->page().invalidate_compositor_keyboard_scroll_state_for_document(*document);
-    set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Arrow);
+    m_navigable->page().cursor().request(Gfx::StandardCursor::Arrow);
     clear_mousedown_tracking();
     stop_updating_selection();
     return result;
@@ -3840,69 +3869,6 @@ void EventHandler::update_hovered_chrome_widget(RefPtr<Painting::ChromeWidget> w
         m_hovered_chrome_widget->mouse_enter();
 }
 
-static constexpr Gfx::Cursor css_to_gfx_cursor(CSS::CursorPredefined css_cursor)
-{
-    switch (css_cursor) {
-    case CSS::CursorPredefined::Crosshair:
-    case CSS::CursorPredefined::Cell:
-        return Gfx::StandardCursor::Crosshair;
-    case CSS::CursorPredefined::Grab:
-        return Gfx::StandardCursor::OpenHand;
-    case CSS::CursorPredefined::Grabbing:
-        return Gfx::StandardCursor::Drag;
-    case CSS::CursorPredefined::Pointer:
-        return Gfx::StandardCursor::Hand;
-    case CSS::CursorPredefined::Help:
-        return Gfx::StandardCursor::Help;
-    case CSS::CursorPredefined::None:
-        return Gfx::StandardCursor::Hidden;
-    case CSS::CursorPredefined::NotAllowed:
-        return Gfx::StandardCursor::Disallowed;
-    case CSS::CursorPredefined::Text:
-    case CSS::CursorPredefined::VerticalText:
-        return Gfx::StandardCursor::IBeam;
-    case CSS::CursorPredefined::Move:
-    case CSS::CursorPredefined::AllScroll:
-        return Gfx::StandardCursor::Move;
-    case CSS::CursorPredefined::Progress:
-    case CSS::CursorPredefined::Wait:
-        return Gfx::StandardCursor::Wait;
-    case CSS::CursorPredefined::ColResize:
-        return Gfx::StandardCursor::ResizeColumn;
-    case CSS::CursorPredefined::EResize:
-    case CSS::CursorPredefined::WResize:
-    case CSS::CursorPredefined::EwResize:
-        return Gfx::StandardCursor::ResizeHorizontal;
-    case CSS::CursorPredefined::RowResize:
-        return Gfx::StandardCursor::ResizeRow;
-    case CSS::CursorPredefined::NResize:
-    case CSS::CursorPredefined::SResize:
-    case CSS::CursorPredefined::NsResize:
-        return Gfx::StandardCursor::ResizeVertical;
-    case CSS::CursorPredefined::NeResize:
-    case CSS::CursorPredefined::SwResize:
-    case CSS::CursorPredefined::NeswResize:
-        return Gfx::StandardCursor::ResizeDiagonalBLTR;
-    case CSS::CursorPredefined::NwResize:
-    case CSS::CursorPredefined::SeResize:
-    case CSS::CursorPredefined::NwseResize:
-        return Gfx::StandardCursor::ResizeDiagonalTLBR;
-    case CSS::CursorPredefined::ZoomIn:
-    case CSS::CursorPredefined::ZoomOut:
-        return Gfx::StandardCursor::Zoom;
-    case CSS::CursorPredefined::Default:
-        return Gfx::StandardCursor::Arrow;
-    case CSS::CursorPredefined::ContextMenu:
-    case CSS::CursorPredefined::Alias:
-    case CSS::CursorPredefined::Copy:
-    case CSS::CursorPredefined::NoDrop:
-        // FIXME: No corresponding GFX Standard Cursor, fallthrough to None
-    case CSS::CursorPredefined::Auto:
-    default:
-        return Gfx::StandardCursor::None;
-    }
-}
-
 static Gfx::Cursor resolve_cursor(Layout::NodeWithStyle const& layout_node, Layout::NodeWithStyle const* cursor_values_owner, ReadonlySpan<CSS::ComputedValuesFFI::ComputedCursor> cursor_data, Gfx::StandardCursor auto_cursor)
 {
     ReadonlySpan<RefPtr<CSS::CursorStyleValue const>> cursor_style_values;
@@ -3972,7 +3938,7 @@ void EventHandler::update_cursor(Layout::BegunRead const& read, Layout::Node con
         return Gfx::StandardCursor::Arrow;
     }();
 
-    set_page_cursor(m_navigable->page(), cursor);
+    m_navigable->page().cursor().request(cursor);
 }
 
 bool EventHandler::has_committed_root_box() const

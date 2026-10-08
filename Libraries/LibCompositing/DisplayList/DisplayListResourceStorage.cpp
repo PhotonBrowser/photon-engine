@@ -4,32 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/BitCast.h>
-#include <AK/ByteBuffer.h>
 #include <AK/Function.h>
 #include <AK/Math.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/RustFFI.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/ColorSpace.h>
 #include <LibGfx/Filter.h>
 #include <LibGfx/Font/Font.h>
-#include <LibGfx/SkiaBackendContext.h>
-#include <LibGfx/SkiaUtils.h>
-#include <LibGfx/VideoSurfaceImage.h>
-#include <LibGfx/YUVData.h>
 #include <LibMedia/VideoFrame.h>
-#include <LibMedia/VideoFrameHandle.h>
-#include <LibMedia/VideoSurface.h>
-
-#include <core/SkColorSpace.h>
-#include <core/SkFont.h>
-#include <core/SkImage.h>
-#include <core/SkTextBlob.h>
-#include <core/SkYUVAPixmaps.h>
-#include <gpu/ganesh/GrDirectContext.h>
-#include <gpu/ganesh/SkImageGanesh.h>
 
 namespace Compositing {
 
@@ -45,122 +28,13 @@ struct DisplayListStoredImageFrameResource {
     // Classifying costs a walk over the pixels and the answer never changes for a given frame — so it's worked out on
     // first use, and kept.
     mutable Optional<bool> force_dark_should_filter;
-    mutable sk_sp<SkImage> skia_image;
-    mutable RefPtr<Gfx::SkiaBackendContext> skia_backend_context;
-};
-
-struct DisplayListCachedRepeatedTileRaster {
-    AK_ALLOC_WITH_KMALLOC;
-
-    DisplayListCachedRepeatedTileRaster(Gfx::IntSize tile_size, RefPtr<Gfx::SkiaBackendContext> skia_backend_context, sk_sp<SkImage> image)
-        : tile_size(tile_size)
-        , skia_backend_context(move(skia_backend_context))
-        , image(move(image))
-    {
-    }
-
-    size_t byte_size() const { return static_cast<size_t>(tile_size.width()) * tile_size.height() * 4; }
-
-    Gfx::IntSize tile_size;
-    RefPtr<Gfx::SkiaBackendContext> skia_backend_context;
-    sk_sp<SkImage> image;
-};
-
-struct DisplayListCachedNestedRasterResource {
-    AK_ALLOC_WITH_KMALLOC;
-
-    explicit DisplayListCachedNestedRasterResource(RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
-        : skia_backend_context(move(skia_backend_context))
-    {
-    }
-
-    struct Raster {
-        Gfx::IntRect rect_in_list_space;
-        sk_sp<SkImage> image;
-        MonotonicTime last_used { MonotonicTime::now() };
-
-        size_t byte_size() const { return static_cast<size_t>(rect_in_list_space.width()) * rect_in_list_space.height() * 4; }
-    };
-
-    size_t total_byte_size() const
-    {
-        size_t total = 0;
-        for (auto const& raster : rasters)
-            total += raster.byte_size();
-        return total;
-    }
-
-    RefPtr<Gfx::SkiaBackendContext> skia_backend_context;
-    Optional<bool> requires_direct_replay;
-    bool was_painted { false };
-
-    // The same display list can be painted at several places in one frame (repeated SVG images, atlas-style
-    // lists painted in many small slices), each with its own visible sub-rectangle, so a single list keeps a
-    // bounded set of rasters, most recently used first.
-    static constexpr size_t max_rasters = 32;
-    Vector<Raster> rasters;
-};
-
-struct DisplayListCachedTextBlobResource {
-    AK_ALLOC_WITH_KMALLOC;
-
-    DisplayListCachedTextBlobResource(ByteBuffer glyph_bytes, sk_sp<SkTextBlob> blob, size_t byte_size, MonotonicTime last_used)
-        : glyph_bytes(move(glyph_bytes))
-        , blob(move(blob))
-        , byte_size(byte_size)
-        , last_used(last_used)
-    {
-    }
-
-    ByteBuffer glyph_bytes;
-    sk_sp<SkTextBlob> blob;
-    size_t byte_size { 0 };
-    MonotonicTime last_used;
-};
-
-struct DisplayListCachedVideoSinkImageResource {
-    Media::VideoFramePoolID pool_id { 0 };
-    u32 slot_index { 0 };
-    u64 slot_acquisition_id { 0 };
-    // A surface-backed image samples the surface where it lies, so it stays valid for every frame decoded into
-    // that surface rather than only for the one acquisition.
-    u32 surface_id { 0 };
-    // Drawing is recorded here but read by the GPU afterwards, so the surface stays in use until a different one
-    // is drawn in its place.
-    Media::VideoSurfaceUse surface_use;
-    RefPtr<Gfx::SkiaBackendContext> skia_backend_context;
-    sk_sp<SkImage> image;
 };
 
 struct DisplayListStoredVideoSinkResource {
     AK_ALLOC_WITH_KMALLOC;
 
     RefPtr<Media::VideoSink> sink;
-    mutable DisplayListCachedVideoSinkImageResource cached_image;
 };
-
-static sk_sp<SkImage> create_skia_image(Gfx::DecodedImageFrame const& frame, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
-{
-    auto raster_image = Gfx::sk_image_from_bitmap(frame.bitmap(), frame.color_space());
-    auto* gr_context = skia_backend_context ? skia_backend_context->sk_context() : nullptr;
-    if (!gr_context)
-        return raster_image;
-
-    auto texture_image = SkImages::TextureFromImage(gr_context, raster_image.get(), skgpu::Mipmapped::kNo, skgpu::Budgeted::kYes);
-    if (texture_image)
-        return texture_image;
-    return raster_image;
-}
-
-static sk_sp<SkImage> skia_image_for_stored_image_frame(DisplayListStoredImageFrameResource const& resource, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
-{
-    if (resource.skia_image && resource.skia_backend_context.ptr() == skia_backend_context.ptr())
-        return resource.skia_image;
-
-    resource.skia_image = create_skia_image(resource.frame, skia_backend_context);
-    resource.skia_backend_context = skia_backend_context;
-    return resource.skia_image;
-}
 
 bool DisplayListResourceSet::is_empty() const
 {
@@ -311,306 +185,6 @@ Gfx::DecodedImageFrame const& DisplayListResourceStorage::image_frame(ImageFrame
     return m_image_frames.get(id.value()).value()->frame;
 }
 
-sk_sp<SkImage> DisplayListResourceStorage::skia_image_for_image_frame(ImageFrameResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context) const
-{
-    return skia_image_for_stored_image_frame(*m_image_frames.get(id.value()).value(), skia_backend_context);
-}
-
-sk_sp<SkImage> DisplayListResourceStorage::skia_image_for_video_sink(VideoSinkResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context) const
-{
-    auto stored = m_video_sinks.find(id.value());
-    if (stored == m_video_sinks.end())
-        return nullptr;
-    auto& resolved = *stored->value;
-    if (!resolved.sink)
-        return nullptr;
-    auto frame = resolved.sink->current_frame();
-    if (!frame)
-        return nullptr;
-
-    auto handle = Media::VideoFrameHandle::for_frame(*frame);
-    auto surface = frame->surface();
-    auto surface_id = surface ? surface->id() : 0;
-    auto& cached_image_storage = resolved.cached_image;
-    auto cached_image_matches = [&] {
-        if (!cached_image_storage.image)
-            return false;
-        if (cached_image_storage.skia_backend_context != skia_backend_context)
-            return false;
-        if (surface_id != 0)
-            return cached_image_storage.surface_id == surface_id;
-        if (cached_image_storage.pool_id != handle.pool_id)
-            return false;
-        if (cached_image_storage.slot_index != handle.slot_index)
-            return false;
-        if (cached_image_storage.slot_acquisition_id != handle.slot_acquisition_id)
-            return false;
-        return true;
-    }();
-    if (cached_image_matches)
-        return cached_image_storage.image;
-
-    sk_sp<SkImage> image;
-    auto* gr_context = skia_backend_context ? skia_backend_context->sk_context() : nullptr;
-
-#ifdef AK_OS_MACOS
-    if (surface != nullptr && skia_backend_context)
-        image = Gfx::sk_image_from_video_surface(surface->io_surface(), frame->cicp(), *skia_backend_context);
-#endif
-
-    auto yuv_data = image ? Optional<Gfx::YUVData> {} : frame->yuv_data();
-    if (!image && !yuv_data.has_value() && surface == nullptr)
-        return nullptr;
-
-    auto color_space = Gfx::ColorSpace {};
-    if (auto color_space_result = Gfx::ColorSpace::from_cicp(frame->cicp()); !color_space_result.is_error())
-        color_space = color_space_result.release_value();
-
-    if (!image && gr_context && yuv_data.has_value()) {
-        image = SkImages::TextureFromYUVAPixmaps(
-            gr_context,
-            yuv_data->make_pixmaps(),
-            skgpu::Mipmapped::kNo,
-            false,
-            color_space.color_space<sk_sp<SkColorSpace>>());
-    }
-
-    if (!image) {
-        auto bitmap_or_error = [&] -> ErrorOr<NonnullRefPtr<Gfx::Bitmap>> {
-#ifdef AK_OS_MACOS
-            // Without a GPU to sample the surface on, its pixels have to be read back into memory to be drawn.
-            if (surface != nullptr)
-                return Gfx::bitmap_from_video_surface(surface->io_surface(), frame->cicp());
-#endif
-            return yuv_data->to_bitmap();
-        }();
-        if (bitmap_or_error.is_error()) {
-            dbgln("Could not convert video frame to bitmap: {}", bitmap_or_error.release_error());
-            return nullptr;
-        }
-        auto raster_image = Gfx::sk_image_adopting_bitmap(bitmap_or_error.release_value(), color_space);
-        if (gr_context)
-            image = SkImages::TextureFromImage(gr_context, raster_image.get(), skgpu::Mipmapped::kNo, skgpu::Budgeted::kYes);
-        if (!image)
-            image = move(raster_image);
-    }
-
-    if (!frame->revalidate_backing())
-        return nullptr;
-
-    if (!image)
-        return nullptr;
-
-    cached_image_storage.pool_id = handle.pool_id;
-    cached_image_storage.slot_index = handle.slot_index;
-    cached_image_storage.slot_acquisition_id = handle.slot_acquisition_id;
-    cached_image_storage.surface_id = surface_id;
-    cached_image_storage.surface_use = surface ? surface->begin_use() : Media::VideoSurfaceUse {};
-    cached_image_storage.skia_backend_context = skia_backend_context;
-    cached_image_storage.image = image;
-    return image;
-}
-
-sk_sp<SkImage> DisplayListResourceStorage::cached_repeated_tile_raster(u64 tile_key, Gfx::IntSize tile_size, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context) const
-{
-    auto cached_raster = m_repeated_tile_rasters.find(tile_key);
-    if (cached_raster == m_repeated_tile_rasters.end())
-        return nullptr;
-
-    auto const& raster = *cached_raster->value;
-    if (raster.tile_size != tile_size)
-        return nullptr;
-    if (raster.skia_backend_context.ptr() != skia_backend_context.ptr())
-        return nullptr;
-
-    return raster.image;
-}
-
-void DisplayListResourceStorage::add_cached_repeated_tile_raster(u64 tile_key, Gfx::IntSize tile_size, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, sk_sp<SkImage> image) const
-{
-    constexpr size_t max_repeated_tile_raster_bytes = 64 * MiB;
-    auto raster = make<DisplayListCachedRepeatedTileRaster>(tile_size, skia_backend_context, move(image));
-    if (m_repeated_tile_raster_bytes + raster->byte_size() > max_repeated_tile_raster_bytes) {
-        m_repeated_tile_rasters.clear();
-        m_repeated_tile_raster_bytes = 0;
-    }
-    if (auto existing = m_repeated_tile_rasters.get(tile_key); existing.has_value())
-        m_repeated_tile_raster_bytes -= (*existing)->byte_size();
-    m_repeated_tile_raster_bytes += raster->byte_size();
-    m_repeated_tile_rasters.set(tile_key, move(raster));
-}
-
-sk_sp<SkImage> DisplayListResourceStorage::cached_nested_display_list_raster(DisplayListResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, Gfx::IntRect visible_rect_in_list_space, Gfx::IntRect& raster_rect_in_list_space) const
-{
-    auto cached_resource = m_display_list_cached_nested_rasters.find(id.value());
-    if (cached_resource == m_display_list_cached_nested_rasters.end())
-        return nullptr;
-
-    auto& resource = *cached_resource->value;
-    if (resource.skia_backend_context.ptr() != skia_backend_context.ptr())
-        return nullptr;
-
-    for (size_t i = 0; i < resource.rasters.size(); ++i) {
-        if (!resource.rasters[i].rect_in_list_space.contains(visible_rect_in_list_space))
-            continue;
-        if (i != 0) {
-            auto raster = move(resource.rasters[i]);
-            resource.rasters.remove(i);
-            resource.rasters.prepend(move(raster));
-        }
-        resource.rasters.first().last_used = MonotonicTime::now();
-        raster_rect_in_list_space = resource.rasters.first().rect_in_list_space;
-        return resource.rasters.first().image;
-    }
-    return {};
-}
-
-void DisplayListResourceStorage::add_cached_nested_display_list_raster(DisplayListResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, Gfx::IntRect rect_in_list_space, sk_sp<SkImage> image) const
-{
-    VERIFY(image);
-    auto& resource = *m_display_list_cached_nested_rasters.ensure(id.value(), [&] {
-        return make<DisplayListCachedNestedRasterResource>(skia_backend_context);
-    });
-
-    if (resource.skia_backend_context.ptr() != skia_backend_context.ptr()) {
-        resource.rasters.clear();
-        resource.skia_backend_context = skia_backend_context;
-    }
-
-    // When the budget is exceeded, evict rasters that are not part of the active working set (not used
-    // recently). If everything is recently used, the live working set genuinely exceeds the budget; then skip
-    // caching this raster instead of evicting hot entries, so an oversized page degrades to direct replay for
-    // the overflow instead of thrashing the whole cache. Additions are rare by design, so the total is simply
-    // recomputed here instead of being tracked incrementally.
-    constexpr size_t max_nested_raster_cache_bytes = 512 * MiB;
-    auto total_bytes = static_cast<size_t>(rect_in_list_space.width()) * rect_in_list_space.height() * 4;
-    for (auto const& it : m_display_list_cached_nested_rasters)
-        total_bytes += it.value->total_byte_size();
-    if (total_bytes > max_nested_raster_cache_bytes) {
-        auto now = MonotonicTime::now();
-        for (auto& it : m_display_list_cached_nested_rasters) {
-            it.value->rasters.remove_all_matching([&](auto const& raster) {
-                if (now - raster.last_used < AK::Duration::from_milliseconds(250))
-                    return false;
-                total_bytes -= raster.byte_size();
-                return true;
-            });
-        }
-        if (total_bytes > max_nested_raster_cache_bytes)
-            return;
-    }
-
-    if (resource.rasters.size() == DisplayListCachedNestedRasterResource::max_rasters)
-        resource.rasters.take_last();
-    resource.rasters.prepend({ rect_in_list_space, move(image) });
-}
-
-static u64 text_blob_glyph_hash(ReadonlySpan<DisplayListGlyph> glyphs)
-{
-    u64 hash = glyphs.size();
-    for (auto const& glyph : glyphs) {
-        u64 position = static_cast<u64>(bit_cast<u32>(glyph.position.x())) << 32 | bit_cast<u32>(glyph.position.y());
-        hash = (hash ^ position) * 0x9e3779b97f4a7c15ULL;
-        hash = (hash ^ glyph.glyph_id) * 0x9e3779b97f4a7c15ULL;
-        hash ^= hash >> 32;
-    }
-    return hash;
-}
-
-static sk_sp<SkTextBlob> make_text_blob(Gfx::Font const& font, float scale, ReadonlySpan<DisplayListGlyph> glyphs, [[maybe_unused]] u8 font_smoothing, TextRasterizationMode rasterization_mode)
-{
-    if (font.is_invisible())
-        return nullptr;
-    auto sk_font = font.skia_font(scale);
-#ifdef AK_OS_MACOS
-    // INTEROP: Blink disables CoreGraphics outline dilation for antialiased text.
-    // https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/platform/fonts/mac/font_platform_data_mac.mm
-    switch (static_cast<FontSmoothing>(font_smoothing)) {
-    case FontSmoothing::Antialiased:
-        sk_font.setEdging(SkFont::Edging::kAntiAlias);
-        sk_font.setHinting(SkFontHinting::kNone);
-        break;
-    case FontSmoothing::None:
-        sk_font.setEdging(SkFont::Edging::kAlias);
-        break;
-    case FontSmoothing::SubpixelAntialiased:
-        sk_font.setEdging(SkFont::Edging::kSubpixelAntiAlias);
-        break;
-    default:
-        break;
-    }
-#endif
-    if (rasterization_mode == TextRasterizationMode::Unhinted) {
-        // NB: Preserve canvas text's fractional baseline and unhinted outline geometry.
-        sk_font.setHinting(SkFontHinting::kNone);
-        sk_font.setForceAutoHinting(false);
-        sk_font.setBaselineSnap(false);
-    }
-    SkTextBlobBuilder builder;
-    auto const& run = builder.allocRunPos(sk_font, glyphs.size());
-
-    auto font_ascent = font.pixel_metrics().ascent;
-    for (size_t i = 0; i < glyphs.size(); ++i) {
-        run.glyphs[i] = glyphs[i].glyph_id;
-        run.pos[i * 2] = glyphs[i].position.x() * scale;
-        run.pos[i * 2 + 1] = (glyphs[i].position.y() + font_ascent) * scale;
-    }
-    return builder.make();
-}
-
-sk_sp<SkTextBlob> DisplayListResourceStorage::text_blob(FontResourceId font_id, float scale, ReadonlySpan<DisplayListGlyph> glyphs, u8 font_smoothing, TextRasterizationMode rasterization_mode) const
-{
-    constexpr size_t max_text_blob_cache_bytes = 16 * MiB;
-    constexpr auto text_blob_idle_duration = AK::Duration::from_milliseconds(250);
-
-    ReadonlyBytes glyph_bytes { reinterpret_cast<u8 const*>(glyphs.data()), glyphs.size() * sizeof(DisplayListGlyph) };
-    DisplayListTextBlobCacheKey key { font_id.value(), bit_cast<u32>(scale), font_smoothing, text_blob_glyph_hash(glyphs), rasterization_mode };
-    auto now = MonotonicTime::now();
-
-    if (auto cached = m_text_blobs.find(key); cached != m_text_blobs.end()) {
-        auto& resource = *cached->value;
-        if (resource.glyph_bytes.bytes() == glyph_bytes) {
-            resource.last_used = now;
-            return resource.blob;
-        }
-        m_text_blob_cache_bytes -= resource.byte_size;
-        m_text_blobs.remove(cached);
-    }
-
-    auto blob = make_text_blob(font(font_id), scale, glyphs, font_smoothing, rasterization_mode);
-    if (!blob)
-        return nullptr;
-
-    auto byte_size = glyphs.size() * 24 + 256;
-    if (m_text_blob_cache_bytes + byte_size > max_text_blob_cache_bytes) {
-        if (now - m_text_blob_cache_sweep_time < text_blob_idle_duration)
-            return blob;
-        m_text_blob_cache_sweep_time = now;
-        m_text_blobs.remove_all_matching([&](auto const&, auto const& resource) {
-            if (now - resource->last_used < text_blob_idle_duration)
-                return false;
-            m_text_blob_cache_bytes -= resource->byte_size;
-            return true;
-        });
-        if (m_text_blob_cache_bytes + byte_size > max_text_blob_cache_bytes)
-            return blob;
-    }
-
-    m_text_blob_cache_bytes += byte_size;
-    m_text_blobs.set(key, make<DisplayListCachedTextBlobResource>(MUST(ByteBuffer::copy(glyph_bytes)), blob, byte_size, now));
-    return blob;
-}
-
-void DisplayListResourceStorage::remove_text_blobs_without_font()
-{
-    m_text_blobs.remove_all_matching([&](auto const& key, auto const& resource) {
-        if (m_fonts.contains(key.font_id))
-            return false;
-        m_text_blob_cache_bytes -= resource->byte_size;
-        return true;
-    });
-}
-
 static ReadonlyBytes inline_data(ReadonlyBytes payload, DisplayListDataSpan span)
 {
     VERIFY(static_cast<size_t>(span.offset) + span.size <= payload.size());
@@ -635,18 +209,10 @@ static void for_each_command_byte_range_inside(Command const& command, ReadonlyB
     }
 }
 
-bool DisplayListResourceStorage::should_cache_nested_display_list_raster(DisplayListResourceId id) const
+bool DisplayListResourceStorage::display_list_requires_direct_replay(DisplayListResourceId id) const
 {
-    // Only rasterize a list that has been painted before: content that is re-recorded for every update gets a
-    // fresh id each time and would waste a full rasterization per recording, while anything replayed more than
-    // once converges to cache hits after its second paint.
-    auto& resource = *m_display_list_cached_nested_rasters.ensure(id.value(), [&] {
-        return make<DisplayListCachedNestedRasterResource>(nullptr);
-    });
-    if (!exchange(resource.was_painted, true))
-        return false;
     HashTable<u64> visited_display_lists;
-    return !nested_display_list_requires_direct_replay(id, visited_display_lists);
+    return nested_display_list_requires_direct_replay(id, visited_display_lists);
 }
 
 // Determines whether reusing a rasterization of the display list can produce different pixels than replaying it
@@ -656,14 +222,11 @@ bool DisplayListResourceStorage::should_cache_nested_display_list_raster(Display
 // content that changes underneath its immutable command stream (video frames are updated in place under a stable
 // resource id, canvas surfaces and composited child contexts are resolved at replay time). Destination-reading
 // operations enclosed in a save layer recorded within the list only ever read within-list content, so they do
-// not require direct replay. The verdict is intrinsic to the list and memoized alongside its cached rasters.
+// not require direct replay. The verdict is intrinsic to the list and memoized until the list is removed.
 bool DisplayListResourceStorage::nested_display_list_requires_direct_replay(DisplayListResourceId id, HashTable<u64>& visited_display_lists) const
 {
-    auto& resource = *m_display_list_cached_nested_rasters.ensure(id.value(), [&] {
-        return make<DisplayListCachedNestedRasterResource>(nullptr);
-    });
-    if (resource.requires_direct_replay.has_value())
-        return *resource.requires_direct_replay;
+    if (auto memoized = m_display_list_requires_direct_replay.get(id.value()); memoized.has_value())
+        return *memoized;
 
     visited_display_lists.set(id.value());
     auto const& list_resource = display_list_resource(id);
@@ -712,7 +275,7 @@ bool DisplayListResourceStorage::nested_display_list_requires_direct_replay(Disp
     for (auto const& run : list_resource.display_list->command_runs())
         scan_records(list_resource.display_list->command_bytes_of_run(run), run.context, false);
 
-    resource.requires_direct_replay = requires_direct_replay;
+    m_display_list_requires_direct_replay.set(id.value(), requires_direct_replay);
     return requires_direct_replay;
 }
 
@@ -792,6 +355,54 @@ DisplayListResourceSet DisplayListResourceStorage::collect_referenced_resources(
     return referenced_resources;
 }
 
+static ErrorOr<void> validate_display_list_against_visual_context_tree(DisplayList const& display_list, AccumulatedVisualContextTree const& visual_context_tree)
+{
+    if (display_list.compatible_visual_context_tree_structural_epoch() != visual_context_tree.structural_epoch())
+        return Error::from_string_literal("Display list was recorded against another visual context tree");
+    return validate_display_list_references_live_visual_context_nodes(display_list, visual_context_tree);
+}
+
+static ErrorOr<void> validate_resources_are_present(DisplayListResourceStorage const& storage, DisplayListResourceSet const& resources)
+{
+    for (auto id : resources.fonts) {
+        if (!storage.has_font(id))
+            return Error::from_string_literal("Display list refers to a font that is not present");
+    }
+    for (auto id : resources.image_frames) {
+        if (!storage.has_image_frame(id))
+            return Error::from_string_literal("Display list refers to an image frame that is not present");
+    }
+    for (auto id : resources.display_lists) {
+        if (!storage.has_display_list(id))
+            return Error::from_string_literal("Display list refers to a nested display list that is not present");
+    }
+    return {};
+}
+
+ErrorOr<DisplayListResourceTransaction> DisplayListResourceStorage::create_self_contained_transaction(DisplayList const& display_list, AccumulatedVisualContextTree const& visual_context_tree) const
+{
+    auto resources = collect_referenced_resources(display_list);
+    resources.include(collect_referenced_resources(visual_context_tree));
+    TRY(validate_resources_are_present(*this, resources));
+    return create_transaction({}, resources);
+}
+
+ErrorOr<void> DisplayListResourceStorage::validate_for_replay(DisplayList const& display_list, AccumulatedVisualContextTree const& visual_context_tree) const
+{
+    TRY(validate_display_list_against_visual_context_tree(display_list, visual_context_tree));
+    auto resources = collect_referenced_resources(display_list);
+    resources.include(collect_referenced_resources(visual_context_tree));
+    TRY(validate_resources_are_present(*this, resources));
+    for (auto id : resources.display_lists) {
+        auto const& nested_display_list = this->display_list(id);
+        TRY(validate_display_list_against_visual_context_tree(nested_display_list, display_list_visual_context_tree(id)));
+        // Replay follows nested lists with no depth limit, so a list must not reach itself.
+        if (collect_referenced_resources(nested_display_list).display_lists.contains(id))
+            return Error::from_string_literal("Nested display list refers to itself");
+    }
+    return {};
+}
+
 DisplayListResourceTransaction DisplayListResourceStorage::create_transaction(
     DisplayListResourceSet const& previous,
     DisplayListResourceSet const& current) const
@@ -836,55 +447,78 @@ DisplayListResourceTransaction DisplayListResourceStorage::create_transaction(
     return transaction;
 }
 
-void DisplayListResourceStorage::apply_transaction(DisplayListResourceTransaction&& transaction)
+DisplayListResourceSet DisplayListResourceStorage::apply_transaction(DisplayListResourceTransaction&& transaction)
 {
+    DisplayListResourceSet removed_resources;
     m_has_resources_added_since_last_retain = true;
     for (auto& font : transaction.fonts)
         set_font(font.id, move(font.font));
-    for (auto& frame : transaction.image_frames)
+    for (auto& frame : transaction.image_frames) {
+        if (m_image_frames.contains(frame.id.value()))
+            removed_resources.image_frames.set(frame.id);
         set_image_frame(frame.id, move(frame.frame));
+    }
     for (auto& video_sink : transaction.video_sinks)
         add_video_sink(video_sink.id, video_sink.sink_handle);
     for (auto& display_list : transaction.display_lists)
         add_display_list(move(display_list));
 
-    for (auto id : transaction.font_ids_to_remove)
-        m_fonts.remove(id.value());
-    if (!transaction.font_ids_to_remove.is_empty())
-        remove_text_blobs_without_font();
-    for (auto id : transaction.image_frame_ids_to_remove)
-        m_image_frames.remove(id.value());
-    for (auto id : transaction.video_sink_ids_to_remove) {
-        m_video_sink_handles.remove(id.value());
-        m_video_sinks.remove(id.value());
+    for (auto id : transaction.font_ids_to_remove) {
+        if (m_fonts.remove(id.value()))
+            removed_resources.fonts.set(id);
     }
-    for (auto id : transaction.display_list_ids_to_remove)
-        m_display_lists.remove(id.value());
-    for (auto id : transaction.display_list_ids_to_remove)
-        m_display_list_cached_nested_rasters.remove(id.value());
+    for (auto id : transaction.image_frame_ids_to_remove) {
+        if (m_image_frames.remove(id.value()))
+            removed_resources.image_frames.set(id);
+    }
+    for (auto id : transaction.video_sink_ids_to_remove) {
+        auto removed_handle = m_video_sink_handles.remove(id.value());
+        auto removed_sink = m_video_sinks.remove(id.value());
+        if (removed_handle || removed_sink)
+            removed_resources.video_sinks.set(id);
+    }
+    for (auto id : transaction.display_list_ids_to_remove) {
+        if (m_display_lists.remove(id.value()))
+            removed_resources.display_lists.set(id);
+        m_display_list_requires_direct_replay.remove(id.value());
+    }
+    return removed_resources;
 }
 
-void DisplayListResourceStorage::retain_only(DisplayListResourceSet const& resource_set)
+DisplayListResourceSet DisplayListResourceStorage::retain_only(DisplayListResourceSet const& resource_set)
 {
+    DisplayListResourceSet removed_resources;
     m_fonts.remove_all_matching([&](auto id, auto const&) {
-        return !resource_set.fonts.contains(FontResourceId { id });
+        if (resource_set.fonts.contains(FontResourceId { id }))
+            return false;
+        removed_resources.fonts.set(FontResourceId { id });
+        return true;
     });
-    remove_text_blobs_without_font();
     m_image_frames.remove_all_matching([&](auto id, auto const&) {
-        return !resource_set.image_frames.contains(ImageFrameResourceId { id });
+        if (resource_set.image_frames.contains(ImageFrameResourceId { id }))
+            return false;
+        removed_resources.image_frames.set(ImageFrameResourceId { id });
+        return true;
     });
-    auto should_remove_video_resource = [&](auto id) {
-        return !resource_set.video_sinks.contains(VideoSinkResourceId { id });
+    auto remove_video_resource = [&](auto id) {
+        if (resource_set.video_sinks.contains(VideoSinkResourceId { id }))
+            return false;
+        removed_resources.video_sinks.set(VideoSinkResourceId { id });
+        return true;
     };
-    m_video_sink_handles.remove_all_matching([&](auto id, auto const&) { return should_remove_video_resource(id); });
-    m_video_sinks.remove_all_matching([&](auto id, auto const&) { return should_remove_video_resource(id); });
+    m_video_sink_handles.remove_all_matching([&](auto id, auto const&) { return remove_video_resource(id); });
+    m_video_sinks.remove_all_matching([&](auto id, auto const&) { return remove_video_resource(id); });
     m_display_lists.remove_all_matching([&](auto id, auto const&) {
-        return !resource_set.display_lists.contains(DisplayListResourceId { id });
+        if (resource_set.display_lists.contains(DisplayListResourceId { id }))
+            return false;
+        removed_resources.display_lists.set(DisplayListResourceId { id });
+        return true;
     });
-    m_display_list_cached_nested_rasters.remove_all_matching([&](auto id, auto const&) {
+    m_display_list_requires_direct_replay.remove_all_matching([&](auto id, auto const&) {
         return !resource_set.display_lists.contains(DisplayListResourceId { id });
     });
     m_has_resources_added_since_last_retain = false;
+    return removed_resources;
 }
 
 void DisplayListResourceStorage::set_video_sink(VideoSinkResourceId id, RefPtr<Media::VideoSink> sink)

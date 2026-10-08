@@ -32,6 +32,7 @@ namespace Gfx {
 struct VulkanContext;
 class Direct3DContext;
 class MetalContext;
+class PaintingSurface;
 
 class SkiaBackendContext : public AtomicRefCounted<SkiaBackendContext> {
     AK_MAKE_NONCOPYABLE(SkiaBackendContext);
@@ -62,6 +63,8 @@ public:
     SkiaBackendContext() { }
     virtual ~SkiaBackendContext() { }
 
+    void flush_and_submit(PaintingSurface&);
+    void flush_and_submit_async(PaintingSurface&, Function<void()>&&, uint64_t presentation_signal_value = 0);
     void flush_and_submit(SkSurface*, SurfaceAccess);
     void flush_and_submit_async(SkSurface*, SurfaceAccess, Function<void()>&&, uint64_t presentation_signal_value = 0);
     void check_async_work_completion();

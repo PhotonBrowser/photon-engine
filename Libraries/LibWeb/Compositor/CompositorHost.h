@@ -23,24 +23,12 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
-namespace Web::HTML {
-
-class PresentationQueue;
-
-}
-
 namespace Web::Compositor {
 
 class CompositorFrameSink;
 class CompositorHost;
+class NavigablePresenter;
 struct CompositorFrame;
-
-// A frame's turn to be presented. Only the event loop's presentation queue hands one out, to a frame no recording of
-// its navigable's containers flies ahead of, so that a frame presented before the one it goes with does not compile.
-class PresentationTurn {
-    friend class HTML::PresentationQueue;
-    PresentationTurn() = default;
-};
 
 struct PlaceholderCanvasLink {
     Compositing::CanvasId canvas_id;
@@ -65,13 +53,6 @@ public:
     void set_parent_context(Optional<Web::CompositorContextId>);
     void stop_presenting_to_client();
 
-    // Brings the context up to date with one frame, whose messages reach the compositor in order.
-    void submit_frame(PresentationTurn, CompositorFrame&&);
-    // What takes this context's frames from any thread, while the compositor can be reached, once the canvas commands
-    // a frame may sample have reached the compositor.
-    RefPtr<CompositorFrameSink> frame_sink();
-    void add_video_sink(Media::VideoSinkHandle);
-    void remove_video_sink(Media::VideoSinkHandle);
     void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
     void invalidate_wheel_event_listener_state(u64 generation);
     void invalidate_keyboard_scroll_state(u64 generation);
@@ -83,7 +64,9 @@ public:
     void viewport_size_updated(Gfx::IntSize, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(double maximum_frames_per_second);
     void hurry_rendering_opportunity();
-    void request_screenshot(NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&& callback);
+    void request_screenshot(NonnullRefPtr<Gfx::Bitmap>, Function<void()>&& callback);
+    // Sends the canvas commands a frame may sample ahead of it, and answers whether the compositor can be reached.
+    bool ready_for_frame();
 
 private:
     friend class CompositorHost;
@@ -117,13 +100,14 @@ public:
     void commit_placeholder_canvas(PlaceholderCanvasLink, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize, bool origin_clean);
     PlaceholderCanvasPixels read_placeholder_canvas_pixels(Compositing::CanvasId, Gfx::IntRect);
 
+    // Has the compositor draw a display list that belongs to no compositor context into the target, which must be a
+    // shareable BGRA8888 bitmap with premultiplied alpha. Returns false if nothing was drawn.
+    bool rasterize_display_list(Compositing::DisplayListResource const&, Compositing::DisplayListResourceStorage const&, NonnullRefPtr<Gfx::Bitmap> target) const;
+
     void destroy_context(Web::CompositorContextId);
     void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>);
     void stop_presenting_to_client(Web::CompositorContextId);
 
-    void submit_frame(PresentationTurn, CompositorFrame&&);
-    // What takes the frames of this host's contexts from any thread, while the compositor can be reached.
-    RefPtr<CompositorFrameSink> frame_sink();
     void add_video_sink(Media::VideoSinkHandle);
     void remove_video_sink(Media::VideoSinkHandle);
     void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
@@ -137,7 +121,7 @@ public:
     void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
-    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&& callback);
+    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void()>&& callback);
 
 protected:
     CompositorHost();
@@ -147,6 +131,8 @@ protected:
     virtual void context_was_destroyed(Web::CompositorContextId) { }
 
 private:
+    friend class CompositorContextHandle;
+
     // Drains the stream, but only when the message can actually be delivered.
     void send_canvas_2d_stream(Compositing::Canvas2DCommandStream&);
 

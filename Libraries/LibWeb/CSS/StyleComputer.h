@@ -24,12 +24,11 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/InstalledStyle.h>
-#include <LibWeb/CSS/MediaQuery.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
+#include <LibWeb/CSS/RustMediaList.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/SharedCompiledStyleSheet.h>
-#include <LibWeb/CSS/StyleGroupPayloadPins.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/Export.h>
@@ -38,15 +37,6 @@
 #include <LibWeb/CSS/StyleEngineBridge.h>
 
 namespace Web::CSS {
-
-// Matching an originating element answers both its own cascade and every
-// pseudo-element cascade. A caller that computes those cascades as one batch
-// can keep this result between them.
-struct StyleEngineMatchResult {
-    StyleNodeID node;
-    Optional<Vector<StyleEngine::RuleMatch>> matches;
-    Optional<u32> signature;
-};
 
 class WEB_API StyleComputer final : public GC::Cell {
     GC_CELL(StyleComputer, GC::Cell);
@@ -83,7 +73,6 @@ public:
     [[nodiscard]] Optional<StyleEngineRuleTarget> style_engine_rule_target(Layout::BegunRead const& read, StyleEngineRuleID rule_id) const;
 
     static CSSPixels default_user_font_size();
-    static void ensure_style_metadata_tables_installed();
     static CSSPixels absolute_size_mapping(AbsoluteSize, CSSPixels default_font_size);
 
     void set_viewport_rect(Badge<DOM::Document>, CSSPixelRect const& viewport_rect) { m_viewport_rect = viewport_rect; }
@@ -107,14 +96,14 @@ public:
         bool any_computed_value_changed { false };
     };
 
-    // Has the engine compose a sampled overlay over the record the element installed, which it was sampled on, compare
-    // it with that record and publish it. `before_publication` sees the comparison before the element installs the
-    // published record.
-    struct SampledAnimationOverlayPublication {
-        StyleEngineFFI::FfiAnimationInvalidation invalidation;
-        StyleEngine::StyleRecordDelta publication;
+    // Has the engine compose each element's sampled overlay over the record the element installed, which it was sampled
+    // on, compare it with that record and publish it, in one call of the engine, answering each at the same index of
+    // `publications`.
+    struct SampledAnimationOverlay {
+        DOM::AbstractElement element;
+        ComputedStyleWorkingSet const& style;
     };
-    [[nodiscard]] SampledAnimationOverlayPublication publish_sampled_animation_overlay(Layout::BegunRead const& read, DOM::AbstractElement, ComputedStyleWorkingSet& style, Function<void(StyleEngineFFI::FfiAnimationInvalidation const&)> const& before_publication = {}) const;
+    void publish_sampled_animation_overlays(Layout::BegunRead const& read, ReadonlySpan<SampledAnimationOverlay>, Span<StyleEngineFFI::FfiAnimationOverlayPublication> publications) const;
     // Give a layout-only variant of an element or pseudo-element style an authoritative record
     // without replacing the StyleEngine assignment of its DOM target.
     [[nodiscard]] StyleRecordID intern_computed_style_inputs(Layout::BegunRead const& read, DOM::AbstractElement, ComputedValues const&) const;
@@ -269,32 +258,13 @@ private:
     // The environments the style engine resolved, by the identity it minted, materialized once.
     mutable HashMap<u64, NonnullRefPtr<CustomPropertyData const>> m_engine_custom_property_environments;
 
-    // What one final value parses to against one registration's syntax: a pure function of the
-    // value, the syntax, and the registration generation, unlike the computed-value step after it,
-    // which resolves font-relative units against the reading element and runs per read.
-    struct RegisteredCustomPropertyParse {
-        NonnullRefPtr<StyleValue const> value;
-        void const* syntax_identity { nullptr };
-        u64 registration_generation { 0 };
-        NonnullRefPtr<StyleValue const> parsed;
-    };
-    mutable HashMap<void const*, Vector<RegisteredCustomPropertyParse>> m_registered_custom_property_parses;
-
-    enum class ProvisionalTransitionAction : u8 {
-        None,
-        Remove,
-        Cancel,
-        Start,
-        RemoveAndStart,
-        CancelRemoveAndStart,
-    };
     struct ProvisionalTransitionState {
         GC::Ptr<DOM::Element> element;
         Optional<PseudoElement> pseudo_element;
         PropertyID property_id;
         GC::Ptr<CSSTransition> committed_transition;
         GC::Ptr<CSSTransition> proposed_transition;
-        ProvisionalTransitionAction action { ProvisionalTransitionAction::None };
+        StyleValueFFI::FfiTransitionActionKind action {};
         bool has_decision { false };
     };
     // Whether the animation collection of the computation in progress resolved a keyframe-borne

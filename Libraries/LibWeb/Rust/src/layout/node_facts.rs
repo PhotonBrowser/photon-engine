@@ -614,7 +614,6 @@ pub(crate) fn kind_is_box(kind: NodeKind) -> bool {
             | NodeKind::BreakNode
             | NodeKind::InlineNode
             | NodeKind::Node
-            | NodeKind::NodeWithStyle
             | NodeKind::GeneratedTextNode
             | NodeKind::TextNode
     )
@@ -646,7 +645,6 @@ pub(crate) fn kind_is_replaced_box(kind: NodeKind) -> bool {
             | NodeKind::ImageBox
             | NodeKind::NavigableContainerViewport
             | NodeKind::RadioButton
-            | NodeKind::ReplacedBox
             | NodeKind::SVGSVGBox
             | NodeKind::VideoBox
     )
@@ -664,8 +662,7 @@ pub(crate) fn kind_is_svg_resource_box(kind: NodeKind) -> bool {
 pub(crate) fn kind_is_svg_box(kind: NodeKind) -> bool {
     matches!(
         kind,
-        NodeKind::SVGBox
-            | NodeKind::SVGClipBox
+        NodeKind::SVGClipBox
             | NodeKind::SVGGeometryBox
             | NodeKind::SVGGraphicsBox
             | NodeKind::SVGImageBox
@@ -890,11 +887,7 @@ impl<'pass> NodeFacts<'pass> {
     pub(crate) fn has_box_model_metrics(&self) -> bool {
         !matches!(
             self.data().kind.get(),
-            NodeKind::Unset
-                | NodeKind::Node
-                | NodeKind::NodeWithStyle
-                | NodeKind::GeneratedTextNode
-                | NodeKind::TextNode
+            NodeKind::Unset | NodeKind::Node | NodeKind::GeneratedTextNode | NodeKind::TextNode
         )
     }
 
@@ -1328,7 +1321,6 @@ mod node_facts_tests {
             NodeKind::ListItemMarkerBox
         )));
         assert!(!super::node_can_have_children(&data_with_kind(NodeKind::ImageBox)));
-        assert!(!super::node_can_have_children(&data_with_kind(NodeKind::ReplacedBox)));
         assert!(!super::node_can_have_children(&data_with_kind(
             NodeKind::NavigableContainerViewport
         )));
@@ -1454,7 +1446,7 @@ mod node_facts_tests {
 /// `host` must be a live document host, on its document's thread, and `natural_size` writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_take_changed_document_svg_root_natural_size(
-    host: *const crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     natural_size: *mut crate::painting::host::FfiNaturalSize,
 ) -> bool {

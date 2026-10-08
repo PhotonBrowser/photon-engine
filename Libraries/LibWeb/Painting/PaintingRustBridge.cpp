@@ -18,6 +18,7 @@
 #include <LibGfx/Matrix4x4.h>
 #include <LibGfx/Path.h>
 #include <LibGfx/TextLayout.h>
+#include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
@@ -195,9 +196,6 @@ static Compositing::RustFFI::FfiVisualContextTreeInputs visual_context_tree_inpu
     inputs.visual_viewport_offset_x = offset.x();
     inputs.visual_viewport_offset_y = offset.y();
     inputs.visual_viewport_scale = visual_viewport.scale();
-    auto viewport_overflow = overflow_values_applied_to_viewport_for_wheel_scrolling(document);
-    inputs.viewport_wheel_overflow_x = static_cast<u8>(to_underlying(viewport_overflow.x));
-    inputs.viewport_wheel_overflow_y = static_cast<u8>(to_underlying(viewport_overflow.y));
     return inputs;
 }
 
@@ -477,11 +475,14 @@ static Layout::RustFFI::FfiRecordingPublishCallbacks recording_publish_callbacks
             if (!layout_node)
                 return empty_display_list();
             GC::Ptr<HTML::DecodedImageData> decoded_image_data;
+            // A recording that lands after its boxes' elements were removed may draw a box whose element is gone.
             if (request->is_replaced_content) {
-                if (layout_node->kind() == Layout::RustFFI::NodeKind::ImageBox)
-                    decoded_image_data = static_cast<Layout::Box const&>(*layout_node).image_provider().decoded_image_data();
-                else if (layout_node->kind() == Layout::RustFFI::NodeKind::SVGImageBox)
-                    decoded_image_data = as<SVG::SVGImageElement>(*layout_node->dom_node()).decoded_image_data();
+                if (layout_node->kind() == Layout::RustFFI::NodeKind::ImageBox) {
+                    if (auto const* image_provider = static_cast<Layout::Box const&>(*layout_node).image_provider_if_any())
+                        decoded_image_data = image_provider->decoded_image_data();
+                } else if (auto const* image = as_if<SVG::SVGImageElement>(layout_node->dom_node())) {
+                    decoded_image_data = image->decoded_image_data();
+                }
             } else if (auto const* observer = layer_image_observer(*layout_node, request->list, request->computed_index)) {
                 decoded_image_data = observer->decoded_image_data();
             }
@@ -534,7 +535,28 @@ void take_recording_trace_if_pending(Layout::BegunRead const& read, DOM::Documen
         document.paint_state().append_recording_trace(MUST(context.trace.to_string()));
 }
 
-Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const& read, DOM::Document& document, Compositing::AccumulatedVisualContextTree visual_context_tree, NonnullRefPtr<Compositing::DisplayList> placeholder_display_list, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs, Layout::RustFFI::FfiFlightBlocker blocker, Optional<Compositor::FlightPresentation>* flight)
+// The time of the document's timeline its rendering update sampled the animations at: the frames sampled after the
+// update's never show them before it.
+static double rendering_update_timestamp(DOM::Document& document)
+{
+    if (auto time = document.timeline()->current_time(); time.has_value() && time->type == Animations::TimeValue::Type::Milliseconds)
+        return time->value;
+    return -AK::Infinity<double>;
+}
+
+// Hands the render owner `presentation` and its seal, which the host gives up.
+static Layout::RustFFI::FfiPresentation give_up(Compositor::FlightPresentation presentation)
+{
+    return { .presenter = &presentation.presenter.leak_ref(), .sealed = presentation.sealed.leak_ptr() };
+}
+
+void commit_unrecorded_frame(Layout::BegunRead const& read, DOM::Document& document, Compositor::FlightPresentation presentation)
+{
+    bool const sends_visual_context_tree = presentation.sealed->sends_visual_context_tree;
+    Layout::RustFFI::render_state_commit_unrecorded_frame(document_host(document), &read, sends_visual_context_tree, rendering_update_timestamp(document), give_up(move(presentation)));
+}
+
+Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const& read, DOM::Document& document, Compositing::AccumulatedVisualContextTree visual_context_tree, NonnullRefPtr<Compositing::DisplayList> placeholder_display_list, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs, Optional<Compositor::FlightPresentation> committed)
 {
     auto* host = document_host(document);
     auto device_pixels_per_css_pixel = document.page().client().device_pixels_per_css_pixel();
@@ -599,7 +621,6 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
     inputs.force_dark_foreground_threshold = config.force_dark_foreground_threshold;
     inputs.force_dark_background_threshold = config.force_dark_background_threshold;
     inputs.should_paint_overlay = config.paint_overlay;
-    inputs.is_recording_async_scrolling_metadata = true;
     inputs.document_id = document.unique_id().value();
     inputs.has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport;
     inputs.wheel_event_listener_state_generation = document.page().wheel_event_listener_state_generation();
@@ -625,6 +646,11 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
         inputs.inactive_selection_background_light = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Light));
         inputs.inactive_selection_background_dark = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Dark));
         inputs.document_has_supported_color_schemes = document.supported_color_schemes().has_value();
+        // The AT focus ring paints as an outline on one paintable, whether or not that element has a CSS outline of
+        // its own. So the recorder learns which paintable that is here, up front — its paint-phase mask would
+        // otherwise skip that paintable's outline phase as empty.
+        auto const* accessibility_focus_target = document.accessibility_focus_target();
+        inputs.accessibility_focus_target = Layout::Node::slot_id(accessibility_focus_target ? accessibility_focus_target->layout_node(read) : nullptr);
     }
     inputs.caret = resolve_document_caret_paint(read, document);
     inputs.focused_text_control = resolve_focused_text_control_selection(read, document);
@@ -670,23 +696,25 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
         .async_scrolling_metadata = async_scrolling_metadata,
         .paint_command_cache_source = document.paint_state().display_list_used_as_paint_command_cache_source(),
     };
-    // A recording that flies takes the presentation it presents its frame with, which the landing gives back.
-    Layout::RustFFI::FfiPresentation ffi_presentation {};
-    if (flight && flight->has_value()) {
-        (*flight)->sealed->recording = recording;
-        ffi_presentation = { .presenter = (*flight)->presenter.ptr(), .sealed = (*flight)->sealed.ptr() };
-    }
     // The recording copies what it reads of the overlay arrays and buffers, which live until here.
-    auto start = Layout::RustFFI::render_state_record_display_list(host, &read, viewport_row_slot(read, document), inputs, blocker, &ffi_presentation);
-    if (flight && flight->has_value() && !ffi_presentation.presenter) {
-        auto taken = flight->release_value();
-        (void)taken.presenter.leak_ptr();
-        (void)taken.sealed.leak_ptr();
+    auto viewport = viewport_row_slot(read, document);
+    // A committed frame takes the presentation it presents with, which the landing gives back.
+    if (committed.has_value()) {
+        committed->sealed->recording = recording;
+        recording.in_flight = true;
+        Layout::RustFFI::render_state_commit_recorded_frame(host, &read, viewport, inputs, rendering_update_timestamp(document), give_up(committed.release_value()));
+        return recording;
     }
-    if (start == Layout::RustFFI::FfiRecordingStart::NothingToRecord)
+    if (Layout::RustFFI::render_state_record_display_list(host, &read, viewport, inputs) == Layout::RustFFI::FfiRecordingStart::NothingToRecord)
         return {};
-    recording.in_flight = start == Layout::RustFFI::FfiRecordingStart::InFlight;
     return recording;
+}
+
+void render_vector_images(Layout::BegunRead const& read, DOM::Document& document, DisplayListRecording const& recording)
+{
+    auto resources = make<Compositor::VectorImageResources>();
+    RecordingPublishContext publish_context { resources->storage, document_host(document), read, recording.visual_context_tree };
+    Layout::RustFFI::render_state_render_vector_images(publish_context.host, recording_publish_callbacks(publish_context), resources.leak_ptr());
 }
 
 RefPtr<Compositing::DisplayList> finish_rust_display_list_recording(Layout::BegunRead const& read, DOM::Document& document, DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage)
@@ -726,6 +754,18 @@ NonnullRefPtr<Compositing::DisplayList> display_list_of_published_recording(Disp
     return display_list;
 }
 
+static Compositing::DisplayListResource record_image_paint(Layout::RustFFI::FfiImagePaintRecordInputs const& inputs)
+{
+    Optional<Compositing::DisplayListResource> recorded_display_list;
+    Layout::RustFFI::ladybird_web_record_image_paint_display_list(&inputs, &recorded_display_list,
+        [](void* context, void const* retained_commands, void const* retained_tree) {
+            auto visual_context_tree = Compositing::AccumulatedVisualContextTree::adopt_rust_handle(retained_tree);
+            auto display_list = Compositing::DisplayList::adopt_rust_command_storage(visual_context_tree, retained_commands);
+            *static_cast<Optional<Compositing::DisplayListResource>*>(context) = Compositing::DisplayListResource { move(display_list), move(visual_context_tree) };
+        });
+    return recorded_display_list.release_value();
+}
+
 Compositing::DisplayListResource record_image_paint_display_list(ImagePaint const& paint, ImagePaintRequest const& request, double device_pixels_per_css_pixel)
 {
     Layout::RustFFI::FfiImagePaintRecordInputs inputs {};
@@ -751,14 +791,18 @@ Compositing::DisplayListResource record_image_paint_display_list(ImagePaint cons
             gradient_stop_color_resolution_input = CSS::make_rust_color_resolution_input(request.gradient_stop_color_resolution_context, gradient_stop_length_resolution_context_storage);
             inputs.gradient_stop_color_resolution_input = &gradient_stop_color_resolution_input;
         });
-    Optional<Compositing::DisplayListResource> recorded_display_list;
-    Layout::RustFFI::ladybird_web_record_image_paint_display_list(&inputs, &recorded_display_list,
-        [](void* context, void const* retained_commands, void const* retained_tree) {
-            auto visual_context_tree = Compositing::AccumulatedVisualContextTree::adopt_rust_handle(retained_tree);
-            auto display_list = Compositing::DisplayList::adopt_rust_command_storage(visual_context_tree, retained_commands);
-            *static_cast<Optional<Compositing::DisplayListResource>*>(context) = Compositing::DisplayListResource { move(display_list), move(visual_context_tree) };
-        });
-    return recorded_display_list.release_value();
+    return record_image_paint(inputs);
+}
+
+Compositing::DisplayListResource record_image_frame_display_list(Gfx::DecodedImageFrame const& frame, Gfx::FloatRect const& dest_rect, Gfx::ScalingMode scaling_mode, Compositing::DisplayListResourceStorage& resource_storage)
+{
+    Layout::RustFFI::FfiImagePaintRecordInputs inputs {};
+    inputs.kind = Layout::RustFFI::FfiImagePaintRecordKind::DecodedFrame;
+    inputs.dest_rect = dest_rect;
+    inputs.device_pixels_per_css_pixel = 1;
+    inputs.frame_id = resource_storage.add_image_frame(frame).value();
+    inputs.scaling_mode = scaling_mode;
+    return record_image_paint(inputs);
 }
 
 }

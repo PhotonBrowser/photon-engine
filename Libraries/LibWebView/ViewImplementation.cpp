@@ -1355,6 +1355,23 @@ void ViewImplementation::inspect_accessibility_tree()
     page().async_inspect_accessibility_tree();
 }
 
+void ViewImplementation::request_accessibility_tree()
+{
+    m_accessibility_tree_requested = true;
+    page().async_request_accessibility_tree();
+}
+
+void ViewImplementation::perform_accessibility_action(i64 node_id, String action)
+{
+    page().async_perform_accessibility_action(node_id, move(action));
+}
+
+void ViewImplementation::perform_accessibility_text_action(i64 node_id, String action, i32 offset_start,
+    i32 offset_end, String text)
+{
+    page().async_perform_accessibility_text_action(node_id, move(action), offset_start, offset_end, move(text));
+}
+
 void ViewImplementation::get_hovered_node_id()
 {
     page().async_get_hovered_node_id();
@@ -2614,6 +2631,15 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
     Application::the().update_compositor_viewport(compositor_context_id, viewport_size().to_type<int>());
     Application::the().update_compositor_context_visibility(compositor_context_id, traversable().system_visibility_state());
     page.async_update_visibility_state(traversable().id(), traversable().system_visibility_state());
+
+    // An assistive technology's interest is per-page state in WebContent, and a cross-site navigation moves the display
+    // page to another process. So ask the new page for its tree too, or the assistive technology keeps the outgoing
+    // page's tree for good. Blink hands every new RenderFrameHost the AX mode (RenderFrameHostImpl::
+    // UpdateAccessibilityMode), Gecko activates a11y in each content process it starts (ContentParent::SendActivateA11y),
+    // and WebKit re-registers its accessibility tokens with the process that takes over the page (WebPageProxy::
+    // registerUIProcessAccessibilityTokens).
+    if (m_accessibility_tree_requested)
+        page.async_request_accessibility_tree();
     handle_resize();
     update_paused_debugger_overlay();
 
@@ -3860,8 +3886,9 @@ void ViewImplementation::initialize_context_menus()
             return;
 
         application.display_add_bookmark_dialog(bookmark_id->target_folder_id)
-            ->when_resolved([](Application::AddBookmarkDialogResult result) {
-                Application::bookmark_store().add_bookmark(move(result.bookmark.url), move(result.bookmark.title), move(result.bookmark.favicon_hash), result.target_folder_id);
+            ->when_resolved([](Application::BookmarkDialogResult result) {
+                auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
+                Application::bookmark_store().add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), result.target_folder_id);
             });
     });
     auto add_bookmark_folder_action = Action::create("Add Folder..."sv, ActionID::AddBookmarkFolder, []() {
@@ -3871,9 +3898,10 @@ void ViewImplementation::initialize_context_menus()
         if (!bookmark_id.has_value())
             return;
 
-        application.display_add_bookmark_folder_dialog()
-            ->when_resolved([bookmark_id = bookmark_id.release_value()](BookmarkItem::Folder folder) {
-                Application::bookmark_store().add_folder(move(folder.title), bookmark_id.target_folder_id);
+        application.display_add_bookmark_folder_dialog({}, bookmark_id->target_folder_id)
+            ->when_resolved([](Application::BookmarkDialogResult result) {
+                auto& folder = result.data.get<BookmarkItem::Folder>();
+                Application::bookmark_store().add_folder(move(folder.title), result.target_folder_id);
             });
     });
 
@@ -3930,9 +3958,13 @@ void ViewImplementation::initialize_context_menus()
         if (!current_bookmark.has_value() || !current_bookmark->is_bookmark())
             return;
 
-        application.display_edit_bookmark_dialog(current_bookmark->bookmark())
-            ->when_resolved([bookmark_id = bookmark_id.release_value()](BookmarkItem::Bookmark bookmark) {
-                Application::bookmark_store().edit_bookmark(bookmark_id.id, move(bookmark.url), move(bookmark.title));
+        application.display_edit_bookmark_dialog(*current_bookmark, bookmark_id->parent_folder_id)
+            ->when_resolved([bookmark_id = bookmark_id.release_value()](Application::BookmarkDialogResult result) {
+                auto& store = Application::bookmark_store();
+                auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
+                store.edit_bookmark(bookmark_id.id, move(bookmark.url), move(bookmark.title));
+                if (bookmark_id.parent_folder_id != result.target_folder_id)
+                    store.move_item(bookmark_id.id, result.target_folder_id, NumericLimits<size_t>::max());
             });
     }));
     m_bookmark_context_menu->add_action(Action::create("Delete Bookmark"sv, ActionID::DeleteBookmark, []() {
@@ -3962,9 +3994,13 @@ void ViewImplementation::initialize_context_menus()
         if (!current_folder.has_value() || !current_folder->is_folder())
             return;
 
-        application.display_edit_bookmark_folder_dialog(current_folder->folder())
-            ->when_resolved([bookmark_id = bookmark_id.release_value()](BookmarkItem::Folder folder) {
-                Application::bookmark_store().edit_folder(bookmark_id.id, move(folder.title));
+        application.display_edit_bookmark_folder_dialog(*current_folder, bookmark_id->parent_folder_id)
+            ->when_resolved([bookmark_id = bookmark_id.release_value()](Application::BookmarkDialogResult result) {
+                auto& store = Application::bookmark_store();
+                auto& folder = result.data.get<BookmarkItem::Folder>();
+                store.edit_folder(bookmark_id.id, move(folder.title));
+                if (bookmark_id.parent_folder_id != result.target_folder_id)
+                    store.move_item(bookmark_id.id, result.target_folder_id, NumericLimits<size_t>::max());
             });
     }));
     m_bookmark_folder_context_menu->add_action(Action::create("Delete Folder"sv, ActionID::DeleteBookmarkFolder, []() {

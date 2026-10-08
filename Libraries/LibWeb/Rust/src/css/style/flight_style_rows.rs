@@ -57,8 +57,8 @@ pub(crate) enum Decline {
 
 /// The `InvalidationLevel` of a style move at which its box lays out again, and the one at which the layout tree is
 /// built again.
-const RELAYOUT_LEVEL: u32 = 2;
-const REBUILD_LEVEL: u32 = 3;
+pub(crate) const RELAYOUT_LEVEL: u32 = 2;
+pub(crate) const REBUILD_LEVEL: u32 = 3;
 
 impl StyleEngine {
     /// The rows of `answers`, a style transaction's, that a frame applies to the boxes of their elements itself, or why
@@ -149,14 +149,18 @@ impl StyleEngine {
         let holds_images = self
             .style_record_dependency_flags(record)
             .is_none_or(|flags| flags & super::computed::HOLDS_IMAGE_VALUES != 0);
-        holds_images
-            || self.style_record_payloads(record).is_none_or(|payloads| {
-                !ComputedValuesView::new(SharedPayload::as_pointer_slice(payloads))
-                    .anchor()
-                    .anchor_names
-                    .as_slice()
-                    .is_empty()
-            })
+        holds_images || self.record_names_anchors(record)
+    }
+
+    /// Whether `record` names an anchor the host registers, or is gone.
+    pub(super) fn record_names_anchors(&self, record: u64) -> bool {
+        self.style_record_payloads(record).is_none_or(|payloads| {
+            !ComputedValuesView::new(SharedPayload::as_pointer_slice(payloads))
+                .anchor()
+                .anchor_names
+                .as_slice()
+                .is_empty()
+        })
     }
 }
 

@@ -49,11 +49,12 @@ set(SOURCES
     DecoderError.cpp
     DecoderRegistry.cpp
     DemuxerRegistry.cpp
+    DemuxerScanState.cpp
     IncrementallyPopulatedStream.cpp
     MediaSourceExtensions/ISOBMFFByteStreamParser.cpp
+    MediaSourceExtensions/SourceBufferDemuxer.cpp
     MediaSourceExtensions/SourceBufferProcessor.cpp
     MediaSourceExtensions/TrackBuffer.cpp
-    MediaSourceExtensions/TrackBufferDemuxer.cpp
     MediaSourceExtensions/WebMByteStreamParser.cpp
     MediaSupport.cpp
     MediaTime.cpp

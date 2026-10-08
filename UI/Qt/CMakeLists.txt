@@ -24,9 +24,11 @@ qt_add_executable(ladybird main.cpp)
 target_sources(ladybird PRIVATE
     Application.cpp
     Autocomplete.cpp
+    BookmarkDialog.cpp
     BookmarksBar.cpp
     BrowserWindow.cpp
     ChromeStyle.cpp
+    CrashReportNotifier.cpp
     CrashReportReviewWidget.cpp
     DevToolsBanner.cpp
     EventLoopImplementationQt.cpp
@@ -41,6 +43,7 @@ target_sources(ladybird PRIVATE
     NativeWindowContainer.cpp
     ProcessManagerWindow.cpp
     PerformanceMonitorWidget.cpp
+    Popover.cpp
     SelectDropdown.cpp
     Settings.cpp
     StringUtils.cpp
@@ -50,6 +53,12 @@ target_sources(ladybird PRIVATE
     WindowControlButton.cpp
     ladybird.qrc
 )
+if (NOT APPLE AND NOT WIN32 AND NOT ANDROID)
+    target_sources(ladybird PRIVATE
+        AccessibilityInterface.cpp
+    )
+endif()
+
 target_link_libraries(ladybird PRIVATE Qt::Core Qt::Gui Qt::Widgets)
 
 if (TARGET Qt6::Positioning)
@@ -69,11 +78,18 @@ if (APPLE)
         Conversions.mm
         DictionaryLookup.mm
         ExternalURLHandler.mm
+        LadybirdAccessibilityElement.mm
         MacWindow.mm
         Menu.mm
+        WebContentViewAccessibility.mm
         WebContentViewMac.mm
     )
-    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    set_source_files_properties(
+        LadybirdAccessibilityElement.mm
+        WebContentViewAccessibility.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+    )
 endif()
 
 if (NOT APPLE AND USE_VULKAN_DMABUF_IMAGES)

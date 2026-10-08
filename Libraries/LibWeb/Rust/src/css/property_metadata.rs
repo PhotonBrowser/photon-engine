@@ -103,7 +103,6 @@ pub(crate) fn property_has_hashless_hex_color_quirk(property_id: u16) -> bool {
 /// How much of the computation a property needs, mirroring the C++
 /// requires-computation levels: 0 = never, 1 = with the cascaded value,
 /// 2 = with any non-inherited value, 3 = always.
-pub const REQUIRES_COMPUTATION_NEVER: u8 = 0;
 pub const REQUIRES_COMPUTATION_CASCADED: u8 = 1;
 pub const REQUIRES_COMPUTATION_NON_INHERITED: u8 = 2;
 pub const REQUIRES_COMPUTATION_ALWAYS: u8 = 3;
@@ -210,14 +209,6 @@ pub fn property_computation_order() -> &'static [u16] {
 
 /// FFI accessors for the parity test on the C++ side.
 ///
-/// # Safety
-/// `out_length` must be a valid pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_property_metadata_computation_order(out_length: *mut usize) -> *const u16 {
-    unsafe { *out_length = PROPERTY_COMPUTATION_ORDER.len() };
-    PROPERTY_COMPUTATION_ORDER.as_ptr()
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_property_metadata_is_inherited(property_id: u16) -> bool {
     property_is_inherited(property_id)

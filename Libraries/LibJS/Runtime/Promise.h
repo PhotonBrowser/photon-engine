@@ -6,18 +6,13 @@
 
 #pragma once
 
-#include <AK/Vector.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/Object.h>
+#include <LibJS/Runtime/Value.h>
 
 namespace JS {
 
-ThrowCompletionOr<Object*> promise_resolve(VM&, Object& constructor, Value);
-
 class JS_API Promise : public Object {
-    JS_OBJECT(Promise, Object);
-    GC_DECLARE_ALLOCATOR(Promise);
-
 public:
     enum class State {
         Pending,
@@ -29,50 +24,22 @@ public:
         Handle,
     };
 
-    static GC::Ref<Promise> create(Realm&);
-
-    virtual ~Promise() = default;
-
-    State state() const { return m_state; }
-    Value result() const { return m_result; }
+    State state() const;
+    Value result() const;
 
     struct ResolvingFunctions {
         GC::Ref<FunctionObject> resolve;
         GC::Ref<FunctionObject> reject;
     };
+
     ResolvingFunctions create_resolving_functions();
 
-    static Value resolve_function_steps(VM&, Promise&, bool& already_resolved);
-    static Value reject_function_steps(VM&, Promise&, bool& already_resolved);
-
-    void fulfill(Value value);
-    void reject(Value reason);
     Value perform_then(Value on_fulfilled, Value on_rejected, GC::Ptr<PromiseCapability> result_capability);
 
-    bool is_handled() const { return m_is_handled; }
-    void set_is_handled() { m_is_handled = true; }
+    bool is_handled() const;
+    void set_is_handled();
 
-protected:
-    explicit Promise(Object& prototype);
-
-    virtual void visit_edges(Visitor&) override;
-    virtual size_t external_memory_size() const override;
-
-private:
-    virtual bool is_promise() const override { return true; }
-    bool is_settled() const { return m_state == State::Fulfilled || m_state == State::Rejected; }
-
-    void trigger_reactions() const;
-
-    // 27.2.6 Properties of Promise Instances, https://tc39.es/ecma262/#sec-properties-of-promise-instances
-    State m_state { State::Pending };                     // [[PromiseState]]
-    bool m_is_handled { false };                          // [[PromiseIsHandled]]
-    Value m_result;                                       // [[PromiseResult]]
-    Vector<GC::Ptr<PromiseReaction>> m_fulfill_reactions; // [[PromiseFulfillReactions]]
-    Vector<GC::Ptr<PromiseReaction>> m_reject_reactions;  // [[PromiseRejectReactions]]
+    static bool is_engine_class_of(Object const& object) { return object.is_of_engine_class_or_subclass(JS_LAYOUT_CLASS_ID_PROMISE); }
 };
-
-template<>
-inline bool Object::fast_is<Promise>() const { return is_promise(); }
 
 }

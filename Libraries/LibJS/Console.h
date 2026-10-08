@@ -10,16 +10,21 @@
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/Noncopyable.h>
+#include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/RootVector.h>
 #include <LibJS/ConsoleLogLevel.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibJS/Heap/EngineCell.h>
+#include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/Value.h>
 
 namespace JS {
@@ -27,13 +32,10 @@ namespace JS {
 class ConsoleClient;
 
 // https://console.spec.whatwg.org
-class JS_API Console : public Cell {
-    GC_CELL(Console, Cell);
-    GC_DECLARE_ALLOCATOR(Console);
-
+// The console of a realm's console object, which keeps the counters, timers and group stack of the console methods, and
+// hands what they log to its client.
+class JS_API Console : public EngineCell {
 public:
-    virtual ~Console() override;
-
     using LogLevel = ConsoleLogLevel;
 
     struct Group {
@@ -52,52 +54,19 @@ public:
         Vector<TraceFrame> stack;
     };
 
-    void set_client(ConsoleClient& client) { m_client = &client; }
+    // The console keeps its client alive.
+    void set_client(ConsoleClient&);
 
-    Realm& realm() const { return m_realm; }
-
-    GC::RootVector<Value> vm_arguments();
-
-    HashMap<Utf16String, unsigned>& counters() { return m_counters; }
-    HashMap<Utf16String, unsigned> const& counters() const { return m_counters; }
-
-    ThrowCompletionOr<Value> assert_();
-    Value clear();
-    ThrowCompletionOr<Value> debug();
-    ThrowCompletionOr<Value> error();
-    ThrowCompletionOr<Value> info();
-    ThrowCompletionOr<Value> log();
-    ThrowCompletionOr<Value> table();
-    ThrowCompletionOr<Value> trace();
-    ThrowCompletionOr<Value> warn();
-    ThrowCompletionOr<Value> dir();
-    ThrowCompletionOr<Value> dirxml();
-    ThrowCompletionOr<Value> count();
-    ThrowCompletionOr<Value> count_reset();
-    ThrowCompletionOr<Value> group();
-    ThrowCompletionOr<Value> group_collapsed();
-    ThrowCompletionOr<Value> group_end();
-    ThrowCompletionOr<Value> time();
-    ThrowCompletionOr<Value> time_log();
-    ThrowCompletionOr<Value> time_end();
+    Realm& realm() const;
 
     void output_debug_message(LogLevel log_level, StringView output) const;
     void output_debug_message(LogLevel log_level, Utf16View output) const;
     void report_exception(Utf16View name, Utf16View message, JS::ErrorData const&, bool) const;
+};
 
-private:
-    explicit Console(Realm&);
-
-    virtual void visit_edges(Visitor&) override;
-
-    ThrowCompletionOr<Utf16String> value_vector_to_string(GC::RootVector<Value> const&);
-
-    GC::Ref<Realm> m_realm;
-    GC::Ptr<ConsoleClient> m_client;
-
-    HashMap<Utf16String, unsigned> m_counters;
-    HashMap<Utf16String, Core::ElapsedTimer> m_timer_table;
-    Vector<Group> m_group_stack;
+// The cell of the Rust runtime that a console holds as its client. It forwards what the console logs to the virtual
+// functions of the ConsoleClient it was created for, which it keeps alive.
+class EngineConsoleClient final : public EngineCell {
 };
 
 class JS_API ConsoleClient : public Cell {
@@ -107,8 +76,6 @@ class JS_API ConsoleClient : public Cell {
 public:
     using PrinterArguments = Variant<Console::Group, Console::Trace, GC::RootVector<Value>>;
 
-    ThrowCompletionOr<Value> logger(Console::LogLevel log_level, GC::RootVector<Value> const& args);
-    ThrowCompletionOr<GC::RootVector<Value>> formatter(GC::RootVector<Value> const& args);
     virtual ThrowCompletionOr<Value> printer(Console::LogLevel log_level, PrinterArguments) = 0;
 
     virtual void add_css_style_to_current_message(Utf16View) { }
@@ -125,6 +92,11 @@ protected:
     virtual void visit_edges(Visitor& visitor) override;
 
     GC::Ref<Console> m_console;
+
+private:
+    friend class Console;
+
+    GC::Ref<EngineConsoleClient> m_engine_console_client;
 };
 
 }

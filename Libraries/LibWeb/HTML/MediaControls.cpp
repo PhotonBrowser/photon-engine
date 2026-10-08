@@ -292,15 +292,8 @@ void MediaControls::set_up_event_listeners()
             if (auto range = timeline_range(); range.has_value())
                 set_current_time(range->time_at(compute_timeline_progress(event, *m_dom->timeline_element)));
 
-            if (was_playing) {
-                if (m_media_element->ended()) {
-                    auto loop = m_media_element->has_attribute(HTML::AttributeNames::loop);
-                    if (loop)
-                        m_media_element->play_from_user_interaction();
-                } else {
-                    m_media_element->play_from_user_interaction();
-                }
-            }
+            if (was_playing && !m_media_element->ended())
+                m_media_element->play_from_user_interaction();
 
             update_play_pause_icon();
 
@@ -472,7 +465,7 @@ void MediaControls::toggle_playback()
 
 void MediaControls::set_current_time(double time)
 {
-    m_media_element->set_current_time(time);
+    m_media_element->seek_from_media_controls(time);
     update_timeline();
     update_timestamp();
     show_controls();

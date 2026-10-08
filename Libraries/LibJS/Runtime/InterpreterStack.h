@@ -10,60 +10,33 @@
 #include <AK/Platform.h>
 #include <AK/Span.h>
 #include <AK/Types.h>
+#include <LibJS/Export.h>
+#include <LibJS/Forward.h>
 #include <LibJS/Runtime/ExecutionContext.h>
 
 namespace JS {
 
-class InterpreterStack {
+// The VM's stack of execution contexts that live as long as a block of code, which the runtime's interpreter
+// allocates its frames on, too. A context allocated here lives until deallocate() is passed a mark taken before it.
+class JS_API InterpreterStack {
     AK_MAKE_NONCOPYABLE(InterpreterStack);
     AK_MAKE_NONMOVABLE(InterpreterStack);
 
 public:
-    static constexpr size_t stack_size = 8 * MiB;
-
-    InterpreterStack();
-    ~InterpreterStack();
-
-    [[nodiscard]] ALWAYS_INLINE void* top() const { return m_top; }
-
-    [[nodiscard]] ALWAYS_INLINE ExecutionContext* allocate(u32 registers_and_locals_count, ReadonlySpan<Value> constants, u32 arguments_count)
+    explicit InterpreterStack(VM& vm)
+        : m_vm(vm)
     {
-        auto tail_count = registers_and_locals_count + constants.size() + arguments_count;
-        auto size = sizeof(ExecutionContext) + tail_count * sizeof(Value);
-
-        // Align up to alignof(ExecutionContext).
-        size = (size + alignof(ExecutionContext) - 1) & ~(alignof(ExecutionContext) - 1);
-
-        auto* new_top = static_cast<u8*>(m_top) + size;
-        if (new_top > m_limit) [[unlikely]]
-            return nullptr;
-
-        auto* result = new (m_top) ExecutionContext(registers_and_locals_count, constants, arguments_count, m_next_frame_id++);
-        m_top = new_top;
-        return result;
     }
 
-    ALWAYS_INLINE void deallocate(void* mark)
-    {
-        VERIFY(mark >= m_base && mark <= m_top);
-        m_top = mark;
-    }
+    [[nodiscard]] void* top() const;
 
-    [[nodiscard]] ALWAYS_INLINE bool is_exhausted() const
-    {
-        return m_top >= m_limit;
-    }
+    // Null if the stack has no room for the context. Its argument slots are uninitialized.
+    [[nodiscard]] ExecutionContext* allocate(u32 registers_and_locals_count, ReadonlySpan<Value> constants, u32 arguments_count);
 
-    [[nodiscard]] ALWAYS_INLINE size_t size_remaining() const
-    {
-        return static_cast<u8*>(m_limit) - static_cast<u8*>(m_top);
-    }
+    void deallocate(void* mark);
 
 private:
-    void* m_base { nullptr };
-    void* m_top { nullptr };
-    void* m_limit { nullptr };
-    u64 m_next_frame_id { 1 };
+    VM& m_vm;
 };
 
 }

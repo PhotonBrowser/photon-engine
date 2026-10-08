@@ -10,6 +10,7 @@
 
 use super::commit::CommitNotifications;
 use super::formatting_context::{FfiLayoutHostCallbacks, LayoutStageFacts, lay_out_boundary, lay_out_root};
+use super::layout_changes::LayoutChange;
 use super::layout_node_arena::{OwedImageResources, sync_enrolled_content_for_layout};
 use super::node_data::NodeSlotId;
 use super::node_facts;
@@ -18,8 +19,11 @@ use super::tree_builder::{FfiGeneratedImage, FfiPseudoElement, TreeBuildAnswer, 
 use super::tree_mutation::{HostWorkDue, OwedHostWork};
 use super::{ArenaHandle, LayoutNodeArena};
 use crate::abort_on_panic;
+use crate::css::css_pixels::CssPixelPoint;
 use crate::css::style::tree::StyleNodeID;
-use crate::render_state::{BegunRead, DocumentHost};
+use crate::painting::host::FfiNodeIdentity;
+use crate::painting::recording_slot::FlightLicense;
+use crate::render_state::{ArenaChange, BegunRead, DocumentHost};
 use crate::stage::MainThread;
 use std::ffi::c_void;
 
@@ -32,7 +36,17 @@ pub(crate) use main_thread_entries::MainThreadFfiEntry;
 fn run_layout_round_job(host: &DocumentHost, read: &BegunRead, job: LayoutRoundJob) -> LayoutRoundAnswer {
     host.let_go_of_rows();
     // The host keeps what the job's inputs name until it has the answer.
-    host.run(read, true, move |state| job.run(state.arena_handle_mut()))
+    let (answer, rows) = host.run(read, true, move |state| {
+        let mut answer = job.run(state.arena_handle_mut());
+        answer.prepare_committed_layout_for_rendering(state.arena_mut());
+        // The host reads what each box owed an image is from rows published with the answer.
+        let rows = (!answer.owed_images.is_empty()).then(|| state.arena_mut().publish_row_snapshot(false));
+        (answer, rows)
+    });
+    if let Some(rows) = rows {
+        host.keep_rows(rows);
+    }
+    answer
 }
 
 /// Answers `answer` from the render state of `host`'s document and `args`, in `read`: the host's layout update reads it
@@ -65,8 +79,10 @@ pub struct FfiLayoutUpdateHostCallbacks {
     /// Retires the tree a build replaced once the host has been paid for the build: the viewport
     /// before the build, then the one it placed.
     finish_layout_tree_build: unsafe extern "C" fn(*mut c_void, &BegunRead, NodeSlotId, NodeSlotId),
-    /// True when stale list-item counters marked more of the tree for a rebuild.
-    reconcile_stale_list_item_counters_after_tree_build: unsafe extern "C" fn(*mut c_void, &BegunRead) -> bool,
+    /// True when stale list-item counters marked more of the tree for a rebuild, given the DOM nodes whose subtrees the
+    /// build rebuilt.
+    reconcile_stale_list_item_counters_after_tree_build:
+        unsafe extern "C" fn(*mut c_void, *const FfiNodeIdentity, usize) -> bool,
     /// Refreshes what derives from committed layout; the flag says whether the tree changed.
     after_layout_commit: unsafe extern "C" fn(*mut c_void, &BegunRead, bool),
     note_full_layout_performed: unsafe extern "C" fn(*mut c_void),
@@ -179,8 +195,18 @@ impl FfiLayoutUpdateHostCallbacks {
         unsafe { (self.finish_layout_tree_build)(self.context, read, replaced_viewport, viewport) }
     }
 
-    fn reconcile_stale_list_item_counters_after_tree_build(&self, _: &MainThread, read: &BegunRead) -> bool {
-        unsafe { (self.reconcile_stale_list_item_counters_after_tree_build)(self.context, read) }
+    fn reconcile_stale_list_item_counters_after_tree_build(
+        &self,
+        _: &MainThread,
+        rebuilt_roots: &[FfiNodeIdentity],
+    ) -> bool {
+        unsafe {
+            (self.reconcile_stale_list_item_counters_after_tree_build)(
+                self.context,
+                rebuilt_roots.as_ptr(),
+                rebuilt_roots.len(),
+            )
+        }
     }
 
     fn after_layout_commit(&self, _: &MainThread, read: &BegunRead, layout_tree_changed: bool) {
@@ -203,30 +229,19 @@ impl FfiLayoutUpdateHostCallbacks {
     /// in the order the builds came to owe them. Until now a box that owns its image's provider
     /// had no image; one handed a provider whose image is already there lays out again.
     fn attach_owed_image_resources(&self, _: &MainThread, host: &DocumentHost, read: &BegunRead) {
-        if host.known_owed_image_resources() == Some(false) {
+        let owed = host.host_tables().owed_images.take();
+        if owed.is_empty() {
             return;
         }
-        // Each box reads whether its style holds image values, which the engine answers with the rows rather than
-        // once per box, and what its row is, which the rows published with them answer.
-        let (owed, rows) = read_arena(host, read, (), |arena, ()| {
-            let owed = arena.take_image_resources_owed_to_host();
-            let owed = arena.with_style_engine(|engine| {
-                owed.into_iter()
-                    // A later build of the update may have freed the row.
-                    .filter(|&(row, _)| arena.slot_is_live(row))
-                    .map(|(row, owed)| {
-                        arena.note_owned_provider_handed_over(row);
-                        (row, owed, FfiStyleImageFacts::of(engine, arena.node_style_record(row)))
-                    })
-                    .collect::<Vec<_>>()
-            });
-            let rows = (!owed.is_empty()).then(|| arena.publish_row_snapshot(false));
-            (owed, rows)
-        });
-        if let Some(rows) = rows {
-            host.keep_rows(rows);
-        }
-        for (row, owed, images) in owed {
+        // A later build of the update, or a write of the host, may have freed the row.
+        let identities = host.row_identities(read);
+        for OwedImage { row, owed, images } in owed {
+            if identities.shell_facts(row).is_none() {
+                continue;
+            }
+            if owed.owns_provider() {
+                host.queue_change(ArenaChange::Layout(LayoutChange::HandOverOwnedProvider { node: row }));
+            }
             match owed {
                 OwedImageResources::StyleResources {
                     owns_content_replacement_image,
@@ -319,8 +334,22 @@ enum RoundLayout {
     Full,
 }
 
+/// How a layout round goes on from its tree build.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildEnd {
+    /// The build asks for another pass before anything is laid out.
+    AnotherPass,
+    /// The document reconciles stale list item counters with what was built before anything is laid out.
+    ReconcileCounters,
+    /// The round lays out what was built.
+    LayOut,
+}
+
 /// Where a layout round ended.
 enum LayoutRoundEnd {
+    /// The round's build may build the viewport, whose style is the document's, which only the host makes. The round
+    /// did nothing, for the host to send it again with the style.
+    NeedsDocumentStyle,
     /// The round built the tree and stopped before laying it out: the build asks for another pass,
     /// or the document reconciles stale list item counters with what it rebuilt first.
     Built {
@@ -344,6 +373,53 @@ pub(crate) struct LayoutRoundAnswer {
     /// What committing each layout stage of the round owes.
     commits: Vec<CommitNotifications>,
     end: LayoutRoundEnd,
+    /// The DOM nodes whose subtrees the round's build rebuilt, where the document has stale list item counters to
+    /// reconcile with them.
+    rebuilt_roots: Vec<FfiNodeIdentity>,
+    /// The image resources the round's build owes the rows it stamped, which the host attaches once its layout update
+    /// is over.
+    owed_images: Vec<OwedImage>,
+    /// The scroll offsets the new overflow moved out of range, each clamped into it, where the round prepared the layout
+    /// it committed for rendering, for the host to store.
+    clamped_scroll_offsets: Vec<(NodeSlotId, CssPixelPoint)>,
+}
+
+/// An image resource a tree build owes the host for a row it stamped, with what the row's style held as the round that
+/// built it ended.
+pub(crate) struct OwedImage {
+    row: NodeSlotId,
+    owed: OwedImageResources,
+    images: FfiStyleImageFacts,
+}
+
+impl OwedImage {
+    /// Takes the image resources the builds that ran on `arena` owe the rows they stamped and left live.
+    fn take_from(arena: &LayoutNodeArena) -> Vec<Self> {
+        let owed = arena.take_image_resources_owed_to_host();
+        if owed.is_empty() {
+            return Vec::new();
+        }
+        arena.with_style_engine(|engine| {
+            owed.into_iter()
+                .filter(|&(row, _)| arena.slot_is_live(row))
+                .map(|(row, owed)| Self {
+                    row,
+                    owed,
+                    images: FfiStyleImageFacts::of(engine, arena.node_style_record(row)),
+                })
+                .collect()
+        })
+    }
+
+    /// Whether the box shows the image: one whose provider it owns, or one its style names that the host loads. A box
+    /// whose style names none, or only gradients, paints nothing the host attaches.
+    fn is_shown(&self, arena: &LayoutNodeArena) -> bool {
+        use crate::painting::paint_read::PaintRead;
+        self.owed.owns_provider()
+            || arena
+                .node_style_if_live(self.row)
+                .is_some_and(|style| style.names_loaded_images())
+    }
 }
 
 /// The first round of a rendering update's layout, sealed on the host's thread with the facts it read there, to run in
@@ -365,11 +441,9 @@ impl SealedRound {
         {
             return None;
         }
-        let answer = self.job.run_owing(state, work);
-        let arena = state.arena();
-        if arena.take_unresolved_container_lengths() && !arena.layout_root().is_invalid() {
-            arena.set_needs_layout_update(arena.layout_root(), false);
-        }
+        let mut answer = self.job.run_owing(state, work);
+        answer.prepare_committed_layout_for_rendering(state.arena());
+        state.arena().mark_unresolved_container_lengths_for_layout();
         Some(FlownRound {
             answer,
             rebuilds_tree: self.rebuilds_tree,
@@ -390,17 +464,12 @@ impl FlownRound {
     ///
     /// The host's layout update callbacks must answer synchronously from its live document.
     pub(crate) unsafe fn pay(mut self, main_thread: &MainThread, host: &DocumentHost, read: &BegunRead) {
-        let callbacks = host
-            .host_tables()
-            .layout_update_host
-            .get()
-            .expect("the document has no layout update host");
         // SAFETY: Guaranteed by the caller.
-        unsafe { self.answer.pay(main_thread, &callbacks, read) };
+        unsafe { self.answer.pay(main_thread, host, read) };
     }
 }
 
-/// The layout round each tick of a clock lease runs once it has shown the samples of the document's animations: the
+/// The layout round each tick of a clock lane runs once it has shown the samples of the document's animations: the
 /// document's facts, and a container length query that answers nothing, sealed where the clock's plan was, at the end of
 /// a rendering update that left the layout up to date.
 pub(crate) struct ClockRound {
@@ -409,35 +478,60 @@ pub(crate) struct ClockRound {
 }
 
 impl ClockRound {
-    /// Lays out what the tick's samples moved, and answers what the round owes the host, or why it laid nothing out: a
-    /// tick builds no tree, and a length only the host resolves is the host's to lay out.
-    pub(crate) fn run(&self, state: &mut ArenaHandle) -> Result<Option<LayoutRoundAnswer>, ClockRoundDeclined> {
+    /// Builds again what the clock frame marked and lays out what it moved, and pushes what the round owes the host to
+    /// `owed`, answering it, or nothing where the round laid nothing out. A round declines a build that needs the host
+    /// and a length only the host resolves, after it owes the host what it ran.
+    pub(crate) fn run<'a>(
+        &self,
+        state: &mut ArenaHandle,
+        owed: &'a mut Vec<LayoutRoundAnswer>,
+    ) -> Result<Option<&'a LayoutRoundAnswer>, ClockRoundDeclined> {
         let arena = state.arena();
         if arena.layout_root().is_invalid() || arena.needs_full_layout_tree_update() {
-            return Err(ClockRoundDeclined);
+            return Err(ClockRoundDeclined("the layout tree needs the host's update"));
         }
-        if arena.layout_is_up_to_date(false) {
+        let build = arena
+            .document_style_node()
+            .filter(|&document| arena.layout_tree_update_marks().borrow().child_needs(document))
+            .map(|document| TreeBuildJob::new(document, None));
+        if build.is_none() && arena.layout_is_up_to_date(false) {
             return Ok(None);
         }
         let answer = LayoutRoundJob {
             facts: self.facts,
-            build: None,
+            build,
             layout: RoundLayout::PartialIfPlanned,
             container_query_evaluation_is_pending: false,
             container_length_bases: self.container_length_bases,
         }
         .run(state);
-        match state.arena().take_unresolved_container_lengths() {
-            true => Err(ClockRoundDeclined),
-            false => Ok(Some(answer)),
+        // A box the build gave an image has none until the host attaches it.
+        let arena = state.arena();
+        let declined = if matches!(answer.end, LayoutRoundEnd::Built { .. }) {
+            Some("a build that asks for another pass")
+        } else if matches!(answer.end, LayoutRoundEnd::NeedsDocumentStyle) {
+            Some("a build that needs the document's style")
+        } else if answer.owed_images.iter().any(|image| image.is_shown(arena)) {
+            Some("a box the build owes an image")
+        } else {
+            None
+        };
+        owed.push(answer);
+        if state.arena().mark_unresolved_container_lengths_for_layout() {
+            return Err(ClockRoundDeclined("a length only the host resolves"));
+        }
+        match declined {
+            Some(reason) => Err(ClockRoundDeclined(reason)),
+            None => Ok(owed.last()),
         }
     }
 }
 
-/// A clock round that would build the tree or lay out a length only the host resolves.
-pub(crate) struct ClockRoundDeclined;
+/// A clock round whose tree build or layout needs the host: a build that asks for another pass, reconciles list item
+/// counters or owes the host image resources, or a length only the host resolves.
+pub(crate) struct ClockRoundDeclined(pub(crate) &'static str);
 
-/// Seals the round the ticks of a clock lease of `document_host`'s document run, where its layout is up to date in
+/// Seals the round the ticks of a clock lane of `document_host`'s document run, where its layout is up to date in
 /// `read`.
 fn seal_clock_round(main_thread: &MainThread, document_host: &DocumentHost, read: &BegunRead) -> Option<ClockRound> {
     let host = document_host.host_tables().layout_update_host.get()?;
@@ -463,6 +557,7 @@ impl LayoutRoundJob {
     fn run_owing(self, state: &mut ArenaHandle, work: OwedHostWork) -> LayoutRoundAnswer {
         let mut answer = self.run_with(state, &work);
         answer.work = work.resolve(state.arena());
+        answer.owed_images = OwedImage::take_from(state.arena());
         answer
     }
 
@@ -473,6 +568,9 @@ impl LayoutRoundJob {
             work: HostWorkDue::default(),
             commits: Vec::new(),
             end: LayoutRoundEnd::FullLayout,
+            rebuilt_roots: Vec::new(),
+            owed_images: Vec::new(),
+            clamped_scroll_offsets: Vec::new(),
         };
         let stage = LayoutStageFacts {
             container_length_bases: self.container_length_bases,
@@ -482,6 +580,14 @@ impl LayoutRoundJob {
         };
         // The round cannot call the host, which hears of the boxes nodes gain and lose once it is over.
         state.arena().queue_box_presence();
+        if self
+            .build
+            .as_ref()
+            .is_some_and(|build| build.lacks_document_style(state.arena()))
+        {
+            answer.end = LayoutRoundEnd::NeedsDocumentStyle;
+            return answer;
+        }
         // Attempts to satisfy the round by laying out only the registered partial relayout boundary subtrees. The
         // build runs here when the tree needs one, so a round that is not eligible goes on to the full layout without
         // building again.
@@ -493,15 +599,15 @@ impl LayoutRoundJob {
         if self.layout == RoundLayout::PartialIfPlanned
             && arena.partial_relayout_may_be_attempted(
                 arena.layout_root(),
-                &arena.partial_relayout_boundary_roots.borrow(),
+                arena.partial_relayout_boundary_roots.borrow().roots(),
                 partial_relayout_facts,
             )
         {
             if let Some(build) = self.build.take() {
-                let needs_another_build_pass = Self::build(state, build, work, &mut answer);
-                if needs_another_build_pass || facts.has_stale_list_item_counters {
+                let end = Self::build(state, build, work, &mut answer, facts.has_stale_list_item_counters);
+                if end != BuildEnd::LayOut {
                     answer.end = LayoutRoundEnd::Built {
-                        needs_another_build_pass,
+                        needs_another_build_pass: end == BuildEnd::AnotherPass,
                         layout: RoundLayout::PartialIfPlanned,
                     };
                     return answer;
@@ -529,7 +635,8 @@ impl LayoutRoundJob {
         }
 
         if let Some(build) = self.build.take() {
-            if Self::build(state, build, work, &mut answer) {
+            let end = Self::build(state, build, work, &mut answer, facts.has_stale_list_item_counters);
+            if end == BuildEnd::AnotherPass {
                 answer.end = LayoutRoundEnd::Built {
                     needs_another_build_pass: true,
                     layout: RoundLayout::Full,
@@ -537,7 +644,7 @@ impl LayoutRoundJob {
                 return answer;
             }
             state.arena().set_needs_full_layout_tree_update(false);
-            if facts.has_stale_list_item_counters {
+            if end == BuildEnd::ReconcileCounters {
                 answer.end = LayoutRoundEnd::Built {
                     needs_another_build_pass: false,
                     layout: RoundLayout::Full,
@@ -562,19 +669,31 @@ impl LayoutRoundJob {
         answer
     }
 
-    /// Runs `build`, records it, and answers whether it asks for another pass.
+    /// Runs `build`, records it, and answers how the round goes on from it. A build that shows the value of a
+    /// `list-item` counter, while some list's counters are stale, may show a stale one: the document reconciles them
+    /// with what was built before anything is laid out.
     fn build(
         state: &mut ArenaHandle,
         build: TreeBuildJob,
         work: &OwedHostWork,
         answer: &mut LayoutRoundAnswer,
-    ) -> bool {
+        has_stale_list_item_counters: bool,
+    ) -> BuildEnd {
         let replaced_viewport = state.arena().layout_root();
         let built = build.run(state, work);
         state.arena().record_layout_tree_build(&built.outcome);
-        let needs_another_build_pass = built.outcome.needs_another_build_pass;
+        if has_stale_list_item_counters {
+            answer.rebuilt_roots = state.arena().pending_rebuilt_dom_roots();
+        }
+        let end = if built.outcome.needs_another_build_pass {
+            BuildEnd::AnotherPass
+        } else if has_stale_list_item_counters && built.shows_list_item_counter_value() {
+            BuildEnd::ReconcileCounters
+        } else {
+            BuildEnd::LayOut
+        };
         answer.build = Some((replaced_viewport, built));
-        needs_another_build_pass
+        end
     }
 }
 
@@ -586,21 +705,37 @@ impl LayoutRoundAnswer {
             .flat_map(CommitNotifications::resized_size_containers)
     }
 
-    /// Pays what the round owes the host, in the order it came to owe it. The boxes nodes gained
-    /// and lost and the host calls the round owes come first, then a build's commit messages and
-    /// styled scroll containers, after which the document retires the tree the build replaced; then
-    /// what the layout stages owe.
+    /// Prepares `arena` for rendering where the round committed a layout, as the host's commit of it asks, so that the
+    /// host waits for no preparation of its own after the round.
+    fn prepare_committed_layout_for_rendering(&mut self, arena: &LayoutNodeArena) {
+        if matches!(
+            self.end,
+            LayoutRoundEnd::Built { .. } | LayoutRoundEnd::NeedsDocumentStyle
+        ) {
+            return;
+        }
+        // The commit has the host update the visual contexts, which refreshes the sticky constraints.
+        if let Some(pending) = crate::painting::paint_passes::rendering_preparation_pending(arena) {
+            self.clamped_scroll_offsets = pending.prepare(arena, None).clamped_scroll_offsets;
+        }
+    }
+
+    /// Pays what the round owes `document_host`, in the order it came to owe it. The boxes nodes
+    /// gained and lost and the host calls the round owes come first, then a build's commit messages
+    /// and styled scroll containers, after which the document retires the tree the build replaced;
+    /// then what the layout stages owe, and the scroll offsets the round's preparation clamped.
     ///
     /// # Safety
     ///
     /// The host's callbacks must answer synchronously from its live document.
-    pub(crate) unsafe fn pay(
-        &mut self,
-        main_thread: &MainThread,
-        host: &FfiLayoutUpdateHostCallbacks,
-        read: &BegunRead,
-    ) {
+    pub(crate) unsafe fn pay(&mut self, main_thread: &MainThread, document_host: &DocumentHost, read: &BegunRead) {
+        let host = layout_update_host(document_host);
         let layout_host = FfiLayoutHostCallbacks::of(main_thread);
+        document_host
+            .host_tables()
+            .owed_images
+            .borrow_mut()
+            .append(&mut self.owed_images);
         // SAFETY (for every call below): Guaranteed by the caller.
         std::mem::take(&mut self.work).pay(main_thread);
         if let Some((replaced_viewport, built)) = self.build.take() {
@@ -617,6 +752,12 @@ impl LayoutRoundAnswer {
             unsafe { commit.notify_host(main_thread, read, &layout_host) };
         }
         super::trace::name_layout_trace_owners(main_thread, read);
+        if let Some(geometry_host) = document_host.host_tables().geometry_host.get() {
+            for (slot, offset) in self.clamped_scroll_offsets.drain(..) {
+                // SAFETY: The round clamped the offsets of rows it left live, whose layout nodes the host has now.
+                unsafe { geometry_host.set_scroll_offset(main_thread, read, slot, offset.into()) };
+            }
+        }
     }
 }
 
@@ -627,13 +768,15 @@ enum NextRound {
 }
 
 /// Readies the next round of the layout update of `document_host`'s document, which lays it out as of `facts`, with a
-/// tree build where the tree needs one.
+/// tree build where the tree needs one, handed the document's style where `with_document_style` says. Only a build that
+/// builds the viewport needs it, which the round finds out itself.
 fn next_round(
     main_thread: &MainThread,
     document_host: &DocumentHost,
     read: &BegunRead,
     host: &FfiLayoutUpdateHostCallbacks,
     facts: FfiLayoutUpdateDocumentFacts,
+    with_document_style: bool,
 ) -> SealedRound {
     let layout_host = FfiLayoutHostCallbacks::of(main_thread);
     let rebuilds_tree = facts.document_needs_layout_tree_build
@@ -643,15 +786,9 @@ fn next_round(
     let build = rebuilds_tree.then(|| {
         let document_style_node = StyleNodeID::from_raw(facts.document_style_node)
             .expect("a document that lays out is named in the style mirror");
-        let may_create_viewport = read_arena(
-            document_host,
-            read,
-            document_style_node,
-            |arena, document_style_node| arena.tree_build_may_create_viewport(Some(document_style_node)),
-        );
         TreeBuildJob::new(
             document_style_node,
-            host.prepare_layout_tree_build(main_thread, read, may_create_viewport),
+            host.prepare_layout_tree_build(main_thread, read, with_document_style),
         )
     });
     SealedRound {
@@ -666,6 +803,39 @@ fn next_round(
     }
 }
 
+/// The host that `document_host`'s document lays out through.
+fn layout_update_host(document_host: &DocumentHost) -> FfiLayoutUpdateHostCallbacks {
+    document_host
+        .host_tables()
+        .layout_update_host
+        .get()
+        .expect("the document has no layout update host")
+}
+
+/// The first round of a rendering update's layout of `document_host`'s document, sealed for a frame to run beside the
+/// host, where the document is active and `needs_round` says the round has something to do as of its facts.
+///
+/// # Safety
+///
+/// As for [`update_layout`].
+unsafe fn sealed_first_round(
+    main_thread: &MainThread,
+    document_host: &DocumentHost,
+    read: &BegunRead,
+    inputs: &FfiLayoutUpdateInputs,
+    needs_round: impl FnOnce(&FfiLayoutUpdateDocumentFacts) -> bool,
+) -> Option<SealedRound> {
+    let host = layout_update_host(document_host);
+    let facts = host.document_facts(main_thread, read);
+    if !facts.document_is_active || inputs.is_template_contents_document || !needs_round(&facts) {
+        return None;
+    }
+    let mut round = next_round(main_thread, document_host, read, &host, facts, false);
+    // The round runs beside the host, which it cannot ask.
+    round.job.container_length_bases = round.job.container_length_bases.sealed();
+    Some(round)
+}
+
 /// Seals the first round of a rendering update's layout of `document_host`'s document, which the frame the update lets
 /// fly next runs after its style.
 ///
@@ -678,21 +848,84 @@ unsafe fn seal_first_round(
     read: &BegunRead,
     inputs: &FfiLayoutUpdateInputs,
 ) {
-    let host = document_host
-        .host_tables()
-        .layout_update_host
-        .get()
-        .expect("the document has no layout update host");
     // A round is sealed for a document whose layout is up to date as well: the frame's style may leave it layout to
     // do, which the round finds once the frame has applied the style.
-    let facts = host.document_facts(main_thread, read);
-    if !facts.document_is_active || inputs.is_template_contents_document {
-        return;
+    // SAFETY: Guaranteed by the caller.
+    if let Some(round) = unsafe { sealed_first_round(main_thread, document_host, read, inputs, |_| true) } {
+        document_host.seal_round(round);
     }
-    let mut round = next_round(main_thread, document_host, read, &host, facts);
-    // The round runs beside the host, which it cannot ask.
-    round.job.container_length_bases = round.job.container_length_bases.sealed();
-    document_host.seal_round(round);
+}
+
+/// Lets the first round of a rendering update's layout of `document_host`'s document fly beside the host, once the
+/// host's style is up to date, where the layout is not and no round that flew with the style waits to be taken in. The
+/// host's next layout update pays it first. Answers whether it flies.
+///
+/// # Safety
+///
+/// As for [`update_layout`].
+unsafe fn fly_first_round(
+    main_thread: &MainThread,
+    document_host: &DocumentHost,
+    read: &BegunRead,
+    inputs: &FfiLayoutUpdateInputs,
+    license: &FlightLicense,
+) -> bool {
+    // A round that flew with the style is the layout update's first: the update takes it in and goes on from it here.
+    if document_host.has_flown_round() {
+        return false;
+    }
+    // Otherwise the round goes on from the style as the layout update's first round would: list items that wait to be
+    // renumbered, and top layer changes, are the host's to take in first.
+    let host = layout_update_host(document_host);
+    host.process_pending_list_item_renumbers(main_thread, read);
+    host.process_pending_top_layer_layout_changes(main_thread, read);
+    // SAFETY: Guaranteed by the caller.
+    let round = unsafe {
+        sealed_first_round(main_thread, document_host, read, inputs, |facts| {
+            !host_layout_is_up_to_date(document_host, read, facts)
+        })
+    };
+    let Some(round) = round else {
+        return false;
+    };
+    crate::render_state::fly(document_host, None, Some(round), license);
+    true
+}
+
+/// Takes in the layout round that flew in the frame of `document_host`'s document, waiting for it to land, and pays it as
+/// a layout update pays its last round, where the round left the document laid out as of the frame. Answers whether it
+/// did: no other round runs, so what the host wrote since the frame flew stays the next layout update's.
+///
+/// # Safety
+///
+/// As for [`update_layout`].
+unsafe fn take_flown_layout_in(main_thread: &MainThread, document_host: &DocumentHost, read: &BegunRead) -> bool {
+    let host = layout_update_host(document_host);
+    document_host.take_frame_in_with(read);
+    let Some(FlownRound {
+        mut answer,
+        rebuilds_tree,
+    }) = document_host.take_flown_round()
+    else {
+        return false;
+    };
+    // SAFETY (for every pay below): Guaranteed by the caller.
+    unsafe { answer.pay(main_thread, document_host, read) };
+    if rebuilds_tree && host.reconcile_stale_list_item_counters_after_tree_build(main_thread, &answer.rebuilt_roots) {
+        return false;
+    }
+    match answer.end {
+        LayoutRoundEnd::Built { .. } | LayoutRoundEnd::NeedsDocumentStyle => return false,
+        LayoutRoundEnd::PartialLayout => host.after_layout_commit(main_thread, read, rebuilds_tree),
+        LayoutRoundEnd::FullLayout => {
+            host.note_full_layout_performed(main_thread);
+            host.after_layout_commit(main_thread, read, true);
+            host.evaluate_pending_container_queries(main_thread, read);
+        }
+    }
+    // The style written since the round flew is the next layout update's; only container queries the layout decides
+    // restyle what the round laid out.
+    !host.container_query_evaluation_is_pending(main_thread, read)
 }
 
 /// # Safety
@@ -704,11 +937,7 @@ unsafe fn update_layout(
     read: &BegunRead,
     inputs: &FfiLayoutUpdateInputs,
 ) {
-    let host = document_host
-        .host_tables()
-        .layout_update_host
-        .get()
-        .expect("the document has no layout update host");
+    let host = layout_update_host(document_host);
     let layout_host = FfiLayoutHostCallbacks::of(main_thread);
     assert!(
         document_host.host_tables().update_layout_running.get(),
@@ -729,10 +958,9 @@ unsafe fn update_layout(
         layout_pass += 1;
 
         host.update_style(main_thread, read);
-        // What the ticks of a clock lease the update ended laid out, the host pays before anything else of the update.
-        document_host.pay_clock_rounds(|mut answer| unsafe { answer.pay(main_thread, &host, read) });
         // A round that flew in the frame the update took in is the update's first, which the host pays before
         // anything else of the update reads the layout.
+        document_host.take_frame_in_with(read);
         let (rebuilds_tree, mut next) = match document_host.take_flown_round() {
             Some(FlownRound { answer, rebuilds_tree }) => (rebuilds_tree, NextRound::Flown(answer)),
             None => {
@@ -752,7 +980,7 @@ unsafe fn update_layout(
                     return;
                 }
 
-                let round = next_round(main_thread, document_host, read, &host, facts);
+                let round = next_round(main_thread, document_host, read, &host, facts, false);
                 (round.rebuilds_tree, NextRound::Job(round.job))
             }
         };
@@ -761,9 +989,16 @@ unsafe fn update_layout(
                 NextRound::Flown(answer) => answer,
                 NextRound::Job(job) => run_layout_round_job(document_host, read, job),
             };
-            unsafe { answer.pay(main_thread, &host, read) };
+            unsafe { answer.pay(main_thread, document_host, read) };
+            if matches!(answer.end, LayoutRoundEnd::NeedsDocumentStyle) {
+                let facts = host.document_facts(main_thread, read);
+                next = NextRound::Job(next_round(main_thread, document_host, read, &host, facts, true).job);
+                continue;
+            }
             let built = matches!(answer.end, LayoutRoundEnd::Built { .. });
-            if rebuilds_tree && host.reconcile_stale_list_item_counters_after_tree_build(main_thread, read) {
+            if rebuilds_tree
+                && host.reconcile_stale_list_item_counters_after_tree_build(main_thread, &answer.rebuilt_roots)
+            {
                 // The stale counters marked more of the tree for a rebuild, which the next round runs.
                 debug_assert!(
                     built,
@@ -792,6 +1027,7 @@ unsafe fn update_layout(
 
         match end {
             None | Some(LayoutRoundEnd::Built { .. }) => continue,
+            Some(LayoutRoundEnd::NeedsDocumentStyle) => unreachable!("a round that needs the style runs again with it"),
             Some(LayoutRoundEnd::PartialLayout) => {
                 // A round that built the tree changed it, whichever of its jobs ran the build.
                 host.after_layout_commit(main_thread, read, rebuilds_tree);
@@ -840,22 +1076,10 @@ unsafe fn update_layout(
 /// cleared or the host is destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn document_host_set_layout_update_host_callbacks(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     callbacks: FfiLayoutUpdateHostCallbacks,
 ) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.host_tables().layout_update_host.set(Some(callbacks));
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_clear_layout_update_host_callbacks(host: *const DocumentHost) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.host_tables().layout_update_host.set(None);
+    host.host_tables().layout_update_host.set(Some(callbacks));
 }
 
 /// # Safety
@@ -863,10 +1087,8 @@ pub unsafe extern "C" fn document_host_clear_layout_update_host_callbacks(host: 
 /// `host` must be a live document host, on its document's thread, with no layout update running. A document runs
 /// one layout update at a time; a nested request is a caller bug.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_begin_update_layout(host: *const DocumentHost) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let running = &unsafe { &*host }.host_tables().update_layout_running;
+pub unsafe extern "C" fn document_host_begin_update_layout(host: &DocumentHost) {
+    let running = &host.host_tables().update_layout_running;
     assert!(!running.replace(true), "a layout update is already running");
 }
 
@@ -874,10 +1096,8 @@ pub unsafe extern "C" fn document_host_begin_update_layout(host: *const Document
 ///
 /// `host` must be a live document host, on its document's thread, with a layout update running.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_end_update_layout(host: *const DocumentHost) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let running = &unsafe { &*host }.host_tables().update_layout_running;
+pub unsafe extern "C" fn document_host_end_update_layout(host: &DocumentHost) {
+    let running = &host.host_tables().update_layout_running;
     assert!(running.replace(false), "no layout update is running");
 }
 
@@ -885,10 +1105,8 @@ pub unsafe extern "C" fn document_host_end_update_layout(host: *const DocumentHo
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_update_layout_is_running(host: *const DocumentHost) -> bool {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.host_tables().update_layout_running.get()
+pub unsafe extern "C" fn document_host_update_layout_is_running(host: &DocumentHost) -> bool {
+    host.host_tables().update_layout_running.get()
 }
 
 #[cfg(test)]
@@ -941,6 +1159,37 @@ mod tests {
             .free_subtree(viewport)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
         assert!(!layout_is_up_to_date(&arena, &facts));
+    }
+
+    #[test]
+    fn a_round_that_commits_a_layout_prepares_it_for_rendering_and_a_built_round_does_not() {
+        use crate::painting::paint_passes::rendering_preparation_pending;
+        let answer_ending = |end| LayoutRoundAnswer {
+            build: None,
+            work: HostWorkDue::default(),
+            commits: Vec::new(),
+            end,
+            rebuilt_roots: Vec::new(),
+            owed_images: Vec::new(),
+            clamped_scroll_offsets: Vec::new(),
+        };
+        let mut arena = LayoutNodeArena::new();
+        let viewport = arena.allocate_unbound();
+        arena.set_layout_root(viewport);
+        assert!(rendering_preparation_pending(&arena).is_some());
+
+        answer_ending(LayoutRoundEnd::Built {
+            needs_another_build_pass: false,
+            layout: RoundLayout::Full,
+        })
+        .prepare_committed_layout_for_rendering(&arena);
+        assert!(rendering_preparation_pending(&arena).is_some());
+
+        answer_ending(LayoutRoundEnd::FullLayout).prepare_committed_layout_for_rendering(&arena);
+        assert!(rendering_preparation_pending(&arena).is_none());
+        arena
+            .free_subtree(viewport)
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
     }
 
     #[test]

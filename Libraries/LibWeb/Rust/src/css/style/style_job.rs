@@ -28,10 +28,14 @@ use std::sync::Arc;
 /// Takes the pending style transaction under `root`, with the document computation inputs the host sealed for it.
 pub(crate) struct StyleJob {
     root: StyleNodeID,
-    computation_inputs: SealedStyleInputs,
+    computation_inputs: Arc<SealedStyleInputs>,
     /// Whether the transaction flies beside the host, which leaves its atom sweep to a later transaction: the host may
     /// name an atom meanwhile that the sweep would reclaim before the host hears of it.
     flies: bool,
+    /// Where a style update applies the transaction's reactions as the job answers them, they close over the elements
+    /// they inherit through, but for those that inherit from the elements here, which arrived, moved or retired
+    /// beside the transaction the host drains: those are the next transaction's.
+    closes_beside: Option<super::HashSet<StyleNodeID>>,
 }
 
 /// A style transaction's document computation inputs, sealed on the host's thread: the job owns a copy of every buffer
@@ -53,6 +57,15 @@ pub(crate) struct SealedStyleInputs {
 // SAFETY: Every pointer the sealed inputs hold names one of their own buffers, a custom function they hold a
 // reference to, or the registry they hold one to, none of which the host writes.
 unsafe impl Send for SealedStyleInputs {}
+// SAFETY: As above; nothing writes them once sealed, so threads that share them only read.
+unsafe impl Sync for SealedStyleInputs {}
+
+impl SealedStyleInputs {
+    /// The inputs, which name the buffers they own, for as long as they live.
+    pub(crate) fn inputs(&self) -> FfiDocumentStyleComputationInputs {
+        self.inputs
+    }
+}
 
 /// The `count` values at `values`, or none.
 ///
@@ -131,15 +144,7 @@ impl SealedStyleInputs {
                 ..context
             })
         });
-        let custom_functions: Box<[_]> = lent_functions
-            .iter()
-            .map(|entry| FfiCustomFunctionEntry {
-                function: entry.function,
-                caller_scope: entry.caller_scope,
-                definition_scope: entry.definition_scope,
-                tree_scope: entry.tree_scope,
-            })
-            .collect();
+        let custom_functions = Box::<[FfiCustomFunctionEntry]>::from(lent_functions);
         let retained_functions = lent_functions
             .iter()
             .filter(|entry| !entry.function.is_null())
@@ -229,6 +234,11 @@ impl StyleJobAnswer {
         self.output.answers()
     }
 
+    /// The atoms the engine reclaimed as it took the transaction.
+    pub(crate) fn reclaimed_style_atoms(&self) -> &[super::atoms::ReclaimedStyleAtom] {
+        self.output.reclaimed_style_atoms()
+    }
+
     /// The view of `record`, one the rows name, and the custom-property environment it was computed in.
     pub(crate) fn record(&self, record: u64) -> Option<(super::bridge::FfiStyleRecordView, Option<u64>)> {
         let records = &self.records.0;
@@ -257,7 +267,14 @@ impl StyleJob {
     pub(crate) fn run(self, engine: &mut StyleEngine) -> StyleJobAnswer {
         engine.defer_atom_sweep(self.flies);
         // SAFETY: The sealed inputs name only what they own, and live until the transaction has taken them in.
-        let output = unsafe { take_style_transaction(engine, self.root, self.computation_inputs.inputs) };
+        let output = unsafe {
+            take_style_transaction(
+                engine,
+                self.root,
+                self.computation_inputs.inputs,
+                self.closes_beside.as_ref(),
+            )
+        };
         engine.defer_atom_sweep(false);
         // The host reads the record each row replaces as well, as it compares a box's old style with its new one. Only a
         // live base record comes along: the host asks about a replaced overlay record itself.
@@ -341,9 +358,11 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
     let job = StyleJob {
         root,
         // SAFETY: Guaranteed by the caller.
-        computation_inputs: unsafe { SealedStyleInputs::seal(computation_inputs) },
+        computation_inputs: Arc::new(unsafe { SealedStyleInputs::seal(computation_inputs) }),
         flies: false,
+        closes_beside: host.engine_memo().closes_taken_transaction_beside(),
     };
+    host.keep_style_inputs(root, Arc::clone(&job.computation_inputs));
     let answer = host.run(read, true, move |state| job.run(state.engine_mut()));
     host.keep_style_transaction(answer).output.view()
 }
@@ -374,10 +393,12 @@ pub unsafe extern "C" fn style_engine_let_style_transaction_fly(
     let job = StyleJob {
         root,
         // SAFETY: Guaranteed by the caller.
-        computation_inputs: unsafe { SealedStyleInputs::seal(computation_inputs) },
+        computation_inputs: Arc::new(unsafe { SealedStyleInputs::seal(computation_inputs) }),
         flies: true,
+        closes_beside: None,
     };
-    fly(host, job, round, &license);
+    host.keep_style_inputs(root, Arc::clone(&job.computation_inputs));
+    fly(host, Some(job), round, &license);
     true
 }
 
@@ -406,7 +427,32 @@ pub unsafe extern "C" fn style_engine_take_flown_style_transaction(
 /// `host` must be a live document host, on its document's thread, that drains a style transaction that flew.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_end_flown_style_drain(host: &DocumentHost) {
+    host.engine_memo().beside_flown_transaction.borrow_mut().clear();
     host.end_style_drain();
+}
+
+/// Notes that the element `node` names arrived, moved or retired beside the style transaction of `host`'s document that
+/// flew, which knows nothing of that, until the drain of its reactions ends.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_note_style_node_beside_flown_transaction(host: &DocumentHost, node: u32) {
+    if let Some(node) = StyleNodeID::from_raw(node) {
+        host.engine_memo().beside_flown_transaction.borrow_mut().insert(node);
+    }
+}
+
+/// Whether the element `node` names arrived, moved or retired beside the style transaction of `host`'s document that
+/// flew.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_style_node_is_beside_flown_transaction(host: &DocumentHost, node: u32) -> bool {
+    StyleNodeID::from_raw(node).is_some_and(|node| host.engine_memo().beside_flown_transaction.borrow().contains(&node))
 }
 
 /// Whether the frame whose style transaction `host`'s document drains applied the element `style_node` names its record

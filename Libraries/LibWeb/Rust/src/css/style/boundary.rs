@@ -16,10 +16,11 @@ use super::ReplacedContentInput;
 use super::StyleEngine;
 use super::bridge::{ElementBoxKind, FfiAppliedAnimationDefinition, borrow};
 use super::engine_calls::with_engine;
-use super::index::{AttributeNameForms, StyleAtomID};
+use super::index::StyleAtomID;
 use super::program::{CascadeLayerID, SheetID};
 use super::tree::{StyleNodeID, TableSpans, TreeScopeID};
 use crate::abort_on_panic;
+use crate::css::css_string::CssString;
 use crate::render_state::{ArenaChange, BegunRead, DocumentHost};
 
 /// An array the host lends an entry for the call, as C++ passes an AK `Span`.
@@ -80,7 +81,11 @@ carried! {
     Option<SheetID>: u32 as "SheetID" = |sheet| sheet.checked_sub(1).map(SheetID);
     [u32; 4]: *const [u32; 4] as "u32 const*" = |values| unsafe { *values };
     Box<[u16]>: FfiSpan<u16> as "ReadonlySpan<u16>" = |span| unsafe { borrow(span.data, span.size) }.into();
+    // The names of fly strings the host lends, as their raw identities, which a change copies.
+    Box<[CssString]>: FfiSpan<usize> as "ReadonlySpan<FlatPtr>" =
+        |span| unsafe { borrow(span.data, span.size) }.iter().map(|&raw| unsafe { CssString::from_borrowed_raw(raw) }).collect();
     Box<[u32]>: FfiSpan<u32> as "ReadonlySpan<u32>" = |span| unsafe { borrow(span.data, span.size) }.into();
+    Box<[u64]>: FfiSpan<u64> as "ReadonlySpan<u64>" = |span| unsafe { borrow(span.data, span.size) }.into();
     Box<[StyleAtomID]>: FfiSpan<u32> as "ReadonlySpan<StyleAtomID>" =
         |span| unsafe { borrow(span.data, span.size) }.iter().copied().map(StyleAtomID).collect();
     Box<[StyleNodeID]>: FfiSpan<u32> as "ReadonlySpan<StyleNodeID>" =
@@ -224,12 +229,6 @@ style_boundary! {
             });
         set_element_id_name => SetElementIdName { node: StyleNodeID, name: StyleAtomID };
         set_shadow_root => SetShadowRoot { shadow_host: StyleNodeID, shadow_root: StyleNodeID };
-        note_attribute_substitution_name => NoteAttributeSubstitutionName {
-            name: StyleAtomID, local_name: Box<[u16]>
-        } => engine.note_attribute_substitution_name(name, &local_name);
-        note_attribute_name_forms => NoteAttributeNameForms {
-            name: StyleAtomID, local: StyleAtomID, folded_name: StyleAtomID, folded_local: StyleAtomID
-        } => engine.note_attribute_name_forms(name, AttributeNameForms { local, folded_name, folded_local });
         record_environment_change => RecordEnvironmentChange;
         record_custom_property_registration_change => RecordCustomPropertyRegistrationChange { name: StyleAtomID };
         flush => Flush => engine.flush_without_document_root();
@@ -257,6 +256,9 @@ style_boundary! {
         record_derived_element_style_input => RecordDerivedElementStyleInput {
             node: StyleNodeID, reaction: u8, inherited_style_groups: u8
         };
+        record_font_input_changes => RecordFontInputChanges {
+            family_name_lengths: Box<[u32]>, family_name_units: Box<[u16]>, font_lists: Box<[u64]>
+        } => engine.record_font_input_changes(&family_name_lengths, &family_name_units, &font_lists);
         record_flat_tree_descendant_style_inputs => RecordFlatTreeDescendantStyleInputs {
             root: StyleNodeID, reaction: u8, inherited_style_groups: u8
         };
@@ -276,15 +278,12 @@ style_boundary! {
         record_transition_baseline => RecordTransitionBaseline {
             node: StyleNodeID, pseudo_kind: u8, style_record: u64
         };
-        begin_transition_baselines => BeginTransitionBaselines;
         release_transition_baselines => ReleaseTransitionBaselines;
         pin_style_record => PinStyleRecord { style_record: u64 };
         unpin_style_record => UnpinStyleRecord { style_record: u64 };
         begin_style_record_view_epoch => BeginStyleRecordViewEpoch;
         end_style_record_view_epoch => EndStyleRecordViewEpoch;
         set_tree_scope_uses_document_sheets => SetTreeScopeUsesDocumentSheets { tree_scope: TreeScopeID };
-        set_attribute_value_text => SetAttributeValueText { value: StyleAtomID, text: Box<[u16]> } =>
-            engine.set_attribute_value_text(value, &text);
         set_element_custom_property_names => SetElementCustomPropertyNames {
             node: StyleNodeID, name_atoms: Box<[StyleAtomID]>, uses_unnamed: bool, uses_custom_functions: bool
         } => engine.set_element_custom_property_names(node, &name_atoms, uses_unnamed, uses_custom_functions);
@@ -312,12 +311,8 @@ style_boundary! {
         };
         set_held_style_record => SetHeldStyleRecord { node: StyleNodeID, style_record: u64 };
         set_element_css_defined_animations => SetElementCssDefinedAnimations {
-            node: StyleNodeID,
-            slot: u8,
-            name_lengths: Box<[u32]>,
-            name_units: Box<[u16]>,
-            definitions: Box<[FfiAppliedAnimationDefinition]>
-        } => engine.set_element_css_defined_animations(node, slot, &name_lengths, &name_units, &definitions);
+            node: StyleNodeID, slot: u8, names: Box<[CssString]>, definitions: Box<[FfiAppliedAnimationDefinition]>
+        } => engine.set_element_css_defined_animations(node, slot, names, &definitions);
         set_tree_scope_root => SetTreeScopeRoot { tree_scope: TreeScopeID, root: StyleNodeID };
         set_sheet_conditions_hold => SetSheetConditionsHold { sheet: SheetID, conditions_hold: bool };
     }
@@ -335,12 +330,6 @@ style_boundary! {
         node_declares_custom_properties(node: Option<StyleNodeID>) -> bool =>
             node.is_some_and(|node| engine.node_declares_custom_properties(node));
         size_query_container_scan_visits(reset: bool) -> u64;
-        complete_published_match_answers_for_closure(nodes: FfiSpan<u32>) -> bool => {
-            // SAFETY: The host lends the nodes for the call.
-            let nodes = unsafe { borrow(nodes.data, nodes.size) }.iter().copied().map(StyleNodeID::from_raw);
-            let nodes: Option<Vec<_>> = nodes.collect();
-            nodes.is_some_and(|nodes| engine.complete_published_match_answers_for_closure(&nodes).is_ok())
-        };
         ensure_random_base_value(node: Option<StyleNodeID>, name: FfiSpan<u16>, element_shared: bool) -> u64 => {
             // SAFETY: The host lends the name for the call.
             let name = unsafe { borrow(name.data, name.size) };
@@ -350,15 +339,6 @@ style_boundary! {
 }
 
 impl StyleChange {
-    /// Whether the change notes what an attribute name's forms are, or what an `attr()` reads it as: what the name is,
-    /// which no style transaction can answer differently, so it need not wait for the drain of one that flew.
-    pub(crate) fn notes_attribute_name(&self) -> bool {
-        matches!(
-            self,
-            Self::NoteAttributeNameForms { .. } | Self::NoteAttributeSubstitutionName { .. }
-        )
-    }
-
     /// Whether the change only keeps the engine from reclaiming records: it pins or unpins one, or begins or ends an
     /// epoch of style record views. It changes nothing the paint properties are prepared from.
     pub(crate) fn only_keeps_records_alive(&self) -> bool {
@@ -372,15 +352,13 @@ impl StyleChange {
     }
 
     /// Whether the change may move a fact the host knows of the render state. One that keeps records alive, notes what
-    /// an attribute name is or what a value or a text spells, picks the pseudo-element whose style is deferred, or
-    /// begins or ends a cold matching batch never does: none of them stages a style input or touches a layout box.
+    /// a text spells, picks the pseudo-element whose style is deferred, or begins or ends a cold matching batch never
+    /// does: none of them stages a style input or touches a layout box.
     pub(crate) fn may_move_facts(&self) -> bool {
         !self.only_keeps_records_alive()
-            && !self.notes_attribute_name()
             && !matches!(
                 self,
-                Self::SetAttributeValueText { .. }
-                    | Self::SetTextIsAsciiWhitespace { .. }
+                Self::SetTextIsAsciiWhitespace { .. }
                     | Self::SetPseudoElementStyleDeferred { .. }
                     | Self::BeginColdMatchingBatch { .. }
                     | Self::BeginAdaptiveColdMatchingBatch { .. }

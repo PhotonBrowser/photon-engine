@@ -476,12 +476,15 @@ fn outline_style_to_line_style(style: u8) -> u8 {
     }
 }
 
+// `auto` lets us do whatever we want for the outline. 2px of the accent color seems reasonable.
+pub(crate) fn auto_outline_width() -> CssPixels {
+    CssPixels::from_integer(2)
+}
+
 pub(crate) fn outline_geometry(style: ComputedValuesView<'_>) -> Option<OutlineGeometry> {
     let misc = style.misc_reset();
     let (line_style, width) = if misc.outline_style == outline_style::AUTO {
-        // `auto` lets us do whatever we want for the outline. 2px of the accent
-        // colour seems reasonable.
-        (line_style::SOLID, CssPixels::from_integer(2))
+        (line_style::SOLID, auto_outline_width())
     } else {
         (outline_style_to_line_style(misc.outline_style), misc.outline_width)
     };
@@ -489,6 +492,17 @@ pub(crate) fn outline_geometry(style: ComputedValuesView<'_>) -> Option<OutlineG
         return None;
     }
     Some(OutlineGeometry { line_style, width })
+}
+
+pub(crate) fn auto_outline_data(auto_outline_color: u32) -> OutlineData {
+    OutlineData {
+        color: auto_outline_color,
+        geometry: OutlineGeometry {
+            line_style: line_style::SOLID,
+            width: CssPixels::from_integer(2),
+        },
+        is_auto: true,
+    }
 }
 
 pub(crate) fn outline_data(
@@ -586,6 +600,27 @@ pub(crate) fn is_invisible_for_line_clamp(arena: &impl PaintRead, node: NodeSlot
         link.is_some_and(|link| link.fragment.is_invisible_for_line_clamp)
     })
 }
+
+pub(crate) fn has_line_clamp_point(arena: &impl PaintRead, node: NodeSlotId) -> bool {
+    arena.with_committed_fragment_link(node, |link| link.is_some_and(|link| link.fragment.has_line_clamp_point))
+}
+
+pub(crate) fn clamped_content_is_scrollable_overflow(arena: &impl PaintRead, container: NodeSlotId) -> bool {
+    arena.with_committed_fragment_link(container, |link| {
+        link.is_some_and(|link| link.fragment.clamped_content_is_scrollable_overflow)
+    })
+}
+
+fn line_clamp_container(arena: &impl PaintRead, start: Option<NodeSlotId>) -> Option<NodeSlotId> {
+    std::iter::successors(start, |node| arena.node_parent_if_live(*node))
+        .find(|node| has_line_clamp_point(arena, *node))
+}
+
+pub(crate) fn is_excluded_from_scrollable_overflow_by_line_clamp(arena: &impl PaintRead, node: NodeSlotId) -> bool {
+    is_invisible_for_line_clamp(arena, node)
+        && !line_clamp_container(arena, arena.node_parent_if_live(node))
+            .is_some_and(|container| clamped_content_is_scrollable_overflow(arena, container))
+}
 pub(crate) fn line_clamp_clip_rect(arena: &impl PaintRead, container: NodeSlotId) -> CssPixelRect {
     let style = arena
         .node_style_if_live(container)
@@ -605,11 +640,7 @@ pub(crate) fn line_clamp_float_clip_rect(arena: &impl PaintRead, node: NodeSlotI
     if is_invisible_for_line_clamp(arena, node) {
         return Some(CssPixelRect::default());
     }
-    let container = std::iter::successors(Some(node), |node| arena.node_parent_if_live(*node)).find(|node| {
-        arena.with_committed_fragment_link(*node, |link| {
-            link.is_some_and(|link| link.fragment.has_line_clamp_point)
-        })
-    })?;
+    let container = line_clamp_container(arena, Some(node))?;
     Some(line_clamp_clip_rect(arena, container))
 }
 

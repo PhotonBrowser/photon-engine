@@ -48,6 +48,21 @@ macro_rules! define_id {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
         $visibility struct $name($field_visibility u32);
     };
+    // An identity an `InternTable` hands out, which indexes the table directly.
+    ($(#[$attribute:meta])* interned $($rest:tt)*) => {
+        define_id! { $(#[$attribute])* $($rest)* }
+        define_id!(@interned $($rest)*);
+    };
+    (@interned default $($rest:tt)*) => {
+        define_id!(@interned $($rest)*);
+    };
+    (@interned $visibility:vis struct $name:ident($($field:tt)*);) => {
+        impl $crate::css::style::intern_table::InternIdentity for $name {
+            fn index(self) -> usize {
+                self.0 as usize
+            }
+        }
+    };
 }
 
 pub(crate) mod animations;
@@ -63,29 +78,31 @@ mod column;
 pub mod compiler;
 mod computed;
 mod container_queries;
-mod counter_context;
 mod custom_property_cascade;
 mod custom_property_environments;
 #[cfg(test)]
 mod differential_tests;
 pub(crate) mod effect_descriptions;
+mod engine;
 pub mod engine_calls;
 pub(crate) mod engine_sample;
 mod environment_move;
 pub mod exact_matcher;
 pub(crate) mod flight_style_rows;
+pub(crate) mod host_atoms;
 pub(crate) mod style_job;
-pub use crate::fast_hash;
+pub(crate) use crate::fast_hash;
 mod engine_handle;
 mod flush;
 mod fnv;
 mod font_resolution;
+pub(crate) mod hover_lane;
 pub mod identities;
 pub mod impact;
 pub mod index;
 mod input_routing;
 mod inputs;
-pub(crate) use inputs::next_declaration_block_version;
+pub(crate) use inputs::{give_up_custom_property_data_let_go_beside_the_host, next_declaration_block_version};
 pub mod instrumentation;
 mod intern_table;
 pub(crate) mod layout_style;
@@ -101,11 +118,13 @@ pub mod program;
 mod program_updates;
 mod publication;
 mod random_bases;
+pub mod reaction_application;
 mod resource_contexts;
 mod routing;
 pub(crate) mod rule_writes;
 mod sorted_merge;
 mod style_invalidation;
+pub(crate) use style_invalidation::SampleBounds;
 mod transition_baselines;
 mod user_agent_selectors;
 pub(crate) use computed::{ENGINE_INHERITED_GROUP_COUNT, StyleRecordLease};
@@ -140,10 +159,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-/// The attribute names whose value text a selector reads, which a document's engine shares with its host.
-pub(crate) type SelectorValueTextNames = Arc<HashSet<StyleAtomID>>;
+/// Attribute names a document's selectors read, which its engine shares with its host.
+pub(crate) type SelectorAttributeNames = Arc<HashSet<StyleAtomID>>;
 
 use crate::css::cascaded_properties::CascadeOrigin;
+#[cfg(test)]
 use crate::css::cascaded_properties::CascadedPropertyStore;
 use crate::css::computed_values::computed_group_output_mask;
 use crate::css::host_shared::{HostShared, SharedPayload};
@@ -159,7 +179,6 @@ use instrumentation::Counters;
 use exact_matcher::ExactMatchContext;
 use exact_matcher::ExactMatcher;
 
-pub use counter_context::StyleEngine;
 pub use engine_handle::StyleEngineHandle;
 pub use inputs::{NaturalSize, PublishedBoxFacts, PublishedTextSource, ReplacedContentInput, TextStyleParentFacts};
 
@@ -316,7 +335,6 @@ const RETAINED_WITNESS_SIBLING_STEPS: usize = 64;
 const INITIAL_SIBLING_FACT_WINDOW: usize = 8;
 
 mod verification {
-    use super::Counters;
     use super::MatchAnswerID;
     use super::RetainedState;
     use super::RuleMatch;
@@ -343,14 +361,13 @@ mod verification {
 
     pub(super) struct StyleAnswerVerifier<'a> {
         engine: &'a mut RetainedState,
-        counters: &'a mut Counters,
     }
 
     impl StyleAnswerVerifier<'_> {
         pub(super) fn verify_match_answer(&mut self, answer: &[RuleMatch], node: StyleNodeID, description: &str) {
             let cold = self
                 .engine
-                .exact_match_answer_for_verification(node, self.counters)
+                .exact_match_answer_for_verification(node)
                 .expect("cold matching must answer wherever a retained answer did");
             assert_eq!(answer, cold, "{description} differs from cold matching for {node:?}");
         }
@@ -358,7 +375,7 @@ mod verification {
         pub(super) fn verify_cascade_answer(&mut self, answer: &[RuleMatch], node: StyleNodeID, description: &str) {
             let (cold, _) = self
                 .engine
-                .exact_cascade_answer_for_verification(node, self.counters)
+                .exact_cascade_answer_for_verification(node)
                 .expect("cold matching must answer wherever a retained answer did");
             assert_eq!(answer, cold, "{description} differs from cold matching for {node:?}");
         }
@@ -369,20 +386,15 @@ mod verification {
             node: StyleNodeID,
             cascade_input: MatchAnswerID,
         ) {
-            self.engine
-                .verify_retained_cascade_input(effects, node, cascade_input, self.counters);
+            self.engine.verify_retained_cascade_input(effects, node, cascade_input);
         }
     }
 
     /// Re-derive every patched or reused retained answer cold and compare it. The callback receives
     /// only the verifier capability, so it cannot publish through or otherwise mutate the engine.
-    pub(super) fn style_answer_patch(
-        engine: &mut RetainedState,
-        counters: &mut Counters,
-        check: impl FnOnce(&mut StyleAnswerVerifier<'_>),
-    ) {
+    pub(super) fn style_answer_patch(engine: &mut RetainedState, check: impl FnOnce(&mut StyleAnswerVerifier<'_>)) {
         if enabled(&STYLE_ANSWER_PATCH, "LIBWEB_VERIFY_STYLE_ANSWER_PATCH") {
-            check(&mut StyleAnswerVerifier { engine, counters });
+            check(&mut StyleAnswerVerifier { engine });
         }
     }
 
@@ -511,6 +523,7 @@ fn for_each_matching_scope(
     Ok(())
 }
 
+#[derive(Clone)]
 struct StagedFieldRow<V> {
     before: V,
     after: V,
@@ -520,6 +533,7 @@ struct StagedFieldRow<V> {
 /// Sparse staging for one program field. The first write freezes `before`, later writes replace
 /// `after`, and `take_dirty()` applies only the last write while retaining both sides for
 /// `ProgramStaging::delta()`.
+#[derive(Clone)]
 struct StagedField<K, V> {
     rows: HashMap<K, StagedFieldRow<V>>,
     touched: Vec<K>,
@@ -629,7 +643,7 @@ struct ProgramStagingDelta {
 
 /// Program transaction staging. Every field preserves its first before value and last-writer
 /// after value until release; `delta()` may read those pairs after the final values are applied.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ProgramStaging {
     rule_conditions: StagedField<RuleID, bool>,
     sheet_conditions: StagedField<SheetID, bool>,
@@ -741,7 +755,10 @@ pub(super) struct BatchCustomPropertyMatch {
 /// Long-lived engine state: the document, its program, derived results and cross-flush
 /// caches. This is the whole read side of an evaluation step; it holds no
 /// host handle, no journal intake and no borrowed FFI result storage.
+#[derive(Clone)]
 pub struct RetainedState {
+    /// What the engine counts of its own decisions.
+    counters: Counters,
     memory: MemoryController,
     /// The controller's Tier-3 admission facts, copied at the loop and quota boundaries that can
     /// change them. A walk reads admission from here: a step may not reach the controller, whose
@@ -749,9 +766,11 @@ pub struct RetainedState {
     /// points are `refresh_admission_facts`'s callers.
     admission: AdmissionFacts,
     deferred_pseudo_elements: u64,
-    tree: StyleNodeTree,
-    program: StyleSheetProgram,
-    native_rules: native_rules::NativeRuleRegistry,
+    tree: crate::fork::ForkShared<StyleNodeTree>,
+    /// Where the hover is.
+    hover: hover_lane::Hover,
+    program: crate::fork::ForkShared<StyleSheetProgram>,
+    native_rules: crate::fork::ForkShared<native_rules::NativeRuleRegistry>,
     /// The last declaration block version minted, by the engine or by its document's host, which mints without it.
     declaration_block_version: Arc<std::sync::atomic::AtomicU32>,
     /// Whether the last transaction taken planned nothing but derived child reactions.
@@ -798,16 +817,16 @@ pub struct RetainedState {
     sheet_order_version: u64,
 
     /// Canonical specified values referenced by dense rule and winner rows.
-    specified_values: SpecifiedValues,
+    specified_values: crate::fork::ForkShared<SpecifiedValues>,
     /// The winning stylesheet declarations last observed for each element, interned by their
     /// property-wise answer. Element identities are dense, so the column is directly indexed.
-    winner_groups: WinnerGroups,
+    winner_groups: crate::fork::ForkShared<WinnerGroups>,
     /// The shared computed-group payload tuple last published for each live element. This is the
     /// computed half of the eventual base style record; custom properties and metadata remain
     /// separate inputs until that record is complete.
-    computed_group_sets: ComputedGroupSets,
+    computed_group_sets: crate::fork::ForkShared<ComputedGroupSets>,
     /// The stores behind the custom-property environments live records are published with.
-    custom_property_environments: custom_property_environments::CustomPropertyEnvironments,
+    custom_property_environments: crate::fork::ForkShared<custom_property_environments::CustomPropertyEnvironments>,
     /// The nodes whose engine-computed record substituted a custom property into a winner: what
     /// C++ notes as reading custom properties when it installs the record.
     nodes_with_substituted_records: HashSet<StyleNodeID>,
@@ -833,10 +852,11 @@ pub struct RetainedState {
     nodes_with_element_relative_substitutions: HashMap<StyleNodeID, publication::ElementRelativeSubstitutions>,
     /// The custom-property environment each element holds, for the elements that hold one. This is
     /// the only copy: the element reads its environment from here.
-    element_custom_property_data: HashMap<StyleNodeID, inputs::HeldCustomPropertyEnvironment>,
+    element_custom_property_data: crate::fork::ForkShared<HashMap<StyleNodeID, inputs::HeldCustomPropertyEnvironment>>,
     /// The custom-property environments of each element's synthetic pseudo-elements, by
     /// pseudo-element kind, for the elements with a pseudo-element that holds one.
-    pseudo_element_custom_property_data: HashMap<StyleNodeID, Vec<(u8, inputs::HeldCustomPropertyEnvironment)>>,
+    pseudo_element_custom_property_data:
+        crate::fork::ForkShared<HashMap<StyleNodeID, Vec<(u8, inputs::HeldCustomPropertyEnvironment)>>>,
     /// The elements whose style reads their custom-property environment other than through `var()`,
     /// which a moved environment computes again.
     environment_move_recompute_nodes: HashSet<StyleNodeID>,
@@ -868,7 +888,10 @@ pub struct RetainedState {
     counter_style_environment_identities: HashMap<TreeScopeID, u64>,
     /// The style record each element holds, for the elements that hold one, as the host reports
     /// every record it installs or clears.
-    held_style_records: HashMap<StyleNodeID, u64>,
+    held_style_records: crate::fork::ForkShared<HashMap<StyleNodeID, u64>>,
+    /// The records a clock frame shows in place of the ones the host installed, which it lends the published reads
+    /// for as long as it runs.
+    tick_shown: engine_sample::TickShownRecords,
     /// Per shadow host, the elements of its shadow tree that stood for one of its element-backed
     /// pseudo-elements when the host published them; [`RetainedState::backing_elements`] reads the
     /// ones that still do.
@@ -878,12 +901,12 @@ pub struct RetainedState {
     children_explicitly_inherit_marks: HashSet<StyleNodeID>,
     /// The names of the CSS animations the host holds for each element, which the computation of
     /// its animation definitions matches them against.
-    css_defined_animations: animations::CssDefinedAnimations,
+    css_defined_animations: crate::fork::ForkShared<animations::CssDefinedAnimations>,
     /// The `@keyframes` each of the document's style scopes defines, as the host's rule caches
     /// resolved them, which an animation definition's keyframes are resolved from.
-    animation_keyframes: animations::AnimationKeyframes,
+    animation_keyframes: crate::fork::ForkShared<animations::AnimationKeyframes>,
     /// The animation effects the host holds for each element, described for sampling.
-    animation_effect_descriptions: effect_descriptions::AnimationEffectDescriptions,
+    animation_effect_descriptions: crate::fork::ForkShared<effect_descriptions::AnimationEffectDescriptions>,
     /// The font metrics of the record the host holds for the document element, which a `rem` the
     /// host resolves reads, once it holds one.
     held_root_font_inputs: Option<publication::RootFontInputs>,
@@ -893,9 +916,6 @@ pub struct RetainedState {
     /// What each element that has replaced content gives its natural size, which layout resolves
     /// against the style of the element's box.
     replaced_content_inputs: HashMap<StyleNodeID, inputs::ReplacedContentInput>,
-    /// The computed style groups each longhand reaches, which the host registers before it creates
-    /// the engine.
-    style_groups: &'static crate::css::computed_values::StyleGroupMasks,
     /// The before-change style each transition target's transitions are decided against for the
     /// rest of the style stabilization epoch, pinned until the epoch commits.
     transition_baselines: transition_baselines::TransitionBaselines,
@@ -927,8 +947,9 @@ pub struct RetainedState {
     /// Beside them, each published host's matches for the element-backed pseudo-elements, which
     /// the elements backing them cascade from while the host's answer is not installed.
     batch_backing_pseudo_matches: HashMap<StyleNodeID, Vec<RuleMatch>>,
-    engine_cold_record_cache: HashMap<publication::ColdRecordKey, publication::ColdRecord>,
-    engine_cold_record_donors: HashMap<publication::ColdRecordDonorKey, Vec<publication::ColdRecordDonor>>,
+    engine_cold_record_cache: crate::fork::ForkShared<HashMap<publication::ColdRecordKey, publication::ColdRecord>>,
+    engine_cold_record_donors:
+        crate::fork::ForkShared<HashMap<publication::ColdRecordDonorKey, Vec<publication::ColdRecordDonor>>>,
     computed_group_set_memory: MemoryLease,
     custom_property_environment_memory: MemoryLease,
     computed_fixed_metadata_memory: MemoryLease,
@@ -943,9 +964,9 @@ pub struct RetainedState {
     /// which is what a script reading style gets - opens no traversal, and an identity that only
     /// exists inside one answers the pages that need it least. An id is never reused for a
     /// different answer, so a consumer holding one across a flush is never told the wrong thing.
-    match_answers: MatchAnswerCatalog,
+    match_answers: crate::fork::ForkShared<MatchAnswerCatalog>,
     selector_truth_sets: SelectorTruthSetCatalog,
-    retained_match_answers: RetainedMatchAnswers,
+    retained_match_answers: crate::fork::ForkShared<RetainedMatchAnswers>,
     retained_selector_incidences: RetainedSelectorIncidences,
     /// Whether the current transaction changes activation without changing selector inputs.
     selector_incidence_is_current: bool,
@@ -960,7 +981,10 @@ pub struct RetainedState {
     /// invalidates naturally; cleared per transaction so the map cannot grow across flushes. A
     /// `None` entry records that the posting's coverage was incomplete, which is a `false`
     /// verdict for every asker.
-    route_pruning_states: Mutex<RoutePruningStateCache>,
+    route_pruning_states: crate::fork::ForkReset<Mutex<RoutePruningStateCache>>,
+    /// The places of the children of parents with many of them, which sibling-counting functions
+    /// read, kept while the tree's DOM order stands.
+    sibling_positions: crate::fork::ForkReset<Mutex<publication::SiblingPositionCache>>,
     /// Once Tier-3 pressure closes retained-answer admission, the rest of the completion batch
     /// stops asking for exact answers: an exact answer costs more to evaluate, and paying that
     /// premium for an answer the controller cannot retain buys nothing on any later flush.
@@ -979,10 +1003,12 @@ pub struct RetainedState {
     /// consumes. This is required Tier-4 scratch, not a persistent inverse match relation.
     published_match_answers: PublishedMatchAnswers,
     transaction_fact_view: Option<TransactionFactView>,
-    facts: ElementFactStore,
+    facts: crate::fork::ForkShared<ElementFactStore>,
     programs: SelectorPrograms,
     /// The attribute names whose value text a selector reads, which the host holds a copy of between jobs.
-    attribute_value_text_names: SelectorValueTextNames,
+    attribute_value_text_names: SelectorAttributeNames,
+    /// The attribute names a selector tests in any way, which the host holds a copy of between jobs.
+    tested_attribute_names: SelectorAttributeNames,
     attribute_value_text_requirements_version: u64,
     selector_programs_need_sweep: bool,
     routing: Arc<RoutingRegistry>,
@@ -1004,7 +1030,7 @@ pub struct RetainedState {
     scope_roots: Column<Option<StyleNodeID>>,
     /// The inverse of `scope_roots`. Departing ordinary elements vastly outnumber departing scope
     /// roots, so retirement must ask this index instead of scanning every historical tree scope.
-    scope_by_root: SegmentedNodeColumn<TreeScopeID>,
+    scope_by_root: crate::fork::ForkShared<SegmentedNodeColumn<TreeScopeID>>,
     /// The immutable selector dispatch of each distinct effective sheet set and encapsulation
     /// depth. Concrete scopes retain only its dense identity.
     scope_programs: intern_table::InternTable<ScopeProgramID, Option<ScopeProgram>>,
@@ -1018,7 +1044,8 @@ pub struct RetainedState {
     scope_cascade_templates: HashMap<ScopeCascadeShape, Arc<RuleDispatch>>,
     /// One ancestor table for each key layout. Selector program growth often leaves this layout
     /// unchanged. Keep only the table so sharing it cannot retain an obsolete selector dispatch.
-    ancestor_dispatch_templates: HashMap<AncestorDispatchShape, Arc<index::AncestorDispatchTopology>>,
+    ancestor_dispatch_templates:
+        crate::fork::ForkShared<HashMap<AncestorDispatchShape, Arc<index::AncestorDispatchTopology>>>,
     /// The shared program each concrete tree scope resolved to. Program changes clear the table,
     /// while a depth change replaces only this scope's identity. It uses the same direct tree-scope
     /// index as the root column.
@@ -1029,7 +1056,7 @@ pub struct RetainedState {
     /// An attribute in a namespace is published under this as well as under its local name, and a
     /// selector that names the namespace tests it. The owner retains one document reference to each
     /// global identity and releases it when this engine is destroyed.
-    atoms: DocumentAtoms,
+    atoms: crate::fork::ForkShared<DocumentAtoms>,
     /// The HTML namespace when this is an HTML document, and none otherwise. Some attribute names
     /// compare their values ASCII case-insensitively on an HTML element in an HTML document.
     html_element_namespace: StyleAtomID,
@@ -1043,6 +1070,7 @@ pub struct RetainedState {
 
 /// Host-facing engine state: C++ ownership and journal intake.
 /// Never reachable from an evaluation step.
+#[derive(Clone)]
 pub struct HostState {
     /// The style pass the host is installing wave by wave, between two of its waves.
     suspended_style_pass: Option<flush::StylePass>,
@@ -1062,8 +1090,6 @@ pub struct HostState {
     /// Whether the deferred element style inputs are owed to the next transaction, as opposed to
     /// held back by a flush without a document root.
     deferred_element_style_inputs_are_pending: bool,
-    /// What the last custom-property environment move answered the host, kept until the next one.
-    environment_move_actions: Vec<bridge::FfiEnvironmentMoveAction>,
     deferred_element_style_input_memory: MemoryLease,
     /// Whether any tree input batch has crossed into the engine. A first batch consisting entirely
     /// of unique arrivals can install its final relation rows as one bulk load.
@@ -1090,12 +1116,13 @@ pub struct HostState {
 }
 
 /// Mutable engine state; operations borrow their instrumentation from the boundary.
-pub struct StyleEngineState {
+#[derive(Clone)]
+pub struct StyleEngine {
     pub(super) retained: RetainedState,
     pub(super) host: HostState,
 }
 
-impl std::ops::Deref for StyleEngineState {
+impl std::ops::Deref for StyleEngine {
     type Target = RetainedState;
 
     fn deref(&self) -> &Self::Target {
@@ -1103,7 +1130,7 @@ impl std::ops::Deref for StyleEngineState {
     }
 }
 
-impl std::ops::DerefMut for StyleEngineState {
+impl std::ops::DerefMut for StyleEngine {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.retained
     }

@@ -55,16 +55,6 @@ impl BoxDirtyBits {
         self.0 == VisualContextBoxDirtyKind::StyleValueChange.bit()
     }
 
-    /// Whether only the box's geometry changed, with its row, its place in the layout tree and its style as they were.
-    pub fn is_geometry_only(&self) -> bool {
-        use VisualContextBoxDirtyKind as Kind;
-        const GEOMETRY: u16 = Kind::RecommittedInPlace.bit()
-            | Kind::MovedWithDescendants.bit()
-            | Kind::ContainingBlockChanged.bit()
-            | Kind::InlineGeometryChanged.bit();
-        self.0 & !GEOMETRY == 0
-    }
-
     /// Whether the box only moved, with its style and content as they were.
     pub fn is_move_only(&self) -> bool {
         self.0 == VisualContextBoxDirtyKind::MovedWithDescendants.bit()
@@ -78,7 +68,7 @@ pub struct RemovedBoxBlocks {
     pub former_paint_parent: NodeSlotId,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct VisualContextDirtySet {
     pub boxes: HashMap<NodeSlotId, BoxDirtyBits>,
     pub removed: Vec<RemovedBoxBlocks>,
@@ -113,10 +103,12 @@ impl VisualContextDirtySet {
         self.boxes.clear();
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.boxes.is_empty() && self.removed.is_empty() && self.scope == VisualContextUpdateScope::DirtyPath
     }
 
+    #[cfg(test)]
     pub fn is_value_only(&self) -> bool {
         self.scope == VisualContextUpdateScope::DirtyPath
             && self.removed.is_empty()

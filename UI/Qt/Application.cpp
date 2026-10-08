@@ -6,10 +6,12 @@
 
 #include <LibCore/ArgsParser.h>
 #include <LibURL/InternalURLs.h>
+#include <LibURL/URL.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
 #include <UI/Qt/Application.h>
+#include <UI/Qt/BookmarkDialog.h>
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/EventLoopImplementationQt.h>
@@ -26,24 +28,22 @@
 
 #include <QAction>
 #include <QClipboard>
-#include <QComboBox>
 #include <QDesktopServices>
-#include <QDialog>
-#include <QDialogButtonBox>
+#include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileOpenEvent>
 #include <QFont>
-#include <QFormLayout>
 #include <QKeySequence>
-#include <QLineEdit>
+#include <QLoggingCategory>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
 #include <QMimeDatabase>
 #include <QPointer>
+#include <QSaveFile>
 #include <QShortcut>
-#include <QSizePolicy>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -57,6 +57,114 @@ template<>
 constexpr bool AllocatedWithSystemAllocator<QWidget> = true;
 
 namespace Ladybird {
+
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+// Orca 49.7 removed support for the ~/.local/share/orca/orca-scripts/ directory as a means to directly load custom
+// user/app-supplied scripts. We still deliver our custom script there — but to make it work, we plumb into the means
+// Orca now uses for loading customer user-supplied scripts: Orca's orca-customizations.py file. So, in that file, we
+// mark/delimit the block we own — to ensure we don't change any content outside that (the user's own manual additions).
+static constexpr QByteArrayView ORCA_CUSTOMIZATIONS_BEGIN_MARKER = "# --- Ladybird-bootstrap-begin ---";
+static constexpr QByteArrayView ORCA_CUSTOMIZATIONS_END_MARKER = "# --- Ladybird-bootstrap-end ---";
+
+static void install_orca_customizations_bootstrap(QString const& orca_dir)
+{
+    QFile bootstrap_resource(QStringLiteral(":/OrcaScripts/orca_customizations_bootstrap.py"));
+    if (!bootstrap_resource.open(QIODevice::ReadOnly))
+        return;
+
+    QByteArray managed_region;
+    managed_region.append(ORCA_CUSTOMIZATIONS_BEGIN_MARKER);
+    managed_region.append('\n');
+    managed_region.append(bootstrap_resource.readAll());
+    if (!managed_region.endsWith('\n'))
+        managed_region.append('\n');
+    managed_region.append(ORCA_CUSTOMIZATIONS_END_MARKER);
+    managed_region.append('\n');
+
+    auto customizations_path = orca_dir + QStringLiteral("/orca-customizations.py");
+
+    QByteArray existing_content;
+    if (QFile::exists(customizations_path)) {
+        QFile existing(customizations_path);
+        if (existing.open(QIODevice::ReadOnly))
+            existing_content = existing.readAll();
+    }
+
+    auto begin_idx = existing_content.indexOf(ORCA_CUSTOMIZATIONS_BEGIN_MARKER);
+    auto end_idx = existing_content.indexOf(ORCA_CUSTOMIZATIONS_END_MARKER);
+
+    QByteArray new_content;
+    if (begin_idx < 0 || end_idx < 0 || end_idx < begin_idx) {
+        new_content = existing_content;
+        if (!new_content.isEmpty() && !new_content.endsWith('\n'))
+            new_content.append('\n');
+        new_content.append(managed_region);
+    } else {
+        auto end_of_end_line = existing_content.indexOf('\n', end_idx);
+        if (end_of_end_line < 0)
+            end_of_end_line = existing_content.size();
+        else
+            ++end_of_end_line;
+        new_content = existing_content.left(begin_idx)
+            + managed_region
+            + existing_content.mid(end_of_end_line);
+    }
+
+    if (new_content == existing_content)
+        return;
+
+    // Write atomically: the file holds the user's own customizations outside the managed region (preserved in
+    // new_content), and QFile::open(WriteOnly) truncates it at open() — so a crash or short write before write()
+    // completes would destroy them. QSaveFile writes to a temporary and renames only on commit().
+    QSaveFile out(customizations_path);
+    if (out.open(QIODevice::WriteOnly)) {
+        out.write(new_content);
+        out.commit();
+    }
+}
+
+static void install_orca_scripts()
+{
+    static constexpr auto scripts = Array {
+        "__init__.py"sv,
+        "script.py"sv,
+        "script_utilities.py"sv,
+    };
+
+    auto orca_dir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+        + QStringLiteral("/orca");
+    auto dest_dir = QDir(orca_dir + QStringLiteral("/orca-scripts/Ladybird"));
+
+    if (!dest_dir.exists())
+        dest_dir.mkpath(QStringLiteral("."));
+
+    for (auto script_name : scripts) {
+        auto resource_path = QStringLiteral(":/OrcaScripts/Ladybird/%1")
+                                 .arg(QString::fromUtf8(script_name.characters_without_null_termination(), script_name.length()));
+        auto dest_path = dest_dir.filePath(
+            QString::fromUtf8(script_name.characters_without_null_termination(), script_name.length()));
+
+        QFile resource(resource_path);
+        if (!resource.open(QIODevice::ReadOnly))
+            continue;
+
+        auto resource_data = resource.readAll();
+
+        QFile existing(dest_path);
+        if (existing.exists() && existing.open(QIODevice::ReadOnly)) {
+            if (existing.readAll() == resource_data)
+                continue;
+            existing.close();
+        }
+
+        QFile out(dest_path);
+        if (out.open(QIODevice::WriteOnly))
+            out.write(resource_data);
+    }
+
+    install_orca_customizations_bootstrap(orca_dir);
+}
+#endif
 
 #if defined(AK_OS_WINDOWS)
 class NativeWindowsTimeChangeEventFilter : public QAbstractNativeEventFilter {
@@ -109,6 +217,13 @@ public:
         install_appkit_event_capture();
 #endif
         update_chrome_style();
+
+        // Suppress some warnings that end up flooding the console when Orca is in use. QSpiAccessibleBridge logs both
+        // (1) one-time at startup, a couple warnings for some AT-SPI2 methods it doesn't implement, and (2) for *every*
+        // single Orca navigation action a user makes *every* time, warns about upstream Qt gaps in scroll-related stuff
+        // we can't fix from here. So, this silences all those warnings. But if/when you *do* actually want to see the
+        // messages — to debug Qt's bridge behavior, or whatever — you can override this with QT_LOGGING_RULES.
+        QLoggingCategory::setFilterRules(QStringLiteral("qt.accessibility.atspi=false"));
     }
 
     virtual bool event(QEvent* event) override
@@ -430,9 +545,24 @@ Core::EventLoop& Application::create_platform_event_loop()
 {
     if (!browser_options().headless_mode.has_value()) {
         Core::EventLoopManager::install(*new EventLoopManagerQt);
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+        // Prevent any competing AT-SPI2 bridge from attaching to our process. On GNOME/Fedora, Qt loads the libqgtk3
+        // platform-theme plugin by default — which pulls in libgtk-3 via DT_NEEDED. Once libgtk-3 is loaded, its init
+        // calls atk_bridge_adaptor_init(). And that registers an ATK app on the shared AT-SPI2 bus under *our* D-Bus
+        // name, hijacking it from QSpiAccessibleBridge. AT clients then see a GTK app with zero accessible children
+        // (because ATK has no widgets to expose in a Qt app) — and our entire accessibility tree is unreachable.
+        //
+        // So, we set NO_AT_BRIDGE=1 here — before libgtk-3 is loaded – to tell GTK's init code to skip the atk-bridge
+        // registration. The library is still linked, but the hijack doesn't happen; AT-SPI2 queries reach Qt's bridge
+        // (and therefore our WebContentViewAccessible) normally. Firefox's toolkit/xre/nsAppRunner.cpp does the same.
+        qputenv("NO_AT_BRIDGE", "1");
+#endif
         m_application = make<LadybirdQApplication>(arguments());
 #if defined(AK_OS_LINUX)
         QGuiApplication::setDesktopFileName(QStringLiteral("org.ladybird.Ladybird"));
+#endif
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+        install_orca_scripts();
 #endif
     }
 
@@ -649,6 +779,24 @@ void Application::reopen_recently_closed_tab()
         window->activate_tab(*tab_index_to_activate);
 
     update_reopen_recently_closed_actions();
+}
+
+void Application::display_crash_report_notification(ByteString const& report_name)
+{
+    m_crash_report_notifier.offer(report_name);
+}
+
+void Application::review_crash_report(ByteString const& report_name)
+{
+    if (!m_active_window)
+        return;
+
+    // The tab is blank, so no web content runs behind the review, and it closes once the review is left.
+    auto* current_tab = m_active_window->current_tab();
+    auto& tab = m_active_window->new_tab_from_url(URL::about_blank(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
+    if (current_tab)
+        tab.set_tab_to_activate_on_close(*current_tab);
+    tab.view().review_hidden_crash_report(report_name);
 }
 
 void Application::open_file()
@@ -1026,11 +1174,11 @@ void Application::update_reopen_recently_closed_actions() const
         static_cast<LadybirdQApplication*>(m_application.ptr())->update_reopen_recently_closed_action();
 }
 
-void Application::show_bookmark_context_menu(Gfx::IntPoint content_position, Optional<WebView::BookmarkItem const&> item, Optional<String const&> target_folder_id)
+void Application::show_bookmark_context_menu(Gfx::IntPoint content_position, Optional<WebView::BookmarkItem const&> item, Optional<String const&> target_folder_id, Optional<String const&> parent_folder_id)
 {
     if (auto* active_tab = this->active_tab()) {
         auto position = active_tab->view().mapToGlobal(QPoint { content_position.x(), content_position.y() });
-        active_tab->bookmarks_bar().show_context_menu(position, item, target_folder_id);
+        active_tab->bookmarks_bar().show_context_menu(position, item, target_folder_id, parent_folder_id);
     }
 }
 
@@ -1042,118 +1190,61 @@ Optional<Application::BookmarkID> Application::bookmark_item_id_for_context_menu
         return Application::BookmarkID {
             .id = bookmarks_bar.selected_bookmark_menu_item_id(),
             .target_folder_id = bookmarks_bar.selected_bookmark_menu_target_folder_id(),
+            .parent_folder_id = bookmarks_bar.selected_bookmark_menu_parent_folder_id(),
         };
     }
 
     return {};
 }
 
-static void add_bookmark_folder_options(QComboBox& folder_combo, ReadonlySpan<WebView::BookmarkItem> items, QString const& prefix, Optional<String const&> selected_folder_id)
-{
-    for (auto const& item : items) {
-        if (!item.is_folder())
-            continue;
-
-        auto title = qstring_from_ak_string(item.folder().title.value_or("(no title)"_string));
-        auto path = prefix.isEmpty() ? title : QString("%1 / %2").arg(prefix, title);
-        folder_combo.addItem(path, qstring_from_ak_string(item.id));
-        if (selected_folder_id.has_value() && item.id == *selected_folder_id)
-            folder_combo.setCurrentIndex(folder_combo.count() - 1);
-
-        add_bookmark_folder_options(folder_combo, item.folder().children, path, selected_folder_id);
-    }
-}
-
-template<typename PromiseType, typename ResolveCallback>
-static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_dialog(
+static NonnullRefPtr<WebView::Application::BookmarkPromise> display_add_or_edit_bookmark_dialog(
     QWidget* parent,
-    QString const& dialog_title,
+    BookmarkDialog::Type dialog_type,
     Optional<URL::URL const&> current_url,
     Optional<String const&> current_title,
     Optional<String> current_favicon_hash,
-    ResolveCallback resolve_bookmark,
-    bool show_folder_picker,
     Optional<String const&> selected_folder_id = {})
 {
-    auto promise = PromiseType::construct();
+    auto const& folders = WebView::Application::bookmark_store().root_items();
 
-    auto* dialog = new QDialog(parent);
-    dialog->resize(500, dialog->height());
-    dialog->setWindowTitle(dialog_title);
-    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    auto* dialog = new BookmarkDialog(parent, dialog_type, current_url, current_title, selected_folder_id, folders);
+    auto promise = WebView::Application::BookmarkPromise::construct();
 
-    auto* url_edit = new QLineEdit(dialog);
-    auto* title_edit = new QLineEdit(dialog);
-    url_edit->setMinimumWidth(320);
-    url_edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    title_edit->setMinimumWidth(320);
-    title_edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    QComboBox* folder_combo = nullptr;
-
-    if (current_url.has_value())
-        url_edit->setText(qstring_from_ak_string(current_url->serialize()));
-    if (current_title.has_value())
-        title_edit->setText(qstring_from_ak_string(*current_title));
-
-    if (show_folder_picker) {
-        folder_combo = new QComboBox(dialog);
-        folder_combo->setMinimumWidth(320);
-        folder_combo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        folder_combo->addItem("Bookmarks", QString {});
-        add_bookmark_folder_options(*folder_combo, WebView::Application::bookmark_store().root_items(), {}, selected_folder_id);
-    }
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dialog);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, dialog, &QDialog::accept);
-    QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
-
-    auto* layout = new QFormLayout(dialog);
-    layout->setContentsMargins(32, 28, 32, 28);
-    layout->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
-    layout->setHorizontalSpacing(16);
-    layout->setVerticalSpacing(14);
-    layout->addRow("URL:", url_edit);
-    layout->addRow("Title:", title_edit);
-    if (folder_combo)
-        layout->addRow("Folder:", folder_combo);
-    layout->addRow(buttons);
-
-    QObject::connect(dialog, &QDialog::finished, [promise, current_favicon_hash = move(current_favicon_hash), resolve_bookmark = move(resolve_bookmark), url_edit = QPointer { url_edit }, title_edit = QPointer { title_edit }, folder_combo = QPointer { folder_combo }](auto result) mutable {
-        if (result != QDialog::Accepted || !url_edit || !title_edit) {
+    QObject::connect(dialog, &QDialog::finished, [promise, current_favicon_hash = move(current_favicon_hash), dialog = QPointer { dialog }](auto result) mutable {
+        if (result != QDialog::Accepted || !dialog) {
             promise->reject(Error::from_errno(ECANCELED));
             return;
         }
 
-        auto url = WebView::sanitize_url(ak_string_from_qstring(url_edit->text()));
+        auto url = WebView::sanitize_url(ak_string_from_qstring(dialog->url()));
         if (!url.has_value()) {
             promise->reject(Error::from_errno(EINVAL));
             return;
         }
 
         Optional<String> title;
-        if (auto title_text = ak_string_from_qstring(title_edit->text()); !title_text.is_empty())
+        if (auto title_text = ak_string_from_qstring(dialog->title()); !title_text.is_empty())
             title = move(title_text);
 
         Optional<String> target_folder_id;
-        if (folder_combo) {
-            auto target_folder_id_text = ak_string_from_qstring(folder_combo->currentData().toString());
-            if (!target_folder_id_text.is_empty())
-                target_folder_id = move(target_folder_id_text);
-        }
+        if (auto target_folder_id_text = ak_string_from_qstring(dialog->selected_folder_id()); !target_folder_id_text.is_empty())
+            target_folder_id = move(target_folder_id_text);
 
-        WebView::BookmarkItem::Bookmark bookmark {
-            .url = url.release_value(),
-            .title = move(title),
-            .favicon_hash = move(current_favicon_hash),
-        };
-        resolve_bookmark(*promise, move(bookmark), move(target_folder_id));
+        promise->resolve(WebView::Application::BookmarkDialogResult {
+            .data = WebView::BookmarkItem::Bookmark {
+                .url = url.release_value(),
+                .title = move(title),
+                .favicon_hash = move(current_favicon_hash),
+            },
+            .target_folder_id = move(target_folder_id),
+        });
     });
 
     dialog->open();
     return promise;
 }
 
-NonnullRefPtr<Application::AddBookmarkPromise> Application::display_add_bookmark_dialog(Optional<String const&> target_folder_id) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_dialog(Optional<String const&> target_folder_id) const
 {
     Optional<URL::URL> current_url;
     Optional<String> current_title;
@@ -1165,71 +1256,44 @@ NonnullRefPtr<Application::AddBookmarkPromise> Application::display_add_bookmark
         current_favicon_hash = view->favicon_hash();
     }
 
-    return display_add_or_edit_bookmark_dialog<AddBookmarkPromise>(
-        active_tab(), "Add Bookmark", current_url, current_title, current_favicon_hash,
-        [](AddBookmarkPromise& promise, WebView::BookmarkItem::Bookmark bookmark, Optional<String> target_folder_id) {
-            promise.resolve(AddBookmarkDialogResult {
-                .bookmark = move(bookmark),
-                .target_folder_id = move(target_folder_id),
-            });
-        },
-        true, target_folder_id);
+    return display_add_or_edit_bookmark_dialog(active_tab(), BookmarkDialog::Type::AddBookmark, current_url, current_title, current_favicon_hash, target_folder_id);
 }
 
-NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_dialog(WebView::BookmarkItem::Bookmark const& current_bookmark) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_dialog(WebView::BookmarkItem const& current_bookmark, Optional<String const&> parent_folder_id) const
 {
-    return display_add_or_edit_bookmark_dialog<BookmarkPromise>(
-        active_tab(), "Edit Bookmark", current_bookmark.url, current_bookmark.title, current_bookmark.favicon_hash,
-        [](BookmarkPromise& promise, WebView::BookmarkItem::Bookmark bookmark, Optional<String>) {
-            promise.resolve(move(bookmark));
-        },
-        false);
+    return display_add_or_edit_bookmark_dialog(active_tab(), BookmarkDialog::Type::EditBookmark, current_bookmark.bookmark().url, current_bookmark.bookmark().title, current_bookmark.bookmark().favicon_hash, parent_folder_id);
 }
 
-template<typename PromiseType>
-static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_folder_dialog(
+static NonnullRefPtr<WebView::Application::BookmarkPromise> display_add_or_edit_bookmark_folder_dialog(
     QWidget* parent,
-    QString const& dialog_title,
-    Optional<String const&> current_title)
+    BookmarkDialog::Type dialog_type,
+    Optional<String const&> current_title,
+    Optional<String const&> selected_folder_id,
+    Optional<String const&> excluded_folder_id = {})
 {
-    auto promise = PromiseType::construct();
+    auto* dialog = new BookmarkDialog(parent, dialog_type, {}, current_title, selected_folder_id, WebView::Application::bookmark_store().root_items(), excluded_folder_id);
+    auto promise = WebView::Application::BookmarkPromise::construct();
 
-    auto* dialog = new QDialog(parent);
-    dialog->resize(400, dialog->height());
-    dialog->setWindowTitle(dialog_title);
-    dialog->setAttribute(Qt::WA_DeleteOnClose);
-
-    auto* title_edit = new QLineEdit(dialog);
-    title_edit->setMinimumWidth(320);
-    title_edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    if (current_title.has_value())
-        title_edit->setText(qstring_from_ak_string(*current_title));
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dialog);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, dialog, &QDialog::accept);
-    QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
-
-    auto* layout = new QFormLayout(dialog);
-    layout->setContentsMargins(32, 28, 32, 28);
-    layout->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
-    layout->setHorizontalSpacing(16);
-    layout->setVerticalSpacing(14);
-    layout->addRow("Title:", title_edit);
-    layout->addRow(buttons);
-
-    QObject::connect(dialog, &QDialog::finished, [promise, title_edit = QPointer { title_edit }](auto result) {
-        if (result != QDialog::Accepted || !title_edit) {
+    QObject::connect(dialog, &QDialog::finished, [promise, dialog = QPointer { dialog }](auto result) {
+        if (result != QDialog::Accepted || !dialog) {
             promise->reject(Error::from_errno(ECANCELED));
             return;
         }
 
         Optional<String> title;
-        if (auto title_text = ak_string_from_qstring(title_edit->text()); !title_text.is_empty())
+        if (auto title_text = ak_string_from_qstring(dialog->title()); !title_text.is_empty())
             title = move(title_text);
 
-        promise->resolve(WebView::BookmarkItem::Folder {
-            .title = move(title),
-            .children = {},
+        Optional<String> target_folder_id;
+        if (auto target_folder_id_text = ak_string_from_qstring(dialog->selected_folder_id()); !target_folder_id_text.is_empty())
+            target_folder_id = move(target_folder_id_text);
+
+        promise->resolve(WebView::Application::BookmarkDialogResult {
+            .data = WebView::BookmarkItem::Folder {
+                .title = move(title),
+                .children = {},
+            },
+            .target_folder_id = move(target_folder_id),
         });
     });
 
@@ -1237,14 +1301,14 @@ static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_folder_dialog(
     return promise;
 }
 
-NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_add_bookmark_folder_dialog(Optional<String const&> default_title) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_folder_dialog(Optional<String const&> default_title, Optional<String const&> target_folder_id) const
 {
-    return display_add_or_edit_bookmark_folder_dialog<BookmarkFolderPromise>(active_tab(), "Add Folder", default_title);
+    return display_add_or_edit_bookmark_folder_dialog(active_tab(), BookmarkDialog::Type::AddFolder, default_title, target_folder_id);
 }
 
-NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_edit_bookmark_folder_dialog(WebView::BookmarkItem::Folder const& current_folder) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_folder_dialog(WebView::BookmarkItem const& current_folder, Optional<String const&> parent_folder_id) const
 {
-    return display_add_or_edit_bookmark_folder_dialog<BookmarkFolderPromise>(active_tab(), "Edit Folder", current_folder.title);
+    return display_add_or_edit_bookmark_folder_dialog(active_tab(), BookmarkDialog::Type::EditFolder, current_folder.folder().title, parent_folder_id, current_folder.id);
 }
 
 void Application::on_devtools_enabled() const

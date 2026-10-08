@@ -10,53 +10,16 @@
 #include <LibGC/Heap.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/Environment.h>
+#include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
+// The ordinary global object of a realm whose host does not create one, and the runtime's own global objects, which
+// extend it. A host's global object is a host object of a class with JS_HOST_CLASS_IS_GLOBAL_OBJECT instead.
 class JS_API GlobalObject : public Object {
-    JS_OBJECT(GlobalObject, Object);
-    GC_DECLARE_ALLOCATOR(GlobalObject);
-
-    friend class Intrinsics;
-
 public:
-    virtual ~GlobalObject() override;
-
-protected:
-    explicit GlobalObject(Realm&);
-
-private:
-    virtual bool is_global_object() const final { return true; }
-
-    JS_DECLARE_NATIVE_FUNCTION(is_nan);
-    JS_DECLARE_NATIVE_FUNCTION(is_finite);
-    JS_DECLARE_NATIVE_FUNCTION(parse_float);
-    JS_DECLARE_NATIVE_FUNCTION(parse_int);
-    JS_DECLARE_NATIVE_FUNCTION(eval);
-    JS_DECLARE_NATIVE_FUNCTION(encode_uri);
-    JS_DECLARE_NATIVE_FUNCTION(decode_uri);
-    JS_DECLARE_NATIVE_FUNCTION(encode_uri_component);
-    JS_DECLARE_NATIVE_FUNCTION(decode_uri_component);
-    JS_DECLARE_NATIVE_FUNCTION(escape);
-    JS_DECLARE_NATIVE_FUNCTION(unescape);
+    static bool is_engine_class_of(Object const& object) { return object.is_of_engine_class_or_subclass(JS_LAYOUT_CLASS_ID_GLOBAL_OBJECT); }
 };
-
-JS_API void set_default_global_bindings(Realm&);
-
-template<>
-inline bool Object::fast_is<GlobalObject>() const { return is_global_object(); }
-
-template<typename... Args>
-[[nodiscard]] ALWAYS_INLINE ThrowCompletionOr<Value> Value::invoke(VM& vm, PropertyKey const& property_key, Args... args)
-{
-    if constexpr (sizeof...(Args) > 0) {
-        GC::RootVector<Value> arglist;
-        (..., arglist.append(move(args)));
-        return invoke_internal(vm, property_key, move(arglist));
-    }
-
-    return invoke_internal(vm, property_key, Optional<GC::RootVector<Value>> {});
-}
 
 }

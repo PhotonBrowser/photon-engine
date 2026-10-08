@@ -9,11 +9,12 @@
 #include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibGfx/CanvasCommandList.h>
-#include <LibGfx/PaintingSurface.h>
 #include <LibMedia/VideoFrame.h>
 #include <LibWeb/Compositor/CompositorConnection.h>
 #include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Compositor/NavigablePresenter.h>
+#include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/HTML/Canvas/RemoteCanvas2DTransport.h>
 #include <LibWeb/WebGL/RemoteWebGLTransport.h>
 
@@ -40,30 +41,10 @@ void CompositorContextHandle::stop_presenting_to_client()
     m_host.stop_presenting_to_client(m_context_id);
 }
 
-void CompositorContextHandle::submit_frame(PresentationTurn turn, CompositorFrame&& frame)
-{
-    frame.context_id = m_context_id;
-    // Pending canvas commands (and present markers) must reach the Compositor
-    // before a display list that samples the presented canvas surfaces.
-    if (frame.display_list_update.has_value() || frame.present_viewport_rect.has_value())
-        m_host.flush_canvas_2d_stream();
-    m_host.submit_frame(turn, move(frame));
-}
-
-RefPtr<CompositorFrameSink> CompositorContextHandle::frame_sink()
+bool CompositorContextHandle::ready_for_frame()
 {
     m_host.flush_canvas_2d_stream();
-    return m_host.frame_sink();
-}
-
-void CompositorContextHandle::add_video_sink(Media::VideoSinkHandle video_sink_handle)
-{
-    m_host.add_video_sink(video_sink_handle);
-}
-
-void CompositorContextHandle::remove_video_sink(Media::VideoSinkHandle video_sink_handle)
-{
-    m_host.remove_video_sink(video_sink_handle);
+    return m_host.compositor_connection();
 }
 
 void CompositorContextHandle::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
@@ -117,10 +98,10 @@ void CompositorContextHandle::hurry_rendering_opportunity()
     m_host.hurry_rendering_opportunity(m_context_id);
 }
 
-void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
+void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void()>&& callback)
 {
     m_host.flush_canvas_2d_stream();
-    m_host.request_screenshot(m_context_id, move(target_surface), move(callback));
+    m_host.request_screenshot(m_context_id, move(target_bitmap), move(callback));
 }
 
 CompositorHost::CompositorHost()
@@ -296,11 +277,11 @@ private:
         m_connection->update_canvas_2d_stream(*m_stream);
     }
 
-    virtual RefPtr<Gfx::Bitmap> read_back_pixels(Gfx::IntRect const& rect) override
+    virtual RefPtr<Gfx::Bitmap> read_back_pixels(Gfx::IntRect const& rect, Gfx::AlphaType alpha_type) override
     {
         if (!m_canvas_id.has_value())
             return nullptr;
-        auto shareable_bitmap = m_connection->get_canvas_pixels(*m_canvas_id, rect);
+        auto shareable_bitmap = m_connection->get_canvas_pixels(*m_canvas_id, rect, alpha_type);
         if (!shareable_bitmap.is_valid())
             return nullptr;
         return shareable_bitmap.bitmap();
@@ -357,10 +338,26 @@ void CompositorHost::send_canvas_2d_stream(Compositing::Canvas2DCommandStream& s
         connection->update_canvas_2d_stream(stream);
 }
 
+bool CompositorHost::rasterize_display_list(Compositing::DisplayListResource const& display_list, Compositing::DisplayListResourceStorage const& resource_storage, NonnullRefPtr<Gfx::Bitmap> target) const
+{
+    auto* connection = compositor_connection();
+    if (!connection)
+        return false;
+    auto resource_transaction = resource_storage.create_self_contained_transaction(*display_list.display_list, display_list.visual_context_tree);
+    if (resource_transaction.is_error()) {
+        dbgln("WebContent: Not rasterizing a display list: {}", resource_transaction.error());
+        return false;
+    }
+    return connection->rasterize_display_list(*display_list.display_list, display_list.visual_context_tree, resource_transaction.release_value(), move(target));
+}
+
 void CompositorHost::destroy_context(Web::CompositorContextId context_id)
 {
-    if (auto* connection = compositor_connection())
+    if (auto* connection = compositor_connection()) {
         connection->destroy_context(context_id);
+        // A connection attached the render clock, whose lanes of the context hear of it no more.
+        RenderClock::the().forget_context(context_id);
+    }
     context_was_destroyed(context_id);
 }
 
@@ -374,19 +371,6 @@ void CompositorHost::stop_presenting_to_client(Web::CompositorContextId context_
 {
     if (auto* connection = compositor_connection())
         connection->stop_presenting_to_client(context_id);
-}
-
-void CompositorHost::submit_frame(PresentationTurn, CompositorFrame&& frame)
-{
-    if (auto* connection = compositor_connection())
-        connection->submit_frame(move(frame));
-}
-
-RefPtr<CompositorFrameSink> CompositorHost::frame_sink()
-{
-    if (auto* connection = compositor_connection())
-        return connection->frame_sink();
-    return nullptr;
 }
 
 void CompositorHost::add_video_sink(Media::VideoSinkHandle video_sink_handle)
@@ -466,10 +450,10 @@ void CompositorHost::hurry_rendering_opportunity(Web::CompositorContextId contex
         connection->hurry_rendering_opportunity(context_id);
 }
 
-void CompositorHost::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
+void CompositorHost::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void()>&& callback)
 {
     if (auto* connection = compositor_connection()) {
-        connection->request_screenshot(context_id, move(target_surface), move(callback));
+        connection->request_screenshot(context_id, move(target_bitmap), move(callback));
         return;
     }
     if (callback)

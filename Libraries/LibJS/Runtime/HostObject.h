@@ -15,66 +15,21 @@ namespace JS {
 
 // An object whose internal methods come from a JSHostClass of kind JS_HOST_CLASS_OBJECT. It carries two cells for the
 // embedder: the implementation object it wraps, at the fixed offset that direct getter functions read, and a companion
-// cell with any other per-object state.
+// cell with any other per-object state. LibJS/HostObjectABI.h fixes where the object keeps its class and both cells.
 class JS_API HostObject : public Object {
-    JS_OBJECT_WITH_CUSTOM_CLASS_NAME(HostObject, Object);
-
 public:
     static GC::Ref<HostObject> create(Realm&, JSHostClass const&, GC::Ptr<Object> prototype, GC::Ptr<GC::Cell> wrappable = {}, GC::Ptr<GC::Cell> host_data = {});
 
-    virtual ~HostObject() override = default;
+    JSHostClass const& host_class() const { return *engine_field<JSHostClass const*>(JS_HOST_OBJECT_HOST_CLASS_OFFSET); }
+    GC::Ptr<GC::Cell> wrappable() const { return engine_field<GC::Cell*>(JS_HOST_OBJECT_WRAPPABLE_OFFSET); }
+    GC::Ptr<GC::Cell> host_data() const { return engine_field<GC::Cell*>(JS_HOST_OBJECT_HOST_DATA_OFFSET); }
+    void set_host_data(GC::Ptr<GC::Cell> host_data);
 
-    JSHostClass const& host_class() const { return *m_host_class; }
-    GC::Ptr<GC::Cell> wrappable() const { return m_wrappable; }
-    GC::Ptr<GC::Cell> host_data() const { return m_host_data; }
-    void set_host_data(GC::Ptr<GC::Cell> host_data) { m_host_data = host_data; }
+    static constexpr size_t wrappable_offset() { return JS_HOST_OBJECT_WRAPPABLE_OFFSET; }
 
-    static constexpr size_t wrappable_offset() { return offsetof(HostObject, m_wrappable); }
-
-    virtual StringView class_name() const override;
-
-    virtual ThrowCompletionOr<Object*> internal_get_prototype_of() const override;
-    virtual ThrowCompletionOr<bool> internal_set_prototype_of(Object* prototype) override;
-    virtual ThrowCompletionOr<bool> internal_is_extensible() const override;
-    virtual ThrowCompletionOr<bool> internal_prevent_extensions() override;
-    virtual ThrowCompletionOr<Optional<PropertyDescriptor>> internal_get_own_property(PropertyKey const&) const override;
-    virtual ThrowCompletionOr<bool> internal_define_own_property(PropertyKey const&, PropertyDescriptor&, Optional<PropertyDescriptor>* precomputed_get_own_property = nullptr) override;
-    virtual ThrowCompletionOr<bool> internal_has_property(PropertyKey const&) const override;
-    virtual ThrowCompletionOr<Value> internal_get(PropertyKey const&, Value receiver, CacheableGetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty) const override;
-    virtual ThrowCompletionOr<bool> internal_set(PropertyKey const&, Value value, Value receiver, CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty) override;
-    virtual ThrowCompletionOr<bool> internal_delete(PropertyKey const&) override;
-    virtual ThrowCompletionOr<GC::RootVector<Value>> internal_own_property_keys() const override;
-
-    virtual bool is_cacheable_for_property_absence() const override;
-    virtual bool is_cacheable_for_inherited_property() const override;
-    virtual bool eligible_for_own_property_enumeration_fast_path() const override;
-
-    virtual ErrorData* error_data() override;
-    virtual ErrorData const* error_data() const override;
-
-protected:
-    HostObject(Realm&, JSHostClass const&, GC::Ptr<Object> prototype, GC::Ptr<GC::Cell> wrappable, GC::Ptr<GC::Cell> host_data);
-
-    virtual void visit_edges(Cell::Visitor&) override;
-    virtual void finalize() override;
-
-    virtual JSHostClass const* host_class_if_host_object() const override { return m_host_class; }
-
-private:
-    JSHostObjectHooks const& hooks() const;
-    JSObject* as_abi_object() const;
-
-    JSHostClass const* m_host_class { nullptr };
-    GC::Ptr<GC::Cell> m_wrappable;
-    GC::Ptr<GC::Cell> m_host_data;
+    // The class of every host object is derived from the runtime's host object class, whose id it keeps.
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_HOST_OBJECT; }
 };
-
-template<>
-inline bool Object::fast_is<HostObject>() const
-{
-    auto const* host_class = host_class_of(*this);
-    return host_class && host_class->kind == JS_HOST_CLASS_OBJECT;
-}
 
 // Whether the object's host class is the given one or derives from it through JSHostClass::parent.
 JS_API bool is_host_instance_of(Object const&, JSHostClass const&);

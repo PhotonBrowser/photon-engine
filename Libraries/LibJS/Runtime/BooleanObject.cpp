@@ -1,25 +1,26 @@
 /*
- * Copyright (c) 2020, Jack Karamanian <karamanian.jack@gmail.com>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/BooleanObject.h>
-#include <LibJS/Runtime/GlobalObject.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(BooleanObject);
+using namespace EmbeddingABI;
 
 GC::Ref<BooleanObject> BooleanObject::create(Realm& realm, bool value)
 {
-    return realm.create<BooleanObject>(value, realm.intrinsics().boolean_prototype());
+    return static_cast<BooleanObject&>(object_from_abi(js_primitive_wrapper_create_boolean(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), value)));
 }
 
-BooleanObject::BooleanObject(bool value, Object& prototype)
-    : Object(ConstructWithPrototypeTag::Tag, prototype)
-    , m_value(value)
+bool BooleanObject::boolean() const
 {
+    return js_primitive_wrapper_boolean(object_to_abi(*this));
 }
 
 }

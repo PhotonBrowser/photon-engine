@@ -15,7 +15,16 @@
 
 namespace Web::Fetch::Infrastructure {
 
-using TaskDestination = Variant<Empty, GC::Ref<JS::Object>, NonnullRefPtr<HTML::ParallelQueue>>;
+struct WEB_API TaskDestination : public Variant<Empty, GC::Ref<JS::Object>, NonnullRefPtr<HTML::ParallelQueue>> {
+    TaskDestination() = default;
+    TaskDestination(Empty);
+    TaskDestination(GC::Ref<JS::Object>);
+    TaskDestination(NonnullRefPtr<HTML::ParallelQueue>);
+
+    void visit_edges(GC::Cell::Visitor&) const;
+
+    GC::Ptr<DOM::Document> document_override;
+};
 
 HTML::TaskID queue_fetch_task(TaskDestination, GC::Ref<GC::Function<void()>>);
 WEB_API HTML::TaskID queue_fetch_task(GC::Ref<FetchController>, TaskDestination, GC::Ref<GC::Function<void()>>);

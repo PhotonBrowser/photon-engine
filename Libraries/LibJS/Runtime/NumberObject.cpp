@@ -1,25 +1,26 @@
 /*
- * Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/GlobalObject.h>
+#include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/NumberObject.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(NumberObject);
+using namespace EmbeddingABI;
 
 GC::Ref<NumberObject> NumberObject::create(Realm& realm, double value)
 {
-    return realm.create<NumberObject>(value, realm.intrinsics().number_prototype());
+    return static_cast<NumberObject&>(object_from_abi(js_primitive_wrapper_create_number(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), value)));
 }
 
-NumberObject::NumberObject(double value, Object& prototype)
-    : Object(ConstructWithPrototypeTag::Tag, prototype)
-    , m_value(value)
+double NumberObject::number() const
 {
+    return js_primitive_wrapper_number(object_to_abi(*this));
 }
 
 }

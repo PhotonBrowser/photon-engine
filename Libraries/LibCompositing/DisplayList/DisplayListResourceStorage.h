@@ -29,12 +29,6 @@
 #include <LibMedia/VideoFrame.h>
 #include <LibMedia/VideoSinkHandle.h>
 
-class SkImage;
-class SkTextBlob;
-
-template<typename T>
-class sk_sp;
-
 namespace Compositing {
 
 struct COMPOSITING_API DisplayListResourceSet {
@@ -64,11 +58,6 @@ struct DisplayListVideoSinkResource {
     Media::VideoSinkHandle sink_handle;
 };
 
-enum class TextRasterizationMode : u8 {
-    Normal,
-    Unhinted,
-};
-
 // The -webkit-font-smoothing values the recorder writes as a byte, in the order the CSS enum declares them.
 enum class FontSmoothing : u8 {
     Auto,
@@ -77,20 +66,7 @@ enum class FontSmoothing : u8 {
     SubpixelAntialiased,
 };
 
-struct DisplayListTextBlobCacheKey {
-    u64 font_id { 0 };
-    u32 scale_bits { 0 };
-    u8 font_smoothing { 0 };
-    u64 glyph_hash { 0 };
-    TextRasterizationMode rasterization_mode { TextRasterizationMode::Normal };
-
-    bool operator==(DisplayListTextBlobCacheKey const&) const = default;
-};
-
 struct DisplayListStoredImageFrameResource;
-struct DisplayListCachedRepeatedTileRaster;
-struct DisplayListCachedNestedRasterResource;
-struct DisplayListCachedTextBlobResource;
 struct DisplayListStoredVideoSinkResource;
 
 struct COMPOSITING_API DisplayListResource {
@@ -130,28 +106,30 @@ public:
     DisplayListResourceId add_display_list(DisplayListResource&&);
     bool has_display_list(DisplayListResourceId id) const { return m_display_lists.contains(id.value()); }
     void set_font(FontResourceId, NonnullRefPtr<Gfx::Font const>);
-    void set_image_frame(ImageFrameResourceId, Gfx::DecodedImageFrame);
-    void apply_transaction(DisplayListResourceTransaction&&);
+    // Returns the resources that the transaction removed or replaced, so whatever was made from them can be dropped.
+    DisplayListResourceSet apply_transaction(DisplayListResourceTransaction&&);
     DisplayListResourceTransaction create_transaction(DisplayListResourceSet const& previous, DisplayListResourceSet const& current) const;
     DisplayListResourceSet collect_referenced_resources(DisplayList const&) const;
     DisplayListResourceSet collect_referenced_resources(AccumulatedVisualContextTree const&) const;
-    void retain_only(DisplayListResourceSet const&);
+    // Carries everything the list and its tree refer to, for a receiver that holds none of it yet.
+    ErrorOr<DisplayListResourceTransaction> create_self_contained_transaction(DisplayList const&, AccumulatedVisualContextTree const&) const;
+    // Checks that the list, and each list nested in it, can replay against what this storage holds, and that no nested
+    // list reaches itself.
+    ErrorOr<void> validate_for_replay(DisplayList const&, AccumulatedVisualContextTree const&) const;
+    // Returns the resources that were removed.
+    DisplayListResourceSet retain_only(DisplayListResourceSet const&);
     bool has_resources_added_since_last_retain() const { return m_has_resources_added_since_last_retain; }
     void set_video_sink(VideoSinkResourceId, RefPtr<Media::VideoSink>);
 
     bool has_font(FontResourceId id) const { return m_fonts.contains(id.value()); }
+    bool has_image_frame(ImageFrameResourceId id) const { return m_image_frames.contains(id.value()); }
     Gfx::Font const& font(FontResourceId id) const { return *m_fonts.get(id.value()).value(); }
     Gfx::DecodedImageFrame const& image_frame(ImageFrameResourceId) const;
     // Whether force-dark should invert this image, worked out once and cached.
     bool image_frame_should_force_dark(ImageFrameResourceId) const;
-    sk_sp<SkImage> skia_image_for_image_frame(ImageFrameResourceId, RefPtr<Gfx::SkiaBackendContext> const&) const;
-    sk_sp<SkImage> skia_image_for_video_sink(VideoSinkResourceId, RefPtr<Gfx::SkiaBackendContext> const&) const;
-    sk_sp<SkImage> cached_repeated_tile_raster(u64 tile_key, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&) const;
-    void add_cached_repeated_tile_raster(u64 tile_key, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&, sk_sp<SkImage>) const;
-    sk_sp<SkImage> cached_nested_display_list_raster(DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect visible_rect_in_list_space, Gfx::IntRect& raster_rect_in_list_space) const;
-    void add_cached_nested_display_list_raster(DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_list_space, sk_sp<SkImage>) const;
-    bool should_cache_nested_display_list_raster(DisplayListResourceId) const;
-    sk_sp<SkTextBlob> text_blob(FontResourceId, float scale, ReadonlySpan<DisplayListGlyph>, u8 font_smoothing, TextRasterizationMode = TextRasterizationMode::Normal) const;
+    // Whether reusing a raster of the display list could show other pixels than a replay in place, worked out once
+    // and cached.
+    bool display_list_requires_direct_replay(DisplayListResourceId) const;
     RefPtr<Media::VideoSink const> video_sink(VideoSinkResourceId id) const;
     Optional<Media::VideoSinkHandle> video_sink_handle(VideoSinkResourceId id) const { return m_video_sink_handles.get(id.value()); }
     HashMap<u64, Media::VideoSinkHandle> const& video_sink_handles() const { return m_video_sink_handles; }
@@ -160,12 +138,12 @@ public:
     AccumulatedVisualContextTree const& display_list_visual_context_tree(DisplayListResourceId id) const { return display_list_resource(id).visual_context_tree; }
 
 private:
+    void set_image_frame(ImageFrameResourceId, Gfx::DecodedImageFrame);
     void collect_referenced_resources(ReadonlyBytes command_bytes, DisplayListResourceSet&) const;
     void collect_referenced_resources(DisplayList const&, DisplayListResourceSet&) const;
     void collect_referenced_resources(AccumulatedVisualContextTree const&, DisplayListResourceSet&) const;
     void add_referenced_display_list(DisplayListResourceId, DisplayListResourceSet&) const;
     bool nested_display_list_requires_direct_replay(DisplayListResourceId, HashTable<u64>& visited_display_lists) const;
-    void remove_text_blobs_without_font();
 
     bool m_has_resources_added_since_last_retain { false };
     HashMap<u64, NonnullRefPtr<Gfx::Font const>> m_fonts;
@@ -173,24 +151,7 @@ private:
     HashMap<u64, Media::VideoSinkHandle> m_video_sink_handles;
     HashMap<u64, NonnullOwnPtr<DisplayListStoredVideoSinkResource>> m_video_sinks;
     HashMap<u64, DisplayListResource> m_display_lists;
-    mutable HashMap<u64, NonnullOwnPtr<DisplayListCachedRepeatedTileRaster>> m_repeated_tile_rasters;
-    mutable size_t m_repeated_tile_raster_bytes { 0 };
-    mutable HashMap<u64, NonnullOwnPtr<DisplayListCachedNestedRasterResource>> m_display_list_cached_nested_rasters;
-    mutable HashMap<DisplayListTextBlobCacheKey, NonnullOwnPtr<DisplayListCachedTextBlobResource>> m_text_blobs;
-    mutable size_t m_text_blob_cache_bytes { 0 };
-    mutable MonotonicTime m_text_blob_cache_sweep_time { MonotonicTime::now() };
-};
-
-}
-
-namespace AK {
-
-template<>
-struct Traits<Compositing::DisplayListTextBlobCacheKey> : public DefaultTraits<Compositing::DisplayListTextBlobCacheKey> {
-    static unsigned hash(Compositing::DisplayListTextBlobCacheKey const& key)
-    {
-        return pair_int_hash(pair_int_hash(u64_hash(key.font_id ^ key.glyph_hash), key.scale_bits), pair_int_hash(key.font_smoothing, static_cast<u8>(key.rasterization_mode)));
-    }
+    mutable HashMap<u64, bool> m_display_list_requires_direct_replay;
 };
 
 }

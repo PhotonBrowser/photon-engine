@@ -17,12 +17,9 @@
 
 namespace JS {
 
-class JS_API Error
-    : public Object
-    , public ErrorData {
-    JS_OBJECT(Error, Object);
-    GC_DECLARE_ALLOCATOR(Error);
-
+// An Error object of the runtime. Its [[ErrorData]] lives inside it rather than at its address, so an Error converts
+// to its ErrorData rather than deriving from it.
+class JS_API Error : public Object {
 public:
     static GC::Ref<Error> create(Realm&);
     static GC::Ref<Error> create(Realm&, Utf16String message);
@@ -32,8 +29,6 @@ public:
     static GC::Ref<Error> create(Realm&, Object& prototype);
     static GC::Ref<Error> create(Realm&, Object& prototype, Utf16String message);
 
-    virtual ~Error() override = default;
-
     [[nodiscard]] Utf16String stack_string(CompactTraceback compact = CompactTraceback::No) const;
 
     ThrowCompletionOr<void> install_error_cause(Value options);
@@ -41,41 +36,39 @@ public:
     void set_message(Utf16String);
     void set_message(Utf16View);
 
-protected:
-    explicit Error(Object& prototype);
+    operator ErrorData&() { return own_error_data(); }
+    operator ErrorData const&() const { return own_error_data(); }
 
-    virtual void visit_edges(Visitor&) override;
+    static bool is_engine_class_of(Object const& object) { return object.is_of_engine_class_or_subclass(JS_LAYOUT_CLASS_ID_ERROR); }
+
+protected:
+    // A new error, without a message, of one of the runtime's error kinds (a JS_ERROR_KIND_*) in the realm.
+    static Error& create_of_engine_error_kind(Realm&, u8 engine_error_kind);
 
 private:
-    virtual size_t external_memory_size() const override;
-    virtual bool is_error_object() const final { return true; }
-    virtual ErrorData* error_data() final { return this; }
-    virtual ErrorData const* error_data() const final { return this; }
+    ErrorData& own_error_data() const;
 };
-
-template<>
-inline bool Object::fast_is<Error>() const { return is_error_object(); }
 
 // NOTE: Making these inherit from Error is not required by the spec but
 //       our way of implementing the [[ErrorData]] internal slot, which is
 //       used in Object.prototype.toString().
-#define DECLARE_NATIVE_ERROR(ClassName, snake_name, PrototypeName, ConstructorName) \
-    class JS_API ClassName final : public Error {                                   \
-        JS_OBJECT(ClassName, Error);                                                \
-        GC_DECLARE_ALLOCATOR(ClassName);                                            \
-                                                                                    \
-    public:                                                                         \
-        static GC::Ref<ClassName> create(Realm&);                                   \
-        static GC::Ref<ClassName> create(Realm&, Utf16String message);              \
-        static GC::Ref<ClassName> create(Realm&, Utf16View message);                \
-                                                                                    \
-        explicit ClassName(Object& prototype);                                      \
-        virtual ~ClassName() override = default;                                    \
+#define DECLARE_NATIVE_ERROR(ClassName, layout_class_id)                                                             \
+    class JS_API ClassName final : public Error {                                                                    \
+    public:                                                                                                          \
+        static GC::Ref<ClassName> create(Realm&);                                                                    \
+        static GC::Ref<ClassName> create(Realm&, Utf16String message);                                               \
+        static GC::Ref<ClassName> create(Realm&, Utf16View message);                                                 \
+                                                                                                                     \
+        static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == layout_class_id; } \
     };
 
-#define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
-    DECLARE_NATIVE_ERROR(ClassName, snake_name, PrototypeName, ConstructorName)
-JS_ENUMERATE_NATIVE_ERRORS
-#undef __JS_ENUMERATE
+DECLARE_NATIVE_ERROR(EvalError, JS_LAYOUT_CLASS_ID_EVAL_ERROR)
+DECLARE_NATIVE_ERROR(InternalError, JS_LAYOUT_CLASS_ID_INTERNAL_ERROR)
+DECLARE_NATIVE_ERROR(RangeError, JS_LAYOUT_CLASS_ID_RANGE_ERROR)
+DECLARE_NATIVE_ERROR(ReferenceError, JS_LAYOUT_CLASS_ID_REFERENCE_ERROR)
+DECLARE_NATIVE_ERROR(SyntaxError, JS_LAYOUT_CLASS_ID_SYNTAX_ERROR)
+DECLARE_NATIVE_ERROR(TypeError, JS_LAYOUT_CLASS_ID_TYPE_ERROR)
+DECLARE_NATIVE_ERROR(URIError, JS_LAYOUT_CLASS_ID_URI_ERROR)
+#undef DECLARE_NATIVE_ERROR
 
 }

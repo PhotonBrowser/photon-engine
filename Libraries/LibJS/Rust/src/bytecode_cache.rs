@@ -6,30 +6,35 @@
 
 //! Versioned serialization for fully compiled JavaScript bytecode cache blobs.
 //!
+//! [`serialize_compiled_program()`] writes a program that was compiled with
+//! [`FunctionPrecompileMode::All`](crate::compile::FunctionPrecompileMode::All), and [`decode_blob()`] reads it back
+//! into views that borrow strings and bytecode from the blob. A runtime builds its executables from those views once
+//! [`DecodedCacheBlob::validate_for_materialization()`] has accepted them.
+//!
+//! Every blob names the [`BytecodeCacheRuntime`] it was written for, and decoding it for the other one fails, so a
+//! profile that a build of either runtime filled is safe to use with the other: its blobs only miss.
+//!
 //! The format is expressed as small record types with `Encode`
 //! implementations. The matching decoder should mirror these records instead
 //! of growing a separate procedural parser.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::CompiledProgram;
-use crate::CompiledProgramBytecode;
-use crate::ModuleCallbacks;
 use crate::ast;
 use crate::bytecode::basic_block::SourceMapEntry;
-use crate::bytecode::ffi::AbstractOperationKind;
-use crate::bytecode::ffi::ConstantTag;
-use crate::bytecode::ffi::FFISharedFunctionData;
-use crate::bytecode::ffi::FFIUtf16Slice;
-use crate::bytecode::ffi::WellKnownSymbolKind;
-use crate::bytecode::generator::AssembledBytecode;
+use crate::bytecode::constant::AbstractOperationKind;
+use crate::bytecode::constant::ConstantTag;
+use crate::bytecode::constant::WellKnownSymbolKind;
+use crate::bytecode::executable_data::ExecutableCacheCounts;
+use crate::bytecode::executable_data::ExecutableData;
 use crate::bytecode::generator::ConstantValue;
 use crate::bytecode::generator::ExceptionHandler;
 use crate::bytecode::generator::FunctionSfdMetadata;
-use crate::bytecode::generator::Generator;
+use crate::bytecode::generator::LocalVariable;
 use crate::bytecode::generator::PendingClassBlueprint;
 use crate::bytecode::generator::PendingClassElement;
 use crate::bytecode::generator::PendingLiteralValueKind;
@@ -39,11 +44,14 @@ use crate::bytecode::validator::FFIExceptionHandlerOffsets;
 use crate::bytecode::validator::FFIValidatorBounds;
 use crate::bytecode::validator::ValidationErrorKind;
 use crate::bytecode::validator::validate_bytecode;
+use crate::compile::CompiledProgram;
+use crate::compile::CompiledProgramBytecode;
 use crate::u32_from_usize;
 
 const MAGIC: &[u8; 8] = b"LBJSBC\0\0";
-const FORMAT_VERSION: u32 = 19;
-const SOURCE_HASH_SIZE: usize = 32;
+const FORMAT_VERSION: u32 = 20;
+/// The size of the source hash a blob is keyed by.
+pub(crate) const SOURCE_HASH_SIZE: usize = 32;
 const BYTECODE_ALIGNMENT: usize = 8;
 const COMPLETION_TYPE_VARIANT_COUNT: u32 = 6;
 const ITERATOR_HINT_VARIANT_COUNT: u32 = 2;
@@ -62,52 +70,79 @@ fn source_range_is_valid(offset: usize, length: usize, source_len: usize) -> boo
     offset <= source_len && length <= source_len - offset
 }
 
+/// The runtime that materializes the executables of a blob. Both runtimes run the frontend's bytecode, but each turns
+/// a blob into executables of its own, so a blob is only accepted by the runtime it was written for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BytecodeCacheRuntime {
+    Cpp,
+    Rust,
+}
+
+impl BytecodeCacheRuntime {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Cpp => b'C',
+            Self::Rust => b'R',
+        }
+    }
+}
+
+/// Serializes, for `runtime`, a program compiled with
+/// [`FunctionPrecompileMode::All`](crate::compile::FunctionPrecompileMode::All) from source that hashes to
+/// `source_hash`.
+///
+/// # Panics
+/// Panics if a function of the program was not precompiled.
 pub fn serialize_compiled_program(
     compiled: &CompiledProgram,
     program_type: ast::ProgramType,
     source_hash: &[u8; SOURCE_HASH_SIZE],
+    runtime: BytecodeCacheRuntime,
 ) -> Vec<u8> {
     let mut encoder = Encoder::new();
     CacheBlob {
         compiled,
         program_type,
         source_hash,
+        runtime,
     }
     .encode(&mut encoder);
     encoder.finish()
 }
 
-pub(crate) type FreeBytecodeCacheBlobOwner = unsafe extern "C" fn(*mut c_void);
-pub(crate) type CloneBytecodeCacheBlobOwner = unsafe extern "C" fn(*const c_void) -> *mut c_void;
+pub type FreeBytecodeCacheBlobOwner = unsafe extern "C" fn(*mut c_void);
 
-pub(crate) struct ForeignBytecodeCacheBlobOwner {
-    pub(crate) owner: *mut c_void,
-    pub(crate) clone_owner: CloneBytecodeCacheBlobOwner,
-    pub(crate) free_owner: FreeBytecodeCacheBlobOwner,
+/// An embedder's handle on the bytes of a bytecode cache blob.
+pub struct ForeignBytecodeCacheBlobOwner {
+    pub owner: *mut c_void,
+    /// Releases a handle once nothing decoded from the bytes needs them anymore.
+    pub free_owner: FreeBytecodeCacheBlobOwner,
 }
 
-pub(crate) fn decode_blob_with_foreign_owner(
+/// Decodes a blob that [`serialize_compiled_program()`] wrote for `expected_runtime` and a program of
+/// `expected_program_type`, from source that hashes to `expected_source_hash`.
+///
+/// Strings and bytecode stay in `bytes`, which `owner` keeps alive for as long as anything decoded from them does.
+/// `owner` is released when the blob is rejected as well. Returns `None` for a blob of another format version, runtime,
+/// program type or source, and for a malformed one.
+///
+/// # Safety
+/// `bytes` must stay alive and unchanged until `owner.free_owner` is called with `owner.owner`.
+pub unsafe fn decode_blob(
     bytes: &[u8],
     expected_program_type: ast::ProgramType,
     expected_source_hash: &[u8; SOURCE_HASH_SIZE],
+    expected_runtime: BytecodeCacheRuntime,
     owner: ForeignBytecodeCacheBlobOwner,
 ) -> Option<DecodedCacheBlob> {
-    decode_blob_impl(bytes, expected_program_type, expected_source_hash, Some(owner))
-}
-
-fn decode_blob_impl(
-    bytes: &[u8],
-    expected_program_type: ast::ProgramType,
-    expected_source_hash: &[u8; SOURCE_HASH_SIZE],
-    owner: Option<ForeignBytecodeCacheBlobOwner>,
-) -> Option<DecodedCacheBlob> {
-    let mut decoder = Decoder::new(bytes, owner);
-    let blob = CacheBlob::decode(&mut decoder, expected_program_type, expected_source_hash)?;
-    if !decoder.is_empty() {
-        return None;
-    }
-    blob.validate();
-    Some(blob)
+    let mut decoder = Decoder::new(bytes, Some(owner));
+    let blob = CacheBlob::decode(
+        &mut decoder,
+        expected_program_type,
+        expected_source_hash,
+        expected_runtime,
+    )?;
+    decoder.is_empty().then_some(blob)
 }
 
 struct Encoder {
@@ -154,7 +189,6 @@ struct ForeignBytecodeCacheBlob {
     data: *const u8,
     length: usize,
     owner: *mut c_void,
-    clone_owner: CloneBytecodeCacheBlobOwner,
     free_owner: FreeBytecodeCacheBlobOwner,
 }
 
@@ -179,7 +213,6 @@ impl<'a> Decoder<'a> {
                 data: bytes.as_ptr(),
                 length: bytes.len(),
                 owner: owner.owner,
-                clone_owner: owner.clone_owner,
                 free_owner: owner.free_owner,
             })
         });
@@ -222,7 +255,7 @@ impl<'a> Decoder<'a> {
         let offset = self.offset;
         self.bytes(length)?;
         let foreign_blob = self.foreign_blob.as_ref()?;
-        Some(DecodedBytecodeBytes::Foreign {
+        Some(DecodedBytecodeBytes {
             blob: foreign_blob.clone(),
             range: offset..offset + length,
         })
@@ -386,7 +419,7 @@ impl Decode for ast::Utf16String {
     }
 }
 
-enum DecodedUtf16String {
+pub(crate) enum DecodedUtf16String {
     Owned(ast::Utf16String),
     // The surrounding decoded executable keeps the mapped blob alive through its
     // DecodedBytecodeBytes. Store only the payload pointer here so large string
@@ -423,81 +456,37 @@ impl From<ast::Utf16String> for DecodedUtf16String {
 }
 
 impl DecodedUtf16String {
-    fn len(&self) -> usize {
-        match self {
-            Self::Owned(value) => value.len(),
-            Self::Foreign { length, .. } => *length,
-        }
+    pub(crate) fn to_vec(&self) -> Vec<u16> {
+        self.code_units().into_owned()
     }
 
-    fn to_vec(&self) -> Vec<u16> {
+    /// The code units, in place where the blob stores them in the native byte order. A foreign string is only valid
+    /// while its blob is, so callers only reach one through a record that keeps the blob alive.
+    fn code_units(&self) -> Cow<'_, [u16]> {
         match self {
-            Self::Owned(value) => value.to_vec(),
-            Self::Foreign { data, length } => unsafe {
+            Self::Owned(value) => Cow::Borrowed(value.as_slice()),
+            #[cfg(target_endian = "little")]
+            // SAFETY: The record this string was reached through keeps the blob alive, and the decoder checked that
+            //         the code units lie within it and are aligned.
+            Self::Foreign { data, length } => Cow::Borrowed(unsafe { std::slice::from_raw_parts(*data, *length) }),
+            #[cfg(not(target_endian = "little"))]
+            // SAFETY: As above.
+            Self::Foreign { data, length } => Cow::Owned(unsafe {
                 std::slice::from_raw_parts(*data, *length)
                     .iter()
                     .map(|code_unit| u16::from_le(*code_unit))
                     .collect()
-            },
+            }),
         }
     }
 
     fn to_utf16_string(&self) -> ast::Utf16String {
         self.to_vec().into()
     }
-}
 
-struct PreparedUtf16Slice {
-    _storage: Option<Vec<u16>>,
-    slice: FFIUtf16Slice,
-}
-
-impl PreparedUtf16Slice {
-    fn new(value: &DecodedUtf16String) -> Self {
-        match value {
-            DecodedUtf16String::Owned(value) => Self {
-                _storage: None,
-                slice: FFIUtf16Slice::from(value.as_ref()),
-            },
-            DecodedUtf16String::Foreign { data, length } => {
-                #[cfg(target_endian = "little")]
-                {
-                    Self {
-                        _storage: None,
-                        slice: FFIUtf16Slice {
-                            data: *data,
-                            length: *length,
-                        },
-                    }
-                }
-                #[cfg(not(target_endian = "little"))]
-                {
-                    let storage = value.to_vec();
-                    let slice = FFIUtf16Slice::from(storage.as_slice());
-                    Self {
-                        _storage: Some(storage),
-                        slice,
-                    }
-                }
-            }
-        }
+    fn to_fly_string(&self) -> ak::Utf16FlyString {
+        ak::Utf16FlyString::from_utf16(&self.code_units())
     }
-
-    fn as_ptr_len(&self) -> (*const u16, usize) {
-        (self.slice.data, self.slice.length)
-    }
-}
-
-fn native_string_table<'a>(strings: impl Iterator<Item = &'a DecodedUtf16String>) -> Vec<ak::Utf16FlyString> {
-    strings
-        .map(|string| {
-            let prepared = PreparedUtf16Slice::new(string);
-            // SAFETY: The prepared slice borrows the decoded string or its own converted storage.
-            ak::Utf16FlyString::from_utf16(unsafe {
-                std::slice::from_raw_parts(prepared.slice.data, prepared.slice.length)
-            })
-        })
-        .collect()
 }
 
 struct Bytes<'a>(&'a [u8]);
@@ -518,14 +507,11 @@ impl ByteVector {
     }
 }
 
+/// Bytes of a decoded blob, in place, which keep the whole blob alive.
 #[derive(Clone)]
-enum DecodedBytecodeBytes {
-    Foreign {
-        blob: Rc<ForeignBytecodeCacheBlob>,
-        range: Range<usize>,
-    },
-    #[cfg(test)]
-    Owned(Vec<u8>),
+pub struct DecodedBytecodeBytes {
+    blob: Rc<ForeignBytecodeCacheBlob>,
+    range: Range<usize>,
 }
 
 impl DecodedBytecodeBytes {
@@ -534,45 +520,17 @@ impl DecodedBytecodeBytes {
         decoder.bytecode_bytes(length)
     }
 
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Foreign { blob, range } => {
-                debug_assert!(range.end <= blob.length);
-                unsafe { std::slice::from_raw_parts(blob.data.add(range.start), range.len()) }
-            }
-            #[cfg(test)]
-            Self::Owned(bytes) => bytes,
-        }
-    }
-
-    fn owner_for_ffi(&self) -> *mut c_void {
-        match self {
-            // The C++ executable adopts this as its bytecode_owner, so the callback
-            // returns the exact owner type rust_create_executable() expects. The
-            // original decoded blob keeps its own owner until materialization finishes.
-            Self::Foreign { blob, .. } => unsafe { (blob.clone_owner)(blob.owner.cast_const()) },
-            #[cfg(test)]
-            Self::Owned(_) => std::ptr::null_mut(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.as_slice().len()
+    pub fn as_slice(&self) -> &[u8] {
+        debug_assert!(self.range.end <= self.blob.length);
+        // SAFETY: The decoder checked that the range lies within the blob, which the Rc keeps alive.
+        unsafe { std::slice::from_raw_parts(self.blob.data.add(self.range.start), self.range.len()) }
     }
 
     fn decoder(&self) -> Decoder<'_> {
-        match self {
-            Self::Foreign { blob, range } => Decoder {
-                bytes: self.as_slice(),
-                offset: range.start,
-                foreign_blob: Some(blob.clone()),
-            },
-            #[cfg(test)]
-            Self::Owned(bytes) => Decoder {
-                bytes,
-                offset: 0,
-                foreign_blob: None,
-            },
+        Decoder {
+            bytes: self.as_slice(),
+            offset: self.range.start,
+            foreign_blob: Some(self.blob.clone()),
         }
     }
 }
@@ -655,12 +613,14 @@ struct CacheBlob<'a> {
     // time we go to attach the sidecar. Embedding the source hash makes a stale write harmless: a later read whose
     // source no longer matches will reject the blob and fall through to source compilation.
     source_hash: &'a [u8; SOURCE_HASH_SIZE],
+    runtime: BytecodeCacheRuntime,
 }
 
 impl Encode for CacheBlob<'_> {
     fn encode(&self, encoder: &mut Encoder) {
         encoder.bytes(MAGIC);
         FORMAT_VERSION.encode(encoder);
+        self.runtime.tag().encode(encoder);
         self.program_type.encode(encoder);
         encoder.bytes(self.source_hash);
         u32_from_usize(self.compiled.source_len).encode(encoder);
@@ -680,9 +640,11 @@ impl CacheBlob<'_> {
         decoder: &mut Decoder<'_>,
         expected_program_type: ast::ProgramType,
         expected_source_hash: &[u8; SOURCE_HASH_SIZE],
+        expected_runtime: BytecodeCacheRuntime,
     ) -> Option<DecodedCacheBlob> {
         decoder.expect_bytes(MAGIC)?;
         (u32::decode(decoder)? == FORMAT_VERSION).then_some(())?;
+        (u8::decode(decoder)? == expected_runtime.tag()).then_some(())?;
         let program_type = ast::ProgramType::decode(decoder)?;
         (program_type == expected_program_type).then_some(())?;
         (decoder.bytes(SOURCE_HASH_SIZE)? == expected_source_hash).then_some(())?;
@@ -699,31 +661,40 @@ impl CacheBlob<'_> {
     }
 }
 
-pub(crate) struct DecodedCacheBlob {
-    program_type: ast::ProgramType,
-    source_len: usize,
-    has_top_level_await: bool,
-    is_strict_mode: bool,
-    metadata: DecodedDeclarationMetadata,
-    program: DecodedProgramRecord,
+/// A decoded bytecode cache blob, whose strings and bytecode stay in the blob.
+pub struct DecodedCacheBlob {
+    pub(crate) program_type: ast::ProgramType,
+    pub(crate) source_len: usize,
+    pub(crate) has_top_level_await: bool,
+    pub(crate) is_strict_mode: bool,
+    pub(crate) metadata: DecodedDeclarationMetadata,
+    pub(crate) program: DecodedProgramRecord,
     has_been_validated_for_materialization: bool,
 }
 
+/// Witnesses that the blob a cached executable came from passed validation for materialization.
 #[derive(Clone, Copy)]
-enum CachedBytecodeValidation {
+pub(crate) enum CachedBytecodeValidation {
     Validated,
 }
 
 impl DecodedCacheBlob {
-    fn validate(&self) {
-        let _ = self.program_type as u8;
-        let _ = self.source_len;
-        let _ = self.has_top_level_await || self.is_strict_mode;
-        self.metadata.validate();
-        self.program.validate();
+    pub fn program_type(&self) -> ast::ProgramType {
+        self.program_type
     }
 
-    pub(crate) fn validate_for_materialization(&mut self, source_len: usize) -> Result<(), ValidationErrorKind> {
+    pub fn has_top_level_await(&self) -> bool {
+        self.has_top_level_await
+    }
+
+    pub fn is_strict_mode(&self) -> bool {
+        self.is_strict_mode
+    }
+
+    /// Checks everything that bytecode built from this blob may rely on for source code of `source_len` code units:
+    /// source ranges, the tables and the indices into them, and the bytecode of every executable, including those of
+    /// nested functions.
+    pub fn validate_for_materialization(&mut self, source_len: usize) -> Result<(), ValidationErrorKind> {
         if self.source_len != source_len {
             return Err(ValidationErrorKind::InvalidLength);
         }
@@ -736,984 +707,29 @@ impl DecodedCacheBlob {
         Ok(())
     }
 
-    fn verify_has_been_validated_for_materialization(&self) {
+    pub(crate) fn verify_has_been_validated_for_materialization(&self) {
         assert!(
             self.has_been_validated_for_materialization,
             "decoded bytecode cache blob must be validated before materialization"
         );
     }
 
-    pub(crate) unsafe fn materialize_script(
-        &self,
-        vm_ptr: *mut c_void,
-        source_code_ptr: *const c_void,
-        shared_function_data_list_ptr: *mut c_void,
-        gdi_context: *mut c_void,
-    ) -> *mut c_void {
-        unsafe {
-            self.verify_has_been_validated_for_materialization();
-            if self.program_type != ast::ProgramType::Script {
-                return std::ptr::null_mut();
-            }
-            let DecodedDeclarationMetadata::Script {
-                metadata,
-                declaration_functions,
-            } = &self.metadata
-            else {
-                return std::ptr::null_mut();
-            };
-            let ProgramKind::ScriptOrModule = self.program.kind else {
-                return std::ptr::null_mut();
-            };
-            if declaration_functions.len() != metadata.function_names.len() {
-                return std::ptr::null_mut();
-            }
-
-            let shared_function_data_owner =
-                crate::bytecode::ffi::SharedFunctionDataOwner::List(shared_function_data_list_ptr);
-            if !materialize_script_declaration_metadata(
-                metadata,
-                declaration_functions,
-                self.is_strict_mode,
-                vm_ptr,
-                source_code_ptr,
-                shared_function_data_owner,
-                gdi_context,
-            ) {
-                return std::ptr::null_mut();
-            }
-            materialize_executable(
-                &self.program.executable,
-                vm_ptr,
-                source_code_ptr,
-                shared_function_data_owner,
-                CachedBytecodeValidation::Validated,
-            )
-        }
+    /// What declaration instantiation of the program needs. Every record reached from here passed validation.
+    ///
+    /// # Panics
+    /// Panics if the blob has not passed [`DecodedCacheBlob::validate_for_materialization()`].
+    pub fn declaration_metadata(&self) -> &DecodedDeclarationMetadata {
+        self.verify_has_been_validated_for_materialization();
+        &self.metadata
     }
 
-    pub(crate) unsafe fn materialize_module(
-        &self,
-        vm_ptr: *mut c_void,
-        source_code_ptr: *const c_void,
-        shared_function_data_list_ptr: *mut c_void,
-        module_context: *mut c_void,
-        callbacks: *const ModuleCallbacks,
-        tla_executable_out: *mut *mut c_void,
-    ) -> *mut c_void {
-        unsafe {
-            self.verify_has_been_validated_for_materialization();
-            if callbacks.is_null() {
-                return std::ptr::null_mut();
-            }
-            let cb = &*callbacks;
-            if self.program_type != ast::ProgramType::Module {
-                return std::ptr::null_mut();
-            }
-            let DecodedDeclarationMetadata::Module {
-                metadata,
-                declaration_functions,
-            } = &self.metadata
-            else {
-                return std::ptr::null_mut();
-            };
-            if declaration_functions.len() != metadata.function_names.len() {
-                return std::ptr::null_mut();
-            }
-
-            let shared_function_data_owner =
-                crate::bytecode::ffi::SharedFunctionDataOwner::List(shared_function_data_list_ptr);
-            (cb.set_has_top_level_await)(module_context, self.has_top_level_await);
-            if !materialize_module_declaration_metadata(
-                metadata,
-                declaration_functions,
-                vm_ptr,
-                source_code_ptr,
-                shared_function_data_owner,
-                module_context,
-                cb,
-            ) {
-                return std::ptr::null_mut();
-            }
-
-            match self.program.kind {
-                ProgramKind::AsyncModule => {
-                    let exec_ptr = materialize_executable(
-                        &self.program.executable,
-                        vm_ptr,
-                        source_code_ptr,
-                        shared_function_data_owner,
-                        CachedBytecodeValidation::Validated,
-                    );
-                    if !tla_executable_out.is_null() {
-                        *tla_executable_out = exec_ptr;
-                    }
-                    std::ptr::null_mut()
-                }
-                ProgramKind::ScriptOrModule => {
-                    if !tla_executable_out.is_null() {
-                        *tla_executable_out = std::ptr::null_mut();
-                    }
-                    materialize_executable(
-                        &self.program.executable,
-                        vm_ptr,
-                        source_code_ptr,
-                        shared_function_data_owner,
-                        CachedBytecodeValidation::Validated,
-                    )
-                }
-            }
-        }
-    }
-
-    pub(crate) unsafe fn install_script(
-        &self,
-        vm_ptr: *mut c_void,
-        source_code_ptr: *const c_void,
-        existing_executable_ptr: *const c_void,
-        existing_shared_function_data_ptrs: &[*mut c_void],
-    ) -> *mut c_void {
-        unsafe {
-            self.verify_has_been_validated_for_materialization();
-            if existing_executable_ptr.is_null() {
-                return std::ptr::null_mut();
-            }
-
-            if self.program_type != ast::ProgramType::Script {
-                return std::ptr::null_mut();
-            }
-            let DecodedDeclarationMetadata::Script {
-                metadata,
-                declaration_functions,
-            } = &self.metadata
-            else {
-                return std::ptr::null_mut();
-            };
-            let ProgramKind::ScriptOrModule = self.program.kind else {
-                return std::ptr::null_mut();
-            };
-
-            let mut existing_shared_function_data = ExistingSharedFunctionData::new(existing_shared_function_data_ptrs);
-            let mut pending_function_installs = Vec::new();
-            if !prepare_declaration_function_installs(
-                declaration_functions,
-                metadata.function_names.len(),
-                &mut existing_shared_function_data,
-                self.is_strict_mode,
-                vm_ptr,
-                source_code_ptr,
-                &mut pending_function_installs,
-            ) {
-                return std::ptr::null_mut();
-            }
-            let executable_ptr = materialize_executable_for_install(
-                &self.program.executable,
-                Some(&mut existing_shared_function_data),
-                crate::bytecode::ffi::SharedFunctionDataOwner::None,
-                vm_ptr,
-                source_code_ptr,
-                &mut pending_function_installs,
-                CachedBytecodeValidation::Validated,
-            );
-            if executable_ptr.is_null() {
-                return std::ptr::null_mut();
-            }
-            if !existing_shared_function_data.all_matched() {
-                return std::ptr::null_mut();
-            }
-            for install in pending_function_installs {
-                install.commit();
-            }
-            executable_ptr
-        }
-    }
-
-    pub(crate) unsafe fn install_module(
-        &self,
-        vm_ptr: *mut c_void,
-        source_code_ptr: *const c_void,
-        existing_executable_ptr: *const c_void,
-        existing_shared_function_data_ptrs: &[*mut c_void],
-        existing_tla_sfd_ptr: *mut c_void,
-        tla_executable_out: *mut *mut c_void,
-    ) -> *mut c_void {
-        unsafe {
-            self.verify_has_been_validated_for_materialization();
-            if self.program_type != ast::ProgramType::Module {
-                return std::ptr::null_mut();
-            }
-            let DecodedDeclarationMetadata::Module {
-                metadata,
-                declaration_functions,
-            } = &self.metadata
-            else {
-                return std::ptr::null_mut();
-            };
-
-            let mut existing_shared_function_data = ExistingSharedFunctionData::new(existing_shared_function_data_ptrs);
-            let mut pending_function_installs = Vec::new();
-            if !prepare_declaration_function_installs(
-                declaration_functions,
-                metadata.function_names.len(),
-                &mut existing_shared_function_data,
-                true,
-                vm_ptr,
-                source_code_ptr,
-                &mut pending_function_installs,
-            ) {
-                return std::ptr::null_mut();
-            }
-            match self.program.kind {
-                ProgramKind::AsyncModule => {
-                    if !self.has_top_level_await || existing_tla_sfd_ptr.is_null() {
-                        return std::ptr::null_mut();
-                    }
-                    let exec_ptr = materialize_executable_for_install(
-                        &self.program.executable,
-                        Some(&mut existing_shared_function_data),
-                        crate::bytecode::ffi::SharedFunctionDataOwner::None,
-                        vm_ptr,
-                        source_code_ptr,
-                        &mut pending_function_installs,
-                        CachedBytecodeValidation::Validated,
-                    );
-                    if exec_ptr.is_null() {
-                        return std::ptr::null_mut();
-                    }
-                    if !existing_shared_function_data.all_matched() {
-                        return std::ptr::null_mut();
-                    }
-                    for install in pending_function_installs {
-                        install.commit();
-                    }
-                    if !tla_executable_out.is_null() {
-                        *tla_executable_out = exec_ptr;
-                    }
-                    std::ptr::null_mut()
-                }
-                ProgramKind::ScriptOrModule => {
-                    if self.has_top_level_await || existing_executable_ptr.is_null() {
-                        return std::ptr::null_mut();
-                    }
-                    if !tla_executable_out.is_null() {
-                        *tla_executable_out = std::ptr::null_mut();
-                    }
-                    let executable_ptr = materialize_executable_for_install(
-                        &self.program.executable,
-                        Some(&mut existing_shared_function_data),
-                        crate::bytecode::ffi::SharedFunctionDataOwner::None,
-                        vm_ptr,
-                        source_code_ptr,
-                        &mut pending_function_installs,
-                        CachedBytecodeValidation::Validated,
-                    );
-                    if executable_ptr.is_null() {
-                        return std::ptr::null_mut();
-                    }
-                    if !existing_shared_function_data.all_matched() {
-                        return std::ptr::null_mut();
-                    }
-                    for install in pending_function_installs {
-                        install.commit();
-                    }
-                    executable_ptr
-                }
-            }
-        }
-    }
-}
-
-unsafe fn prepare_declaration_function_installs(
-    declaration_functions: &[DecodedFunctionRecord],
-    expected_function_count: usize,
-    existing_shared_function_data: &mut ExistingSharedFunctionData<'_>,
-    outer_strict: bool,
-    vm_ptr: *mut c_void,
-    source_code_ptr: *const c_void,
-    pending_function_installs: &mut Vec<PendingFunctionInstall>,
-) -> bool {
-    unsafe {
-        if declaration_functions.len() != expected_function_count {
-            return false;
-        }
-
-        for function in declaration_functions {
-            if prepare_function_install(
-                function,
-                outer_strict,
-                existing_shared_function_data,
-                vm_ptr,
-                source_code_ptr,
-                pending_function_installs,
-                CachedBytecodeValidation::Validated,
-            )
-            .is_null()
-            {
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-unsafe fn materialize_script_declaration_metadata(
-    metadata: &ScriptDeclarationMetadata,
-    declaration_functions: &[DecodedFunctionRecord],
-    is_strict_mode: bool,
-    vm_ptr: *mut c_void,
-    source_code_ptr: *const c_void,
-    shared_function_data_owner: crate::bytecode::ffi::SharedFunctionDataOwner,
-    gdi_context: *mut c_void,
-) -> bool {
-    unsafe {
-        use crate::bytecode::ffi::script_gdi_push_annex_b_name;
-        use crate::bytecode::ffi::script_gdi_push_function;
-        use crate::bytecode::ffi::script_gdi_push_lexical_binding;
-        use crate::bytecode::ffi::script_gdi_push_lexical_name;
-        use crate::bytecode::ffi::script_gdi_push_var_name;
-        use crate::bytecode::ffi::script_gdi_push_var_scoped_name;
-
-        for name in &metadata.lexical_names {
-            script_gdi_push_lexical_name(gdi_context, name.as_ptr(), name.len());
-        }
-        for name in &metadata.var_names {
-            script_gdi_push_var_name(gdi_context, name.as_ptr(), name.len());
-        }
-        for (function, name) in declaration_functions.iter().zip(metadata.function_names.iter()) {
-            let sfd_ptr = materialize_function(
-                function,
-                is_strict_mode,
-                vm_ptr,
-                source_code_ptr,
-                shared_function_data_owner,
-                CachedBytecodeValidation::Validated,
-            );
-            if sfd_ptr.is_null() {
-                return false;
-            }
-            script_gdi_push_function(gdi_context, sfd_ptr, name.as_ptr(), name.len());
-        }
-        for name in &metadata.var_scoped_names {
-            script_gdi_push_var_scoped_name(gdi_context, name.as_ptr(), name.len());
-        }
-        for name in &metadata.annex_b_candidate_names {
-            script_gdi_push_annex_b_name(gdi_context, name.as_ptr(), name.len());
-        }
-        for binding in &metadata.lexical_bindings {
-            script_gdi_push_lexical_binding(
-                gdi_context,
-                binding.name.as_ptr(),
-                binding.name.len(),
-                binding.is_constant,
-            );
-        }
-
-        true
-    }
-}
-
-unsafe fn materialize_module_declaration_metadata(
-    metadata: &ModuleDeclarationMetadata,
-    declaration_functions: &[DecodedFunctionRecord],
-    vm_ptr: *mut c_void,
-    source_code_ptr: *const c_void,
-    shared_function_data_owner: crate::bytecode::ffi::SharedFunctionDataOwner,
-    module_context: *mut c_void,
-    cb: &ModuleCallbacks,
-) -> bool {
-    unsafe {
-        for entry in &metadata.import_entries {
-            let (import_name, import_name_len, is_namespace) = entry
-                .import_name
-                .as_ref()
-                .map(|name| (name.as_ptr(), name.len(), false))
-                .unwrap_or((std::ptr::null(), 0, true));
-            let attributes = import_attributes_to_ffi(&entry.module_request.attributes);
-            (cb.push_import_entry)(
-                module_context,
-                import_name,
-                import_name_len,
-                is_namespace,
-                entry.local_name.as_ptr(),
-                entry.local_name.len(),
-                entry.module_request.specifier.as_ptr(),
-                entry.module_request.specifier.len(),
-                attributes.keys.as_ptr(),
-                attributes.values.as_ptr(),
-                attributes.keys.len(),
-            );
-        }
-
-        for entry in &metadata.local_exports {
-            push_module_export_entry(module_context, cb.push_local_export, entry);
-        }
-        for entry in &metadata.indirect_exports {
-            push_module_export_entry(module_context, cb.push_indirect_export, entry);
-        }
-        for entry in &metadata.star_exports {
-            push_module_export_entry(module_context, cb.push_star_export, entry);
-        }
-        for request in &metadata.requested_modules {
-            let attributes = import_attributes_to_ffi(&request.attributes);
-            (cb.push_requested_module)(
-                module_context,
-                request.specifier.as_ptr(),
-                request.specifier.len(),
-                attributes.keys.as_ptr(),
-                attributes.values.as_ptr(),
-                attributes.keys.len(),
-            );
-        }
-        if let Some(name) = &metadata.default_export_binding_name {
-            (cb.set_default_export_binding)(module_context, name.as_ptr(), name.len());
-        }
-        for name in &metadata.var_declared_names {
-            (cb.push_var_name)(module_context, name.as_ptr(), name.len());
-        }
-        for (function, name) in declaration_functions.iter().zip(metadata.function_names.iter()) {
-            let sfd_ptr = materialize_function(
-                function,
-                true,
-                vm_ptr,
-                source_code_ptr,
-                shared_function_data_owner,
-                CachedBytecodeValidation::Validated,
-            );
-            if sfd_ptr.is_null() {
-                return false;
-            }
-            (cb.push_function)(module_context, sfd_ptr, name.as_ptr(), name.len());
-        }
-        for binding in &metadata.lexical_bindings {
-            (cb.push_lexical_binding)(
-                module_context,
-                binding.name.as_ptr(),
-                binding.name.len(),
-                binding.is_constant,
-                binding.function_index,
-            );
-        }
-
-        true
-    }
-}
-
-struct ImportAttributesFfi {
-    keys: Vec<FFIUtf16Slice>,
-    values: Vec<FFIUtf16Slice>,
-}
-
-fn import_attributes_to_ffi(attributes: &[ast::ImportAttribute]) -> ImportAttributesFfi {
-    ImportAttributesFfi {
-        keys: attributes
-            .iter()
-            .map(|attribute| FFIUtf16Slice::from(attribute.key.as_ref()))
-            .collect(),
-        values: attributes
-            .iter()
-            .map(|attribute| FFIUtf16Slice::from(attribute.value.as_ref()))
-            .collect(),
-    }
-}
-
-unsafe fn push_module_export_entry(
-    module_context: *mut c_void,
-    callback: crate::ModuleExportEntryCallback,
-    entry: &ModuleExportEntryRecord,
-) {
-    unsafe {
-        let (export_name, export_name_len) = entry
-            .export_name
-            .as_ref()
-            .map(|name| (name.as_ptr(), name.len()))
-            .unwrap_or((std::ptr::null(), 0));
-        let (local_or_import_name, local_or_import_name_len) = entry
-            .local_or_import_name
-            .as_ref()
-            .map(|name| (name.as_ptr(), name.len()))
-            .unwrap_or((std::ptr::null(), 0));
-        let (module_specifier, module_specifier_len, attributes) = entry
-            .module_request
-            .as_ref()
-            .map(|request| {
-                (
-                    request.specifier.as_ptr(),
-                    request.specifier.len(),
-                    import_attributes_to_ffi(&request.attributes),
-                )
-            })
-            .unwrap_or((
-                std::ptr::null(),
-                0,
-                ImportAttributesFfi {
-                    keys: Vec::new(),
-                    values: Vec::new(),
-                },
-            ));
-
-        callback(
-            module_context,
-            entry.kind as u8,
-            export_name,
-            export_name_len,
-            local_or_import_name,
-            local_or_import_name_len,
-            module_specifier,
-            module_specifier_len,
-            attributes.keys.as_ptr(),
-            attributes.values.as_ptr(),
-            attributes.keys.len(),
-        );
-    }
-}
-
-enum PendingFunctionInstallReplacement {
-    CachedBytecode(DecodedCachedExecutableRecord),
-    Executable(*mut c_void),
-}
-
-struct ExistingSharedFunctionData<'a> {
-    ptrs: &'a [*mut c_void],
-    matched: Vec<bool>,
-}
-
-impl<'a> ExistingSharedFunctionData<'a> {
-    fn new(ptrs: &'a [*mut c_void]) -> Self {
-        Self {
-            ptrs,
-            matched: vec![false; ptrs.len()],
-        }
-    }
-
-    unsafe fn take_matching(&mut self, data: &FFISharedFunctionData) -> *mut c_void {
-        unsafe {
-            for (index, ptr) in self.ptrs.iter().copied().enumerate() {
-                if self.matched[index] || ptr.is_null() {
-                    continue;
-                }
-                if crate::bytecode::ffi::rust_sfd_matches_bytecode_cache_function(ptr, data) {
-                    self.matched[index] = true;
-                    return ptr;
-                }
-            }
-            std::ptr::null_mut()
-        }
-    }
-
-    fn all_matched(&self) -> bool {
-        self.matched.iter().all(|matched| *matched)
-    }
-}
-
-struct PendingFunctionInstall {
-    existing_sfd_ptr: *mut c_void,
-    replacement: PendingFunctionInstallReplacement,
-    metadata: FunctionSfdMetadata,
-}
-
-impl PendingFunctionInstall {
-    unsafe fn commit(self) {
-        unsafe {
-            match self.replacement {
-                PendingFunctionInstallReplacement::CachedBytecode(cached_executable) => {
-                    cached_executable.verify_has_been_validated_for_materialization();
-                    let cached_executable_ptr = Box::into_raw(Box::new(cached_executable)) as *mut c_void;
-                    crate::bytecode::ffi::rust_sfd_install_cached_bytecode_executable(
-                        self.existing_sfd_ptr,
-                        cached_executable_ptr,
-                        self.metadata.uses_this,
-                        self.metadata.this_value_needs_environment_resolution,
-                        self.metadata.function_environment_needed,
-                        self.metadata.function_environment_bindings_count,
-                        self.metadata.var_environment_bindings_count,
-                        self.metadata.might_need_arguments,
-                        self.metadata.contains_eval,
-                    );
-                }
-                PendingFunctionInstallReplacement::Executable(executable_ptr) => {
-                    crate::bytecode::ffi::rust_sfd_install_bytecode_cache_executable(
-                        self.existing_sfd_ptr,
-                        executable_ptr,
-                        self.metadata.uses_this,
-                        self.metadata.this_value_needs_environment_resolution,
-                        self.metadata.function_environment_needed,
-                        self.metadata.function_environment_bindings_count,
-                        self.metadata.var_environment_bindings_count,
-                        self.metadata.might_need_arguments,
-                        self.metadata.contains_eval,
-                    );
-                }
-            }
-        }
-    }
-}
-
-unsafe fn materialize_function(
-    function: &DecodedFunctionRecord,
-    outer_strict: bool,
-    vm_ptr: *mut c_void,
-    source_code_ptr: *const c_void,
-    shared_function_data_owner: crate::bytecode::ffi::SharedFunctionDataOwner,
-    validation: CachedBytecodeValidation,
-) -> *mut c_void {
-    unsafe {
-        let parameter_names = function
-            .parameter_names
-            .as_ref()
-            .map(|names| native_string_table(names.iter()))
-            .unwrap_or_default();
-        let name_storage = function.name.as_ref().map(PreparedUtf16Slice::new);
-        let (name, name_len) = name_storage
-            .as_ref()
-            .map(PreparedUtf16Slice::as_ptr_len)
-            .unwrap_or((std::ptr::null(), 0));
-        let source_text_offset = function.source_text_start as usize;
-        let source_text_length = function
-            .source_text_end
-            .checked_sub(function.source_text_start)
-            .map(|length| length as usize)
-            .unwrap_or(0);
-
-        let data = FFISharedFunctionData {
-            name,
-            name_len,
-            function_kind: function.kind as u8,
-            function_length: function.function_length,
-            formal_parameter_count: function.formal_parameter_count,
-            strict: function.is_strict_mode || outer_strict,
-            is_arrow: function.is_arrow_function,
-            has_simple_parameter_list: function.parameter_names.is_some(),
-            parameter_names: parameter_names.as_ptr().cast(),
-            parameter_name_count: parameter_names.len(),
-            source_text_offset,
-            source_text_length,
-            rust_function_ast: std::ptr::null_mut(),
-            uses_this: function.uses_this,
-            uses_this_from_environment: function.uses_this_from_environment,
-        };
-
-        let sfd_ptr = match shared_function_data_owner {
-            crate::bytecode::ffi::SharedFunctionDataOwner::None => {
-                crate::bytecode::ffi::rust_create_sfd(vm_ptr, source_code_ptr, &raw const data)
-            }
-            crate::bytecode::ffi::SharedFunctionDataOwner::List(list_ptr) => {
-                assert!(!list_ptr.is_null(), "SharedFunctionDataOwner::List must not be null");
-                crate::bytecode::ffi::rust_create_sfd_in_list(vm_ptr, source_code_ptr, list_ptr, &raw const data)
-            }
-        };
-        if sfd_ptr.is_null() {
-            return std::ptr::null_mut();
-        }
-
-        if let Some((name, is_private)) = &function.class_field_initializer_name {
-            let name_storage = PreparedUtf16Slice::new(name);
-            let (name, name_len) = name_storage.as_ptr_len();
-            crate::bytecode::ffi::rust_sfd_set_class_field_initializer_name(sfd_ptr, name, name_len, *is_private);
-        }
-
-        let cached_executable_ptr =
-            Box::into_raw(Box::new(function.precompiled.validated_copy(validation))) as *mut c_void;
-        crate::bytecode::ffi::rust_sfd_set_cached_bytecode_executable(
-            sfd_ptr,
-            cached_executable_ptr,
-            function.metadata.uses_this,
-            function.metadata.this_value_needs_environment_resolution,
-            function.metadata.function_environment_needed,
-            function.metadata.function_environment_bindings_count,
-            function.metadata.var_environment_bindings_count,
-            function.metadata.might_need_arguments,
-            function.metadata.contains_eval,
-        );
-
-        sfd_ptr
-    }
-}
-
-unsafe fn prepare_function_install(
-    function: &DecodedFunctionRecord,
-    outer_strict: bool,
-    existing_shared_function_data: &mut ExistingSharedFunctionData<'_>,
-    vm_ptr: *mut c_void,
-    source_code_ptr: *const c_void,
-    pending_function_installs: &mut Vec<PendingFunctionInstall>,
-    validation: CachedBytecodeValidation,
-) -> *mut c_void {
-    unsafe {
-        let parameter_names = function
-            .parameter_names
-            .as_ref()
-            .map(|names| native_string_table(names.iter()))
-            .unwrap_or_default();
-        let name_storage = function.name.as_ref().map(PreparedUtf16Slice::new);
-        let (name, name_len) = name_storage
-            .as_ref()
-            .map(PreparedUtf16Slice::as_ptr_len)
-            .unwrap_or((std::ptr::null(), 0));
-        let source_text_offset = function.source_text_start as usize;
-        let source_text_length = function
-            .source_text_end
-            .checked_sub(function.source_text_start)
-            .map(|length| length as usize)
-            .unwrap_or(0);
-
-        let data = FFISharedFunctionData {
-            name,
-            name_len,
-            function_kind: function.kind as u8,
-            function_length: function.function_length,
-            formal_parameter_count: function.formal_parameter_count,
-            strict: function.is_strict_mode || outer_strict,
-            is_arrow: function.is_arrow_function,
-            has_simple_parameter_list: function.parameter_names.is_some(),
-            parameter_names: parameter_names.as_ptr().cast(),
-            parameter_name_count: parameter_names.len(),
-            source_text_offset,
-            source_text_length,
-            rust_function_ast: std::ptr::null_mut(),
-            uses_this: function.uses_this,
-            uses_this_from_environment: function.uses_this_from_environment,
-        };
-
-        let existing_sfd_ptr = existing_shared_function_data.take_matching(&data);
-        if existing_sfd_ptr.is_null() {
-            return std::ptr::null_mut();
-        }
-
-        if crate::bytecode::ffi::rust_sfd_executable(existing_sfd_ptr).is_null() {
-            pending_function_installs.push(PendingFunctionInstall {
-                existing_sfd_ptr,
-                replacement: PendingFunctionInstallReplacement::CachedBytecode(
-                    function.precompiled.validated_copy(validation),
-                ),
-                metadata: function.metadata.clone(),
-            });
-            return existing_sfd_ptr;
-        }
-
-        let Some(executable) = function.precompiled.decode_validated_executable(validation) else {
-            return std::ptr::null_mut();
-        };
-        let executable_ptr = materialize_executable_for_install(
-            &executable,
-            Some(existing_shared_function_data),
-            crate::bytecode::ffi::SharedFunctionDataOwner::None,
-            vm_ptr,
-            source_code_ptr,
-            pending_function_installs,
-            validation,
-        );
-        if executable_ptr.is_null() {
-            return std::ptr::null_mut();
-        }
-
-        pending_function_installs.push(PendingFunctionInstall {
-            existing_sfd_ptr,
-            replacement: PendingFunctionInstallReplacement::Executable(executable_ptr),
-            metadata: function.metadata.clone(),
-        });
-
-        existing_sfd_ptr
-    }
-}
-
-pub(crate) unsafe fn materialize_cached_function(
-    cached_executable_ptr: *mut c_void,
-    vm_ptr: *mut c_void,
-    source_code_ptr: *const c_void,
-    shared_function_data_list_ptr: *mut c_void,
-) -> *mut c_void {
-    unsafe {
-        if cached_executable_ptr.is_null() {
-            return std::ptr::null_mut();
-        }
-        let cached_executable = Box::from_raw(cached_executable_ptr as *mut DecodedCachedExecutableRecord);
-        let Some(executable) = cached_executable.decode_executable() else {
-            return std::ptr::null_mut();
-        };
-        let shared_function_data_owner = if shared_function_data_list_ptr.is_null() {
-            crate::bytecode::ffi::SharedFunctionDataOwner::None
-        } else {
-            crate::bytecode::ffi::SharedFunctionDataOwner::List(shared_function_data_list_ptr)
-        };
-        materialize_executable(
-            &executable,
-            vm_ptr,
-            source_code_ptr,
-            shared_function_data_owner,
-            CachedBytecodeValidation::Validated,
-        )
-    }
-}
-
-pub(crate) unsafe fn free_cached_function(cached_executable_ptr: *mut c_void) {
-    unsafe {
-        if !cached_executable_ptr.is_null() {
-            drop(Box::from_raw(
-                cached_executable_ptr as *mut DecodedCachedExecutableRecord,
-            ));
-        }
-    }
-}
-
-unsafe fn materialize_executable(
-    executable: &DecodedExecutableRecord,
-    vm_ptr: *mut c_void,
-    source_code_ptr: *const c_void,
-    shared_function_data_owner: crate::bytecode::ffi::SharedFunctionDataOwner,
-    validation: CachedBytecodeValidation,
-) -> *mut c_void {
-    unsafe {
-        let mut pending_function_installs = Vec::new();
-        materialize_executable_for_install(
-            executable,
-            None,
-            shared_function_data_owner,
-            vm_ptr,
-            source_code_ptr,
-            &mut pending_function_installs,
-            validation,
-        )
-    }
-}
-
-unsafe fn materialize_executable_for_install(
-    executable: &DecodedExecutableRecord,
-    mut existing_shared_function_data: Option<&mut ExistingSharedFunctionData<'_>>,
-    shared_function_data_owner: crate::bytecode::ffi::SharedFunctionDataOwner,
-    vm_ptr: *mut c_void,
-    source_code_ptr: *const c_void,
-    pending_function_installs: &mut Vec<PendingFunctionInstall>,
-    validation: CachedBytecodeValidation,
-) -> *mut c_void {
-    unsafe {
-        let Some(identifier_table) = executable.identifier_table.values() else {
-            return std::ptr::null_mut();
-        };
-        let Some(property_key_table) = executable.property_key_table.values() else {
-            return std::ptr::null_mut();
-        };
-        let native_identifiers = native_string_table(identifier_table.iter());
-        let native_property_keys = native_string_table(property_key_table.iter());
-        let Some(string_table) = executable.string_table.values() else {
-            return std::ptr::null_mut();
-        };
-        let native_strings = native_string_table(string_table.iter());
-        let Some((constants_count, constants_bytes)) = executable.constants.ffi_data() else {
-            return std::ptr::null_mut();
-        };
-        let Some(local_variables) = executable.local_variables.values() else {
-            return std::ptr::null_mut();
-        };
-        let local_variable_names = native_string_table(local_variables.iter().map(|local_variable| {
-            let _ = local_variable.is_lexically_declared;
-            let _ = local_variable.is_initialized_during_declaration_instantiation;
-            &local_variable.name
-        }));
-        let local_variable_metadata: Vec<crate::bytecode::ffi::FFILocalVariableMetadata> = local_variables
-            .iter()
-            .zip(&local_variable_names)
-            .map(|(variable, name)| crate::bytecode::ffi::FFILocalVariableMetadata {
-                name: name.raw_identity(),
-                is_mutable: variable.is_mutable,
-                has_scope_range: variable.scope_range.is_some(),
-                scope_start_line: variable.scope_range.map_or(0, |range| range.start.line),
-                scope_start_column: variable.scope_range.map_or(0, |range| range.start.column),
-                scope_end_line: variable.scope_range.map_or(0, |range| range.end.line),
-                scope_end_column: variable.scope_range.map_or(0, |range| range.end.column),
-            })
-            .collect();
-        let Some(argument_variable_names) = executable.argument_variable_names.values() else {
-            return std::ptr::null_mut();
-        };
-        let argument_variable_names = native_string_table(argument_variable_names.iter());
-
-        let Some(shared_functions) = executable.shared_functions.values() else {
-            return std::ptr::null_mut();
-        };
-        let mut sfd_ptrs = Vec::with_capacity(shared_functions.len());
-        for function in &shared_functions {
-            let sfd_ptr = if let Some(registry) = existing_shared_function_data.as_deref_mut() {
-                prepare_function_install(
-                    function,
-                    executable.strict,
-                    registry,
-                    vm_ptr,
-                    source_code_ptr,
-                    pending_function_installs,
-                    validation,
-                ) as *const c_void
-            } else {
-                materialize_function(
-                    function,
-                    executable.strict,
-                    vm_ptr,
-                    source_code_ptr,
-                    shared_function_data_owner,
-                    validation,
-                ) as *const c_void
-            };
-            sfd_ptrs.push(sfd_ptr);
-        }
-        if sfd_ptrs.iter().any(|ptr| ptr.is_null()) {
-            return std::ptr::null_mut();
-        }
-
-        let Some(class_blueprints) = executable.class_blueprints.values() else {
-            return std::ptr::null_mut();
-        };
-        let class_blueprints: Vec<PendingClassBlueprint> =
-            class_blueprints.iter().map(PendingClassBlueprint::from).collect();
-        let bp_ptrs: Vec<*mut c_void> = class_blueprints
-            .iter()
-            .map(|blueprint| crate::bytecode::ffi::materialize_class_blueprint(blueprint, vm_ptr, source_code_ptr))
-            .collect();
-        if bp_ptrs.iter().any(|ptr| ptr.is_null()) {
-            return std::ptr::null_mut();
-        }
-        let Some(exception_handlers) = executable.exception_handlers.values() else {
-            return std::ptr::null_mut();
-        };
-        let Some(source_map) = executable.source_map.values() else {
-            return std::ptr::null_mut();
-        };
-
-        crate::bytecode::ffi::create_executable_from_slices(
-            crate::bytecode::ffi::ExecutableParts {
-                bytecode: executable.bytecode.as_slice(),
-                bytecode_owner: executable.bytecode.owner_for_ffi(),
-                exception_handlers: &exception_handlers,
-                source_map: &source_map,
-                basic_block_start_offsets: &[],
-                number_of_registers: executable.number_of_registers,
-                number_of_arguments: executable.number_of_arguments,
-            },
-            crate::bytecode::ffi::ExecutableMetadata {
-                property_lookup_cache_count: executable.cache_counters.property_lookup_cache_count,
-                global_variable_cache_count: executable.cache_counters.global_variable_cache_count,
-                environment_coordinate_cache_count: executable.cache_counters.environment_coordinate_cache_count,
-                template_object_cache_count: executable.cache_counters.template_object_cache_count,
-                object_shape_cache_count: executable.cache_counters.object_shape_cache_count,
-                object_property_iterator_cache_count: executable.cache_counters.object_property_iterator_cache_count,
-                environment_shape_cache_count: executable.cache_counters.environment_shape_cache_count,
-                is_strict: executable.strict,
-                length_identifier: executable.length_identifier,
-            },
-            crate::bytecode::ffi::ExecutableSlices {
-                identifier_table: &native_identifiers,
-                property_key_table: &native_property_keys,
-                string_table: &native_strings,
-                constants_data: constants_bytes.as_slice(),
-                constants_count,
-                local_variable_metadata: &local_variable_metadata,
-                argument_variable_names: &argument_variable_names,
-                compiled_regexes: &[],
-            },
-            vm_ptr,
-            source_code_ptr,
-            &sfd_ptrs,
-            &bp_ptrs,
-        )
+    /// The program's body. Every record reached from here passed validation.
+    ///
+    /// # Panics
+    /// Panics if the blob has not passed [`DecodedCacheBlob::validate_for_materialization()`].
+    pub fn program(&self) -> &DecodedProgramRecord {
+        self.verify_has_been_validated_for_materialization();
+        &self.program
     }
 }
 
@@ -1791,7 +807,8 @@ impl DeclarationMetadataRecord<'_> {
     }
 }
 
-enum DecodedDeclarationMetadata {
+/// What declaration instantiation of a cached script or module needs, with the functions it declares.
+pub enum DecodedDeclarationMetadata {
     Script {
         metadata: ScriptDeclarationMetadata,
         declaration_functions: Vec<DecodedFunctionRecord>,
@@ -1803,29 +820,6 @@ enum DecodedDeclarationMetadata {
 }
 
 impl DecodedDeclarationMetadata {
-    fn validate(&self) {
-        match self {
-            Self::Script {
-                metadata,
-                declaration_functions,
-            } => {
-                metadata.validate();
-                for function in declaration_functions {
-                    function.validate();
-                }
-            }
-            Self::Module {
-                metadata,
-                declaration_functions,
-            } => {
-                metadata.validate();
-                for function in declaration_functions {
-                    function.validate();
-                }
-            }
-        }
-    }
-
     fn validate_for_materialization(&self, source_len: usize) -> Result<(), ValidationErrorKind> {
         match self {
             Self::Script {
@@ -1882,13 +876,13 @@ impl Decode for MetadataKind {
     }
 }
 
-struct ScriptDeclarationMetadata {
-    lexical_names: Vec<ast::Utf16String>,
-    var_names: Vec<ast::Utf16String>,
-    function_names: Vec<ast::Utf16String>,
-    var_scoped_names: Vec<ast::Utf16String>,
-    annex_b_candidate_names: Vec<ast::Utf16String>,
-    lexical_bindings: Vec<LexicalBindingRecord>,
+pub struct ScriptDeclarationMetadata {
+    pub lexical_names: Vec<ast::Utf16String>,
+    pub var_names: Vec<ast::Utf16String>,
+    pub function_names: Vec<ast::Utf16String>,
+    pub var_scoped_names: Vec<ast::Utf16String>,
+    pub annex_b_candidate_names: Vec<ast::Utf16String>,
+    pub lexical_bindings: Vec<LexicalBindingRecord>,
 }
 
 impl ScriptDeclarationMetadata {
@@ -1927,15 +921,6 @@ impl ScriptDeclarationMetadata {
             lexical_bindings: LexicalBindingTable::decode(decoder)?,
         })
     }
-
-    fn validate(&self) {
-        let _ = self.lexical_names.len()
-            + self.var_names.len()
-            + self.function_names.len()
-            + self.var_scoped_names.len()
-            + self.annex_b_candidate_names.len()
-            + self.lexical_bindings.len();
-    }
 }
 
 impl Encode for ScriptDeclarationMetadata {
@@ -1950,16 +935,16 @@ impl Encode for ScriptDeclarationMetadata {
     }
 }
 
-struct ModuleDeclarationMetadata {
-    import_entries: Vec<ModuleImportEntryRecord>,
-    local_exports: Vec<ModuleExportEntryRecord>,
-    indirect_exports: Vec<ModuleExportEntryRecord>,
-    star_exports: Vec<ModuleExportEntryRecord>,
-    requested_modules: Vec<ModuleRequestRecord>,
-    default_export_binding_name: Option<ast::Utf16String>,
-    var_declared_names: Vec<ast::Utf16String>,
-    function_names: Vec<ast::Utf16String>,
-    lexical_bindings: Vec<ModuleLexicalBindingRecord>,
+pub struct ModuleDeclarationMetadata {
+    pub import_entries: Vec<ModuleImportEntryRecord>,
+    pub local_exports: Vec<ModuleExportEntryRecord>,
+    pub indirect_exports: Vec<ModuleExportEntryRecord>,
+    pub star_exports: Vec<ModuleExportEntryRecord>,
+    pub requested_modules: Vec<ModuleRequestRecord>,
+    pub default_export_binding_name: Option<ast::Utf16String>,
+    pub var_declared_names: Vec<ast::Utf16String>,
+    pub function_names: Vec<ast::Utf16String>,
+    pub lexical_bindings: Vec<ModuleLexicalBindingRecord>,
 }
 
 impl ModuleDeclarationMetadata {
@@ -2014,21 +999,6 @@ impl ModuleDeclarationMetadata {
             lexical_bindings: ModuleLexicalBindingTable::decode(decoder)?,
         })
     }
-
-    fn validate(&self) {
-        let _ = self.import_entries.len()
-            + self.local_exports.len()
-            + self.indirect_exports.len()
-            + self.star_exports.len()
-            + self.requested_modules.len()
-            + self.var_declared_names.len()
-            + self.function_names.len()
-            + self.lexical_bindings.len();
-        let _ = self
-            .default_export_binding_name
-            .as_ref()
-            .map(|name| name.as_slice().len());
-    }
 }
 
 impl Encode for ModuleDeclarationMetadata {
@@ -2063,9 +1033,9 @@ impl Utf16Vector<'_> {
     }
 }
 
-struct LexicalBindingRecord {
-    name: ast::Utf16String,
-    is_constant: bool,
+pub struct LexicalBindingRecord {
+    pub name: ast::Utf16String,
+    pub is_constant: bool,
 }
 
 impl Encode for LexicalBindingRecord {
@@ -2094,10 +1064,11 @@ impl LexicalBindingTable<'_> {
     }
 }
 
-struct ModuleLexicalBindingRecord {
-    name: ast::Utf16String,
-    is_constant: bool,
-    function_index: i32,
+/// A lexical binding of a module, which the declared function at `function_index` initializes, unless that is -1.
+pub struct ModuleLexicalBindingRecord {
+    pub name: ast::Utf16String,
+    pub is_constant: bool,
+    pub function_index: i32,
 }
 
 impl Encode for ModuleLexicalBindingRecord {
@@ -2129,9 +1100,9 @@ impl ModuleLexicalBindingTable<'_> {
 }
 
 #[derive(Clone)]
-struct ModuleRequestRecord {
-    specifier: ast::Utf16String,
-    attributes: Vec<ast::ImportAttribute>,
+pub struct ModuleRequestRecord {
+    pub specifier: ast::Utf16String,
+    pub attributes: Vec<ast::ImportAttribute>,
 }
 
 impl From<&ast::ModuleRequest> for ModuleRequestRecord {
@@ -2156,6 +1127,15 @@ impl Decode for ModuleRequestRecord {
             specifier: ast::Utf16String::decode(decoder)?,
             attributes: ImportAttributeTable::decode(decoder)?,
         })
+    }
+}
+
+impl From<&ModuleRequestRecord> for ast::ModuleRequest {
+    fn from(record: &ModuleRequestRecord) -> Self {
+        Self {
+            module_specifier: record.specifier.clone(),
+            attributes: record.attributes.clone(),
+        }
     }
 }
 
@@ -2195,10 +1175,10 @@ impl ImportAttributeTable<'_> {
     }
 }
 
-struct ModuleImportEntryRecord {
-    import_name: Option<ast::Utf16String>,
-    local_name: ast::Utf16String,
-    module_request: ModuleRequestRecord,
+pub struct ModuleImportEntryRecord {
+    pub import_name: Option<ast::Utf16String>,
+    pub local_name: ast::Utf16String,
+    pub module_request: ModuleRequestRecord,
 }
 
 impl Encode for ModuleImportEntryRecord {
@@ -2229,11 +1209,11 @@ impl ModuleImportEntryTable<'_> {
     }
 }
 
-struct ModuleExportEntryRecord {
-    kind: ast::ExportEntryKind,
-    export_name: Option<ast::Utf16String>,
-    local_or_import_name: Option<ast::Utf16String>,
-    module_request: Option<ModuleRequestRecord>,
+pub struct ModuleExportEntryRecord {
+    pub kind: ast::ExportEntryKind,
+    pub export_name: Option<ast::Utf16String>,
+    pub local_or_import_name: Option<ast::Utf16String>,
+    pub module_request: Option<ModuleRequestRecord>,
 }
 
 impl Encode for ModuleExportEntryRecord {
@@ -2680,19 +1660,13 @@ struct ProgramRecord<'a> {
 impl<'a> From<&'a CompiledProgram> for ProgramRecord<'a> {
     fn from(compiled: &'a CompiledProgram) -> Self {
         match &compiled.bytecode {
-            CompiledProgramBytecode::Program(bytecode) => Self {
+            CompiledProgramBytecode::Program(executable) => Self {
                 kind: ProgramKind::ScriptOrModule,
-                executable: ExecutableRecord {
-                    generator: &bytecode.generator,
-                    assembled: &bytecode.assembled,
-                },
+                executable: ExecutableRecord(executable),
             },
-            CompiledProgramBytecode::AsyncModule(bytecode) => Self {
+            CompiledProgramBytecode::AsyncModule(executable) => Self {
                 kind: ProgramKind::AsyncModule,
-                executable: ExecutableRecord {
-                    generator: &bytecode.generator,
-                    assembled: &bytecode.assembled,
-                },
+                executable: ExecutableRecord(executable),
             },
         }
     }
@@ -2714,25 +1688,30 @@ impl ProgramRecord<'_> {
     }
 }
 
-struct DecodedProgramRecord {
-    kind: ProgramKind,
-    executable: DecodedExecutableRecord,
+/// The body of a cached script or module.
+pub struct DecodedProgramRecord {
+    pub(crate) kind: ProgramKind,
+    pub(crate) executable: DecodedExecutableRecord,
 }
 
 impl DecodedProgramRecord {
-    fn validate(&self) {
-        let _ = self.kind as u8;
-        self.executable.validate();
-    }
-
     fn validate_for_materialization(&self, source_len: usize) -> Result<(), ValidationErrorKind> {
         self.executable.validate_for_materialization(source_len)
+    }
+
+    /// Whether this is the body of a module with top-level await, which is compiled as that of an async function.
+    pub fn is_async_module(&self) -> bool {
+        matches!(self.kind, ProgramKind::AsyncModule)
+    }
+
+    pub fn executable(&self) -> &DecodedExecutableRecord {
+        &self.executable
     }
 }
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
-enum ProgramKind {
+pub(crate) enum ProgramKind {
     ScriptOrModule = 0,
     AsyncModule = 1,
 }
@@ -2753,40 +1732,37 @@ impl Decode for ProgramKind {
     }
 }
 
-struct ExecutableRecord<'a> {
-    generator: &'a Generator,
-    assembled: &'a AssembledBytecode,
-}
+struct ExecutableRecord<'a>(&'a ExecutableData);
 
 impl Encode for ExecutableRecord<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        self.generator.strict.encode(encoder);
-        self.assembled.number_of_registers.encode(encoder);
-        self.assembled.number_of_arguments.encode(encoder);
-        CacheCounters(self.generator).encode(encoder);
-        self.generator.this_value_needs_environment_resolution.encode(encoder);
-        self.generator.length_identifier.map(|index| index.0).encode(encoder);
+        self.0.is_strict.encode(encoder);
+        self.0.number_of_registers.encode(encoder);
+        self.0.number_of_arguments.encode(encoder);
+        CacheCounters(&self.0.cache_counts).encode(encoder);
+        self.0.this_value_needs_environment_resolution.encode(encoder);
+        self.0.length_identifier.map(|index| index.0).encode(encoder);
 
         encoder.align_bytes_payload_to(BYTECODE_ALIGNMENT);
-        Bytes(&self.assembled.bytecode).encode(encoder);
+        Bytes(&self.0.bytecode).encode(encoder);
         for table in [
-            &self.generator.identifier_table,
-            &self.generator.property_key_table,
-            &self.generator.string_table,
+            &self.0.identifier_table,
+            &self.0.property_key_table,
+            &self.0.string_table,
         ] {
             DecodedRecordSequence::encode(encoder, table, |value, encoder| {
                 Utf16(&value.to_utf16()).encode(encoder);
             });
         }
-        ConstantTable(&self.generator.constants).encode(encoder);
-        ExceptionHandlerTable(self.assembled).encode(encoder);
-        SourceMapTable(self.assembled).encode(encoder);
-        LocalVariableTable(self.generator).encode(encoder);
-        DecodedRecordSequence::encode(encoder, &self.generator.argument_variable_names, |value, encoder| {
+        ConstantTable(&self.0.constants).encode(encoder);
+        ExceptionHandlerTable(&self.0.exception_handlers).encode(encoder);
+        SourceMapTable(&self.0.source_map).encode(encoder);
+        LocalVariableTable(&self.0.local_variables).encode(encoder);
+        DecodedRecordSequence::encode(encoder, &self.0.argument_variable_names, |value, encoder| {
             Utf16(&value.to_utf16()).encode(encoder);
         });
-        SharedFunctionTable(self.generator).encode(encoder);
-        ClassBlueprintTable(self.generator).encode(encoder);
+        SharedFunctionTable(&self.0.shared_function_data).encode(encoder);
+        ClassBlueprintTable(&self.0.class_blueprints).encode(encoder);
     }
 }
 
@@ -2797,8 +1773,12 @@ impl ExecutableRecord<'_> {
             number_of_registers: u32::decode(decoder)?,
             number_of_arguments: u32::decode(decoder)?,
             cache_counters: CacheCounters::decode(decoder)?,
-            this_value_needs_environment_resolution: bool::decode(decoder)?,
-            length_identifier: Option::<u32>::decode(decoder)?,
+            length_identifier: {
+                // this_value_needs_environment_resolution, which the runtime takes from the metadata of the function
+                // that owns the executable instead.
+                bool::decode(decoder)?;
+                Option::<u32>::decode(decoder)?
+            },
             bytecode: {
                 decoder.align_bytes_payload_to(BYTECODE_ALIGNMENT)?;
                 DecodedBytecodeBytes::decode(decoder)?
@@ -2817,53 +1797,36 @@ impl ExecutableRecord<'_> {
     }
 }
 
-struct DecodedExecutableRecord {
-    strict: bool,
-    number_of_registers: u32,
-    number_of_arguments: u32,
-    cache_counters: DecodedCacheCounters,
-    this_value_needs_environment_resolution: bool,
-    length_identifier: Option<u32>,
-    bytecode: DecodedBytecodeBytes,
-    identifier_table: DecodedUtf16Table,
-    property_key_table: DecodedUtf16Table,
-    string_table: DecodedUtf16Table,
-    constants: DecodedConstantTable,
-    exception_handlers: DecodedExceptionHandlerTable,
-    source_map: DecodedSourceMapTable,
-    local_variables: DecodedLocalVariableTable,
-    argument_variable_names: DecodedUtf16Table,
-    shared_functions: DecodedFunctionTable,
-    class_blueprints: DecodedClassBlueprintTable,
+/// One cached executable, whose bytecode stays in the blob. Its tables are decoded on request, into what a runtime
+/// creates an executable from; each returns `None` if the blob turns out to be malformed there.
+pub struct DecodedExecutableRecord {
+    pub(crate) strict: bool,
+    pub(crate) number_of_registers: u32,
+    pub(crate) number_of_arguments: u32,
+    pub(crate) cache_counters: DecodedCacheCounters,
+    pub(crate) length_identifier: Option<u32>,
+    pub(crate) bytecode: DecodedBytecodeBytes,
+    pub(crate) identifier_table: DecodedUtf16Table,
+    pub(crate) property_key_table: DecodedUtf16Table,
+    pub(crate) string_table: DecodedUtf16Table,
+    pub(crate) constants: DecodedConstantTable,
+    pub(crate) exception_handlers: DecodedExceptionHandlerTable,
+    pub(crate) source_map: DecodedSourceMapTable,
+    pub(crate) local_variables: DecodedLocalVariableTable,
+    pub(crate) argument_variable_names: DecodedUtf16Table,
+    pub(crate) shared_functions: DecodedFunctionTable,
+    pub(crate) class_blueprints: DecodedClassBlueprintTable,
 }
 
 impl DecodedExecutableRecord {
-    fn validate(&self) {
-        let _ = self.strict;
-        let _ = self.number_of_registers + self.number_of_arguments;
-        self.cache_counters.validate();
-        let _ = self.this_value_needs_environment_resolution;
-        let _ = self.length_identifier;
-        let _ = self.bytecode.len()
-            + self.identifier_table.len()
-            + self.property_key_table.len()
-            + self.string_table.len()
-            + self.constants.len()
-            + self.exception_handlers.len()
-            + self.source_map.len()
-            + self.local_variables.len()
-            + self.argument_variable_names.len()
-            + self.shared_functions.len()
-            + self.class_blueprints.len();
-        self.shared_functions.validate();
-        self.class_blueprints.validate();
-    }
-
     fn validate_for_materialization(&self, source_len: usize) -> Result<(), ValidationErrorKind> {
         if self
             .length_identifier
             .is_some_and(|index| (index as usize) >= self.property_key_table.len())
         {
+            return Err(ValidationErrorKind::InvalidLength);
+        }
+        if !self.tables_are_well_formed() {
             return Err(ValidationErrorKind::InvalidLength);
         }
         self.shared_functions.validate_for_materialization(source_len)?;
@@ -2922,33 +1885,131 @@ impl DecodedExecutableRecord {
 
         Ok(())
     }
+
+    /// Whether every table that an executable is created from decodes. A function's executable is only created on its
+    /// first call, when a malformed table can no longer make the host compile the source instead.
+    fn tables_are_well_formed(&self) -> bool {
+        self.identifier_table.is_well_formed()
+            && self.property_key_table.is_well_formed()
+            && self.string_table.is_well_formed()
+            && self.argument_variable_names.is_well_formed()
+            && self.constants.is_well_formed()
+            && self.local_variables.values().is_some()
+    }
+
+    pub fn is_strict(&self) -> bool {
+        self.strict
+    }
+
+    pub fn number_of_registers(&self) -> u32 {
+        self.number_of_registers
+    }
+
+    pub fn number_of_arguments(&self) -> u32 {
+        self.number_of_arguments
+    }
+
+    pub fn cache_counts(&self) -> ExecutableCacheCounts {
+        let counters = &self.cache_counters;
+        ExecutableCacheCounts {
+            property_lookup: counters.property_lookup_cache_count,
+            global_variable: counters.global_variable_cache_count,
+            environment_coordinate: counters.environment_coordinate_cache_count,
+            template_object: counters.template_object_cache_count,
+            object_shape: counters.object_shape_cache_count,
+            object_property_iterator: counters.object_property_iterator_cache_count,
+            environment_shape: counters.environment_shape_cache_count,
+        }
+    }
+
+    /// The index in the property key table of the name the bytecode reads a length through, if any.
+    pub fn length_identifier(&self) -> Option<u32> {
+        self.length_identifier
+    }
+
+    /// The bytecode, in the blob, which these bytes keep alive.
+    pub fn bytecode(&self) -> &DecodedBytecodeBytes {
+        &self.bytecode
+    }
+
+    pub fn identifiers(&self) -> Option<Vec<ak::Utf16FlyString>> {
+        self.identifier_table.fly_strings()
+    }
+
+    pub fn property_keys(&self) -> Option<Vec<ak::Utf16FlyString>> {
+        self.property_key_table.fly_strings()
+    }
+
+    pub fn strings(&self) -> Option<Vec<ak::Utf16FlyString>> {
+        self.string_table.fly_strings()
+    }
+
+    pub fn argument_names(&self) -> Option<Vec<ak::Utf16FlyString>> {
+        self.argument_variable_names.fly_strings()
+    }
+
+    pub fn constant_values(&self) -> Option<Vec<ConstantValue>> {
+        self.constants.values()
+    }
+
+    pub fn exception_handler_entries(&self) -> Option<Vec<ExceptionHandler>> {
+        self.exception_handlers.values()
+    }
+
+    pub fn source_map_entries(&self) -> Option<Vec<SourceMapEntry>> {
+        self.source_map.values()
+    }
+
+    pub fn locals(&self) -> Option<Vec<LocalVariable>> {
+        self.local_variables.local_variables()
+    }
+
+    /// The functions the bytecode creates, which refer to it by index.
+    pub fn functions(&self) -> Option<Vec<DecodedFunctionRecord>> {
+        self.shared_functions.values()
+    }
+
+    pub fn classes(&self) -> Option<Vec<PendingClassBlueprint>> {
+        Some(
+            self.class_blueprints
+                .values()?
+                .iter()
+                .map(PendingClassBlueprint::from)
+                .collect(),
+        )
+    }
 }
 
-struct DecodedCachedExecutableRecord {
+/// The executable of a cached function, kept in the blob until the function is first called.
+pub struct DecodedCachedExecutableRecord {
     bytes: DecodedBytecodeBytes,
     has_been_validated_for_materialization: bool,
 }
 
 impl DecodedCachedExecutableRecord {
-    fn decode_executable(&self) -> Option<DecodedExecutableRecord> {
+    /// The executable, decoded.
+    ///
+    /// # Panics
+    /// Panics unless the record came from a blob that passed validation.
+    pub fn decode_executable(&self) -> Option<DecodedExecutableRecord> {
         self.verify_has_been_validated_for_materialization();
         self.decode_validated_executable(CachedBytecodeValidation::Validated)
     }
 
-    fn decode_validated_executable(&self, _: CachedBytecodeValidation) -> Option<DecodedExecutableRecord> {
+    pub(crate) fn decode_validated_executable(&self, _: CachedBytecodeValidation) -> Option<DecodedExecutableRecord> {
         let mut decoder = self.bytes.decoder();
         let executable = ExecutableRecord::decode(&mut decoder)?;
         decoder.is_empty().then_some(executable)
     }
 
-    fn validated_copy(&self, _: CachedBytecodeValidation) -> Self {
+    pub(crate) fn validated_copy(&self, _: CachedBytecodeValidation) -> Self {
         Self {
             bytes: self.bytes.clone(),
             has_been_validated_for_materialization: true,
         }
     }
 
-    fn verify_has_been_validated_for_materialization(&self) {
+    pub(crate) fn verify_has_been_validated_for_materialization(&self) {
         assert!(
             self.has_been_validated_for_materialization,
             "cached bytecode executable must be validated before materialization"
@@ -2963,24 +2024,19 @@ impl DecodedCachedExecutableRecord {
         }
         executable.validate_for_materialization(source_len)
     }
-
-    fn validate(&self) {
-        let _ = self.bytes.len();
-        let _ = self.has_been_validated_for_materialization;
-    }
 }
 
-struct CacheCounters<'a>(&'a Generator);
+struct CacheCounters<'a>(&'a ExecutableCacheCounts);
 
 impl Encode for CacheCounters<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        self.0.next_property_lookup_cache.encode(encoder);
-        self.0.next_global_variable_cache.encode(encoder);
-        self.0.next_environment_coordinate_cache.encode(encoder);
-        self.0.next_template_object_cache.encode(encoder);
-        self.0.next_object_shape_cache.encode(encoder);
-        self.0.next_object_property_iterator_cache.encode(encoder);
-        self.0.next_environment_shape_cache.encode(encoder);
+        self.0.property_lookup.encode(encoder);
+        self.0.global_variable.encode(encoder);
+        self.0.environment_coordinate.encode(encoder);
+        self.0.template_object.encode(encoder);
+        self.0.object_shape.encode(encoder);
+        self.0.object_property_iterator.encode(encoder);
+        self.0.environment_shape.encode(encoder);
     }
 }
 
@@ -2998,26 +2054,14 @@ impl CacheCounters<'_> {
     }
 }
 
-struct DecodedCacheCounters {
-    property_lookup_cache_count: u32,
-    global_variable_cache_count: u32,
-    environment_coordinate_cache_count: u32,
-    template_object_cache_count: u32,
-    object_shape_cache_count: u32,
-    object_property_iterator_cache_count: u32,
-    environment_shape_cache_count: u32,
-}
-
-impl DecodedCacheCounters {
-    fn validate(&self) {
-        let _ = self.property_lookup_cache_count
-            + self.global_variable_cache_count
-            + self.environment_coordinate_cache_count
-            + self.template_object_cache_count
-            + self.object_shape_cache_count
-            + self.object_property_iterator_cache_count
-            + self.environment_shape_cache_count;
-    }
+pub(crate) struct DecodedCacheCounters {
+    pub(crate) property_lookup_cache_count: u32,
+    pub(crate) global_variable_cache_count: u32,
+    pub(crate) environment_coordinate_cache_count: u32,
+    pub(crate) template_object_cache_count: u32,
+    pub(crate) object_shape_cache_count: u32,
+    pub(crate) object_property_iterator_cache_count: u32,
+    pub(crate) environment_shape_cache_count: u32,
 }
 
 struct Utf16Table<'a>(&'a [ast::Utf16String]);
@@ -3036,7 +2080,7 @@ impl Utf16Table<'_> {
     }
 }
 
-struct DecodedUtf16Table {
+pub(crate) struct DecodedUtf16Table {
     sequence: DecodedRecordSequence,
 }
 
@@ -3045,13 +2089,23 @@ impl DecodedUtf16Table {
         self.sequence.len()
     }
 
-    fn values(&self) -> Option<Vec<DecodedUtf16String>> {
+    pub(crate) fn values(&self) -> Option<Vec<DecodedUtf16String>> {
         let mut decoder = self.sequence.decoder();
         let mut values = Vec::with_capacity(self.sequence.len());
         for _ in 0..self.sequence.len() {
             values.push(DecodedUtf16String::decode(&mut decoder)?);
         }
         decoder.is_empty().then_some(values)
+    }
+
+    fn is_well_formed(&self) -> bool {
+        let mut decoder = self.sequence.decoder();
+        (0..self.sequence.len()).all(|_| DecodedUtf16String::decode(&mut decoder).is_some()) && decoder.is_empty()
+    }
+
+    fn fly_strings(&self) -> Option<Vec<ak::Utf16FlyString>> {
+        // The strings point into the bytes of this table, which keep the blob alive while they are converted.
+        Some(self.values()?.iter().map(DecodedUtf16String::to_fly_string).collect())
     }
 }
 
@@ -3084,7 +2138,7 @@ impl ConstantTable<'_> {
     }
 }
 
-struct DecodedConstantTable {
+pub(crate) struct DecodedConstantTable {
     count: usize,
     bytes: DecodedBytecodeBytes,
 }
@@ -3094,17 +2148,19 @@ impl DecodedConstantTable {
         self.count
     }
 
-    fn ffi_data(&self) -> Option<(usize, &DecodedBytecodeBytes)> {
-        {
-            let mut decoder = Decoder::new(self.bytes.as_slice(), None);
-            for _ in 0..self.count {
-                validate_constant_value(&mut decoder)?;
-            }
-            if !decoder.is_empty() {
-                return None;
-            }
+    /// Whether every constant is one that the runtime creates a value from.
+    fn is_well_formed(&self) -> bool {
+        let mut decoder = Decoder::new(self.bytes.as_slice(), None);
+        (0..self.count).all(|_| validate_constant_value(&mut decoder).is_some()) && decoder.is_empty()
+    }
+
+    fn values(&self) -> Option<Vec<ConstantValue>> {
+        let mut decoder = Decoder::new(self.bytes.as_slice(), None);
+        let mut values = Vec::with_capacity(self.count);
+        for _ in 0..self.count {
+            values.push(ConstantValue::decode(&mut decoder)?);
         }
-        Some((self.count, &self.bytes))
+        decoder.is_empty().then_some(values)
     }
 }
 
@@ -3125,7 +2181,7 @@ fn validate_constant_value(decoder: &mut Decoder<'_>) -> Option<()> {
         }
         tag if tag == ConstantTag::BigInt as u8 => {
             let length: usize = u32::decode(decoder)?.try_into().ok()?;
-            decoder.bytes(length)?.is_ascii().then_some(())?;
+            is_big_int_constant(decoder.bytes(length)?).then_some(())?;
         }
         tag if tag == ConstantTag::WellKnownSymbol as u8 => match u8::decode(decoder)? {
             0 | 1 => {}
@@ -3139,6 +2195,24 @@ fn validate_constant_value(decoder: &mut Decoder<'_>) -> Option<()> {
     }
 
     Some(())
+}
+
+/// Whether `literal` is a BigInt as the frontend writes one into a constant table, which the runtime parses: the
+/// digits of a literal, after its 0x, 0o or 0b prefix and with the numeric separators of its source text, or the
+/// decimal digits of a folded value, which may be negative.
+fn is_big_int_constant(literal: &[u8]) -> bool {
+    let (radix, digits) = match literal {
+        [b'0', b'x' | b'X', digits @ ..] if !digits.is_empty() => (16, digits),
+        [b'0', b'o' | b'O', digits @ ..] if !digits.is_empty() => (8, digits),
+        [b'0', b'b' | b'B', digits @ ..] if !digits.is_empty() => (2, digits),
+        [b'-', digits @ ..] => (10, digits),
+        digits => (10, digits),
+    };
+    let is_digit = |byte: &u8| char::from(*byte).is_digit(radix);
+    digits.first().is_some_and(is_digit)
+        && digits.last().is_some_and(is_digit)
+        && digits.windows(2).all(|pair| pair != b"__")
+        && digits.iter().all(|byte| *byte == b'_' || is_digit(byte))
 }
 
 impl Encode for ConstantValue {
@@ -3206,11 +2280,11 @@ impl Decode for ConstantValue {
     }
 }
 
-struct ExceptionHandlerTable<'a>(&'a AssembledBytecode);
+struct ExceptionHandlerTable<'a>(&'a [ExceptionHandler]);
 
 impl Encode for ExceptionHandlerTable<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        DecodedRecordSequence::encode(encoder, &self.0.exception_handlers, |handler, encoder| {
+        DecodedRecordSequence::encode(encoder, self.0, |handler, encoder| {
             handler.start_offset.encode(encoder);
             handler.end_offset.encode(encoder);
             handler.handler_offset.encode(encoder);
@@ -3227,16 +2301,12 @@ impl ExceptionHandlerTable<'_> {
     }
 }
 
-struct DecodedExceptionHandlerTable {
+pub(crate) struct DecodedExceptionHandlerTable {
     sequence: DecodedRecordSequence,
 }
 
 impl DecodedExceptionHandlerTable {
-    fn len(&self) -> usize {
-        self.sequence.len()
-    }
-
-    fn values(&self) -> Option<Vec<ExceptionHandler>> {
+    pub(crate) fn values(&self) -> Option<Vec<ExceptionHandler>> {
         let mut decoder = self.sequence.decoder();
         let mut values = Vec::with_capacity(self.sequence.len());
         for _ in 0..self.sequence.len() {
@@ -3251,11 +2321,11 @@ impl DecodedExceptionHandlerTable {
     }
 }
 
-struct SourceMapTable<'a>(&'a AssembledBytecode);
+struct SourceMapTable<'a>(&'a [SourceMapEntry]);
 
 impl Encode for SourceMapTable<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        DecodedRecordSequence::encode(encoder, &self.0.source_map, |entry, encoder| {
+        DecodedRecordSequence::encode(encoder, self.0, |entry, encoder| {
             entry.bytecode_offset.encode(encoder);
             entry.line.encode(encoder);
             entry.column.encode(encoder);
@@ -3271,16 +2341,12 @@ impl SourceMapTable<'_> {
     }
 }
 
-struct DecodedSourceMapTable {
+pub(crate) struct DecodedSourceMapTable {
     sequence: DecodedRecordSequence,
 }
 
 impl DecodedSourceMapTable {
-    fn len(&self) -> usize {
-        self.sequence.len()
-    }
-
-    fn values(&self) -> Option<Vec<SourceMapEntry>> {
+    pub(crate) fn values(&self) -> Option<Vec<SourceMapEntry>> {
         let mut decoder = self.sequence.decoder();
         let mut values = Vec::with_capacity(self.sequence.len());
         for _ in 0..self.sequence.len() {
@@ -3294,11 +2360,11 @@ impl DecodedSourceMapTable {
     }
 }
 
-struct LocalVariableTable<'a>(&'a Generator);
+struct LocalVariableTable<'a>(&'a [LocalVariable]);
 
 impl Encode for LocalVariableTable<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        DecodedRecordSequence::encode(encoder, &self.0.local_variables, |local_variable, encoder| {
+        DecodedRecordSequence::encode(encoder, self.0, |local_variable, encoder| {
             Utf16(&local_variable.name.to_utf16()).encode(encoder);
             local_variable.is_lexically_declared.encode(encoder);
             local_variable
@@ -3324,7 +2390,7 @@ impl LocalVariableTable<'_> {
     }
 }
 
-struct DecodedLocalVariableTable {
+pub(crate) struct DecodedLocalVariableTable {
     sequence: DecodedRecordSequence,
 }
 
@@ -3333,7 +2399,7 @@ impl DecodedLocalVariableTable {
         self.sequence.len()
     }
 
-    fn values(&self) -> Option<Vec<DecodedLocalVariable>> {
+    pub(crate) fn values(&self) -> Option<Vec<DecodedLocalVariable>> {
         let mut decoder = self.sequence.decoder();
         let mut values = Vec::with_capacity(self.sequence.len());
         for _ in 0..self.sequence.len() {
@@ -3362,32 +2428,40 @@ impl DecodedLocalVariableTable {
         }
         decoder.is_empty().then_some(values)
     }
+
+    fn local_variables(&self) -> Option<Vec<LocalVariable>> {
+        // The names point into the bytes of this table, which keep the blob alive while they are converted.
+        Some(
+            self.values()?
+                .into_iter()
+                .map(|local_variable| LocalVariable {
+                    name: local_variable.name.to_fly_string(),
+                    is_lexically_declared: local_variable.is_lexically_declared,
+                    is_initialized_during_declaration_instantiation: local_variable
+                        .is_initialized_during_declaration_instantiation,
+                    is_mutable: local_variable.is_mutable,
+                    scope_range: local_variable.scope_range,
+                })
+                .collect(),
+        )
+    }
 }
 
-struct DecodedLocalVariable {
-    name: DecodedUtf16String,
-    is_lexically_declared: bool,
-    is_initialized_during_declaration_instantiation: bool,
-    is_mutable: bool,
-    scope_range: Option<crate::ast::SourceRange>,
+pub(crate) struct DecodedLocalVariable {
+    pub(crate) name: DecodedUtf16String,
+    pub(crate) is_lexically_declared: bool,
+    pub(crate) is_initialized_during_declaration_instantiation: bool,
+    pub(crate) is_mutable: bool,
+    pub(crate) scope_range: Option<crate::ast::SourceRange>,
 }
 
-struct SharedFunctionTable<'a>(&'a Generator);
+struct SharedFunctionTable<'a>(&'a [PendingSharedFunctionData]);
 
 impl Encode for SharedFunctionTable<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        DecodedRecordSequence::encode_with_alignment(
-            encoder,
-            &self.0.shared_function_data,
-            BYTECODE_ALIGNMENT,
-            |shared_data, encoder| {
-                FunctionRecord {
-                    shared_data,
-                    arena: &self.0.arena,
-                }
-                .encode(encoder);
-            },
-        );
+        DecodedRecordSequence::encode_with_alignment(encoder, self.0, BYTECODE_ALIGNMENT, |shared_data, encoder| {
+            FunctionRecord(shared_data).encode(encoder);
+        });
     }
 }
 
@@ -3399,7 +2473,7 @@ impl SharedFunctionTable<'_> {
     }
 }
 
-struct DecodedFunctionTable {
+pub(crate) struct DecodedFunctionTable {
     sequence: DecodedRecordSequence,
 }
 
@@ -3408,11 +2482,7 @@ impl DecodedFunctionTable {
         self.sequence.len()
     }
 
-    fn validate(&self) {
-        let _ = self.sequence.len();
-    }
-
-    fn values(&self) -> Option<Vec<DecodedFunctionRecord>> {
+    pub(crate) fn values(&self) -> Option<Vec<DecodedFunctionRecord>> {
         let mut decoder = self.sequence.decoder();
         let mut values = Vec::with_capacity(self.sequence.len());
         for _ in 0..self.sequence.len() {
@@ -3441,11 +2511,7 @@ impl Encode for DeclarationFunctionTable<'_> {
         u32_from_usize(self.0.len()).encode(encoder);
         let mut payload_encoder = Encoder::new();
         for shared_data in self.0 {
-            let arena = shared_data
-                .arena
-                .as_deref()
-                .expect("bytecode cache declaration function is missing its AST arena");
-            FunctionRecord { shared_data, arena }.encode(&mut payload_encoder);
+            FunctionRecord(shared_data).encode(&mut payload_encoder);
         }
         encoder.align_bytes_payload_to(BYTECODE_ALIGNMENT);
         Bytes(&payload_encoder.finish()).encode(encoder);
@@ -3470,20 +2536,17 @@ impl DeclarationFunctionTable<'_> {
     }
 }
 
-struct FunctionRecord<'a> {
-    shared_data: &'a PendingSharedFunctionData,
-    arena: &'a ast::AstArena,
-}
+struct FunctionRecord<'a>(&'a PendingSharedFunctionData);
 
 impl Encode for FunctionRecord<'_> {
     fn encode(&self, encoder: &mut Encoder) {
         let function_data = self
-            .shared_data
+            .0
             .function_data
             .as_ref()
             .expect("bytecode cache requires function data to be retained until serialization");
         let precompiled = self
-            .shared_data
+            .0
             .precompiled_function
             .as_ref()
             .expect("fully compiled bytecode cache entry is missing nested function bytecode");
@@ -3506,7 +2569,7 @@ impl Encode for FunctionRecord<'_> {
             .parsing_insights
             .uses_this_from_environment
             .encode(encoder);
-        ClassFieldInitializerName(self.shared_data).encode(encoder);
+        ClassFieldInitializerName(self.0).encode(encoder);
         precompiled.metadata.encode(encoder);
         PrecompiledFunctionRecord(precompiled).encode(encoder);
     }
@@ -3533,49 +2596,101 @@ impl FunctionRecord<'_> {
     }
 }
 
-struct DecodedFunctionRecord {
-    name: Option<DecodedUtf16String>,
-    source_text_start: u32,
-    source_text_end: u32,
-    function_length: i32,
-    formal_parameter_count: u32,
-    kind: ast::FunctionKind,
-    is_strict_mode: bool,
-    is_arrow_function: bool,
-    parameter_names: Option<Vec<DecodedUtf16String>>,
-    uses_this: bool,
-    uses_this_from_environment: bool,
-    class_field_initializer_name: Option<(DecodedUtf16String, bool)>,
-    metadata: FunctionSfdMetadata,
-    precompiled: DecodedCachedExecutableRecord,
+/// One function a cached executable creates or a cached program declares. The strings it returns stay in the blob.
+pub struct DecodedFunctionRecord {
+    pub(crate) name: Option<DecodedUtf16String>,
+    pub(crate) source_text_start: u32,
+    pub(crate) source_text_end: u32,
+    pub(crate) function_length: i32,
+    pub(crate) formal_parameter_count: u32,
+    pub(crate) kind: ast::FunctionKind,
+    pub(crate) is_strict_mode: bool,
+    pub(crate) is_arrow_function: bool,
+    pub(crate) parameter_names: Option<Vec<DecodedUtf16String>>,
+    pub(crate) uses_this: bool,
+    pub(crate) uses_this_from_environment: bool,
+    pub(crate) class_field_initializer_name: Option<(DecodedUtf16String, bool)>,
+    pub(crate) metadata: FunctionSfdMetadata,
+    pub(crate) precompiled: DecodedCachedExecutableRecord,
 }
 
 impl DecodedFunctionRecord {
-    fn validate(&self) {
-        let _ = self.name.as_ref().map(DecodedUtf16String::len);
-        let _ = self.source_text_start;
-        let _ = self.source_text_end;
-        let _ = self.formal_parameter_count;
-        let _ = self.function_length;
-        let _ = self.kind as u8;
-        let _ = self.is_strict_mode || self.is_arrow_function || self.uses_this || self.uses_this_from_environment;
-        let _ = self.parameter_names.as_ref().map(|names| names.len());
-        let _ = self.class_field_initializer_name.as_ref().map(|(name, _)| name.len());
-        self.precompiled.validate();
-        validate_function_metadata(&self.metadata);
-    }
-
     fn validate_for_materialization(&self, source_len: usize) -> Result<(), ValidationErrorKind> {
         if !source_span_is_valid(self.source_text_start, self.source_text_end, source_len) {
             return Err(ValidationErrorKind::InvalidLength);
         }
         self.precompiled.validate_for_materialization(source_len)
     }
+
+    // NB: The strings of a record point into the blob, which the record's own bytecode keeps alive.
+    pub fn function_name(&self) -> Option<Cow<'_, [u16]>> {
+        self.name.as_ref().map(DecodedUtf16String::code_units)
+    }
+
+    /// Where the function's source text starts and ends in the source code, in code units.
+    pub fn source_text_range(&self) -> Range<usize> {
+        self.source_text_start as usize..self.source_text_end as usize
+    }
+
+    pub fn length(&self) -> i32 {
+        self.function_length
+    }
+
+    pub fn parameter_count(&self) -> u32 {
+        self.formal_parameter_count
+    }
+
+    pub fn function_kind(&self) -> ast::FunctionKind {
+        self.kind
+    }
+
+    /// Whether the function's own code is strict, which does not count code it is nested in.
+    pub fn has_strict_code(&self) -> bool {
+        self.is_strict_mode
+    }
+
+    pub fn is_arrow(&self) -> bool {
+        self.is_arrow_function
+    }
+
+    /// The names of the parameters if the parameter list is simple, and `None` otherwise.
+    pub fn simple_parameter_names(&self) -> Option<Vec<ak::Utf16FlyString>> {
+        Some(
+            self.parameter_names
+                .as_ref()?
+                .iter()
+                .map(DecodedUtf16String::to_fly_string)
+                .collect(),
+        )
+    }
+
+    /// What parsing found out about the function's use of `this`: whether it does, and whether it resolves `this`
+    /// through its environment.
+    pub fn parsing_insights_about_this(&self) -> (bool, bool) {
+        (self.uses_this, self.uses_this_from_environment)
+    }
+
+    /// The name of the field whose initializer the function is, and whether that field is private.
+    pub fn field_initializer_name(&self) -> Option<(Cow<'_, [u16]>, bool)> {
+        self.class_field_initializer_name
+            .as_ref()
+            .map(|(name, is_private)| (name.code_units(), *is_private))
+    }
+
+    pub fn scope_metadata(&self) -> &FunctionSfdMetadata {
+        &self.metadata
+    }
+
+    /// The function's own executable, which stays in the blob until the function is first called.
+    pub fn cached_executable(&self) -> DecodedCachedExecutableRecord {
+        // Records are only reachable from outside this module through a blob that passed validation.
+        self.precompiled.validated_copy(CachedBytecodeValidation::Validated)
+    }
 }
 
 impl<'a> FunctionRecord<'a> {
     fn function_name(&self, function_data: &'a ast::FunctionData) -> Option<Utf16<'a>> {
-        self.shared_data
+        self.0
             .name_override
             .as_deref()
             .or_else(|| function_data.name.map(|name| self.function_arena().name_slice(name)))
@@ -3583,7 +2698,10 @@ impl<'a> FunctionRecord<'a> {
     }
 
     fn function_arena(&self) -> &'a ast::AstArena {
-        self.shared_data.arena.as_deref().unwrap_or(self.arena)
+        self.0
+            .arena
+            .as_deref()
+            .expect("bytecode cache function is missing its AST arena")
     }
 }
 
@@ -3686,25 +2804,12 @@ impl FunctionSfdMetadata {
     }
 }
 
-fn validate_function_metadata(metadata: &FunctionSfdMetadata) {
-    let _ = metadata.uses_this
-        || metadata.this_value_needs_environment_resolution
-        || metadata.function_environment_needed
-        || metadata.might_need_arguments
-        || metadata.contains_eval;
-    let _ = metadata.function_environment_bindings_count + metadata.var_environment_bindings_count;
-}
-
 struct PrecompiledFunctionRecord<'a>(&'a PrecompiledFunction);
 
 impl Encode for PrecompiledFunctionRecord<'_> {
     fn encode(&self, encoder: &mut Encoder) {
         let mut payload_encoder = Encoder::new();
-        ExecutableRecord {
-            generator: &self.0.generator,
-            assembled: &self.0.assembled,
-        }
-        .encode(&mut payload_encoder);
+        ExecutableRecord(&self.0.executable).encode(&mut payload_encoder);
         encoder.align_bytes_payload_to(BYTECODE_ALIGNMENT);
         Bytes(&payload_encoder.finish()).encode(encoder);
     }
@@ -3720,11 +2825,11 @@ impl PrecompiledFunctionRecord<'_> {
     }
 }
 
-struct ClassBlueprintTable<'a>(&'a Generator);
+struct ClassBlueprintTable<'a>(&'a [PendingClassBlueprint]);
 
 impl Encode for ClassBlueprintTable<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        DecodedRecordSequence::encode(encoder, &self.0.class_blueprints, |blueprint, encoder| {
+        DecodedRecordSequence::encode(encoder, self.0, |blueprint, encoder| {
             ClassBlueprintRecord(blueprint).encode(encoder);
         });
     }
@@ -3738,7 +2843,7 @@ impl ClassBlueprintTable<'_> {
     }
 }
 
-struct DecodedClassBlueprintTable {
+pub(crate) struct DecodedClassBlueprintTable {
     sequence: DecodedRecordSequence,
 }
 
@@ -3747,11 +2852,7 @@ impl DecodedClassBlueprintTable {
         self.sequence.len()
     }
 
-    fn validate(&self) {
-        let _ = self.sequence.len();
-    }
-
-    fn values(&self) -> Option<Vec<DecodedClassBlueprintRecord>> {
+    pub(crate) fn values(&self) -> Option<Vec<DecodedClassBlueprintRecord>> {
         let mut decoder = self.sequence.decoder();
         let mut values = Vec::with_capacity(self.sequence.len());
         for _ in 0..self.sequence.len() {
@@ -3811,7 +2912,7 @@ impl ClassBlueprintRecord<'_> {
     }
 }
 
-struct DecodedClassBlueprintRecord {
+pub(crate) struct DecodedClassBlueprintRecord {
     name: Option<DecodedUtf16String>,
     source_text_offset: usize,
     source_text_length: usize,
@@ -3881,7 +2982,7 @@ impl ClassElementRecord<'_> {
     }
 }
 
-struct DecodedClassElementRecord {
+pub(crate) struct DecodedClassElementRecord {
     kind: u8,
     is_static: bool,
     is_private: bool,
@@ -3964,24 +3065,92 @@ fn literal_value_kind_tag(kind: PendingLiteralValueKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// Blob bytes as an embedder owns them: aligned the way an embedder's blob is, and counting their releases.
+    struct TestBlobStorage {
+        words: Vec<u64>,
+        releases: Rc<Cell<usize>>,
+    }
+
+    unsafe extern "C" fn release_test_blob(owner: *mut c_void) {
+        let storage = unsafe { Box::from_raw(owner.cast::<TestBlobStorage>()) };
+        storage.releases.set(storage.releases.get() + 1);
+    }
+
+    /// Copies `bytes` into storage of the returned owner, which adds one to `releases` when it is released.
+    fn test_blob(bytes: &[u8], releases: &Rc<Cell<usize>>) -> (&'static [u8], ForeignBytecodeCacheBlobOwner) {
+        let mut storage = Box::new(TestBlobStorage {
+            words: vec![0u64; bytes.len().div_ceil(size_of::<u64>())],
+            releases: releases.clone(),
+        });
+        // SAFETY: The words have room for every byte.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), storage.words.as_mut_ptr().cast::<u8>(), bytes.len());
+        }
+        // SAFETY: The owner keeps the words alive until the decoded blob releases it.
+        let view = unsafe { std::slice::from_raw_parts(storage.words.as_ptr().cast::<u8>(), bytes.len()) };
+        let owner = ForeignBytecodeCacheBlobOwner {
+            owner: Box::into_raw(storage).cast(),
+            free_owner: release_test_blob,
+        };
+        (view, owner)
+    }
+
+    fn decode_test_blob(
+        bytes: &[u8],
+        expected_program_type: ast::ProgramType,
+        expected_source_hash: &[u8; SOURCE_HASH_SIZE],
+        releases: &Rc<Cell<usize>>,
+    ) -> Option<DecodedCacheBlob> {
+        decode_test_blob_for_runtime(
+            bytes,
+            expected_program_type,
+            expected_source_hash,
+            BytecodeCacheRuntime::Rust,
+            releases,
+        )
+    }
+
+    fn decode_test_blob_for_runtime(
+        bytes: &[u8],
+        expected_program_type: ast::ProgramType,
+        expected_source_hash: &[u8; SOURCE_HASH_SIZE],
+        expected_runtime: BytecodeCacheRuntime,
+        releases: &Rc<Cell<usize>>,
+    ) -> Option<DecodedCacheBlob> {
+        let (view, owner) = test_blob(bytes, releases);
+        // SAFETY: The owner keeps the view alive.
+        unsafe {
+            decode_blob(
+                view,
+                expected_program_type,
+                expected_source_hash,
+                expected_runtime,
+                owner,
+            )
+        }
+    }
 
     fn empty_record_sequence(encoder: &mut Encoder) {
         DecodedRecordSequence::encode::<u8>(encoder, &[], |_, _| {});
     }
 
-    fn cached_executable_with_shared_function(function_payload: Option<Vec<u8>>) -> DecodedCachedExecutableRecord {
+    fn executable_record_with_shared_function(function_payload: Option<Vec<u8>>) -> Vec<u8> {
         let mut encoder = Encoder::new();
 
         false.encode(&mut encoder); // Strict.
         0u32.encode(&mut encoder); // Number of registers.
         0u32.encode(&mut encoder); // Number of arguments.
-        for _ in 0..5 {
-            0u32.encode(&mut encoder);
+        for _ in 0..7 {
+            0u32.encode(&mut encoder); // Cache counters.
         }
         false.encode(&mut encoder); // This value needs environment resolution.
-        Option::<u32>::None.encode(&mut encoder);
+        Option::<u32>::None.encode(&mut encoder); // Length identifier.
 
+        encoder.align_bytes_payload_to(BYTECODE_ALIGNMENT);
         Bytes(&[]).encode(&mut encoder); // Bytecode.
         empty_record_sequence(&mut encoder); // Identifier table.
         empty_record_sequence(&mut encoder); // Property key table.
@@ -3991,22 +3160,21 @@ mod tests {
         empty_record_sequence(&mut encoder); // Exception handlers.
         empty_record_sequence(&mut encoder); // Source map.
         empty_record_sequence(&mut encoder); // Local variables.
+        empty_record_sequence(&mut encoder); // Argument variable names.
 
         match function_payload {
             Some(payload) => {
-                1u32.encode(&mut encoder);
-                encoder.align_to(align_of::<u16>());
+                1u32.encode(&mut encoder); // Shared function count.
+                encoder.align_bytes_payload_to(BYTECODE_ALIGNMENT);
                 Bytes(&payload).encode(&mut encoder);
             }
-            None => empty_record_sequence(&mut encoder),
+            None => {
+                DecodedRecordSequence::encode_with_alignment::<u8>(&mut encoder, &[], BYTECODE_ALIGNMENT, |_, _| {});
+            }
         }
 
         empty_record_sequence(&mut encoder); // Class blueprints.
-
-        DecodedCachedExecutableRecord {
-            bytes: DecodedBytecodeBytes::Owned(encoder.finish()),
-            has_been_validated_for_materialization: false,
-        }
+        encoder.finish()
     }
 
     fn function_payload(source_text_start: u32, source_text_end: u32) -> Vec<u8> {
@@ -4035,11 +3203,19 @@ mod tests {
         }
         .encode(&mut encoder);
 
-        let empty_executable = cached_executable_with_shared_function(None);
-        encoder.align_to(align_of::<u16>());
-        Bytes(empty_executable.bytes.as_slice()).encode(&mut encoder);
+        encoder.align_bytes_payload_to(BYTECODE_ALIGNMENT);
+        Bytes(&executable_record_with_shared_function(None)).encode(&mut encoder);
 
         encoder.finish()
+    }
+
+    fn cached_executable(bytes: &[u8]) -> DecodedCachedExecutableRecord {
+        let (view, owner) = test_blob(bytes, &Rc::default());
+        let mut decoder = Decoder::new(view, Some(owner));
+        DecodedCachedExecutableRecord {
+            bytes: decoder.bytecode_bytes(view.len()).expect("the record fits in its blob"),
+            has_been_validated_for_materialization: false,
+        }
     }
 
     #[test]
@@ -4090,27 +3266,13 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.push(BytecodeCacheRuntime::Rust.tag());
         bytes.push(ast::ProgramType::Script as u8);
         bytes.extend_from_slice(&stored_source_hash);
 
-        assert!(
-            decode_blob_with_foreign_owner(
-                &bytes,
-                ast::ProgramType::Script,
-                &expected_source_hash,
-                ForeignBytecodeCacheBlobOwner {
-                    owner: std::ptr::null_mut(),
-                    clone_owner: ignore_clone_foreign_owner,
-                    free_owner: ignore_foreign_owner,
-                },
-            )
-            .is_none()
-        );
-    }
-
-    unsafe extern "C" fn ignore_foreign_owner(_: *mut c_void) {}
-    unsafe extern "C" fn ignore_clone_foreign_owner(_: *const c_void) -> *mut c_void {
-        std::ptr::null_mut()
+        let releases = Rc::default();
+        assert!(decode_test_blob(&bytes, ast::ProgramType::Script, &expected_source_hash, &releases).is_none());
+        assert_eq!(releases.get(), 1);
     }
 
     #[test]
@@ -4121,14 +3283,8 @@ mod tests {
         bytes.extend_from_slice(&0x2262u16.to_le_bytes());
         bytes.extend_from_slice(&0x0391u16.to_le_bytes());
 
-        let mut decoder = Decoder::new(
-            &bytes,
-            Some(ForeignBytecodeCacheBlobOwner {
-                owner: std::ptr::null_mut(),
-                clone_owner: ignore_clone_foreign_owner,
-                free_owner: ignore_foreign_owner,
-            }),
-        );
+        let (view, owner) = test_blob(&bytes, &Rc::default());
+        let mut decoder = Decoder::new(view, Some(owner));
         let decoded = DecodedUtf16String::decode(&mut decoder).unwrap();
         assert!(matches!(decoded, DecodedUtf16String::Foreign { .. }));
         assert_eq!(decoded.to_vec(), vec![0x41, 0x2262, 0x0391]);
@@ -4136,12 +3292,12 @@ mod tests {
 
     #[test]
     fn cached_function_validation_includes_nested_source_ranges() {
-        let nested_function = function_payload(20, 21);
-        let executable = cached_executable_with_shared_function(Some(nested_function));
+        let executable = cached_executable(&executable_record_with_shared_function(Some(function_payload(20, 21))));
 
         assert_eq!(
             executable.validate_for_materialization(10),
             Err(ValidationErrorKind::InvalidLength)
         );
+        assert_eq!(executable.validate_for_materialization(30), Ok(()));
     }
 }

@@ -41,7 +41,7 @@ use custom_property_environments::{CascadedCustomProperty, CustomPropertyName};
 /// The document's media features as the style update a transaction belongs to saw them, which
 /// `media()` conditions in `if()` read. Copied rather than borrowed: the host's snapshot ends with
 /// the style update, and a record demanded after it still resolves against these.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct DocumentMediaSnapshot {
     values: Vec<crate::css::parser::query_parser::FfiMediaFeatureValue>,
     /// Lent no output flag: `take_in` clears the one the host's context points to.
@@ -107,7 +107,7 @@ impl DocumentMediaSnapshot {
 /// The `@function` definitions each scope sees, as the host published them with a transaction's
 /// inputs: what a custom function call resolves against. A scope is a host `StyleScope`, named by
 /// its identity, as the resolver names the scope of a call and of a definition.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct DocumentFunctionSnapshot {
     /// Each definition some scope sees, by its identity, with the scope that defines it.
     definitions: HashMap<u64, (Arc<CompiledFunction>, usize)>,
@@ -122,6 +122,7 @@ pub(super) struct DocumentFunctionSnapshot {
 /// What a call from one scope reaches, as `visible_from` finds it, with the input blocks of each
 /// definition's body the document's media selects: only the container-gated blocks among those
 /// differ from one element to the next.
+#[derive(Clone)]
 pub(super) struct ScopeFunctions {
     /// Each reachable definition, with the scope that defines it and its selected blocks.
     definitions: Vec<(Arc<CompiledFunction>, usize, Box<[usize]>)>,
@@ -137,16 +138,18 @@ struct VisibleFunctions<'a> {
 }
 
 impl DocumentFunctionSnapshot {
-    /// Take in what the host lent with the inputs, retaining each definition, and clear the
-    /// borrowed fields so the inputs compare by value from here on.
+    /// Take in what the host lent with the inputs, retaining each definition a scope sees, and
+    /// clear the borrowed fields so the inputs compare by value from here on. `layer_index` ranks a
+    /// cascade layer within its tree scope.
     ///
     /// # Safety
     /// The borrowed fields must name a live array of their stated length, or nothing, for this
-    /// call, and each entry a live compiled function.
+    /// call, and each entry a live compiled function or none.
     pub(super) unsafe fn take_in(
         &mut self,
         inputs: &mut bridge::FfiDocumentStyleComputationInputs,
         media: &DocumentMediaSnapshot,
+        layer_index: impl Fn(TreeScopeID, CascadeLayerID) -> u32,
     ) {
         self.definitions.clear();
         self.visibilities.clear();
@@ -165,27 +168,62 @@ impl DocumentFunctionSnapshot {
                 )
             }
         };
+        // SAFETY: The host lends a live compiled function, or none.
+        let function_of =
+            |entry: &bridge::FfiCustomFunctionEntry| unsafe { entry.function.cast::<CompiledFunction>().as_ref() };
+        // What a scope defines under a name is the rule of the most precedent origin, and within it
+        // of the last layer, a later rule winning a tie.
+        let mut parent_scopes = HashMap::default();
+        let mut winners = HashMap::default();
         for entry in entries {
-            let function = entry.function.cast::<CompiledFunction>();
-            // SAFETY: The host lends a live compiled function, which is shared by reference count.
-            let Some(identity) = (unsafe { function.as_ref() }).map(|function| function.identity) else {
-                debug_assert!(false, "a published custom function names its definition");
+            self.caller_scopes.insert(TreeScopeID(entry.tree_scope), entry.scope);
+            parent_scopes.insert(entry.scope, entry.parent_scope);
+            let Some(function) = function_of(entry) else {
                 continue;
             };
-            self.definitions.entry(identity).or_insert_with(|| {
-                // SAFETY: As above; the snapshot keeps a reference of its own.
-                let function = unsafe {
-                    Arc::increment_strong_count(function);
-                    Arc::from_raw(function)
-                };
-                (function, entry.definition_scope)
-            });
-            self.visibilities.push(FfiSubstitutionFunctionVisibility {
-                caller_scope_identity: entry.caller_scope,
-                function_identity: identity,
-            });
-            self.caller_scopes
-                .insert(TreeScopeID(entry.tree_scope), entry.caller_scope);
+            let precedence = (
+                entry.origin,
+                layer_index(TreeScopeID(entry.tree_scope), CascadeLayerID(entry.layer)),
+            );
+            let key = (entry.scope, function.signature.name.units());
+            if winners.get(&key).is_none_or(|&(winner, _)| winner <= precedence) {
+                winners.insert(key, (precedence, function));
+            }
+        }
+        let mut defined: HashMap<usize, Vec<&CompiledFunction>> = HashMap::default();
+        for entry in entries {
+            if let Some(function) = function_of(entry)
+                && std::ptr::eq(winners[&(entry.scope, function.signature.name.units())].1, function)
+            {
+                defined.entry(entry.scope).or_default().push(function);
+            }
+        }
+        // https://drafts.csswg.org/css-shadow-1/#tree-scoped-name-global
+        // A name a scope does not define is looked up in the scope of its host's tree, and so on up.
+        for &caller_scope in parent_scopes.keys() {
+            let mut names = HashSet::default();
+            let mut scope = caller_scope;
+            while scope != 0 {
+                for &function in defined.get(&scope).into_iter().flatten() {
+                    if !names.insert(function.signature.name.units()) {
+                        continue;
+                    }
+                    self.definitions.entry(function.identity).or_insert_with(|| {
+                        let function = std::ptr::from_ref(function);
+                        // SAFETY: The host lends a function shared by reference count; the snapshot keeps one.
+                        let function = unsafe {
+                            Arc::increment_strong_count(function);
+                            Arc::from_raw(function)
+                        };
+                        (function, scope)
+                    });
+                    self.visibilities.push(FfiSubstitutionFunctionVisibility {
+                        caller_scope_identity: caller_scope,
+                        function_identity: function.identity,
+                    });
+                }
+                scope = parent_scopes.get(&scope).copied().unwrap_or(0);
+            }
         }
         inputs.custom_functions = bridge::FfiHostHandle::default();
         inputs.custom_function_count = 0;
@@ -1280,15 +1318,6 @@ impl RetainedState {
         })
     }
 
-    /// Take in the custom functions the host lent with a transaction's inputs, and what a call
-    /// from each scope reaches under the document's media, which the inputs moved first.
-    ///
-    /// # Safety
-    /// As for `DocumentFunctionSnapshot::take_in`.
-    pub(super) unsafe fn take_in_document_functions(&mut self, inputs: &mut bridge::FfiDocumentStyleComputationInputs) {
-        unsafe { self.document_functions.take_in(inputs, &self.document_media) };
-    }
-
     /// The name a cascaded custom declaration names, as its store entry keys it. A block's
     /// publication notes every custom property name it declares before the block is set, so a
     /// live declaration's name is always known.
@@ -1326,9 +1355,8 @@ impl RetainedState {
         parent_environment: u64,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         registered: Option<&RegisteredValueContext>,
-        counters: &mut Counters,
     ) -> Drive<u64> {
-        self.engine_custom_property_environment_of(node, None, parent_environment, inputs, registered, counters)
+        self.engine_custom_property_environment_of(node, None, parent_environment, inputs, registered)
     }
 
     /// What `engine_custom_property_environment` says of the element, for one of its
@@ -1340,7 +1368,6 @@ impl RetainedState {
         parent_environment: u64,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         registered: Option<&RegisteredValueContext>,
-        counters: &mut Counters,
     ) -> Drive<u64> {
         if !self.any_custom_property_is_declared() {
             if pseudo.is_none() {
@@ -1354,19 +1381,11 @@ impl RetainedState {
         let cascaded = self.cascaded_custom_declarations_of(node, pseudo);
         debug_assert!(cascaded.is_some(), "a driven node's custom declarations cascade");
         let Some(cascaded) = cascaded else {
-            counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
+            self.counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
             return Err(Unanswered::Refused);
         };
         self.note_custom_declaration_reads(node, pseudo, &cascaded);
-        self.engine_custom_property_environment_over(
-            node,
-            pseudo,
-            cascaded,
-            parent_environment,
-            inputs,
-            registered,
-            counters,
-        )
+        self.engine_custom_property_environment_over(node, pseudo, cascaded, parent_environment, inputs, registered)
     }
 
     /// Note what the custom declarations cascaded for an element or one of its pseudo-elements
@@ -1397,10 +1416,6 @@ impl RetainedState {
     /// What `engine_custom_property_environment_of` says of custom declarations the caller
     /// cascaded for the node or one of its pseudo-elements; `attr()` among them reads the node's
     /// attributes.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the declarations resolve over independent inputs"
-    )]
     pub(super) fn engine_custom_property_environment_over(
         &mut self,
         node: StyleNodeID,
@@ -1409,7 +1424,6 @@ impl RetainedState {
         parent_environment: u64,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         registered: Option<&RegisteredValueContext>,
-        counters: &mut Counters,
     ) -> Drive<u64> {
         let inherited_environment = self.custom_property_environments.inheritable(parent_environment);
         if cascaded.is_empty() {
@@ -1436,7 +1450,7 @@ impl RetainedState {
             // A container condition the engine cannot decide asks about an ancestor the host styles
             // in this update: the row waits for it.
             let Some(mut functions) = self.prepare_custom_functions(node, pseudo) else {
-                counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
                 return Err(Unanswered::AwaitsParent);
             };
             container_effects = functions.container_effects.take();
@@ -1469,14 +1483,14 @@ impl RetainedState {
                 && identity & custom_property_environments::ENGINE_ENVIRONMENT_IDENTITY_BIT == 0
         });
         if memoizes && let Some(identity) = memoized.filter(|_| !keeps_cpp_environment) {
-            counters.bump(Counter::EngineCustomPropertyEnvironmentMemoHits);
+            self.counters.bump(Counter::EngineCustomPropertyEnvironmentMemoHits);
             return Ok(identity);
         }
         let (Some(parent_store), Some(inheritance_store)) = (
             self.inherited_environment_store(inherited_environment),
             self.inherited_environment_store(parent_environment),
         ) else {
-            counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
+            self.counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
             return Err(Unanswered::Refused);
         };
         let parent = unsafe { parent_store.cast::<CustomPropertyStore>().as_ref() };
@@ -1581,7 +1595,7 @@ impl RetainedState {
         }
         unsafe { destroy_resolved_custom_properties(resolved.storage, resolved.count) };
         unsafe { Arc::decrement_strong_count(cascaded_store.cast::<CustomPropertyStore>()) };
-        counters.bump(Counter::EngineCustomPropertyEnvironmentsResolved);
+        self.counters.bump(Counter::EngineCustomPropertyEnvironmentsResolved);
         // What the registered values read beyond the element's fonts reaches the element's
         // records as what they read themselves does: a sibling change, a container's size.
         if reads.sibling_position {
@@ -1741,7 +1755,7 @@ impl RetainedState {
         inputs: &SubstitutionInputs<'_>,
         property: u16,
         written: RetainedStyleValueData,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Drive<RetainedStyleValueData> {
         let calls_functions = value_calls_custom_functions(written.data());
         let functions = inputs.functions.filter(|_| calls_functions);
@@ -1893,27 +1907,40 @@ mod tests {
         let functions: Vec<_> = crate::css::rule::compile_functions_for_testing(
             "@function --outer() { result: --inner(); }
             @function --inner() { result: 2px; }
-            @function --local() { result: 1px; }",
+            @function --local() { result: 1px; }
+            @function --local() { result: 3px; }
+            @function --inner() { result: 4px; }",
         )
         .into_iter()
         .map(Arc::new)
         .collect();
-        let [outer, inner, local] = [&functions[0], &functions[1], &functions[2]];
-        // The document's scope (1) sees --local and --outer, which a shadow tree's scope (2)
-        // defines; the shadow tree's sees --outer and --inner.
-        let entry = |function: &Arc<CompiledFunction>, caller_scope, definition_scope, tree_scope| {
+        let [outer, inner, user_agent_local, local, shadow_inner] = [
+            &functions[0],
+            &functions[1],
+            &functions[2],
+            &functions[3],
+            &functions[4],
+        ];
+        // The document's scope (1) defines --outer, --inner and --local, whose author rule wins
+        // over the user agent's in a later layer. A shadow tree's scope (2) defines another --inner,
+        // and a scope below it (3) defines nothing.
+        let entry = |function: Option<&Arc<CompiledFunction>>, scope, parent_scope, tree_scope, layer, origin| {
             bridge::FfiCustomFunctionEntry {
-                function: Arc::as_ptr(function).cast(),
-                caller_scope,
-                definition_scope,
+                function: function.map_or(std::ptr::null(), |function| Arc::as_ptr(function).cast()),
+                scope,
+                parent_scope,
                 tree_scope,
+                layer,
+                origin,
             }
         };
         let entries = [
-            entry(outer, 1, 2, 0),
-            entry(local, 1, 1, 0),
-            entry(outer, 2, 2, 5),
-            entry(inner, 2, 2, 5),
+            entry(Some(outer), 1, 0, 0, 0, 2),
+            entry(Some(inner), 1, 0, 0, 0, 2),
+            entry(Some(local), 1, 0, 0, 0, 2),
+            entry(Some(user_agent_local), 1, 0, 0, 7, 0),
+            entry(Some(shadow_inner), 2, 1, 5, 0, 2),
+            entry(None, 3, 2, 9, 0, 0),
         ];
         let mut inputs = bridge::FfiDocumentStyleComputationInputs {
             custom_functions: bridge::FfiHostHandle::from_pointer(entries.as_ptr().cast()),
@@ -1921,39 +1948,38 @@ mod tests {
             ..Default::default()
         };
         let mut snapshot = DocumentFunctionSnapshot::default();
-        unsafe { snapshot.take_in(&mut inputs, &DocumentMediaSnapshot::default()) };
+        unsafe { snapshot.take_in(&mut inputs, &DocumentMediaSnapshot::default(), |_, layer| layer.0) };
         assert_eq!(inputs, bridge::FfiDocumentStyleComputationInputs::default());
-        let reached = |visible: &VisibleFunctions<'_>| {
-            visible
+        let reached = |tree_scope| {
+            snapshot
+                .visible_from(TreeScopeID(tree_scope))
                 .definitions
                 .iter()
                 .map(|(function, scope)| (function.identity, *scope))
                 .collect::<Vec<_>>()
         };
 
-        // A call in the document reaches --inner through the body of --outer.
-        let document = snapshot.visible_from(TreeScopeID(0));
         assert_eq!(snapshot.scope_functions(TreeScopeID(0)).0, 1);
         assert_eq!(
-            reached(&document),
-            [(outer.identity, 2), (local.identity, 1), (inner.identity, 2)]
+            reached(0),
+            [(outer.identity, 1), (inner.identity, 1), (local.identity, 1)]
         );
-        assert_eq!(document.visibilities.len(), entries.len());
 
-        // A call in the shadow tree never reaches what only the document sees.
-        let shadow = snapshot.visible_from(TreeScopeID(5));
+        // A call in the shadow tree reaches its own --inner, and the document's through the body
+        // of --outer, as does one in the scope below it.
+        let below_shadow = [
+            (shadow_inner.identity, 2),
+            (outer.identity, 1),
+            (local.identity, 1),
+            (inner.identity, 1),
+        ];
         assert_eq!(snapshot.scope_functions(TreeScopeID(5)).0, 2);
-        assert_eq!(reached(&shadow), [(outer.identity, 2), (inner.identity, 2)]);
-        assert!(
-            shadow
-                .visibilities
-                .iter()
-                .all(|visibility| visibility.caller_scope_identity == 2)
-        );
+        assert_eq!(reached(5), below_shadow);
+        assert_eq!(snapshot.scope_functions(TreeScopeID(9)).0, 3);
+        assert_eq!(reached(9), below_shadow);
 
-        // A tree scope whose scope sees no definition reaches none.
-        let elsewhere = snapshot.visible_from(TreeScopeID(9));
-        assert_eq!(snapshot.scope_functions(TreeScopeID(9)).0, 0);
-        assert!(elsewhere.definitions.is_empty() && elsewhere.visibilities.is_empty());
+        // A tree scope with no scope reaches none.
+        assert_eq!(snapshot.scope_functions(TreeScopeID(11)).0, 0);
+        assert!(reached(11).is_empty());
     }
 }

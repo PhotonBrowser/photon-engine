@@ -196,6 +196,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -437,6 +447,12 @@ name = "fastrand"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f"
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flapc"
@@ -779,6 +795,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ladybird_allocator"
+version = "0.1.0"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -802,7 +822,9 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "foldhash 0.1.5",
+ "ladybird_allocator",
  "libgfx_rust",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -811,6 +833,8 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "foldhash 0.1.5",
+ "ladybird_allocator",
+ "rustc-demangle",
  "yuv",
 ]
 
@@ -820,6 +844,21 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "jxl",
+ "ladybird_allocator",
+ "rustc-demangle",
+]
+
+[[package]]
+name = "libjs_abi"
+version = "0.1.0"
+
+[[package]]
+name = "libjs_runtime_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -828,15 +867,22 @@ version = "0.1.0"
 dependencies = [
  "ak",
  "cbindgen",
+ "cc",
  "fARM64",
  "flapc",
  "foldhash 0.1.5",
  "iced-x86",
  "indexmap",
+ "ladybird_allocator",
+ "libc",
+ "libjs_abi",
+ "libjs_runtime_macros",
+ "libregex_rust",
  "libunicode_rust",
  "num-bigint",
  "num-integer",
  "num-traits",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -850,7 +896,9 @@ name = "libregex_rust"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "ladybird_allocator",
  "libunicode_rust",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -859,6 +907,8 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "encoding_rs",
+ "ladybird_allocator",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -868,6 +918,8 @@ dependencies = [
  "calendrical_calculations",
  "cbindgen",
  "icu_calendar",
+ "ladybird_allocator",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -876,8 +928,10 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "encoding_rs",
+ "ladybird_allocator",
  "libregex_rust",
  "libunicode_rust",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -900,6 +954,8 @@ version = "0.1.0"
 dependencies = [
  "adblock",
  "cbindgen",
+ "ladybird_allocator",
+ "rustc-demangle",
  "serde_json",
 ]
 
@@ -920,10 +976,12 @@ dependencies = [
  "chardetng",
  "foldhash 0.1.5",
  "hashbrown 0.16.1",
+ "ladybird_allocator",
  "libcompositing_rust",
  "libgfx_rust",
  "liburl_rust",
  "libweb_html_tokenizer",
+ "rustc-demangle",
  "serde_json",
  "smallvec",
 ]
@@ -1147,6 +1205,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "rustc-demangle"
+version = "0.1.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1256,6 +1320,12 @@ checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "simdutf8"

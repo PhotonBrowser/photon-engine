@@ -1,21 +1,32 @@
 /*
- * Copyright (c) 2020-2025, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2021-2023, Linus Groh <linusg@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/Completion.h>
+#include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/Error.h>
-#include <LibJS/Runtime/GlobalObject.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(Error);
+using namespace EmbeddingABI;
+
+static JSObject* error_to_abi(Error const& error)
+{
+    return object_to_abi(error);
+}
+
+Error& Error::create_of_engine_error_kind(Realm& realm, u8 engine_error_kind)
+{
+    auto& error = object_from_abi(js_error_create(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), engine_error_kind));
+    return static_cast<Error&>(error);
+}
 
 GC::Ref<Error> Error::create(Realm& realm)
 {
-    return realm.create<Error>(realm.intrinsics().error_prototype());
+    return create_of_engine_error_kind(realm, JS_ERROR_KIND_ERROR);
 }
 
 GC::Ref<Error> Error::create(Realm& realm, Utf16String message)
@@ -34,7 +45,8 @@ GC::Ref<Error> Error::create(Realm& realm, Utf16View message)
 
 GC::Ref<Error> Error::create(Realm& realm, Object& prototype)
 {
-    return realm.create<Error>(prototype);
+    auto& error = object_from_abi(js_error_create_with_prototype(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), object_to_abi(prototype)));
+    return static_cast<Error&>(error);
 }
 
 GC::Ref<Error> Error::create(Realm& realm, Object& prototype, Utf16String message)
@@ -46,87 +58,59 @@ GC::Ref<Error> Error::create(Realm& realm, Object& prototype, Utf16String messag
 
 Utf16String Error::stack_string(CompactTraceback compact) const
 {
-    return ErrorData::stack_string(compact);
-}
-
-Error::Error(Object& prototype)
-    : Object(ConstructWithPrototypeTag::Tag, prototype)
-    , ErrorData(prototype.vm())
-{
-}
-
-void Error::visit_edges(Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    ErrorData::visit_edges(visitor);
-}
-
-size_t Error::external_memory_size() const
-{
-    return Object::external_memory_size() + ErrorData::external_memory_size();
+    return own_error_data().stack_string(compact);
 }
 
 // 20.5.8.1 InstallErrorCause ( O, options ), https://tc39.es/ecma262/#sec-installerrorcause
 ThrowCompletionOr<void> Error::install_error_cause(Value options)
 {
-    auto& vm = this->vm();
-
-    // 1. If Type(options) is Object and ? HasProperty(options, "cause") is true, then
-    if (options.is_object() && TRY(options.as_object().has_property(vm.names.cause))) {
-        // a. Let cause be ? Get(options, "cause").
-        auto cause = TRY(options.as_object().get(vm.names.cause));
-
-        // b. Perform CreateNonEnumerableDataPropertyOrThrow(O, "cause", cause).
-        create_non_enumerable_data_property_or_throw(vm.names.cause, cause);
-    }
-
-    // 2. Return unused.
-    return {};
+    return completion_from_abi<void>(js_error_install_error_cause(vm_to_abi(vm()), error_to_abi(*this), value_to_abi(options)));
 }
 
 void Error::set_message(Utf16String message)
 {
-    auto& vm = this->vm();
-
-    u8 attr = Attribute::Writable | Attribute::Configurable;
-    define_direct_property(vm.names.message, PrimitiveString::create(vm, move(message)), attr);
+    js_error_set_owned_message(vm_to_abi(vm()), error_to_abi(*this), owned_utf16_string_to_abi(move(message)));
 }
 
 void Error::set_message(Utf16View message)
 {
-    auto& vm = this->vm();
-
-    u8 attr = Attribute::Writable | Attribute::Configurable;
-    define_direct_property(vm.names.message, PrimitiveString::create(vm, message), attr);
+    js_error_set_message(vm_to_abi(vm()), error_to_abi(*this), utf16_view_to_abi(message));
 }
 
-#define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
-    GC_DEFINE_ALLOCATOR(ClassName);                                                      \
-    GC::Ref<ClassName> ClassName::create(Realm& realm)                                   \
-    {                                                                                    \
-        return realm.create<ClassName>(realm.intrinsics().snake_name##_prototype());     \
-    }                                                                                    \
-                                                                                         \
-    GC::Ref<ClassName> ClassName::create(Realm& realm, Utf16String message)              \
-    {                                                                                    \
-        auto error = ClassName::create(realm);                                           \
-        error->set_message(move(message));                                               \
-        return error;                                                                    \
-    }                                                                                    \
-                                                                                         \
-    GC::Ref<ClassName> ClassName::create(Realm& realm, Utf16View message)                \
-    {                                                                                    \
-        auto error = ClassName::create(realm);                                           \
-        error->set_message(message);                                                     \
-        return error;                                                                    \
-    }                                                                                    \
-                                                                                         \
-    ClassName::ClassName(Object& prototype)                                              \
-        : Error(prototype)                                                               \
-    {                                                                                    \
+ErrorData& Error::own_error_data() const
+{
+    auto const* error_data = js_error_data_of(error_to_abi(*this));
+    VERIFY(error_data);
+    return *const_cast<ErrorData*>(reinterpret_cast<ErrorData const*>(error_data));
+}
+
+#define DEFINE_NATIVE_ERROR(ClassName, engine_error_kind)                                      \
+    GC::Ref<ClassName> ClassName::create(Realm& realm)                                         \
+    {                                                                                          \
+        return static_cast<ClassName&>(create_of_engine_error_kind(realm, engine_error_kind)); \
+    }                                                                                          \
+                                                                                               \
+    GC::Ref<ClassName> ClassName::create(Realm& realm, Utf16String message)                    \
+    {                                                                                          \
+        auto error = ClassName::create(realm);                                                 \
+        error->set_message(move(message));                                                     \
+        return error;                                                                          \
+    }                                                                                          \
+                                                                                               \
+    GC::Ref<ClassName> ClassName::create(Realm& realm, Utf16View message)                      \
+    {                                                                                          \
+        auto error = ClassName::create(realm);                                                 \
+        error->set_message(message);                                                           \
+        return error;                                                                          \
     }
 
-JS_ENUMERATE_NATIVE_ERRORS
-#undef __JS_ENUMERATE
+DEFINE_NATIVE_ERROR(EvalError, JS_ERROR_KIND_EVAL_ERROR)
+DEFINE_NATIVE_ERROR(InternalError, JS_ERROR_KIND_INTERNAL_ERROR)
+DEFINE_NATIVE_ERROR(RangeError, JS_ERROR_KIND_RANGE_ERROR)
+DEFINE_NATIVE_ERROR(ReferenceError, JS_ERROR_KIND_REFERENCE_ERROR)
+DEFINE_NATIVE_ERROR(SyntaxError, JS_ERROR_KIND_SYNTAX_ERROR)
+DEFINE_NATIVE_ERROR(TypeError, JS_ERROR_KIND_TYPE_ERROR)
+DEFINE_NATIVE_ERROR(URIError, JS_ERROR_KIND_URI_ERROR)
+#undef DEFINE_NATIVE_ERROR
 
 }

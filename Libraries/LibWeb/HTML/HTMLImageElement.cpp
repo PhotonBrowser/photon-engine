@@ -68,13 +68,13 @@ public:
     {
     }
 
-    void enqueue(GC::Root<GC::Function<void()>> callback)
+    void enqueue(GC::Ptr<DOM::Document const> document, GC::Root<GC::Function<void()>> callback)
     {
         // NOTE: We don't want to flush the queue on every image load, since that would be slow.
         //       However, we don't want to keep growing the batch forever either.
         static constexpr size_t max_loads_to_batch_before_flushing = 16;
 
-        m_queue.append(move(callback));
+        m_queue.append(Task::create(Task::Source::DOMManipulation, document, *callback));
         if (m_queue.size() < max_loads_to_batch_before_flushing)
             m_timer->restart();
     }
@@ -83,12 +83,12 @@ private:
     void process()
     {
         auto queue = move(m_queue);
-        for (auto& callback : queue)
-            callback->function()();
+        for (auto& task : queue)
+            task->execute();
     }
 
     NonnullRefPtr<Core::Timer> m_timer;
-    Vector<GC::Root<GC::Function<void()>>> m_queue;
+    Vector<GC::Root<Task>> m_queue;
 };
 
 static BatchingDispatcher& batching_dispatcher()
@@ -577,7 +577,7 @@ void HTMLImageElement::decode(GC::Ref<WebIDL::Promise> promise) const
             //         current request transitions to CompletelyAvailable, leaving the image dimensions at zero when
             //         callers inspect them.
             [weak_this, expected_request, queue_resolve_task, queue_reject_task] {
-                batching_dispatcher().enqueue(GC::create_function(GC::Heap::the(), [weak_this, expected_request, queue_resolve_task, queue_reject_task] {
+                batching_dispatcher().enqueue(weak_this ? &weak_this->document() : nullptr, GC::create_function(GC::Heap::the(), [weak_this, expected_request, queue_resolve_task, queue_reject_task] {
                     if (!weak_this) {
                         queue_reject_task("Image element no longer available"_utf16);
                         return;
@@ -679,6 +679,19 @@ Optional<ARIA::Role> HTMLImageElement::default_role() const
     // NOTE: The "image" role value is a synonym for the older "img" role value; however, the el-img test in
     //       https://wpt.fyi/results/html-aam/roles.html expects the value to be "image" (not "img").
     if (!alt().is_empty())
+        return ARIA::Role::image;
+    // https://www.w3.org/TR/html-aam/#el-img-empty-alt
+    // An img whose alt is empty is decorative, and its implicit role none keeps it out of the accessibility tree. But
+    // an accessible name from another naming mechanism restores the image role — and that's aria-label or
+    // aria-labelledby: a title doesn't override an empty alt, and an empty or whitespace-only aria-label names
+    // nothing (the el-img-empty-alt-* tests in https://wpt.fyi/results/html-aam/roles-contextual.html). The
+    // aria-labelledby check is the one the name computation makes, so the role comes back exactly when a name would.
+    // WebKit does the same (hasARIAAccNameAttribute() in AccessibilityRenderObject::computeIsIgnored()); Blink
+    // (AXNodeObject::ShouldIncludeBasedOnSemantics()) and Gecko (nsAccessibilityService::ShouldCreateImgAccessible())
+    // keep the img for any ARIA attribute, an empty one included, and fail the empty and whitespace-only tests.
+    if (auto label = aria_label(); label.has_value() && !label->utf16_view().is_ascii_whitespace())
+        return ARIA::Role::image;
+    if (auto labelled_by = aria_labelled_by(); labelled_by.has_value() && DOM::Node::first_valid_id(*labelled_by, document()).has_value())
         return ARIA::Role::image;
     // https://www.w3.org/TR/html-aria/#el-img-empty-alt
     // NOTE: The "none" role value is a synonym for the older "presentation" role value; however, the el-img-alt-no-value
@@ -1114,7 +1127,7 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
 
     image_request->add_callbacks(
         [this, image_request, maybe_omit_events, url_string = captured_url_string, previous_url = captured_previous_url, originating_document, cache_key]() {
-            batching_dispatcher().enqueue(GC::create_function(GC::Heap::the(), [this, image_request, maybe_omit_events, url_string, previous_url, originating_document, cache_key] {
+            batching_dispatcher().enqueue(document(), GC::create_function(GC::Heap::the(), [this, image_request, maybe_omit_events, url_string, previous_url, originating_document, cache_key] {
                 // AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
                 //         between when the fetch completed and when this batched callback runs.
                 if (!document().is_fully_active()) {
@@ -1218,7 +1231,7 @@ void HTMLImageElement::did_set_viewport_rect(CSSPixelRect const& viewport_rect)
     if (viewport_rect.size() == m_last_seen_viewport_size)
         return;
     m_last_seen_viewport_size = viewport_rect.size();
-    batching_dispatcher().enqueue(GC::create_function(GC::Heap::the(), [this] {
+    batching_dispatcher().enqueue(document(), GC::create_function(GC::Heap::the(), [this] {
         react_to_changes_in_the_environment();
     }));
 }
@@ -1348,7 +1361,7 @@ void HTMLImageElement::react_to_changes_in_the_environment()
 
         // Set the callbacks to handle steps 6 and 7 before starting the fetch request.
         image_request->add_callbacks(
-            [step_16, selected_source = selected_source.value(), image_request, key]() mutable {
+            [this, step_16, selected_source = selected_source.value(), image_request, key]() mutable {
                 // 6. If response's unsafe response is a network error
                 // NOTE: This is handled in the second callback below.
 
@@ -1362,7 +1375,7 @@ void HTMLImageElement::react_to_changes_in_the_environment()
 
                 // then set the pending request to null and abort these steps.
 
-                batching_dispatcher().enqueue(GC::create_function(GC::Heap::the(), [step_16, selected_source = move(selected_source), image_request, key] {
+                batching_dispatcher().enqueue(document(), GC::create_function(GC::Heap::the(), [step_16, selected_source = move(selected_source), image_request, key] {
                     // 7. Otherwise, response's unsafe response is image request's image data. It can be either CORS-same-origin
                     //    or CORS-cross-origin; this affects the image's interaction with other APIs (e.g., when used on a canvas).
                     VERIFY(image_request->shared_resource_request());
@@ -1519,10 +1532,8 @@ static void update_the_source_set(DOM::Element& element)
 
         // 6. If child has a media attribute, and its value does not match the environment, continue to the next child.
         if (child->has_attribute(HTML::AttributeNames::media)) {
-            auto media_query = parse_media_query(child->attribute(HTML::AttributeNames::media).value_or({}));
-            if (!media_query || !media_query->evaluate(element.document())) {
+            if (!CSS::RustMediaList::parse(child->attribute(HTML::AttributeNames::media).value_or({})).evaluate(element.document()))
                 continue;
-            }
         }
 
         // 7. Parse child's sizes attribute with img, and let source set's source size be the returned value.

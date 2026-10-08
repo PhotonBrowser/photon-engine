@@ -78,7 +78,7 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
                 arena.free_subtree(*read, replaced_root);
             }
             document.m_paint_state = make<Painting::DocumentPaintState>(arena); },
-        .reconcile_stale_list_item_counters_after_tree_build = [](void* context, Layout::BegunRead const* read) -> bool { return static_cast<Document*>(context)->reconcile_stale_list_item_counters_after_tree_build(*read); },
+        .reconcile_stale_list_item_counters_after_tree_build = [](void* context, Layout::RustFFI::FfiNodeIdentity const* rebuilt_roots, size_t count) -> bool { return static_cast<Document*>(context)->reconcile_stale_list_item_counters_after_tree_build({ rebuilt_roots, count }); },
         .after_layout_commit = [](void* context, Layout::BegunRead const* read, bool layout_tree_changed) { static_cast<Document*>(context)->after_layout_commit(*read, layout_tree_changed ? LayoutTreeChanged::Yes : LayoutTreeChanged::No); },
         .note_full_layout_performed = [](void* context) { static_cast<Document*>(context)->style_invalidation_counters().relayouts_performed++; },
         .evaluate_pending_container_queries = [](void* context, Layout::BegunRead const* read) { static_cast<Document*>(context)->style_computer().style_engine().evaluate_size_containers_needing_evaluation_after_layout(*read); },
@@ -135,17 +135,85 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
 // to do first, so nothing is sealed while either waits.
 void Document::seal_first_layout_round(Layout::BegunRead const& read)
 {
-    auto navigable = this->navigable();
-    if (!navigable || navigable->active_document().ptr() != this || !m_layout_node_arena)
-        return;
-    if (!m_list_owners_pending_item_renumber.is_empty() || !m_elements_with_pending_top_layer_membership_change.is_empty() || m_top_layer_needs_layout_zone_rebuild)
+    if (!may_seal_first_layout_round())
         return;
     update_highlight_states_if_needed(read);
-    Layout::RustFFI::FfiLayoutUpdateInputs inputs {
+    auto inputs = first_layout_round_inputs();
+    Layout::RustFFI::render_state_seal_first_layout_round(m_layout_node_arena->host(), &read, &inputs);
+}
+
+bool Document::may_seal_first_layout_round() const
+{
+    auto navigable = this->navigable();
+    if (!navigable || navigable->active_document().ptr() != this || !m_layout_node_arena)
+        return false;
+    return m_list_owners_pending_item_renumber.is_empty() && m_elements_with_pending_top_layer_membership_change.is_empty() && !m_top_layer_needs_layout_zone_rebuild;
+}
+
+Layout::RustFFI::FfiLayoutUpdateInputs Document::first_layout_round_inputs() const
+{
+    return {
         .reason_is_inspect_devtools_layout_data = false,
         .is_template_contents_document = m_created_for_appropriate_template_contents,
     };
-    Layout::RustFFI::render_state_seal_first_layout_round(m_layout_node_arena->host(), &read, &inputs);
+}
+
+// The style a rendering update's layout lays out is brought up to date first, as the layout update would: the round then
+// reads it as it is, and what is written beside the round is the next layout update's. The round takes in the list items
+// that wait to be renumbered and the top layer changes first, as the layout update's first round does.
+bool Document::let_layout_fly(Layout::RustFFI::FfiFlightBlocker blocker)
+{
+    if (blocker != Layout::RustFFI::FfiFlightBlocker::None)
+        return false;
+    // The round views the style records the style update leaves it as a layout update does, inside an epoch that spans
+    // both and ends behind the round.
+    style_computer().begin_style_record_view_epoch();
+    ScopeGuard end_style_record_view_epoch = [&] {
+        style_computer().end_style_record_view_epoch();
+    };
+    update_style();
+    auto navigable = this->navigable();
+    if (!navigable || navigable->active_document().ptr() != this || !m_layout_node_arena)
+        return false;
+    Layout::ForcedReadScope read { *this };
+    update_highlight_states_if_needed(read);
+    auto inputs = first_layout_round_inputs();
+    return Layout::RustFFI::render_state_let_first_layout_round_fly(m_layout_node_arena->host(), read, &inputs, blocker);
+}
+
+bool Document::take_flown_layout_in()
+{
+    auto navigable = this->navigable();
+    if (!navigable || navigable->active_document().ptr() != this || !m_layout_node_arena)
+        return false;
+    Layout::ForcedReadScope read { *this };
+    auto* host = m_layout_node_arena->host();
+    Layout::RustFFI::document_host_begin_update_layout(host);
+    style_computer().begin_style_record_view_epoch();
+    bool laid_out = Layout::RustFFI::render_state_take_flown_layout_in(host, read);
+    style_computer().end_style_record_view_epoch();
+    Layout::RustFFI::document_host_end_update_layout(host);
+    page().client().flush_pending_dom_mutations();
+    // As after a layout update's pass, a face the round reached is requested now. A box the round built that was handed
+    // an image already there, or a face that was requested, lays out again, as the layout update does: the round did not
+    // lay the document out.
+    if (Gfx::request_wanted_pending_faces())
+        m_requested_wanted_font_faces = true;
+    return laid_out && !m_owed_image_provider_arrived_with_image && !m_requested_wanted_font_faces;
+}
+
+Document::LayoutAsItFlew::LayoutAsItFlew(Document& document)
+    : m_document(document)
+{
+    VERIFY(!m_document->m_reads_layout_as_it_flew);
+    Layout::RustFFI::document_host_set_writes_aside(m_document->layout_node_arena().host());
+    m_document->m_reads_layout_as_it_flew = true;
+}
+
+Document::LayoutAsItFlew::~LayoutAsItFlew()
+{
+    m_document->m_reads_layout_as_it_flew = false;
+    Layout::RustFFI::document_host_queue_writes_set_aside(m_document->layout_node_arena().host());
 }
 
 void Document::update_style_and_layout_once(Layout::BegunRead const& read, UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)

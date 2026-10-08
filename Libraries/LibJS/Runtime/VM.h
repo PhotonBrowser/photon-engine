@@ -9,22 +9,33 @@
 
 #pragma once
 
+#include <AK/Array.h>
+#include <AK/DistinctNumeric.h>
 #include <AK/FlyString.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/Noncopyable.h>
+#include <AK/NonnullRefPtr.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
+#include <AK/Span.h>
 #include <AK/StackInfo.h>
 #include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <AK/Variant.h>
+#include <AK/Vector.h>
+#include <AK/kmalloc.h>
 #include <LibCrypto/Forward.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
-#include <LibJS/Bytecode/Executable.h>
-#include <LibJS/Bytecode/Label.h>
-#include <LibJS/Bytecode/Register.h>
+#include <LibJS/Breakpoint.h>
 #include <LibJS/CyclicModule.h>
+#include <LibJS/Embedding/Layout.h>
 #include <LibJS/Export.h>
+#include <LibJS/Heap/Cell.h>
+#include <LibJS/Heap/EngineCell.h>
 #include <LibJS/ModuleLoading.h>
 #include <LibJS/Runtime/Agent.h>
 #include <LibJS/Runtime/CommonPropertyNames.h>
@@ -32,15 +43,17 @@
 #include <LibJS/Runtime/Error.h>
 #include <LibJS/Runtime/ErrorTypes.h>
 #include <LibJS/Runtime/ExecutionContext.h>
+#include <LibJS/Runtime/ExternalMemory.h>
+#include <LibJS/Runtime/FunctionKind.h>
 #include <LibJS/Runtime/InterpreterStack.h>
+#include <LibJS/Runtime/ModuleRequest.h>
 #include <LibJS/Runtime/Promise.h>
 #include <LibJS/Runtime/PromiseJob.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/Symbol.h>
 #include <LibJS/Runtime/Value.h>
 
 namespace JS {
-
-class Identifier;
-struct BindingPattern;
 
 enum class HandledByHost {
     Handled,
@@ -59,146 +72,90 @@ enum class CompilationType {
     Timer,
 };
 
-enum class NativeFunctionType : u32 {
-    RawNativeFunction,
+// The constructors of the errors that the runtime creates for the embedder, in the order of the runtime's own list.
+enum class EngineErrorKind : u8 {
+    Error,
+    EvalError,
+    InternalError,
+    RangeError,
+    ReferenceError,
+    SyntaxError,
+    TypeError,
+    URIError,
+    AggregateError,
+    SuppressedError,
 };
 
-struct NativeFunctionTableEntry {
-    NativeFunctionPointer function { nullptr };
-    NativeFunctionType type { NativeFunctionType::RawNativeFunction };
+template<typename T>
+struct EngineErrorKindOf;
 
-    bool operator==(NativeFunctionTableEntry const&) const = default;
-};
+#define JS_DEFINE_ENGINE_ERROR_KIND_OF(ClassName)                                        \
+    template<>                                                                           \
+    struct EngineErrorKindOf<ClassName> {                                                \
+        static constexpr EngineErrorKind engine_error_kind = EngineErrorKind::ClassName; \
+    };
+JS_DEFINE_ENGINE_ERROR_KIND_OF(Error)
+JS_DEFINE_ENGINE_ERROR_KIND_OF(AggregateError)
+JS_DEFINE_ENGINE_ERROR_KIND_OF(SuppressedError)
+#define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
+    JS_DEFINE_ENGINE_ERROR_KIND_OF(ClassName)
+JS_ENUMERATE_NATIVE_ERRORS
+#undef __JS_ENUMERATE
+#undef JS_DEFINE_ENGINE_ERROR_KIND_OF
 
-class JS_API VM : public RefCounted<VM> {
+template<typename T>
+concept IsEngineErrorType = requires { EngineErrorKindOf<T>::engine_error_kind; };
+
+struct HostHookThunks;
+
+// The VM of the Rust runtime, which this object holds in its first bytes, so that a VM& of C++ and the runtime's VM
+// pointer are the same address: the runtime passes it to raw native functions as their VM&. The host hooks, the
+// property names and the agent are C++ members after it, and the runtime calls the hooks through one table of thunks.
+class JS_API VM {
+    AK_MAKE_NONCOPYABLE(VM);
+    AK_MAKE_NONMOVABLE(VM);
+
+    // The runtime's VM is constructed here, and must stay at the start of the object.
+    alignas(JS_LAYOUT_VM_ALIGN) u8 m_engine_storage[JS_LAYOUT_VM_SIZE];
+
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static NonnullRefPtr<VM> create();
     ~VM();
 
+    // VM is reference counted like an AK::RefCounted, whose count would have to come first.
+    void ref() const { ++m_reference_count; }
+    void unref() const;
+
     ALWAYS_INLINE static VM& the() { return *s_the; }
 
-    GC::Heap& heap() const { return const_cast<GC::Heap&>(m_heap); }
+    GC::Heap& heap() const { return *m_heap; }
 
     VM& vm() { return *this; }
     VM const& vm() const { return *this; }
 
-    [[nodiscard]] Realm& realm() { return *m_running_execution_context->realm; }
+    [[nodiscard]] Realm& realm() { return *running_execution_context().realm; }
     [[nodiscard]] Object& global_object() { return realm().global_object(); }
-    [[nodiscard]] DeclarativeEnvironment& global_declarative_environment();
 
     ThrowCompletionOr<Value> run(Script&, GC::Ptr<Environment> lexical_environment_override = nullptr);
-    ThrowCompletionOr<Value> run(SourceTextModule&);
 
-    ThrowCompletionOr<Value> run_executable(ExecutionContext&, Bytecode::Executable&, u32 entry_point = 0);
-    ThrowCompletionOr<Value> run_executable(ExecutionContext& context, Bytecode::Executable& executable, u32 entry_point, Value initial_accumulator_value)
-    {
-        context.registers_and_constants_and_locals_and_arguments_span()[0] = initial_accumulator_value;
-        return run_executable(context, executable, entry_point);
-    }
-
-    void enter_module_execution() { ++m_module_execution_depth; }
-    void leave_module_execution()
-    {
-        VERIFY(m_module_execution_depth > 0);
-        --m_module_execution_depth;
-    }
-    [[nodiscard]] bool is_executing_module() const { return m_module_execution_depth > 0; }
-    u64 increment_module_async_evaluation_count() { return m_module_async_evaluation_count++; }
-
-    ALWAYS_INLINE Value& accumulator() { return reg(Bytecode::Register::accumulator()); }
-    Value& reg(Bytecode::Register const& r)
-    {
-        return m_running_execution_context->registers_and_constants_and_locals_and_arguments()[r.index()];
-    }
-    Value reg(Bytecode::Register const& r) const
-    {
-        return m_running_execution_context->registers_and_constants_and_locals_and_arguments()[r.index()];
-    }
-
-    void do_return(Value value)
-    {
-        if (value.is_special_empty_value())
-            value = js_undefined();
-        reg(Bytecode::Register::return_value()) = value;
-        reg(Bytecode::Register::exception()) = js_special_empty_value();
-    }
-
-    Bytecode::Executable& current_executable() { return *m_running_execution_context->executable; }
-    Bytecode::Executable const& current_executable() const { return *m_running_execution_context->executable; }
-
-    [[nodiscard]] Utf16FlyString const& get_identifier(Bytecode::IdentifierTableIndex) const;
-    [[nodiscard]] Optional<Utf16FlyString const&> get_identifier(Optional<Bytecode::IdentifierTableIndex> index) const
-    {
-        if (!index.has_value())
-            return {};
-        return get_identifier(*index);
-    }
-
-    [[nodiscard]] PropertyKey const& get_property_key(Bytecode::PropertyKeyTableIndex) const;
-
-    // NB: The interpreter picks its dispatch table when it starts running an outermost executable.
-    //     Enabling debugging therefore only takes effect for later interpreter invocations, not
-    //     code that is already running.
     void enable_debugging();
     void disable_debugging();
-    [[nodiscard]] bool debugging_enabled() const { return m_debugger; }
-    [[nodiscard]] Debugger* debugger() { return m_debugger; }
-    [[nodiscard]] Debugger const* debugger() const { return m_debugger; }
+    [[nodiscard]] bool debugging_enabled() const;
+    // The runtime's debugger, which is attached while debugging is enabled. A Debugger handle has the VM's address.
+    [[nodiscard]] Debugger* debugger();
+    [[nodiscard]] Debugger const* debugger() const;
 
-    enum class HandleExceptionResponse {
-        ExitFromExecutable,
-        ContinueInThisExecutable,
-    };
-    [[nodiscard]] COLD HandleExceptionResponse handle_exception(u32 program_counter, Value exception);
-    NEVER_INLINE void unwind_inline_frame_for_exception();
-
-    ExecutionContext* push_inline_frame(
-        ECMAScriptFunctionObject& callee_function,
-        Bytecode::Executable& callee_executable,
-        ReadonlySpan<Value> arguments,
-        u32 return_pc,
-        u32 dst_raw,
-        Value this_value,
-        Object* new_target,
-        bool is_construct);
-
-    void dump_backtrace() const;
-
-    void gather_roots(HashMap<GC::Cell*, GC::HeapRoot>&);
-
-#define __JS_ENUMERATE(SymbolName, snake_name)             \
-    GC::Ref<Symbol> well_known_symbol_##snake_name() const \
-    {                                                      \
-        return *m_well_known_symbols.snake_name;           \
+#define __JS_ENUMERATE(SymbolName, snake_name)                 \
+    GC::Ref<Symbol> well_known_symbol_##snake_name() const     \
+    {                                                          \
+        return well_known_symbol(WellKnownSymbol::snake_name); \
     }
     JS_ENUMERATE_WELL_KNOWN_SYMBOLS
 #undef __JS_ENUMERATE
 
-    Bytecode::KeyedPropertyLookupCache& keyed_property_lookup_cache() { return *m_keyed_property_lookup_cache; }
-
-    struct StringToAtomCacheEntry {
-        GC::Ptr<PrimitiveString const> string;
-        Optional<Utf16FlyString> atom;
-    };
-
-    auto& string_to_atom_cache() { return m_string_to_atom_cache; }
-
-    struct NumericStringCacheEntry {
-        u64 number { 0 };
-        GC::Ptr<PrimitiveString> string;
-    };
-
-    auto& fly_string_cache() { return m_fly_string_cache; }
-    auto& numeric_string_cache() { return m_numeric_string_cache; }
-    auto& large_numeric_string_cache() { return m_large_numeric_string_cache; }
-
-    PrimitiveString& empty_string() { return *m_empty_string; }
-
-    PrimitiveString& single_ascii_character_string(u8 character)
-    {
-        VERIFY(character < 0x80);
-        return *m_single_ascii_character_strings[character];
-    }
+    PrimitiveString& empty_string();
 
     // This represents the list of errors from ErrorTypes.h whose messages are used in contexts which
     // must not fail to allocate when they are used. For example, we cannot allocate when we raise an
@@ -211,56 +168,36 @@ public:
     };
     Utf16String const& error_message(ErrorMessage) const;
 
-    bool did_reach_stack_space_limit() const
-    {
-#if defined(HAS_ADDRESS_SANITIZER)
-        // We hit stack limits sooner with ASAN enabled.
-        return m_stack_info.size_free() < 96 * KiB;
-#else
-        return m_stack_info.size_free() < 32 * KiB;
-#endif
-    }
+    bool did_reach_stack_space_limit() const;
 
-    // TODO: Rename this function instead of providing a second argument, now that the global object is no longer passed in.
-    struct CheckStackSpaceLimitTag { };
-
-    ThrowCompletionOr<void> push_execution_context(ExecutionContext& context, CheckStackSpaceLimitTag)
+    // Pushes onto the runtime's execution context stack in place, as the runtime itself does, unless the stack's
+    // storage is full, which only the runtime can grow.
+    void push_execution_context(ExecutionContext& execution_context)
     {
-        // Ensure we got some stack space left, so the next function call doesn't kill us.
-        if (did_reach_stack_space_limit()) [[unlikely]] {
-            return throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
+        auto length = execution_context_stack_length();
+        if (length == execution_context_stack_capacity()) [[unlikely]] {
+            push_execution_context_growing_the_stack(execution_context);
+            return;
         }
-        context.caller_frame = nullptr;
-        context.caller_return_pc = 0;
-        context.caller_dst_raw = 0;
-        context.caller_is_construct = false;
-        m_execution_context_stack.append(&context);
-        m_execution_context_stack_previous_running_contexts.append(m_running_execution_context);
-        m_running_execution_context = &context;
-        return {};
-    }
-
-    void push_execution_context(ExecutionContext& context)
-    {
-        context.caller_frame = nullptr;
-        context.caller_return_pc = 0;
-        context.caller_dst_raw = 0;
-        context.caller_is_construct = false;
-        m_execution_context_stack.append(&context);
-        m_execution_context_stack_previous_running_contexts.append(m_running_execution_context);
-        m_running_execution_context = &context;
+        execution_context.caller_frame = nullptr;
+        execution_context.caller_return_pc = 0;
+        execution_context.caller_dst_raw = 0;
+        execution_context.caller_is_construct = false;
+        auto& entry = execution_context_stack_entries()[length];
+        entry.execution_context = &execution_context;
+        entry.previous_running_execution_context = running_execution_context_or_null();
+        set_engine_head_field<size_t>(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_LENGTH_OFFSET, length + 1);
+        set_engine_head_field<ExecutionContext*>(JS_LAYOUT_VM_RUNNING_EXECUTION_CONTEXT_OFFSET, &execution_context);
     }
 
     ExecutionContext* pop_execution_context()
     {
-        VERIFY(!m_execution_context_stack.is_empty());
-        auto* context = m_execution_context_stack.take_last();
-        context->caller_frame = nullptr;
-        context->caller_return_pc = 0;
-        context->caller_dst_raw = 0;
-        context->caller_is_construct = false;
-        m_running_execution_context = m_execution_context_stack_previous_running_contexts.take_last();
-        return context;
+        auto length = execution_context_stack_length();
+        VERIFY(length > 0);
+        auto const& entry = execution_context_stack_entries()[length - 1];
+        set_engine_head_field<size_t>(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_LENGTH_OFFSET, length - 1);
+        set_engine_head_field<ExecutionContext*>(JS_LAYOUT_VM_RUNNING_EXECUTION_CONTEXT_OFFSET, entry.previous_running_execution_context);
+        return entry.execution_context;
     }
 
     // https://tc39.es/ecma262/#running-execution-context
@@ -268,33 +205,70 @@ public:
     // This is known as the agent's running execution context.
     ExecutionContext& running_execution_context()
     {
-        VERIFY(m_running_execution_context);
-        return *m_running_execution_context;
+        auto* execution_context = running_execution_context_or_null();
+        VERIFY(execution_context);
+        return *execution_context;
     }
     ExecutionContext const& running_execution_context() const
     {
-        VERIFY(m_running_execution_context);
-        return *m_running_execution_context;
+        auto const* execution_context = running_execution_context_or_null();
+        VERIFY(execution_context);
+        return *execution_context;
     }
 
-    bool has_running_execution_context() const { return m_running_execution_context != nullptr; }
+    bool has_running_execution_context() const { return running_execution_context_or_null() != nullptr; }
 
     // https://tc39.es/ecma262/#execution-context-stack
-    // The execution context stack tracks base execution contexts. Inline JS-to-JS
-    // frames are threaded through ExecutionContext::caller_frame starting at the
-    // running execution context.
-    Vector<ExecutionContext*> const& execution_context_stack() const { return m_execution_context_stack; }
+    // What LibJS's users need of the execution context stack is how many contexts are on it.
+    class ExecutionContextStack {
+    public:
+        size_t size() const { return m_vm.execution_context_stack_length(); }
+        bool is_empty() const { return size() == 0; }
 
-    template<typename Callback>
-    void for_each_execution_context_top_to_bottom(Callback callback)
-    {
-        for_each_execution_context_top_to_bottom(m_execution_context_stack, m_execution_context_stack_previous_running_contexts, m_running_execution_context, callback);
-    }
+    private:
+        friend class VM;
 
+        explicit ExecutionContextStack(VM const& vm)
+            : m_vm(vm)
+        {
+        }
+
+        VM const& m_vm;
+    };
+    ExecutionContextStack execution_context_stack() const { return ExecutionContextStack { *this }; }
+
+    // Calls the callback with each execution context from the running one down, the frames of JavaScript functions
+    // that the interpreter calls directly included, until the callback returns false. This is the runtime's own walk:
+    // from a context that is on the execution context stack, it goes on to the context that was running when that one
+    // was pushed, and from any other context to its caller frame. The stack is read anew at every step, so the
+    // callback may push and pop contexts as long as it leaves the stack as it found it.
     template<typename Callback>
     void for_each_execution_context_top_to_bottom(Callback callback) const
     {
-        for_each_execution_context_top_to_bottom(m_execution_context_stack, m_execution_context_stack_previous_running_contexts, m_running_execution_context, callback);
+        auto stack_index = execution_context_stack_length();
+        auto* execution_context = running_execution_context_or_null();
+        if (!execution_context) {
+            while (stack_index > 0) {
+                --stack_index;
+                if (stack_index >= execution_context_stack_length())
+                    return;
+                if (!callback(*execution_context_stack_entries()[stack_index].execution_context))
+                    return;
+            }
+            return;
+        }
+        while (true) {
+            if (!callback(*execution_context))
+                return;
+            auto* next_execution_context = execution_context->caller_frame;
+            if (stack_index > 0 && stack_index - 1 < execution_context_stack_length() && execution_context_stack_entries()[stack_index - 1].execution_context == execution_context) {
+                --stack_index;
+                next_execution_context = execution_context_stack_entries()[stack_index].previous_running_execution_context;
+            }
+            if (!next_execution_context)
+                return;
+            execution_context = next_execution_context;
+        }
     }
 
     template<typename Callback>
@@ -323,8 +297,6 @@ public:
         return matching_execution_context;
     }
 
-    ExecutionContext* previous_execution_context() const;
-
     Environment const* lexical_environment() const { return running_execution_context().lexical_environment.ptr(); }
     Environment* lexical_environment() { return running_execution_context().lexical_environment.ptr(); }
 
@@ -340,52 +312,33 @@ public:
     // The value of the Function component of the running execution context is also called the active function object.
     FunctionObject const* active_function_object() const { return running_execution_context().function.ptr(); }
     FunctionObject* active_function_object() { return running_execution_context().function.ptr(); }
-    SharedFunctionInstanceData* active_shared_function_data();
 
-    size_t argument_count() const
-    {
-        return running_execution_context().argument_count;
-    }
-
-    Value argument(size_t index) const
-    {
-        return running_execution_context().argument(index);
-    }
-
-    Value this_value() const
-    {
-        return running_execution_context().this_value.value();
-    }
-
-    ThrowCompletionOr<Value> resolve_this_binding();
-
-    StackInfo const& stack_info() const { return m_stack_info; }
+    size_t argument_count() const { return running_execution_context().argument_count; }
+    Value argument(size_t index) const { return running_execution_context().argument(index); }
+    Value this_value() const { return running_execution_context().this_value.value(); }
 
     InterpreterStack& interpreter_stack() { return m_interpreter_stack; }
 
-    HashMap<Utf16String, GC::Ref<Symbol>> const& global_symbol_registry() const { return m_global_symbol_registry; }
-    HashMap<Utf16String, GC::Ref<Symbol>>& global_symbol_registry() { return m_global_symbol_registry; }
+    // Ends the synchronous run of code during which the targets of the WeakRefs it dereferenced stay alive.
+    void finish_execution_generation();
 
-    u32 execution_generation() const { return m_execution_generation; }
-    void finish_execution_generation() { ++m_execution_generation; }
-    FlatPtr primitive_storage_cage_base() const { return m_primitive_storage_cage_base; }
-    u32 register_native_function(NativeFunctionPointer, NativeFunctionType);
-    NativeFunctionPointer native_function(u32 index, NativeFunctionType expected_type) const;
-
+    // 9.4.2 ResolveBinding ( name [ , env ] ), https://tc39.es/ecma262/#sec-resolvebinding
     ThrowCompletionOr<Reference> resolve_binding(Utf16FlyString const&, Strict, GC::Ptr<Environment> = nullptr);
-    ThrowCompletionOr<Reference> get_identifier_reference(Environment*, Utf16FlyString, Strict, size_t hops = 0);
 
-    // The override only applies at the execution-context-stack depth the scope was created at, so
-    // callees pushed while the scope is alive are unaffected without any per-call bookkeeping.
+    // Has the TypeErrors that are thrown at the execution context stack depth the scope was created at created in
+    // `realm`, until the scope is restored. Callees that push execution contexts are unaffected.
     class TypeErrorRealmScope {
+        AK_MAKE_NONCOPYABLE(TypeErrorRealmScope);
+        AK_MAKE_NONMOVABLE(TypeErrorRealmScope);
+
     public:
         TypeErrorRealmScope(VM& vm, Realm& realm)
             : m_vm(vm)
-            , m_previous_realm(vm.m_type_error_realm_override)
-            , m_previous_depth(vm.m_type_error_realm_override_depth)
+            , m_previous_realm(vm.engine_head_field<Realm*>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_OFFSET))
+            , m_previous_depth(vm.engine_head_field<size_t>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH_OFFSET))
         {
-            m_vm.m_type_error_realm_override = &realm;
-            m_vm.m_type_error_realm_override_depth = vm.m_execution_context_stack.size();
+            vm.set_engine_head_field<Realm*>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_OFFSET, &realm);
+            vm.set_engine_head_field<size_t>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH_OFFSET, vm.execution_context_stack_length());
         }
 
         ~TypeErrorRealmScope()
@@ -397,12 +350,15 @@ public:
         {
             if (!m_active)
                 return;
-            m_vm.m_type_error_realm_override = m_previous_realm;
-            m_vm.m_type_error_realm_override_depth = m_previous_depth;
+            m_vm.set_engine_head_field<Realm*>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_OFFSET, m_previous_realm.ptr());
+            m_vm.set_engine_head_field<size_t>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH_OFFSET, m_previous_depth);
             m_active = false;
         }
 
     private:
+        static_assert(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_SIZE == sizeof(Realm*));
+        static_assert(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH_SIZE == sizeof(size_t));
+
         VM& m_vm;
         GC::Ptr<Realm> m_previous_realm;
         size_t m_previous_depth { 0 };
@@ -410,29 +366,30 @@ public:
     };
 
     // 5.2.3.2 Throw an Exception, https://tc39.es/ecma262/#sec-throw-an-exception
+    // The runtime creates the errors of its own constructors, in the current realm or the realm of a TypeErrorRealmScope.
     template<typename T, typename... Args>
     COLD Completion throw_completion(Args&&... args)
     {
-        auto& realm = [&]() -> Realm& {
-            if constexpr (IsSame<T, TypeError>) {
-                if (m_type_error_realm_override && m_execution_context_stack.size() == m_type_error_realm_override_depth)
-                    return *m_type_error_realm_override;
-            }
-            return *current_realm();
-        }();
-        auto completion = T::create(realm, forward<Args>(args)...);
-
-        return JS::throw_completion(completion);
+        if constexpr (IsEngineErrorType<T>) {
+            static_assert(sizeof...(Args) == 1, "The runtime's errors are thrown with a message");
+            return throw_engine_error(EngineErrorKindOf<T>::engine_error_kind, forward<Args>(args)...);
+        } else {
+            return JS::throw_completion(T::create(*current_realm(), forward<Args>(args)...));
+        }
     }
 
     template<typename T>
     COLD Completion throw_completion(ErrorType const& type)
     {
-        auto& realm = *current_realm();
-        if constexpr (requires { T::create(realm, type.message()); })
-            return throw_completion<T>(type.message());
-        else
-            return throw_completion<T>(Utf16String::from_utf16(type.message()));
+        if constexpr (IsEngineErrorType<T>) {
+            return throw_engine_error(EngineErrorKindOf<T>::engine_error_kind, type.message());
+        } else {
+            auto& realm = *current_realm();
+            if constexpr (requires { T::create(realm, type.message()); })
+                return throw_completion<T>(type.message());
+            else
+                return throw_completion<T>(Utf16String::from_utf16(type.message()));
+        }
     }
 
     template<typename T, typename... Args>
@@ -441,44 +398,11 @@ public:
         return throw_completion<T>(Utf16String::formatted(type.format(), forward<Args>(args)...));
     }
 
-    Value get_new_target();
-
-    GC::Ref<Object> get_import_meta();
-
-    Object& get_global_object();
-
     CommonPropertyNames names;
-    struct {
-        GC::Ptr<PrimitiveString> number;
-        GC::Ptr<PrimitiveString> undefined;
-        GC::Ptr<PrimitiveString> object;
-        GC::Ptr<PrimitiveString> string;
-        GC::Ptr<PrimitiveString> symbol;
-        GC::Ptr<PrimitiveString> boolean;
-        GC::Ptr<PrimitiveString> bigint;
-        GC::Ptr<PrimitiveString> function;
-        GC::Ptr<PrimitiveString> object_Object;
-    } cached_strings;
 
-    void run_queued_promise_jobs()
-    {
-        if (m_promise_jobs.is_empty())
-            return;
-        run_queued_promise_jobs_impl();
-    }
-
-    void enqueue_promise_job(PromiseJob, GC::Ptr<Realm>);
-
-    void run_queued_finalization_registry_cleanup_jobs();
-    void enqueue_finalization_registry_cleanup_job(FinalizationRegistry&);
-
-    void promise_rejection_tracker(Promise&, Promise::RejectionOperation) const;
-
-    Function<void(Promise&)> on_promise_unhandled_rejection;
-    Function<void(Promise&)> on_promise_rejection_handled;
     Function<void(Object const&, PropertyKey const&)> on_unimplemented_property_access;
 
-    void set_agent(OwnPtr<Agent> agent) { m_agent = move(agent); }
+    void set_agent(OwnPtr<Agent>);
     Agent* agent() { return m_agent; }
     Agent const* agent() const { return m_agent; }
 
@@ -488,15 +412,14 @@ public:
 
     ScriptOrModule get_active_script_or_module() const;
 
+    // The host hooks, which start out with the runtime's own behavior.
+
     // 16.2.1.10 HostLoadImportedModule ( referrer, moduleRequest, hostDefined, payload ), https://tc39.es/ecma262/#sec-HostLoadImportedModule
     Function<void(ImportedModuleReferrer, ModuleRequest const&, GC::Ptr<GC::Cell> load_state, ImportedModulePayload)> host_load_imported_module;
 
     Function<HashMap<PropertyKey, Value>(SourceTextModule&)> host_get_import_meta_properties;
-    Function<void(Object*, SourceTextModule const&)> host_finalize_import_meta;
 
     Function<Vector<Utf16String>()> host_get_supported_import_attributes;
-
-    void set_dynamic_imports_allowed(bool value) { m_dynamic_imports_allowed = value; }
 
     Function<void(Promise&, Promise::RejectionOperation)> host_promise_rejection_tracker;
     Function<ThrowCompletionOr<Value>(JobCallback&, Value, ReadonlySpan<Value>)> host_call_job_callback;
@@ -509,176 +432,100 @@ public:
     Function<ThrowCompletionOr<HandledByHost>(ArrayBuffer&, size_t)> host_resize_array_buffer;
     Function<ThrowCompletionOr<HandledByHost>(ArrayBuffer&, size_t)> host_grow_shared_array_buffer;
     Function<void(Utf16View)> host_unrecognized_date_string;
-    Function<Crypto::SignedBigInteger(Object const& global)> host_system_utc_epoch_nanoseconds;
     Function<bool()> host_promise_job_queue_is_empty;
 
+    // The frames of the execution context stack from the running one down, with where in its source code each one is.
     [[nodiscard]] Vector<StackTraceElement> stack_trace() const;
 
 private:
-    using ErrorMessages = AK::Array<Utf16String, to_underlying(ErrorMessage::__Count)>;
+    friend class InterpreterStack;
+    friend struct HostHookThunks;
 
-    struct NativeFunctionTableEntryTraits : public Traits<NativeFunctionTableEntry> {
-        static unsigned hash(NativeFunctionTableEntry const& entry)
-        {
-            return pair_int_hash(ptr_hash(bit_cast<FlatPtr>(entry.function)), to_underlying(entry.type));
-        }
-    };
-
-    struct WellKnownSymbols {
-#define __JS_ENUMERATE(SymbolName, snake_name) \
-    GC::Ptr<Symbol> snake_name;
+    enum class WellKnownSymbol : u8 {
+#define __JS_ENUMERATE(SymbolName, snake_name) snake_name,
         JS_ENUMERATE_WELL_KNOWN_SYMBOLS
 #undef __JS_ENUMERATE
     };
 
+    using ErrorMessages = AK::Array<Utf16String, to_underlying(ErrorMessage::__Count)>;
+
     explicit VM(ErrorMessages);
 
-    template<typename Callback>
-    static void for_each_execution_context_top_to_bottom(Vector<ExecutionContext*> const& execution_context_stack, Vector<ExecutionContext*> const& execution_context_stack_previous_running_contexts, ExecutionContext* running_execution_context, Callback callback)
+    void install_default_host_hooks();
+    void clear_host_hooks();
+
+    GC::Ref<Symbol> well_known_symbol(WellKnownSymbol) const;
+
+    Completion throw_engine_error(EngineErrorKind, Utf16View message);
+    Completion throw_engine_error(EngineErrorKind, Utf16String message);
+
+    template<typename Field>
+    Field engine_head_field(size_t offset) const
     {
-        VERIFY(execution_context_stack.size() == execution_context_stack_previous_running_contexts.size());
-
-        if (!running_execution_context) {
-            for (size_t i = execution_context_stack.size(); i-- > 0;) {
-                if (!callback(*execution_context_stack[i]))
-                    return;
-            }
-            return;
-        }
-
-        if (execution_context_stack.is_empty()) {
-            for (auto* execution_context = running_execution_context; execution_context; execution_context = execution_context->caller_frame) {
-                if (!callback(*execution_context))
-                    return;
-            }
-            return;
-        }
-
-        auto stack_index = execution_context_stack.size();
-        auto* execution_context = running_execution_context;
-        while (execution_context) {
-            if (!callback(*execution_context))
-                return;
-            if (stack_index > 0 && execution_context == execution_context_stack[stack_index - 1]) {
-                execution_context = execution_context_stack_previous_running_contexts[stack_index - 1];
-                --stack_index;
-                continue;
-            }
-
-            execution_context = execution_context->caller_frame;
-        }
-
-        VERIFY(stack_index == 0);
+        Field field;
+        __builtin_memcpy(&field, m_engine_storage + offset, sizeof(field));
+        return field;
     }
 
-    struct SavedExecutionContextStack {
-        Vector<ExecutionContext*> stack;
-        Vector<ExecutionContext*> previous_running_contexts;
-        ExecutionContext* running_execution_context { nullptr };
-        GC::Ptr<Realm> type_error_realm_override;
-        size_t type_error_realm_override_depth { 0 };
+    template<typename Field>
+    void set_engine_head_field(size_t offset, Field field)
+    {
+        __builtin_memcpy(m_engine_storage + offset, &field, sizeof(field));
+    }
+
+    ExecutionContext* running_execution_context_or_null() const
+    {
+        static_assert(JS_LAYOUT_VM_RUNNING_EXECUTION_CONTEXT_SIZE == sizeof(ExecutionContext*));
+        return engine_head_field<ExecutionContext*>(JS_LAYOUT_VM_RUNNING_EXECUTION_CONTEXT_OFFSET);
+    }
+
+    size_t execution_context_stack_length() const
+    {
+        static_assert(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_LENGTH_SIZE == sizeof(size_t));
+        return engine_head_field<size_t>(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_LENGTH_OFFSET);
+    }
+
+    size_t execution_context_stack_capacity() const
+    {
+        static_assert(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_CAPACITY_SIZE == sizeof(size_t));
+        return engine_head_field<size_t>(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_CAPACITY_OFFSET);
+    }
+
+    // An entry of the runtime's execution context stack: a context pushed onto it, and the context that was running
+    // when it was pushed.
+    struct ExecutionContextStackEntry {
+        ExecutionContext* execution_context;
+        ExecutionContext* previous_running_execution_context;
     };
+    static_assert(sizeof(ExecutionContextStackEntry) == JS_LAYOUT_EXECUTION_CONTEXT_STACK_ENTRY_SIZE);
+    static_assert(__builtin_offsetof(ExecutionContextStackEntry, execution_context) == JS_LAYOUT_EXECUTION_CONTEXT_STACK_ENTRY_EXECUTION_CONTEXT_OFFSET);
+    static_assert(__builtin_offsetof(ExecutionContextStackEntry, previous_running_execution_context) == JS_LAYOUT_EXECUTION_CONTEXT_STACK_ENTRY_PREVIOUS_RUNNING_EXECUTION_CONTEXT_OFFSET);
 
-    void load_imported_module(ImportedModuleReferrer, ModuleRequest const&, GC::Ptr<GC::Cell> load_state, ImportedModulePayload);
-    ThrowCompletionOr<void> link_and_eval_module(CyclicModule&);
-    ThrowCompletionOr<void> link_and_eval_module(SourceTextModule&);
+    ExecutionContextStackEntry* execution_context_stack_entries() const
+    {
+        static_assert(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_ENTRIES_SIZE == sizeof(ExecutionContextStackEntry*));
+        return engine_head_field<ExecutionContextStackEntry*>(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_ENTRIES_OFFSET);
+    }
 
-    void set_well_known_symbols(WellKnownSymbols well_known_symbols) { m_well_known_symbols = move(well_known_symbols); }
-
-    void run_queued_promise_jobs_impl();
+    void push_execution_context_growing_the_stack(ExecutionContext&);
 
     static VM* s_the;
 
-    OwnPtr<Bytecode::KeyedPropertyLookupCache> m_keyed_property_lookup_cache;
-
-    static constexpr size_t string_to_atom_cache_size = 2;
-    AK::Array<StringToAtomCacheEntry, string_to_atom_cache_size> m_string_to_atom_cache;
-
-    static constexpr size_t fly_string_cache_size = 1024;
-    AK::Array<GC::Ptr<PrimitiveString>, fly_string_cache_size> m_fly_string_cache;
-
-    static constexpr size_t numeric_string_cache_size = 1000;
-    AK::Array<GC::Ptr<PrimitiveString>, numeric_string_cache_size> m_numeric_string_cache;
-
-    static constexpr size_t large_numeric_string_cache_size = 1024;
-    AK::Array<NumericStringCacheEntry, large_numeric_string_cache_size> m_large_numeric_string_cache;
-
-    GC::Heap m_heap;
-
-    Vector<ExecutionContext*> m_execution_context_stack;
-    // Base pushes may happen while an inline JS-to-JS frame is running, and
-    // TemporaryExecutionContext can push the same context multiple times. Keep
-    // the previous running context for each base push so we can restore and
-    // walk the full active stack without relying on caller_frame there.
-    Vector<ExecutionContext*> m_execution_context_stack_previous_running_contexts;
-    ExecutionContext* m_running_execution_context { nullptr };
-    // This override is only active while generated WebIDL conversion code is
-    // running without re-entering ECMAScript. Any execution context push saves
-    // and clears it, so nested author script throws TypeErrors in its own realm
-    // and the pointer never remains active while that nested script can run
-    // arbitrary GC-visible code.
-    GC::Ptr<Realm> m_type_error_realm_override;
-    size_t m_type_error_realm_override_depth { 0 };
-
-    Vector<SavedExecutionContextStack> m_saved_execution_context_stacks;
-
-    StackInfo m_stack_info;
-
-    InterpreterStack m_interpreter_stack;
-
-    // GlobalSymbolRegistry, https://tc39.es/ecma262/#table-globalsymbolregistry-record-fields
-    HashMap<Utf16String, GC::Ref<Symbol>> m_global_symbol_registry;
-
-    Vector<PromiseJob> m_promise_jobs;
-
-    Vector<GC::Ref<FinalizationRegistry>> m_finalization_registry_cleanup_jobs;
-
-    GC::Ptr<PrimitiveString> m_empty_string;
-    GC::Ptr<PrimitiveString> m_single_ascii_character_strings[128] {};
+    mutable u32 m_reference_count { 1 };
+    GC::Heap* m_heap { nullptr };
+    InterpreterStack m_interpreter_stack { *this };
     ErrorMessages m_error_messages;
-
-    struct StoredModule {
-        ImportedModuleReferrer referrer;
-        ByteString filename;
-        String type;
-        GC::Root<Module> module;
-        bool has_once_started_linking { false };
-    };
-
-    StoredModule* get_stored_module(ImportedModuleReferrer const& script_or_module, ByteString const& filename, Utf16String const& type);
-
-    Vector<StoredModule> m_loaded_modules;
-
-    WellKnownSymbols m_well_known_symbols;
-
-    u32 m_execution_generation { 0 };
-    FlatPtr m_primitive_storage_cage_base { 0 };
-    FlatPtr m_heap_region_base { 0 };
-    Vector<NativeFunctionTableEntry> m_native_function_table;
-    NativeFunctionTableEntry const* m_native_function_table_data { nullptr };
-    u32 m_run_executable_depth { 0 };
-    u32 m_module_execution_depth { 0 };
-    u64 m_module_async_evaluation_count { 0 }; // [[ModuleAsyncEvaluationCount]]
-
-    OwnPtr<Debugger> m_debugger;
     OwnPtr<Agent> m_agent;
-
-    bool m_dynamic_imports_allowed { false };
-    HashMap<NativeFunctionTableEntry, u32, NativeFunctionTableEntryTraits> m_native_function_indices;
 };
 
 template<typename GlobalObjectType, typename... Args>
-[[nodiscard]] static NonnullOwnPtr<ExecutionContext> create_simple_execution_context(VM& vm, Args&&... args)
+[[nodiscard]] static NonnullOwnPtr<ExecutionContext> create_simple_execution_context(VM& vm, [[maybe_unused]] Args&&... args)
 {
-    auto root_execution_context = MUST(Realm::initialize_host_defined_realm(
-        vm,
-        [&](Realm& realm_) -> GC::Ref<GlobalObject> {
-            return vm.heap().allocate<GlobalObjectType>(realm_, forward<Args>(args)...);
-        },
-        nullptr));
-    return root_execution_context;
+    static_assert(IsSame<GlobalObjectType, GlobalObject> && sizeof...(Args) == 0, "The runtime creates the ordinary global object; a host global object comes from a callback of Realm::initialize_host_defined_realm()");
+    return MUST(Realm::initialize_host_defined_realm(vm, nullptr, nullptr));
 }
 
 ALWAYS_INLINE VM& Cell::vm() const { return VM::the(); }
+ALWAYS_INLINE VM& EngineCell::vm() const { return VM::the(); }
 
 }

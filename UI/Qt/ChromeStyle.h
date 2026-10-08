@@ -28,6 +28,7 @@ QColor chrome_control_border(QPalette const&);
 QColor chrome_active_tab_surface_top(QPalette const&);
 QColor chrome_active_tab_surface_bottom(QPalette const&);
 QColor chrome_border(QPalette const&);
+QColor chrome_separator(QPalette const&);
 QColor chrome_window_outline(QPalette const&);
 QColor chrome_accent(QPalette const&);
 QColor chrome_muted_text(QPalette const&);
@@ -41,13 +42,14 @@ QString location_edit_style_sheet(QPalette const&);
 QString bookmarks_bar_style_sheet(QPalette const&);
 QString find_in_page_style_sheet(QPalette const&);
 QString javascript_dialog_style_sheet(QPalette const&);
+QString bookmark_dialog_style_sheet(QPalette const&);
 QString crash_report_review_style_sheet(QPalette const&);
 QColor crash_report_review_placeholder_text(QPalette const&);
 QString devtools_banner_style_sheet(QPalette const&);
 QString tab_widget_style_sheet(QPalette const&);
 QString autocomplete_popup_style_sheet(QPalette const&);
 QString downloads_popover_style_sheet(QPalette const&);
-QString private_session_popover_style_sheet(QPalette const&);
+QString message_popover_style_sheet(QPalette const&);
 
 enum class CircularControlFrameStyle {
     InteractionOnly,

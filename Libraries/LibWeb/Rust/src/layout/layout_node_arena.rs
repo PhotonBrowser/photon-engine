@@ -20,7 +20,7 @@ use crate::cow_column::{ColumnSnapshot, CowColumn};
 use crate::css::css_pixels::{CssPixelPoint, FfiCssPixelPoint};
 use crate::css::style::bridge::ElementBoxKind;
 use crate::css::style::fast_hash::{FastMap as HashMap, FastSet as HashSet};
-use crate::css::style::flight_style_rows::{Decline, FlightStyleRow};
+use crate::css::style::flight_style_rows::{Decline, FlightStyleRow, REBUILD_LEVEL, RELAYOUT_LEVEL};
 use crate::css::style::tree::{StyleNodeID, TableSpans};
 use crate::css::style::{
     PublishedBoxFacts, PublishedTextSource, StyleEngine, TextStyleParentFacts,
@@ -361,36 +361,32 @@ impl IntrinsicSizeCaches {
         }
     }
 
+    /// Answers `answer` from the maps of the row `stamp` names, where they hold what was measured for it.
+    fn with_maps<R>(
+        &self,
+        stamp: IntrinsicSizeCacheStamp,
+        answer: impl FnOnce(&IntrinsicSizeMaps) -> Option<R>,
+    ) -> Option<R> {
+        let caches = self.slots.borrow();
+        let slot = caches.get(stamp.index as usize)?;
+        if slot.generation != stamp.generation || slot.epoch != stamp.epoch {
+            return None;
+        }
+        answer(slot.sizes.as_ref()?)
+    }
+
     pub(crate) fn intrinsic_block_size_cache_get(
         &self,
         stamp: IntrinsicSizeCacheStamp,
         kind: IntrinsicSizeCacheKind,
         key: IntrinsicSizeCacheKey,
     ) -> Option<IntrinsicBlockSizeMeasurement> {
-        assert!(
-            matches!(
-                kind,
-                IntrinsicSizeCacheKind::MinContentBlock | IntrinsicSizeCacheKind::MaxContentBlock
-            ),
-            "block size cache kind must use the block axis"
-        );
-
-        let IntrinsicSizeCacheStamp {
-            index,
-            generation,
-            epoch,
-        } = stamp;
-        let caches = self.slots.borrow();
-        let slot = caches.get(index as usize)?;
-        if slot.generation != generation || slot.epoch != epoch {
-            return None;
-        }
-        let map = slot
-            .sizes
-            .as_ref()?
-            .block_sizes(kind)
-            .expect("block size cache kind must use the block axis");
-        intrinsic_cache_lookup(map, key)
+        self.with_maps(stamp, |maps| {
+            let map = maps
+                .block_sizes(kind)
+                .expect("block size cache kind must use the block axis");
+            intrinsic_cache_lookup(map, key)
+        })
     }
 
     fn with_maps_mut(&self, stamp: IntrinsicSizeCacheStamp, callback: impl FnOnce(&mut IntrinsicSizeMaps)) {
@@ -435,30 +431,12 @@ impl IntrinsicSizeCaches {
         kind: IntrinsicSizeCacheKind,
         key: IntrinsicSizeCacheKey,
     ) -> Option<IntrinsicInlineSizeMeasurement> {
-        assert!(
-            matches!(
-                kind,
-                IntrinsicSizeCacheKind::MinContentInline | IntrinsicSizeCacheKind::MaxContentInline
-            ),
-            "inline measurement cache kind must use the inline axis"
-        );
-
-        let IntrinsicSizeCacheStamp {
-            index,
-            generation,
-            epoch,
-        } = stamp;
-        let caches = self.slots.borrow();
-        let slot = caches.get(index as usize)?;
-        if slot.generation != generation || slot.epoch != epoch {
-            return None;
-        }
-        let map = slot
-            .sizes
-            .as_ref()?
-            .inline_measurements(kind)
-            .expect("inline measurement cache kind must use the inline axis");
-        intrinsic_cache_lookup(map, key)
+        self.with_maps(stamp, |maps| {
+            let map = maps
+                .inline_measurements(kind)
+                .expect("inline measurement cache kind must use the inline axis");
+            intrinsic_cache_lookup(map, key)
+        })
     }
 
     pub(crate) fn intrinsic_inline_size_depends_on_block_size(
@@ -466,25 +444,9 @@ impl IntrinsicSizeCaches {
         stamp: IntrinsicSizeCacheStamp,
         compute: impl FnOnce() -> bool,
     ) -> bool {
-        let IntrinsicSizeCacheStamp {
-            index,
-            generation,
-            epoch,
-        } = stamp;
-        {
-            let caches = self.slots.borrow();
-            if let Some(slot) = caches.get(index as usize)
-                && slot.generation == generation
-                && slot.epoch == epoch
-                && let Some(value) = slot
-                    .sizes
-                    .as_ref()
-                    .and_then(|sizes| sizes.inline_size_depends_on_block_size)
-            {
-                return value;
-            }
+        if let Some(value) = self.with_maps(stamp, |maps| maps.inline_size_depends_on_block_size) {
+            return value;
         }
-
         let value = compute();
         self.with_maps_mut(stamp, |maps| {
             maps.inline_size_depends_on_block_size = Some(value);
@@ -512,17 +474,7 @@ impl IntrinsicSizeCaches {
         stamp: IntrinsicSizeCacheStamp,
         key: TableCellMeasurementKey,
     ) -> Option<TableCellMeasurement> {
-        let IntrinsicSizeCacheStamp {
-            index,
-            generation,
-            epoch,
-        } = stamp;
-        let caches = self.slots.borrow();
-        let slot = caches.get(index as usize)?;
-        if slot.generation != generation || slot.epoch != epoch {
-            return None;
-        }
-        slot.sizes.as_ref()?.table_cell_measurements.get(&key).copied()
+        self.with_maps(stamp, |maps| maps.table_cell_measurements.get(&key).copied())
     }
 
     pub(crate) fn table_cell_measurement_cache_put(
@@ -543,18 +495,36 @@ struct DefaultScrollShiftAnchorSlot {
     anchor: NodeSlotId,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
 struct TextNodeSlot {
     generation: u8,
-    state: Option<Box<TextNodeState>>,
+    /// Where the slot's state is in [`TextSlots::states`], or [`TextNodeSlot::NO_STATE`].
+    state: u32,
+}
+
+impl TextNodeSlot {
+    const NO_STATE: u32 = u32::MAX;
+}
+
+impl Default for TextNodeSlot {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            state: Self::NO_STATE,
+        }
+    }
 }
 
 /// Each text row's state, and what it publishes for the paint side. A slot is written only through
 /// a [`TextStateMut`], which republishes the slot when it drops, or by [`TextSlots::reset`], so
-/// the published column cannot fall behind the slots.
-#[derive(Default)]
+/// the published column cannot fall behind the slots. The states live side by side rather than
+/// each in an allocation of its own, which keeps a copy of the slots to one allocation.
+#[derive(Clone, Default)]
 struct TextSlots {
     slots: Vec<TextNodeSlot>,
+    states: Vec<TextNodeState>,
+    /// The places in `states` no slot uses.
+    vacant_states: Vec<u32>,
     published: CowColumn<PublishedTextSlot, SLOTS_PER_CHUNK>,
 }
 
@@ -562,8 +532,8 @@ impl TextSlots {
     fn state(&self, id: NodeSlotId) -> Option<&TextNodeState> {
         self.slots
             .get(id.slot_index() as usize)
-            .filter(|slot| slot.generation == id.generation())
-            .and_then(|slot| slot.state.as_deref())
+            .filter(|slot| slot.generation == id.generation() && slot.state != TextNodeSlot::NO_STATE)
+            .map(|slot| &self.states[slot.state as usize])
     }
 
     /// The state of `id`'s slot, for writing. A slot last used by another generation starts over.
@@ -572,22 +542,37 @@ impl TextSlots {
         if self.slots.len() <= index {
             self.slots.resize_with(index + 1, TextNodeSlot::default);
         }
-        let slot = &mut self.slots[index];
-        if slot.generation != id.generation() {
-            *slot = TextNodeSlot {
-                generation: id.generation(),
-                ..TextNodeSlot::default()
+        if self.slots[index].generation != id.generation() {
+            self.release_state(index);
+            self.slots[index].generation = id.generation();
+        }
+        if self.slots[index].state == TextNodeSlot::NO_STATE {
+            self.slots[index].state = match self.vacant_states.pop() {
+                Some(state) => state,
+                None => {
+                    self.states.push(TextNodeState::default());
+                    u32::try_from(self.states.len() - 1).expect("text states fit in u32")
+                }
             };
         }
-        slot.state.get_or_insert_with(Default::default);
         TextStateMut { slots: self, index }
     }
 
     /// Empties the slot at `index`, if there is one.
     fn reset(&mut self, index: usize) {
-        if let Some(slot) = self.slots.get_mut(index) {
-            *slot = TextNodeSlot::default();
+        if index < self.slots.len() {
+            self.release_state(index);
+            self.slots[index] = TextNodeSlot::default();
             self.republish(index);
+        }
+    }
+
+    /// Lets go of the state of the slot at `index`, if it has one.
+    fn release_state(&mut self, index: usize) {
+        let state = std::mem::replace(&mut self.slots[index].state, TextNodeSlot::NO_STATE);
+        if state != TextNodeSlot::NO_STATE {
+            self.states[state as usize] = TextNodeState::default();
+            self.vacant_states.push(state);
         }
     }
 
@@ -596,13 +581,14 @@ impl TextSlots {
         let published = self
             .slots
             .get(index)
-            .and_then(|slot| {
-                let state = slot.state.as_deref()?;
-                Some(PublishedTextSlot {
+            .filter(|slot| slot.state != TextNodeSlot::NO_STATE)
+            .map(|slot| {
+                let state = &self.states[slot.state as usize];
+                PublishedTextSlot {
                     generation: slot.generation,
                     first_letter: state.first_letter,
                     rendered: state.content.as_ref().map(|content| content.rendered().clone()),
-                })
+                }
             })
             .unwrap_or_default();
         if self.published.get(index).is_none() {
@@ -625,19 +611,13 @@ impl Deref for TextStateMut<'_> {
     type Target = TextNodeState;
 
     fn deref(&self) -> &TextNodeState {
-        self.slots.slots[self.index]
-            .state
-            .as_deref()
-            .expect("a written slot has state")
+        &self.slots.states[self.slots.slots[self.index].state as usize]
     }
 }
 
 impl DerefMut for TextStateMut<'_> {
     fn deref_mut(&mut self) -> &mut TextNodeState {
-        self.slots.slots[self.index]
-            .state
-            .as_deref_mut()
-            .expect("a written slot has state")
+        &mut self.slots.states[self.slots.slots[self.index].state as usize]
     }
 }
 
@@ -647,7 +627,7 @@ impl Drop for TextStateMut<'_> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TextNodeState {
     source_range: Option<FfiTextSourceRange>,
     first_letter: NodeSlotId,
@@ -697,7 +677,7 @@ impl RowsVersion {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ReplacedContentFactsSlot {
     generation: u8,
     facts: Option<FfiReplacedContentFacts>,
@@ -742,6 +722,10 @@ pub(crate) struct DueBoxPresence {
 }
 
 impl DueBoxPresence {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
     /// Tells the host, if it listens.
     pub(crate) fn tell(self, _: &MainThread) {
         let Some(BoxPresenceHost(context, callback)) = self.host else {
@@ -821,6 +805,18 @@ pub(crate) enum OwedImageResources {
     },
 }
 
+impl OwedImageResources {
+    /// Whether the box owns the provider of the image it shows.
+    pub(crate) fn owns_provider(self) -> bool {
+        match self {
+            Self::StyleResources {
+                owns_content_replacement_image,
+            } => owns_content_replacement_image,
+            Self::GeneratedImage { .. } => true,
+        }
+    }
+}
+
 /// Where an image box that owns the provider of the image it shows stands with it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnedImageProvider {
@@ -883,6 +879,7 @@ impl FreedSubtree {
                 }
             }
             for &slot in &self.rows {
+                host_tables.rows_with_layer_image_paint_facts.borrow_mut().remove(&slot);
                 let provider = host_tables.owned_image_providers.borrow_mut().remove(&slot);
                 if let Some(provider) = provider {
                     crate::layout::tree_mutation::destroy_owned_image_provider(main_thread, provider);
@@ -911,7 +908,7 @@ const BOUND_ROWS_PER_CHUNK: usize = 64;
 /// The row each node is bound to, kept so that the host reads it from published rows: by the dense
 /// index of an element or text identity, by generator and kind for a pseudo-element, and the
 /// viewport row for the document.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct BoundRows {
     elements: CowColumn<NodeSlotId, BOUND_ROWS_PER_CHUNK>,
     texts: CowColumn<NodeSlotId, BOUND_ROWS_PER_CHUNK>,
@@ -1023,7 +1020,7 @@ impl PublishedBoundRows {
 
 /// One row for each StyleNodeID, indexed by the identity's dense index within its kind, so element
 /// and text identities each cost one entry per node of their own kind.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RowsByStyleNode {
     elements: Vec<NodeSlotId>,
     texts: Vec<NodeSlotId>,
@@ -1066,7 +1063,7 @@ const PUBLISHED_REFERENCE_ATOM_COUNT: usize = 5;
 /// What the arena keeps under a style node identity, besides the rows carrying it. Identities are
 /// reissued, so every table here must let go of a retired one: `LayoutNodeArena::forget_style_node`
 /// names each field, and a table added here does not compile until it says how it forgets.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StyleNodeTables {
     /// The CSS counters set of every element and pseudo-element the tree build resolved one for.
     counters_sets: RefCell<super::counters::CountersSets>,
@@ -1134,6 +1131,15 @@ enum ArenaStylePin {
     Sampled,
 }
 
+/// What a sample a clock tick shows in a box samples: the animations the host runs on the box's element, or transitions
+/// a hover beside the host started on it, which leave a record the host pinned for its own readers theirs until the
+/// host starts the transitions in its turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SampleKind {
+    Animation,
+    Transition,
+}
+
 /// The style a clock tick took from a box to show a sample of its element's animations in its place:
 /// the record the host installed for the box, and the pin the arena held it by. Only
 /// [`LayoutNodeArena::restore_host_style`] gives it back, so the host never reads a sample.
@@ -1150,6 +1156,7 @@ impl HostStyle {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct LayoutNodeArena {
     chunks: Vec<Box<Chunk>>,
     tree_shape: TreeShape,
@@ -1207,8 +1214,8 @@ pub(crate) struct LayoutNodeArena {
     /// Every box must be recreated by the next layout tree build; set when the tree is torn down
     /// or a build finds a box it cannot place among rebuilt roots, cleared by the full pass.
     needs_full_layout_tree_update: Cell<bool>,
-    /// Whether a pass that could not ask the host resolved a container-relative length without its container.
-    unresolved_container_lengths: Cell<bool>,
+    /// The nodes whose container-relative lengths a pass that could not ask the host resolved without their container.
+    unresolved_container_lengths: RefCell<Vec<NodeSlotId>>,
     partial_layout_count: Cell<u64>,
     full_layout_count: Cell<u64>,
     layout_tree_build_stats: Cell<FfiLayoutTreeBuildStats>,
@@ -1243,7 +1250,7 @@ pub(crate) struct LayoutNodeArena {
     // Hit testing can measure overflow and invalidate painting state while querying this list.
     // Reuse workspace allocations without making recording scratch part of the committed paint state.
     pub(crate) scrollable_overflow: crate::painting::scrollable_overflow::ScrollableOverflowState,
-    pub(crate) partial_relayout_boundary_roots: RefCell<Vec<NodeSlotId>>,
+    pub(crate) partial_relayout_boundary_roots: RefCell<super::partial_relayout::PartialRelayoutBoundaryRoots>,
     nodes_with_layout_update_flags: RefCell<Vec<NodeSlotId>>,
     layout_update_flag_node_indices: RefCell<HashMap<NodeSlotId, usize>>,
     pub(super) pending_attached_subtree_roots: RefCell<Vec<NodeSlotId>>,
@@ -1271,8 +1278,6 @@ pub(crate) struct LayoutNodeArena {
     image_resources_owed_to_host: RefCell<Vec<(NodeSlotId, OwedImageResources)>>,
     /// The image boxes among the rows that own the provider of the image they show.
     owned_image_providers: RefCell<HashMap<NodeSlotId, OwnedImageProvider>>,
-    /// Whether a text box has ever had a first letter split off it, which gives both halves a source range.
-    may_have_text_source_ranges: bool,
     /// Whether a row has ever been given a style with `content-visibility: auto`.
     may_have_auto_content_visibility: Cell<bool>,
     /// Whether a row has ever been given a style with a scroll snap type.
@@ -1327,7 +1332,7 @@ impl LayoutNodeArena {
             pending_rebuilt_subtree_roots: RefCell::new(Vec::new()),
             pending_layout_tree_update_escaped_rebuild_roots: Cell::new(false),
             needs_full_layout_tree_update: Cell::new(false),
-            unresolved_container_lengths: Cell::new(false),
+            unresolved_container_lengths: RefCell::new(Vec::new()),
             partial_layout_count: Cell::new(0),
             full_layout_count: Cell::new(0),
             layout_tree_build_stats: Cell::new(FfiLayoutTreeBuildStats::default()),
@@ -1356,7 +1361,7 @@ impl LayoutNodeArena {
             paintable_rows: crate::painting::paintable_rows::PaintableRowStore::default(),
             paint_state: RefCell::new(crate::painting::paint_state::PaintState::default()),
             scrollable_overflow: Default::default(),
-            partial_relayout_boundary_roots: RefCell::new(Vec::new()),
+            partial_relayout_boundary_roots: RefCell::default(),
             nodes_with_layout_update_flags: RefCell::new(Vec::new()),
             layout_update_flag_node_indices: RefCell::new(HashMap::default()),
             pending_attached_subtree_roots: RefCell::new(Vec::new()),
@@ -1371,7 +1376,6 @@ impl LayoutNodeArena {
             built_scroll_containers: RefCell::default(),
             image_resources_owed_to_host: RefCell::default(),
             owned_image_providers: RefCell::default(),
-            may_have_text_source_ranges: false,
             may_have_auto_content_visibility: Cell::new(false),
             may_have_scroll_snap_areas: Cell::new(false),
             nodes_enrolled_for_replaced_content_facts_sync: RefCell::new(Vec::new()),
@@ -1672,6 +1676,7 @@ impl LayoutNodeArena {
         self.inline_boxes_lifted_out_of.get_mut().remove(&id);
         self.out_of_flow_positioning_contained.get_mut().remove(&id);
         self.pre_order_labels[index as usize].set(0);
+        self.partial_relayout_boundary_roots.get_mut().note_freed(id);
         self.metadata_mut(index).occupied = false;
         self.forget_row_sharing_dom_node(id);
         self.unbind_row(id);
@@ -2344,31 +2349,179 @@ impl LayoutNodeArena {
         Ok(applied)
     }
 
-    /// Shows `sample`, a sample of the animations of the element whose box `row` is, in the box in place of the record the
-    /// host installed, with the relayout the move asks for. Answers the host's style where the box held it, or nothing
-    /// where it held a sample already, which `sample` replaces. A box the host styles in a way of its own shows no sample,
-    /// and neither does one whose sample moves the style of an anonymous box: its layout node would have to hear of a
-    /// style no host reads.
-    pub(crate) fn install_animation_sample(
+    /// The box of the element or pseudo-element `row` of a hover's style transaction styles, `generated_for` naming the
+    /// pseudo-element, or 0 for the element.
+    fn hover_row_box(&self, row: &crate::css::style::bridge::FfiStyleDelta, generated_for: u8) -> NodeSlotId {
+        let Some(node) = StyleNodeID::from_raw(row.style_node) else {
+            return NodeSlotId::INVALID;
+        };
+        match generated_for {
+            0 => self.bound_row(node),
+            generated_for => self.bound_pseudo_element_row(node, generated_for),
+        }
+    }
+
+    /// Whether the box of the element or pseudo-element `row` of a hover's style transaction moves takes the row's
+    /// record as the host's install of it would, without the host: the move rebuilds no box, and a box it styles is a
+    /// plain one that shows the record the row moves from. List items, images and SVG boxes, which take facts from their
+    /// element as the host styles them, take a move that only repaints them.
+    /// Whether the move of `row` builds boxes again, which the box takes only from a build.
+    pub(crate) fn hover_row_builds_boxes_again(&self, row: &crate::css::style::bridge::FfiStyleDelta) -> bool {
+        row.record_damage & crate::css::style::bridge::FfiStyleInvalidationField::LevelMask as u32 >= REBUILD_LEVEL
+    }
+
+    pub(crate) fn takes_hover_row(&self, row: &crate::css::style::bridge::FfiStyleDelta, generated_for: u8) -> bool {
+        self.hover_row_box_refusal(row, generated_for).is_none()
+    }
+
+    /// Why the box of the element or pseudo-element `row` of a hover's style transaction moves cannot take the row's
+    /// record without the host, or none where it can (see [`Self::takes_hover_row`]).
+    pub(crate) fn hover_row_box_refusal(
+        &self,
+        row: &crate::css::style::bridge::FfiStyleDelta,
+        generated_for: u8,
+    ) -> Option<String> {
+        use crate::css::style::bridge::FfiStyleInvalidationField;
+        let level = row.record_damage & FfiStyleInvalidationField::LevelMask as u32;
+        if level >= REBUILD_LEVEL {
+            return Some("a move that builds boxes again".into());
+        }
+        let slot = self.hover_row_box(row, generated_for);
+        // A row without a new record moves only what its element's children inherit.
+        if slot.is_invalid() || row.old_style_record == row.new_style_record || row.new_style_record == 0 {
+            return None;
+        }
+        let kind = self.data(slot).kind.get();
+        let repaints_only = level < RELAYOUT_LEVEL;
+        let plain = matches!(kind, NodeKind::Box | NodeKind::BlockContainer | NodeKind::InlineNode)
+            || (repaints_only
+                && matches!(
+                    kind,
+                    NodeKind::ListItemBox
+                        | NodeKind::ListItemMarkerBox
+                        | NodeKind::ImageBox
+                        | NodeKind::VideoBox
+                        | NodeKind::SVGSVGBox
+                        | NodeKind::SVGGeometryBox
+                        | NodeKind::SVGGraphicsBox
+                        | NodeKind::SVGTextBox
+                ));
+        if !plain {
+            return Some(format!("a {kind:?} box at damage level {level}"));
+        }
+        // A record the host pinned for its own readers stays theirs until the host installs the row, beside the one
+        // the box shows.
+        if self.style_records[slot.slot_index() as usize].get() != row.old_style_record {
+            return Some("a box that shows another record".into());
+        }
+        if self.style_record_pins[slot.slot_index() as usize].get() == ArenaStylePin::Sampled {
+            return Some("a box that shows an animation sample".into());
+        }
+        if self.node_style_record_is_derived(slot) {
+            return Some("a box whose record the arena derived".into());
+        }
+        let parent = self.data(slot).parent.get();
+        (!parent.is_invalid() && self.data(parent).kind.get() == NodeKind::TableWrapper).then(|| "a table box".into())
+    }
+
+    /// Whether the box of the element or pseudo-element `row` of a hover's style transaction styles shows the record the
+    /// row moves to already, or there is no box.
+    pub(crate) fn hover_row_box_shows_its_record(
+        &self,
+        row: &crate::css::style::bridge::FfiStyleDelta,
+        generated_for: u8,
+    ) -> bool {
+        let slot = self.hover_row_box(row, generated_for);
+        slot.is_invalid() || self.style_records[slot.slot_index() as usize].get() == row.new_style_record
+    }
+
+    /// Installs the record `row` of a hover's style transaction moves to in the box of its element or pseudo-element,
+    /// which [`Self::takes_hover_row`] took, as the host's install of the row does: the style, the styles the box's
+    /// anonymous descendants inherit, and the relayout, the visual contexts and the repaint the move asks for.
+    pub(crate) fn install_hover_row(
+        &self,
+        host_calls: HostCalls<'_>,
+        row: &crate::css::style::bridge::FfiStyleDelta,
+        generated_for: u8,
+    ) {
+        use crate::css::style::bridge::FfiStyleInvalidationField;
+        let slot = self.hover_row_box(row, generated_for);
+        if slot.is_invalid() || row.old_style_record == row.new_style_record || row.new_style_record == 0 {
+            return;
+        }
+        let previous_payloads = self.data(slot).style.get();
+        let payloads = self.with_style_engine(|engine| {
+            engine
+                .style_record_payloads(row.new_style_record)
+                .map_or(std::ptr::null(), <[_]>::as_ptr)
+        });
+        let payloads = StylePayloadsRef::new(payloads.cast());
+        if self.set_node_style(slot, row.new_style_record, payloads) {
+            self.refresh_style_flags(slot);
+        }
+        self.publish_new_size_container_geometry(slot);
+        self.enroll_node_for_svg_paint_resources_sync(slot);
+        if !style_payloads_equal_in_layout_affecting_groups(previous_payloads, payloads) {
+            self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
+            self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
+        }
+        self.reinherit_anonymous_descendants(HostCalls(host_calls.0), slot);
+        let level = row.record_damage & FfiStyleInvalidationField::LevelMask as u32;
+        if level >= RELAYOUT_LEVEL
+            && let Some(style_node) = self.node_style_node(slot)
+        {
+            self.mark_row_for_relayout_after_style_change(style_node, slot);
+        }
+        self.note_style_visual_context_moves(slot, row.record_damage);
+        self.push_paint_damage_for_repaint(slot, crate::painting::record::damage::PaintDamage::ALL_PRODUCERS);
+    }
+
+    /// Notes the visual contexts a style move with `damage`, an `FfiStyleInvalidationField` word, moves for `slot`'s
+    /// box, which the next recording builds again.
+    pub(crate) fn note_style_visual_context_moves(&self, slot: NodeSlotId, damage: u32) {
+        use crate::css::style::bridge::FfiStyleInvalidationField;
+        use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
+        let visual_contexts = (damage >> FfiStyleInvalidationField::VisualContextShift as u32)
+            & FfiStyleInvalidationField::LevelMask as u32;
+        if visual_contexts == 0 || !crate::painting::paint_read::GeometryRead::paintable_row_is_populated(self, slot) {
+            return;
+        }
+        let kind = match visual_contexts {
+            1 => VisualContextBoxDirtyKind::StyleValueChange,
+            _ => VisualContextBoxDirtyKind::StyleStructuralChange,
+        };
+        self.note_visual_context_box_dirty(slot, kind);
+    }
+
+    /// Whether the box `row` shows `sample`, a sample of `kind` of the effects of its element, where
+    /// [`Self::install_sample`] would. A box the host styles in a way of its own shows no sample, and neither does one
+    /// whose sample moves the style of an anonymous box: its layout node would have to hear of a style no host reads.
+    pub(crate) fn takes_sample(&self, row: NodeSlotId, sample: &DerivedStyleRecord, kind: SampleKind) -> bool {
+        matches!(
+            self.data(row).kind.get(),
+            NodeKind::Box | NodeKind::BlockContainer | NodeKind::InlineNode
+        ) && self.style_record_pins[row.slot_index() as usize].get() != ArenaStylePin::Derived
+            && (kind == SampleKind::Transition || self.node_style_record_pinned_by_host(row) == 0)
+            && self.node_style_node(row).is_some()
+            && !self.sample_moves_anonymous_box_style(row, sample.payloads)
+    }
+
+    /// Shows `sample`, a sample of `kind` of the effects of the element whose box `row` is, in the box in place of the
+    /// record the host installed, with the relayout the move asks for, where the box takes it (see
+    /// [`Self::takes_sample`]). Answers the host's style where the box held it, or nothing where it held a sample
+    /// already, which `sample` replaces.
+    pub(crate) fn install_sample(
         &self,
         row: NodeSlotId,
         sample: DerivedStyleRecord,
+        kind: SampleKind,
     ) -> Result<Option<HostStyle>, NeedsHost> {
-        let index = row.slot_index() as usize;
-        let pin = self.style_record_pins[index].get();
-        let style_node = self.node_style_node(row);
-        if !matches!(
-            self.data(row).kind.get(),
-            NodeKind::Box | NodeKind::BlockContainer | NodeKind::InlineNode
-        ) || pin == ArenaStylePin::Derived
-            || self.node_style_record_pinned_by_host(row) != 0
-            || style_node.is_none()
-            || self.sample_moves_anonymous_box_style(row, sample.payloads)
-        {
+        if !self.takes_sample(row, &sample, kind) {
             self.with_style_engine(|engine| engine.unpin_layout_style_record(sample.record));
             return Err(NeedsHost);
         }
-        let host_style = match pin {
+        let index = row.slot_index() as usize;
+        let host_style = match self.style_record_pins[index].get() {
             ArenaStylePin::Sampled => {
                 let previous = self.style_records[index].get();
                 self.with_style_engine(|engine| engine.unpin_layout_style_record(previous));
@@ -2380,7 +2533,7 @@ impl LayoutNodeArena {
             }),
         };
         self.style_record_pins[index].set(ArenaStylePin::Sampled);
-        self.show_style(row, style_node, sample);
+        self.show_style(row, self.node_style_node(row), sample);
         Ok(host_style)
     }
 
@@ -2504,6 +2657,25 @@ impl LayoutNodeArena {
 
     pub(crate) fn svg_paint_resources(&self) -> &crate::painting::svg_paint_resources::SvgPaintResources {
         &self.svg_paint_resources
+    }
+
+    /// A fork of the arena, linked to `engine`, the fork of its style engine: its chunks have addresses of their own,
+    /// and the flags the arena shares with the host are its own. See [`crate::fork`].
+    pub(crate) fn fork(&self, engine: crate::css::style::StyleEngineHandle) -> Self {
+        let mut fork = self.clone();
+        fork.chunks_by_address = fork
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(chunk_index, chunk)| ChunkAddress {
+                start: chunk.slots_address(),
+                chunk_index,
+            })
+            .collect();
+        fork.chunks_by_address.sort_unstable_by_key(|address| address.start);
+        fork.style_engine.set(engine);
+        fork.svg_paint_resources.detach_enrolled_flag_for_fork();
+        fork
     }
 
     /// See [`crate::painting::svg_paint_resources::SvgPaintResources::share_enrolled_flag`].
@@ -2677,6 +2849,16 @@ impl LayoutNodeArena {
         )
     }
 
+    /// The DOM nodes the subtrees the last build rebuilt and left live stand for. An anonymous root stands for none.
+    pub(crate) fn pending_rebuilt_dom_roots(&self) -> Vec<crate::painting::host::FfiNodeIdentity> {
+        self.pending_rebuilt_subtree_roots
+            .borrow()
+            .iter()
+            .filter(|&&root| self.node_is_dom_backed(root))
+            .map(|&root| crate::painting::hit_test::resolve::row_node_identity(self, root, false))
+            .collect()
+    }
+
     pub(crate) fn clear_pending_rebuilt_subtree_roots(&self) {
         self.pending_rebuilt_subtree_roots.borrow_mut().clear();
         self.pending_layout_tree_update_escaped_rebuild_roots.set(false);
@@ -2715,14 +2897,24 @@ impl LayoutNodeArena {
         self.needs_full_layout_tree_update.get()
     }
 
-    /// Notes that a pass that could not ask the host resolved a container-relative length without its container.
-    pub(crate) fn note_unresolved_container_lengths(&self) {
-        self.unresolved_container_lengths.set(true);
+    /// Notes that a pass that could not ask the host resolved a container-relative length of `node` without its
+    /// container.
+    pub(crate) fn note_unresolved_container_lengths(&self, node: NodeSlotId) {
+        let mut nodes = self.unresolved_container_lengths.borrow_mut();
+        if nodes.last() != Some(&node) {
+            nodes.push(node);
+        }
     }
 
-    /// Whether a pass resolved a container-relative length without its container since this was asked last.
-    pub(crate) fn take_unresolved_container_lengths(&self) -> bool {
-        self.unresolved_container_lengths.take()
+    /// Marks the nodes whose container-relative lengths a pass resolved without their container since this was asked
+    /// last for a layout update, ancestors included, so that the next layout lays them out again rather than reusing
+    /// what the pass laid out. Answers whether there were any.
+    pub(crate) fn mark_unresolved_container_lengths_for_layout(&self) -> bool {
+        let nodes = self.unresolved_container_lengths.take();
+        for &node in &nodes {
+            self.set_needs_layout_update(node, true);
+        }
+        !nodes.is_empty()
     }
 
     pub(crate) fn set_needs_full_layout_tree_update(&self, value: bool) {
@@ -3501,10 +3693,10 @@ impl LayoutNodeArena {
 
     /// Whether the build about to run may build the viewport, which is what needs the document's
     /// style: there is no viewport row yet, the whole tree is to be rebuilt, or the document is.
-    pub(crate) fn tree_build_may_create_viewport(&self, document_style_node: Option<StyleNodeID>) -> bool {
+    pub(crate) fn tree_build_may_create_viewport(&self, document_style_node: StyleNodeID) -> bool {
         self.bound_viewport_row().is_invalid()
             || self.needs_full_layout_tree_update()
-            || document_style_node.is_some_and(|document| self.needs_layout_tree_update(document))
+            || self.needs_layout_tree_update(document_style_node)
     }
 
     /// Stamps a row the build allocated for a pseudo-element of `generator`, with the style record
@@ -4727,7 +4919,6 @@ impl LayoutNodeArena {
         assert_eq!(self.data(first_letter).kind.get(), NodeKind::TextNode);
         assert_eq!(self.data(remainder).kind.get(), NodeKind::TextNode);
         assert!(letter_end <= source_length);
-        self.may_have_text_source_ranges = true;
         self.text_node_state_mut(first_letter).source_range = Some(FfiTextSourceRange {
             start: 0,
             length: letter_end,
@@ -4753,14 +4944,17 @@ impl LayoutNodeArena {
             })
     }
 
-    /// Whether any text box may have a source range: none has before a first letter is split off one.
-    pub(crate) fn may_have_text_source_ranges(&self) -> bool {
-        self.may_have_text_source_ranges
-    }
-
     pub(crate) fn text_has_source_range(&self, id: NodeSlotId) -> bool {
         self.text_node_state(id)
             .is_some_and(|state| state.source_range.is_some())
+    }
+
+    pub(crate) fn first_letter_owner_of_split_text(&self, id: NodeSlotId) -> Option<StyleNodeID> {
+        let first_letter = self.text_node_state(id)?.first_letter;
+        if !self.slot_is_live(first_letter) {
+            return None;
+        }
+        self.node_style_node(self.data(first_letter).parent.get())
     }
 
     pub(crate) fn text_fragments(&self, primary: NodeSlotId) -> TextFragments {
@@ -4809,6 +5003,11 @@ impl LayoutNodeArena {
     /// Whether a row has ever been given a style with `content-visibility: auto`.
     pub(crate) fn may_have_auto_content_visibility(&self) -> bool {
         self.may_have_auto_content_visibility.get()
+    }
+
+    /// Whether a row has ever been given a style with a scroll snap type, short of which no scroll container snaps.
+    pub(crate) fn may_have_scroll_snap_areas(&self) -> bool {
+        self.may_have_scroll_snap_areas.get()
     }
 
     pub(crate) fn style_payloads(&self, id: NodeSlotId) -> Option<&FfiStylePayloads> {
@@ -5088,13 +5287,7 @@ impl LayoutNodeArena {
     /// Owes the host `id`'s image resources once the layout update the running build is part of
     /// is over. An image box that owns its image's provider has no image until then.
     pub(crate) fn owe_image_resources(&self, id: NodeSlotId, owed: OwedImageResources) {
-        let owns_provider = match owed {
-            OwedImageResources::StyleResources {
-                owns_content_replacement_image,
-            } => owns_content_replacement_image,
-            OwedImageResources::GeneratedImage { .. } => true,
-        };
-        if owns_provider {
+        if owed.owns_provider() {
             self.owned_image_providers
                 .borrow_mut()
                 .insert(id, OwnedImageProvider::Awaited);
@@ -5106,11 +5299,6 @@ impl LayoutNodeArena {
     /// A later build can free a row, so whoever pays them asks whether it is live first.
     pub(crate) fn take_image_resources_owed_to_host(&self) -> Vec<(NodeSlotId, OwedImageResources)> {
         self.image_resources_owed_to_host.take()
-    }
-
-    /// Whether the finished builds owe the host any image resource.
-    pub(crate) fn owes_image_resources_to_host(&self) -> bool {
-        !self.image_resources_owed_to_host.borrow().is_empty()
     }
 
     /// Where `id` stands with the provider of its image, if it is an image box that owns one.
@@ -5257,7 +5445,7 @@ pub(crate) struct NodeAllocation {
 /// The arena must remain valid for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_content_counter_styles_changed(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     style_node: u32,
     generated_for: u8,
@@ -5271,17 +5459,6 @@ pub unsafe extern "C" fn render_state_content_counter_styles_changed(
             super::generated_content::content_counter_styles_changed(arena, owner)
         })
     }
-}
-
-/// The host tables of `host`'s document.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, which outlives the borrow.
-unsafe fn host_tables<'a>(host: *const DocumentHost) -> &'a super::HostTables {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.host_tables()
 }
 
 fn counter_owner(style_node: u32, generated_for: u8) -> Option<super::counters::CounterOwner> {
@@ -5305,7 +5482,7 @@ pub unsafe extern "C" fn style_resets_forward_list_item_counter(payloads: *const
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_set_node_needs_compositor_animation_frame(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     id: NodeSlotId,
     kind: super::node_data::CompositorAnimationFrameKind,
     value: bool,
@@ -5325,10 +5502,7 @@ pub unsafe extern "C" fn render_state_set_node_needs_compositor_animation_frame(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_row_scroll_offset(
-    host: *const DocumentHost,
-    slot: NodeSlotId,
-) -> FfiCssPixelPoint {
+pub unsafe extern "C" fn render_state_row_scroll_offset(host: &DocumentHost, slot: NodeSlotId) -> FfiCssPixelPoint {
     // SAFETY: Guaranteed by the caller.
     unsafe {
         read_arena(host, node_read(), slot, |arena, slot| {
@@ -5339,7 +5513,7 @@ pub unsafe extern "C" fn render_state_row_scroll_offset(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_set_node_style(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     id: NodeSlotId,
     style_record: u64,
     payloads: *const c_void,
@@ -5403,7 +5577,7 @@ pub(crate) fn prepare_subtree_for_detach(host_calls: HostCalls<'_>, arena: &Layo
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_pin_bound_box_style_record_for_detachment(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     style_node: u32,
     generated_for: u8,
 ) {
@@ -5430,7 +5604,7 @@ pub unsafe extern "C" fn render_state_pin_bound_box_style_record_for_detachment(
 /// `host` must be a live document host, on its document's thread, and `slot` a live row.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_pin_node_style_record_for_host(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     slot: NodeSlotId,
     record: u64,
 ) {
@@ -5442,22 +5616,18 @@ pub unsafe extern "C" fn render_state_pin_node_style_record_for_host(
 ///
 /// `host` must be a live document host, on its document's thread, and `slot` a live row.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_release_node_style_record_pin_for_host(
-    host: *const DocumentHost,
-    slot: NodeSlotId,
-) {
+pub unsafe extern "C" fn render_state_release_node_style_record_pin_for_host(host: &DocumentHost, slot: NodeSlotId) {
     // SAFETY: Guaranteed by the caller.
     unsafe { queue(host, LayoutChange::ReleaseNodeStyleRecordPinForHost { node: slot }) };
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn document_host_set_shell_factory(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     context: *mut c_void,
     factory: unsafe extern "C" fn(*mut c_void, NodeSlotId, NodeKind),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { host_tables(host) }.shell_factory.set(Some((context, factory)));
+    host.host_tables().shell_factory.set(Some((context, factory)));
 }
 
 /// # Safety
@@ -5466,7 +5636,7 @@ pub unsafe extern "C" fn document_host_set_shell_factory(
 /// its context is live, and must not reenter the arena from the callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_set_box_presence_host(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     context: *mut c_void,
     callback: unsafe extern "C" fn(*mut c_void, u32, u8),
 ) {
@@ -5483,49 +5653,41 @@ pub unsafe extern "C" fn render_state_set_box_presence_host(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_clear_box_presence_host(host: *const DocumentHost) {
+pub unsafe extern "C" fn render_state_clear_box_presence_host(host: &DocumentHost) {
     // SAFETY: Guaranteed by the caller.
     unsafe { queue(host, LayoutChange::SetBoxPresenceHost(None)) };
 }
 
+/// Forgets every callback the document registered with its host, as the document is finalized.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_clear_shell_factory(host: *const DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { host_tables(host) }.shell_factory.set(None);
+pub extern "C" fn document_host_clear_callbacks(host: &DocumentHost) {
+    host.host_tables().clear_callbacks();
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_attach_shell(host: *const DocumentHost, id: NodeSlotId, shell: *mut c_void) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { host_tables(host) }.attach_shell(id, shell);
+pub unsafe extern "C" fn document_host_attach_shell(host: &DocumentHost, id: NodeSlotId, shell: *mut c_void) {
+    host.host_tables().attach_shell(id, shell);
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn document_host_set_style_record_host_callbacks(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     callbacks: FfiStyleRecordHostCallbacks,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { host_tables(host) }
+    host.host_tables()
         .shell_style_changed_host
         .set(Some((callbacks.context, callbacks.shell_style_changed)));
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_clear_style_record_host_callbacks(host: *const DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { host_tables(host) }.shell_style_changed_host.set(None);
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_layout_pass_is_running(host: *const DocumentHost) -> bool {
+pub unsafe extern "C" fn render_state_layout_pass_is_running(host: &DocumentHost) -> bool {
     // SAFETY: Guaranteed by the caller.
     unsafe { read_arena(host, node_read(), (), |arena, ()| arena.layout_pass_is_running()) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_needs_full_layout_tree_update(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
 ) -> bool {
     // SAFETY: Guaranteed by the caller.
@@ -5534,30 +5696,38 @@ pub unsafe extern "C" fn render_state_needs_full_layout_tree_update(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_layout_root(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
 ) -> NodeSlotId {
     // SAFETY: Guaranteed by the caller.
     unsafe { read_arena(host, read, (), |arena, ()| arena.layout_root()) }
 }
 
+/// Whether the layout of `host`'s document is up to date, where the host knows it without asking and no frame brings
+/// layout the host waits for.
+fn known_layout_is_up_to_date(
+    host: &DocumentHost,
+    _: &crate::render_state::NoFrameInFlight,
+    document: Option<StyleNodeID>,
+) -> Option<bool> {
+    let up_to_date = host.known_layout_up_to_date_unless_built()?;
+    Some(
+        up_to_date
+            && !document
+                .is_some_and(|document| host.read_marks(|marks| marks.needs(document) || marks.child_needs(document))),
+    )
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_layout_is_up_to_date(
-    host: *const DocumentHost,
-    document_style_node: u32,
-) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
+pub unsafe extern "C" fn render_state_layout_is_up_to_date(host: &DocumentHost, document_style_node: u32) -> bool {
     // A frame in flight, or a round that flew and is not paid yet, brings layout the host waits for. The document's
     // layout tree update marks are the frame's, so they are read only once no frame holds them.
     let Some(here) = host.layout_waits_for_no_frame() else {
         return false;
     };
     let document = StyleNodeID::from_raw(document_style_node);
-    if let Some(up_to_date) = host.known_layout_up_to_date_unless_built() {
-        return up_to_date
-            && !document
-                .is_some_and(|document| host.read_marks(|marks| marks.needs(document) || marks.child_needs(document)));
+    if let Some(up_to_date) = known_layout_is_up_to_date(host, &here, document) {
+        return up_to_date;
     }
     host.ask(here, |state| {
         let arena = state.arena_mut();
@@ -5569,13 +5739,18 @@ pub unsafe extern "C" fn render_state_layout_is_up_to_date(
     })
 }
 
+/// Whether the host knows, without asking, that the layout of `host`'s document is not up to date: a frame brings
+/// layout it waits for, or what it knows of the render state says so.
+///
 /// # Safety
 ///
-/// `host` must be a live document host with a registered layout host, on its document's thread.
+/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_sync_enrolled_content_for_layout(host: *const DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SyncEnrolledContentForLayout) };
+pub unsafe extern "C" fn render_state_layout_is_known_stale(host: &DocumentHost, document_style_node: u32) -> bool {
+    let Some(here) = host.layout_waits_for_no_frame() else {
+        return true;
+    };
+    known_layout_is_up_to_date(host, &here, StyleNodeID::from_raw(document_style_node)) == Some(false)
 }
 
 /// Refreshes the text content and replaced-content facts of every node enrolled since the last
@@ -5817,6 +5992,44 @@ mod tests {
                 (element, 0),
             ]
         );
+    }
+
+    #[test]
+    fn a_change_that_forgets_a_style_node_owes_the_host_its_box_presence() {
+        use crate::css::style::tree::StyleNodeID;
+        use crate::layout::layout_changes::LayoutChange;
+        unsafe extern "C" fn record(context: *mut c_void, style_node: u32, bits: u8) {
+            // SAFETY: The test registers a live Vec as the context, and reads it only after unregistering.
+            unsafe { &mut *context.cast::<Vec<(u32, u8)>>() }.push((style_node, bits));
+        }
+        let mut reports: Vec<(u32, u8)> = Vec::new();
+        let mut arena = LayoutNodeArena::new();
+        let element = StyleNodeID::element(3);
+        let row = arena.allocate(NodeConstructionFacts {
+            style_node: element.raw(),
+            ..test_construction_facts()
+        });
+        arena.bind_row(row);
+        arena.set_box_presence_host(Some(super::BoxPresenceHost(
+            std::ptr::from_mut(&mut reports).cast::<c_void>(),
+            record,
+        )));
+
+        let owed = LayoutChange::StyleNodeChanged {
+            old: Some(element),
+            new: None,
+            generated_for: Default::default(),
+        }
+        .apply_owing(&mut arena);
+        assert!(reports.is_empty(), "the change tells the host nothing while it applies");
+        assert!(!owed.is_empty());
+        owed.pay(&crate::stage::MainThread::for_test());
+        arena.set_box_presence_host(None);
+        assert_eq!(reports, [(element.raw(), 0)]);
+
+        arena
+            .free_subtree(row)
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
     }
 
     #[test]

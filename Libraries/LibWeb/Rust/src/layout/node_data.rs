@@ -9,7 +9,6 @@ use crate::layout::CssPixels;
 use std::cell::Cell;
 use std::ffi::c_void;
 
-pub use super::node_slot_id::INVALID_NODE_SLOT_INDEX;
 pub const GENERATED_FOR_AFTER: u8 = 1;
 pub const GENERATED_FOR_BACKDROP: u8 = 2;
 pub const GENERATED_FOR_BEFORE: u8 = 3;
@@ -150,11 +149,8 @@ pub enum NodeKind {
     ListItemMarkerBox = 13,
     NavigableContainerViewport = 14,
     Node = 15,
-    NodeWithStyle = 16,
     RadioButton = 18,
     RangeInputBox = 19,
-    ReplacedBox = 20,
-    SVGBox = 21,
     SVGClipBox = 22,
     SVGForeignObjectBox = 23,
     SVGGeometryBox = 24,
@@ -246,6 +242,7 @@ pub enum CompositorAnimationFrameKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+#[cfg_attr(not(test), expect(dead_code, reason = "C++ constructs the variants"))]
 pub enum FfiNodeLink {
     Parent,
     FirstChild,
@@ -281,6 +278,7 @@ pub(crate) struct NodeConstructionFacts {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub(crate) struct NodeData {
     pub parent: ShapeCell<NodeSlotId>,
     pub first_child: ShapeCell<NodeSlotId>,

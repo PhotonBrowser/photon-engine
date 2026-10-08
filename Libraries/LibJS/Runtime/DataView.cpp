@@ -1,124 +1,68 @@
 /*
- * Copyright (c) 2021, Idan Horowitz <idan.horowitz@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibJS/Runtime/ArrayBufferABIConversions.h>
 #include <LibJS/Runtime/DataView.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(DataView);
+using namespace EmbeddingABI;
 
 GC::Ref<DataView> DataView::create(Realm& realm, ArrayBuffer* viewed_buffer, ByteLength byte_length, size_t byte_offset)
 {
-    return realm.create<DataView>(viewed_buffer, move(byte_length), byte_offset, realm.intrinsics().data_view_prototype());
+    VERIFY(viewed_buffer);
+    auto* data_view = js_array_buffer_create_data_view(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), array_buffer_to_abi(*viewed_buffer), byte_length_to_abi(byte_length), byte_offset);
+    VERIFY(data_view);
+    return cell_ref_from_abi<DataView>(data_view);
 }
 
-DataView::DataView(GC::Ptr<ArrayBuffer> viewed_buffer, ByteLength byte_length, size_t byte_offset, Object& prototype)
-    : Object(ConstructWithPrototypeTag::Tag, prototype)
-    , m_viewed_array_buffer(viewed_buffer)
-    , m_byte_length(move(byte_length))
-    , m_byte_offset(byte_offset)
+ArrayBuffer* DataView::viewed_array_buffer() const
 {
+    return &array_buffer_from_abi(js_array_buffer_data_view_viewed_buffer(object_to_abi(*this)));
 }
 
-void DataView::visit_edges(Visitor& visitor)
+ByteLength DataView::byte_length() const
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_viewed_array_buffer);
+    return byte_length_from_abi(js_array_buffer_data_view_byte_length(object_to_abi(*this)));
 }
 
-// 25.3.1.2 MakeDataViewWithBufferWitnessRecord ( obj, order ), https://tc39.es/ecma262/#sec-makedataviewwithbufferwitnessrecord
+u32 DataView::byte_offset() const
+{
+    return js_array_buffer_data_view_byte_offset(object_to_abi(*this));
+}
+
+static JSDataViewWithBufferWitness witness_record_to_abi(DataViewWithBufferWitness const& record)
+{
+    return {
+        .data_view = object_to_abi(*record.object),
+        .cached_buffer_byte_length = byte_length_to_abi(record.cached_buffer_byte_length),
+    };
+}
+
 DataViewWithBufferWitness make_data_view_with_buffer_witness_record(DataView const& data_view, ArrayBuffer::Order order)
 {
-    // 1. Let buffer be obj.[[ViewedArrayBuffer]].
-    auto* buffer = data_view.viewed_array_buffer();
-
-    ByteLength byte_length { 0 };
-
-    // 2. If IsDetachedBuffer(buffer) is true, then
-    if (buffer->is_detached()) {
-        // a. Let byteLength be detached.
-        byte_length = ByteLength::detached();
-    }
-    // 3. Else,
-    else {
-        // a. Let byteLength be ArrayBufferByteLength(buffer, order).
-        byte_length = array_buffer_byte_length(*buffer, order);
-    }
-
-    // 4. Return the DataView With Buffer Witness Record { [[Object]]: obj, [[CachedBufferByteLength]]: byteLength }.
-    return { .object = data_view, .cached_buffer_byte_length = move(byte_length) };
+    auto record = js_array_buffer_make_data_view_witness_record(object_to_abi(data_view), order_to_abi(order));
+    return {
+        .object = cell_ref_from_abi<DataView>(record.data_view),
+        .cached_buffer_byte_length = byte_length_from_abi(record.cached_buffer_byte_length),
+    };
 }
 
-// 25.3.1.3 GetViewByteLength ( viewRecord ), https://tc39.es/ecma262/#sec-getviewbytelength
 u32 get_view_byte_length(DataViewWithBufferWitness const& view_record)
 {
-    // 1. Assert: IsViewOutOfBounds(viewRecord) is false.
-    VERIFY(!is_view_out_of_bounds(view_record));
-
-    // 2. Let view be viewRecord.[[Object]].
-    auto const& view = *view_record.object;
-
-    // 3. If view.[[ByteLength]] is not auto, return view.[[ByteLength]].
-    if (!view.byte_length().is_auto())
-        return view.byte_length().length();
-
-    // 4. Assert: IsFixedLengthArrayBuffer(view.[[ViewedArrayBuffer]]) is false.
-    VERIFY(!view.viewed_array_buffer()->is_fixed_length());
-
-    // 5. Let byteOffset be view.[[ByteOffset]].
-    auto byte_offset = view.byte_offset();
-
-    // 6. Let byteLength be viewRecord.[[CachedBufferByteLength]].
-    auto const& byte_length = view_record.cached_buffer_byte_length;
-
-    // 7. Assert: byteLength is not detached.
-    VERIFY(!byte_length.is_detached());
-
-    // 8. Return byteLength - byteOffset.
-    return byte_length.length() - byte_offset;
+    auto record = witness_record_to_abi(view_record);
+    return js_array_buffer_data_view_view_byte_length(&record);
 }
 
-// 25.3.1.4 IsViewOutOfBounds ( viewRecord ), https://tc39.es/ecma262/#sec-isviewoutofbounds
 bool is_view_out_of_bounds(DataViewWithBufferWitness const& view_record)
 {
-    // 1. Let view be viewRecord.[[Object]].
-    auto const& view = *view_record.object;
-
-    // 2. Let bufferByteLength be viewRecord.[[CachedBufferByteLength]].
-    auto const& buffer_byte_length = view_record.cached_buffer_byte_length;
-
-    // 3. Assert: IsDetachedBuffer(view.[[ViewedArrayBuffer]]) is true if and only if bufferByteLength is detached.
-    VERIFY(view.viewed_array_buffer()->is_detached() == buffer_byte_length.is_detached());
-
-    // 4. If bufferByteLength is detached, return true.
-    if (buffer_byte_length.is_detached())
-        return true;
-
-    // 5. Let byteOffsetStart be view.[[ByteOffset]].
-    auto byte_offset_start = view.byte_offset();
-    u32 byte_offset_end = 0;
-
-    // 6. If view.[[ByteLength]] is auto, then
-    if (view.byte_length().is_auto()) {
-        // a. Let byteOffsetEnd be bufferByteLength.
-        byte_offset_end = buffer_byte_length.length();
-    }
-    // 7. Else,
-    else {
-        // a. Let byteOffsetEnd be byteOffsetStart + view.[[ByteLength]].
-        byte_offset_end = byte_offset_start + view.byte_length().length();
-    }
-
-    // 8. If byteOffsetStart > bufferByteLength or byteOffsetEnd > bufferByteLength, return true.
-    if ((byte_offset_start > buffer_byte_length.length()) || (byte_offset_end > buffer_byte_length.length()))
-        return true;
-
-    // 9. NOTE: 0-length DataViews are not considered out-of-bounds.
-    // 10. Return false.
-    return false;
+    auto record = witness_record_to_abi(view_record);
+    return js_array_buffer_is_data_view_out_of_bounds(&record);
 }
 
 }

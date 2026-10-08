@@ -6,23 +6,22 @@
 
 #pragma once
 
-#include <AK/StringView.h>
+#include <AK/Concepts.h>
+#include <AK/Utf16FlyString.h>
 #include <LibJS/Export.h>
+#include <LibJS/Forward.h>
+#include <LibJS/Heap/EngineCell.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/Object.h>
+#include <LibJS/Runtime/Value.h>
 
 namespace JS {
 
-struct Variable {
-    Value value;
-    DeclarationKind declaration_kind;
-};
-
-#define JS_ENVIRONMENT(class_, base_class) GC_CELL(class_, base_class)
-
-class JS_API Environment : public Cell {
-    GC_CELL(Environment, Cell);
-
+// 9.1 Environment Records, https://tc39.es/ecma262/#sec-environment-records
+// An Environment Record of the Rust runtime. The runtime dispatches each abstract method on the kind of the record, so
+// these types have no virtual functions, and is<T>(), as<T>() and as_if<T>() recognize the kind with
+// `static bool T::is_environment_kind_of(Environment const&)`.
+class JS_API Environment : public EngineCell {
 public:
     enum class InitializeBindingHint {
         Normal,
@@ -30,61 +29,41 @@ public:
         AsyncDispose,
     };
 
-    virtual bool has_this_binding() const { return false; }
-    virtual ThrowCompletionOr<Value> get_this_binding(VM&) const { return Value {}; }
-
-    virtual Object* with_base_object() const { return nullptr; }
-
-    virtual ThrowCompletionOr<bool> has_binding([[maybe_unused]] Utf16FlyString const& name, [[maybe_unused]] Optional<size_t>* out_index = nullptr) const = 0;
-    virtual ThrowCompletionOr<void> create_mutable_binding(VM&, [[maybe_unused]] Utf16FlyString const& name, [[maybe_unused]] bool can_be_deleted) = 0;
-    virtual ThrowCompletionOr<void> create_immutable_binding(VM&, [[maybe_unused]] Utf16FlyString const& name, [[maybe_unused]] bool strict) = 0;
-    virtual ThrowCompletionOr<void> initialize_binding(VM&, [[maybe_unused]] Utf16FlyString const& name, Value, InitializeBindingHint) = 0;
-    virtual ThrowCompletionOr<void> set_mutable_binding(VM&, [[maybe_unused]] Utf16FlyString const& name, Value, [[maybe_unused]] bool strict) = 0;
-    virtual ThrowCompletionOr<Value> get_binding_value(VM&, [[maybe_unused]] Utf16FlyString const& name, [[maybe_unused]] bool strict) = 0;
-    virtual ThrowCompletionOr<bool> delete_binding(VM&, [[maybe_unused]] Utf16FlyString const& name) = 0;
+    ThrowCompletionOr<void> create_immutable_binding(VM&, Utf16FlyString const& name, bool strict);
+    ThrowCompletionOr<void> initialize_binding(VM&, Utf16FlyString const& name, Value, InitializeBindingHint);
+    ThrowCompletionOr<void> set_mutable_binding(VM&, Utf16FlyString const& name, Value, bool strict);
+    ThrowCompletionOr<Value> get_binding_value(VM&, Utf16FlyString const& name, bool strict);
+    ThrowCompletionOr<bool> delete_binding(VM&, Utf16FlyString const& name);
 
     // [[OuterEnv]]
-    Environment* outer_environment() { return m_outer_environment.ptr(); }
-    Environment const* outer_environment() const { return m_outer_environment.ptr(); }
+    Environment* outer_environment();
+    Environment const* outer_environment() const;
 
-    [[nodiscard]] bool is_declarative_environment() const { return m_declarative; }
-    virtual bool is_global_environment() const { return false; }
-    virtual bool is_function_environment() const { return false; }
-    virtual bool is_object_environment() const { return false; }
-    virtual bool is_catch_environment() const { return false; }
+    // Function and module Environment Records are declarative Environment Records, too.
+    enum class EngineEnvironmentKind : u8 {
+        Declarative,
+        Function,
+        Module,
+        Global,
+        Object,
+    };
+    EngineEnvironmentKind engine_environment_kind() const;
+
+    [[nodiscard]] bool is_declarative_environment() const
+    {
+        auto kind = engine_environment_kind();
+        return kind == EngineEnvironmentKind::Declarative || kind == EngineEnvironmentKind::Function || kind == EngineEnvironmentKind::Module;
+    }
+    bool is_global_environment() const { return engine_environment_kind() == EngineEnvironmentKind::Global; }
+    bool is_function_environment() const { return engine_environment_kind() == EngineEnvironmentKind::Function; }
+    bool is_object_environment() const { return engine_environment_kind() == EngineEnvironmentKind::Object; }
 
     template<typename T>
-    bool fast_is() const = delete;
-
-    // This flag is set on environments within a function when direct eval() is performed in that function.
-    // It propagates up to the function boundary (not beyond) and is used to disable variable access caching.
-    // Code in parent functions is not affected because eval can only inject vars into its containing
-    // function's variable environment, not into parent function scopes.
-    bool is_permanently_screwed_by_eval() const { return m_permanently_screwed_by_eval; }
-    void set_permanently_screwed_by_eval();
-
-protected:
-    enum class IsDeclarative {
-        No,
-        Yes,
-    };
-    explicit Environment(GC::Ptr<Environment> parent, IsDeclarative = IsDeclarative::No);
-
-    virtual void visit_edges(Visitor&) override;
-
-    // NB: This belongs to FunctionEnvironment, but we keep it here to pack better.
-    ThisBindingStatus m_this_binding_status { ThisBindingStatus::Uninitialized }; // [[ThisBindingStatus]]
-
-private:
-    virtual bool is_environment() const final { return true; }
-
-    bool m_permanently_screwed_by_eval { false };
-    bool m_declarative { false };
-
-    GC::Ptr<Environment> m_outer_environment;
+    requires(IsBaseOf<Environment, T> && requires(Environment const& environment) { { T::is_environment_kind_of(environment) } -> SameAs<bool>; })
+    bool fast_is() const
+    {
+        return T::is_environment_kind_of(*this);
+    }
 };
-
-template<>
-inline bool Cell::fast_is<Environment>() const { return is_environment(); }
 
 }

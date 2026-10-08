@@ -12,35 +12,11 @@
 
 namespace JS {
 
-class JS_API MapIterator final : public Object
-    , public BuiltinIterator {
-    JS_OBJECT(MapIterator, Object);
-    GC_DECLARE_ALLOCATOR(MapIterator);
-
+class JS_API MapIterator final : public Object {
 public:
     static GC::Ref<MapIterator> create(Realm&, Map& map, Object::PropertyKind iteration_kind);
 
-    virtual ~MapIterator() override = default;
-
-    BuiltinIterator* as_builtin_iterator_if_next_is_not_redefined(Value next_method) override;
-    ThrowCompletionOr<void> next(VM&, bool& done, Value& value) override;
-
-private:
-    friend class MapIteratorPrototype;
-
-    explicit MapIterator(Map& map, Object::PropertyKind iteration_kind, Object& prototype);
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    GC::Ref<Map> m_map;
-    bool m_done { false };
-    Object::PropertyKind m_iteration_kind;
-    Map::ConstIterator m_iterator;
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_MAP_ITERATOR; }
 };
-
-// Returns true if iterating a Map with iterator_method cannot be observed: iterator_method is this realm's original
-// Map.prototype.entries, and %MapIteratorPrototype%.next is still the original data property. Walking the Map's
-// storage with a live Map::ConstIterator then produces the same entries as the iterator protocol.
-bool map_iteration_is_unobservable(Realm&, FunctionObject const& iterator_method);
 
 }

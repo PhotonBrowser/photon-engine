@@ -26,6 +26,7 @@
 #    include <UI/Qt/MacWindow.h>
 #endif
 #include <UI/Qt/Menu.h>
+#include <UI/Qt/Popover.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WindowControlButton.h>
 
@@ -35,7 +36,6 @@
 #include <QFont>
 #include <QFontMetrics>
 #include <QFrame>
-#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QImage>
 #include <QMenu>
@@ -46,7 +46,6 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QResizeEvent>
-#include <QScreen>
 #include <QScrollArea>
 #include <QStyleOptionToolButton>
 #include <QStylePainter>
@@ -383,23 +382,17 @@ private:
     QPushButton* m_cancel_button { nullptr };
 };
 
-class DownloadsPopover final : public QFrame {
+class DownloadsPopover final : public Popover {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
     explicit DownloadsPopover(QWidget* parent)
-        : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
+        : Popover(parent)
     {
-        setObjectName("LadybirdDownloadsPopover");
-#if defined(AK_OS_MACOS)
-        setAttribute(Qt::WA_NativeWindow);
-#endif
-        setFrameShape(QFrame::StyledPanel);
-        setFrameShadow(QFrame::Raised);
-        setAutoFillBackground(true);
-        setFixedWidth(DOWNLOADS_POPOVER_WIDTH);
+        card().setObjectName("LadybirdDownloadsPopover");
+        card().setFixedWidth(DOWNLOADS_POPOVER_WIDTH);
 
-        auto* layout = new QVBoxLayout(this);
+        auto* layout = new QVBoxLayout(&card());
         layout->setContentsMargins(12, 10, 12, 12);
         layout->setSpacing(8);
 
@@ -531,72 +524,6 @@ private:
     QWidget* m_rows_widget { nullptr };
     QVBoxLayout* m_rows_layout { nullptr };
     Vector<DownloadRow*> m_download_rows;
-};
-
-class PrivateSessionPopover final : public QFrame {
-public:
-    AK_ALLOC_WITH_KMALLOC;
-
-    explicit PrivateSessionPopover(QWidget* parent)
-        : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
-    {
-        setObjectName("LadybirdPrivateSessionPopover");
-#if defined(AK_OS_MACOS)
-        setAttribute(Qt::WA_NativeWindow);
-#endif
-        setFrameShape(QFrame::StyledPanel);
-        setFrameShadow(QFrame::Raised);
-        setAutoFillBackground(true);
-        setFixedWidth(PRIVATE_SESSION_POPOVER_WIDTH);
-
-        auto* layout = new QVBoxLayout(this);
-        layout->setContentsMargins(16, 14, 16, 14);
-        layout->setSpacing(10);
-
-        auto* title = new QLabel("Start a fresh private session?", this);
-        title->setObjectName("LadybirdPrivateSessionPopoverTitle");
-        title->setWordWrap(true);
-        layout->addWidget(title);
-
-        auto* body = new QLabel("This closes all private windows and deletes history and other site data from the current private browsing session.", this);
-        body->setObjectName("LadybirdPrivateSessionPopoverBody");
-        body->setWordWrap(true);
-        layout->addWidget(body);
-
-        auto* button_row = new QWidget(this);
-        auto* button_layout = new QHBoxLayout(button_row);
-        button_layout->setContentsMargins(0, 0, 0, 0);
-        button_layout->setSpacing(8);
-        button_layout->addStretch();
-
-        auto* cancel_button = new QPushButton("Cancel", button_row);
-        cancel_button->setObjectName("LadybirdPrivateSessionCancelButton");
-        cancel_button->setFocusPolicy(Qt::NoFocus);
-        QObject::connect(cancel_button, &QPushButton::clicked, this, [this] {
-            close();
-        });
-        button_layout->addWidget(cancel_button);
-
-        auto* restart_button = new QPushButton("Restart Private Session", button_row);
-        restart_button->setObjectName("LadybirdPrivateSessionRestartButton");
-        restart_button->setDefault(true);
-        QObject::connect(restart_button, &QPushButton::clicked, this, [this] {
-            close();
-            if (on_confirm)
-                on_confirm();
-        });
-        button_layout->addWidget(restart_button);
-
-        layout->addWidget(button_row);
-    }
-
-    void update_chrome_style(QPalette const& palette)
-    {
-        setPalette(palette);
-        setStyleSheet(ChromeStyle::private_session_popover_style_sheet(palette));
-    }
-
-    Function<void()> on_confirm;
 };
 
 Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> traversable)
@@ -796,7 +723,12 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
     };
 
     view().on_close = [this] {
-        m_window->definitely_close_tab(tab_index());
+        auto index = tab_index();
+        if (m_tab_to_activate_on_close) {
+            if (auto index_to_activate = m_window->tab_index(m_tab_to_activate_on_close); index_to_activate >= 0)
+                m_window->activate_tab(index_to_activate);
+        }
+        m_window->definitely_close_tab(index);
     };
 
     view().on_link_hover = [this](auto const& url) {
@@ -1575,26 +1507,15 @@ void Tab::position_downloads_popover()
         return;
 
     m_downloads_popover->adjustSize();
-    auto size = m_downloads_popover->sizeHint();
+    auto& card = m_downloads_popover->card();
+    auto size = card.sizeHint();
     size.setWidth(DOWNLOADS_POPOVER_WIDTH);
     if (size.height() > DOWNLOADS_POPOVER_MAX_HEIGHT)
         size.setHeight(DOWNLOADS_POPOVER_MAX_HEIGHT);
-    m_downloads_popover->setFixedSize(size);
+    card.setFixedSize(size);
+    m_downloads_popover->adjustSize();
 
-    auto anchor_position = m_downloads_button->mapToGlobal(m_downloads_button->rect().bottomRight());
-    auto popup_position = QPoint(anchor_position.x() - m_downloads_popover->width(), anchor_position.y() + 4);
-
-    if (auto* screen = QGuiApplication::screenAt(anchor_position)) {
-        auto available_geometry = screen->availableGeometry();
-        if (popup_position.x() < available_geometry.left())
-            popup_position.setX(available_geometry.left());
-        if (popup_position.x() + m_downloads_popover->width() > available_geometry.right())
-            popup_position.setX(available_geometry.right() - m_downloads_popover->width() + 1);
-        if (popup_position.y() + m_downloads_popover->height() > available_geometry.bottom())
-            popup_position.setY(m_downloads_button->mapToGlobal(m_downloads_button->rect().topRight()).y() - m_downloads_popover->height() - 4);
-    }
-
-    m_downloads_popover->move(popup_position);
+    move_popover_below(*m_downloads_popover, *m_downloads_button);
 }
 
 void Tab::download_added(WebView::FileDownloader::Download const&)
@@ -1636,8 +1557,10 @@ void Tab::show_private_session_popover()
         return;
 
     if (!m_private_session_popover) {
-        m_private_session_popover = new PrivateSessionPopover(this);
-        m_private_session_popover->on_confirm = [] {
+        m_private_session_popover = new MessagePopover(this, PRIVATE_SESSION_POPOVER_WIDTH, "Start a fresh private session?",
+            "This closes all private windows and deletes history and other site data from the current private browsing session.",
+            "Cancel", "Restart Private Session");
+        m_private_session_popover->on_accept = [] {
             Application::the().restart_private_browsing_session();
         };
     }
@@ -1656,20 +1579,7 @@ void Tab::position_private_session_popover()
 
     m_private_session_popover->adjustSize();
 
-    auto anchor_position = m_private_badge->mapToGlobal(m_private_badge->rect().bottomRight());
-    auto popup_position = QPoint(anchor_position.x() - m_private_session_popover->width(), anchor_position.y() + 4);
-
-    if (auto* screen = QGuiApplication::screenAt(anchor_position)) {
-        auto available_geometry = screen->availableGeometry();
-        if (popup_position.x() < available_geometry.left())
-            popup_position.setX(available_geometry.left());
-        if (popup_position.x() + m_private_session_popover->width() > available_geometry.right())
-            popup_position.setX(available_geometry.right() - m_private_session_popover->width() + 1);
-        if (popup_position.y() + m_private_session_popover->height() > available_geometry.bottom())
-            popup_position.setY(m_private_badge->mapToGlobal(m_private_badge->rect().topRight()).y() - m_private_session_popover->height() - 4);
-    }
-
-    m_private_session_popover->move(popup_position);
+    move_popover_below(*m_private_session_popover, *m_private_badge);
 }
 
 void Tab::show_find_in_page()

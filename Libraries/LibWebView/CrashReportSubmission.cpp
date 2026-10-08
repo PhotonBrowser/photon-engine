@@ -179,14 +179,15 @@ static Optional<int> retry_after_ms(HTTP::HeaderList const& headers)
     return static_cast<int>(min<u64>(*seconds * 1000ull, maximum_retry_delay_ms));
 }
 
-NonnullRefPtr<CrashReportSubmission> CrashReportSubmission::create(CrashReportStore& store, Options options)
+NonnullRefPtr<CrashReportSubmission> CrashReportSubmission::create(CrashReportStore const& store, Options options)
 {
     return adopt_ref(*new CrashReportSubmission(store, move(options)));
 }
 
 // A submission builds its manifest, solves the proof-of-work challenge off the main thread, uploads
-// the report, and removes the local copy after the server acknowledges it.
-CrashReportSubmission::CrashReportSubmission(CrashReportStore& store, Options options)
+// the report, and removes the local copy after the server acknowledges it. It can outlive the review that started it,
+// and so the store that review was given, which is why it keeps a store of its own.
+CrashReportSubmission::CrashReportSubmission(CrashReportStore const& store, Options options)
     : m_store(store)
     , m_options(move(options))
 {
@@ -199,6 +200,7 @@ CrashReportSubmission::~CrashReportSubmission()
         (void)m_proof_thread->join();
 }
 
+// A submission keeps itself alive until it is sent or fails for good, so it outlives the review that started it.
 void CrashReportSubmission::start()
 {
     if (!is_enabled) {
@@ -207,6 +209,8 @@ void CrashReportSubmission::start()
         return;
     }
 
+    // A submission keeps itself alive until it is sent or fails for good, so it outlives the review that started it.
+    m_self_while_in_flight = *this;
     begin_attempt();
 }
 
@@ -241,6 +245,7 @@ void CrashReportSubmission::fail_preparation(String reason)
     // Reporting the failure can release the last reference to this submission.
     NonnullRefPtr protector = *this;
 
+    m_self_while_in_flight = nullptr;
     if (on_failed)
         on_failed(Failure::Preparation, move(reason));
 }
@@ -417,6 +422,7 @@ void CrashReportSubmission::finish()
     }
     if (auto result = m_store.remove_sent_report(m_options.report_name); result.is_error())
         warnln("Could not remove the sent crash report: {}", result.error());
+    m_self_while_in_flight = nullptr;
     if (on_sent)
         on_sent();
 }
@@ -432,6 +438,7 @@ void CrashReportSubmission::fail(String reason, ShouldRetry should_retry, Option
     }
 
     if (should_retry == ShouldRetry::No || m_attempt >= maximum_attempts) {
+        m_self_while_in_flight = nullptr;
         if (on_failed)
             on_failed(Failure::Sending, move(reason));
         return;

@@ -54,6 +54,7 @@
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
 #include <LibWeb/HTML/WebViewHints.h>
 #include <LibWeb/Loader/FileRequest.h>
+#include <LibWeb/Page/PageCursor.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
@@ -255,8 +256,8 @@ public:
     GC::Ptr<HTML::LocalNavigable> hover_reporting_navigable() const { return m_hover_reporting_navigable.ptr(); }
     void set_hover_reporting_navigable(Badge<EventHandler>, GC::Ptr<HTML::LocalNavigable>);
 
-    Gfx::Cursor current_cursor() const { return m_current_cursor; }
-    void set_current_cursor(Gfx::Cursor cursor) { m_current_cursor = move(cursor); }
+    Gfx::Cursor current_cursor() const { return m_cursor->current(); }
+    PageCursor& cursor() { return *m_cursor; }
 
     DevicePixelPoint window_position() const { return m_window_position; }
     void set_window_position(DevicePixelPoint position) { m_window_position = position; }
@@ -391,6 +392,11 @@ public:
     bool listen_for_dom_mutations() const { return m_listen_for_dom_mutations; }
     void set_listen_for_dom_mutations(bool listen_for_dom_mutations) { m_listen_for_dom_mutations = listen_for_dom_mutations; }
 
+    // True once an assistive technology has asked for the accessibility tree. Gates whether focus changes and DOM
+    // changes reach the UI, so that only assistive-technology users pay for the focus reports and whole-tree rebuilds.
+    bool accessibility_interested() const { return m_accessibility_interested; }
+    void set_accessibility_interested(bool accessibility_interested) { m_accessibility_interested = accessibility_interested; }
+
     void enqueue_fullscreen_enter(GC::Ref<DOM::Element>, GC::Ref<DOM::Document>, DOM::RequestFullscreenError, GC::Ptr<WebIDL::Promise>, Fullscreen::RequestType);
     void enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ptr<WebIDL::Promise>, Optional<HTML::CrossProcessId> requesting_navigable_id = {});
     void process_pending_fullscreen_operations();
@@ -474,7 +480,7 @@ private:
     bool m_is_hovering_link { false };
     bool m_is_in_tooltip_area { false };
 
-    Gfx::Cursor m_current_cursor { Gfx::StandardCursor::Arrow };
+    NonnullRefPtr<PageCursor> m_cursor { PageCursor::create() };
 
     DevicePixelPoint m_window_position {};
     DevicePixelSize m_window_size {};
@@ -532,6 +538,7 @@ private:
     Vector<GC::Weak<DOM::Document>> m_find_in_page_highlighted_documents;
 
     bool m_listen_for_dom_mutations { false };
+    bool m_accessibility_interested { false };
     Optional<CSS::PreferredColorScheme> m_preferred_color_scheme_override_for_testing;
 
     // The chain of containers above a document leaves this process at a hosted root, and the process holding the
@@ -676,7 +683,9 @@ public:
     virtual void page_did_register_download_reader([[maybe_unused]] u64 download_id, [[maybe_unused]] GC::Ref<Streams::ReadableStreamDefaultReader>) { }
     virtual void page_did_unregister_download([[maybe_unused]] u64 download_id) { }
     virtual bool page_is_download_canceled([[maybe_unused]] u64 download_id) const { return false; }
-    virtual void page_did_request_cursor_change(Gfx::Cursor const&) { }
+    // The node an assistive technology should treat as focused: the focused element, or the document element once
+    // nothing in the document is focused.
+    virtual void page_did_change_accessibility_focus(Web::UniqueNodeID) { }
     virtual void page_did_request_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, ContextMenuForInputEventsTarget) { }
     virtual void page_did_request_link_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_request_image_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>) { }
@@ -819,6 +828,7 @@ public:
 
     virtual void page_did_mutate_dom([[maybe_unused]] Utf16FlyString const& type, [[maybe_unused]] DOM::Node const& target, [[maybe_unused]] DOM::NodeList& added_nodes, [[maybe_unused]] DOM::NodeList& removed_nodes, [[maybe_unused]] GC::Ptr<DOM::Node> previous_sibling, [[maybe_unused]] GC::Ptr<DOM::Node> next_sibling, [[maybe_unused]] Optional<Utf16FlyString> const& attribute_name) { }
     virtual void flush_pending_dom_mutations() { }
+    virtual void page_did_change_accessibility_tree() { }
 
     virtual void page_did_take_screenshot(Gfx::ShareableBitmap const&) { }
 

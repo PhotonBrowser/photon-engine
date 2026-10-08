@@ -24,6 +24,7 @@
 #include <LibJS/DecodedBytecodeCache.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
+#include <LibJS/Heap/EngineCell.h>
 #include <LibJS/ParserError.h>
 #include <LibJS/Position.h>
 #include <LibJS/Runtime/ExecutionContext.h>
@@ -54,9 +55,13 @@ public:
     GC::Ref<FunctionObject> instantiate(Realm&, Environment& scope, GC::Ptr<PrivateEnvironment>, ScriptOrModule) const;
 
 private:
-    explicit CompiledDynamicFunction(GC::Ref<SharedFunctionInstanceData>);
+    // The runtime's compiled code of a function, its SharedFunctionInstanceData.
+    class FunctionData final : public EngineCell {
+    };
 
-    GC::Root<SharedFunctionInstanceData> m_function_data;
+    explicit CompiledDynamicFunction(GC::Ref<FunctionData>);
+
+    GC::Root<FunctionData> m_function_data;
 };
 
 // Every position in the source where a breakpoint can be set, including positions inside functions that have not been
@@ -97,10 +102,9 @@ private:
     friend JS_API Result<GC::Ref<Script>, Vector<ParserError>> create_script(ParsedProgram, NonnullRefPtr<SourceCode const>, Realm&, StringView filename, GC::Ptr<GC::Cell>);
     friend JS_API Result<GC::Ref<SourceTextModule>, Vector<ParserError>> create_module(ParsedProgram, NonnullRefPtr<SourceCode const>, Realm&, StringView filename, GC::Ptr<GC::Cell>);
 
-    ParsedProgram(FFI::ParsedProgram*, size_t source_length_in_code_units);
+    explicit ParsedProgram(FFI::ParsedProgram*);
 
     FFI::ParsedProgram* m_program { nullptr };
-    size_t m_source_length_in_code_units { 0 };
 };
 
 class JS_API CompiledProgram {
@@ -141,6 +145,8 @@ JS_API RefPtr<DecodedBytecodeCache> decode_and_validate_bytecode_cache(Core::Imm
 // worker thread. post_to_main_thread is called on that worker thread and must run the task on the main thread. Both
 // callbacks may be destroyed on either thread.
 struct OffThreadCompilationCallbacks {
+    AK_ALLOC_WITH_KMALLOC;
+
     Function<void(Function<void()>)> submit_work;
     Function<void(Function<void()>)> post_to_main_thread;
 };

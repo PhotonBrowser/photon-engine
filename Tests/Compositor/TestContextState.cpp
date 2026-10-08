@@ -7,9 +7,9 @@
 #include <AK/Array.h>
 #include <AK/Math.h>
 #include <Compositor/CompositorState.h>
+#include <Compositor/DisplayListPlayerSkia.h>
 #include <Compositor/FramePacer.h>
 #include <LibCompositing/DisplayList/DisplayListDamage.h>
-#include <LibCompositing/DisplayList/DisplayListPlayerSkia.h>
 #include <LibCompositing/DisplayList/VisualContextTreeTestBuilder.h>
 #include <LibCompositing/PausedDebuggerOverlay.h>
 #include <LibCore/EventLoop.h>
@@ -28,7 +28,7 @@ struct TestWebContentClient final : public Compositor::CompositorStateWebContent
     virtual void dispatch_key_event_to_web_content(u64, Web::KeyEvent const&) override { }
     virtual void request_rendering_update() override { events.append("request_rendering_update"_string); }
     virtual void rendering_opportunity(Web::CompositorContextId, i64, double) override { }
-    virtual void clock_tick(Web::CompositorContextId, i64, double) override { }
+    virtual void clock_tick(Web::CompositorContextId, i64, double, Vector<Web::CompositorScrollOffset> const&) override { }
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) override { events.append("async_scroll_updates"_string); }
     virtual void create_video_edge(Media::VideoSinkHandle) override { }
     virtual void release_video_edge(Media::VideoSinkHandle) override { }
@@ -253,7 +253,7 @@ TEST_CASE(rasterization_clears_damaged_pixels_to_the_canvas_color_in_presentatio
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
     Compositor::ContextState context { Web::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
-    Compositing::DisplayListPlayerSkia display_list_player { RefPtr<Gfx::SkiaBackendContext> {} };
+    Compositor::DisplayListPlayerSkia display_list_player { RefPtr<Gfx::SkiaBackendContext> {} };
     auto visual_context_tree = Compositing::VisualContextTreeTestBuilder().finish();
     auto viewport_rect = Gfx::IntRect { 0, 0, 4, 4 };
 
@@ -717,7 +717,7 @@ struct RecordingWebContentClient final : public Compositor::CompositorStateWebCo
     virtual void dispatch_key_event_to_web_content(u64, Web::KeyEvent const&) override { }
     virtual void request_rendering_update() override { events.append("request_rendering_update"_string); }
     virtual void rendering_opportunity(Web::CompositorContextId, i64, double) override { }
-    virtual void clock_tick(Web::CompositorContextId, i64, double) override { }
+    virtual void clock_tick(Web::CompositorContextId, i64, double, Vector<Web::CompositorScrollOffset> const&) override { }
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const& updates) override
     {
         events.append("async_scroll_updates"_string);
@@ -785,6 +785,24 @@ TEST_CASE(dragging_a_scrollbar_thumb_scrolls_its_scroller_to_where_the_thumb_was
     EXPECT(result_past_the_end.accepted);
     EXPECT(!result_past_the_end.frame_to_present.has_value());
     EXPECT(context.take_pending_async_scroll_updates().scroll_offsets.is_empty());
+}
+
+TEST_CASE(a_render_clock_frame_carries_where_the_compositor_has_scrolled_to)
+{
+    TestWebContentClient client;
+    Compositing::CanvasSurfaceRegistry canvas_surface_registry;
+    Compositor::ContextState context { Web::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
+    auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
+    context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
+
+    // A render clock tick samples scroll-driven animations where the page is scrolled to, before the main thread has
+    // taken the scroll in.
+    EXPECT(context.handle_mouse_event(mouse_event(Web::MouseEvent::Type::MouseDown, 98, 10, Web::UIEvents::MouseButton::Primary)).accepted);
+    EXPECT(context.handle_mouse_event(mouse_event(Web::MouseEvent::Type::MouseMove, 98, 50)).accepted);
+    auto scroll_offsets = context.scroll_offsets();
+    EXPECT_EQ(scroll_offsets.size(), 1u);
+    EXPECT_EQ(scroll_offsets[0].scroll_node.kind, Web::AsyncScrollNodeKind::Viewport);
+    EXPECT_EQ(scroll_offsets[0].offset, Web::CSSPixelPoint(0, 50));
 }
 
 TEST_CASE(losing_the_scrollbar_a_drag_holds_ends_its_user_scroll_gesture)
@@ -1499,7 +1517,7 @@ struct RasterizingContextFixture {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
     Compositor::ContextState context;
-    Compositing::DisplayListPlayerSkia display_list_player { RefPtr<Gfx::SkiaBackendContext> {} };
+    Compositor::DisplayListPlayerSkia display_list_player { RefPtr<Gfx::SkiaBackendContext> {} };
     Gfx::IntRect viewport_rect;
 
     explicit RasterizingContextFixture(Gfx::IntSize viewport_size = test_viewport_rect.size())
