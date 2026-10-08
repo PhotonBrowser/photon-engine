@@ -25,15 +25,19 @@ static ErrorOr<Optional<ByteString>> application_darwin_user_cache_directory()
     if (confstr(_CS_DARWIN_USER_CACHE_DIR, darwin_user_cache_directory, sizeof(darwin_user_cache_directory)) == 0)
         return OptionalNone {};
 
+    auto darwin_user_cache_directory_view = StringView { darwin_user_cache_directory, strlen(darwin_user_cache_directory) };
+
+    // Without a bundle identifier, for example when the helper runs outside an application bundle, Metal keeps its
+    // shader caches in a directory shared by every such process.
     auto bundle_identifier = CFBundleGetIdentifier(CFBundleGetMainBundle());
     if (!bundle_identifier)
-        return OptionalNone {};
+        return LexicalPath::join(darwin_user_cache_directory_view, "com.apple.metalfe"sv).string();
 
     char bundle_identifier_buffer[256];
     if (!CFStringGetCString(bundle_identifier, bundle_identifier_buffer, sizeof(bundle_identifier_buffer), kCFStringEncodingUTF8))
         return OptionalNone {};
 
-    return LexicalPath::join(StringView { darwin_user_cache_directory, strlen(darwin_user_cache_directory) }, StringView { bundle_identifier_buffer, strlen(bundle_identifier_buffer) }).string();
+    return LexicalPath::join(darwin_user_cache_directory_view, StringView { bundle_identifier_buffer, strlen(bundle_identifier_buffer) }).string();
 }
 
 ErrorOr<void> apply_sandbox(StringView mach_server_name, StringView cache_path, StringView resource_root)
@@ -46,8 +50,12 @@ ErrorOr<void> apply_sandbox(StringView mach_server_name, StringView cache_path, 
     TRY(Sandbox::add_seatbelt_path_if_exists(paths, executable_path, Sandbox::SeatbeltPath::Access::ReadOnly));
 
     // The helpers read their own application bundle, for example when CoreFoundation looks up the main bundle.
+    // Outside an application bundle, CoreFoundation treats the executable's directory as the main bundle, and Metal
+    // issues an extension for it to its compiler service.
     if (auto bundle = Sandbox::application_bundle_for_executable(executable_path); bundle.has_value())
         TRY(Sandbox::add_seatbelt_path_if_exists(paths, *bundle, Sandbox::SeatbeltPath::Access::ReadOnly));
+    else
+        TRY(Sandbox::add_seatbelt_path_if_exists(paths, LexicalPath::dirname(executable_path), Sandbox::SeatbeltPath::Access::ReadOnly));
 
     TRY(Sandbox::add_seatbelt_path_if_exists(paths, TRY(String::formatted("{}/fonts", resource_root)), Sandbox::SeatbeltPath::Access::ReadOnly));
 
@@ -59,7 +67,8 @@ ErrorOr<void> apply_sandbox(StringView mach_server_name, StringView cache_path, 
     TRY(Sandbox::add_seatbelt_path_if_exists(paths, photon_cache_path, Sandbox::SeatbeltPath::Access::ReadWrite));
 
     // Metal keeps its shader caches in the Darwin user cache directory, in a directory named after the application's
-    // bundle identifier. The rest of that directory belongs to other applications.
+    // bundle identifier. The rest of that directory belongs to other applications. Metal also issues an extension for
+    // this directory to its compiler service, which the sandbox only allows for paths named here.
     if (auto metal_cache_directory = TRY(application_darwin_user_cache_directory()); metal_cache_directory.has_value()) {
         TRY(Core::Directory::create(*metal_cache_directory, Core::Directory::CreateDirectories::Yes));
         TRY(Sandbox::add_seatbelt_path_if_exists(paths, *metal_cache_directory, Sandbox::SeatbeltPath::Access::ReadWrite));
