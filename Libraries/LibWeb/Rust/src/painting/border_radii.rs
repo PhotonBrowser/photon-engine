@@ -108,7 +108,7 @@ impl BorderRadii {
     /// Whether any corner with a radius uses a non-`round` shape and therefore
     /// needs a superellipse path instead of the elliptical fast path.
     pub fn has_shaped_corners(&self) -> bool {
-        if !self.has_any_radius() {
+        if !self.has_any_radius() || self.is_all_round() {
             return false;
         }
         let [tl_h, tl_v, tr_h, tr_v, br_h, br_v, bl_h, bl_v] = self.values;

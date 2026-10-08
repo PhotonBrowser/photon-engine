@@ -219,7 +219,7 @@ public:
     void did_submit_prepared_frame(Gfx::IntRect);
     bool present_synchronously(DisplayListPlayerSkia&, CompositedContextResolver const*);
     bool can_paint_screenshot(Gfx::ShareableBitmap&) const;
-    void paint_screenshot(Compositing::DisplayListPlayerSkia&, Gfx::ShareableBitmap&, CompositedContextResolver const*);
+    void paint_screenshot(DisplayListPlayerSkia&, Gfx::ShareableBitmap&, CompositedContextResolver const*);
     bool acknowledge_presented_bitmap(i32 bitmap_id, bool consumer_gpu_work_complete = false);
     void did_finish_gpu_present(i32 bitmap_id);
 
