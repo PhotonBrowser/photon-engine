@@ -685,13 +685,13 @@ pub struct FfiImagePaintRecordInputs {
     pub nested_display_list_size: libgfx_rust::IntSize,
     pub gradient_style_value: *const c_void,
     pub gradient_tile_size: FfiCssPixelSize,
-    /// The `FfiColorResolutionInput` the gradient's color stops resolve against.
-    pub gradient_stop_color_resolution_input: *const c_void,
+    /// The `FfiColorResolutionStyle` the gradient's color stops resolve against.
+    pub gradient_stop_color_resolution_style: *const c_void,
 }
 
 /// # Safety
 ///
-/// `inputs`, and the gradient style value and color resolution input it points at, must be
+/// `inputs`, and the gradient style value and color resolution style it points at, must be
 /// live for the call. `consume` is called synchronously and takes ownership of the command
 /// storage and visual context tree handles.
 #[unsafe(no_mangle)]
@@ -700,7 +700,7 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
     context: *mut c_void,
     consume: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void),
 ) {
-    use crate::css::color_resolution::{FfiColorResolutionInput, resolution_input_from_ffi};
+    use crate::css::color_resolution::ColorResolutionInput;
     use crate::painting::display_list::commands::{DisplayListResourceId, ImageFrameResourceId};
     use crate::painting::display_list::device_pixels::DevicePixelConverter;
     use crate::painting::display_list::recorder::DisplayListRecorder;
@@ -739,20 +739,16 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
             inputs.nested_display_list_size,
         ),
         FfiImagePaintRecordKind::Gradient => {
-            // SAFETY: the host keeps the gradient style value and its color resolution input
-            // live for the duration of the call.
-            let (gradient_style_value, color_resolution_input) = unsafe {
+            // SAFETY: the host keeps the gradient style value and the style its color stops
+            // resolve against live for the duration of the call.
+            let (gradient_style_value, color_input) = unsafe {
                 (
                     &*inputs
                         .gradient_style_value
                         .cast::<crate::css::style_value::StyleValueData>(),
-                    &*inputs
-                        .gradient_stop_color_resolution_input
-                        .cast::<FfiColorResolutionInput>(),
+                    ColorResolutionInput::for_ffi_style(inputs.gradient_stop_color_resolution_style.cast()),
                 )
             };
-            // SAFETY: the borrowed input outlives the resolution below.
-            let color_input = unsafe { resolution_input_from_ffi(color_resolution_input) };
             let resolved =
                 resolve_gradient_paint_with_input(gradient_style_value, inputs.gradient_tile_size.into(), &color_input);
             record_resolved_gradient_fill(
@@ -1315,6 +1311,47 @@ pub unsafe extern "C" fn render_state_visual_context_tree_has_visual_animations(
                 .as_deref()
                 .is_some_and(|tree| tree.has_visual_animations())
         })
+    }
+}
+
+/// Hands `push_keyframe_color` the keyframe colors of each background color animation the visual context tree runs on
+/// the effect node, in keyframe order.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_background_color_animation_keyframe_colors(
+    host: &DocumentHost,
+    read: &crate::render_state::BegunRead,
+    effect_node_index: u32,
+    context: *mut c_void,
+    push_keyframe_color: unsafe extern "C" fn(*mut c_void, libgfx_rust::Color),
+) {
+    use crate::painting::host::FfiVisualAnimationTargetKind;
+    use crate::painting::visual_animation::VisualAnimationValue;
+    // SAFETY: Guaranteed by the caller.
+    unsafe {
+        read_arena(
+            host,
+            read,
+            (effect_node_index, context, push_keyframe_color),
+            |arena, (effect_node_index, context, push_keyframe_color)| {
+                let paint_state = arena.paint_state().borrow();
+                let Some(tree) = paint_state.visual_context.tree.as_deref() else {
+                    return;
+                };
+                let animations_of_node = tree.visual_animations().iter().filter(|animation| {
+                    animation.target_kind == FfiVisualAnimationTargetKind::BackgroundColor
+                        && animation.node_indices.contains(&effect_node_index)
+                });
+                for keyframe in animations_of_node.flat_map(|animation| &animation.keyframes) {
+                    if let VisualAnimationValue::BackgroundColor(color) = keyframe.value {
+                        push_keyframe_color(context, color);
+                    }
+                }
+            },
+        );
     }
 }
 

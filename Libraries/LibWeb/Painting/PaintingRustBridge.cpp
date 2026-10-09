@@ -8,7 +8,6 @@
 #include <AK/StringBuilder.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
-#include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/Environment.h>
@@ -21,7 +20,6 @@
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -296,23 +294,6 @@ static CSS::PreferredColorScheme image_color_scheme(Layout::NodeWithStyle const&
     return document.svg_image_color_scheme().value_or(document.page().preferred_color_scheme());
 }
 
-CSS::ColorResolutionContext gradient_stop_color_resolution_context(Layout::NodeWithStyle const& layout_node)
-{
-    void const* current_color_style_value_data = nullptr;
-    if (auto* dom_node = layout_node.dom_node()) {
-        if (auto* element = as_if<DOM::Element>(*dom_node)) {
-            if (auto const* values = element->style_group<CSS::ComputedValues::InheritedTextValues>())
-                current_color_style_value_data = values->color_style_value.pointer;
-        }
-    }
-    return {
-        .color_scheme = layout_node.color_scheme(),
-        .current_color = layout_node.color(),
-        .current_color_style_value_data = current_color_style_value_data,
-        .calculation_resolution_context = {},
-    };
-}
-
 void rust_update_visual_viewport_transform(Layout::BegunRead const& read, DOM::Document& document)
 {
     Layout::RustFFI::render_state_update_visual_viewport_transform(document.layout_node_arena().host(), &read, visual_context_tree_inputs(document));
@@ -340,24 +321,13 @@ Utf16String serialize_painting_dump(Layout::BegunRead const& read, DOM::Document
     Layout::RustFFI::FfiPaintingDumpCallbacks callbacks {
         .context = &context,
         .debug_description = [](void* context_pointer, Compositing::RustFFI::NodeSlotId slot, void* description_sink) { push_debug_description(*static_cast<DumpContext*>(context_pointer)->document, slot, description_sink); },
-        .command_bytes = [](void*, void const* display_list_pointer, size_t* byte_count) -> u8 const* {
-            auto bytes = static_cast<Compositing::DisplayList const*>(display_list_pointer)->command_bytes();
-            *byte_count = bytes.size();
-            return bytes.data();
-        },
-        .command_runs = [](void*, void const* display_list_pointer, size_t* run_count) -> Compositing::DisplayListCommandRun const* {
-            auto runs = static_cast<Compositing::DisplayList const*>(display_list_pointer)->command_runs();
-            *run_count = runs.size();
-            return runs.data();
-        },
         .nested_display_list = [](void* context_pointer, u64 display_list_id) -> void const* {
             auto& context = *static_cast<DumpContext*>(context_pointer);
-            return &context.resource_storage.display_list(Compositing::DisplayListResourceId { display_list_id });
+            return context.resource_storage.display_list(Compositing::DisplayListResourceId { display_list_id }).rust_handle();
         },
         .append_text = [](void* context_pointer, u8 const* bytes, size_t byte_count) { static_cast<DumpContext*>(context_pointer)->dump = Utf16String::from_utf8_without_validation(StringView { bytes, byte_count }); },
     };
-    auto command_runs = display_list.command_runs();
-    Layout::RustFFI::painting_dump(document_host(document), &read, viewport_row_slot(read, document), visual_context_tree.rust_handle(), command_runs.data(), command_runs.size(), &display_list, callbacks);
+    Layout::RustFFI::painting_dump(document_host(document), &read, viewport_row_slot(read, document), visual_context_tree.rust_handle(), display_list.rust_handle(), callbacks);
     return move(context.dump);
 }
 
@@ -556,7 +526,7 @@ void commit_unrecorded_frame(Layout::BegunRead const& read, DOM::Document& docum
     Layout::RustFFI::render_state_commit_unrecorded_frame(document_host(document), &read, sends_visual_context_tree, rendering_update_timestamp(document), give_up(move(presentation)));
 }
 
-Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const& read, DOM::Document& document, Compositing::AccumulatedVisualContextTree visual_context_tree, NonnullRefPtr<Compositing::DisplayList> placeholder_display_list, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs, Optional<Compositor::FlightPresentation> committed)
+Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const& read, DOM::Document& document, Compositing::AccumulatedVisualContextTree visual_context_tree, Optional<Gfx::Color> surface_clear_color, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs, Optional<Compositor::FlightPresentation> committed)
 {
     auto* host = document_host(document);
     auto device_pixels_per_css_pixel = document.page().client().device_pixels_per_css_pixel();
@@ -690,7 +660,7 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
     }
     DisplayListRecording recording {
         .visual_context_tree = move(visual_context_tree),
-        .placeholder_display_list = move(placeholder_display_list),
+        .surface_clear_color = surface_clear_color,
         .cache_mode = cache_mode,
         .in_flight = false,
         .async_scrolling_metadata = async_scrolling_metadata,
@@ -726,7 +696,7 @@ RefPtr<Compositing::DisplayList> finish_rust_display_list_recording(Layout::Begu
     take_recording_trace_if_pending(read, document);
     auto display_list = display_list_of_published_recording(recording, presented);
     if (rust_painting_timing_enabled())
-        dbgln("PAINT_RECORD rust={} µs commands={} bytes", rust_timer.elapsed_time().to_microseconds(), display_list->command_bytes().size());
+        dbgln("PAINT_RECORD rust={} µs commands={} bytes", rust_timer.elapsed_time().to_microseconds(), display_list->tape_size());
     return display_list;
 }
 
@@ -748,8 +718,8 @@ NonnullRefPtr<Compositing::DisplayList> display_list_of_published_recording(Disp
     }
 
     auto display_list = Compositing::DisplayList::share_rust_command_storage(recording.visual_context_tree, presented.display_list);
-    if (auto color = recording.placeholder_display_list->surface_clear_color(); color.has_value())
-        display_list->set_surface_clear_color(*color);
+    if (recording.surface_clear_color.has_value())
+        display_list->set_surface_clear_color(*recording.surface_clear_color);
     stamp_async_scrolling_metadata(*display_list);
     return display_list;
 }
@@ -771,8 +741,7 @@ Compositing::DisplayListResource record_image_paint_display_list(ImagePaint cons
     Layout::RustFFI::FfiImagePaintRecordInputs inputs {};
     inputs.dest_rect = request.dest_rect;
     inputs.device_pixels_per_css_pixel = device_pixels_per_css_pixel;
-    Optional<CSS::ComputedValuesFFI::FfiLengthResolutionContext> gradient_stop_length_resolution_context_storage;
-    CSS::StyleValueFFI::FfiColorResolutionInput gradient_stop_color_resolution_input {};
+    auto gradient_stop_color_resolution_style = request.gradient_stop_color_resolution_style.to_ffi();
     paint.value.visit(
         [&](ImagePaint::DecodedFrame const& decoded_frame) {
             inputs.kind = Layout::RustFFI::FfiImagePaintRecordKind::DecodedFrame;
@@ -788,8 +757,7 @@ Compositing::DisplayListResource record_image_paint_display_list(ImagePaint cons
             inputs.kind = Layout::RustFFI::FfiImagePaintRecordKind::Gradient;
             inputs.gradient_style_value = gradient.style_value->rust_style_value_data();
             inputs.gradient_tile_size = request.dest_rect.size().to_type<CSSPixels>();
-            gradient_stop_color_resolution_input = CSS::make_rust_color_resolution_input(request.gradient_stop_color_resolution_context, gradient_stop_length_resolution_context_storage);
-            inputs.gradient_stop_color_resolution_input = &gradient_stop_color_resolution_input;
+            inputs.gradient_stop_color_resolution_style = &gradient_stop_color_resolution_style;
         });
     return record_image_paint(inputs);
 }

@@ -269,6 +269,20 @@ GC::Ref<JS::Object> Internals::visual_context_node_indices(DOM::Element& element
     object->define_direct_property("effects"_utf16_fly_string, owned_indices_as_array(Layout::RustFFI::FfiVisualContextBoxNodeList::EffectNodes), JS::default_attributes);
     object->define_direct_property("needsCompositorEffectsLayer"_utf16_fly_string, JS::Value(layout_node && layout_node->needs_compositor_effects_layer()), JS::default_attributes);
     object->define_direct_property("needsCompositorBackgroundColorFrame"_utf16_fly_string, JS::Value(layout_node && layout_node->needs_compositor_background_color_frame()), JS::default_attributes);
+    Vector<Gfx::Color> background_color_animation_keyframe_colors;
+    if (layout_node) {
+        Layout::BegunRead const& begun_read = read;
+        for (auto effect_node_index : Painting::rust_owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::EffectNodes)) {
+            Layout::RustFFI::render_state_background_color_animation_keyframe_colors(document.layout_node_arena().host(), &begun_read, effect_node_index, &background_color_animation_keyframe_colors, [](void* colors, Gfx::Color color) {
+                static_cast<Vector<Gfx::Color>*>(colors)->append(color);
+            });
+        }
+    }
+    object->define_direct_property("backgroundColorAnimationKeyframes"_utf16_fly_string,
+        JS::Array::create_from<Gfx::Color>(realm, background_color_animation_keyframe_colors.span(), [&](Gfx::Color const& color) {
+            return JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(color.to_string()));
+        }),
+        JS::default_attributes);
     return object;
 }
 
@@ -766,6 +780,22 @@ Utf16String Internals::current_cursor()
         [](Gfx::ImageCursor const&) {
             return "Image"_utf16;
         });
+}
+
+Optional<Utf16String> Internals::current_cursor_pixel(i32 x, i32 y)
+{
+    auto cursor = page().current_cursor();
+    auto const* image_cursor = cursor.get_pointer<Gfx::ImageCursor>();
+    if (!image_cursor || !image_cursor->bitmap.is_valid())
+        return {};
+    return Utf16String::from_utf8(image_cursor->bitmap.bitmap()->get_pixel(x, y).to_string());
+}
+
+Utf16String Internals::theme_color()
+{
+    auto& document = window().associated_document();
+    Layout::ForcedReadScope read { document };
+    return Utf16String::from_utf8(document.theme_color(read).to_string());
 }
 
 Utf16String Internals::selected_text_for_clipboard()

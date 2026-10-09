@@ -26,7 +26,6 @@
 #include <AK/Utf8View.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
-#include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibCore/Timer.h>
 #include <LibGC/ConservativeVector.h>
 #include <LibGC/Heap.h>
@@ -2816,8 +2815,13 @@ void Document::obtain_supported_color_schemes()
     set_supported_color_schemes(move(supported_color_schemes), supported_color_schemes_are_only);
 }
 
-// https://html.spec.whatwg.org/multipage/semantics.html#meta-theme-color
 void Document::obtain_theme_color(Layout::BegunRead const& read)
+{
+    page().client().page_did_change_theme_color(theme_color(read));
+}
+
+// https://html.spec.whatwg.org/multipage/semantics.html#meta-theme-color
+Color Document::theme_color(Layout::BegunRead const& read)
 {
     Color theme_color = Color::Transparent;
 
@@ -2846,13 +2850,12 @@ void Document::obtain_theme_color(Layout::BegunRead const& read)
 
             // 4. If color is not failure, then return color.
             if (!css_value.is_null() && css_value->has_color()) {
-                CSS::ColorResolutionContext color_resolution_context {};
-                // NB: Called during theme color computation, layout may be stale.
-                if (html_element() && html_element()->unsafe_layout_node(read)) {
-                    color_resolution_context = CSS::ColorResolutionContext::for_layout_node_with_style(*html_element()->unsafe_layout_node(read));
-                }
-
-                theme_color = css_value->to_color(color_resolution_context).value();
+                // The parsed value is no computed one, so it resolves against the root element's style the way that
+                // style computes its own values, lengths included.
+                auto root_element_style_record = html_element() ? html_element()->style_record_identity() : CSS::StyleRecordID {};
+                auto resolved = CSS::StyleValueFFI::rust_style_value_to_color_against_style_record(style_computer().style_engine().host(), &read, root_element_style_record.value(), css_value->rust_style_value_data());
+                VERIFY(resolved.resolved);
+                theme_color = Color(resolved.rgba[0], resolved.rgba[1], resolved.rgba[2], resolved.rgba[3]);
                 return TraversalDecision::Break;
             }
         }
@@ -2861,7 +2864,7 @@ void Document::obtain_theme_color(Layout::BegunRead const& read)
     });
 
     // 3. Return nothing(the page has no theme color).
-    document().page().client().page_did_change_theme_color(theme_color);
+    return theme_color;
 }
 
 Layout::Viewport const* Document::layout_node(Layout::BegunRead const& read) const
@@ -10364,13 +10367,13 @@ Optional<Painting::DisplayListRecording> Document::start_recording(Layout::Begun
     auto& document_paint_state = paint_state();
     auto visual_context_tree = document_paint_state.visual_context_tree(*this);
 
-    auto placeholder_display_list = Compositing::DisplayList::create(visual_context_tree);
+    Optional<Gfx::Color> surface_clear_color;
 
     // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
     // On the root element, the used color scheme additionally must affect the surface color of the canvas, and the viewport’s scrollbars.
     if (navigable()->is_top_level_traversable()) {
         auto canvas_background_color = this->canvas_background_color(read);
-        placeholder_display_list->set_surface_clear_color(canvas_background_color);
+        surface_clear_color = canvas_background_color;
         page().client().page_did_change_background_color(canvas_background_color);
     }
 
@@ -10392,7 +10395,7 @@ Optional<Painting::DisplayListRecording> Document::start_recording(Layout::Begun
     if (config.should_show_caret_hit_test_debug_overlay)
         overlay_inputs.caret_debug_rect = m_caret_hit_test_debug_rect;
 
-    return Painting::start_rust_display_list_recording(read, *this, move(visual_context_tree), move(placeholder_display_list), cache_mode, config, overlay_inputs, move(committed));
+    return Painting::start_rust_display_list_recording(read, *this, move(visual_context_tree), surface_clear_color, cache_mode, config, overlay_inputs, move(committed));
 }
 
 RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage, Painting::HitTestListStands hit_test_list_stands)
@@ -10400,11 +10403,11 @@ RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Layout:
     auto display_list = Painting::finish_rust_display_list_recording(read, *this, recording, resource_storage);
     if (!display_list)
         return nullptr;
-    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording, *display_list, resource_storage.collect_referenced_resources(*display_list));
+    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording, *display_list, [&] { return resource_storage.collect_referenced_resources(*display_list); });
     return display_list;
 }
 
-void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Compositing::DisplayListResourceSet referenced_resources)
+void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Function<Compositing::DisplayListResourceSet()> const& referenced_resources)
 {
     auto& document_paint_state = paint_state();
     bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
@@ -10414,7 +10417,7 @@ void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_
         m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(*hit_test_list_read, recording.visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
 
     if (recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source)
-        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, move(referenced_resources));
+        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, referenced_resources());
 }
 
 void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)

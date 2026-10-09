@@ -7,94 +7,30 @@
 
 #pragma once
 
-#include <AK/Atomic.h>
-#include <AK/ByteBuffer.h>
+#include <AK/AtomicRefCounted.h>
 #include <AK/Error.h>
 #include <AK/Forward.h>
-#include <AK/HashMap.h>
+#include <AK/Function.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Span.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/Export.h>
 #include <LibCompositing/Forward.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibCompositing/Types.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Color.h>
-#include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Forward.h>
-#include <LibGfx/PaintStyle.h>
-#include <LibGfx/TextLayout.h>
 #include <LibIPC/Forward.h>
 
 namespace Compositing {
 
-class COMPOSITING_API DisplayListPlayer {
-public:
-    virtual ~DisplayListPlayer() = default;
+namespace RustFFI {
 
-    void execute(DisplayList const&, AccumulatedVisualContextTree const&, DisplayListResourceStorage const&, ScrollStateSnapshot const&, RefPtr<Gfx::PaintingSurface>, CanvasSurfaceRegistry const* = nullptr);
-    virtual void flush(Gfx::PaintingSurface&) = 0;
+struct FfiDisplayListReplayCallbacks;
 
-protected:
-    Gfx::PaintingSurface& surface() const { return *m_surface; }
-    DisplayList const& active_display_list() const { return *m_active_display_list; }
-    AccumulatedVisualContextTree const& active_visual_context_tree() const { return *m_active_visual_context_tree; }
-    DisplayListResourceStorage const& resource_storage() const { return *m_resource_storage; }
-    CanvasSurfaceRegistry const* canvas_surface_registry() const { return m_canvas_surface_registry; }
-    ReadonlyBytes inline_data(DisplayListDataSpan span) const
-    {
-        VERIFY(static_cast<size_t>(span.offset) + span.size <= m_current_command_payload.size());
-        return m_current_command_payload.slice(span.offset, span.size);
-    }
-    template<typename T>
-    ReadonlySpan<T> inline_objects(DisplayListDataSpan span) const
-    {
-        static_assert(alignof(T) <= alignof(DisplayListCommandHeader));
-        auto bytes = inline_data(span);
-        VERIFY(bytes.size() % sizeof(T) == 0);
-        VERIFY(reinterpret_cast<FlatPtr>(bytes.data()) % alignof(T) == 0);
-        return { reinterpret_cast<T const*>(bytes.data()), bytes.size() / sizeof(T) };
-    }
-    void execute_impl(DisplayList const&, ScrollStateSnapshot const& scroll_state);
-    void execute_run_commands(DisplayListCommandRun const&, ScrollStateSnapshot const& scroll_state);
-    void execute_command_bytes(ReadonlyBytes, ScrollStateSnapshot const& scroll_state);
-    ScrollStateSnapshot const& active_scroll_state() const { return *m_active_scroll_state; }
-    void execute_display_list_into_surface(DisplayList const&, AccumulatedVisualContextTree const&, Gfx::PaintingSurface&);
-    void execute_command_bytes_into_surface(ReadonlyBytes, Gfx::PaintingSurface&);
-    void declare_mask_content(EffectNodeIndex, ReadonlyBytes content);
-    Optional<ReadonlyBytes> declared_mask_content(EffectNodeIndex) const;
-    void execute_nested_display_list(DisplayList const&, AccumulatedVisualContextTree const&, ScrollStateSnapshot const&);
-
-private:
-#define DECLARE_PLAY_COMMAND(command_type, player_method) \
-    virtual void play_command(command_type const&) = 0;
-    ENUMERATE_DISPLAY_LIST_COMMANDS(DECLARE_PLAY_COMMAND)
-#undef DECLARE_PLAY_COMMAND
-    virtual void set_matrix(Gfx::FloatMatrix4x4 const&) = 0;
-    virtual Gfx::FloatMatrix4x4 canvas_matrix() const = 0;
-    virtual bool would_be_fully_clipped_by_painter(Gfx::IntRect) const = 0;
-
-    virtual void push_clip(ReplayClip const&) = 0;
-    virtual void push_clip_path(Gfx::Path const&, Gfx::WindingRule) = 0;
-    virtual void push_transform(Gfx::AffineTransform const&) = 0;
-    virtual void push_layer(ReplayLayer const&) = 0;
-    virtual void push_mask(ReplayMask const&) = 0;
-    virtual void pop_mask(ReplayMask const&, EffectNodeIndex) = 0;
-    virtual void pop() = 0;
-    virtual void push_device_space_plane_clip(Gfx::Path const&) = 0;
-
-    DisplayList const* m_active_display_list { nullptr };
-    AccumulatedVisualContextTree const* m_active_visual_context_tree { nullptr };
-    DisplayListResourceStorage const* m_resource_storage { nullptr };
-    CanvasSurfaceRegistry const* m_canvas_surface_registry { nullptr };
-    RefPtr<Gfx::PaintingSurface> m_surface;
-    ReadonlyBytes m_current_command_payload;
-    ScrollStateSnapshot const* m_active_scroll_state { nullptr };
-    HashMap<u32, ReadonlyBytes> m_declared_mask_contents;
-};
+}
 
 class COMPOSITING_API DisplayList : public AtomicRefCounted<DisplayList> {
 public:
@@ -117,32 +53,18 @@ public:
         Optional<AsyncScrollingMetadata> async_scrolling_metadata;
     };
 
-    // How a tape and its run table are laid out in a shared buffer: the tape first, the runs right after
-    // it. Nothing when the sizes overflow or the tape is not a whole number of aligned commands.
-    struct SharedBufferLayout {
-        u64 runs_offset { 0 };
-        u64 total_size { 0 };
-    };
-    static Optional<SharedBufferLayout> shared_buffer_layout(u64 tape_size, u64 run_count);
-
-    static NonnullRefPtr<DisplayList> create(AccumulatedVisualContextTree const& visual_context_tree)
-    {
-        return adopt_ref(*new DisplayList(visual_context_tree.structural_epoch()));
-    }
-
-    // Adopts a strong reference to immutable Rust command storage, including its run table.
+    // An empty list.
+    static NonnullRefPtr<DisplayList> create(AccumulatedVisualContextTree const&);
+    // Adopts a strong reference to an immutable Rust recording, including its run table.
     static NonnullRefPtr<DisplayList> adopt_rust_command_storage(AccumulatedVisualContextTree const&, void const*);
-    // Shares immutable Rust command storage that someone else holds, taking a strong reference of its own.
+    // Shares an immutable Rust recording that someone else holds, taking a strong reference of its own.
     static NonnullRefPtr<DisplayList> share_rust_command_storage(AccumulatedVisualContextTree const&, void const*);
-    static NonnullRefPtr<DisplayList> create_from_command_bytes(AccumulatedVisualContextTree const&, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs);
 
-    // The producer's side of sending a list: a fresh shared buffer holding the tape and the run table,
-    // laid out per shared_buffer_layout. The buffer is handed to the receiver whole; the producer keeps
-    // nothing.
+    // The producer's side of sending a list: a fresh shared buffer holding the tape and the run table. The
+    // buffer is handed to the receiver whole; the producer keeps nothing.
     ErrorOr<Core::AnonymousBuffer> copy_to_shared_buffer() const;
-    // The receiver's side: borrows the tape from the buffer for the list's lifetime and copies the run
-    // table out, so the bounds every reader relies on cannot change underneath it. Fails when the sizes
-    // do not fit the buffer or the runs do not describe the tape.
+    // The receiver's side: copies the tape and the run table out of the buffer, which the sender can still
+    // write to, and checks the copies. Fails when the sizes do not fit the buffer or the tape is malformed.
     static ErrorOr<NonnullRefPtr<DisplayList>> create_from_shared_buffer(Properties, Core::AnonymousBuffer, u64 tape_size, u64 run_count);
 
     // Taken at send time: the async scrolling metadata is restamped on every send.
@@ -151,66 +73,51 @@ public:
     u64 compatible_visual_context_tree_structural_epoch() const { return m_compatible_visual_context_tree_structural_epoch; }
     u64 id() const { return m_id; }
 
-    ReadonlyBytes command_bytes() const { return borrows_command_bytes() ? m_borrowed_command_bytes : m_command_bytes.span(); }
-    ReadonlySpan<DisplayListCommandRun> command_runs() const { return m_rust_command_storage ? m_borrowed_command_runs : m_command_runs.span(); }
-    ReadonlyBytes command_bytes_of_run(DisplayListCommandRun const& run) const { return command_bytes().slice(run.offset, run.size); }
+    // The Rust storage that holds the list's tape.
+    void const* rust_handle() const { return m_storage; }
+
+    // The sizes a receiver needs to unpack the list from its shared buffer.
+    u64 tape_size() const;
+    u64 run_count() const;
+
     void set_surface_clear_color(Gfx::Color color) { m_surface_clear_color = color; }
     Optional<Gfx::Color> surface_clear_color() const { return m_surface_clear_color; }
     void set_async_scrolling_metadata(AsyncScrollingMetadata metadata) { m_async_scrolling_metadata = metadata; }
     Optional<AsyncScrollingMetadata> const& async_scrolling_metadata() const { return m_async_scrolling_metadata; }
 
-    static constexpr size_t command_alignment = 8;
+    // The ids of the resources the list's commands reference, including the commands nested in others, each once.
+    struct ReferencedResourceIds {
+        ReadonlySpan<u64> fonts;
+        ReadonlySpan<u64> image_frames;
+        ReadonlySpan<u64> video_sinks;
+        ReadonlySpan<u64> display_lists;
+    };
+    ReferencedResourceIds referenced_resource_ids() const;
+    // Whether reusing a raster of the list can produce different pixels than replaying it in place, leaving out the
+    // display lists it nests.
+    bool requires_direct_replay_without_nested_lists(AccumulatedVisualContextTree const&) const;
+    // Visits the compositor metadata commands with the context of their run and their payload, in tape order.
+    void for_each_compositor_metadata(Function<void(ContextRef, DisplayListCommandType, ReadonlyBytes payload)> const&) const;
+    // Visits the canvases and carets the list draws outside of any group, with the context of their run and their
+    // bounding rect.
+    void for_each_drawn_canvas(Function<void(ContextRef, Optional<Gfx::IntRect>, DrawCanvas const&)> const&) const;
+    void for_each_caret(Function<void(ContextRef, Optional<Gfx::IntRect>, PaintCaret const&)> const&) const;
 
-    template<typename SpanType, typename Callback>
-    static void for_each_command_header(SpanType command_bytes, Callback callback)
-    {
-        static_assert(IsSame<SpanType, Bytes> || IsSame<SpanType, ReadonlyBytes>);
-        for (size_t offset = 0; offset < command_bytes.size();) {
-            VERIFY(offset + sizeof(DisplayListCommandHeader) <= command_bytes.size());
-            auto header = read_display_list_object<DisplayListCommandHeader>(command_bytes.slice(offset));
-            offset += sizeof(header);
-            VERIFY(offset + header.payload_size <= command_bytes.size());
-            auto payload = SpanType { command_bytes.data() + offset, header.payload_size };
-            offset += header.payload_size;
-            callback(header, payload);
-        }
-    }
-
-    template<typename Callback>
-    void for_each_command_header(Callback callback) const
-    {
-        for (auto const& run : command_runs()) {
-            for_each_command_header(command_bytes_of_run(run), [&](auto const& header, auto payload) {
-                callback(run.context, header, payload);
-            });
-        }
-    }
+    // Replays the list through a player's callbacks, against the visual context tree it was made for.
+    void replay(AccumulatedVisualContextTree const&, ScrollStateSnapshot const&, RustFFI::FfiDisplayListReplayCallbacks const&) const;
+    // Replays a stream of records that a command of a list being replayed nests.
+    static void replay_records(ReadonlyBytes records, ScrollStateSnapshot const&, RustFFI::FfiDisplayListReplayCallbacks const&);
 
 private:
-    friend class DisplayListPlayer;
-    void const* replay_effect_clip_plan(AccumulatedVisualContextTree const&) const;
+    // Takes over the storage of a tape that came from another process and passed its checks.
+    static NonnullRefPtr<DisplayList> adopt_received_storage(Properties, void const* storage);
 
-    explicit DisplayList(u64 compatible_visual_context_tree_structural_epoch);
-    DisplayList(u64 compatible_visual_context_tree_structural_epoch, u64 id, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata>);
-    DisplayList(Properties, Core::AnonymousBuffer shared_tape_buffer, ReadonlyBytes command_bytes, Vector<DisplayListCommandRun>&& command_runs);
+    DisplayList(u64 compatible_visual_context_tree_structural_epoch, u64 id, void const* storage, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata>);
 
-    bool borrows_command_bytes() const { return m_rust_command_storage || m_shared_tape_buffer.is_valid(); }
-
-    // Immutable placement for this list and its compatible clip/effect topology.
-    // Atomic publication allows compositor workers to replay the list concurrently.
-    mutable Atomic<void const*> m_replay_effect_clip_plan { nullptr };
     u64 m_compatible_visual_context_tree_structural_epoch { 0 };
     u64 m_id { 0 };
-    // Native construction and IPC decoding own their buffers here. Rust recordings instead share one
-    // immutable allocation with the cache, and lists received through a shared buffer borrow the tape
-    // from that mapping; the spans borrow whichever retained owner applies. A list received through a
-    // shared buffer still owns its run table, copied out of the mapping.
-    void const* m_rust_command_storage { nullptr };
-    Core::AnonymousBuffer m_shared_tape_buffer;
-    ReadonlyBytes m_borrowed_command_bytes;
-    ReadonlySpan<DisplayListCommandRun> m_borrowed_command_runs;
-    ByteBuffer m_command_bytes;
-    Vector<DisplayListCommandRun> m_command_runs;
+    // One strong reference to the Rust storage, which owns the tape.
+    void const* m_storage { nullptr };
     Optional<Gfx::Color> m_surface_clear_color;
     Optional<AsyncScrollingMetadata> m_async_scrolling_metadata;
 
@@ -220,9 +127,6 @@ private:
     friend ErrorOr<T> IPC::decode(IPC::Decoder&);
 };
 
-// Runs must start at offset zero, follow each other without gaps, stay aligned, and end at the tape's
-// end. Under DISPLAY_LIST_RUNS_DEBUG their boundaries and summaries are checked against the commands.
-COMPOSITING_API ErrorOr<void> validate_display_list_command_runs(ReadonlyBytes command_bytes, ReadonlySpan<DisplayListCommandRun>);
 COMPOSITING_API ErrorOr<void> validate_display_list_references_live_visual_context_nodes(DisplayList const&, AccumulatedVisualContextTree const&);
 
 }

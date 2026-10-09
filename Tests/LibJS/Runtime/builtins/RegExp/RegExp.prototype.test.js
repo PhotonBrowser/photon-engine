@@ -164,3 +164,21 @@ test("a non-writable lastIndex is fine on a pattern that is neither global nor s
     expect(pattern.test("aaa")).toBeTrue();
     expect(pattern.lastIndex).toBe(0);
 });
+
+test("character class with many overlapping ranges", () => {
+    // More than eight ranges, where one range contains all the others.
+    expect(/[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]/.test("P")).toBeTrue();
+    expect(/^[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]+$/.test("PQR")).toBeTrue();
+    expect(/[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]/.test("{")).toBeFalse();
+    expect(/[^\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]/.test("P")).toBeFalse();
+    expect(/[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]/v.test("P")).toBeTrue();
+    expect(/^[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]+$/v.test("PQR")).toBeTrue();
+});
+
+test("a failed test leaves the legacy static properties alone", () => {
+    expect(/(a)/.exec("xa")).not.toBeNull();
+    expect(/b/.test("c")).toBeFalse();
+    expect(RegExp.$1).toBe("a");
+    expect(RegExp.lastMatch).toBe("a");
+    expect(RegExp.leftContext).toBe("x");
+});

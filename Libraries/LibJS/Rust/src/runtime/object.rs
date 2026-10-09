@@ -54,7 +54,7 @@ use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::shape::Shape;
 use crate::runtime::symbol::Symbol;
-use crate::runtime::value::{PreferredType, same_value};
+use crate::runtime::value::{PreferredType, is_strictly_equal, same_value};
 use crate::utf16::to_utf16_fly_string;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +238,7 @@ pub struct ObjectMethods {
     pub internal_set_prototype_of: fn(&Object, &Vm, Option<Gc<Object>>) -> ThrowCompletionOr<bool>,
     pub internal_is_extensible: fn(&Object, &Vm) -> ThrowCompletionOr<bool>,
     pub internal_prevent_extensions: fn(&Object, &Vm) -> ThrowCompletionOr<bool>,
-    pub internal_get_own_property: fn(&Object, &Vm, &PropertyKey) -> ThrowCompletionOr<Option<PropertyDescriptor>>,
+    pub internal_get_own_property: InternalGetOwnPropertyMethod,
     pub internal_define_own_property: InternalDefineOwnProperty,
     pub internal_has_property: fn(&Object, &Vm, &PropertyKey) -> ThrowCompletionOr<bool>,
     pub internal_get: InternalGet,
@@ -268,6 +268,8 @@ pub struct ObjectMethods {
     /// The [[ErrorData]] internal slot, which Error objects have.
     pub error_data: fn(&Object) -> Option<&ErrorData>,
 }
+
+pub type InternalGetOwnPropertyMethod = fn(&Object, &Vm, &PropertyKey) -> ThrowCompletionOr<Option<PropertyDescriptor>>;
 
 pub static ORDINARY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     initialize: |_, _, _| {},
@@ -921,6 +923,15 @@ impl Object {
 
     // 7.3.13 HasOwnProperty ( O, P ), https://tc39.es/ecma262/#sec-hasownproperty
     pub fn has_own_property(&self, vm: &Vm, property_key: &PropertyKey) -> ThrowCompletionOr<bool> {
+        // OPTIMIZATION: Whether the ordinary [[GetOwnProperty]] finds a property only depends on the object's storage,
+        //               so ask the storage without building the descriptor.
+        let ordinary_get_own_property: InternalGetOwnPropertyMethod = Object::ordinary_get_own_property;
+        if core::ptr::fn_addr_eq(self.methods().internal_get_own_property, ordinary_get_own_property)
+            && !self.has_unimplemented_properties()
+        {
+            return Ok(self.storage_has(property_key));
+        }
+
         // 1. Let desc be ? O.[[GetOwnProperty]](P).
         let descriptor = self.internal_get_own_property(vm, property_key)?;
 
@@ -3861,6 +3872,19 @@ impl Object {
     pub fn indexed_packed_elements_span_size(&self) -> u32 {
         assert!(self.indexed_storage_kind() == IndexedStorageKind::Packed);
         self.indexed_packed_element_count()
+    }
+
+    pub fn indexed_packed_index_of(&self, value: Value, start: u32) -> Option<u32> {
+        let count = self.indexed_packed_elements_span_size();
+        if start >= count {
+            return None;
+        }
+        // SAFETY: The count is within the elements buffer, and IsStrictlyEqual runs no code that could write it.
+        let elements = unsafe { core::slice::from_raw_parts(self.indexed_elements.get(), count as usize) };
+        elements[start as usize..]
+            .iter()
+            .position(|element| is_strictly_equal(value, *element))
+            .map(|offset| start + offset as u32)
     }
 
     /// Copies the first elements of packed storage into `destination`.

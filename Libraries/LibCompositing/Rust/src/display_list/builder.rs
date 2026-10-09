@@ -540,9 +540,10 @@ pub fn for_each_command<'a>(bytes: &'a [u8], mut f: impl FnMut(&DisplayListComma
 
 pub fn read_command<C: Copy>(payload: &[u8]) -> C {
     assert!(payload.len() >= std::mem::size_of::<C>());
-    // SAFETY: Display-list records are native-layout copies of these `Copy` command structs. The
-    // byte stream is validated at the C++ boundary, and `read_unaligned` does not require the
-    // payload pointer to have `C`'s alignment.
+    // SAFETY: Display-list records are native-layout copies of these `Copy` command structs. A
+    // tape is either recorded by this crate or checked by `validate::validate_tape` when it
+    // arrives from another process, so every enum and bool byte holds a valid value.
+    // `read_unaligned` does not require the payload pointer to have `C`'s alignment.
     unsafe { std::ptr::read_unaligned(payload.as_ptr().cast::<C>()) }
 }
 
@@ -556,6 +557,20 @@ pub fn inline_transform_entry_offset(header: &DisplayListCommandHeader, payload:
 pub fn inline_transform_of(header: &DisplayListCommandHeader, payload: &[u8]) -> Option<AffineTransform> {
     inline_transform_entry_offset(header, payload)
         .map(|offset| read_command::<DisplayListInlineTransform>(&payload[offset..]).transform)
+}
+
+/// The inline clip entries at the end of a record's payload, in the order the player pushes them.
+pub fn inline_clips_of<'a>(
+    header: &DisplayListCommandHeader,
+    payload: &'a [u8],
+) -> impl Iterator<Item = DisplayListInlineClip> + use<'a> {
+    let count = usize::from(header.inline_clip_count);
+    let entries = &payload[payload.len() - count * INLINE_CLIP_ENTRY_SIZE..];
+    entries
+        .as_chunks::<INLINE_CLIP_ENTRY_SIZE>()
+        .0
+        .iter()
+        .map(|entry| read_command::<DisplayListInlineClip>(entry))
 }
 
 pub fn read_header(bytes: &[u8]) -> DisplayListCommandHeader {

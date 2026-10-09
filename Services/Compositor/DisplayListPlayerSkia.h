@@ -10,6 +10,7 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
+#include <Compositor/DisplayListPlayer.h>
 #include <Compositor/Forward.h>
 #include <cstdint>
 #include <LibCompositing/DisplayList/CompositedContext.h>
@@ -31,7 +32,7 @@ namespace Compositor {
 // take — as a Skia runtime effect. Exposed so a benchmark can time the shipped effect, rather than a copy of it.
 sk_sp<SkColorFilter> force_dark_image_color_filter();
 
-class DisplayListPlayerSkia final : public Compositing::DisplayListPlayer {
+class DisplayListPlayerSkia final : public DisplayListPlayer {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
@@ -54,7 +55,7 @@ public:
     void paint_scrollbar(Gfx::PaintingSurface&, Compositing::PaintScrollBar const&);
 
 private:
-#define DECLARE_PLAY_COMMAND(command_type, player_method) \
+#define DECLARE_PLAY_COMMAND(command_type) \
     void play_command(Compositing::command_type const&) override;
     ENUMERATE_DISPLAY_LIST_COMMANDS(DECLARE_PLAY_COMMAND)
 #undef DECLARE_PLAY_COMMAND

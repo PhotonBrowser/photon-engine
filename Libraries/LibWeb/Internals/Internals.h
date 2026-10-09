@@ -109,6 +109,8 @@ public:
     void reset_zoom();
 
     Utf16String current_cursor();
+    Optional<Utf16String> current_cursor_pixel(i32 x, i32 y);
+    Utf16String theme_color();
 
     Utf16String selected_text_for_clipboard();
 

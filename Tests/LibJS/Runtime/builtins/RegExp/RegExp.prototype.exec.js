@@ -384,3 +384,68 @@ test("case-insensitive Unicode matching of astral characters", () => {
     expect(result).not.toBe(null);
     expect(result[0]).toBe("\u{10400}");
 });
+
+test("character classes with builtin classes", () => {
+    const firstMatch = (regexp, string) => {
+        const match = regexp.exec(string);
+        return match === null ? null : [match.index, match[0]];
+    };
+
+    expect(firstMatch(/[^\s"]+/, '  \t"abc" def')).toEqual([4, "abc"]);
+    expect(firstMatch(/[^\s\/>"'=]+/, ' class="toggle"')).toEqual([1, "class"]);
+    expect(firstMatch(/[^\w-]+/, "12ab-CD_ef!?")).toEqual([10, "!?"]);
+    expect(firstMatch(/[\W\d]+/, "12ab")).toEqual([0, "12"]);
+    expect(firstMatch(/[^\W_]+/, "__ab_")).toEqual([2, "ab"]);
+    expect(firstMatch(/[^\S]+/, "a 　﻿b")).toEqual([1, " 　﻿"]);
+    expect(firstMatch(/[^\D]+/, "ab12c")).toEqual([2, "12"]);
+    expect(firstMatch(/[\s\S]+/, "a\nb")).toEqual([0, "a\nb"]);
+    expect(firstMatch(/[^\w\s]+/, "ab  -+")).toEqual([4, "-+"]);
+    expect(firstMatch(/a[^\s]*?b/, "a b axyb")).toEqual([4, "axyb"]);
+    expect(firstMatch(/[^\s]{2,3}/, "a bcde")).toEqual([2, "bcd"]);
+
+    // Without the u flag, a class matches the code units of a surrogate pair one at a time.
+    expect(firstMatch(/[^\s\uD83D]+/, "😀 x")).toEqual([1, "\uDE00"]);
+    expect(firstMatch(/[\D]/, "😀")).toEqual([0, "\uD83D"]);
+
+    // Case-insensitive classes.
+    expect(firstMatch(/[^\sa-c]+/i, "ABC xyAbz")).toEqual([4, "xy"]);
+    expect(firstMatch(/[^\w]+/i, "ſK")).toEqual([0, "ſK"]);
+    expect(firstMatch(/[\w-]+/i, "ſ-k")).toEqual([1, "-k"]);
+    expect(firstMatch(/[\s-]+/i, "ab - c")).toEqual([2, " - "]);
+});
+
+test("alternatives that start with literal characters", () => {
+    const tokenizer = /<!--([\s\S]*?)-->|<(\?[^>]*)>|<\/([a-z]+)>|<([a-z]+)>|([^<]+|<)/g;
+    const tokens = [];
+    let match;
+    while ((match = tokenizer.exec("a<b>c<!--d--></b><?e>< f")))
+        tokens.push(match.findIndex((capture, index) => index > 0 && capture !== undefined) + ":" + match[0]);
+    expect(tokens).toEqual(["5:a", "4:<b>", "5:c", "1:<!--d-->", "3:</b>", "2:<?e>", "5:<", "5: f"]);
+
+    expect(/ab|ac|(a)d/.exec("ad")[1]).toBe("a");
+    expect(/(?:x|(y))z|yw/.exec("yw")).toEqual(["yw", undefined]);
+    expect(/a(?:bc|bd)|ab/i.exec("ABD")[0]).toBe("ABD");
+    expect(/(?:[a-c]x|[a-c]y)/.exec("by")[0]).toBe("by");
+});
+
+test("modifiers end with their group after backtracking into it", () => {
+    expect(/(?i:[^\s"]+)x/.exec('x"yX')).toBeNull();
+    expect(/(?i:[^\s"]+)x/.exec("xyX")).toBeNull();
+    expect(/(?i:[^\s"]+)x/.exec("xyx")[0]).toBe("xyx");
+    expect(/(?i:a+)b/.exec("AaaAB")).toBeNull();
+    expect(/(?i:a+)b/.exec("AaaAb")[0]).toBe("AaaAb");
+    expect(/(?-i:a+)b/i.exec("aaB")[0]).toBe("aaB");
+    expect(/(?-i:a+)b/i.exec("aAb")).toBeNull();
+    expect(/(?i:a(?-i:b)+)c/.exec("Abbbc")[0]).toBe("Abbbc");
+    expect(/(?i:a(?-i:b)+)c/.exec("AbbbC")).toBeNull();
+    expect(/(?=(?i:a+))a/.exec("Aa")[0]).toBe("a");
+});
+
+test("lookarounds restore state without outer alternatives", () => {
+    expect(/^(?!(a)b)a$/.exec("a")).toEqual(["a", undefined]);
+    expect(/^(?!(?=(a))b)a$/.exec("a")).toEqual(["a", undefined]);
+    expect(/^(?=(a))a$/.exec("a")).toEqual(["a", "a"]);
+    expect(/^(?!(?i:a)b)a$/.exec("a")[0]).toBe("a");
+    expect(/^(?=(?i:a))a$/.exec("a")[0]).toBe("a");
+    expect(/^(?!(?=(?i:a))b)a$/.exec("a")[0]).toBe("a");
+});
