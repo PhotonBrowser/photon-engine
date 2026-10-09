@@ -26,19 +26,21 @@ use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::{AkDouble, ErrorType};
 use crate::runtime::function_object::FunctionObject;
 use crate::runtime::native_function::raw_native;
+use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::object::{PropertyKind, ShouldThrowExceptions, define_object_class};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::property_attributes::{Attribute, DEFAULT_ATTRIBUTES, PropertyAttributes};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
-use crate::runtime::value::{is_strictly_equal, same_value_zero};
+use crate::runtime::value::{PreferredType, append_number_to_string, is_strictly_equal, same_value_zero};
 use crate::runtime::value_conversions::MAX_ARRAY_LIKE_INDEX;
-use crate::utf16::Utf16View;
+use crate::utf16::{Utf16StringBuilder, Utf16View};
 
 thread_local! {
     /// The objects Array.prototype.join and Array.prototype.toLocaleString are joining, by address. Each join keeps its
     /// object alive while it is in here.
-    static ARRAY_JOIN_SEEN_OBJECTS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    static ARRAY_JOIN_SEEN_OBJECTS: RefCell<HashSet<usize, foldhash::fast::RandomState>> =
+        RefCell::new(HashSet::default());
 }
 
 /// Takes an object out of the seen objects of joins when its join returns.
@@ -71,6 +73,21 @@ define_object_class!(ArrayPrototype, extends: [Array, Object], methods: {
     initialize: ArrayPrototype::initialize,
     ..ARRAY_OBJECT_METHODS
 });
+
+/// The element at `index` of an object whose indexed storage nothing intercepts, if it has one there. Holes and
+/// elements of dictionary storage, which may be accessors, are left to a [[Get]].
+fn own_plain_indexed_element(object: &Object, index: u64) -> Option<Value> {
+    if object.may_interfere_with_indexed_property_access() {
+        return None;
+    }
+    if !matches!(
+        object.indexed_storage_kind(),
+        IndexedStorageKind::Packed | IndexedStorageKind::Holey
+    ) {
+        return None;
+    }
+    Some(object.indexed_get(u32::try_from(index).ok()?)?.value)
+}
 
 fn property_key(index: u64) -> PropertyKey {
     PropertyKey::from_number(index)
@@ -118,35 +135,46 @@ impl ArrayPrototype {
         let define_native_function = |name: &PropertyKey, function: RawNativeFunctionPointer, length: i32| {
             object.define_native_function(vm, realm, name, function, length, attributes, None);
         };
+        let intrinsics = realm.intrinsics();
+        let define_native_javascript_backed_function =
+            |name: &PropertyKey, function: Gc<NativeJavaScriptBackedFunction>| {
+                object.define_native_javascript_backed_function(vm, name, function, 1, attributes);
+            };
 
         define_native_function(&names.at, raw_native!(ArrayPrototype::at), 1);
         define_native_function(&names.concat, raw_native!(ArrayPrototype::concat), 1);
         define_native_function(&names.copyWithin, raw_native!(ArrayPrototype::copy_within), 2);
         define_native_function(&names.entries, raw_native!(ArrayPrototype::entries), 0);
-        define_native_function(&names.every, raw_native!(ArrayPrototype::every), 1);
+        define_native_javascript_backed_function(&names.every, intrinsics.every_array_prototype_function(vm));
         define_native_function(&names.fill, raw_native!(ArrayPrototype::fill), 1);
-        define_native_function(&names.filter, raw_native!(ArrayPrototype::filter), 1);
-        define_native_function(&names.find, raw_native!(ArrayPrototype::find), 1);
-        define_native_function(&names.findIndex, raw_native!(ArrayPrototype::find_index), 1);
-        define_native_function(&names.findLast, raw_native!(ArrayPrototype::find_last), 1);
-        define_native_function(&names.findLastIndex, raw_native!(ArrayPrototype::find_last_index), 1);
+        define_native_javascript_backed_function(&names.filter, intrinsics.filter_array_prototype_function(vm));
+        define_native_javascript_backed_function(&names.find, intrinsics.find_array_prototype_function(vm));
+        define_native_javascript_backed_function(&names.findIndex, intrinsics.find_index_array_prototype_function(vm));
+        define_native_javascript_backed_function(&names.findLast, intrinsics.find_last_array_prototype_function(vm));
+        define_native_javascript_backed_function(
+            &names.findLastIndex,
+            intrinsics.find_last_index_array_prototype_function(vm),
+        );
         define_native_function(&names.flat, raw_native!(ArrayPrototype::flat), 0);
         define_native_function(&names.flatMap, raw_native!(ArrayPrototype::flat_map), 1);
-        define_native_function(&names.forEach, raw_native!(ArrayPrototype::for_each), 1);
+        define_native_javascript_backed_function(&names.forEach, intrinsics.for_each_array_prototype_function(vm));
         define_native_function(&names.includes, raw_native!(ArrayPrototype::includes), 1);
         define_native_function(&names.indexOf, raw_native!(ArrayPrototype::index_of), 1);
         define_native_function(&names.join, raw_native!(ArrayPrototype::join), 1);
         define_native_function(&names.keys, raw_native!(ArrayPrototype::keys), 0);
         define_native_function(&names.lastIndexOf, raw_native!(ArrayPrototype::last_index_of), 1);
-        define_native_function(&names.map, raw_native!(ArrayPrototype::map), 1);
+        define_native_javascript_backed_function(&names.map, intrinsics.map_array_prototype_function(vm));
         define_native_function(&names.pop, raw_native!(ArrayPrototype::pop), 0);
         define_native_function(&names.push, raw_native!(ArrayPrototype::push), 1);
-        define_native_function(&names.reduce, raw_native!(ArrayPrototype::reduce), 1);
-        define_native_function(&names.reduceRight, raw_native!(ArrayPrototype::reduce_right), 1);
+        define_native_javascript_backed_function(&names.reduce, intrinsics.reduce_array_prototype_function(vm));
+        define_native_javascript_backed_function(
+            &names.reduceRight,
+            intrinsics.reduce_right_array_prototype_function(vm),
+        );
         define_native_function(&names.reverse, raw_native!(ArrayPrototype::reverse), 0);
         define_native_function(&names.shift, raw_native!(ArrayPrototype::shift), 0);
         define_native_function(&names.slice, raw_native!(ArrayPrototype::slice), 2);
-        define_native_function(&names.some, raw_native!(ArrayPrototype::some), 1);
+        define_native_javascript_backed_function(&names.some, intrinsics.some_array_prototype_function(vm));
         define_native_function(&names.sort, raw_native!(ArrayPrototype::sort), 1);
         define_native_function(&names.splice, raw_native!(ArrayPrototype::splice), 2);
         define_native_function(&names.toLocaleString, raw_native!(ArrayPrototype::to_locale_string), 0);
@@ -429,58 +457,6 @@ impl ArrayPrototype {
         )))
     }
 
-    // 23.1.3.6 Array.prototype.every ( callbackfn [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.every
-    fn every(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let callback_function = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(callbackfn) is false, throw a TypeError exception.
-        if !callback_function.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&callback_function]);
-        }
-
-        // 4. Let k be 0.
-        // 5. Repeat, while k < len,
-        for k in 0..length {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kPresent be ? HasProperty(O, Pk).
-            let k_present = object.has_property(vm, &property_key)?;
-
-            // c. If kPresent is true, then
-            if k_present {
-                // i. Let kValue be ? Get(O, Pk).
-                let k_value = object.get(vm, &property_key)?;
-
-                // ii. Let testResult be ToBoolean(? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »)).
-                let test_result = call_function_object(
-                    vm,
-                    callback_function.as_function(),
-                    this_arg,
-                    &[k_value, number(k), Value::from_object(object)],
-                )?
-                .to_boolean();
-
-                // iii. If testResult is false, return false.
-                if !test_result {
-                    return Ok(Value::FALSE);
-                }
-            }
-
-            // d. Set k to k + 1.
-        }
-
-        // 6. Return true.
-        Ok(Value::TRUE)
-    }
-
     // 23.1.3.7 Array.prototype.fill ( value [ , start [ , end ] ] ), https://tc39.es/ecma262/#sec-array.prototype.fill
     fn fill(vm: &Vm) -> ThrowCompletionOr<Value> {
         let this_object = vm.this_value().to_object(vm)?;
@@ -522,252 +498,6 @@ impl ArrayPrototype {
         }
 
         Ok(Value::from_object(this_object))
-    }
-
-    // 23.1.3.8 Array.prototype.filter ( callbackfn [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.filter
-    fn filter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let callback_function = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(callbackfn) is false, throw a TypeError exception.
-        if !callback_function.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&callback_function]);
-        }
-
-        // 4. Let A be ? ArraySpeciesCreate(O, 0).
-        let array = array_species_create(vm, &object, 0)?;
-
-        // 5. Let k be 0.
-        // 6. Let to be 0.
-        let mut to: u64 = 0;
-
-        // 7. Repeat, while k < len,
-        for k in 0..length {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kPresent be ? HasProperty(O, Pk).
-            let k_present = object.has_property(vm, &property_key)?;
-
-            // c. If kPresent is true, then
-            if k_present {
-                // i. Let kValue be ? Get(O, Pk).
-                let k_value = object.get(vm, &property_key)?;
-
-                // ii. Let selected be ToBoolean(? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »)).
-                let selected = call_function_object(
-                    vm,
-                    callback_function.as_function(),
-                    this_arg,
-                    &[k_value, number(k), Value::from_object(object)],
-                )?
-                .to_boolean();
-
-                // iii. If selected is true, then
-                if selected {
-                    // 1. Perform ? CreateDataPropertyOrThrow(A, ! ToString(𝔽(to)), kValue).
-                    array.create_data_property_or_throw(vm, &self::property_key(to), k_value)?;
-
-                    // 2. Set to to to + 1.
-                    to += 1;
-                }
-            }
-
-            // d. Set k to k + 1.
-        }
-
-        // 8. Return A.
-        Ok(Value::from_object(array))
-    }
-
-    // 23.1.3.9 Array.prototype.find ( predicate [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.find
-    fn find(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let predicate = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(predicate) is false, throw a TypeError exception.
-        if !predicate.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&predicate]);
-        }
-
-        // 4. Let k be 0.
-        // 5. Repeat, while k < len,
-        for k in 0..length {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kValue be ? Get(O, Pk).
-            let k_value = object.get(vm, &property_key)?;
-
-            // c. Let testResult be ToBoolean(? Call(predicate, thisArg, « kValue, 𝔽(k), O »)).
-            let test_result = call_function_object(
-                vm,
-                predicate.as_function(),
-                this_arg,
-                &[k_value, number(k), Value::from_object(object)],
-            )?
-            .to_boolean();
-
-            // d. If testResult is true, return kValue.
-            if test_result {
-                return Ok(k_value);
-            }
-
-            // e. Set k to k + 1.
-        }
-
-        // 6. Return undefined.
-        Ok(Value::UNDEFINED)
-    }
-
-    // 23.1.3.10 Array.prototype.findIndex ( predicate [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.findindex
-    fn find_index(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let predicate = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(predicate) is false, throw a TypeError exception.
-        if !predicate.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&predicate]);
-        }
-
-        // 4. Let k be 0.
-        // 5. Repeat, while k < len,
-        for k in 0..length {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kValue be ? Get(O, Pk).
-            let k_value = object.get(vm, &property_key)?;
-
-            // c. Let testResult be ToBoolean(? Call(predicate, thisArg, « kValue, 𝔽(k), O »)).
-            let test_result = call_function_object(
-                vm,
-                predicate.as_function(),
-                this_arg,
-                &[k_value, number(k), Value::from_object(object)],
-            )?
-            .to_boolean();
-
-            // d. If testResult is true, return 𝔽(k).
-            if test_result {
-                return Ok(number(k));
-            }
-
-            // e. Set k to k + 1.
-        }
-
-        // 6. Return -1𝔽.
-        Ok(Value::from_i32(-1))
-    }
-
-    // 23.1.3.11 Array.prototype.findLast ( predicate [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.findlast
-    fn find_last(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let predicate = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(predicate) is false, throw a TypeError exception.
-        if !predicate.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&predicate]);
-        }
-
-        // 4. Let k be len - 1.
-        // 5. Repeat, while k ≥ 0,
-        for k in (0..length).rev() {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kValue be ? Get(O, Pk).
-            let k_value = object.get(vm, &property_key)?;
-
-            // c. Let testResult be ToBoolean(? Call(predicate, thisArg, « kValue, 𝔽(k), O »)).
-            let test_result = call_function_object(
-                vm,
-                predicate.as_function(),
-                this_arg,
-                &[k_value, number(k), Value::from_object(object)],
-            )?
-            .to_boolean();
-
-            // d. If testResult is true, return kValue.
-            if test_result {
-                return Ok(k_value);
-            }
-
-            // e. Set k to k - 1.
-        }
-
-        // 6. Return undefined.
-        Ok(Value::UNDEFINED)
-    }
-
-    // 23.1.3.12 Array.prototype.findLastIndex ( predicate [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.findlastindex
-    fn find_last_index(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let predicate = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(predicate) is false, throw a TypeError exception.
-        if !predicate.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&predicate]);
-        }
-
-        // 4. Let k be len - 1.
-        // 5. Repeat, while k ≥ 0,
-        for k in (0..length).rev() {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kValue be ? Get(O, Pk).
-            let k_value = object.get(vm, &property_key)?;
-
-            // c. Let testResult be ToBoolean(? Call(predicate, thisArg, « kValue, 𝔽(k), O »)).
-            let test_result = call_function_object(
-                vm,
-                predicate.as_function(),
-                this_arg,
-                &[k_value, number(k), Value::from_object(object)],
-            )?
-            .to_boolean();
-
-            // d. If testResult is true, return 𝔽(k).
-            if test_result {
-                return Ok(number(k));
-            }
-
-            // e. Set k to k - 1.
-        }
-
-        // 6. Return -1𝔽.
-        Ok(Value::from_i32(-1))
     }
 
     // 23.1.3.13 Array.prototype.flat ( [ depth ] ), https://tc39.es/ecma262/#sec-array.prototype.flat
@@ -821,52 +551,6 @@ impl ArrayPrototype {
 
         // 6. Return A.
         Ok(Value::from_object(array))
-    }
-
-    // 23.1.3.15 Array.prototype.forEach ( callbackfn [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.foreach
-    fn for_each(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let callback_function = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(callbackfn) is false, throw a TypeError exception.
-        if !callback_function.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&callback_function]);
-        }
-
-        // 4. Let k be 0.
-        // 5. Repeat, while k < len,
-        for k in 0..length {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kPresent be ? HasProperty(O, Pk).
-            let k_present = object.has_property(vm, &property_key)?;
-
-            // c. If kPresent is true, then
-            if k_present {
-                // i. Let kValue be ? Get(O, Pk).
-                let k_value = object.get(vm, &property_key)?;
-
-                // ii. Perform ? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »).
-                call_function_object(
-                    vm,
-                    callback_function.as_function(),
-                    this_arg,
-                    &[k_value, number(k), Value::from_object(object)],
-                )?;
-            }
-
-            // d. Set k to k + 1.
-        }
-
-        // 6. Return undefined.
-        Ok(Value::UNDEFINED)
     }
 
     // 23.1.3.16 Array.prototype.includes ( searchElement [ , fromIndex ] ), https://tc39.es/ecma262/#sec-array.prototype.includes
@@ -1000,6 +684,7 @@ impl ArrayPrototype {
 
     // 23.1.3.18 Array.prototype.join ( separator ), https://tc39.es/ecma262/#sec-array.prototype.join
     fn join(vm: &Vm) -> ThrowCompletionOr<Value> {
+        // 1. Let obj be ? ToObject(this value).
         let this_object = vm.this_value().to_object(vm)?;
 
         // This is not part of the spec, but all major engines do some kind of circular reference checks.
@@ -1009,27 +694,68 @@ impl ArrayPrototype {
             return Ok(Value::from_string(PrimitiveString::create(vm, Utf16String::default())));
         };
 
+        // 2. Let length be ? LengthOfArrayLike(obj).
         let length = length_of_array_like(vm, &this_object)?;
-        let mut separator = Utf16String::from_utf8(",");
-        if !vm.argument(0).is_undefined() {
-            separator = vm.argument(0).to_utf16_string(vm)?;
-        }
-        let mut builder = Vec::new();
-        for i in 0..length {
-            if i > 0 {
-                Utf16View::of_string(&separator).append_to(&mut builder);
+
+        // 3. If separator is undefined, let sep be ",".
+        // 4. Else, let sep be ? ToString(separator).
+        let separator = if vm.argument(0).is_undefined() {
+            None
+        } else {
+            Some(vm.argument(0).to_utf16_string(vm)?)
+        };
+        let separator = separator.as_ref().map_or(Utf16View::Ascii(b","), Utf16View::of_string);
+
+        // 5. Let result be the empty String.
+        // NB: Most joins are of short strings and numbers, so start with room for a few code units of each.
+        let element_capacity = length.min(1024) as usize * 8;
+        let separator_capacity = length.saturating_sub(1).min(1024) as usize * separator.length_in_code_units().min(8);
+        let mut builder = Utf16StringBuilder::with_capacity(element_capacity + separator_capacity);
+
+        // 6. Let k be 0.
+        // 7. Repeat, while k < length,
+        for k in 0..length {
+            // a. If k > 0, set result to the string-concatenation of result and sep.
+            if k > 0 {
+                builder.append(separator);
             }
-            let value = this_object.get(vm, &property_key(i))?;
-            if value.is_nullish() {
-                continue;
+
+            // b. Let element be ? Get(obj, ! ToString(𝔽(k))).
+            // OPTIMIZATION: Read the elements of objects whose indexed storage nothing intercepts directly. Converting
+            //               an element may run code that changes the object, so this is checked for every element.
+            let element = match own_plain_indexed_element(&this_object, k) {
+                Some(element) => element,
+                None => this_object.get(vm, &property_key(k))?,
+            };
+
+            // c. If element is neither undefined nor null, then
+            if !element.is_nullish() {
+                // i. Let elementString be ? ToString(element).
+                // ii. Set result to the string-concatenation of result and elementString.
+                // OPTIMIZATION: Strings and numbers are appended without making a string of their own first. ToString
+                //               of an object is ToString of ? ToPrimitive(object, string), which is usually a string.
+                let primitive = if element.is_object() {
+                    element.to_primitive(vm, PreferredType::String)?
+                } else {
+                    element
+                };
+                if primitive.is_string() {
+                    builder.append(primitive.as_string().utf16_string_view());
+                } else if primitive.is_number() {
+                    append_number_to_string(&mut builder, primitive.as_f64());
+                } else {
+                    let element_string = primitive.to_utf16_string(vm)?;
+                    builder.append(Utf16View::of_string(&element_string));
+                }
             }
-            let string = value.to_utf16_string(vm)?;
-            Utf16View::of_string(&string).append_to(&mut builder);
+
+            // d. Set k to k + 1.
         }
 
+        // 8. Return result.
         Ok(Value::from_string(PrimitiveString::create(
             vm,
-            Utf16String::from_utf16(&builder),
+            builder.to_utf16_string(),
         )))
     }
 
@@ -1121,58 +847,6 @@ impl ArrayPrototype {
         Ok(Value::from_i32(-1))
     }
 
-    // 23.1.3.21 Array.prototype.map ( callbackfn [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.map
-    fn map(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let callback_function = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(callbackfn) is false, throw a TypeError exception.
-        if !callback_function.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&callback_function]);
-        }
-
-        // 4. Let A be ? ArraySpeciesCreate(O, len).
-        let array = array_species_create(vm, &object, length)?;
-
-        // 5. Let k be 0.
-        // 6. Repeat, while k < len,
-        for k in 0..length {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kPresent be ? HasProperty(O, Pk).
-            let k_present = object.has_property(vm, &property_key)?;
-
-            // c. If kPresent is true, then
-            if k_present {
-                // i. Let kValue be ? Get(O, Pk).
-                let k_value = object.get(vm, &property_key)?;
-
-                // ii. Let mappedValue be ? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »).
-                let mapped_value = call_function_object(
-                    vm,
-                    callback_function.as_function(),
-                    this_arg,
-                    &[k_value, number(k), Value::from_object(object)],
-                )?;
-
-                // iii. Perform ? CreateDataPropertyOrThrow(A, Pk, mappedValue).
-                array.create_data_property_or_throw(vm, &property_key, mapped_value)?;
-            }
-
-            // d. Set k to k + 1.
-        }
-
-        // 7. Return A.
-        Ok(Value::from_object(array))
-    }
-
     // 23.1.3.22 Array.prototype.pop ( ), https://tc39.es/ecma262/#sec-array.prototype.pop
     fn pop(vm: &Vm) -> ThrowCompletionOr<Value> {
         let this_object = vm.this_value().to_object(vm)?;
@@ -1239,188 +913,6 @@ impl ArrayPrototype {
         let new_length_value = number(new_length);
         this_object.set(vm, &vm.names.length, new_length_value, ShouldThrowExceptions::Yes)?;
         Ok(new_length_value)
-    }
-
-    // 23.1.3.24 Array.prototype.reduce ( callbackfn [ , initialValue ] ), https://tc39.es/ecma262/#sec-array.prototype.reduce
-    fn reduce(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let callback_function = vm.argument(0);
-        let initial_value = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(callbackfn) is false, throw a TypeError exception.
-        if !callback_function.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&callback_function]);
-        }
-
-        // 4. If len = 0 and initialValue is not present, throw a TypeError exception.
-        if length == 0 && vm.argument_count() <= 1 {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::ReduceNoInitial, &[]);
-        }
-
-        // 5. Let k be 0.
-        let mut k: u64 = 0;
-
-        // 6. Let accumulator be undefined.
-        let mut accumulator = Value::UNDEFINED;
-
-        // 7. If initialValue is present, then
-        if vm.argument_count() > 1 {
-            // a. Set accumulator to initialValue.
-            accumulator = initial_value;
-        }
-        // 8. Else,
-        else {
-            // a. Let kPresent be false.
-            let mut k_present = false;
-
-            // b. Repeat, while kPresent is false and k < len,
-            while !k_present && k < length {
-                // i. Let Pk be ! ToString(𝔽(k)).
-                let property_key = property_key(k);
-
-                // ii. Set kPresent to ? HasProperty(O, Pk).
-                k_present = object.has_property(vm, &property_key)?;
-
-                // iii. If kPresent is true, then
-                if k_present {
-                    // 1. Set accumulator to ? Get(O, Pk).
-                    accumulator = object.get(vm, &property_key)?;
-                }
-
-                // iv. Set k to k + 1.
-                k += 1;
-            }
-
-            // c. If kPresent is false, throw a TypeError exception.
-            if !k_present {
-                return vm.throw_completion(ErrorKind::TypeError, ErrorType::ReduceNoInitial, &[]);
-            }
-        }
-
-        // 9. Repeat, while k < len,
-        while k < length {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kPresent be ? HasProperty(O, Pk).
-            let k_present = object.has_property(vm, &property_key)?;
-
-            // c. If kPresent is true, then
-            if k_present {
-                // i. Let kValue be ? Get(O, Pk).
-                let k_value = object.get(vm, &property_key)?;
-
-                // ii. Set accumulator to ? Call(callbackfn, undefined, « accumulator, kValue, 𝔽(k), O »).
-                accumulator = call_function_object(
-                    vm,
-                    callback_function.as_function(),
-                    Value::UNDEFINED,
-                    &[accumulator, k_value, number(k), Value::from_object(object)],
-                )?;
-            }
-
-            // d. Set k to k + 1.
-            k += 1;
-        }
-
-        // 10. Return accumulator.
-        Ok(accumulator)
-    }
-
-    // 23.1.3.25 Array.prototype.reduceRight ( callbackfn [ , initialValue ] ), https://tc39.es/ecma262/#sec-array.prototype.reduceright
-    fn reduce_right(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let callback_function = vm.argument(0);
-        let initial_value = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(callbackfn) is false, throw a TypeError exception.
-        if !callback_function.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&callback_function]);
-        }
-
-        // 4. If len = 0 and initialValue is not present, throw a TypeError exception.
-        if length == 0 && vm.argument_count() <= 1 {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::ReduceNoInitial, &[]);
-        }
-
-        // 5. Let k be len - 1.
-        let mut k = length as i64 - 1;
-
-        // 6. Let accumulator be undefined.
-        let mut accumulator = Value::UNDEFINED;
-
-        // 7. If initialValue is present, then
-        if vm.argument_count() > 1 {
-            // a. Set accumulator to initialValue.
-            accumulator = initial_value;
-        }
-        // 8. Else,
-        else {
-            // a. Let kPresent be false.
-            let mut k_present = false;
-
-            // b. Repeat, while kPresent is false and k ≥ 0,
-            while !k_present && k >= 0 {
-                // i. Let Pk be ! ToString(𝔽(k)).
-                let property_key = property_key(k as u64);
-
-                // ii. Set kPresent to ? HasProperty(O, Pk).
-                k_present = object.has_property(vm, &property_key)?;
-
-                // iii. If kPresent is true, then
-                if k_present {
-                    // 1. Set accumulator to ? Get(O, Pk).
-                    accumulator = object.get(vm, &property_key)?;
-                }
-
-                // iv. Set k to k - 1.
-                k -= 1;
-            }
-
-            // c. If kPresent is false, throw a TypeError exception.
-            if !k_present {
-                return vm.throw_completion(ErrorKind::TypeError, ErrorType::ReduceNoInitial, &[]);
-            }
-        }
-
-        // 9. Repeat, while k ≥ 0,
-        while k >= 0 {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k as u64);
-
-            // b. Let kPresent be ? HasProperty(O, Pk).
-            let k_present = object.has_property(vm, &property_key)?;
-
-            // c. If kPresent is true, then
-            if k_present {
-                // i. Let kValue be ? Get(O, Pk).
-                let k_value = object.get(vm, &property_key)?;
-
-                // ii. Set accumulator to ? Call(callbackfn, undefined, « accumulator, kValue, 𝔽(k), O »).
-                accumulator = call_function_object(
-                    vm,
-                    callback_function.as_function(),
-                    Value::UNDEFINED,
-                    &[accumulator, k_value, number(k as u64), Value::from_object(object)],
-                )?;
-            }
-
-            // d. Set k to k - 1.
-            k -= 1;
-        }
-
-        // 10. Return accumulator.
-        Ok(accumulator)
     }
 
     // 23.1.3.26 Array.prototype.reverse ( ), https://tc39.es/ecma262/#sec-array.prototype.reverse
@@ -1541,25 +1033,26 @@ impl ArrayPrototype {
             && can_use_packed_array_fast_path(&array)
             && u64::from(array.indexed_array_like_size()) == initial_length
             && let Some(result_array) = fast_array_species_result(new_array)
+            && result_array != array
         {
             let start = actual_start as u32;
             let end = final_ as u32;
+            // NB: The result ends up with exactly the elements of the slice, as packed data properties with the
+            //     default attributes: a species constructor can return an array with more elements, which setting
+            //     the length at the end removes, and its storage holds no other attributes.
+            let result_length = end.saturating_sub(start);
+            result_array.set_indexed_property_elements_to_undefined(result_length);
             for i in start..end {
-                result_array.indexed_put(
+                result_array.set_packed_indexed_element(
                     i - start,
                     array
                         .indexed_get(i)
                         .expect("a packed array has every element below its size")
                         .value,
-                    DEFAULT_ATTRIBUTES,
                 );
             }
-
-            // NB: A species constructor can return an array with more elements than the slice. The spec sets the
-            //     length of the result at the end, which removes them.
-            let result_length = end.saturating_sub(start);
-            if result_array.indexed_array_like_size() != result_length {
-                assert!(result_array.set_indexed_array_like_size(result_length as usize));
+            if result_length == 0 {
+                assert!(result_array.set_indexed_array_like_size(0));
             }
             return Ok(Value::from_object(result_array));
         }
@@ -1580,58 +1073,6 @@ impl ArrayPrototype {
 
         new_array.set(vm, &vm.names.length, number(index), ShouldThrowExceptions::Yes)?;
         Ok(Value::from_object(new_array))
-    }
-
-    // 23.1.3.29 Array.prototype.some ( callbackfn [ , thisArg ] ), https://tc39.es/ecma262/#sec-array.prototype.some
-    fn some(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let callback_function = vm.argument(0);
-        let this_arg = vm.argument(1);
-
-        // 1. Let O be ? ToObject(this value).
-        let object = vm.this_value().to_object(vm)?;
-
-        // 2. Let len be ? LengthOfArrayLike(O).
-        let length = length_of_array_like(vm, &object)?;
-
-        // 3. If IsCallable(callbackfn) is false, throw a TypeError exception.
-        if !callback_function.is_function() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&callback_function]);
-        }
-
-        // 4. Let k be 0.
-        // 5. Repeat, while k < len,
-        for k in 0..length {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let property_key = property_key(k);
-
-            // b. Let kPresent be ? HasProperty(O, Pk).
-            let k_present = object.has_property(vm, &property_key)?;
-
-            // c. If kPresent is true, then
-            if k_present {
-                // i. Let kValue be ? Get(O, Pk).
-                let k_value = object.get(vm, &property_key)?;
-
-                // ii. Let testResult be ToBoolean(? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »)).
-                let test_result = call_function_object(
-                    vm,
-                    callback_function.as_function(),
-                    this_arg,
-                    &[k_value, number(k), Value::from_object(object)],
-                )?
-                .to_boolean();
-
-                // iii. If testResult is true, return true.
-                if test_result {
-                    return Ok(Value::TRUE);
-                }
-            }
-
-            // d. Set k to k + 1.
-        }
-
-        // 6. Return false.
-        Ok(Value::FALSE)
     }
 
     // 23.1.3.30 Array.prototype.sort ( comparefn ), https://tc39.es/ecma262/#sec-array.prototype.sort
@@ -2351,7 +1792,7 @@ impl ArrayPrototype {
 }
 
 // 10.4.2.3 ArraySpeciesCreate ( originalArray, length ), https://tc39.es/ecma262/#sec-arrayspeciescreate
-fn array_species_create(vm: &Vm, original_array: &Object, length: u64) -> ThrowCompletionOr<Gc<Object>> {
+pub(crate) fn array_species_create(vm: &Vm, original_array: &Object, length: u64) -> ThrowCompletionOr<Gc<Object>> {
     let realm = vm.current_realm().expect("a builtin runs in a realm");
 
     let is_array = Value::from_object(original_array.as_gc()).is_array(vm)?;
@@ -2378,6 +1819,19 @@ fn array_species_create(vm: &Vm, original_array: &Object, length: u64) -> ThrowC
         {
             constructor = Value::UNDEFINED;
         }
+    }
+
+    // OPTIMIZATION: Get(%Array%, @@species) of the intrinsic getter returns %Array% itself, and Construct(%Array%,
+    //               « length ») is ArrayCreate(length), since %Array%.prototype cannot change.
+    if constructor.is_object()
+        && let Some(realm) = vm.current_realm()
+        && constructor.as_object() == realm.intrinsics().array_constructor(vm).upcast()
+        && realm
+            .intrinsics()
+            .array_constructor(vm)
+            .has_intrinsic_symbol_species_getter(vm)
+    {
+        return Ok(Array::create(vm, realm, length, None)?.upcast());
     }
 
     if constructor.is_object() {

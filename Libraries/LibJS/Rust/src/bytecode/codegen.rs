@@ -716,10 +716,16 @@ fn generate_function_expression(
     let should_eager_compile = generator.eager_compile_function_ids.contains(&function_id);
     let data = generator.function_table.take(function_id);
     let has_name = data.name.is_some();
+    // OPTIMIZATION: Nothing observes the scope of a name the function never looks up.
+    let binds_name = has_name
+        && match &data.body.inner {
+            StatementKind::FunctionBody { scope, .. } => !generator.arena.scopes[*scope].function_name_is_unused,
+            _ => true,
+        };
 
     // Named function expressions get an intermediate scope so the name
     // is visible inside the function body but not outside.
-    let name_id = if has_name {
+    let name_id = if binds_name {
         let parent = generator
             .lexical_environment_register_stack
             .last()
@@ -779,12 +785,8 @@ fn generate_function_expression(
         home_object,
     });
 
-    if has_name {
-        emit_initialize_lexical_binding(
-            generator,
-            name_id.expect("has_name guarantees name_id is set"),
-            dst.operand(),
-        );
+    if let Some(name_id) = name_id {
+        emit_initialize_lexical_binding(generator, name_id, dst.operand());
 
         generator.end_variable_scope();
     }
@@ -3227,6 +3229,15 @@ fn try_generate_builtin_abstract_operation(
         generator.emit(Instruction::ThrowIfNotObject { src: src.operand() });
         return Some(Some(dst));
     }
+    if name == utf16!("ThrowNotAFunction") {
+        let src = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        generator.emit(Instruction::ThrowNotAFunction { src: src.operand() });
+        return Some(Some(dst));
+    }
+    if name == utf16!("ArgumentCount") {
+        generator.emit(Instruction::GetArgumentCount { dst: dst.operand() });
+        return Some(Some(dst));
+    }
     if name == utf16!("ThrowTypeError") {
         if let ExpressionKind::StringLiteral(ref s) = data.arguments[0].value.inner {
             let message_string = generator.intern_string(s);
@@ -3315,6 +3326,7 @@ fn try_generate_builtin_abstract_operation(
 
     // Operations that map to intrinsic function calls.
     let known_operations: &[(&[u16], AbstractOperationKind)] = &[
+        (utf16!("ArraySpeciesCreate"), AbstractOperationKind::ArraySpeciesCreate),
         (utf16!("AsyncIteratorClose"), AbstractOperationKind::AsyncIteratorClose),
         (utf16!("GetMethod"), AbstractOperationKind::GetMethod),
         (utf16!("GetIteratorDirect"), AbstractOperationKind::GetIteratorDirect),
@@ -4363,11 +4375,13 @@ fn emit_get_by_value(
         }
         return;
     }
+    let cache = generator.next_property_lookup_cache();
     generator.emit(Instruction::GetByValue {
         dst: dst.operand(),
         base: base.operand(),
         property: property.operand(),
         base_identifier,
+        cache,
     });
 }
 
@@ -4429,12 +4443,14 @@ fn emit_put_normal_by_value(
         });
         return;
     }
+    let cache = generator.next_property_lookup_cache();
     generator.emit(Instruction::PutByValue {
         base: base.operand(),
         property: property.operand(),
         src: src.operand(),
         base_identifier,
         kind: PutKind::Normal as u32,
+        cache,
     });
 }
 
@@ -4487,12 +4503,14 @@ fn emit_put_by_value(
         });
         return;
     }
+    let cache = generator.next_property_lookup_cache();
     generator.emit(Instruction::PutByValue {
         base: base.operand(),
         property: property.operand(),
         src: src.operand(),
         base_identifier: None,
         kind: kind as u32,
+        cache,
     });
 }
 
@@ -5651,12 +5669,14 @@ fn emit_object_property_set_by_key(
 ) {
     if is_computed {
         let key_val = generate_expression_or_undefined(key, generator, None);
+        let cache = generator.next_property_lookup_cache();
         generator.emit(Instruction::PutByValue {
             base: object.operand(),
             property: key_val.operand(),
             src: value.operand(),
             base_identifier: None,
             kind: PutKind::Own as u32,
+            cache,
         });
         return;
     }
@@ -5684,23 +5704,27 @@ fn emit_object_property_set_by_key(
         }
         ExpressionKind::NumericLiteral(n) => {
             let key_val = generator.add_constant_number(*n);
+            let cache = generator.next_property_lookup_cache();
             generator.emit(Instruction::PutByValue {
                 base: object.operand(),
                 property: key_val.operand(),
                 src: value.operand(),
                 base_identifier: None,
                 kind: PutKind::Own as u32,
+                cache,
             });
         }
         _ => {
             // Computed key
             let key_val = generate_expression_or_undefined(key, generator, None);
+            let cache = generator.next_property_lookup_cache();
             generator.emit(Instruction::PutByValue {
                 base: object.operand(),
                 property: key_val.operand(),
                 src: value.operand(),
                 base_identifier: None,
                 kind: PutKind::Own as u32,
+                cache,
             });
         }
     }
@@ -5742,20 +5766,24 @@ fn emit_object_accessor_by_key(
     let emit_by_value = |generator: &mut Generator, key: &Expression| {
         let key_val = generate_expression_or_undefined(key, generator, None);
         if is_getter {
+            let cache = generator.next_property_lookup_cache();
             generator.emit(Instruction::PutByValue {
                 base: object.operand(),
                 property: key_val.operand(),
                 src: value.operand(),
                 base_identifier: None,
                 kind: PutKind::Getter as u32,
+                cache,
             });
         } else {
+            let cache = generator.next_property_lookup_cache();
             generator.emit(Instruction::PutByValue {
                 base: object.operand(),
                 property: key_val.operand(),
                 src: value.operand(),
                 base_identifier: None,
                 kind: PutKind::Setter as u32,
+                cache,
             });
         }
     };
@@ -8598,7 +8626,23 @@ pub fn emit_function_declaration_instantiation(
     if has_parameter_expressions {
         let non_local_parameter_count = parameter_names.iter().filter(|p| !p.is_local).count();
         if non_local_parameter_count > 0 {
-            generator.push_new_lexical_environment(u32_from_usize(non_local_parameter_count));
+            // NB: The arguments binding goes here too, and so do the lexical declarations of strict code without a
+            //     separate var environment for non-local vars (see Step 5 and Step 7).
+            let arguments_name = ak::Utf16FlyString::from_utf8("arguments");
+            let arguments_binding = arguments_object_needed
+                && !generator
+                    .local_variables
+                    .iter()
+                    .any(|lv| lv.name == arguments_name && !lv.is_lexically_declared);
+            let has_non_local_vars =
+                function_scope_data.is_some_and(|fsd| fsd.vars_to_initialize.iter().any(|v| v.local.is_none()));
+            let lexical_bindings = if strict && !has_non_local_vars {
+                count_non_local_lexical_bindings(body_scope, &generator.arena)
+            } else {
+                0
+            };
+            let capacity = u32_from_usize(non_local_parameter_count) + u32::from(arguments_binding) + lexical_bindings;
+            generator.push_new_lexical_environment(capacity);
         }
     }
 

@@ -20,6 +20,7 @@ use super::vm::Vm;
 use crate::bytecode::executable::PropertyLookupCache;
 use crate::bytecode::op;
 use crate::layout::value::Value;
+use property_access::KeyedSiteCache;
 
 /// The VM a helper receives as an integer argument.
 fn vm_from_helper_argument<'vm>(argument: u64) -> &'vm Vm {
@@ -357,7 +358,34 @@ impl RuntimeFunctions for Runtime {
         instruction: &op::GetByValue,
         values: &mut op::GetByValueValues,
     ) -> SlowPathControl {
-        property_access::get_by_value(vm, pc, instruction, values)
+        property_access::get_by_value(vm, pc, instruction, values, KeyedSiteCache::Use)
+    }
+
+    fn get_by_value_uncached(
+        vm: &Vm,
+        pc: u32,
+        instruction: &op::GetByValue,
+        values: &mut op::GetByValueValues,
+    ) -> SlowPathControl {
+        property_access::get_by_value(vm, pc, instruction, values, KeyedSiteCache::Skip)
+    }
+
+    fn try_get_by_id_cache_on_primitive(
+        vm: &Vm,
+        _pc: u32,
+        instruction: &op::GetById,
+        values: &mut op::GetByIdValues,
+    ) -> bool {
+        property_access::try_get_by_id_cache_on_primitive(vm, instruction, values)
+    }
+
+    fn try_get_by_value_cache(
+        vm: &Vm,
+        _pc: u32,
+        instruction: &op::GetByValue,
+        values: &mut op::GetByValueValues,
+    ) -> bool {
+        property_access::try_get_by_value_cache(vm, instruction, values)
     }
 
     fn get_by_value_with_this(
@@ -405,7 +433,25 @@ impl RuntimeFunctions for Runtime {
         instruction: &op::PutByValue,
         values: &mut op::PutByValueValues,
     ) -> SlowPathControl {
-        property_access::put_by_value(vm, pc, instruction, values)
+        property_access::put_by_value(vm, pc, instruction, values, KeyedSiteCache::Use)
+    }
+
+    fn put_by_value_uncached(
+        vm: &Vm,
+        pc: u32,
+        instruction: &op::PutByValue,
+        values: &mut op::PutByValueValues,
+    ) -> SlowPathControl {
+        property_access::put_by_value(vm, pc, instruction, values, KeyedSiteCache::Skip)
+    }
+
+    fn try_put_by_value_cache(
+        vm: &Vm,
+        _pc: u32,
+        instruction: &op::PutByValue,
+        values: &mut op::PutByValueValues,
+    ) -> bool {
+        property_access::try_put_by_value_cache(vm, instruction, values)
     }
 
     fn put_by_value_with_this(
@@ -1421,6 +1467,24 @@ impl RuntimeFunctions for Runtime {
         _values: &mut op::ThrowConstAssignmentValues,
     ) -> SlowPathControl {
         control::throw_const_assignment(vm, pc)
+    }
+
+    fn throw_not_a_function(
+        vm: &Vm,
+        pc: u32,
+        _instruction: &op::ThrowNotAFunction,
+        values: &mut op::ThrowNotAFunctionValues,
+    ) -> SlowPathControl {
+        control::throw_not_a_function(vm, pc, values)
+    }
+
+    fn get_argument_count(
+        vm: &Vm,
+        pc: u32,
+        _instruction: &op::GetArgumentCount,
+        values: &mut op::GetArgumentCountValues,
+    ) -> SlowPathControl {
+        control::get_argument_count(vm, pc, values)
     }
 
     fn r#await(vm: &Vm, _pc: u32, instruction: &op::Await, values: &mut op::AwaitValues) -> SlowPathControl {

@@ -38,7 +38,34 @@ pub struct PropertyLookupCacheEntry {
     pub shape: Cell<Option<Gc<Shape>>>,
     pub prototype: Cell<Option<Gc<Object>>>,
     pub prototype_chain_validity: Cell<Option<Gc<PrototypeChainValidity>>>,
+    /// The encoded string or symbol Value whose property this entry describes, for the caches of keyed accesses like
+    /// GetByValue, or 0 for the caches of named accesses like GetById, whose instruction determines the property. Like
+    /// the cells above, the key is not kept alive by the cache.
+    pub key: Cell<u64>,
 }
+
+/// The layout of an entry of the VM's keyed property lookup cache (KeyedPropertyLookupCacheEntry of the bytecode
+/// executable, which asserts that it matches), for the interpreter, which looks up own data properties in it.
+#[repr(C, align(64))]
+pub struct KeyedPropertyLookupCacheEntryLayout {
+    pub entry_type: PropertyLookupCacheEntryType,
+    pub property_offset: u32,
+    pub shape_dictionary_generation: u32,
+    pub shape: Option<Gc<Shape>>,
+    pub prototype: Option<Gc<Object>>,
+    pub prototype_chain_validity: Option<Gc<PrototypeChainValidity>>,
+    pub new_shape: Option<Gc<Shape>>,
+    /// The identity of the name of the property, the word of a fly string, or 0.
+    pub property_name: u64,
+}
+
+const _: () = assert!(size_of::<KeyedPropertyLookupCacheEntryLayout>() == 64);
+
+/// How the interpreter finds the entry of the keyed property lookup cache that may hold a lookup: the top this many bits
+/// of the 32-bit product of this multiplier and the low 32 bits of the shape's address XORed with the name's identity
+/// (see KeyedPropertyLookupCache::entry_index_for() of the bytecode executable, which asserts that these match).
+pub const KEYED_PROPERTY_LOOKUP_CACHE_INTERPRETER_INDEX_BITS: u32 = 11;
+pub const KEYED_PROPERTY_LOOKUP_CACHE_INTERPRETER_HASH_MULTIPLIER: u32 = 0x9e37_79b9;
 
 /// A tagged pointer to the entries of a property lookup cache; the interpreter only ever consults the first entry.
 #[repr(C)]
@@ -47,6 +74,12 @@ pub struct PropertyLookupCache {
 }
 
 pub const PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK: usize = 3;
+
+/// The tag of a polymorphic cache's data, whose entries are an array the interpreter probes.
+pub const PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG: usize = 1;
+
+/// The data of a keyed generic cache: the tag without data (see PropertyLookupCache::is_keyed_generic()).
+pub const PROPERTY_LOOKUP_CACHE_KEYED_GENERIC_DATA: usize = 3;
 
 #[repr(C)]
 pub struct GlobalVariableCache {

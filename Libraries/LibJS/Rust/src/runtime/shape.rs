@@ -12,6 +12,7 @@ use indexmap::IndexMap;
 
 use crate::gc::class::{GcCell, define_cell};
 use crate::gc::gc_ref_cell::GcRefCell;
+use crate::gc::heap::cell_is_dead;
 use crate::gc::root::MarkedVec;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::gc::weak::GcWeak;
@@ -20,7 +21,9 @@ use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::object::Object;
 use crate::layout::property_lookup_cache::ObjectPropertyIteratorCacheData;
 pub use crate::layout::shape::{PrototypeChainValidity, Shape};
+use crate::layout::value::Value;
 use crate::runtime::descriptor_array::{DescriptorArray, MAX_DESCRIPTOR_COUNT, PropertyMetadata};
+use crate::runtime::object::IntegrityLevel;
 use crate::runtime::property_attributes::PropertyAttributes;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
@@ -62,6 +65,14 @@ impl PrototypeChainValidity {
 mod shape_flag {
     pub const DICTIONARY: u8 = 1 << 0;
     pub const HAS_PARAMETER_MAP: u8 = 1 << 1;
+    /// Whether HAS_CONVERSION_PROPERTIES has been found for a shape that is not a dictionary.
+    pub const CONVERSION_PROPERTIES_KNOWN: u8 = 1 << 2;
+    /// Whether the shape has one of the properties that conversions to primitives look up.
+    pub const HAS_CONVERSION_PROPERTIES: u8 = 1 << 3;
+    /// Whether HAS_TO_STRING_TAG has been found for a shape that is not a dictionary.
+    pub const TO_STRING_TAG_KNOWN: u8 = 1 << 4;
+    /// Whether the shape has a @@toStringTag property.
+    pub const HAS_TO_STRING_TAG: u8 = 1 << 5;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,6 +107,29 @@ struct RareData {
     prototype_transitions: HashMap<usize, GcWeak<Shape>, RandomState>,
     delete_transitions: HashMap<PropertyKey, GcWeak<Shape>, RandomState>,
     child_prototype_shapes: Vec<GcWeak<Shape>>,
+    own_string_keys: Option<OwnStringKeys>,
+    assign_copy: Option<AssignCopy>,
+    /// The shapes that sealing and freezing objects of this shape give them, by integrity level.
+    integrity_level_shapes: [Option<Gc<Shape>>; 2],
+}
+
+/// What Object.assign of an object with a shape onto an empty object makes, as set_cached_assign_copy() keeps it.
+#[derive(Clone, Copy)]
+pub struct AssignCopy {
+    /// The validity of the shape of the prototype of the empty object when the copy was found to be right, which stops
+    /// being valid when that prototype changes its properties.
+    pub prototype_validity: Gc<PrototypeChainValidity>,
+    /// The shape the empty object ends up with.
+    pub copy_shape: Gc<Shape>,
+}
+
+/// The string keys of the properties of a shape, as with_own_string_keys() caches them.
+struct OwnStringKeys {
+    /// The dictionary generation of the shape when the keys were collected. Changing the properties of a shape in
+    /// place changes its generation.
+    generation: u32,
+    keys: Box<[Value]>,
+    enumerable: Box<[bool]>,
 }
 
 /// The parts of a shape the interpreter does not read.
@@ -145,6 +179,16 @@ unsafe impl Trace for ShapeStorage {
             for property_key in rare_data.delete_transitions.keys() {
                 property_key.trace(visitor);
             }
+            if let Some(own_string_keys) = &rare_data.own_string_keys {
+                visitor.visit_values(&own_string_keys.keys);
+            }
+            if let Some(assign_copy) = &rare_data.assign_copy {
+                visitor.visit(assign_copy.prototype_validity);
+                visitor.visit(assign_copy.copy_shape);
+            }
+            for shape in rare_data.integrity_level_shapes.iter().flatten() {
+                visitor.visit(*shape);
+            }
         }
     }
 }
@@ -164,6 +208,71 @@ unsafe impl Trace for Shape {
 
 fn prototype_address(prototype: Option<Gc<Object>>) -> usize {
     prototype.map_or(0, |prototype| prototype.as_ptr().addr())
+}
+
+/// A prototype transition the VM's cache of them remembers: from shape `from` to prototype `prototype` (see
+/// prototype_address()) leads to `target`.
+#[derive(Clone, Copy, Default)]
+struct PrototypeTransition {
+    from: Option<Gc<Shape>>,
+    prototype: usize,
+    target: Option<Gc<Shape>>,
+}
+
+const PROTOTYPE_TRANSITION_CACHE_INDEX_BITS: u32 = 8;
+
+/// The prototype transitions made most recently, by the hash of the shape and the prototype, in front of the
+/// transition tables of shapes. Objects are made with a prototype all the time (arrays, regular expression results,
+/// instances of classes), and their shapes come from the realm's empty object shape, whose table of prototype
+/// transitions has an entry for every prototype objects were ever made with.
+///
+/// Like the transition tables, the cache does not keep its shapes alive: the VM's sweep callback forgets transitions
+/// whose shapes died. A target shape keeps its prototype alive, so the prototype of a remembered transition is alive.
+pub struct PrototypeTransitionCache {
+    entries: [Cell<PrototypeTransition>; 1 << PROTOTYPE_TRANSITION_CACHE_INDEX_BITS],
+}
+
+impl PrototypeTransitionCache {
+    pub fn new() -> Self {
+        Self {
+            entries: core::array::from_fn(|_| Cell::new(PrototypeTransition::default())),
+        }
+    }
+
+    fn entry(&self, from: Gc<Shape>, prototype: usize) -> &Cell<PrototypeTransition> {
+        let hash = (from.as_ptr().addr() as u32 ^ prototype as u32).wrapping_mul(0x9e37_79b9);
+        &self.entries[(hash >> (32 - PROTOTYPE_TRANSITION_CACHE_INDEX_BITS)) as usize]
+    }
+
+    fn get(&self, from: Gc<Shape>, prototype: usize) -> Option<Gc<Shape>> {
+        let transition = self.entry(from, prototype).get();
+        (transition.from == Some(from) && transition.prototype == prototype)
+            .then_some(transition.target)
+            .flatten()
+    }
+
+    fn set(&self, from: Gc<Shape>, prototype: usize, target: Gc<Shape>) {
+        self.entry(from, prototype).set(PrototypeTransition {
+            from: Some(from),
+            prototype,
+            target: Some(target),
+        });
+    }
+
+    pub fn remove_dead_entries(&self) {
+        for entry in &self.entries {
+            let transition = entry.get();
+            if transition.from.is_some_and(cell_is_dead) || transition.target.is_some_and(cell_is_dead) {
+                entry.set(PrototypeTransition::default());
+            }
+        }
+    }
+}
+
+impl Default for PrototypeTransitionCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Shape {
@@ -451,7 +560,16 @@ impl Shape {
     }
 
     pub fn create_prototype_transition(&self, vm: &Vm, new_prototype: Option<Gc<Object>>) -> Gc<Shape> {
+        // NB: Dictionary shapes change in place, and prototype shapes have no cached transitions.
+        let cache = (!self.is_dictionary() && !self.is_prototype_shape()).then(|| vm.prototype_transition_cache());
+        let prototype = prototype_address(new_prototype);
+        if let Some(existing_shape) = cache.and_then(|cache| cache.get(self.as_gc(), prototype)) {
+            return existing_shape;
+        }
         if let Some(existing_shape) = self.get_or_prune_cached_prototype_transition(new_prototype) {
+            if let Some(cache) = cache {
+                cache.set(self.as_gc(), prototype, existing_shape);
+            }
             return existing_shape;
         }
         if let Some(new_prototype) = new_prototype {
@@ -471,11 +589,10 @@ impl Shape {
         self.invalidate_prototype_if_needed_for_new_prototype(vm, new_shape);
         if !self.is_prototype_shape() {
             let target = GcWeak::new(vm.heap(), new_shape);
-            self.with_rare_data(|rare_data| {
-                rare_data
-                    .prototype_transitions
-                    .insert(prototype_address(new_prototype), target)
-            });
+            self.with_rare_data(|rare_data| rare_data.prototype_transitions.insert(prototype, target));
+        }
+        if let Some(cache) = cache {
+            cache.set(self.as_gc(), prototype, new_shape);
         }
         new_shape
     }
@@ -536,6 +653,13 @@ impl Shape {
 
     pub fn add_property_without_transition(&self, vm: &Vm, property_key: &PropertyKey, attributes: PropertyAttributes) {
         self.invalidate_prototype_if_needed_for_change_without_transition(vm);
+        self.flags.set(
+            self.flags.get()
+                & !(shape_flag::CONVERSION_PROPERTIES_KNOWN
+                    | shape_flag::HAS_CONVERSION_PROPERTIES
+                    | shape_flag::TO_STRING_TAG_KNOWN
+                    | shape_flag::HAS_TO_STRING_TAG),
+        );
         let property_count = self.property_count();
         let metadata = PropertyMetadata {
             offset: property_count,
@@ -598,6 +722,74 @@ impl Shape {
             self.property_count.set(self.property_count() - 1);
         }
         self.increment_dictionary_generation();
+    }
+
+    /// Calls `callback` with the string keys of the properties of this shape in insertion order, as string values, and
+    /// whether each of the properties is enumerable. They are made the first time they are asked for, and kept on the
+    /// shape until its properties change. The callback must not allocate cells.
+    pub fn with_own_string_keys<R>(&self, vm: &Vm, callback: impl FnOnce(&[Value], &[bool]) -> R) -> R {
+        let generation = self.dictionary_generation();
+        let is_cached = self
+            .storage
+            .rare_data
+            .borrow()
+            .as_ref()
+            .and_then(|rare_data| rare_data.own_string_keys.as_ref())
+            .is_some_and(|own_string_keys| own_string_keys.generation == generation);
+        if !is_cached {
+            let mut property_keys = Vec::with_capacity(self.property_count() as usize);
+            self.for_each_property_in_insertion_order(|property_key, metadata| {
+                if property_key.is_string() {
+                    property_keys.push((property_key.clone(), metadata.attributes.is_enumerable()));
+                }
+                ControlFlow::Continue(())
+            });
+            let keys = MarkedVec::with_capacity(vm, property_keys.len());
+            for (property_key, _) in &property_keys {
+                keys.push(property_key.to_value(vm));
+            }
+            let own_string_keys = OwnStringKeys {
+                generation,
+                keys: keys.with_values(|keys| keys.into()),
+                enumerable: property_keys.iter().map(|(_, enumerable)| *enumerable).collect(),
+            };
+            self.with_rare_data(|rare_data| rare_data.own_string_keys = Some(own_string_keys));
+        }
+        let rare_data = self.storage.rare_data.borrow();
+        let own_string_keys = rare_data
+            .as_ref()
+            .and_then(|rare_data| rare_data.own_string_keys.as_ref())
+            .expect("the shape has its own string keys");
+        callback(&own_string_keys.keys, &own_string_keys.enumerable)
+    }
+
+    /// What Object.assign of an object with this shape onto an empty object made, if it was kept.
+    pub fn cached_assign_copy(&self) -> Option<AssignCopy> {
+        self.storage
+            .rare_data
+            .borrow()
+            .as_ref()
+            .and_then(|rare_data| rare_data.assign_copy)
+    }
+
+    pub fn set_cached_assign_copy(&self, assign_copy: AssignCopy) {
+        assert!(!self.is_dictionary());
+        self.with_rare_data(|rare_data| rare_data.assign_copy = Some(assign_copy));
+    }
+
+    /// The shape that SetIntegrityLevel with `level` gave objects of this shape that have no accessor properties, if
+    /// it was kept.
+    pub fn cached_integrity_level_shape(&self, level: IntegrityLevel) -> Option<Gc<Shape>> {
+        self.storage
+            .rare_data
+            .borrow()
+            .as_ref()
+            .and_then(|rare_data| rare_data.integrity_level_shapes[level as usize])
+    }
+
+    pub fn set_cached_integrity_level_shape(&self, level: IntegrityLevel, shape: Gc<Shape>) {
+        assert!(!self.is_dictionary() && !self.is_prototype_shape());
+        self.with_rare_data(|rare_data| rare_data.integrity_level_shapes[level as usize] = Some(shape));
     }
 
     fn increment_dictionary_generation(&self) {
@@ -748,6 +940,63 @@ impl Shape {
 
     pub fn set_has_parameter_map(&self) {
         self.flags.set(self.flags.get() | shape_flag::HAS_PARAMETER_MAP);
+    }
+
+    /// Whether objects of this shape have one of the properties that converting an object to a primitive looks up:
+    /// "toString", "valueOf", @@toPrimitive and @@toStringTag.
+    pub fn has_conversion_properties(&self, vm: &Vm) -> bool {
+        if self.property_count() == 0 {
+            return false;
+        }
+        // OPTIMIZATION: The properties of a shape that is not a dictionary only change when one is added to it without a
+        //               transition, which forgets the answer, so the answer is kept.
+        let flags = self.flags.get();
+        if flags & shape_flag::CONVERSION_PROPERTIES_KNOWN != 0 {
+            return flags & shape_flag::HAS_CONVERSION_PROPERTIES != 0;
+        }
+        let well_known_symbols = vm.well_known_symbols();
+        let has_conversion_properties = self.lookup(&vm.names.toString).is_some()
+            || self.lookup(&vm.names.valueOf).is_some()
+            || self
+                .lookup(&PropertyKey::from(well_known_symbols.to_primitive))
+                .is_some()
+            || self
+                .lookup(&PropertyKey::from(well_known_symbols.to_string_tag))
+                .is_some();
+        if !self.is_dictionary() {
+            let has_flag = if has_conversion_properties {
+                shape_flag::HAS_CONVERSION_PROPERTIES
+            } else {
+                0
+            };
+            self.flags
+                .set(flags | shape_flag::CONVERSION_PROPERTIES_KNOWN | has_flag);
+        }
+        has_conversion_properties
+    }
+
+    /// Whether objects of this shape have a @@toStringTag property.
+    pub fn has_to_string_tag(&self, vm: &Vm) -> bool {
+        if self.property_count() == 0 {
+            return false;
+        }
+        // OPTIMIZATION: As with has_conversion_properties(), the answer is kept for shapes that are not dictionaries.
+        let flags = self.flags.get();
+        if flags & shape_flag::TO_STRING_TAG_KNOWN != 0 {
+            return flags & shape_flag::HAS_TO_STRING_TAG != 0;
+        }
+        let has_to_string_tag = self
+            .lookup(&PropertyKey::from(vm.well_known_symbols().to_string_tag))
+            .is_some();
+        if !self.is_dictionary() {
+            let has_flag = if has_to_string_tag {
+                shape_flag::HAS_TO_STRING_TAG
+            } else {
+                0
+            };
+            self.flags.set(flags | shape_flag::TO_STRING_TAG_KNOWN | has_flag);
+        }
+        has_to_string_tag
     }
 
     pub fn dictionary_generation(&self) -> u32 {

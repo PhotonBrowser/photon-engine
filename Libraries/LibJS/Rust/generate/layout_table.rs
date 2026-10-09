@@ -204,6 +204,9 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.section("PropertyLookupCache layout");
     offset!(w, "PROPERTY_LOOKUP_CACHE_DATA", PropertyLookupCache, data);
     w.hex_constant("PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK", !(PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK as u64));
+    w.constant("PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK", PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK);
+    w.constant("PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG", PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG);
+    w.constant("PROPERTY_LOOKUP_CACHE_KEYED_GENERIC", PROPERTY_LOOKUP_CACHE_KEYED_GENERIC_DATA);
     size!(w, "PROPERTY_LOOKUP_CACHE_SIZE", PropertyLookupCache);
 
     w.section("PropertyLookupCache::Entry layout");
@@ -217,7 +220,20 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "PROPERTY_LOOKUP_CACHE_ENTRY_SHAPE", "PropertyLookupCache.shape", "Shape", PropertyLookupCacheEntry, shape, 8, "nullable", "cell", "cache_target");
     field!(w, "PROPERTY_LOOKUP_CACHE_ENTRY_PROTOTYPE", "PropertyLookupCache.prototype", "Object", PropertyLookupCacheEntry, prototype, 8, "nullable", "cell", "cache_target");
     field!(w, "PROPERTY_LOOKUP_CACHE_ENTRY_PROTOTYPE_CHAIN_VALIDITY", "PropertyLookupCache.prototype_chain_validity", "PrototypeChainValidity", PropertyLookupCacheEntry, prototype_chain_validity, 8, "nullable", "cell");
+    field!(w, "PROPERTY_LOOKUP_CACHE_ENTRY_KEY", "PropertyLookupCache.key", "Value", PropertyLookupCacheEntry, key, 8, "nullable", "scalar");
     size!(w, "PROPERTY_LOOKUP_CACHE_ENTRY_SIZE", PropertyLookupCacheEntry);
+    w.constant("PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_OWN_PROPERTY", PropertyLookupCacheEntryType::GetOwnProperty as u32);
+
+    w.section("KeyedPropertyLookupCacheEntry layout");
+    field!(w, "KEYED_PROPERTY_LOOKUP_CACHE_ENTRY_TYPE", "KeyedPropertyLookupCacheEntry.entry_type", "u32", KeyedPropertyLookupCacheEntryLayout, entry_type, 4, "nullable", "scalar");
+    field!(w, "KEYED_PROPERTY_LOOKUP_CACHE_ENTRY_PROPERTY_OFFSET", "KeyedPropertyLookupCacheEntry.property_offset", "u32", KeyedPropertyLookupCacheEntryLayout, property_offset, 4, "nullable", "scalar");
+    field!(w, "KEYED_PROPERTY_LOOKUP_CACHE_ENTRY_DICTIONARY_GENERATION", "KeyedPropertyLookupCacheEntry.shape_dictionary_generation", "u32", KeyedPropertyLookupCacheEntryLayout, shape_dictionary_generation, 4, "nullable", "scalar");
+    field!(w, "KEYED_PROPERTY_LOOKUP_CACHE_ENTRY_SHAPE", "KeyedPropertyLookupCacheEntry.shape", "Shape", KeyedPropertyLookupCacheEntryLayout, shape, 8, "nullable", "cell");
+    field!(w, "KEYED_PROPERTY_LOOKUP_CACHE_ENTRY_PROPERTY_NAME", "KeyedPropertyLookupCacheEntry.property_name", "u64", KeyedPropertyLookupCacheEntryLayout, property_name, 8, "nullable", "scalar");
+    w.constant("KEYED_PROPERTY_LOOKUP_CACHE_ENTRY_SIZE_SHIFT", size_of::<KeyedPropertyLookupCacheEntryLayout>().trailing_zeros());
+    w.constant("KEYED_PROPERTY_LOOKUP_CACHE_INDEX_SHIFT", 32 - KEYED_PROPERTY_LOOKUP_CACHE_INTERPRETER_INDEX_BITS);
+    // NB: As a signed value, which x86-64 multiplies with as an immediate. The low 32 bits of the product are the same.
+    w.constant("KEYED_PROPERTY_LOOKUP_CACHE_HASH_MULTIPLIER", KEYED_PROPERTY_LOOKUP_CACHE_INTERPRETER_HASH_MULTIPLIER as i32);
 
     w.section("ObjectPropertyIteratorCacheData layout");
     offset!(w, "OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTIES", ObjectPropertyIteratorCacheData, storage);
@@ -305,6 +321,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     offset!(w, "VM_HEAP_REGION_BASE", VmHead, heap_region_base);
     offset!(w, "VM_NATIVE_FUNCTION_TABLE_DATA", VmHead, native_function_table_data);
     offset!(w, "VM_BREAKPOINT_CONTROLLER", VmHead, debugger);
+    field!(w, "VM_KEYED_PROPERTY_LOOKUP_CACHE_ENTRIES", "VM.keyed_property_lookup_cache_entries", "u64", VmHead, keyed_property_lookup_cache_entries, 8, "nonnull", "scalar");
     w.line("field VM.primitive_storage_cage_base u64 VM_PRIMITIVE_STORAGE_CAGE_BASE nonnull scalar");
     w.line("field VM.heap_region_base u64 VM_HEAP_REGION_BASE nonnull scalar");
     w.line("field VM.native_function_table Sequence<NativeFunctionTableEntry> VM_NATIVE_FUNCTION_TABLE_DATA nonnull scalar");
@@ -447,12 +464,17 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "GLOBAL_ENVIRONMENT_GLOBAL_THIS_VALUE", "GlobalEnvironment.global_this_value", "Object", GlobalEnvironment, global_this_value, 8, "nullable", "cell");
 
     w.section("PrimitiveString layout");
-    field!(w, "PRIMITIVE_STRING_DEFERRED_KIND", "PrimitiveString.deferred_kind", "u8", PrimitiveString, deferred_kind, 1, "nullable", "scalar");
+    field!(w, "PRIMITIVE_STRING_DEFERRED_KIND_AND_FLAGS", "PrimitiveString.deferred_kind_and_flags", "u8", PrimitiveString, deferred_kind_and_flags, 1, "nullable", "scalar");
     field!(w, "PRIMITIVE_STRING_LENGTH_IN_UTF16_CODE_UNITS", "PrimitiveString.length_in_utf16_code_units", "u32", PrimitiveString, length_in_utf16_code_units, 4, "nullable", "scalar");
     assert_eq!(size_of_field(|string: &PrimitiveString| &string.utf16_string), 8);
     let utf16_string_offset = offset!(w, "PRIMITIVE_STRING_UTF16_STRING", PrimitiveString, utf16_string);
     w.line("field PrimitiveString.utf16_data Utf16StringData PRIMITIVE_STRING_UTF16_STRING nullable scalar");
     w.constant("PRIMITIVE_STRING_DEFERRED_KIND_NONE", DeferredKind::None as u8);
+    w.constant("PRIMITIVE_STRING_DEFERRED_KIND_INLINE", DeferredKind::Inline as u8);
+    offset!(w, "PRIMITIVE_STRING_INLINE_STRING_STORAGE", InlineString, characters);
+    w.line("field PrimitiveString.inline_string_storage Sequence<u8> PRIMITIVE_STRING_INLINE_STRING_STORAGE embedded scalar");
+    w.constant("PRIMITIVE_STRING_DEFERRED_KIND_MASK", DEFERRED_KIND_MASK);
+    w.constant("PRIMITIVE_STRING_INTERNED_FLAG", INTERNED_FLAG);
 
     // A short AK string is stored inline in the string's word: a tag byte holding the flag and the byte count, then
     // the bytes themselves. That puts the tag in the word's lowest byte on the little-endian targets the

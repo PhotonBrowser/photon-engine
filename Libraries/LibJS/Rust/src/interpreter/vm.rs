@@ -69,6 +69,7 @@ use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::reference::{BaseType, Reference};
+use crate::runtime::shape::PrototypeTransitionCache;
 use crate::runtime::shared_function_instance_data::SharedFunctionInstanceData;
 use crate::runtime::source_text_module::SourceTextModule;
 use crate::runtime::symbol::{self, GlobalSymbolRegistry, Symbol, enumerate_well_known_symbols};
@@ -427,7 +428,7 @@ pub(crate) fn default_host_enqueue_finalization_registry_cleanup_job(
     vm.enqueue_finalization_registry_cleanup_job(finalization_registry);
 }
 
-pub const STRING_TO_ATOM_CACHE_SIZE: usize = 2;
+pub const STRING_TO_ATOM_CACHE_SIZE: usize = 256;
 pub const FLY_STRING_CACHE_SIZE: usize = 1024;
 pub const NUMERIC_STRING_CACHE_SIZE: usize = 1000;
 pub const LARGE_NUMERIC_STRING_CACHE_SIZE: usize = 1024;
@@ -499,10 +500,13 @@ pub struct Vm {
 
     pub names: CommonPropertyNames,
     /// The strings in these two caches are weak: the sweep callback drops the ones that die.
-    string_to_atom_cache: RefCell<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>,
+    string_to_atom_cache: RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>>,
     fly_string_cache: Box<[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE]>,
     numeric_string_cache: Box<[Cell<Option<Gc<PrimitiveString>>>; NUMERIC_STRING_CACHE_SIZE]>,
     large_numeric_string_cache: Box<[NumericStringCacheEntry; LARGE_NUMERIC_STRING_CACHE_SIZE]>,
+    /// The interned PrimitiveString of each Utf16FlyString, by its raw identity, see PrimitiveString::is_interned().
+    /// The strings are weak: the sweep callback drops the ones that die.
+    interned_strings: RefCell<HashMap<usize, Gc<PrimitiveString>, foldhash::fast::RandomState>>,
     empty_string: OnceCell<Gc<PrimitiveString>>,
     cached_strings: OnceCell<CachedStrings>,
     single_ascii_character_strings: OnceCell<[Gc<PrimitiveString>; SINGLE_ASCII_CHARACTER_STRING_COUNT]>,
@@ -514,6 +518,14 @@ pub struct Vm {
     executables: RefCell<Vec<Gc<Executable>>>,
     static_property_lookup_caches: StaticPropertyLookupCaches,
     keyed_property_lookup_cache: KeyedPropertyLookupCache,
+    prototype_transition_cache: Box<PrototypeTransitionCache>,
+    /// Like the keyed property lookup cache, how string-keyed PutByValue instructions whose own caches gave up put
+    /// properties: the writable own data properties they change and the properties they add, by shape and name (see
+    /// put_by_value_with_keyed_store_cache()).
+    keyed_property_store_cache: KeyedPropertyLookupCache,
+    /// An empty cache that PutByValue fills for one put at a time, to find out how to remember it in the keyed
+    /// property store cache.
+    keyed_property_store_scratch_cache: PropertyLookupCache,
     host_ensure_can_add_private_element: Cell<HostEnsureCanAddPrivateElement>,
     host_get_code_for_eval: Cell<HostGetCodeForEval>,
     host_ensure_can_compile_strings: Cell<HostEnsureCanCompileStrings>,
@@ -612,6 +624,7 @@ impl Vm {
                 execution_context_stack_capacity: Cell::new(0),
                 type_error_realm_override: Cell::new(None),
                 type_error_realm_override_depth: Cell::new(0),
+                keyed_property_lookup_cache_entries: Cell::new(core::ptr::null()),
             },
             heap: OnceCell::new(),
             _interpreter_stack_memory: interpreter_stack_memory,
@@ -620,7 +633,7 @@ impl Vm {
             native_function_indices: RefCell::new(HashMap::new()),
             roots: RootSet::default(),
             names: CommonPropertyNames::new(),
-            string_to_atom_cache: RefCell::default(),
+            string_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| StringToAtomCacheEntry::default()))),
             fly_string_cache: Box::new([const { Cell::new(None) }; FLY_STRING_CACHE_SIZE]),
             numeric_string_cache: Box::new([const { Cell::new(None) }; NUMERIC_STRING_CACHE_SIZE]),
             large_numeric_string_cache: Box::new(
@@ -631,6 +644,7 @@ impl Vm {
                     }
                 }; LARGE_NUMERIC_STRING_CACHE_SIZE],
             ),
+            interned_strings: RefCell::default(),
             empty_string: OnceCell::new(),
             cached_strings: OnceCell::new(),
             single_ascii_character_strings: OnceCell::new(),
@@ -639,6 +653,9 @@ impl Vm {
             executables: RefCell::new(Vec::new()),
             static_property_lookup_caches: StaticPropertyLookupCaches::new(),
             keyed_property_lookup_cache: KeyedPropertyLookupCache::new(),
+            prototype_transition_cache: Box::new(PrototypeTransitionCache::new()),
+            keyed_property_store_cache: KeyedPropertyLookupCache::new(),
+            keyed_property_store_scratch_cache: PropertyLookupCache::new(),
             host_ensure_can_add_private_element: Cell::new(default_host_ensure_can_add_private_element),
             host_get_code_for_eval: Cell::new(default_host_get_code_for_eval),
             host_ensure_can_compile_strings: Cell::new(default_host_ensure_can_compile_strings),
@@ -683,6 +700,9 @@ impl Vm {
         unsafe { storage.write(vm) };
         // SAFETY: The VM was just written there.
         let vm = unsafe { &*storage };
+        vm.head
+            .keyed_property_lookup_cache_entries
+            .set(vm.keyed_property_lookup_cache.entries_for_interpreter());
         let context = storage.cast();
         // SAFETY: The VM stays at this address until it is dropped, and it destroys the heap before anything else.
         let heap = unsafe { Heap::new(gather_roots, context, options.become_process_default_heap) };
@@ -696,31 +716,37 @@ impl Vm {
     }
 
     fn allocate_preallocated_strings_and_symbols(&self) {
-        let allocate_string = |string: &str| {
-            self.heap()
-                .allocate(PrimitiveString::new(Utf16String::from_utf8(string)))
+        // NB: The empty and single ASCII character strings are interned without being in the table of interned
+        //     strings, since every way to create one of them returns these.
+        let allocate_interned_string = |string: &str| {
+            let string = self
+                .heap()
+                .allocate(PrimitiveString::new(Utf16String::from_utf8(string)));
+            string.set_interned();
+            string
         };
 
-        let _ = self.empty_string.set(allocate_string(""));
-
-        let _ = self.cached_strings.set(CachedStrings {
-            number: allocate_string("number"),
-            undefined: allocate_string("undefined"),
-            object: allocate_string("object"),
-            string: allocate_string("string"),
-            symbol: allocate_string("symbol"),
-            boolean: allocate_string("boolean"),
-            bigint: allocate_string("bigint"),
-            function: allocate_string("function"),
-            object_Object: allocate_string("[object Object]"),
-        });
+        let _ = self.empty_string.set(allocate_interned_string(""));
 
         let _ = self
             .single_ascii_character_strings
             .set(core::array::from_fn(|character| {
                 let character = [character as u8];
-                allocate_string(core::str::from_utf8(&character).expect("ASCII is UTF-8"))
+                allocate_interned_string(core::str::from_utf8(&character).expect("ASCII is UTF-8"))
             }));
+
+        let create_interned = |string: &str| PrimitiveString::create_interned(self, &Utf16FlyString::from_utf8(string));
+        let _ = self.cached_strings.set(CachedStrings {
+            number: create_interned("number"),
+            undefined: create_interned("undefined"),
+            object: create_interned("object"),
+            string: create_interned("string"),
+            symbol: create_interned("symbol"),
+            boolean: create_interned("boolean"),
+            bigint: create_interned("bigint"),
+            function: create_interned("function"),
+            object_Object: create_interned("[object Object]"),
+        });
 
         let _ = self.well_known_symbols.set(WellKnownSymbols::create(self));
         let _ = self.global_symbol_registry.set(GlobalSymbolRegistry::create(self));
@@ -1188,6 +1214,7 @@ impl Vm {
                 *entry = StringToAtomCacheEntry::default();
             }
         }
+        self.interned_strings.borrow_mut().retain(|_, string| !is_dead(*string));
     }
 
     /// Forgets the cells that died in this collection from the inline caches of executables and static call sites.
@@ -1201,6 +1228,8 @@ impl Vm {
         });
         self.static_property_lookup_caches.remove_dead_entries();
         self.keyed_property_lookup_cache.remove_dead_entries();
+        self.prototype_transition_cache.remove_dead_entries();
+        self.keyed_property_store_cache.remove_dead_entries();
     }
 
     pub fn register_executable(&self, executable: Gc<Executable>) {
@@ -1213,6 +1242,18 @@ impl Vm {
 
     pub fn keyed_property_lookup_cache(&self) -> &KeyedPropertyLookupCache {
         &self.keyed_property_lookup_cache
+    }
+
+    pub fn prototype_transition_cache(&self) -> &PrototypeTransitionCache {
+        &self.prototype_transition_cache
+    }
+
+    pub fn keyed_property_store_cache(&self) -> &KeyedPropertyLookupCache {
+        &self.keyed_property_store_cache
+    }
+
+    pub fn keyed_property_store_scratch_cache(&self) -> &PropertyLookupCache {
+        &self.keyed_property_store_scratch_cache
     }
 
     /// Stores the value the running frame returns and clears its exception, for the slow paths that leave the
@@ -1494,12 +1535,16 @@ impl Vm {
         &self.next_private_environment_id
     }
 
-    pub fn string_to_atom_cache(&self) -> &RefCell<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]> {
+    pub fn string_to_atom_cache(&self) -> &RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>> {
         &self.string_to_atom_cache
     }
 
     pub fn fly_string_cache(&self) -> &[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE] {
         &self.fly_string_cache
+    }
+
+    pub fn interned_strings(&self) -> &RefCell<HashMap<usize, Gc<PrimitiveString>, foldhash::fast::RandomState>> {
+        &self.interned_strings
     }
 
     pub fn numeric_string_cache(&self) -> &[Cell<Option<Gc<PrimitiveString>>>; NUMERIC_STRING_CACHE_SIZE] {

@@ -195,6 +195,12 @@ impl ObjectConstructor {
             // i. Let from be ! ToObject(nextSource).
             let from = next_source.to_object(vm).must();
 
+            // OPTIMIZATION: Setting the properties of an ordinary source on an empty target that has no setters or
+            //               read-only properties in the way gives it a copy of them, which can be made directly.
+            if to != from && to.assign_properties_to_new_object(vm, &from) {
+                continue;
+            }
+
             // OPTIMIZATION: Snapshot named property keys and offsets without converting keys to JS strings.
             // Read current values directly while the source shape is unchanged. Getters and target setters
             // can mutate the source, so retain every original key and recheck the shape before each read.
@@ -431,6 +437,16 @@ impl ObjectConstructor {
         let realm = vm.current_realm().expect("a native function runs in a realm");
 
         // 1. Return CreateArrayFromList(? GetOwnPropertyKeys(O, string)).
+        // OPTIMIZATION: The string keys of an object whose own keys are those of its shape are the string keys of the
+        //               shape, which the shape keeps as strings.
+        if vm.argument(0).is_object() && vm.argument(0).as_object().own_property_keys_are_those_of_its_shape() {
+            let object = vm.argument(0).as_object();
+            let array = Array::create(vm, realm, 0, None).must();
+            object
+                .shape()
+                .with_own_string_keys(vm, |keys, _| array.set_indexed_property_elements(keys));
+            return Ok(Value::from_object(array));
+        }
         let keys = get_own_property_keys(vm, vm.argument(0), GetOwnPropertyKeysType::String)?;
         Ok(Value::from_object(Array::create_from_list(vm, realm, &keys)))
     }
@@ -553,6 +569,21 @@ impl ObjectConstructor {
         let object = vm.argument(0).to_object(vm)?;
 
         // 2. Let keyList be ? EnumerableOwnProperties(obj, key).
+        // OPTIMIZATION: The enumerable own keys of an object whose own keys are those of its shape are the enumerable
+        //               string keys of the shape, which the shape keeps as strings.
+        if object.own_property_keys_are_those_of_its_shape() {
+            let array = Array::create(vm, realm, 0, None).must();
+            object.shape().with_own_string_keys(vm, |keys, enumerable| {
+                let count = enumerable.iter().filter(|enumerable| **enumerable).count();
+                array
+                    .set_indexed_property_elements_to_undefined(u32::try_from(count).expect("a key count fits in u32"));
+                let enumerable_keys = keys.iter().zip(enumerable).filter(|(_, enumerable)| **enumerable);
+                for (index, (key, _)) in enumerable_keys.enumerate() {
+                    array.set_packed_indexed_element(index as u32, *key);
+                }
+            });
+            return Ok(Value::from_object(array));
+        }
         let name_list = object.enumerable_own_property_names(vm, PropertyKind::Key)?;
 
         // 3. Return CreateArrayFromList(keyList).
@@ -746,6 +777,17 @@ fn try_assign_from_shape(vm: &Vm, target: &Object, source: &Object) -> ThrowComp
                 continue;
             }
             value = source.get(vm, &property_key)?;
+        }
+        // OPTIMIZATION: [[Set]] of an own writable data property of an object with ordinary property lookup and [[Set]]
+        //               changes its value, and nothing else.
+        if target.has_ordinary_named_property_lookup_and_set()
+            && !target.has_intrinsic_accessors()
+            && let Some(metadata) = target.shape().lookup(&property_key)
+            && metadata.attributes.is_writable()
+            && !target.get_direct(metadata.offset).is_accessor()
+        {
+            target.put_direct(metadata.offset, value);
+            continue;
         }
         target.set(vm, &property_key, value, ShouldThrowExceptions::Yes)?;
     }

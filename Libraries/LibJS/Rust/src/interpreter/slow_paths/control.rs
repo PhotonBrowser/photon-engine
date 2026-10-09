@@ -123,6 +123,19 @@ pub fn fallback_handler(_pc: u32) -> SlowPathControl {
     unreachable!("every bytecode opcode has a handler")
 }
 
+/// The array of an array literal with `elements`, where the empty value is a hole.
+fn create_array_literal(vm: &Vm, elements: &[Value]) -> Gc<Array> {
+    // OPTIMIZATION: Without holes, the elements become the packed indexed storage of the array in one step.
+    if !elements.iter().any(|element| element.is_empty()) {
+        return Array::create_from(vm, current_realm(vm), elements);
+    }
+    let array = Array::create(vm, current_realm(vm), elements.len() as u64, None).must();
+    for (index, element) in elements.iter().enumerate() {
+        array.indexed_put(index as u32, *element, DEFAULT_ATTRIBUTES);
+    }
+    array
+}
+
 pub fn new_array(
     vm: &Vm,
     pc: u32,
@@ -130,11 +143,7 @@ pub fn new_array(
     values: &mut op::NewArrayValues,
     elements: &[Value],
 ) -> SlowPathControl {
-    let array = Array::create(vm, current_realm(vm), u64::from(instruction.element_count), None).must();
-    for (index, element) in elements.iter().enumerate() {
-        array.indexed_put(index as u32, *element, DEFAULT_ATTRIBUTES);
-    }
-    values.dst = Value::from_object(array);
+    values.dst = Value::from_object(create_array_literal(vm, elements));
     SlowPathControl::continue_at(pc + instruction.length())
 }
 
@@ -144,11 +153,7 @@ pub fn new_primitive_array(
     instruction: &op::NewPrimitiveArray,
     values: &mut op::NewPrimitiveArrayValues,
 ) -> SlowPathControl {
-    let array = Array::create(vm, current_realm(vm), u64::from(instruction.element_count), None).must();
-    for (index, element) in primitive_array_elements(instruction).iter().enumerate() {
-        array.indexed_put(index as u32, *element, DEFAULT_ATTRIBUTES);
-    }
-    values.dst = Value::from_object(array);
+    values.dst = Value::from_object(create_array_literal(vm, primitive_array_elements(instruction)));
     SlowPathControl::continue_at(pc + instruction.length())
 }
 
@@ -597,6 +602,16 @@ pub fn throw_if_nullish(vm: &Vm, pc: u32, values: &op::ThrowIfNullishValues) -> 
         return throw_error(vm, pc, ErrorKind::TypeError, ErrorType::NotObjectCoercible, &[&value]);
     }
     SlowPathControl::continue_at(pc + op::ThrowIfNullish::LENGTH)
+}
+
+pub fn throw_not_a_function(vm: &Vm, pc: u32, values: &op::ThrowNotAFunctionValues) -> SlowPathControl {
+    throw_error(vm, pc, ErrorKind::TypeError, ErrorType::NotAFunction, &[&values.src])
+}
+
+pub fn get_argument_count(vm: &Vm, pc: u32, values: &mut op::GetArgumentCountValues) -> SlowPathControl {
+    let passed_argument_count = vm.running_execution_context_ref().passed_argument_count.get();
+    values.dst = Value::from_f64(f64::from(passed_argument_count));
+    SlowPathControl::continue_at(pc + op::GetArgumentCount::LENGTH)
 }
 
 pub fn throw_const_assignment(vm: &Vm, pc: u32) -> SlowPathControl {
