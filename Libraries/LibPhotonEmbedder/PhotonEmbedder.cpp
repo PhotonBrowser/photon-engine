@@ -122,12 +122,9 @@ public:
     {
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
-        if (physical_width != m_native_width || physical_height != m_native_height) {
-            m_native_width = physical_width;
-            m_native_height = physical_height;
-            if (m_native_generation != 0)
-                ++m_native_generation;
-        }
+        // NB: A resize keeps the presentation generation. The compositor pads its pool while a resize is in progress
+        //     and keeps the same backings, which the client must not re-register; each frame carries its own content
+        //     size. A replaced pool advances the generation in on_backing_store_pool_changed.
         m_device_pixel_ratio = dpr;
         if (std::getenv("PHOTON_CORE_RUNLOOP_TRACE")) {
             on_console_message = [](WebView::ConsoleOutput output) {
@@ -455,8 +452,6 @@ private:
 
     uint64_t m_native_generation { 1 };
     uint64_t m_native_next_frame_id { 0 };
-    int m_native_width { 0 };
-    int m_native_height { 0 };
     std::set<std::pair<uint64_t, uint64_t>> m_registered_native_backings;
     std::unordered_map<i32, uint64_t> m_native_backing_ids;
     std::unordered_map<uint64_t, i32> m_native_backing_to_bitmap;
