@@ -828,6 +828,11 @@ void Heap::register_sweep_callback(AK::Function<void()> callback)
     m_sweep_callbacks.append(move(callback));
 }
 
+void Heap::register_sweep_completed_callback(AK::Function<void()> callback)
+{
+    m_sweep_completed_callbacks.append(move(callback));
+}
+
 void Heap::gather_roots(ConservativeScanOrigin const& origin, HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>* out_stack_frames, IncludeIncomingCrossHeapMembers include_incoming_cross_heap_members)
 {
     // Cross-heap members targeting this heap act as roots for local collections (as the foreign holder is invisible to a local mark).
@@ -1297,6 +1302,16 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
         update_gc_bytes_threshold(live_cell_bytes, live_external_bytes);
     }
 
+    Checked<size_t> live_bytes = live_cell_bytes;
+    live_bytes += live_external_bytes;
+    if (!live_bytes.has_overflow())
+        m_last_swept_live_bytes = live_bytes.value();
+    else
+        m_last_swept_live_bytes.clear();
+
+    for (auto& callback : m_sweep_completed_callbacks)
+        callback();
+
     if (print_report) {
         g_sweep_stats = {
             .collected_cells = collected_cells,
@@ -1424,6 +1439,16 @@ void Heap::start_incremental_sweep()
 void Heap::finish_incremental_sweep()
 {
     update_gc_bytes_threshold(m_sweep_live_cell_bytes, m_sweep_live_external_bytes);
+
+    Checked<size_t> live_bytes = m_sweep_live_cell_bytes;
+    live_bytes += m_sweep_live_external_bytes;
+    if (!live_bytes.has_overflow())
+        m_last_swept_live_bytes = live_bytes.value();
+    else
+        m_last_swept_live_bytes.clear();
+
+    for (auto& callback : m_sweep_completed_callbacks)
+        callback();
 
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep] === Sweep complete ===");
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep]     Live cell bytes: {} ({} KiB)", m_sweep_live_cell_bytes, m_sweep_live_cell_bytes / KiB);

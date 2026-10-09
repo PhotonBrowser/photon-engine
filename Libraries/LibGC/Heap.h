@@ -119,6 +119,8 @@ public:
     void did_destroy_weak_container(Badge<WeakContainer>, WeakContainer&);
 
     void register_sweep_callback(AK::Function<void()>);
+    void register_sweep_completed_callback(AK::Function<void()>);
+    Optional<size_t> last_swept_live_bytes() const { return m_last_swept_live_bytes; }
 
     void register_cell_allocator(Badge<CellAllocator>, CellAllocator&);
     CellAllocator& cell_allocator_for(Badge<CellAllocatorDescriptorBase>, CellAllocatorDescriptorBase&);
@@ -279,6 +281,7 @@ private:
 
     Vector<AK::Function<void()>> m_post_gc_tasks;
     Vector<AK::Function<void()>> m_sweep_callbacks;
+    Vector<AK::Function<void()>> m_sweep_completed_callbacks;
 
     HashTable<HeapBlock*> m_live_heap_blocks;
 
@@ -289,6 +292,7 @@ private:
     size_t m_block_sweeps_in_progress { 0 };
     size_t m_sweep_live_cell_bytes { 0 };
     size_t m_sweep_live_external_bytes { 0 };
+    Optional<size_t> m_last_swept_live_bytes;
     Vector<GC::Ptr<Cell>> m_cells_allocated_during_sweep;
     CellAllocator::SweepList m_allocators_to_sweep;
     RefPtr<Core::Timer> m_incremental_sweep_timer;
