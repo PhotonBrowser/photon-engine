@@ -61,6 +61,14 @@ struct ViewState {
     bool can_go_forward { false };
 };
 
+// A page's icon. Pixels are BGRA8888 with straight (unpremultiplied) alpha,
+// tightly packed rows, and owned by this value.
+struct Favicon {
+    int width { 0 };
+    int height { 0 };
+    std::vector<uint8_t> pixels;
+};
+
 struct PerformanceStats {
     bool has_cpu_percent { false };
     double cpu_percent { 0 };
@@ -91,6 +99,9 @@ struct ViewCallbacks {
     std::function<void(NativeGpuFrame const&)> native_frame_ready;
 #endif
     std::function<void(Cursor)> cursor_changed;
+    // Called with the page's new icon, or null when the page has none, such
+    // as when a navigation starts.
+    std::function<void(Favicon const*)> favicon_changed;
     std::function<void(std::string const&)> failed;
     std::function<void(std::string const&)> crashed;
 };

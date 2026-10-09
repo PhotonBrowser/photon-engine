@@ -334,6 +334,41 @@ private:
                 },
                 [this](Gfx::ImageCursor const&) { m_callbacks.cursor_changed(Photon::Cursor::Arrow); });
         };
+        on_favicon_change = [this](Optional<Gfx::Bitmap const&> bitmap) {
+            if (!m_callbacks.favicon_changed)
+                return;
+            if (!bitmap.has_value()) {
+                m_callbacks.favicon_changed(nullptr);
+                return;
+            }
+            Photon::Favicon favicon;
+            favicon.width = bitmap->width();
+            favicon.height = bitmap->height();
+            favicon.pixels.reserve(static_cast<size_t>(favicon.width) * favicon.height * 4);
+            auto premultiplied = bitmap->alpha_type() == Gfx::AlphaType::Premultiplied;
+            for (int y = 0; y < favicon.height; ++y) {
+                for (int x = 0; x < favicon.width; ++x) {
+                    auto color = bitmap->get_pixel(x, y);
+                    u8 red = color.red();
+                    u8 green = color.green();
+                    u8 blue = color.blue();
+                    u8 alpha = color.alpha();
+                    if (premultiplied && alpha != 0 && alpha != 255) {
+                        auto unpremultiply = [alpha](u8 channel) {
+                            return static_cast<u8>(min(255, (channel * 255 + alpha / 2) / alpha));
+                        };
+                        red = unpremultiply(red);
+                        green = unpremultiply(green);
+                        blue = unpremultiply(blue);
+                    }
+                    favicon.pixels.push_back(blue);
+                    favicon.pixels.push_back(green);
+                    favicon.pixels.push_back(red);
+                    favicon.pixels.push_back(alpha);
+                }
+            }
+            m_callbacks.favicon_changed(&favicon);
+        };
         on_browser_history_traversal_complete = [this] { notify_state(); };
         on_web_content_crashed = [this](auto) {
             if (!m_callbacks.crashed)
