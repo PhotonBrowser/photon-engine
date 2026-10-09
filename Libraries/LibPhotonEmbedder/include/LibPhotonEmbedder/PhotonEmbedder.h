@@ -66,6 +66,8 @@ struct PerformanceStats {
     double cpu_percent { 0 };
     bool has_memory_bytes { false };
     uint64_t memory_bytes { 0 };
+    bool has_managed_heap_bytes { false };
+    uint64_t managed_heap_bytes { 0 };
     uint64_t download_bytes_per_second { 0 };
     uint64_t upload_bytes_per_second { 0 };
     bool has_frames_per_second { false };

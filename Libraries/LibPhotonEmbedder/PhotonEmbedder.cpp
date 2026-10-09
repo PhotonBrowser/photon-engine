@@ -292,6 +292,8 @@ private:
                 .cpu_percent = stats.cpu_percent.value_or(0),
                 .has_memory_bytes = stats.memory_bytes.has_value(),
                 .memory_bytes = stats.memory_bytes.value_or(0),
+                .has_managed_heap_bytes = stats.managed_heap_bytes.has_value(),
+                .managed_heap_bytes = stats.managed_heap_bytes.value_or(0),
                 .download_bytes_per_second = stats.download_bytes_per_second,
                 .upload_bytes_per_second = stats.upload_bytes_per_second,
                 .has_frames_per_second = stats.frames_per_second.has_value(),
