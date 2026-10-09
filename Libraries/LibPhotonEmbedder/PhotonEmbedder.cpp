@@ -118,6 +118,24 @@ public:
         return view;
     }
 
+    static OwnPtr<PhotonHeadlessWebView> create_for_traversable(
+        PhotonHeadlessWebView& opener,
+        CanonicalTraversable& traversable,
+        int width,
+        int height,
+        double dpr,
+        Photon::ViewCallbacks callbacks)
+    {
+        auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
+        auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
+        auto view = adopt_own(*new PhotonHeadlessWebView(opener.m_theme, { physical_width, physical_height }, dpr, move(callbacks)));
+        view->initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
+        view->resize(width, height, dpr);
+        view->notify_state();
+        (void)TabPerformanceMonitor::the();
+        return view;
+    }
+
     void resize(int width, int height, double dpr)
     {
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
@@ -407,6 +425,28 @@ private:
                 }
             }
             m_callbacks.favicon_changed(&favicon);
+        };
+        on_new_web_view = [this](Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, CanonicalTraversable& traversable) {
+            if (!m_callbacks.new_web_view_requested)
+                return String {};
+
+            Photon::NewWebViewRequest request {
+                .popup = hints.popup,
+                .activate = activate_tab == Web::HTML::ActivateTab::Yes,
+                .has_width = hints.width.has_value(),
+                .width = hints.width.has_value() ? hints.width->value() : 0,
+                .has_height = hints.height.has_value(),
+                .height = hints.height.has_value() ? hints.height->value() : 0,
+                .has_screen_x = hints.screen_x.has_value(),
+                .screen_x = hints.screen_x.has_value() ? hints.screen_x->value() : 0,
+                .has_screen_y = hints.screen_y.has_value(),
+                .screen_y = hints.screen_y.has_value() ? hints.screen_y->value() : 0,
+                .traversable = &traversable,
+            };
+            auto window_handle = m_callbacks.new_web_view_requested(request);
+            if (window_handle.empty())
+                return String {};
+            return MUST(String::from_utf8(StringView { window_handle.data(), window_handle.size() }));
         };
         on_request_alert = [this](Utf16String const& message) {
             request_dialog(Photon::DialogType::Alert, message, {});
@@ -723,6 +763,33 @@ std::unique_ptr<View> Runtime::create_view(int width, int height, double device_
     return std::unique_ptr<View>(new View(move(impl)));
 }
 
+std::unique_ptr<View> Runtime::create_view_for_traversable(
+    View& opener,
+    void* traversable,
+    int width,
+    int height,
+    double device_pixel_ratio,
+    ViewCallbacks callbacks)
+{
+    if (!opener.m_impl || !opener.m_impl->view || !traversable)
+        return {};
+
+    auto impl = std::make_unique<View::Impl>();
+    impl->view = WebView::PhotonHeadlessWebView::create_for_traversable(
+        *opener.m_impl->view,
+        *static_cast<WebView::CanonicalTraversable*>(traversable),
+        width,
+        height,
+        device_pixel_ratio,
+        move(callbacks));
+    if (!impl->view)
+        return {};
+    impl->last_viewport_width = max(1, static_cast<int>(std::lround(width * device_pixel_ratio)));
+    impl->last_viewport_height = max(1, static_cast<int>(std::lround(height * device_pixel_ratio)));
+    impl->last_device_pixel_ratio = device_pixel_ratio;
+    return std::unique_ptr<View>(new View(move(impl)));
+}
+
 View::View(std::unique_ptr<Impl> impl)
     : m_impl(move(impl))
 {
@@ -775,6 +842,17 @@ void View::set_native_metal_presentation(bool enabled)
 }
 #endif
 void View::set_focus(bool focused) { m_impl->view->set_has_system_focus(focused); }
+void View::notify_state()
+{
+    if (m_impl && m_impl->view)
+        m_impl->view->notify_state();
+}
+std::string View::window_handle() const
+{
+    VERIFY(m_impl && m_impl->view);
+    auto handle = m_impl->view->handle().to_byte_string();
+    return { handle.characters(), handle.length() };
+}
 
 static Web::UIEvents::KeyModifier modifiers(bool shift, bool control, bool alt, bool meta)
 {

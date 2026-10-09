@@ -86,6 +86,24 @@ struct DialogRequest {
     std::string default_text;
 };
 
+// A page asked the embedder to create a top-level browsing context. The
+// traversable is opaque outside LibPhotonEmbedder and is valid only during
+// the callback. The callback may create a View for it synchronously and
+// returns that context's browser window handle.
+struct NewWebViewRequest {
+    bool popup { false };
+    bool activate { false };
+    bool has_width { false };
+    int width { 0 };
+    bool has_height { false };
+    int height { 0 };
+    bool has_screen_x { false };
+    int screen_x { 0 };
+    bool has_screen_y { false };
+    int screen_y { 0 };
+    void* traversable { nullptr };
+};
+
 struct PerformanceStats {
     bool has_cpu_percent { false };
     double cpu_percent { 0 };
@@ -123,6 +141,7 @@ struct ViewCallbacks {
     // A top-level navigation committed, a load finished, or a history
     // traversal completed: the page now shown may open dialogs.
     std::function<void()> navigation_committed;
+    std::function<std::string(NewWebViewRequest const&)> new_web_view_requested;
     std::function<void(std::string const&)> failed;
     std::function<void(std::string const&)> crashed;
     // The page that replaced a crashed one presented its first frame.
@@ -193,6 +212,7 @@ public:
     // its replacement is running. The network service reports only its restart.
     void set_service_callback(std::function<void(EngineService, bool restarted)>);
     std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks);
+    std::unique_ptr<View> create_view_for_traversable(View& opener, void* traversable, int width, int height, double device_pixel_ratio, ViewCallbacks);
 
 private:
     struct Impl;
@@ -226,6 +246,8 @@ public:
     void set_native_metal_presentation(bool enabled);
 #endif
     void set_focus(bool);
+    void notify_state();
+    std::string window_handle() const;
     void send_pointer_event(PointerEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);
     void set_preferred_color_scheme(PreferredColorScheme);
