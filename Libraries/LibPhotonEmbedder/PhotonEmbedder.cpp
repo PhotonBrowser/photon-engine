@@ -463,6 +463,12 @@ private:
         };
         on_top_level_navigation_commit = [this] { notify_navigation_committed(); };
         on_load_finish = [this](URL::URL const&) { notify_navigation_committed(); };
+        on_find_in_page = [this](size_t current_match_index, Optional<size_t> const& total_match_count) {
+            if (!m_callbacks.find_result)
+                return;
+            m_callbacks.find_result(current_match_index,
+                total_match_count.has_value() ? std::optional<size_t>(*total_match_count) : std::nullopt);
+        };
         on_crash_overlay_state_change = [this](bool crashed) {
             if (!crashed && m_callbacks.crash_recovered)
                 m_callbacks.crash_recovered();
@@ -959,6 +965,32 @@ void View::set_preferred_color_scheme(PreferredColorScheme color_scheme)
         break;
     }
     m_impl->view->set_preferred_color_scheme(engine_color_scheme);
+}
+
+void View::find_in_page(std::string const& query, bool case_sensitive, bool highlight_all_matches)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->find_in_page(Utf16String::from_utf8(StringView { query.data(), query.size() }),
+        case_sensitive ? CaseSensitivity::CaseSensitive : CaseSensitivity::CaseInsensitive,
+        highlight_all_matches);
+}
+
+void View::find_in_page_next_match()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->find_in_page_next_match();
+}
+
+void View::find_in_page_previous_match()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->find_in_page_previous_match();
+}
+
+void View::find_in_page_end()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->find_in_page_end();
 }
 
 void View::alert_closed()

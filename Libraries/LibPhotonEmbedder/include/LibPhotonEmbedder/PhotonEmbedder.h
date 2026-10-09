@@ -146,6 +146,9 @@ struct ViewCallbacks {
     std::function<void(std::string const&)> crashed;
     // The page that replaced a crashed one presented its first frame.
     std::function<void()> crash_recovered;
+    // A find-in-page result: the current match's index and, once known, how
+    // many matches there are (zero when the text is not found).
+    std::function<void(size_t current_match_index, std::optional<size_t> total_match_count)> find_result;
 };
 
 enum class PointerType { Move, Leave, Press, Release, Wheel };
@@ -251,6 +254,12 @@ public:
     void send_pointer_event(PointerEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);
     void set_preferred_color_scheme(PreferredColorScheme);
+    // Find text in the page; an empty query clears the search.
+    void find_in_page(std::string const& query, bool case_sensitive, bool highlight_all_matches);
+    void find_in_page_next_match();
+    void find_in_page_previous_match();
+    // End the search and remove its highlights.
+    void find_in_page_end();
     // Answer the open dialog. A prompt's response is empty when cancelled.
     void alert_closed();
     void confirm_closed(bool accepted);
