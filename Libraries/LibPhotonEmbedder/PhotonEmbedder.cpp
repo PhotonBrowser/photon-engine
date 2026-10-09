@@ -194,6 +194,45 @@ public:
         m_callbacks.state_changed(state);
     }
 
+    void request_dialog(Photon::DialogType type, Utf16String const& message, Utf16String const& default_text)
+    {
+        if (!m_callbacks.dialog_requested) {
+            // Nobody can answer, so answer as if dismissed rather than leave the page waiting.
+            switch (type) {
+            case Photon::DialogType::Alert:
+                alert_closed();
+                break;
+            case Photon::DialogType::Confirm:
+                confirm_closed(false);
+                break;
+            case Photon::DialogType::Prompt:
+                prompt_closed({});
+                break;
+            }
+            return;
+        }
+        auto to_std_string = [](auto const& value) {
+            auto string = MUST(String::formatted("{}", value));
+            auto bytes = string.bytes_as_string_view();
+            return std::string(bytes.characters_without_null_termination(), bytes.length());
+        };
+        Photon::DialogRequest request;
+        request.type = type;
+        auto origin = url().origin();
+        request.title = origin.is_opaque()
+            ? to_std_string(MUST(String::formatted("{}://", url().scheme())))
+            : to_std_string(origin.serialize());
+        request.message = to_std_string(message);
+        request.default_text = to_std_string(default_text);
+        m_callbacks.dialog_requested(request);
+    }
+
+    void notify_navigation_committed()
+    {
+        if (m_callbacks.navigation_committed)
+            m_callbacks.navigation_committed();
+    }
+
     void clear_callbacks() { m_callbacks = {}; }
 
     void set_native_metal_presentation(bool enabled)
@@ -369,7 +408,21 @@ private:
             }
             m_callbacks.favicon_changed(&favicon);
         };
-        on_browser_history_traversal_complete = [this] { notify_state(); };
+        on_request_alert = [this](Utf16String const& message) {
+            request_dialog(Photon::DialogType::Alert, message, {});
+        };
+        on_request_confirm = [this](Utf16String const& message) {
+            request_dialog(Photon::DialogType::Confirm, message, {});
+        };
+        on_request_prompt = [this](Utf16String const& message, Utf16String const& default_text) {
+            request_dialog(Photon::DialogType::Prompt, message, default_text);
+        };
+        on_browser_history_traversal_complete = [this] {
+            notify_state();
+            notify_navigation_committed();
+        };
+        on_top_level_navigation_commit = [this] { notify_navigation_committed(); };
+        on_load_finish = [this](URL::URL const&) { notify_navigation_committed(); };
         on_web_content_crashed = [this](auto) {
             if (!m_callbacks.crashed)
                 return;
@@ -810,6 +863,28 @@ void View::set_preferred_color_scheme(PreferredColorScheme color_scheme)
         break;
     }
     m_impl->view->set_preferred_color_scheme(engine_color_scheme);
+}
+
+void View::alert_closed()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->alert_closed();
+}
+
+void View::confirm_closed(bool accepted)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->confirm_closed(accepted);
+}
+
+void View::prompt_closed(std::optional<std::string> const& response)
+{
+    VERIFY(m_impl && m_impl->view);
+    if (!response.has_value()) {
+        m_impl->view->prompt_closed({});
+        return;
+    }
+    m_impl->view->prompt_closed(Utf16String::from_utf8(StringView { response->data(), response->size() }));
 }
 
 void View::shutdown()

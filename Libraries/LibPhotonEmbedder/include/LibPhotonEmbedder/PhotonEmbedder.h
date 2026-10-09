@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,19 @@ struct Favicon {
     std::vector<uint8_t> pixels;
 };
 
+enum class DialogType : uint8_t { Alert, Confirm, Prompt };
+
+// A JavaScript alert, confirm or prompt. The page waits until the embedder
+// answers with the matching View::*_closed call.
+struct DialogRequest {
+    DialogType type { DialogType::Alert };
+    // The page's origin, or its scheme when the origin is opaque.
+    std::string title;
+    std::string message;
+    // The prompt's initial text.
+    std::string default_text;
+};
+
 struct PerformanceStats {
     bool has_cpu_percent { false };
     double cpu_percent { 0 };
@@ -102,6 +116,10 @@ struct ViewCallbacks {
     // Called with the page's new icon, or null when the page has none, such
     // as when a navigation starts.
     std::function<void(Favicon const*)> favicon_changed;
+    std::function<void(DialogRequest const&)> dialog_requested;
+    // A top-level navigation committed, a load finished, or a history
+    // traversal completed: the page now shown may open dialogs.
+    std::function<void()> navigation_committed;
     std::function<void(std::string const&)> failed;
     std::function<void(std::string const&)> crashed;
 };
@@ -203,6 +221,10 @@ public:
     void send_pointer_event(PointerEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);
     void set_preferred_color_scheme(PreferredColorScheme);
+    // Answer the open dialog. A prompt's response is empty when cancelled.
+    void alert_closed();
+    void confirm_closed(bool accepted);
+    void prompt_closed(std::optional<std::string> const& response);
     void shutdown();
 
 private:
