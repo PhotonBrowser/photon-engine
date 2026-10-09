@@ -200,6 +200,7 @@ private:
     void add_backing_store_for_pending_frame_if_needed(Web::CompositorContextId, ContextState&);
     void schedule_surplus_backing_store_retirement(Web::CompositorContextId, ContextState&);
     void retire_idle_surplus_backing_stores(Web::CompositorContextId);
+    void schedule_idle_gpu_cache_purge();
     void present_current_frame(Web::CompositorContextId, ContextState&);
     void resolve_video_sinks(ContextState&);
     enum class VideoSinkUpdateResult : u8 {
@@ -245,6 +246,8 @@ private:
     OwnPtr<DisplayListPlayerSkia> m_display_list_player;
     HashMap<Optional<u64>, OwnPtr<VSyncScheduler>> m_vsync_schedulers_by_display;
     RefPtr<Core::Timer> m_gpu_completion_timer;
+    // Fires once no frame has finished for a while, to give back GPU cache memory an idle page is not using.
+    RefPtr<Core::Timer> m_idle_gpu_cache_purge_timer;
     CompositorStateClient* m_client { nullptr };
 
     // LUID of the GPU adapter the client can present shared GPU textures on, if any.

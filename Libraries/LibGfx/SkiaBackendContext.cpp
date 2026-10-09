@@ -139,6 +139,22 @@ void SkiaBackendContext::flush_and_submit_async(SkSurface* surface, SurfaceAcces
     perform_post_flush_cleanup();
 }
 
+void SkiaBackendContext::purge_resources_unused_for(AK::Duration age)
+{
+    auto* context = sk_context();
+    if (!context)
+        return;
+
+    size_t resource_bytes_before = 0;
+    context->getResourceCacheUsage(nullptr, &resource_bytes_before);
+    context->performDeferredCleanup(std::chrono::milliseconds(age.to_milliseconds()));
+    if (std::getenv("PHOTON_VERBOSE")) {
+        size_t resource_bytes_after = 0;
+        context->getResourceCacheUsage(nullptr, &resource_bytes_after);
+        dbgln("Photon Skia idle purge: cache_bytes={}->{}", resource_bytes_before, resource_bytes_after);
+    }
+}
+
 void SkiaBackendContext::perform_post_flush_cleanup()
 {
     auto* context = sk_context();

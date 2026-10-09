@@ -126,10 +126,31 @@ CompositorState::CompositorState(RefPtr<Gfx::SkiaBackendContext> skia_backend_co
 
 CompositorState::~CompositorState()
 {
+    if (m_idle_gpu_cache_purge_timer) {
+        m_idle_gpu_cache_purge_timer->on_timeout = {};
+        m_idle_gpu_cache_purge_timer->stop();
+    }
     if (!m_gpu_completion_timer)
         return;
     m_gpu_completion_timer->on_timeout = {};
     m_gpu_completion_timer->stop();
+}
+
+// Skia keeps resources it may reuse up to its cache limit, and only trims them after a flush. A page that stops
+// drawing would otherwise hold every texture its last frames used for as long as it stays idle.
+static constexpr int idle_gpu_cache_purge_delay_ms = 5000;
+
+void CompositorState::schedule_idle_gpu_cache_purge()
+{
+    if (!m_skia_backend_context)
+        return;
+    if (!m_idle_gpu_cache_purge_timer) {
+        m_idle_gpu_cache_purge_timer = Core::Timer::create_single_shot(idle_gpu_cache_purge_delay_ms, [this] {
+            if (m_skia_backend_context)
+                m_skia_backend_context->purge_resources_unused_for(AK::Duration::from_milliseconds(idle_gpu_cache_purge_delay_ms));
+        });
+    }
+    m_idle_gpu_cache_purge_timer->restart(idle_gpu_cache_purge_delay_ms);
 }
 
 void CompositorState::set_client(CompositorStateClient& client)
@@ -1169,6 +1190,8 @@ void CompositorState::did_finish_async_present(PendingAsyncPresent& pending_pres
     (void)m_pending_async_presents.remove(pending_present_iterator);
     if (m_pending_async_presents.is_empty() && m_gpu_completion_timer)
         m_gpu_completion_timer->stop();
+
+    schedule_idle_gpu_cache_purge();
 
     if (was_cancelled)
         return;
