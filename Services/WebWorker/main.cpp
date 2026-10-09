@@ -124,6 +124,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto client = TRY(IPC::take_over_accepted_client_from_system_server<WebWorker::ConnectionFromClient>(mach_server_name, enable_test_mode));
 
     auto& heap = Web::Bindings::main_thread_vm().heap();
+    heap.register_sweep_completed_callback([client, &heap] {
+        if (auto bytes = heap.last_swept_live_bytes(); bytes.has_value())
+            client->async_did_update_managed_heap_bytes(static_cast<u64>(*bytes));
+    });
     client->on_request_server_connection = [&heap](auto const& handle) {
         if (auto result = connect_to_resource_loader(heap, handle); result.is_error())
             dbgln("Failed to connect to resource loader: {}", result.error());

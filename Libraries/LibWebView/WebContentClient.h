@@ -128,6 +128,7 @@ public:
     virtual bool may_act_for_page(Web::PageId page_id) const override;
 
     Optional<u64> exclusive_performance_owner() const;
+    Optional<u64> managed_heap_bytes() const { return m_managed_heap_bytes; }
 
     void did_lose_process();
     void did_save_crash_report(ByteString const& report_name);
@@ -172,6 +173,7 @@ private:
     virtual Messages::WebContentClient::DidRequestNewWebViewResponse did_request_new_web_view(Web::PageId page_id, Web::HTML::ActivateTab, Web::HTML::WebViewHints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set) override;
     virtual Messages::WebContentClient::StartWorkerAgentResponse start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) override;
     virtual void did_update_cookie(HTTP::Cookie::Cookie) override;
+    virtual void did_update_managed_heap_bytes(u64) override;
     virtual Messages::WebContentClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String) override;
     virtual Messages::WebContentClient::DidLoseRequestServerConnectionResponse did_lose_request_server_connection() override;
     virtual Messages::WebContentClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
@@ -189,6 +191,7 @@ private:
     RequestServerSiteBindings m_request_server_site_bindings;
     bool m_requested_close { false };
     bool m_rejected_ipc { false };
+    Optional<u64> m_managed_heap_bytes;
     Vector<u64> m_crashed_view_ids;
 
     WebContentPage& open_page(Web::PageId, CanonicalTraversable&);

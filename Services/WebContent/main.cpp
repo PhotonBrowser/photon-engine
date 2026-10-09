@@ -233,6 +233,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #endif
 
     auto& heap = Web::Bindings::main_thread_vm().heap();
+    heap.register_sweep_completed_callback([webcontent_client, &heap] {
+        if (auto bytes = heap.last_swept_live_bytes(); bytes.has_value())
+            webcontent_client->async_did_update_managed_heap_bytes(static_cast<u64>(*bytes));
+    });
     webcontent_client->on_request_server_connection = [&heap](auto const& handle) {
         if (auto result = connect_to_resource_loader(heap, handle); result.is_error())
             dbgln("Failed to connect to resource loader: {}", result.error());

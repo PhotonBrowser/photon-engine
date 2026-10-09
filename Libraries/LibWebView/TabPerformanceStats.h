@@ -21,6 +21,7 @@ WEBVIEW_API String format_performance_bytes(u64);
 struct TabPerformanceStats {
     Optional<double> cpu_percent;
     Optional<u64> memory_bytes;
+    Optional<u64> managed_heap_bytes;
     u64 download_bytes_per_second { 0 };
     u64 upload_bytes_per_second { 0 };
     Optional<double> frames_per_second;

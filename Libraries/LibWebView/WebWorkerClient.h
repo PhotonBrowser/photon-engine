@@ -43,11 +43,13 @@ public:
     void remove_blob_url_entries();
 
     pid_t pid() const { return m_pid; }
+    Optional<u64> managed_heap_bytes() const { return m_managed_heap_bytes; }
 
     Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
     void set_pid(pid_t pid) { m_pid = pid; }
 
     virtual void did_close_worker() override;
+    virtual void did_update_managed_heap_bytes(u64) override;
     virtual void did_finish_loading_worker_script(bool worker_is_secure_context) override;
     virtual void did_fail_loading_worker_script() override;
     virtual void did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
@@ -73,6 +75,7 @@ private:
 
     pid_t m_pid { -1 };
     Web::HTML::WorkerAgentId m_agent_id { 0 };
+    Optional<u64> m_managed_heap_bytes;
 
     // The controller connection to the MediaServer spawned for this process, from its first media use until it exits.
     RefPtr<MediaClient::Client> m_media_server_client;

@@ -30,6 +30,12 @@ counter differencing and windowing independently of the UI and OS APIs.
   are not directly comparable. Other platforms report unavailable until a
   collector is implemented. Shared helper/cache allocations and resources
   without a process-level ownership charge are excluded.
+* **Managed heap:** The most recent completed garbage collector sweep's live
+  cell bytes plus external-memory sizes reported by live cells, summed across
+  exclusively owned WebContent and WebWorker processes. It includes engine
+  objects as well as page objects, can be stale between collections, and omits
+  allocations the GC does not track. Treat it as a managed-heap estimate, not
+  total page RAM.
 * **Download/upload:** HTTP response/request body bytes transferred by curl,
   before response decompression. Disk-cache hits contribute no traffic.
   Headers, TLS/TCP overhead, WebSockets, and helper-initiated background
@@ -50,7 +56,8 @@ orange. Fixed-width columns and tabular digits prevent layout shifts.
 
 ## Sampling and overhead
 
-The browser samples owned process counters every 500 ms. RequestServer runs
+The browser samples owned process counters every 500 ms. WebContent and worker
+processes push managed-heap updates when a GC sweep finishes. RequestServer runs
 its own 500 ms timer and **pushes** byte deltas asynchronously to the browser;
 there is no UI polling or synchronous traffic-statistics IPC. Completed
 requests contribute their final delta before their curl handle is released.

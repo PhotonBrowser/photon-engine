@@ -723,6 +723,11 @@ void WebContentClient::did_update_cookie(HTTP::Cookie::Cookie cookie)
     m_session->cookie_jar->update_cookie(cookie);
 }
 
+void WebContentClient::did_update_managed_heap_bytes(u64 bytes)
+{
+    m_managed_heap_bytes = bytes;
+}
+
 Messages::WebContentClient::DidIsKnownHstsHostResponse WebContentClient::did_is_known_hsts_host(String domain)
 {
     return m_session->hsts_store->is_known_hsts_host(domain);

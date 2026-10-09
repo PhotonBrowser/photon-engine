@@ -53,6 +53,11 @@ void WebWorkerClient::did_close_worker()
     WorkerProcessManager::the().worker_did_close(m_agent_id);
 }
 
+void WebWorkerClient::did_update_managed_heap_bytes(u64 bytes)
+{
+    m_managed_heap_bytes = bytes;
+}
+
 void WebWorkerClient::did_finish_loading_worker_script(bool worker_is_secure_context)
 {
     WorkerProcessManager::the().worker_did_finish_loading_script(m_agent_id, worker_is_secure_context);

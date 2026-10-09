@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Checked.h>
 #include <AK/HashTable.h>
 #include <LibRequests/RequestControlClient.h>
 #include <LibWebView/Application.h>
@@ -12,6 +13,7 @@
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebWorkerClient.h>
 #include <LibWebView/WorkerProcessManager.h>
 
 namespace WebView {
@@ -114,6 +116,21 @@ void TabPerformanceMonitor::did_present(u64 view_id)
 void TabPerformanceMonitor::sample()
 {
     HashMap<u64, HashMap<pid_t, Core::Platform::ProcessResourceUsage>> processes;
+    HashMap<u64, HashMap<pid_t, u64>> managed_heaps;
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        auto owner = client.exclusive_performance_owner();
+        auto bytes = client.managed_heap_bytes();
+        if (owner.has_value() && bytes.has_value())
+            managed_heaps.ensure(*owner).set(client.pid(), *bytes);
+        return IterationDecision::Continue;
+    });
+    WorkerProcessManager::the().for_each_client([&](WebWorkerClient& client) {
+        auto owner = WorkerProcessManager::the().exclusive_performance_owner(client.pid());
+        auto bytes = client.managed_heap_bytes();
+        if (owner.has_value() && bytes.has_value())
+            managed_heaps.ensure(*owner).set(client.pid(), *bytes);
+        return IterationDecision::Continue;
+    });
     Application::process_manager().for_each_process([&](Process& process) {
         Optional<u64> owner;
         if (process.type() == ProcessType::WebContent) {
@@ -130,6 +147,13 @@ void TabPerformanceMonitor::sample()
     auto now = MonotonicTime::now();
     ViewImplementation::for_each_view([&](ViewImplementation& view) {
         auto stats = m_tabs.ensure(view.view_id()).sample(now, processes.ensure(view.view_id()));
+        Checked<u64> managed_heap_bytes = 0;
+        if (auto heaps = managed_heaps.get(view.view_id()); heaps.has_value()) {
+            for (auto const& heap : *heaps)
+                managed_heap_bytes += heap.value;
+            if (!managed_heap_bytes.has_overflow())
+                stats.managed_heap_bytes = managed_heap_bytes.value();
+        }
         if ((m_setting_enabled || m_explicitly_enabled_views.contains(view.view_id())) && view.on_performance_stats)
             view.on_performance_stats(stats);
         return IterationDecision::Continue;
