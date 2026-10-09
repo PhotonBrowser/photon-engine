@@ -423,6 +423,10 @@ private:
         };
         on_top_level_navigation_commit = [this] { notify_navigation_committed(); };
         on_load_finish = [this](URL::URL const&) { notify_navigation_committed(); };
+        on_crash_overlay_state_change = [this](bool crashed) {
+            if (!crashed && m_callbacks.crash_recovered)
+                m_callbacks.crash_recovered();
+        };
         on_web_content_crashed = [this](auto) {
             if (!m_callbacks.crashed)
                 return;
@@ -676,6 +680,20 @@ void Runtime::pump()
 void Runtime::set_system_reduced_motion_preference(bool reduce_motion)
 {
     m_impl->application->set_system_reduced_motion_preference(reduce_motion);
+}
+
+void Runtime::set_service_callback(std::function<void(EngineService, bool restarted)> callback)
+{
+    auto& application = *m_impl->application;
+    application.on_compositor_process_death = [callback] {
+        callback(EngineService::Compositor, false);
+        // The Application queues the Compositor's relaunch before telling us it
+        // died, so this runs once the replacement is up.
+        Core::deferred_invoke([callback] { callback(EngineService::Compositor, true); });
+    };
+    application.on_request_server_restarted = [callback] {
+        callback(EngineService::Network, true);
+    };
 }
 
 #if defined(__APPLE__)

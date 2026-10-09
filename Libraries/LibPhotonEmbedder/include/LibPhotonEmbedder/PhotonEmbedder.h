@@ -70,6 +70,9 @@ struct Favicon {
     std::vector<uint8_t> pixels;
 };
 
+// An Engine service process that is restarted when it stops.
+enum class EngineService : uint8_t { Compositor, Network };
+
 enum class DialogType : uint8_t { Alert, Confirm, Prompt };
 
 // A JavaScript alert, confirm or prompt. The page waits until the embedder
@@ -122,6 +125,8 @@ struct ViewCallbacks {
     std::function<void()> navigation_committed;
     std::function<void(std::string const&)> failed;
     std::function<void(std::string const&)> crashed;
+    // The page that replaced a crashed one presented its first frame.
+    std::function<void()> crash_recovered;
 };
 
 enum class PointerType { Move, Leave, Press, Release, Wheel };
@@ -184,6 +189,9 @@ public:
     // Set the host system's reduced-motion preference used by the app's Auto
     // setting. Call again when the system accessibility setting changes.
     void set_system_reduced_motion_preference(bool reduce_motion);
+    // Called with `restarted` false when a service process stops and true once
+    // its replacement is running. The network service reports only its restart.
+    void set_service_callback(std::function<void(EngineService, bool restarted)>);
     std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks);
 
 private:
