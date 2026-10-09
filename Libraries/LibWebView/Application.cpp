@@ -1893,6 +1893,9 @@ ErrorOr<void> Application::launch_request_server()
         if (Core::EventLoop::current().was_exit_requested())
             return;
 
+        if (on_request_server_process_death)
+            on_request_server_process_death();
+
         if (auto result = launch_request_server(); result.is_error()) {
             warnln("\033[31;1mUnable to launch replacement RequestServer: {}\033[0m", result.error());
             VERIFY_NOT_REACHED();

@@ -737,6 +737,9 @@ void Runtime::set_service_callback(std::function<void(EngineService, bool restar
         // died, so this runs once the replacement is up.
         Core::deferred_invoke([callback] { callback(EngineService::Compositor, true); });
     };
+    application.on_request_server_process_death = [callback] {
+        callback(EngineService::Network, false);
+    };
     application.on_request_server_restarted = [callback] {
         callback(EngineService::Network, true);
     };
