@@ -216,7 +216,7 @@ static void with_replaced_image_paint_facts(Layout::ImageProvider const& image_p
     queue(facts);
 }
 
-static void queue_video_paint_facts(HTML::HTMLVideoElement const& video_element)
+static Layout::RustFFI::FfiVideoPaintFacts video_paint_facts(HTML::HTMLVideoElement const& video_element)
 {
     Layout::RustFFI::FfiVideoPaintFacts facts {};
     switch (video_element.current_representation()) {
@@ -243,9 +243,33 @@ static void queue_video_paint_facts(HTML::HTMLVideoElement const& video_element)
         facts.representation = Layout::RustFFI::FfiVideoRepresentation::TransparentBlack;
         break;
     }
+    return facts;
+}
+
+static VideoPaintFactsSnapshot snapshot_video_paint_facts(HTML::HTMLVideoElement const& video_element, Layout::RustFFI::FfiVideoPaintFacts const& facts)
+{
+    VideoPaintFactsSnapshot snapshot {
+        .representation = static_cast<u8>(facts.representation),
+        .has_video_frame = facts.has_video_frame,
+        .video_src_width = facts.video_src_width,
+        .video_src_height = facts.video_src_height,
+        .video_sink_resource_id = facts.video_sink_resource_id,
+        .video_sink_handle = facts.video_sink_handle,
+        .poster_frame = facts.poster_frame,
+    };
+    queue_element_paint_facts(video_element, [&](auto* host, u32 element) {
+        snapshot.host = host;
+        snapshot.element = element;
+    });
+    return snapshot;
+}
+
+static void queue_video_paint_facts(HTML::HTMLVideoElement const& video_element, Layout::RustFFI::FfiVideoPaintFacts const& facts)
+{
     queue_element_paint_facts(video_element, [&](auto* host, u32 element) {
         Layout::RustFFI::render_state_set_video_paint_facts(host, element, facts);
     });
+    video_element.set_pushed_paint_facts(snapshot_video_paint_facts(video_element, facts));
 }
 
 static bool paints_replaced_image_from_facts(Layout::Node const& layout_node)
@@ -295,7 +319,20 @@ void push_video_paint_facts(HTML::HTMLVideoElement const& video_element)
 {
     if (!video_element.has_layout_box())
         return;
-    queue_video_paint_facts(video_element);
+    queue_video_paint_facts(video_element, video_paint_facts(video_element));
+    request_document_repaint(video_element.document(), InvalidateDisplayList::PaintCommands);
+}
+
+// Repainting unconditionally from a per-frame caller requests the next frame, so a page with any video would render at
+// the display rate even while the video is paused.
+void push_video_paint_facts_if_changed(HTML::HTMLVideoElement const& video_element)
+{
+    if (!video_element.has_layout_box())
+        return;
+    auto facts = video_paint_facts(video_element);
+    if (video_element.pushed_paint_facts() == snapshot_video_paint_facts(video_element, facts))
+        return;
+    queue_video_paint_facts(video_element, facts);
     request_document_repaint(video_element.document(), InvalidateDisplayList::PaintCommands);
 }
 
@@ -380,12 +417,14 @@ void push_paint_facts_after_style_attach(Layout::NodeWithStyle& layout_node, Sty
         queue_box_image_paint_facts(layout_node);
         request_document_repaint(layout_node.document(), InvalidateDisplayList::PaintCommands);
         break;
-    case Layout::RustFFI::NodeKind::VideoBox:
+    case Layout::RustFFI::NodeKind::VideoBox: {
         if (!dom_node)
             break;
-        queue_video_paint_facts(as<HTML::HTMLVideoElement>(*dom_node));
+        auto const& video_element = as<HTML::HTMLVideoElement>(*dom_node);
+        queue_video_paint_facts(video_element, video_paint_facts(video_element));
         request_document_repaint(layout_node.document(), InvalidateDisplayList::PaintCommands);
         break;
+    }
     default:
         break;
     }

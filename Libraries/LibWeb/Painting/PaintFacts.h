@@ -11,6 +11,22 @@
 
 namespace Web::Painting {
 
+// A video's paint facts as last pushed, with where they went. Frames are presented through the video's sink, so a
+// steady video needs no repaint; only a change to these does.
+struct VideoPaintFactsSnapshot {
+    u8 representation { 0 };
+    bool has_video_frame { false };
+    i32 video_src_width { 0 };
+    i32 video_src_height { 0 };
+    u64 video_sink_resource_id { 0 };
+    u64 video_sink_handle { 0 };
+    void const* poster_frame { nullptr };
+    void const* host { nullptr };
+    u32 element { 0 };
+
+    bool operator==(VideoPaintFactsSnapshot const&) const = default;
+};
+
 enum class StyleHoldsImageValues : u8 {
     No,
     Yes,
@@ -21,6 +37,8 @@ enum class StyleHoldsImageValues : u8 {
 // the boxes. Facts read off a box are queued for its row.
 WEB_API void push_paint_facts_after_style_attach(Layout::NodeWithStyle&, StyleHoldsImageValues);
 WEB_API void push_video_paint_facts(HTML::HTMLVideoElement const&);
+// For callers that run on every rendering update: pushes and repaints only when the facts differ from the last push.
+WEB_API void push_video_paint_facts_if_changed(HTML::HTMLVideoElement const&);
 WEB_API void push_form_control_paint_facts(HTML::HTMLInputElement&);
 WEB_API void push_canvas_paint_facts(HTML::HTMLCanvasElement const&);
 WEB_API void push_layer_image_paint_facts(Layout::NodeWithStyle&);

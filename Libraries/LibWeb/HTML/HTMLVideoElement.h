@@ -13,6 +13,7 @@
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::HTML {
@@ -56,6 +57,9 @@ public:
 
     Optional<Gfx::DecodedImageFrame> current_decoded_image_frame() const;
 
+    Optional<Painting::VideoPaintFactsSnapshot> const& pushed_paint_facts() const { return m_pushed_paint_facts; }
+    void set_pushed_paint_facts(Painting::VideoPaintFactsSnapshot snapshot) const { m_pushed_paint_facts = snapshot; }
+
 private:
     HTMLVideoElement(DOM::Document&, DOM::QualifiedName);
     virtual void finalize() override;
@@ -76,6 +80,7 @@ private:
     GC::Ptr<HTML::VideoTrack> m_video_track;
     VideoFrame m_current_frame;
     Optional<Gfx::DecodedImageFrame> m_poster_frame;
+    mutable Optional<Painting::VideoPaintFactsSnapshot> m_pushed_paint_facts;
 
     Optional<Gfx::Size<u32>> m_intrinsic_video_dimensions;
     Optional<CSSPixelSize> m_natural_dimensions;
