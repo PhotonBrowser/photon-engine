@@ -78,6 +78,13 @@ ScopedSVGImageDocument::ScopedSVGImageDocument(DOM::Document& document, FrameReq
         }
     }
 
+    // A document whose image is still loading has drawn nothing yet, and its image tells its clients once it is
+    // created. Without an image to route to, its frame requests would reach every image of the page instead.
+    if (!current_image_data && !m_should_unsuppress_frame_requests) {
+        m_page_client->suppress_frame_requests();
+        m_should_unsuppress_frame_requests = true;
+    }
+
     m_page_client->set_current_svg_image_data(current_image_data);
 
     document.set_browsing_context(m_navigable->active_browsing_context());
