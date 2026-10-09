@@ -137,6 +137,9 @@ struct ViewCallbacks {
     // Called with the page's new icon, or null when the page has none, such
     // as when a navigation starts.
     std::function<void(Favicon const*)> favicon_changed;
+    // Called when the tab starts or stops playing audio and when its mute
+    // state changes.
+    std::function<void(bool playing, bool muted)> audio_state_changed;
     std::function<void(DialogRequest const&)> dialog_requested;
     // A top-level navigation committed, a load finished, or a history
     // traversal completed: the page now shown may open dialogs.
@@ -236,6 +239,7 @@ public:
     void stop_loading();
     void go_back();
     void go_forward();
+    bool toggle_audio_mute();
     void resize(int logical_width, int logical_height, double device_pixel_ratio);
     void set_visible(bool visible);
     void set_performance_monitor_enabled(bool enabled);

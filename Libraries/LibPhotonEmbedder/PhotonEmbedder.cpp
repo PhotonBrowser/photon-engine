@@ -284,7 +284,23 @@ public:
         update_compositor_display_metadata(page());
     }
 
+    bool toggle_audio_mute()
+    {
+        toggle_page_mute_state();
+        auto muted = page_mute_state() == Web::HTML::MuteState::Muted;
+        notify_audio_state(audio_play_state());
+        return muted;
+    }
+
 private:
+    void notify_audio_state(Web::HTML::AudioPlayState play_state)
+    {
+        if (m_callbacks.audio_state_changed)
+            m_callbacks.audio_state_changed(
+                play_state == Web::HTML::AudioPlayState::Playing,
+                page_mute_state() == Web::HTML::MuteState::Muted);
+    }
+
     // A tab can move to a page in another WebContent process; its compositor
     // context needs the display metadata as well.
     virtual void prepare_page_for_tab(WebContentPage& page) override
@@ -316,6 +332,9 @@ private:
         , m_callbacks(move(callbacks))
     {
         m_device_pixel_ratio = dpr;
+        on_audio_play_state_changed = [this](Web::HTML::AudioPlayState play_state) {
+            notify_audio_state(play_state);
+        };
         on_url_change = [this](URL::URL const& url) {
             if (external_image_lease_trace_enabled()) {
                 auto serialized_url = url.serialize();
@@ -811,6 +830,7 @@ void View::reload() { m_impl->view->reload(); }
 void View::stop_loading() { m_impl->view->stop_loading(); }
 void View::go_back() { m_impl->view->traverse_the_history_by_delta(-1); }
 void View::go_forward() { m_impl->view->traverse_the_history_by_delta(1); }
+bool View::toggle_audio_mute() { return m_impl->view->toggle_audio_mute(); }
 void View::resize(int width, int height, double device_pixel_ratio)
 {
     auto physical_width = max(1, static_cast<int>(std::lround(width * device_pixel_ratio)));
