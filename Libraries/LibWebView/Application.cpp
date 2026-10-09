@@ -1940,6 +1940,9 @@ ErrorOr<void> Application::launch_request_server()
             warnln("Unable to reconnect WebWorker processes to RequestServer: {}", result.error());
             VERIFY_NOT_REACHED();
         }
+
+        if (on_request_server_restarted)
+            on_request_server_restarted();
     };
 
     if (m_browser_options.dns_settings.has_value())

@@ -227,6 +227,8 @@ public:
     void notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
 
     Function<void()> on_compositor_process_death;
+    // Called once a replacement RequestServer has reconnected every client.
+    Function<void()> on_request_server_restarted;
 
     virtual Optional<ViewImplementation&> active_web_view() const { return {}; }
     virtual Vector<ViewImplementation&> active_window_web_views() const { return {}; }
