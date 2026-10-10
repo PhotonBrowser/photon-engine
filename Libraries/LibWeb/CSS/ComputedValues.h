@@ -579,6 +579,8 @@ public:
 
     Overflow overflow_x() const { return static_cast<Overflow>(m_noninherited.box->overflow_x); }
     Overflow overflow_y() const { return static_cast<Overflow>(m_noninherited.box->overflow_y); }
+    OverscrollBehavior overscroll_behavior_x() const { return static_cast<OverscrollBehavior>(m_noninherited.box->overscroll_behavior_x); }
+    OverscrollBehavior overscroll_behavior_y() const { return static_cast<OverscrollBehavior>(m_noninherited.box->overscroll_behavior_y); }
 
     Color color() const { return m_inherited.text->color_value(); }
     Color background_color() const { return m_noninherited.background->background_color_value(); }

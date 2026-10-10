@@ -857,6 +857,11 @@
     "break-word",
     "anywhere"
   ],
+  "overscroll-behavior": [
+    "auto",
+    "contain",
+    "none"
+  ],
   "page-size": [
     "a5",
     "a4",

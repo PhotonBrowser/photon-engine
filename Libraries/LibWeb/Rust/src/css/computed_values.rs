@@ -964,6 +964,8 @@ impl_computed_payload_clone_and_eq!(BoxValues {
     position,
     overflow_x,
     overflow_y,
+    overscroll_behavior_x,
+    overscroll_behavior_y,
     box_sizing,
     resize,
     text_overflow,
@@ -2941,8 +2943,8 @@ impl ComputedAspectRatio {
 impl BoxValues {
     fn initial() -> Self {
         use crate::css::css_enums::{
-            box_sizing, clear, float, overflow, positioning, resize, table_layout, text_overflow, unicode_bidi,
-            vertical_align,
+            box_sizing, clear, float, overflow, overscroll_behavior, positioning, resize, table_layout, text_overflow,
+            unicode_bidi, vertical_align,
         };
         use crate::css::display::FfiDisplay;
 
@@ -2954,6 +2956,8 @@ impl BoxValues {
             position: positioning::STATIC,
             overflow_x: overflow::VISIBLE,
             overflow_y: overflow::VISIBLE,
+            overscroll_behavior_x: overscroll_behavior::AUTO,
+            overscroll_behavior_y: overscroll_behavior::AUTO,
             box_sizing: box_sizing::CONTENT_BOX,
             resize: resize::NONE,
             text_overflow: text_overflow::CLIP,

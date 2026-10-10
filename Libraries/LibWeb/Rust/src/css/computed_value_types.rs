@@ -178,6 +178,8 @@ pub struct BoxValues {
     pub position: u8,
     pub overflow_x: u8,
     pub overflow_y: u8,
+    pub overscroll_behavior_x: u8,
+    pub overscroll_behavior_y: u8,
     pub box_sizing: u8,
     pub resize: u8,
     pub text_overflow: u8,

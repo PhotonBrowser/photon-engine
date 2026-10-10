@@ -2936,8 +2936,8 @@ unsafe fn build_box_group(
     };
     use crate::css::css_enums::{
         keyword_to_box_sizing, keyword_to_clear, keyword_to_continue_value, keyword_to_float, keyword_to_overflow,
-        keyword_to_positioning, keyword_to_resize, keyword_to_table_layout, keyword_to_text_overflow,
-        keyword_to_unicode_bidi, keyword_to_vertical_align,
+        keyword_to_overscroll_behavior, keyword_to_positioning, keyword_to_resize, keyword_to_table_layout,
+        keyword_to_text_overflow, keyword_to_unicode_bidi, keyword_to_vertical_align,
     };
 
     let display = match values.value(property_id::DISPLAY) {
@@ -3158,6 +3158,16 @@ unsafe fn build_box_group(
         position: required_keyword_code(values, property_id::POSITION, keyword_to_positioning),
         overflow_x: required_keyword_code(values, property_id::OVERFLOW_X, keyword_to_overflow),
         overflow_y: required_keyword_code(values, property_id::OVERFLOW_Y, keyword_to_overflow),
+        overscroll_behavior_x: required_keyword_code(
+            values,
+            property_id::OVERSCROLL_BEHAVIOR_X,
+            keyword_to_overscroll_behavior,
+        ),
+        overscroll_behavior_y: required_keyword_code(
+            values,
+            property_id::OVERSCROLL_BEHAVIOR_Y,
+            keyword_to_overscroll_behavior,
+        ),
         box_sizing: required_keyword_code(values, property_id::BOX_SIZING, keyword_to_box_sizing),
         resize: required_keyword_code(values, property_id::RESIZE, keyword_to_resize),
         text_overflow: required_keyword_code(values, property_id::TEXT_OVERFLOW, keyword_to_text_overflow),
