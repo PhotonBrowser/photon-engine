@@ -73,6 +73,10 @@ public:
     void check_async_work_completion();
     virtual GrDirectContext* sk_context() const = 0;
 
+    // Compiles the next GPU program recent sessions used, ahead of its first use, so that a first paint does not wait
+    // for the compiles. Returns whether any are left; backends without a program cache have none.
+    virtual bool precompile_next_shader() { return false; }
+
     virtual MetalContext& metal_context() = 0;
     virtual VulkanContext const& vulkan_context() = 0;
     virtual Direct3DContext& direct3d_context() { VERIFY_NOT_REACHED(); }

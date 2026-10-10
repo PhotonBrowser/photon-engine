@@ -383,7 +383,7 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
     };
 
     auto extensions = make<skgpu::VulkanExtensions>();
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#    ifdef USE_VULKAN_DMABUF_IMAGES
     static constexpr Array<char const*, 4> enabled_device_extensions {
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
         VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
@@ -392,10 +392,10 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
     };
     extensions->init(backend_context.fGetProc, vulkan_context.instance, vulkan_context.physical_device,
         0, nullptr, enabled_device_extensions.size(), enabled_device_extensions.data());
-#else
+#    else
     extensions->init(backend_context.fGetProc, vulkan_context.instance, vulkan_context.physical_device,
         0, nullptr, 0, nullptr);
-#endif
+#    endif
     backend_context.fVkExtensions = extensions.ptr();
 
     backend_context.fMemoryAllocator = create_skia_vulkan_memory_allocator(vulkan_context);
@@ -453,10 +453,29 @@ public:
 
     MetalContext& metal_context() override { return m_metal_context; }
 
+    bool precompile_next_shader() override
+    {
+        if (!m_warm_entries.has_value())
+            m_warm_entries = m_persistent_cache->load_warm_entries();
+        if (m_next_warm_entry >= m_warm_entries->size())
+            return false;
+        auto const& entry = m_warm_entries->at(m_next_warm_entry++);
+        auto started_at = MonotonicTime::now();
+        m_context->precompileShader(*entry.key, *entry.data);
+        m_warm_duration += MonotonicTime::now() - started_at;
+        auto remaining = m_next_warm_entry < m_warm_entries->size();
+        if (!remaining && std::getenv("PHOTON_VERBOSE"))
+            dbgln("Photon Skia precompiled {} programs in {:.2f}ms", m_warm_entries->size(), m_warm_duration.to_seconds_f64() * 1000.0);
+        return remaining;
+    }
+
 private:
     sk_sp<GrDirectContext> m_context;
     OwnPtr<PhotonGaneshPersistentCache> m_persistent_cache;
     NonnullRefPtr<MetalContext> m_metal_context;
+    Optional<Vector<PhotonGaneshPersistentCache::WarmEntry>> m_warm_entries;
+    size_t m_next_warm_entry { 0 };
+    AK::Duration m_warm_duration;
 };
 
 RefPtr<SkiaBackendContext> SkiaBackendContext::create_metal_context(NonnullRefPtr<MetalContext> metal_context)

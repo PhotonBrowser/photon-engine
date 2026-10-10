@@ -13,6 +13,7 @@
 #include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
 #include <LibCore/ResourceImplementationFile.h>
+#include <LibCore/Timer.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/SkiaBackendContext.h>
@@ -83,6 +84,17 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     if (!disable_sandbox)
         TRY(Compositor::apply_sandbox(mach_server_name, cache_path, resource_root));
+
+    // Compile the GPU programs recent sessions used before pages need them, one per turn of the event loop so that a
+    // frame waits for one compile at most rather than for every program its first paint uses.
+    RefPtr<Core::Timer> precompile_timer;
+    if (skia_backend_context) {
+        precompile_timer = Core::Timer::create_repeating(0, [context = skia_backend_context, &precompile_timer] {
+            if (!context->precompile_next_shader())
+                precompile_timer->stop();
+        });
+        precompile_timer->start();
+    }
 
     auto client = TRY(IPC::take_over_accepted_client_from_system_server<Compositor::ConnectionFromClient>(
         mach_server_name, move(skia_backend_context)));
