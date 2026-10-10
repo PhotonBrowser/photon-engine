@@ -850,11 +850,26 @@ static void perform_native_release_drain(void* info)
 #endif
 
 struct Runtime::Impl {
-    std::string executable { "photon" };
-    std::string temporary_profile { "--temporary-profile" };
-    char* argv[3] { executable.data(), temporary_profile.data(), nullptr };
-    AK::StringView argument_views[2] { { executable.data(), executable.size() }, { temporary_profile.data(), temporary_profile.size() } };
-    Main::Arguments arguments { 2, argv, argument_views };
+    // The command line the Engine application parses. It keeps pointers into
+    // `strings`, so the Impl must not move once it is built.
+    std::vector<std::string> strings;
+    std::vector<char*> argv;
+    std::vector<AK::StringView> argument_views;
+    Main::Arguments arguments;
+
+    void set_arguments(std::string const& profile_path)
+    {
+        strings = { "photon", profile_path.empty() ? "--temporary-profile" : "--profile-path=" + profile_path };
+        for (auto& string : strings) {
+            argv.push_back(string.data());
+            argument_views.emplace_back(string.data(), string.size());
+        }
+        argv.push_back(nullptr);
+        arguments.argc = static_cast<int>(strings.size());
+        arguments.argv = argv.data();
+        arguments.strings = { argument_views.data(), argument_views.size() };
+    }
+
     OwnPtr<WebView::PhotonApplication> application;
 #if defined(__APPLE__)
     CFRunLoopRef owner_run_loop { nullptr };
@@ -892,9 +907,10 @@ Runtime::Runtime(std::unique_ptr<Impl> impl)
 {
 }
 
-std::unique_ptr<Runtime> Runtime::create(std::string const& helper_directory, std::string& error)
+std::unique_ptr<Runtime> Runtime::create(std::string const& helper_directory, std::string const& profile_path, std::string& error)
 {
     auto impl = std::make_unique<Impl>();
+    impl->set_arguments(profile_path);
     auto app = WebView::PhotonApplication::create(impl->arguments, ByteString(helper_directory.c_str()));
     if (app.is_error()) {
         error = "Photon Engine runtime initialization failed";
@@ -968,6 +984,23 @@ void Runtime::set_service_callback(std::function<void(EngineService, bool restar
 void Runtime::set_clipboard(Clipboard clipboard)
 {
     m_impl->application->set_clipboard(move(clipboard));
+}
+
+void Runtime::clear_browsing_data(ClearBrowsingData const& request, std::function<void()> done)
+{
+    using Delete = WebView::Application::ClearBrowsingDataOptions::Delete;
+    WebView::Application::ClearBrowsingDataOptions options {
+        .since = UnixDateTime::from_seconds_since_epoch(request.since_unix_seconds),
+        .delete_cached_files = request.cache ? Delete::Yes : Delete::No,
+        // Photon keeps its own history; it never uses the Engine's.
+        .delete_history = Delete::No,
+        .delete_download_history = Delete::No,
+        .delete_site_data = request.site_data ? Delete::Yes : Delete::No,
+    };
+    m_impl->application->clear_browsing_data(options)->when_resolved([done = move(done)](auto) {
+        if (done)
+            done();
+    });
 }
 
 #if defined(__APPLE__)

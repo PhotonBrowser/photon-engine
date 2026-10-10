@@ -150,6 +150,15 @@ struct Clipboard {
     std::function<void(std::vector<ClipboardEntry> const&)> write;
 };
 
+// Website data to delete. Data last used before `since_unix_seconds` is kept.
+struct ClearBrowsingData {
+    int64_t since_unix_seconds { 0 };
+    // The network cache.
+    bool cache { false };
+    // Cookies and site storage such as localStorage and IndexedDB.
+    bool site_data { false };
+};
+
 enum class Cursor : uint8_t {
     Arrow, Hidden, Crosshair, IBeam, ResizeHorizontal, ResizeVertical,
     ResizeDiagonalTLBR, ResizeDiagonalBLTR, ResizeColumn, ResizeRow, Hand,
@@ -236,7 +245,9 @@ class View;
 
 class PHOTONEMBEDDER_API Runtime {
 public:
-    static std::unique_ptr<Runtime> create(std::string const& helper_directory, std::string& error);
+    // Keeps cookies, site storage and the cache in `profile_path`. An empty
+    // path uses a temporary profile that is removed on a clean shutdown.
+    static std::unique_ptr<Runtime> create(std::string const& helper_directory, std::string const& profile_path, std::string& error);
     ~Runtime();
     Runtime(Runtime&&) noexcept;
     Runtime& operator=(Runtime&&) noexcept;
@@ -260,6 +271,8 @@ public:
     void set_service_callback(std::function<void(EngineService, bool restarted)>);
     // Use the host's system clipboard for copying and pasting.
     void set_clipboard(Clipboard);
+    // Deletes website data, then calls `done`.
+    void clear_browsing_data(ClearBrowsingData const&, std::function<void()> done);
     std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks);
     std::unique_ptr<View> create_view_for_traversable(View& opener, void* traversable, int width, int height, double device_pixel_ratio, ViewCallbacks);
 
