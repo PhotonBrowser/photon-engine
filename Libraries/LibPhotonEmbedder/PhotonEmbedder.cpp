@@ -79,6 +79,7 @@ private:
     virtual Optional<ViewImplementation&> active_web_view() const override;
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
     virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const override;
+    virtual void open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor) const override;
 
     virtual Utf16String clipboard_text(ClipboardType type) const override
     {
@@ -281,6 +282,14 @@ public:
         m_callbacks.open_in_new_tab_requested(
             std::string(serialized.characters_without_null_termination(), serialized.length()),
             activate_tab == Web::HTML::ActivateTab::Yes);
+    }
+
+    void peek(URL::URL const& url)
+    {
+        if (!m_callbacks.peek_requested)
+            return;
+        auto serialized = url.serialize().bytes_as_string_view();
+        m_callbacks.peek_requested(std::string(serialized.characters_without_null_termination(), serialized.length()));
     }
 
     void activate_context_menu_item(size_t index)
@@ -821,6 +830,12 @@ void PhotonApplication::open_url_in_new_tab(URL::URL const& url, Web::HTML::Acti
 void PhotonApplication::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab) const
 {
     open_url_in_new_tab(navigation.url, activate_tab);
+}
+
+void PhotonApplication::open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor navigation) const
+{
+    if (m_active_view)
+        m_active_view->peek(navigation.url);
 }
 
 }

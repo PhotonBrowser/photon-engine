@@ -202,6 +202,8 @@ struct ViewCallbacks {
     std::function<void(ContextMenuRequest const&)> context_menu_requested;
     // A context menu action opened a link in a new tab.
     std::function<void(std::string const& url, bool activate)> open_in_new_tab_requested;
+    // A link was shift-clicked, to be shown in a preview over the page.
+    std::function<void(std::string const& url)> peek_requested;
 };
 
 enum class PointerType { Move, Leave, Press, Release, Wheel };
