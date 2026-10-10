@@ -50,7 +50,7 @@ TEST_CASE(persistent_cache_stores_and_retrieves_exact_bytes)
 
 TEST_CASE(persistent_cache_load_does_not_mutate_entry_metadata)
 {
-    auto root = test_cache_root("read-only-load");
+    auto root = test_cache_root("read-only-load"sv);
     std::filesystem::remove_all(root.characters());
     Gfx::PhotonGaneshPersistentCache cache(root, ByteString("namespace-a"), 1024);
     auto key = data("program-key"sv);
@@ -137,5 +137,57 @@ TEST_CASE(persistent_cache_evicts_oldest_entries_across_namespaces)
     current_namespace.store(*new_key, *value, SkString("new"));
     EXPECT(!std::filesystem::exists(old_path.characters()));
     EXPECT(std::filesystem::exists(current_namespace.file_path_for_key(*new_key).characters()));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_warms_programs_in_first_use_order)
+{
+    auto root = test_cache_root("warm-order"sv);
+    std::filesystem::remove_all(root.characters());
+    auto first = data("first-key"sv);
+    auto second = data("second-key"sv);
+    {
+        Gfx::PhotonGaneshPersistentCache session(root, ByteString("namespace-a"), 1024);
+        EXPECT(!session.load(*second));
+        session.store(*second, *data("second-program"sv), SkString("second"));
+        EXPECT(!session.load(*first));
+        session.store(*first, *data("first-program"sv), SkString("first"));
+        // Asked for again, a program keeps its first place.
+        EXPECT(session.load(*second));
+    }
+
+    Gfx::PhotonGaneshPersistentCache next_session(root, ByteString("namespace-a"), 1024);
+    auto entries = next_session.load_warm_entries();
+    EXPECT_EQ(entries.size(), 2u);
+    EXPECT(data_equals(*entries[0].key, *second));
+    EXPECT(data_equals(*entries[0].data, *data("second-program"sv)));
+    EXPECT(data_equals(*entries[1].key, *first));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_keeps_warmed_programs_ahead_of_new_ones)
+{
+    auto root = test_cache_root("warm-keep"sv);
+    std::filesystem::remove_all(root.characters());
+    auto warmed = data("warmed-key"sv);
+    auto added = data("added-key"sv);
+    {
+        Gfx::PhotonGaneshPersistentCache session(root, ByteString("namespace-a"), 1024);
+        EXPECT(!session.load(*warmed));
+        session.store(*warmed, *data("warmed-program"sv), SkString("warmed"));
+    }
+    {
+        // This session compiles the warmed program up front, so never asks for it, and asks for a new one.
+        Gfx::PhotonGaneshPersistentCache session(root, ByteString("namespace-a"), 1024);
+        EXPECT_EQ(session.load_warm_entries().size(), 1u);
+        EXPECT(!session.load(*added));
+        session.store(*added, *data("added-program"sv), SkString("added"));
+    }
+
+    Gfx::PhotonGaneshPersistentCache next_session(root, ByteString("namespace-a"), 1024);
+    auto entries = next_session.load_warm_entries();
+    EXPECT_EQ(entries.size(), 2u);
+    EXPECT(data_equals(*entries[0].key, *warmed));
+    EXPECT(data_equals(*entries[1].key, *added));
     std::filesystem::remove_all(root.characters());
 }
