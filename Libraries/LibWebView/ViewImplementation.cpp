@@ -996,6 +996,15 @@ void ViewImplementation::did_consume_input_event_in_compositor(Badge<WebContentP
     update_input_response_watchdog();
 }
 
+void ViewImplementation::did_detect_history_swipe_candidate(Badge<WebContentPage>, u64 gesture_id, bool back, float unconsumed_delta)
+{
+    if (gesture_id == 0)
+        return;
+
+    if (on_history_swipe_candidate)
+        on_history_swipe_candidate(gesture_id, back, unconsumed_delta);
+}
+
 void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id)
 {
     auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });

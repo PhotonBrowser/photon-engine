@@ -72,11 +72,17 @@ public:
         Optional<PendingFrame> frame_to_present;
     };
 
+    struct HistorySwipeCandidate {
+        bool back { false };
+        float unconsumed_delta { 0 };
+    };
+
     struct ContextUpdateResult {
         bool accepted { false };
         Optional<PendingFrame> frame_to_present;
         bool should_request_rendering_update { false };
         Optional<Web::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
+        Optional<HistorySwipeCandidate> history_swipe_candidate {};
     };
 
     struct PreparedFrame {
@@ -157,7 +163,7 @@ public:
     bool visual_animations_need_frame();
     u64 visual_context_tree_copy_count_for_testing() const { return m_visual_context_tree_copy_count; }
     Optional<Web::AsyncScrollNodeStableID> latched_wheel_scroller_for_testing() const;
-    ContextUpdateResult async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Optional<MonotonicTime> now_for_testing = {});
+    ContextUpdateResult async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Optional<MonotonicTime> now_for_testing = {}, bool history_swipe_back_enabled = false, bool history_swipe_forward_enabled = false);
     Compositing::PendingAsyncScrollUpdates take_pending_async_scroll_updates();
     bool has_pending_async_scroll_updates() const;
     // A gesture whose steps this context chains ends once they stop arriving, which is reported to WebContent so
@@ -275,15 +281,16 @@ private:
         Optional<Compositing::AsyncScrollOperationID> operation_id;
         // The viewport to present, when the scroll moved a scrolling box or started a snap scroll of one.
         Optional<Gfx::IntRect> viewport_rect_to_present;
+        Optional<HistorySwipeCandidate> history_swipe_candidate;
     };
-    WheelScrollOutcome perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID, Gfx::FloatPoint delta, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, Compositing::AsyncScrollOperationTracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining);
+    WheelScrollOutcome perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID, Gfx::FloatPoint delta, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, Compositing::AsyncScrollOperationTracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining, bool history_swipe_back_enabled = false, bool history_swipe_forward_enabled = false);
     // The latched scroller of the gesture the wheel event continues, in the current scroll tree, with the gesture
     // advanced to the event. A latch the event does not continue, or whose scroller the current display list no
     // longer has, is dropped here.
     Optional<Compositing::AsyncScrollNodeID> resolve_wheel_scroll_latch(Gfx::FloatPoint position, Web::ScrollGesturePhase, u32 modifiers, MonotonicTime now);
     // The scroller the first step of a wheel gesture is routed to, which the gesture is latched to.
     Optional<Compositing::AsyncScrollNodeID> hit_test_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::ScrollGesturePhase, u32 modifiers, MonotonicTime now, Optional<Web::UniqueNodeID> expected_document_id);
-    Gfx::IntRect note_async_scrolling_viewport_rect(Gfx::IntRect viewport_rect, Optional<Compositing::AsyncScrollOffset> const&);
+    Gfx::IntRect note_async_scrolling_viewport_rect(Gfx::IntRect viewport_rect, ReadonlySpan<Compositing::AsyncScrollOffset>);
     Optional<Compositing::AsyncScrollOperationID> snap_at_gesture_end(MonotonicTime now);
     Compositing::AsyncScrollOperationID start_snap_scroll(Compositing::AsyncScrollNodeID, ScrollSnapController::SnapScrollStart&&, bool settles_gesture, MonotonicTime now);
     void retire_smooth_scroll_animation(Web::AsyncScrollNodeStableID);

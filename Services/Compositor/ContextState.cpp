@@ -706,18 +706,18 @@ Optional<Compositing::AsyncScrollOperationID> ContextState::snap_at_gesture_end(
 }
 
 // The viewport rect a wheel scroll presents, moved along with the viewport when the scroll moved it.
-Gfx::IntRect ContextState::note_async_scrolling_viewport_rect(Gfx::IntRect viewport_rect, Optional<Compositing::AsyncScrollOffset> const& scroll_offset)
+Gfx::IntRect ContextState::note_async_scrolling_viewport_rect(Gfx::IntRect viewport_rect, ReadonlySpan<Compositing::AsyncScrollOffset> scroll_offsets)
 {
-    if (scroll_offset.has_value()) {
-        auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(scroll_offset->stable_node_id);
+    for (auto const& scroll_offset : scroll_offsets) {
+        auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(scroll_offset.stable_node_id);
         if (node_id.has_value() && m_async_scroll_tree.scroll_node_is_viewport(*node_id))
-            viewport_rect.set_location(scroll_offset->compositor_scroll_offset.to_type<int>());
+            viewport_rect.set_location(scroll_offset.compositor_scroll_offset.to_type<int>());
     }
     m_async_scrolling_viewport_rect = viewport_rect;
     return viewport_rect;
 }
 
-ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Compositing::AsyncScrollOperationTracking operation_tracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining scroll_chaining)
+ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Compositing::AsyncScrollOperationTracking operation_tracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining scroll_chaining, bool history_swipe_back_enabled, bool history_swipe_forward_enabled)
 {
     WheelScrollOutcome outcome;
     auto css_delta = m_async_scroll_tree.css_pixels_from_device_offset(delta);
@@ -748,25 +748,41 @@ ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Comp
     if (operation_tracking == Compositing::AsyncScrollOperationTracking::Yes)
         outcome.operation_id = ++m_next_async_scroll_operation_id;
 
-    auto scroll_offset = m_async_scroll_tree.apply_scroll_delta(node_id, delta, current_visual_context_tree(), m_scroll_state_snapshot, scroll_chaining);
-    if (!scroll_offset.has_value()) {
+    auto application = m_async_scroll_tree.apply_scroll_delta(node_id, delta, current_visual_context_tree(), m_scroll_state_snapshot, scroll_chaining);
+    if (!application.scroll_offsets.is_empty()) {
+        for (auto& scroll_offset : application.scroll_offsets) {
+            auto scroll_offset_before_scroll = scroll_offset.compositor_scroll_offset - scroll_offset.unadopted_scroll_delta;
+            m_scroll_snap_controller.did_scroll_node_plainly(scroll_offset.stable_node_id, scroll_gesture_phase, m_async_scroll_tree.css_pixels_from_device_offset(scroll_offset_before_scroll));
+            // https://drafts.csswg.org/css-scroll-snap-1/#scroll-types
+            // A wheel or panning scroll is relative, which scroll-state(scrolled) queries observe.
+            scroll_offset.last_relative_scroll_delta = scroll_offset.unadopted_scroll_delta;
+        }
+        rebuild_wheel_hit_test_targets();
+        store_pending_async_scroll_offsets(application.scroll_offsets, outcome.operation_id);
+    }
+
+    if (application.horizontal_boundary_node.has_value()) {
+        if (auto const* node = m_async_scroll_tree.scroll_node_for_id(*application.horizontal_boundary_node)) {
+            auto can_history_swipe = node->is_viewport
+                && node->overscroll_behavior_x == Compositing::ScrollOverscrollBehavior::Auto
+                && application.unconsumed_delta.x() != 0
+                && (history_swipe_back_enabled || history_swipe_forward_enabled);
+            if (can_history_swipe) {
+                outcome.history_swipe_candidate = HistorySwipeCandidate {
+                    .back = history_swipe_back_enabled,
+                    .unconsumed_delta = fabsf(application.unconsumed_delta.x()),
+                };
+            }
+        }
+    }
+
+    if (application.scroll_offsets.is_empty()) {
         if (outcome.operation_id.has_value())
             m_completed_async_scroll_operation_ids.append(*outcome.operation_id);
         return outcome;
     }
 
-    // The box the delta moved is the one a gesture pans; on the first step of a gesture, scroll node chaining may have
-    // moved an ancestor of the node the gesture latched to.
-    auto scroll_offset_before_scroll = scroll_offset->compositor_scroll_offset - scroll_offset->unadopted_scroll_delta;
-    m_scroll_snap_controller.did_scroll_node_plainly(scroll_offset->stable_node_id, scroll_gesture_phase, m_async_scroll_tree.css_pixels_from_device_offset(scroll_offset_before_scroll));
-
-    // https://drafts.csswg.org/css-scroll-snap-1/#scroll-types
-    // A wheel or panning scroll is relative, which scroll-state(scrolled) queries observe.
-    scroll_offset->last_relative_scroll_delta = scroll_offset->unadopted_scroll_delta;
-
-    rebuild_wheel_hit_test_targets();
-    store_pending_async_scroll_offsets({ &*scroll_offset, 1 }, outcome.operation_id);
-    outcome.viewport_rect_to_present = note_async_scrolling_viewport_rect(viewport_rect, scroll_offset);
+    outcome.viewport_rect_to_present = note_async_scrolling_viewport_rect(viewport_rect, application.scroll_offsets);
     return outcome;
 }
 
@@ -811,8 +827,7 @@ ContextState::AsyncScrollResult ContextState::async_scroll_by(
         return {};
     }
 
-    auto scroll_chaining = is_first_step_of_gesture ? Compositing::ScrollChaining::ToScrollableAncestors : Compositing::ScrollChaining::None;
-    auto outcome = perform_wheel_scroll_of_node(*latched_node_id, delta, wheel_delta_precision, scroll_gesture_phase, operation_tracking, viewport_rect, now, scroll_chaining);
+    auto outcome = perform_wheel_scroll_of_node(*latched_node_id, delta, wheel_delta_precision, scroll_gesture_phase, operation_tracking, viewport_rect, now, Compositing::ScrollChaining::ToScrollableAncestors);
     return {
         .enqueue_result = { true, outcome.operation_id },
         .frame_to_present = outcome.viewport_rect_to_present.map([](auto const& rect) { return PendingFrame::repainting_changes(rect); }),
@@ -971,7 +986,7 @@ ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event(Web::Mous
     };
     auto delta_in_device_pixels = Gfx::FloatPoint { static_cast<float>(wheel_delta_x), static_cast<float>(wheel_delta_y) }
                                       .scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
-    return async_scroll_by(position, delta_in_device_pixels, event.wheel_delta_precision, event.scroll_gesture_phase, event.modifiers, now);
+    return async_scroll_by(position, delta_in_device_pixels, event.wheel_delta_precision, event.scroll_gesture_phase, event.modifiers, now, event.history_swipe_back_enabled, event.history_swipe_forward_enabled);
 }
 
 static bool is_touchpad_step(Web::MouseEvent const& event)
@@ -1079,7 +1094,7 @@ Optional<ContextState::ScrollFlingStep> ContextState::end_scroll_fling(Monotonic
     return ScrollFlingStep { move(event), move(result) };
 }
 
-ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Optional<MonotonicTime> now_for_testing)
+ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Optional<MonotonicTime> now_for_testing, bool history_swipe_back_enabled, bool history_swipe_forward_enabled)
 {
     if (!presents_to_client())
         return {};
@@ -1142,15 +1157,15 @@ ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint 
         }
     }
 
-    auto scroll_chaining = is_first_step_of_gesture ? Compositing::ScrollChaining::ToScrollableAncestors : Compositing::ScrollChaining::None;
-    auto outcome = perform_wheel_scroll_of_node(*latched_node_id, async_scroll_delta, wheel_delta_precision, scroll_gesture_phase, Compositing::AsyncScrollOperationTracking::No, m_async_scrolling_viewport_rect, now, scroll_chaining);
+    auto outcome = perform_wheel_scroll_of_node(*latched_node_id, async_scroll_delta, wheel_delta_precision, scroll_gesture_phase, Compositing::AsyncScrollOperationTracking::No, m_async_scrolling_viewport_rect, now, Compositing::ScrollChaining::ToScrollableAncestors, history_swipe_back_enabled, history_swipe_forward_enabled);
     if (!outcome.viewport_rect_to_present.has_value())
         return {
             .accepted = true,
             .frame_to_present = frame_to_present,
             .should_request_rendering_update = frame_to_present.has_value(),
+            .history_swipe_candidate = outcome.history_swipe_candidate,
         };
-    return { .accepted = true, .frame_to_present = PendingFrame::repainting_changes(*outcome.viewport_rect_to_present), .should_request_rendering_update = true };
+    return { .accepted = true, .frame_to_present = PendingFrame::repainting_changes(*outcome.viewport_rect_to_present), .should_request_rendering_update = true, .history_swipe_candidate = outcome.history_swipe_candidate };
 }
 
 Compositing::PendingAsyncScrollUpdates ContextState::take_pending_async_scroll_updates()

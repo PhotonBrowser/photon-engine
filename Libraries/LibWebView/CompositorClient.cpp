@@ -102,4 +102,10 @@ void CompositorClient::did_not_dispatch_input_event(Web::CompositorContextId con
         page->did_not_dispatch_input_event_through_compositor(event_id);
 }
 
+void CompositorClient::did_detect_history_swipe_candidate(Web::CompositorContextId context_id, u64 gesture_id, bool back, float unconsumed_delta)
+{
+    if (auto* page = page_for_compositor_context_id(context_id))
+        page->did_detect_history_swipe_candidate(gesture_id, back, unconsumed_delta);
+}
+
 }

@@ -186,6 +186,8 @@ struct ViewCallbacks {
     // A top-level navigation committed, a load finished, or a history
     // traversal completed: the page now shown may open dialogs.
     std::function<void()> navigation_committed;
+    // A precise trackpad wheel delta reached the root viewport's horizontal edge and can traverse tab history.
+    std::function<void(uint64_t gesture_id, bool back, float unconsumed_delta)> history_swipe_candidate;
     std::function<std::string(NewWebViewRequest const&)> new_web_view_requested;
     std::function<void(std::string const&)> failed;
     std::function<void(std::string const&)> crashed;
@@ -226,6 +228,9 @@ struct PointerEvent {
     bool precise_wheel { false };
     ScrollPhase scroll_phase { ScrollPhase::None };
     int click_count { 0 };
+    bool history_swipe_back_enabled { false };
+    bool history_swipe_forward_enabled { false };
+    uint64_t history_swipe_gesture_id { 0 };
 };
 
 enum class Key : uint16_t {

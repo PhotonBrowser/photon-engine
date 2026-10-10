@@ -62,6 +62,11 @@ void ConnectionFromClient::did_not_dispatch_input_event(Web::CompositorContextId
     async_did_not_dispatch_input_event(context_id, event_id);
 }
 
+void ConnectionFromClient::did_detect_history_swipe_candidate(Web::CompositorContextId context_id, u64 gesture_id, bool back, float unconsumed_delta)
+{
+    async_did_detect_history_swipe_candidate(context_id, gesture_id, back, unconsumed_delta);
+}
+
 Messages::CompositorControlServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
 {
 #ifdef AK_OS_WINDOWS

@@ -52,6 +52,12 @@ enum class ScrollChaining : u8 {
     None,
 };
 
+struct AsyncScrollApplication {
+    Vector<AsyncScrollOffset> scroll_offsets;
+    Gfx::FloatPoint unconsumed_delta;
+    Optional<AsyncScrollNodeID> horizontal_boundary_node;
+};
+
 // Mutable compositor-side copy of AsyncScrollingState. Current scroll offsets live in ScrollStateSnapshot; this tree
 // owns scroll node geometry and derived hit-test targets.
 class COMPOSITING_API AsyncScrollTree {
@@ -84,7 +90,7 @@ public:
     bool scroll_node_is_viewport(AsyncScrollNodeID) const;
     Optional<AsyncScrollNodeID> scroll_node_for_keyboard_scroll(Web::AsyncScrollNodeStableID, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot const&) const;
     Gfx::FloatPoint clamped_scroll_offset_for_node(AsyncScrollNodeID, Gfx::FloatPoint) const;
-    Optional<AsyncScrollOffset> apply_scroll_delta(AsyncScrollNodeID, Gfx::FloatPoint delta, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&, ScrollChaining);
+    AsyncScrollApplication apply_scroll_delta(AsyncScrollNodeID, Gfx::FloatPoint delta, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&, ScrollChaining);
     Optional<Gfx::FloatPoint> set_scroll_offset(AsyncScrollNodeID, Gfx::FloatPoint, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&);
 
 private:

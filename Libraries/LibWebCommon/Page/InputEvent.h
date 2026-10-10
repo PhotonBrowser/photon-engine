@@ -103,8 +103,11 @@ struct WEBCOMMON_API MouseEvent {
 
     OwnPtr<BrowserInputData> browser_data;
     bool async_scroll_performed_default_action { false };
+    bool history_swipe_back_enabled { false };
+    bool history_swipe_forward_enabled { false };
     u64 id { 0 };
     Optional<Web::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
+    u64 history_swipe_gesture_id { 0 };
 };
 
 struct WEBCOMMON_API PinchEvent {

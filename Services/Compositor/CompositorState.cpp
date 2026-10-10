@@ -677,6 +677,8 @@ void CompositorState::handle_and_dispatch_mouse_event(Web::CompositorContextId c
     // which reach WebContent ahead of the event itself on the same connection.
     auto handled = apply_context_update_result(context_id, *context, result);
     if (is_wheel_event) {
+        if (result.history_swipe_candidate.has_value())
+            m_client->did_detect_history_swipe_candidate(context_id, event.history_swipe_gesture_id, result.history_swipe_candidate->back, result.history_swipe_candidate->unconsumed_delta);
         event.async_scroll_performed_default_action = handled;
     } else if (handled) {
         // The page still sees the events of a drag the compositor scrolls for a scrollbar the display list paints.

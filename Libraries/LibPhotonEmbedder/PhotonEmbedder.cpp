@@ -516,6 +516,10 @@ private:
             if (m_callbacks.page_unresponsive_changed)
                 m_callbacks.page_unresponsive_changed(unresponsive);
         };
+        on_history_swipe_candidate = [this](u64 gesture_id, bool back, float unconsumed_delta) {
+            if (m_callbacks.history_swipe_candidate)
+                m_callbacks.history_swipe_candidate(gesture_id, back, unconsumed_delta);
+        };
         on_url_change = [this](URL::URL const& url) {
             if (external_image_lease_trace_enabled()) {
                 auto serialized_url = url.serialize();
@@ -1202,7 +1206,10 @@ void View::send_pointer_event(PointerEvent const& event)
         .click_count = event.click_count,
         .browser_data = {},
         .async_scroll_performed_default_action = false,
+        .history_swipe_back_enabled = event.history_swipe_back_enabled,
+        .history_swipe_forward_enabled = event.history_swipe_forward_enabled,
         .id = 0,
+        .history_swipe_gesture_id = event.history_swipe_gesture_id,
     };
     m_impl->view->enqueue_input_event(move(native_event));
 }
