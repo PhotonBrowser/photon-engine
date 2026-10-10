@@ -139,6 +139,8 @@ public:
     void load(Web::HTML::PreparedNavigationDescriptor);
     void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab);
     void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate);
+    // Shows a link in a preview over the page, where the browser offers one.
+    void open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor);
     void set_next_history_visit_transition(HistoryVisitTransition transition) { m_history_visit_transition_for_next_load = transition; }
     void load_html(StringView);
     void load_navigation_error_page(StringView);

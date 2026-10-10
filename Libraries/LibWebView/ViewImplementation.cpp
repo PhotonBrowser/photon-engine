@@ -378,6 +378,15 @@ void ViewImplementation::open_navigation_in_new_tab(Web::HTML::PreparedNavigatio
     Application::the().open_navigation_in_new_tab(move(navigation), activate_tab);
 }
 
+void ViewImplementation::open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor navigation)
+{
+    if (!is_url_handled_internally(navigation.url)) {
+        handle_external_url_from_user_input(navigation.url);
+        return;
+    }
+    Application::the().open_navigation_in_peek(move(navigation));
+}
+
 void ViewImplementation::open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor navigation, IsPrivate is_private)
 {
     if (!is_url_handled_internally(navigation.url)) {

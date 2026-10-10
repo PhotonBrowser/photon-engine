@@ -241,6 +241,8 @@ public:
     virtual void open_url_in_new_window(URL::URL const&, IsPrivate) { }
     virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const;
     virtual void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate) { }
+    // A browser without a link preview opens the link in a new tab instead.
+    virtual void open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor navigation) const { open_navigation_in_new_tab(move(navigation), Web::HTML::ActivateTab::Yes); }
 
     virtual void resolve_external_url_handler(URL::URL const&, ExternalURLHandlerCallback callback) const { callback(nullptr); }
 

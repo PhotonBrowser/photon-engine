@@ -911,6 +911,10 @@ void WebContentPage::did_click_link(Web::HTML::PreparedNavigationDescriptor navi
         view().handle_external_url({}, verified_navigation->url, verified_navigation->initiator_origin_snapshot, verified_navigation->source_snapshot_params.has_transient_activation);
         return;
     }
+    if (modifiers == Web::UIEvents::Mod_Shift) {
+        view().open_navigation_in_peek(verified_navigation.release_value());
+        return;
+    }
     auto open_in_background = modifiers == Web::UIEvents::Mod_PlatformCtrl;
     auto open_in_foreground = modifiers == (Web::UIEvents::Mod_PlatformCtrl | Web::UIEvents::Mod_Shift);
     if (open_in_background || open_in_foreground || target == "_blank"sv) {
