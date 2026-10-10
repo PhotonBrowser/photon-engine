@@ -3026,7 +3026,7 @@ void EventHandler::run_activation_behavior(GC::Ref<DOM::Node> node, unsigned but
             auto navigation = [&] {
                 return HTML::prepare_navigation_from_document(*document, url.release_value(), element.hyperlink_referrer_policy());
             };
-            if (button == UIEvents::MouseButton::Primary && (modifiers & UIEvents::Mod_PlatformCtrl) != 0) {
+            if (button == UIEvents::MouseButton::Primary && (modifiers & (UIEvents::Mod_PlatformCtrl | UIEvents::Mod_Shift)) != 0) {
                 m_navigable->page().client().page_did_click_link(navigation(), link->target().to_byte_string(), modifiers);
             } else if (button == UIEvents::MouseButton::Middle) {
                 m_navigable->page().client().page_did_middle_click_link(navigation(), link->target().to_byte_string(), modifiers);

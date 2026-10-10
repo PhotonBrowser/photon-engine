@@ -743,9 +743,9 @@ void Element::activate_the_hyperlink(Event const& event)
 
     auto const* mouse_event = as_if<UIEvents::MouseEvent>(event);
 
-    // AD-HOC: Do not activate the element for clicks with the ctrl/cmd modifier present. This lets
-    //         the browser process open the link in a new tab.
-    if (mouse_event && mouse_event->platform_ctrl_key())
+    // AD-HOC: Do not activate the element for clicks with the ctrl/cmd or shift modifier present. This lets the
+    //         browser process open the link in a new tab, or show it in a preview.
+    if (mouse_event && (mouse_event->platform_ctrl_key() || mouse_event->shift_key()))
         return;
 
     // 2. Let hyperlinkSuffix be null.
