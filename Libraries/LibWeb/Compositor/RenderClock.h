@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/ConditionVariable.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
@@ -55,8 +56,9 @@ public:
     // Hands the lane a tick, with where the Compositor had scrolled to then, and answers whether it wants the next one.
     bool tick(i64 frame_time_nanoseconds, ReadonlySpan<Web::CompositorScrollOffset>) const;
 
-    // Hands the lane where the pointer went, or that it left, and answers what the lanes want next.
-    PointerAnswer pointer_moved(Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame) const;
+    // Hands the lane where the pointer went, or that it left, with the input event id of the mouse event the main thread
+    // takes beside it, and answers what the lanes want next.
+    PointerAnswer pointer_moved(Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id) const;
 
     bool hands_on_to(ClockTicksHandle const& other) const { return m_ticks == other.m_ticks; }
 
@@ -103,6 +105,15 @@ public:
     // after this returns. For a test.
     void disarm_all_for_testing();
 
+    // Hands the ticks that hear of the pointer moves over the context a move, as the compositor hands them those over a
+    // page's context, from the lane of the document around a same-process iframe's. Asynchronous, but for a test that
+    // ticks by hand, whose ticks hear of it before this returns.
+    void hand_pointer_move(Web::CompositorContextId, Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id);
+
+    // Has a test tick the lanes by hand, whose pointer moves then arm no context.
+    void set_manual_for_testing(bool manual) { m_manual_for_testing = manual; }
+    bool is_manual_for_testing() const { return m_manual_for_testing; }
+
 private:
     struct ArmedContext {
         double maximum_frames_per_second { 60.0 };
@@ -114,16 +125,18 @@ private:
     RenderClock();
     intptr_t thread_main();
     [[nodiscard]] bool invoke_on_clock_thread(Function<void()>);
+    void run_on_clock_thread_and_wait(Function<void()>);
 
     // On the clock thread.
     ErrorOr<IPC::TransportHandle> replace_channel();
     void drop_channel();
     void request_clock_tick(Web::CompositorContextId, double maximum_frames_per_second);
     void did_receive_clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, ReadonlySpan<Web::CompositorScrollOffset>);
-    void did_receive_pointer_move(Web::CompositorContextId, Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame);
+    void did_receive_pointer_move(Web::CompositorContextId, Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id);
     void did_lose_channel();
 
     NonnullRefPtr<Threading::Thread> m_thread;
+    Atomic<bool> m_manual_for_testing { false };
 
     Mutex m_mutex;
     ConditionVariable m_condition { m_mutex };

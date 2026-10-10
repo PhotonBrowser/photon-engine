@@ -799,6 +799,15 @@ impl RuntimeFunctions for Runtime {
         bindings::get_global(vm, pc, instruction, values)
     }
 
+    fn typeof_global(
+        vm: &Vm,
+        pc: u32,
+        instruction: &op::TypeofGlobal,
+        values: &mut op::TypeofGlobalValues,
+    ) -> SlowPathControl {
+        bindings::typeof_global(vm, pc, instruction, values)
+    }
+
     fn set_global(vm: &Vm, pc: u32, instruction: &op::SetGlobal, values: &mut op::SetGlobalValues) -> SlowPathControl {
         bindings::set_global(vm, pc, instruction, values)
     }
@@ -841,6 +850,15 @@ impl RuntimeFunctions for Runtime {
         values: &mut op::ResolveBindingValues,
     ) -> SlowPathControl {
         bindings::resolve_binding(vm, pc, instruction, values)
+    }
+
+    fn resolve_global_binding(
+        vm: &Vm,
+        pc: u32,
+        instruction: &op::ResolveGlobalBinding,
+        values: &mut op::ResolveGlobalBindingValues,
+    ) -> SlowPathControl {
+        bindings::resolve_global_binding(vm, pc, instruction, values)
     }
 
     fn resolve_super_base(

@@ -66,6 +66,7 @@ asm_dispatch_table:
     .quad asm_handler_SetResolvedBinding
     .quad asm_handler_TypeofBinding
     .quad asm_handler_DynamicTypeofBinding
+    .quad asm_handler_TypeofGlobal
     .quad asm_handler_VerifyEnvironmentCoordinate
     .quad asm_handler_HasPrivateId
     .quad asm_handler_SetFunctionName
@@ -126,6 +127,7 @@ asm_dispatch_table:
     .quad asm_handler_GetMethod
     .quad asm_handler_GetIterator
     .quad asm_handler_GetGlobal
+    .quad asm_handler_ResolveGlobalBinding
     .quad asm_handler_SetGlobal
     .quad asm_handler_Call
     .quad asm_handler_CallBuiltinMathAbs
@@ -233,8 +235,6 @@ asm_dispatch_table:
     .quad asm_handler_JumpStrictlyInequalsRhsInt32
     .quad asm_handler_JumpLooselyEqualsRhsInt32
     .quad asm_handler_JumpLooselyInequalsRhsInt32
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
@@ -746,6 +746,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_DynamicTypeofBinding_hot_end
     .quad asm_handler_DynamicTypeofBinding_cold
     .quad asm_handler_DynamicTypeofBinding_cold_end
+    .quad asm_handler_TypeofGlobal
+    .quad asm_handler_TypeofGlobal_hot_end
+    .quad asm_handler_TypeofGlobal_cold
+    .quad asm_handler_TypeofGlobal_cold_end
     .quad asm_handler_VerifyEnvironmentCoordinate
     .quad asm_handler_VerifyEnvironmentCoordinate_hot_end
     .quad asm_handler_VerifyEnvironmentCoordinate_cold
@@ -986,6 +990,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_GetGlobal_hot_end
     .quad asm_handler_GetGlobal_cold
     .quad asm_handler_GetGlobal_cold_end
+    .quad asm_handler_ResolveGlobalBinding
+    .quad asm_handler_ResolveGlobalBinding_hot_end
+    .quad asm_handler_ResolveGlobalBinding_cold
+    .quad asm_handler_ResolveGlobalBinding_cold_end
     .quad asm_handler_SetGlobal
     .quad asm_handler_SetGlobal_hot_end
     .quad asm_handler_SetGlobal_cold
@@ -1414,14 +1422,6 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_JumpLooselyInequalsRhsInt32_hot_end
     .quad asm_handler_JumpLooselyInequalsRhsInt32_cold
     .quad asm_handler_JumpLooselyInequalsRhsInt32_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
     .quad asm_handler_fallback
     .quad asm_handler_fallback_hot_end
     .quad asm_handler_fallback_cold
@@ -4528,7 +4528,7 @@ asm_handler_GetById:
     jz .Lasm_GetById.ssa_block_1
     and rdi, -4
     test rdi, rdi
-    jz .Lasm_GetById.assert_predicate_failure_330
+    jz .Lasm_GetById.assert_predicate_failure_331
     cmp QWORD PTR [rdi + 24], rsi
     jne .Lasm_GetById.ssa_block_15
     mov eax, DWORD PTR [rdi]
@@ -5128,6 +5128,50 @@ asm_handler_GetGlobal:
 asm_handler_GetGlobal_hot_end:
 
 .p2align 6
+asm_handler_ResolveGlobalBinding:
+    mov rax, QWORD PTR [rbx - 120]
+    mov rdx, QWORD PTR [rax + 16]
+    mov rsi, QWORD PTR [rax + 24]
+    mov rax, QWORD PTR [rbx - 40]
+    test rax, rax
+    jz .Lasm_ResolveGlobalBinding.assert_predicate_failure_9
+    mov rcx, QWORD PTR [rax + 104]
+    test rcx, rcx
+    jz .Lasm_ResolveGlobalBinding.assert_failure_0
+    mov eax, DWORD PTR [r14 + r13 + 12]
+    imul rax, rax, 72
+    add rax, rcx
+    test rax, rax
+    jz .Lasm_ResolveGlobalBinding.assert_predicate_failure_15
+    mov rcx, QWORD PTR [rax + 56]
+    cmp QWORD PTR [rsi + 64], rcx
+    jne .Lasm_ResolveGlobalBinding.ssa_block_1
+    mov rcx, QWORD PTR [rdx + 24]
+    test rcx, rcx
+    jz .Lasm_ResolveGlobalBinding.assert_failure_1
+    cmp QWORD PTR [rax + 24], rcx
+    jne .Lasm_ResolveGlobalBinding.ssa_block_2
+    mov edx, DWORD PTR [rax + 8]
+    cmp DWORD PTR [rcx + 52], edx
+    jne .Lasm_ResolveGlobalBinding.ssa_block_2
+    movabs r11, 9221401712017801217
+    mov eax, DWORD PTR [r14 + r13 + 4]
+    mov QWORD PTR [rbx + rax * 8], r11
+    add r13d, 16
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_ResolveGlobalBinding.ssa_block_2:
+    cmp BYTE PTR [rax + 68], 0
+    jz .Lasm_ResolveGlobalBinding.ssa_block_1
+    movabs r11, 9221401712017801217
+    mov eax, DWORD PTR [r14 + r13 + 4]
+    mov QWORD PTR [rbx + rax * 8], r11
+    add r13d, 16
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+asm_handler_ResolveGlobalBinding_hot_end:
+
+.p2align 6
 asm_handler_SetGlobal:
     mov rax, QWORD PTR [rbx - 120]
     mov rsi, QWORD PTR [rax + 16]
@@ -5284,11 +5328,11 @@ asm_handler_Call:
     mov rdx, rax
 .Lasm_Call.ssa_block_27:
     test rdi, rdi
-    jz .Lasm_Call.assert_predicate_failure_275
+    jz .Lasm_Call.assert_predicate_failure_276
     mov eax, DWORD PTR [rdi + 12]
     mov esi, DWORD PTR [rdi + 16]
     cmp rsi, rax
-    jb .Lasm_Call.assert_predicate_failure_281
+    jb .Lasm_Call.assert_predicate_failure_282
     mov eax, 4294967295
     sub rax, rsi
     cmp rax, rdx
@@ -5307,7 +5351,7 @@ asm_handler_Call:
     lea r8, [r8 + 128]
     add r8, rax
     cmp r8, rax
-    jb .Lasm_Call.assert_predicate_failure_296
+    jb .Lasm_Call.assert_predicate_failure_297
     cmp r8, r11
     ja .Lasm_Call.ssa_block_1
     mov r11, QWORD PTR [rbp - 48]
@@ -5327,7 +5371,7 @@ asm_handler_Call:
     mov r8, QWORD PTR [rcx + 104]
     mov r10, QWORD PTR [rcx + 112]
     test r8, r8
-    jz .Lasm_Call.assert_predicate_failure_324
+    jz .Lasm_Call.assert_predicate_failure_325
     mov QWORD PTR [rax + 32], r8
     mov QWORD PTR [rax + 40], r8
     mov QWORD PTR [rax + 48], r10
@@ -5370,7 +5414,7 @@ asm_handler_Call:
     mov DWORD PTR [rax + 112], r8d
     mov edi, DWORD PTR [r14 + r13 + 20]
     cmp rdx, rdi
-    jb .Lasm_Call.assert_predicate_failure_389
+    jb .Lasm_Call.assert_predicate_failure_390
     lea r8, [rax + 128]
     lea r9, [rbx]
     lea r10, [r14 + r13 + 28]
@@ -5508,11 +5552,12 @@ asm_handler_Call:
     mov rcx, QWORD PTR [rdx + 72]
     test rcx, rcx
     jz .Lasm_Call.assert_failure_15
+    and eax, 65535
     shl rax, 4
     add rax, rcx
     mov ecx, DWORD PTR [rax + 8]
     cmp rcx, 1
-    jae .Lasm_Call.assert_predicate_failure_246
+    jae .Lasm_Call.assert_predicate_failure_247
     mov rdx, QWORD PTR [rax]
     test rdx, rdx
     jz .Lasm_Call.assert_failure_16
@@ -5523,12 +5568,12 @@ asm_handler_Call:
     mov rdx, rax
     and rcx, 255
     cmp rcx, 2
-    jae .Lasm_Call.assert_predicate_failure_253
+    jae .Lasm_Call.assert_predicate_failure_254
     test rcx, rcx
     jnz .Lasm_Call.ssa_block_4
     mov rax, QWORD PTR [rbx - 32]
     test rax, rax
-    jz .Lasm_Call.assert_predicate_failure_259
+    jz .Lasm_Call.assert_predicate_failure_260
     mov rcx, QWORD PTR [rbp - 48]
     mov QWORD PTR [rcx], rax
     lea r11, [rbx - 128]
@@ -9520,6 +9565,45 @@ asm_handler_DynamicTypeofBinding_cold:
 asm_handler_DynamicTypeofBinding_cold_end:
 
 .p2align 4
+asm_handler_TypeofGlobal:
+    mov DWORD PTR [rbx + -64], r13d
+    lea r11, [r14 + r13]
+    mov rdi, QWORD PTR [rbp - 48]
+    mov esi, r13d
+    lea rdx, [r14 + r13]
+    call CSYM(asm_slow_path_typeof_global)
+    test rax, rax
+    js .Lasm_TypeofGlobal.scalar_result_done_0
+    bt rax, 32
+    jnc .Lasm_TypeofGlobal.scalar_result_done_0
+    lea rcx, [r14 + r13]
+    mov r10d, DWORD PTR [rcx + 4]
+    mov QWORD PTR [rbx + r10 * 8], rdx
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_TypeofGlobal.scalar_result_done_0:
+    test rax, rax
+    js .Lexit
+    bt rax, 32
+    jnc .Lasm_TypeofGlobal.slow_path_transfer_1
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_TypeofGlobal.slow_path_transfer_1:
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rbx, QWORD PTR [rcx]
+    add rbx, 128
+    mov rcx, QWORD PTR [rbx + -40]
+    mov r14, QWORD PTR [rcx + 40]
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+asm_handler_TypeofGlobal_hot_end:
+asm_handler_TypeofGlobal_cold:
+asm_handler_TypeofGlobal_cold_end:
+
+.p2align 4
 asm_handler_VerifyEnvironmentCoordinate:
     mov DWORD PTR [rbx + -64], r13d
     lea r11, [r14 + r13]
@@ -12279,11 +12363,12 @@ asm_handler_GetById_cold:
     mov rcx, QWORD PTR [rcx + 72]
     test rcx, rcx
     jz .Lasm_GetById.assert_failure_5
+    and esi, 65535
     shl rsi, 4
     add rsi, rcx
     mov edi, DWORD PTR [rsi + 8]
     cmp rdi, 1
-    jae .Lasm_GetById.assert_predicate_failure_156
+    jae .Lasm_GetById.assert_predicate_failure_157
     mov rcx, QWORD PTR [rbp - 48]
     mov r9, QWORD PTR [rcx + 24]
     mov rcx, QWORD PTR [rcx + 16]
@@ -12293,7 +12378,7 @@ asm_handler_GetById_cold:
     jz .Lasm_GetById.assert_failure_7
     lea r8, [rcx + 128]
     cmp r8, rcx
-    jb .Lasm_GetById.assert_predicate_failure_165
+    jb .Lasm_GetById.assert_predicate_failure_166
     cmp r8, r9
     ja .Lasm_GetById.ssa_block_3
     mov r9, QWORD PTR [rbp - 48]
@@ -12301,7 +12386,7 @@ asm_handler_GetById_cold:
     mov r9, r10
     add r9, 32768
     cmp r9, r10
-    jb .Lasm_GetById.assert_predicate_failure_173
+    jb .Lasm_GetById.assert_predicate_failure_174
     cmp r9, rbp
     ja .Lasm_GetById.ssa_block_3
     mov r9, QWORD PTR [rbp - 48]
@@ -12320,9 +12405,9 @@ asm_handler_GetById_cold:
     mov rax, QWORD PTR [rbx - 96]
     mov rdi, QWORD PTR [rbx - 88]
     test rax, rax
-    jz .Lasm_GetById.assert_predicate_failure_198
+    jz .Lasm_GetById.assert_predicate_failure_199
     test rdi, rdi
-    jz .Lasm_GetById.assert_predicate_failure_200
+    jz .Lasm_GetById.assert_predicate_failure_201
     mov QWORD PTR [rcx + 32], rax
     mov QWORD PTR [rcx + 40], rdi
     mov rax, QWORD PTR [rbx - 80]
@@ -12366,12 +12451,12 @@ asm_handler_GetById_cold:
     mov rdx, rax
     and rcx, 255
     cmp rcx, 2
-    jae .Lasm_GetById.assert_predicate_failure_260
+    jae .Lasm_GetById.assert_predicate_failure_261
     test rcx, rcx
     jnz .Lasm_GetById.ssa_block_6
     mov rax, QWORD PTR [rbx - 32]
     test rax, rax
-    jz .Lasm_GetById.assert_predicate_failure_269
+    jz .Lasm_GetById.assert_predicate_failure_270
     mov rcx, QWORD PTR [rbp - 48]
     mov QWORD PTR [rcx], rax
     lea r11, [rbx - 128]
@@ -13424,6 +13509,43 @@ asm_handler_GetGlobal_cold:
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
 asm_handler_GetGlobal_cold_end:
+asm_handler_ResolveGlobalBinding_cold:
+# Cold paths for ResolveGlobalBinding
+.Lasm_ResolveGlobalBinding.ssa_block_1:
+    mov DWORD PTR [rbx + -64], r13d
+    lea r11, [r14 + r13]
+    mov rdi, QWORD PTR [rbp - 48]
+    mov esi, r13d
+    lea rdx, [r14 + r13]
+    call CSYM(asm_slow_path_resolve_global_binding)
+    test rax, rax
+    js .Lasm_ResolveGlobalBinding.scalar_result_done_2
+    bt rax, 32
+    jnc .Lasm_ResolveGlobalBinding.scalar_result_done_2
+    lea rcx, [r14 + r13]
+    mov r10d, DWORD PTR [rcx + 4]
+    mov QWORD PTR [rbx + r10 * 8], rdx
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_ResolveGlobalBinding.scalar_result_done_2:
+    test rax, rax
+    js .Lexit
+    bt rax, 32
+    jnc .Lasm_ResolveGlobalBinding.slow_path_transfer_3
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_ResolveGlobalBinding.slow_path_transfer_3:
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rbx, QWORD PTR [rcx]
+    add rbx, 128
+    mov rcx, QWORD PTR [rbx + -40]
+    mov r14, QWORD PTR [rcx + 40]
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+asm_handler_ResolveGlobalBinding_cold_end:
 asm_handler_SetGlobal_cold:
 # Cold paths for SetGlobal
 .Lasm_SetGlobal.ssa_block_1:
@@ -19282,7 +19404,7 @@ asm_assertion_failure_traps:
     ud2
 .Lasm_GetById.assert_failure_1:
     ud2
-.Lasm_GetById.assert_predicate_failure_330:
+.Lasm_GetById.assert_predicate_failure_331:
     ud2
 .Lasm_GetById.assert_failure_2:
     ud2
@@ -19292,29 +19414,29 @@ asm_assertion_failure_traps:
     ud2
 .Lasm_GetById.assert_failure_5:
     ud2
-.Lasm_GetById.assert_predicate_failure_156:
+.Lasm_GetById.assert_predicate_failure_157:
     ud2
 .Lasm_GetById.assert_failure_6:
     ud2
 .Lasm_GetById.assert_failure_7:
     ud2
-.Lasm_GetById.assert_predicate_failure_165:
+.Lasm_GetById.assert_predicate_failure_166:
     ud2
-.Lasm_GetById.assert_predicate_failure_173:
+.Lasm_GetById.assert_predicate_failure_174:
     ud2
 .Lasm_GetById.assert_failure_8:
     ud2
 .Lasm_GetById.assert_failure_9:
     ud2
-.Lasm_GetById.assert_predicate_failure_198:
+.Lasm_GetById.assert_predicate_failure_199:
     ud2
-.Lasm_GetById.assert_predicate_failure_200:
+.Lasm_GetById.assert_predicate_failure_201:
     ud2
 .Lasm_GetById.assert_failure_10:
     ud2
-.Lasm_GetById.assert_predicate_failure_260:
+.Lasm_GetById.assert_predicate_failure_261:
     ud2
-.Lasm_GetById.assert_predicate_failure_269:
+.Lasm_GetById.assert_predicate_failure_270:
     ud2
 .Lasm_GetById.assert_predicate_failure_23:
     ud2
@@ -19384,6 +19506,14 @@ asm_assertion_failure_traps:
     ud2
 .Lasm_GetGlobal.assert_failure_3:
     ud2
+.Lasm_ResolveGlobalBinding.assert_predicate_failure_9:
+    ud2
+.Lasm_ResolveGlobalBinding.assert_failure_0:
+    ud2
+.Lasm_ResolveGlobalBinding.assert_predicate_failure_15:
+    ud2
+.Lasm_ResolveGlobalBinding.assert_failure_1:
+    ud2
 .Lasm_SetGlobal.assert_predicate_failure_9:
     ud2
 .Lasm_SetGlobal.assert_failure_0:
@@ -19410,25 +19540,25 @@ asm_assertion_failure_traps:
     ud2
 .Lasm_Call.assert_failure_3:
     ud2
-.Lasm_Call.assert_predicate_failure_275:
+.Lasm_Call.assert_predicate_failure_276:
     ud2
-.Lasm_Call.assert_predicate_failure_281:
+.Lasm_Call.assert_predicate_failure_282:
     ud2
 .Lasm_Call.assert_failure_4:
     ud2
 .Lasm_Call.assert_failure_5:
     ud2
-.Lasm_Call.assert_predicate_failure_296:
+.Lasm_Call.assert_predicate_failure_297:
     ud2
 .Lasm_Call.assert_failure_6:
     ud2
 .Lasm_Call.assert_failure_7:
     ud2
-.Lasm_Call.assert_predicate_failure_324:
+.Lasm_Call.assert_predicate_failure_325:
     ud2
 .Lasm_Call.assert_failure_8:
     ud2
-.Lasm_Call.assert_predicate_failure_389:
+.Lasm_Call.assert_predicate_failure_390:
     ud2
 .Lasm_Call.assert_predicate_failure_212:
     ud2
@@ -19454,13 +19584,13 @@ asm_assertion_failure_traps:
     ud2
 .Lasm_Call.assert_failure_15:
     ud2
-.Lasm_Call.assert_predicate_failure_246:
+.Lasm_Call.assert_predicate_failure_247:
     ud2
 .Lasm_Call.assert_failure_16:
     ud2
-.Lasm_Call.assert_predicate_failure_253:
+.Lasm_Call.assert_predicate_failure_254:
     ud2
-.Lasm_Call.assert_predicate_failure_259:
+.Lasm_Call.assert_predicate_failure_260:
     ud2
 .Lasm_Call.assert_predicate_failure_11:
     ud2

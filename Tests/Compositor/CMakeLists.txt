@@ -1,6 +1,7 @@
 set(TEST_SOURCES
     TestAsyncScrollTree.cpp
     TestBackingStoreManager.cpp
+    TestContextState.cpp
     TestScrollbarController.cpp
     TestVSyncScheduler.cpp
 )

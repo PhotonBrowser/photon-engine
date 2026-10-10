@@ -179,6 +179,7 @@ pub(crate) struct PublishedEffect {
     /// The effect belongs to a CSS transition, which the interpolation treats differently.
     pub(crate) is_transition: bool,
     pub(crate) resource_context: Option<PublishedResourceContext>,
+    pub(crate) target_properties: Box<[u16]>,
     pub(crate) keyframes: Box<[PublishedKeyframe]>,
     declarations: Box<[PublishedDeclaration]>,
     custom_declarations: Box<[PublishedCustomDeclaration]>,
@@ -196,6 +197,23 @@ pub(crate) struct TransitionReversing {
     pub(crate) shortening_factor: f64,
 }
 
+fn target_properties(properties: impl IntoIterator<Item = u16>) -> Box<[u16]> {
+    use crate::css::property_metadata::{longhands_for_shorthand, property_animation_type, property_is_shorthand};
+
+    let mut pending: Vec<_> = properties.into_iter().collect();
+    let mut longhands = Vec::new();
+    while let Some(property) = pending.pop() {
+        if property_is_shorthand(property) {
+            pending.extend_from_slice(longhands_for_shorthand(property));
+        } else if property_animation_type(property) != crate::css::animation::ANIMATION_TYPE_NONE {
+            longhands.push(property);
+        }
+    }
+    longhands.sort_unstable();
+    longhands.dedup();
+    longhands.into_boxed_slice()
+}
+
 impl PublishedEffect {
     /// The effect of a CSS transition of `property_id` from `start` to `end`, as the host describes one:
     /// two keyframes, each running the linear easing, that replace the value beneath them.
@@ -204,6 +222,7 @@ impl PublishedEffect {
         property_id: u16,
         start: RetainedStyleValueData,
         end: RetainedStyleValueData,
+        timing: Option<EffectTiming>,
     ) -> Self {
         let keyframe = |key, index| PublishedKeyframe {
             key,
@@ -218,6 +237,7 @@ impl PublishedEffect {
             generation: 0,
             is_transition: true,
             resource_context: None,
+            target_properties: target_properties([property_id]),
             // `KeyframeEffect::AnimationKeyFrameKeyScaleFactor` keys the end at 100%.
             keyframes: Box::new([keyframe(0, 0), keyframe(100 * 1000, 1)]),
             declarations: Box::new([start, end].map(|value| PublishedDeclaration {
@@ -225,7 +245,7 @@ impl PublishedEffect {
                 value: PublishedValue::Declared(value),
             })),
             custom_declarations: Box::new([]),
-            timing: None,
+            timing,
             reversing: None,
         }
     }
@@ -308,6 +328,9 @@ impl PublishedEffectBuffers<'_> {
                         base_url: self.base_url_bytes[range(effect.base_url_offset, effect.base_url_length)].into(),
                         origin_clean: effect.resource_context_is_origin_clean,
                     }),
+                    target_properties: target_properties(
+                        declarations.iter().map(|declaration| declaration.property_id),
+                    ),
                     keyframes,
                     declarations: declarations.into(),
                     custom_declarations: custom_declarations.into(),
@@ -418,7 +441,7 @@ impl AnimationEffectDescriptions {
         identity: u64,
         timing: &FfiEffectTiming,
         easing: &FfiEasingDescriptor,
-        host_key: f64,
+        host_key: Option<f64>,
     ) -> Option<f64> {
         let effect = self
             .rows
@@ -450,6 +473,20 @@ impl AnimationEffectDescriptions {
             .and_then(|(_, effects)| effects.iter_mut().find(|effect| effect.identity == identity))
         {
             effect.timing = Some(timing);
+        }
+    }
+
+    /// Has one of an element's described effects that the host sampled before take `timing`, keeping its easing: the
+    /// timing the host runs it on since, where it runs it without sampling it.
+    pub(crate) fn refresh_timing(&mut self, node: StyleNodeID, identity: u64, timing: &FfiEffectTiming) {
+        if let Some(kept) = self
+            .rows
+            .get_mut(&node)
+            .and_then(|lists| lists.iter_mut().find(|(list_slot, _)| *list_slot == 0))
+            .and_then(|(_, effects)| effects.iter_mut().find(|effect| effect.identity == identity))
+            .and_then(|effect| effect.timing.as_mut())
+        {
+            kept.timing = *timing;
         }
     }
 

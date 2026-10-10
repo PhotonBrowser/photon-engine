@@ -1742,6 +1742,14 @@ handler DynamicTypeofBinding(
     cache: EnvironmentCoordinateCacheIndex
 ) @cold = call_slow_path(dynamic_typeof_binding);
 
+# `typeof` of a global variable, which finds it through the global variable
+# cache of GetGlobal, and is "undefined" for unresolvable ones.
+handler TypeofGlobal(
+    dst: out Operand,
+    identifier: IdentifierTableIndex,
+    cache: GlobalVariableCacheIndex
+) @cold = call_slow_path(typeof_global);
+
 handler VerifyEnvironmentCoordinate(
     identifier: IdentifierTableIndex,
     coordinate: EnvironmentCoordinate,
@@ -2517,7 +2525,7 @@ handler GetById(
         let raw_native_function: RawNativeFunction = alias(function);
         let native_function_index = raw_native_function.native_function_index;
         let native_table_vm = current_vm();
-        let native_function_entry = &native_table_vm.native_function_table[native_function_index];
+        let native_function_entry = &native_table_vm.native_function_table[native_function_index & NATIVE_FUNCTION_TABLE_INDEX_MASK];
         let native_function_type = native_function_entry.type;
         assert(native_function_type < NATIVE_FUNCTION_TYPE_COUNT);
 
@@ -3049,6 +3057,35 @@ handler GetGlobal(
     dispatch_next;
 }
 
+handler ResolveGlobalBinding(
+    dst: out Operand,
+    identifier: IdentifierTableIndex,
+    cache: GlobalVariableCacheIndex
+) {
+    let slow = || @cold {
+        call_slow_path(resolve_global_binding);
+    };
+
+    # A binding the cache of the SetGlobal or GetGlobal of the identifier still finds exists.
+    let realm = exec_ctx.realm;
+    let global_object = realm.global_object;
+    let environment = realm.global_declarative_environment;
+    let global_cache = load_global_variable_cache(cache);
+    guard global_cache.environment_serial_number == environment.serial_number else slow;
+
+    let try_environment = || {
+        guard global_cache.has_environment_binding_index != 0 else slow;
+        store(dst, Value<True>);
+        dispatch_next;
+    };
+
+    let shape = global_object.shape;
+    guard global_cache.shape == shape else try_environment;
+    guard global_cache.shape_dictionary_generation == shape.dictionary_generation else try_environment;
+    store(dst, Value<True>);
+    dispatch_next;
+}
+
 handler SetGlobal(
     identifier: IdentifierTableIndex,
     src: in Operand,
@@ -3290,7 +3327,7 @@ handler Call(
         values = exec_ctx.slots;
         let raw_native_function: RawNativeFunction = alias(function);
         let native_function_index = raw_native_function.native_function_index;
-        let native_function_entry = &native_running_vm.native_function_table[native_function_index];
+        let native_function_entry = &native_running_vm.native_function_table[native_function_index & NATIVE_FUNCTION_TABLE_INDEX_MASK];
         assert(native_function_entry.type < NATIVE_FUNCTION_TYPE_COUNT);
         let native_function = native_function_entry.function;
         # FIXME: Bind native_payload directly once the allocator can keep the

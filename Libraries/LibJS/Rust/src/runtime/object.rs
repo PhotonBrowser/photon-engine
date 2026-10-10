@@ -235,7 +235,8 @@ pub struct ObjectMethods {
     /// What Realm::create_object() runs once it allocates an object, which defines the properties of built-in objects.
     /// Subclasses call the method of the class they extend first.
     pub initialize: fn(&Object, &Vm, Gc<Realm>),
-    pub internal_get_prototype_of: fn(&Object, &Vm) -> ThrowCompletionOr<Option<Gc<Object>>>,
+    /// [[GetPrototypeOf]], unless it is OrdinaryGetPrototypeOf, which returns the prototype of the object's shape.
+    pub internal_get_prototype_of: Option<InternalGetPrototypeOf>,
     pub internal_set_prototype_of: fn(&Object, &Vm, Option<Gc<Object>>) -> ThrowCompletionOr<bool>,
     pub internal_is_extensible: fn(&Object, &Vm) -> ThrowCompletionOr<bool>,
     pub internal_prevent_extensions: fn(&Object, &Vm) -> ThrowCompletionOr<bool>,
@@ -273,11 +274,14 @@ pub struct ObjectMethods {
     pub error_data: fn(&Object) -> Option<&ErrorData>,
 }
 
+/// [[GetPrototypeOf]].
+pub type InternalGetPrototypeOf = fn(&Object, &Vm) -> ThrowCompletionOr<Option<Gc<Object>>>;
+
 pub type InternalGetOwnPropertyMethod = fn(&Object, &Vm, &PropertyKey) -> ThrowCompletionOr<Option<PropertyDescriptor>>;
 
 pub static ORDINARY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     initialize: |_, _, _| {},
-    internal_get_prototype_of: Object::ordinary_get_prototype_of,
+    internal_get_prototype_of: None,
     internal_set_prototype_of: Object::ordinary_set_prototype_of,
     internal_is_extensible: Object::ordinary_is_extensible,
     internal_prevent_extensions: Object::ordinary_prevent_extensions,
@@ -531,7 +535,7 @@ fn remove_intrinsic_accessor(vm: &Vm, object: &Object, property_key: &PropertyKe
 }
 
 const SPARSE_ARRAY_HOLE_THRESHOLD: u32 = 200;
-const MAX_TRANSITIONS_BEFORE_CONVERTING_TO_DICTIONARY: u32 = 64;
+pub(crate) const MAX_TRANSITIONS_BEFORE_CONVERTING_TO_DICTIONARY: u32 = 64;
 
 /// Moves an object into the heap and finishes what its constructor could not do before it had an address: its named
 /// properties start out in its inline storage. Every object, of any class, is allocated through this.
@@ -959,7 +963,7 @@ impl Object {
             methods.internal_get_own_property,
             ARRAY_OBJECT_METHODS.internal_get_own_property,
         )) && is_ordinary_method!(methods, internal_get)
-            && is_ordinary_method!(methods, internal_get_prototype_of)
+            && methods.internal_get_prototype_of.is_none()
     }
 
     /// Whether this object has ordinary named property lookup, and an ordinary [[Set]].
@@ -1006,6 +1010,10 @@ impl Object {
 
     // 7.3.13 HasOwnProperty ( O, P ), https://tc39.es/ecma262/#sec-hasownproperty
     pub fn has_own_property(&self, vm: &Vm, property_key: &PropertyKey) -> ThrowCompletionOr<bool> {
+        // OPTIMIZATION: For most objects, an own property with a string key is a property of their shape.
+        if property_key.is_string() && self.own_string_keyed_properties_are_in_shape() {
+            return Ok(self.shape().lookup(property_key).is_some());
+        }
         // OPTIMIZATION: Whether the ordinary [[GetOwnProperty]] finds a property only depends on the object's storage,
         //               so ask the storage without building the descriptor.
         if core::ptr::fn_addr_eq(
@@ -1832,7 +1840,10 @@ impl Object {
     // The internal methods, which dispatch through the object's class.
 
     pub fn internal_get_prototype_of(&self, vm: &Vm) -> ThrowCompletionOr<Option<Gc<Object>>> {
-        (self.methods().internal_get_prototype_of)(self, vm)
+        match self.methods().internal_get_prototype_of {
+            Some(internal_get_prototype_of) => internal_get_prototype_of(self, vm),
+            None => self.ordinary_get_prototype_of(vm),
+        }
     }
 
     pub fn internal_set_prototype_of(&self, vm: &Vm, prototype: Option<Gc<Object>>) -> ThrowCompletionOr<bool> {
@@ -1946,6 +1957,16 @@ impl Object {
 
     pub fn eligible_for_own_property_enumeration_fast_path(&self) -> bool {
         (self.methods().eligible_for_own_property_enumeration_fast_path)(self)
+    }
+
+    /// Whether this object's own string-keyed properties are exactly the properties of its shape, in the shape's
+    /// insertion order, with the shape's attributes: no exotic [[GetOwnProperty]] or [[OwnPropertyKeys]] for string
+    /// keys, no magical length and no lazily materialized properties.
+    pub fn own_string_keyed_properties_are_in_shape(&self) -> bool {
+        self.eligible_for_own_property_enumeration_fast_path()
+            && !self.is_ecmascript_function_object()
+            && !self.has_magical_length_property()
+            && !self.has_parameter_map()
     }
 
     pub fn initialize(&self, vm: &Vm, realm: Gc<Realm>) {
@@ -3634,6 +3655,17 @@ impl Object {
         self.indexed_elements.set(core::ptr::null_mut());
         self.indexed_storage_kind.set(IndexedStorageKind::None);
         self.indexed_array_like_size.set(0);
+    }
+
+    /// Makes room for `capacity` elements in packed or holey indexed storage up front, so that filling them in does not
+    /// grow the storage.
+    pub fn reserve_indexed_elements(&self, capacity: u32) {
+        if matches!(
+            self.indexed_storage_kind(),
+            IndexedStorageKind::Packed | IndexedStorageKind::Holey
+        ) {
+            self.ensure_indexed_elements(capacity);
+        }
     }
 
     fn ensure_indexed_elements(&self, needed_capacity: u32) {

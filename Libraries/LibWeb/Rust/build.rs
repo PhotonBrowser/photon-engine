@@ -2467,6 +2467,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiExistingTransition",
         "FfiTransitionAction",
         "FfiColorResolutionStyle",
+        "FfiLaneTransition",
     ]
     .map(String::from)
     .to_vec();
@@ -2581,14 +2582,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
     );
     // A transition step's decision is asked of the engine in the style value header's terms.
-    for name in ["FfiTransitionInput", "FfiTransitionAction"] {
+    for name in ["FfiTransitionInput", "FfiTransitionAction", "FfiLaneTransition"] {
         style_engine_config
             .export
             .rename
             .insert(name.to_string(), format!("Web::CSS::StyleValueFFI::{name}"));
     }
     style_engine_config.after_includes = Some(
-        "namespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; enum class FfiTransitionActionKind : uint8_t; struct FfiTransitionInput; struct FfiTransitionAction; }"
+        "namespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; enum class FfiTransitionActionKind : uint8_t; struct FfiTransitionInput; struct FfiTransitionAction; struct FfiLaneTransition; }"
             .to_string(),
     );
     // The host queues the engine's changes on the document host, which the layout header declares.
@@ -2708,6 +2709,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     expose_css_pixel_types_as_web_types(&mut computed_values_config);
     // An effect the host samples carries its easing as the compositing crate describes one.
     expose_compositing_types_as_cpp_types(&mut computed_values_config);
+    computed_values_config.export.exclude.push("OptionalF64".to_string());
+    computed_values_config
+        .export
+        .rename
+        .insert("OptionalF64".to_string(), "Optional<double>".to_string());
+    computed_values_config.includes.push("AK/Optional.h".to_string());
     computed_values_config.export.rename.insert(
         "DeclarationBlockData".to_string(),
         "Web::CSS::Parser::ValueParserFFI::DeclarationBlockData".to_string(),

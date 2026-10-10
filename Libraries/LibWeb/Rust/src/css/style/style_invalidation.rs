@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::bridge::{FfiAnimationInvalidation, FfiStyleInvalidationField, element_adjustment_fact};
+use super::bridge::{ElementBoxKind, FfiAnimationInvalidation, FfiStyleInvalidationField, element_adjustment_fact};
 use super::{RetainedState, StyleNodeID};
 use crate::css::animated_overlay::{AnimatedOverlay, overlay_wins};
 use crate::css::computed_longhand_table::ComputedLonghandTable;
@@ -24,7 +24,6 @@ const VISUAL_CONTEXT_UPDATE_VALUES: u8 = 1;
 const VISUAL_CONTEXT_REBUILD: u8 = 2;
 const REBUILD_ROOT_PSEUDO_ELEMENTS: u8 = 0;
 const REBUILD_ROOT_SELF: u8 = 1;
-const REBUILD_ROOT_SELF_UNLESS_DOCUMENT_ELEMENT_OR_BODY: u8 = 2;
 const REBUILD_ROOT_BOX_PRESENCE_CHANGE: u8 = 3;
 const REBUILD_ROOT_PARENT: u8 = 4;
 const ALL_INHERITED_STYLE_GROUPS: u8 = (1 << 7) - 1;
@@ -246,13 +245,17 @@ fn value_creates_stacking_context(property: u16, values: ComputedValuesView<'_>)
         property_id::CONTENT_VISIBILITY => {
             values.content_visibility() == crate::css::css_enums::content_visibility::AUTO
         }
-        property_id::WILL_CHANGE => will_change_creates_stacking_context(values.misc_reset().will_change.data()),
+        property_id::WILL_CHANGE => will_change_creates_stacking_context(values),
         _ => true,
     }
 }
 
-fn will_change_mentions(value: Option<&StyleValueData>, predicate: impl Fn(u16) -> bool) -> bool {
-    let Some(StyleValueData::ValueList { values, .. }) = value else {
+fn will_change_mentions(values: ComputedValuesView<'_>, predicate: impl Fn(u16) -> bool) -> bool {
+    let implicit_will_change_values = values.misc_reset().implicit_will_change.as_slice();
+    if implicit_will_change_values.iter().copied().any(&predicate) {
+        return true;
+    }
+    let Some(StyleValueData::ValueList { values, .. }) = values.misc_reset().will_change.data() else {
         return false;
     };
     values.as_slice().iter().any(|entry| {
@@ -269,8 +272,8 @@ fn will_change_mentions(value: Option<&StyleValueData>, predicate: impl Fn(u16) 
     })
 }
 
-fn will_change_creates_stacking_context(value: Option<&StyleValueData>) -> bool {
-    will_change_mentions(value, |property| {
+fn will_change_creates_stacking_context(values: ComputedValuesView<'_>) -> bool {
+    will_change_mentions(values, |property| {
         matches!(
             property,
             property_id::OPACITY
@@ -301,10 +304,9 @@ fn will_change_creates_stacking_context(value: Option<&StyleValueData>) -> bool 
 // property establishes at a non-initial value. A value change of that property leaves all three
 // in place, and only the properties below are matched against will-change in style_queries.
 fn will_change_covers_property(property: u16, values: ComputedValuesView<'_>) -> bool {
-    let will_change = values.misc_reset().will_change.data();
     match property {
         property_id::TRANSFORM | property_id::TRANSLATE | property_id::ROTATE | property_id::SCALE => {
-            will_change_mentions(will_change, |named| {
+            will_change_mentions(values, |named| {
                 matches!(
                     named,
                     property_id::TRANSFORM | property_id::TRANSLATE | property_id::ROTATE | property_id::SCALE
@@ -322,7 +324,7 @@ fn will_change_covers_property(property: u16, values: ComputedValuesView<'_>) ->
         | property_id::MASK_IMAGE
         | property_id::ISOLATION
         | property_id::CONTAIN
-        | property_id::VIEW_TRANSITION_NAME => will_change_mentions(will_change, |named| named == property),
+        | property_id::VIEW_TRANSITION_NAME => will_change_mentions(values, |named| named == property),
         _ => false,
     }
 }
@@ -516,9 +518,6 @@ fn property_invalidation(property: u16, old: ComputedValuesView<'_>, new: Comput
         property_id::DISPLAY | property_id::FLOAT | property_id::POSITION
     ) {
         return StyleInvalidation::full();
-    }
-    if matches!(property, property_id::OVERFLOW_X | property_id::OVERFLOW_Y) {
-        return StyleInvalidation::rebuild_layout_tree_from(REBUILD_ROOT_SELF_UNLESS_DOCUMENT_ELEMENT_OR_BODY);
     }
     if matches!(
         property,
@@ -719,13 +718,19 @@ fn inheritance_dependent_value_changed(
         }
 }
 
-/// Whether `new_overlay` changes any effective value of a published record whose table is `table`, in place of the
-/// record's own overlay, `old_overlay`.
+/// Whether replacing the record's `old_overlay` with `new_overlay` changes effective CSS values or the additional
+/// properties to treat as included in will-change.
 pub(crate) fn animation_overlay_changed(
     table: &ComputedLonghandTable,
     old_overlay: Option<&AnimatedOverlay>,
     new_overlay: Option<&AnimatedOverlay>,
 ) -> bool {
+    if old_overlay.map_or(&[][..], |overlay| overlay.implicit_will_change.as_slice())
+        != new_overlay.map_or(&[][..], |overlay| overlay.implicit_will_change.as_slice())
+    {
+        return true;
+    }
+
     animation_overlay_properties(old_overlay, new_overlay)
         .any(|property| animation_value_changed(table, old_overlay, new_overlay, property))
 }
@@ -752,6 +757,12 @@ impl RetainedState {
         let mut ffi_result = FfiAnimationInvalidation::default();
         let mut invalidation = StyleInvalidation::default();
         let mut text_decoration_line_animated = false;
+
+        if old_values.misc_reset().implicit_will_change != new_values.misc_reset().implicit_will_change {
+            invalidation.merge(property_invalidation(property_id::WILL_CHANGE, old_values, new_values));
+            ffi_result.changed_non_inherited_style_groups |=
+                1 << crate::css::table_group_builder::group_index::MISC_RESET;
+        }
 
         for property in animation_overlay_properties(old_overlay, new_overlay) {
             if !animation_value_changed(table, old_overlay, new_overlay, property) {
@@ -857,6 +868,33 @@ impl RetainedState {
                 || self.tree.first_element_child(node).is_none())
     }
 
+    /// What moving a box from the record `old_style_record` to `new_style_record` damages, of `properties` alone, read
+    /// from the records' payloads: a sample of animations over a record keeps the record's longhand table, and holds
+    /// the values it animates only in its payloads.
+    pub(crate) fn sampled_properties_damage(
+        &self,
+        old_style_record: u64,
+        new_style_record: u64,
+        properties: &[u16],
+    ) -> u32 {
+        if properties.is_empty() || old_style_record == new_style_record {
+            return 0;
+        }
+        let (Some(old_record), Some(new_record)) = (
+            self.computed_group_sets.style_record_view(old_style_record),
+            self.computed_group_sets.style_record_view(new_style_record),
+        ) else {
+            return unreadable_record_damage();
+        };
+        let old_values = ComputedValuesView::new(SharedPayload::as_pointer_slice(old_record.payloads));
+        let new_values = ComputedValuesView::new(SharedPayload::as_pointer_slice(new_record.payloads));
+        let mut result = StyleInvalidation::default();
+        for &property in properties {
+            result.merge(property_invalidation(property, old_values, new_values));
+        }
+        result.pack()
+    }
+
     pub(crate) fn compare_style_records(
         &mut self,
         old_style_record: u64,
@@ -909,6 +947,9 @@ impl RetainedState {
             result.ensure_level(INVALIDATION_RELAYOUT);
         }
         if !can_skip {
+            if old_values.misc_reset().implicit_will_change != new_values.misc_reset().implicit_will_change {
+                result.merge(property_invalidation(property_id::WILL_CHANGE, old_values, new_values));
+            }
             // Equal resolved values can still inherit differently: currentcolor and an RGB color
             // may paint the same here, but resolve to different colors in an inheriting child.
             for (property, _) in old_table
@@ -1042,7 +1083,7 @@ impl RetainedState {
         old_style_record: u64,
         new_style_record: u64,
     ) -> u32 {
-        let (font_lists_equal, color_changed, stroke_uses_current_color, table_fixup_child_changed) = {
+        let (font_lists_equal, color_changed, stroke_uses_current_color, table_fixup_child_changed, overflow_changed) = {
             let (Some(old_record), Some(new_record)) = (
                 self.computed_group_sets.style_record_view(old_style_record),
                 self.computed_group_sets.style_record_view(new_style_record),
@@ -1074,6 +1115,8 @@ impl RetainedState {
                 old_values.inherited_text().color != new_values.inherited_text().color,
                 stroke_uses_current_color(old_values) || stroke_uses_current_color(new_values),
                 is_table_fixup_child(old_values) != is_table_fixup_child(new_values),
+                old_values.box_values().overflow_x != new_values.box_values().overflow_x
+                    || old_values.box_values().overflow_y != new_values.box_values().overflow_y,
             )
         };
         let is_svg_graphics_element =
@@ -1086,6 +1129,11 @@ impl RetainedState {
             !is_pseudo_element && self.element_propagates_overflow_to_viewport(node),
         );
         let mut damage = StyleInvalidation::unpack(packed);
+        // Fieldsets with a rendered legend or flex contents transfer overflow to an anonymous
+        // content box during tree construction. Rebuild to refresh both boxes' overrides.
+        if !is_pseudo_element && overflow_changed && self.element_box_kind(node) == ElementBoxKind::FieldSet {
+            damage.merge(StyleInvalidation::rebuild_layout_tree_from(REBUILD_ROOT_SELF));
+        }
         // An SVG currentColor stroke stores its resolved color alongside the fact that it came from
         // currentColor. A color-only change can therefore alter the visible stroke width and the SVG
         // container bounds without changing the stroke longhand itself.

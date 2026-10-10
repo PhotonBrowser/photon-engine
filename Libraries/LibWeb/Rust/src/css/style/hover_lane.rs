@@ -37,9 +37,88 @@ pub(crate) enum HoverBoxRebuild {
     LosesItsBox { parent: StyleNodeID },
     /// The element's boxes, and every box below them, move with its record.
     BoxesMove,
+    /// The element's box moves its place among the children of `parent`'s, as from inline-level to block-level, into or
+    /// out of the flow, or into or out of a float: they are built again with it.
+    PlaceMoves { parent: StyleNodeID },
+}
+
+/// Cursor facts copied from the presented frame, including elements that have no layout box.
+pub(crate) struct HoverCursorFacts {
+    parents: Vec<Option<StyleNodeID>>,
+    editable: super::fast_hash::FastSet<StyleNodeID>,
+    user_select: Vec<Option<u8>>,
+}
+
+impl HoverCursorFacts {
+    pub(crate) fn is_editable(&self, element: StyleNodeID) -> bool {
+        self.editable.contains(&element)
+    }
+
+    pub(crate) fn text_may_be_selected(&self, mut element: StyleNodeID) -> Option<bool> {
+        use crate::css::css_enums::user_select;
+        loop {
+            if self.is_editable(element) {
+                return None;
+            }
+            let value = self.user_select.get(element.element_slot()).copied().flatten()?;
+            if value != user_select::AUTO {
+                return Some(value != user_select::NONE);
+            }
+            match self.parents.get(element.element_slot()).copied().flatten() {
+                Some(parent) if parent.element_index().is_some() => element = parent,
+                _ => return Some(true),
+            }
+        }
+    }
 }
 
 impl StyleEngine {
+    pub(crate) fn hover_cursor_facts(&self) -> HoverCursorFacts {
+        let (parents, editable) = self.tree().hover_cursor_relations();
+        HoverCursorFacts {
+            parents,
+            editable: editable.into_iter().collect(),
+            user_select: self.computed_group_sets.hover_user_select_values(),
+        }
+    }
+
+    /// Whether a hover needs the style engine to restyle an element or reject a disabled control.
+    pub(crate) fn hover_needs_style_state(&self, root: StyleNodeID) -> bool {
+        use super::index::FeatureKey;
+        use super::partial_view::Lookup;
+        if self.tree().live_nodes().any(|node| {
+            self.facts.states_of_node(node).contains(StateFact::Disabled)
+                && self.tree().is_in_shadow_including_subtree_of(node, root)
+        }) {
+            return true;
+        }
+        let may_have_elements = |key: FeatureKey| {
+            if !key.has_selector_posting() || key == FeatureKey::State(StateFact::Hover) {
+                return true;
+            }
+            match self.facts.postings().lookup(key) {
+                Lookup::Known(posting) => posting
+                    .candidates()
+                    .any(|node| self.tree().is_in_shadow_including_subtree_of(node, root)),
+                Lookup::KnownAbsent => false,
+                Lookup::Missing(_) => true,
+            }
+        };
+        self.routing
+            .routes_for(FeatureKey::State(StateFact::Hover))
+            .iter()
+            .any(|&route| {
+                let alternatives = self.routing.origin_dispatch_of(route);
+                (alternatives.is_empty() || alternatives.iter().copied().any(may_have_elements))
+                    && self
+                        .routing
+                        .origin_required_of(route)
+                        .iter()
+                        .copied()
+                        .all(may_have_elements)
+            })
+    }
+
     /// The element a mouse move aimed at `node`, an element, is dispatched to, as the host dispatches it: none where
     /// the node is gone, or where the move would be aimed at a disabled form control or anything under one, which the
     /// host dispatches no event to.
@@ -126,7 +205,13 @@ impl StyleEngine {
         match (boxed, self.record_generates_a_box(record)) {
             (false, true) => Some(HoverBoxRebuild::GainsABox { parent }),
             (true, false) => Some(HoverBoxRebuild::LosesItsBox { parent }),
-            (true, true) => Some(HoverBoxRebuild::BoxesMove),
+            (true, true) => {
+                let old_record = super::computed::FinalStyleRecordID::from_raw(row.old_style_record);
+                match old_record.is_some_and(|old| !self.box_keeps_its_place(old, record)) {
+                    true => Some(HoverBoxRebuild::PlaceMoves { parent }),
+                    false => Some(HoverBoxRebuild::BoxesMove),
+                }
+            }
             (false, false) => None,
         }
     }
@@ -338,9 +423,11 @@ impl StyleEngine {
     /// `composed_beside` holds the elements of the hover's earlier waves whose transitions the render owner composes,
     /// each with the non-inherited style groups they animate, which the wave adds its own to. `scroll_snaps` says whether
     /// a scroll container of the document may snap, `at` is the time of the hover in the document timeline's
-    /// milliseconds, and `reference_box` answers the transform reference box of an element's box, which the transitions
-    /// of a transform interpolate against.
-    pub(crate) unsafe fn take_hover_wave(
+    /// milliseconds, `reference_box` answers the transform reference box of an element's box, which the transitions
+    /// of a transform interpolate against, and `lane_transitions` the transitions a lane's hover started on an element,
+    /// which a step decides over in place of those the host runs on it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn take_hover_wave<'lane>(
         &mut self,
         root: StyleNodeID,
         inputs: FfiDocumentStyleComputationInputs,
@@ -348,6 +435,7 @@ impl StyleEngine {
         scroll_snaps: bool,
         at: f64,
         reference_box: impl Fn(StyleNodeID) -> Option<crate::css::css_pixels::CssPixelRect>,
+        lane_transitions: impl Fn(StyleNodeID) -> Option<crate::css::transition::LaneTransitions<'lane>>,
     ) -> HoverWave {
         self.defer_atom_sweep(true);
         // SAFETY: Guaranteed by the caller.
@@ -355,6 +443,24 @@ impl StyleEngine {
         self.defer_atom_sweep(false);
         let mut rows = output.answers().to_vec();
         self.answer_hover_row_damage(&mut rows);
+        // The host runs the transition step of an element that runs transitions as it installs a record that moves it,
+        // whatever the row owes: a step toward a style that declares none still ends them. So does the render owner,
+        // over the host's transitions or those a lane's hover started.
+        for row in &mut rows {
+            if row.pseudo_kind == u8::MAX
+                && !row.owes_a_transition_step
+                && !row.owes_an_animation_plan
+                && row.old_style_record != 0
+                && row.new_style_record != 0
+                && row.old_style_record != row.new_style_record
+                && StyleNodeID::from_raw(row.style_node).is_some_and(|node| {
+                    self.element_adjustment_facts(node) & element_adjustment_fact::HAS_ANIMATIONS != 0
+                        || lane_transitions(node).is_some()
+                })
+            {
+                row.owes_a_transition_step = true;
+            }
+        }
         let mut installable =
             output.reclaimed_style_atoms().is_empty() && rows.iter().all(|row| self.hover_row_is_installable(row));
         let mut refusal = None;
@@ -383,8 +489,10 @@ impl StyleEngine {
             if !installable {
                 break;
             }
-            let reference_box = StyleNodeID::from_raw(row.style_node).and_then(&reference_box);
-            let started = HoverTransitions::of_row(self, row, reference_box, at).and_then(|transitions| {
+            let node = StyleNodeID::from_raw(row.style_node);
+            let reference_box = node.and_then(&reference_box);
+            let lane = node.and_then(&lane_transitions);
+            let started = HoverTransitions::of_row(self, row, reference_box, at, lane).and_then(|transitions| {
                 let Some(mut transitions) = transitions else {
                     return Ok(None);
                 };
@@ -842,34 +950,44 @@ pub unsafe extern "C" fn style_engine_request_hover(host: &crate::render_state::
     moves
 }
 
-/// Writes when the hover of the clock lane of `host`'s document that follows the presented frame started a transition of
-/// `property` of the element the style node `node` names to `start_time`, in the document's milliseconds, and answers
-/// whether it started one the host has yet to start its own of: the host's own transition runs from then.
+/// Hands `adopt` the transitions the hover of the clock lane of `host`'s document that follows the presented frame
+/// leaves each element running that the host has yet to run as the lane does: the element's style node, the host's
+/// transitions the lane's steps ended as they ran, those the steps saw at all, and the transitions.
 ///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread, and `start_time` must be valid for writes.
+/// `host` must be a live document host, on its document's thread. `adopt` must not keep the pointers it gets beyond
+/// the call, or the values they point at without retaining them.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_lane_transition_start(
+pub unsafe extern "C" fn style_engine_adopt_lane_transitions(
     host: &crate::render_state::DocumentHost,
-    node: u32,
-    property: u16,
-    start_time: &mut f64,
-) -> bool {
-    let Some(time) = StyleNodeID::from_raw(node).and_then(|node| host.lane_transition_start(node, property)) else {
-        return false;
-    };
-    *start_time = time;
-    true
-}
-
-/// Forgets when the hover of the clock lane of `host`'s document started transitions, once the host's own hover started
-/// its.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_forget_lane_transition_starts(host: &crate::render_state::DocumentHost) {
-    host.forget_lane_transition_starts();
+    context: *mut std::ffi::c_void,
+    adopt: unsafe extern "C" fn(
+        context: *mut std::ffi::c_void,
+        node: u32,
+        cancelled: *const u64,
+        cancelled_count: usize,
+        seen: *const u64,
+        seen_count: usize,
+        transitions: *const crate::css::transition::FfiLaneTransition,
+        transition_count: usize,
+    ),
+) {
+    for transitions in host.take_lane_transitions() {
+        let lane_transitions: Vec<_> = transitions.lane_transitions().collect();
+        let host_seen = &transitions.host_seen;
+        // SAFETY: Guaranteed by the caller; the element's transitions keep the values alive across the call.
+        unsafe {
+            adopt(
+                context,
+                transitions.node.raw(),
+                host_seen.cancelled.as_ptr(),
+                host_seen.cancelled.len(),
+                host_seen.seen.as_ptr(),
+                host_seen.seen.len(),
+                lane_transitions.as_ptr(),
+                lane_transitions.len(),
+            );
+        }
+    }
 }

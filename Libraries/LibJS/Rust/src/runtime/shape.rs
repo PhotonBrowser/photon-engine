@@ -137,6 +137,11 @@ pub struct ShapeStorage {
     property_storage: GcRefCell<PropertyStorage>,
     forward_transitions: GcRefCell<ForwardTransitions>,
     rare_data: GcRefCell<Option<Box<RareData>>>,
+    /// The shape this one transitioned from, unless it changed the prototype. Transition caches only hold their
+    /// targets weakly, so every shape keeps its parent alive (like V8's back pointers and JSC's previous structure): as
+    /// long as any object has a shape, the whole chain that leads to it stays cached and the next object built the same
+    /// way gets the same shape, also after a garbage collection.
+    previous: Cell<Option<Gc<Shape>>>,
 }
 
 impl Default for ShapeStorage {
@@ -145,14 +150,17 @@ impl Default for ShapeStorage {
             property_storage: GcRefCell::new(PropertyStorage::Descriptors(None)),
             forward_transitions: GcRefCell::new(ForwardTransitions::Empty),
             rare_data: GcRefCell::new(None),
+            previous: Cell::new(None),
         }
     }
 }
 
-// SAFETY: Visits the descriptor array and the keys this storage owns. The shapes of transitions are weak, and so are
-// the keys of prototype transitions, which are only compared.
+// SAFETY: Visits the descriptor array, the keys this storage owns and the previous shape. The shapes of transitions are
+// weak, and so are the keys of prototype transitions, which are only compared.
 unsafe impl Trace for ShapeStorage {
     fn trace(&self, visitor: &mut Visitor) {
+        self.previous.trace(visitor);
+
         match &*self.property_storage.borrow() {
             PropertyStorage::Descriptors(descriptors) => descriptors.trace(visitor),
             // Descriptor arrays mark their own keys; dictionary tables are not cells, so Shape marks their keys directly.
@@ -296,6 +304,7 @@ impl Shape {
             .flags
             .set(previous_shape.flags.get() & shape_flag::HAS_PARAMETER_MAP);
         shape.prototype.set(previous_shape.prototype());
+        shape.storage.previous.set(Some(previous_shape.as_gc()));
         let mut property_count = previous_shape.property_count();
         match property_count_change {
             PropertyCountChange::Preserve => {}
@@ -318,6 +327,9 @@ impl Shape {
             .flags
             .set(previous_shape.flags.get() & shape_flag::HAS_PARAMETER_MAP);
         shape.prototype.set(new_prototype);
+        // NB: Unlike the other transitions, this one does not keep the shape it came from alive. An object that changes
+        //     its prototype time and again (like a WindowProxy as its browsing context navigates) would otherwise keep
+        //     every prototype it ever had alive, and with them the realms they belong to.
         shape.property_count.set(previous_shape.property_count());
         shape
     }
@@ -676,13 +688,15 @@ impl Shape {
             return;
         }
 
+        // NB: Only the premade shapes of intrinsics get properties without transitions when they are not
+        //     dictionaries, before any object has them, so nothing can have cached them. Their dictionary generation
+        //     stays 0 like that of every other shape that is no dictionary, which caches compare it with.
         self.ensure_descriptor_array(vm);
         let descriptors = self.descriptors().expect("the shape has a descriptor array");
         if descriptors.lookup(property_key, property_count).is_none() {
             assert!(property_count < u32::MAX);
             descriptors.set(property_key, metadata, property_count);
             self.property_count.set(property_count + 1);
-            self.increment_dictionary_generation();
             return;
         }
         descriptors.set(property_key, metadata, property_count);

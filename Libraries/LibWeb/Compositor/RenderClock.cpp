@@ -43,16 +43,16 @@ private:
             m_clock.did_receive_clock_tick(context_id, frame_time_nanoseconds, scroll_offsets);
     }
 
-    virtual void pointer_moved(Web::CompositorContextId context_id, Web::DevicePixelPoint position, u32 buttons, bool scrolled_since_frame) override
+    virtual void pointer_moved(Web::CompositorContextId context_id, Web::DevicePixelPoint position, u32 buttons, bool scrolled_since_frame, u64 input_event_id) override
     {
         if (!m_detached)
-            m_clock.did_receive_pointer_move(context_id, Gfx::FloatPoint { position.x().value(), position.y().value() }, buttons, scrolled_since_frame);
+            m_clock.did_receive_pointer_move(context_id, Gfx::FloatPoint { position.x().value(), position.y().value() }, buttons, scrolled_since_frame, input_event_id);
     }
 
-    virtual void pointer_left(Web::CompositorContextId context_id) override
+    virtual void pointer_left(Web::CompositorContextId context_id, u64 input_event_id) override
     {
         if (!m_detached)
-            m_clock.did_receive_pointer_move(context_id, {}, 0, false);
+            m_clock.did_receive_pointer_move(context_id, {}, 0, false, input_event_id);
     }
 
     RenderClock& m_clock;
@@ -77,10 +77,10 @@ bool ClockTicksHandle::tick(i64 frame_time_nanoseconds, ReadonlySpan<Web::Compos
     return Layout::RustFFI::clock_ticks_tick(m_ticks, frame_time_nanoseconds, scrollers.data(), scrollers.size());
 }
 
-PointerAnswer ClockTicksHandle::pointer_moved(Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame) const
+PointerAnswer ClockTicksHandle::pointer_moved(Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id) const
 {
     auto position = device_position.value_or({});
-    return static_cast<PointerAnswer>(Layout::RustFFI::clock_ticks_pointer_moved(m_ticks, device_position.has_value(), position.x(), position.y(), buttons, scrolled_since_frame));
+    return static_cast<PointerAnswer>(Layout::RustFFI::clock_ticks_pointer_moved(m_ticks, device_position.has_value(), position.x(), position.y(), buttons, scrolled_since_frame, input_event_id));
 }
 
 RenderClock& RenderClock::the()
@@ -183,7 +183,7 @@ void RenderClock::drop_channel()
 void RenderClock::arm_lane(Web::CompositorContextId context_id, double maximum_frames_per_second, NonnullRefPtr<ClockTicksHandle> ticks, Optional<i64> tick_now_at)
 {
     VERIFY(isfinite(maximum_frames_per_second) && maximum_frames_per_second > 0);
-    (void)invoke_on_clock_thread([this, context_id, maximum_frames_per_second, ticks = move(ticks), tick_now_at]() mutable {
+    auto arm = [this, context_id, maximum_frames_per_second, ticks = move(ticks), tick_now_at]() mutable {
         // Another document of the context hears of the pointer no more, and a tick armed for it would hand its ticks to
         // this one's.
         if (auto it = m_pointer_lanes.find(context_id); it != m_pointer_lanes.end() && !it->value.ticks->hands_on_to(*ticks))
@@ -195,7 +195,12 @@ void RenderClock::arm_lane(Web::CompositorContextId context_id, double maximum_f
             request_clock_tick(context_id, maximum_frames_per_second);
         }
         m_pointer_lanes.set(context_id, PointerLane { maximum_frames_per_second, move(ticks) });
-    });
+    };
+    // A test hands the lanes pointer moves by hand, which find the context armed once the rendering update is over.
+    if (m_manual_for_testing)
+        run_on_clock_thread_and_wait(move(arm));
+    else
+        (void)invoke_on_clock_thread(move(arm));
 }
 
 void RenderClock::forget_context(Web::CompositorContextId context_id)
@@ -206,37 +211,55 @@ void RenderClock::forget_context(Web::CompositorContextId context_id)
     });
 }
 
-void RenderClock::disarm_all_for_testing()
+// Runs `job` on the clock thread, and waits for it. The clock thread never waits for the caller's, and goes away only with
+// this RenderClock, so it runs what was just handed to it.
+void RenderClock::run_on_clock_thread_and_wait(Function<void()> job)
 {
     Mutex done_mutex;
     ConditionVariable done_condition { done_mutex };
     bool done = false;
-
     auto invoked = invoke_on_clock_thread([&] {
-        m_armed_contexts.clear();
+        job();
         MutexLocker locker(done_mutex);
         done = true;
         done_condition.broadcast();
     });
     if (!invoked)
         return;
-
-    // The clock thread goes away only with this RenderClock, so it runs what was just handed to it.
     MutexLocker locker(done_mutex);
     done_condition.wait_while([&] { return !done; });
 }
 
-void RenderClock::did_receive_pointer_move(Web::CompositorContextId context_id, Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame)
+void RenderClock::disarm_all_for_testing()
+{
+    run_on_clock_thread_and_wait([this] { m_armed_contexts.clear(); });
+}
+
+void RenderClock::hand_pointer_move(Web::CompositorContextId context_id, Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id)
+{
+    auto pointer_move = [this, context_id, device_position, buttons, scrolled_since_frame, input_event_id] {
+        did_receive_pointer_move(context_id, device_position, buttons, scrolled_since_frame, input_event_id);
+    };
+    if (m_manual_for_testing)
+        run_on_clock_thread_and_wait(move(pointer_move));
+    else
+        (void)invoke_on_clock_thread(move(pointer_move));
+}
+
+void RenderClock::did_receive_pointer_move(Web::CompositorContextId context_id, Optional<Gfx::FloatPoint> device_position, u32 buttons, bool scrolled_since_frame, u64 input_event_id)
 {
     auto it = m_pointer_lanes.find(context_id);
     if (it == m_pointer_lanes.end())
         return;
-    switch (it->value.ticks->pointer_moved(device_position, buttons, scrolled_since_frame)) {
+    switch (it->value.ticks->pointer_moved(device_position, buttons, scrolled_since_frame, input_event_id)) {
     case PointerAnswer::Moves:
         return;
     case PointerAnswer::Ticks:
         break;
     }
+    // A test ticks the lanes by hand.
+    if (m_manual_for_testing)
+        return;
     // A context armed for ticks already asked for the next one.
     if (m_armed_contexts.contains(context_id))
         return;
@@ -276,4 +299,15 @@ void RenderClock::did_lose_channel()
     m_channel = nullptr;
 }
 
+}
+
+extern "C" void web_render_clock_hand_pointer_move(u64, bool, float, float, u32, bool, u64);
+
+// The lane of a document hands the render clock a pointer move over a same-process iframe's compositor context.
+extern "C" void web_render_clock_hand_pointer_move(u64 context_id, bool has_position, float x, float y, u32 buttons, bool scrolled_since_frame, u64 input_event_id)
+{
+    Optional<Gfx::FloatPoint> position;
+    if (has_position)
+        position = Gfx::FloatPoint { x, y };
+    Web::Compositor::RenderClock::the().hand_pointer_move(Web::CompositorContextId { context_id }, position, buttons, scrolled_since_frame, input_event_id);
 }

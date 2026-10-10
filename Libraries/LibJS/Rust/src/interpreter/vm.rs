@@ -38,7 +38,10 @@ use crate::gc::weak_container::WeakContainer;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::Environment;
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
-use crate::layout::function_object::{FunctionObject, NativeFunctionTableEntry, NativeFunctionType};
+use crate::layout::function_object::{
+    FunctionObject, NATIVE_FUNCTION_TABLE_CAPACITY, NATIVE_FUNCTION_TABLE_INDEX_MASK, NativeFunctionTableEntry,
+    NativeFunctionType,
+};
 use crate::layout::object::Object;
 use crate::layout::realm::Realm;
 use crate::layout::value::Value;
@@ -60,6 +63,8 @@ use crate::runtime::error_types::ErrorType;
 use crate::runtime::finalization_registry::FinalizationRegistry;
 use crate::runtime::function_environment::FunctionEnvironment;
 use crate::runtime::job_callback::{JobCallback, call_job_callback, make_job_callback};
+use crate::runtime::json_object::JsonStringifyCache;
+use crate::runtime::json_text_parser::JsonParseCache;
 use crate::runtime::module::{Module, finish_loading_imported_module};
 use crate::runtime::module_loading::{ImportedModulePayload, ImportedModuleReferrer};
 use crate::runtime::module_request::ModuleRequest;
@@ -493,7 +498,10 @@ pub struct Vm {
     /// The storage of the execution context stack, whose length is its capacity. The head points into it and knows
     /// which of its entries are on the stack.
     execution_context_stack_storage: RefCell<Vec<ExecutionContextStackEntry>>,
-    native_function_table: RefCell<Vec<NativeFunctionTableEntry>>,
+    /// All NATIVE_FUNCTION_TABLE_CAPACITY entries, of which the first native_function_count are registered. The rest
+    /// have no function.
+    native_function_table: RefCell<Box<[NativeFunctionTableEntry]>>,
+    native_function_count: Cell<u32>,
     /// The index of each function in the native function table, by its address and type.
     native_function_indices: RefCell<HashMap<(usize, u32), u32>>,
     roots: RootSet,
@@ -507,6 +515,8 @@ pub struct Vm {
     /// The interned PrimitiveString of each Utf16FlyString, by its raw identity, see PrimitiveString::is_interned().
     /// The strings are weak: the sweep callback drops the ones that die.
     interned_strings: RefCell<HashMap<usize, Gc<PrimitiveString>, foldhash::fast::RandomState>>,
+    json_parse_cache: JsonParseCache,
+    json_stringify_cache: JsonStringifyCache,
     empty_string: OnceCell<Gc<PrimitiveString>>,
     cached_strings: OnceCell<CachedStrings>,
     single_ascii_character_strings: OnceCell<[Gc<PrimitiveString>; SINGLE_ASCII_CHARACTER_STRING_COUNT]>,
@@ -605,7 +615,10 @@ impl Vm {
         let heap_region_base = unsafe { capi::gc_heap_region_base() };
         let primitive_storage_cage_base = crate::runtime::array_buffer::primitive_storage_cage_base();
         let interpreter_stack_memory = InterpreterStackMemory::allocate();
-        let native_function_table = Vec::new();
+        // SAFETY: An all-zero NativeFunctionTableEntry is valid: no function and the first function type.
+        let native_function_table = unsafe {
+            Box::<[NativeFunctionTableEntry]>::new_zeroed_slice(NATIVE_FUNCTION_TABLE_CAPACITY).assume_init()
+        };
         let mut execution_context_stack_storage = Vec::new();
         let vm = Vm {
             head: VmHead {
@@ -615,7 +628,7 @@ impl Vm {
                 execution_generation: Cell::new(0),
                 primitive_storage_cage_base: Cell::new(primitive_storage_cage_base),
                 heap_region_base: Cell::new(heap_region_base),
-                native_function_table_data: Cell::new(Vec::<NativeFunctionTableEntry>::as_ptr(&native_function_table)),
+                native_function_table_data: Cell::new(native_function_table.as_ptr()),
                 debugger: Cell::new(core::ptr::null_mut()),
                 execution_context_stack_entries: Cell::new(Vec::<ExecutionContextStackEntry>::as_mut_ptr(
                     &mut execution_context_stack_storage,
@@ -630,6 +643,7 @@ impl Vm {
             _interpreter_stack_memory: interpreter_stack_memory,
             execution_context_stack_storage: RefCell::new(execution_context_stack_storage),
             native_function_table: RefCell::new(native_function_table),
+            native_function_count: Cell::new(0),
             native_function_indices: RefCell::new(HashMap::new()),
             roots: RootSet::default(),
             names: CommonPropertyNames::new(),
@@ -645,6 +659,8 @@ impl Vm {
                 }; LARGE_NUMERIC_STRING_CACHE_SIZE],
             ),
             interned_strings: RefCell::default(),
+            json_parse_cache: JsonParseCache::default(),
+            json_stringify_cache: JsonStringifyCache::default(),
             empty_string: OnceCell::new(),
             cached_strings: OnceCell::new(),
             single_ascii_character_strings: OnceCell::new(),
@@ -991,6 +1007,8 @@ impl Vm {
         self.single_ascii_character_strings.trace(visitor);
         self.numeric_string_cache.trace(visitor);
         self.large_numeric_string_cache.trace(visitor);
+        self.json_parse_cache.trace(visitor);
+        self.json_stringify_cache.trace(visitor);
         self.cached_strings.trace(visitor);
         self.well_known_symbols.trace(visitor);
         self.global_symbol_registry.trace(visitor);
@@ -1566,6 +1584,14 @@ impl Vm {
             .expect("the VM allocates the single ASCII character strings")[usize::from(character)]
     }
 
+    pub fn json_parse_cache(&self) -> &JsonParseCache {
+        &self.json_parse_cache
+    }
+
+    pub fn json_stringify_cache(&self) -> &JsonStringifyCache {
+        &self.json_stringify_cache
+    }
+
     pub fn cached_strings(&self) -> &CachedStrings {
         self.cached_strings.get().expect("the VM allocates the cached strings")
     }
@@ -1590,18 +1616,20 @@ impl Vm {
             return *index;
         }
 
-        let mut table = self.native_function_table.borrow_mut();
-        assert!(table.len() < u32::MAX as usize);
-        let index = u32::try_from(table.len()).expect("native function index fits in u32");
-        table.push(entry);
+        let index = self.native_function_count.get();
+        assert!(
+            (index as usize) < NATIVE_FUNCTION_TABLE_CAPACITY,
+            "the native function table is full"
+        );
+        self.native_function_table.borrow_mut()[index as usize] = entry;
+        self.native_function_count.set(index + 1);
         self.native_function_indices.borrow_mut().insert(key, index);
-        self.head.native_function_table_data.set(table.as_ptr());
         index
     }
 
     pub fn native_function(&self, index: u32, expected_type: NativeFunctionType) -> RawNativeFunctionPointer {
         let table = self.native_function_table.borrow();
-        let entry = &table[index as usize];
+        let entry = &table[(index & NATIVE_FUNCTION_TABLE_INDEX_MASK) as usize];
         assert!(entry.function_type == expected_type);
         assert!(entry.function.is_some());
         entry.function

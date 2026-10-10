@@ -23,6 +23,96 @@ pub struct FfiFloatRect {
     pub height: f32,
 }
 
+/// The glyph cell one code unit of an SVG text content element's character data occupies, in the
+/// element's coordinate system. The SVG DOM text methods read these back from the committed box.
+/// https://svgwg.org/svg2-draft/coords.html#BoundingBoxes
+/// The full glyph cell must have width equal to the horizontal advance and height equal to the EM
+/// box for horizontal text.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct FfiSvgTextCharacterCell {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Whether this code unit is the first, in document order, of the typographic character whose
+    /// cell this is. A later code unit of the same character carries the same cell, unmarked.
+    pub starts_typographic_character: bool,
+}
+
+/// What shaping one SVG text run yields: its glyphs, its total advance, the union of its glyph
+/// cells, and the glyph cell of every one of its code units.
+struct ShapedSvgText {
+    runs: Vec<libgfx_rust::path::GlyphRun>,
+    advance: f32,
+    glyph_cells: SvgCssPixelRect,
+    character_cells: Vec<FfiSvgTextCharacterCell>,
+}
+
+/// Appends the glyph cell of each code unit of one shaped run, in code unit order. A typographic
+/// character's cell spans its advance; every code unit of it carries that cell, and the first one
+/// is marked as the one that starts it.
+/// https://svgwg.org/svg2-draft/text.html#TermTypographicCharacterUnit
+/// A unit of a writing system - such as a Latin alphabetic letter (including its diacritics),
+/// Hangul syllable, Chinese ideographic character, Myanmar syllable cluster - that is indivisible
+/// with respect to a particular typographic operation [...]
+/// FIXME: The glyphs are taken to be in code unit order, which holds for the left-to-right text
+///        this layout shapes.
+fn append_svg_text_character_cells(
+    cells: &mut Vec<FfiSvgTextCharacterCell>,
+    glyphs: &[libgfx_rust::text_layout::DrawGlyph],
+    length_in_code_units: usize,
+    run_end_x: f32,
+    top: f32,
+    height: f32,
+) {
+    let mut covered = 0usize;
+    let mut index = 0usize;
+    while index < glyphs.len() && covered < length_in_code_units {
+        let first = glyphs[index];
+        // A glyph that maps to no code unit of its own (a combining mark's, e.g.) belongs to the
+        // typographic character before it, so it extends that character's cell. One at the start
+        // of the run has no character before it, so it joins the character after it instead.
+        let mut next = index + 1;
+        let mut code_units = first.length_in_code_units;
+        while next < glyphs.len() && (glyphs[next].length_in_code_units == 0 || code_units == 0) {
+            code_units += glyphs[next].length_in_code_units;
+            next += 1;
+        }
+        let end_x = glyphs.get(next).map_or(run_end_x, |glyph| glyph.x);
+        let code_units = code_units.max(1).min(length_in_code_units - covered);
+        let cell = FfiSvgTextCharacterCell {
+            x: first.x,
+            y: top,
+            width: end_x - first.x,
+            height,
+            starts_typographic_character: true,
+        };
+        cells.push(cell);
+        cells.extend(std::iter::repeat_n(
+            FfiSvgTextCharacterCell {
+                starts_typographic_character: false,
+                ..cell
+            },
+            code_units - 1,
+        ));
+        covered += code_units;
+        index = next;
+    }
+    // A code unit no glyph accounts for gets an empty cell at the run's end, so that indices keep
+    // lining up with the characters.
+    cells.extend(std::iter::repeat_n(
+        FfiSvgTextCharacterCell {
+            x: run_end_x,
+            y: top,
+            width: 0.0,
+            height,
+            starts_typographic_character: false,
+        },
+        length_in_code_units - covered,
+    ));
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct FfiAffineTransform {
@@ -250,6 +340,27 @@ impl SvgCssPixelRect {
         self.y -= height / 2;
         self.height += height;
     }
+
+    fn is_empty(&self) -> bool {
+        self.width <= CssPixels::default() || self.height <= CssPixels::default()
+    }
+
+    /// Grows this rect to cover `other` too. An empty rect covers nothing, so it doesn't take part.
+    fn unite(&mut self, other: SvgCssPixelRect) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        self.x = self.x.min(other.x);
+        self.y = self.y.min(other.y);
+        self.width = right - self.x;
+        self.height = bottom - self.y;
+    }
 }
 
 impl From<FfiAffineTransform> for libgfx_rust::AffineTransform {
@@ -420,16 +531,83 @@ impl Default for SvgTextChunkMeasurement {
     }
 }
 
-/// Strips the ASCII whitespace AK's Utf16String::trim_ascii_whitespace() strips from both ends.
-fn trim_ascii_whitespace(text: &mut Vec<u16>) {
-    let is_whitespace = |unit: &u16| matches!(unit, 0x09..=0x0d | 0x20);
-    let end = text
-        .iter()
-        .rposition(|unit| !is_whitespace(unit))
-        .map_or(0, |last| last + 1);
-    text.truncate(end);
-    let start = text.iter().position(|unit| !is_whitespace(unit)).unwrap_or(end);
-    text.drain(..start);
+/// Processes the white space in an SVG text content element's character data, as the element's
+/// 'white-space-collapse' value directs.
+/// https://svgwg.org/svg2-draft/text.html#WhiteSpace
+/// Rendering of white space in SVG 2 is controlled by the white-space property. [...] Values and
+/// their meanings are defined in CSS Text Module Level 3.
+/// NB: SVG text is laid out as one line, so both phases of CSS Text's white space processing
+///     happen here, on the characters themselves, before they are shaped.
+fn process_svg_text_white_space(text: &mut Vec<u16>, white_space_collapse: u8) {
+    const SPACE: u16 = b' ' as u16;
+    const TAB: u16 = b'\t' as u16;
+    const LINE_FEED: u16 = b'\n' as u16;
+    const CARRIAGE_RETURN: u16 = b'\r' as u16;
+    // A segment break is a line feed; the parser has already normalized every other newline into
+    // one. A carriage return that script wrote into the DOM never went through that
+    // normalization, so it counts as a segment break here too.
+    let is_segment_break = |unit: u16| unit == LINE_FEED || unit == CARRIAGE_RETURN;
+    let is_white_space = |unit: u16| unit == SPACE || unit == TAB || is_segment_break(unit);
+
+    match white_space_collapse {
+        // https://drafts.csswg.org/css-text-4/#valdef-white-space-collapse-discard
+        // This value directs user agents to "discard" all white space in the element.
+        white_space_collapse::DISCARD => text.retain(|&unit| !is_white_space(unit)),
+        // https://drafts.csswg.org/css-text-4/#white-space-phase-1
+        // If white-space-collapse is set to collapse or preserve-breaks, white space characters are
+        // considered collapsible and are processed by performing the following steps:
+        // 1. Any sequence of collapsible spaces and tabs immediately preceding or following a
+        //    segment break is removed.
+        // 2. Collapsible segment breaks are transformed for rendering according to the segment
+        //    break transformation rules.
+        // 3. Every collapsible tab is converted to a collapsible space (U+0020).
+        // 4. Any collapsible space immediately following another collapsible space [...] is
+        //    collapsed to have zero advance width.
+        // https://drafts.csswg.org/css-text-4/#white-space-phase-2
+        // 1. A sequence of collapsible spaces at the beginning of a line is removed.
+        // 3. A sequence of collapsible spaces at the end of a line is removed [...]
+        // Together, those steps turn every run of collapsible white space into a single space, and
+        // drop the runs at either end of the one line SVG text renders as.
+        // https://drafts.csswg.org/css-text-4/#line-break-transform
+        // Then any remaining segment break is either transformed into a space (U+0020) or removed
+        // depending on the context before and after the break. The rules for this operation are
+        // UA-defined in this level.
+        // We transform every remaining segment break into a space.
+        // AD-HOC: preserve-breaks keeps segment breaks as forced line breaks, but SVG text has no
+        //         line breaking here, so its segment breaks collapse like collapse's do.
+        white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS => {
+            let mut processed = Vec::with_capacity(text.len());
+            let mut after_white_space = false;
+            for &unit in text.iter() {
+                if is_white_space(unit) {
+                    after_white_space = true;
+                    continue;
+                }
+                if after_white_space && !processed.is_empty() {
+                    processed.push(SPACE);
+                }
+                after_white_space = false;
+                processed.push(unit);
+            }
+            *text = processed;
+        }
+        // https://drafts.csswg.org/css-text-4/#white-space-phase-1
+        // If white-space-collapse is set to preserve-spaces, each tab and segment break is
+        // converted to a space.
+        // https://drafts.csswg.org/css-text-4/#valdef-white-space-collapse-preserve
+        // preserve: This value prevents user agents from collapsing sequences of white space.
+        // Segment breaks such as line feeds are preserved as forced line breaks.
+        // AD-HOC: SVG text has no line breaking here, so preserve and break-spaces render each
+        //         segment break as a space too, rather than as a forced line break. Likewise a
+        //         preserved tab renders as a space rather than as a shift to the next tab stop.
+        _ => {
+            for unit in text.iter_mut() {
+                if *unit == TAB || is_segment_break(*unit) {
+                    *unit = SPACE;
+                }
+            }
+        }
+    }
 }
 
 fn code_point_length_at(text: &[u16], offset: usize) -> usize {
@@ -852,9 +1030,10 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
-    /// The character data an SVG text content element renders: its direct child text, as written.
-    /// SVG shapes the element's own characters, not the white-space-collapsed text a line box
-    /// would lay out, so this reads the source text the row kept beside its rendering.
+    /// The character data an SVG text content element renders: its direct child text, with its
+    /// white space processed as the element's 'white-space-collapse' directs. SVG shapes the
+    /// element's own characters, not the text a line box would lay out, so this reads the source
+    /// text the row kept beside its rendering.
     fn svg_text_contents(&self, node: Node) -> Vec<u16> {
         let mut text: Vec<u16> = Vec::new();
         for child in self.run.callbacks.children(node) {
@@ -862,12 +1041,18 @@ impl<'pass> SvgFormattingContext<'pass> {
                 self.append_svg_source_text(child, &mut text);
             }
         }
-        trim_ascii_whitespace(&mut text);
+        // FIXME: White space is processed per element, so a collapsible space at an element
+        //        boundary (<text>a <tspan>b</tspan></text>) collapses away instead of surviving as
+        //        the one space between the runs. Collapsing across the whole <text> subtree needs
+        //        its text walked in document order.
+        process_svg_text_white_space(&mut text, self.style(node).white_space_collapse());
         text
     }
 
     /// The character data text on a path renders: the source text of every text node in its
     /// subtree whose parent has a box, rather than of its direct children alone.
+    /// AD-HOC: The subtree's text is processed as one run, with the <textPath>'s own
+    ///         'white-space-collapse', rather than each child's text with that child's value.
     fn rendered_svg_text_contents(&self, root: Node) -> Vec<u16> {
         let mut text: Vec<u16> = Vec::new();
         let mut current = root;
@@ -882,7 +1067,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             }
             loop {
                 if current == root {
-                    trim_ascii_whitespace(&mut text);
+                    process_svg_text_white_space(&mut text, self.style(root).white_space_collapse());
                     return text;
                 }
                 let sibling = self.next_sibling(current);
@@ -998,25 +1183,51 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     /// Mirrors Gfx::shape_text(baseline_start, text, font_cascade_list): one run per stretch of
-    /// text the cascade resolves to the same font, each starting where the last one ended.
-    fn shape_svg_text(
-        &self,
-        style: StyleValues<'_>,
-        text: &[u16],
-        baseline_start: FfiFloatPoint,
-    ) -> (Vec<libgfx_rust::path::GlyphRun>, f32) {
-        let mut runs = Vec::new();
-        let mut advance = 0.0f32;
+    /// text the cascade resolves to the same font, each starting where the last one ended. Also
+    /// returns the union of the runs' glyph cells, each run's measured with its own font, and the
+    /// glyph cell of every code unit of the text.
+    fn shape_svg_text(&self, style: StyleValues<'_>, text: &[u16], baseline_start: FfiFloatPoint) -> ShapedSvgText {
+        let mut shaped_text = ShapedSvgText {
+            runs: Vec::new(),
+            advance: 0.0,
+            glyph_cells: SvgCssPixelRect::default(),
+            character_cells: Vec::with_capacity(text.len()),
+        };
         Self::for_each_svg_font_run(style, text, |font, run_text| {
+            let run_start_x = baseline_start.x + shaped_text.advance;
             let shaped = libgfx_rust::text_layout::shape_text(
                 font,
                 run_text,
                 libgfx_rust::text_layout::TextType::Common,
-                baseline_start.x + advance,
+                run_start_x,
                 0.0,
                 0.0,
             );
-            advance += shaped.width();
+            // https://svgwg.org/svg2-draft/coords.html#BoundingBoxes
+            // The full glyph cell must have width equal to the horizontal advance and height equal to the EM box for
+            // horizontal text.
+            // For example, for horizontal text, the calculations must assume that each glyph extends vertically to the
+            // full ascent and descent values for the font.
+            // NB: The glyphs of one run sit side by side on one baseline, so the union of their cells is a single rect.
+            // FIXME: Take writing mode into account.
+            let facts = font.facts();
+            let cell_top = baseline_start.y - facts.ascent;
+            let cell_height = facts.ascent + facts.descent;
+            shaped_text.glyph_cells.unite(float_rect_to_css_pixels(FfiFloatRect {
+                x: run_start_x,
+                y: cell_top,
+                width: shaped.width(),
+                height: cell_height,
+            }));
+            append_svg_text_character_cells(
+                &mut shaped_text.character_cells,
+                shaped.glyphs(),
+                run_text.len(),
+                run_start_x + shaped.width(),
+                cell_top,
+                cell_height,
+            );
+            shaped_text.advance += shaped.width();
             let mut glyph_buffer = shaped.into_glyphs();
             let glyphs = glyph_buffer.to_mut();
             if baseline_start.y != 0.0 {
@@ -1024,12 +1235,12 @@ impl<'pass> SvgFormattingContext<'pass> {
                     glyph.y += baseline_start.y;
                 }
             }
-            runs.push(libgfx_rust::path::GlyphRun {
+            shaped_text.runs.push(libgfx_rust::path::GlyphRun {
                 font: font.clone(),
                 glyphs: std::mem::take(glyphs),
             });
         });
-        (runs, advance)
+        shaped_text
     }
 
     /// The advance of the text run rendered by the given box; that is, of its direct child text.
@@ -1112,8 +1323,16 @@ impl<'pass> SvgFormattingContext<'pass> {
         measurement
     }
 
-    /// The glyph outlines a <text> or <tspan> renders, and the current text position it leaves.
-    fn svg_text_box_path(&mut self, text_box: Node) -> libgfx_rust::path::OwnedPath {
+    /// The glyph outlines a <text> or <tspan> renders, the cells they occupy, and the glyph cell of each of its
+    /// characters, advancing the current text position.
+    fn svg_text_box_path(
+        &mut self,
+        text_box: Node,
+    ) -> (
+        libgfx_rust::path::OwnedPath,
+        SvgCssPixelRect,
+        Vec<FfiSvgTextCharacterCell>,
+    ) {
         let attributes = self.svg_attributes(text_box);
         // https://svgwg.org/svg2-draft/text.html#TextElementXAttribute
         // the starting X (Y) coordinate for rendering the glyphs corresponding to the given
@@ -1158,27 +1377,39 @@ impl<'pass> SvgFormattingContext<'pass> {
             y: self.current_text_position.y + self.svg_dominant_baseline_offset(style),
         };
         let text = self.svg_text_contents(text_box);
-        let (runs, advance) = self.shape_svg_text(style, &text, text_offset);
+        let shaped = self.shape_svg_text(style, &text, text_offset);
+
         // https://svgwg.org/svg2-draft/text.html#TextLayoutIntroduction
         // After each glyph is placed, the current text position is advanced by the glyph's advance
         // value (typically the width for horizontal text or height for vertical text).
         // FIXME: Take writing mode and text direction into account.
-        self.current_text_position.x += advance;
-        libgfx_rust::path::OwnedPath::from_glyph_runs(&runs)
+        self.current_text_position.x += shaped.advance;
+
+        (
+            libgfx_rust::path::OwnedPath::from_glyph_runs(&shaped.runs),
+            shaped.glyph_cells,
+            shaped.character_cells,
+        )
     }
 
     /// The glyph outlines a <textPath> renders: its whole subtree's text, shaped from the origin
-    /// and then laid along the shape its `href` names.
+    /// and then laid along the shape its `href` names. Also returns the glyph cell of each of its
+    /// characters.
     /// https://svgwg.org/svg2-draft/text.html#TextPathElement
-    fn svg_text_path_box_path(&self, text_path_box: Node) -> libgfx_rust::path::OwnedPath {
+    /// FIXME: The character cells are those of the text shaped from the origin; they aren't moved
+    ///        onto the path or rotated along it, so only their advances are meaningful.
+    fn svg_text_path_box_path(
+        &self,
+        text_path_box: Node,
+    ) -> (libgfx_rust::path::OwnedPath, Vec<FfiSvgTextCharacterCell>) {
         let empty = || libgfx_rust::path::PathBuilder::new().build();
         let Some(shape_path) = self.svg_referenced_shape_path(text_path_box) else {
-            return empty();
+            return (empty(), Vec::new());
         };
 
         let style = self.style(text_path_box);
         let text = self.rendered_svg_text_contents(text_path_box);
-        let (runs, total_advance) = self.shape_svg_text(style, &text, FfiFloatPoint::default());
+        let shaped = self.shape_svg_text(style, &text, FfiFloatPoint::default());
 
         // https://svgwg.org/svg2-draft/text.html#TextPathElementStartOffsetAttribute
         let mut start_offset = self
@@ -1188,12 +1419,15 @@ impl<'pass> SvgFormattingContext<'pass> {
         // FIXME: Take writing mode and text direction into account.
         match style.inherited_svg().text_anchor {
             text_anchor::START => {}
-            text_anchor::MIDDLE => start_offset -= total_advance / 2.0,
-            text_anchor::END => start_offset -= total_advance,
+            text_anchor::MIDDLE => start_offset -= shaped.advance / 2.0,
+            text_anchor::END => start_offset -= shaped.advance,
             _ => unreachable!("invalid text-anchor value"),
         }
 
-        shape_path.place_glyph_runs_along(&runs, start_offset)
+        (
+            shape_path.place_glyph_runs_along(&shaped.runs, start_offset),
+            shaped.character_cells,
+        )
     }
 
     /// The geometry of the shape element an SVG reference names, read from what that element
@@ -1692,32 +1926,65 @@ impl<'pass> SvgFormattingContext<'pass> {
     ) {
         // A shape's geometry is its own attributes and computed style against the viewport, and
         // text is its own character data shaped with its own font cascade, so the pass draws both.
-        let path = match self.node_kind(graphics_box) {
-            NodeKind::SVGGeometryBox => self.svg_geometry_path(graphics_box),
-            NodeKind::SVGTextBox => self.svg_text_box_path(graphics_box),
-            NodeKind::SVGTextPathBox => self.svg_text_path_box_path(graphics_box),
-            _ => libgfx_rust::path::PathBuilder::new().build(),
+        let kind = self.node_kind(graphics_box);
+        let (path, glyph_cells, character_cells) = match kind {
+            NodeKind::SVGGeometryBox => (self.svg_geometry_path(graphics_box), None, None),
+            NodeKind::SVGTextBox => {
+                let (path, glyph_cells, character_cells) = self.svg_text_box_path(graphics_box);
+                (path, Some(glyph_cells), Some(character_cells))
+            }
+            NodeKind::SVGTextPathBox => {
+                let (path, character_cells) = self.svg_text_path_box_path(graphics_box);
+                (path, None, Some(character_cells))
+            }
+            _ => (libgfx_rust::path::PathBuilder::new().build(), None, None),
         };
 
-        if self.node_kind(graphics_box) == NodeKind::SVGTextBox {
-            // <text> and <tspan> elements can contain more text elements.
+        // https://svgwg.org/svg2-draft/coords.html#BoundingBoxes
+        // Let fill-shape be the equivalent path of element if it is a shape, or a shape that includes each of the glyph
+        // cells corresponding to the text within the elements otherwise.
+        // NB: A text content element's box is its bounding box: The box getBBox() and getBoundingClientRect() report.
+        let is_text_content_box = matches!(kind, NodeKind::SVGTextBox | NodeKind::SVGTextPathBox);
+        let [x, y, width, height] = path.bounding_box();
+        let mut bounding_box = float_rect_to_css_pixels(FfiFloatRect { x, y, width, height });
+        // AD-HOC: The spec's fill-shape for text is just its glyph cells. We follow what other engines do: Cover the
+        //         glyph outlines, so a glyph that overflows its cell (an italic's overhang, e.g.) stays within the box.
+        // FIXME: A <textPath>'s box covers its glyph outlines, not the glyph cells laid along its path.
+        if let Some(glyph_cells) = glyph_cells {
+            bounding_box.unite(glyph_cells);
+        }
+        if !is_text_content_box {
+            // Stroke increases the path's size by stroke_width/2 per side.
+            let stroke_width = CssPixels::nearest_value_for_f32(facts.visible_stroke_width);
+            bounding_box.inflate(stroke_width, stroke_width);
+        }
+
+        if kind == NodeKind::SVGTextBox {
+            // <text> and <tspan> elements can contain more text elements, whose glyph cells count toward this box too.
             for child in self.run.callbacks.children(graphics_box) {
                 if matches!(self.node_kind(child), NodeKind::SVGTextBox | NodeKind::SVGTextPathBox) {
                     self.layout_graphics_element(run, child, input);
+                    let child_used = self.used_values(child);
+                    let offset = child_used.content_offset.get();
+                    bounding_box.unite(SvgCssPixelRect {
+                        x: offset.x,
+                        y: offset.y,
+                        width: child_used.content_inline_size.get(),
+                        height: child_used.content_block_size.get(),
+                    });
                 }
             }
         }
-        let [x, y, width, height] = path.bounding_box();
-        let mut bounding_box = float_rect_to_css_pixels(FfiFloatRect { x, y, width, height });
-        // Stroke increases the path's size by stroke_width/2 per side.
-        let stroke_width = CssPixels::nearest_value_for_f32(facts.visible_stroke_width);
-        bounding_box.inflate(stroke_width, stroke_width);
 
         let used_pointer = self.used_values(graphics_box);
         let used = &used_pointer;
         used.set_content_inline_size(bounding_box.width);
         used.set_content_block_size(bounding_box.height);
-        self.used_values(graphics_box).rare_data_mut().computed_svg_path = Some(std::sync::Arc::new(path));
+        {
+            let mut rare_data = used.rare_data_mut();
+            rare_data.computed_svg_path = Some(std::sync::Arc::new(path));
+            rare_data.svg_text_character_cells = character_cells.map(std::sync::Arc::new);
+        }
         self.place_child(graphics_box, bounding_box.x, bounding_box.y);
         used.has_definite_inline_size.set(true);
         used.has_definite_block_size.set(true);

@@ -200,8 +200,8 @@ impl RetainedState {
     ) -> Option<Result<RebuiltOverlayGroups, NeedsHostFont>> {
         let view = self.computed_group_sets.style_record_view(style_record)?;
         payloads.copy_from_slice(SharedPayload::as_pointer_slice(view.base_payloads));
-        // An overlay that animates nothing leaves the base as it is: publishing it releases the
-        // element's overlay record.
+        // An overlay with no sampled values or additional properties to treat as included in will-change leaves the
+        // base as it is: publishing it releases the element's overlay record.
         let Some(overlay) = overlay.filter(|overlay| !overlay.is_empty()) else {
             return Some(Ok(RebuiltOverlayGroups {
                 groups: 0,
@@ -220,6 +220,9 @@ impl RetainedState {
         });
         let rebuilds_every_group = named_groups.is_none();
         let mut groups = named_groups.unwrap_or((1 << group_index::COUNT) - 1);
+        if !overlay.implicit_will_change.is_empty() {
+            groups |= 1 << group_index::MISC_RESET;
+        }
         // The surround group duplicates `position-anchor` for layout, so rebuilding the anchor
         // group refreshes it too.
         if groups & (1 << STYLE_GROUP_INDEX_ANCHOR) != 0 {
@@ -394,11 +397,29 @@ impl super::StyleEngine {
         {
             overlay.remove_animated(property);
         }
-        self.sample_composed_over_record(node, record, overlay, None, composed, transform_reference_box, bounds)
+        self.sample_composed_over_record(
+            node,
+            record,
+            overlay,
+            None,
+            composed,
+            transform_reference_box,
+            bounds,
+            samples,
+        )
     }
 
     /// The inherited properties the animations of the element `node` names animate, which its descendants inherit.
     pub(crate) fn animated_inherited_properties(&self, node: StyleNodeID) -> smallvec::SmallVec<[u16; 2]> {
+        self.animated_properties_that(node, crate::css::property_metadata::property_is_inherited)
+    }
+
+    /// The properties the animations of the element `node` names animate.
+    pub(crate) fn animated_properties(&self, node: StyleNodeID) -> smallvec::SmallVec<[u16; 2]> {
+        self.animated_properties_that(node, |_| true)
+    }
+
+    fn animated_properties_that(&self, node: StyleNodeID, keeps: impl Fn(u16) -> bool) -> smallvec::SmallVec<[u16; 2]> {
         let mut properties = smallvec::SmallVec::new();
         for effect in self.element_animation_effects(node, 0) {
             for declaration in effect
@@ -407,7 +428,7 @@ impl super::StyleEngine {
                 .flat_map(|keyframe| effect.declarations_of(keyframe))
             {
                 let property = declaration.property_id;
-                if crate::css::property_metadata::property_is_inherited(property) && !properties.contains(&property) {
+                if keeps(property) && !properties.contains(&property) {
                     properties.push(property);
                 }
             }
@@ -428,9 +449,18 @@ impl super::StyleEngine {
         composed: crate::css::style_compute::SampledEffects,
         transform_reference_box: Option<crate::css::css_pixels::CssPixelRect>,
         bounds: super::style_invalidation::SampleBounds,
+        timeline_samples: super::animations::AnimationTimelineSamples<'_>,
     ) -> Result<(super::layout_style::DerivedStyleRecord, AnimatedOverlay), NeedsHost> {
         let outcome = self
-            .sample_over_record(node, record, &mut overlay, fresh, composed, transform_reference_box)?
+            .sample_over_record(
+                node,
+                record,
+                &mut overlay,
+                fresh,
+                composed,
+                transform_reference_box,
+                timeline_samples,
+            )?
             .outcome;
         if outcome == crate::css::style_compute::FfiHostAnimationSampleOutcome::Cleared {
             overlay = AnimatedOverlay::default();
@@ -525,6 +555,7 @@ impl super::StyleEngine {
     /// Samples `composed` onto `overlay` over `record`, a record the engine holds for the element `node`
     /// names, as far as the engine goes without the host, reading the effects `fresh` describes, or the
     /// element's where it is `None`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sample_over_record(
         &mut self,
         node: StyleNodeID,
@@ -533,6 +564,7 @@ impl super::StyleEngine {
         fresh: Option<&[super::effect_descriptions::PublishedEffect]>,
         composed: crate::css::style_compute::SampledEffects,
         transform_reference_box: Option<crate::css::css_pixels::CssPixelRect>,
+        timeline_samples: super::animations::AnimationTimelineSamples<'_>,
     ) -> Result<crate::css::style_compute::FfiHostAnimationSampleResult, NeedsHost> {
         let table = self
             .computed_group_sets
@@ -604,7 +636,14 @@ impl super::StyleEngine {
         };
         // SAFETY: Everything `input` names lives until the sample returns.
         unsafe {
-            crate::css::style_compute::sample_without_host(&input, self, fresh, composed, transform_reference_box)
+            crate::css::style_compute::sample_without_host(
+                &input,
+                self,
+                fresh,
+                composed,
+                transform_reference_box,
+                timeline_samples,
+            )
         }
     }
 
@@ -658,6 +697,13 @@ impl super::StyleEngine {
         if built {
             if !self.record_generates_a_box(restyled) {
                 return self.take_box_away(node, restyled);
+            }
+            // A box that moves its place among its parent's children, as from inline-level to block-level, moves what
+            // its parent lays out, which only the host builds again.
+            if let Some(shown) = self.tick_shown.element(node)
+                && !self.box_keeps_its_place(shown, restyled)
+            {
+                return Err(NeedsHost);
             }
             let moved = self.show_built_boxes(node, ShownBoxes::Built, restyled, &record, Transitions::Refused)?;
             return Ok(if moved {
@@ -755,7 +801,9 @@ impl super::StyleEngine {
                 return Ok(());
             }
             super::hover_lane::HoverBoxRebuild::GainsABox { .. } => Transitions::StartNone,
-            super::hover_lane::HoverBoxRebuild::BoxesMove => Transitions::Refused,
+            super::hover_lane::HoverBoxRebuild::BoxesMove | super::hover_lane::HoverBoxRebuild::PlaceMoves { .. } => {
+                Transitions::Refused
+            }
         };
         self.show_built_boxes(node, ShownBoxes::Built, element, &record, transitions)
             .map(|_| ())
@@ -947,26 +995,6 @@ impl super::StyleEngine {
         .then_some(parent)
     }
 
-    /// Shows `record`, the sample a clock frame showed in the box of `node`, in the box a build makes for it again.
-    pub(crate) fn show_sample_in_rebuilt_box(&mut self, node: StyleNodeID, record: u64) {
-        let Some(record) = super::computed::FinalStyleRecordID::from_raw(record) else {
-            return;
-        };
-        let shown = match self.tick_shown.get(node) {
-            Some(&shown) => ShownRecords {
-                element: record,
-                ..shown
-            },
-            None => ShownRecords {
-                boxes: ShownBoxes::Restyled,
-                element: record,
-                pseudo_present: 0,
-                pseudo: [0; bridge::PSEUDO_RECORD_SLOTS],
-            },
-        };
-        self.retained.show_for_tick(node, shown);
-    }
-
     /// Lends the engine's published reads the records `shown`, which a clock frame shows in the boxes it builds.
     pub(crate) fn lend_tick_shown(&mut self, shown: TickShownRecords) {
         debug_assert!(
@@ -1005,6 +1033,34 @@ impl super::StyleEngine {
         view.dependency_flags & super::computed::IN_DISPLAY_NONE_SUBTREE == 0
             && !display.is_none()
             && !display.is_contents()
+    }
+
+    /// Whether the box of an element whose record moves from `old` to `new` keeps its place among its parent's children
+    /// as a build of it alone makes it, as the host's style invalidation decides that: its outer display, whether it is
+    /// absolutely positioned and whether it floats stay. Otherwise its parent's children are built again with it.
+    pub(super) fn box_keeps_its_place(
+        &self,
+        old: super::computed::FinalStyleRecordID,
+        new: super::computed::FinalStyleRecordID,
+    ) -> bool {
+        let place = |record: super::computed::FinalStyleRecordID| {
+            self.computed_group_sets.style_record_view(record.raw()).map(|view| {
+                let values = crate::css::computed_value_views::ComputedValuesView::new(
+                    SharedPayload::as_pointer_slice(view.payloads),
+                );
+                let display = values.display();
+                (
+                    display.is_outside_and_inside(),
+                    display.outside,
+                    values.is_absolutely_positioned(),
+                    values.is_floating(),
+                )
+            })
+        };
+        match (place(old), place(new)) {
+            (Some(old), Some(new)) => old.0 && new.0 && old == new,
+            _ => false,
+        }
     }
 
     /// What the font group of `node`'s record is built from over `overlay`, with the font the document's font resolver

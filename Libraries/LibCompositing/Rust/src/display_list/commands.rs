@@ -621,7 +621,14 @@ ffi_bytes_fields!(Repeat { x, y });
 
 pub trait DisplayListCommand: Copy + FfiBytes {
     const COMMAND_TYPE: DisplayListCommandType;
+    // Encloses everything the command draws. Only compositor metadata, which draws nothing, has none.
     fn bounding_rect(&self) -> Option<IntRect> {
+        const {
+            assert!(
+                Self::COMMAND_TYPE.is_compositor_metadata(),
+                "a draw command must report its bounding rect"
+            );
+        };
         None
     }
 }
@@ -1304,7 +1311,7 @@ impl DisplayListCommand for PaintNestedDisplayList {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct DrawIsolatedGroup {
-    pub clip_rect: OptionalFloatRect,
+    pub clip_rect: FloatRect,
     pub content: DisplayListDataSpan,
     pub mask: DisplayListDataSpan,
     pub filter: DisplayListDataSpan,
@@ -1325,7 +1332,7 @@ ffi_bytes_fields!(DrawIsolatedGroup {
 impl DisplayListCommand for DrawIsolatedGroup {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawIsolatedGroup;
     fn bounding_rect(&self) -> Option<IntRect> {
-        self.clip_rect.get().map(enclosing_int_rect)
+        Some(enclosing_int_rect(self.clip_rect))
     }
 }
 

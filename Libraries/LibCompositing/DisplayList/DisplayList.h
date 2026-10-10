@@ -36,6 +36,9 @@ class COMPOSITING_API DisplayList : public AtomicRefCounted<DisplayList> {
 public:
     ~DisplayList();
     struct AsyncScrollingMetadata {
+        // The document whose viewport this is, which the compositor names when it pans the visual viewport of a page
+        // that has no scroll node.
+        Optional<Web::UniqueNodeID> document_id;
         Gfx::IntRect viewport_rect;
         u64 wheel_event_listener_state_generation { 0 };
         bool has_blocking_wheel_event_listeners { false };
@@ -100,8 +103,8 @@ public:
     void for_each_compositor_metadata(Function<void(ContextRef, DisplayListCommandType, ReadonlyBytes payload)> const&) const;
     // Visits the canvases and carets the list draws outside of any group, with the context of their run and their
     // bounding rect.
-    void for_each_drawn_canvas(Function<void(ContextRef, Optional<Gfx::IntRect>, DrawCanvas const&)> const&) const;
-    void for_each_caret(Function<void(ContextRef, Optional<Gfx::IntRect>, PaintCaret const&)> const&) const;
+    void for_each_drawn_canvas(Function<void(ContextRef, Gfx::IntRect, DrawCanvas const&)> const&) const;
+    void for_each_caret(Function<void(ContextRef, Gfx::IntRect, PaintCaret const&)> const&) const;
 
     // Replays the list through a player's callbacks, against the visual context tree it was made for.
     void replay(AccumulatedVisualContextTree const&, ScrollStateSnapshot const&, RustFFI::FfiDisplayListReplayCallbacks const&) const;

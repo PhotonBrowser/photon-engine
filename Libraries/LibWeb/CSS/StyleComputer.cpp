@@ -55,6 +55,7 @@
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/StyleComputeFFI.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineEffectTiming.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/CSS/StyleScope.h>
@@ -95,7 +96,6 @@
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Namespace.h>
@@ -293,9 +293,22 @@ void StyleComputer::unregister_style_node(StyleNodeID style_node_id)
     }
     if (index < m_element_style_nodes.size()) {
         m_element_style_nodes[index] = nullptr;
+        m_style_nodes_retired_beside_lanes.set(style_node_id);
         StyleEngineFFI::style_engine_consume_element_style_input(m_style_engine.host(), style_node_id);
         m_style_engine.note_style_node_arrived_or_retired(style_node_id);
     }
+}
+
+GC::Ptr<DOM::Node> StyleComputer::node_for_lane_style_node(StyleNodeID style_node_id) const
+{
+    if (m_style_nodes_retired_beside_lanes.contains(style_node_id))
+        return nullptr;
+    return node_for_style_node(style_node_id);
+}
+
+GC::Ptr<DOM::Element> StyleComputer::element_for_lane_style_node(StyleNodeID style_node_id) const
+{
+    return as_if<DOM::Element>(node_for_lane_style_node(style_node_id).ptr());
 }
 
 GC::Ptr<DOM::Element> StyleComputer::element_for_style_node(StyleNodeID style_node_id) const
@@ -425,10 +438,6 @@ void StyleComputer::for_each_provisional_transition_effect(DOM::AbstractElement 
 
 void StyleComputer::commit_transition_stabilization_epoch()
 {
-    // The transitions a hover of the render clock started beside the host showed from when it started them: those the
-    // host's own hover starts on the same elements run from then.
-    Vector<GC::Root<CSSTransition>> started_beside_host;
-    Vector<double> started_beside_host_at;
     for (auto const& state : m_provisional_transition_states) {
         VERIFY(state.element);
         auto& element = *state.element;
@@ -445,11 +454,6 @@ void StyleComputer::commit_transition_stabilization_epoch()
             VERIFY(state.proposed_transition);
             state.proposed_transition->commit_provisional_transition();
             ++document().style_invalidation_counters().committed_transitions_started;
-            double started_at = 0;
-            if (!state.pseudo_element.has_value() && StyleEngineFFI::style_engine_lane_transition_start(m_style_engine.host(), element.style_node_id().value(), to_underlying(state.property_id), &started_at)) {
-                started_beside_host.append(*state.proposed_transition);
-                started_beside_host_at.append(started_at);
-            }
         };
 
         switch (state.action) {
@@ -480,14 +484,6 @@ void StyleComputer::commit_transition_stabilization_epoch()
     m_provisional_transition_states.clear();
     m_provisional_transition_state_indices.clear();
     m_provisional_transition_state_indices_by_target.clear();
-    if (!started_beside_host.is_empty()) {
-        // Setting a transition's start time settles its promises, which a rendering update's style update runs without
-        // a script.
-        HTML::TemporaryExecutionContext execution_context { document().relevant_settings_object() };
-        for (size_t i = 0; i < started_beside_host.size(); ++i)
-            (void)started_beside_host[i]->set_start_time_for_bindings(Animations::NullableCSSNumberish { started_beside_host_at[i] });
-        StyleEngineFFI::style_engine_forget_lane_transition_starts(m_style_engine.host());
-    }
     if (exchange(m_transition_baselines_recorded, false))
         StyleEngineFFI::style_engine_release_transition_baselines(m_style_engine.host());
 }
@@ -629,12 +625,15 @@ void StyleComputer::finish_animation_refresh(Layout::BegunRead const& read, DOM:
     }
 }
 
-// The timing the style engine computes the key an effect samples its keyframes at from: what its animation contributes,
-// the effect's own timing, and its timeline's current time. The engine decides it only where every time is in one unit:
-// a duration, or a percentage of a scroll timeline's progress.
-static ComputedValuesFFI::FfiEffectTiming style_engine_effect_timing(Animations::KeyframeEffect const& effect, Animations::Animation const& animation)
+// The engine decides the timing only where every time is in one unit: a duration, or a percentage of a scroll
+// timeline's progress.
+ComputedValuesFFI::FfiEffectTiming style_engine_effect_timing(Animations::KeyframeEffect const& effect, Animations::Animation const& animation)
 {
     ComputedValuesFFI::FfiEffectTiming timing {};
+
+    timing.is_relevant = animation.is_relevant();
+    timing.is_removed = animation.replace_state() == Animations::AnimationReplaceState::Removed;
+
     Optional<Animations::TimeValue::Type> unit;
     bool one_unit = true;
     auto duration = [&](Animations::TimeValue const& time) {
@@ -666,6 +665,7 @@ static ComputedValuesFFI::FfiEffectTiming style_engine_effect_timing(Animations:
     }
     optional_duration(animation.start_time(), timing.has_start_time, timing.start_time);
     optional_duration(animation.hold_time(), timing.has_hold_time, timing.hold_time);
+    timing.paused = animation.play_state() == Bindings::AnimationPlayState::Paused;
     timing.playback_rate = animation.playback_rate();
     timing.start_delay = duration(effect.start_delay());
     timing.end_delay = duration(effect.end_delay());
@@ -704,12 +704,10 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
         if (!animation)
             continue;
         auto timing = style_engine_effect_timing(*effect, *animation);
-        double current_key = 0;
+        Optional<double> current_key;
         if (!timing.decidable) {
-            auto output_progress = effect->transformed_progress();
-            if (!output_progress.has_value())
-                continue;
-            current_key = clamp(*output_progress * 100.0 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor, static_cast<double>(NumericLimits<i64>::min()), static_cast<double>(NumericLimits<i64>::max()));
+            if (auto output_progress = effect->transformed_progress(); output_progress.has_value())
+                current_key = clamp(*output_progress * 100.0 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor, static_cast<double>(NumericLimits<i64>::min()), static_cast<double>(NumericLimits<i64>::max()));
         }
         easing_points.unchecked_append({});
         sampled_effects.unchecked_append({
@@ -1270,7 +1268,7 @@ void StyleComputer::start_needed_transitions(Layout::BegunRead const& read, Comp
     // A transition action is provisional until the stabilization epoch commits, but the style
     // published by this pass must already reflect that decision. Rebuild the effect stack without
     // transitions which are being removed, then layer any proposed replacements on top.
-    if (!replaced_transition_effects.is_empty()) {
+    if (!replaced_transition_effects.is_empty() || !newly_started_transition_effects.is_empty()) {
         new_style.clear_animated_properties(Badge<StyleComputer> {});
         auto animations = abstract_element.element().get_animations_internal(
             Animations::Animatable::GetAnimationsSorted::Yes,
@@ -1290,14 +1288,16 @@ void StyleComputer::start_needed_transitions(Layout::BegunRead const& read, Comp
                     continue;
                 remaining_effects.append(keyframe_effect);
             }
+            remaining_effects.extend(newly_started_transition_effects);
+            quick_sort(remaining_effects, [](auto const& a, auto const& b) {
+                return Animations::KeyframeEffect::composite_order(a, b) < 0;
+            });
             if (!remaining_effects.is_empty())
                 collect_animations_into(read, abstract_element, remaining_effects.span(), new_style, AnimationRefresh::Yes);
         }
     }
 
-    // Immediately set the properties to the transitions' current values, to prevent single-frame jumps.
     if (!newly_started_transition_effects.is_empty()) {
-        collect_animations_into(read, abstract_element, newly_started_transition_effects.span(), new_style, AnimationRefresh::Yes);
         // NB: Construction does not invalidate animated style because the effects were just evaluated. Request the
         //     first animation frame directly so timeline updates can schedule subsequent animated style updates.
         m_document->page().client().request_frame();
@@ -2163,15 +2163,7 @@ void StyleComputer::apply_animated_properties_to_reconstruction(ComputedStyleWor
     auto const* animated_properties = computed_values.animated_properties();
     if (!animated_properties)
         return;
-    for (auto const& entry : animated_properties->entries()) {
-        auto property_id = static_cast<PropertyID>(entry.property);
-        style.set_animated_property(
-            Badge<StyleComputer> {}, property_id, animated_properties->property(property_id),
-            // NB: An adjustment wins over an important declaration as a transition's value does, and the working
-            //     set's flag says only that.
-            entry.result_of_transition || entry.post_compute_adjustment ? AnimatedPropertyResultOfTransition::Yes : AnimatedPropertyResultOfTransition::No,
-            entry.inherited ? ComputedStyleWorkingSet::Inherited::Yes : ComputedStyleWorkingSet::Inherited::No);
-    }
+    style.install_animated_overlay(Badge<StyleComputer> {}, animated_properties->overlay());
 }
 
 NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::reconstruct_computed_properties_for_animation(Layout::BegunRead const& read, StyleRecordID style_record) const

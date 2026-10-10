@@ -60,8 +60,8 @@ public:
     virtual void request_rendering_update() = 0;
     virtual void rendering_opportunity(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) = 0;
     virtual void clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds, Vector<Web::CompositorScrollOffset> const& scroll_offsets) = 0;
-    virtual void pointer_moved(Web::CompositorContextId, Web::DevicePixelPoint, u32 /* buttons */, bool /* scrolled_since_frame */) { }
-    virtual void pointer_left(Web::CompositorContextId) { }
+    virtual void pointer_moved(Web::CompositorContextId, Web::DevicePixelPoint, u32 /* buttons */, bool /* scrolled_since_frame */, u64 /* input_event_id */) { }
+    virtual void pointer_left(Web::CompositorContextId, u64 /* input_event_id */) { }
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) = 0;
     virtual void create_video_edge(Media::VideoSinkHandle) = 0;
     virtual void release_video_edge(Media::VideoSinkHandle) = 0;
@@ -188,6 +188,7 @@ private:
     ContextState const* context_if_present(Web::CompositorContextId) const;
     Optional<u64> display_id_for_context(ContextState const&) const;
     ContextState const* root_context_of(ContextState const&) const;
+    bool nested_context_scrolled_since_last_frame(Web::CompositorContextId) const;
     bool context_is_effectively_visible(ContextState const&) const;
     void resume_presentation_after_becoming_visible(Web::CompositorContextId root_context_id, ContextState& root_context);
     double display_refresh_rate_for_context(ContextState const&) const;

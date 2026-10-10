@@ -206,6 +206,7 @@ public:
     void reload_through_ui_process();
     void traverse_history_through_ui_process(i32 delta);
     GC::Ref<WebIDL::Promise> flush_session_history_traversal_queue();
+    bool html_parser_body_is_exhausted(DOM::Document&);
     bool has_html_parser_end_state(DOM::Document& document) { return document.has_html_parser_end_state(); }
 
     bool has_shadow_root(GC::Ref<DOM::Element>);
@@ -236,14 +237,18 @@ public:
     void hold_next_frame(Utf16String const& hold);
     Utf16String last_frame_presented_by(DOM::Document&);
     void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
-    void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms);
-    void move_hover_pointer(double x, double y);
+    void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id);
+    u64 queue_mouse_move(double x, double y, u32 buttons);
+    void move_hover_pointer(double x, double y, Optional<u64> input_event_id);
     Utf16String clock_lane_state(DOM::Document&);
     bool clock_lane_is_coming(DOM::Document&);
     GC::Ptr<Geometry::DOMRect> presented_border_box(DOM::Element&);
+    Optional<u32> presented_compositor_animation_count(DOM::Element&);
+    Optional<double> presented_opacity(DOM::Element&);
     Optional<String> presented_color(DOM::Element&);
     bool last_frame_keyboard_scroll_state_is_current();
     void release_held_frame();
+    bool rendering_update_holds_tasks_of(DOM::Document&);
     void update_compositor_animations();
     bool run_empty_animation_style_update_for_testing();
     void arm_compositor_animation_timers_for_testing();
