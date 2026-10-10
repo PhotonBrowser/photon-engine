@@ -382,6 +382,18 @@ bool AsyncScrollTree::blocks_wheel_event_at_position(Compositing::AccumulatedVis
 
 WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta) const
 {
+    return hit_test_scroll_node(visual_context_tree, position, delta, false);
+}
+
+WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_history_swipe(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta) const
+{
+    // A native history swipe is browser navigation, so page wheel listeners must not hide the scroll boundary from it.
+    // Main-thread regions still block this path because they represent nested navigables with their own scroll state.
+    return hit_test_scroll_node(visual_context_tree, position, delta, true);
+}
+
+WheelHitTestResult AsyncScrollTree::hit_test_scroll_node(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool ignore_blocking_wheel_event_regions) const
+{
     if (m_visual_context_tree_structural_epoch != visual_context_tree.structural_epoch())
         return {};
 
@@ -389,7 +401,7 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Compositing::
         return visual_context_tree.context_is_valid(context);
     };
 
-    if (m_has_blocking_wheel_event_region_covering_viewport)
+    if (!ignore_blocking_wheel_event_regions && m_has_blocking_wheel_event_region_covering_viewport)
         return { {}, false, true };
 
     for (auto const& target : m_cached_main_thread_wheel_event_targets) {
@@ -402,7 +414,7 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Compositing::
             return { {}, true };
     }
 
-    if (blocks_wheel_event_at_position(visual_context_tree, position))
+    if (!ignore_blocking_wheel_event_regions && blocks_wheel_event_at_position(visual_context_tree, position))
         return { {}, false, true };
 
     for (auto const& target : m_cached_wheel_hit_test_targets.in_reverse()) {

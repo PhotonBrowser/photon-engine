@@ -112,6 +112,27 @@ TEST_CASE(blocking_wheel_event_hit_testing_fails_closed_for_invalid_visual_conte
     EXPECT(!result.node_id.has_value());
 }
 
+TEST_CASE(native_history_swipe_hit_testing_ignores_blocking_wheel_listeners)
+{
+    auto visual_context_tree = make_visual_context_tree();
+    auto state = make_scrolling_state_with_viewport_scroll_node(0);
+    state.has_blocking_wheel_event_listeners = true;
+    state.has_blocking_wheel_event_region_covering_viewport = true;
+
+    Compositing::AsyncScrollTree scroll_tree;
+    scroll_tree.set_state(move(state));
+    scroll_tree.rebuild_wheel_hit_test_targets(make_empty_display_list(visual_context_tree), &visual_context_tree, {});
+
+    auto regular_result = scroll_tree.hit_test_scroll_node_for_wheel(visual_context_tree, { 200, 200 }, { 10, 0 });
+    EXPECT(regular_result.blocked_by_wheel_event_region);
+    EXPECT(!regular_result.node_id.has_value());
+
+    auto history_swipe_result = scroll_tree.hit_test_scroll_node_for_history_swipe(visual_context_tree, { 200, 200 }, { 10, 0 });
+    EXPECT(!history_swipe_result.blocked_by_wheel_event_region);
+    EXPECT(history_swipe_result.node_id.has_value());
+    EXPECT_EQ(*history_swipe_result.node_id, viewport_node_id);
+}
+
 TEST_CASE(wheel_scroll_admission_preserves_main_thread_region_and_viewport_blocker_precedence)
 {
     auto visual_context_tree = make_visual_context_tree();

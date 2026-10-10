@@ -1098,11 +1098,48 @@ ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint 
 {
     if (!presents_to_client())
         return {};
+
+    auto detect_native_history_swipe_at_scroll_boundary = [&]() -> ContextUpdateResult {
+        if ((!history_swipe_back_enabled && !history_swipe_forward_enabled)
+            || scroll_gesture_phase != Web::ScrollGesturePhase::Ongoing
+            || delta.x() == 0
+            || visual_viewport_scale_for_compositing().value_or(1.0f) > 1.0f)
+            return {};
+
+        auto const& visual_context_tree = current_visual_context_tree();
+        auto hit_test = m_async_scroll_tree.hit_test_scroll_node_for_history_swipe(visual_context_tree, position, delta);
+        if (hit_test.blocked_by_main_thread_region || !hit_test.node_id.has_value())
+            return {};
+
+        // Probe the scroll chain without changing the page's scroll position. This also preserves nested scroller and
+        // overscroll-behavior boundaries when normal wheel routing is held on the main thread.
+        auto simulated_scroll_state = m_scroll_state_snapshot;
+        auto application = m_async_scroll_tree.apply_scroll_delta(*hit_test.node_id, delta, visual_context_tree, simulated_scroll_state, Compositing::ScrollChaining::ToScrollableAncestors);
+        if (!application.horizontal_boundary_node.has_value())
+            return {};
+
+        auto const* boundary_node = m_async_scroll_tree.scroll_node_for_id(*application.horizontal_boundary_node);
+        if (!boundary_node || !boundary_node->is_viewport
+            || boundary_node->overscroll_behavior_x != Compositing::ScrollOverscrollBehavior::Auto
+            || application.unconsumed_delta.x() == 0)
+            return {};
+
+        return {
+            .accepted = true,
+            .frame_to_present = {},
+            .should_request_rendering_update = false,
+            .history_swipe_candidate = HistorySwipeCandidate {
+                .back = history_swipe_back_enabled,
+                .unconsumed_delta = fabsf(application.unconsumed_delta.x()),
+            },
+        };
+    };
+
     // A page without scroll nodes still has a visual viewport to pan once it is zoomed in.
     auto can_pan_zoomed_visual_viewport = m_wheel_routing_admission == Compositing::WheelRoutingAdmission::NoScrollNode
         && visual_viewport_scale_for_compositing().value_or(1.0f) > 1.0f;
     if (!m_can_accept_async_wheel_events && !can_pan_zoomed_visual_viewport)
-        return {};
+        return detect_native_history_swipe_at_scroll_boundary();
 
     auto now = now_for_testing.value_or(MonotonicTime::now());
     m_scroll_snap_controller.note_gesture_phase(scroll_gesture_phase);
@@ -1119,8 +1156,10 @@ ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint 
     bool is_first_step_of_gesture = !latched_node_id.has_value();
     if (is_first_step_of_gesture) {
         auto initial_scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(visual_context_tree_for_compositing(), position, delta);
-        if (initial_scroll_target.blocked_by_main_thread_region || initial_scroll_target.blocked_by_wheel_event_region)
+        if (initial_scroll_target.blocked_by_main_thread_region)
             return {};
+        if (initial_scroll_target.blocked_by_wheel_event_region)
+            return detect_native_history_swipe_at_scroll_boundary();
     }
 
     Optional<PendingFrame> frame_to_present;
