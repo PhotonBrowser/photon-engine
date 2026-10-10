@@ -59,6 +59,8 @@ static uint64_t next_native_backing_id()
     return next_id.fetch_add(1, std::memory_order_relaxed);
 }
 
+class PhotonHeadlessWebView;
+
 class PhotonApplication final : public Application {
     WEB_VIEW_APPLICATION(PhotonApplication)
 
@@ -68,7 +70,72 @@ public:
     {
     }
 
+    // The view that application actions such as Copy and Reload act on: the
+    // one most recently focused or asked for a context menu.
+    void set_active_view(PhotonHeadlessWebView&);
+    void set_clipboard(Photon::Clipboard clipboard) { m_system_clipboard = move(clipboard); }
+
 private:
+    virtual Optional<ViewImplementation&> active_web_view() const override;
+    virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
+    virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const override;
+
+    virtual Utf16String clipboard_text(ClipboardType type) const override
+    {
+        if (!m_system_clipboard.read)
+            return Application::clipboard_text(type);
+        for (auto const& entry : m_system_clipboard.read()) {
+            if (entry.mime_type == "text/plain")
+                return Utf16String::from_utf8(StringView { entry.data.data(), entry.data.size() });
+        }
+        return {};
+    }
+
+    virtual void set_clipboard_text(String text, ClipboardType type) override
+    {
+        if (!m_system_clipboard.write) {
+            Application::set_clipboard_text(move(text), type);
+            return;
+        }
+        auto bytes = text.bytes_as_string_view();
+        m_system_clipboard.write({ { "text/plain", std::string(bytes.characters_without_null_termination(), bytes.length()) } });
+    }
+
+    virtual Web::Clipboard::SystemClipboardItem clipboard_item() const override
+    {
+        if (!m_system_clipboard.read)
+            return Application::clipboard_item();
+        Web::Clipboard::SystemClipboardItem item;
+        for (auto const& entry : m_system_clipboard.read()) {
+            item.system_clipboard_representations.append({
+                .name = MUST(String::from_utf8(StringView { entry.mime_type.data(), entry.mime_type.size() })),
+                .data = ByteString { entry.data.data(), entry.data.size() },
+            });
+        }
+        return item;
+    }
+
+    virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem item) override
+    {
+        if (!m_system_clipboard.write) {
+            Application::insert_clipboard_item(move(item));
+            return;
+        }
+        std::vector<Photon::ClipboardEntry> entries;
+        for (auto const& representation : item.system_clipboard_representations) {
+            // Files copied in the system file manager are only ever read.
+            auto const* data = representation.data.get_pointer<ByteString>();
+            if (!data)
+                continue;
+            auto name = representation.name.bytes_as_string_view();
+            entries.push_back({
+                std::string(name.characters_without_null_termination(), name.length()),
+                std::string(data->characters(), data->length()),
+            });
+        }
+        m_system_clipboard.write(entries);
+    }
+
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions& content) override
     {
         // Viewport scrollbars are painted into the page's shared GPU surface.
@@ -79,6 +146,9 @@ private:
         if (std::getenv("PHOTON_FORCE_CPU_PAINTING"))
             content.force_cpu_painting = ForceCPUPainting::Yes;
     }
+
+    Photon::Clipboard m_system_clipboard;
+    WeakPtr<PhotonHeadlessWebView> m_active_view;
 };
 
 class PhotonHeadlessWebView final : public HeadlessWebView {
@@ -196,6 +266,34 @@ public:
         load(*parsed);
     }
 
+    void update_zoom() override
+    {
+        HeadlessWebView::update_zoom();
+        if (m_callbacks.zoom_changed)
+            m_callbacks.zoom_changed(zoom_level());
+    }
+
+    void open_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab)
+    {
+        if (!m_callbacks.open_in_new_tab_requested)
+            return;
+        auto serialized = url.serialize().bytes_as_string_view();
+        m_callbacks.open_in_new_tab_requested(
+            std::string(serialized.characters_without_null_termination(), serialized.length()),
+            activate_tab == Web::HTML::ActivateTab::Yes);
+    }
+
+    void activate_context_menu_item(size_t index)
+    {
+        if (index >= m_context_menu_actions.size() || !m_context_menu_actions[index])
+            return;
+        auto action = m_context_menu_actions[index];
+        if (!action->enabled())
+            return;
+        static_cast<PhotonApplication&>(Application::the()).set_active_view(*this);
+        action->activate();
+    }
+
     void notify_state()
     {
         if (!m_callbacks.state_changed)
@@ -269,7 +367,16 @@ public:
 
     void set_visible(bool visible)
     {
+        auto was_hidden = traversable().system_visibility_state() == Web::HTML::VisibilityState::Hidden;
         set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+
+        // Re-submit the viewport when a tab becomes active again. Resuming
+        // visibility schedules animation work, but a page with no pending
+        // damage may otherwise keep showing its stale native surface.
+        if (visible && was_hidden) {
+            start_page_frame_response_watchdog();
+            handle_resize();
+        }
     }
 
     void set_display_metadata(Optional<u64> display_id, double refresh_rate)
@@ -293,6 +400,67 @@ public:
     }
 
 private:
+    // Context menu actions Photon has no UI for yet: dictionary lookup, a
+    // save panel, more windows, and screenshot confirmation.
+    static bool is_unsupported_context_menu_action(ActionID id)
+    {
+        switch (id) {
+        case ActionID::LookUpSelectedText:
+        case ActionID::OpenInNewWindow:
+        case ActionID::OpenInNewPrivateWindow:
+        case ActionID::DownloadLinkedFileAs:
+        case ActionID::SaveImage:
+        case ActionID::TakeVisibleScreenshot:
+        case ActionID::TakeFullScreenshot:
+        case ActionID::ViewSource:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Lists the menu's shown actions for the embedder, with one separator
+    // between groups, and keeps them to activate by index.
+    void request_context_menu(Menu& menu, Gfx::IntPoint widget_position)
+    {
+        if (!m_callbacks.context_menu_requested)
+            return;
+        static_cast<PhotonApplication&>(Application::the()).set_active_view(*this);
+
+        Photon::ContextMenuRequest request;
+        request.x = widget_position.x() / m_device_pixel_ratio;
+        request.y = widget_position.y() / m_device_pixel_ratio;
+        m_context_menu_actions.clear();
+        bool separator_pending = false;
+        for (auto& item : menu.items()) {
+            item.visit(
+                [&](NonnullRefPtr<Action>& action) {
+                    if (!action->visible() || is_unsupported_context_menu_action(action->id()))
+                        return;
+                    if (separator_pending && !request.items.empty()) {
+                        Photon::ContextMenuItem separator;
+                        separator.separator = true;
+                        request.items.push_back(move(separator));
+                        m_context_menu_actions.append(nullptr);
+                    }
+                    separator_pending = false;
+                    auto text = action->text();
+                    request.items.push_back({
+                        .text = std::string(text.characters_without_null_termination(), text.length()),
+                        .enabled = action->enabled(),
+                        .checkable = action->is_checkable(),
+                        .checked = action->is_checkable() && action->checked(),
+                    });
+                    m_context_menu_actions.append(action);
+                },
+                // Page context menus have no submenus.
+                [](NonnullRefPtr<Menu>&) {},
+                [&](Separator) { separator_pending = true; });
+        }
+        if (!request.items.empty())
+            m_callbacks.context_menu_requested(request);
+    }
+
     void notify_audio_state(Web::HTML::AudioPlayState play_state)
     {
         if (m_callbacks.audio_state_changed)
@@ -332,8 +500,17 @@ private:
         , m_callbacks(move(callbacks))
     {
         m_device_pixel_ratio = dpr;
+        for (auto* menu : { &page_context_menu(), &link_context_menu(), &selected_text_link_context_menu(), &image_context_menu(), &media_context_menu() }) {
+            menu->on_activation = [this, menu](Gfx::IntPoint position) {
+                request_context_menu(*menu, position);
+            };
+        }
         on_audio_play_state_changed = [this](Web::HTML::AudioPlayState play_state) {
             notify_audio_state(play_state);
+        };
+        on_page_unresponsive_changed = [this](bool unresponsive) {
+            if (m_callbacks.page_unresponsive_changed)
+                m_callbacks.page_unresponsive_changed(unresponsive);
         };
         on_url_change = [this](URL::URL const& url) {
             if (external_image_lease_trace_enabled()) {
@@ -593,7 +770,12 @@ private:
         };
     }
 
+    // Open links in a Photon tab rather than a hidden headless view.
+    virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) override { return nullptr; }
+
     Photon::ViewCallbacks m_callbacks;
+    // The shown context menu's actions, with null for separators.
+    Vector<RefPtr<Action>> m_context_menu_actions;
     Optional<std::chrono::steady_clock::time_point> m_last_paint_completed;
 #if defined(AK_OS_MACOS)
     virtual bool defer_backing_store_release(i32 bitmap_id) override
@@ -621,6 +803,30 @@ private:
     bool m_native_metal_presentation { false };
 #endif
 };
+
+void PhotonApplication::set_active_view(PhotonHeadlessWebView& view)
+{
+    m_active_view = view.make_weak_ptr<PhotonHeadlessWebView>();
+}
+
+Optional<ViewImplementation&> PhotonApplication::active_web_view() const
+{
+    if (!m_active_view)
+        return {};
+    return *m_active_view;
+}
+
+void PhotonApplication::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab) const
+{
+    if (m_active_view)
+        m_active_view->open_in_new_tab(url, activate_tab);
+}
+
+// Photon opens the tab by URL, like a link the user entered.
+void PhotonApplication::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab) const
+{
+    open_url_in_new_tab(navigation.url, activate_tab);
+}
 
 }
 
@@ -764,6 +970,11 @@ void Runtime::set_service_callback(std::function<void(EngineService, bool restar
     };
 }
 
+void Runtime::set_clipboard(Clipboard clipboard)
+{
+    m_impl->application->set_clipboard(move(clipboard));
+}
+
 #if defined(__APPLE__)
 void Runtime::set_native_release_drain_callback(void* context, NativeReleaseDrainCallback callback)
 {
@@ -870,7 +1081,12 @@ void View::set_native_metal_presentation(bool enabled)
     m_impl->view->set_native_metal_presentation(enabled);
 }
 #endif
-void View::set_focus(bool focused) { m_impl->view->set_has_system_focus(focused); }
+void View::set_focus(bool focused)
+{
+    m_impl->view->set_has_system_focus(focused);
+    if (focused)
+        static_cast<WebView::PhotonApplication&>(WebView::Application::the()).set_active_view(*m_impl->view);
+}
 void View::notify_state()
 {
     if (m_impl && m_impl->view)
@@ -1008,6 +1224,36 @@ void View::find_in_page_previous_match()
 {
     VERIFY(m_impl && m_impl->view);
     m_impl->view->find_in_page_previous_match();
+}
+
+void View::zoom_in()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->zoom_in();
+}
+
+void View::zoom_out()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->zoom_out();
+}
+
+void View::reset_zoom()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->reset_zoom();
+}
+
+void View::restart_unresponsive_page()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->restart_unresponsive_page();
+}
+
+void View::activate_context_menu_item(size_t index)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->activate_context_menu_item(index);
 }
 
 void View::find_in_page_end()

@@ -117,6 +117,39 @@ struct PerformanceStats {
     double frames_per_second { 0 };
 };
 
+// One item in a page's context menu: an action, or a separator between
+// groups of actions.
+struct ContextMenuItem {
+    bool separator { false };
+    std::string text;
+    bool enabled { true };
+    bool checkable { false };
+    bool checked { false };
+};
+
+// The page asked for a context menu at a point in the view, in logical
+// pixels. The embedder shows the items and answers with
+// View::activate_context_menu_item, or nothing if the menu is dismissed.
+struct ContextMenuRequest {
+    double x { 0 };
+    double y { 0 };
+    std::vector<ContextMenuItem> items;
+};
+
+// One representation of the clipboard's contents, such as "text/plain" or
+// "image/png" data.
+struct ClipboardEntry {
+    std::string mime_type;
+    std::string data;
+};
+
+// Reads and writes the host's system clipboard. Without one, the Engine
+// keeps its own clipboard that other apps cannot see.
+struct Clipboard {
+    std::function<std::vector<ClipboardEntry>()> read;
+    std::function<void(std::vector<ClipboardEntry> const&)> write;
+};
+
 enum class Cursor : uint8_t {
     Arrow, Hidden, Crosshair, IBeam, ResizeHorizontal, ResizeVertical,
     ResizeDiagonalTLBR, ResizeDiagonalBLTR, ResizeColumn, ResizeRow, Hand,
@@ -152,6 +185,14 @@ struct ViewCallbacks {
     // A find-in-page result: the current match's index and, once known, how
     // many matches there are (zero when the text is not found).
     std::function<void(size_t current_match_index, std::optional<size_t> total_match_count)> find_result;
+    // The page's zoom level changed, as a factor (1.0 is 100%), whether by
+    // the embedder or by restoring a site's saved zoom on navigation.
+    std::function<void(double zoom_level)> zoom_changed;
+    // A user input has gone unanswered by the page for several seconds.
+    std::function<void(bool unresponsive)> page_unresponsive_changed;
+    std::function<void(ContextMenuRequest const&)> context_menu_requested;
+    // A context menu action opened a link in a new tab.
+    std::function<void(std::string const& url, bool activate)> open_in_new_tab_requested;
 };
 
 enum class PointerType { Move, Leave, Press, Release, Wheel };
@@ -217,6 +258,8 @@ public:
     // Called with `restarted` false when a service process stops and true once
     // its replacement is running. The network service reports only its restart.
     void set_service_callback(std::function<void(EngineService, bool restarted)>);
+    // Use the host's system clipboard for copying and pasting.
+    void set_clipboard(Clipboard);
     std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks);
     std::unique_ptr<View> create_view_for_traversable(View& opener, void* traversable, int width, int height, double device_pixel_ratio, ViewCallbacks);
 
@@ -264,6 +307,16 @@ public:
     void find_in_page_previous_match();
     // End the search and remove its highlights.
     void find_in_page_end();
+    // Zoom in or out a step, or back to 100%. Ladybird remembers each site's
+    // zoom and restores it when the site is visited again.
+    void zoom_in();
+    void zoom_out();
+    void reset_zoom();
+    // Stop and restart the WebContent process currently holding unresponsive input.
+    void restart_unresponsive_page();
+    // Run an item of the context menu most recently requested, by its index
+    // in ContextMenuRequest::items.
+    void activate_context_menu_item(size_t index);
     // Answer the open dialog. A prompt's response is empty when cancelled.
     void alert_closed();
     void confirm_closed(bool accepted);
