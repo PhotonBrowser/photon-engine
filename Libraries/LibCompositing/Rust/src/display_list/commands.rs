@@ -515,6 +515,16 @@ ffi_enum_bytes!(CompositorScrollNodeKind as u8);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+pub enum CompositorOverscrollBehavior {
+    #[default]
+    Auto,
+    Contain,
+    None,
+}
+ffi_enum_bytes!(CompositorOverscrollBehavior as u8);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum PathPaintKind {
     #[default]
     Color,
@@ -1367,6 +1377,8 @@ pub struct CompositorScrollNode {
     pub is_viewport: bool,
     pub can_be_wheel_scrolled_horizontally: bool,
     pub can_be_wheel_scrolled_vertically: bool,
+    pub overscroll_behavior_x: CompositorOverscrollBehavior,
+    pub overscroll_behavior_y: CompositorOverscrollBehavior,
 }
 ffi_bytes_fields!(CompositorScrollNode {
     document_id,
@@ -1380,7 +1392,9 @@ ffi_bytes_fields!(CompositorScrollNode {
     pseudo_element_type,
     is_viewport,
     can_be_wheel_scrolled_horizontally,
-    can_be_wheel_scrolled_vertically
+    can_be_wheel_scrolled_vertically,
+    overscroll_behavior_x,
+    overscroll_behavior_y
 });
 
 impl DisplayListCommand for CompositorScrollNode {

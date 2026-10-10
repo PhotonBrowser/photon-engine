@@ -245,6 +245,12 @@ impl<O: Observer> PaintRecorder<'_, O> {
         };
         let scale = self.inputs.device_pixels_per_css_pixel;
         let hit_test_facts = self.hit_test_facts(paintable);
+        let style = self.source.node_style_if_live(paintable);
+        let overscroll_behavior = |value: Option<u8>| match value {
+            Some(crate::css::css_enums::overscroll_behavior::CONTAIN) => CompositorOverscrollBehavior::Contain,
+            Some(crate::css::css_enums::overscroll_behavior::NONE) => CompositorOverscrollBehavior::None,
+            _ => CompositorOverscrollBehavior::Auto,
+        };
         self.recorder.compositor_scroll_node(CompositorScrollNode {
             document_id: self.inputs.uncaptured.document_id,
             scrollable_node_id: UniqueNodeId(node_identity),
@@ -258,6 +264,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
             is_viewport,
             can_be_wheel_scrolled_horizontally: hit_test_facts.could_be_scrolled_horizontally,
             can_be_wheel_scrolled_vertically: hit_test_facts.could_be_scrolled_vertically,
+            overscroll_behavior_x: overscroll_behavior(style.map(|style| style.box_values().overscroll_behavior_x)),
+            overscroll_behavior_y: overscroll_behavior(style.map(|style| style.box_values().overscroll_behavior_y)),
         });
         if let Some(geometry) = scroll_snap::snap_container_geometry(self.source, paintable) {
             self.record_snap_geometry(paintable, geometry);

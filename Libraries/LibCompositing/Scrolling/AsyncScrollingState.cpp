@@ -39,6 +39,19 @@ static Web::AsyncScrollNodeStableID stable_scroll_node_id_for(Web::UniqueNodeID 
     };
 }
 
+static ScrollOverscrollBehavior scroll_overscroll_behavior_for(Compositing::CompositorOverscrollBehavior behavior)
+{
+    switch (behavior) {
+    case Compositing::CompositorOverscrollBehavior::Auto:
+        return ScrollOverscrollBehavior::Auto;
+    case Compositing::CompositorOverscrollBehavior::Contain:
+        return ScrollOverscrollBehavior::Contain;
+    case Compositing::CompositorOverscrollBehavior::None:
+        return ScrollOverscrollBehavior::None;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 AsyncScrollingState async_scrolling_state_from_display_list(Compositing::DisplayList const& display_list)
 {
     AsyncScrollingState async_scrolling_state;
@@ -92,6 +105,8 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
                 .is_viewport = command.is_viewport,
                 .can_be_wheel_scrolled_horizontally = command.can_be_wheel_scrolled_horizontally,
                 .can_be_wheel_scrolled_vertically = command.can_be_wheel_scrolled_vertically,
+                .overscroll_behavior_x = scroll_overscroll_behavior_for(command.overscroll_behavior_x),
+                .overscroll_behavior_y = scroll_overscroll_behavior_for(command.overscroll_behavior_y),
             });
             break;
         }

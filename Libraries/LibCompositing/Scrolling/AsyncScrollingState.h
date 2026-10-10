@@ -57,6 +57,12 @@ struct AsyncScrollOffset {
     }
 };
 
+enum class ScrollOverscrollBehavior : u8 {
+    Auto,
+    Contain,
+    None,
+};
+
 // One scrollable area from the paint snapshot.
 struct AsyncScrollNode {
     AsyncScrollNodeID node_id;
@@ -68,6 +74,8 @@ struct AsyncScrollNode {
     bool is_viewport { false };
     bool can_be_wheel_scrolled_horizontally { false };
     bool can_be_wheel_scrolled_vertically { false };
+    ScrollOverscrollBehavior overscroll_behavior_x { ScrollOverscrollBehavior::Auto };
+    ScrollOverscrollBehavior overscroll_behavior_y { ScrollOverscrollBehavior::Auto };
 };
 
 // A region with a non-passive wheel listener. Wheels inside it must stay on the main thread because script may cancel.
