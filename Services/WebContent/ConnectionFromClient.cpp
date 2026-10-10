@@ -849,6 +849,12 @@ void ConnectionFromClient::set_viewport(Web::PageId page_id, Web::DevicePixelSiz
     }
 }
 
+void ConnectionFromClient::check_page_responsiveness(Web::PageId page_id, u64 request_id)
+{
+    if (this->page(page_id).has_value())
+        async_did_respond_to_page_responsiveness_check(page_id, request_id);
+}
+
 void ConnectionFromClient::key_event(Web::PageId page_id, Web::KeyEvent event)
 {
     enqueue_input_event({ page_id, move(event), {}, {} });

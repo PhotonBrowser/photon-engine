@@ -100,6 +100,8 @@ ViewImplementation::~ViewImplementation()
 {
     if (m_input_response_timer)
         m_input_response_timer->stop();
+    if (m_page_responsiveness_timer)
+        m_page_responsiveness_timer->stop();
     TabPerformanceMonitor::forget_view(view_id());
     if (m_top_level_traversable)
         m_top_level_traversable->clear_ongoing_navigation();
@@ -229,10 +231,16 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
     if (did_swap_bitmap)
         TabPerformanceMonitor::did_present(view_id());
 
-    if (did_swap_bitmap)
-        clear_page_frame_response_watchdog();
     if (did_swap_bitmap && on_ready_to_paint)
         on_ready_to_paint();
+}
+
+void ViewImplementation::did_respond_to_page_responsiveness_check(Badge<WebContentPage>, u64 request_id)
+{
+    if (m_pending_page_responsiveness_request_id != request_id)
+        return;
+
+    clear_page_responsiveness_check();
 }
 
 void ViewImplementation::release_backing_store(i32 bitmap_id)
@@ -260,7 +268,7 @@ void ViewImplementation::set_system_visibility_state(Web::HTML::VisibilityState 
     traversable().set_system_visibility_state(visibility_state);
     Application::the().update_compositor_context_visibility(page().compositor_context_id(), visibility_state);
     if (visibility_state == Web::HTML::VisibilityState::Hidden)
-        clear_page_frame_response_watchdog();
+        clear_page_responsiveness_check();
 }
 
 void ViewImplementation::set_has_system_focus(bool has_system_focus)
@@ -1054,45 +1062,49 @@ void ViewImplementation::update_input_response_watchdog()
     m_input_response_timer->start();
 }
 
-void ViewImplementation::start_page_frame_response_watchdog()
+void ViewImplementation::start_page_responsiveness_check()
 {
-    if (m_page_frame_response_timer)
-        m_page_frame_response_timer->stop();
+    if (m_page_responsiveness_timer)
+        m_page_responsiveness_timer->stop();
 
-    m_frame_page_unresponsive = false;
-    m_unresponsive_frame_process_id = 0;
+    m_probe_page_unresponsive = false;
+    m_unresponsive_page_process_id = 0;
     update_page_unresponsive_state();
 
-    auto deadline_ms = MonotonicTime::now().milliseconds() + page_response_timeout_ms;
-    m_page_frame_response_deadline_ms = deadline_ms;
-    m_page_frame_response_timer = Core::Timer::create_single_shot(page_response_timeout_ms, [this, deadline_ms] {
-        if (m_page_frame_response_deadline_ms != deadline_ms)
+    auto request_id = m_next_page_responsiveness_request_id++;
+    if (request_id == 0)
+        request_id = m_next_page_responsiveness_request_id++;
+    m_pending_page_responsiveness_request_id = request_id;
+    page().async_check_page_responsiveness(request_id);
+
+    m_page_responsiveness_timer = Core::Timer::create_single_shot(page_response_timeout_ms, [this, request_id] {
+        if (m_pending_page_responsiveness_request_id != request_id)
             return;
-        m_page_frame_response_deadline_ms = 0;
+        m_pending_page_responsiveness_request_id = 0;
         if (traversable().system_visibility_state() != Web::HTML::VisibilityState::Visible || m_crash_state.has_value())
             return;
 
-        m_frame_page_unresponsive = true;
-        m_unresponsive_frame_process_id = static_cast<int>(page().client().pid());
+        m_probe_page_unresponsive = true;
+        m_unresponsive_page_process_id = static_cast<int>(page().client().pid());
         update_page_unresponsive_state();
     });
-    m_page_frame_response_timer->start();
+    m_page_responsiveness_timer->start();
 }
 
-void ViewImplementation::clear_page_frame_response_watchdog()
+void ViewImplementation::clear_page_responsiveness_check()
 {
-    if (m_page_frame_response_timer)
-        m_page_frame_response_timer->stop();
-    m_page_frame_response_deadline_ms = 0;
+    if (m_page_responsiveness_timer)
+        m_page_responsiveness_timer->stop();
+    m_pending_page_responsiveness_request_id = 0;
 
-    m_frame_page_unresponsive = false;
-    m_unresponsive_frame_process_id = 0;
+    m_probe_page_unresponsive = false;
+    m_unresponsive_page_process_id = 0;
     update_page_unresponsive_state();
 }
 
 void ViewImplementation::update_page_unresponsive_state()
 {
-    auto unresponsive = m_input_page_unresponsive || m_frame_page_unresponsive;
+    auto unresponsive = m_input_page_unresponsive || m_probe_page_unresponsive;
     if (m_page_unresponsive == unresponsive)
         return;
 
@@ -1106,7 +1118,7 @@ void ViewImplementation::clear_page_response_watchdog()
     for (auto& pending : m_pending_input_events)
         pending.watches_page_response = false;
     update_input_response_watchdog();
-    clear_page_frame_response_watchdog();
+    clear_page_responsiveness_check();
 }
 
 void ViewImplementation::restart_unresponsive_page()
@@ -1123,7 +1135,7 @@ void ViewImplementation::restart_unresponsive_page()
 
     auto pid = oldest_pending.has_value()
         ? m_pending_input_events[*oldest_pending].endpoint->client().pid()
-        : static_cast<pid_t>(m_unresponsive_frame_process_id);
+        : static_cast<pid_t>(m_unresponsive_page_process_id);
     if (pid <= 0) {
         update_input_response_watchdog();
         return;

@@ -253,6 +253,7 @@ private:
     virtual void blob_url_entry_removed(Utf16String url) override;
     virtual void did_delete_all_cookies(Web::PageId page_id, u64 request_id) override;
     virtual void set_system_visibility_state(Web::PageId page_id, Web::HTML::VisibilityState) override;
+    virtual void check_page_responsiveness(Web::PageId page_id, u64 request_id) override;
     virtual void set_browsing_context_group(Web::PageId page_id, u64 browsing_context_group_id) override;
     virtual void update_visibility_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::VisibilityState) override;
     virtual void reset_zoom(Web::PageId page_id) override;

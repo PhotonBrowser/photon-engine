@@ -1643,6 +1643,11 @@ void WebContentPage::did_request_set_system_visibility_state(Web::HTML::Visibili
     view().set_system_visibility_state(visibility_state);
 }
 
+void WebContentPage::did_respond_to_page_responsiveness_check(u64 request_id)
+{
+    view().did_respond_to_page_responsiveness_check({}, request_id);
+}
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
 // NB: initiatorOriginSnapshot is sourceDocument's origin. The process names sourceDocument's relevant settings object as
 //     the fetch client, an environment that a process hosts, and the UI process takes the origin from it. Without a

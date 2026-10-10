@@ -123,6 +123,7 @@ public:
     String const& handle() const { return m_window_handle; }
 
     void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect, u64 presentation_signal_value = 0);
+    void did_respond_to_page_responsiveness_check(Badge<WebContentPage>, u64 request_id);
 
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
@@ -544,8 +545,8 @@ protected:
     void did_finish_history_traversal(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult);
     void clear_page_response_watchdog();
     void update_input_response_watchdog();
-    void start_page_frame_response_watchdog();
-    void clear_page_frame_response_watchdog();
+    void start_page_responsiveness_check();
+    void clear_page_responsiveness_check();
     void update_page_unresponsive_state();
 
     virtual Web::Clipboard::SystemClipboardItem clipboard_item() const;
@@ -768,11 +769,12 @@ protected:
     Vector<PendingInputEvent> m_pending_input_events;
     RefPtr<Core::Timer> m_input_response_timer;
     i64 m_input_response_deadline_ms { 0 };
-    RefPtr<Core::Timer> m_page_frame_response_timer;
-    i64 m_page_frame_response_deadline_ms { 0 };
+    RefPtr<Core::Timer> m_page_responsiveness_timer;
+    u64 m_next_page_responsiveness_request_id { 1 };
+    u64 m_pending_page_responsiveness_request_id { 0 };
     bool m_input_page_unresponsive { false };
-    bool m_frame_page_unresponsive { false };
-    int m_unresponsive_frame_process_id { 0 };
+    bool m_probe_page_unresponsive { false };
+    int m_unresponsive_page_process_id { 0 };
     bool m_page_unresponsive { false };
     u64 m_next_input_event_id { 1 };
     bool m_debugger_is_attached { false };

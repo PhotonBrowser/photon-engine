@@ -370,13 +370,8 @@ public:
         auto was_hidden = traversable().system_visibility_state() == Web::HTML::VisibilityState::Hidden;
         set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
 
-        // Re-submit the viewport when a tab becomes active again. Resuming
-        // visibility schedules animation work, but a page with no pending
-        // damage may otherwise keep showing its stale native surface.
-        if (visible && was_hidden) {
-            start_page_frame_response_watchdog();
-            handle_resize();
-        }
+        if (visible && was_hidden)
+            start_page_responsiveness_check();
     }
 
     void set_display_metadata(Optional<u64> display_id, double refresh_rate)
