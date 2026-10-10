@@ -91,7 +91,7 @@ public:
     bool is_collecting_everything() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectEverything; }
 
     void set_incremental_sweep_enabled(bool enabled) { m_incremental_sweep_enabled = enabled; }
-    void set_should_collect_on_every_allocation(bool b) { m_should_collect_on_every_allocation = b; }
+    void set_should_collect_on_every_allocation(bool);
 
     void did_create_root(Badge<RootImpl>, RootImpl&);
     void did_destroy_root(Badge<RootImpl>, RootImpl&);
@@ -178,25 +178,46 @@ private:
     }
 
     // Shared by allocate<T>() and any allocation whose cell type is only known through its allocator descriptor.
-    Cell* allocate_cell(CellAllocatorDescriptorBase& descriptor)
+    // Cells that other cells keep their storage in neither collect garbage nor count towards the next collection
+    // (see gc_heap_allocate_storage_cell()).
+    enum class TriggersCollection {
+        No,
+        Yes,
+    };
+    Cell* allocate_cell(CellAllocatorDescriptorBase& descriptor, TriggersCollection triggers_collection = TriggersCollection::Yes)
     {
         VERIFY(!m_collecting_garbage);
-        will_allocate(descriptor.cell_size());
+        will_allocate(descriptor.cell_size(), triggers_collection);
         return descriptor.for_heap(*this).allocate_cell(*this);
     }
 
-    // Cells allocated during incremental sweep must be marked so they
-    // survive until the next GC cycle clears and re-establishes marks.
+    // Cells allocated during incremental sweep in a block that the sweep has
+    // yet to finish must be marked so that it keeps them. The sweep clears the
+    // marks of the blocks it has yet to sweep; cells in the block it is
+    // sweeping right now are remembered so their marks get cleared when the
+    // sweep finishes. Swept and new blocks need nothing.
     bool mark_if_allocated_during_incremental_sweep(Cell& cell)
     {
         if (!m_incremental_sweep_active)
             return false;
-        cell.set_marked(true);
-        m_cells_allocated_during_sweep.append(&cell);
-        return true;
+        auto* block = HeapBlock::from_cell(&cell);
+        if (block->is_pending_sweep()) {
+            cell.set_marked(true);
+            return true;
+        }
+        if (block->is_being_swept()) {
+            cell.set_marked(true);
+            m_cells_allocated_during_sweep.append(&cell);
+            return true;
+        }
+        return false;
     }
 
-    void will_allocate(size_t);
+    // Marking makes every block pending sweep again, which local free lists
+    // must never be in, so every collection starts with this.
+    void give_back_local_free_lists();
+
+    void will_allocate(size_t, TriggersCollection = TriggersCollection::Yes);
     void update_gc_bytes_threshold(size_t live_cell_bytes, size_t live_external_bytes);
 
     enum class IncludeIncomingCrossHeapMembers {
@@ -299,6 +320,8 @@ private:
 
     RefPtr<Core::Timer> m_idle_gc_timer;
     u64 m_total_allocated_bytes { 0 };
+    // The context a heap created through LibGC/CAPI.h was created with.
+    void* m_foreign_context { nullptr };
     IdleCollectionPolicy m_idle_collection_policy;
 };
 

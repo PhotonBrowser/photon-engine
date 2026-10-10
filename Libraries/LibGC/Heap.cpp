@@ -319,9 +319,14 @@ Heap::~Heap()
     m_incoming_cross_heap_members.clear();
 }
 
-void Heap::will_allocate(size_t size)
+void Heap::will_allocate(size_t size, TriggersCollection triggers_collection)
 {
     ASSERT(!heap_access_is_forbidden_on_this_thread());
+    if (triggers_collection == TriggersCollection::No) {
+        m_total_allocated_bytes += size;
+        return;
+    }
+
     // NB: Sweeping a block destroys its dead cells, and a destructor may allocate. A collection started from there
     //     would mark the block's reachable cells and queue the block for the next sweep, the rest of the current sweep
     //     would then clear those marks, and the next sweep of the block would free cells that are still in use. So an
@@ -667,6 +672,7 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
 
     VERIFY(!m_collecting_garbage);
 
+    give_back_local_free_lists();
     finish_pending_incremental_sweep();
     g_next_incremental_sweep_should_report = false;
 
@@ -741,6 +747,20 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
     // A collection just happened: restart the idle policy's episode (peak rate and watchdog tick count) from here, so
     // a threshold-driven GC mid-episode doesn't leave it comparing against stale state.
     m_idle_collection_policy.reset(m_total_allocated_bytes);
+}
+
+void Heap::set_should_collect_on_every_allocation(bool should_collect)
+{
+    m_should_collect_on_every_allocation = should_collect;
+    // NB: Code that pops local free lists itself would take cells from them without collecting.
+    if (should_collect)
+        give_back_local_free_lists();
+}
+
+void Heap::give_back_local_free_lists()
+{
+    for (auto& allocator : m_all_cell_allocators)
+        allocator.give_back_local_free_list({});
 }
 
 void Heap::run_post_gc_tasks()
@@ -1337,6 +1357,7 @@ void Heap::sweep_block(HeapBlock& block)
     // Remove from the allocator's pending sweep list.
     block.m_sweep_list_node.remove();
 
+    block.set_being_swept(true);
     bool block_has_live_cells = false;
     bool block_was_full = block.is_full();
     size_t collected_cells = 0;
@@ -1361,6 +1382,7 @@ void Heap::sweep_block(HeapBlock& block)
                 : m_sweep_live_external_bytes + cell_external_memory_size;
         }
     });
+    block.set_being_swept(false);
 
     if (!block_has_live_cells) {
         dbgln_if(HEAP_DEBUG, " - HeapBlock empty @ {}: cell_size={}", &block, block.cell_size());

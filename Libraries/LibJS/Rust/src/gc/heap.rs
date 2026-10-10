@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, OnceCell, RefCell};
 use core::ffi::c_void;
 use core::mem::offset_of;
 use core::ptr::NonNull;
@@ -18,11 +18,49 @@ use crate::build_configuration::{HEAP_REGION_OFFSET_MASK, PRIMITIVE_STORAGE_CAGE
 use crate::layout::cell::{CellHeader, CellState, Gc};
 
 /// A LibGC heap, with one allocator per class of cell.
+///
+/// Cells are taken from the local free lists of the allocators in the heap without a call into LibGC whenever the heap
+/// does not have to collect garbage (see gc_heap_allocator_local_free_list()).
 pub struct Heap {
     raw: NonNull<GCHeap>,
-    allocators: [Cell<*mut GCAllocator>; CLASS_COUNT],
+    allocators: [Cell<Option<HeapAllocator>>; CLASS_COUNT],
     /// The allocators of the classes derived at run time, by the address of their class.
-    runtime_class_allocators: RefCell<HashMap<usize, NonNull<GCAllocator>, foldhash::fast::RandomState>>,
+    runtime_class_allocators: RefCell<HashMap<usize, HeapAllocator, foldhash::fast::RandomState>>,
+    /// The size classes of each class, by class id, out of line, as few classes have any.
+    size_class_tables: Box<[OnceCell<SizeClassTable>; CLASS_COUNT]>,
+    inline_allocation_info: InlineAllocationInfo,
+}
+
+/// The size classes of a class, with the type infos their blocks dispatch through, which have to outlive the
+/// allocators.
+struct SizeClassTable {
+    allocators: Box<[SizeClassAllocator]>,
+    _type_infos: Box<[CellTypeInfo]>,
+}
+
+/// What the heap needs to know to allocate cells from its local free lists itself, besides the address of the list:
+/// where the heap's allocation counters are, and where a free cell keeps the link to the next free cell and which bits
+/// of it count. See gc_heap_allocator_local_free_list() for how to allocate with them.
+struct InlineAllocationInfo {
+    allocated_bytes_since_last_gc: NonNull<usize>,
+    gc_bytes_threshold: NonNull<usize>,
+    total_allocated_bytes: NonNull<usize>,
+    free_cell_next_offset: usize,
+    free_cell_link_mask: usize,
+}
+
+/// An allocator of a heap, with the address of its local free list in the heap, which is null if every cell has to be
+/// allocated through LibGC.
+#[derive(Clone, Copy)]
+struct HeapAllocator {
+    raw: NonNull<GCAllocator>,
+    local_free_list: *mut *mut c_void,
+}
+
+impl HeapAllocator {
+    fn local_free_list(self) -> Option<NonNull<*mut c_void>> {
+        NonNull::new(self.local_free_list)
+    }
 }
 
 /// The allocator of a class derived at run time, which only the cells of that class come from, as each C++ class that
@@ -30,7 +68,7 @@ pub struct Heap {
 #[derive(Clone, Copy)]
 pub struct RuntimeClassAllocator {
     class: &'static Class,
-    raw: NonNull<GCAllocator>,
+    allocator: HeapAllocator,
 }
 
 impl RuntimeClassAllocator {
@@ -41,11 +79,49 @@ impl RuntimeClassAllocator {
 
 impl PartialEq for RuntimeClassAllocator {
     fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
+        self.allocator.raw == other.allocator.raw
     }
 }
 
 impl Eq for RuntimeClassAllocator {}
+
+/// One size class of a class whose cells end in a variable-size part, like an array of trailing values: an allocator of
+/// its own, whose cells are larger than the type of the class. It belongs to the heap that created it and lives as long
+/// as it. LibGC dispatches through the class's type info with the size class's cell size, so gc_cell_type_info() of
+/// such a cell is not the type info of its class.
+#[derive(Clone, Copy)]
+pub struct SizeClassAllocator {
+    class: &'static Class,
+    cell_size: u32,
+    allocator: HeapAllocator,
+}
+
+impl SizeClassAllocator {
+    pub fn class(&self) -> &'static Class {
+        self.class
+    }
+
+    /// The size of each cell, including the part beyond the type of the class.
+    pub fn cell_size(&self) -> u32 {
+        self.cell_size
+    }
+}
+
+impl PartialEq for SizeClassAllocator {
+    fn eq(&self, other: &Self) -> bool {
+        self.allocator.raw == other.allocator.raw
+    }
+}
+
+impl Eq for SizeClassAllocator {}
+
+/// Whether an allocation may collect garbage and counts towards the next collection, as cells do, or does neither, as
+/// the cells other cells keep their storage in.
+#[derive(Clone, Copy)]
+enum AllocationKind {
+    Cell,
+    Storage,
+}
 
 impl Heap {
     /// Creates a heap that calls `gather_roots` with `context` whenever it gathers its roots. A heap that becomes the
@@ -55,13 +131,24 @@ impl Heap {
     ///
     /// `context` must stay valid for as long as the heap exists, including while it is being destroyed.
     pub unsafe fn new(gather_roots: GCGatherRootsCallback, context: *mut c_void, become_process_default: bool) -> Self {
-        check_layout();
+        let layout = check_layout();
         // SAFETY: The caller keeps the context alive for the heap's lifetime.
         let raw = unsafe { capi::gc_heap_create(gather_roots, context, become_process_default) };
+        let raw = NonNull::new(raw).expect("LibGC creates the heap");
+        // SAFETY: LibGC reports offsets of fields of its heap.
+        let counter = |offset: u32| unsafe { raw.byte_add(offset as usize) }.cast::<usize>();
         Self {
-            raw: NonNull::new(raw).expect("LibGC creates the heap"),
-            allocators: [const { Cell::new(core::ptr::null_mut()) }; CLASS_COUNT],
+            raw,
+            allocators: [const { Cell::new(None) }; CLASS_COUNT],
             runtime_class_allocators: RefCell::default(),
+            size_class_tables: Box::new([const { OnceCell::new() }; CLASS_COUNT]),
+            inline_allocation_info: InlineAllocationInfo {
+                allocated_bytes_since_last_gc: counter(layout.heap_allocated_bytes_since_last_gc_offset),
+                gc_bytes_threshold: counter(layout.heap_gc_bytes_threshold_offset),
+                total_allocated_bytes: counter(layout.heap_total_allocated_bytes_offset),
+                free_cell_next_offset: layout.free_cell_next_offset as usize,
+                free_cell_link_mask: layout.free_cell_link_mask as usize,
+            },
         }
     }
 
@@ -74,7 +161,7 @@ impl Heap {
     pub fn allocate<T: GcCell>(&self, cell: T) -> Gc<T> {
         let allocator = self.allocator_for(T::CLASS);
         // SAFETY: The allocator is the one of the cell's static class, whose cells have the size and alignment of a T.
-        unsafe { self.allocate_with(allocator, cell) }
+        unsafe { self.allocate_with(allocator, size_of::<T>(), AllocationKind::Cell, cell, |_| {}) }
     }
 
     /// Moves `cell`, whose class is the one `allocator` was created for or a class derived from it, into the storage
@@ -92,21 +179,120 @@ impl Heap {
             unsafe { (*core::ptr::from_ref(&cell).cast::<CellHeader>()).class }.is_subclass_of(allocator.class)
         );
         // SAFETY: The allocator's cells have the size of a T, checked above, and T's alignment, as its class extends T's.
-        unsafe { self.allocate_with(allocator.raw.as_ptr(), cell) }
+        unsafe { self.allocate_with(allocator.allocator, size_of::<T>(), AllocationKind::Cell, cell, |_| {}) }
+    }
+
+    /// Moves `cell` into a cell of `size_class`, whose class is the class of the cell or one that it extends, and fills
+    /// the rest of the larger cell with copies of `tail`. Finding and tracing the part beyond the T is up to the T.
+    pub fn allocate_with_size_class<T: GcCell, E: Copy>(
+        &self,
+        size_class: SizeClassAllocator,
+        cell: T,
+        tail: E,
+    ) -> Gc<T> {
+        self.allocate_in_size_class(size_class, AllocationKind::Cell, cell, tail)
+    }
+
+    /// allocate_with_size_class() for a cell that another cell keeps its storage in, instead of malloc memory: it never
+    /// collects garbage and does not count towards the next collection, so storage can grow while its owner is between
+    /// states nothing may observe, and callers can hold on to anything across the growth. Live storage counts once a
+    /// collection finds it, through the live cell bytes that set the next threshold.
+    pub fn allocate_storage_with_size_class<T: GcCell, E: Copy>(
+        &self,
+        size_class: SizeClassAllocator,
+        cell: T,
+        tail: E,
+    ) -> Gc<T> {
+        self.allocate_in_size_class(size_class, AllocationKind::Storage, cell, tail)
+    }
+
+    #[inline(always)]
+    fn allocate_in_size_class<T: GcCell, E: Copy>(
+        &self,
+        size_class: SizeClassAllocator,
+        kind: AllocationKind,
+        cell: T,
+        tail: E,
+    ) -> Gc<T> {
+        const {
+            assert!(
+                size_of::<E>() > 0 && align_of::<E>() <= 8,
+                "the tail starts 8-byte aligned"
+            );
+        }
+        assert!(
+            size_class.class.type_info.cell_size as usize == size_of::<T>()
+                && size_class.class.is_subclass_of(T::CLASS),
+            "{} cells are not {}s",
+            size_class.class.name,
+            T::CLASS.name
+        );
+        // SAFETY: Every cell starts with its header.
+        debug_assert!(
+            unsafe { (*core::ptr::from_ref(&cell).cast::<CellHeader>()).class }.is_subclass_of(size_class.class)
+        );
+        let tail_size = size_class.cell_size as usize - size_of::<T>();
+        assert!(
+            tail_size.is_multiple_of(size_of::<E>()),
+            "the tail of a size class is a whole number of values"
+        );
+        let initialize_tail = |tail_start: *mut u8| {
+            let tail_start = tail_start.cast::<E>();
+            for index in 0..tail_size / size_of::<E>() {
+                // SAFETY: The cell has tail_size bytes beyond the T, which starts 8-byte aligned, as each class's size
+                // is a multiple of 8.
+                unsafe { tail_start.add(index).write(tail) };
+            }
+        };
+        // SAFETY: The size class's cells are larger than a T, checked above, and have T's alignment, as its class
+        // extends T's.
+        unsafe {
+            self.allocate_with(
+                size_class.allocator,
+                size_class.cell_size as usize,
+                kind,
+                cell,
+                initialize_tail,
+            )
+        }
     }
 
     /// # Safety
     ///
-    /// The allocator must belong to this heap and hand out storage of the size and alignment of a T.
+    /// The allocator must belong to this heap and hand out storage of `cell_size` bytes, at least the size of a T, with
+    /// the alignment of a T, and `initialize_tail` must write every byte beyond the T, which it gets the address of.
     #[inline(always)]
-    unsafe fn allocate_with<T: GcCell>(&self, allocator: *mut GCAllocator, cell: T) -> Gc<T> {
+    unsafe fn allocate_with<T: GcCell>(
+        &self,
+        allocator: HeapAllocator,
+        cell_size: usize,
+        kind: AllocationKind,
+        cell: T,
+        initialize_tail: impl FnOnce(*mut u8),
+    ) -> Gc<T> {
         let mut must_mark = false;
-        // SAFETY: The heap and the allocator are live.
-        let storage =
-            unsafe { capi::gc_heap_allocate_cell(self.raw.as_ptr(), allocator, &raw mut must_mark) }.cast::<T>();
-        let storage = NonNull::new(storage).expect("LibGC allocates the cell");
-        // SAFETY: LibGC returned uninitialized storage of the size and alignment of a T, as the caller guarantees.
-        unsafe { storage.write(cell) };
+        // SAFETY: The allocator belongs to this heap and hands out cells of cell_size bytes.
+        let storage = match unsafe { self.take_from_local_free_list(allocator, cell_size, kind) } {
+            Some(storage) => storage,
+            // SAFETY: The heap and the allocator are live.
+            None => unsafe {
+                let raw = allocator.raw.as_ptr();
+                let storage = match kind {
+                    AllocationKind::Cell => capi::gc_heap_allocate_cell(self.raw.as_ptr(), raw, &raw mut must_mark),
+                    AllocationKind::Storage => {
+                        capi::gc_heap_allocate_storage_cell(self.raw.as_ptr(), raw, &raw mut must_mark)
+                    }
+                };
+                NonNull::new(storage).expect("LibGC allocates the cell")
+            },
+        }
+        .cast::<T>();
+        // SAFETY: LibGC returned uninitialized storage of at least the size and the alignment of a T, as the caller
+        // guarantees, which nothing can collect garbage before it is written.
+        unsafe {
+            storage.write(cell);
+            initialize_tail(storage.as_ptr().cast::<u8>().add(size_of::<T>()));
+        }
         let header = storage.cast::<CellHeader>();
         // SAFETY: Every cell starts with its header.
         unsafe {
@@ -116,6 +302,64 @@ impl Heap {
         }
     }
 
+    /// Pops the allocator's local free list, unless LibGC has to collect garbage first or the list is empty, with the
+    /// bookkeeping gc_heap_allocator_local_free_list() describes. Cells from the list never need marking.
+    ///
+    /// # Safety
+    ///
+    /// The allocator must belong to this heap and hand out cells of `cell_size` bytes.
+    #[inline(always)]
+    unsafe fn take_from_local_free_list(
+        &self,
+        allocator: HeapAllocator,
+        cell_size: usize,
+        kind: AllocationKind,
+    ) -> Option<NonNull<c_void>> {
+        let local_free_list = allocator.local_free_list()?;
+        let info = &self.inline_allocation_info;
+        let link_mask = info.free_cell_link_mask;
+        // SAFETY: The list and the counters are fields of the live heap, and every cell on the list is a free cell that
+        //         keeps the link to the next one at free_cell_next_offset.
+        unsafe {
+            let cell = local_free_list.read();
+            if cell.addr() & link_mask == 0 {
+                return None;
+            }
+            let cell = NonNull::new_unchecked(cell);
+            if let AllocationKind::Cell = kind {
+                let allocated_bytes = info.allocated_bytes_since_last_gc.read() + cell_size;
+                if allocated_bytes > info.gc_bytes_threshold.read() {
+                    return None;
+                }
+                info.allocated_bytes_since_last_gc.write(allocated_bytes);
+            }
+            info.total_allocated_bytes
+                .write(info.total_allocated_bytes.read() + cell_size);
+            // NB: Only the bits of the link under the mask count, so that the next cell is in the block of this one
+            //     whatever the link was overwritten with.
+            let link = cell.byte_add(info.free_cell_next_offset).cast::<usize>().read();
+            local_free_list.write(
+                cell.as_ptr()
+                    .map_addr(|address| (address & !link_mask) | (link & link_mask)),
+            );
+            Some(cell)
+        }
+    }
+
+    /// Creates an allocator of cells with `type_info`.
+    ///
+    /// # Safety
+    ///
+    /// The type info and the name must outlive the allocator.
+    unsafe fn create_allocator(&self, type_info: *const CellTypeInfo, name: &str) -> HeapAllocator {
+        // SAFETY: The caller keeps the type info and the name alive for as long as the allocator.
+        let raw = unsafe { capi::gc_allocator_create(type_info, name.as_ptr().cast(), name.len()) };
+        let raw = NonNull::new(raw).expect("LibGC creates the allocator");
+        // SAFETY: The heap and the allocator are live.
+        let local_free_list = unsafe { capi::gc_heap_allocator_local_free_list(self.raw.as_ptr(), raw.as_ptr()) };
+        HeapAllocator { raw, local_free_list }
+    }
+
     /// The allocator of `class`, a class derived at run time, which the first call for the class creates.
     pub fn runtime_class_allocator(&self, class: &'static Class) -> RuntimeClassAllocator {
         assert!(
@@ -123,38 +367,77 @@ impl Heap {
             "the cells of {} come from the allocator of its id",
             class.name
         );
-        let raw = *self
+        let allocator = *self
             .runtime_class_allocators
             .borrow_mut()
             .entry(core::ptr::from_ref(class) as usize)
-            .or_insert_with(|| {
-                // SAFETY: The class and its name live as long as the process, so they outlive the allocator.
-                let allocator = unsafe {
-                    capi::gc_allocator_create(
-                        core::ptr::from_ref(&class.type_info),
-                        class.name.as_ptr().cast(),
-                        class.name.len(),
-                    )
-                };
-                NonNull::new(allocator).expect("LibGC creates the allocator")
-            });
-        RuntimeClassAllocator { class, raw }
+            // SAFETY: The class and its name live as long as the process, so they outlive the allocator.
+            .or_insert_with(|| unsafe { self.create_allocator(&raw const class.type_info, class.name) });
+        RuntimeClassAllocator { class, allocator }
     }
 
-    fn allocator_for(&self, class: &'static Class) -> *mut GCAllocator {
-        let slot = &self.allocators[class.id as usize];
-        if slot.get().is_null() {
-            // SAFETY: The class and its name are static, so they outlive the allocator.
-            let allocator = unsafe {
-                capi::gc_allocator_create(
-                    core::ptr::from_ref(&class.type_info),
-                    class.name.as_ptr().cast(),
-                    class.name.len(),
-                )
-            };
-            slot.set(allocator);
+    /// The size classes of `class`, whose cells have `cell_sizes` bytes, in that order, which the first call for the
+    /// class creates. A class has one set of size classes, so every call for it passes the same sizes.
+    #[inline(always)]
+    pub fn size_classes(&self, class: &'static Class, cell_sizes: &[u32]) -> &[SizeClassAllocator] {
+        let table =
+            self.size_class_tables[class.id as usize].get_or_init(|| self.create_size_classes(class, cell_sizes));
+        debug_assert!(
+            table
+                .allocators
+                .iter()
+                .map(SizeClassAllocator::cell_size)
+                .eq(cell_sizes.iter().copied())
+        );
+        &table.allocators
+    }
+
+    #[cold]
+    fn create_size_classes(&self, class: &'static Class, cell_sizes: &[u32]) -> SizeClassTable {
+        assert!(
+            !class.is_derived_at_run_time(),
+            "a class derived at run time shares the id of {}",
+            class.name
+        );
+        let type_infos: Box<[CellTypeInfo]> = cell_sizes
+            .iter()
+            .map(|&cell_size| {
+                assert!(
+                    cell_size >= class.type_info.cell_size && cell_size.is_multiple_of(8),
+                    "a size class of {} has cells of {cell_size} bytes",
+                    class.name
+                );
+                CellTypeInfo {
+                    cell_size,
+                    ..class.type_info
+                }
+            })
+            .collect();
+        let allocators = type_infos
+            .iter()
+            .map(|type_info| SizeClassAllocator {
+                class,
+                cell_size: type_info.cell_size,
+                // SAFETY: The heap destroys the allocator before the type info, and the class name is static.
+                allocator: unsafe { self.create_allocator(type_info, class.name) },
+            })
+            .collect();
+        SizeClassTable {
+            allocators,
+            _type_infos: type_infos,
         }
-        slot.get()
+    }
+
+    #[inline(always)]
+    fn allocator_for(&self, class: &'static Class) -> HeapAllocator {
+        let slot = &self.allocators[class.id as usize];
+        if let Some(allocator) = slot.get() {
+            return allocator;
+        }
+        // SAFETY: The class and its name are static, so they outlive the allocator.
+        let allocator = unsafe { self.create_allocator(&raw const class.type_info, class.name) };
+        slot.set(Some(allocator));
+        allocator
     }
 
     pub fn collect_garbage(&self) {
@@ -234,13 +517,16 @@ impl Drop for Heap {
         // SAFETY: This owns the heap. The allocators outlive it, as LibGC requires.
         unsafe {
             capi::gc_heap_destroy(self.raw.as_ptr());
-            for allocator in &self.allocators {
-                if !allocator.get().is_null() {
-                    capi::gc_allocator_destroy(allocator.get());
-                }
+            for allocator in self.allocators.iter().filter_map(Cell::get) {
+                capi::gc_allocator_destroy(allocator.raw.as_ptr());
             }
             for allocator in self.runtime_class_allocators.get_mut().values() {
-                capi::gc_allocator_destroy(allocator.as_ptr());
+                capi::gc_allocator_destroy(allocator.raw.as_ptr());
+            }
+            for table in self.size_class_tables.iter().filter_map(OnceCell::get) {
+                for size_class in &table.allocators {
+                    capi::gc_allocator_destroy(size_class.allocator.raw.as_ptr());
+                }
             }
         }
     }
@@ -254,8 +540,8 @@ pub fn cell_is_dead<T>(cell: Gc<T>) -> bool {
     header.state.get() != CellState::Live || !header.mark.get()
 }
 
-/// Checks the layouts this crate mirrors against the LibGC it is linked with.
-fn check_layout() {
+/// Checks the layouts this crate mirrors against the LibGC it is linked with, and returns LibGC's layout.
+fn check_layout() -> GCLayout {
     let mut layout = GCLayout::default();
     // SAFETY: LibGC fills in the whole struct.
     unsafe { capi::gc_get_layout(&raw mut layout) };
@@ -300,4 +586,5 @@ fn check_layout() {
         layout.weak_impl_pointer_offset.into(),
         WEAK_IMPL_POINTER_OFFSET as u64,
     );
+    layout
 }
