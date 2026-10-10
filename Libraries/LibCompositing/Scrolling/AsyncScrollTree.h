@@ -56,6 +56,7 @@ struct AsyncScrollApplication {
     Vector<AsyncScrollOffset> scroll_offsets;
     Gfx::FloatPoint unconsumed_delta;
     Optional<AsyncScrollNodeID> horizontal_boundary_node;
+    Optional<AsyncScrollNodeID> vertical_boundary_node;
 };
 
 // Mutable compositor-side copy of AsyncScrollingState. Current scroll offsets live in ScrollStateSnapshot; this tree

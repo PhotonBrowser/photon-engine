@@ -187,12 +187,18 @@ AsyncScrollApplication AsyncScrollTree::apply_scroll_delta(AsyncScrollNodeID nod
             return;
 
         auto on_axis = [&](float value) { return horizontal ? Gfx::FloatPoint { value, 0 } : Gfx::FloatPoint { 0, value }; };
-        // A horizontal delta left at a boundary may go to the browser, such as for a swipe through history.
+        // A delta left at the viewport boundary may go to the browser for a native edge effect.
         auto stop_at_boundary = [&](AsyncScrollNodeID boundary_node_id) {
-            if (!horizontal)
-                return;
-            application.horizontal_boundary_node = boundary_node_id;
-            application.unconsumed_delta.set_x(remaining);
+            if (horizontal) {
+                application.horizontal_boundary_node = boundary_node_id;
+                application.unconsumed_delta.set_x(remaining);
+            }
+#if defined(AK_OS_MACOS)
+            else {
+                application.vertical_boundary_node = boundary_node_id;
+                application.unconsumed_delta.set_y(remaining);
+            }
+#endif
         };
 
         auto current_node_id = node_id;

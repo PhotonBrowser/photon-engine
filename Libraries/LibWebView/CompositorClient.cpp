@@ -108,4 +108,10 @@ void CompositorClient::did_detect_history_swipe_candidate(Web::CompositorContext
         page->did_detect_history_swipe_candidate(gesture_id, back, unconsumed_delta);
 }
 
+void CompositorClient::did_detect_vertical_overscroll(Web::CompositorContextId context_id, u64 gesture_id, float unconsumed_delta)
+{
+    if (auto* page = page_for_compositor_context_id(context_id))
+        page->did_detect_vertical_overscroll(gesture_id, unconsumed_delta);
+}
+
 }

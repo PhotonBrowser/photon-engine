@@ -77,12 +77,17 @@ public:
         float unconsumed_delta { 0 };
     };
 
+    struct VerticalOverscrollCandidate {
+        float unconsumed_delta { 0 };
+    };
+
     struct ContextUpdateResult {
         bool accepted { false };
         Optional<PendingFrame> frame_to_present;
         bool should_request_rendering_update { false };
         Optional<Web::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
         Optional<HistorySwipeCandidate> history_swipe_candidate {};
+        Optional<VerticalOverscrollCandidate> vertical_overscroll_candidate {};
     };
 
     struct PreparedFrame {
@@ -282,6 +287,7 @@ private:
         // The viewport to present, when the scroll moved a scrolling box or started a snap scroll of one.
         Optional<Gfx::IntRect> viewport_rect_to_present;
         Optional<HistorySwipeCandidate> history_swipe_candidate;
+        Optional<VerticalOverscrollCandidate> vertical_overscroll_candidate;
     };
     WheelScrollOutcome perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID, Gfx::FloatPoint delta, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, Compositing::AsyncScrollOperationTracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining, bool history_swipe_back_enabled = false, bool history_swipe_forward_enabled = false);
     // The latched scroller of the gesture the wheel event continues, in the current scroll tree, with the gesture

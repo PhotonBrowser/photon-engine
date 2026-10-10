@@ -39,6 +39,7 @@ private:
     virtual void did_consume_input_event(Web::CompositorContextId, u64 event_id) override;
     virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) override;
     virtual void did_detect_history_swipe_candidate(Web::CompositorContextId, u64 gesture_id, bool back, float unconsumed_delta) override;
+    virtual void did_detect_vertical_overscroll(Web::CompositorContextId, u64 gesture_id, float unconsumed_delta) override;
 
     virtual Messages::CompositorControlServer::InitTransportResponse init_transport(int peer_pid) override;
     virtual void set_font_service(IPC::TransportHandle, IPC::File catalog, u64 catalog_size, u64 generation) override;

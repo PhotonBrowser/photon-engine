@@ -67,6 +67,11 @@ void ConnectionFromClient::did_detect_history_swipe_candidate(Web::CompositorCon
     async_did_detect_history_swipe_candidate(context_id, gesture_id, back, unconsumed_delta);
 }
 
+void ConnectionFromClient::did_detect_vertical_overscroll(Web::CompositorContextId context_id, u64 gesture_id, float unconsumed_delta)
+{
+    async_did_detect_vertical_overscroll(context_id, gesture_id, unconsumed_delta);
+}
+
 Messages::CompositorControlServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
 {
 #ifdef AK_OS_WINDOWS

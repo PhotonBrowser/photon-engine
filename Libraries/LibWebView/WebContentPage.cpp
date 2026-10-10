@@ -561,6 +561,19 @@ void WebContentPage::did_detect_history_swipe_candidate(u64 gesture_id, bool bac
     }
 }
 
+void WebContentPage::did_detect_vertical_overscroll(u64 gesture_id, float unconsumed_delta)
+{
+    if (displays_tab()) {
+        view().did_detect_vertical_overscroll({}, gesture_id, unconsumed_delta);
+        return;
+    }
+
+    if (auto display_page = traversable().display_page(); display_page) {
+        if (display_page->is_open() && display_page.ptr() != this)
+            display_page->did_detect_vertical_overscroll(gesture_id, unconsumed_delta);
+    }
+}
+
 void WebContentPage::did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, u64 presentation_signal_value)
 {
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC did_paint for page {} bitmap {} rect={}x{} at {},{}",

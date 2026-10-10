@@ -520,6 +520,10 @@ private:
             if (m_callbacks.history_swipe_candidate)
                 m_callbacks.history_swipe_candidate(gesture_id, back, unconsumed_delta);
         };
+        on_vertical_overscroll = [this](u64 gesture_id, float unconsumed_delta) {
+            if (m_callbacks.vertical_overscroll)
+                m_callbacks.vertical_overscroll(gesture_id, unconsumed_delta);
+        };
         on_url_change = [this](URL::URL const& url) {
             if (external_image_lease_trace_enabled()) {
                 auto serialized_url = url.serialize();
