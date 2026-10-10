@@ -62,6 +62,7 @@ static void fail_webdriver_content_commands_after_window_close(auto const& comma
 }
 
 static u64 s_view_count = 1; // This has to start at 1 for Firefox DevTools.
+static constexpr i64 page_response_timeout_ms = 8000;
 
 void ViewImplementation::for_each_view(Function<IterationDecision(ViewImplementation&)> callback)
 {
@@ -97,6 +98,8 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
 
 ViewImplementation::~ViewImplementation()
 {
+    if (m_input_response_timer)
+        m_input_response_timer->stop();
     TabPerformanceMonitor::forget_view(view_id());
     if (m_top_level_traversable)
         m_top_level_traversable->clear_ongoing_navigation();
@@ -155,6 +158,7 @@ void ViewImplementation::set_url(URL::URL url)
     if (m_url == url)
         return;
 
+    clear_page_response_watchdog();
     m_url = move(url);
     update_bookmark_action();
 
@@ -225,6 +229,8 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
     if (did_swap_bitmap)
         TabPerformanceMonitor::did_present(view_id());
 
+    if (did_swap_bitmap)
+        clear_page_frame_response_watchdog();
     if (did_swap_bitmap && on_ready_to_paint)
         on_ready_to_paint();
 }
@@ -253,6 +259,8 @@ void ViewImplementation::set_system_visibility_state(Web::HTML::VisibilityState 
 
     traversable().set_system_visibility_state(visibility_state);
     Application::the().update_compositor_context_visibility(page().compositor_context_id(), visibility_state);
+    if (visibility_state == Web::HTML::VisibilityState::Hidden)
+        clear_page_frame_response_watchdog();
 }
 
 void ViewImplementation::set_has_system_focus(bool has_system_focus)
@@ -269,6 +277,7 @@ void ViewImplementation::load(URL::URL const& url, Web::Bindings::NavigationHist
 // source is still that page.
 void ViewImplementation::load(Web::HTML::PreparedNavigationDescriptor navigation)
 {
+    clear_page_response_watchdog();
     if (on_before_browser_initiated_navigation)
         on_before_browser_initiated_navigation();
 
@@ -393,6 +402,7 @@ void ViewImplementation::open_url_in_new_window(URL::URL const& url, IsPrivate i
 
 void ViewImplementation::load_html(StringView html)
 {
+    clear_page_response_watchdog();
     if (on_before_browser_initiated_navigation)
         on_before_browser_initiated_navigation();
 
@@ -416,6 +426,7 @@ void ViewImplementation::load_navigation_error_page(StringView text)
 
 void ViewImplementation::reload()
 {
+    clear_page_response_watchdog();
     m_history_visit_transition_for_next_load = HistoryVisitTransition::Reload;
 
     // A load stopped before its document was activated is loaded again, rather than the document it was to replace.
@@ -647,6 +658,8 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 {
     auto* key_event = event.get_pointer<Web::KeyEvent>();
     auto* mouse_event = event.get_pointer<Web::MouseEvent>();
+    auto watches_page_response = (key_event && key_event->type == Web::KeyEvent::Type::KeyDown)
+        || (mouse_event && first_is_one_of(mouse_event->type, Web::MouseEvent::Type::MouseDown, Web::MouseEvent::Type::MouseUp, Web::MouseEvent::Type::MouseWheel));
     if (m_debugger_paused) {
         if (mouse_event) {
             if (mouse_event->type == Web::MouseEvent::Type::MouseMove) {
@@ -716,6 +729,9 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
     m_pending_input_events.append({ move(event), page() });
 
     auto& pending = m_pending_input_events.last();
+    pending.enqueued_at_ms = MonotonicTime::now().milliseconds();
+    pending.watches_page_response = watches_page_response;
+    update_input_response_watchdog();
     pending.event.visit(
         [&](Web::KeyEvent const& event) {
             auto& host = focused_navigable_host();
@@ -918,6 +934,7 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
     if (!index.has_value())
         return;
     auto event = m_pending_input_events.take(*index).event;
+    update_input_response_watchdog();
 
     if (event_result == Web::EventResult::Handled || event_result == Web::EventResult::Cancelled)
         return;
@@ -952,12 +969,14 @@ void ViewImplementation::did_lose_input_event_endpoint(Badge<WebContentClient>, 
 {
     // Nothing will finish the events the lost page held, and a pending event holds back compositor input.
     m_pending_input_events.remove_all_matching([&](auto const& pending) { return pending.endpoint == page; });
+    update_input_response_watchdog();
 }
 
 void ViewImplementation::did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id)
 {
     // The compositor performed the default action itself, so there is no result to hand to the view.
     m_pending_input_events.remove_first_matching([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
+    update_input_response_watchdog();
 }
 
 void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id)
@@ -982,6 +1001,134 @@ void ViewImplementation::discard_input_events_routed_through_lost_compositor(Bad
     // The compositor may have forwarded some of these before it died, and WebContent does not de-duplicate event ids,
     // so sending them again could run an event twice. Acknowledgements that still arrive for them are ignored.
     m_pending_input_events.remove_all_matching([](auto const& pending) { return pending.routed_through_compositor; });
+    update_input_response_watchdog();
+}
+
+void ViewImplementation::update_input_response_watchdog()
+{
+    Optional<i64> oldest_input_time;
+    for (auto const& pending : m_pending_input_events) {
+        if (!pending.watches_page_response)
+            continue;
+        if (!oldest_input_time.has_value() || pending.enqueued_at_ms < *oldest_input_time)
+            oldest_input_time = pending.enqueued_at_ms;
+    }
+
+    if (!oldest_input_time.has_value()) {
+        if (m_input_response_timer)
+            m_input_response_timer->stop();
+        m_input_response_deadline_ms = 0;
+        m_input_page_unresponsive = false;
+        update_page_unresponsive_state();
+        return;
+    }
+
+    if (m_input_page_unresponsive)
+        return;
+
+    auto deadline_ms = *oldest_input_time + page_response_timeout_ms;
+    if (m_input_response_deadline_ms == deadline_ms)
+        return;
+
+    if (m_input_response_timer)
+        m_input_response_timer->stop();
+    m_input_response_deadline_ms = deadline_ms;
+    auto remaining_ms = max(1, static_cast<int>(deadline_ms - MonotonicTime::now().milliseconds()));
+    m_input_response_timer = Core::Timer::create_single_shot(remaining_ms, [this, deadline_ms] {
+        if (m_input_response_deadline_ms != deadline_ms)
+            return;
+        m_input_response_deadline_ms = 0;
+
+        auto now_ms = MonotonicTime::now().milliseconds();
+        auto still_waiting = any_of(m_pending_input_events, [&](auto const& pending) {
+            return pending.watches_page_response && pending.enqueued_at_ms + page_response_timeout_ms <= now_ms;
+        });
+        if (!still_waiting) {
+            update_input_response_watchdog();
+            return;
+        }
+
+        m_input_page_unresponsive = true;
+        update_page_unresponsive_state();
+    });
+    m_input_response_timer->start();
+}
+
+void ViewImplementation::start_page_frame_response_watchdog()
+{
+    if (m_page_frame_response_timer)
+        m_page_frame_response_timer->stop();
+
+    m_frame_page_unresponsive = false;
+    m_unresponsive_frame_process_id = 0;
+    update_page_unresponsive_state();
+
+    auto deadline_ms = MonotonicTime::now().milliseconds() + page_response_timeout_ms;
+    m_page_frame_response_deadline_ms = deadline_ms;
+    m_page_frame_response_timer = Core::Timer::create_single_shot(page_response_timeout_ms, [this, deadline_ms] {
+        if (m_page_frame_response_deadline_ms != deadline_ms)
+            return;
+        m_page_frame_response_deadline_ms = 0;
+        if (traversable().system_visibility_state() != Web::HTML::VisibilityState::Visible || m_crash_state.has_value())
+            return;
+
+        m_frame_page_unresponsive = true;
+        m_unresponsive_frame_process_id = static_cast<int>(page().client().pid());
+        update_page_unresponsive_state();
+    });
+    m_page_frame_response_timer->start();
+}
+
+void ViewImplementation::clear_page_frame_response_watchdog()
+{
+    if (m_page_frame_response_timer)
+        m_page_frame_response_timer->stop();
+    m_page_frame_response_deadline_ms = 0;
+
+    m_frame_page_unresponsive = false;
+    m_unresponsive_frame_process_id = 0;
+    update_page_unresponsive_state();
+}
+
+void ViewImplementation::update_page_unresponsive_state()
+{
+    auto unresponsive = m_input_page_unresponsive || m_frame_page_unresponsive;
+    if (m_page_unresponsive == unresponsive)
+        return;
+
+    m_page_unresponsive = unresponsive;
+    if (on_page_unresponsive_changed)
+        on_page_unresponsive_changed(unresponsive);
+}
+
+void ViewImplementation::clear_page_response_watchdog()
+{
+    for (auto& pending : m_pending_input_events)
+        pending.watches_page_response = false;
+    update_input_response_watchdog();
+    clear_page_frame_response_watchdog();
+}
+
+void ViewImplementation::restart_unresponsive_page()
+{
+    if (!m_page_unresponsive)
+        return;
+
+    auto oldest_pending = m_pending_input_events.find_first_index_if([](auto const& pending) {
+        return pending.watches_page_response;
+    });
+    if (!oldest_pending.has_value()) {
+        update_input_response_watchdog();
+    }
+
+    auto pid = oldest_pending.has_value()
+        ? m_pending_input_events[*oldest_pending].endpoint->client().pid()
+        : static_cast<pid_t>(m_unresponsive_frame_process_id);
+    if (pid <= 0) {
+        update_input_response_watchdog();
+        return;
+    }
+    Application::process_manager().force_exit_after_timeout(pid, 0);
 }
 
 void ViewImplementation::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)
@@ -3239,6 +3386,7 @@ void ViewImplementation::handle_web_content_process_crash()
     // Nothing will finish the input events the crashed process still held, and the events another process holds
     // for this tab are stale once its tree is abandoned or restored.
     m_pending_input_events.clear();
+    update_input_response_watchdog();
 
     set_loading_state(false);
     traversable().clear_ongoing_navigation();

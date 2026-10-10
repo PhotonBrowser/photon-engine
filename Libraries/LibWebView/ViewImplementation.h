@@ -191,6 +191,7 @@ public:
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
     void discard_input_events_routed_through_lost_compositor(Badge<Application>);
+    void restart_unresponsive_page();
     size_t pending_input_event_count_for_testing() const { return m_pending_input_events.size(); }
     void handle_external_url(Badge<WebContentPage>, URL::URL, URL::Origin, bool has_transient_activation);
     void did_request_cursor_change(Badge<WebContentPage>, Gfx::Cursor);
@@ -495,6 +496,7 @@ public:
     Function<void(Gfx::Color)> on_theme_color_change;
     Function<void(Gfx::Color)> on_page_background_color_change;
     Function<void(Web::HTML::AudioPlayState)> on_audio_play_state_changed;
+    Function<void(bool)> on_page_unresponsive_changed;
     Function<void(Web::ScreenWakeLockState)> on_screen_wake_lock_state_changed;
     enum class WebContentCrashReason {
         ProcessCrash,
@@ -540,6 +542,11 @@ protected:
     void will_apply_history_traversal_step(Web::HTML::CrossProcessId operation_id);
     void did_apply_top_level_history_traversal_step(Web::HTML::CrossProcessId operation_id);
     void did_finish_history_traversal(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult);
+    void clear_page_response_watchdog();
+    void update_input_response_watchdog();
+    void start_page_frame_response_watchdog();
+    void clear_page_frame_response_watchdog();
+    void update_page_unresponsive_state();
 
     virtual Web::Clipboard::SystemClipboardItem clipboard_item() const;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
@@ -755,8 +762,18 @@ protected:
         // Set while the compositor decides whether it consumes the event, forwards it or hands it back. A compositor
         // that dies forwards none of the events still marked this way.
         bool routed_through_compositor { false };
+        i64 enqueued_at_ms { 0 };
+        bool watches_page_response { false };
     };
     Vector<PendingInputEvent> m_pending_input_events;
+    RefPtr<Core::Timer> m_input_response_timer;
+    i64 m_input_response_deadline_ms { 0 };
+    RefPtr<Core::Timer> m_page_frame_response_timer;
+    i64 m_page_frame_response_deadline_ms { 0 };
+    bool m_input_page_unresponsive { false };
+    bool m_frame_page_unresponsive { false };
+    int m_unresponsive_frame_process_id { 0 };
+    bool m_page_unresponsive { false };
     u64 m_next_input_event_id { 1 };
     bool m_debugger_is_attached { false };
     bool m_debugger_paused { false };
