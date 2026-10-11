@@ -34,6 +34,11 @@ impl SlowPathControl {
     pub fn dispatch_at(pc: u32) -> Self {
         Self(i64::from(pc))
     }
+
+    /// Whether the interpreter continues in the frame that called the slow path.
+    pub fn continues_in_frame(self) -> bool {
+        self.0 >= 0 && self.0 & (1 << Self::SAME_FRAME_BIT) != 0
+    }
 }
 
 /// The control word and the primary output of a slow path that receives its operands in registers, returned in two
@@ -90,4 +95,4 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/runtime_functions.rs"));
 }
 
-pub use generated::{RUNTIME_FUNCTION_SYMBOLS, RuntimeFunctions};
+pub use generated::{RUNTIME_FUNCTION_SYMBOLS, RuntimeFunctions, runtime_function_addresses};

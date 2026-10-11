@@ -28,6 +28,10 @@
 #include <LibWebView/DownloadStore.h>
 #include <LibWebView/FileDownloader.h>
 
+#if defined(AK_OS_MACOS)
+#    include <sys/xattr.h>
+#endif
+
 namespace WebView {
 
 struct FileDownloader::Segment {
@@ -99,6 +103,8 @@ struct FileDownloader::ActiveDownload {
     DownloadRangeSupport range_support;
     bool segmentation_abandoned { false };
     bool restored_from_disk { false };
+    // Whether the user chose to replace a file at the destination.
+    bool may_replace_destination { false };
 
     u8 restart_count { 0 };
     u64 last_request_generation { 0 };
@@ -128,6 +134,18 @@ Optional<double> FileDownloader::Download::progress() const
 FileDownloader::FileDownloader() = default;
 FileDownloader::~FileDownloader() = default;
 
+// The operating system checks a downloaded file before it is first opened, as long as the file carries the mark that
+// browsers give their downloads.
+static void mark_as_downloaded([[maybe_unused]] Core::File& file)
+{
+#if defined(AK_OS_MACOS)
+    // NB: These are the quarantine flags other browsers set, and the time of the download in hexadecimal seconds.
+    auto quarantine = ByteString::formatted("0083;{:08x};Ladybird;", UnixDateTime::now().seconds_since_epoch());
+    if (::fsetxattr(file.fd(), "com.apple.quarantine", quarantine.characters(), quarantine.length(), 0, 0) < 0)
+        dbgln("Unable to quarantine a download: {}", Error::from_errno(errno));
+#endif
+}
+
 static LexicalPath temporary_destination_for(LexicalPath const& destination, u64 download_id)
 {
     auto suffix = ByteString::formatted(".{}.{}.download", download_id, generate_random_uuid());
@@ -156,9 +174,9 @@ static String status_to_error_string(Optional<Requests::NetworkError> const& net
     return MUST(String::formatted("Received error response code {} while downloading file", *response_code));
 }
 
-u64 FileDownloader::download_file(IsPrivate is_private, URL::URL const& url, LexicalPath destination)
+u64 FileDownloader::download_file(IsPrivate is_private, URL::URL const& url, LexicalPath destination, MayReplaceDestination may_replace_destination)
 {
-    auto download_id = start_download(is_private, url, move(destination));
+    auto download_id = start_download(is_private, url, move(destination), {}, may_replace_destination);
     auto* active = active_download(download_id);
     if (!active)
         return download_id;
@@ -852,7 +870,7 @@ void FileDownloader::restart_download_from_zero(u64 download_id, String reason_i
     start_download_request(download_id, active->effective_url);
 }
 
-u64 FileDownloader::start_download(IsPrivate is_private, URL::URL const& url, LexicalPath destination, Optional<u64> total_size)
+u64 FileDownloader::start_download(IsPrivate is_private, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, MayReplaceDestination may_replace_destination)
 {
     auto download_id = m_next_download_id++;
 
@@ -876,8 +894,11 @@ u64 FileDownloader::start_download(IsPrivate is_private, URL::URL const& url, Le
         return download_id;
     }
     auto file = file_or_error.release_value();
+    mark_as_downloaded(*file);
 
-    m_active_downloads.set(download_id, make<ActiveDownload>(move(file), temporary_destination));
+    auto active = make<ActiveDownload>(move(file), temporary_destination);
+    active->may_replace_destination = may_replace_destination == MayReplaceDestination::Yes;
+    m_active_downloads.set(download_id, move(active));
 
     return download_id;
 }
@@ -1046,6 +1067,27 @@ void FileDownloader::stop_segment_request(ActiveDownload& active, size_t segment
     ++segment.request_generation;
 }
 
+// A file that appeared at the destination while the download ran is not the download's to replace, so the download
+// takes the first free numbered name beside it instead.
+static ErrorOr<void> move_to_destination(FileDownloader::Download& download, LexicalPath const& temporary_destination, bool may_replace_destination)
+{
+    if (may_replace_destination)
+        return FileSystem::move_file(download.destination.string(), temporary_destination.string());
+
+    auto destination = download.destination;
+    for (u64 index = 1;; ++index) {
+        auto result = FileSystem::rename_without_replacing(destination.string(), temporary_destination.string());
+        if (!result.is_error()) {
+            download.destination = move(destination);
+            return {};
+        }
+        if (!result.error().is_errno() || result.error().code() != EEXIST)
+            return result.release_error();
+        auto numbered_filename = Web::numbered_download_filename(download.destination.basename(), index);
+        destination = LexicalPath::join(download.destination.dirname(), numbered_filename.view());
+    }
+}
+
 void FileDownloader::finish_download(u64 id)
 {
     auto* download = mutable_download_or_null(id);
@@ -1060,7 +1102,7 @@ void FileDownloader::finish_download(u64 id)
 
     active->file = nullptr;
 
-    if (auto result = FileSystem::move_file(download->destination.string(), active->temporary_destination.string()); result.is_error()) {
+    if (auto result = move_to_destination(*download, active->temporary_destination, active->may_replace_destination); result.is_error()) {
         fail_download(id, MUST(String::formatted("Unable to save downloaded file: {}", result.error())));
         return;
     }
@@ -1127,6 +1169,8 @@ void FileDownloader::resume_download(u64 id)
         }
 
         active->file = file_or_error.release_value();
+        // NB: The file may come from a build that did not mark downloads, or have been created anew by opening it.
+        mark_as_downloaded(*active->file);
         active->file_offset = {};
     }
 
@@ -1251,6 +1295,7 @@ void FileDownloader::persist_download_snapshot(u64 id, PersistUrgency urgency)
         .segments = {},
         .created_time = active->created_time,
         .can_restart_from_zero = active->can_restart_from_zero,
+        .may_replace_destination = active->may_replace_destination,
     };
 
     record.segments.ensure_capacity(active->segments.size());
@@ -1348,6 +1393,7 @@ bool FileDownloader::restore_persisted_download(DownloadRecord& record)
     active->effective_url = effective_url.release_value();
     active->can_issue_own_requests = true;
     active->can_restart_from_zero = record.can_restart_from_zero;
+    active->may_replace_destination = record.may_replace_destination;
     active->created_time = record.created_time;
     active->restored_from_disk = true;
     active->range_support.supports_ranges = true;
@@ -1496,21 +1542,21 @@ void FileDownloader::cancel_unresumable_downloads()
         cancel_download(id);
 }
 
-void FileDownloader::cancel_private_downloads()
+// A private session leaves no record of its downloads behind for the next one.
+void FileDownloader::discard_private_downloads()
 {
     for (size_t i = m_downloads.size(); i > 0; --i) {
         auto const& download = m_downloads[i - 1];
 
-        if (!status_is_active(download.status))
-            continue;
         if (download.is_private == IsPrivate::No)
             continue;
 
         auto id = download.id;
-        cancel_download(id);
+        if (status_is_active(download.status))
+            cancel_download(id);
 
         m_downloads.remove(i - 1);
-        notify_download_removed(id);
+        notify_download_removed(id, IsPrivate::Yes);
     }
 }
 
@@ -1544,31 +1590,46 @@ void FileDownloader::fail_download(u64 id, String error)
     notify_download_updated(*download);
 }
 
-Vector<u64> FileDownloader::prune_inactive_downloads()
+Vector<FileDownloader::Download> FileDownloader::downloads_of_session(IsPrivate is_private) const
 {
-    return remove_inactive_downloads_created_since(UnixDateTime::earliest());
+    Vector<Download> downloads;
+    for (auto const& download : m_downloads) {
+        if (download.is_private == is_private)
+            downloads.append(download);
+    }
+    return downloads;
 }
 
-Vector<u64> FileDownloader::remove_inactive_downloads_created_since(UnixDateTime since)
+Vector<u64> FileDownloader::prune_inactive_downloads(IsPrivate is_private)
+{
+    return remove_inactive_downloads_created_since(UnixDateTime::earliest(), is_private);
+}
+
+Vector<u64> FileDownloader::remove_inactive_downloads_created_since(UnixDateTime since, Optional<IsPrivate> only_of_session)
 {
     Vector<u64> removed_download_ids;
+    Vector<IsPrivate> removed_download_sessions;
 
     for (size_t i = m_downloads.size(); i > 0; --i) {
         auto const index = i - 1;
         auto const id = m_downloads[index].id;
+        auto const is_private = m_downloads[index].is_private;
         if (status_is_active(m_downloads[index].status))
             continue;
         if (m_downloads[index].created_time < since)
+            continue;
+        if (only_of_session.has_value() && is_private != *only_of_session)
             continue;
 
         forget_persisted_download(id);
         m_active_downloads.remove(id);
         m_downloads.remove(index);
         removed_download_ids.append(id);
+        removed_download_sessions.append(is_private);
     }
 
-    for (auto id : removed_download_ids)
-        notify_download_removed(id);
+    for (size_t i = 0; i < removed_download_ids.size(); ++i)
+        notify_download_removed(removed_download_ids[i], removed_download_sessions[i]);
 
     return removed_download_ids;
 }
@@ -1585,10 +1646,10 @@ void FileDownloader::notify_download_updated(Download const& download)
         observer.download_updated(download);
 }
 
-void FileDownloader::notify_download_removed(u64 id)
+void FileDownloader::notify_download_removed(u64 id, IsPrivate is_private)
 {
     for (auto& observer : m_observers)
-        observer.download_removed(id);
+        observer.download_removed(id, is_private);
 }
 
 void FileDownloader::add_observer(Badge<FileDownloaderObserver>, FileDownloaderObserver& observer)

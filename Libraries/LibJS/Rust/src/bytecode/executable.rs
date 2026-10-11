@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
@@ -18,6 +18,7 @@ use crate::bytecode::constant::{AbstractOperationKind, WellKnownSymbolKind};
 use crate::bytecode::encoding::{IdentifierTableIndex, PropertyKeyTableIndex, StringTableIndex};
 use crate::bytecode::executable_data::ExecutableCacheCounts as FrontendExecutableCacheCounts;
 use crate::bytecode::executable_data::ExecutableData;
+use crate::bytecode::feedback::{ExecutableFeedback, FeedbackSlotCounts};
 use crate::bytecode::generator::{ConstantValue, ExceptionHandler};
 use crate::bytecode::generator::{LocalVariable, PendingClassBlueprint};
 use crate::bytecode_cache::{DecodedBytecodeBytes, DecodedExecutableRecord};
@@ -27,9 +28,12 @@ use crate::gc::heap::cell_is_dead;
 use crate::gc::root::MarkedVec;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
+use crate::jit::InterpreterTier;
+use crate::jit::code::ExecutableJitState;
 use crate::layout::buffer::InterpreterBuffer;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::executable::ExecutableHead;
+use crate::layout::feedback::ExecutableFeedbackHead;
 use crate::layout::object::Object;
 use crate::layout::property_lookup_cache::KeyedPropertyLookupCacheEntryLayout;
 pub use crate::layout::property_lookup_cache::{
@@ -113,7 +117,8 @@ impl PropertyLookupCacheEntryData {
             }
             PropertyLookupCacheEntryType::ChangeOwnProperty
             | PropertyLookupCacheEntryType::GetOwnProperty
-            | PropertyLookupCacheEntryType::GetMissingProperty => self.shape == other.shape,
+            | PropertyLookupCacheEntryType::GetMissingProperty
+            | PropertyLookupCacheEntryType::MissingOwnProperty => self.shape == other.shape,
             PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain
             | PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
                 self.shape == other.shape && self.prototype == other.prototype
@@ -148,6 +153,7 @@ impl PropertyLookupCacheEntry {
             prototype: Cell::new(data.prototype),
             prototype_chain_validity: Cell::new(data.prototype_chain_validity),
             key: Cell::new(data.key),
+            accessor: Cell::new(None),
         }
     }
 
@@ -167,6 +173,7 @@ impl PropertyLookupCacheEntry {
     }
 
     pub fn set(&self, data: PropertyLookupCacheEntryData) {
+        self.accessor.set(None);
         self.entry_type.set(data.entry_type);
         self.property_offset.set(data.property_offset);
         self.shape_dictionary_generation.set(data.shape_dictionary_generation);
@@ -183,6 +190,9 @@ impl PropertyLookupCacheEntry {
     fn clear_if_it_has_a_dead_cell(&self) {
         if self.get().has_dead_cell() {
             self.set(PropertyLookupCacheEntryData::default());
+        }
+        if self.accessor.get().is_some_and(cell_is_dead) {
+            self.accessor.set(None);
         }
     }
 }
@@ -202,10 +212,19 @@ pub const MEGAMORPHIC_SECONDARY_CACHE_SIZE: usize = 1 << MEGAMORPHIC_INDEX_BITS;
 /// Fibonacci hashing (see megamorphic_hash()).
 pub const MEGAMORPHIC_HASH_MULTIPLIER: u32 = 0x9e37_79b9;
 const POLYMORPHIC_DATA_TAG: usize = PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG;
-const MEGAMORPHIC_DATA_TAG: usize = 2;
+pub const MEGAMORPHIC_DATA_TAG: usize = 2;
 /// How many (shape, key) pairs a megamorphic cache of a keyed access may miss and learn before it gives up (see
 /// PropertyLookupCache::is_keyed_generic()).
 const MAX_KEYED_MEGAMORPHIC_MISSES: u32 = 1024;
+
+/// Which tier a property lookup cache is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropertyLookupCacheTier {
+    Empty,
+    Monomorphic,
+    Polymorphic,
+    Megamorphic,
+}
 
 const _: () = assert!(MEGAMORPHIC_PRIMARY_CACHE_SIZE.is_power_of_two());
 const _: () = assert!(MEGAMORPHIC_SECONDARY_CACHE_SIZE.is_power_of_two());
@@ -238,6 +257,10 @@ const _: () = assert!(align_of::<MegamorphicData>() > PROPERTY_LOOKUP_CACHE_DATA
 const _: () = assert!(core::mem::offset_of!(MonomorphicData, entry) == 0);
 const _: () = assert!(core::mem::offset_of!(PolymorphicData, entries) == 0);
 const _: () = assert!(core::mem::offset_of!(MegamorphicData, entry) == 0);
+
+/// Where the hash tables of a megamorphic cache's data are, for JIT code that probes them.
+pub const MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET: usize = core::mem::offset_of!(MegamorphicData, primary_entries);
+pub const MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET: usize = core::mem::offset_of!(MegamorphicData, secondary_entries);
 
 /// Fibonacci hashing of the low 32 bits of the shape pointer, mixed with the key of keyed caches: the indices are the
 /// top bits of the product, which takes a multiply and a shift.
@@ -338,7 +361,24 @@ impl PropertyLookupCache {
         None
     }
 
-    fn entries(&self) -> &[PropertyLookupCacheEntry] {
+    pub fn tier(&self) -> PropertyLookupCacheTier {
+        let data = self.data.get();
+        if data == 0 {
+            return PropertyLookupCacheTier::Empty;
+        }
+        if self.is_keyed_generic() {
+            return PropertyLookupCacheTier::Megamorphic;
+        }
+        match data & PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK {
+            POLYMORPHIC_DATA_TAG => PropertyLookupCacheTier::Polymorphic,
+            MEGAMORPHIC_DATA_TAG => PropertyLookupCacheTier::Megamorphic,
+            _ => PropertyLookupCacheTier::Monomorphic,
+        }
+    }
+
+    /// The entries the interpreter looks through: every entry of a polymorphic cache, and the most recently used one
+    /// of the others.
+    pub fn entries(&self) -> &[PropertyLookupCacheEntry] {
         if let Some(data) = self.monomorphic_data() {
             return core::slice::from_ref(&data.entry);
         }
@@ -699,6 +739,9 @@ define_static_property_lookup_cache_sites! {
     IteratorValueValue,
     ArrayAppendIteratorMethod,
     ArrayAppendNextMethod,
+    CreateArrayIteratorOwnIteratorMethod,
+    CreateArrayIteratorIteratorMethod,
+    CreateArrayIteratorNextMethod,
     ObjectPrototypeToStringToStringTag,
     ArrayFromIteratorMethod,
     ArraySpeciesCreateConstructor,
@@ -864,6 +907,18 @@ const _: () = {
 // NB: The interpreter compares the name of an entry with the identity of a string, a word.
 const _: () = assert!(size_of::<Option<Utf16FlyString>>() == size_of::<u64>());
 
+/// Where JIT code finds the parts of the VM's keyed property lookup cache it reads.
+pub struct KeyedPropertyLookupCacheLayout {
+    pub entries: u64,
+    pub index_bits: u32,
+    pub entry_size: u32,
+    pub entry_type: u32,
+    pub property_offset: u32,
+    pub shape_dictionary_generation: u32,
+    pub shape: u32,
+    pub property_name: u32,
+}
+
 /// The VM-wide cache of string-keyed GetByValue lookups. Lookups are copied out, so that no entry is borrowed while
 /// the lookup it caches runs.
 pub struct KeyedPropertyLookupCache {
@@ -887,6 +942,22 @@ impl KeyedPropertyLookupCache {
     pub fn entry_index_for(shape: Gc<Shape>, property_name: &Utf16FlyString) -> usize {
         let hash = (shape.as_ptr().addr() as u32) ^ (property_name.raw_identity() as u32);
         (hash.wrapping_mul(MEGAMORPHIC_HASH_MULTIPLIER) >> (32 - KEYED_PROPERTY_LOOKUP_CACHE_INDEX_BITS)) as usize
+    }
+
+    /// Where JIT code finds the entries and their parts. The entries stay where they are for as long as the VM lives.
+    pub fn jit_layout(&self) -> KeyedPropertyLookupCacheLayout {
+        use core::mem::offset_of;
+        let lookup = offset_of!(KeyedPropertyLookupCacheEntry, lookup);
+        KeyedPropertyLookupCacheLayout {
+            entries: self.entries.borrow().as_ptr() as u64,
+            index_bits: KEYED_PROPERTY_LOOKUP_CACHE_INDEX_BITS,
+            entry_size: size_of::<KeyedPropertyLookupCacheEntry>() as u32,
+            entry_type: (lookup + offset_of!(KeyedPropertyLookup, entry_type)) as u32,
+            property_offset: (lookup + offset_of!(KeyedPropertyLookup, property_offset)) as u32,
+            shape_dictionary_generation: (lookup + offset_of!(KeyedPropertyLookup, shape_dictionary_generation)) as u32,
+            shape: (lookup + offset_of!(KeyedPropertyLookup, shape)) as u32,
+            property_name: offset_of!(KeyedPropertyLookupCacheEntry, property_name) as u32,
+        }
     }
 
     /// The entries, for the interpreter, which looks up own data properties in them (see
@@ -1144,6 +1215,17 @@ pub struct Executable {
     template_object_caches: Box<[Gc<TemplateObjectCache>]>,
     object_shape_caches: Box<[ObjectShapeCache]>,
     object_property_iterator_caches: Box<[ObjectPropertyIteratorCache]>,
+    /// Which interpreter handlers the executable's frames run with, see `head.dispatch_table_index`.
+    interpreter_tier: Cell<InterpreterTier>,
+    /// How many feedback slots of each kind the bytecode indexes into.
+    feedback_slot_counts: FeedbackSlotCounts,
+    /// What the interpreter observed running the bytecode, for the optimizing JIT. Only executables that left the
+    /// plain tier collect feedback, so it is made when the executable first does.
+    feedback: OnceCell<ExecutableFeedback>,
+    /// Whether LIBJS_JIT=dump-feedback printed the executable's feedback already.
+    has_dumped_feedback: Cell<bool>,
+    /// The executable's JIT code and what its exits taught the JIT.
+    jit: ExecutableJitState,
     pub number_of_registers: u32,
     pub number_of_arguments: u32,
     pub is_strict_mode: bool,
@@ -1248,6 +1330,18 @@ impl Executable {
         self.template_object_caches[index as usize]
     }
 
+    pub fn property_lookup_caches(&self) -> &[PropertyLookupCache] {
+        &self.property_lookup_caches
+    }
+
+    pub fn global_variable_caches(&self) -> &[GlobalVariableCache] {
+        &self.global_variable_caches
+    }
+
+    pub fn object_shape_caches(&self) -> &[ObjectShapeCache] {
+        &self.object_shape_caches
+    }
+
     pub fn object_shape_cache(&self, index: u32) -> &ObjectShapeCache {
         &self.object_shape_caches[index as usize]
     }
@@ -1289,6 +1383,9 @@ impl Executable {
             if cache.shape.get().is_some_and(cell_is_dead) {
                 cache.shape.set(None);
             }
+        }
+        if let Some(feedback) = self.feedback() {
+            feedback.remove_dead_cells();
         }
     }
 
@@ -1349,6 +1446,12 @@ impl Executable {
             asm_constants_data: Cell::new(constants.as_ptr()),
             bytecode_data: Cell::new(bytecode.as_slice().as_ptr()),
             bytecode_size: Cell::new(bytecode.as_slice().len()),
+            // The VM picks the table when it registers the executable.
+            dispatch_table_index: Cell::new(InterpreterTier::Plain as u8),
+            feedback: ExecutableFeedbackHead::empty(),
+            tier_up_budget: Cell::new(i32::MAX),
+            jit_entry_slot: Cell::new(0),
+            jit_compile_state: Cell::new(0),
             constants: interpreter_buffer(&constants),
             property_lookup_caches: interpreter_buffer(&property_lookup_caches),
             global_variable_caches: interpreter_buffer(&global_variable_caches),
@@ -1370,6 +1473,11 @@ impl Executable {
             template_object_caches: Box::new([]),
             object_shape_caches: Box::new([]),
             object_property_iterator_caches: Box::new([]),
+            interpreter_tier: Cell::new(InterpreterTier::Plain),
+            feedback_slot_counts: FeedbackSlotCounts::default(),
+            feedback: OnceCell::new(),
+            has_dumped_feedback: Cell::new(false),
+            jit: ExecutableJitState::default(),
             number_of_registers,
             number_of_arguments,
             is_strict_mode,
@@ -1554,6 +1662,12 @@ impl Executable {
             parts.cache_counts.object_shape,
             parts.cache_counts.object_property_iterator,
         );
+        executable.feedback_slot_counts = FeedbackSlotCounts {
+            arith: parts.cache_counts.arith_feedback,
+            value: parts.cache_counts.value_feedback,
+            call: parts.cache_counts.call_feedback,
+            keyed: parts.cache_counts.keyed_feedback,
+        };
         executable.length_identifier = parts.length_identifier.map(PropertyKeyTableIndex);
         executable.source_map = parts.source_map.into_boxed_slice();
         executable.local_variable_metadata = parts
@@ -1796,6 +1910,59 @@ impl Executable {
 
     pub fn environment_coordinate_cache(&self, index: u32) -> &Cell<EnvironmentCoordinate> {
         &self.environment_coordinate_caches[index as usize]
+    }
+
+    pub fn interpreter_tier(&self) -> InterpreterTier {
+        self.interpreter_tier.get()
+    }
+
+    /// Moves the executable's frames to the handlers of `tier`, the next time the interpreter enters one of them.
+    pub fn set_interpreter_tier(&self, tier: InterpreterTier) {
+        if tier != InterpreterTier::Plain {
+            self.ensure_feedback();
+        }
+        self.interpreter_tier.set(tier);
+        self.head.dispatch_table_index.set(tier as u8);
+    }
+
+    /// Gives the executable its feedback arrays, if it has none yet, and points the interpreter at them.
+    pub fn ensure_feedback(&self) -> &ExecutableFeedback {
+        if let Some(feedback) = self.feedback.get() {
+            return feedback;
+        }
+        let feedback = ExecutableFeedback::new(self.feedback_slot_counts);
+        let head = &self.head.feedback;
+        let [arith, value_buckets, call, keyed] = feedback.array_offsets();
+        head.arith.set(arith);
+        head.value_buckets.set(value_buckets);
+        head.call.set(call);
+        head.keyed.set(keyed);
+        if self.feedback.set(feedback).is_err() {
+            unreachable!("the feedback is made once");
+        }
+        self.feedback.get().expect("the feedback was just made")
+    }
+
+    pub fn has_dumped_feedback(&self) -> bool {
+        self.has_dumped_feedback.get()
+    }
+
+    pub fn set_has_dumped_feedback(&self) {
+        self.has_dumped_feedback.set(true);
+    }
+
+    /// What the interpreter observed running the bytecode, indexed by the feedback slots of its instructions, if the
+    /// executable ever left the plain tier.
+    pub fn feedback(&self) -> Option<&ExecutableFeedback> {
+        self.feedback.get()
+    }
+
+    pub fn jit_state(&self) -> &ExecutableJitState {
+        &self.jit
+    }
+
+    pub fn environment_shape_cache_count(&self) -> u32 {
+        u32::try_from(self.environment_shape_caches.len()).expect("the cache count fits in u32")
     }
 
     pub fn environment_shape_cache(&self, index: u32) -> EnvironmentShapeCache {
@@ -2102,5 +2269,6 @@ unsafe impl Trace for Executable {
         self.template_object_caches.trace(visitor);
         self.shared_function_data.trace(visitor);
         self.class_blueprints.trace(visitor);
+        self.trace_jit_code(visitor);
     }
 }

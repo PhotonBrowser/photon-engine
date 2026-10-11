@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Debug.h>
 #include <AK/Error.h>
 #include <AK/NeverDestroyed.h>
@@ -16,6 +17,7 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/Timer.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibURL/Parser.h>
@@ -37,7 +39,7 @@
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/ViewImplementation.h>
-#include <LibWebView/WebContentTestClient.h>
+#include <LibWebView/WebContentClient.h>
 
 #include <cstdlib>
 
@@ -163,6 +165,8 @@ void ViewImplementation::set_url(URL::URL url)
     clear_page_response_watchdog();
     m_url = move(url);
     update_bookmark_action();
+    if (auto page = traversable().display_page(); page && page->routed_connection())
+        page->routed_connection()->update_audio_capture_permission();
 
     if (on_url_change)
         on_url_change(m_url);
@@ -671,6 +675,24 @@ void ViewImplementation::enqueue_webdriver_mouse_event(Badge<WebContentPage>, We
     enqueue_input_event(move(event));
 }
 
+// https://html.spec.whatwg.org/multipage/interaction.html#activation-triggering-input-event
+static bool is_activation_triggering_input_event(Web::InputEvent const& event)
+{
+    // An activation triggering input event is any event whose isTrusted attribute is true and whose type is one of:
+    // - "keydown", provided the key is neither the Esc key nor a shortcut key reserved by the user agent;
+    // - "mousedown";
+    // NB: The pointer and touch events of the rest of the list follow the mouse events the view delivers.
+    if (auto const* key_event = event.get_pointer<Web::KeyEvent>())
+        return key_event->type == Web::KeyEvent::Type::KeyDown && key_event->key != Web::UIEvents::KeyCode::Key_Escape;
+    if (auto const* mouse_event = event.get_pointer<Web::MouseEvent>())
+        return mouse_event->type == Web::MouseEvent::Type::MouseDown;
+    return false;
+}
+
+// A page busy for a while handles input late, and its activation counts from then. A page that never finishes handling
+// the input keeps the activation no longer than this.
+static constexpr auto longest_user_activation_delivery = AK::Duration::from_seconds(30);
+
 void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 {
     auto* key_event = event.get_pointer<Web::KeyEvent>();
@@ -717,6 +739,12 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         m_external_url_request_policy.allow_next_request();
     }
 
+    // The page the input goes to gains activation, and so does the page displaying the tab, which hosts the top-level
+    // traversable that is an ancestor of every navigable of the tab. A mouse event the page displaying the tab hands
+    // to a child frame goes to the page hosting that frame once it does. The input gives activation while the page
+    // handles it, and the pages keep it for the transient activation duration once the page finishes.
+    auto gives_user_activation = is_activation_triggering_input_event(event);
+
     if (mouse_event && mouse_event->type == Web::MouseEvent::Type::MouseWheel) {
         mouse_event->wheel_delta_x /= zoom_level();
         mouse_event->wheel_delta_y /= zoom_level();
@@ -746,9 +774,17 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
     m_pending_input_events.append({ move(event), page() });
 
     auto& pending = m_pending_input_events.last();
-    pending.enqueued_at_ms = MonotonicTime::now().milliseconds();
+    auto now = MonotonicTime::now();
+    pending.enqueued_at_ms = now.milliseconds();
     pending.watches_page_response = watches_page_response;
     update_input_response_watchdog();
+    if (gives_user_activation) {
+        pending.user_activation_time = now;
+        m_inputs_to_open_links_in_new_tabs.remove_all_matching([&](auto const& input) {
+            return now - input.delivered_at >= longest_user_activation_delivery;
+        });
+        m_inputs_to_open_links_in_new_tabs.append({ Web::input_event_id(pending.event), now });
+    }
     pending.event.visit(
         [&](Web::KeyEvent const& event) {
             auto& host = focused_navigable_host();
@@ -944,14 +980,24 @@ static bool is_history_traversal_key_event(Web::KeyEvent const& event)
     return event.modifiers == modifier || event.modifiers == (modifier | Web::UIEvents::Mod_Keypad);
 }
 
-void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, u64 event_id, Web::EventResult event_result)
+void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result)
 {
     // Adjacent events can be handled by different processes, which finish them in no particular order.
     auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
-    if (!index.has_value())
+    if (!index.has_value() || m_pending_input_events[*index].endpoint.ptr() != &reporting_page)
         return;
-    auto event = m_pending_input_events.take(*index).event;
+    auto pending = m_pending_input_events.take(*index);
+    auto event = move(pending.event);
     update_input_response_watchdog();
+
+    // The renderer's activation counts from when it handled the event, so the activation the event gives does too. An
+    // event the page dropped gives none, and opens no link.
+    if (event_result == Web::EventResult::Dropped) {
+        m_inputs_to_open_links_in_new_tabs.remove_all_matching([&](auto const& input) { return input.event_id == event_id; });
+    } else if (pending.user_activation_time.has_value()) {
+        page().give_user_activation();
+        pending.endpoint->give_user_activation();
+    }
 
     if (event_result == Web::EventResult::Handled || event_result == Web::EventResult::Cancelled)
         return;
@@ -975,11 +1021,60 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
         [](auto const&) {});
 }
 
-void ViewImplementation::did_forward_input_event(Badge<WebContentPage>, u64 event_id, WebContentPage& endpoint)
+void ViewImplementation::did_forward_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, WebContentPage& endpoint)
 {
     auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
+    if (!index.has_value() || m_pending_input_events[*index].endpoint.ptr() != &reporting_page)
+        return;
+    m_pending_input_events[*index].endpoint = endpoint;
+}
+
+// The earliest input the page has yet to finish handling that gives it user activation: input the page handles, or
+// input to the page displaying the tab, which hosts an ancestor of every navigable of the tab.
+Optional<size_t> ViewImplementation::index_of_input_in_flight_giving_user_activation_to(WebContentPage const& page) const
+{
+    auto now = MonotonicTime::now();
+    return m_pending_input_events.find_first_index_if([&](auto const& pending) {
+        return pending.user_activation_time.has_value()
+            && now - *pending.user_activation_time < longest_user_activation_delivery
+            && (pending.endpoint.ptr() == &page || &this->page() == &page);
+    });
+}
+
+bool ViewImplementation::is_delivering_user_activation_to(WebContentPage const& page) const
+{
+    return index_of_input_in_flight_giving_user_activation_to(page).has_value();
+}
+
+void ViewImplementation::consume_user_activation_of_input_in_flight_to(Badge<WebContentPage>, WebContentPage const& page)
+{
+    if (auto index = index_of_input_in_flight_giving_user_activation_to(page); index.has_value())
+        m_pending_input_events[*index].user_activation_time.clear();
+}
+
+// NB: A page handles its input in the order the view delivered it, so the earliest input to the page that the page has
+//     yet to finish is the input it is handling, if any.
+void ViewImplementation::consume_user_activation_of_input_handled_by(Badge<WebContentPage>, WebContentPage const& page)
+{
+    auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return pending.endpoint.ptr() == &page; });
     if (index.has_value())
-        m_pending_input_events[*index].endpoint = endpoint;
+        m_pending_input_events[*index].user_activation_time.clear();
+}
+
+bool ViewImplementation::take_input_to_open_link_in_new_tab(Badge<WebContentPage>)
+{
+    // NB: Automation lets a renderer synthesize the input that opens a link.
+    if (WebContentClient::renderers_may_synthesize_input())
+        return true;
+    // NB: Each press opens at most one link, the earliest press first, and only while a page could still be handling it.
+    auto now = MonotonicTime::now();
+    m_inputs_to_open_links_in_new_tabs.remove_all_matching([&](auto const& input) {
+        return now - input.delivered_at >= longest_user_activation_delivery;
+    });
+    if (m_inputs_to_open_links_in_new_tabs.is_empty())
+        return false;
+    m_inputs_to_open_links_in_new_tabs.remove(0);
+    return true;
 }
 
 void ViewImplementation::did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage& page)
@@ -991,9 +1086,11 @@ void ViewImplementation::did_lose_input_event_endpoint(Badge<WebContentClient>, 
 
 void ViewImplementation::did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id)
 {
-    // The compositor performed the default action itself, so there is no result to hand to the view.
+    // The compositor performed the default action itself, so there is no result to hand to the view, and the page got
+    // no input to open a link with.
     m_pending_input_events.remove_first_matching([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
     update_input_response_watchdog();
+    m_inputs_to_open_links_in_new_tabs.remove_all_matching([&](auto const& input) { return input.event_id == event_id; });
 }
 
 void ViewImplementation::did_detect_history_swipe_candidate(Badge<WebContentPage>, u64 gesture_id, bool back, float unconsumed_delta)
@@ -2178,7 +2275,9 @@ WebContentPage& ViewImplementation::focused_navigable_host() const
 
 void ViewImplementation::paste_from_clipboard()
 {
+    // The user asked the browser to paste, which lets the page read the clipboard.
     auto& host = focused_navigable_host();
+    host.give_user_activation();
     host.async_paste_from_clipboard();
 }
 
@@ -4340,7 +4439,11 @@ void ViewImplementation::download_context_menu_url(PromptForPath prompt_for_path
     if (download_path.is_error())
         return;
 
-    Application::the().file_downloader().download_file(is_private(), m_context_menu_url, download_path.release_value());
+    // NB: A file at a path the user chose was there when the user chose to replace it, as saving asks before replacing.
+    auto may_replace_destination = prompt_for_path == PromptForPath::Yes && FileSystem::exists(download_path.value().string())
+        ? FileDownloader::MayReplaceDestination::Yes
+        : FileDownloader::MayReplaceDestination::No;
+    Application::the().file_downloader().download_file(is_private(), m_context_menu_url, download_path.release_value(), may_replace_destination);
 }
 
 void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap)

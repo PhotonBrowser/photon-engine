@@ -6,8 +6,8 @@ $fd650eed destructure-array-rest.js:9:1
 
 block0:
   [   0] Enter
-  [   8] GetGlobal dst:reg6, `f`
-  [  18] Call dst:reg5, callee:reg6, this_value:Undefined, f
+  [   8] GetGlobal value_feedback:0, dst:reg6, `f`
+  [  18] Call value_feedback:1, call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined, f
   [  38] End value:reg5
 
 
@@ -47,7 +47,7 @@ block4:
 
 block5:
   [  b8] IteratorNextUnpack dst_value:reg12, dst_done:reg6, iterator_object:reg7, iterator_next:reg8, iterator_done:reg9
-  [  d0] JumpTrue condition:reg6, target:block4
+  [  d0] JumpTrueLoop condition:reg6, target:block4
 
 block6:
   [  e0] Mov dst:a~0, src:reg12
@@ -71,13 +71,13 @@ block11:
 
 block12:
   [ 158] IteratorClose iterator_object:reg7, iterator_next:reg8, iterator_done:reg9, completion_value:Undefined
-  [ 170] Jump target:block11
+  [ 170] JumpLoop target:block11
 
 block13:
-  [ 178] JumpStrictlyEqualsRhsInt32 lhs:reg10, rhs:1, true_target:block15, false_target:block16
+  [ 178] JumpStrictlyEqualsRhsInt32 arith_feedback:0, lhs:reg10, rhs:1, true_target:block15, false_target:block16
 
 block14:
-  [ 190] JumpStrictlyEqualsRhsInt32 lhs:reg10, rhs:2, true_target:block17, false_target:block18
+  [ 190] JumpStrictlyEqualsRhsInt32 arith_feedback:1, lhs:reg10, rhs:2, true_target:block17, false_target:block18
 
 block15:
   [ 1a8] IteratorClose iterator_object:reg7, iterator_next:reg8, iterator_done:reg9, completion_value:reg11
@@ -85,7 +85,7 @@ block15:
 
 block16:
   [ 1c8] IteratorClose iterator_object:reg7, iterator_next:reg8, iterator_done:reg9, completion_value:Undefined
-  [ 1e0] Jump target:block14
+  [ 1e0] JumpLoop target:block14
 
 block17:
   [ 1e8] Return value:reg11

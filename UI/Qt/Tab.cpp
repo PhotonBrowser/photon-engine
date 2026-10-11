@@ -871,6 +871,11 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
         }
         if (m_external_url_confirmation_dialog)
             m_external_url_confirmation_dialog->close();
+        auto pending_permission_requests = AK::move(m_pending_permission_requests);
+        for (auto& it : pending_permission_requests) {
+            if (it.value.dialog)
+                it.value.dialog->close();
+        }
     };
 
     view().on_request_external_url_confirmation = [this](auto const& url, auto const& initiator_origin, auto const& handler, auto on_complete) {
@@ -903,6 +908,40 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
             if (m_external_url_confirmation_dialog == dialog)
                 m_external_url_confirmation_dialog = nullptr;
             on_complete(accepted);
+        });
+
+        dialog->open();
+    };
+
+    view().on_request_permission = [this](auto const& name, auto const& origin, auto on_decided) {
+        auto requester = origin.is_opaque() ? "this page"_string : origin.serialize();
+        auto question = MUST(String::formatted("Allow {} to use your {}?", requester, name));
+        if (auto pending = m_pending_permission_requests.get(question); pending.has_value()) {
+            pending.value().on_decided.append(AK::move(on_decided));
+            return;
+        }
+
+        auto* dialog = new QMessageBox(&view());
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setIcon(QMessageBox::Icon::Question);
+        dialog->setWindowTitle("Ladybird");
+        dialog->setTextFormat(Qt::PlainText);
+        dialog->setText(qstring_from_ak_string(question));
+        auto* allow_button = dialog->addButton("Allow", QMessageBox::ButtonRole::AcceptRole);
+        auto* block_button = dialog->addButton("Block", QMessageBox::ButtonRole::RejectRole);
+        dialog->setDefaultButton(block_button);
+
+        PendingPermissionRequests pending { .dialog = dialog, .on_decided = {} };
+        pending.on_decided.append(AK::move(on_decided));
+        m_pending_permission_requests.set(question, AK::move(pending));
+
+        QObject::connect(dialog, &QDialog::finished, this, [this, dialog = QPointer<QMessageBox> { dialog }, allow_button, question](auto) {
+            auto pending = m_pending_permission_requests.take(question);
+            if (!pending.has_value())
+                return;
+            auto granted = dialog && dialog->clickedButton() == allow_button;
+            for (auto& on_decided : pending.value().on_decided)
+                on_decided(granted);
         });
 
         dialog->open();
@@ -1427,7 +1466,7 @@ void Tab::update_downloads_button()
     if (!m_downloads_button)
         return;
 
-    auto downloads = WebView::Application::the().file_downloader().downloads();
+    auto downloads = WebView::Application::the().file_downloader().downloads_of_session(m_window->is_private());
     auto button_state = WebView::downloads_button_state(downloads);
 
     m_downloads_button->setVisible(button_state.has_downloads);
@@ -1461,7 +1500,7 @@ void Tab::update_downloads_popover()
     if (!m_downloads_popover || !m_downloads_popover->isVisible())
         return;
 
-    if (m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads()))
+    if (m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads_of_session(m_window->is_private())))
         position_downloads_popover();
 }
 
@@ -1494,7 +1533,7 @@ void Tab::show_downloads_popover()
     }
 
     m_downloads_popover->update_chrome_style(palette());
-    (void)m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads());
+    (void)m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads_of_session(m_window->is_private()));
     position_downloads_popover();
     m_downloads_popover->show();
     position_downloads_popover();
@@ -1518,8 +1557,11 @@ void Tab::position_downloads_popover()
     move_popover_below(*m_downloads_popover, *m_downloads_button);
 }
 
-void Tab::download_added(WebView::FileDownloader::Download const&)
+void Tab::download_added(WebView::FileDownloader::Download const& download)
 {
+    // NB: A window lists the downloads of its own browsing session only.
+    if (download.is_private != m_window->is_private())
+        return;
     update_downloads_button();
     if (Application::the().active_tab() == this && m_window->isActiveWindow()) {
         show_downloads_popover();
@@ -1528,14 +1570,18 @@ void Tab::download_added(WebView::FileDownloader::Download const&)
     update_downloads_popover();
 }
 
-void Tab::download_updated(WebView::FileDownloader::Download const&)
+void Tab::download_updated(WebView::FileDownloader::Download const& download)
 {
+    if (download.is_private != m_window->is_private())
+        return;
     update_downloads_button();
     update_downloads_popover();
 }
 
-void Tab::download_removed(u64)
+void Tab::download_removed(u64, WebView::IsPrivate is_private)
 {
+    if (is_private != m_window->is_private())
+        return;
     update_downloads_button();
     update_downloads_popover();
 }

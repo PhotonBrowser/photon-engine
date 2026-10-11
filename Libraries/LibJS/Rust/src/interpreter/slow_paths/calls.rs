@@ -15,15 +15,18 @@ use crate::bytecode::property_access::Strict;
 use crate::interpreter::runtime_functions::{
     SlowPathControl, asm_try, handle_asm_exception, unimplemented_runtime_function,
 };
+use crate::interpreter::slow_paths::feedback;
 use crate::interpreter::vm::{EvalMode, Vm};
-use crate::layout::cell::Gc;
+use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::execution_context::ExecutionContext;
+use crate::layout::feedback::CallFeedbackForwarding;
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{
     self, CallerMode, create_mapped_arguments_object, create_unmapped_arguments_object, function_object_as_object,
     get_prototype_from_constructor, get_this_environment, length_of_array_like, perform_eval,
 };
 use crate::runtime::array::Array;
+use crate::runtime::bound_function::BoundFunction;
 use crate::runtime::class_construction::construct_class;
 use crate::runtime::class_field_definition::ClassElementName;
 use crate::runtime::completion::{Must, ThrowCompletionOr};
@@ -47,7 +50,7 @@ use crate::utf16::Utf16Display;
 
 /// Op::CallType: how a call instruction calls its callee.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CallType {
+pub(crate) enum CallType {
     Call,
     Construct,
     DirectEval,
@@ -88,7 +91,7 @@ fn as_array_exotic_object(value: Value) -> Gc<Array> {
 }
 
 /// Throws a new error and hands it to the interpreter, the ASM_TRY of a throw completion.
-fn throw_error(
+pub(crate) fn throw_error(
     vm: &Vm,
     pc: u32,
     kind: ErrorKind,
@@ -237,7 +240,7 @@ fn throw_type_error_for_asm_callee(
     vm.throw_completion(ErrorKind::TypeError, ErrorType::IsNotA, &[&callee, &callee_type])
 }
 
-fn throw_if_needed_for_asm_call(
+pub(crate) fn throw_if_needed_for_asm_call(
     vm: &Vm,
     callee: Value,
     call_type: CallType,
@@ -283,7 +286,7 @@ fn copy_arguments_into_callee_context(callee_context: &ExecutionContext, argumen
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn execute_asm_call(
+pub(crate) fn execute_asm_call(
     call_type: CallType,
     vm: &Vm,
     callee: Value,
@@ -346,9 +349,25 @@ pub fn call(
     values: &mut op::CallValues,
     arguments: &[Value],
 ) -> SlowPathControl {
+    if values.callee.is_object()
+        && let Some(bound) = values.callee.as_object().downcast::<BoundFunction>()
+    {
+        let target = Value::from_object(bound.bound_target_function()).as_cell();
+        let argument_count = bound.bound_arguments_count() + arguments.len();
+        feedback::record_forwarded_call(
+            vm,
+            vm.running_execution_context_ref(),
+            pc,
+            values.callee.as_cell(),
+            target,
+            CallFeedbackForwarding::Bound,
+            argument_count,
+        );
+    }
     if let Some(builtin) = value_as_native_javascript_backed_function(values.callee)
         && let Some(executable) = builtin.inline_call_executable(vm)
     {
+        record_callback(vm, vm.running_execution_context_ref(), pc, builtin, arguments);
         // NB: Stack traces show the caller at its program counter.
         vm.running_execution_context_ref().program_counter.set(pc);
         if vm
@@ -356,6 +375,7 @@ pub fn call(
                 builtin,
                 executable,
                 arguments,
+                argument_count_of(arguments.len()),
                 pc + instruction.length(),
                 instruction.dst.0,
                 values.this_value,
@@ -1019,8 +1039,32 @@ pub fn super_call_with_argument_array(
     SlowPathControl::continue_at(pc + op::SuperCallWithArgumentArray::LENGTH)
 }
 
+/// Records the function a call of a builtin written in JavaScript passes it as its first argument, which the builtins
+/// that take callbacks call back, as the call site's forwarded call.
+pub(crate) fn record_callback(
+    vm: &Vm,
+    frame: &ExecutionContext,
+    pc: u32,
+    builtin: Gc<NativeJavaScriptBackedFunction>,
+    arguments: &[Value],
+) {
+    let Some(callback) = arguments.first().filter(|callback| callback.is_function()) else {
+        return;
+    };
+    feedback::record_forwarded_call(
+        vm,
+        frame,
+        pc,
+        // SAFETY: Every cell starts with a cell header.
+        unsafe { Gc::<CellHeader>::from_non_null(builtin.as_non_null().cast()) },
+        callback.as_cell(),
+        CallFeedbackForwarding::Callback,
+        0,
+    );
+}
+
 /// `value` as a builtin written in JavaScript, if it is one.
-fn value_as_native_javascript_backed_function(value: Value) -> Option<Gc<NativeJavaScriptBackedFunction>> {
+pub(crate) fn value_as_native_javascript_backed_function(value: Value) -> Option<Gc<NativeJavaScriptBackedFunction>> {
     if !value.is_object() {
         return None;
     }
@@ -1135,6 +1179,13 @@ pub fn create_arguments(
     let arguments_object = if instruction.kind == ArgumentsKind::Mapped as u32 {
         let ecmascript_function =
             as_ecmascript_function_object(function).expect("only ECMAScript functions have mapped arguments objects");
+        // NB: The bytecode leaves creating the bindings of the parameters that a mapped arguments object aliases to it,
+        //     which makes them all at once in the function environment, in the order of the parameters.
+        if instruction.creates_parameter_bindings {
+            for name in ecmascript_function.parameter_binding_names().iter() {
+                environment.create_mutable_binding(vm, name, false).must();
+            }
+        }
         create_mapped_arguments_object(
             vm,
             function,

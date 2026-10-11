@@ -11,8 +11,8 @@
 #include <AK/Function.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Vector.h>
+#include <LibAudio/SpscAudioFrameRing.h>
 #include <LibCore/Forward.h>
-#include <LibMedia/Audio/SpscAudioFrameRing.h>
 #include <LibWeb/WebAudio/Rendering/RenderNode.h>
 
 namespace Web::WebAudio::Rendering {
@@ -20,12 +20,12 @@ namespace Web::WebAudio::Rendering {
 // The render thread only touches the ring and pending flag; the control thread owns the drain
 // callback so its captured GC roots never cross threads.
 struct MediaStreamDestinationSharedState final : public AtomicRefCounted<MediaStreamDestinationSharedState> {
-    explicit MediaStreamDestinationSharedState(NonnullRefPtr<Media::SpscAudioFrameRing> ring)
+    explicit MediaStreamDestinationSharedState(NonnullRefPtr<Audio::SpscAudioFrameRing> ring)
         : ring(move(ring))
     {
     }
 
-    NonnullRefPtr<Media::SpscAudioFrameRing> ring;
+    NonnullRefPtr<Audio::SpscAudioFrameRing> ring;
 
     // Set by the rendering thread when it schedules a drain on the control thread and cleared
     // by the control thread when the drain runs, coalescing the notifications down to one

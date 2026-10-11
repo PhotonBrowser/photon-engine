@@ -174,28 +174,54 @@ fn main() {
 
     let interpreter_source_text = fs::read_to_string(&interpreter_source).expect("read interpreter.flap");
     let interpreter_source_name = interpreter_source.display().to_string();
-    let compiler = interpreter_compiler(&target);
-    let prepared = compiler
-        .prepare(flapc::CompilationUnit {
-            source: flapc::SourceInput {
-                name: &interpreter_source_name,
-                contents: &interpreter_source_text,
-            },
-            constants: Some(flapc::SourceInput {
-                name: "layout.conf",
-                contents: &layout.text,
-            }),
-        })
-        .unwrap_or_else(|error| panic!("flapc failed to compile the interpreter:\n{error}"));
-    let functions = compiler
-        .runtime_functions(&prepared)
-        .unwrap_or_else(|error| panic!("flapc could not list the interpreter's runtime functions:\n{error}"));
-    let assembly = compiler
-        .compile_prepared(&prepared)
-        .unwrap_or_else(|error| panic!("flapc failed to compile the interpreter:\n{error}"));
-
+    // The interpreter is built twice from interpreter.flap: the plain variant, and a profiling variant whose
+    // @profiling inline functions collect feedback for the optimizing JIT. Executables pick the variant their frames
+    // run with through their dispatch tables, so both are linked in, and the runtime defines every function either
+    // of them calls. Without the JIT, only the plain variant is assembled, but the runtime still defines the
+    // functions of both, so that its interface with the interpreter is the same in every build.
+    let jit = env::var_os("CARGO_FEATURE_JIT").is_some();
+    let source = || flapc::CompilationUnit {
+        source: flapc::SourceInput {
+            name: &interpreter_source_name,
+            contents: &interpreter_source_text,
+        },
+        constants: Some(flapc::SourceInput {
+            name: "layout.conf",
+            contents: &layout.text,
+        }),
+    };
+    let mut functions: Vec<flapc::runtime_interface::RuntimeFunction> = Vec::new();
+    let mut assemblies = Vec::new();
+    for profiling in [false, true] {
+        let compiler = interpreter_compiler(&target, profiling);
+        let prepared = compiler
+            .prepare(source())
+            .unwrap_or_else(|error| panic!("flapc failed to compile the interpreter:\n{error}"));
+        let variant_functions = compiler
+            .runtime_functions(&prepared)
+            .unwrap_or_else(|error| panic!("flapc could not list the interpreter's runtime functions:\n{error}"));
+        for function in variant_functions {
+            match functions.iter().find(|existing| existing.symbol == function.symbol) {
+                Some(existing) => assert!(
+                    *existing == function,
+                    "the interpreter variants call {} in different ways",
+                    function.symbol
+                ),
+                None => functions.push(function),
+            }
+        }
+        if profiling && !jit {
+            continue;
+        }
+        let assembly = compiler
+            .compile_prepared(&prepared)
+            .unwrap_or_else(|error| panic!("flapc failed to compile the interpreter:\n{error}"));
+        assemblies.push((profiling, assembly));
+    }
     let instructions = flapc::metadata::parse_flap_metadata(&interpreter_source_name, &interpreter_source_text)
         .unwrap_or_else(|error| panic!("parse the interpreter's bytecode definitions: {error}"));
+    add_jit_only_slow_paths(&target, &instructions, &mut functions);
+    functions.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     let instructions_with_values = functions
         .iter()
         .filter_map(|function| match &function.kind {
@@ -213,12 +239,62 @@ fn main() {
         &runtime_functions::generate(&functions, &instructions),
     );
 
-    let assembly_path = output_directory.join("interpreter.S");
-    write_if_changed(&assembly_path, assembly.as_str());
-    assemble_interpreter(&target, &assembly_path);
+    let assembly_paths = assemblies
+        .iter()
+        .map(|(profiling, assembly)| {
+            let file_name = if *profiling {
+                "interpreter_profiling.S"
+            } else {
+                "interpreter.S"
+            };
+            let assembly_path = output_directory.join(file_name);
+            write_if_changed(&assembly_path, assembly.as_str());
+            assembly_path
+        })
+        .collect::<Vec<_>>();
+    assemble_interpreter(&target, &assembly_paths);
 }
 
-fn interpreter_compiler(target: &Target) -> flapc::Compiler {
+/// Slow paths that only the optimizing JIT's code calls, with the instruction whose operands they take. JIT code calls
+/// them with the interpreter's calling convention for that instruction's slow path, so they are generated like the
+/// interpreter's.
+const JIT_ONLY_SLOW_PATHS: &[(&str, &str)] = &[
+    ("asm_slow_path_get_initialized_binding", "GetInitializedBinding"),
+    ("asm_slow_path_initialize_lexical_binding", "InitializeLexicalBinding"),
+    ("asm_slow_path_initialize_variable_binding", "InitializeVariableBinding"),
+    ("asm_slow_path_get_by_id_from_jit", "GetById"),
+    ("asm_slow_path_get_by_value_from_jit", "GetByValue"),
+    ("asm_slow_path_put_by_value_from_jit", "PutByValue"),
+];
+
+fn add_jit_only_slow_paths(
+    target: &Target,
+    instructions: &[flapc::metadata::InstructionDefinition],
+    functions: &mut Vec<flapc::runtime_interface::RuntimeFunction>,
+) {
+    let record_form_only = matches!(target.object_format, flapc::ObjectFormat::Coff);
+    for (symbol, op) in JIT_ONLY_SLOW_PATHS {
+        assert!(
+            !functions.iter().any(|function| function.symbol == *symbol),
+            "the interpreter calls the JIT-only slow path {symbol}"
+        );
+        let definition = instructions
+            .iter()
+            .find(|definition| definition.name == *op)
+            .unwrap_or_else(|| panic!("the JIT-only slow path {symbol} is for an unknown instruction {op}"));
+        let layout = flapc::metadata::SlowPathLayout::new(definition);
+        functions.push(flapc::runtime_interface::RuntimeFunction {
+            symbol: (*symbol).to_string(),
+            kind: flapc::runtime_interface::RuntimeFunctionKind::SlowPath {
+                op: (*op).to_string(),
+                abi: layout.abi(record_form_only),
+                layout,
+            },
+        });
+    }
+}
+
+fn interpreter_compiler(target: &Target, profiling: bool) -> flapc::Compiler {
     flapc::Compiler::new(flapc::CompileOptions {
         target: flapc::Target {
             architecture: target.architecture,
@@ -226,6 +302,7 @@ fn interpreter_compiler(target: &Target) -> flapc::Compiler {
         },
         has_jscvt: target.is_apple && matches!(target.architecture, flapc::Architecture::Aarch64),
         enable_assertions: true,
+        profiling,
     })
 }
 
@@ -247,9 +324,9 @@ fn rust_macos_deployment_target() -> Option<String> {
         .map(str::to_string)
 }
 
-fn assemble_interpreter(target: &Target, assembly_path: &Path) {
+fn assemble_interpreter(target: &Target, assembly_paths: &[PathBuf]) {
     let mut build = cc::Build::new();
-    build.file(assembly_path);
+    build.files(assembly_paths);
     if target.is_apple
         && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos")
         && let Some(deployment_target) = rust_macos_deployment_target()
@@ -266,7 +343,9 @@ fn assemble_interpreter(target: &Target, assembly_path: &Path) {
         }
         // Given -Fo, clang-cl writes the preprocessed assembly to the working directory, which cargo makes the source
         // directory of the crate.
-        let output_directory = assembly_path.parent().expect("the assembly is in the output directory");
+        let output_directory = assembly_paths[0]
+            .parent()
+            .expect("the assembly is in the output directory");
         env::set_current_dir(output_directory)
             .unwrap_or_else(|error| panic!("enter {}: {error}", output_directory.display()));
     }

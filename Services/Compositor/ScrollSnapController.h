@@ -40,8 +40,10 @@ public:
         Web::AsyncScrollNodeStableID stable_node_id;
         Web::CSSPixelPoint initial_scroll_offset;
         Web::CSSPixelPoint unsnapped_scroll_destination;
+        Web::CSSPixelPoint relative_scroll_delta;
         Compositing::SnapDestination selection;
         Compositing::ScrollAnimationKind animation_kind { Compositing::ScrollAnimationKind::SmoothScroll };
+        bool is_absolute_scroll { false };
     };
 
     // A step that selected the snap position the scrolling box already rests at, or is already scrolling to, is
@@ -63,6 +65,7 @@ public:
     void did_start_main_thread_scroll(Web::AsyncScrollNodeStableID);
     void did_start_snap_scroll(Web::AsyncScrollNodeStableID, Compositing::AsyncScrollOperationID, Web::CSSPixelPoint destination);
     void did_end_snap_scroll(Web::AsyncScrollNodeStableID, Compositing::AsyncScrollOperationID, Optional<Web::CSSPixelPoint> scroll_offset);
+    void did_retarget_scroll(Web::AsyncScrollNodeStableID, Compositing::AsyncScrollOperationID);
     bool is_snap_scroll(Web::AsyncScrollNodeStableID, Compositing::AsyncScrollOperationID) const;
     Optional<Web::CSSPixelPoint> unsnapped_destination_for_snap_scroll(Web::AsyncScrollNodeStableID, Compositing::AsyncScrollOperationID) const;
 
@@ -73,7 +76,7 @@ public:
 
     // https://drafts.csswg.org/css-scroll-snap-1/#scroll-types
     // A discrete wheel step is a relative scroll with only an intended direction.
-    Optional<StepDecision> decide_discrete_step(Compositing::AsyncScrollTree const&, Compositing::ScrollStateSnapshot const&, Compositing::AsyncScrollNodeID, Web::CSSPixelPoint delta, MonotonicTime now);
+    Optional<StepDecision> decide_discrete_step(Compositing::AsyncScrollTree const&, Compositing::ScrollStateSnapshot const&, Compositing::AsyncScrollNodeID, Web::CSSPixelPoint delta, Optional<Web::CSSPixelPoint> scroll_in_flight_destination, MonotonicTime now);
     // The momentum of a flick is a relative scroll with an intended direction and, once its decay tells where it is
     // headed, an intended end position.
     Optional<StepDecision> decide_momentum_delta(Compositing::AsyncScrollTree const&, Compositing::ScrollStateSnapshot const&, Compositing::AsyncScrollNodeID, Web::CSSPixelPoint delta);

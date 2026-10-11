@@ -197,6 +197,18 @@ define_machine_opcodes! {
         }
     } printing store_instruction(width);
     [Increment32Memory] => Self::Increment32Memory => [[A]] printing simple!("inc"; SimpleOperand::Resolved(0, "DWORD PTR "));
+    [MemoryUpdate { operation: AluOperation, width: MemoryWidth }] => opcode @ Self::MemoryUpdate { operation, width } => [[A, RI]] encoding {
+        let Self::MemoryUpdate { width, .. } = opcode else { unreachable!() };
+        matches!(width, MemoryWidth::Byte | MemoryWidth::Word)
+            && immediate(1).is_none_or(|value| match width {
+                MemoryWidth::Byte => (i8::MIN as i64..=u8::MAX as i64).contains(&value),
+                _ => (i32::MIN as i64..=u32::MAX as i64).contains(&value),
+            })
+    } printing match width {
+        MemoryWidth::Byte => simple!(operation.mnemonic(); SimpleOperand::Resolved(0, "BYTE PTR "), SimpleOperand::ResolvedInteger(1, IntegerWidth::U8)),
+        MemoryWidth::Word => simple!(operation.mnemonic(); SimpleOperand::Resolved(0, "DWORD PTR "), SimpleOperand::ResolvedInteger(1, IntegerWidth::U32)),
+        MemoryWidth::HalfWord | MemoryWidth::DoubleWord | MemoryWidth::Float => unreachable!("unsupported x86-64 memory update width"),
+    };
     [SignExtend32To64] => Self::SignExtend32To64 => [[R, R]] printing simple!("movsxd"; native(0), integer(1, IntegerWidth::U32));
     [Move64Register] => Self::Move64Register => [[R, R]] printing simple!("mov"; native(0), native(1));
     [MoveExecutionContext] => Self::MoveExecutionContext => [[R, R]];
@@ -434,6 +446,10 @@ impl Opcode {
             Operation::Negate => Self::Negate64,
             Operation::Not(width) => Self::BitwiseNot(width),
             Operation::Increment32Memory => Self::Increment32Memory,
+            Operation::MemoryUpdate { operation, width } => Self::MemoryUpdate {
+                operation: AluOperation::from_binary(operation).expect("memory updates use ALU operations"),
+                width,
+            },
             Operation::Memory(MemoryOperation::Load { .. } | MemoryOperation::Store(_))
             | Operation::Move(_)
             | Operation::IntegerBinary { .. } => {
@@ -604,12 +620,20 @@ fn generate_entry_point(out: &mut String, program: &Program, abi: X86_64Abi) {
         "    mov r15, QWORD PTR [{vm} + {heap_region_base}]  # heap region base"
     );
     w!(out, "    mov QWORD PTR {}, {vm}  # save VM*", vm_slot(abi));
-    let vm_breakpoint_controller = runtime(program)[KnownLayoutConstant::VmBreakpointController];
-    w!(out, "    cmp QWORD PTR [{vm} + {vm_breakpoint_controller}], 0");
-    w!(out, "    lea r12, [rip + asm_dispatch_table]");
-    w!(out, "    je .Ldispatch_table_ready");
-    w!(out, "    lea r12, [rip + asm_debug_dispatch_table]");
-    w!(out, ".Ldispatch_table_ready:");
+    // Every executable names the VM's dispatch table its frames run with, so
+    // the handlers reload it whenever they switch to another frame.
+    let exec_executable = runtime(program)[KnownLayoutConstant::ExecutionContextExecutable];
+    let dispatch_table_index = runtime(program)[KnownLayoutConstant::ExecutableDispatchTableIndex];
+    let vm_dispatch_tables = runtime(program)[KnownLayoutConstant::VmDispatchTables];
+    let dispatch_table_index_mask = runtime(program)[KnownLayoutConstant::DispatchTableIndexMask];
+    w!(
+        out,
+        "    mov rax, QWORD PTR [rbx + {}]",
+        exec_executable - values_offset(program)
+    );
+    w!(out, "    movzx eax, BYTE PTR [rax + {dispatch_table_index}]");
+    w!(out, "    and eax, {dispatch_table_index_mask}");
+    w!(out, "    mov r12, QWORD PTR [{vm} + {vm_dispatch_tables} + rax * 8]");
     w!(out, "    # r12 = dispatch table");
     emit_dispatch(out);
     w!(out);
@@ -834,6 +858,7 @@ mod tests {
                 object_format: ObjectFormat::MachO,
             },
             functions: Vec::new(),
+            profiling: false,
         }
     }
 

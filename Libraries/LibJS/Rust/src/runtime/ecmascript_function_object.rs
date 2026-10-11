@@ -23,7 +23,7 @@ use crate::layout::cell::Gc;
 use crate::layout::environment::{Environment, PrivateEnvironment};
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
 pub use crate::layout::function_object::EcmascriptFunctionObject;
-use crate::layout::object::Object;
+use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
 use crate::layout_forward::FlyStringSlot;
 use crate::runtime::abstract_operations::{
@@ -161,6 +161,7 @@ impl EcmascriptFunctionObject {
         private_environment: Option<Gc<PrivateEnvironment>>,
         prototype: Gc<Object>,
     ) -> Gc<EcmascriptFunctionObject> {
+        shared_data.note_closure_created();
         let function = allocate_object(
             vm,
             Self::new(vm, shared_data, parent_environment, private_environment, prototype),
@@ -288,23 +289,26 @@ impl EcmascriptFunctionObject {
         unsafe { Gc::from_ref(self) }
     }
 
+    /// The function's executable, compiled first if the function never ran.
+    pub fn compiled_executable(&self, vm: &Vm) -> Gc<Executable> {
+        let shared_data = self.shared_data();
+        if let Some(executable) = shared_data.executable() {
+            return executable;
+        }
+        let rust_executable = SharedFunctionInstanceData::compile_function(vm, shared_data, false)
+            .expect("an ECMAScript function compiles to an executable");
+        shared_data.set_executable(Some(rust_executable));
+        rust_executable.set_name(self.name());
+        if should_dump_bytecode() {
+            rust_executable.dump();
+        }
+        shared_data.clear_compile_inputs();
+        rust_executable
+    }
+
     fn get_stack_frame_info(object: &Object, vm: &Vm, stack_frame_info: &mut StackFrameInfo) {
         let function = as_ecmascript_function(object);
-        let shared_data = function.shared_data();
-        let executable = match shared_data.executable() {
-            Some(executable) => executable,
-            None => {
-                let rust_executable = SharedFunctionInstanceData::compile_function(vm, shared_data, false)
-                    .expect("an ECMAScript function compiles to an executable");
-                shared_data.set_executable(Some(rust_executable));
-                rust_executable.set_name(function.name());
-                if should_dump_bytecode() {
-                    rust_executable.dump();
-                }
-                shared_data.clear_compile_inputs();
-                rust_executable
-            }
-        };
+        let executable = function.compiled_executable(vm);
         stack_frame_info.registers_and_locals_count = executable.registers_and_locals_count();
         stack_frame_info.constant_count =
             u32::try_from(executable.constants().len()).expect("the constant count fits in u32");
@@ -538,17 +542,32 @@ impl EcmascriptFunctionObject {
 
     // 10.2.1.2 OrdinaryCallBindThis ( F, calleeContext, thisArgument ), https://tc39.es/ecma262/#sec-ordinarycallbindthis
     pub fn ordinary_call_bind_this(&self, vm: &Vm, callee_context: &ExecutionContext, this_argument: Value) {
+        if let Some(this_value) =
+            self.resolve_and_bind_this(vm, callee_context.lexical_environment.get(), this_argument)
+        {
+            callee_context.this_value.set(this_value);
+        }
+    }
+
+    /// OrdinaryCallBindThis() for a call whose callee context has `local_env` as its LexicalEnvironment: binds and
+    /// returns the this value, or returns nothing if the function's this is lexical.
+    pub fn resolve_and_bind_this(
+        &self,
+        vm: &Vm,
+        local_env: Option<Gc<Environment>>,
+        this_argument: Value,
+    ) -> Option<Value> {
         // 1. Let thisMode be F.[[ThisMode]].
         // If thisMode is lexical, return unused.
         if self.this_mode() == ThisMode::Lexical {
-            return;
+            return None;
         }
 
         // 3. Let calleeRealm be F.[[Realm]].
         let callee_realm = self.realm().expect("an ECMAScript function has a realm");
 
         // 4. Let localEnv be the LexicalEnvironment of calleeContext.
-        let local_env = callee_context.lexical_environment.get();
+        // NB: The caller passes it.
 
         // 5. If thisMode is strict, let thisValue be thisArgument.
         let this_value = if self.this_mode() == ThisMode::Strict {
@@ -578,7 +597,6 @@ impl EcmascriptFunctionObject {
         // 7. Assert: localEnv is a function Environment Record.
         // 8. Assert: The next step never returns an abrupt completion because localEnv.[[ThisBindingStatus]] is not initialized.
         // 9. Perform ! localEnv.BindThisValue(thisValue).
-        callee_context.this_value.set(this_value);
         if self.function_environment_needed() {
             local_env
                 .and_then(|environment| environment.downcast::<FunctionEnvironment>())
@@ -588,6 +606,35 @@ impl EcmascriptFunctionObject {
         }
 
         // 10. Return unused.
+        Some(this_value)
+    }
+
+    /// The LexicalEnvironment and VariableEnvironment of a call of the function in an inline frame: a new function
+    /// environment (steps 7 to 9 of PrepareForOrdinaryCall) if the function needs one, and its [[Environment]]
+    /// otherwise.
+    pub fn inline_call_environment(&self, vm: &Vm, new_target: Option<Gc<Object>>) -> Option<Gc<Environment>> {
+        if !self.function_environment_needed() {
+            return self.environment();
+        }
+        let local_environment = new_function_environment(vm, self.as_ecmascript_function_gc(), new_target);
+        let shared_data = self.shared_data();
+        let function_environment_bindings_count = shared_data.function_environment_bindings_count();
+        local_environment.set_environment_shape_cache(
+            shared_data.function_environment_shape_cache(),
+            function_environment_bindings_count,
+        );
+        local_environment.ensure_capacity(function_environment_bindings_count);
+        Some(local_environment.upcast())
+    }
+
+    /// Whether calls of the function need a function environment or the resolution of their this value through the
+    /// environment, which inline frames of JIT code do not set up.
+    pub fn needs_environment_or_this_value_resolution(&self) -> bool {
+        self.function_environment_needed() || self.this_value_needs_environment_resolution()
+    }
+
+    pub fn contains_direct_call_to_eval(&self) -> bool {
+        self.shared_data().contains_direct_call_to_eval()
     }
 
     // 10.2.1.4 OrdinaryCallEvaluateBody ( F, argumentsList ), https://tc39.es/ecma262/#sec-ordinarycallevaluatebody
@@ -661,6 +708,17 @@ impl EcmascriptFunctionObject {
             .get()
             .expect("an ECMAScript function has its name string once initialized")
             .utf16_string()
+    }
+
+    /// Whether a copy of the function's bytes is a function of its own: it has no name of its own, no class data,
+    /// nothing outside the heap as an object, and no property storage outside its cell.
+    pub fn can_be_copied(&self) -> bool {
+        let object = &self.base.base;
+        self.name.get().is_none()
+            && self.storage.class_data.borrow().is_none()
+            && object.owns_nothing_outside_the_heap()
+            && object.named_storage_is_inline()
+            && object.indexed_storage_kind() == IndexedStorageKind::None
     }
 
     pub fn name(&self) -> Utf16FlyString {
@@ -757,6 +815,10 @@ impl EcmascriptFunctionObject {
     /// Shares the cached parameter map with an arguments object.
     pub fn mapped_argument_names(&self) -> Rc<[Utf16FlyString]> {
         self.shared_data().mapped_argument_names()
+    }
+
+    pub fn parameter_binding_names(&self) -> Rc<[Utf16FlyString]> {
+        self.shared_data().parameter_binding_names()
     }
 
     pub fn set_is_class_constructor(&self) {
@@ -904,15 +966,15 @@ impl EcmascriptFunctionObject {
         let mut caller: Option<Gc<EcmascriptFunctionObject>> = None;
         let mut found_this_function = false;
 
-        vm.for_each_execution_context_top_to_bottom(|context| {
+        vm.for_each_stack_frame_top_to_bottom(|frame| {
             if !found_this_function {
-                if context.function.get() == Some(this_function) {
+                if frame.function == Some(this_function) {
                     found_this_function = true;
                 }
                 return ControlFlow::Continue(());
             }
 
-            let Some(function) = context.function.get() else {
+            let Some(function) = frame.function else {
                 return ControlFlow::Continue(());
             };
 
@@ -934,26 +996,44 @@ impl EcmascriptFunctionObject {
 
     fn legacy_arguments(&self, vm: &Vm) -> Value {
         let this_function = self.as_function_object_gc();
-        let mut active_context: Option<NonNull<ExecutionContext>> = None;
+        // NB: The arguments of a frame of an inlined call may be objects JIT code never created, which only the
+        //     arguments object holds once it exists.
+        let _defer_gc = crate::jit::DeferGc::new(vm);
+        let mut passed_arguments: Option<Vec<Cell<Value>>> = None;
 
-        vm.for_each_execution_context_top_to_bottom(|context| {
-            if context.function.get() != Some(this_function) {
+        vm.for_each_stack_frame_top_to_bottom(|frame| {
+            if frame.function != Some(this_function) {
                 return ControlFlow::Continue(());
             }
 
-            active_context = Some(NonNull::from(context));
+            // NB: The frame of a call that JIT code inlined has its arguments in the JIT frame.
+            passed_arguments = Some(match frame.inlined_call {
+                Some(inlined_call) => crate::jit::translate::call_site_frame_arguments(
+                    vm,
+                    frame.execution_context,
+                    inlined_call.site,
+                    inlined_call.frame_pointer,
+                    inlined_call.frame_state,
+                )
+                .into_iter()
+                .map(Cell::new)
+                .collect(),
+                None => {
+                    let context = frame.execution_context;
+                    context.arguments()[..context.passed_argument_count.get() as usize]
+                        .iter()
+                        .map(|argument| Cell::new(argument.get()))
+                        .collect()
+                }
+            });
             ControlFlow::Break(())
         });
 
-        let Some(active_context) = active_context else {
+        let Some(passed_arguments) = passed_arguments else {
             return Value::NULL;
         };
 
-        // SAFETY: The context is a frame of a call of this function that has not returned yet.
-        let active_context = unsafe { active_context.as_ref() };
-        let arguments = active_context.arguments();
-        let passed_arguments = &arguments[..active_context.passed_argument_count.get() as usize];
-        let arguments_object = create_unmapped_arguments_object(vm, passed_arguments);
+        let arguments_object = create_unmapped_arguments_object(vm, &passed_arguments);
         if self.has_simple_parameter_list() {
             arguments_object.define_direct_property(
                 vm,

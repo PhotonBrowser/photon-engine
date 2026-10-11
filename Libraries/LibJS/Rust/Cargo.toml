@@ -7,7 +7,10 @@ edition = "2024"
 crate-type = ["staticlib", "rlib"]
 
 [features]
+default = ["jit"]
 allocator = ["dep:ladybird_allocator"]
+# The optimizing JIT. Without it, the interpreter is built without the machinery that only the JIT needs.
+jit = ["dep:libjs_jit"]
 address-sanitizer = []
 thread-sanitizer = []
 
@@ -21,6 +24,7 @@ indexmap = "2"
 ladybird_allocator = { path = "../../RustAllocator", optional = true }
 libc = "0.2"
 libjs_abi = { path = "../ABI" }
+libjs_jit = { path = "../JIT/Rust", optional = true }
 libjs_runtime_macros = { path = "macros" }
 libregex_rust = { path = "../../LibRegex/Rust", default-features = false }
 libunicode_rust = { path = "../../LibUnicode/Rust", default-features = false }

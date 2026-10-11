@@ -44,6 +44,7 @@ public:
 
     pid_t pid() const { return m_pid; }
     Optional<u64> managed_heap_bytes() const { return m_managed_heap_bytes; }
+    void terminate_process();
 
     Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
     void set_pid(pid_t pid) { m_pid = pid; }
@@ -77,8 +78,11 @@ private:
     Web::HTML::WorkerAgentId m_agent_id { 0 };
     Optional<u64> m_managed_heap_bytes;
 
-    // The controller connection to the MediaServer spawned for this process, from its first media use until it exits.
+    // The controller connections to the MediaServer and AudioServer spawned for this process, from its first media use
+    // until it exits.
     RefPtr<MediaClient::Client> m_media_server_client;
+    RefPtr<AudioServerControlClient> m_audio_server_client;
+    u64 m_audio_tab_id { 0 };
 };
 
 }

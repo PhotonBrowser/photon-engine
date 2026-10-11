@@ -103,6 +103,7 @@ public:
     static FontService& font_service() { return *the().m_font_service; }
     static FontServiceHost& font_service_host() { return *the().m_font_service_host; }
     JsonValue const& site_compatibility_data() const { return m_site_compatibility_data; }
+    bool blocks_pop_ups() const;
     ErrorOr<void> reload_site_compatibility_data();
 
     bool claim_cpu_profiler(ProcessType);
@@ -256,7 +257,7 @@ public:
 
     // FIXME: Should these methods be part of Application, instead of deferring to ProcessManager?
 #if defined(AK_OS_MACH)
-    void set_process_mach_port(pid_t, Core::MachPort&&);
+    void set_process_task_name_port(pid_t, Core::MachPort&&);
 #endif
     Optional<Process&> find_process(pid_t);
 

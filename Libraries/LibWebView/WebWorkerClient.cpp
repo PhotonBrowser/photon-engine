@@ -7,6 +7,7 @@
 #include <LibCore/Process.h>
 #include <LibWebCommon/WebView/ProcessHandle.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/AudioServerControlClient.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CookieJar.h>
@@ -21,6 +22,7 @@ WebWorkerClient::WebWorkerClient(NonnullOwnPtr<IPC::Transport> transport, IsPriv
     : IPC::ConnectionToServer<WebWorkerClientEndpoint, WebWorkerServerEndpoint>(*this, move(transport))
     , m_is_private(is_private)
     , m_agent_id(agent_id)
+    , m_audio_tab_id(allocate_audio_tab_id())
 {
     if (auto session = Application::existing_session(is_private))
         m_session = session->make_weak_ptr();
@@ -34,15 +36,26 @@ WebWorkerClient::~WebWorkerClient()
 void WebWorkerClient::did_misbehave(StringView message_name, StringView reason)
 {
     dbgln("WebWorkerClient: terminating helper process {}: {} rejected: {}", pid(), message_name, reason);
+    terminate_process();
+    shutdown();
+}
+
+void WebWorkerClient::terminate_process()
+{
     if (should_terminate_pid(pid()))
         (void)Core::Process::terminate_process(pid(), Core::Process::TerminationMode::Forceful);
-    shutdown();
 }
 
 void WebWorkerClient::die()
 {
     remove_blob_url_entries();
     WorkerProcessManager::the().worker_did_die(m_agent_id);
+
+    // NB: A worker whose connection is gone does no more work, so a process that outlives its connection is ended.
+    //     Until it is reaped, its process ID is still its own.
+    if (Application::process_manager().find_process(pid()).has_value())
+        terminate_process();
+    WorkerProcessManager::the().worker_process_did_exit(*this);
 
     // Otherwise nested workers we own would outlive us, in violation of the HTML spec.
     WorkerProcessManager::the().remove_web_worker_owner(*this);
@@ -151,7 +164,9 @@ Messages::WebWorkerClient::DidIsKnownHstsHostResponse WebWorkerClient::did_is_kn
 
 Messages::WebWorkerClient::RequestMediaServerConnectionResponse WebWorkerClient::request_media_server_connection()
 {
-    auto handle = connect_new_media_server_client(m_media_server_client);
+    auto handle = connect_new_media_server_client(m_media_server_client, [this] {
+        return connect_new_audio_server_client(m_audio_server_client, m_audio_tab_id);
+    });
     if (handle.is_error()) {
         warnln("Unable to connect a MediaServer client: {}", handle.error());
         return OptionalNone {};

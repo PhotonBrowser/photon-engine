@@ -1168,6 +1168,16 @@ void PageClient::page_did_request_geolocation_position(u64 request_id)
     client().async_did_request_geolocation_position(m_id, request_id);
 }
 
+void PageClient::page_did_request_permission(u64 request_id, Utf16String const& name)
+{
+    client().async_did_request_permission(m_id, request_id, name);
+}
+
+void PageClient::permission_request_completed(u64 request_id, bool granted)
+{
+    page().permission_request_completed(request_id, granted);
+}
+
 void PageClient::page_did_cancel_geolocation_position_request(u64 request_id)
 {
     client().async_did_cancel_geolocation_position_request(m_id, request_id);
@@ -1529,11 +1539,6 @@ PageClient::NewWebViewResult PageClient::page_did_request_new_web_view(Web::HTML
     auto& new_client = m_owner.create_page(*response->new_page_id(), *response->root_navigable_id());
     new_client.page().set_system_visibility_state(response->system_visibility_state());
     return { &new_client.page(), response->take_handle(), response->take_initial_history_entry(), response->take_initial_environment_id(), response->browsing_context_group_id() };
-}
-
-void PageClient::page_did_request_activate_tab()
-{
-    client().async_did_request_activate_tab(m_id);
 }
 
 void PageClient::page_did_close()

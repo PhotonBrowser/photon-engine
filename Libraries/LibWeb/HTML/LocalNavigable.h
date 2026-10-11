@@ -268,6 +268,7 @@ public:
     void adopt_started_user_scroll(DOM::Document&, Compositing::StartedUserScroll const&);
     void process_main_thread_smooth_scrolls();
     void wait_for_async_scroll_operation(Compositing::AsyncScrollOperationID, GC::Ref<WebIDL::Promise>);
+    void wait_for_wheel_scrolls(Vector<GC::Ref<WebIDL::Promise>>&);
     void clamp_viewport_scroll_offset();
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#rendering-opportunity
@@ -417,10 +418,12 @@ public:
         TakenOverByUserInput,
     };
 
-    GC::Ref<WebIDL::Promise> scroll_viewport_by_delta(CSSPixelPoint delta, Bindings::ScrollBehavior, Painting::ScrollKind);
-    GC::Ref<WebIDL::Promise> perform_a_scroll_of_the_viewport(CSSPixelPoint position, Bindings::ScrollBehavior = Bindings::ScrollBehavior::Auto, ScrollTrigger = ScrollTrigger::Programmatic, Optional<CSSPixelPoint> relative_displacement = {}, Painting::ScrollKind = Painting::ScrollKind::Absolute);
+    bool scroll_scrolling_box_by_delta(Layout::Node&, CSSPixelPoint delta, Painting::ScrollKind, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll);
+    bool continued_scroll_step_moves(Layout::Node&, CSSPixelPoint delta, Compositing::ScrollAnimationKind);
+    bool scroll_viewport_by_delta(CSSPixelPoint delta, Bindings::ScrollBehavior, Painting::ScrollKind, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll);
+    GC::Ref<WebIDL::Promise> perform_a_scroll_of_the_viewport(CSSPixelPoint position, Bindings::ScrollBehavior = Bindings::ScrollBehavior::Auto, ScrollTrigger = ScrollTrigger::Programmatic, Optional<CSSPixelPoint> relative_displacement = {}, Painting::ScrollKind = Painting::ScrollKind::Absolute, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll);
     GC::Ref<WebIDL::Promise> perform_a_scroll_of_an_element(DOM::Element&, CSSPixelPoint position, Bindings::ScrollBehavior, Optional<CSSPixelPoint> relative_displacement = {});
-    bool perform_a_snapped_relative_user_scroll(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type, SnapStepAccumulation, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll);
+    bool perform_a_snapped_relative_user_scroll(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type, SnapStepAccumulation, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll, Painting::ScrollKind = Painting::ScrollKind::Relative);
     bool perform_a_scroll_step_for_key_input(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type);
     bool perform_a_snapped_momentum_scroll(Layout::Node&, CSSPixelPoint momentum_delta);
     Layout::Node* layout_node_for_async_scroll_node_stable_id(Web::AsyncScrollNodeStableID);
@@ -505,20 +508,24 @@ private:
         DestinationIsSnapPosition,
     };
     GC::Ref<WebIDL::Promise> perform_a_scroll_of_a_scrolling_box(Web::AsyncScrollNodeStableID, CSSPixelPoint position, Bindings::ScrollBehavior, GC::Ptr<DOM::Element> associated_element, ScrollTrigger, Optional<CSSPixelPoint> relative_displacement = {}, DestinationSnapping = DestinationSnapping::SelectSnapPosition, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll, Painting::ScrollKind = Painting::ScrollKind::Absolute);
+    Gfx::FloatPoint device_scroll_offset(CSSPixelPoint) const;
+    GC::Ptr<WebIDL::Promise> continue_in_flight_user_smooth_scroll(Web::AsyncScrollNodeStableID, CSSPixelPoint position, Compositing::ScrollAnimationKind);
     Optional<CSSPixelPoint> scroll_offset_for(Web::AsyncScrollNodeStableID) const;
     bool set_scroll_offset_for(Web::AsyncScrollNodeStableID, CSSPixelPoint);
     void queue_scrollend_event(Web::AsyncScrollNodeStableID, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll = {});
     void queue_scrollend_event(DOM::Document&, GC::Ref<DOM::EventTarget>, Optional<Web::AsyncScrollNodeStableID>, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll = {});
     void queue_scrollend_event_for_finished_scroll(Web::AsyncScrollNodeStableID, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll);
     void queue_scrollend_event_and_promise_resolution_for_finished_scroll(Optional<Web::AsyncScrollNodeStableID>, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll, ReadonlySpan<GC::Ref<WebIDL::Promise>>);
-    ScrollPromises* promises_of_smooth_scroll_in_flight_toward(Web::AsyncScrollNodeStableID, CSSPixelPoint position, ScrollTrigger);
+    ScrollPromises* promises_of_smooth_scroll_in_flight_toward(Web::AsyncScrollNodeStableID, CSSPixelPoint position, ScrollTrigger, Compositing::ScrollAnimationKind);
     // The scroll a new input to a scrolling box would interact with; a scroll driven by user input is reported over
     // any programmatic scroll also in flight.
     struct InFlightScroll {
         ScrollTrigger trigger { ScrollTrigger::Programmatic };
         Optional<CSSPixelPoint> destination_scroll_offset;
+        Compositing::ScrollAnimationKind animation_kind { Compositing::ScrollAnimationKind::SmoothScroll };
     };
     Optional<InFlightScroll> in_flight_scroll_for(Optional<Web::AsyncScrollNodeStableID> const&) const;
+    Optional<CSSPixelPoint> in_flight_user_scroll_destination(Web::AsyncScrollNodeStableID, Compositing::ScrollAnimationKind) const;
     struct PendingUserScrollendTarget {
         GC::Ref<DOM::EventTarget> target;
         Optional<Web::AsyncScrollNodeStableID> stable_node_id;
@@ -657,6 +664,7 @@ private:
         Optional<CSSPixelPoint> initial_scroll_offset;
         Optional<CSSPixelPoint> destination_scroll_offset;
         ScrollTrigger trigger { ScrollTrigger::Programmatic };
+        Compositing::ScrollAnimationKind animation_kind { Compositing::ScrollAnimationKind::SmoothScroll };
     };
     Vector<PendingAsyncScrollOperation> m_pending_async_scroll_operations;
     // The registry entry of an operation, whether the scroll was registered when it was started or is first heard of

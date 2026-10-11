@@ -10,10 +10,10 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/ThreadSafeWeakable.h>
+#include <LibAudio/AudioOutput.h>
+#include <LibAudio/Forward.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Forward.h>
-#include <LibMedia/Audio/Forward.h>
-#include <LibMedia/AudioOutput.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/MediaClock.h>
@@ -31,8 +31,8 @@ private:
     class OutputThreadData;
 
 public:
-    static ErrorOr<NonnullRefPtr<AudioPlaybackSink>> try_create(PipelineStateChangeHandler on_state_changed, AudioOutput = AudioOutput::Platform);
-    AudioPlaybackSink(NonnullRefPtr<OutputThreadData>, MediaTimeReader, PipelineStateChangeHandler, AudioOutput);
+    static ErrorOr<NonnullRefPtr<AudioPlaybackSink>> try_create(PipelineStateChangeHandler on_state_changed, Audio::AudioOutput = Audio::AudioOutput::Platform);
+    AudioPlaybackSink(NonnullRefPtr<OutputThreadData>, MediaTimeReader, PipelineStateChangeHandler, Audio::AudioOutput);
     virtual ~AudioPlaybackSink() override;
 
     virtual ErrorOr<void> connect_input(NonnullRefPtr<AudioProducer> const&) override;
@@ -46,6 +46,7 @@ public:
     virtual void seek(AK::Duration) override;
     // Replaces the queued output with data read again from the input, without moving the clock.
     void reseek_input_keeping_clock();
+    void reseek_input_continuing_at_output_frame(Optional<i64> output_frame);
 
     virtual void set_playback_rate(float) override;
 
@@ -59,31 +60,29 @@ private:
         Playing,
     };
 
+    void reopen_playback_stream_after_loss();
+    bool playback_stream_is_current(Audio::PlaybackStream const&) const;
+
     void create_playback_stream();
-    void publish_clock_anchor(MonotonicTime now) const;
     bool effectively_paused() const;
     void update_playback_stream_state();
     void resume_playback_stream();
     void pause_playback_stream();
     void resume_input_from_suspension();
-    i64 played_output_frame_index() const;
     void dispatch_waiting_status_once_played_out();
 
     Core::EventLoop& m_main_thread_event_loop;
     PipelineStateChangeHandler m_on_state_changed;
-    AudioOutput m_audio_output { AudioOutput::Platform };
+    Audio::AudioOutput m_audio_output { Audio::AudioOutput::Platform };
 
     bool m_started_creating_playback_stream { false };
     bool m_playing { false };
     StreamState m_stream_state { StreamState::Suspended };
     double m_volume { 1 };
 
-    AK::Duration m_anchor_stream_time;
-    i64 m_anchor_output_frame_index { 0 };
-    Optional<AK::Duration> m_seek_target_awaiting_drain;
+    Optional<AK::Duration> m_seek_target_awaiting_discard;
 
     NonnullRefPtr<OutputThreadData> m_output_thread_data;
-    RefPtr<Core::Timer> m_clock_refresh_timer;
     RefPtr<Core::Timer> m_played_out_timer;
     MediaTimeReader m_time_reader;
 };

@@ -27,6 +27,8 @@
 #include <LibRequests/CacheState.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
+#include <LibURL/Origin.h>
+#include <LibURL/URL.h>
 #include <LibWebCommon/Bindings/Navigation.h>
 #include <LibWebCommon/CSS/StyleSheetIdentifier.h>
 #include <LibWebCommon/Forward.h>
@@ -108,10 +110,19 @@ public:
 
     void web_ui_disconnected(Badge<WebUI>);
     void set_web_ui(RefPtr<WebUI>);
+    RefPtr<WebUI> const& web_ui() const { return m_web_ui; }
     virtual void did_misbehave(StringView message_name, StringView reason) override;
     static bool renderers_may_access_cookies_like_http();
     static bool renderers_may_synthesize_input();
-    bool may_read_local_files();
+    bool may_read_local_files() const;
+    // A process that has hosted local file content may read local files. Site isolation gives such content processes
+    // of its own, which host nothing else.
+    bool has_hosted_local_file_content() const { return m_has_hosted_local_file_content; }
+    void set_has_hosted_local_file_content() { m_has_hosted_local_file_content = true; }
+    // The WebUI whose documents the process has hosted, whose channel the process may have. Site isolation gives such
+    // documents processes of their own, which host nothing else.
+    Optional<String> const& hosted_web_ui() const { return m_hosted_web_ui; }
+    void set_hosted_web_ui(String host) { m_hosted_web_ui = move(host); }
     void register_embedded_page(Web::PageId page_id, CanonicalTraversable&);
     void unregister_embedded_page(Web::PageId page_id);
     Optional<Web::PageId> page_id_for_traversable(CanonicalTraversable const&) const;
@@ -138,6 +149,11 @@ public:
     bool has_crashed_views() const { return !m_crashed_view_ids.is_empty(); }
     ErrorOr<void> reconnect_to_compositor_process(Badge<Application>);
     ErrorOr<void> recreate_compositor_contexts(Badge<Application>);
+    // The user let the page at the URL capture audio. The process's AudioServer hears of the permission before this
+    // returns, so a page told afterwards finds it in place.
+    ErrorOr<void> grant_audio_capture(URL::URL const&);
+    // The permission follows the origins the process's open pages show, so it goes with a navigation away.
+    void update_audio_capture_permission();
     void replay_compositor_view_state_after_reconnect(Badge<Application>);
     void notify_compositor_process_reconnected(Badge<Application>);
     Web::CompositorContextId compositor_context_id_for_page(WebContentPage const&);
@@ -179,6 +195,7 @@ private:
     virtual Messages::WebContentClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String) override;
     virtual Messages::WebContentClient::DidLoseRequestServerConnectionResponse did_lose_request_server_connection() override;
     virtual Messages::WebContentClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
+    virtual Messages::WebContentClient::RequestAudioServerConnectionResponse request_audio_server_connection() override;
     virtual void did_start_using_gamepads() override;
     virtual void gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect) override;
     virtual void gamepad_stop_effects(Web::Gamepad::GamepadHandle handle) override;
@@ -194,6 +211,8 @@ private:
     bool m_requested_close { false };
     bool m_rejected_ipc { false };
     Optional<u64> m_managed_heap_bytes;
+    bool m_has_hosted_local_file_content { false };
+    Optional<String> m_hosted_web_ui;
     Vector<u64> m_crashed_view_ids;
 
     WebContentPage& open_page(Web::PageId, CanonicalTraversable&);
@@ -210,8 +229,22 @@ private:
 
     ProcessHandle m_process_handle;
 
-    // The controller connection to the MediaServer spawned for this process, from its first media use until it exits.
+    ErrorOr<IPC::TransportHandle> connect_audio_server_client();
+    ErrorOr<void> ensure_audio_server_controller();
+    ErrorOr<void> tell_audio_server_of_capture_permission();
+    static String audio_capture_permission_key(URL::URL const&);
+    bool audio_capture_permitted() const;
+    void decide_audio_capture_request(u64 request_id);
+
+    // The controller connections to the MediaServer and AudioServer spawned for this process, from its first media use
+    // until it exits. The AudioServer mixes for this process alone, so a compromised one hears only its own site.
     RefPtr<MediaClient::Client> m_media_server_client;
+    RefPtr<AudioServerControlClient> m_audio_server_client;
+    u64 m_audio_tab_id { 0 };
+    // The pages the user let capture audio, and whether an open page is one of them; the AudioServer is told of the latter,
+    // again whenever it relaunches, and rules on nothing itself.
+    HashTable<String> m_audio_capture_grants;
+    bool m_audio_capture_permitted { false };
     RefPtr<Core::Timer> m_detached_page_close_timer;
 
     RefPtr<WebUI> m_web_ui;

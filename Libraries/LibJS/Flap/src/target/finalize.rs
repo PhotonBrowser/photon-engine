@@ -66,6 +66,7 @@ fn finalize_function(function: AllocatedFunction, runtime: &RuntimeConstants) ->
         },
         has_jscvt: false,
         enable_assertions: false,
+        profiling: false,
     };
     finalize_function_for_target(function, runtime, &options)
 }
@@ -92,6 +93,7 @@ pub(crate) fn finalize_program(
         runtime,
         dispatch_handlers: program.dispatch_handlers,
         target,
+        profiling: options.profiling,
         functions,
     };
     super::machine_verify::verify_program(&machine)?;
@@ -390,6 +392,9 @@ fn finalize_instruction(
         }
         Operation::Store64IndexedOffset => backend.finalize_indexed_offset_store(emit, operands),
         Operation::Increment32Memory => backend.finalize_memory_increment(emit, operands)?,
+        Operation::MemoryUpdate { operation, width } => {
+            backend.finalize_memory_update(emit, operation, width, operands)?;
+        }
         Operation::Memory(MemoryOperation::Load { width, signed, .. }) => {
             backend.finalize_scalar_load(emit, opcode, width, signed, operands)?;
         }
@@ -487,6 +492,7 @@ mod tests {
             },
             has_jscvt: false,
             enable_assertions: false,
+            profiling: false,
         }
     }
 

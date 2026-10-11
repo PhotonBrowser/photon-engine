@@ -190,6 +190,7 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     did_lose_request_server_connection() => (Optional<IPC::TransportHandle> handle)
     request_media_server_connection() => (Optional<IPC::TransportHandle> handle)
+    request_audio_server_connection() => (Optional<IPC::TransportHandle> handle)
 
     [NotRouted] did_request_storage_item(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key) => (Optional<Utf16String> value)
     [NotRouted] did_set_storage_item(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key, Utf16String value) => (WebView::StorageSetResult result)
@@ -203,7 +204,6 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     did_update_resource_count(Web::PageId page_id, i32 count_waiting) =|
     [NotRouted] did_request_new_web_view(Web::PageId page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set) => (Optional<Web::PageId> new_page_id, Optional<Web::HTML::CrossProcessId> root_navigable_id, Optional<Web::HTML::SessionHistoryEntryDescriptor> initial_history_entry, Optional<Web::HTML::EnvironmentId> initial_environment_id, Optional<u64> browsing_context_group_id, Web::HTML::VisibilityState system_visibility_state, String handle)
-    did_request_activate_tab(Web::PageId page_id) =|
     [NotRouted] did_close_browsing_context(Web::PageId page_id) =|
     did_change_needs_beforeunload_check(Web::PageId page_id, bool needs_beforeunload_check) =|
     did_consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption consumption) =|
@@ -223,6 +223,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_cancel_geolocation_position_request(Web::PageId page_id, u64 request_id) =|
     did_start_geolocation_position_watch(Web::PageId page_id, u64 request_id) =|
     did_stop_geolocation_position_watch(Web::PageId page_id, u64 request_id) =|
+    did_request_permission(Web::PageId page_id, u64 request_id, Utf16String name) =|
     did_request_file_picker(Web::PageId page_id, Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) =|
     did_request_select_dropdown(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) =|
     did_finish_handling_input_event(Web::PageId page_id, u64 event_id, Web::EventResult event_result) =|

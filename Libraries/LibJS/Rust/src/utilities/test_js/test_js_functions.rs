@@ -157,7 +157,7 @@ fn run_queued_promise_jobs(vm: &Vm) -> ThrowCompletionOr<Value> {
 #[allow(clippy::unnecessary_wraps, reason = "native functions return a completion")]
 fn clear_kept_objects(vm: &Vm) -> ThrowCompletionOr<Value> {
     // VM::finish_execution_generation()
-    vm.head.execution_generation.set(vm.head.execution_generation.get() + 1);
+    vm.head.finish_execution_generation();
     Ok(Value::UNDEFINED)
 }
 
@@ -361,7 +361,8 @@ enum Expectation {
 }
 
 /// TESTJS_RUN_FILE_FUNCTION: with --test262-parser-tests, a file only has to parse, or fail to parse, as the
-/// directory it is in says.
+/// directory it is in says. Builds without the JIT skip the tests of the JIT in jit directories, which use the jit
+/// object.
 pub fn run_file(
     vm: &Vm,
     test262_parser_tests: bool,
@@ -369,6 +370,9 @@ pub fn run_file(
     test_file: &str,
     realm: Gc<Realm>,
 ) -> Result<JSFileResult, RunFileHookResult> {
+    if !crate::jit::BUILT && test_file.contains("/jit/") {
+        return Err(RunFileHookResult::SkipFile);
+    }
     if !test262_parser_tests {
         return Err(RunFileHookResult::RunAsNormal);
     }

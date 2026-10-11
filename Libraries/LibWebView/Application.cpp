@@ -243,6 +243,10 @@ Application::~Application()
     }
 
     m_spare_web_content_process = nullptr;
+
+    // NB: Connection die() handlers use the process manager, so destroy the processes while it is still reachable.
+    if (m_process_manager)
+        m_process_manager->remove_all_processes();
     m_process_manager = nullptr;
     m_browser_process = nullptr;
 
@@ -537,12 +541,12 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
             return;
         }
         result.release_value().visit(
-            [this, pid = request.pid, task_port = move(request.task_port)](IPC::TransportBootstrapMachServer::ChildTransportHandled) mutable {
-                // The child sends its task port before Process::spawn() returns, so it cannot be added to the process
+            [this, pid = request.pid, task_name_port = move(request.task_name_port)](IPC::TransportBootstrapMachServer::ChildTransportHandled) mutable {
+                // The child sends its task name port before Process::spawn() returns, so it cannot be added to the process
                 // manager yet. Install the port once control returns to the browser event loop.
                 VERIFY(m_event_loop);
-                m_event_loop->deferred_invoke([this, pid, task_port = move(task_port)]() mutable {
-                    set_process_mach_port(pid, move(task_port));
+                m_event_loop->deferred_invoke([this, pid, task_name_port = move(task_name_port)]() mutable {
+                    set_process_task_name_port(pid, move(task_name_port));
                 });
             },
             [this](IPC::TransportBootstrapMachServer::OnDemandTransport& transport) {
@@ -1274,7 +1278,7 @@ void Application::complete_webdriver_content_command(u64 command_id, Web::WebDri
 
 void Application::reset_private_browsing_session()
 {
-    m_file_downloader.cancel_private_downloads();
+    m_file_downloader.discard_private_downloads();
 
     // RequestServer answers our own private client with the cookies of the session it was created for, so the next
     // private request made by the UI process needs a client of the new session.
@@ -2131,9 +2135,9 @@ void Application::add_child_process(WebView::Process&& process)
 }
 
 #if defined(AK_OS_MACH)
-void Application::set_process_mach_port(pid_t pid, Core::MachPort&& port)
+void Application::set_process_task_name_port(pid_t pid, Core::MachPort&& port)
 {
-    m_process_manager->set_process_mach_port(pid, move(port));
+    m_process_manager->set_process_task_name_port(pid, move(port));
 }
 #endif
 
@@ -2172,6 +2176,10 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         break;
     case ProcessType::MediaServer:
         // The connection's holder launches a new MediaServer when it next connects a client.
+        break;
+    case ProcessType::AudioServer:
+        // The connection's holder launches a new AudioServer when it next connects a client; the streams of the old
+        // one report their loss and reopen.
         break;
     case ProcessType::RequestServer:
         if (auto client = process.client<Requests::RequestControlClient>()) {
@@ -2252,15 +2260,8 @@ static LexicalPath unique_download_path(ByteString const& downloads_directory, B
     if (download_path_is_available(destination))
         return destination;
 
-    auto lexical_file = LexicalPath { file };
-    auto title = lexical_file.title();
-    auto extension = lexical_file.extension();
     for (u64 index = 1;; ++index) {
-        auto suffix = extension.is_empty()
-            ? ByteString::formatted(" ({})", index)
-            : ByteString::formatted(" ({}).{}", index, extension);
-        auto truncated_title = Web::truncate_filename_to_byte_length(title, Web::maximum_filename_byte_length - min(suffix.length(), Web::maximum_filename_byte_length));
-        auto candidate_filename = ByteString::formatted("{}{}", truncated_title, suffix);
+        auto candidate_filename = Web::numbered_download_filename(file, index);
         auto candidate = LexicalPath::join(downloads_directory, candidate_filename.view());
         if (download_path_is_available(candidate))
             return candidate;
@@ -2804,6 +2805,11 @@ void Application::set_system_reduced_motion_preference(bool reduce_motion)
         view.set_preferred_motion(m_system_preferred_motion);
         return IterationDecision::Continue;
     });
+}
+
+bool Application::blocks_pop_ups() const
+{
+    return m_block_pop_ups_action->checked();
 }
 
 // The options every page hosting the tab's document runs with.

@@ -378,6 +378,10 @@ pub struct Generator {
     pub next_object_shape_cache: u32,
     pub next_object_property_iterator_cache: u32,
     pub next_environment_shape_cache: u32,
+    pub next_arith_feedback: u32,
+    pub next_value_feedback: u32,
+    pub next_call_feedback: u32,
+    pub next_keyed_feedback: u32,
 
     // --- Codegen state ---
     pub strict: bool,
@@ -480,6 +484,20 @@ macro_rules! next_cache_method {
     };
 }
 
+/// Feedback slot indices are encoded as u16. Sites beyond the last index share
+/// it, which only merges their feedback.
+pub const MAX_FEEDBACK_SLOT_COUNT: u32 = u16::MAX as u32 + 1;
+
+macro_rules! next_feedback_slot_method {
+    ($method:ident, $field:ident) => {
+        pub fn $method(&mut self) -> u16 {
+            let index = u16::try_from(self.$field).unwrap_or(u16::MAX);
+            self.$field = (self.$field + 1).min(MAX_FEEDBACK_SLOT_COUNT);
+            index
+        }
+    };
+}
+
 macro_rules! define_intern_method {
     ($method_name:ident, $index_type:ident, $table:ident, $cache:ident) => {
         pub fn $method_name(&mut self, s: &[u16]) -> $index_type {
@@ -546,6 +564,10 @@ impl Generator {
             next_object_shape_cache: 0,
             next_object_property_iterator_cache: 0,
             next_environment_shape_cache: 0,
+            next_arith_feedback: 0,
+            next_value_feedback: 0,
+            next_call_feedback: 0,
+            next_keyed_feedback: 0,
             strict: false,
             this_value_needs_environment_resolution: true,
             enclosing_function_kind: FunctionKind::Normal,
@@ -1008,70 +1030,102 @@ impl Generator {
             let block = &mut self.basic_blocks[self.current_block_index.basic_block_index()];
             if let Some((last_instruction, _, _)) = block.instructions.last() {
                 let fused = match last_instruction {
-                    Instruction::LessThan { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpLessThan {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::LessThanEquals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpLessThanEquals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::GreaterThan { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpGreaterThan {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::GreaterThanEquals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpGreaterThanEquals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::LooselyEquals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpLooselyEquals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::LooselyInequals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpLooselyInequals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::StrictlyEquals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpStrictlyEquals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::StrictlyInequals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpStrictlyInequals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
+                    Instruction::LessThan {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpLessThan {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::LessThanEquals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpLessThanEquals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::GreaterThan {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpGreaterThan {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::GreaterThanEquals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpGreaterThanEquals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::LooselyEquals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpLooselyEquals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::LooselyInequals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpLooselyInequals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::StrictlyEquals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpStrictlyEquals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::StrictlyInequals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpStrictlyInequals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
                     _ => None,
                 };
                 if let Some(fused_instruction) = fused {
@@ -1099,6 +1153,10 @@ impl Generator {
     next_cache_method!(next_object_shape_cache, next_object_shape_cache);
     next_cache_method!(next_object_property_iterator_cache, next_object_property_iterator_cache);
     next_cache_method!(next_environment_shape_cache, next_environment_shape_cache);
+    next_feedback_slot_method!(next_arith_feedback, next_arith_feedback);
+    next_feedback_slot_method!(next_value_feedback, next_value_feedback);
+    next_feedback_slot_method!(next_call_feedback, next_call_feedback);
+    next_feedback_slot_method!(next_keyed_feedback, next_keyed_feedback);
 
     // --- Lexical environment helpers ---
 
@@ -1233,6 +1291,12 @@ impl Generator {
 
     fn pop_environment_coordinate_scope(&mut self) {
         self.environment_coordinate_scope_stack.pop();
+    }
+
+    /// Records a binding of the innermost environment that an instruction other than CreateVariable creates.
+    pub fn record_environment_binding_created_elsewhere(&mut self, identifier: IdentifierTableIndex) {
+        let name = self.identifier_table[identifier.0 as usize].clone();
+        self.record_environment_binding(name);
     }
 
     fn record_environment_binding(&mut self, name: ak::Utf16FlyString) {
@@ -1896,8 +1960,10 @@ impl Generator {
         // Select declarative single-instruction specializations and fused
         // sequences before operand indices are rewritten away from the
         // generator's constant table.
-        for block in &mut self.basic_blocks {
+        for (block_index, block) in self.basic_blocks.iter_mut().enumerate() {
             remove_redundant_movs(&mut block.instructions);
+
+            mark_loop_back_edge(block_index, &mut block.instructions);
 
             specialize_instructions(&mut block.instructions, &self.constants);
         }
@@ -1941,8 +2007,16 @@ impl Generator {
             Skip,
             JumpToReturn(Operand),
             JumpToEnd(Operand),
-            EmitJumpTrue { condition: Operand, target: Label },
-            EmitJumpFalse { condition: Operand, target: Label },
+            EmitJumpTrue {
+                condition: Operand,
+                target: Label,
+                loop_back_edge: bool,
+            },
+            EmitJumpFalse {
+                condition: Operand,
+                target: Label,
+                loop_back_edge: bool,
+            },
         }
         let mut actions: Vec<Vec<InstAction>> = Vec::with_capacity(num_blocks);
         let mut offset: usize = 0;
@@ -1953,7 +2027,7 @@ impl Generator {
             let mut block_actions = Vec::with_capacity(block.instructions.len());
             for (instruction, _, _) in &block.instructions {
                 match instruction {
-                    Instruction::Jump { target } => {
+                    Instruction::Jump { target } | Instruction::JumpLoop { target } => {
                         let target_block = target.0 as usize;
                         // OPTIMIZATION: Don't emit jumps that just jump to the next block.
                         if target_block == block_index + 1 {
@@ -1989,15 +2063,22 @@ impl Generator {
                         condition,
                         true_target,
                         false_target,
+                    }
+                    | Instruction::JumpIfLoop {
+                        condition,
+                        true_target,
+                        false_target,
                     } => {
                         let true_block = true_target.0 as usize;
                         let false_block = false_target.0 as usize;
+                        let loop_back_edge = matches!(instruction, Instruction::JumpIfLoop { .. });
                         // OPTIMIZATION: Replace JumpIf where one target is next block
                         // with JumpTrue or JumpFalse.
                         if true_block == block_index + 1 {
                             block_actions.push(InstAction::EmitJumpFalse {
                                 condition: *condition,
                                 target: *false_target,
+                                loop_back_edge,
                             });
                             let replacement = Instruction::JumpFalse {
                                 condition: *condition,
@@ -2010,6 +2091,7 @@ impl Generator {
                             block_actions.push(InstAction::EmitJumpTrue {
                                 condition: *condition,
                                 target: *true_target,
+                                loop_back_edge,
                             });
                             let replacement = Instruction::JumpTrue {
                                 condition: *condition,
@@ -2120,7 +2202,11 @@ impl Generator {
                         let replacement = Instruction::End { value };
                         replacement.encode(*strict, &mut bytecode);
                     }
-                    InstAction::EmitJumpFalse { condition, mut target } => {
+                    InstAction::EmitJumpFalse {
+                        condition,
+                        mut target,
+                        loop_back_edge,
+                    } => {
                         // Patch label for the target
                         let target_block = target.0 as usize;
                         target.0 = u32_from_usize(block_offsets[target_block]);
@@ -2133,10 +2219,18 @@ impl Generator {
                                 column: sm.column,
                             },
                         );
-                        let replacement = Instruction::JumpFalse { condition, target };
+                        let replacement = if loop_back_edge {
+                            Instruction::JumpFalseLoop { condition, target }
+                        } else {
+                            Instruction::JumpFalse { condition, target }
+                        };
                         replacement.encode(*strict, &mut bytecode);
                     }
-                    InstAction::EmitJumpTrue { condition, mut target } => {
+                    InstAction::EmitJumpTrue {
+                        condition,
+                        mut target,
+                        loop_back_edge,
+                    } => {
                         let target_block = target.0 as usize;
                         target.0 = u32_from_usize(block_offsets[target_block]);
                         let instruction_offset = bytecode.len();
@@ -2148,7 +2242,11 @@ impl Generator {
                                 column: sm.column,
                             },
                         );
-                        let replacement = Instruction::JumpTrue { condition, target };
+                        let replacement = if loop_back_edge {
+                            Instruction::JumpTrueLoop { condition, target }
+                        } else {
+                            Instruction::JumpTrue { condition, target }
+                        };
                         replacement.encode(*strict, &mut bytecode);
                     }
                 }
@@ -2311,6 +2409,89 @@ fn specialize_instructions(instructions: &mut Vec<(Instruction, SourceMapEntry, 
         read_index += consumed;
     }
     instructions.truncate(write_index);
+}
+
+/// A jump to the same or an earlier block is a loop back edge. Back edges use
+/// the loop variants of the jump instructions, which count loop iterations
+/// towards the executable's tier-up budget, so that ordinary jumps do not
+/// have to check their direction.
+fn mark_loop_back_edge(block_index: usize, instructions: &mut [(Instruction, SourceMapEntry, bool)]) {
+    let Some((instruction, _, _)) = instructions.last_mut() else {
+        return;
+    };
+    let mut is_back_edge = false;
+    instruction.visit_labels(&mut |label: &mut Label| {
+        if label.0 as usize <= block_index {
+            is_back_edge = true;
+        }
+    });
+    if !is_back_edge {
+        return;
+    }
+
+    macro_rules! compare_jump_loop {
+        ($from:ident, $to:ident, $instruction:expr) => {
+            if let Instruction::$from {
+                arith_feedback,
+                lhs,
+                rhs,
+                true_target,
+                false_target,
+            } = $instruction
+            {
+                return Some(Instruction::$to {
+                    arith_feedback: *arith_feedback,
+                    lhs: *lhs,
+                    rhs: *rhs,
+                    true_target: *true_target,
+                    false_target: *false_target,
+                });
+            }
+        };
+    }
+
+    let loop_variant = |instruction: &Instruction| -> Option<Instruction> {
+        match instruction {
+            Instruction::Jump { target } => return Some(Instruction::JumpLoop { target: *target }),
+            Instruction::JumpIf {
+                condition,
+                true_target,
+                false_target,
+            } => {
+                return Some(Instruction::JumpIfLoop {
+                    condition: *condition,
+                    true_target: *true_target,
+                    false_target: *false_target,
+                });
+            }
+            Instruction::JumpTrue { condition, target } => {
+                return Some(Instruction::JumpTrueLoop {
+                    condition: *condition,
+                    target: *target,
+                });
+            }
+            Instruction::JumpFalse { condition, target } => {
+                return Some(Instruction::JumpFalseLoop {
+                    condition: *condition,
+                    target: *target,
+                });
+            }
+            _ => {}
+        }
+        compare_jump_loop!(JumpLessThan, JumpLessThanLoop, instruction);
+        compare_jump_loop!(JumpGreaterThan, JumpGreaterThanLoop, instruction);
+        compare_jump_loop!(JumpLessThanEquals, JumpLessThanEqualsLoop, instruction);
+        compare_jump_loop!(JumpGreaterThanEquals, JumpGreaterThanEqualsLoop, instruction);
+        compare_jump_loop!(JumpLooselyEquals, JumpLooselyEqualsLoop, instruction);
+        compare_jump_loop!(JumpLooselyInequals, JumpLooselyInequalsLoop, instruction);
+        compare_jump_loop!(JumpStrictlyEquals, JumpStrictlyEqualsLoop, instruction);
+        compare_jump_loop!(JumpStrictlyInequals, JumpStrictlyInequalsLoop, instruction);
+        None
+    };
+
+    if let Some(replacement) = loop_variant(instruction) {
+        *instruction = replacement;
+    }
 }
 
 fn remove_redundant_movs(instructions: &mut Vec<(Instruction, SourceMapEntry, bool)>) {

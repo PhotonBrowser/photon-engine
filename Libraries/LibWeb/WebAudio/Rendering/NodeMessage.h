@@ -10,7 +10,7 @@
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Variant.h>
-#include <LibMedia/Audio/SpscAudioFrameRing.h>
+#include <LibAudio/SpscAudioFrameRing.h>
 #include <LibWeb/Bindings/BiquadFilterNode.h>
 #include <LibWeb/Bindings/OscillatorNode.h>
 #include <LibWeb/Bindings/PannerNode.h>
@@ -83,7 +83,7 @@ struct SetPannerParameters {
 // argument so the ring can be replaced without rebuilding the render node.
 struct SetMediaStreamSourceRing {
     NodeID node_id { 0 };
-    RefPtr<Media::SpscAudioFrameRing> ring;
+    RefPtr<Audio::SpscAudioFrameRing> ring;
     u32 channel_count { 0 };
 };
 

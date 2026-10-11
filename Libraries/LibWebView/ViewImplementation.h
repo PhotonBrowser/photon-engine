@@ -188,9 +188,19 @@ public:
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
     void enqueue_input_event(Web::InputEvent);
-    void did_finish_handling_input_event(Badge<WebContentPage>, u64 event_id, Web::EventResult event_result);
+    // The page reporting on an event must be the one handling it.
+    void did_finish_handling_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result);
     void did_detect_history_swipe_candidate(Badge<WebContentPage>, u64 gesture_id, bool back, float unconsumed_delta);
-    void did_forward_input_event(Badge<WebContentPage>, u64 event_id, WebContentPage& endpoint);
+    void did_forward_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, WebContentPage& endpoint);
+    // Whether the page has yet to finish handling input that gives it user activation.
+    bool is_delivering_user_activation_to(WebContentPage const&) const;
+    // Consumes the activation of the earliest input giving the page activation that the page has yet to finish
+    // handling, which leaves the input queued behind it the activation it gives.
+    void consume_user_activation_of_input_in_flight_to(Badge<WebContentPage>, WebContentPage const&);
+    // Consumes the activation of the input the page is handling, if that input gives activation.
+    void consume_user_activation_of_input_handled_by(Badge<WebContentPage>, WebContentPage const&);
+    // Opening a link in a new tab takes one key or mouse press the view delivered.
+    bool take_input_to_open_link_in_new_tab(Badge<WebContentPage>);
     void did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
@@ -489,6 +499,7 @@ public:
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_cancel_geolocation_position_request;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_start_geolocation_position_watch;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_stop_geolocation_position_watch;
+    Function<void(Utf16String const& name, URL::Origin const&, Function<void(bool granted)> on_decided)> on_request_permission;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;
     Function<void(Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)> on_request_select_dropdown;
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
@@ -769,6 +780,9 @@ protected:
         bool routed_through_compositor { false };
         i64 enqueued_at_ms { 0 };
         bool watches_page_response { false };
+
+        // When the view delivered an event that gives user activation, until something consumes that activation.
+        Optional<MonotonicTime> user_activation_time {};
     };
     Vector<PendingInputEvent> m_pending_input_events;
     RefPtr<Core::Timer> m_input_response_timer;
@@ -780,6 +794,14 @@ protected:
     bool m_probe_page_unresponsive { false };
     int m_unresponsive_page_process_id { 0 };
     bool m_page_unresponsive { false };
+    Optional<size_t> index_of_input_in_flight_giving_user_activation_to(WebContentPage const&) const;
+
+    // The key and mouse presses the view delivered that have yet to open a link in a new tab.
+    struct InputToOpenLinkInNewTab {
+        u64 event_id { 0 };
+        MonotonicTime delivered_at;
+    };
+    Vector<InputToOpenLinkInNewTab> m_inputs_to_open_links_in_new_tabs;
     u64 m_next_input_event_id { 1 };
     bool m_debugger_is_attached { false };
     bool m_debugger_paused { false };

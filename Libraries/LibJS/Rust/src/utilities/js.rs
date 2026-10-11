@@ -76,6 +76,7 @@ struct Options {
     debug: bool,
     evaluate_script: String,
     use_test262_global: bool,
+    expose_jit_testing: bool,
     script_paths: Vec<String>,
 }
 
@@ -97,6 +98,7 @@ enum OptionTarget {
     Debug,
     EvaluateScript,
     UseTest262Global,
+    ExposeJitTesting,
 }
 
 /// An option as Core::ArgsParser describes it. Options with a value name take a value.
@@ -202,6 +204,12 @@ const OPTIONS: &[OptionDescription] = &[
         None,
         OptionTarget::UseTest262Global,
     ),
+    option(
+        "Define the jit object that compiles functions on demand",
+        "expose-jit-testing",
+        None,
+        OptionTarget::ExposeJitTesting,
+    ),
 ];
 
 const GENERAL_HELP: &str = "This is a JavaScript interpreter.";
@@ -231,6 +239,7 @@ impl OptionDescription {
             OptionTarget::Debug => options.debug = true,
             OptionTarget::EvaluateScript => options.evaluate_script = value.unwrap_or_default().to_string(),
             OptionTarget::UseTest262Global => options.use_test262_global = true,
+            OptionTarget::ExposeJitTesting => options.expose_jit_testing = true,
         }
     }
 }
@@ -1888,6 +1897,9 @@ fn ladybird_main(arguments: &[String], line_editor: Option<JSLineEditor>) -> c_i
     };
 
     let realm = root_execution_context.realm();
+    if options.expose_jit_testing {
+        crate::jit::testing::define_jit_testing_object(vm, realm, &realm.global_object());
+    }
     let console_object = realm.intrinsics().console_object(vm);
     let console_client = ReplConsoleClient::create(vm, console_object.console());
     console_object.console().set_client(console_client.upcast());
@@ -1924,7 +1936,10 @@ fn ladybird_main(arguments: &[String], line_editor: Option<JSLineEditor>) -> c_i
 
     // We resolve modules as if it is the first file
 
-    match parse_and_run(vm, realm, &options, &builder, source_name, options.parse_only) {
+    let result = parse_and_run(vm, realm, &options, &builder, source_name, options.parse_only);
+    // NB: The VM lives until the process exits.
+    vm.jit.flush_coverage();
+    match result {
         Ok(true) => EXIT_CODE.load(Ordering::Relaxed),
         Ok(false) => 1,
         Err(error) => {

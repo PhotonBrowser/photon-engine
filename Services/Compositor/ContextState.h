@@ -140,7 +140,7 @@ public:
         u32 modifiers,
         Compositing::AsyncScrollOperationTracking,
         Optional<MonotonicTime> now_for_testing = {});
-    AsyncScrollResult smooth_scroll_to(Web::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator);
+    AsyncScrollResult smooth_scroll_to(Web::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue);
     void cancel_smooth_scroll(Web::AsyncScrollNodeStableID);
     Optional<Gfx::IntRect> advance_smooth_scroll_animations(MonotonicTime now);
     bool has_active_smooth_scroll_animations() const { return !m_smooth_scroll_animations.is_empty(); }
@@ -289,7 +289,7 @@ private:
     // longer has, is dropped here.
     Optional<Compositing::AsyncScrollNodeID> resolve_wheel_scroll_latch(Gfx::FloatPoint position, Web::ScrollGesturePhase, u32 modifiers, MonotonicTime now);
     // The scroller the first step of a wheel gesture is routed to, which the gesture is latched to.
-    Optional<Compositing::AsyncScrollNodeID> hit_test_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::ScrollGesturePhase, u32 modifiers, MonotonicTime now, Optional<Web::UniqueNodeID> expected_document_id);
+    Optional<Compositing::AsyncScrollNodeID> hit_test_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, MonotonicTime now, Optional<Web::UniqueNodeID> expected_document_id);
     Gfx::IntRect note_async_scrolling_viewport_rect(Gfx::IntRect viewport_rect, ReadonlySpan<Compositing::AsyncScrollOffset>);
     Optional<Compositing::AsyncScrollOperationID> snap_at_gesture_end(MonotonicTime now);
     Compositing::AsyncScrollOperationID start_snap_scroll(Compositing::AsyncScrollNodeID, ScrollSnapController::SnapScrollStart&&, bool settles_gesture, MonotonicTime now);
@@ -298,6 +298,10 @@ private:
     void track_wheel_event_for_scroll_fling(Web::MouseEvent const&, MonotonicTime now);
     ContextUpdateResult scroll_for_wheel_event(Web::MouseEvent const&, MonotonicTime now);
     Web::MouseEvent scroll_fling_event(Gfx::FloatPoint delta, Web::ScrollGesturePhase) const;
+    Optional<Gfx::FloatPoint> in_flight_wheel_destination(Web::AsyncScrollNodeStableID) const;
+    AsyncScrollResult smooth_wheel_scroll_by(Optional<Compositing::WheelScrollTarget> const&, Gfx::IntRect viewport_rect, MonotonicTime now);
+    void retarget_user_scroll(ActiveSmoothScrollAnimation&, Gfx::FloatPoint destination_offset, MonotonicTime now);
+    void report_started_user_scroll(Compositing::AsyncScrollOperationID, Web::AsyncScrollNodeStableID, Gfx::FloatPoint step_start_offset, Gfx::FloatPoint destination_offset, Compositing::ScrollAnimationKind, bool is_absolute_scroll = false);
     void note_user_scroll_gesture_end_if_drag_ended(bool was_dragging_scrollbar);
     bool user_scroll_gesture_in_progress() const;
     void schedule_end_of_scroll_step_gestures(MonotonicTime now);

@@ -8,7 +8,7 @@
 
 #include <AK/RefPtr.h>
 #include <AK/Vector.h>
-#include <LibMedia/Audio/SpscAudioFrameRing.h>
+#include <LibAudio/SpscAudioFrameRing.h>
 #include <LibWeb/WebAudio/Rendering/RenderNode.h>
 
 namespace Web::WebAudio::Rendering {
@@ -22,7 +22,7 @@ public:
     virtual void handle_message(NodeMessage const&) override;
 
 private:
-    RefPtr<Media::SpscAudioFrameRing> m_ring;
+    RefPtr<Audio::SpscAudioFrameRing> m_ring;
     u32 m_channel_count { 1 };
     Vector<float> m_interleaved_scratch;
 };

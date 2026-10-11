@@ -210,6 +210,9 @@ define_named_types! {
         GlobalVariableCache => "GlobalVariableCache", Some(8), true;
         PropertyLookupCache => "PropertyLookupCache", Some(8), true;
         KeyedPropertyLookupCacheEntry => "KeyedPropertyLookupCacheEntry", Some(8), true;
+        ExecutableFeedback => "ExecutableFeedback", Some(8), true;
+        CallFeedback => "CallFeedback", Some(8), true;
+        KeyedFeedback => "KeyedFeedback", Some(8), true;
         ObjectPropertyIteratorCacheData => "ObjectPropertyIteratorCacheData", Some(8), true;
         ObjectPropertyIteratorCache => "ObjectPropertyIteratorCache", Some(8), true;
         PrototypeChainValidity => "PrototypeChainValidity", Some(8), true;
@@ -231,6 +234,10 @@ define_named_types! {
         EnvironmentCoordinateCacheIndex => "EnvironmentCoordinateCacheIndex", Some(4), false;
         GlobalVariableCacheIndex => "GlobalVariableCacheIndex", Some(4), false;
         PropertyLookupCacheIndex => "PropertyLookupCacheIndex", Some(4), false;
+        ArithFeedbackIndex => "ArithFeedbackIndex", Some(2), false;
+        ValueFeedbackIndex => "ValueFeedbackIndex", Some(2), false;
+        CallFeedbackIndex => "CallFeedbackIndex", Some(2), false;
+        KeyedFeedbackIndex => "KeyedFeedbackIndex", Some(2), false;
         Operand => "Operand", Some(8), false;
         Memory => "Memory", None, false;
         IntegerCondition => "IntegerCondition", None, false;

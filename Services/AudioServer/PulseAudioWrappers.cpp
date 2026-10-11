@@ -1,0 +1,975 @@
+/*
+ * Copyright (c) 2022-2025, Gregory Bertilson <gregory@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AudioServer/PulseAudioWrappers.h>
+
+#include <AK/Mutex.h>
+#include <AK/NeverDestroyed.h>
+#include <LibAudio/AudioDevices.h>
+#include <LibAudio/SampleSpecification.h>
+
+namespace Audio {
+
+static PulseAudioContext* s_pulse_audio_context;
+
+static RecursiveMutex& pulse_audio_context_mutex()
+{
+    static NeverDestroyed<RecursiveMutex> mutex;
+    return *mutex;
+}
+
+ErrorOr<NonnullRefPtr<PulseAudioContext>> PulseAudioContext::the()
+{
+    auto instantiation_locker = MutexLocker(pulse_audio_context_mutex());
+
+    // Lock and unlock the mutex to ensure that the mutex is fully unlocked at application
+    // exit.
+    static bool registered_atexit_callback = false;
+    if (!registered_atexit_callback) {
+        auto atexit_result = atexit([]() {
+            pulse_audio_context_mutex().lock();
+            pulse_audio_context_mutex().unlock();
+        });
+        if (atexit_result)
+            return Error::from_string_literal("Unable to set PulseAudioContext atexit action");
+        registered_atexit_callback = true;
+    }
+
+    RefPtr<PulseAudioContext> strong_instance_pointer = RefPtr<PulseAudioContext>(s_pulse_audio_context);
+
+    if (strong_instance_pointer == nullptr) {
+        auto* main_loop = pa_threaded_mainloop_new();
+        if (main_loop == nullptr)
+            return Error::from_string_literal("Failed to create PulseAudio main loop");
+
+        auto* api = pa_threaded_mainloop_get_api(main_loop);
+        if (api == nullptr)
+            return Error::from_string_literal("Failed to get PulseAudio API");
+
+        auto* context = pa_context_new(api, "Ladybird");
+        if (context == nullptr)
+            return Error::from_string_literal("Failed to get PulseAudio connection context");
+
+        strong_instance_pointer = make_ref_counted<PulseAudioContext>(main_loop, api, context);
+
+        // Set a callback to signal ourselves to wake when the state changes, so that we can
+        // synchronously wait for the connection.
+        pa_context_set_state_callback(
+            context, [](pa_context*, void* user_data) {
+                static_cast<PulseAudioContext*>(user_data)->signal_to_wake();
+            },
+            strong_instance_pointer.ptr());
+
+        if (auto error = pa_context_connect(context, nullptr, PA_CONTEXT_NOFLAGS, nullptr); error < 0) {
+            warnln("Starting PulseAudio context connection failed with error: {}", pulse_audio_error_to_string(static_cast<PulseAudioErrorCode>(-error)));
+            return Error::from_string_literal("Error while starting PulseAudio daemon connection");
+        }
+
+        if (auto error = pa_threaded_mainloop_start(main_loop); error < 0) {
+            warnln("Starting PulseAudio main loop failed with error: {}", pulse_audio_error_to_string(static_cast<PulseAudioErrorCode>(-error)));
+            return Error::from_string_literal("Failed to start PulseAudio main loop");
+        }
+
+        {
+            auto locker = strong_instance_pointer->main_loop_locker();
+            while (true) {
+                bool is_ready = false;
+                switch (strong_instance_pointer->get_connection_state()) {
+                case PulseAudioContextState::Connecting:
+                case PulseAudioContextState::Authorizing:
+                case PulseAudioContextState::SettingName:
+                    break;
+                case PulseAudioContextState::Ready:
+                    is_ready = true;
+                    break;
+                case PulseAudioContextState::Failed:
+                    warnln("PulseAudio server connection failed with error: {}", pulse_audio_error_to_string(strong_instance_pointer->get_last_error()));
+                    return Error::from_string_literal("Failed to connect to PulseAudio server");
+                case PulseAudioContextState::Unconnected:
+                case PulseAudioContextState::Terminated:
+                    VERIFY_NOT_REACHED();
+                    break;
+                }
+
+                if (is_ready)
+                    break;
+
+                strong_instance_pointer->wait_for_signal();
+            }
+
+            strong_instance_pointer->request_device_sample_specification();
+            while (!strong_instance_pointer->m_device_sample_specification.is_valid() && strong_instance_pointer->connection_is_good())
+                strong_instance_pointer->wait_for_signal();
+            VERIFY(strong_instance_pointer->m_device_sample_specification.is_valid());
+
+            // FIXME: We should hook up a callback to update the device sample specification
+            //        when it changes and somehow reinitialize any existing streams.
+        }
+
+        s_pulse_audio_context = strong_instance_pointer;
+    }
+
+    return strong_instance_pointer.release_nonnull();
+}
+
+bool PulseAudioContext::is_connected()
+{
+    auto locker = MutexLocker(pulse_audio_context_mutex());
+    return s_pulse_audio_context != nullptr;
+}
+
+PulseAudioContext::PulseAudioContext(pa_threaded_mainloop* main_loop, pa_mainloop_api* api, pa_context* context)
+    : m_main_loop(main_loop)
+    , m_api(api)
+    , m_context(context)
+{
+}
+
+PulseAudioContext::~PulseAudioContext()
+{
+    auto locker = MutexLocker(pulse_audio_context_mutex());
+
+    {
+        auto loop_locker = main_loop_locker();
+        pa_context_set_state_callback(m_context, nullptr, nullptr);
+        pa_context_set_subscribe_callback(m_context, nullptr, nullptr);
+        pa_context_disconnect(m_context);
+        pa_context_unref(m_context);
+    }
+    pa_threaded_mainloop_stop(m_main_loop);
+    pa_threaded_mainloop_free(m_main_loop);
+
+    s_pulse_audio_context = nullptr;
+}
+
+bool PulseAudioContext::current_thread_is_main_loop_thread()
+{
+    return static_cast<bool>(pa_threaded_mainloop_in_thread(m_main_loop));
+}
+
+void PulseAudioContext::lock_main_loop()
+{
+    if (!current_thread_is_main_loop_thread())
+        pa_threaded_mainloop_lock(m_main_loop);
+}
+
+void PulseAudioContext::unlock_main_loop()
+{
+    if (!current_thread_is_main_loop_thread())
+        pa_threaded_mainloop_unlock(m_main_loop);
+}
+
+void PulseAudioContext::wait_for_signal()
+{
+    pa_threaded_mainloop_wait(m_main_loop);
+}
+
+void PulseAudioContext::signal_to_wake()
+{
+    pa_threaded_mainloop_signal(m_main_loop, 0);
+}
+
+PulseAudioContextState PulseAudioContext::get_connection_state()
+{
+    return static_cast<PulseAudioContextState>(pa_context_get_state(m_context));
+}
+
+bool PulseAudioContext::connection_is_good()
+{
+    return PA_CONTEXT_IS_GOOD(pa_context_get_state(m_context));
+}
+
+PulseAudioErrorCode PulseAudioContext::get_last_error()
+{
+    return static_cast<PulseAudioErrorCode>(pa_context_errno(m_context));
+}
+
+void PulseAudioContext::request_device_sample_specification()
+{
+    VERIFY(pa_context_get_state(m_context) == PA_CONTEXT_READY);
+
+    static constexpr auto set_default_sample_specification = [](PulseAudioContext& context) {
+        context.m_device_sample_specification = SampleSpecification(44100, ChannelMap::stereo());
+        context.signal_to_wake();
+    };
+
+    m_device_sample_specification = {};
+
+    auto* operation = pa_context_get_server_info(
+        m_context, [](pa_context*, pa_server_info const* info, void* user_data) {
+            auto& context = *reinterpret_cast<PulseAudioContext*>(user_data);
+
+            if (info->default_sink_name == nullptr) {
+                set_default_sample_specification(context);
+                return;
+            }
+
+            auto* operation = pa_context_get_sink_info_by_name(
+                context.m_context, info->default_sink_name, [](pa_context*, pa_sink_info const* info, int status, void* user_data) {
+                    auto& context = *reinterpret_cast<PulseAudioContext*>(user_data);
+
+                    if (status != 0) {
+                        if (!context.m_device_sample_specification.is_valid()) {
+                            warnln("PulseAudio was unable to find the default sink by name.");
+                            set_default_sample_specification(context);
+                        }
+                        return;
+                    }
+
+                    auto channel_map_result = pulse_audio_channel_map_to_channel_map(info->channel_map);
+                    if (channel_map_result.is_error()) {
+                        warnln("Failed to convert the PulseAudio's default sink's channel map to ChannelMap.");
+                        set_default_sample_specification(context);
+                        return;
+                    }
+
+                    context.m_device_sample_specification = SampleSpecification(info->sample_spec.rate, channel_map_result.release_value());
+                    context.signal_to_wake();
+                },
+                &context);
+            VERIFY(operation != nullptr);
+            pa_operation_unref(operation);
+        },
+        this);
+    VERIFY(operation != nullptr);
+    pa_operation_unref(operation);
+}
+
+ErrorOr<void> PulseAudioContext::wait_for_operation(pa_operation* operation, StringView error_message)
+{
+    if (operation == nullptr)
+        return Error::from_string_view(error_message);
+
+    ScopeGuard unref_operation { [&] {
+        pa_operation_unref(operation);
+    } };
+
+    while (pa_operation_get_state(operation) == PA_OPERATION_RUNNING) {
+        auto context_state = get_connection_state();
+        if (context_state == PulseAudioContextState::Failed || context_state == PulseAudioContextState::Terminated) {
+            warnln("{} with error: {}", error_message, pulse_audio_error_to_string(get_last_error()));
+            return Error::from_string_view(error_message);
+        }
+        wait_for_signal();
+    }
+
+    if (pa_operation_get_state(operation) != PA_OPERATION_DONE || !connection_is_good()) {
+        warnln("{} with error: {}", error_message, pulse_audio_error_to_string(get_last_error()));
+        return Error::from_string_view(error_message);
+    }
+
+    return {};
+}
+
+ErrorOr<void> PulseAudioContext::watch_devices(Function<void()> on_devices_changed)
+{
+    auto locker = main_loop_locker();
+    m_on_devices_changed = move(on_devices_changed);
+
+    pa_context_set_subscribe_callback(
+        m_context, [](pa_context*, pa_subscription_event_type_t event_type, uint32_t, void* user_data) {
+            auto& context = *static_cast<PulseAudioContext*>(user_data);
+            auto facility = event_type & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
+            auto change = event_type & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
+            // A sink or source "change" is mostly volume; only the server's defaults changing counts.
+            bool is_device_change = facility == PA_SUBSCRIPTION_EVENT_SERVER || change != PA_SUBSCRIPTION_EVENT_CHANGE;
+            if (is_device_change && context.m_on_devices_changed)
+                context.m_on_devices_changed();
+        },
+        this);
+
+    auto mask = static_cast<pa_subscription_mask_t>(PA_SUBSCRIPTION_MASK_SINK | PA_SUBSCRIPTION_MASK_SOURCE | PA_SUBSCRIPTION_MASK_SERVER);
+    auto* operation = pa_context_subscribe(
+        m_context, mask, [](pa_context*, int, void* user_data) {
+            static_cast<PulseAudioContext*>(user_data)->signal_to_wake();
+        },
+        this);
+    return wait_for_operation(operation, "Subscribing to PulseAudio device changes failed"sv);
+}
+
+ErrorOr<void> PulseAudioContext::enumerate_audio_devices(Vector<AudioDeviceInfo>& inputs, Vector<AudioDeviceInfo>& outputs)
+{
+    struct EnumerationState {
+        PulseAudioContext& context;
+        Vector<AudioDeviceInfo> inputs;
+        Vector<AudioDeviceInfo> outputs;
+        ByteString default_source_name;
+        ByteString default_sink_name;
+        bool list_query_failed { false };
+    };
+
+    auto locker = main_loop_locker();
+
+    VERIFY(get_connection_state() == PulseAudioContextState::Ready);
+
+    EnumerationState state { .context = *this, .inputs = {}, .outputs = {}, .default_source_name = {}, .default_sink_name = {} };
+
+    // Fetch the defaults first so the enumeration callbacks can mark them.
+    TRY(wait_for_operation(pa_context_get_server_info(
+                               m_context, [](pa_context*, pa_server_info const* info, void* user_data) {
+                                   auto& state = *static_cast<EnumerationState*>(user_data);
+                                   if (info != nullptr) {
+                                       if (info->default_source_name != nullptr)
+                                           state.default_source_name = info->default_source_name;
+                                       if (info->default_sink_name != nullptr)
+                                           state.default_sink_name = info->default_sink_name;
+                                   }
+                                   state.context.signal_to_wake();
+                               },
+                               &state),
+        "Failed to query PulseAudio server information"sv));
+
+    TRY(wait_for_operation(pa_context_get_source_info_list(
+                               m_context, [](pa_context*, pa_source_info const* info, int is_end_of_list, void* user_data) {
+                                   auto& state = *static_cast<EnumerationState*>(user_data);
+                                   if (is_end_of_list < 0) {
+                                       state.list_query_failed = true;
+                                       state.context.signal_to_wake();
+                                       return;
+                                   }
+                                   if (is_end_of_list != 0) {
+                                       state.context.signal_to_wake();
+                                       return;
+                                   }
+                                   if (info == nullptr || info->name == nullptr)
+                                       return;
+                                   AudioDeviceInfo entry {
+                                       .dom_device_id = ByteString::formatted("pulse:source:{}", info->name),
+                                       .label = info->description != nullptr ? ByteString { info->description } : ByteString { info->name },
+                                       .group_id = {},
+                                       .sample_rate_hz = info->sample_spec.rate,
+                                       .channel_count = info->sample_spec.channels,
+                                       .is_default = state.default_source_name == info->name,
+                                   };
+                                   state.inputs.append(move(entry));
+                               },
+                               &state),
+        "Failed to query PulseAudio source list"sv));
+    if (state.list_query_failed)
+        return Error::from_string_literal("PulseAudio source list query failed");
+
+    TRY(wait_for_operation(pa_context_get_sink_info_list(
+                               m_context, [](pa_context*, pa_sink_info const* info, int is_end_of_list, void* user_data) {
+                                   auto& state = *static_cast<EnumerationState*>(user_data);
+                                   if (is_end_of_list < 0) {
+                                       state.list_query_failed = true;
+                                       state.context.signal_to_wake();
+                                       return;
+                                   }
+                                   if (is_end_of_list != 0) {
+                                       state.context.signal_to_wake();
+                                       return;
+                                   }
+                                   if (info == nullptr || info->name == nullptr)
+                                       return;
+                                   AudioDeviceInfo entry {
+                                       .dom_device_id = ByteString::formatted("pulse:sink:{}", info->name),
+                                       .label = info->description != nullptr ? ByteString { info->description } : ByteString { info->name },
+                                       .group_id = {},
+                                       .sample_rate_hz = info->sample_spec.rate,
+                                       .channel_count = info->sample_spec.channels,
+                                       .is_default = state.default_sink_name == info->name,
+                                   };
+                                   state.outputs.append(move(entry));
+                               },
+                               &state),
+        "Failed to query PulseAudio sink list"sv));
+    if (state.list_query_failed)
+        return Error::from_string_literal("PulseAudio sink list query failed");
+
+    inputs = move(state.inputs);
+    outputs = move(state.outputs);
+    return {};
+}
+
+#define STREAM_SIGNAL_CALLBACK(stream)                                          \
+    [](auto*, int, void* user_data) {                                           \
+        static_cast<PulseAudioStream*>(user_data)->m_context->signal_to_wake(); \
+    },                                                                          \
+        (stream)
+
+ErrorOr<NonnullRefPtr<PulseAudioStream>> PulseAudioContext::create_stream(OutputState initial_state, u32 target_latency_ms, PulseAudioDataRequestCallback write_callback)
+{
+    auto locker = main_loop_locker();
+
+    VERIFY(get_connection_state() == PulseAudioContextState::Ready);
+
+    pa_sample_spec sample_specification {
+        PA_SAMPLE_FLOAT32LE,
+        m_device_sample_specification.sample_rate(),
+        m_device_sample_specification.channel_map().channel_count(),
+    };
+
+    // Check the sample specification and channel map here. These are also checked by stream_new(),
+    // but we can return a more accurate error if we check beforehand.
+    if (pa_sample_spec_valid(&sample_specification) == 0)
+        return Error::from_string_literal("PulseAudio sample specification is invalid");
+    pa_channel_map pa_channel_map = TRY(channel_map_to_pulse_audio_channel_map(m_device_sample_specification.channel_map()));
+    if (!pa_channel_map_valid(&pa_channel_map)) {
+        warnln("Channel map is incompatible with PulseAudio: {}", m_device_sample_specification.channel_map());
+        return Error::from_string_literal("Channel map is incompatible with PulseAudio");
+    }
+
+    // Create the stream object and set a callback to signal ourselves to wake when the stream changes states,
+    // allowing us to wait synchronously for it to become Ready or Failed.
+    auto* stream = pa_stream_new_with_proplist(m_context, "Audio Stream", &sample_specification, &pa_channel_map, nullptr);
+    if (stream == nullptr) {
+        warnln("Instantiating PulseAudio stream failed with error: {}", pulse_audio_error_to_string(get_last_error()));
+        return Error::from_string_literal("Failed to create PulseAudio stream");
+    }
+    pa_stream_set_state_callback(
+        stream, [](pa_stream*, void* user_data) {
+            static_cast<PulseAudioContext*>(user_data)->signal_to_wake();
+        },
+        this);
+
+    auto stream_wrapper = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) PulseAudioStream(*this, stream)));
+
+    stream_wrapper->m_write_callback = move(write_callback);
+    pa_stream_set_write_callback(
+        stream, [](pa_stream* stream, size_t bytes_to_write, void* user_data) {
+            auto& stream_wrapper = *static_cast<PulseAudioStream*>(user_data);
+            VERIFY(stream_wrapper.m_stream == stream);
+            stream_wrapper.on_write_requested(bytes_to_write);
+        },
+        stream_wrapper.ptr());
+
+    // Borrowing logic from cubeb to set reasonable buffer sizes for a target latency:
+    // https://searchfox.org/mozilla-central/rev/3b707c8fd7e978eebf24279ee51ccf07895cfbcb/third_party/rust/cubeb-sys/libcubeb/src/cubeb_pulse.c#910-927
+    pa_buffer_attr buffer_attributes;
+    buffer_attributes.maxlength = -1;
+    buffer_attributes.prebuf = -1;
+    u64 const target_latency_frames = target_latency_ms * sample_specification.rate / 1000u;
+    u64 const target_latency_bytes = target_latency_frames * pa_frame_size(&sample_specification);
+    buffer_attributes.tlength = static_cast<u32>(min<u64>(target_latency_bytes, NumericLimits<u32>::max()));
+    buffer_attributes.minreq = buffer_attributes.tlength / 4;
+    buffer_attributes.fragsize = buffer_attributes.minreq;
+    auto flags = static_cast<pa_stream_flags>(PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_ADJUST_LATENCY | PA_STREAM_RELATIVE_VOLUME);
+
+    if (initial_state == OutputState::Suspended) {
+        stream_wrapper->m_suspended = true;
+        flags = static_cast<pa_stream_flags>(static_cast<u32>(flags) | PA_STREAM_START_CORKED);
+    } else {
+        stream_wrapper->m_callback_state = PulseAudioStream::CallbackState::Active;
+    }
+
+    // This is a workaround for an issue with starting the stream corked, see PulseAudioStream::next_write_starts_playing_at().
+    pa_stream_set_started_callback(
+        stream, [](pa_stream* stream, void* user_data) {
+            static_cast<PulseAudioStream*>(user_data)->m_started_playback = true;
+            pa_stream_set_started_callback(stream, nullptr, nullptr);
+        },
+        stream_wrapper.ptr());
+
+    if (auto error = pa_stream_connect_playback(stream, nullptr, &buffer_attributes, flags, nullptr, nullptr); error != 0) {
+        warnln("Failed to start PulseAudio stream connection with error: {}", pulse_audio_error_to_string(static_cast<PulseAudioErrorCode>(error)));
+        return Error::from_string_literal("Error while connecting the PulseAudio stream");
+    }
+
+    while (true) {
+        bool is_ready = false;
+        switch (stream_wrapper->get_connection_state()) {
+        case PulseAudioStreamState::Creating:
+            break;
+        case PulseAudioStreamState::Ready:
+            is_ready = true;
+            break;
+        case PulseAudioStreamState::Failed:
+            warnln("PulseAudio stream connection failed with error: {}", pulse_audio_error_to_string(get_last_error()));
+            return Error::from_string_literal("Failed to connect to PulseAudio daemon");
+        case PulseAudioStreamState::Unconnected:
+        case PulseAudioStreamState::Terminated:
+            VERIFY_NOT_REACHED();
+            break;
+        }
+        if (is_ready)
+            break;
+
+        wait_for_signal();
+    }
+
+    pa_stream_set_state_callback(stream, nullptr, nullptr);
+
+    return stream_wrapper;
+}
+
+ErrorOr<NonnullRefPtr<PulseAudioRecordStream>> PulseAudioContext::create_record_stream(SampleSpecification const& specification, u32 fragment_size_bytes, char const* device_name, PulseAudioRecordCallback read_callback)
+{
+    auto locker = main_loop_locker();
+
+    VERIFY(get_connection_state() == PulseAudioContextState::Ready);
+
+    pa_sample_spec sample_specification {
+        PA_SAMPLE_FLOAT32LE,
+        specification.sample_rate(),
+        specification.channel_map().channel_count(),
+    };
+
+    // Check the sample specification and channel map here. These are also checked by stream_new(),
+    // but we can return a more accurate error if we check beforehand.
+    if (pa_sample_spec_valid(&sample_specification) == 0)
+        return Error::from_string_literal("PulseAudio sample specification is invalid");
+    pa_channel_map pa_channel_map = TRY(channel_map_to_pulse_audio_channel_map(specification.channel_map()));
+    if (!pa_channel_map_valid(&pa_channel_map)) {
+        warnln("Channel map is incompatible with PulseAudio: {}", specification.channel_map());
+        return Error::from_string_literal("Channel map is incompatible with PulseAudio");
+    }
+
+    // Create the stream object and set a callback to signal ourselves to wake when the stream changes states,
+    // allowing us to wait synchronously for it to become Ready or Failed.
+    auto* stream = pa_stream_new_with_proplist(m_context, "Audio Record Stream", &sample_specification, &pa_channel_map, nullptr);
+    if (stream == nullptr) {
+        warnln("Instantiating PulseAudio record stream failed with error: {}", pulse_audio_error_to_string(get_last_error()));
+        return Error::from_string_literal("Failed to create PulseAudio record stream");
+    }
+    pa_stream_set_state_callback(
+        stream, [](pa_stream*, void* user_data) {
+            static_cast<PulseAudioContext*>(user_data)->signal_to_wake();
+        },
+        this);
+
+    auto stream_wrapper = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) PulseAudioRecordStream(*this, stream, specification)));
+
+    stream_wrapper->m_read_callback = move(read_callback);
+    pa_stream_set_read_callback(
+        stream, [](pa_stream* stream, size_t, void* user_data) {
+            auto& stream_wrapper = *static_cast<PulseAudioRecordStream*>(user_data);
+            VERIFY(stream_wrapper.m_stream == stream);
+            stream_wrapper.on_data_available();
+        },
+        stream_wrapper.ptr());
+
+    pa_buffer_attr buffer_attributes;
+    buffer_attributes.maxlength = -1;
+    buffer_attributes.tlength = -1;
+    buffer_attributes.prebuf = -1;
+    buffer_attributes.minreq = -1;
+    buffer_attributes.fragsize = fragment_size_bytes;
+    auto flags = static_cast<pa_stream_flags>(PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_ADJUST_LATENCY);
+
+    if (auto error = pa_stream_connect_record(stream, device_name, &buffer_attributes, flags); error != 0) {
+        warnln("Failed to start PulseAudio record stream connection with error: {}", pulse_audio_error_to_string(static_cast<PulseAudioErrorCode>(error)));
+        return Error::from_string_literal("Error while connecting the PulseAudio record stream");
+    }
+
+    while (true) {
+        bool is_ready = false;
+        switch (stream_wrapper->get_connection_state()) {
+        case PulseAudioStreamState::Creating:
+            break;
+        case PulseAudioStreamState::Ready:
+            is_ready = true;
+            break;
+        case PulseAudioStreamState::Failed:
+            warnln("PulseAudio record stream connection failed with error: {}", pulse_audio_error_to_string(get_last_error()));
+            return Error::from_string_literal("Failed to connect to PulseAudio daemon");
+        case PulseAudioStreamState::Unconnected:
+        case PulseAudioStreamState::Terminated:
+            VERIFY_NOT_REACHED();
+            break;
+        }
+        if (is_ready)
+            break;
+
+        wait_for_signal();
+    }
+
+    pa_stream_set_state_callback(stream, nullptr, nullptr);
+
+    return stream_wrapper;
+}
+
+PulseAudioRecordStream::PulseAudioRecordStream(PulseAudioContext& context, pa_stream* stream, SampleSpecification specification)
+    : m_context(context)
+    , m_stream(stream)
+    , m_sample_specification(specification)
+{
+}
+
+PulseAudioRecordStream::~PulseAudioRecordStream()
+{
+    auto locker = m_context->main_loop_locker();
+    pa_stream_set_read_callback(m_stream, nullptr, nullptr);
+    pa_stream_set_state_callback(m_stream, nullptr, nullptr);
+    pa_stream_disconnect(m_stream);
+    pa_stream_unref(m_stream);
+}
+
+PulseAudioStreamState PulseAudioRecordStream::get_connection_state()
+{
+    return static_cast<PulseAudioStreamState>(pa_stream_get_state(m_stream));
+}
+
+bool PulseAudioRecordStream::connection_is_good()
+{
+    return PA_STREAM_IS_GOOD(pa_stream_get_state(m_stream));
+}
+
+void PulseAudioRecordStream::on_data_available()
+{
+    while (true) {
+        auto readable_size = pa_stream_readable_size(m_stream);
+        if (readable_size == 0 || readable_size == static_cast<size_t>(-1))
+            break;
+
+        void const* data = nullptr;
+        size_t length = 0;
+        if (pa_stream_peek(m_stream, &data, &length) != 0)
+            break;
+        // The buffer is empty despite readable_size() saying otherwise; there is no
+        // fragment to drop in this case.
+        if (length == 0)
+            break;
+        // A null data pointer with a nonzero length indicates a hole in the stream (e.g.
+        // caused by an overrun); dropping the fragment skips past the missing data.
+        if (data != nullptr && m_read_callback)
+            m_read_callback(ReadonlyBytes { static_cast<u8 const*>(data), length }, m_sample_specification);
+        pa_stream_drop(m_stream);
+    }
+}
+
+PulseAudioStream::PulseAudioStream(PulseAudioContext& context, pa_stream* stream)
+    : m_context(context)
+    , m_stream(stream)
+{
+}
+
+PulseAudioStream::~PulseAudioStream()
+{
+    auto locker = m_context->main_loop_locker();
+    pa_stream_set_write_callback(m_stream, nullptr, nullptr);
+    pa_stream_set_started_callback(m_stream, nullptr, nullptr);
+    pa_stream_disconnect(m_stream);
+    pa_stream_unref(m_stream);
+}
+
+PulseAudioStreamState PulseAudioStream::get_connection_state()
+{
+    return static_cast<PulseAudioStreamState>(pa_stream_get_state(m_stream));
+}
+
+bool PulseAudioStream::connection_is_good()
+{
+    return PA_STREAM_IS_GOOD(pa_stream_get_state(m_stream));
+}
+
+SampleSpecification PulseAudioStream::sample_specification()
+{
+    auto const* pa_sample_specification = pa_stream_get_sample_spec(m_stream);
+    auto const* pa_channel_map = pa_stream_get_channel_map(m_stream);
+    VERIFY(pa_sample_specification->format == PA_SAMPLE_FLOAT32LE);
+    auto channel_map = MUST(pulse_audio_channel_map_to_channel_map(*pa_channel_map));
+    return SampleSpecification(pa_sample_specification->rate, channel_map);
+}
+
+u32 PulseAudioStream::sample_rate()
+{
+    return pa_stream_get_sample_spec(m_stream)->rate;
+}
+
+size_t PulseAudioStream::sample_size()
+{
+    return pa_sample_size(pa_stream_get_sample_spec(m_stream));
+}
+
+size_t PulseAudioStream::frame_size()
+{
+    return pa_frame_size(pa_stream_get_sample_spec(m_stream));
+}
+
+u8 PulseAudioStream::channel_count()
+{
+    return pa_stream_get_sample_spec(m_stream)->channels;
+}
+
+void PulseAudioStream::on_write_requested(size_t bytes_to_write)
+{
+    VERIFY(m_write_callback);
+    if (m_suspended)
+        return;
+    auto callback_state = m_callback_state.load();
+    if (callback_state == CallbackState::Parked)
+        return;
+    while (bytes_to_write > 0) {
+        auto buffer = begin_write(bytes_to_write).release_value_but_fixme_should_propagate_errors();
+        auto frame_size = this->frame_size();
+        VERIFY(buffer.size() % frame_size == 0);
+        auto written_buffer = m_write_callback(*this, buffer.reinterpret<float>(), next_write_starts_playing_at()).reinterpret<u8 const>();
+        if (written_buffer.size() == 0) {
+            cancel_write().release_value_but_fixme_should_propagate_errors();
+
+            while (true) {
+                if (m_callback_state.compare_exchange_strong(callback_state, CallbackState::Parked))
+                    break;
+                VERIFY(callback_state != CallbackState::Parked);
+                if (callback_state == CallbackState::ActiveWithFutureData) {
+                    if (!m_callback_state.compare_exchange_strong(callback_state, CallbackState::Active))
+                        continue;
+                    queue_a_write_while_locked();
+                    break;
+                }
+            }
+
+            break;
+        }
+        bytes_to_write -= written_buffer.size();
+        write(written_buffer).release_value_but_fixme_should_propagate_errors();
+    }
+}
+
+ErrorOr<Bytes> PulseAudioStream::begin_write(size_t bytes_to_write)
+{
+    void* data_pointer;
+    size_t data_size = bytes_to_write;
+    if (pa_stream_begin_write(m_stream, &data_pointer, &data_size) != 0 || data_pointer == nullptr)
+        return Error::from_string_literal("Failed to get the playback stream's write buffer from PulseAudio");
+    return Bytes { data_pointer, data_size };
+}
+
+ErrorOr<void> PulseAudioStream::write(ReadonlyBytes data)
+{
+    if (pa_stream_write(m_stream, data.data(), data.size(), nullptr, 0, PA_SEEK_RELATIVE) != 0)
+        return Error::from_string_literal("Failed to write data to PulseAudio playback stream");
+    return {};
+}
+
+ErrorOr<void> PulseAudioStream::cancel_write()
+{
+    if (pa_stream_cancel_write(m_stream) != 0)
+        return Error::from_string_literal("Failed to get the playback stream's write buffer from PulseAudio");
+    return {};
+}
+
+bool PulseAudioStream::is_suspended() const
+{
+    return m_suspended;
+}
+
+StringView pulse_audio_error_to_string(PulseAudioErrorCode code)
+{
+    if (code < PulseAudioErrorCode::OK || code >= PulseAudioErrorCode::Sentinel)
+        return "Unknown error code"sv;
+
+    char const* string = pa_strerror(static_cast<int>(code));
+    return StringView { string, strlen(string) };
+}
+
+ErrorOr<void> PulseAudioStream::wait_for_operation(pa_operation* operation, StringView error_message)
+{
+    while (pa_operation_get_state(operation) == PA_OPERATION_RUNNING)
+        m_context->wait_for_signal();
+    pa_operation_unref(operation);
+    if (!m_context->connection_is_good() || !this->connection_is_good()) {
+        auto pulse_audio_error_name = pulse_audio_error_to_string(m_context->get_last_error());
+        warnln("Encountered stream error: {}", pulse_audio_error_name);
+        return Error::from_string_view(error_message);
+    }
+    return {};
+}
+
+ErrorOr<void> PulseAudioStream::drain_and_suspend()
+{
+    auto locker = m_context->main_loop_locker();
+
+    if (m_suspended)
+        return {};
+    m_suspended = true;
+
+    if (pa_stream_is_corked(m_stream) > 0)
+        return {};
+
+    TRY(wait_for_operation(pa_stream_drain(m_stream, STREAM_SIGNAL_CALLBACK(this)), "Draining PulseAudio stream failed"sv));
+    TRY(wait_for_operation(pa_stream_cork(m_stream, 1, STREAM_SIGNAL_CALLBACK(this)), "Corking PulseAudio stream after drain failed"sv));
+    return {};
+}
+
+ErrorOr<void> PulseAudioStream::flush_and_suspend()
+{
+    auto locker = m_context->main_loop_locker();
+
+    if (m_suspended)
+        return {};
+    m_suspended = true;
+
+    if (pa_stream_is_corked(m_stream) > 0)
+        return {};
+
+    TRY(wait_for_operation(pa_stream_flush(m_stream, STREAM_SIGNAL_CALLBACK(this)), "Flushing PulseAudio stream failed"sv));
+    TRY(wait_for_operation(pa_stream_cork(m_stream, 1, STREAM_SIGNAL_CALLBACK(this)), "Corking PulseAudio stream after flush failed"sv));
+    return {};
+}
+
+void PulseAudioStream::queue_a_write_while_locked()
+{
+    // NOTE: We ref here and then unref in the callback so that this stream will not be deleted until
+    //       it finishes.
+    ref();
+    pa_mainloop_api_once(
+        m_context->m_api, [](pa_mainloop_api*, void* user_data) {
+            auto stream = adopt_ref(*static_cast<PulseAudioStream*>(user_data));
+            if (stream->m_suspended)
+                return;
+            // NOTE: writable_size() returns -1 in case of an error. However, the value is still safe
+            //       since begin_write() will interpret -1 as a default parameter and choose a good size.
+            auto bytes_to_write = pa_stream_writable_size(stream->m_stream);
+            stream->on_write_requested(bytes_to_write);
+        },
+        this);
+}
+
+ErrorOr<void> PulseAudioStream::resume()
+{
+    auto locker = m_context->main_loop_locker();
+
+    if (!m_suspended)
+        return {};
+    m_suspended = false;
+
+    TRY(wait_for_operation(pa_stream_cork(m_stream, 0, STREAM_SIGNAL_CALLBACK(this)), "Uncorking PulseAudio stream failed"sv));
+
+    // Defer a write to the playback buffer on the PulseAudio main loop. Otherwise, playback will not
+    // begin again, despite the fact that we uncorked.
+    m_callback_state = CallbackState::Active;
+    queue_a_write_while_locked();
+    return {};
+}
+
+void PulseAudioStream::notify_data_available()
+{
+    auto callback_state = m_callback_state.load();
+    while (true) {
+        if (callback_state == CallbackState::Parked) {
+            if (m_callback_state.compare_exchange_strong(callback_state, CallbackState::Active)) {
+                auto locker = m_context->main_loop_locker();
+                queue_a_write_while_locked();
+                return;
+            }
+            continue;
+        }
+
+        if (callback_state == CallbackState::Active) [[likely]] {
+            if (m_callback_state.compare_exchange_strong(callback_state, CallbackState::ActiveWithFutureData))
+                return;
+            continue;
+        }
+
+        if (callback_state == CallbackState::ActiveWithFutureData)
+            return;
+    }
+}
+
+MonotonicTime PulseAudioStream::next_write_starts_playing_at()
+{
+    auto now = MonotonicTime::now();
+    // Asking before the first write has started a corked stream latches a stale time in the smoother.
+    if (!m_started_playback)
+        return now;
+    pa_usec_t latency_usec = 0;
+    int latency_is_negative = 0;
+    if (pa_stream_get_latency(m_stream, &latency_usec, &latency_is_negative) != 0 || latency_is_negative)
+        return now;
+    return now + AK::Duration::from_microseconds(static_cast<i64>(latency_usec));
+}
+
+ErrorOr<void> PulseAudioStream::set_volume(double volume)
+{
+    auto locker = m_context->main_loop_locker();
+
+    auto index = pa_stream_get_index(m_stream);
+    if (index == PA_INVALID_INDEX)
+        return Error::from_string_literal("Failed to get PulseAudio stream index while setting volume");
+
+    auto pulse_volume = pa_sw_volume_from_linear(volume);
+    pa_cvolume per_channel_volumes;
+    pa_cvolume_set(&per_channel_volumes, channel_count(), pulse_volume);
+
+    auto* operation = pa_context_set_sink_input_volume(m_context->m_context, index, &per_channel_volumes, STREAM_SIGNAL_CALLBACK(this));
+    return wait_for_operation(operation, "Failed to set PulseAudio stream volume"sv);
+}
+
+#define ENUMERATE_CHANNEL_POSITIONS(C)                                               \
+    C(Audio::Channel::FrontLeft, PA_CHANNEL_POSITION_FRONT_LEFT)                     \
+    C(Audio::Channel::FrontRight, PA_CHANNEL_POSITION_FRONT_RIGHT)                   \
+    C(Audio::Channel::FrontCenter, PA_CHANNEL_POSITION_FRONT_CENTER)                 \
+    C(Audio::Channel::LowFrequency, PA_CHANNEL_POSITION_LFE)                         \
+    C(Audio::Channel::BackLeft, PA_CHANNEL_POSITION_REAR_LEFT)                       \
+    C(Audio::Channel::BackRight, PA_CHANNEL_POSITION_REAR_RIGHT)                     \
+    C(Audio::Channel::FrontLeftOfCenter, PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER)   \
+    C(Audio::Channel::FrontRightOfCenter, PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER) \
+    C(Audio::Channel::BackCenter, PA_CHANNEL_POSITION_REAR_CENTER)                   \
+    C(Audio::Channel::SideLeft, PA_CHANNEL_POSITION_SIDE_LEFT)                       \
+    C(Audio::Channel::SideRight, PA_CHANNEL_POSITION_SIDE_RIGHT)                     \
+    C(Audio::Channel::TopCenter, PA_CHANNEL_POSITION_TOP_CENTER)                     \
+    C(Audio::Channel::TopFrontLeft, PA_CHANNEL_POSITION_TOP_FRONT_LEFT)              \
+    C(Audio::Channel::TopFrontCenter, PA_CHANNEL_POSITION_TOP_FRONT_CENTER)          \
+    C(Audio::Channel::TopFrontRight, PA_CHANNEL_POSITION_TOP_FRONT_RIGHT)            \
+    C(Audio::Channel::TopBackLeft, PA_CHANNEL_POSITION_TOP_REAR_LEFT)                \
+    C(Audio::Channel::TopBackCenter, PA_CHANNEL_POSITION_TOP_REAR_CENTER)            \
+    C(Audio::Channel::TopBackRight, PA_CHANNEL_POSITION_TOP_REAR_RIGHT)
+
+ErrorOr<Audio::ChannelMap> pulse_audio_channel_map_to_channel_map(pa_channel_map const& channel_map)
+{
+    if (channel_map.channels <= 0)
+        return Error::from_string_literal("PulseAudio channel map had no channels");
+    if (static_cast<size_t>(channel_map.channels) > Audio::ChannelMap::capacity())
+        return Error::from_string_literal("PulseAudio channel map had too many channels");
+    Vector<Audio::Channel, Audio::ChannelMap::capacity()> channels;
+    channels.resize(channel_map.channels);
+
+#define PA_CHANNEL_POSITION_TO_AUDIO_CHANNEL(audio_channel, pa_channel_position) \
+    case pa_channel_position:                                                    \
+        return audio_channel;
+
+    for (int i = 0; i < channel_map.channels; i++) {
+        auto channel = [&] {
+            switch (channel_map.map[i]) {
+                ENUMERATE_CHANNEL_POSITIONS(PA_CHANNEL_POSITION_TO_AUDIO_CHANNEL);
+            default:
+                return Audio::Channel::Unknown;
+            }
+        }();
+        // If any channel position is one we don't enumerate (e.g. PA_CHANNEL_POSITION_AUX*, as seen on Asahi AUX0..3),
+        // converting the map back to PulseAudio would produce PA_CHANNEL_POSITION_INVALID and fail.
+        // Let PA do the remixing instead in those cases.
+        if (channel == Audio::Channel::Unknown)
+            return Audio::ChannelMap::stereo();
+        channels[i] = channel;
+    }
+
+    return Audio::ChannelMap(channels);
+}
+
+ErrorOr<pa_channel_map> channel_map_to_pulse_audio_channel_map(Audio::ChannelMap const& channel_map)
+{
+    static_assert(sizeof(pa_channel_map::map) >= PA_CHANNELS_MAX * sizeof(*pa_channel_map::map));
+    if (static_cast<size_t>(channel_map.channel_count()) > PA_CHANNELS_MAX)
+        return Error::from_string_literal("PulseAudio channel map had too many channels");
+
+    pa_channel_map map;
+    map.channels = channel_map.channel_count();
+
+#define AUDIO_CHANNEL_TO_PA_CHANNEL_POSITION(audio_channel, pa_channel_position) \
+    case audio_channel:                                                          \
+        return pa_channel_position;
+
+    u32 i = 0;
+    while (i < channel_map.channel_count()) {
+        auto channel = [&] {
+            switch (channel_map.channel_at(i)) {
+                ENUMERATE_CHANNEL_POSITIONS(AUDIO_CHANNEL_TO_PA_CHANNEL_POSITION);
+            default:
+                return PA_CHANNEL_POSITION_INVALID;
+            }
+        }();
+        map.map[i++] = channel;
+    }
+    while (i < PA_CHANNELS_MAX)
+        map.map[i++] = PA_CHANNEL_POSITION_INVALID;
+
+    return map;
+}
+
+}

@@ -36,12 +36,13 @@ public:
     void for_each_process(Function<void(Process&)>);
     void for_each_process_statistics(Function<void(Process&, Core::Platform::ProcessInfo const&)>);
     Optional<Process> remove_process(pid_t);
+    void remove_all_processes();
     Optional<Process&> find_process(pid_t);
     void cancel_forced_exit(pid_t);
     void force_exit_after_timeout(pid_t, int timeout_ms);
 
 #if defined(AK_OS_MACH)
-    void set_process_mach_port(pid_t, Core::MachPort&&);
+    void set_process_task_name_port(pid_t, Core::MachPort&&);
 #endif
 
     void update_all_process_statistics();

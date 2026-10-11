@@ -12,6 +12,7 @@
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/String.h>
+#include <AK/Time.h>
 #include <AK/WeakPtr.h>
 #include <LibCompositing/Types.h>
 #include <LibGfx/Point.h>
@@ -106,6 +107,14 @@ public:
     void owe_reply(OwedReply);
     bool take_owed_reply(OwedReply);
 
+    // The user activation the UI process gives a page when it delivers input the user produced. Unlike the activation
+    // a renderer reports, a compromised renderer cannot claim it.
+    void give_user_activation();
+    bool has_transient_user_activation() const;
+    // Consumes the activation of every page of the tab, as consuming a window's activation does for the windows of its
+    // top-level traversable. Returns false, consuming nothing, when the page has no transient activation.
+    bool consume_transient_user_activation();
+
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
     bool detached_close_pending() const { return m_detached_close_pending; }
     void set_detached_close_pending(bool pending) { m_detached_close_pending = pending; }
@@ -143,10 +152,11 @@ public:
     void reset_session_history_for_testing();
 
 private:
+    void relay_finished_input_event(WebContentPage const& reporting_page, u64 event_id, Web::EventResult);
     Optional<CanonicalNavigable&> population_worker_navigable(Web::HTML::CrossProcessId navigable_id) const;
     bool continue_navigation_population_in_selected_process(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id);
     void for_each_hosted_document(Function<IterationDecision(CanonicalDocument&)> const&) const;
-    bool hosts_local_file_content() const;
+    bool populates_a_navigation_to_local_file(ByteString const& path) const;
     Optional<CanonicalDocument&> document_with_hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
     StorageJar* storage_jar(Web::StorageAPI::StorageEndpointType) const;
     Optional<String> canonical_storage_key(Web::HTML::EnvironmentId const&) const;
@@ -220,7 +230,6 @@ private:
     virtual void did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key) override;
     Messages::WebContentClient::DidRequestStorageKeysResponse did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id);
     virtual void did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id) override;
-    virtual void did_request_activate_tab() override;
     virtual void did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
     virtual void did_consume_user_activation(Web::HTML::UserActivationConsumption consumption) override;
     virtual void webdriver_user_prompt_handling_complete(u64 request_id, Web::WebDriver::Response response) override;
@@ -240,6 +249,7 @@ private:
     virtual void did_cancel_geolocation_position_request(u64 request_id) override;
     virtual void did_start_geolocation_position_watch(u64 request_id) override;
     virtual void did_stop_geolocation_position_watch(u64 request_id) override;
+    virtual void did_request_permission(u64 request_id, Utf16String name) override;
     virtual void did_request_file_picker(Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) override;
     virtual void did_finish_handling_input_event(u64 event_id, Web::EventResult event_result) override;
     virtual void did_update_input_method_state(Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) override;
@@ -360,6 +370,7 @@ private:
     Optional<String> m_history_recorded_url_for_current_load;
     HashTable<u64> m_renderer_owned_downloads;
     HashTable<OwedReply> m_owed_replies;
+    Optional<MonotonicTime> m_last_user_activation;
 };
 
 }

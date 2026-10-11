@@ -8,8 +8,12 @@ use core::cell::Cell;
 
 use super::buffer::InterpreterBuffer;
 use super::cell::CellHeader;
+use super::feedback::ExecutableFeedbackHead;
 use super::property_lookup_cache::{EnvironmentCoordinate, GlobalVariableCache, PropertyLookupCache};
 use super::value::Value;
+
+/// The `jit::CompileState` of executables whose JIT code new frames run in.
+pub const JIT_COMPILE_STATE_INSTALLED: u8 = 2;
 
 /// The part of a bytecode executable that the interpreter reads. The rest of the executable follows it.
 #[repr(C)]
@@ -21,6 +25,20 @@ pub struct ExecutableHead {
     pub asm_constants_data: Cell<*const Value>,
     pub bytecode_data: Cell<*const u8>,
     pub bytecode_size: Cell<usize>,
+    /// Which of the VM's dispatch tables (see `VmHead::dispatch_tables`) the interpreter runs this executable's frames
+    /// with, which it switches to whenever it enters one of them.
+    pub dispatch_table_index: Cell<u8>,
+    /// Where the profiling interpreter records feedback for the optimizing JIT.
+    pub feedback: ExecutableFeedbackHead,
+    /// The profiling interpreter counts this down as it enters this executable and runs its loop back edges. The
+    /// JIT's tier-up policy runs when it reaches zero; while the executable warms up, that moves it to the profiling
+    /// handlers.
+    pub tier_up_budget: Cell<i32>,
+    /// The executable's slot in the VM's JIT entry table (see `jit::entry_table`), which holds its JIT code, or 0.
+    pub jit_entry_slot: Cell<u32>,
+    /// The executable's `jit::CompileState`. The interpreter runs new frames of the executable in its JIT code while
+    /// it is `JIT_COMPILE_STATE_INSTALLED`.
+    pub jit_compile_state: Cell<u8>,
     pub constants: InterpreterBuffer<Value>,
     pub property_lookup_caches: InterpreterBuffer<PropertyLookupCache>,
     pub global_variable_caches: InterpreterBuffer<GlobalVariableCache>,

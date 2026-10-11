@@ -27,6 +27,7 @@ use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::run::should_dump_bytecode;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
+use crate::layout::function_object::CallEnvironmentTemplate;
 pub use crate::layout::function_object::{SharedFunctionInstanceData, asm_call_metadata};
 use crate::runtime::environment_shape::{EnvironmentShape, EnvironmentShapeCache};
 use crate::runtime::private_environment::PrivateName;
@@ -39,6 +40,14 @@ pub enum ThisMode {
     Lexical,
     Strict,
     Global,
+}
+
+/// How many closures of a function were created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosureCount {
+    None,
+    One,
+    Many,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +86,10 @@ pub struct SharedFunctionInstanceDataStorage {
     /// the same name.
     #[gc(untraced)]
     mapped_argument_names: Rc<[Utf16FlyString]>,
+    /// The names of the parameters without the ones that repeat, in the order the bindings of the parameters are
+    /// created in the function environment.
+    #[gc(untraced)]
+    parameter_binding_names: Rc<[Utf16FlyString]>,
 
     #[gc(untraced)]
     this_mode: ThisMode, // [[ThisMode]]
@@ -121,6 +134,11 @@ pub struct SharedFunctionInstanceDataStorage {
     /// construct_reserve()), and how many constructions asked.
     construct_reserve: Cell<u32>,
     construct_count: Cell<u32>,
+
+    /// How many closures of the function were created. JIT code may only treat the bindings of a closure's
+    /// environment as the bindings of every frame running the function while it is the only closure.
+    #[gc(untraced)]
+    closure_count: Cell<ClosureCount>,
 }
 
 impl Drop for SharedFunctionInstanceDataStorage {
@@ -156,12 +174,32 @@ pub fn discard_precompiled_function(mut precompiled: Box<PrecompiledFunction>) {
 
 define_cell!(SharedFunctionInstanceData, Other);
 
-// SAFETY: Visits the executable and every cell the storage holds.
+// SAFETY: Visits the executable, the call environment template and every cell the storage holds.
 unsafe impl Trace for SharedFunctionInstanceData {
     fn trace(&self, visitor: &mut Visitor) {
         self.executable.trace(visitor);
+        self.call_environment_template.trace(visitor);
         self.storage.trace(visitor);
     }
+}
+
+define_cell!(CallEnvironmentTemplate, Other);
+
+// SAFETY: The words of a template refer to the environment's shape, which the shared function instance data keeps
+//         alive, and to no other cell.
+unsafe impl Trace for CallEnvironmentTemplate {
+    fn trace(&self, _visitor: &mut Visitor) {}
+}
+
+fn parameter_binding_names(parameter_names: &[Utf16FlyString]) -> Rc<[Utf16FlyString]> {
+    let mut seen_names = HashSet::with_capacity(parameter_names.len());
+    let mut names: Vec<Utf16FlyString> = Vec::with_capacity(parameter_names.len());
+    for name in parameter_names {
+        if seen_names.insert(name) {
+            names.push(name.clone());
+        }
+    }
+    names.into()
 }
 
 /// OPTIMIZATION: Precompute the argument indices that alias parameter bindings. Only the last occurrence of each
@@ -213,6 +251,7 @@ impl SharedFunctionInstanceData {
             function_environment_needed: Cell::new(false),
             uses_this: Cell::new(false),
             can_inline_call: Cell::new(false),
+            call_environment_template: Cell::new(None),
             storage: SharedFunctionInstanceDataStorage {
                 name,
                 source_code: RefCell::new(None),
@@ -220,6 +259,7 @@ impl SharedFunctionInstanceData {
                 source_text_offset: Cell::new(0),
                 source_text_length: Cell::new(0),
                 function_length,
+                parameter_binding_names: parameter_binding_names(&parameter_names_for_mapped_arguments),
                 mapped_argument_names: mapped_argument_names(parameter_names_for_mapped_arguments),
                 this_mode,
                 kind,
@@ -244,6 +284,7 @@ impl SharedFunctionInstanceData {
                 use_rust_compilation: true,
                 construct_reserve: Cell::new(0),
                 construct_count: Cell::new(0),
+                closure_count: Cell::new(ClosureCount::None),
             },
         }
     }
@@ -670,6 +711,10 @@ impl SharedFunctionInstanceData {
         self.storage.mapped_argument_names.clone()
     }
 
+    pub fn parameter_binding_names(&self) -> Rc<[Utf16FlyString]> {
+        self.storage.parameter_binding_names.clone()
+    }
+
     pub fn strict(&self) -> bool {
         self.strict.get()
     }
@@ -723,6 +768,24 @@ impl SharedFunctionInstanceData {
         }
         storage.construct_count.set(count.saturating_add(1));
         storage.construct_reserve.get()
+    }
+
+    pub fn closure_count(&self) -> ClosureCount {
+        self.storage.closure_count.get()
+    }
+
+    /// Counts a new closure of the function.
+    pub fn note_closure_created(&self) {
+        let count = match self.storage.closure_count.get() {
+            ClosureCount::None => ClosureCount::One,
+            ClosureCount::One | ClosureCount::Many => ClosureCount::Many,
+        };
+        self.storage.closure_count.set(count);
+    }
+
+    /// The reserve of the last construct_reserve(), without asking for it.
+    pub fn current_construct_reserve(&self) -> u32 {
+        self.storage.construct_reserve.get()
     }
 
     pub fn function_environment_needed(&self) -> bool {

@@ -36,6 +36,10 @@ if (APPLE)
     list(APPEND TEST_SOURCES TestProcessReaper.cpp)
 endif()
 
+if (LINUX)
+    list(APPEND TEST_SOURCES TestAudioDaemonSocket.cpp)
+endif()
+
 if (APPLE AND NOT IOS)
     ladybird_test(TestWebDriverMachBootstrap.cpp LibWebView LIBS LibGfx LibIPC LibURL LibWebCommon OpenSSL::Crypto OpenSSL::SSL)
     target_sources(TestWebDriverMachBootstrap PRIVATE
@@ -63,6 +67,13 @@ endforeach()
 
 if (TARGET TestProcessReaper)
     add_dependencies(TestProcessReaper ProcessReaper)
+endif()
+
+if (TARGET TestAudioDaemonSocket)
+    include(audio)
+    if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
+        target_compile_definitions(TestAudioDaemonSocket PRIVATE HAVE_PULSEAUDIO=1)
+    endif()
 endif()
 
 if (TARGET TestCrashReport AND cpptrace_FOUND AND LADYBIRD_ENABLE_CPPTRACE)
@@ -149,6 +160,13 @@ if (NOT WIN32)
     target_link_libraries(TestLinkHoverStatus PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
     if (APPLE)
         target_compile_definitions(TestLinkHoverStatus PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
+    add_executable(TestUserActivation TestUserActivation.cpp)
+    add_dependencies(TestUserActivation ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestUserActivation PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestUserActivation PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
     add_executable(TestShadowTreeTooltipsAndLinks TestShadowTreeTooltipsAndLinks.cpp)
@@ -258,6 +276,16 @@ if (BUILD_TESTING AND NOT WIN32)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-message-port-collection.py $<TARGET_FILE:WebDriver>
         )
         set_tests_properties(TestMessagePortCollection PROPERTIES TIMEOUT 120)
+        add_test(
+            NAME TestSharedStyleSheetMemory
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-shared-stylesheet-memory.py $<TARGET_FILE:WebDriver>
+        )
+        set_tests_properties(TestSharedStyleSheetMemory PROPERTIES TIMEOUT 180)
+        add_test(
+            NAME TestBytecodeCacheBlobIsFileBacked
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-bytecode-cache-blob-is-file-backed.py $<TARGET_FILE:WebDriver>
+        )
+        set_tests_properties(TestBytecodeCacheBlobIsFileBacked PROPERTIES TIMEOUT 120)
     endif()
 
     add_test(
@@ -322,6 +350,9 @@ if (BUILD_TESTING AND NOT WIN32)
 
     add_test(NAME TestLinkHoverStatus COMMAND $<TARGET_FILE:TestLinkHoverStatus>)
     set_tests_properties(TestLinkHoverStatus PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+
+    add_test(NAME TestUserActivation COMMAND $<TARGET_FILE:TestUserActivation>)
+    set_tests_properties(TestUserActivation PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
     add_test(NAME TestShadowTreeTooltipsAndLinks COMMAND $<TARGET_FILE:TestShadowTreeTooltipsAndLinks>)
     set_tests_properties(TestShadowTreeTooltipsAndLinks PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})

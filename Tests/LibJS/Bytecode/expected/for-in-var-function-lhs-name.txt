@@ -6,8 +6,8 @@ $d0083583 for-in-var-function-lhs-name.js:7:1
 
 block0:
   [   0] Enter
-  [   8] GetGlobal dst:reg6, `fn`
-  [  18] Call dst:reg5, callee:reg6, this_value:Undefined, fn
+  [   8] GetGlobal value_feedback:0, dst:reg6, `fn`
+  [  18] Call value_feedback:1, call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined, fn
   [  38] End value:reg5
 
 
@@ -32,16 +32,16 @@ block1:
 
 block2:
   [  60] ObjectPropertyIteratorNext dst_value:reg9, dst_done:reg10, receiver:reg6, keys:reg7, cursor:reg8
-  [  78] JumpIf condition:reg10, true_target:block1, false_target:block5
+  [  78] JumpIfLoop condition:reg10, true_target:block1, false_target:block5
 
 block3:
-  [  88] Jump target:block1
+  [  88] JumpLoop target:block1
 
 block4:
   [  90] GetObjectPropertyIterator dst_keys:reg7, dst_receiver:reg6, object:reg5
   [  a8] Mov dst:reg8, src:Int32(0)
-  [  b8] Jump target:block2
+  [  b8] JumpLoop target:block2
 
 block5:
   [  c0] Mov dst:f~0, src:reg9
-  [  d0] Jump target:block2
+  [  d0] JumpLoop target:block2

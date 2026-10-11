@@ -555,6 +555,61 @@ pub fn get_binding(
     advance_or_continue(pc, next_pc, op::GetBinding::LENGTH)
 }
 
+/// Only JIT code calls this: the interpreter reads initialized bindings inline.
+pub fn get_initialized_binding(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::GetInitializedBinding,
+    values: &mut op::GetInitializedBindingValues,
+) -> SlowPathControl {
+    let next_pc = asm_get_binding(
+        vm,
+        pc,
+        &mut values.dst,
+        instruction.cache,
+        AsmBindingIsKnownToBeInitialized::Yes,
+    );
+    advance_or_continue(pc, next_pc, op::GetInitializedBinding::LENGTH)
+}
+
+/// Only JIT code calls this: the interpreter initializes bindings inline.
+pub fn initialize_lexical_binding(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::InitializeLexicalBinding,
+    values: &mut op::InitializeLexicalBindingValues,
+) -> SlowPathControl {
+    let next_pc = asm_initialize_or_set_binding(
+        vm,
+        pc,
+        EnvironmentMode::Lexical,
+        BindingInitializationMode::Initialize,
+        strict_of(&instruction.header),
+        values.src,
+        instruction.cache,
+    );
+    advance_or_continue(pc, next_pc, op::InitializeLexicalBinding::LENGTH)
+}
+
+/// Only JIT code calls this: the interpreter initializes bindings inline.
+pub fn initialize_variable_binding(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::InitializeVariableBinding,
+    values: &mut op::InitializeVariableBindingValues,
+) -> SlowPathControl {
+    let next_pc = asm_initialize_or_set_binding(
+        vm,
+        pc,
+        EnvironmentMode::Var,
+        BindingInitializationMode::Initialize,
+        strict_of(&instruction.header),
+        values.src,
+        instruction.cache,
+    );
+    advance_or_continue(pc, next_pc, op::InitializeVariableBinding::LENGTH)
+}
+
 pub fn dynamic_get_binding(
     vm: &Vm,
     pc: u32,
@@ -843,6 +898,8 @@ pub fn set_global(vm: &Vm, pc: u32, instruction: &op::SetGlobal, values: &mut op
     let mut offset = None;
     if asm_try!(vm, pc, declarative_record.has_binding(&identifier, Some(&mut offset))) {
         let offset = offset.expect("the global declarative record reports the index of its bindings");
+        // NB: Fast paths assign the binding through the cache from now on, without telling the environment.
+        declarative_record.note_binding_assignment(vm, offset);
         cache().environment_binding_index.set(offset as u32);
         cache().has_environment_binding_index.set(true);
         asm_try!(

@@ -853,6 +853,16 @@ name = "libjs_abi"
 version = "0.1.0"
 
 [[package]]
+name = "libjs_jit"
+version = "0.1.0"
+dependencies = [
+ "fARM64",
+ "flapc",
+ "iced-x86",
+ "libc",
+]
+
+[[package]]
 name = "libjs_runtime_macros"
 version = "0.1.0"
 dependencies = [
@@ -877,6 +887,7 @@ dependencies = [
  "ladybird_allocator",
  "libc",
  "libjs_abi",
+ "libjs_jit",
  "libjs_runtime_macros",
  "libregex_rust",
  "libunicode_rust",

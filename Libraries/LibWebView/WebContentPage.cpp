@@ -227,29 +227,6 @@ Optional<CanonicalNavigable&> WebContentPage::hosted_navigable(Web::HTML::CrossP
     return *navigable;
 }
 
-// A page holds local file content while it hosts such a document, or populates or is to host one for a navigation to a
-// file: URL the UI process admitted. Only such content loads its subresources from the local file system.
-bool WebContentPage::hosts_local_file_content() const
-{
-    bool result = false;
-    for_each_hosted_document([&](CanonicalDocument& document) {
-        result = document.is_local_file_content();
-        return result ? IterationDecision::Break : IterationDecision::Continue;
-    });
-    if (result)
-        return true;
-
-    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
-        auto const& ongoing_navigation = navigable.ongoing_navigation();
-        result = ongoing_navigation.has_value()
-            && ongoing_navigation->url.has_value()
-            && ongoing_navigation->url->scheme() == "file"sv
-            && (ongoing_navigation->population_worker.ptr() == this || ongoing_navigation->host.ptr() == this);
-        return result ? IterationDecision::Break : IterationDecision::Continue;
-    });
-    return result;
-}
-
 // The environments a page names are the window environments of the documents it hosts, and of those populated for it
 // to host.
 void WebContentPage::for_each_hosted_document(Function<IterationDecision(CanonicalDocument&)> const& callback) const
@@ -649,6 +626,8 @@ void WebContentPage::close()
     m_is_open = false;
     m_needs_beforeunload_check = true;
     m_history_recorded_url_for_current_load.clear();
+    if (m_client)
+        m_client->update_audio_capture_permission();
     auto owed_replies = move(m_owed_replies);
     for (auto owed : owed_replies)
         owe_reply(owed);
@@ -921,7 +900,7 @@ void WebContentPage::did_click_link(Web::HTML::PreparedNavigationDescriptor navi
     // NB: A link the browser does not handle itself is an external application's. The page asking to open it is not
     //     the browser's UI, so the request takes the page's path, which honors only input the UI process saw.
     if (!is_url_handled_internally(verified_navigation->url)) {
-        view().handle_external_url({}, verified_navigation->url, verified_navigation->initiator_origin_snapshot, verified_navigation->source_snapshot_params.has_transient_activation);
+        view().handle_external_url({}, verified_navigation->url, verified_navigation->initiator_origin_snapshot, verified_navigation->source_snapshot_params.has_transient_activation && has_transient_user_activation());
         return;
     }
     if (modifiers == Web::UIEvents::Mod_Shift) {
@@ -931,6 +910,11 @@ void WebContentPage::did_click_link(Web::HTML::PreparedNavigationDescriptor navi
     auto open_in_background = modifiers == Web::UIEvents::Mod_PlatformCtrl;
     auto open_in_foreground = modifiers == (Web::UIEvents::Mod_PlatformCtrl | Web::UIEvents::Mod_Shift);
     if (open_in_background || open_in_foreground || target == "_blank"sv) {
+        // NB: The renderer sends a link to open in a new tab only for the user's own click, which the view delivered.
+        //     That click opens the link whatever activation the page used up for other things, such as a popup its
+        //     click handler opened.
+        if (!view().take_input_to_open_link_in_new_tab({}))
+            return;
         view().open_navigation_in_new_tab(verified_navigation.release_value(), open_in_background ? Web::HTML::ActivateTab::No : Web::HTML::ActivateTab::Yes);
     } else {
         view().load(verified_navigation.release_value());
@@ -945,15 +929,20 @@ void WebContentPage::did_middle_click_link(Web::HTML::PreparedNavigationDescript
     // NB: A link the browser does not handle itself is an external application's. The page asking to open it is not
     //     the browser's UI, so the request takes the page's path, which honors only input the UI process saw.
     if (!is_url_handled_internally(verified_navigation->url)) {
-        view().handle_external_url({}, verified_navigation->url, verified_navigation->initiator_origin_snapshot, verified_navigation->source_snapshot_params.has_transient_activation);
+        view().handle_external_url({}, verified_navigation->url, verified_navigation->initiator_origin_snapshot, verified_navigation->source_snapshot_params.has_transient_activation && has_transient_user_activation());
         return;
     }
+    // NB: The renderer sends a link to open in a new tab only for the user's own click, which the view delivered.
+    //     That click opens the link whatever activation the page used up for other things.
+    if (!view().take_input_to_open_link_in_new_tab({}))
+        return;
     view().open_navigation_in_new_tab(verified_navigation.release_value(), Web::HTML::ActivateTab::No);
 }
 
 void WebContentPage::did_request_external_url(URL::URL url, URL::Origin initiator_origin, bool has_transient_activation)
 {
-    view().handle_external_url({}, move(url), move(initiator_origin), has_transient_activation);
+    // NB: The page's own claim of activation counts only along with input the UI process delivered to it.
+    view().handle_external_url({}, move(url), move(initiator_origin), has_transient_activation && has_transient_user_activation());
 }
 
 void WebContentPage::did_inspect_storage(u64 request_id, String storage_items)
@@ -1246,15 +1235,53 @@ void WebContentPage::did_clear_storage(Web::StorageAPI::StorageEndpointType stor
         storage_jar->clear_storage_key(storage_endpoint, *canonical_key);
 }
 
-void WebContentPage::did_request_activate_tab()
-{
-    if (view().on_activate_tab)
-        view().on_activate_tab();
-}
-
 void WebContentPage::did_change_needs_beforeunload_check(bool needs_beforeunload_check)
 {
     m_needs_beforeunload_check = needs_beforeunload_check;
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#transient-activation-duration
+static constexpr auto transient_activation_duration = AK::Duration::from_seconds(5);
+
+void WebContentPage::give_user_activation()
+{
+    m_last_user_activation = MonotonicTime::now();
+}
+
+bool WebContentPage::has_transient_user_activation() const
+{
+    // NB: Automation lets a renderer synthesize the input that gives it activation.
+    if (WebContentClient::renderers_may_synthesize_input())
+        return true;
+    if (m_last_user_activation.has_value() && MonotonicTime::now() - *m_last_user_activation < transient_activation_duration)
+        return true;
+    auto view = traversable().view();
+    return view.has_value() && view->is_delivering_user_activation_to(*this);
+}
+
+// NB: The UI process consumes its activation only where the renderer consumes the activation of its windows too, so
+//     the two agree on what is left of it. As the renderer does, it consumes the activation every page of the tab has
+//     from input they finished handling, along with that of the input the page is handling, which the renderer gave
+//     the activation it consumes. A page whose activation comes only from input it has yet to finish handling consumes
+//     that of the earliest such input. Input queued behind keeps its activation either way, as the renderer gives
+//     activation anew for each press it handles.
+bool WebContentPage::consume_transient_user_activation()
+{
+    if (!has_transient_user_activation())
+        return false;
+
+    auto has_activation_of_handled_input = m_last_user_activation.has_value() && MonotonicTime::now() - *m_last_user_activation < transient_activation_duration;
+    auto& top_level_traversable = traversable().top_level_traversable();
+    top_level_traversable.for_each_hosting_page([](WebContentPage& page) {
+        page.m_last_user_activation.clear();
+    });
+    if (auto view = top_level_traversable.view(); view.has_value()) {
+        if (has_activation_of_handled_input)
+            view->consume_user_activation_of_input_handled_by({}, *this);
+        else
+            view->consume_user_activation_of_input_in_flight_to({}, *this);
+    }
+    return true;
 }
 
 void WebContentPage::did_consume_user_activation(Web::HTML::UserActivationConsumption consumption)
@@ -1291,14 +1318,27 @@ void WebContentPage::did_update_resource_count(i32 count_waiting)
     }
 }
 
+// Only WebDriver's window commands and the internals object of a test ask for a change to the window.
+static bool may_change_window(WebContentPage& page, StringView message)
+{
+    if (WebContentClient::renderers_may_synthesize_input())
+        return true;
+    page.client().did_misbehave(message, "not driven by WebDriver or a test"sv);
+    return false;
+}
+
 void WebContentPage::did_request_restore_window()
 {
+    if (!may_change_window(*this, "did_request_restore_window"sv))
+        return;
     if (view().on_restore_window)
         view().on_restore_window();
 }
 
 void WebContentPage::did_request_reposition_window(Gfx::IntPoint position, u64 completion_id)
 {
+    if (!may_change_window(*this, "did_request_reposition_window"sv))
+        return;
     if (view().on_reposition_window)
         view().on_reposition_window(position);
     async_did_complete_window_rect_request(completion_id);
@@ -1306,6 +1346,8 @@ void WebContentPage::did_request_reposition_window(Gfx::IntPoint position, u64 c
 
 void WebContentPage::did_request_resize_window(Gfx::IntSize size, u64 completion_id)
 {
+    if (!may_change_window(*this, "did_request_resize_window"sv))
+        return;
     if (view().on_resize_window)
         view().on_resize_window(size);
     async_did_complete_window_rect_request(completion_id);
@@ -1313,6 +1355,8 @@ void WebContentPage::did_request_resize_window(Gfx::IntSize size, u64 completion
 
 void WebContentPage::did_request_maximize_window(u64 completion_id)
 {
+    if (!may_change_window(*this, "did_request_maximize_window"sv))
+        return;
     if (view().on_maximize_window)
         view().on_maximize_window();
     async_did_complete_window_rect_request(completion_id);
@@ -1320,12 +1364,20 @@ void WebContentPage::did_request_maximize_window(u64 completion_id)
 
 void WebContentPage::did_request_minimize_window()
 {
+    if (!may_change_window(*this, "did_request_minimize_window"sv))
+        return;
     if (view().on_minimize_window)
         view().on_minimize_window();
 }
 
 void WebContentPage::did_request_fullscreen_window()
 {
+    // Element fullscreen needs and consumes the activation of the user's input, which the renderer checks. A
+    // compromised renderer skips that check. The process of an isolated iframe asks for the window of its tab itself.
+    if (!consume_transient_user_activation()) {
+        async_deny_fullscreen_window();
+        return;
+    }
     if (view().on_fullscreen_window)
         view().on_fullscreen_window();
 }
@@ -1336,11 +1388,33 @@ void WebContentPage::did_request_exit_fullscreen()
         view().on_exit_fullscreen_window();
 }
 
+// A navigation's population steps run in the process with its source document, which need not have hosted local file
+// content. For a navigation to a file: URL the UI process admitted, that process reads the file the URL names, as it does
+// for a history step to an entry of one.
+bool WebContentPage::populates_a_navigation_to_local_file(ByteString const& path) const
+{
+    if (traversable().page_populates_a_history_entry_for_local_file(*this, path))
+        return true;
+
+    bool result = false;
+    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+        auto const& ongoing_navigation = navigable.ongoing_navigation();
+        result = ongoing_navigation.has_value()
+            && ongoing_navigation->population_worker.ptr() == this
+            && ongoing_navigation->url.has_value()
+            && ongoing_navigation->url->scheme() == "file"sv
+            && ongoing_navigation->url->file_path() == path;
+        return result ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return result;
+}
+
 void WebContentPage::did_request_file(ByteString path, i32 request_id)
 {
     // NB: The renderer's sandbox keeps it out of the local file system, so this is the only way it can read a file.
-    //     Answer only a process that holds local file content: any other could read every file the user can.
-    if (!client().may_read_local_files()) {
+    //     Answer only a process that has hosted local file content, or one reading the file a navigation it populates
+    //     names: any other could read every file the user can.
+    if (!client().may_read_local_files() && !populates_a_navigation_to_local_file(path)) {
         async_handle_file_return(EACCES, {}, request_id);
         return;
     }
@@ -1361,6 +1435,33 @@ void WebContentPage::did_request_geolocation_position(u64 request_id)
 {
     if (view().on_request_geolocation_position)
         view().on_request_geolocation_position(*this, request_id);
+}
+
+void WebContentPage::did_request_permission(u64 request_id, Utf16String name)
+{
+    if (name != "microphone"_utf16) {
+        client().did_misbehave("did_request_permission"sv, "unknown permission name"sv);
+        return;
+    }
+
+    if (!view().on_request_permission) {
+        async_permission_request_completed(request_id, false);
+        return;
+    }
+
+    auto url = view().url();
+    view().on_request_permission(name, url.origin(), [page = NonnullRefPtr(*this), request_id, name, url](bool granted) {
+        if (!page->is_open())
+            return;
+        // The AudioServer hears of the permission before the page does, so the page's first request finds it in place.
+        if (granted && name == "microphone"_utf16) {
+            if (auto result = page->client().grant_audio_capture(url); result.is_error()) {
+                warnln("Unable to grant audio capture: {}", result.error());
+                granted = false;
+            }
+        }
+        page->async_permission_request_completed(request_id, granted);
+    });
 }
 
 void WebContentPage::did_cancel_geolocation_position_request(u64 request_id)
@@ -1388,15 +1489,20 @@ void WebContentPage::did_request_file_picker(Web::HTML::FileFilter accepted_file
 
 void WebContentPage::did_finish_handling_input_event(u64 event_id, Web::EventResult event_result)
 {
+    relay_finished_input_event(*this, event_id, event_result);
+}
+
+void WebContentPage::relay_finished_input_event(WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result)
+{
     if (displays_tab()) {
-        view().did_finish_handling_input_event({}, event_id, event_result);
+        view().did_finish_handling_input_event({}, reporting_page, event_id, event_result);
         return;
     }
 
     // The view displaying the tab handed the event down; it hears the result.
     if (auto display_page = traversable().display_page(); display_page) {
         if (display_page->is_open() && display_page.ptr() != this)
-            display_page->did_finish_handling_input_event(event_id, event_result);
+            display_page->relay_finished_input_event(reporting_page, event_id, event_result);
     }
 }
 
@@ -1427,8 +1533,12 @@ void WebContentPage::did_change_background_color(Gfx::Color color)
         view().did_change_background_color({}, color);
 }
 
+// NB: The system clipboard belongs to the user, so a page reaches it only right after the user's own input to it, as
+//     with a copy or paste shortcut, a click on a page control, or the browser's Paste command.
 void WebContentPage::did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem item, String)
 {
+    if (!has_transient_user_activation())
+        return;
     view().insert_clipboard_item(move(item));
 }
 
@@ -1722,6 +1832,10 @@ void WebContentPage::did_update_indexed_database(String update)
 void WebContentPage::did_request_clipboard_entries(u64 request_id)
 {
     Vector<Web::Clipboard::SystemClipboardItem> items;
+    if (!has_transient_user_activation()) {
+        async_retrieved_clipboard_entries(request_id, items);
+        return;
+    }
     if (auto item = view().clipboard_item(); !item.system_clipboard_representations.is_empty())
         items.append(move(item));
 
@@ -2125,7 +2239,7 @@ void WebContentPage::did_forward_mouse_event_to_child_frame(Web::HTML::CrossProc
     }
 
     auto& host = child_frame->remote_host();
-    view().did_forward_input_event({}, event.id, host);
+    view().did_forward_input_event({}, *this, event.id, host);
     host.async_mouse_event_in_hosted_root(frame_id, move(event));
 }
 
@@ -2243,11 +2357,15 @@ void WebContentPage::did_finish_loading(Web::HTML::CrossProcessId navigable_id, 
     if (displays_tab()) {
         auto const& committed_url = view().url();
 
-        if (committed_url.scheme() == "about"sv && committed_url.path_segment_count() == 1) {
-            if (auto web_ui = WebUI::create(client(), m_id, MUST(String::from_utf8(committed_url.path_segments().first()))); web_ui.is_error())
+        // The WebUI channel goes to the process the UI process gave the WebUI's document to, never by a URL a process
+        // reports. A page that loads anything else loses its channel.
+        if (auto const& web_ui_host = navigable->active_document().web_ui_host(); web_ui_host.has_value() && client().hosted_web_ui() == web_ui_host) {
+            if (auto web_ui = WebUI::create(client(), m_id, *web_ui_host); web_ui.is_error())
                 warnln("Could not create WebUI for {}: {}", committed_url, web_ui.error());
             else
                 client().set_web_ui(web_ui.release_value());
+        } else if (auto const& web_ui = client().web_ui(); web_ui && web_ui->page_id() == m_id) {
+            client().set_web_ui(nullptr);
         }
 
         auto title = history_title(view().title(), committed_url);
@@ -2460,6 +2578,11 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentPage::did_req
             return { {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
     }
 
+    // The popup blocker runs in the renderer, which a compromised renderer skips. Each popup takes the activation of
+    // input the UI process delivered to the page, as the renderer's popup consumes the activation of its window.
+    if (Application::the().blocks_pop_ups() && !consume_transient_user_activation())
+        return { {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
+
     auto root_navigable_id = Application::the().allocate_ui_process_cross_process_id();
     auto initial_history_entry = Web::HTML::create_initial_session_history_entry_descriptor(
         Application::the().allocate_ui_process_cross_process_id(), move(opener_base_url), move(target_name));
@@ -2509,6 +2632,8 @@ void WebContentPage::did_request_select_dropdown(Web::HTML::CrossProcessId local
 
 void WebContentPage::did_request_primary_paste()
 {
+    if (!has_transient_user_activation())
+        return;
     auto text = Application::the().clipboard_text(Application::ClipboardType::Selection);
     async_paste(text);
 }

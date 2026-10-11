@@ -159,6 +159,7 @@ impl Default for CacheableSetPropertyMetadata {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum PropertyKind {
     Key,
     Value,
@@ -236,7 +237,8 @@ pub struct ObjectMethods {
     /// What Realm::create_object() runs once it allocates an object, which defines the properties of built-in objects.
     /// Subclasses call the method of the class they extend first.
     pub initialize: fn(&Object, &Vm, Gc<Realm>),
-    /// [[GetPrototypeOf]], unless it is OrdinaryGetPrototypeOf, which returns the prototype of the object's shape.
+    /// [[GetPrototypeOf]], unless it is OrdinaryGetPrototypeOf, which returns the prototype of the object's shape. JIT
+    /// code walks prototype chains as long as their objects have none.
     pub internal_get_prototype_of: Option<InternalGetPrototypeOf>,
     pub internal_set_prototype_of: fn(&Object, &Vm, Option<Gc<Object>>) -> ThrowCompletionOr<bool>,
     pub internal_is_extensible: fn(&Object, &Vm) -> ThrowCompletionOr<bool>,
@@ -379,10 +381,7 @@ unsafe impl Trace for Object {
 impl Drop for Object {
     fn drop(&mut self) {
         // OPTIMIZATION: Most objects own nothing outside the GC heap.
-        if self.flags.get() & (object_flag::HAS_MALLOC_NAMED_STORAGE | object_flag::HAS_MALLOC_INDEXED_STORAGE) == 0
-            && self.indexed_storage_kind() != IndexedStorageKind::Dictionary
-            && self.private_elements.get().is_none()
-        {
+        if self.owns_nothing_outside_the_heap() {
             return;
         }
         self.free_storage_outside_the_heap();
@@ -390,6 +389,13 @@ impl Drop for Object {
 }
 
 impl Object {
+    /// Whether the object has no malloc storage, dictionary elements or private elements, which the object frees.
+    pub(crate) fn owns_nothing_outside_the_heap(&self) -> bool {
+        self.flags.get() & (object_flag::HAS_MALLOC_NAMED_STORAGE | object_flag::HAS_MALLOC_INDEXED_STORAGE) == 0
+            && self.indexed_storage_kind() != IndexedStorageKind::Dictionary
+            && self.private_elements.get().is_none()
+    }
+
     #[cold]
     fn free_storage_outside_the_heap(&mut self) {
         let flags = self.flags.get();
@@ -480,11 +486,11 @@ fn remove_intrinsic_accessor(vm: &Vm, object: &Object, property_key: &PropertyKe
 /// Plain objects (exactly an Object, as create() and create_with_premade_shape() make them) come in size classes by how
 /// many named property values they hold inline: the smallest one that fits the properties of their shape at creation,
 /// so that most of them never need named property storage of their own. The first size class is an Object's own cell.
-const PLAIN_OBJECT_INLINE_CAPACITIES: [u8; 6] = [2, 4, 6, 8, 12, 16];
+pub const PLAIN_OBJECT_INLINE_CAPACITIES: [u8; 6] = [2, 4, 6, 8, 12, 16];
 
 /// The inline capacity of plain objects created without properties. More would keep the properties many of them get
 /// right away (like `this` in constructors) inline, but makes the cells of all of them larger.
-const EMPTY_PLAIN_OBJECT_INLINE_CAPACITY: u8 = PLAIN_OBJECT_INLINE_CAPACITIES[0];
+pub const EMPTY_PLAIN_OBJECT_INLINE_CAPACITY: u8 = PLAIN_OBJECT_INLINE_CAPACITIES[0];
 
 const _: () = assert!(PLAIN_OBJECT_INLINE_CAPACITIES[0] as usize == INLINE_NAMED_STORAGE_CAPACITY);
 
@@ -503,7 +509,7 @@ const PLAIN_OBJECT_SIZE_CLASS_CELL_SIZES: [u32; PLAIN_OBJECT_INLINE_CAPACITIES.l
 
 /// The size class (an index into PLAIN_OBJECT_INLINE_CAPACITIES) of plain objects created with a shape of that many
 /// properties.
-fn plain_object_size_class(property_count: u32) -> usize {
+pub fn plain_object_size_class(property_count: u32) -> usize {
     let inline_values = if property_count == 0 {
         u32::from(EMPTY_PLAIN_OBJECT_INLINE_CAPACITY)
     } else {
@@ -515,12 +521,18 @@ fn plain_object_size_class(property_count: u32) -> usize {
         .unwrap_or(PLAIN_OBJECT_INLINE_CAPACITIES.len() - 1)
 }
 
-/// The allocators of the plain object size classes beyond the first, which is Object's own allocator.
-fn plain_object_size_classes(heap: &Heap) -> &[SizeClassAllocator] {
+/// The allocators of the plain object size classes beyond the first, which is Object's own allocator, for JIT code
+/// that allocates plain objects itself.
+pub fn plain_object_size_classes(heap: &Heap) -> &[SizeClassAllocator] {
     heap.size_classes(Object::CLASS, &PLAIN_OBJECT_SIZE_CLASS_CELL_SIZES)
 }
 
 const SPARSE_ARRAY_HOLE_THRESHOLD: u32 = 200;
+
+/// Whether elements with `filled` of their `length` indices filled are dense enough for holey storage: three quarters.
+fn are_dense_enough(filled: usize, length: usize) -> bool {
+    filled >= length - length / 4
+}
 pub(crate) const MAX_TRANSITIONS_BEFORE_CONVERTING_TO_DICTIONARY: u32 = 64;
 
 /// Moves an object into the heap and finishes what its constructor could not do before it had an address: its named
@@ -706,6 +718,12 @@ impl Object {
         }
         let reserve = shared_data.construct_reserve(shape);
         Self::create_in_size_class(vm, shape, reserve)
+    }
+
+    /// Like create_with_premade_shape(), in the size class for at least `reserve` properties, for properties that will
+    /// be added right away.
+    pub fn create_with_premade_shape_and_reserve(vm: &Vm, shape: Gc<Shape>, reserve: u32) -> Gc<Object> {
+        Self::create_in_size_class(vm, shape, shape.property_count().max(reserve))
     }
 
     /// A plain object of the shape, in the size class for that many properties.
@@ -1433,6 +1451,8 @@ impl Object {
             }
         };
 
+        // NB: The object leaves its shape without a transition away from it.
+        self.shape().mark_unstable(vm);
         self.unsafe_set_shape(copy_shape);
         let mut offset = 0;
         from_shape.for_each_property_in_insertion_order(|_, metadata| {
@@ -1487,6 +1507,8 @@ impl Object {
             && !from.requires_slow_add_own_property()
             && !from.shape().is_dictionary()
             && !from.shape().is_prototype_shape()
+            // NB: No other object may share the shape of a global object (see `Dependency::GlobalPropertyUnassigned`).
+            && !from.has_global_object_flag()
             && from.shape().realm() == current_realm()
             && from.shape().prototype() == self.shape().prototype()
         {
@@ -1500,6 +1522,8 @@ impl Object {
             });
 
             if has_only_default_data_properties {
+                // NB: The object leaves its shape without a transition away from it.
+                self.shape().mark_unstable(vm);
                 self.unsafe_set_shape(from.shape());
                 from.shape().for_each_property_in_insertion_order(|_, metadata| {
                     self.put_direct(metadata.offset, from.get_direct(metadata.offset));
@@ -2337,23 +2361,35 @@ impl Object {
         };
 
         let mut accessor = None;
-        let mut receiver_uses_holder_cache = false;
+        let mut cache_object = None;
         if let Some(property_offset) = descriptor.property_offset {
             let value = self.get_direct(property_offset);
             if value.is_accessor() {
                 let holder_accessor = value.as_accessor();
                 accessor = Some(holder_accessor);
-                receiver_uses_holder_cache = receiver.is_object()
-                    && (receiver.as_object() == self.as_gc() || receiver.as_object().prototype() == Some(self.as_gc()));
+                let can_cache = receiver.is_object()
+                    && (holder_accessor.cache_on_receiver()
+                        || receiver.as_object() == self.as_gc()
+                        || receiver.as_object().prototype() == Some(self.as_gc()));
+                if can_cache {
+                    cache_object = Some(if holder_accessor.cache_on_receiver() {
+                        receiver.as_object()
+                    } else {
+                        self.as_gc()
+                    });
+                }
                 if let Some(cached_value_key) = holder_accessor.cached_value_key()
-                    && receiver_uses_holder_cache
-                    && let Some(cached_value) = self.get_engine_private_property(cached_value_key)
+                    && let Some(cache_object) = cache_object
+                    && let Some(cached_value) = cache_object.get_engine_private_property(cached_value_key)
                 {
-                    update_inline_cache(
+                    // NB: An inherited receiver cache keeps the accessor's offset in the prototype lookup cache.
+                    update_inline_cache(if cache_object == self.as_gc() {
                         cached_value
                             .property_offset
-                            .expect("an engine private property is a named property"),
-                    );
+                            .expect("an engine private property is a named property")
+                    } else {
+                        property_offset
+                    });
                     return Ok(cached_value.value);
                 }
             }
@@ -2365,13 +2401,13 @@ impl Object {
         let result = call_function_object(vm, getter, receiver, &[])?;
 
         if let Some(accessor) = accessor
-            && receiver_uses_holder_cache
+            && let Some(cache_object) = cache_object
             && let Some(cached_value_key) = accessor.cached_value_key()
         {
             let property = self.storage_get(vm, property_key);
             if property.is_some_and(|property| property.value.is_accessor() && property.value.as_accessor() == accessor)
             {
-                self.set_engine_private_property(vm, cached_value_key, result);
+                cache_object.set_engine_private_property(vm, cached_value_key, result);
             }
         }
 
@@ -2510,6 +2546,18 @@ impl Object {
                 };
                 match phase {
                     PropertyLookupPhase::OwnProperty => {
+                        // NB: Caches may only write to the slots of a global object that may have been assigned
+                        //     already, since the runtime notes assignments to them (see `storage_set()`).
+                        if writes_data_property
+                            && self.has_global_object_flag()
+                            && !crate::jit::dependencies::global_object_slot_may_have_been_assigned(
+                                vm,
+                                self,
+                                property_offset,
+                            )
+                        {
+                            return;
+                        }
                         *cacheable_metadata = CacheableSetPropertyMetadata {
                             r#type: CacheableSetPropertyMetadataType::ChangeOwnProperty,
                             property_offset: Some(property_offset),
@@ -2789,6 +2837,17 @@ impl Object {
             }
         }
 
+        // NB: JIT code may take the values of global object properties that were never assigned as constants.
+        if self.has_global_object_flag() {
+            let previous = self.get_direct(metadata.offset);
+            if !previous.is_undefined() && previous != value {
+                crate::jit::dependencies::note_global_object_slot_assignments(
+                    vm,
+                    self,
+                    metadata.offset..metadata.offset + 1,
+                );
+            }
+        }
         self.put_direct(metadata.offset, value);
         Some(metadata.offset)
     }
@@ -2839,6 +2898,15 @@ impl Object {
         }
 
         let metadata = self.shape().lookup(property_key).expect("the object has the property");
+
+        // NB: Deleting the property moves those after it to the slots before them.
+        if self.has_global_object_flag() {
+            crate::jit::dependencies::note_global_object_slot_assignments(
+                vm,
+                self,
+                metadata.offset..self.shape().property_count(),
+            );
+        }
 
         let shape = self.shape();
         if shape.is_dictionary() {
@@ -3134,6 +3202,7 @@ impl Object {
         getter: Option<Gc<FunctionObject>>,
         setter: Option<Gc<FunctionObject>>,
         attributes: PropertyAttributes,
+        cache_on_receiver: bool,
     ) {
         self.clear_cached_accessor_value(vm, property_key);
         self.define_direct_accessor(vm, property_key, getter, setter, attributes);
@@ -3143,7 +3212,8 @@ impl Object {
             .expect("the accessor was just defined");
         assert!(property.value.is_accessor());
         let accessor = property.value.as_accessor();
-        if accessor.cached_value_key().is_none() {
+        accessor.set_cache_on_receiver(cache_on_receiver);
+        if cache_on_receiver || accessor.cached_value_key().is_none() {
             accessor.set_cached_value_key(Some(Symbol::create_private(vm)));
         }
     }
@@ -3459,8 +3529,9 @@ impl Object {
         self.has_flag(object_flag::IS_HTMLDDA)
     }
 
-    pub fn set_is_htmldda(&self) {
+    pub fn set_is_htmldda(&self, vm: &Vm) {
         self.set_flag(object_flag::IS_HTMLDDA);
+        crate::jit::dependencies::note_htmldda_object(vm);
     }
 
     pub fn has_magical_length_property(&self) -> bool {
@@ -3533,7 +3604,7 @@ impl Object {
             .cast_mut()
     }
 
-    fn named_storage_is_inline(&self) -> bool {
+    pub(crate) fn named_storage_is_inline(&self) -> bool {
         core::ptr::eq(self.named_properties.get(), self.inline_named_storage_pointer())
     }
 
@@ -3656,6 +3727,16 @@ impl Object {
         value_storage::capacity(elements)
     }
 
+    /// Whether the packed or holey indexed storage holds an element (not a hole) at `index`.
+    pub fn has_stored_indexed_element(&self, index: u32) -> bool {
+        matches!(
+            self.indexed_storage_kind(),
+            IndexedStorageKind::Packed | IndexedStorageKind::Holey
+        ) && index < self.indexed_array_like_size()
+            && index < self.indexed_elements_capacity()
+            && self.indexed_element(index) != Value::EMPTY
+    }
+
     fn indexed_element(&self, index: u32) -> Value {
         assert!(index < self.indexed_elements_capacity());
         // SAFETY: The index is within the elements buffer.
@@ -3719,7 +3800,7 @@ impl Object {
 
     /// Makes room for `capacity` elements in packed or holey indexed storage up front, so that filling them in does not
     /// grow the storage.
-    pub fn reserve_indexed_elements(&self, capacity: u32) {
+    pub(crate) fn reserve_indexed_elements(&self, capacity: u32) {
         if matches!(
             self.indexed_storage_kind(),
             IndexedStorageKind::Packed | IndexedStorageKind::Holey
@@ -3783,7 +3864,8 @@ impl Object {
     }
 
     #[cold]
-    fn transition_to_packed(&self) {
+    fn transition_to_dense(&self, kind: IndexedStorageKind) {
+        assert!(matches!(kind, IndexedStorageKind::Packed | IndexedStorageKind::Holey));
         let elements = self.allocate_indexed_elements(self.indexed_array_like_size());
         for (&index, element) in self.indexed_dictionary().borrow().sparse_elements() {
             // SAFETY: Every index of the dictionary is below its array-like size, the size of the new buffer.
@@ -3792,7 +3874,7 @@ impl Object {
 
         self.free_indexed_elements_dictionary();
         self.adopt_indexed_elements(elements);
-        self.indexed_storage_kind.set(IndexedStorageKind::Packed);
+        self.indexed_storage_kind.set(kind);
     }
 
     fn free_indexed_elements_dictionary(&self) {
@@ -3837,19 +3919,58 @@ impl Object {
     fn indexed_put_into_dictionary(&self, index: u32, value: Value, attributes: PropertyAttributes) {
         let promote = {
             let mut dictionary = self.indexed_dictionary().borrow_mut();
-            let had_missing_entries = dictionary.size() < dictionary.array_like_size();
+            let old_size = dictionary.size();
             dictionary.put(index, value, attributes);
-            self.indexed_array_like_size.set(dictionary.array_like_size() as u32);
-            had_missing_entries
-                && dictionary.size() >= dictionary.array_like_size()
+            let length = dictionary.array_like_size();
+            self.indexed_array_like_size.set(length as u32);
+            // NB: Promote once the elements are dense enough. Only scan
+            //     attributes when crossing this threshold or filling the last
+            //     hole, so sparse writes do not repeatedly scan a dictionary
+            //     that has non-default attributes.
+            let becoming_dense = !are_dense_enough(old_size, length) && are_dense_enough(dictionary.size(), length);
+            let becoming_packed = old_size < length && dictionary.size() == length;
+            if (becoming_dense || becoming_packed)
                 && dictionary
                     .sparse_elements()
                     .values()
                     .all(|element| element.attributes == DEFAULT_ATTRIBUTES && !element.value.is_empty())
+            {
+                Some(if dictionary.size() == length {
+                    IndexedStorageKind::Packed
+                } else {
+                    IndexedStorageKind::Holey
+                })
+            } else {
+                None
+            }
         };
-        if promote {
-            self.transition_to_packed();
+        if let Some(kind) = promote {
+            self.transition_to_dense(kind);
         }
+    }
+
+    /// Whether a store at `index`, past the first `materialized_elements` of the dense elements, keeps them dense
+    /// instead of making them a dictionary: where their storage has room for it already, or where they stay dense
+    /// enough (see `are_dense_enough()`), so that a dictionary would be promoted back right away.
+    ///
+    /// NB: Only stores past the room of the storage count the holes of holey elements. The storage then grows by half
+    ///     at least, and copies the elements anyway, so repeated sparse stores scan the elements in linear time overall.
+    fn keeps_dense_storage_for(&self, index: u32, materialized_elements: u32) -> bool {
+        let kind = self.indexed_storage_kind();
+        if !matches!(kind, IndexedStorageKind::Packed | IndexedStorageKind::Holey) {
+            return false;
+        }
+        if index < self.indexed_elements_capacity() {
+            return true;
+        }
+        let filled = match kind {
+            IndexedStorageKind::Packed => materialized_elements as usize,
+            IndexedStorageKind::Holey => (0..materialized_elements)
+                .filter(|index| !self.indexed_element(*index).is_empty())
+                .count(),
+            IndexedStorageKind::None | IndexedStorageKind::Dictionary => unreachable!(),
+        };
+        are_dense_enough(filled + 1, index as usize + 1)
     }
 
     fn indexed_put_dictionary_and_update_size(&self, index: u32, value: Value, attributes: PropertyAttributes) {
@@ -3879,7 +4000,9 @@ impl Object {
         }
 
         // Check for sparse threshold
-        if u64::from(index) > u64::from(materialized_elements) + u64::from(SPARSE_ARRAY_HOLE_THRESHOLD) {
+        if u64::from(index) > u64::from(materialized_elements) + u64::from(SPARSE_ARRAY_HOLE_THRESHOLD)
+            && !self.keeps_dense_storage_for(index, materialized_elements)
+        {
             self.transition_to_dictionary();
             self.indexed_put_dictionary_and_update_size(index, value, attributes);
             return;

@@ -15,6 +15,7 @@ use crate::layout::buffer::*;
 use crate::layout::environment::*;
 use crate::layout::executable::*;
 use crate::layout::execution_context::*;
+use crate::layout::feedback::*;
 use crate::layout::function_object::*;
 use crate::layout::object::*;
 use crate::layout::primitive_string::*;
@@ -33,6 +34,7 @@ use crate::layout::buffer::*;
 use crate::layout::environment::*;
 use crate::layout::executable::*;
 use crate::layout::execution_context::*;
+use crate::layout::feedback::*;
 use crate::layout::function_object::*;
 use crate::layout::object::*;
 use crate::layout::primitive_string::*;
@@ -259,6 +261,68 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "EXECUTABLE_REGISTERS_AND_LOCALS_AND_CONSTANTS_COUNT", "Executable.registers_and_locals_and_constants_count", "u32", ExecutableHead, registers_and_locals_and_constants_count, 4, "nullable", "scalar", "slot_counts");
     field!(w, "EXECUTABLE_ASM_CONSTANTS_SIZE", "Executable.asm_constants_size", "u64", ExecutableHead, asm_constants_size, 8, "nullable", "scalar", "constants");
     field!(w, "EXECUTABLE_ASM_CONSTANTS_DATA", "Executable.asm_constants_data", "Sequence<Value>", ExecutableHead, asm_constants_data, 8, "nullable", "scalar", "constants");
+    field!(w, "EXECUTABLE_TIER_UP_BUDGET", "Executable.tier_up_budget", "i32", ExecutableHead, tier_up_budget, 4, "nullable", "scalar");
+    field!(w, "EXECUTABLE_JIT_COMPILE_STATE", "Executable.jit_compile_state", "u8", ExecutableHead, jit_compile_state, 1, "nullable", "scalar");
+    w.constant("JIT_COMPILE_STATE_INSTALLED", JIT_COMPILE_STATE_INSTALLED);
+    w.constant("TIER_UP_FUNCTION_ENTRY_COST", tier_up_costs::FUNCTION_ENTRY);
+    w.constant("TIER_UP_LOOP_ITERATION_COST", tier_up_costs::LOOP_ITERATION);
+    offset!(w, "EXECUTABLE_FEEDBACK", ExecutableHead, feedback);
+    w.line("field Executable.feedback ExecutableFeedback EXECUTABLE_FEEDBACK embedded scalar");
+
+    w.section("Feedback layout");
+    w.constant("ARITH_FEEDBACK_INT32", arith_feedback::INT32);
+    w.constant("ARITH_FEEDBACK_DOUBLE", arith_feedback::DOUBLE);
+    w.constant("ARITH_FEEDBACK_INT32_OVERFLOW", arith_feedback::INT32_OVERFLOW);
+    w.constant("ARITH_FEEDBACK_STRING", arith_feedback::STRING);
+    w.constant("ARITH_FEEDBACK_BIGINT", arith_feedback::BIG_INT);
+    w.constant("ARITH_FEEDBACK_OTHER", arith_feedback::OTHER);
+    w.constant("ARITH_FEEDBACK_OBJECT_PAIR", arith_feedback::OBJECT_PAIR);
+    w.constant("ARITH_FEEDBACK_INT32_AND_DOUBLE", arith_feedback::INT32 | arith_feedback::DOUBLE);
+    w.constant("ARITH_FEEDBACK_INT32_AND_OTHER", arith_feedback::INT32 | arith_feedback::OTHER);
+    offset!(w, "CALL_FEEDBACK_TARGET", CallFeedback, target);
+    offset!(w, "CALL_FEEDBACK_FLAGS", CallFeedback, flags);
+    assert_eq!(size_of_field(|feedback: &CallFeedback| &feedback.target), 8);
+    assert_eq!(size_of_field(|feedback: &CallFeedback| &feedback.flags), 1);
+    w.line(&format!(
+        "field CallFeedback.target u64 CALL_FEEDBACK_TARGET nullable scalar stride {}",
+        size_of::<CallFeedback>()
+    ));
+    w.line("field CallFeedback.flags u8 CALL_FEEDBACK_FLAGS nullable scalar");
+    w.constant("CALL_FEEDBACK_SIZE", size_of::<CallFeedback>());
+    w.constant("CALL_FEEDBACK_POLYMORPHIC", call_feedback_flags::POLYMORPHIC);
+    w.constant("CALL_FEEDBACK_SAW_NATIVE", call_feedback_flags::SAW_NATIVE);
+    w.constant("CALL_FEEDBACK_OTHER_FUNCTIONS", call_feedback_flags::OTHER_FUNCTIONS);
+    offset!(w, "KEYED_FEEDBACK_BITS", KeyedFeedback, bits);
+    assert_eq!(size_of_field(|feedback: &KeyedFeedback| &feedback.bits), 4);
+    w.line(&format!(
+        "field KeyedFeedback.bits u32 KEYED_FEEDBACK_BITS nullable scalar stride {}",
+        size_of::<KeyedFeedback>()
+    ));
+    w.constant("KEYED_FEEDBACK_SIZE", size_of::<KeyedFeedback>());
+    w.constant("KEYED_FEEDBACK_INT32_INDEX", keyed_feedback_bits::INT32_INDEX);
+    w.constant("KEYED_FEEDBACK_PACKED", keyed_feedback_bits::PACKED);
+    w.constant("KEYED_FEEDBACK_HOLEY", keyed_feedback_bits::HOLEY);
+    w.constant("KEYED_FEEDBACK_OTHER_ELEMENTS", keyed_feedback_bits::OTHER_ELEMENTS);
+    w.constant("KEYED_FEEDBACK_MAGICAL_LENGTH", keyed_feedback_bits::MAGICAL_LENGTH);
+    w.constant("KEYED_FEEDBACK_INT32_INDEX_PACKED", keyed_feedback_bits::INT32_INDEX | keyed_feedback_bits::PACKED);
+    w.constant("KEYED_FEEDBACK_INT32_INDEX_HOLEY", keyed_feedback_bits::INT32_INDEX | keyed_feedback_bits::HOLEY);
+    w.constant(
+        "KEYED_FEEDBACK_PRIMITIVE_BASE",
+        keyed_feedback_bits::OTHER_KEY | keyed_feedback_bits::OTHER_ELEMENTS,
+    );
+    w.constant(
+        "KEYED_FEEDBACK_MULTIPLE_STRING_KEYS",
+        keyed_feedback_bits::STRING_KEY | keyed_feedback_bits::MULTIPLE_KEYS | keyed_feedback_bits::OTHER_ELEMENTS,
+    );
+    w.constant("KEYED_FEEDBACK_TYPED_ARRAY_SHIFT", keyed_feedback_bits::TYPED_ARRAY_SHIFT);
+    offset!(w, "EXECUTABLE_FEEDBACK_ARITH_DATA", ExecutableFeedbackHead, arith);
+    w.line("field ExecutableFeedback.arith u64 EXECUTABLE_FEEDBACK_ARITH_DATA nullable scalar");
+    offset!(w, "EXECUTABLE_FEEDBACK_VALUE_BUCKETS_DATA", ExecutableFeedbackHead, value_buckets);
+    w.line("field ExecutableFeedback.value_buckets u64 EXECUTABLE_FEEDBACK_VALUE_BUCKETS_DATA nullable scalar");
+    offset!(w, "EXECUTABLE_FEEDBACK_CALL_DATA", ExecutableFeedbackHead, call);
+    w.line("field ExecutableFeedback.call u64 EXECUTABLE_FEEDBACK_CALL_DATA nullable scalar");
+    offset!(w, "EXECUTABLE_FEEDBACK_KEYED_DATA", ExecutableFeedbackHead, keyed);
+    w.line("field ExecutableFeedback.keyed u64 EXECUTABLE_FEEDBACK_KEYED_DATA nullable scalar");
 
     w.section("ExecutionContext layout");
     assert_eq!(align_of::<ExecutionContext>(), value_size);
@@ -284,6 +348,8 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "EXECUTION_CONTEXT_FRAME_ID", "ExecutionContext.frame_id", "u64", ExecutionContext, frame_id, 8, "nullable", "scalar");
     field!(w, "EXECUTION_CONTEXT_REGISTERS_AND_CONSTANTS_AND_LOCALS_AND_ARGUMENTS_COUNT", "ExecutionContext.slot_count", "u32", ExecutionContext, registers_and_constants_and_locals_and_arguments_count, 4, "nullable", "scalar", "counts");
     field!(w, "EXECUTION_CONTEXT_ARGUMENT_COUNT", "ExecutionContext.argument_count", "u32", ExecutionContext, argument_count, 4, "nullable", "scalar", "counts");
+    field!(w, "EXECUTION_CONTEXT_RETURNS_TO_NATIVE_CALLER", "ExecutionContext.returns_to_native_caller", "bool", ExecutionContext, returns_to_native_caller, 1, "nullable", "scalar");
+    field!(w, "EXECUTION_CONTEXT_RUNS_JIT_CODE", "ExecutionContext.runs_jit_code", "bool", ExecutionContext, runs_jit_code, 1, "nullable", "scalar");
     let sizeof_execution_context = size!(w, "SIZEOF_EXECUTION_CONTEXT", ExecutionContext);
     w.line("field ExecutionContext.slots Sequence<Value> SIZEOF_EXECUTION_CONTEXT embedded scalar");
     let slot_offset = |index: u32| sizeof_execution_context + index as usize * value_size;
@@ -325,6 +391,9 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.line("field VM.primitive_storage_cage_base u64 VM_PRIMITIVE_STORAGE_CAGE_BASE nonnull scalar");
     w.line("field VM.heap_region_base u64 VM_HEAP_REGION_BASE nonnull scalar");
     w.line("field VM.native_function_table Sequence<NativeFunctionTableEntry> VM_NATIVE_FUNCTION_TABLE_DATA nonnull scalar");
+    offset!(w, "VM_DISPATCH_TABLES", VmHead, dispatch_tables);
+    w.line("field VM.dispatch_tables Sequence<u64> VM_DISPATCH_TABLES embedded scalar");
+    w.constant("DISPATCH_TABLE_INDEX_MASK", DISPATCH_TABLE_INDEX_MASK);
     offset!(w, "VM_INTERPRETER_STACK_TOP", VmHead, interpreter_stack.top);
     offset!(w, "VM_INTERPRETER_STACK_LIMIT", VmHead, interpreter_stack.limit);
     offset!(w, "VM_INTERPRETER_STACK_NEXT_FRAME_ID", VmHead, interpreter_stack.next_frame_id);
@@ -357,6 +426,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.line("field IndexedElements.capacity u32 INDEXED_ELEMENTS_CAPACITY nullable scalar");
     offset!(w, "EXECUTABLE_BYTECODE_DATA", ExecutableHead, bytecode_data);
     w.line("field Executable.bytecode_data u64 EXECUTABLE_BYTECODE_DATA nonnull scalar");
+    field!(w, "EXECUTABLE_DISPATCH_TABLE_INDEX", "Executable.dispatch_table_index", "u8", ExecutableHead, dispatch_table_index, 1, "nullable", "scalar");
     offset!(w, "EXECUTABLE_PROPERTY_LOOKUP_CACHES_DATA", ExecutableHead, property_lookup_caches.data);
     w.line("field Executable.property_lookup_caches PropertyLookupCaches EXECUTABLE_PROPERTY_LOOKUP_CACHES_DATA nonnull scalar");
     offset!(w, "EXECUTABLE_GLOBAL_VARIABLE_CACHES_DATA", ExecutableHead, global_variable_caches.data);
@@ -538,6 +608,15 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "TYPED_ARRAY_CACHED_DATA_OFFSET", "Object.typed_array_cached_data_offset", "u64", TypedArrayBase, cached_data_offset, 8, "nullable", "scalar");
     w.hex_constant("TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID", TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID as u64);
     w.hex_constant("PRIMITIVE_STORAGE_CAGE_OFFSET_MASK", configuration.primitive_storage_cage_offset_mask);
+    // NB: The offset mask is the low bits, which shifting the others out and back masks off.
+    assert_eq!(
+        configuration.primitive_storage_cage_offset_mask.leading_zeros() + configuration.primitive_storage_cage_offset_mask.trailing_ones(),
+        64
+    );
+    w.constant(
+        "PRIMITIVE_STORAGE_CAGE_OFFSET_SHIFT",
+        configuration.primitive_storage_cage_offset_mask.leading_zeros(),
+    );
     w.hex_constant("HEAP_REGION_OFFSET_MASK", configuration.heap_region_offset_mask);
 
     w.section("ByteLength layout");

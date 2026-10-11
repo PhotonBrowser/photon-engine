@@ -308,6 +308,11 @@ public:
     void cancel_geolocation_position_request(u64 request_id);
     void receive_geolocation_position(u64 request_id, GeolocationPositionResult);
 
+    // The browser-process bridge for the Permissions spec's "ask the user for express permission" step.
+    using PermissionPromptCallback = GC::Ref<GC::Function<void(bool granted)>>;
+    void request_permission(Utf16String const& name, PermissionPromptCallback);
+    void permission_request_completed(u64 request_id, bool granted);
+
     // https://w3c.github.io/geolocation/#dfn-emulated-position-data
     // NB: The top-level traversable's, which the UI process tells every page representing it.
     Geolocation::EmulatedPositionData const& emulated_position_data() const { return m_emulated_position_data; }
@@ -405,6 +410,7 @@ public:
 
     ViewportIsFullscreen viewport_is_fullscreen() const { return m_viewport_is_fullscreen; }
     void set_viewport_is_fullscreen(ViewportIsFullscreen);
+    void did_deny_fullscreen_window();
 
 private:
     explicit Page(GC::Ref<PageClient>);
@@ -506,6 +512,9 @@ private:
     HashMap<u64, PendingGeolocationRequest> m_pending_geolocation_requests;
     u64 m_next_geolocation_request_id { 0 };
     Optional<u64> m_active_geolocation_request_id;
+
+    HashMap<u64, PermissionPromptCallback> m_pending_permission_requests;
+    u64 m_next_permission_request_id { 0 };
 
     // AD-HOC: Denied until the UI process sends the browser-wide setting, so a request cannot observe the test
     //         position in the short window before that arrives.
@@ -745,7 +754,6 @@ public:
         Optional<u64> browsing_context_group_id;
     };
     virtual NewWebViewResult page_did_request_new_web_view(HTML::ActivateTab, HTML::WebViewHints, [[maybe_unused]] Optional<HTML::CrossProcessId> opener_navigable_id, [[maybe_unused]] Optional<URL::URL> opener_base_url, [[maybe_unused]] Utf16String const& target_name, [[maybe_unused]] HTML::SandboxingFlagSet popup_sandboxing_flag_set) { return {}; }
-    virtual void page_did_request_activate_tab() { }
     virtual void page_did_close() { }
     virtual void page_did_update_session_history_entry_navigation_api_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] HTML::StorageSerializationRecord const& navigation_api_state) { }
     virtual void page_did_update_session_history_entry_scroll_restoration_mode([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryIdentity const& entry_identity, [[maybe_unused]] HTML::ScrollRestorationMode scroll_restoration_mode) { }
@@ -784,6 +792,7 @@ public:
     virtual void page_did_cancel_geolocation_position_request([[maybe_unused]] u64 request_id) { }
     virtual void page_did_start_geolocation_position_watch([[maybe_unused]] u64 request_id) { }
     virtual void page_did_stop_geolocation_position_watch([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_request_permission([[maybe_unused]] u64 request_id, [[maybe_unused]] Utf16String const& name) { }
 
     virtual void page_did_finish_test([[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_set_test_timeout([[maybe_unused]] double milliseconds) { }

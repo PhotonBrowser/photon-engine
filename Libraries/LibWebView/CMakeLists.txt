@@ -2,6 +2,7 @@ set(SOURCES
     AccessibilityTreeManager.cpp
     Application.cpp
     ApplyHistoryStep.cpp
+    AudioServerControlClient.cpp
     Autocomplete.cpp
     AutocompleteMuxer.cpp
     AutocompleteRanker.cpp
@@ -84,16 +85,20 @@ if (APPLE)
         ProcessReaper.cpp
     )
 elseif (LINUX)
-    list(APPEND SOURCES CrashReportPOSIX.cpp)
+    list(APPEND SOURCES AudioDaemonSocket.cpp CrashReportPOSIX.cpp)
 endif()
 
 set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
 
+compile_ipc(../../Services/AudioServer/AudioServerControl.ipc ../../Services/AudioServer/AudioServerControlEndpoint.h)
+compile_ipc(../../Services/AudioServer/AudioServerControlClient.ipc ../../Services/AudioServer/AudioServerControlClientEndpoint.h)
 compile_ipc(UIProcessServer.ipc UIProcessServerEndpoint.h)
 compile_ipc(UIProcessClient.ipc UIProcessClientEndpoint.h)
 
 set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
+    ../../Services/AudioServer/AudioServerControlClientEndpoint.h
+    ../../Services/AudioServer/AudioServerControlEndpoint.h
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
     UIProcessClientEndpoint.h
@@ -131,6 +136,15 @@ ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWebView generate_build_information)
 target_link_libraries(LibWebView PUBLIC LibCompositing LibSandbox LibWebCommon)
 target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading SDL3::SDL3)
+
+if (LINUX)
+    # The connect broker asks the audio library where the daemon is before connecting a helper to it.
+    include(audio)
+    if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
+        target_compile_definitions(LibWebView PRIVATE HAVE_PULSEAUDIO=1)
+        target_link_libraries(LibWebView PRIVATE PkgConfig::PULSEAUDIO)
+    endif()
+endif()
 
 if (ENABLE_CRANELIFT_JIT)
     target_link_libraries(LibWebView PRIVATE LibWasmCompilerClient)

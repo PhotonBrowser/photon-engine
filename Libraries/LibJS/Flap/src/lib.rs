@@ -31,6 +31,7 @@ pub(crate) mod intrinsic;
 pub(crate) mod low_ir;
 pub mod metadata;
 pub mod runtime_interface;
+pub mod rust_bytecode;
 pub(crate) mod ssa;
 pub(crate) mod target;
 pub(crate) mod types;
@@ -89,6 +90,11 @@ pub struct CompileOptions {
     pub target: Target,
     pub has_jscvt: bool,
     pub enable_assertions: bool,
+    /// Compile the profiling variant of the interpreter: inline functions
+    /// annotated with `@profiling` keep their bodies, and the entry points get
+    /// a `_profiling` suffix so both variants can be linked together. The
+    /// plain variant compiles those functions to nothing.
+    pub profiling: bool,
 }
 
 /// Controls optional diagnostics collected while optimizing a program.
@@ -447,6 +453,9 @@ impl Compiler {
 
         let mut ast = frontend::parser::parse(unit.source.name, unit.source.contents)
             .map_err(|diagnostic| CompileError::from_diagnostic(CompileStage::Parse, diagnostic))?;
+        if !self.options.profiling {
+            ast.strip_profiling_code();
+        }
         frontend::specialize::expand_declarative_specializations(unit.source.name, &mut ast, &specialized_ops)
             .map_err(|diagnostic| CompileError::from_diagnostic(CompileStage::Semantic, diagnostic))?;
         let typed_program = if let Some(layouts) = &layouts {
@@ -663,6 +672,9 @@ const VM_RUNNING_EXECUTION_CONTEXT = 15288
 const VM_BREAKPOINT_CONTROLLER = 16664
 const SLOW_PATH_CONTINUATION_BIT = 32
 const EXECUTABLE_BYTECODE_DATA = 104
+const EXECUTABLE_DISPATCH_TABLE_INDEX = 112
+const VM_DISPATCH_TABLES = 16672
+const DISPATCH_TABLE_INDEX_MASK = 7
 const INT32_TAG = 0x7FFA
 const BOOLEAN_TAG = 0x7FF9
 const INT32_TAG_SHIFTED = 0x7FFA000000000000
@@ -680,6 +692,7 @@ const HEAP_REGION_OFFSET_MASK = 0x3FFFFFFFFFF
             },
             has_jscvt: false,
             enable_assertions: false,
+            profiling: false,
         })
     }
 

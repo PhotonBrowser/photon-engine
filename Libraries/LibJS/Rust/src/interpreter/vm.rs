@@ -35,6 +35,9 @@ use crate::gc::heap_function::HeapFunction;
 use crate::gc::root::{MarkedVec, RootSet};
 use crate::gc::visitor::{Trace, Visitor};
 use crate::gc::weak_container::WeakContainer;
+use crate::jit::code::INLINED_CALL_SITE_BIT;
+use crate::jit::options::Options as JitOptions;
+use crate::jit::{JitState, tier_up};
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::Environment;
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
@@ -45,7 +48,7 @@ use crate::layout::function_object::{
 use crate::layout::object::Object;
 use crate::layout::realm::Realm;
 use crate::layout::value::Value;
-use crate::layout::vm::{ExecutionContextStackEntry, InterpreterStack, VmHead};
+use crate::layout::vm::{DISPATCH_TABLE_COUNT, ExecutionContextStackEntry, InterpreterStack, VmHead};
 use crate::layout_forward::RawNativeFunctionPointer;
 use crate::lexical_path;
 use crate::runtime::abstract_operations::get_this_environment;
@@ -493,6 +496,10 @@ enumerate_well_known_symbols!(define_well_known_symbols);
 #[repr(C)]
 pub struct Vm {
     pub head: VmHead,
+    /// The lowest native stack address JIT code runs at, JIT_NATIVE_STACK_HEADROOM above the native stack limit.
+    /// Below it, JIT code leaves calls to the interpreter, which runs JavaScript on its own stack, so that the code
+    /// running after a stack overflow (catch blocks and the native functions they call) does not overflow again.
+    pub jit_native_stack_limit: Cell<usize>,
     heap: OnceCell<Heap>,
     _interpreter_stack_memory: InterpreterStackMemory,
     /// The storage of the execution context stack, whose length is its capacity. The head points into it and knows
@@ -586,9 +593,15 @@ pub struct Vm {
     agent: Cell<AgentRecord>,
     saved_execution_context_stacks: RefCell<Vec<SavedExecutionContextStack>>,
     host_classes: RefCell<HostClassRegistry>,
+    pub jit: JitState,
 }
 
 const _: () = assert!(core::mem::offset_of!(Vm, head) == 0);
+
+/// How much native stack JIT code leaves to the code that runs after it overflows the stack (see
+/// Vm::jit_native_stack_limit). Recursing in JIT code uses the native stack, unlike the interpreter, and catch blocks
+/// that call native functions near the native stack limit would otherwise overflow again, once per frame they unwind.
+const JIT_NATIVE_STACK_HEADROOM: usize = 4 * VM_STACK_SPACE_LIMIT as usize;
 
 impl Vm {
     pub fn create() -> Box<Vm> {
@@ -625,6 +638,7 @@ impl Vm {
                 running_execution_context: Cell::new(core::ptr::null_mut()),
                 interpreter_stack: interpreter_stack_memory.initial_state(),
                 stack_base: Cell::new(0),
+                native_stack_limit: Cell::new(0),
                 execution_generation: Cell::new(0),
                 primitive_storage_cage_base: Cell::new(primitive_storage_cage_base),
                 heap_region_base: Cell::new(heap_region_base),
@@ -638,7 +652,9 @@ impl Vm {
                 type_error_realm_override: Cell::new(None),
                 type_error_realm_override_depth: Cell::new(0),
                 keyed_property_lookup_cache_entries: Cell::new(core::ptr::null()),
+                dispatch_tables: [const { Cell::new(core::ptr::null()) }; DISPATCH_TABLE_COUNT],
             },
+            jit_native_stack_limit: Cell::new(0),
             heap: OnceCell::new(),
             _interpreter_stack_memory: interpreter_stack_memory,
             execution_context_stack_storage: RefCell::new(execution_context_stack_storage),
@@ -711,6 +727,7 @@ impl Vm {
             agent: Cell::new(AgentRecord::default()),
             saved_execution_context_stacks: RefCell::new(Vec::new()),
             host_classes: RefCell::new(HashMap::default()),
+            jit: JitState::new(JitOptions::from_environment()),
         };
         // SAFETY: The caller provides storage for a Vm.
         unsafe { storage.write(vm) };
@@ -719,12 +736,18 @@ impl Vm {
         vm.head
             .keyed_property_lookup_cache_entries
             .set(vm.keyed_property_lookup_cache.entries_for_interpreter());
+        vm.update_dispatch_tables();
         let context = storage.cast();
         // SAFETY: The VM stays at this address until it is dropped, and it destroys the heap before anything else.
         let heap = unsafe { Heap::new(gather_roots, context, options.become_process_default_heap) };
         // SAFETY: As above.
         unsafe { heap.register_sweep_callback(sweep, context) };
         vm.head.stack_base.set(heap.stack_bounds().0);
+        vm.head
+            .native_stack_limit
+            .set(heap.stack_bounds().0 + VM_STACK_SPACE_LIMIT as usize);
+        vm.jit_native_stack_limit
+            .set(vm.head.native_stack_limit.get() + JIT_NATIVE_STACK_HEADROOM);
         if vm.heap.set(heap).is_err() {
             unreachable!("the heap is created once");
         }
@@ -800,7 +823,7 @@ impl Vm {
     pub fn did_reach_stack_space_limit(&self) -> bool {
         let marker = 0u8;
         let current = core::ptr::from_ref(&marker) as usize;
-        current.saturating_sub(self.head.stack_base.get()) < VM_STACK_SPACE_LIMIT as usize
+        current < self.head.native_stack_limit.get()
     }
 
     pub fn push_execution_context(&self, context: NonNull<ExecutionContext>) {
@@ -892,6 +915,43 @@ impl Vm {
         );
     }
 
+    /// The id of a frame, which frames that JIT code creates get when first asked (see ExecutionContext::frame_id).
+    pub fn frame_id_of(&self, frame: &ExecutionContext) -> u64 {
+        if frame.frame_id.get() == 0 {
+            frame.frame_id.set(self.interpreter_stack().take_next_frame_id());
+        }
+        frame.frame_id.get()
+    }
+
+    /// Calls `callback` (until it breaks) with every execution context of the stack and of the stacks that
+    /// save_execution_context_stack() saved, the way the garbage collector finds them.
+    pub fn for_each_live_execution_context(&self, mut callback: impl FnMut(&ExecutionContext) -> ControlFlow<()>) {
+        let stopped = Cell::new(false);
+        let mut visit = |context: &ExecutionContext| {
+            let flow = callback(context);
+            stopped.set(flow.is_break());
+            flow
+        };
+        self.for_each_execution_context_top_to_bottom(&mut visit);
+        for saved_stack in self.saved_execution_context_stacks.borrow().iter() {
+            if stopped.get() {
+                return;
+            }
+            for_each_execution_context_top_to_bottom_of(
+                saved_stack.length,
+                |index| {
+                    let entry = saved_stack.storage[..saved_stack.length].get(index)?;
+                    Some((
+                        NonNull::new(entry.execution_context.get()).expect("every entry on the stack has its context"),
+                        entry.previous_running_execution_context.get(),
+                    ))
+                },
+                saved_stack.running_execution_context,
+                &mut visit,
+            );
+        }
+    }
+
     /// VM::last_execution_context_matching(): the topmost execution context that `predicate` accepts, in the order of
     /// for_each_execution_context_top_to_bottom().
     pub fn last_execution_context_matching(
@@ -980,6 +1040,7 @@ impl Vm {
     }
 
     fn gather_roots(&self, visitor: &mut Visitor) {
+        self.jit.trace(visitor);
         self.for_each_execution_context_top_to_bottom(|context| {
             context.trace(visitor);
             ControlFlow::Continue(())
@@ -1028,6 +1089,15 @@ impl Vm {
         let debugger = Rc::new(Debugger::new());
         self.head.debugger.set(Rc::as_ptr(&debugger).cast_mut().cast());
         *self.debugger.borrow_mut() = Some(debugger);
+        self.update_dispatch_tables();
+        // NB: Debuggers step through bytecode, so nothing enters JIT code while one is attached, not even JIT code
+        //     that runs already, which calls other JIT code only through the entries of executables.
+        let executables = self.executables.borrow().clone();
+        for executable in executables {
+            if executable.jit_compile_state() == crate::jit::code::CompileState::Installed {
+                executable.discard_jit_code(self);
+            }
+        }
     }
 
     pub fn disable_debugging(&self) {
@@ -1037,6 +1107,7 @@ impl Vm {
         }
         self.head.debugger.set(core::ptr::null_mut());
         drop(debugger);
+        self.update_dispatch_tables();
     }
 
     #[inline]
@@ -1200,23 +1271,63 @@ impl Vm {
     /// The frames of every execution context, from the running one down, with where each is in its executable.
     pub fn stack_trace(&self) -> Vec<StackTraceElement> {
         let mut stack_trace = Vec::new();
-        self.for_each_execution_context_top_to_bottom(|context| {
+        self.for_each_stack_frame_top_to_bottom(|frame| {
             // NB: Builtins written in JavaScript show up like other builtins, without a position in their source.
-            let runs_builtin = context
+            let runs_builtin = frame
                 .function
-                .get()
                 .is_some_and(|function| function.is::<NativeJavaScriptBackedFunction>());
-            let source_range =
-                context.executable.get().filter(|_| !runs_builtin).map(|executable| {
-                    Executable::from_head(executable).get_source_range(context.program_counter.get())
-                });
+            let source_range = frame
+                .executable
+                .filter(|_| !runs_builtin)
+                .map(|executable| executable.get_source_range(frame.program_counter));
             stack_trace.push(StackTraceElement {
-                execution_context: NonNull::from(context),
+                execution_context: NonNull::from(frame.execution_context),
+                function: frame.function,
                 source_range,
             });
             ControlFlow::Continue(())
         });
         stack_trace
+    }
+
+    /// Calls `callback` with each frame from the running one down, until it breaks, like
+    /// for_each_execution_context_top_to_bottom(), and with the frames of calls that JIT code inlined and runs without
+    /// execution contexts of their own (see INLINED_CALL_SITE_BIT), between the callee frame of the call they make and
+    /// the frame of the function they are inlined in. Those all run in that function's realm and script, so walks that
+    /// only look at realms and scripts need not see them.
+    pub fn for_each_stack_frame_top_to_bottom(&self, mut callback: impl FnMut(StackFrame<'_>) -> ControlFlow<()>) {
+        self.for_each_execution_context_top_to_bottom(|context| {
+            callback(StackFrame {
+                execution_context: context,
+                function: context.function.get(),
+                executable: context.executable.get().map(Executable::from_head),
+                program_counter: context.program_counter.get(),
+                inlined_call: None,
+            })?;
+            let caller = context.caller_frame.get();
+            let return_pc = context.caller_return_pc.get();
+            if caller.is_null() || return_pc & INLINED_CALL_SITE_BIT == 0 {
+                return ControlFlow::Continue(());
+            }
+            // SAFETY: A frame's caller outlives it.
+            let caller = unsafe { &*caller };
+            let site = return_pc & !INLINED_CALL_SITE_BIT;
+            let frame_pointer = crate::jit::translate::frame_pointer_from_low_half(context.caller_dst_raw.get());
+            for frame in crate::jit::translate::call_site_frames(caller, site, frame_pointer) {
+                callback(StackFrame {
+                    execution_context: caller,
+                    function: Some(frame.function),
+                    executable: Some(frame.executable),
+                    program_counter: frame.program_counter,
+                    inlined_call: Some(InlinedCallStackFrame {
+                        site,
+                        frame_pointer,
+                        frame_state: frame.frame_state,
+                    }),
+                })?;
+            }
+            ControlFlow::Continue(())
+        });
     }
 
     /// Drops the weak cache entries of strings that died in this collection.
@@ -1239,6 +1350,7 @@ impl Vm {
     fn remove_dead_cells_from_property_lookup_caches(&self) {
         self.executables.borrow_mut().retain(|executable| {
             if cell_is_dead(*executable) {
+                executable.free_jit_entry_slot(self);
                 return false;
             }
             executable.remove_dead_cells();
@@ -1248,9 +1360,14 @@ impl Vm {
         self.keyed_property_lookup_cache.remove_dead_entries();
         self.prototype_transition_cache.remove_dead_entries();
         self.keyed_property_store_cache.remove_dead_entries();
+        self.jit.dependents.remove_dead_entries();
     }
 
     pub fn register_executable(&self, executable: Gc<Executable>) {
+        let (tier, tier_up_budget) = tier_up::initial_tier(&self.jit);
+        executable.set_interpreter_tier(tier);
+        executable.head.tier_up_budget.set(tier_up_budget);
+        executable.allocate_jit_entry_slot(self);
         self.executables.borrow_mut().push(executable);
     }
 
@@ -1584,6 +1701,15 @@ impl Vm {
             .expect("the VM allocates the single ASCII character strings")[usize::from(character)]
     }
 
+    /// The address of the strings of the ASCII characters, indexed by character, for JIT code.
+    pub fn single_ascii_character_strings_address(&self) -> u64 {
+        self.single_ascii_character_strings
+            .get()
+            .expect("the VM allocates the single ASCII character strings")
+            .as_ptr()
+            .expose_provenance() as u64
+    }
+
     pub fn json_parse_cache(&self) -> &JsonParseCache {
         &self.json_parse_cache
     }
@@ -1840,6 +1966,8 @@ impl Drop for Vm {
     fn drop(&mut self) {
         // The debugger holds weak references to executables, which go away with the heap.
         drop(self.debugger.take());
+        // Compile jobs that are still running are abandoned; their results are dropped when they finish.
+        self.jit.abandon_compile_jobs();
         // The heap's final collection destroys every cell, so it has to happen while the rest of the VM exists.
         drop(self.heap.take());
     }
@@ -1888,10 +2016,34 @@ pub struct TypeErrorRealmOverride {
     pub depth: usize,
 }
 
-/// An element of VM::stack_trace(): an execution context and where it is in its executable, if it runs one.
+/// An element of VM::stack_trace(): a frame's execution context, its function and where it is in its executable, if it
+/// runs one. A frame of a call that JIT code inlined has the execution context of the function it is inlined in.
 pub struct StackTraceElement {
     pub execution_context: NonNull<ExecutionContext>,
+    pub function: Option<Gc<FunctionObject>>,
     pub source_range: Option<SourceRange>,
+}
+
+/// A frame of VM::for_each_stack_frame_top_to_bottom(): an execution context, or a frame of a call that JIT code
+/// inlined, with the execution context of the function it is inlined in.
+#[derive(Clone, Copy)]
+pub struct StackFrame<'a> {
+    pub execution_context: &'a ExecutionContext,
+    pub function: Option<Gc<FunctionObject>>,
+    pub executable: Option<Gc<Executable>>,
+    pub program_counter: u32,
+    /// For a frame of a call that JIT code inlined: where its values are.
+    pub inlined_call: Option<InlinedCallStackFrame>,
+}
+
+/// Where the values of a frame of a call that JIT code inlined are: the inlined call site of the code running the
+/// execution context of the stack frame, the JIT frame, and the frame's frame state there (see
+/// jit::translate::call_site_frame_arguments()).
+#[derive(Clone, Copy)]
+pub struct InlinedCallStackFrame {
+    pub site: u32,
+    pub frame_pointer: u64,
+    pub frame_state: usize,
 }
 
 /// TextCodec's UTF-8 decoder, unless the bytes start with a byte order mark, which picks the encoding instead. Both

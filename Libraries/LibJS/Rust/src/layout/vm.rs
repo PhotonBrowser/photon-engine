@@ -30,6 +30,12 @@ pub struct ExecutionContextStackEntry {
     pub previous_running_execution_context: Cell<*mut ExecutionContext>,
 }
 
+/// How many dispatch tables the VM has, a power of two (see `VmHead::dispatch_tables`).
+pub const DISPATCH_TABLE_COUNT: usize = 8;
+
+/// An executable's dispatch table index is masked with this, which keeps it inside the VM's dispatch tables.
+pub const DISPATCH_TABLE_INDEX_MASK: u8 = (DISPATCH_TABLE_COUNT - 1) as u8;
+
 /// The part of the VM that the interpreter reads and writes. The rest of the VM follows it.
 #[repr(C)]
 pub struct VmHead {
@@ -37,7 +43,12 @@ pub struct VmHead {
     pub interpreter_stack: InterpreterStack,
     /// The lowest address of the stack of the thread that runs JavaScript.
     pub stack_base: Cell<usize>,
-    pub execution_generation: Cell<u64>,
+    /// The lowest native stack address JavaScript runs at: the stack base plus VM_STACK_SPACE_LIMIT (see
+    /// Vm::did_reach_stack_space_limit()). JIT code stops above it, see Vm::jit_native_stack_limit.
+    pub native_stack_limit: Cell<usize>,
+    /// Advanced at the end of every synchronous run of code (see `finish_execution_generation()`). WeakRef targets
+    /// used during the current generation stay alive. Interpreter and JIT code advance it with a 32-bit increment.
+    pub execution_generation: Cell<u32>,
     pub primitive_storage_cage_base: Cell<usize>,
     pub heap_region_base: Cell<usize>,
     pub native_function_table_data: Cell<*const NativeFunctionTableEntry>,
@@ -55,9 +66,21 @@ pub struct VmHead {
     pub type_error_realm_override_depth: Cell<usize>,
     /// The entries of the VM's keyed property lookup cache, which stay where they are for as long as the VM lives.
     pub keyed_property_lookup_cache_entries: Cell<*const KeyedPropertyLookupCacheEntryLayout>,
+    /// The dispatch tables the interpreter runs frames with, by the dispatch table index of their executable (see
+    /// `ExecutableHead::dispatch_table_index`). Indices without a table of their own have the plain one.
+    pub dispatch_tables: [Cell<*const c_void>; DISPATCH_TABLE_COUNT],
 }
 
 /// The storage an embedder reserves to construct a Vm in place, and its alignment. build.rs cannot see the Vm, only its
 /// head, so these are a capacity that the crate checks the Vm against rather than its exact size and alignment.
 pub const VM_SIZE: usize = 16 * 1024;
 pub const VM_ALIGN: usize = 16;
+
+impl VmHead {
+    /// Starts a new execution generation. The counter wraps around, which at worst keeps a WeakRef target that was
+    /// last used 2^32 generations earlier alive until the next one.
+    pub fn finish_execution_generation(&self) {
+        self.execution_generation
+            .set(self.execution_generation.get().wrapping_add(1));
+    }
+}

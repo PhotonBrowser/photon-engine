@@ -1,4 +1,4 @@
-$f5bf1d5d numeric-class-field-name.js:1:1
+$fe0af08d numeric-class-field-name.js:1:1
   Registers: 7
   Blocks:    1
   Constants:
@@ -13,11 +13,11 @@ block0:
   [  38] SetLexicalEnvironment environment:reg4
   [  40] NewClass dst:reg6, class_environment:reg5, class_blueprint_index:0, element_keys:[element_keys:Int32(42)]
   [  68] DynamicInitializeLexicalBinding `C`, src:reg6
-  [  78] GetGlobal dst:reg5, `C`
-  [  88] CallConstruct dst:reg6, callee:reg5, C
-  [  a0] GetByValue dst:reg5, base:reg6, property:Int32(42)
-  [  b8] GetById dst:reg6, base:reg5, `name` ([42].name)
-  [  d0] End value:reg6
+  [  78] GetGlobal value_feedback:0, dst:reg5, `C`
+  [  88] CallConstruct value_feedback:1, call_feedback:0, dst:reg6, callee:reg5, C
+  [  a8] GetByValue value_feedback:2, keyed_feedback:0, dst:reg5, base:reg6, property:Int32(42)
+  [  c8] GetById value_feedback:3, dst:reg6, base:reg5, `name` ([42].name)
+  [  e0] End value:reg6
 
 
 C$638b9046

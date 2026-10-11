@@ -7,6 +7,7 @@
 #include <AK/String.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
+#include <LibIPC/Connection.h>
 #include <LibWebView/ProcessManager.h>
 
 namespace WebView {
@@ -27,6 +28,8 @@ ProcessType process_type_from_name(StringView name)
         return ProcessType::ImageDecoder;
     if (name == "MediaServer"sv)
         return ProcessType::MediaServer;
+    if (name == "AudioServer"sv)
+        return ProcessType::AudioServer;
     if (name == "WasmCompiler"sv)
         return ProcessType::WasmCompiler;
 
@@ -51,6 +54,8 @@ StringView process_name_from_type(ProcessType type)
         return "ImageDecoder"sv;
     case ProcessType::MediaServer:
         return "MediaServer"sv;
+    case ProcessType::AudioServer:
+        return "AudioServer"sv;
     case ProcessType::WasmCompiler:
         return "WasmCompiler"sv;
     }
@@ -70,10 +75,10 @@ ProcessManager::ProcessManager()
     add_process(Process(WebView::ProcessType::Browser, nullptr, Core::Process::current()));
 
 #ifdef AK_OS_MACH
-    auto self_send_port = mach_task_self();
-    auto res = mach_port_mod_refs(mach_task_self(), self_send_port, MACH_PORT_RIGHT_SEND, +1);
+    mach_port_t task_name_port = MACH_PORT_NULL;
+    auto res = task_get_special_port(mach_task_self(), TASK_NAME_PORT, &task_name_port);
     VERIFY(res == KERN_SUCCESS);
-    set_process_mach_port(getpid(), Core::MachPort::adopt_right(self_send_port, Core::MachPort::PortRight::Send));
+    set_process_task_name_port(getpid(), Core::MachPort::adopt_right(task_name_port, Core::MachPort::PortRight::Send));
 #endif
 }
 
@@ -114,12 +119,12 @@ void ProcessManager::for_each_process_statistics(Function<void(Process&, Core::P
 }
 
 #if defined(AK_OS_MACH)
-void ProcessManager::set_process_mach_port(pid_t pid, Core::MachPort&& port)
+void ProcessManager::set_process_task_name_port(pid_t pid, Core::MachPort&& port)
 {
     verify_event_loop();
     for (auto const& info : m_statistics.processes) {
         if (info->pid == pid) {
-            info->child_task_port = move(port);
+            info->task_name_port = move(port);
             return;
         }
     }
@@ -134,6 +139,30 @@ Optional<Process> ProcessManager::remove_process(pid_t pid)
         return (info->pid == pid);
     });
     return m_processes.take(pid);
+}
+
+void ProcessManager::remove_all_processes()
+{
+    verify_event_loop();
+
+    // NB: Shutting down a connection runs its die() handler, which looks up its process, for example to end a worker
+    //     that did not notice the connection closing. Shut the connections down while the table is intact.
+    Vector<pid_t> pids;
+    pids.ensure_capacity(m_processes.size());
+    for (auto const& entry : m_processes)
+        pids.unchecked_append(entry.key);
+    for (auto pid : pids) {
+        auto process = m_processes.get(pid);
+        if (!process.has_value())
+            continue;
+        if (auto connection = process->client<IPC::ConnectionBase>())
+            connection->shutdown();
+    }
+
+    // Destroying a process may run a die() handler too, so take the processes out first. Lookups then see an empty
+    // table rather than one being destroyed.
+    auto processes = move(m_processes);
+    processes.clear();
 }
 
 void ProcessManager::cancel_forced_exit(pid_t pid)

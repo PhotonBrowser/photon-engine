@@ -1,4 +1,4 @@
-$047a27b9 parameter-environment-capacity.js:10:1
+$83182f31 parameter-environment-capacity.js:10:1
   Registers: 9
   Blocks:    1
   Constants:
@@ -13,13 +13,13 @@ block0:
   [  38] SetLexicalEnvironment environment:reg4
   [  40] NewClass dst:reg6, class_environment:reg5, class_blueprint_index:0, element_keys:[element_keys:String("method")]
   [  68] DynamicInitializeLexicalBinding `Strict`, src:reg6
-  [  78] GetGlobal dst:reg5, `sloppy`
-  [  88] Call dst:reg6, callee:reg5, this_value:Undefined, sloppy
-  [  a8] GetGlobal dst:reg8, `Strict`
-  [  b8] CallConstruct dst:reg7, callee:reg8, Strict
-  [  d0] GetById dst:reg8, base:reg7, `method`
-  [  e8] Call dst:reg5, callee:reg8, this_value:reg7, <object>.method
-  [ 108] End value:reg5
+  [  78] GetGlobal value_feedback:0, dst:reg5, `sloppy`
+  [  88] Call value_feedback:1, call_feedback:0, dst:reg6, callee:reg5, this_value:Undefined, sloppy
+  [  a8] GetGlobal value_feedback:2, dst:reg8, `Strict`
+  [  b8] CallConstruct value_feedback:3, call_feedback:1, dst:reg7, callee:reg8, Strict
+  [  d8] GetById value_feedback:4, dst:reg8, base:reg7, `method`
+  [  f0] Call value_feedback:5, call_feedback:2, dst:reg5, callee:reg8, this_value:reg7, <object>.method
+  [ 110] End value:reg5
 
 
 sloppy$b222ab46 parameter-environment-capacity.js:7:5
@@ -33,7 +33,7 @@ block0:
   [   8] GetLexicalEnvironment dst:reg4
   [  10] CreateLexicalEnvironment dst:reg5, parent:reg4, capacity:2, is_catch_environment:false
   [  28] CreateVariable `a`, is_immutable:false, is_global:false, is_strict:false
-  [  38] CreateArguments is_immutable:false
+  [  38] CreateArguments is_immutable:false, creates_parameter_bindings:false
   [  48] JumpUndefined condition:arg0, true_target:block1, false_target:block2
 
 block1:
@@ -78,8 +78,8 @@ block2:
   [  68] InitializeLexicalBinding `mode`, src:arg0
   [  80] InitializeLexicalBinding `index`, src:arg1
   [  98] CreateVariable `active`, is_immutable:true, is_global:false, is_strict:true
-  [  a8] GetBinding dst:reg6, `mode`
-  [  c0] StrictlyEquals dst:reg7, lhs:reg6, rhs:String("a")
+  [  a8] GetBinding value_feedback:0, dst:reg6, `mode`
+  [  c0] StrictlyEquals arith_feedback:0, dst:reg7, lhs:reg6, rhs:String("a")
   [  d0] InitializeLexicalBinding `active`, src:reg7
   [  e8] NewFunction dst:reg7, shared_function_data_index:0
   [ 100] Return value:reg7

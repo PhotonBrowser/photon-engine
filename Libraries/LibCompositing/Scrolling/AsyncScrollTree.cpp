@@ -36,19 +36,30 @@ AsyncScrollNode const* AsyncScrollTree::scroll_node_for_id(AsyncScrollNodeID nod
     return nullptr;
 }
 
-WheelHitTestResult AsyncScrollTree::hit_test_result_for_scroll_node(AsyncScrollNodeID node_id, Gfx::FloatPoint delta) const
+WheelHitTestResult AsyncScrollTree::hit_test_result_for_scroll_node(AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for) const
 {
-    auto const* node = scroll_node_for_id(node_id);
-    if (!node)
-        return {};
-    if (can_scroll_node_by_delta(*node, m_scroll_state_snapshot, delta))
-        return { node_id, false };
-    if (auto ancestor = scrollable_ancestor_for_node(node_id, m_scroll_state_snapshot, delta); ancestor.has_value())
-        return { ancestor, false };
-    auto can_dispatch_boundary_delta = (delta.x() != 0 && (node->is_viewport || node->can_be_wheel_scrolled_horizontally) && node->overscroll_behavior_x != ScrollOverscrollBehavior::None)
-        || (delta.y() != 0 && (node->is_viewport || node->can_be_wheel_scrolled_vertically) && node->overscroll_behavior_y != ScrollOverscrollBehavior::None);
-    if (can_dispatch_boundary_delta)
-        return { node_id, false };
+    auto can_take_step = [&](AsyncScrollNode const& node) {
+        Optional<Gfx::FloatPoint> in_flight_destination;
+        if (in_flight_destination_for)
+            in_flight_destination = in_flight_destination_for(node.stable_node_id);
+        return can_scroll_node_from_offset_by_delta(node, in_flight_destination.value_or(scroll_offset_for_node(node, m_scroll_state_snapshot)), delta);
+    };
+
+    for (auto const* node = scroll_node_for_id(node_id); node;) {
+        if (can_take_step(*node))
+            return { node->node_id, false };
+
+        auto can_dispatch_boundary_delta = (delta.x() != 0 && (node->is_viewport || node->can_be_wheel_scrolled_horizontally) && node->overscroll_behavior_x != ScrollOverscrollBehavior::None)
+            || (delta.y() != 0 && (node->is_viewport || node->can_be_wheel_scrolled_vertically) && node->overscroll_behavior_y != ScrollOverscrollBehavior::None);
+
+        auto blocks_chaining = (delta.x() != 0 && node->overscroll_behavior_x != ScrollOverscrollBehavior::Auto)
+            || (delta.y() != 0 && node->overscroll_behavior_y != ScrollOverscrollBehavior::Auto);
+        if (blocks_chaining)
+            return can_dispatch_boundary_delta ? WheelHitTestResult { node->node_id, false } : WheelHitTestResult {};
+        if (!node->parent_node_id.has_value())
+            return can_dispatch_boundary_delta ? WheelHitTestResult { node->node_id, false } : WheelHitTestResult {};
+        node = scroll_node_for_id(*node->parent_node_id);
+    }
     return {};
 }
 
@@ -85,7 +96,11 @@ Gfx::FloatPoint AsyncScrollTree::scroll_offset_for_node(AsyncScrollNode const& n
 
 bool AsyncScrollTree::can_scroll_node_by_delta(AsyncScrollNode const& node, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint delta)
 {
-    auto scroll_offset = scroll_offset_for_node(node, scroll_state_snapshot);
+    return can_scroll_node_from_offset_by_delta(node, scroll_offset_for_node(node, scroll_state_snapshot), delta);
+}
+
+bool AsyncScrollTree::can_scroll_node_from_offset_by_delta(AsyncScrollNode const& node, Gfx::FloatPoint scroll_offset, Gfx::FloatPoint delta)
+{
     if (node.can_be_wheel_scrolled_horizontally && delta.x() < 0 && scroll_offset.x() > node.min_scroll_offset.x())
         return true;
     if (node.can_be_wheel_scrolled_horizontally && delta.x() > 0 && scroll_offset.x() < node.max_scroll_offset.x())
@@ -235,6 +250,41 @@ AsyncScrollApplication AsyncScrollTree::apply_scroll_delta(AsyncScrollNodeID nod
     return application;
 }
 
+Optional<WheelScrollTarget> AsyncScrollTree::select_wheel_scroll_target(AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for, ScrollChaining scroll_chaining) const
+{
+    // Each box is measured from where its scroll in flight is headed, so a box already headed for its extent passes the
+    // first step of a gesture on to an ancestor.
+    for (size_t remaining_handoffs = m_scroll_nodes.size(); remaining_handoffs > 0; --remaining_handoffs) {
+        auto const* node = scroll_node_for_id(node_id);
+        if (!node)
+            return {};
+
+        auto start_offset = in_flight_destination_for(node->stable_node_id).value_or(scroll_offset_for_node(*node, scroll_state_snapshot));
+        Gfx::FloatPoint wheel_scrollable_delta {
+            node->can_be_wheel_scrolled_horizontally ? delta.x() : 0,
+            node->can_be_wheel_scrolled_vertically ? delta.y() : 0,
+        };
+        auto destination_offset = clamp_scroll_offset_to_node(*node, start_offset + wheel_scrollable_delta);
+        if (destination_offset != start_offset) {
+            return WheelScrollTarget {
+                .stable_node_id = node->stable_node_id,
+                .current_offset = scroll_offset_for_node(*node, scroll_state_snapshot),
+                .start_offset = start_offset,
+                .destination_offset = destination_offset,
+            };
+        }
+
+        auto blocks_chaining = (delta.x() != 0 && node->overscroll_behavior_x != ScrollOverscrollBehavior::Auto)
+            || (delta.y() != 0 && node->overscroll_behavior_y != ScrollOverscrollBehavior::Auto);
+        if (blocks_chaining)
+            return {};
+        if (scroll_chaining == ScrollChaining::None || !node->parent_node_id.has_value())
+            return {};
+        node_id = *node->parent_node_id;
+    }
+    return {};
+}
+
 void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Compositing::DisplayList const> const& display_list, Compositing::AccumulatedVisualContextTree const* visual_context_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot)
 {
     m_cached_wheel_hit_test_targets.clear();
@@ -380,19 +430,19 @@ bool AsyncScrollTree::blocks_wheel_event_at_position(Compositing::AccumulatedVis
     return false;
 }
 
-WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta) const
+WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for) const
 {
-    return hit_test_scroll_node(visual_context_tree, position, delta, false);
+    return hit_test_scroll_node(visual_context_tree, position, delta, false, in_flight_destination_for);
 }
 
 WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_history_swipe(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta) const
 {
     // A native history swipe is browser navigation, so page wheel listeners must not hide the scroll boundary from it.
     // Main-thread regions still block this path because they represent nested navigables with their own scroll state.
-    return hit_test_scroll_node(visual_context_tree, position, delta, true);
+    return hit_test_scroll_node(visual_context_tree, position, delta, true, {});
 }
 
-WheelHitTestResult AsyncScrollTree::hit_test_scroll_node(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool ignore_blocking_wheel_event_regions) const
+WheelHitTestResult AsyncScrollTree::hit_test_scroll_node(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool ignore_blocking_wheel_event_regions, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for) const
 {
     if (m_visual_context_tree_structural_epoch != visual_context_tree.structural_epoch())
         return {};
@@ -427,7 +477,7 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node(Compositing::Accumulate
             continue;
         if (!target.target_node_id.has_value())
             return {};
-        return hit_test_result_for_scroll_node(*target.target_node_id, delta);
+        return hit_test_result_for_scroll_node(*target.target_node_id, delta, in_flight_destination_for);
     }
 
     auto viewport_node_id = viewport_scroll_node_id();
@@ -436,7 +486,7 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node(Compositing::Accumulate
     auto const* viewport_node = scroll_node_for_id(*viewport_node_id);
     if (!viewport_node || !viewport_node->scrollport_rect.to_type<float>().contains(position))
         return {};
-    return hit_test_result_for_scroll_node(*viewport_node_id, delta);
+    return hit_test_result_for_scroll_node(*viewport_node_id, delta, in_flight_destination_for);
 }
 
 bool AsyncScrollTree::is_covered_by_hit_test_target_painted_after(u32 paint_order_index, Compositing::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position) const

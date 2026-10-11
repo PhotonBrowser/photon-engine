@@ -1553,8 +1553,8 @@ void SeccompPolicy::allow_socket_pairs()
 }
 
 // socket(AF_UNIX) asks the Browser for a stream or seqpacket socket. connect() goes to the
-// Browser too, and it connects only to a path it put on its own allowlist. Every other domain is
-// refused outright, so this cannot become a way onto the network either.
+// Browser too, which connects only to the one endpoint it brokers. Every other domain is refused
+// outright, so this cannot become a way onto the network either.
 void SeccompPolicy::broker_unix_socket_connections()
 {
     // Each request to the broker carries a socket pair of its own for the answer.
@@ -1748,6 +1748,26 @@ void SeccompPolicy::allow_writable_executable_memory_mappings()
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PROT_WRITE | PROT_EXEC, 0, 1));
     append(SECCOMP_ALLOW);
     append(SECCOMP_LOAD_SYSCALL_NR);
+}
+
+// Memory protection keys, for JIT code whose pages are writable and executable
+// but which no thread may write unless it enables writes to the key's pages
+// in its own register. Only pages with a key may be writable and executable.
+void SeccompPolicy::allow_memory_protection_keys()
+{
+#if defined(__NR_pkey_alloc) && defined(__NR_pkey_free) && defined(__NR_pkey_mprotect)
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, pkey_alloc);
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, pkey_free);
+
+    // NB: Key 0 is the default key, which every thread may write, and -1
+    //     makes pkey_mprotect() behave like mprotect().
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_pkey_mprotect, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(3));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xFFFFFFFF, 1, 0));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
 }
 
 void SeccompPolicy::allow_threads()

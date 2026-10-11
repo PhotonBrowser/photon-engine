@@ -1,13 +1,5 @@
-include(audio)
-
 set(SOURCES
-    Audio/AudioDevices.cpp
     Audio/AudioRingBuffer.cpp
-    Audio/AudioServerPath.cpp
-    Audio/NullPlaybackStream.cpp
-    Audio/PlaybackStream.cpp
-    Audio/RecordStream.cpp
-    Audio/SpscAudioFrameRing.cpp
     Audio/WSOLAAlgorithm.cpp
     Audio/WSOLAInternals.cpp
     Audio/WSOLATimeStretcher.cpp
@@ -95,7 +87,6 @@ set(GENERATED_SOURCES
 
 if (APPLE)
     list(APPEND SOURCES
-        Audio/CoreAudioChannelLayout.cpp
         AudioToolbox/AudioToolboxAudioDecoder.cpp
         VideoToolbox/VideoToolboxVideoDecoder.mm
     )
@@ -106,6 +97,7 @@ compile_ipc(VideoPresentation/VideoPresentationServer.ipc VideoPresentation/Vide
 
 ladybird_lib(LibMedia media EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibMedia PRIVATE LibCore LibCrypto LibIPC LibGfx LibThreading LibUnicode)
+target_link_libraries(LibMedia PUBLIC LibAudio)
 
 if (APPLE)
     target_link_libraries(LibMedia PRIVATE "-framework AudioToolbox" "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo")
@@ -135,32 +127,4 @@ if (LINUX)
         FFmpeg/SystemFFmpegDecoders.cpp
     )
     target_link_libraries(LibMedia PRIVATE ${CMAKE_DL_LIBS})
-endif()
-
-if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
-    target_sources(LibMedia PRIVATE
-        Audio/AudioDevicesPulseAudio.cpp
-        Audio/PlaybackStreamPulseAudio.cpp
-        Audio/PulseAudioWrappers.cpp
-        Audio/RecordStreamPulseAudio.cpp
-    )
-    target_compile_definitions(LibMedia PRIVATE LIBMEDIA_AUDIO_BACKEND=1 LIBMEDIA_AUDIO_BACKEND_PULSE=1 LIBMEDIA_AUDIO_CAPTURE_BACKEND=1 LIBMEDIA_AUDIO_DEVICE_ENUMERATION=1)
-    target_link_libraries(LibMedia PRIVATE PkgConfig::PULSEAUDIO)
-elseif (LADYBIRD_AUDIO_BACKEND STREQUAL "AUDIO_UNIT")
-    target_sources(LibMedia PRIVATE
-        Audio/AudioDevicesCoreAudio.cpp
-        Audio/PlaybackStreamAudioUnit.cpp
-        Audio/RecordStreamAudioUnit.cpp
-    )
-    target_compile_definitions(LibMedia PRIVATE LIBMEDIA_AUDIO_BACKEND=1 LIBMEDIA_AUDIO_CAPTURE_BACKEND=1 LIBMEDIA_AUDIO_DEVICE_ENUMERATION=1)
-    find_library(AUDIO_TOOLBOX AudioToolbox REQUIRED)
-    find_library(CORE_AUDIO CoreAudio REQUIRED)
-    find_library(CORE_FOUNDATION CoreFoundation REQUIRED)
-    target_link_libraries(LibMedia PRIVATE ${AUDIO_TOOLBOX} ${CORE_AUDIO} ${CORE_FOUNDATION})
-elseif(LADYBIRD_AUDIO_BACKEND STREQUAL "WASAPI")
-    target_sources(LibMedia PRIVATE Audio/PlaybackStreamWasapi.cpp)
-    target_compile_definitions(LibMedia PRIVATE LIBMEDIA_AUDIO_BACKEND=1)
-    target_link_libraries(LibMedia PRIVATE ole32 avrt winmm)
-elseif (DEFINED LADYBIRD_AUDIO_BACKEND)
-    message(FATAL_ERROR "Please update ${CMAKE_CURRENT_LIST_FILE} for audio backend ${LADYBIRD_AUDIO_BACKEND}")
 endif()

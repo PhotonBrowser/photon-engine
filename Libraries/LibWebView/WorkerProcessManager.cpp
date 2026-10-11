@@ -6,6 +6,7 @@
 
 #include <AK/ScopeGuard.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/Timer.h>
 #include <LibIPC/File.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
@@ -18,6 +19,11 @@
 #include <LibWebView/WorkerProcessManager.h>
 
 namespace WebView {
+
+// Generous enough for a site that starts a worker per CPU core, as compute-heavy sites do.
+static constexpr size_t maximum_worker_count_per_top_level_site = 64;
+
+static constexpr auto worker_exit_grace_period = AK::Duration::from_seconds(5);
 
 WorkerProcessManager& WorkerProcessManager::the()
 {
@@ -67,6 +73,12 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
         return 0;
     }
     request.outside_settings.origin = outside_settings->origin();
+
+    // Only dedicated and shared workers are started on an owner's request.
+    if (request.agent_type != Web::HTML::AgentType::DedicatedWorker && request.agent_type != Web::HTML::AgentType::SharedWorker) {
+        notify_worker_script_load_failure(owner);
+        return 0;
+    }
 
     // NB: A worker shares the ancestors of the environment that creates it.
     auto has_cross_site_ancestor = owner.client.visit(
@@ -144,43 +156,79 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
         }
     }
 
+    // NB: Each worker runs in a process of its own, so a top-level site may run only so many of them at once, wherever
+    //     its documents and workers start them.
+    //     An opaque top-level origin is a site of its own. A worker counts until its process is gone, and one whose
+    //     creator's browsing context has been discarded, leaving it no top-level origin, does not start.
+    auto top_level_origin = outside_settings->top_level_origin();
+    if (!top_level_origin.has_value()) {
+        notify_worker_script_load_failure(owner);
+        return 0;
+    }
+    auto counts_toward_top_level_site = [&](IsPrivate worker_is_private, Optional<URL::Origin> const& worker_top_level_origin) {
+        return worker_is_private == is_private && worker_top_level_origin.has_value() && worker_top_level_origin->is_same_site(*top_level_origin);
+    };
+    size_t worker_count_of_top_level_site = 0;
+    for (auto const& [id, agent] : m_agents) {
+        if (counts_toward_top_level_site(agent.is_private, agent.top_level_origin))
+            ++worker_count_of_top_level_site;
+    }
+    for (auto const& exiting_worker : m_exiting_workers) {
+        if (counts_toward_top_level_site(exiting_worker.is_private, exiting_worker.top_level_origin))
+            ++worker_count_of_top_level_site;
+    }
+    if (worker_count_of_top_level_site >= maximum_worker_count_per_top_level_site) {
+        notify_worker_script_load_failure(owner);
+        return 0;
+    }
+
     // 11.6. Otherwise, in parallel, run a worker given worker, urlRecord, outsideSettings, outsidePort,
     //       and options.
     // AD-HOC: For DedicatedWorker there is no shared worker manager step; we always launch a fresh
     //         worker process here.
     auto agent_id = ++m_next_agent_id;
-    auto client = MUST(launch_web_worker_process(request.agent_type, is_private, agent_id));
+    auto client_or_error = [&]() -> ErrorOr<NonnullRefPtr<WebWorkerClient>> {
+        auto client = TRY(launch_web_worker_process(request.agent_type, is_private, agent_id));
 
-    // The worker's RequestServer client uses the cookies of the session the worker itself belongs to.
-    auto session = client->session();
-    if (!session)
-        session = Application::session_for_new_view(is_private);
-    // The worker makes its requests for the sites its owner makes them for.
-    owner.client.visit(
-        [&](WebContentOwner const& web_content_owner) {
-            if (web_content_owner.client)
-                client->request_server_site_bindings().bind_sites_of(web_content_owner.client->request_server_site_bindings());
-        },
-        [&](WebWorkerOwner const& web_worker_owner) {
-            client->request_server_site_bindings().bind_sites_of(web_worker_owner.client->request_server_site_bindings());
-        });
+        // The worker's RequestServer client uses the cookies of the session the worker itself belongs to.
+        auto session = client->session();
+        if (!session)
+            session = Application::session_for_new_view(is_private);
+        // The worker makes its requests for the sites its owner makes them for.
+        owner.client.visit(
+            [&](WebContentOwner const& web_content_owner) {
+                if (web_content_owner.client)
+                    client->request_server_site_bindings().bind_sites_of(web_content_owner.client->request_server_site_bindings());
+            },
+            [&](WebWorkerOwner const& web_worker_owner) {
+                client->request_server_site_bindings().bind_sites_of(web_worker_owner.client->request_server_site_bindings());
+            });
 
-    auto request_server_connection = MUST(connect_new_request_server_client(*session, RequestServer::SiteBinding::Bound));
-    auto image_decoder = MUST(launch_image_decoder_process());
+        auto request_server_connection = TRY(connect_new_request_server_client(*session, RequestServer::SiteBinding::Bound));
+        auto image_decoder = TRY(launch_image_decoder_process());
 #if defined(HAVE_WASM_COMPILER_SERVICE)
-    auto wasm_compiler_handle = MUST(connect_new_wasm_compiler_client());
+        auto wasm_compiler_handle = TRY(connect_new_wasm_compiler_client());
 #endif
 
-    client->request_server_site_bindings().did_connect(request_server_connection.client_id);
-    client->async_connect_to_request_server(move(request_server_connection.handle));
-    client->async_set_site_compatibility_data(Application::the().site_compatibility_data());
-    connect_to_image_decoder(*client, move(image_decoder));
+        client->request_server_site_bindings().did_connect(request_server_connection.client_id);
+        client->async_connect_to_request_server(move(request_server_connection.handle));
+        client->async_set_site_compatibility_data(Application::the().site_compatibility_data());
+        connect_to_image_decoder(*client, move(image_decoder));
 #if defined(HAVE_WASM_COMPILER_SERVICE)
-    client->async_connect_to_wasm_compiler(wasm_compiler_handle);
+        client->async_connect_to_wasm_compiler(wasm_compiler_handle);
 #endif
 
-    if (auto compositor_handle = Application::the().connect_new_compositor_canvas_client(); !compositor_handle.is_error())
-        client->async_connect_to_compositor(compositor_handle.release_value());
+        if (auto compositor_handle = Application::the().connect_new_compositor_canvas_client(); !compositor_handle.is_error())
+            client->async_connect_to_compositor(compositor_handle.release_value());
+        return client;
+    }();
+    // A worker the system cannot give a process fails to load, as one whose script cannot be fetched does.
+    if (client_or_error.is_error()) {
+        dbgln("Unable to start a worker process: {}", client_or_error.error());
+        notify_worker_script_load_failure(owner);
+        return 0;
+    }
+    auto client = client_or_error.release_value();
 
     Vector<Owner> owners;
     owners.append(owner);
@@ -227,6 +275,7 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
         .extended_lifetime = request.extended_lifetime,
         .worker_is_secure_context = request.caller_is_secure_context,
         .is_private = is_private,
+        .top_level_origin = top_level_origin,
         .shared_worker_key = {},
         .owners = move(owners),
         .inside_settings = move(inside_settings),
@@ -577,8 +626,29 @@ void WorkerProcessManager::remove_agent(Web::HTML::WorkerAgentId agent_id, Agent
         m_shared_workers.remove(*agent.shared_worker_key);
 
     agent.closing = true;
-    if (agent.client->is_open())
-        agent.client->async_close_worker();
+    if (!agent.client->is_open())
+        return;
+    agent.client->async_close_worker();
+
+    // NB: A worker busy running script handles no request to close, so its process is terminated if it has not exited
+    //     in time. Until it exits, it counts toward the workers of its top-level site.
+    auto termination_timer = Core::Timer::create_single_shot(static_cast<int>(worker_exit_grace_period.to_milliseconds()), [client = agent.client] {
+        if (client->is_open())
+            client->terminate_process();
+    });
+    termination_timer->start();
+    m_exiting_workers.append({ agent.client, agent.is_private, move(agent.top_level_origin), move(termination_timer) });
+}
+
+void WorkerProcessManager::worker_process_did_exit(WebWorkerClient& client)
+{
+    Vector<ExitingWorker> exited_workers;
+    for (size_t i = m_exiting_workers.size(); i > 0; --i) {
+        if (m_exiting_workers[i - 1].client.ptr() == &client)
+            exited_workers.append(m_exiting_workers.take(i - 1));
+    }
+    // NB: The client is still tearing down its connection, so the last references to it go once it is done.
+    Core::deferred_invoke([exited_workers = move(exited_workers)] { });
 }
 
 void WorkerProcessManager::remove_owner(Web::HTML::WorkerAgentId agent_id, Owner const& identity)

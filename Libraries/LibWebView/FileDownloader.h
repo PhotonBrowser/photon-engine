@@ -80,25 +80,33 @@ public:
     FileDownloader();
     ~FileDownloader();
 
-    u64 download_file(IsPrivate, URL::URL const&, LexicalPath);
+    // Whether the user chose to replace a file at the destination. A download never replaces any other file.
+    enum class MayReplaceDestination : u8 {
+        No,
+        Yes,
+    };
+
+    u64 download_file(IsPrivate, URL::URL const&, LexicalPath, MayReplaceDestination = MayReplaceDestination::No);
     u64 adopt_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data = {});
-    u64 start_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size = {});
+    u64 start_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size = {}, MayReplaceDestination = MayReplaceDestination::No);
     bool has_active_downloads() const;
     bool has_unresumable_downloads() const;
     void set_cancel_callback(u64 id, Function<void()>);
     void append_download_data(u64 id, ReadonlyBytes);
     void finish_download(u64 id);
     void cancel_unresumable_downloads();
-    void cancel_private_downloads();
+    void discard_private_downloads();
     void cancel_download(u64 id);
     void pause_download(u64 id);
     void resume_download(u64 id);
     void pause_active_downloads();
     void fail_download(u64 id, String);
-    Vector<u64> prune_inactive_downloads();
-    Vector<u64> remove_inactive_downloads_created_since(UnixDateTime);
+    Vector<u64> prune_inactive_downloads(IsPrivate);
+    Vector<u64> remove_inactive_downloads_created_since(UnixDateTime, Optional<IsPrivate> = {});
 
     ReadonlySpan<Download> downloads() const { return m_downloads.span(); }
+    // The downloads of one browsing session, which that session's UI lists without the other's.
+    Vector<Download> downloads_of_session(IsPrivate) const;
     Optional<Download const&> download(u64 id) const;
 
     Vector<SegmentProgress> segment_progress(u64 id) const;
@@ -153,7 +161,7 @@ private:
 
     void notify_download_added(Download const&);
     void notify_download_updated(Download const&);
-    void notify_download_removed(u64 id);
+    void notify_download_removed(u64 id, IsPrivate);
 
     Vector<Download> m_downloads;
     HashMap<u64, NonnullOwnPtr<ActiveDownload>> m_active_downloads;
@@ -169,7 +177,7 @@ public:
 
     virtual void download_added(FileDownloader::Download const&) { }
     virtual void download_updated(FileDownloader::Download const&) { }
-    virtual void download_removed(u64) { }
+    virtual void download_removed(u64, IsPrivate) { }
 };
 
 }
