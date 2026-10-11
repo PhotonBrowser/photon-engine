@@ -136,6 +136,32 @@ struct ContextMenuRequest {
     std::vector<ContextMenuItem> items;
 };
 
+// One entry in a <select> element's dropdown: an option to choose, the
+// label of a group of options, or a separator.
+struct SelectDropdownItem {
+    enum class Kind {
+        Option,
+        GroupLabel,
+        Separator,
+    };
+    Kind kind { Kind::Option };
+    std::string label;
+    // The option's id, to answer View::select_dropdown_closed with.
+    uint32_t id { 0 };
+    bool selected { false };
+    bool enabled { true };
+};
+
+// A <select> element asked to show its options, below the element at a
+// point in the view and at least as wide as it, in logical pixels. The
+// embedder answers with View::select_dropdown_closed, also when dismissed.
+struct SelectDropdownRequest {
+    double x { 0 };
+    double y { 0 };
+    double minimum_width { 0 };
+    std::vector<SelectDropdownItem> items;
+};
+
 // One representation of the clipboard's contents, such as "text/plain" or
 // "image/png" data.
 struct ClipboardEntry {
@@ -202,6 +228,10 @@ struct ViewCallbacks {
     // A user input has gone unanswered by the page for several seconds.
     std::function<void(bool unresponsive)> page_unresponsive_changed;
     std::function<void(ContextMenuRequest const&)> context_menu_requested;
+    std::function<void(SelectDropdownRequest const&)> select_dropdown_requested;
+    // A file input asked for files. The embedder answers with
+    // View::file_picker_closed, also when cancelled.
+    std::function<void(bool allow_multiple)> file_picker_requested;
     // A context menu action opened a link in a new tab.
     std::function<void(std::string const& url, bool activate)> open_in_new_tab_requested;
     // A link was shift-clicked, to be shown in a preview over the page.
@@ -337,6 +367,12 @@ public:
     // Run an item of the context menu most recently requested, by its index
     // in ContextMenuRequest::items.
     void activate_context_menu_item(size_t index);
+    // Answer the open <select> dropdown with the chosen option's id, or
+    // nothing when it was dismissed.
+    void select_dropdown_closed(std::optional<uint32_t> selected_id);
+    // Answer the open file picker with the chosen files' paths, empty when
+    // cancelled.
+    void file_picker_closed(std::vector<std::string> const& paths);
     // Answer the open dialog. A prompt's response is empty when cancelled.
     void alert_closed();
     void confirm_closed(bool accepted);

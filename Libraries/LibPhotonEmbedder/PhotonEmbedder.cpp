@@ -303,6 +303,74 @@ public:
         action->activate();
     }
 
+    void request_select_dropdown(Gfx::IntPoint widget_position, i32 minimum_width, Vector<Web::HTML::SelectItem> const& items)
+    {
+        if (!m_callbacks.select_dropdown_requested) {
+            select_dropdown_closed({});
+            return;
+        }
+        Photon::SelectDropdownRequest request;
+        request.x = widget_position.x() / m_device_pixel_ratio;
+        request.y = widget_position.y() / m_device_pixel_ratio;
+        request.minimum_width = minimum_width;
+        auto to_std_string = [](Utf16String const& text) {
+            auto utf8 = text.to_utf8();
+            return std::string(utf8.bytes_as_string_view().characters_without_null_termination(), utf8.bytes().size());
+        };
+        auto add_option = [&](Web::HTML::SelectItemOption const& option) {
+            request.items.push_back({
+                .kind = Photon::SelectDropdownItem::Kind::Option,
+                .label = to_std_string(option.label),
+                .id = option.id,
+                .selected = option.selected,
+                .enabled = !option.disabled,
+            });
+        };
+        for (auto const& item : items) {
+            item.visit(
+                [&](Web::HTML::SelectItemOption const& option) { add_option(option); },
+                [&](Web::HTML::SelectItemOptionGroup const& group) {
+                    request.items.push_back({
+                        .kind = Photon::SelectDropdownItem::Kind::GroupLabel,
+                        .label = to_std_string(group.label),
+                        .id = 0,
+                        .selected = false,
+                        .enabled = false,
+                    });
+                    for (auto const& option : group.items)
+                        add_option(option);
+                },
+                [&](Web::HTML::SelectItemSeparator const&) {
+                    Photon::SelectDropdownItem separator;
+                    separator.kind = Photon::SelectDropdownItem::Kind::Separator;
+                    request.items.push_back(move(separator));
+                });
+        }
+        m_callbacks.select_dropdown_requested(request);
+    }
+
+    void request_file_picker(Web::HTML::AllowMultipleFiles allow_multiple_files)
+    {
+        if (!m_callbacks.file_picker_requested) {
+            file_picker_closed({});
+            return;
+        }
+        m_callbacks.file_picker_requested(allow_multiple_files == Web::HTML::AllowMultipleFiles::Yes);
+    }
+
+    void choose_files(std::vector<std::string> const& paths)
+    {
+        Vector<Web::HTML::SelectedFile> selected_files;
+        for (auto const& path : paths) {
+            ByteString file_path { path.data(), path.size() };
+            if (auto file = WebView::create_selected_file(file_path); file.is_error())
+                warnln("Unable to open file {}: {}", file_path, file.error());
+            else
+                selected_files.append(file.release_value());
+        }
+        file_picker_closed(move(selected_files));
+    }
+
     void notify_state()
     {
         if (!m_callbacks.state_changed)
@@ -651,6 +719,12 @@ private:
             if (window_handle.empty())
                 return String {};
             return MUST(String::from_utf8(StringView { window_handle.data(), window_handle.size() }));
+        };
+        on_request_select_dropdown = [this](Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) {
+            request_select_dropdown(content_position, minimum_width, items);
+        };
+        on_request_file_picker = [this](Web::HTML::FileFilter const&, Web::HTML::AllowMultipleFiles allow_multiple_files) {
+            request_file_picker(allow_multiple_files);
         };
         on_request_alert = [this](Utf16String const& message) {
             request_dialog(Photon::DialogType::Alert, message, {});
@@ -1304,6 +1378,18 @@ void View::activate_context_menu_item(size_t index)
 {
     VERIFY(m_impl && m_impl->view);
     m_impl->view->activate_context_menu_item(index);
+}
+
+void View::select_dropdown_closed(std::optional<uint32_t> selected_id)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->select_dropdown_closed(selected_id.has_value() ? Optional<u32> { *selected_id } : Optional<u32> {});
+}
+
+void View::file_picker_closed(std::vector<std::string> const& paths)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->choose_files(paths);
 }
 
 void View::find_in_page_end()
