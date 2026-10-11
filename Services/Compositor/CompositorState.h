@@ -50,7 +50,6 @@ public:
     // No context could take the event; the UI sends it to WebContent itself.
     virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) = 0;
     virtual void did_detect_history_swipe_candidate(Web::CompositorContextId, u64 gesture_id, bool back, float unconsumed_delta) = 0;
-    virtual void did_detect_vertical_overscroll(Web::CompositorContextId, u64 gesture_id, float unconsumed_delta) = 0;
 };
 
 class CompositorStateWebContentClient {

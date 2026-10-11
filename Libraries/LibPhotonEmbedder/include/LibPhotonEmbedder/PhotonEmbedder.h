@@ -188,8 +188,6 @@ struct ViewCallbacks {
     std::function<void()> navigation_committed;
     // A precise trackpad wheel delta reached the root viewport's horizontal edge and can traverse tab history.
     std::function<void(uint64_t gesture_id, bool back, float unconsumed_delta)> history_swipe_candidate;
-    // A precise trackpad wheel delta reached the root viewport's vertical edge.
-    std::function<void(uint64_t gesture_id, float unconsumed_delta)> vertical_overscroll;
     std::function<std::string(NewWebViewRequest const&)> new_web_view_requested;
     std::function<void(std::string const&)> failed;
     std::function<void(std::string const&)> crashed;

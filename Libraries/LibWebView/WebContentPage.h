@@ -127,7 +127,6 @@ public:
     void did_consume_input_event_in_compositor(u64 event_id);
     void did_not_dispatch_input_event_through_compositor(u64 event_id);
     void did_detect_history_swipe_candidate(u64 gesture_id, bool back, float unconsumed_delta);
-    void did_detect_vertical_overscroll(u64 gesture_id, float unconsumed_delta);
     void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, u64 presentation_signal_value = 0);
     void did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_add_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);

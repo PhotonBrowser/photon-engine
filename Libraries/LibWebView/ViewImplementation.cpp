@@ -1005,15 +1005,6 @@ void ViewImplementation::did_detect_history_swipe_candidate(Badge<WebContentPage
         on_history_swipe_candidate(gesture_id, back, unconsumed_delta);
 }
 
-void ViewImplementation::did_detect_vertical_overscroll(Badge<WebContentPage>, u64 gesture_id, float unconsumed_delta)
-{
-    if (gesture_id == 0)
-        return;
-
-    if (on_vertical_overscroll)
-        on_vertical_overscroll(gesture_id, unconsumed_delta);
-}
-
 void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id)
 {
     auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });

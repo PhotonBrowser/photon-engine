@@ -776,22 +776,6 @@ ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Comp
         }
     }
 
-#if defined(AK_OS_MACOS)
-    if (wheel_delta_precision == Web::WheelDeltaPrecision::Precise
-        && application.vertical_boundary_node.has_value()) {
-        if (auto const* node = m_async_scroll_tree.scroll_node_for_id(*application.vertical_boundary_node)) {
-            auto can_elastically_overscroll = node->is_viewport
-                && node->overscroll_behavior_y != Compositing::ScrollOverscrollBehavior::None
-                && application.unconsumed_delta.y() != 0;
-            if (can_elastically_overscroll) {
-                outcome.vertical_overscroll_candidate = VerticalOverscrollCandidate {
-                    .unconsumed_delta = application.unconsumed_delta.y(),
-                };
-            }
-        }
-    }
-#endif
-
     if (application.scroll_offsets.is_empty()) {
         if (outcome.operation_id.has_value())
             m_completed_async_scroll_operation_ids.append(*outcome.operation_id);
@@ -1240,9 +1224,8 @@ ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint 
             .frame_to_present = frame_to_present,
             .should_request_rendering_update = frame_to_present.has_value(),
             .history_swipe_candidate = outcome.history_swipe_candidate,
-            .vertical_overscroll_candidate = outcome.vertical_overscroll_candidate,
         };
-    return { .accepted = true, .frame_to_present = PendingFrame::repainting_changes(*outcome.viewport_rect_to_present), .should_request_rendering_update = true, .history_swipe_candidate = outcome.history_swipe_candidate, .vertical_overscroll_candidate = outcome.vertical_overscroll_candidate };
+    return { .accepted = true, .frame_to_present = PendingFrame::repainting_changes(*outcome.viewport_rect_to_present), .should_request_rendering_update = true, .history_swipe_candidate = outcome.history_swipe_candidate };
 }
 
 Compositing::PendingAsyncScrollUpdates ContextState::take_pending_async_scroll_updates()
