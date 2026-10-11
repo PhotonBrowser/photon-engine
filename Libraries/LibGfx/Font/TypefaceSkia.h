@@ -38,6 +38,8 @@ public:
     static ErrorOr<NonnullRefPtr<TypefaceSkia>> load_from_buffer(ReadonlyBytes, u32 ttc_index, NonnullRefPtr<FontDataBacking>);
     static ErrorOr<RefPtr<TypefaceSkia>> match_system_ui(SystemUIFontKind, float point_size, u16 weight, u16 width, u8 slope);
     static ErrorOr<RefPtr<TypefaceSkia>> match_family_style(StringView family_name, u16 weight, u16 width, u8 slope);
+    // The PostScript name of the font find_typeface_for_code_point() would load, found without reading its data.
+    static Optional<String> find_postscript_name_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji);
     static ErrorOr<RefPtr<TypefaceSkia>> find_typeface_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji);
     static Optional<FlyString> resolve_generic_family(StringView family_name, u16 weight, u8 slope);
 

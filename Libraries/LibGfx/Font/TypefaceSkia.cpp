@@ -438,16 +438,32 @@ ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::match_family_style(StringView family
     return typeface_from_skia_typeface(move(skia_typeface));
 }
 
-ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::find_typeface_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
+static sk_sp<SkTypeface> match_typeface_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
 {
     SkFontStyle style(weight, width, slope_to_skia_slant(slope));
 
     // The "und-Zsye" language tag steers the font matcher towards a color emoji font. Without it, a text-presentation
     // font is preferred for emoji-capable code points.
     char const* emoji_locale[] = { "und-Zsye" };
-    auto skia_typeface = font_manager().matchFamilyStyleCharacter(
+    return font_manager().matchFamilyStyleCharacter(
         nullptr, style, prefer_color_emoji ? emoji_locale : nullptr, prefer_color_emoji ? 1 : 0, code_point);
+}
 
+Optional<String> TypefaceSkia::find_postscript_name_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
+{
+    auto skia_typeface = match_typeface_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
+    SkString name;
+    if (!skia_typeface || !skia_typeface->getPostScriptName(&name))
+        return {};
+    auto result = String::from_utf8(StringView { name.c_str(), name.size() });
+    if (result.is_error())
+        return {};
+    return result.release_value();
+}
+
+ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::find_typeface_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
+{
+    auto skia_typeface = match_typeface_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
     if (!skia_typeface)
         return RefPtr<TypefaceSkia> {};
 

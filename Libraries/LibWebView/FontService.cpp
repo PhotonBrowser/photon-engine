@@ -320,6 +320,18 @@ Gfx::BrokeredFont FontService::match_font_for_code_point(u32 code_point, u16 wei
     if (auto face_id = m_dynamic_match_cache.get(cache_key); face_id.has_value())
         return open_font_without_lock(m_generation, *face_id);
 
+    // A fallback font the catalog lists is shared as its file, as any catalog font is. Loading it to share a copy of
+    // its data would hold the whole font in memory, around 200 MB for a color emoji font.
+    if (auto name = Gfx::TypefaceSkia::find_postscript_name_for_code_point(code_point, weight, width, slope, prefer_color_emoji); name.has_value()) {
+        if (auto folded_name = name->to_casefold(); !folded_name.is_error()) {
+            if (auto face_id = m_local_font_names.get(folded_name.value()); face_id.has_value()) {
+                auto catalog_face_id = *face_id;
+                m_dynamic_match_cache.set(move(cache_key), catalog_face_id);
+                return open_font_without_lock(m_generation, catalog_face_id);
+            }
+        }
+    }
+
     auto typeface = Gfx::TypefaceSkia::find_typeface_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
     if (typeface.is_error() || !typeface.value())
         return {};
