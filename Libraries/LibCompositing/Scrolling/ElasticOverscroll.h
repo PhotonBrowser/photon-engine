@@ -21,7 +21,7 @@ class COMPOSITING_API ElasticOverscroll {
 public:
     explicit ElasticOverscroll(Gfx::FloatSize scrollport_size);
 
-    // Whole pixels, like the scroll offsets the stretch is presented with.
+    // Retain subpixel stretch so slow gestures and the end of a rebound move smoothly.
     Gfx::FloatPoint stretch() const;
     bool is_at_rest() const { return !m_rebound.has_value() && m_accumulated_overscroll.is_zero(); }
     bool is_rebounding() const { return m_rebound.has_value(); }

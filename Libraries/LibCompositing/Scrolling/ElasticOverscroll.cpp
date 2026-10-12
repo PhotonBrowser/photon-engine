@@ -11,13 +11,13 @@ namespace Compositing {
 
 // The stretch is the overscroll divided by the stiffness, and a released stretch S0 with velocity V0 is
 // (S0 + amplitude * V0 * t) * exp(-t * stiffness / period) after t seconds.
-static constexpr double rubber_band_stiffness = 20;
+static constexpr double rubber_band_stiffness = 12;
 static constexpr double rubber_band_amplitude = 0.31;
-static constexpr double rubber_band_period = 1.6;
+static constexpr double rubber_band_period = 1.2;
 static constexpr double rebound_decay_per_second = rubber_band_stiffness / rubber_band_period;
 
 static constexpr double largest_bounce_as_share_of_scrollport = 0.2;
-static constexpr float stretch_that_counts_as_sprung_back = 1;
+static constexpr float stretch_that_counts_as_sprung_back = 0.25f;
 
 // A scroller released at its edge with speed V peaks at amplitude * V / (decay * e). Wheel events carry no
 // timestamps, so the speed measured for events that were handled in a burst can be far above any real one.
@@ -36,7 +36,7 @@ Gfx::FloatPoint ElasticOverscroll::stretch() const
     auto unrounded_stretch = m_rebound.has_value()
         ? m_rebound->current_stretch
         : m_accumulated_overscroll.scaled(static_cast<float>(1 / rubber_band_stiffness));
-    return { AK::trunc(unrounded_stretch.x()), AK::trunc(unrounded_stretch.y()) };
+    return unrounded_stretch;
 }
 
 static float relax_axis_by(float& accumulated_overscroll, float delta)

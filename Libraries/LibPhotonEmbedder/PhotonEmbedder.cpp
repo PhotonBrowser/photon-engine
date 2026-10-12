@@ -81,6 +81,15 @@ private:
     virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const override;
     virtual void open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor) const override;
 
+    virtual bool platform_scrolls_elastically() const override
+    {
+#if defined(AK_OS_MACOS)
+        return true;
+#else
+        return false;
+#endif
+    }
+
     virtual Utf16String clipboard_text(ClipboardType type) const override
     {
         if (!m_system_clipboard.read)

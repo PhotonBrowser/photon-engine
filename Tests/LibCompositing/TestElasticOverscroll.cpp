@@ -17,17 +17,40 @@ static MonotonicTime time_after_release(MonotonicTime released_at, i64 milliseco
     return released_at + AK::Duration::from_milliseconds(milliseconds);
 }
 
-TEST_CASE(pull_stretches_by_a_fraction_of_the_overscroll_in_whole_pixels)
+TEST_CASE(pull_stretches_in_proportion_to_the_overscroll)
 {
     ElasticOverscroll overscroll { scrollport_size };
     EXPECT(overscroll.is_at_rest());
 
     overscroll.pull_by({ 0, -19 });
-    EXPECT_EQ(overscroll.stretch(), Gfx::FloatPoint(0, 0));
+    EXPECT(AK::abs(overscroll.stretch().y() + 19.0f / 12.0f) < 0.001f);
     EXPECT(!overscroll.is_at_rest());
 
     overscroll.pull_by({ 0, -381 });
-    EXPECT_EQ(overscroll.stretch(), Gfx::FloatPoint(0, -20));
+    EXPECT(AK::abs(overscroll.stretch().y() + 400.0f / 12.0f) < 0.001f);
+}
+
+TEST_CASE(a_slow_pull_and_rebound_keep_subpixel_motion)
+{
+    ElasticOverscroll overscroll { scrollport_size };
+    for (int i = 0; i < 12; ++i)
+        overscroll.pull_by({ 0, -1 });
+    EXPECT_EQ(overscroll.stretch(), Gfx::FloatPoint(0, -1));
+
+    auto released_at = MonotonicTime::now();
+    overscroll.release({}, released_at);
+    EXPECT(overscroll.advance_rebound_to(time_after_release(released_at, 16)));
+    auto stretch_after_one_frame = overscroll.stretch().y();
+    EXPECT(stretch_after_one_frame < -0.8f);
+    EXPECT(stretch_after_one_frame > -0.9f);
+
+    EXPECT(overscroll.advance_rebound_to(time_after_release(released_at, 80)));
+    auto stretch_after_five_frames = overscroll.stretch().y();
+    EXPECT(stretch_after_five_frames < -0.4f);
+    EXPECT(stretch_after_five_frames > -0.5f);
+
+    EXPECT(!overscroll.advance_rebound_to(time_after_release(released_at, 200)));
+    EXPECT(overscroll.is_at_rest());
 }
 
 TEST_CASE(pull_never_stretches_past_the_scrollport_length)
@@ -43,10 +66,10 @@ TEST_CASE(delta_back_to_the_scroll_range_relaxes_the_stretch_before_it_scrolls)
     overscroll.pull_by({ 0, -400 });
 
     EXPECT_EQ(overscroll.relax_by({ 7, 100 }), Gfx::FloatPoint(7, 0));
-    EXPECT_EQ(overscroll.stretch(), Gfx::FloatPoint(0, -15));
+    EXPECT_EQ(overscroll.stretch(), Gfx::FloatPoint(0, -25));
 
     EXPECT_EQ(overscroll.relax_by({ 0, -50 }), Gfx::FloatPoint(0, -50));
-    EXPECT_EQ(overscroll.stretch(), Gfx::FloatPoint(0, -15));
+    EXPECT_EQ(overscroll.stretch(), Gfx::FloatPoint(0, -25));
 
     EXPECT_EQ(overscroll.relax_by({ 0, 350 }), Gfx::FloatPoint(0, 50));
     EXPECT(overscroll.is_at_rest());
@@ -55,7 +78,7 @@ TEST_CASE(delta_back_to_the_scroll_range_relaxes_the_stretch_before_it_scrolls)
 TEST_CASE(released_stretch_springs_back_without_crossing_the_edge)
 {
     ElasticOverscroll overscroll { scrollport_size };
-    overscroll.pull_by({ 0, -2000 });
+    overscroll.pull_by({ 0, -1200 });
     auto released_at = MonotonicTime::now();
     overscroll.release({}, released_at);
     EXPECT(overscroll.is_rebounding());
@@ -117,7 +140,7 @@ TEST_CASE(momentum_into_an_edge_bounces_out_and_back_within_a_share_of_the_scrol
 TEST_CASE(fingers_take_a_rebound_over_from_where_it_has_got_to)
 {
     ElasticOverscroll overscroll { scrollport_size };
-    overscroll.pull_by({ 0, -2000 });
+    overscroll.pull_by({ 0, -1200 });
     auto released_at = MonotonicTime::now();
     overscroll.release({}, released_at);
     EXPECT(overscroll.advance_rebound_to(time_after_release(released_at, 50)));
