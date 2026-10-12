@@ -1,0 +1,3 @@
+the fading animation is pending as the task begins: true
+lane after the tick: ticking
+last frame presented by: clock

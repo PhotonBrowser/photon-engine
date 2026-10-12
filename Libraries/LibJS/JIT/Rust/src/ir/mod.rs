@@ -29,6 +29,8 @@ use crate::code::ExitKind;
 use crate::code::Repr;
 use crate::code::ResumeMode;
 use crate::snapshot::CellId;
+use crate::snapshot::HelperResult;
+use crate::snapshot::Intrinsic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct NodeId(pub u32);
@@ -300,6 +302,16 @@ impl BinaryOp {
         )
     }
 
+    /// Whether swapping the operands of the int32 operation keeps its
+    /// result. The generic Add is no such operation: it concatenates
+    /// strings, and converts its operands in order.
+    pub fn is_commutative_on_int32(self) -> bool {
+        matches!(
+            self,
+            BinaryOp::Add | BinaryOp::Mul | BinaryOp::BitwiseAnd | BinaryOp::BitwiseOr | BinaryOp::BitwiseXor
+        )
+    }
+
     /// Whether the operation converts its operands with ToInt32.
     pub fn is_bitwise(self) -> bool {
         matches!(
@@ -325,9 +337,28 @@ pub enum Comparison {
     StrictlyInequals,
     LooselyEquals,
     LooselyInequals,
+    /// The unsigned comparisons of the bits of int32 values, which only
+    /// `Op::Int32Compare` and `BranchCondition::Int32` make (see
+    /// `Comparison::unsigned()`).
+    Below,
+    BelowOrEqual,
+    Above,
+    AboveOrEqual,
 }
 
 impl Comparison {
+    /// The comparison of the bits of two int32 values, read as unsigned
+    /// integers, that compares them like this one compares the integers.
+    pub fn unsigned(self) -> Self {
+        match self {
+            Comparison::LessThan => Comparison::Below,
+            Comparison::LessThanEquals => Comparison::BelowOrEqual,
+            Comparison::GreaterThan => Comparison::Above,
+            Comparison::GreaterThanEquals => Comparison::AboveOrEqual,
+            _ => self,
+        }
+    }
+
     /// For the equalities and inequalities: whether they test for equality.
     pub fn equality(self) -> Option<bool> {
         match self {
@@ -418,6 +449,12 @@ pub enum Op {
     /// `String(value)` of the primitive input 0, through the runtime:
     /// ToString, but the descriptive string of a symbol.
     PrimitiveToString,
+    /// The builtin `intrinsic` of the `this` value input 0 and the
+    /// arguments in the other inputs, of the kinds and representations its
+    /// `HelperCall` says, through its runtime helper.
+    CallIntrinsic {
+        intrinsic: Intrinsic,
+    },
     /// ToObject of input 0, a primitive other than undefined and null, as
     /// the builtin function input 1 makes it (in its realm), through the
     /// runtime, or the empty value where that is not the running realm.
@@ -523,6 +560,13 @@ pub enum Op {
     Int32Binary {
         op: BinaryOp,
     },
+    /// The low 32 bits of `input 0 op input 1` of two `Repr::Int32` inputs,
+    /// as a `Repr::Int32`, for Add, Sub, Mul and UnsignedRightShift. Never
+    /// exits: the truncation pass makes the int32 operations whose users only
+    /// read the low 32 bits of their results these, and Mul is `Math.imul`.
+    Int32WrappingBinary {
+        op: BinaryOp,
+    },
     /// `input 0 comparison input 1` of two `Repr::Int32` inputs, as a
     /// `Repr::Bool`. Equalities and inequalities are strict and loose alike.
     Int32Compare {
@@ -558,6 +602,12 @@ pub enum Op {
     /// invalid: accesses must first check the index against
     /// `LoadTypedArrayLength`, which is zero without cached storage.
     LoadTypedArrayDataOffset,
+    /// The address of the elements of a typed array whose storage offset is
+    /// the `Repr::Pointer` input 0: the primitive storage cage base plus the
+    /// offset masked into the cage, as a `Repr::Pointer`. Whatever the
+    /// offset, accesses at a zero-extended 32-bit index scaled by at most 8
+    /// from it stay within the cage or the guard region past it.
+    TypedArrayDataAddress,
     /// The `Repr::Pointer` storage offset input 0, checked to be valid.
     /// Exits with `ExitKind::OutOfBounds` if it is invalid, so a captured
     /// typed array's fixed length can be used until its storage changes.
@@ -570,7 +620,7 @@ pub enum Op {
     /// object's `LoadElementsLength` and `LoadElementsCapacity`, or its
     /// `LoadTypedArrayLength`) of the object at the `Repr::Pointer` input 0,
     /// whose elements are of `kind`, in `kind.loaded_repr()`. For typed
-    /// arrays, input 0 is instead their `LoadTypedArrayDataOffset`. A hole
+    /// arrays, input 0 is instead their `TypedArrayDataAddress`. A hole
     /// of holey elements is the empty value.
     LoadElementAt {
         kind: ElementsKind,
@@ -578,7 +628,7 @@ pub enum Op {
     /// Stores input 2, in `kind.stored_repr()`, as the element at index
     /// input 1 (like for `LoadElementAt`) of the object at the
     /// `Repr::Pointer` input 0, whose elements are of `kind`. For typed
-    /// arrays, input 0 is instead their `LoadTypedArrayDataOffset`.
+    /// arrays, input 0 is instead their `TypedArrayDataAddress`.
     StoreElementAt {
         kind: ElementsKind,
     },
@@ -854,8 +904,18 @@ pub enum Op {
     /// The absolute value of the `Repr::Int32` input 0, which must not be
     /// `i32::MIN`, as a `Repr::Int32`.
     Int32Abs,
+    /// The smaller and the larger of the `Repr::Int32` inputs 0 and 1, as a
+    /// `Repr::Int32`.
+    Int32Min,
+    Int32Max,
+    /// The smaller of the `Repr::Int32` inputs 0 and 1 as unsigned numbers,
+    /// as a `Repr::Int32`.
+    Uint32Min,
     /// The `Repr::Float64` of the `Repr::Int32` input 0.
     Int32ToFloat64,
+    /// The `Repr::Int32` 0 or 1 of the `Repr::Bool` input 0, like ToInt32
+    /// of a boolean.
+    BoolToInt32,
     /// The `Repr::Float64` of the tagged input 0, which must be a double:
     /// the refinement of a branch on `BranchCondition::Double`.
     UnboxDouble,
@@ -872,6 +932,10 @@ pub enum Op {
     Float64Binary {
         op: BinaryOp,
     },
+    /// `Math.min` and `Math.max` of the `Repr::Float64` inputs 0 and 1, as a
+    /// `Repr::Float64`: NaN if either is NaN, and -0 below +0.
+    Float64Min,
+    Float64Max,
     /// `input 0 comparison input 1` of two `Repr::Float64` inputs, as a
     /// `Repr::Bool`: false if either is NaN, but for the inequalities.
     /// Equalities are strict and loose alike.
@@ -1147,6 +1211,20 @@ impl Op {
                 is_call: true,
                 ..P::PURE
             },
+            Op::CallIntrinsic { intrinsic } => {
+                let call = intrinsic
+                    .helper_call()
+                    .expect("intrinsics called through a helper have one");
+                // NB: Helpers that answer with a number or a boolean make no
+                //     cells.
+                P {
+                    is_call: true,
+                    allocates: matches!(call.result, HelperResult::String | HelperResult::Value),
+                    reads: call.reads,
+                    writes: call.writes,
+                    ..P::PURE
+                }
+            }
             Op::PrimitiveToString | Op::ToObject | Op::ArrayCreate => P {
                 is_call: true,
                 allocates: true,
@@ -1156,6 +1234,7 @@ impl Op {
             Op::BoxInt32
             | Op::BoxBool
             | Op::Int32Binary { .. }
+            | Op::Int32WrappingBinary { .. }
             | Op::Int32Compare { .. }
             | Op::TaggedEquals { .. }
             | Op::CellAddress => P::PURE,
@@ -1347,13 +1426,20 @@ impl Op {
             | Op::BoxFloat64
             | Op::Float64Unary { .. }
             | Op::Float64Binary { .. }
+            | Op::Float64Min
+            | Op::Float64Max
             | Op::Float64Compare { .. }
             | Op::Float64ToInt32
             | Op::Float64ToUint8Clamped
             | Op::Uint32ShiftRight
             | Op::Uint32ToFloat64
             | Op::Int32Abs
+            | Op::Int32Min
+            | Op::Int32Max
+            | Op::Uint32Min
             | Op::Int32ToFloat64
+            | Op::BoolToInt32
+            | Op::TypedArrayDataAddress
             | Op::StringAddress => P::PURE,
             // NB: A cache miss and strings whose characters only the slow
             //     path reads stay that way until the slow path ran.
@@ -1424,6 +1510,7 @@ impl Op {
             Op::IsCallable => "IsCallable",
             Op::ToBoolean => "ToBoolean",
             Op::PrimitiveToString => "PrimitiveToString",
+            Op::CallIntrinsic { .. } => "CallIntrinsic",
             Op::ToObject => "ToObject",
             Op::ArrayCreate => "ArrayCreate",
             Op::Generic { .. } => "Generic",
@@ -1438,6 +1525,7 @@ impl Op {
             Op::BoxInt32 => "BoxInt32",
             Op::BoxBool => "BoxBool",
             Op::Int32Binary { .. } => "Int32Binary",
+            Op::Int32WrappingBinary { .. } => "Int32WrappingBinary",
             Op::Int32Compare { .. } => "Int32Compare",
             Op::TaggedEquals { .. } => "TaggedEquals",
             Op::CheckElements { .. } => "CheckElements",
@@ -1446,6 +1534,7 @@ impl Op {
             Op::CheckNonNegativeInt32 => "CheckNonNegativeInt32",
             Op::LoadTypedArrayLength => "LoadTypedArrayLength",
             Op::LoadTypedArrayDataOffset => "LoadTypedArrayDataOffset",
+            Op::TypedArrayDataAddress => "TypedArrayDataAddress",
             Op::CheckTypedArrayStorage => "CheckTypedArrayStorage",
             Op::CheckBounds => "CheckBounds",
             Op::LoadElementAt { .. } => "LoadElementAt",
@@ -1491,11 +1580,17 @@ impl Op {
             Op::CallSlowPath { .. } => "CallSlowPath",
             Op::UnboxInt32 => "UnboxInt32",
             Op::Int32Abs => "Int32Abs",
+            Op::Int32Min => "Int32Min",
+            Op::Uint32Min => "Uint32Min",
+            Op::Int32Max => "Int32Max",
             Op::Int32ToFloat64 => "Int32ToFloat64",
+            Op::BoolToInt32 => "BoolToInt32",
             Op::UnboxDouble => "UnboxDouble",
             Op::BoxFloat64 => "BoxFloat64",
             Op::Float64Unary { .. } => "Float64Unary",
             Op::Float64Binary { .. } => "Float64Binary",
+            Op::Float64Min => "Float64Min",
+            Op::Float64Max => "Float64Max",
             Op::Float64Compare { .. } => "Float64Compare",
             Op::Float64ToInt32 => "Float64ToInt32",
             Op::Float64ToUint8Clamped => "Float64ToUint8Clamped",
@@ -1882,64 +1977,47 @@ impl Graph {
         chain
     }
 
+    /// The values `node` uses: its inputs, then the values of its frame
+    /// state.
+    pub fn used_values(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let data = self.node(node);
+        data.inputs.iter().copied().chain(
+            data.frame_state
+                .into_iter()
+                .flat_map(|id| self.frame_state_values(id).map(|(_, value)| value)),
+        )
+    }
+
     /// The values of every frame of a frame state chain, innermost frame first.
     ///
     /// They are followed by the properties of the virtual objects among them
     /// (see `virtual_objects()`), in order, with the slot
     /// `VIRTUAL_OBJECT_PROPERTY`: exits need those values too.
-    /// The values `node` uses: its inputs, then the values of its frame
-    /// state.
-    pub fn used_values(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        let data = self.node(node);
-        let frame_state_values = data
-            .frame_state
-            .map(|frame_state| self.frame_state_values(frame_state))
-            .unwrap_or_default();
-        data.inputs
-            .iter()
-            .copied()
-            .chain(frame_state_values.into_iter().map(|(_, value)| value))
-    }
-
-    pub fn frame_state_values(&self, id: FrameStateId) -> Vec<(u32, NodeId)> {
-        let mut values = self.chain_values(id);
-        for object in self.virtual_objects_among(&values) {
-            values.extend(
-                self.node(object)
-                    .inputs
-                    .iter()
-                    .map(|property| (VIRTUAL_OBJECT_PROPERTY, *property)),
-            );
-        }
-        values
+    pub fn frame_state_values(&self, id: FrameStateId) -> impl Iterator<Item = (u32, NodeId)> + '_ {
+        self.chain_values(id).chain(
+            std::iter::once_with(move || self.virtual_objects(id))
+                .flatten()
+                .flat_map(|object| {
+                    self.node(object)
+                        .inputs
+                        .iter()
+                        .map(|property| (VIRTUAL_OBJECT_PROPERTY, *property))
+                }),
+        )
     }
 
     /// The virtual objects the values of a frame state chain refer to,
     /// directly or through other virtual objects, each once, in the order
     /// they are first referred to.
     pub fn virtual_objects(&self, id: FrameStateId) -> Vec<NodeId> {
-        self.virtual_objects_among(&self.chain_values(id))
-    }
-
-    fn chain_values(&self, id: FrameStateId) -> Vec<(u32, NodeId)> {
-        let mut values = Vec::new();
-        let mut frame_state = Some(id);
-        while let Some(current) = frame_state {
-            let data = self.frame_state(current);
-            values.extend_from_slice(&data.values);
-            frame_state = data.parent;
-        }
-        values
-    }
-
-    fn virtual_objects_among(&self, values: &[(u32, NodeId)]) -> Vec<NodeId> {
         let is_virtual_object = |value: NodeId| matches!(self.node(value).op, Op::VirtualObject { .. });
         // NB: Most frame states refer to no virtual object.
-        if !values.iter().any(|(_, value)| is_virtual_object(*value)) {
+        if !self.chain_values(id).any(|(_, value)| is_virtual_object(value)) {
             return Vec::new();
         }
         let mut objects = Vec::new();
-        let mut pending = values.iter().rev().map(|(_, value)| *value).collect::<Vec<_>>();
+        let mut pending = self.chain_values(id).map(|(_, value)| value).collect::<Vec<_>>();
+        pending.reverse();
         while let Some(value) = pending.pop() {
             if !is_virtual_object(value) || objects.contains(&value) {
                 continue;
@@ -1948,6 +2026,11 @@ impl Graph {
             pending.extend(self.node(value).inputs.iter().rev().copied());
         }
         objects
+    }
+
+    fn chain_values(&self, id: FrameStateId) -> impl Iterator<Item = (u32, NodeId)> + '_ {
+        std::iter::successors(Some(id), |id| self.frame_state(*id).parent)
+            .flat_map(|id| self.frame_state(id).values.iter().copied())
     }
 
     /// The blocks code starts at: block 0, and the on-stack replacement
@@ -2007,26 +2090,19 @@ impl Graph {
     /// Reorders the blocks so that `order[i]` becomes block `i`. Blocks not
     /// in `order` are dropped; nothing may refer to them.
     pub fn reorder_blocks(&mut self, order: &[BlockId]) {
+        if order.len() == self.blocks.len() && order.iter().enumerate().all(|(index, block)| block.index() == index) {
+            return;
+        }
         let mut new_index = vec![None; self.blocks.len()];
         for (index, block) in order.iter().enumerate() {
+            assert!(new_index[block.index()].is_none(), "blocks appear once in the order");
             new_index[block.index()] = Some(BlockId::from_index(index));
         }
         let remap = |block: &mut BlockId| {
             *block = new_index[block.index()].expect("reordering keeps every referenced block");
         };
-        let mut old_blocks = std::mem::take(&mut self.blocks)
-            .into_iter()
-            .map(Some)
-            .collect::<Vec<_>>();
-        self.blocks = order
-            .iter()
-            .map(|block| {
-                old_blocks[block.index()]
-                    .take()
-                    .expect("blocks appear once in the order")
-            })
-            .collect();
-        for block in &mut self.blocks {
+        for block in order {
+            let block = &mut self.blocks[block.index()];
             block.predecessors.iter_mut().for_each(remap);
             if let Some(control) = block.control {
                 for successor in self.nodes[control.index()].op.successors_mut() {
@@ -2037,12 +2113,33 @@ impl Graph {
         for (_, block) in &mut self.osr_entries {
             remap(block);
         }
+        // Move each retained block to its destination, carrying the displaced
+        // block's destination with it. Dropped blocks end up past the new end.
+        for index in 0..self.blocks.len() {
+            while let Some(target) = new_index[index] {
+                if target.index() == index {
+                    break;
+                }
+                self.blocks.swap(index, target.index());
+                new_index.swap(index, target.index());
+            }
+        }
+        self.blocks.truncate(order.len());
     }
 
     /// The bits of `id` if it is a constant, or a refinement of one.
     pub fn constant_value(&self, id: NodeId) -> Option<u64> {
         match self.node(self.unrefined(id)).op {
             Op::Constant(bits) => Some(bits),
+            _ => None,
+        }
+    }
+
+    /// The value of `id`, if it is a `Repr::Int32` constant.
+    pub fn int32_constant(&self, id: NodeId) -> Option<i32> {
+        let node = self.node(self.unrefined(id));
+        match (&node.op, node.repr) {
+            (Op::Constant(bits), Some(Repr::Int32)) => Some((*bits as u32).cast_signed()),
             _ => None,
         }
     }
@@ -2054,5 +2151,92 @@ impl Graph {
             id = self.node(id).inputs[index];
         }
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(graph: &mut Graph, values: Vec<(u32, NodeId)>, parent: Option<FrameStateId>) -> FrameStateId {
+        graph.add_frame_state(FrameState {
+            executable: 0,
+            pc: 0,
+            mode: ResumeMode::ResumeAt,
+            values,
+            in_frame: Vec::new(),
+            parent,
+            passed_argument_count: None,
+        })
+    }
+
+    #[test]
+    fn reordering_moves_blocks_and_remaps_edges_and_entries() {
+        for order in [[2, 0, 3], [3, 2, 0], [0, 3, 2]] {
+            let mut graph = Graph::default();
+            for index in 0..4 {
+                graph.add_block(Block {
+                    bytecode_start: Some(index),
+                    ..Block::default()
+                });
+            }
+            let control = graph.add_node(Node::new(Op::Jump { target: BlockId(2) }, Vec::new(), None, 0));
+            graph.blocks[0].control = Some(control);
+            graph.blocks[2].predecessors.push(BlockId(0));
+            graph.osr_entries.push((10, BlockId(3)));
+            let storage = graph.blocks.as_ptr();
+            let order = order.map(BlockId);
+            graph.reorder_blocks(&order);
+            assert_eq!(graph.blocks.as_ptr(), storage);
+            assert_eq!(graph.blocks.len(), 3);
+            for (index, old) in order.iter().enumerate() {
+                assert_eq!(graph.blocks[index].bytecode_start, Some(old.0));
+            }
+            let new_id = |old| BlockId::from_index(order.iter().position(|block| *block == BlockId(old)).unwrap());
+            assert_eq!(graph.blocks[new_id(2).index()].predecessors, [new_id(0)]);
+            assert!(matches!(graph.node(control).op, Op::Jump { target } if target == new_id(2)));
+            assert_eq!(graph.osr_entries, [(10, new_id(3))]);
+        }
+    }
+
+    #[test]
+    fn frame_state_values_keep_caller_and_nested_object_order() {
+        let mut graph = Graph::default();
+        let value = graph.add_node(Node::new(Op::Constant(value::UNDEFINED), vec![], Some(Repr::Tagged), 0));
+        let inner = graph.add_node(Node::new(
+            Op::VirtualObject { shape: CellId(1) },
+            vec![value],
+            Some(Repr::Tagged),
+            0,
+        ));
+        let outer = graph.add_node(Node::new(
+            Op::VirtualObject { shape: CellId(2) },
+            vec![inner, value],
+            Some(Repr::Tagged),
+            0,
+        ));
+        let parent = state(&mut graph, vec![(0, value), (1, inner)], None);
+        let current = state(&mut graph, vec![(0, outer), (1, inner)], Some(parent));
+        assert_eq!(graph.virtual_objects(current), [outer, inner]);
+        assert_eq!(
+            graph.frame_state_values(current).collect::<Vec<_>>(),
+            [
+                (0, outer),
+                (1, inner),
+                (0, value),
+                (1, inner),
+                (VIRTUAL_OBJECT_PROPERTY, inner),
+                (VIRTUAL_OBJECT_PROPERTY, value),
+                (VIRTUAL_OBJECT_PROPERTY, value),
+            ]
+        );
+        graph.nodes[inner.index()].inputs.push(outer);
+        assert_eq!(graph.virtual_objects(current), [outer, inner]);
+        assert_eq!(
+            graph.frame_state_values(current).last(),
+            Some((VIRTUAL_OBJECT_PROPERTY, outer))
+        );
+        let empty = state(&mut graph, vec![], None);
+        assert_eq!(graph.frame_state_values(empty).count(), 0);
     }
 }

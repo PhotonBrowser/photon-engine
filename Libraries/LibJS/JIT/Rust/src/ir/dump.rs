@@ -124,6 +124,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         Op::BoxBool => with_inputs("BoxBool"),
         Op::CellAddress => with_inputs("CellAddress"),
         Op::Int32Binary { op } => with_inputs(&format!("Int32{op:?}")),
+        Op::Int32WrappingBinary { op } => with_inputs(&format!("Int32Wrapping{op:?}")),
         Op::Int32Compare { comparison } => with_inputs(&format!("Int32{comparison:?}")),
         Op::CheckElements { kind } => with_inputs(&format!("CheckElements {kind:?}")),
         Op::LoadElementAt { kind } | Op::StoreElementAt { kind } => with_inputs(&format!("{} {kind:?}", op.name())),
@@ -131,6 +132,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         Op::TaggedEquals { equal: false } => with_inputs("TaggedNotEquals"),
         Op::ToBoolean => with_inputs("ToBoolean"),
         Op::PrimitiveToString | Op::ToObject | Op::ArrayCreate => with_inputs(op.name()),
+        Op::CallIntrinsic { intrinsic } => with_inputs(&format!("CallIntrinsic {intrinsic:?}")),
         Op::Generic { opcode, executable, pc } => {
             let location = if *executable == 0 {
                 format!("@{pc}")
@@ -262,7 +264,13 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         Op::SlowPathOutput { index } => with_inputs(&format!("SlowPathOutput {index}")),
         Op::UnboxInt32
         | Op::Int32Abs
+        | Op::Int32Min
+        | Op::Uint32Min
+        | Op::Int32Max
+        | Op::Float64Min
+        | Op::Float64Max
         | Op::Int32ToFloat64
+        | Op::BoolToInt32
         | Op::UnboxDouble
         | Op::BoxFloat64
         | Op::StringAddress
@@ -295,6 +303,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::CheckNonNegativeInt32
         | Op::LoadTypedArrayLength
         | Op::LoadTypedArrayDataOffset
+        | Op::TypedArrayDataAddress
         | Op::CheckTypedArrayStorage => with_inputs(op.name()),
         Op::ProbeHasProperty { own: true } => with_inputs("ProbeHasOwnProperty"),
         Op::ProbeHasProperty { own: false } => with_inputs("ProbeHasProperty"),

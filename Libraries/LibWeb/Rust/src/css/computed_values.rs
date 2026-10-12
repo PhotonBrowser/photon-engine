@@ -785,6 +785,8 @@ impl_computed_payload_clone_and_eq!(MiscResetValues {
     scroll_snap_strictness,
     scrollbar_gutter,
     scrollbar_width,
+    overscroll_behavior_x,
+    overscroll_behavior_y,
     shape_image_threshold,
     shape_margin,
     shape_outside,
@@ -1570,6 +1572,26 @@ pub(crate) fn style_group_affects_layout(group_index: usize) -> bool {
     )
 }
 
+/// The style groups in `groups` whose payloads differ between two records, `[base, composed]` each: explicit
+/// inheritance reads both the base and the composition over it. `None` when a record holds fewer groups.
+pub(crate) fn changed_style_groups(
+    old: [&[crate::css::host_shared::SharedPayload]; 2],
+    new: [&[crate::css::host_shared::SharedPayload]; 2],
+    groups: std::ops::Range<usize>,
+) -> Option<u32> {
+    let mut changed = 0;
+    for group in groups {
+        for (before, after) in old.iter().zip(new.iter()) {
+            let (&before, &after) = (before.get(group)?, after.get(group)?);
+            if before != after && !style_group_payloads_equal(group, before.as_ptr(), after.as_ptr()) {
+                changed |= 1 << group;
+                break;
+            }
+        }
+    }
+    Some(changed)
+}
+
 pub(crate) fn style_group_payloads_equal(group_index: usize, a: *const c_void, b: *const c_void) -> bool {
     assert!(!a.is_null());
     assert!(!b.is_null());
@@ -2007,6 +2029,8 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             SCROLL_SNAP_TYPE => RequireInitialValue,
             SCROLLBAR_GUTTER => RequireInitialValue,
             SCROLLBAR_WIDTH @ scrollbar_width => EnumKeyword(enums::keyword_to_scrollbar_width),
+            OVERSCROLL_BEHAVIOR_X @ overscroll_behavior_x => EnumKeyword(enums::keyword_to_overscroll_behavior),
+            OVERSCROLL_BEHAVIOR_Y @ overscroll_behavior_y => EnumKeyword(enums::keyword_to_overscroll_behavior),
             SHAPE_IMAGE_THRESHOLD @ shape_image_threshold => ResolvedF64,
             SHAPE_MARGIN => RequireZeroPx,
             SHAPE_OUTSIDE => RequireKeyword(k::NONE),
@@ -3534,6 +3558,8 @@ impl MiscResetValues {
             scroll_snap_strictness: crate::css::css_enums::scroll_snap_strictness::NONE,
             scrollbar_gutter: 0,
             scrollbar_width: 0,
+            overscroll_behavior_x: crate::css::css_enums::overscroll_behavior::AUTO,
+            overscroll_behavior_y: crate::css::css_enums::overscroll_behavior::AUTO,
             shape_image_threshold: 0.0,
             shape_margin: initial(property_id::SHAPE_MARGIN),
             shape_outside: initial(property_id::SHAPE_OUTSIDE),

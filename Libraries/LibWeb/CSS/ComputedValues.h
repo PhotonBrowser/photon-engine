@@ -838,6 +838,19 @@ public:
 
 private:
     struct InheritedValues {
+        InheritedValues() = default;
+
+        explicit InheritedValues(StyleGroupInitialization initialization)
+            : table(initialization)
+            , list(initialization)
+            , ui(initialization)
+            , svg(initialization)
+            , text(initialization)
+            , box(initialization)
+            , font(initialization)
+        {
+        }
+
         StyleStructRef<InheritedTableValues> table;
         StyleStructRef<InheritedListValues> list;
         StyleStructRef<InheritedUIValues> ui;
@@ -1153,6 +1166,28 @@ public:
 
 private:
     struct NonInheritedValues {
+        NonInheritedValues() = default;
+
+        explicit NonInheritedValues(StyleGroupInitialization initialization)
+            : animation(initialization)
+            , box(initialization)
+            , surround(initialization)
+            , sizing(initialization)
+            , misc(initialization)
+            , alignment(initialization)
+            , border(initialization)
+            , background(initialization)
+            , transform(initialization)
+            , effects(initialization)
+            , mask_data(initialization)
+            , text_reset(initialization)
+            , content_data(initialization)
+            , anchor(initialization)
+            , grid(initialization)
+            , svg_reset(initialization)
+        {
+        }
+
         StyleStructRef<AnimationValues> animation;
         StyleStructRef<BoxValues> box;
         StyleStructRef<SurroundValues> surround;

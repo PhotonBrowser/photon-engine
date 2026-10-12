@@ -269,6 +269,8 @@ All properties associated with getComputedStyle(document.body):
     "overflow-inline",
     "overflow-x",
     "overflow-y",
+    "overscroll-behavior-block",
+    "overscroll-behavior-inline",
     "overscroll-behavior-x",
     "overscroll-behavior-y",
     "padding-block-end",

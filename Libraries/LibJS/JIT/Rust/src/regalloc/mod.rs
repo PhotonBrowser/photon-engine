@@ -13,6 +13,9 @@
 //! Spilling is simple: a value that ever needs a stack slot gets one slot for
 //! its whole life, and code generation stores it there right after its
 //! definition. Values live across a call always get one.
+//! Phis share their slots with the values flowing into them where their
+//! lives do not overlap (see `coalescing`), so that values carried around
+//! loops in stack slots need no copying.
 //!
 //! A merge or loop header starts with the register state of its first
 //! predecessor in linear order (its "state predecessor"; for a loop header,
@@ -35,6 +38,7 @@
 //! ones, so float64 values live across them get stack slots, like values
 //! live across a call.
 
+mod coalescing;
 mod liveness;
 mod moves;
 mod verify;
@@ -108,6 +112,16 @@ pub fn saves_only_gprs(op: &Op) -> bool {
             | Op::AllocateArray { .. }
             | Op::AllocateFunction { .. }
             | Op::AllocateEnvironment { .. }
+    )
+}
+
+/// Whether the lowering of `op` computes its output from its first input
+/// as two-address instructions do, so that the output may take the
+/// register of that input where it dies.
+fn reuses_first_input(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Int32WrappingBinary { .. } | Op::Int32Binary { .. } | Op::BoolToInt32 | Op::TypedArrayDataAddress
     )
 }
 
@@ -306,7 +320,7 @@ fn constraints(node: &Node, registers: &RegisterSet) -> Constraints {
             constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
         }
         // NB: The VM is the first argument.
-        Op::PrimitiveToString | Op::ToObject | Op::ArrayCreate => {
+        Op::PrimitiveToString | Op::CallIntrinsic { .. } | Op::ToObject | Op::ArrayCreate => {
             constraints.inputs = (0..node.inputs.len())
                 .map(|index| InputConstraint::FixedRegister(registers.argument_gprs[index + 1]))
                 .collect();
@@ -332,6 +346,7 @@ fn constraints(node: &Node, registers: &RegisterSet) -> Constraints {
             condition: BranchCondition::Int32(_) | BranchCondition::TaggedEquals { .. },
             ..
         } => constraints.inputs[1] = InputConstraint::RegisterOrConstant,
+        Op::Int32WrappingBinary { .. } => constraints.inputs[1] = InputConstraint::RegisterOrConstant,
         Op::Int32Binary { op } if op != crate::ir::BinaryOp::Mul => {
             constraints.inputs[1] = InputConstraint::RegisterOrConstant;
             // The quotient of a remainder.
@@ -426,7 +441,10 @@ fn constraints(node: &Node, registers: &RegisterSet) -> Constraints {
             constraints.inputs[1] = InputConstraint::RegisterOrConstant;
             constraints.temps = 1;
         }
-        Op::CheckBounds => constraints.inputs[0] = InputConstraint::RegisterOrConstant,
+        Op::CheckBounds => {
+            constraints.inputs[0] = InputConstraint::RegisterOrConstant;
+            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
+        }
         // The heap and a value.
         Op::AllocateObject { .. } => constraints.temps = 2,
         // The object's property storage.
@@ -466,16 +484,22 @@ struct Allocator<'a> {
     end_contents: Vec<Option<Vec<Option<NodeId>>>>,
     /// The position of the node being allocated.
     position: u32,
+    /// The spill slot class of each value (see `coalescing`), and the
+    /// slot of each class that has one.
+    slot_classes: Vec<u32>,
+    class_slots: Vec<Option<u32>>,
 }
 
 impl<'a> Allocator<'a> {
     fn new(graph: &'a Graph, registers: &'a RegisterSet) -> Self {
         assert!(registers.allocatable_gprs.0 >> FPR_BASE == 0);
         assert!(!registers.allocatable_gprs.contains(registers.scratch_gpr));
+        let liveness = ValueLiveness::compute(graph);
+        let slot_classes = coalescing::spill_slot_classes(graph, &liveness);
         Self {
             graph,
             registers,
-            liveness: ValueLiveness::compute(graph),
+            liveness,
             allocation: Allocation {
                 nodes: vec![NodeAllocation::default(); graph.nodes.len()],
                 block_end_moves: vec![Vec::new(); graph.blocks.len()],
@@ -486,6 +510,8 @@ impl<'a> Allocator<'a> {
             value_registers: vec![None; graph.nodes.len()],
             end_contents: vec![None; graph.blocks.len()],
             position: 0,
+            slot_classes,
+            class_slots: vec![None; graph.nodes.len()],
         }
     }
 
@@ -582,7 +608,15 @@ impl<'a> Allocator<'a> {
         if let Some(slot) = self.allocation.nodes[value.index()].spill_slot {
             return slot;
         }
-        let slot = self.new_spill_slot();
+        let class = self.slot_classes[value.index()] as usize;
+        let slot = match self.class_slots[class] {
+            Some(slot) => slot,
+            None => {
+                let slot = self.new_spill_slot();
+                self.class_slots[class] = Some(slot);
+                slot
+            }
+        };
         self.allocation.nodes[value.index()].spill_slot = Some(slot);
         slot
     }
@@ -740,7 +774,6 @@ impl<'a> Allocator<'a> {
         };
         self.graph
             .frame_state_values(frame_state)
-            .into_iter()
             .map(|(slot, value)| (slot, self.current_location(value)))
             .collect()
     }
@@ -821,12 +854,31 @@ impl<'a> Allocator<'a> {
             temps.push(register);
         }
 
+        // NB: Two-address instructions (like those of x86) write their output
+        //     over their first input, which then needs no copy where it dies
+        //     here. Nodes that may exit keep their inputs for the exit.
+        let first_input_register = match inputs.first() {
+            Some(Location::Register(register))
+                if node.frame_state.is_none()
+                    && reuses_first_input(&node.op)
+                    && is_allocated_value(self.graph, node.inputs[0])
+                    && self.liveness.dies_at[node_id.index()].contains(&node.inputs[0])
+                    && RegisterClass::of_register(*register) == RegisterClass::of(node.repr)
+                    && !temps.contains(register) =>
+            {
+                Some(*register)
+            }
+            _ => None,
+        };
+
         // Pick the output register before recording where exits find their
         // values: a node may exit after writing its output (a check of a value
         // it loaded), so no exit value may stay in that register.
         let pick_output = |allocator: &mut Self| match constraints.output {
             OutputConstraint::None => None,
-            OutputConstraint::Register => Some(allocator.pick_register(blocked, RegisterClass::of(node.repr))),
+            OutputConstraint::Register => Some(
+                first_input_register.unwrap_or_else(|| allocator.pick_register(blocked, RegisterClass::of(node.repr))),
+            ),
             OutputConstraint::FixedRegister(register) => {
                 debug_assert!(constraints.is_call || !blocked.contains(register));
                 allocator.evict(register);
@@ -935,12 +987,10 @@ impl<'a> Allocator<'a> {
                 (from != to).then_some(Move { from, to })
             })
             .chain(
-                liveness::phi_inputs_from(self.graph, block, join)
-                    .into_iter()
-                    .map(|(phi, input)| Move {
-                        from: self.current_location(input),
-                        to: self.allocation.nodes[phi.index()].output.expect("phis have locations"),
-                    }),
+                liveness::phi_inputs_from(self.graph, block, join).map(|(phi, input)| Move {
+                    from: self.current_location(input),
+                    to: self.allocation.nodes[phi.index()].output.expect("phis have locations"),
+                }),
             )
             .collect()
     }
@@ -962,7 +1012,6 @@ impl<'a> Allocator<'a> {
                     self.place_merge_phis(block, *successor);
                 }
                 liveness::phi_inputs_from(self.graph, block, *successor)
-                    .into_iter()
                     .map(|(phi, input)| Move {
                         from: self.current_location(input),
                         to: self.allocation.nodes[phi.index()].output.expect("phis have locations"),
@@ -980,6 +1029,23 @@ impl<'a> Allocator<'a> {
         });
         resolve_parallel_moves(&moves, Location::Stack(temp))
     }
+}
+
+/// The spill slot to store `phi`, which is in a register, to at the start
+/// of its block, if it has one that its inputs did not fill already. Inputs
+/// sharing the phi's slot (see `coalescing`) are in it from their own
+/// definition on.
+pub fn phi_spill_store(graph: &Graph, allocation: &Allocation, phi: NodeId) -> Option<u32> {
+    let node = allocation.node(phi);
+    let (Some(Location::Register(_)), Some(slot)) = (node.output, node.spill_slot) else {
+        return None;
+    };
+    let filled = graph
+        .node(phi)
+        .inputs
+        .iter()
+        .all(|input| allocation.node(*input).spill_slot == Some(slot));
+    (!filled).then_some(slot)
 }
 
 /// Prints the allocation of `graph` as text: every node with the moves

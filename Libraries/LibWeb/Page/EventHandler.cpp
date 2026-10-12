@@ -884,24 +884,30 @@ static Layout::Node* scrolling_box_for_scroll_step(Layout::Node& target, CSSPixe
 }
 
 // Each box is measured from where its user scroll of the given kind in flight is headed, as the step that continues
-// that scroll measures it, so a box already headed for its extent passes the step on to an ancestor.
-static Layout::Node* scrolling_box_for_continued_scroll_step(HTML::LocalNavigable& navigable, Layout::Node& target, CSSPixelPoint delta, Compositing::ScrollAnimationKind animation_kind)
+// that scroll measures it, so a box already headed for its extent passes the step on to an ancestor. No box around
+// `box_ending_scroll_chain` is offered the step.
+static Layout::Node* scrolling_box_for_continued_scroll_step(HTML::LocalNavigable& navigable, Layout::Node& target, CSSPixelPoint delta, Compositing::ScrollAnimationKind animation_kind, Layout::Node const* box_ending_scroll_chain)
 {
     for (auto* scrolling_box = &target; scrolling_box; scrolling_box = scrolling_box->containing_block()) {
-        if (!navigable.continued_scroll_step_moves(*scrolling_box, delta, animation_kind))
-            continue;
-        if (scrolling_box->is_viewport() && !visual_viewport_pan_axes_for_scroll_step(target.document(), delta.x().to_double(), delta.y().to_double()).is_empty())
+        if (navigable.continued_scroll_step_moves(*scrolling_box, delta, animation_kind)) {
+            if (scrolling_box->is_viewport() && !visual_viewport_pan_axes_for_scroll_step(target.document(), delta.x().to_double(), delta.y().to_double()).is_empty())
+                return nullptr;
+            return scrolling_box;
+        }
+        if (scrolling_box == box_ending_scroll_chain)
             return nullptr;
-        return scrolling_box;
     }
     return nullptr;
 }
 
-static Layout::Node* scroll_containing_block_chain_smoothly(HTML::LocalNavigable& navigable, Layout::Node& node, CSSPixelPoint delta, Painting::ScrollKind scroll_kind, Compositing::ScrollAnimationKind animation_kind = Compositing::ScrollAnimationKind::SmoothScroll)
+// No box around `box_ending_scroll_chain` is offered the scroll.
+static Layout::Node* scroll_containing_block_chain_smoothly(HTML::LocalNavigable& navigable, Layout::Node& node, CSSPixelPoint delta, Painting::ScrollKind scroll_kind, Compositing::ScrollAnimationKind animation_kind, Layout::Node const* box_ending_scroll_chain)
 {
     for (auto* scrolling_box = &node; scrolling_box; scrolling_box = scrolling_box->containing_block()) {
         if (navigable.scroll_scrolling_box_by_delta(*scrolling_box, delta, scroll_kind, animation_kind))
             return scrolling_box;
+        if (scrolling_box == box_ending_scroll_chain)
+            return nullptr;
     }
     return nullptr;
 }
@@ -1115,17 +1121,21 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
                 latch_gesture_to_wheel_event_target(*fresh_hit_test_target, walk_start);
             }
         }
+        // https://drafts.csswg.org/css-overscroll-1/#overscroll-behavior-properties
+        // The step scrolls this box or a box inside it. If none of them takes it, it is not passed on any further.
+        auto* viewport_box = document->layout_node(read);
+        auto const* box_ending_scroll_chain = Painting::box_ending_scroll_chain(walk_start ? *walk_start : *viewport_box, wheel_delta_x, wheel_delta_y);
         if (walk_start) {
             Layout::Node* snap_container = nullptr;
             if (is_discrete_step)
-                snap_container = scrolling_box_for_continued_scroll_step(*m_navigable, *walk_start, wheel_step_delta, Compositing::ScrollAnimationKind::Wheel);
+                snap_container = scrolling_box_for_continued_scroll_step(*m_navigable, *walk_start, wheel_step_delta, Compositing::ScrollAnimationKind::Wheel, box_ending_scroll_chain);
             else if (wheel_step_may_snap)
                 snap_container = scrolling_box_for_scroll_step(*walk_start, wheel_step_delta);
             Layout::Node* scrolled_box = nullptr;
             if (snap_container && snap_wheel_step_in(*snap_container)) {
                 scrolled_box = snap_container;
             } else if (is_discrete_step) {
-                scrolled_box = scroll_containing_block_chain_smoothly(*m_navigable, *walk_start, wheel_step_delta, Painting::ScrollKind::Relative, Compositing::ScrollAnimationKind::Wheel);
+                scrolled_box = scroll_containing_block_chain_smoothly(*m_navigable, *walk_start, wheel_step_delta, Painting::ScrollKind::Relative, Compositing::ScrollAnimationKind::Wheel, box_ending_scroll_chain);
             } else {
                 scrolled_box = Painting::wheel_scroll_along_containing_block_chain(*walk_start, wheel_delta_x, wheel_delta_y);
             }
@@ -1135,9 +1145,17 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
             }
         }
 
-        auto viewport_scroll_result = scroll_viewport_by_wheel_delta(*document, Painting::wheel_scrollable_axes(*document->layout_node(read)));
+        // A step that a box keeps to itself is handled even though nothing scrolled, so that neither the viewport
+        // nor a document this one is nested in scrolls by it. No scrolling box is latched: the next step may point
+        // along the other axis, which the box may well pass on.
+        if (box_ending_scroll_chain && !box_ending_scroll_chain->is_viewport())
+            return EventResult::Handled;
+
+        auto viewport_scroll_result = scroll_viewport_by_wheel_delta(*document, Painting::wheel_scrollable_axes(*viewport_box));
         if (viewport_scroll_result == EventResult::Handled)
-            latch_gesture_to_scrolling_box(*document->layout_node(read));
+            latch_gesture_to_scrolling_box(*viewport_box);
+        else if (box_ending_scroll_chain)
+            return EventResult::Handled;
         return viewport_scroll_result;
     };
 
@@ -1583,6 +1601,16 @@ EventHandler::KeyboardScrollSnapshot EventHandler::keyboard_scroll_snapshot() co
         target = scroll_target->layout_node(read);
     if (!target)
         return snapshot;
+    // The compositor only knows the scrollers that a wheel can scroll. If any other box keeps the scrolls of keys to
+    // itself, the keys are scrolled by here, where every box in the chain is seen.
+    for (auto delta : { Gfx::FloatPoint { 1, 0 }, Gfx::FloatPoint { 0, 1 } }) {
+        auto const* box_ending_scroll_chain = Painting::box_ending_scroll_chain(*target, delta.x(), delta.y());
+        if (!box_ending_scroll_chain || box_ending_scroll_chain->is_viewport())
+            continue;
+        auto wheel_scrollable_axes = Painting::wheel_scrollable_axes(*box_ending_scroll_chain);
+        if (!wheel_scrollable_axes.horizontal && !wheel_scrollable_axes.vertical)
+            return snapshot;
+    }
     auto* scrolling_box = Painting::first_wheel_scrollable_box_in_containing_block_chain(*target);
     if (!scrolling_box)
         scrolling_box = document->layout_node(read);
@@ -1856,6 +1884,11 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
             m_scroll_key_gesture_hold = make<HTML::UserScrollGestureHold>(*m_navigable);
         m_navigable->note_user_scroll_input_intent(intent);
     };
+    // https://drafts.csswg.org/css-overscroll-1/#overscroll-behavior-properties
+    // This property must be applied to all scrolling methods supported by the user agent.
+    auto box_ending_scroll_chain_from = [](Layout::Node const& node, CSSPixelPoint delta) {
+        return Painting::box_ending_scroll_chain(node, delta.x().to_double(), delta.y().to_double());
+    };
     auto scroll_container_of_scroll_target_by = [&](CSSPixelPoint delta, Painting::ScrollKind scroll_kind) -> bool {
         auto scroll_target = scroll_target_for_key_input();
         if (!scroll_target)
@@ -1863,18 +1896,31 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         Layout::ForcedReadScope read { *document };
         document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleKeyDown);
         auto* scroll_target_layout_node = scroll_target->layout_node(read);
-        return scroll_target_layout_node && scroll_containing_block_chain_smoothly(*m_navigable, *scroll_target_layout_node, delta, scroll_kind);
+        return scroll_target_layout_node && scroll_containing_block_chain_smoothly(*m_navigable, *scroll_target_layout_node, delta, scroll_kind, Compositing::ScrollAnimationKind::SmoothScroll, box_ending_scroll_chain_from(*scroll_target_layout_node, delta));
     };
-    auto scrolling_box_for_key_input = [&](Layout::BegunRead const& read, CSSPixelPoint delta) -> Layout::Node* {
+    auto layout_node_keys_scroll_from = [&](Layout::BegunRead const& read) -> Layout::Node* {
         document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleKeyDown);
         Layout::Node* target = nullptr;
         if (auto scroll_target = scroll_target_for_key_input())
             target = scroll_target->layout_node(read);
         if (!target)
             target = document->layout_node(read);
+        return target;
+    };
+    auto scrolling_box_for_key_input = [&](Layout::BegunRead const& read, CSSPixelPoint delta) -> Layout::Node* {
+        auto* target = layout_node_keys_scroll_from(read);
         if (!target)
             return nullptr;
-        return scrolling_box_for_continued_scroll_step(*m_navigable, *target, delta, Compositing::ScrollAnimationKind::SmoothScroll);
+        return scrolling_box_for_continued_scroll_step(*m_navigable, *target, delta, Compositing::ScrollAnimationKind::SmoothScroll, box_ending_scroll_chain_from(*target, delta));
+    };
+    // The viewport is the last scroller a key scrolls. It is not offered a scroll that a box inside it keeps to itself.
+    auto viewport_is_in_scroll_chain_for_key_input = [&](CSSPixelPoint delta) {
+        Layout::ForcedReadScope read { *document };
+        auto* target = layout_node_keys_scroll_from(read);
+        if (!target)
+            return true;
+        auto const* box_ending_scroll_chain = box_ending_scroll_chain_from(*target, delta);
+        return !box_ending_scroll_chain || box_ending_scroll_chain->is_viewport();
     };
     auto perform_scroll_step_for_key_input = [&](CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type strategy_type) {
         Layout::ForcedReadScope read { *document };
@@ -1894,6 +1940,8 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         hold_scroll_gesture_until_key_release(intent);
         if (perform_scroll_step_for_key_input({ delta_x, delta_y }, intent))
             return;
+        if (!viewport_is_in_scroll_chain_for_key_input({ delta_x, delta_y }))
+            return;
         m_navigable->scroll_viewport_by_delta({ delta_x, delta_y }, Bindings::ScrollBehavior::Smooth, Painting::ScrollKind::Relative);
     };
     auto scroll_to_the_beginning_for_key_input = [&] {
@@ -1904,6 +1952,8 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
             return;
         if (scroll_container_of_scroll_target_by({ 0, -CSSPixels::max() }, Painting::ScrollKind::Absolute))
             return;
+        if (!viewport_is_in_scroll_chain_for_key_input({ 0, -CSSPixels::max() }))
+            return;
         m_navigable->scroll_viewport_by_delta({ 0, -CSSPixels::max() }, Bindings::ScrollBehavior::Smooth, Painting::ScrollKind::Absolute);
     };
     auto scroll_to_the_end_for_key_input = [&] {
@@ -1911,6 +1961,8 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         if (perform_snapped_scroll_to_extent_for_key_input({ 0, CSSPixels::max() }))
             return;
         if (scroll_container_of_scroll_target_by({ 0, CSSPixels::max() }, Painting::ScrollKind::Absolute))
+            return;
+        if (!viewport_is_in_scroll_chain_for_key_input({ 0, CSSPixels::max() }))
             return;
         m_navigable->scroll_viewport_by_delta({ 0, CSSPixels::max() }, Bindings::ScrollBehavior::Smooth, Painting::ScrollKind::Absolute);
     };

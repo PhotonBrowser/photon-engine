@@ -9,7 +9,6 @@
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
-#include <LibWeb/CSS/Invalidation/SlotInvalidator.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
@@ -156,6 +155,7 @@ static void apply_document_style_invalidation_after_style_change(DOM::Document& 
 struct StyleBeforeReaction {
     explicit StyleBeforeReaction(DOM::Element const& element)
         : was_unstyled(!element.has_style())
+        , style_record(element.document().style_computer(), (element.has_children() || element.shadow_root() || is<HTML::HTMLSlotElement>(element)) ? element.style_record_identity() : StyleRecordID {})
     {
         if (auto const* box_values = element.style_group<ComputedValues::BoxValues>())
             display = display_from_ffi_display(box_values->display);
@@ -163,10 +163,11 @@ struct StyleBeforeReaction {
 
     bool was_unstyled { false };
     Optional<Display> display;
+    StyleRecordPin style_record;
 };
 
 // Reports what applying a reaction to the element did, from which the engine derives the reactions of its children.
-static void note_style_reaction_applied(DOM::Element const& element, u8 reaction, StyleBeforeReaction const& before, RequiredInvalidationAfterStyleChange const& invalidation, u32 facts = 0)
+static void note_style_reaction_applied(Layout::BegunRead const& read, DOM::Element const& element, u8 reaction, StyleBeforeReaction const& before, RequiredInvalidationAfterStyleChange const& invalidation, u32 facts = 0)
 {
     // A counter-style rebuild moves no style, so it is not what the children react to.
     if (invalidation.style_change_is_none())
@@ -175,9 +176,20 @@ static void note_style_reaction_applied(DOM::Element const& element, u8 reaction
         facts |= StyleEngine::NeedsLayoutTreeRebuild;
     if (invalidation.recompute_descendant_styles)
         facts |= StyleEngine::RecomputeDescendants;
-    if (element.children_explicitly_inherited_non_inherited_style_groups() != 0)
+    // NB: Explicit inheritance reads both the base and the composition, which may cover a changed value.
+    auto changed_non_inherited_style_groups = [&]() -> u32 {
+        if (!before.style_record.style_record() || !element.has_style())
+            return NumericLimits<u32>::max();
+        auto old_record = element.document().style_computer().style_engine().style_record_view(read, before.style_record.style_record());
+        auto new_record = element.installed_style().view();
+        if (!old_record.longhand_table || !new_record.longhand_table)
+            return NumericLimits<u32>::max();
+        auto groups = StyleEngineFFI::style_engine_changed_style_groups(&old_record, &new_record, ComputedValues::inherited_style_group_count, old_record.payload_count);
+        return groups | ComputedValuesFFI::rust_computed_longhand_table_non_inherited_inheritance_changes(static_cast<ComputedValuesFFI::ComputedLonghandTable const*>(old_record.longhand_table), static_cast<ComputedValuesFFI::ComputedLonghandTable const*>(new_record.longhand_table));
+    }();
+    if (element.children_explicitly_inherited_non_inherited_style_groups() & changed_non_inherited_style_groups)
         facts |= StyleEngine::ChildrenExplicitlyInherit;
-    if (auto shadow_root = element.shadow_root(); shadow_root && shadow_root->children_explicitly_inherited_non_inherited_style_groups() != 0)
+    if (auto shadow_root = element.shadow_root(); shadow_root && (shadow_root->children_explicitly_inherited_non_inherited_style_groups() & changed_non_inherited_style_groups))
         facts |= StyleEngine::ShadowChildrenExplicitlyInherit;
     if (before.was_unstyled)
         facts |= StyleEngine::WasUnstyled;
@@ -187,7 +199,7 @@ static void note_style_reaction_applied(DOM::Element const& element, u8 reaction
     // style-engine bookkeeping, such as a synthetic pseudo-element reaction, and stays unstyled.
     if (auto const* box_values = element.style_group<ComputedValues::BoxValues>(); box_values && before.display.has_value() && *before.display != display_from_ffi_display(box_values->display))
         facts |= StyleEngine::DisplayChanged;
-    StyleEngineFFI::style_engine_note_style_reaction_applied(element.document().style_computer().style_engine().host(), element.style_node_id(), reaction, invalidation.inherited_style_groups_changed(), facts);
+    StyleEngineFFI::style_engine_note_style_reaction_applied(element.document().style_computer().style_engine().host(), element.style_node_id(), reaction, invalidation.inherited_style_groups_changed(), changed_non_inherited_style_groups, facts);
 }
 
 // One element's computed style answers for another only while the inputs it was keyed on still mean what they meant. A
@@ -285,6 +297,7 @@ static void sample_animations_for_installed_record(Layout::BegunRead const& read
         return;
     Animations::AnimationUpdateContext::ElementData element_data { style_record, abstract_element.document().style_computer().reconstruct_computed_properties_for_animation(read, style_record) };
     element_data.base_is_current = true;
+    element_data.inherited_style_update_owned_by_reaction = true;
     Animations::AnimationUpdateContext context;
     context.elements.set(abstract_element, move(element_data));
     context.publish();
@@ -458,7 +471,7 @@ static RequiredInvalidationAfterStyleChange install_engine_computed_records(Layo
     // NB: Earlier rows can replace the element's composition after this row was planned. Pin the record it holds now,
     //     which is the before-change style for this installation, rather than the row's possibly reclaimed old record.
     bool const owes_a_transition_step = reaction.owes_a_transition_step || element.has_existing_transitions({});
-    StyleRecordPin const before_change { document.style_computer(), owes_a_transition_step ? element.style_record_identity() : StyleRecordID {} };
+    StyleRecordPin const before_change { document.style_computer(), (owes_a_transition_step || reaction.composed_by_the_host) ? element.style_record_identity() : StyleRecordID {} };
     // The record answers any style input the element owes, as the C++ computation it equals would: nothing is left for
     // a later transaction to plan.
     StyleEngineFFI::style_engine_consume_element_style_input(style_engine.host(), reaction.style_node);
@@ -486,8 +499,17 @@ static RequiredInvalidationAfterStyleChange install_engine_computed_records(Layo
         if (element.has_relevant_animations() || element.has_associated_animations())
             sample_animations_for_installed_record(read, abstract_element);
     }
-    if (!!before_change.style_record())
+    if (owes_a_transition_step && !!before_change.style_record())
         invalidation |= document.style_computer().run_transition_step_for_installed_record(read, { element }, before_change.style_record());
+    if (reaction.composed_by_the_host && !!before_change.style_record()) {
+        // NB: Installing an uncomposed base can temporarily change an inherited value covered by an animation.
+        //     Descendants observe the final composition, and their transition selection also observes its base.
+        //     Compare both rather than propagating the intermediate base-to-overlay changes.
+        auto old_record = style_engine.style_record_view(read, before_change.style_record());
+        auto new_record = element.installed_style().view();
+        auto changed_inherited_groups = StyleEngineFFI::style_engine_changed_style_groups(&old_record, &new_record, 0, ComputedValues::inherited_style_group_count);
+        invalidation.set_inherited_style_groups_changed(static_cast<u8>(changed_inherited_groups & RequiredInvalidationAfterStyleChange::all_inherited_style_groups));
+    }
     if (old_computed_values)
         element.apply_display_none_change(read, DOM::Element::DisplayNoneState::of(*old_computed_values));
     // The pseudo-elements of a record the host composes inherit the composition, so the engine settles them only now.
@@ -560,7 +582,7 @@ void StyleEngineFFI::web_css_apply_style_reaction(StyleReactionApplication* appl
     // for their own computation. The engine derives no reactions for the move.
     if (did_change_custom_properties)
         propagate_custom_property_environment_move(application, element, old_custom_property_data);
-    note_style_reaction_applied(element, reaction, before, invalidation);
+    note_style_reaction_applied(read, element, reaction, before, invalidation);
 }
 
 ContainerLayoutUpToDate lay_out_container_for_style_update(DOM::Document& document)
@@ -681,6 +703,11 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
     if (!inputs.has_value())
         return;
 
+    // The animations the update ticked are sampled before the transaction is taken, as they are ahead of the seal of
+    // one that flies: the records it computes inherit their values, and what they feed back joins the transaction.
+    if constexpr (!drains_flown_transaction)
+        document.sample_animation_effects_needing_style_update();
+
     // A style flush is a transaction boundary. Everything recorded since the last one crosses into StyleEngine as one
     // flat batch, is normalized there, and is routed into the region its transpose programs reach. A transaction that
     // could not be proven narrower publishes a complete document reaction batch.
@@ -752,13 +779,11 @@ StyleEngineFFI::FfiTargetedStyleReaction StyleEngineFFI::web_css_apply_targeted_
     RequiredInvalidationAfterStyleChange invalidation;
     if (installation)
         invalidation = install_engine_computed_records(read, element, *installation, did_change_custom_properties);
-    if (!invalidation.is_none() || did_change_custom_properties)
-        Invalidation::invalidate_assigned_slottables_after_slot_style_change(element);
     apply_element_style_invalidation_after_style_change(read, element, invalidation);
     u8 reaction = StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle;
     if (descendant_style_recompute_needed)
         reaction |= StyleEngine::RecomputeDescendantStyles;
-    note_style_reaction_applied(element, reaction, before, invalidation, did_change_custom_properties ? u32 { StyleEngine::DidChangeCustomProperties } : 0);
+    note_style_reaction_applied(read, element, reaction, before, invalidation, did_change_custom_properties ? u32 { StyleEngine::DidChangeCustomProperties } : 0);
     apply_document_style_invalidation_after_style_change(element.document(), invalidation);
     return {
         .descendants_need_recompute = did_change_custom_properties || invalidation.needs_layout_tree_rebuild(),

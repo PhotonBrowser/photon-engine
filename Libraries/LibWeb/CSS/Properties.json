@@ -3881,7 +3881,8 @@
     }
   },
   "overscroll-behavior-x": {
-    "style-group": "BoxValues",
+    "affects-hit-testing": true,
+    "style-group": "MiscResetValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -3892,7 +3893,8 @@
     ]
   },
   "overscroll-behavior-y": {
-    "style-group": "BoxValues",
+    "affects-hit-testing": true,
+    "style-group": "MiscResetValues",
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,

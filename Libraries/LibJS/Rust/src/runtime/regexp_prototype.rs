@@ -45,6 +45,8 @@ use crate::runtime::regexp_constructor::is_raw_native_function_running;
 use crate::runtime::regexp_legacy_static_properties::{
     invalidate_legacy_regexp_static_properties, update_legacy_regexp_static_properties_lazy,
 };
+#[cfg(feature = "jit")]
+use crate::runtime::regexp_object::NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET;
 use crate::runtime::regexp_object::{
     REGEXP_FLAGS_WITH_CHARACTERS, RegExpFlags, RegExpObject, compile_flags_for, parse_regex_pattern,
 };
@@ -418,6 +420,25 @@ fn indices_pair(vm: &Vm, realm: Gc<Realm>, start: usize, end: usize) -> Value {
 
 // 22.2.7.2 RegExpBuiltinExec ( R, S ), https://tc39.es/ecma262/#sec-regexpbuiltinexec
 // 22.2.7.2 RegExpBuiltInExec ( R, S ), https://github.com/tc39/proposal-regexp-legacy-features#regexpbuiltinexec--r-s-
+/// RegExpBuiltinExec(R, S) where it runs no code and throws nothing: for a RegExp object R that still has the shape it
+/// was created with, whose one property is a writable lastIndex, and whose lastIndex is a number. `None` for other
+/// values, and where matching exceeds the backtracking limit, which happens before anything observable.
+#[cfg(feature = "jit")]
+pub(crate) fn regexp_builtin_exec_running_no_code(vm: &Vm, value: Value, string: Gc<PrimitiveString>) -> Option<Value> {
+    if !value.is_object() {
+        return None;
+    }
+    let object = value.as_object();
+    let realm = vm.current_realm().expect("RegExpBuiltinExec runs in a realm");
+    if object.shape() != realm.intrinsics().new_regexp_object_shape(vm)
+        || !object.get_direct(NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET).is_number()
+    {
+        return None;
+    }
+    let regexp_object = object.downcast::<RegExpObject>()?;
+    regexp_builtin_exec(vm, regexp_object, string).ok()
+}
+
 fn regexp_builtin_exec(
     vm: &Vm,
     regexp_object: Gc<RegExpObject>,

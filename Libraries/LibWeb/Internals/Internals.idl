@@ -62,7 +62,8 @@ interface Internals {
     undefined grantTransientActivation();
     undefined clickThroughUIProcess(double x, double y);
     undefined mouseMoveThroughUIProcess(double x, double y);
-    undefined wheelThroughUIProcess(double x, double y, double deltaX, double deltaY);
+    // Resolves once the UI process reports that the event has been handled.
+    [CreatesPromise] Promise<undefined> wheelThroughUIProcess(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional ScrollGesturePhase scrollGesturePhase = "none");
     undefined sendKey(HTMLElement target, DOMString keyName, optional unsigned short modifiers = 0, optional unsigned long repeatCount = 1);
     undefined paste(HTMLElement target, DOMString text);
     undefined pasteFromClipboard();
@@ -79,6 +80,10 @@ interface Internals {
     undefined click(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
     undefined clickAndHold(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
     [CreatesPromise] Promise<undefined> wheel(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional ScrollGesturePhase scrollGesturePhase = "none");
+    // How far, in CSS pixels, the compositor presents a scroller past the edges of its scroll range. The scroller is
+    // the viewport if none is given.
+    double elasticOverscrollStretchX(optional Element? scroller = null);
+    double elasticOverscrollStretchY(optional Element? scroller = null);
     undefined pinch(double x, double y, double scaleDelta, optional unsigned short modifiers = 0);
     undefined resetZoom();
 
@@ -245,9 +250,9 @@ interface Internals {
     DOMString clockLaneState(Document document);
     // Whether the lane of a frame the document sampled after the one it presented last has yet to come together.
     boolean clockLaneIsComing(Document document);
-    // The color, as a CSS color string, that a box a hover's transitions restyled showed in the last frame a tick of
-    // a clock lane presented, or null.
-    DOMString? presentedColor(Element element);
+    // The color, as a CSS color string, that the box of the element, or of its "::before", "::after" or "::marker"
+    // pseudo-element, showed in the last frame a tick of a clock lane presented where the tick restyled it, or null.
+    DOMString? presentedColor(Element element, optional DOMString pseudoElement);
     // The border box of the element in the last frame a clock tick presented.
     DOMRect? presentedBorderBox(Element element);
     // How many compositor animations drove the box of the element in the last frame a clock tick presented, or null

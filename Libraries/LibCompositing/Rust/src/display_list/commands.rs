@@ -52,10 +52,11 @@ pub enum DisplayListCommandType {
     PaintScrollBar,
     CompositorSnapContainer,
     CompositorSnapArea,
+    CompositorScrollChainingBarrier,
 }
 ffi_enum_bytes!(DisplayListCommandType as u8);
 
-pub const DISPLAY_LIST_COMMAND_TYPE_COUNT: usize = DisplayListCommandType::CompositorSnapArea as usize + 1;
+pub const DISPLAY_LIST_COMMAND_TYPE_COUNT: usize = DisplayListCommandType::CompositorScrollChainingBarrier as usize + 1;
 
 impl DisplayListCommandType {
     pub fn from_u8(value: u8) -> Option<Self> {
@@ -78,6 +79,7 @@ impl DisplayListCommandType {
                 | Self::CompositorBlockingWheelEventRegion
                 | Self::CompositorSnapContainer
                 | Self::CompositorSnapArea
+                | Self::CompositorScrollChainingBarrier
         )
     }
 
@@ -119,6 +121,7 @@ impl DisplayListCommandType {
             Self::PaintScrollBar => "PaintScrollBar",
             Self::CompositorSnapContainer => "CompositorSnapContainer",
             Self::CompositorSnapArea => "CompositorSnapArea",
+            Self::CompositorScrollChainingBarrier => "CompositorScrollChainingBarrier",
         }
     }
 }
@@ -512,16 +515,6 @@ pub enum CompositorScrollNodeKind {
     PseudoElement,
 }
 ffi_enum_bytes!(CompositorScrollNodeKind as u8);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum CompositorOverscrollBehavior {
-    #[default]
-    Auto,
-    Contain,
-    None,
-}
-ffi_enum_bytes!(CompositorOverscrollBehavior as u8);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -1377,8 +1370,12 @@ pub struct CompositorScrollNode {
     pub is_viewport: bool,
     pub can_be_wheel_scrolled_horizontally: bool,
     pub can_be_wheel_scrolled_vertically: bool,
-    pub overscroll_behavior_x: CompositorOverscrollBehavior,
-    pub overscroll_behavior_y: CompositorOverscrollBehavior,
+    /// Whether a scroll the scroller cannot scroll by is passed on to the scrollers around it.
+    pub chains_scroll_to_ancestors_horizontally: bool,
+    pub chains_scroll_to_ancestors_vertically: bool,
+    /// Whether a touchpad may pull the scroller past the edges of its scroll range.
+    pub shows_overscroll_effect_horizontally: bool,
+    pub shows_overscroll_effect_vertically: bool,
 }
 ffi_bytes_fields!(CompositorScrollNode {
     document_id,
@@ -1393,8 +1390,10 @@ ffi_bytes_fields!(CompositorScrollNode {
     is_viewport,
     can_be_wheel_scrolled_horizontally,
     can_be_wheel_scrolled_vertically,
-    overscroll_behavior_x,
-    overscroll_behavior_y
+    chains_scroll_to_ancestors_horizontally,
+    chains_scroll_to_ancestors_vertically,
+    shows_overscroll_effect_horizontally,
+    shows_overscroll_effect_vertically
 });
 
 impl DisplayListCommand for CompositorScrollNode {
@@ -1506,6 +1505,29 @@ ffi_bytes_fields!(CompositorWheelHitTestTargetWithCornerRadii {
 
 impl DisplayListCommand for CompositorWheelHitTestTargetWithCornerRadii {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii;
+}
+
+/// A scroll container that has no scroll node, because a wheel can scroll nothing in it, and that keeps the scrolls
+/// along an axis to itself all the same: a wheel inside `rect` is not passed on to the scroll node above it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorScrollChainingBarrier {
+    pub document_id: UniqueNodeId,
+    pub scroll_node_index_above_barrier: SpatialNodeIndex,
+    pub rect: FloatRect,
+    pub keeps_horizontal_scrolls: bool,
+    pub keeps_vertical_scrolls: bool,
+}
+ffi_bytes_fields!(CompositorScrollChainingBarrier {
+    document_id,
+    scroll_node_index_above_barrier,
+    rect,
+    keeps_horizontal_scrolls,
+    keeps_vertical_scrolls
+});
+
+impl DisplayListCommand for CompositorScrollChainingBarrier {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorScrollChainingBarrier;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

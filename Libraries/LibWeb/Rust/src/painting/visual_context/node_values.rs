@@ -22,8 +22,8 @@ use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::style_queries;
 use libgfx_rust::{
-    AffineTransform, CompositingAndBlendingOperator, CornerRadii, FloatPoint, affine_to_matrix, perspective_matrix,
-    enclosing_int_rect, scale_matrix_for_device_pixels, translation_matrix, FloatRect,
+    AffineTransform, CompositingAndBlendingOperator, CornerRadii, FloatPoint, FloatRect, affine_to_matrix,
+    enclosing_int_rect, perspective_matrix, scale_matrix_for_device_pixels, translation_matrix,
 };
 
 pub(crate) fn visual_viewport_transform_data(inputs: &FfiVisualContextTreeInputs) -> TransformData {
@@ -809,7 +809,11 @@ pub(crate) fn may_have_clip(layout_arena: &impl PaintRead, node: NodeSlotId) -> 
         || style.content_visibility() == content_visibility::AUTO
 }
 
-pub(crate) fn compute_clip_data(layout_arena: &impl PaintRead, slot: NodeSlotId, pixel_ratio: f64) -> Option<ClipNodeData> {
+pub(crate) fn compute_clip_data(
+    layout_arena: &impl PaintRead,
+    slot: NodeSlotId,
+    pixel_ratio: f64,
+) -> Option<ClipNodeData> {
     use crate::css::css_enums::{content_visibility, overflow};
     let node = slot;
     let style = layout_arena.node_style_if_live(node)?;

@@ -87,7 +87,7 @@ public:
     void grant_transient_activation();
     void mouse_move_through_ui_process(double x, double y);
     void click_through_ui_process(double x, double y);
-    void wheel_through_ui_process(double x, double y, double delta_x, double delta_y);
+    void wheel_through_ui_process(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, GC::Ref<WebIDL::Promise>);
     void send_key(HTML::HTMLElement&, Utf16String const&, WebIDL::UnsignedShort modifiers, WebIDL::UnsignedLong repeat_count);
     void paste(HTML::HTMLElement& target, Utf16String const& text);
     void paste_from_clipboard();
@@ -105,6 +105,8 @@ public:
     void click_and_hold(double x, double y, WebIDL::UnsignedShort click_count, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers);
     void wheel(GC::Ref<WebIDL::Promise>, double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase);
     void wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, GC::Ref<WebIDL::Promise>);
+    double elastic_overscroll_stretch_x(GC::Ptr<DOM::Element> scroller);
+    double elastic_overscroll_stretch_y(GC::Ptr<DOM::Element> scroller);
     void pinch(double x, double y, double scale_delta, WebIDL::UnsignedShort modifiers);
     void reset_zoom();
 
@@ -245,7 +247,7 @@ public:
     GC::Ptr<Geometry::DOMRect> presented_border_box(DOM::Element&);
     Optional<u32> presented_compositor_animation_count(DOM::Element&);
     Optional<double> presented_opacity(DOM::Element&);
-    Optional<String> presented_color(DOM::Element&);
+    Optional<String> presented_color(DOM::Element&, Optional<Utf16String> const& pseudo_element);
     bool last_frame_keyboard_scroll_state_is_current();
     void release_held_frame();
     bool rendering_update_holds_tasks_of(DOM::Document&);

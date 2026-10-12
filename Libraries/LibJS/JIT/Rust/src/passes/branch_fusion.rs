@@ -33,6 +33,10 @@ fn mirrored(comparison: Comparison) -> Comparison {
         Comparison::LessThanEquals => Comparison::GreaterThanEquals,
         Comparison::GreaterThan => Comparison::LessThan,
         Comparison::GreaterThanEquals => Comparison::LessThanEquals,
+        Comparison::Below => Comparison::Above,
+        Comparison::BelowOrEqual => Comparison::AboveOrEqual,
+        Comparison::Above => Comparison::Below,
+        Comparison::AboveOrEqual => Comparison::BelowOrEqual,
         Comparison::StrictlyEquals
         | Comparison::StrictlyInequals
         | Comparison::LooselyEquals
@@ -151,7 +155,7 @@ fn remove_predecessor(graph: &mut Graph, target: BlockId, predecessor: BlockId) 
         .position(|block| *block == predecessor)
         .expect("the threaded block is a predecessor of its targets");
     graph.blocks[target.index()].predecessors.remove(index);
-    for phi in graph.blocks[target.index()].phis.clone() {
+    for phi in &graph.blocks[target.index()].phis {
         graph.nodes[phi.index()].inputs.remove(index);
     }
 }
@@ -166,7 +170,7 @@ fn add_predecessor(graph: &mut Graph, target: BlockId, predecessor: BlockId, lik
         .position(|block| *block == like)
         .expect("the target is a successor of the threaded block");
     graph.blocks[target.index()].predecessors.push(predecessor);
-    for phi in graph.blocks[target.index()].phis.clone() {
+    for phi in &graph.blocks[target.index()].phis {
         let input: NodeId = graph.nodes[phi.index()].inputs[index];
         graph.nodes[phi.index()].inputs.push(input);
     }

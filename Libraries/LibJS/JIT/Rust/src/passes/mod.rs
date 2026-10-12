@@ -13,18 +13,21 @@
 //! tests check the graph's invariants (see `verify`) after building and after
 //! every pass.
 
+mod bounds_check_elimination;
 mod branch_fusion;
 mod check_elimination;
 mod dce;
 pub mod dominators;
 pub mod edit;
 mod escape_analysis;
+mod exit_unboxing;
 mod facts;
 mod frame_initialization;
 mod gvn;
 mod licm;
 mod representation;
 mod simplify;
+mod truncation;
 pub mod verify;
 
 #[cfg(test)]
@@ -44,6 +47,10 @@ const PASSES: &[Pass] = &[
     Pass {
         name: "trivial phi removal",
         run: edit::remove_trivial_phis,
+    },
+    Pass {
+        name: "truncation",
+        run: truncation::run,
     },
     Pass {
         name: "simplification",
@@ -68,6 +75,14 @@ const PASSES: &[Pass] = &[
     Pass {
         name: "loop invariant code motion",
         run: licm::run,
+    },
+    Pass {
+        name: "bounds check elimination",
+        run: bounds_check_elimination::run,
+    },
+    Pass {
+        name: "exit unboxing",
+        run: exit_unboxing::run,
     },
     Pass {
         name: "dead code elimination",

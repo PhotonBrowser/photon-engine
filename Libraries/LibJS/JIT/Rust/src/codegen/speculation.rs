@@ -30,6 +30,10 @@ pub(super) fn int32_condition(comparison: Comparison) -> Condition {
         Comparison::GreaterThanEquals => Condition::GreaterThanOrEqual,
         Comparison::StrictlyEquals | Comparison::LooselyEquals => Condition::Equal,
         Comparison::StrictlyInequals | Comparison::LooselyInequals => Condition::NotEqual,
+        Comparison::Below => Condition::Below,
+        Comparison::BelowOrEqual => Condition::BelowOrEqual,
+        Comparison::Above => Condition::Above,
+        Comparison::AboveOrEqual => Condition::AboveOrEqual,
     }
 }
 
@@ -173,6 +177,24 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             BinaryOp::Div => unreachable!("division is no int32 operation"),
             BinaryOp::Mod => unreachable!("remainders are lowered on their own"),
+        }
+    }
+
+    pub(super) fn emit_int32_wrapping_binary(&mut self, node: NodeId, op: BinaryOp) {
+        let (lhs, output) = (self.input(node, 0), self.output(node));
+        match (op, self.input_value(node, 1)) {
+            (BinaryOp::Add, InputValue::Register(rhs)) => self.masm.add32(output, lhs, rhs),
+            (BinaryOp::Add, InputValue::Constant(bits)) => self.masm.add32_imm(output, lhs, bits as i32),
+            (BinaryOp::Sub, InputValue::Register(rhs)) => self.masm.sub32(output, lhs, rhs),
+            (BinaryOp::Sub, InputValue::Constant(bits)) => self.masm.sub32_imm(output, lhs, bits as i32),
+            (BinaryOp::Mul, InputValue::Register(rhs)) => self.masm.mul32(output, lhs, rhs),
+            (BinaryOp::Mul, InputValue::Constant(bits)) => self.masm.mul32_imm(output, lhs, bits as u32),
+            (BinaryOp::UnsignedRightShift, InputValue::Register(rhs)) => self.masm.shr32(output, lhs, rhs),
+            // NB: Shifts use the low five bits of the amount.
+            (BinaryOp::UnsignedRightShift, InputValue::Constant(bits)) => {
+                self.masm.shr32_imm(output, lhs, (bits & 31) as u8);
+            }
+            _ => unreachable!("only additions, subtractions, multiplications and unsigned right shifts wrap"),
         }
     }
 

@@ -39,19 +39,6 @@ static Web::AsyncScrollNodeStableID stable_scroll_node_id_for(Web::UniqueNodeID 
     };
 }
 
-static ScrollOverscrollBehavior scroll_overscroll_behavior_for(Compositing::CompositorOverscrollBehavior behavior)
-{
-    switch (behavior) {
-    case Compositing::CompositorOverscrollBehavior::Auto:
-        return ScrollOverscrollBehavior::Auto;
-    case Compositing::CompositorOverscrollBehavior::Contain:
-        return ScrollOverscrollBehavior::Contain;
-    case Compositing::CompositorOverscrollBehavior::None:
-        return ScrollOverscrollBehavior::None;
-    }
-    VERIFY_NOT_REACHED();
-}
-
 AsyncScrollingState async_scrolling_state_from_display_list(Compositing::DisplayList const& display_list)
 {
     AsyncScrollingState async_scrolling_state;
@@ -105,8 +92,10 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
                 .is_viewport = command.is_viewport,
                 .can_be_wheel_scrolled_horizontally = command.can_be_wheel_scrolled_horizontally,
                 .can_be_wheel_scrolled_vertically = command.can_be_wheel_scrolled_vertically,
-                .overscroll_behavior_x = scroll_overscroll_behavior_for(command.overscroll_behavior_x),
-                .overscroll_behavior_y = scroll_overscroll_behavior_for(command.overscroll_behavior_y),
+                .chains_scroll_to_ancestors_horizontally = command.chains_scroll_to_ancestors_horizontally,
+                .chains_scroll_to_ancestors_vertically = command.chains_scroll_to_ancestors_vertically,
+                .shows_overscroll_effect_horizontally = command.shows_overscroll_effect_horizontally,
+                .shows_overscroll_effect_vertically = command.shows_overscroll_effect_vertically,
             });
             break;
         }
@@ -125,6 +114,17 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
             async_scrolling_state.main_thread_wheel_event_regions.append({
                 .context = context,
                 .rect = command.rect,
+            });
+            break;
+        }
+        case Compositing::DisplayListCommandType::CompositorScrollChainingBarrier: {
+            auto command = Compositing::read_display_list_object<Compositing::CompositorScrollChainingBarrier>(payload);
+            async_scrolling_state.scroll_chaining_barriers.append({
+                .context = context,
+                .rect = command.rect,
+                .scroll_node_id_above_barrier = scroll_node_id_for(command.document_id, command.scroll_node_index_above_barrier),
+                .keeps_horizontal_scrolls = command.keeps_horizontal_scrolls,
+                .keeps_vertical_scrolls = command.keeps_vertical_scrolls,
             });
             break;
         }

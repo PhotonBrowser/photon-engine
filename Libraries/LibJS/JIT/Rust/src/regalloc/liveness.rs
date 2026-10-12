@@ -15,9 +15,11 @@ use crate::ir::BlockId;
 use crate::ir::Graph;
 use crate::ir::NodeId;
 use crate::ir::Op;
+use std::cell::OnceCell;
 
 pub(super) struct ValueLiveness {
     pub live_in: Vec<BitSet>,
+    pub live_out: Vec<BitSet>,
     /// For each node, the values whose last use (on this path) it is.
     pub dies_at: Vec<Vec<NodeId>>,
     /// Values nobody uses.
@@ -38,15 +40,24 @@ pub(super) fn is_allocated_value(graph: &Graph, node: NodeId) -> bool {
     node.repr.is_some() && !matches!(node.op, Op::Constant(_) | Op::VirtualObject { .. })
 }
 
-/// The values a node uses through its frame state.
-pub(super) fn frame_state_uses(graph: &Graph, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-    graph
-        .node(node)
-        .frame_state
-        .into_iter()
-        .flat_map(|frame_state| graph.frame_state_values(frame_state))
-        .map(|(_, value)| value)
-        .filter(|value| is_allocated_value(graph, *value))
+/// The allocated values a node uses through its frame state, cached for both walks.
+fn cached_frame_state_uses<'a>(
+    graph: &'a Graph,
+    frames: &'a [OnceCell<Vec<NodeId>>],
+    node: NodeId,
+) -> impl Iterator<Item = NodeId> + 'a {
+    graph.node(node).frame_state.into_iter().flat_map(move |frame| {
+        frames[frame.index()]
+            .get_or_init(|| {
+                graph
+                    .frame_state_values(frame)
+                    .map(|(_, value)| value)
+                    .filter(|value| is_allocated_value(graph, *value))
+                    .collect()
+            })
+            .iter()
+            .copied()
+    })
 }
 
 /// For a merge or a loop header: the predecessor whose register state the
@@ -73,27 +84,36 @@ pub(super) fn state_predecessor(graph: &Graph, block: BlockId) -> Option<BlockId
 }
 
 /// The input of each phi of `successor` that flows in from `block`.
-pub(super) fn phi_inputs_from(graph: &Graph, block: BlockId, successor: BlockId) -> Vec<(NodeId, NodeId)> {
+pub(super) fn phi_inputs_from(
+    graph: &Graph,
+    block: BlockId,
+    successor: BlockId,
+) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
     let successor_block = graph.block(successor);
-    if successor_block.phis.is_empty() {
-        return Vec::new();
-    }
-    let index = successor_block
-        .predecessors
-        .iter()
-        .position(|predecessor| *predecessor == block)
-        .expect("successors list their predecessors");
+    let index = if successor_block.phis.is_empty() {
+        0
+    } else {
+        successor_block
+            .predecessors
+            .iter()
+            .position(|predecessor| *predecessor == block)
+            .expect("successors list their predecessors")
+    };
     successor_block
         .phis
         .iter()
-        .map(|phi| (*phi, graph.node(*phi).inputs[index]))
-        .collect()
+        .map(move |phi| (*phi, graph.node(*phi).inputs[index]))
 }
 
 impl ValueLiveness {
     pub fn compute(graph: &Graph) -> Self {
         let value_count = graph.nodes.len();
         let block_count = graph.blocks.len();
+        // NB: Both backwards walks and spill analysis use these immutable
+        //     dependencies. Flatten each referenced frame only once.
+        let frames = (0..graph.frame_states.len())
+            .map(|_| OnceCell::new())
+            .collect::<Vec<_>>();
 
         let mut positions = vec![0; value_count];
         let mut use_positions = vec![Vec::new(); value_count];
@@ -119,7 +139,7 @@ impl ValueLiveness {
         let mut used = Vec::new();
         for block in &block_ids {
             let mut live = BitSet::new(value_count);
-            Self::transfer_block(graph, *block, &mut live, &mut used, |_, _, _| {});
+            Self::transfer_block(graph, &frames, *block, &mut live, &mut used, |_, _, _| {});
             used_before_defined.push(live);
             let mut nodes = BitSet::new(value_count);
             for node in graph.block_nodes(*block) {
@@ -144,61 +164,79 @@ impl ValueLiveness {
 
         let mut live_in = vec![BitSet::new(value_count); block_count];
         let mut live_out = vec![BitSet::new(value_count); block_count];
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for block in block_ids.iter().rev() {
-                let live = &mut live_out[block.index()];
-                for successor in graph.successors(*block) {
-                    live.union_with(&live_in[successor.index()]);
+        let mut entering = BitSet::new(value_count);
+        // Visit backwards initially, then only revisit predecessors whose
+        // successor's live-in set changed. Acyclic regions need one visit.
+        let mut worklist = block_ids.clone();
+        let mut queued = vec![true; block_count];
+        while let Some(block) = worklist.pop() {
+            queued[block.index()] = false;
+            let live = &mut live_out[block.index()];
+            for successor in graph.successors(block) {
+                live.union_with(&live_in[successor.index()]);
+            }
+            for input in &phi_inputs[block.index()] {
+                live.insert(input.index());
+            }
+            entering.clone_from(live);
+            entering.subtract(&defined[block.index()]);
+            entering.union_with(&used_before_defined[block.index()]);
+            if live_in[block.index()].union_with(&entering) {
+                for predecessor in &graph.block(block).predecessors {
+                    if !queued[predecessor.index()] {
+                        queued[predecessor.index()] = true;
+                        worklist.push(*predecessor);
+                    }
                 }
-                for input in &phi_inputs[block.index()] {
-                    live.insert(input.index());
-                }
-                let mut entering = live.clone();
-                entering.subtract(&defined[block.index()]);
-                entering.union_with(&used_before_defined[block.index()]);
-                changed |= live_in[block.index()].union_with(&entering);
             }
         }
 
         let mut dies_at = vec![Vec::new(); value_count];
+        let mut last_death = vec![None; value_count];
         let mut dead_outputs = BitSet::new(value_count);
         let mut needs_spill = BitSet::new(value_count);
         for block in &block_ids {
             let mut live = live_out[block.index()].clone();
-            Self::transfer_block(graph, *block, &mut live, &mut used, |node, live_after, used| {
-                if is_allocated_value(graph, node) && !live_after.contains(node.index()) {
-                    dead_outputs.insert(node.index());
-                }
-                let op = &graph.node(node).op;
-                if op.properties().is_call {
-                    for value in live_after
-                        .iter()
-                        .chain(frame_state_uses(graph, node).map(NodeId::index))
-                    {
-                        if value != node.index() {
-                            needs_spill.insert(value);
+            Self::transfer_block(
+                graph,
+                &frames,
+                *block,
+                &mut live,
+                &mut used,
+                |node, live_after, used| {
+                    if is_allocated_value(graph, node) && !live_after.contains(node.index()) {
+                        dead_outputs.insert(node.index());
+                    }
+                    let op = &graph.node(node).op;
+                    if op.properties().is_call {
+                        for value in live_after
+                            .iter()
+                            .chain(cached_frame_state_uses(graph, &frames, node).map(NodeId::index))
+                        {
+                            if value != node.index() {
+                                needs_spill.insert(value);
+                            }
+                        }
+                    } else if super::saves_only_gprs(op) {
+                        // NB: Their slow paths clobber the floating point registers.
+                        for value in live_after
+                            .iter()
+                            .chain(cached_frame_state_uses(graph, &frames, node).map(NodeId::index))
+                        {
+                            let is_float = graph.nodes[value].repr == Some(crate::code::Repr::Float64);
+                            if value != node.index() && is_float {
+                                needs_spill.insert(value);
+                            }
                         }
                     }
-                } else if super::saves_only_gprs(op) {
-                    // NB: Their slow paths clobber the floating point registers.
-                    for value in live_after
-                        .iter()
-                        .chain(frame_state_uses(graph, node).map(NodeId::index))
-                    {
-                        let is_float = graph.nodes[value].repr == Some(crate::code::Repr::Float64);
-                        if value != node.index() && is_float {
-                            needs_spill.insert(value);
+                    for value in used {
+                        if !live_after.contains(value.index()) && last_death[value.index()] != Some(node) {
+                            last_death[value.index()] = Some(node);
+                            dies_at[node.index()].push(*value);
                         }
                     }
-                }
-                for value in used {
-                    if !live_after.contains(value.index()) && !dies_at[node.index()].contains(value) {
-                        dies_at[node.index()].push(*value);
-                    }
-                }
-            });
+                },
+            );
             // NB: Most merges start with the register state of one of their
             //     predecessors (see `state_predecessor()`).
             let predecessors = &graph.block(*block).predecessors;
@@ -211,6 +249,7 @@ impl ValueLiveness {
 
         Self {
             live_in,
+            live_out,
             dies_at,
             dead_outputs,
             needs_spill,
@@ -224,6 +263,7 @@ impl ValueLiveness {
     /// the values live into the block (phis excluded) in `live`.
     fn transfer_block(
         graph: &Graph,
+        frames: &[OnceCell<Vec<NodeId>>],
         block: BlockId,
         live: &mut BitSet,
         used: &mut Vec<NodeId>,
@@ -239,7 +279,7 @@ impl ValueLiveness {
                     .iter()
                     .copied()
                     .filter(|input| is_allocated_value(graph, *input))
-                    .chain(frame_state_uses(graph, *node)),
+                    .chain(cached_frame_state_uses(graph, frames, *node)),
             );
             visit(*node, live, used);
             live.remove(node.index());
@@ -250,5 +290,44 @@ impl ValueLiveness {
         for phi in &block_data.phis {
             live.remove(phi.index());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::code::{Repr, ResumeMode};
+    use crate::ir::{Block, FrameState, Node};
+
+    #[test]
+    fn shared_frames_and_duplicate_uses_have_one_last_use_per_value() {
+        let mut graph = Graph::default();
+        graph.add_block(Block::default());
+        let value = graph.add_node(Node::new(Op::LoadSlot { slot: 0 }, vec![], Some(Repr::Tagged), 0));
+        graph.blocks[0].body.push(value);
+        let frame = graph.add_frame_state(FrameState {
+            executable: 0,
+            pc: 0,
+            mode: ResumeMode::ResumeAt,
+            values: vec![(0, value), (1, value)],
+            in_frame: vec![],
+            parent: None,
+            passed_argument_count: None,
+        });
+        let mut checks = Vec::new();
+        for _ in 0..2 {
+            let check = graph.add_node(Node::new(Op::CheckObject, vec![value], Some(Repr::Tagged), 0));
+            graph.nodes[check.index()].frame_state = Some(frame);
+            graph.blocks[0].body.push(check);
+            checks.push(check);
+        }
+        let constant = graph.add_node(Node::new(Op::Constant(0), vec![], Some(Repr::Tagged), 0));
+        let returned = graph.add_node(Node::new(Op::Return, vec![constant], None, 0));
+        graph.blocks[0].control = Some(returned);
+        let liveness = ValueLiveness::compute(&graph);
+        assert!(liveness.dies_at[checks[0].index()].is_empty());
+        assert_eq!(liveness.dies_at[checks[1].index()], [value]);
+        assert!(!liveness.dead_outputs.contains(value.index()));
+        assert!(liveness.live_in[0].is_empty());
     }
 }

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="frame-in-flight.js"></script>
+<style>
+    #card::before { content: "x"; }
+    #card::after { content: "y"; color: rgb(255, 0, 0); }
+</style>
+<div id="card" style="color: rgb(0, 0, 0)">Card</div>
+<script>
+    // A tick of a running animation of an inherited property shows it in the boxes of the generated pseudo-elements
+    // of the element that inherit it, and leaves those that declare it their own.
+    asyncTest(async done => {
+        const result = await whileLaneAnimates(() => {
+            return card.animate([{ color: "rgb(0, 0, 0)" }, { color: "rgb(0, 0, 200)" }], { duration: 10000, easing: "linear" });
+        }, (frameTime, animation) => {
+            internals.injectClockTick(frameTime + 5000);
+            const expectedBlue = Math.round(((frameTime + 5000 - animation.startTime) / 10000) * 200);
+            return {
+                lane: internals.clockLaneState(document),
+                presentedBy: internals.lastFramePresentedBy(document),
+                expectedColor: `rgb(0, 0, ${expectedBlue})`,
+                color: internals.presentedColor(card),
+                beforeColor: internals.presentedColor(card, "::before"),
+                afterColor: internals.presentedColor(card, "::after"),
+            };
+        });
+        println(`lane after the tick: ${result.lane}`);
+        println(`last frame presented by: ${result.presentedBy}`);
+        println(`element shows the tick's color: ${result.color === result.expectedColor}`);
+        println(`::before shows the tick's color: ${result.beforeColor === result.expectedColor}`);
+        println(`::after shows its own color: ${result.afterColor}`);
+        done();
+    });
+</script>

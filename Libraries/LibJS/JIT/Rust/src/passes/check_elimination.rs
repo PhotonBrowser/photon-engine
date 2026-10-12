@@ -10,9 +10,9 @@
 //! every node, what is known about values (see `Facts`): what kinds of value
 //! they may be, which shapes and elements kinds objects may have, which
 //! prototype chains are valid, which values passed which value checks, and
-//! what named properties, bindings and element counts hold. Loop headers
-//! start optimistically with what holds on entry and are revisited until
-//! what the back edges bring agrees with it.
+//! what named properties, bindings, element counts and elements hold. Loop
+//! headers start optimistically with what holds on entry and are revisited
+//! until what the back edges bring agrees with it.
 //!
 //! Branches on the kind of a value tell their targets what it is, and
 //! become jumps where what is known decides them.
@@ -195,7 +195,7 @@ fn facts_at_entry(
     match incoming.len() {
         0 => None,
         1 => incoming.pop(),
-        _ => Some(Facts::merge(incoming.iter())),
+        _ => Some(Facts::merge(incoming.into_iter())),
     }
 }
 
@@ -215,8 +215,8 @@ fn visit_block(
             facts.expose(decisions.value(graph, *input));
         }
     }
-    let body = graph.block(block).body.clone();
-    for node in body {
+    for index in 0..graph.block(block).body.len() {
+        let node = graph.block(block).body[index];
         visit_node(graph, constants, node, &mut facts, decisions);
     }
     let control = graph.control_id(block);
@@ -337,13 +337,13 @@ fn visit_node(
     let removable = !refines || anchor.is_some();
     let mut remove = false;
     let mut becomes_assumption = false;
-    match node.op.clone() {
+    match node.op {
         Op::CheckObject => {
             let value = input(0);
             remove = removable && facts.is_object(value);
             facts.set_object(value);
         }
-        Op::CheckShape { shapes } => {
+        Op::CheckShape { ref shapes } => {
             let object = input(0);
             remove = removable
                 && facts
@@ -363,7 +363,7 @@ fn visit_node(
                 }
                 validate(facts, &graph.stable_shapes, decisions);
             } else if !remove {
-                facts.set_shapes(object, &shapes);
+                facts.set_shapes(object, shapes);
             }
         }
         // NB: Values that pass are int32 values.
@@ -395,7 +395,8 @@ fn visit_node(
         | Op::LoadElementsLength
         | Op::LoadElementsCapacity
         | Op::LoadTypedArrayLength
-        | Op::LoadTypedArrayDataOffset => {
+        | Op::LoadTypedArrayDataOffset
+        | Op::LoadElementAt { .. } => {
             let location = loaded_location(graph, decisions, node_id).expect("loads load a location");
             remove = reuse_contents(facts, location, node_id, decisions);
         }
@@ -529,24 +530,55 @@ fn loaded_location(graph: &Graph, decisions: &Decisions, load: NodeId) -> Option
             environment: input(0),
             index,
         },
+        Op::LoadElementAt { kind } => Location::Element {
+            storage: storage_object(graph, decisions, input(0)),
+            index: index_value(graph, decisions, input(1)),
+            kind,
+        },
         ref op => {
             let count = ElementCount::loaded_by(op);
             if count.is_none() && !matches!(op, Op::LoadTypedArrayDataOffset) {
                 return None;
             }
-            // NB: Before value numbering, an object may have several
-            //     addresses.
-            let address = graph.node(input(0));
-            let object = match address.op {
-                Op::CellAddress => decisions.value(graph, address.inputs[0]),
-                _ => input(0),
-            };
+            let object = storage_object(graph, decisions, input(0));
             match count {
                 Some(count) => Location::ElementCount { count, object },
                 None => Location::TypedArrayDataOffset { object },
             }
         }
     })
+}
+
+/// The value that the index `index` of an element access is, as the
+/// analysis knows it: refinements of a value (like the bounds checks of each
+/// access) and int32 checks and unboxings of a value are the same index.
+fn index_value(graph: &Graph, decisions: &Decisions, index: NodeId) -> NodeId {
+    let mut index = decisions.value(graph, index);
+    while matches!(graph.node(index).op, Op::CheckInt32 | Op::UnboxInt32) {
+        index = decisions.value(graph, graph.node(index).inputs[0]);
+    }
+    index
+}
+
+/// The object whose address or whose typed array data address is
+/// `address`, or `address` itself if it is none's.
+fn storage_object(graph: &Graph, decisions: &Decisions, address: NodeId) -> NodeId {
+    // NB: Before value numbering, an object may have several addresses,
+    //     and every access of a typed array computes its data address.
+    //     Writes of element counts, which change the storage offset, forget
+    //     the elements of every storage.
+    let node = graph.node(address);
+    match node.op {
+        Op::CellAddress => decisions.value(graph, node.inputs[0]),
+        Op::TypedArrayDataAddress => {
+            let offset = graph.node(graph.unrefined(decisions.value(graph, node.inputs[0])));
+            match offset.op {
+                Op::LoadTypedArrayDataOffset => storage_object(graph, decisions, offset.inputs[0]),
+                _ => address,
+            }
+        }
+        _ => address,
+    }
 }
 
 /// `object` is a new object, which is what it is by its definition.

@@ -3123,6 +3123,62 @@ static void report_a_document_with_an_origin_of_its_own(LocalNavigable& navigabl
     navigable.page().client().page_did_create_populated_document_with_an_origin_of_its_own(navigable.id(), origin, output.document->relevant_settings_object().id);
 }
 
+static GC::Ref<DOM::Document> create_navigation_error_document(LocalNavigable& navigable, Optional<Utf16String> const& navigation_id, Bindings::NavigationTimingType navigation_timing_type, UserNavigationInvolvement user_involvement, URL::Origin const& origin, URL::URL const& url, Utf16String const& error_message)
+{
+    auto error_html = load_error_page(url, error_message.to_utf8()).release_value_but_fixme_should_propagate_errors();
+    return create_document_for_inline_content(&navigable, navigation_id, navigation_timing_type, user_involvement, origin, [error_html](auto& document) {
+        auto scripting_mode = document.is_scripting_enabled() ? HTML::ParserScriptingMode::Normal : HTML::ParserScriptingMode::Disabled;
+        auto parser = HTMLParser::create_from_byte_string(document, error_html, scripting_mode, "utf-8"sv);
+        document.set_url(URL::about_error());
+        parser->run();
+
+        // FIXME: This should go in create_document_for_inline_content() instead.
+        // FIXME: Directly calling parser->the_end results in a deadlock, because it waits for the warning image to load.
+        //        However the response is never processed when parser->the_end is called.
+        //        Queuing a global task is a workaround for now.
+        queue_a_task(Task::Source::Unspecified, HTML::main_thread_event_loop(), document, GC::create_function(document.heap(), [&document, parser] {
+            HTMLParser::the_end(document, parser);
+        }));
+    });
+}
+
+static void load_document_or_handle_download(GC::Ref<NavigationParams> navigation_params, ReadonlyBytes sniff_bytes, URL::URL const& url, bool source_allows_downloading, Optional<URL::Origin> source_interface_origin, PopulateSessionHistoryEntryDocumentOutput& output)
+{
+    // AD-HOC: Match other browsers and show a UA error page for an empty HTTP error response to a top-level navigation.
+    if (navigation_params->navigable->is_top_level_traversable() && navigation_params->response->status() >= 400 && navigation_params->response->status() <= 599 && sniff_bytes.is_empty()) {
+        stop_or_resume_response_body_delivery(navigation_params);
+
+        if (navigation_params->reserved_environment)
+            navigation_params->reserved_environment->discard_environment();
+
+        output.save_extra_document_state = false;
+
+        auto error_message = Utf16String::formatted("HTTP error: {} {}", navigation_params->response->status(), navigation_params->response->status_message());
+
+        output.document = create_navigation_error_document(
+            *navigation_params->navigable,
+            navigation_params->id,
+            navigation_params->navigation_timing_type,
+            navigation_params->user_involvement,
+            output.inline_content_origin.value(),
+            output.redirected_url.value_or(url),
+            error_message);
+
+        output.document->make_unsalvageable("navigation-failure"_utf16);
+
+        return;
+    }
+
+    output.document = load_document(navigation_params, sniff_bytes);
+
+    if (!output.document) {
+        output.download_handled = handle_navigation_response_as_download(navigation_params, source_allows_downloading, source_interface_origin, sniff_bytes);
+        output.save_extra_document_state = false;
+    } else {
+        navigation_params->response->resume_body_delivery();
+    }
+}
+
 void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_entry_population(
     URL::URL url,
     bool source_allows_downloading,
@@ -3184,26 +3240,10 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
                      [](GC::Ref<NonFetchSchemeNavigationParams>) { return false; })) {
             // 1. Set entry's document state's document to the result of creating a document for inline content that doesn't have a DOM, given navigable, null, navTimingType, and userInvolvement. The inline content should indicate to the user the sort of error that occurred.
             auto error_message = navigation_params.has<NullOrError>() ? navigation_params.get<NullOrError>().value_or("Unknown error"_utf16) : "The request was denied."_utf16;
-            auto error_message_utf8 = error_message.to_utf8();
-
             // AD-HOC: Name the URL that actually failed to load: The last URL the navigation was redirected to, if
             //         any — rather than the URL it started at.
             auto error_url = output->redirected_url.value_or(url);
-            auto error_html = load_error_page(error_url, error_message_utf8).release_value_but_fixme_should_propagate_errors();
-            output->document = create_document_for_inline_content(this, navigation_id, navigation_timing_type, user_involvement, output->inline_content_origin.value(), [this, error_html](auto& document) {
-                auto scripting_mode = document.is_scripting_enabled() ? HTML::ParserScriptingMode::Normal : HTML::ParserScriptingMode::Disabled;
-                auto parser = HTMLParser::create_from_byte_string(document, error_html, scripting_mode, "utf-8"sv);
-                document.set_url(URL::about_error());
-                parser->run();
-
-                // FIXME: This should go in create_document_for_inline_content() instead.
-                // FIXME: Directly calling parser->the_end results in a deadlock, because it waits for the warning image to load.
-                //        However the response is never processed when parser->the_end is called.
-                //        Queuing a global task is a workaround for now.
-                queue_a_task(Task::Source::Unspecified, HTML::main_thread_event_loop(), document, GC::create_function(heap(), [&document, parser] {
-                    HTMLParser::the_end(document, parser);
-                }));
-            });
+            output->document = create_navigation_error_document(*this, navigation_id, navigation_timing_type, user_involvement, output->inline_content_origin.value(), error_url, error_message);
 
             // 2. Make document unsalvageable given entry's document state's document and "navigation-failure".
             if (output->document)
@@ -3250,17 +3290,11 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
                 // Async path: bytes not yet available, wait for them
                 nav_params->response->resume_body_delivery_up_to(Fetch::Infrastructure::MAX_SNIFF_BYTES);
                 body->wait_for_sniff_bytes(GC::create_function(heap(),
-                    [output, nav_params, navigation_params, completion_steps, source_allows_downloading, source_interface_origin](ReadonlyBytes sniff_bytes) {
+                    [output, nav_params, navigation_params, completion_steps, source_allows_downloading, source_interface_origin, url](ReadonlyBytes sniff_bytes) {
                         // AD-HOC: The document may have been destroyed between when the fetch started and when the
                         //         bytes arrived.
                         if (nav_params->navigable->active_browsing_context()) {
-                            output->document = load_document(nav_params, sniff_bytes);
-                            if (!output->document) {
-                                output->download_handled = handle_navigation_response_as_download(nav_params, source_allows_downloading, source_interface_origin, sniff_bytes);
-                                output->save_extra_document_state = false;
-                            } else {
-                                nav_params->response->resume_body_delivery();
-                            }
+                            load_document_or_handle_download(nav_params, sniff_bytes, url, source_allows_downloading, source_interface_origin, *output);
                         } else {
                             stop_or_resume_response_body_delivery(navigation_params);
                         }
@@ -3273,13 +3307,7 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
             }
 
             // Sync path: bytes available immediately
-            output->document = load_document(nav_params, sniff_bytes.value());
-            if (!output->document) {
-                output->download_handled = handle_navigation_response_as_download(nav_params, source_allows_downloading, source_interface_origin, sniff_bytes.value());
-                output->save_extra_document_state = false;
-            } else {
-                nav_params->response->resume_body_delivery();
-            }
+            load_document_or_handle_download(nav_params, sniff_bytes.value(), url, source_allows_downloading, source_interface_origin, *output);
         } else {
             stop_or_resume_response_body_delivery(navigation_params);
         }
@@ -4930,7 +4958,6 @@ void LocalNavigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList 
         compositor_context().viewport_size_updated(
             page().css_to_device_rect(viewport_rect()).size().to_type<int>(),
             Compositing::WindowResizingInProgress::Yes);
-        m_pending_set_browser_zoom_request = false;
     }
 
     if (auto document = active_document()) {

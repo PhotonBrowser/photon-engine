@@ -387,12 +387,24 @@ fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
             | Op::StoreElementAt {
                 kind: ElementsKind::TypedArray(_),
             } = node.op
+                && graph.node(node.inputs[0]).op != Op::TypedArrayDataAddress
+            {
+                errors.push(format!(
+                    "v{} ({}) takes no typed array data address",
+                    node_id.0,
+                    node.op.name()
+                ));
+            }
+            if node.op == Op::TypedArrayDataAddress
                 && !matches!(
                     graph.node(node.inputs[0]).op,
                     Op::LoadTypedArrayDataOffset | Op::CheckTypedArrayStorage
                 )
             {
-                errors.push(format!("v{} ({}) takes no storage offset", node_id.0, node.op.name()));
+                errors.push(format!(
+                    "v{} (TypedArrayDataAddress) takes no storage offset",
+                    node_id.0
+                ));
             }
             // A slow path's further outputs are where its call left them only
             // until anything else runs.
@@ -484,11 +496,20 @@ fn expected_input_reprs(graph: &Graph, node: NodeId) -> Option<Vec<Repr>> {
         Op::BoxFloat64 | Op::Float64Unary { .. } | Op::Float64ToInt32 | Op::Float64ToUint8Clamped => {
             Some(vec![Repr::Float64])
         }
-        Op::Float64Binary { .. } | Op::Float64Compare { .. } => Some(vec![Repr::Float64, Repr::Float64]),
+        Op::Float64Binary { .. } | Op::Float64Min | Op::Float64Max | Op::Float64Compare { .. } => {
+            Some(vec![Repr::Float64, Repr::Float64])
+        }
+        Op::Int32Min | Op::Int32Max | Op::Uint32Min => Some(vec![Repr::Int32, Repr::Int32]),
         Op::Uint32ShiftRight => Some(vec![Repr::Int32, Repr::Int32]),
         Op::Uint32ToFloat64 | Op::IntegerToString => Some(vec![Repr::Int32]),
         Op::StringsEqual | Op::ConcatenateStrings | Op::ToObject => Some(tagged(2)),
         Op::PrimitiveToString => Some(tagged(1)),
+        Op::CallIntrinsic { intrinsic } => intrinsic.helper_call().map(|call| {
+            std::iter::once(call.receiver)
+                .chain(call.arguments.iter().copied())
+                .map(|operand| operand.repr())
+                .collect()
+        }),
         Op::ArrayCreate => Some(vec![Repr::Int32, Repr::Tagged]),
         Op::LoadStringCodeUnit => Some(vec![Repr::Pointer, Repr::Int32]),
         Op::SingleCharacterString | Op::Int32Abs | Op::Int32ToFloat64 => Some(vec![Repr::Int32]),
@@ -509,10 +530,11 @@ fn expected_input_reprs(graph: &Graph, node: NodeId) -> Option<Vec<Repr>> {
         Op::LoadElementAt { .. } => Some(vec![Repr::Pointer, Repr::Int32]),
         Op::StoreElementAt { kind } => Some(vec![Repr::Pointer, Repr::Int32, kind.stored_repr()]),
         Op::CheckBounds => Some(vec![Repr::Int32, Repr::Int32]),
-        Op::LoadTypedArrayLength | Op::LoadTypedArrayDataOffset | Op::CheckTypedArrayStorage => {
-            Some(vec![Repr::Pointer])
-        }
-        Op::BoxBool => Some(vec![Repr::Bool]),
+        Op::LoadTypedArrayLength
+        | Op::LoadTypedArrayDataOffset
+        | Op::TypedArrayDataAddress
+        | Op::CheckTypedArrayStorage => Some(vec![Repr::Pointer]),
+        Op::BoxBool | Op::BoolToInt32 => Some(vec![Repr::Bool]),
         Op::LoadFunctionEnvironment { .. }
         | Op::BoxCell
         | Op::LoadOuterEnvironment
@@ -521,7 +543,9 @@ fn expected_input_reprs(graph: &Graph, node: NodeId) -> Option<Vec<Repr>> {
         Op::StoreEnvironmentBinding { .. } => Some(vec![Repr::Pointer, Repr::Tagged]),
         Op::AllocateFunction { .. } | Op::ProbeGlobalCache { .. } => Some(vec![Repr::Pointer, Repr::Pointer]),
         Op::ProbeGlobalStore { .. } => Some(vec![Repr::Tagged, Repr::Pointer, Repr::Pointer]),
-        Op::Int32Binary { .. } | Op::Int32Compare { .. } => Some(vec![Repr::Int32, Repr::Int32]),
+        Op::Int32Binary { .. } | Op::Int32WrappingBinary { .. } | Op::Int32Compare { .. } => {
+            Some(vec![Repr::Int32, Repr::Int32])
+        }
         _ => Some(tagged(node.inputs.len())),
     }
 }

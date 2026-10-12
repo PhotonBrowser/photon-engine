@@ -28,7 +28,7 @@ use super::allocation::{
     lexical_environment_templates,
 };
 use super::cell_as;
-use super::code::{InlinedFunction, SnapshotExecutable};
+use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable};
 use super::runtime_info::RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS;
 use crate::bytecode::executable::{Executable, PropertyLookupCacheEntryData, PropertyLookupCacheTier};
 use crate::bytecode::feedback::{CallFeedback, CallFeedbackForwarding, call_feedback_flags};
@@ -42,16 +42,17 @@ use crate::layout::property_lookup_cache::{
     GlobalVariableCache, PropertyLookupCache, PropertyLookupCacheEntry, PropertyLookupCacheEntryType,
 };
 use crate::layout::value::Value;
+use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::array_constructor::ArrayConstructor;
-use crate::runtime::array_prototype::ArrayPrototype;
+use crate::runtime::array_prototype;
 use crate::runtime::boolean_constructor::BooleanConstructor;
 use crate::runtime::bound_function::BoundFunction;
 use crate::runtime::ecmascript_function_object::as_ecmascript_function_object;
-use crate::runtime::function_prototype::FunctionPrototype;
-use crate::runtime::math_object::MathObject;
+use crate::runtime::function_prototype::{self, FunctionPrototype};
+use crate::runtime::math_object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::object_constructor::ObjectConstructor;
-use crate::runtime::object_prototype::ObjectPrototype;
+use crate::runtime::object_prototype;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::shape::Shape;
@@ -60,7 +61,8 @@ use crate::runtime::shared_function_instance_data::ConstructorKind;
 use crate::runtime::shared_function_instance_data::FunctionKind;
 use crate::runtime::shared_function_instance_data::ThisMode;
 use crate::runtime::string_constructor::StringConstructor;
-use crate::runtime::typed_array_prototype::TypedArrayPrototype;
+use crate::runtime::string_prototype;
+use crate::runtime::typed_array_prototype;
 
 /// Candidates with at most this many bytecode instructions are always inlined, without counting against the inlining
 /// budget.
@@ -153,29 +155,69 @@ fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
         return Some(Intrinsic::BooleanConstructor);
     }
     let function = cell_as::<RawNativeFunction>(cell)?;
-    if FunctionPrototype::is_apply_function(vm, &function) {
-        Some(Intrinsic::FunctionPrototypeApply)
-    } else if FunctionPrototype::is_call_function(vm, &function) {
-        Some(Intrinsic::FunctionPrototypeCall)
-    } else if ArrayPrototype::is_push_function(vm, &function) {
-        Some(Intrinsic::ArrayPrototypePush)
-    } else if ArrayPrototype::is_slice_function(vm, &function) {
-        Some(Intrinsic::ArrayPrototypeSlice)
-    } else if ObjectPrototype::is_has_own_property_function(vm, &function) {
-        Some(Intrinsic::ObjectPrototypeHasOwnProperty)
-    } else if TypedArrayPrototype::is_length_getter(vm, &function) {
-        Some(Intrinsic::TypedArrayPrototypeLength)
-    } else if MathObject::is_max_function(vm, &function) {
-        Some(Intrinsic::MathMax)
-    } else if MathObject::is_min_function(vm, &function) {
-        Some(Intrinsic::MathMin)
-    } else {
-        match function.builtin() {
-            Some(Builtin::StringFromCharCode) => Some(Intrinsic::StringFromCharCode),
-            _ => None,
-        }
+    match function.builtin() {
+        Some(Builtin::StringFromCharCode) => return Some(Intrinsic::StringFromCharCode),
+        Some(Builtin::RegExpPrototypeExec) => return Some(Intrinsic::RegExpPrototypeExec),
+        _ => {}
     }
+    let address = function.native_function(vm)? as usize;
+    NATIVE_INTRINSICS
+        .iter()
+        .find(|(native_function, _)| native_function.is_some_and(|native_function| native_function as usize == address))
+        .map(|(_, intrinsic)| *intrinsic)
 }
+
+/// The intrinsics the compiler knows by their native functions (of any realm).
+static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 21] = [
+    (&function_prototype::APPLY_FUNCTION, Intrinsic::FunctionPrototypeApply),
+    (&function_prototype::CALL_FUNCTION, Intrinsic::FunctionPrototypeCall),
+    (&array_prototype::PUSH_FUNCTION, Intrinsic::ArrayPrototypePush),
+    (&array_prototype::SLICE_FUNCTION, Intrinsic::ArrayPrototypeSlice),
+    (
+        &object_prototype::HAS_OWN_PROPERTY_FUNCTION,
+        Intrinsic::ObjectPrototypeHasOwnProperty,
+    ),
+    (
+        &typed_array_prototype::LENGTH_GETTER,
+        Intrinsic::TypedArrayPrototypeLength,
+    ),
+    (&math_object::MAX_FUNCTION, Intrinsic::MathMax),
+    (&math_object::MIN_FUNCTION, Intrinsic::MathMin),
+    (&math_object::IMUL_FUNCTION, Intrinsic::MathImul),
+    (&string_prototype::INDEX_OF_FUNCTION, Intrinsic::StringPrototypeIndexOf),
+    (
+        &string_prototype::TO_LOWERCASE_FUNCTION,
+        Intrinsic::StringPrototypeToLowerCase,
+    ),
+    (
+        &string_prototype::TO_UPPERCASE_FUNCTION,
+        Intrinsic::StringPrototypeToUpperCase,
+    ),
+    (
+        &string_prototype::LAST_INDEX_OF_FUNCTION,
+        Intrinsic::StringPrototypeLastIndexOf,
+    ),
+    (&string_prototype::INCLUDES_FUNCTION, Intrinsic::StringPrototypeIncludes),
+    (
+        &string_prototype::STARTS_WITH_FUNCTION,
+        Intrinsic::StringPrototypeStartsWith,
+    ),
+    (
+        &string_prototype::ENDS_WITH_FUNCTION,
+        Intrinsic::StringPrototypeEndsWith,
+    ),
+    (&string_prototype::SLICE_FUNCTION, Intrinsic::StringPrototypeSlice),
+    (
+        &string_prototype::SUBSTRING_FUNCTION,
+        Intrinsic::StringPrototypeSubstring,
+    ),
+    (&string_prototype::TRIM_FUNCTION, Intrinsic::StringPrototypeTrim),
+    (
+        &string_prototype::TRIM_START_FUNCTION,
+        Intrinsic::StringPrototypeTrimStart,
+    ),
+    (&string_prototype::TRIM_END_FUNCTION, Intrinsic::StringPrototypeTrimEnd),
+];
 
 /// The builtin `%ArrayIteratorPrototype%.next` of the realm, if `%ArrayIteratorPrototype%` holds it.
 fn array_iterator_next(vm: &Vm, realm: Gc<Realm>) -> Option<Gc<FunctionObject>> {
@@ -895,6 +937,9 @@ impl SnapshotBuilder<'_> {
             captured_bindings: arguments_function
                 .map(|function| self.captured_bindings(function, executable, realm))
                 .unwrap_or_default(),
+            mutable_bindings: arguments_function
+                .map(|function| mutable_bindings(function, executable))
+                .unwrap_or_default(),
             builtin: matches!(entry.function, Some(InlinedFunction::Builtin(_))),
             mapped_arguments_alias_parameters: arguments_function
                 .is_some_and(|function| !function.mapped_argument_names().is_empty()),
@@ -943,10 +988,11 @@ impl SnapshotBuilder<'_> {
         if function.allocates_function_environment() || function.shared_data().closure_count() != ClosureCount::One {
             return Vec::new();
         }
-        let loads = executable
+        let loads = &executable
             .jit_state()
-            .captured_binding_loads
-            .get_or_init(|| captured_binding_loads(&executable));
+            .captured_binding_accesses
+            .get_or_init(|| captured_binding_accesses(&executable))
+            .loads;
         let exit_sites = executable.jit_exit_sites();
         let changed: Vec<EnvironmentCoordinate> = loads
             .iter()
@@ -983,13 +1029,47 @@ impl SnapshotBuilder<'_> {
     }
 }
 
-/// The coordinate and pc of every load of a binding from an environment in `executable`, or none if its code may change
-/// its lexical environment, so that they are not the environments of its closure.
-fn captured_binding_loads(executable: &Executable) -> Box<[(EnvironmentCoordinate, u32)]> {
+/// The bindings of the environments of `function`'s closure that `executable` stores to and that are mutable in every
+/// instance of their environment: declared mutable, and never deleted. Its stores to them need no check of that. Like
+/// captured bindings, these are only found while the function has no other closure.
+fn mutable_bindings(function: Gc<EcmascriptFunctionObject>, executable: Gc<Executable>) -> Vec<EnvironmentCoordinate> {
+    if function.allocates_function_environment() || function.shared_data().closure_count() != ClosureCount::One {
+        return Vec::new();
+    }
+    let stores = &executable
+        .jit_state()
+        .captured_binding_accesses
+        .get_or_init(|| captured_binding_accesses(&executable))
+        .stores;
+    let mut bindings = Vec::new();
+    for &coordinate in stores {
+        if bindings.contains(&coordinate) {
+            continue;
+        }
+        let mut environment = function.environment();
+        for _ in 0..coordinate.hops {
+            environment = environment.and_then(|environment| environment.outer_environment());
+        }
+        let Some(environment) = environment else {
+            continue;
+        };
+        let Some(environment) = environment.as_declarative_environment() else {
+            continue;
+        };
+        if environment.binding_is_declared_mutable(coordinate.index as usize) {
+            bindings.push(coordinate);
+        }
+    }
+    bindings
+}
+
+/// The loads and stores of bindings of environments in `executable`, or none if its code may change its lexical
+/// environment, so that they are not the environments of its closure.
+fn captured_binding_accesses(executable: &Executable) -> CapturedBindingAccesses {
     let Ok(instructions) = decode_all(executable.bytecode()) else {
-        return Box::default();
+        return CapturedBindingAccesses::default();
     };
-    if instructions.iter().any(|decoded| {
+    let changes_environment = instructions.iter().any(|decoded| {
         matches!(
             decoded.instruction.opcode(),
             OpCode::SetLexicalEnvironment
@@ -1001,18 +1081,27 @@ fn captured_binding_loads(executable: &Executable) -> Box<[(EnvironmentCoordinat
                 | OpCode::CallDirectEvalWithArgumentArray
                 | OpCode::Debugger
         )
-    }) {
-        return Box::default();
+    });
+    if changes_environment {
+        return CapturedBindingAccesses::default();
     }
-    instructions
-        .into_iter()
-        .filter_map(|decoded| match decoded.instruction {
+    let mut loads = Vec::new();
+    let mut stores = Vec::new();
+    for decoded in instructions {
+        match decoded.instruction {
             Instruction::GetBinding { cache: coordinate, .. }
             | Instruction::GetInitializedBinding { cache: coordinate, .. }
-            | Instruction::GetCalleeAndThisFromEnvironment { cache: coordinate, .. } => Some((coordinate, decoded.pc)),
-            _ => None,
-        })
-        .collect()
+            | Instruction::GetCalleeAndThisFromEnvironment { cache: coordinate, .. } => {
+                loads.push((coordinate, decoded.pc));
+            }
+            Instruction::SetLexicalBinding { cache: coordinate, .. } => stores.push(coordinate),
+            _ => {}
+        }
+    }
+    CapturedBindingAccesses {
+        loads: loads.into_boxed_slice(),
+        stores: stores.into_boxed_slice(),
+    }
 }
 
 /// Captures the snapshot of a compile job for `executable`, whose frames run `function`. `osr_pc` is the loop back

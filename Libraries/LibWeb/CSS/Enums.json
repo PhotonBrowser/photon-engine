@@ -859,6 +859,7 @@
   ],
   "overscroll-behavior": [
     "auto",
+    "chain",
     "contain",
     "none"
   ],

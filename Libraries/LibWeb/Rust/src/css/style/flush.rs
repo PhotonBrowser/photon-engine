@@ -1271,6 +1271,30 @@ impl StyleEngine {
         self.retained
             .memory
             .reserve_required(MemoryCategory::BatchScratch, style_input_reaction_bytes);
+        let reuse_unchanged_cascades = transaction_reaches_no_selector
+            && !rule_declarations_edited
+            && !environment_changed
+            && transaction.markers.is_empty();
+        // NB: Only cascade reuse reads this, and it reaches no selector, so no local feature moved.
+        let mut changed_cascade_input_nodes: Vec<_> = if reuse_unchanged_cascades {
+            transaction
+                .inputs
+                .iter()
+                .filter_map(|input| match input.key {
+                    InputKey::ElementDeclaration(node, _) => Some(node),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        changed_cascade_input_nodes.sort_unstable();
+        changed_cascade_input_nodes.dedup();
+        let changed_cascade_input_node_bytes =
+            (changed_cascade_input_nodes.capacity() * size_of::<StyleNodeID>()) as u64;
+        self.retained
+            .memory
+            .reserve_required(MemoryCategory::BatchScratch, changed_cascade_input_node_bytes);
         self.release_transaction_and_sweep_atoms(transaction);
         // Releasing staging can compact primary payloads. Take the shared view afterwards so that
         // compaction does not need to copy the complete primary arrangement away from its view.
@@ -1408,8 +1432,17 @@ impl StyleEngine {
             let mut repair_match_identity = false;
             let mut can_stop_at_exact_cascade = false;
             let mut can_confirm_exact_cascade = false;
-            let emit_node = match retained_answer_patch.as_mut() {
-                Some(patch) => {
+            // OPTIMIZATION: Patching an unchanged inherited-input row would discard its exact cascade input on a
+            //               patch miss. Preserve that input before the completion step can reuse its winner rows.
+            let keep_cascade = has_direct_action
+                && reuse_unchanged_cascades
+                && changed_cascade_input_nodes.binary_search(&node).is_err()
+                && !inputs_moved.given_up(node)
+                && !has_signed_delta
+                && stale_refresh_nodes.binary_search(&node).is_err();
+            let emit_node = match (keep_cascade, retained_answer_patch.as_mut()) {
+                (true, _) => true,
+                (false, Some(patch)) => {
                     let node_is_coarse_covered = patch_cover
                         .as_ref()
                         .is_some_and(|cover| regions.batch_contains_node(&cover.full, node));
@@ -1567,7 +1600,7 @@ impl StyleEngine {
                         }
                     }
                 }
-                None => {
+                (false, None) => {
                     if !transaction_reaches_no_selector {
                         published_match_answers.answer_effects.forget_answer(
                             node,
@@ -1742,7 +1775,14 @@ impl StyleEngine {
                             }
                         })
                         .or_else(|| {
-                            if self.retained.last_transaction_only_derived_child_reactions {
+                            // OPTIMIZATION: A declaration change on one element does not change its children's
+                            //               cascade. Keep their winners when this transaction reaches no selector.
+                            if self.retained.last_transaction_only_derived_child_reactions
+                                || (reuse_unchanged_cascades
+                                    && changed_cascade_input_nodes.binary_search(&node).is_err()
+                                    && !inputs_moved.given_up(node)
+                                    && stale_refresh_nodes.binary_search(&node).is_err())
+                            {
                                 self.reuse_published_match_answer(&mut published_match_answers.answer_effects, node)
                             } else {
                                 None
@@ -1983,6 +2023,9 @@ impl StyleEngine {
         self.retained
             .memory
             .release(MemoryCategory::BatchScratch, direct_action_node_bytes);
+        self.retained
+            .memory
+            .release(MemoryCategory::BatchScratch, changed_cascade_input_node_bytes);
         published_match_answers.sort();
         // Record computation interns and installs immediately in the current evaluator.
         clock.enter(Counter::ComputationPublicationMicroseconds, &self.retained.counters);
@@ -2031,6 +2074,7 @@ impl StyleEngine {
                     });
                 let parent_inputs = publication::ParentInputsMoved {
                     inherited_style: reaction & transaction::STYLE_REACTION_INHERITED_STYLE != 0,
+                    inherited_style_groups: 0,
                     display: inputs_moved.parent_display_moved(root),
                 };
                 // The probe settles what the root's own row settles, under the same unseen inputs.
@@ -2399,11 +2443,18 @@ impl StyleEngine {
                     !row_of(&pass.scratch.derived_child_inputs, parent).is_some_and(|row| row.inheritance_unresolved)
                 })
                 .and_then(|parent| {
-                    self.computed_group_sets.replace_engine_resolvable_inherited_groups(
+                    let (before, after, reused) = self.computed_group_sets.replace_engine_resolvable_inherited_groups(
                         node,
                         parent,
                         inherited_style_groups,
-                    )
+                        &mut pass.scratch.inherited_group_swaps,
+                    )?;
+                    self.retained.counters.bump(if reused {
+                        Counter::InheritedGroupSwapReuses
+                    } else {
+                        Counter::InheritedGroupSwapComputations
+                    });
+                    Some((before, after))
                 });
                 // A regular style reaction whose moved winners the engine can compute itself
                 // publishes its new record here, so C++ applies a record instead of running a
@@ -2423,10 +2474,8 @@ impl StyleEngine {
                         .or(prepared_parent_inputs)
                         .unwrap_or(publication::ParentInputsMoved {
                             inherited_style: reaction & transaction::STYLE_REACTION_INHERITED_STYLE != 0,
-                            // A slotted element's box-type parent moves with its slot's place in
-                            // the shadow tree, which no input of its own says.
-                            display: pass.inputs_moved.parent_display_moved(node)
-                                || self.retained.tree.assigned_slot_of(node).is_some(),
+                            inherited_style_groups,
+                            display: pass.inputs_moved.parent_display_moved(node),
                         });
                 let full_drive_reason =
                     self.full_drive_reason(node, reaction, pass.named_rules_moved, &pass.inputs_moved);
@@ -2471,6 +2520,9 @@ impl StyleEngine {
                         }
                         Some(relied_on_settled_ancestor) => {
                             parent_inputs_moved.inherited_style |= relied_on_settled_ancestor;
+                            if relied_on_settled_ancestor {
+                                parent_inputs_moved.inherited_style_groups = 0;
+                            }
                             true
                         }
                     }

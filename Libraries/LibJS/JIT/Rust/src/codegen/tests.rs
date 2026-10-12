@@ -433,6 +433,7 @@ fn write_frame_states(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *con
     let descriptor = test_state(vm).borrow().exits[exit_index as usize].clone();
     assert_eq!(descriptor.kind == SiteKind::Leave, leaving == Leaving::Yes);
     let frame_pointer_index = <crate::asm::MacroAssembler as PortableMacroAssembler>::FRAME_POINTER.0 as usize;
+    let gpr_dump_count = register_dump_counts::<crate::asm::MacroAssembler>().0 as usize;
     // SAFETY: The dump and the JIT frame it points into are alive during the call.
     let frames = unsafe {
         let frame_pointer = *dump.add(frame_pointer_index);
@@ -455,7 +456,14 @@ fn write_frame_states(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *con
                         // NB: Like the runtime, box unboxed values.
                         let value = match *location {
                             ValueLocation::Register(register, repr) => {
-                                value::boxed_constant(*dump.add(register as usize), repr)
+                                // NB: Like the runtime, read float64 values from the FPRs, which the dump
+                                //     holds after the GPRs.
+                                let index = if repr == crate::code::Repr::Float64 {
+                                    gpr_dump_count + register as usize
+                                } else {
+                                    register as usize
+                                };
+                                value::boxed_constant(*dump.add(index), repr)
                             }
                             ValueLocation::Stack(offset, repr) => {
                                 value::boxed_constant(*((frame_pointer as i64 + i64::from(offset)) as *const u64), repr)
@@ -2063,6 +2071,26 @@ fn slow_paths_share_initialization_of_large_frames() {
             1
         );
     }
+}
+
+#[test]
+fn slow_paths_save_no_more_registers_than_the_saves_area_holds() {
+    fn check<M: PortableMacroAssembler>() {
+        let words = slow_path_calls::slow_path_saved_registers::<M>().len();
+        for register in target_registers::<M>().0.allocatable_gprs.iter() {
+            let allocation = crate::regalloc::NodeAllocation {
+                inputs: crate::inline_vec::InlineVec::from_elem(Location::Register(register), 1),
+                output: Some(Location::Register(register)),
+                ..Default::default()
+            };
+            assert!(
+                slow_path_calls::slow_path_saved_registers_of::<M>(&allocation).len() <= words,
+                "an output in register {register} that an input is in too"
+            );
+        }
+    }
+    check::<crate::asm::x86_64::MacroAssembler>();
+    check::<crate::asm::aarch64::MacroAssembler>();
 }
 
 #[test]

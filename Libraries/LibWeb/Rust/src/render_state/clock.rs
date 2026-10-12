@@ -33,7 +33,7 @@ use crate::css::style::animations::{AnimationTimelineSamples, ScrollProgress};
 use crate::css::style::engine_sample::{DependentRestyle, NeedsHost, TickShownRecords};
 use crate::css::style::tree::StyleNodeID;
 use crate::css::transition::HoverTransitions;
-use crate::layout::node_data::NodeSlotId;
+use crate::layout::node_data::{GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE, GENERATED_FOR_MARKER, NodeSlotId};
 use crate::layout::tree_update_marks::{FfiLayoutTreeUpdateMark, layout_tree_update_reuse_reason};
 use crate::layout::used_values::FfiCssPixelRect;
 use crate::layout::{ClockRound, ClockRoundDeclined, HostStyle, LayoutNodeArena, build_keeps_box};
@@ -43,12 +43,14 @@ use crate::painting::paintable_geometry::absolute_border_box_rect;
 use crate::painting::presentation::Presentation;
 use crate::painting::record::damage::PaintDamage;
 use crate::painting::record::inputs::UnframedRecordingInputs;
-use crate::painting::record::publish::{renders_vector_images, take_in_published_output, take_in_recording};
+use crate::painting::record::publish::{
+    published_vector_image_display_lists, renders_vector_images, take_in_published_output, take_in_recording,
+};
 use crate::painting::record::recorder_state::RecorderState;
 use crate::painting::record::{RecordingInputs, RecordingOutput};
 use crate::painting::recording_slot::{
-    FrameInputs, FrozenFrame, RecordingAnswer, RecordingJob, freeze_recording_frame, present, record_frame,
-    wait_while_recording_is_held_for_testing,
+    FrameInputs, FrozenFrame, RecordingAnswer, RecordingJob, freeze_recording_frame, present,
+    present_with_vector_images, record_frame, wait_while_recording_is_held_for_testing,
 };
 use crate::painting::visual_context::VisualContextTree;
 use crate::stage_thread::{Relay, Riding};
@@ -69,8 +71,6 @@ pub(crate) struct ClockPlan {
     elements: Vec<StyleNodeID>,
     /// The monotonic time, in milliseconds, at which the document's timestamps are zero.
     time_origin: f64,
-    /// The timestamp of the next event of the animations, which the host sends: a tick at or past it samples nothing.
-    deadline: f64,
     /// The timestamp at which the animations of the document timeline a tick samples have all ended: the tick at or
     /// past it shows their ends, and after it only a scroll moves anything.
     last_end: f64,
@@ -96,9 +96,6 @@ pub struct FfiPlannedScrollTimeline {
     pub max_scroll_offset: f64,
     /// The progress, in percent, at the scroll offset the host laid out.
     pub progress: f64,
-    /// The progress from which, and up to which, the timeline's animations send no event the host has listeners for.
-    pub progress_start: f64,
-    pub progress_end: f64,
 }
 
 /// Where the compositor had scrolled the scroll node of an element, or of a document's viewport, by its unique node id,
@@ -115,7 +112,6 @@ impl ClockPlan {
     pub(crate) fn new(
         elements: Vec<StyleNodeID>,
         time_origin: f64,
-        deadline: f64,
         last_end: f64,
         scroll_timelines: Vec<FfiPlannedScrollTimeline>,
         round: ClockRound,
@@ -124,7 +120,6 @@ impl ClockPlan {
         Self {
             elements,
             time_origin,
-            deadline,
             last_end,
             scroll_timelines,
             round,
@@ -134,8 +129,8 @@ impl ClockPlan {
     }
 
     /// The progress of the scroll timelines where `scroll_offsets` scrolled their scrollers to, or where the host laid
-    /// out those it has none for. Past the progress at which an animation sends an event, the host has it to send.
-    fn scroll_progress(&self, scroll_offsets: &[FfiScrollOffset]) -> Result<SmallVec<[ScrollProgress; 2]>, Park> {
+    /// out those it has none for.
+    fn scroll_progress(&self, scroll_offsets: &[FfiScrollOffset]) -> SmallVec<[ScrollProgress; 2]> {
         self.scroll_timelines
             .iter()
             .map(|timeline| {
@@ -146,14 +141,11 @@ impl ClockPlan {
                         let position = if timeline.vertical { offset.y } else { offset.x };
                         position / timeline.max_scroll_offset * 100.0
                     });
-                if !(timeline.progress_start..timeline.progress_end).contains(&progress) {
-                    return Err(Park("scrolled outside a scroll timeline's range"));
-                }
-                Ok(ScrollProgress {
+                ScrollProgress {
                     scroller: timeline.scroller,
                     vertical: timeline.vertical,
                     progress,
-                })
+                }
             })
             .collect()
     }
@@ -184,6 +176,9 @@ pub(crate) struct Lane {
     state: LaneState,
     /// What the ticks sample of each element: the animations the plan names, and the transitions the hover started.
     effects: Vec<effects::ElementEffects>,
+    /// The elements of the plan whose animations a tick found it cannot show samples of, which the ticks sample no more,
+    /// and whose boxes hold what they showed last while the others go on.
+    held_elements: SmallVec<[StyleNodeID; 4]>,
     /// The boxes the ticks showed samples in, with the styles the frame showed in them.
     ticked: Vec<(NodeSlotId, HostStyle)>,
     /// The elements whose boxes the next build makes again, which showed the records a size query decided for them,
@@ -194,7 +189,7 @@ pub(crate) struct Lane {
     /// The border boxes of the plan's elements, and of those the hover restyled, in the last frame a tick presented.
     presented_border_boxes: Vec<(StyleNodeID, CssPixelRect)>,
     /// The color each box the ticks showed samples in showed in that frame, as `0xAARRGGBB`. For a test.
-    presented_colors: Vec<(StyleNodeID, u32)>,
+    presented_colors: Vec<(StyleNodeID, u8, u32)>,
     /// How many compositor animations of the frame drive each box of `presented_border_boxes`, and the opacity its
     /// effect nodes give it. For a test.
     presented_compositor_animations: Vec<(StyleNodeID, u32, f32)>,
@@ -205,8 +200,8 @@ pub(crate) struct Lane {
     /// infinity for the lane's frame, and the progress at which it shows the plan's scroll timelines.
     shown_at: f64,
     shown_scroll_progress: SmallVec<[ScrollProgress; 2]>,
-    /// Whether a tick found the lane could sample no more: past the deadline or the animations' ends, or something only
-    /// the host computes.
+    /// Whether a tick found the lane could sample no more: past the animations' ends, or something only the host
+    /// computes.
     parked: bool,
     /// Whether a tick left its frame to the host, after which the fork may hold what no frame the lane presented shows,
     /// such as visual contexts of another structure than the compositor has: the lane presents no other frame.
@@ -289,7 +284,8 @@ pub(crate) enum TickPresented {
         output: Arc<RecordingOutput>,
         hit_test_list_changed: bool,
     },
-    /// Nothing: the frame renders an SVG image, which only the host renders, and the lane samples no more.
+    /// Nothing: the frame renders an SVG image the recording published last did not draw, which only the host renders,
+    /// and the lane samples no more.
     LeftToHost,
 }
 
@@ -542,7 +538,7 @@ pub struct ClockTicks {
 #[derive(Default)]
 struct PresentedBoxes {
     border_boxes: Vec<(StyleNodeID, CssPixelRect)>,
-    colors: Vec<(StyleNodeID, u32)>,
+    colors: Vec<(StyleNodeID, u8, u32)>,
     compositor_animations: Vec<(StyleNodeID, u32, f32)>,
 }
 
@@ -778,12 +774,14 @@ impl ClockTicks {
     }
 
     /// The color the box of `element` showed in the last frame a tick presented, where a tick showed a sample in it.
-    pub(super) fn presented_color(&self, element: StyleNodeID) -> Option<u32> {
+    pub(super) fn presented_color(&self, element: StyleNodeID, generated_for: u8) -> Option<u32> {
         let presented = self.presented_boxes.lock().expect("presented boxes");
         presented
             .colors
             .iter()
-            .find_map(|&(presented, color)| (presented == element).then_some(color))
+            .find_map(|&(presented, presented_generated_for, color)| {
+                (presented == element && presented_generated_for == generated_for).then_some(color)
+            })
     }
 }
 
@@ -1078,11 +1076,12 @@ impl Drop for Lane {
 impl Lane {
     /// A lane whose ticks record and present with `recorder`, follow `plan`, and write what `state` says.
     fn new(recorder: ClockRecorder, plan: ClockPlan, state: LaneState) -> Self {
-        let shown_scroll_progress = plan.scroll_progress(&[]).unwrap_or_default();
+        let shown_scroll_progress = plan.scroll_progress(&[]);
         let parked = !plan.animates();
         Self {
             recording: TickRecording(Riding::landed(recorder)),
             effects: Self::host_effects(&plan.elements),
+            held_elements: SmallVec::new(),
             plan,
             state,
             ticked: Vec::new(),
@@ -1127,7 +1126,7 @@ impl Lane {
     /// one it followed.
     fn replan(&mut self, plan: ClockPlan) {
         self.parked = !plan.animates();
-        self.shown_scroll_progress = plan.scroll_progress(&[]).unwrap_or_default();
+        self.shown_scroll_progress = plan.scroll_progress(&[]);
         self.shown_at = f64::NEG_INFINITY;
         self.replan_host_effects(&plan.elements);
         self.plan = plan;
@@ -1145,8 +1144,8 @@ impl Lane {
     }
 
     /// Samples the plan's animations at the timestamp of `frame_time_nanoseconds` and where the compositor has scrolled
-    /// to, where `samples_animations`, shows the samples, lays out what they moved and presents the frame. A tick at or
-    /// past the deadline, or one that needs the host, parks the lane, and so does the tick that shows the ends of the
+    /// to, where `samples_animations`, shows the samples, lays out what they moved and presents the frame. A tick that
+    /// needs the host parks the lane, and so does the tick that shows the ends of the
     /// animations where no scroll moves anything after them. A tick handed `pointer`, where the pointer moved since
     /// the last tick, hovers what is under it first (see [`hover`]). Answers none where the lane has no fork to tick on.
     fn tick_on_fork(
@@ -1190,10 +1189,7 @@ impl Lane {
         // What the plan's animations show at the tick, where the lane still samples them.
         let progress = match samples_animations {
             false => None,
-            true => self.sample_progress(sampled_at).unwrap_or_else(|_| {
-                self.parked = true;
-                None
-            }),
+            true => self.sample_progress(),
         };
         if progress.is_none() && hovers.is_none() && !transitions {
             return ticked;
@@ -1292,18 +1288,15 @@ impl Lane {
         ticked
     }
 
-    /// The progress of the scroll timelines a tick sampled at `sampled_at` samples the plan's animations at, or none where
-    /// a frame that showed the document timeline's animations ended shows them already and nothing scrolled since. A tick
-    /// at or past the deadline, or past what the scroll timelines plan for, parks the lane.
-    fn sample_progress(&self, sampled_at: SampleTime) -> Result<Option<SmallVec<[ScrollProgress; 2]>>, Park> {
-        if sampled_at.0 >= self.plan.deadline {
-            return Err(Park("past the deadline"));
-        }
-        let scroll_progress = self.plan.scroll_progress(&self.scroll_offsets)?;
+    /// The progress of the scroll timelines a tick samples the plan's animations at, or none where a frame that showed
+    /// the document timeline's animations ended shows them already and nothing scrolled since. The ticks go on past the
+    /// events of the animations, which the host sends as it gets to them.
+    fn sample_progress(&self) -> Option<SmallVec<[ScrollProgress; 2]>> {
+        let scroll_progress = self.plan.scroll_progress(&self.scroll_offsets);
         if self.shown_at >= self.plan.last_end && scroll_progress == self.shown_scroll_progress {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(scroll_progress))
+        Some(scroll_progress)
     }
 
     /// Lays out what the tick moved, whose effects it sampled at `sampled_at`, and presents the frame.
@@ -1452,16 +1445,34 @@ impl Lane {
         self.presented_colors.clear();
         let restyled: SmallVec<[StyleNodeID; 4]> = self.sampled_elements().collect();
         // NB: A descendant that inherits what the effects animate may have no box, as under `display: none`.
-        self.presented_colors.extend(restyled.into_iter().filter_map(|element| {
-            let row = arena.bound_row(element);
-            if !arena.slot_is_live(row) {
-                return None;
-            }
-            let payloads = arena.style_payloads(row)?;
-            let color = crate::layout::ComputedValuesView::new(&payloads.groups)
-                .inherited_text()
-                .color;
-            Some((element, color))
+        let arena: &LayoutNodeArena = arena;
+        self.presented_colors.extend(restyled.into_iter().flat_map(|element| {
+            [
+                (0, arena.bound_row(element)),
+                (
+                    GENERATED_FOR_BEFORE,
+                    arena.bound_pseudo_element_row(element, GENERATED_FOR_BEFORE),
+                ),
+                (
+                    GENERATED_FOR_AFTER,
+                    arena.bound_pseudo_element_row(element, GENERATED_FOR_AFTER),
+                ),
+                (
+                    GENERATED_FOR_MARKER,
+                    arena.bound_pseudo_element_row(element, GENERATED_FOR_MARKER),
+                ),
+            ]
+            .into_iter()
+            .filter_map(move |(generated_for, row)| {
+                if row.is_invalid() || !arena.slot_is_live(row) {
+                    return None;
+                }
+                let payloads = arena.style_payloads(row)?;
+                let color = crate::layout::ComputedValuesView::new(&payloads.groups)
+                    .inherited_text()
+                    .color;
+                Some((element, generated_for, color))
+            })
         }));
         Ok(())
     }
@@ -1517,7 +1528,8 @@ fn freeze_tick_frame(
 
 impl ClockRecorder {
     /// Records `frame`, which a tick sampled, and presents it with the visual contexts the tick prepared for it, on the
-    /// Paint thread. Only the host renders an SVG image.
+    /// Paint thread. Only the host renders an SVG image: the frame draws those the recording published last drew, as the
+    /// host rendered them for it, and leaves the frame to the host where it draws another.
     fn record(mut self, frame: SampledFrame<RecordedFrame>, presenting: &mut Presenting) -> Self {
         let Self {
             recorder,
@@ -1531,16 +1543,27 @@ impl ClockRecorder {
             visual_contexts,
         }) = frame;
         let (pending, _) = record_frame(frozen.frame, recorder, viewport, false, inputs);
-        // The recording wrote the paint-order tree, which no longer describes the recording published last.
-        if renders_vector_images(&pending) {
-            recorder.forget_published_recording();
-            *presented = TickPresented::LeftToHost;
-            return self;
-        }
+        let vector_image_display_lists = match renders_vector_images(&pending) {
+            true => match published_vector_image_display_lists(&pending, recorder) {
+                Some(display_list_ids) => Some(display_list_ids),
+                None => {
+                    // The recording wrote the paint-order tree, which no longer describes the recording published last.
+                    recorder.forget_published_recording();
+                    *presented = TickPresented::LeftToHost;
+                    return self;
+                }
+            },
+            false => None,
+        };
         if let Some(visual_contexts) = visual_contexts {
             presentation.take_visual_context_tree(visual_contexts);
         }
-        let output = present(presentation, pending, recorder, presenting);
+        let output = match vector_image_display_lists {
+            Some(display_list_ids) => {
+                present_with_vector_images(presentation, pending, recorder, presenting, &display_list_ids)
+            }
+            None => present(presentation, pending, recorder, presenting),
+        };
         take_in_published_output(recorder, &mut None, output, true, |output, hit_test_list_changed| {
             *presented = TickPresented::Frame {
                 output,
@@ -1816,17 +1839,23 @@ pub(super) fn settle_lanes_for_testing() {
 }
 
 /// Writes the color the box of `element` showed in the last frame a tick of a lane of `host`'s document presented to
-/// `color`, as `0xAARRGGBB`, and answers whether a hover's transitions restyled the box in it. For a test.
+/// `color`, as `0xAARRGGBB`, or that of its pseudo-element `generated_for` names where that is not 0, and answers whether
+/// a tick restyled the box in it. For a test.
 ///
 /// # Safety
 ///
 /// `host` must come from `document_host_create` and not be destroyed yet, on its document's thread, and `color` must be
 /// valid for writes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_presented_color(host: &DocumentHost, element: u32, color: *mut u32) -> bool {
+pub unsafe extern "C" fn document_host_presented_color(
+    host: &DocumentHost,
+    element: u32,
+    generated_for: u8,
+    color: *mut u32,
+) -> bool {
     crate::stage_thread::style_layout_thread().run(|| ());
     let Some(presented) =
-        StyleNodeID::from_raw(element).and_then(|element| host.clock_ticks().presented_color(element))
+        StyleNodeID::from_raw(element).and_then(|element| host.clock_ticks().presented_color(element, generated_for))
     else {
         return false;
     };

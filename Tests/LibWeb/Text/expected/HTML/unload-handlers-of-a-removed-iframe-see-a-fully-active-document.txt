@@ -1,0 +1,3 @@
+pagehide: request opened and sent, document.location is a Location
+unload: request opened and sent, document.location is a Location
+after unload: request threw, document.location is null

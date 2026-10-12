@@ -348,13 +348,19 @@ namespace Web::Layout {
 
 void NodeWithStyle::apply_style(CSS::StyleRecordID style_record_identity)
 {
+    bool const changes_published_record = m_style_record_identity != style_record_identity || m_has_layout_derived_style;
     release_pinned_style_record();
     m_background_images.clear();
     m_mask_images.clear();
     m_border_image_source.clear();
     m_list_style_image.clear();
     m_style_record_identity = style_record_identity;
-    publish_style_record_to_node_data();
+    // OPTIMIZATION: Installing the DOM record already published a followed layout node's record. Applying its
+    //               rendering consequences need not enqueue the same record again.
+    if (changes_published_record)
+        publish_style_record_to_node_data();
+    else
+        did_update_style_record();
     set_flag(RustFFI::NodeFlag::HasAnimatedOpacityOrTransform, false);
     // A style change can introduce the properties that make a node carry replaced-content facts,
     // such as size containment arriving on a kept layout node.
@@ -498,15 +504,15 @@ void NodeWithStyle::set_style_record_identity(CSS::InstalledStyle const& install
     if (m_has_layout_derived_style)
         return;
     if (m_style_record_identity == style_record_identity) {
-        publish_style_record_to_node_data();
+        did_update_style_record();
         return;
     }
 
     bool should_repin_style_record = m_style_record_pinned_for_cxx_consumers;
     // Both answers come from the records themselves, so neither side needs a ComputedValues built
-    // for it. An overlay record borrows different payloads than its base, so carrying one is already
-    // reason enough to treat the style as layout-affecting. The node's own record is the one its
-    // target held before where the node followed it, which the target still holds.
+    // for it. Compare the effective payloads, including animations, rather than treating every
+    // animation overlay as layout-affecting. The node's own record is the one its target held
+    // before where the node followed it, which the target still holds.
     auto const& new_record_view = installed.view();
     VERIFY(new_record_view.present);
     CSS::StyleEngine::StyleRecordView old_record_view {};
@@ -515,9 +521,15 @@ void NodeWithStyle::set_style_record_identity(CSS::InstalledStyle const& install
             ? held_before.view()
             : document().style_computer().style_engine().style_record_view(held_read(), m_style_record_identity);
     }
+    // NB: SVG geometry can depend on currentColor strokes and animation composition. Keep its conservative reset.
+    bool svg_style_may_affect_intrinsic_sizes = is_svg_box()
+        && (old_record_view.animation_overlay_identity != 0
+            || new_record_view.animation_overlay_identity != 0
+            || (old_record_view.present
+                && static_cast<CSS::ComputedValues::InheritedTextValues const*>(old_record_view.payloads[to_underlying(CSS::StyleGroupIndex::InheritedTextValues)])->color
+                    != static_cast<CSS::ComputedValues::InheritedTextValues const*>(new_record_view.payloads[to_underlying(CSS::StyleGroupIndex::InheritedTextValues)])->color));
     bool changes_layout_affecting_style = !old_record_view.present
-        || old_record_view.animation_overlay_identity != 0
-        || new_record_view.animation_overlay_identity != 0
+        || svg_style_may_affect_intrinsic_sizes
         || CSS::ComputedValues::layout_affecting_group_payloads_differ(old_record_view.payloads, new_record_view.payloads);
 
     release_pinned_style_record();
@@ -565,6 +577,7 @@ static Node const* scroll_snap_container_of(NodeWithStyle const& node)
 
 void NodeWithStyle::publish_style_record_to_node_data()
 {
+    ++document().style_invalidation_counters().layout_style_record_publications;
     auto const view = document().style_computer().style_engine().style_record_view(held_read(), m_style_record_identity);
     VERIFY(view.present);
     auto const* payloads = view.payloads;

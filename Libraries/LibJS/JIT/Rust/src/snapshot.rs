@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use crate::ir::Locations;
+
 use crate::bytecode::EnvironmentCoordinate;
 use crate::bytecode::ExceptionHandler;
 use crate::bytecode::FrameLayout;
@@ -76,6 +78,10 @@ pub struct ExecutableSnapshot {
     /// check the value before using it as a constant, since bindings and
     /// the environments of other closures sharing the executable may differ.
     pub captured_bindings: Vec<(EnvironmentCoordinate, GlobalValueSnapshot)>,
+    /// The captured bindings that stores of the executable store to, which
+    /// are mutable in every environment of their scope, so that the stores
+    /// need not check that.
+    pub mutable_bindings: Vec<EnvironmentCoordinate>,
     /// Whether `function` is a builtin written in JavaScript. Its frames are
     /// set up like those of other builtins: with the environments of their
     /// caller's frame, and without a script or module.
@@ -687,6 +693,154 @@ pub enum Intrinsic {
     MathMax,
     /// `Math.min`.
     MathMin,
+    /// `Math.imul`.
+    MathImul,
+    /// `String.prototype.indexOf`.
+    StringPrototypeIndexOf,
+    /// `String.prototype.toLowerCase`.
+    StringPrototypeToLowerCase,
+    /// `String.prototype.toUpperCase`.
+    StringPrototypeToUpperCase,
+    /// `String.prototype.lastIndexOf`.
+    StringPrototypeLastIndexOf,
+    /// `String.prototype.includes`.
+    StringPrototypeIncludes,
+    /// `String.prototype.startsWith`.
+    StringPrototypeStartsWith,
+    /// `String.prototype.endsWith`.
+    StringPrototypeEndsWith,
+    /// `String.prototype.slice`.
+    StringPrototypeSlice,
+    /// `String.prototype.substring`.
+    StringPrototypeSubstring,
+    /// `String.prototype.trim`.
+    StringPrototypeTrim,
+    /// `String.prototype.trimStart`.
+    StringPrototypeTrimStart,
+    /// `String.prototype.trimEnd`.
+    StringPrototypeTrimEnd,
+    /// `RegExp.prototype.exec`.
+    RegExpPrototypeExec,
+}
+
+/// A `this` value or argument of a builtin whose runtime helper JIT code
+/// calls (see `HelperCall`), which the code checks to be of its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperOperand {
+    /// Any value, which the helper checks itself.
+    Value,
+    /// A string, as a tagged value.
+    String,
+    /// An int32, as a `Repr::Int32`. Calls that pass no such argument pass
+    /// `absent` instead, which the builtin treats the same, or else go to
+    /// the slow path if there is none.
+    Int32 { absent: Option<i32> },
+}
+
+/// What the runtime helper of a builtin returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperResult {
+    /// An int32, in the low 32 bits.
+    Int32,
+    /// 0 or 1.
+    Bool,
+    /// A tagged string.
+    String,
+    /// A tagged value, or the empty value where the helper declined,
+    /// having done nothing observable: the slow path makes the call then.
+    Value,
+}
+
+/// How JIT code calls a builtin through its runtime helper, without a
+/// native frame, for operands of the kinds it checks: `u64 helper(VM*,
+/// receiver, arguments...)`, which runs no code, reads and writes only the
+/// locations listed, may allocate, and runs in the realm of the calling
+/// code, so only calls of the builtin of that realm use it. Arguments past
+/// those listed are ignored, like the builtin ignores them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelperCall {
+    pub receiver: HelperOperand,
+    pub arguments: &'static [HelperOperand],
+    pub result: HelperResult,
+    pub reads: Locations,
+    pub writes: Locations,
+}
+
+impl HelperOperand {
+    pub fn repr(self) -> crate::code::Repr {
+        match self {
+            HelperOperand::Value | HelperOperand::String => crate::code::Repr::Tagged,
+            HelperOperand::Int32 { .. } => crate::code::Repr::Int32,
+        }
+    }
+}
+
+impl HelperResult {
+    pub fn repr(self) -> crate::code::Repr {
+        match self {
+            HelperResult::Int32 => crate::code::Repr::Int32,
+            HelperResult::Bool => crate::code::Repr::Bool,
+            HelperResult::String | HelperResult::Value => crate::code::Repr::Tagged,
+        }
+    }
+}
+
+/// `u64 (Intrinsic)`: the address of the runtime helper of an intrinsic
+/// that has a `HelperCall`, or 0.
+#[derive(Debug, Clone, Copy)]
+pub struct HelperCallAddresses(pub fn(Intrinsic) -> u64);
+
+impl Default for HelperCallAddresses {
+    fn default() -> Self {
+        Self(|_| 0)
+    }
+}
+
+impl Intrinsic {
+    /// How JIT code calls the builtin through its runtime helper, if it
+    /// does.
+    pub fn helper_call(self) -> Option<HelperCall> {
+        use HelperOperand::Int32;
+        use HelperOperand::String;
+        let call = |arguments, result| {
+            Some(HelperCall {
+                receiver: String,
+                arguments,
+                result,
+                reads: Locations::NONE,
+                writes: Locations::NONE,
+            })
+        };
+        // NB: Positions and ends past the end of the string clamp to its
+        //     length, like the ones absent arguments stand for.
+        const START: HelperOperand = Int32 { absent: Some(0) };
+        const END: HelperOperand = Int32 { absent: Some(i32::MAX) };
+        match self {
+            Intrinsic::StringPrototypeIndexOf => call(&[String, START], HelperResult::Int32),
+            Intrinsic::StringPrototypeLastIndexOf => call(&[String, END], HelperResult::Int32),
+            Intrinsic::StringPrototypeIncludes | Intrinsic::StringPrototypeStartsWith => {
+                call(&[String, START], HelperResult::Bool)
+            }
+            Intrinsic::StringPrototypeEndsWith => call(&[String, END], HelperResult::Bool),
+            Intrinsic::StringPrototypeSlice | Intrinsic::StringPrototypeSubstring => {
+                call(&[START, END], HelperResult::String)
+            }
+            Intrinsic::StringPrototypeToLowerCase
+            | Intrinsic::StringPrototypeToUpperCase
+            | Intrinsic::StringPrototypeTrim
+            | Intrinsic::StringPrototypeTrimStart
+            | Intrinsic::StringPrototypeTrimEnd => call(&[], HelperResult::String),
+            // NB: RegExpBuiltinExec reads and writes lastIndex.
+            Intrinsic::RegExpPrototypeExec => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[String],
+                result: HelperResult::Value,
+                reads: Locations::NAMED,
+                writes: Locations::NAMED_SLOTS,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// The runtime helpers of intrinsics (the out of line probe of
@@ -750,6 +904,9 @@ pub struct RuntimeInfo {
     /// `u64 libjs_jit_primitive_to_string(VM*, u64 primitive)`:
     /// `String(primitive)`.
     pub primitive_to_string: u64,
+    /// The runtime helpers of the intrinsics JIT code calls through them
+    /// (see `Intrinsic::helper_call()`).
+    pub helper_calls: HelperCallAddresses,
     /// `u64 libjs_jit_to_object(VM*, u64 primitive, u64 function)`: ToObject
     /// of a primitive other than undefined and null, as the builtin
     /// `function` makes it, or the empty value if that function is of
@@ -823,6 +980,8 @@ pub struct RuntimeInfo {
     /// compiled code, if `%ArrayIteratorPrototype%` holds it. Code that
     /// embeds it must list it in `CompiledCode::embedded_cells`.
     pub array_iterator_next: Option<CellId>,
+    /// The realm of the compiled code.
+    pub realm: CellId,
     /// `%Array.prototype%` and `%Object.prototype%` of the realm of the
     /// compiled code. Code that embeds them must list them in
     /// `CompiledCode::embedded_cells`.
@@ -1374,8 +1533,10 @@ pub struct RuntimeLayout {
     pub typed_array_kind_int32: u8,
     pub typed_array_kind_float32: u8,
     pub typed_array_kind_float64: u8,
-    /// `GC::PrimitiveStorage::cage_offset_mask`. Typed array elements are at
-    /// `primitive_storage_cage_base + ((cached_data_offset + byte_index) & cage_offset_mask)`.
+    /// `GC::PrimitiveStorage::cage_offset_mask`. Compiled code finds typed
+    /// array elements at `primitive_storage_cage_base + (cached_data_offset &
+    /// cage_offset_mask) + byte_index`, for 32-bit indices, which
+    /// `GC::PrimitiveStorage::cage_guard_size` keeps within reach.
     pub primitive_storage_cage_offset_mask: u64,
     /// `PrimitiveString::length_in_utf16_code_units` (u32).
     pub primitive_string_length: u32,

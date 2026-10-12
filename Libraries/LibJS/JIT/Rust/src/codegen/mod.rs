@@ -1102,8 +1102,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let block_data = self.graph.block(block);
         // Phis in registers that need their spill slots get them here.
         for phi in &block_data.phis {
-            let allocation = self.allocation.node(*phi);
-            if let (Some(Location::Register(register)), Some(slot)) = (allocation.output, allocation.spill_slot) {
+            if let (Some(Location::Register(register)), Some(slot)) = (
+                self.allocation.node(*phi).output,
+                crate::regalloc::phi_spill_store(self.graph, self.allocation, *phi),
+            ) {
                 self.emit_move(&Move {
                     from: Location::Register(register),
                     to: Location::Stack(slot),
@@ -1331,6 +1333,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_box_bool(output, input);
             }
             Op::Int32Binary { op } => self.emit_int32_binary(node_id, *op),
+            Op::Int32WrappingBinary { op } => self.emit_int32_wrapping_binary(node_id, *op),
             Op::Int32Compare { comparison } => self.emit_int32_compare(node_id, *comparison),
             Op::CheckElements { kind } => self.emit_check_elements(node_id, *kind),
             Op::CheckTypedArray => self.emit_check_typed_array(node_id),
@@ -1359,6 +1362,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                     ),
                 );
             }
+            // `cage_base + (offset & mask)`
+            Op::TypedArrayDataAddress => {
+                let (output, input) = (self.output(node_id), self.input(node_id, 0));
+                let layout = self.runtime.layout;
+                self.masm
+                    .and64_imm(output, input, layout.primitive_storage_cage_offset_mask);
+                self.masm
+                    .add64_imm(output, output, self.runtime.primitive_storage_cage_base as i64);
+            }
             Op::CheckBounds => self.emit_check_bounds(node_id),
             Op::LoadElementAt { kind } => self.emit_load_element_at(node_id, *kind),
             Op::StoreElementAt { kind } => self.emit_store_element_at(node_id, *kind),
@@ -1374,9 +1386,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::ToBoolean => {
                 self.masm.call_absolute(self.runtime.to_boolean);
             }
-            Op::PrimitiveToString | Op::ToObject | Op::ArrayCreate => {
+            Op::PrimitiveToString | Op::CallIntrinsic { .. } | Op::ToObject | Op::ArrayCreate => {
                 let function = match node.op {
                     Op::PrimitiveToString => self.runtime.primitive_to_string,
+                    Op::CallIntrinsic { intrinsic } => (self.runtime.helper_calls.0)(intrinsic),
                     Op::ToObject => self.runtime.to_object,
                     _ => self.runtime.array_create,
                 };
@@ -1621,9 +1634,35 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 let (output, input) = (self.float_output(node_id), self.input(node_id, 0));
                 self.masm.convert_int32_to_double(output, input);
             }
+            // NB: Booleans are 0 or 1 in the low 32 bits already.
+            Op::BoolToInt32 => {
+                let (output, input) = (self.output(node_id), self.input(node_id, 0));
+                self.masm.move32(output, input);
+            }
             Op::BoxFloat64 => self.emit_box_float64(node_id),
             Op::Float64Unary { op } => self.emit_float64_unary(node_id, *op),
             Op::Float64Binary { op } => self.emit_float64_binary(node_id, *op),
+            Op::Float64Min | Op::Float64Max => {
+                let (lhs, rhs, output) = (
+                    self.float_input(node_id, 0),
+                    self.float_input(node_id, 1),
+                    self.float_output(node_id),
+                );
+                if matches!(node.op, Op::Float64Min) {
+                    self.masm.min_double(output, lhs, rhs);
+                } else {
+                    self.masm.max_double(output, lhs, rhs);
+                }
+            }
+            Op::Int32Min | Op::Int32Max | Op::Uint32Min => {
+                let (lhs, rhs, output) = (self.input(node_id, 0), self.input(node_id, 1), self.output(node_id));
+                let condition = match node.op {
+                    Op::Int32Min => Condition::LessThan,
+                    Op::Int32Max => Condition::GreaterThan,
+                    _ => Condition::Below,
+                };
+                self.masm.select32(condition, lhs, rhs, output, lhs, rhs);
+            }
             Op::Float64Compare { comparison } => self.emit_float64_compare(node_id, *comparison),
             Op::Float64ToInt32 => self.emit_float64_to_int32(node_id),
             Op::Float64ToUint8Clamped => self.emit_float64_to_uint8_clamped(node_id),

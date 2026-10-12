@@ -47,7 +47,6 @@ macro_rules! tape_enum {
 tape_enum!(InlineClipKind as u8 { Rect, RoundedRect, Path });
 tape_enum!(ClipMode as u8 { Intersect, Difference });
 tape_enum!(CompositorScrollNodeKind as u8 { Viewport, Element, PseudoElement });
-tape_enum!(CompositorOverscrollBehavior as u8 { Auto, Contain, None });
 tape_enum!(PathPaintKind as u8 { Color, PaintStyle });
 tape_enum!(DisplayListPaintStyleType as u8 { None, LinearGradient, RadialGradient, Pattern });
 tape_enum!(DisplayListGradientSpreadMethod as u8 { Pad, Repeat, Reflect });
@@ -292,6 +291,7 @@ fn command_struct_size(command_type: DisplayListCommandType) -> usize {
         T::PaintScrollBar => size_of::<PaintScrollBar>(),
         T::CompositorSnapContainer => size_of::<CompositorSnapContainer>(),
         T::CompositorSnapArea => size_of::<CompositorSnapArea>(),
+        T::CompositorScrollChainingBarrier => size_of::<CompositorScrollChainingBarrier>(),
     }
 }
 
@@ -446,8 +446,13 @@ fn validate_command_fields(
             p.bool_at(offset_of!(CompositorScrollNode, is_viewport))?;
             p.bool_at(offset_of!(CompositorScrollNode, can_be_wheel_scrolled_horizontally))?;
             p.bool_at(offset_of!(CompositorScrollNode, can_be_wheel_scrolled_vertically))?;
-            p.enum_at::<CompositorOverscrollBehavior>(offset_of!(CompositorScrollNode, overscroll_behavior_x))?;
-            p.enum_at::<CompositorOverscrollBehavior>(offset_of!(CompositorScrollNode, overscroll_behavior_y))?;
+            p.bool_at(offset_of!(
+                CompositorScrollNode,
+                chains_scroll_to_ancestors_horizontally
+            ))?;
+            p.bool_at(offset_of!(CompositorScrollNode, chains_scroll_to_ancestors_vertically))?;
+            p.bool_at(offset_of!(CompositorScrollNode, shows_overscroll_effect_horizontally))?;
+            p.bool_at(offset_of!(CompositorScrollNode, shows_overscroll_effect_vertically))?;
         }
         T::CompositorScrollbar => {
             p.bool_at(offset_of!(CompositorScrollbar, vertical))?;
@@ -460,6 +465,10 @@ fn validate_command_fields(
             p.bool_at(offset_of!(CompositorSnapContainer, snaps_x))?;
             p.bool_at(offset_of!(CompositorSnapContainer, snaps_y))?;
             p.bool_at(offset_of!(CompositorSnapContainer, horizontal_writing_mode))?;
+        }
+        T::CompositorScrollChainingBarrier => {
+            p.bool_at(offset_of!(CompositorScrollChainingBarrier, keeps_horizontal_scrolls))?;
+            p.bool_at(offset_of!(CompositorScrollChainingBarrier, keeps_vertical_scrolls))?;
         }
         T::CompositorSnapArea => {
             p.u8_below(offset_of!(CompositorSnapArea, align_x), SNAP_ALIGN_COUNT)?;

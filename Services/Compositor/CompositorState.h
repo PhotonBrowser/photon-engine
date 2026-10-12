@@ -125,6 +125,8 @@ public:
     void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
     void set_client_gpu_presentation_capability(bool supported, u64 adapter_luid);
     void set_synthesizes_scroll_momentum(bool);
+    void set_scrolls_elastically(bool);
+    Gfx::FloatPoint elastic_overscroll_stretch_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID) const;
 
     struct PlaceholderCanvasAllocation {
         Compositing::CanvasId canvas_id;
@@ -256,6 +258,7 @@ private:
     Optional<u64> m_client_gpu_presentation_adapter_luid;
     Optional<bool> m_client_gpu_presentation_supported;
     bool m_synthesizes_scroll_momentum { false };
+    bool m_scrolls_elastically { false };
 
     struct VideoSinkState {
         RefPtr<Media::DisplayingVideoSink> sink;

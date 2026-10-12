@@ -57,12 +57,6 @@ struct AsyncScrollOffset {
     }
 };
 
-enum class ScrollOverscrollBehavior : u8 {
-    Auto,
-    Contain,
-    None,
-};
-
 // One scrollable area from the paint snapshot.
 struct AsyncScrollNode {
     AsyncScrollNodeID node_id;
@@ -74,8 +68,12 @@ struct AsyncScrollNode {
     bool is_viewport { false };
     bool can_be_wheel_scrolled_horizontally { false };
     bool can_be_wheel_scrolled_vertically { false };
-    ScrollOverscrollBehavior overscroll_behavior_x { ScrollOverscrollBehavior::Auto };
-    ScrollOverscrollBehavior overscroll_behavior_y { ScrollOverscrollBehavior::Auto };
+    // Whether a scroll the scroller cannot scroll by is passed on to the scrollers around it.
+    bool chains_scroll_to_ancestors_horizontally { true };
+    bool chains_scroll_to_ancestors_vertically { true };
+    // Whether a touchpad may pull the scroller past the edges of its scroll range.
+    bool shows_overscroll_effect_horizontally { true };
+    bool shows_overscroll_effect_vertically { true };
 };
 
 // A region with a non-passive wheel listener. Wheels inside it must stay on the main thread because script may cancel.
@@ -97,6 +95,16 @@ struct WheelHitTestTarget {
 struct MainThreadWheelEventRegion {
     Compositing::ContextRef context;
     Gfx::FloatRect rect;
+};
+
+// A scroll container without a scroll node of its own that keeps the scrolls along an axis to itself. A wheel inside
+// its rect is not passed on along that axis to the scroll node above it.
+struct ScrollChainingBarrier {
+    Compositing::ContextRef context;
+    Gfx::FloatRect rect;
+    AsyncScrollNodeID scroll_node_id_above_barrier;
+    bool keeps_horizontal_scrolls { false };
+    bool keeps_vertical_scrolls { false };
 };
 
 struct AsyncScrollbar {
@@ -137,6 +145,7 @@ struct AsyncScrollingState {
     Vector<AsyncSnapContainer> snap_containers;
     Vector<WheelHitTestTarget> wheel_hit_test_targets;
     Vector<MainThreadWheelEventRegion> main_thread_wheel_event_regions;
+    Vector<ScrollChainingBarrier> scroll_chaining_barriers;
     Vector<AsyncScrollbar> scrollbars;
 
     // Non-passive wheel listeners can cancel scrolling, so async scrolling must treat them as hard barriers.

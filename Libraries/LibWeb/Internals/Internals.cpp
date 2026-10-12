@@ -618,7 +618,7 @@ void Internals::mouse_move_through_ui_process(double x, double y)
     page.client().page_did_request_webdriver_mouse_event(window().navigable()->local_root()->id(), move(event), GC::create_function(heap(), [] { }));
 }
 
-void Internals::wheel_through_ui_process(double x, double y, double delta_x, double delta_y)
+void Internals::wheel_through_ui_process(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, GC::Ref<WebIDL::Promise> promise)
 {
     auto& page = this->page();
     auto position = page.css_to_device_point(window().navigable()->to_page_position({ x, y }));
@@ -630,7 +630,13 @@ void Internals::wheel_through_ui_process(double x, double y, double delta_x, dou
     event.screen_position = position;
     event.wheel_delta_x = delta_x;
     event.wheel_delta_y = delta_y;
-    page.client().page_did_request_webdriver_mouse_event(local_root_id, move(event), GC::create_function(heap(), [] { }));
+    event.wheel_delta_precision = wheel_delta_precision_from(precise);
+    event.scroll_gesture_phase = scroll_gesture_phase_from(phase);
+    auto& realm = window().principal_realm();
+    page.client().page_did_request_webdriver_mouse_event(local_root_id, move(event), GC::create_function(heap(), [&realm, promise] {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        WebIDL::resolve_promise(realm, promise);
+    }));
 }
 
 void Internals::send_key(HTML::HTMLElement& target, Utf16String const& key_name, WebIDL::UnsignedShort modifiers, WebIDL::UnsignedLong repeat_count)
@@ -764,6 +770,40 @@ void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, doub
 void Internals::wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, GC::Ref<WebIDL::Promise> promise)
 {
     wheel(promise, x, y, delta_x, delta_y, precise, phase);
+}
+
+static Gfx::FloatPoint elastic_overscroll_stretch_in_css_pixels(HTML::Window& window, GC::Ptr<DOM::Element> scroller)
+{
+    auto& document = window.associated_document();
+    auto navigable = document.navigable();
+    if (!navigable || !navigable->has_compositor_context())
+        return {};
+
+    Web::AsyncScrollNodeStableID stable_node_id { .node_id = document.unique_id(), .kind = Web::AsyncScrollNodeKind::Viewport };
+    if (scroller) {
+        Layout::ForcedReadScope read { document };
+        document.update_layout(DOM::UpdateLayoutReason::InternalsHitTest);
+        auto const* scrolling_box = scroller->layout_node(read);
+        if (!scrolling_box)
+            return {};
+        auto scroller_stable_node_id = Painting::async_scroll_node_stable_id(*scrolling_box);
+        if (!scroller_stable_node_id.has_value())
+            return {};
+        stable_node_id = *scroller_stable_node_id;
+    }
+
+    auto stretch_in_device_pixels = navigable->compositor_context().elastic_overscroll_stretch_for_testing(stable_node_id);
+    return stretch_in_device_pixels.scaled(static_cast<float>(1 / navigable->page().client().device_pixels_per_css_pixel()));
+}
+
+double Internals::elastic_overscroll_stretch_x(GC::Ptr<DOM::Element> scroller)
+{
+    return elastic_overscroll_stretch_in_css_pixels(window(), scroller).x();
+}
+
+double Internals::elastic_overscroll_stretch_y(GC::Ptr<DOM::Element> scroller)
+{
+    return elastic_overscroll_stretch_in_css_pixels(window(), scroller).y();
 }
 
 void Internals::pinch(double x, double y, double scale_delta, WebIDL::UnsignedShort modifiers)
@@ -1800,10 +1840,21 @@ Optional<double> Internals::presented_opacity(DOM::Element& element)
     return opacity;
 }
 
-Optional<String> Internals::presented_color(DOM::Element& element)
+Optional<String> Internals::presented_color(DOM::Element& element, Optional<Utf16String> const& pseudo_element)
 {
+    u8 generated_for = 0;
+    if (pseudo_element.has_value()) {
+        if (*pseudo_element == "::before"sv)
+            generated_for = Layout::RustFFI::GENERATED_FOR_BEFORE;
+        else if (*pseudo_element == "::after"sv)
+            generated_for = Layout::RustFFI::GENERATED_FOR_AFTER;
+        else if (*pseudo_element == "::marker"sv)
+            generated_for = Layout::RustFFI::GENERATED_FOR_MARKER;
+        else
+            return {};
+    }
     u32 argb = 0;
-    if (!element.style_node_id() || !Layout::RustFFI::document_host_presented_color(element.document().layout_node_arena().host(), element.style_node_id().value(), &argb))
+    if (!element.style_node_id() || !Layout::RustFFI::document_host_presented_color(element.document().layout_node_arena().host(), element.style_node_id().value(), generated_for, &argb))
         return {};
     return Color::from_bgra(argb).serialize_a_srgb_value();
 }
@@ -2544,6 +2595,7 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
     object->define_direct_property("styleEngineReactionElements"_utf16_fly_string, JS::Value(counters.style_engine_reaction_elements), JS::default_attributes);
     object->define_direct_property("styleEnginePublishedReactions"_utf16_fly_string, JS::Value(counters.style_engine_published_reactions), JS::default_attributes);
     object->define_direct_property("styleEngineRecordDeltasApplied"_utf16_fly_string, JS::Value(counters.style_engine_record_deltas_applied), JS::default_attributes);
+    object->define_direct_property("layoutStyleRecordPublications"_utf16_fly_string, JS::Value(counters.layout_style_record_publications), JS::default_attributes);
     object->define_direct_property("styleEngineMaterializedGaps"_utf16_fly_string, JS::Value(counters.style_engine_materialized_gaps), JS::default_attributes);
     object->define_direct_property("elementStyleRecomputations"_utf16_fly_string, JS::Value(counters.element_style_recomputations), JS::default_attributes);
     object->define_direct_property("elementStyleNoopRecomputations"_utf16_fly_string, JS::Value(counters.element_style_noop_recomputations), JS::default_attributes);

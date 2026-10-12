@@ -801,10 +801,12 @@ fn updates() {
                 result, expected,
                 "postfix {delta:+} of {value:#x} with feedback {feedback:#x}"
             );
-            let old_value = if matches!(expected, MARKER | EXITED) {
-                expected
-            } else {
-                value
+            // NB: Where nothing reads the new value, int32 arithmetic does not
+            //     exit for overflowing it.
+            let old_value = match expected {
+                MARKER => expected,
+                EXITED if value::as_int32(value).is_none() => expected,
+                _ => value,
             };
             let result = run(&postfix(r(6)));
             assert_eq!(result, old_value, "old value of postfix {delta:+} of {value:#x}");
@@ -946,6 +948,9 @@ fn compare_instruction(comparison: Comparison, dst: Operand, lhs: Operand, rhs: 
         Comparison::StrictlyInequals => pick!(StrictlyInequals, StrictlyInequalsRhsInt32),
         Comparison::LooselyEquals => pick!(LooselyEquals, LooselyEqualsRhsInt32),
         Comparison::LooselyInequals => pick!(LooselyInequals, LooselyInequalsRhsInt32),
+        Comparison::Below | Comparison::BelowOrEqual | Comparison::Above | Comparison::AboveOrEqual => {
+            unreachable!("JavaScript has no unsigned comparisons")
+        }
     }
 }
 
@@ -1043,6 +1048,9 @@ fn compare_jump_instruction(
             JumpLooselyInequalsRhsInt32,
             JumpLooselyInequalsLoopRhsInt32
         ),
+        Comparison::Below | Comparison::BelowOrEqual | Comparison::Above | Comparison::AboveOrEqual => {
+            unreachable!("JavaScript has no unsigned comparisons")
+        }
     }
 }
 

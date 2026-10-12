@@ -183,12 +183,24 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// A `CheckBounds` node.
     pub(super) fn emit_check_bounds(&mut self, node: NodeId) {
         let exit = self.exit_site(node);
-        let count = self.input(node, 1);
-        match self.input_value(node, 0) {
-            InputValue::Register(index) => self.masm.branch32(Condition::AboveOrEqual, index, count, exit),
-            InputValue::Constant(index) => self
-                .masm
-                .branch32_imm(Condition::BelowOrEqual, count, index as i32, exit),
+        match (self.input_value(node, 0), self.input_value(node, 1)) {
+            (InputValue::Register(index), InputValue::Register(count)) => {
+                self.masm.branch32(Condition::AboveOrEqual, index, count, exit);
+            }
+            (InputValue::Register(index), InputValue::Constant(count)) => {
+                self.masm
+                    .branch32_imm(Condition::AboveOrEqual, index, count as i32, exit);
+            }
+            (InputValue::Constant(index), InputValue::Register(count)) => {
+                self.masm
+                    .branch32_imm(Condition::BelowOrEqual, count, index as i32, exit);
+            }
+            (InputValue::Constant(index), InputValue::Constant(count)) => {
+                let scratch = self.pinned.scratch;
+                self.masm.move_imm32(scratch, index as u32);
+                self.masm
+                    .branch32_imm(Condition::AboveOrEqual, scratch, count as i32, exit);
+            }
         }
     }
 
@@ -227,27 +239,25 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                     }
                 }
             }
-            // `cage_base + ((data + index * size) & mask)`
+            // NB: The storage is a `TypedArrayDataAddress`, from which the
+            //     zero-extended index stays within the cage or its guard.
             ElementsKind::TypedArray(element) => {
-                let shift = scale(element).log2();
                 match index {
+                    // NB: Stores use the scratch register for their values.
                     InputValue::Register(index) => {
-                        self.masm.move32(scratch, index);
-                        if shift != 0 {
-                            self.masm.shl64_imm(scratch, scratch, shift);
-                        }
-                        self.masm.add64(temp, storage, scratch);
+                        self.masm.move32(temp, index);
+                        Address::indexed(storage, temp, scale(element), 0)
                     }
                     InputValue::Constant(index) => {
-                        let offset = u64::from(index as u32) << shift;
-                        self.masm.add64_imm(temp, storage, offset as i64);
+                        let offset = u64::from(index as u32) << scale(element).log2();
+                        if let Ok(offset) = i32::try_from(offset) {
+                            Address::new(storage, offset)
+                        } else {
+                            self.masm.add64_imm(temp, storage, offset as i64);
+                            Address::new(temp, 0)
+                        }
                     }
                 }
-                self.masm
-                    .and64_imm(temp, temp, layout.primitive_storage_cage_offset_mask);
-                self.masm
-                    .add64_imm(temp, temp, self.runtime.primitive_storage_cage_base as i64);
-                Address::new(temp, 0)
             }
         }
     }

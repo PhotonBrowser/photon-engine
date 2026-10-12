@@ -227,14 +227,8 @@ impl StyleEngine {
     ) -> bool {
         use super::publication::pseudo_kind::{AFTER, BEFORE, MARKER};
         let inherits = |record: u64| {
-            let Some(table) = self
-                .computed_group_sets
-                .style_record_view(record)
-                .and_then(|view| unsafe { view.longhand_table.as_ref() })
-            else {
-                return true;
-            };
-            properties.iter().any(|&property| table.is_inherited(property))
+            self.properties_inherited_by_record(record, properties)
+                .is_none_or(|inherited| !inherited.is_empty())
         };
         let held = [BEFORE, AFTER, MARKER]
             .into_iter()
@@ -246,6 +240,30 @@ impl StyleEngine {
             .map(|row| row.new_style_record)
             .filter(|&record| record != 0);
         held.chain(moved).any(inherits)
+    }
+
+    /// Those of `properties` that a box with the style record `record` takes from its parent rather than declares, or
+    /// none where the engine holds no such record.
+    pub(crate) fn properties_inherited_by_record(&self, record: u64, properties: &[u16]) -> Option<SmallVec<[u16; 8]>> {
+        // SAFETY: A record's longhand table lives as long as the record, which the engine holds while it views it.
+        let table = self
+            .computed_group_sets
+            .style_record_view(record)
+            .and_then(|view| unsafe { view.longhand_table.as_ref() })?;
+        Some(
+            properties
+                .iter()
+                .copied()
+                .filter(|&property| table.is_inherited(property))
+                .collect(),
+        )
+    }
+
+    /// Whether the style record `record` composes the values of the animations of the element or pseudo-element that
+    /// holds it over its base record.
+    pub(crate) fn record_composes_animations(&self, record: u64) -> bool {
+        super::computed::FinalStyleRecordID::from_raw(record)
+            .is_some_and(super::computed::FinalStyleRecordID::is_animation_overlay)
     }
 
     /// The element the hover targets, as [`Self::set_hover`] last placed it.
@@ -827,11 +845,12 @@ impl StyleEngine {
                     );
                     continue;
                 }
-                let (_, facts) =
+                let (_, _, facts) =
                     self.engine_row_child_reaction_facts(node, row.old_style_record, row.old_style_record, []);
                 self.note_style_reaction_applied(
                     node,
                     reaction,
+                    0,
                     0,
                     facts | style_reaction_applied_fact::INVALIDATION_IS_NONE,
                 );
@@ -854,11 +873,12 @@ impl StyleEngine {
                 let reaction = if absorbed != 0 { absorbed as u8 } else { row.reaction };
                 self.consume_element_style_input(node);
                 self.retained.acknowledge_engine_computed_record(node);
-                let (_, facts) =
+                let (_, _, facts) =
                     self.engine_row_child_reaction_facts(node, row.old_style_record, row.old_style_record, []);
                 self.note_style_reaction_applied(
                     node,
                     reaction,
+                    0,
                     0,
                     facts | style_reaction_applied_fact::INVALIDATION_IS_NONE,
                 );
@@ -877,14 +897,20 @@ impl StyleEngine {
             }
             let damages =
                 std::iter::once(row.record_damage).chain(pseudo_rows.iter().map(|pseudo| pseudo.record_damage));
-            let (inherited_style_groups_changed, mut facts) =
+            let (inherited_style_groups_changed, changed_non_inherited_style_groups, mut facts) =
                 self.engine_row_child_reaction_facts(node, row.old_style_record, row.new_style_record, damages);
             // The host moves the environments below an element whose own moved as it installs the row. Here, the
             // elements below compute again over the environment the engine now assigns their parent, in the next wave.
             if self.hover_row_moves_custom_properties(&row) {
                 facts |= style_reaction_applied_fact::DID_CHANGE_CUSTOM_PROPERTIES;
             }
-            self.note_style_reaction_applied(node, reaction, inherited_style_groups_changed, facts);
+            self.note_style_reaction_applied(
+                node,
+                reaction,
+                inherited_style_groups_changed,
+                changed_non_inherited_style_groups,
+                facts,
+            );
             let install = HoverInstall {
                 element: FfiStyleDelta {
                     reaction,

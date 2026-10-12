@@ -286,6 +286,144 @@ fn swapping_loop_phis_go_through_a_temp_slot() {
 }
 
 #[test]
+fn loop_phis_share_spill_slots_with_their_inputs() {
+    // Values carried around a loop with calls in it need stack slots. Each
+    // phi shares its slot with the value flowing into it over the back edge,
+    // so that nothing moves between slots where both are in theirs.
+    let program = assemble(|label| {
+        vec![
+            Instruction::Enter,
+            Instruction::Mov { dst: l(0), src: a(0) },
+            Instruction::Increment {
+                arith_feedback: 0,
+                dst: l(0),
+            },
+            Instruction::Mov { dst: l(1), src: l(0) },
+            Instruction::Increment {
+                arith_feedback: 0,
+                dst: l(1),
+            },
+            Instruction::Mov { dst: r(6), src: l(1) },
+            Instruction::Increment {
+                arith_feedback: 0,
+                dst: r(6),
+            },
+            Instruction::JumpIf {
+                condition: a(0),
+                true_target: label(8),
+                false_target: label(12),
+            },
+            Instruction::Increment {
+                arith_feedback: 0,
+                dst: l(0),
+            },
+            Instruction::Increment {
+                arith_feedback: 0,
+                dst: l(1),
+            },
+            Instruction::Increment {
+                arith_feedback: 0,
+                dst: r(6),
+            },
+            Instruction::Jump { target: label(7) },
+            Instruction::Add {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: l(0),
+                rhs: l(1),
+            },
+            Instruction::Add {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: r(5),
+                rhs: r(6),
+            },
+            Instruction::Return { value: r(5) },
+        ]
+    });
+    let graph = build(&program);
+    let allocation = allocate_and_verify(&graph);
+    let header = graph.blocks.iter().position(|block| block.is_loop_header).unwrap();
+    let back_edge = graph.blocks[header]
+        .predecessors
+        .iter()
+        .position(|predecessor| predecessor.index() > header)
+        .unwrap();
+    let (mut shared, mut filled) = (0, 0);
+    for phi in &graph.blocks[header].phis {
+        let input = graph.node(*phi).inputs[back_edge];
+        let (phi_slot, input_slot) = (
+            allocation.nodes[phi.index()].spill_slot,
+            allocation.nodes[input.index()].spill_slot,
+        );
+        if let (Some(phi_slot), Some(input_slot)) = (phi_slot, input_slot) {
+            assert_eq!(phi_slot, input_slot, "{}", dump_allocation(&graph, &allocation));
+            shared += 1;
+        }
+        // NB: Where all inputs fill the slot, the phi needs no store to it.
+        if graph
+            .node(*phi)
+            .inputs
+            .iter()
+            .all(|input| allocation.nodes[input.index()].spill_slot == phi_slot)
+        {
+            assert_eq!(phi_spill_store(&graph, &allocation, *phi), None);
+            filled += 1;
+        }
+    }
+    assert_eq!(shared, 2, "{}", dump_allocation(&graph, &allocation));
+    assert!(filled > 0, "{}", dump_allocation(&graph, &allocation));
+}
+
+#[test]
+fn int32_operations_write_over_their_first_input_where_it_dies() {
+    // The first XOR's value dies at the second, whose output then takes its
+    // register: two-address instructions need no copy of it.
+    let program = assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::BitwiseXor {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: a(0),
+            },
+            Instruction::BitwiseXor {
+                arith_feedback: 1,
+                dst: r(6),
+                lhs: r(5),
+                rhs: a(0),
+            },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, crate::bytecode::test_support::test_layout());
+    snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::INT32; 2];
+    let graph = crate::builder::tests::optimized_graph(&snapshot);
+    let allocation = allocate_and_verify(&graph);
+    let xors = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.op
+                == Op::Int32Binary {
+                    op: crate::ir::BinaryOp::BitwiseXor,
+                }
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(xors.len(), 2, "{}", dump_allocation(&graph, &allocation));
+    let second = &allocation.nodes[xors[1]];
+    assert_eq!(
+        second.output,
+        Some(second.inputs[0]),
+        "{}",
+        dump_allocation(&graph, &allocation)
+    );
+}
+
+#[test]
 fn exits_find_constants_registers_and_spilled_values() {
     let program = assemble(|_| {
         vec![

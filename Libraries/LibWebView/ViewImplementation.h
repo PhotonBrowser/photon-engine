@@ -65,6 +65,7 @@
 #include <LibWebCommon/WebView/DictionaryLookup.h>
 #include <LibWebCommon/WebView/PageInfo.h>
 #include <LibWebCommon/WebView/StorageSetResult.h>
+#include <LibWebCommon/WebView/ZoomLevel.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
@@ -182,6 +183,7 @@ public:
     void zoom_in();
     void zoom_out();
     void set_zoom(double zoom_level);
+    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     void reset_zoom();
     double zoom_level() const { return m_zoom_level; }
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
@@ -215,6 +217,7 @@ public:
     void set_preferred_motion(Web::CSS::PreferredMotion);
     // A page created to host documents of the tab in another process takes the preferences the view's page has.
     void send_preferences_to_page(WebContentPage&);
+    virtual void send_system_theme_to_page(WebContentPage&) { }
 
     void notify_cookies_changed(HashTable<String> const& changed_domains, ReadonlySpan<HTTP::Cookie::Cookie> page_cookies, ReadonlySpan<HTTP::Cookie::Cookie> host_cookies);
     void listen_for_host_cookie_changes(DevTools::DevToolsDelegate::OnHostCookieChange);
@@ -571,8 +574,6 @@ protected:
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
     void release_backing_store(i32 bitmap_id);
 
-    static constexpr auto ZOOM_MIN_LEVEL = 0.3;
-    static constexpr auto ZOOM_MAX_LEVEL = 5.0;
     static constexpr auto ZOOM_STEP = 0.1;
 
     explicit ViewImplementation(IsPrivate = IsPrivate::No);

@@ -175,6 +175,7 @@ private:
 
     void request_rendering_opportunity_if_needed();
     void hurry_outstanding_rendering_opportunity();
+    void device_pixels_per_css_pixel_did_change();
     Optional<Web::Compositor::CompositorContextHandle&> rendering_opportunity_context();
     bool hosted_documents_are_hidden() const;
     void schedule_local_rendering_opportunity();
@@ -383,6 +384,8 @@ private:
     size_t m_main_screen_index { 0 };
     Web::DevicePixelSize m_viewport_size;
     double m_device_pixel_ratio { 1.0 };
+    Optional<double> m_pending_device_pixel_ratio_for_testing;
+    Optional<double> m_pending_browser_zoom;
     double m_zoom_level { 1.0 };
     double m_maximum_frames_per_second { 60.0 };
     Web::PageId m_id { 0 };

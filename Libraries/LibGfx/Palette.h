@@ -31,23 +31,13 @@ public:
         return Color::from_bgra(theme().color[(int)role]);
     }
 
-    Gfx::TextAlignment alignment(AlignmentRole role) const
-    {
-        VERIFY((int)role < (int)AlignmentRole::__Count);
-        return theme().alignment[(int)role];
-    }
-
     bool flag(FlagRole role) const
     {
         VERIFY((int)role < (int)FlagRole::__Count);
         return theme().flag[(int)role];
     }
 
-    int metric(MetricRole) const;
-    ByteString path(PathRole) const;
     SystemTheme const& theme() const { return *m_theme_buffer.data<SystemTheme>(); }
-
-    void replace_internal_buffer(Core::AnonymousBuffer);
 
 private:
     explicit PaletteImpl(Core::AnonymousBuffer);
@@ -161,37 +151,13 @@ public:
     Color bright_cyan() const { return color(ColorRole::BrightCyan); }
     Color bright_white() const { return color(ColorRole::BrightWhite); }
 
-    Gfx::TextAlignment title_alignment() const { return alignment(AlignmentRole::TitleAlignment); }
-
-    bool bold_text_as_bright() const { return flag(FlagRole::BoldTextAsBright); }
     bool is_dark() const { return flag(FlagRole::IsDark); }
-    bool title_buttons_icon_only() const { return flag(FlagRole::TitleButtonsIconOnly); }
-
-    int window_border_thickness() const { return metric(MetricRole::BorderThickness); }
-    int window_border_radius() const { return metric(MetricRole::BorderRadius); }
-    int window_title_height() const { return metric(MetricRole::TitleHeight); }
-    int window_title_button_width() const { return metric(MetricRole::TitleButtonWidth); }
-    int window_title_button_height() const { return metric(MetricRole::TitleButtonHeight); }
-
-    ByteString title_button_icons_path() const { return path(PathRole::TitleButtonIcons); }
-    ByteString active_window_shadow_path() const { return path(PathRole::ActiveWindowShadow); }
-    ByteString inactive_window_shadow_path() const { return path(PathRole::InactiveWindowShadow); }
-    ByteString menu_shadow_path() const { return path(PathRole::MenuShadow); }
-    ByteString taskbar_shadow_path() const { return path(PathRole::TaskbarShadow); }
-    ByteString tooltip_shadow_path() const { return path(PathRole::TooltipShadow); }
-    ByteString color_scheme_path() const { return path(PathRole::ColorScheme); }
 
     Color color(ColorRole role) const { return m_impl->color(role); }
-    Gfx::TextAlignment alignment(AlignmentRole role) const { return m_impl->alignment(role); }
     bool flag(FlagRole role) const { return m_impl->flag(role); }
-    int metric(MetricRole role) const { return m_impl->metric(role); }
-    ByteString path(PathRole role) const { return m_impl->path(role); }
 
     void set_color(ColorRole, Color);
-    void set_alignment(AlignmentRole, Gfx::TextAlignment);
     void set_flag(FlagRole, bool);
-    void set_metric(MetricRole, int);
-    void set_path(PathRole, ByteString);
 
     SystemTheme const& theme() const { return m_impl->theme(); }
 

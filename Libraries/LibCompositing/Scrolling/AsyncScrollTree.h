@@ -25,6 +25,9 @@ struct WheelHitTestResult {
     Optional<AsyncScrollNodeID> node_id;
     bool blocked_by_main_thread_region { false };
     bool blocked_by_wheel_event_region { false };
+    // The scroller the wheel is over, which is where the search for `node_id` started. It is set even if neither it
+    // nor any scroller around it can scroll by the delta.
+    Optional<AsyncScrollNodeID> innermost_scroll_node_id {};
 };
 
 struct WheelScrollTarget {
@@ -52,6 +55,11 @@ struct CachedMainThreadWheelEventTarget {
 struct CachedBlockingWheelEventTarget {
     Compositing::ContextRef context;
     Gfx::FloatRect rect;
+    Optional<Gfx::FloatRect> viewport_rect;
+};
+
+struct CachedScrollChainingBarrier {
+    ScrollChainingBarrier barrier;
     Optional<Gfx::FloatRect> viewport_rect;
 };
 
@@ -97,6 +105,9 @@ public:
     // to be covered whenever that cannot be told.
     bool is_covered_by_hit_test_target_painted_after(u32 paint_order_index, Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
     bool scroll_node_is_viewport(AsyncScrollNodeID) const;
+    // Of the scroller and the scrollers around it that a scroll by the delta may be passed on to, the outermost one a
+    // wheel can scroll along the main axis of the delta at all, wherever it is scrolled to.
+    Optional<AsyncScrollNodeID> outermost_scroll_node_wheel_scrollable_along_main_axis_of(AsyncScrollNodeID innermost_node_id, Gfx::FloatPoint delta) const;
     Optional<AsyncScrollNodeID> scroll_node_for_keyboard_scroll(Web::AsyncScrollNodeStableID, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot const&) const;
     Gfx::FloatPoint clamped_scroll_offset_for_node(AsyncScrollNodeID, Gfx::FloatPoint) const;
     AsyncScrollApplication apply_scroll_delta(AsyncScrollNodeID, Gfx::FloatPoint delta, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&, ScrollChaining);
@@ -109,7 +120,7 @@ private:
     static bool can_scroll_node_by_delta(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&, Gfx::FloatPoint);
     static bool can_scroll_node_from_offset_by_delta(AsyncScrollNode const&, Gfx::FloatPoint scroll_offset, Gfx::FloatPoint delta);
 
-    WheelHitTestResult hit_test_result_for_scroll_node(AsyncScrollNodeID, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for) const;
+    WheelHitTestResult hit_test_result_for_scroll_node(AsyncScrollNodeID, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for, ReadonlySpan<AsyncScrollNodeID> scroll_nodes_behind_scroll_chaining_barriers) const;
     WheelHitTestResult hit_test_scroll_node(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool ignore_blocking_wheel_event_regions, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for) const;
     AsyncScrollNode const* scroll_node_for_stable_id(Web::AsyncScrollNodeStableID) const;
     Optional<AsyncScrollNodeID> scrollable_ancestor_for_node(AsyncScrollNodeID, Compositing::ScrollStateSnapshot const&, Gfx::FloatPoint delta) const;
@@ -125,6 +136,8 @@ private:
     Vector<BlockingWheelEventRegion> m_blocking_wheel_event_regions;
     Vector<CachedMainThreadWheelEventTarget> m_cached_main_thread_wheel_event_targets;
     Vector<CachedBlockingWheelEventTarget> m_cached_blocking_wheel_event_targets;
+    Vector<ScrollChainingBarrier> m_scroll_chaining_barriers;
+    Vector<CachedScrollChainingBarrier> m_cached_scroll_chaining_barriers;
     Optional<u64> m_visual_context_tree_structural_epoch;
     Compositing::ScrollStateSnapshot m_scroll_state_snapshot;
     bool m_has_blocking_wheel_event_region_covering_viewport { false };

@@ -165,6 +165,10 @@ pub fn run(graph: &mut Graph) {
     }
     let mut dominators = Dominators::compute(graph);
     if add_preheaders(graph, &dominators) {
+        // NB: The phis of headers that merged their entries in a preheader
+        //     only take the value the preheader brings where the loop leaves
+        //     it as it is, which is then invariant in the loop.
+        edit::remove_trivial_phis(graph);
         dominators = Dominators::compute(graph);
     }
     let loops = find_loops(graph, &dominators);
@@ -181,12 +185,13 @@ pub fn run(graph: &mut Graph) {
     // Inner loops come later in this order; hoisting out of them first lets
     // their invariants move on out of the outer loops.
     for loop_ in loops.iter().rev() {
-        // NB: Calls and other code that runs may write anything.
+        // NB: Code that runs may write anything. Calls of runtime helpers
+        //     that run no code write what they say they do.
         let mut writes = Locations::NONE;
         for block in loop_.blocks.iter() {
             for node in graph.block_nodes(BlockId::from_index(block)) {
                 let properties = graph.node(node).op.properties();
-                writes |= if properties.is_call || properties.runs_code {
+                writes |= if properties.runs_code {
                     Locations::ALL
                 } else {
                     properties.writes

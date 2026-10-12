@@ -23,6 +23,8 @@ use crate::ir::Float64UnaryOp;
 use crate::ir::NodeId;
 use crate::ir::Op;
 use crate::snapshot::CellId;
+use crate::snapshot::HelperOperand;
+use crate::snapshot::HelperResult;
 use crate::snapshot::Intrinsic;
 use crate::snapshot::value_feedback;
 
@@ -37,6 +39,9 @@ pub enum StringCharacter {
 
 /// How many values `try_build_array_push()` appends inline at most.
 const MAX_INLINE_PUSHED_VALUES: usize = 8;
+
+/// How many arguments `try_build_math_min_max()` compares inline at most.
+const MAX_MIN_MAX_ARGUMENTS: usize = 8;
 
 impl GraphBuilder<'_> {
     /// Builds `Math.<op>(argument)`, a `CallBuiltinMath*` instruction, for
@@ -332,12 +337,13 @@ impl GraphBuilder<'_> {
         Ok(Some(Flow::Continue))
     }
 
-    /// Builds `Math.min(a, b)` and `Math.max(a, b)`, `Call`s whose feedback
-    /// saw `Math.min` or `Math.max` as their single callee, and only int32
-    /// results, for int32 arguments: the smaller or larger one. The code
-    /// exits where the callee is another function or an argument is no
-    /// int32. Returns `None`, having built nothing that matters, if it is not
-    /// such a call or an argument is a constant that is no int32.
+    /// Builds `Math.min` and `Math.max` of up to `MAX_MIN_MAX_ARGUMENTS`
+    /// arguments, `Call`s whose feedback saw `Math.min` or `Math.max` as
+    /// their single callee, as `Int32Min` or `Int32Max` of int32 arguments
+    /// where the results were int32 values, and as `Float64Min` or
+    /// `Float64Max` of numbers otherwise, the code exiting for other
+    /// arguments. Returns `None`, having built nothing, if it is not such a
+    /// call, or where arguments that were no numbers exited before.
     pub(super) fn try_build_math_min_max(&mut self, instruction: &Instruction) -> Result<Option<Flow>, CompileFailure> {
         let Instruction::Call {
             value_feedback,
@@ -350,14 +356,10 @@ impl GraphBuilder<'_> {
         else {
             return Ok(None);
         };
-        let [lhs, rhs] = arguments.as_slice() else {
-            return Ok(None);
-        };
-        // NB: Int32 results do not prove int32 arguments (Math.min(1, 2.5)
-        //     is 1). Arguments that are no int32 values exit, and code compiled
-        //     after the exit calls the function.
-        let results = self.function.executable.feedback.value.get(usize::from(value_feedback));
-        if results != Some(&value_feedback::INT32) {
+        if arguments.is_empty()
+            || arguments.len() > MAX_MIN_MAX_ARGUMENTS
+            || arguments.iter().any(|operand| self.holds_virtual_arguments(*operand))
+        {
             return Ok(None);
         }
         let Some((target, intrinsic)) = self
@@ -366,31 +368,96 @@ impl GraphBuilder<'_> {
         else {
             return Ok(None);
         };
-        let comparison = match intrinsic {
-            Intrinsic::MathMin => Comparison::LessThan,
-            Intrinsic::MathMax => Comparison::GreaterThan,
+        let max = match intrinsic {
+            Intrinsic::MathMin => false,
+            Intrinsic::MathMax => true,
             _ => return Ok(None),
         };
-        if !self.may_speculate(ExitKind::BadCallTarget)
-            || !self.may_speculate(ExitKind::NotInt32)
-            || [lhs, rhs]
-                .into_iter()
-                .any(|operand| self.holds_virtual_arguments(*operand))
-        {
+        if !self.may_speculate(ExitKind::BadCallTarget) {
             return Ok(None);
         }
-        let (lhs, rhs) = (self.read_value(*lhs)?, self.read_value(*rhs)?);
-        if !self.may_be_int32(&[lhs, rhs]) {
+        let values = arguments
+            .iter()
+            .map(|operand| self.read_value(*operand))
+            .collect::<Result<Vec<_>, _>>()?;
+        // NB: Int32 results do not prove int32 arguments (Math.min(1, 2.5)
+        //     is 1). Arguments that are no int32 values exit, and code compiled
+        //     after the exit computes with doubles. The results are numbers
+        //     either way.
+        let results = self.function.executable.feedback.value.get(usize::from(value_feedback));
+        let int32 = results == Some(&value_feedback::INT32)
+            && self.may_speculate(ExitKind::NotInt32)
+            && self.may_be_int32(&values);
+        if !int32 && !self.may_speculate(ExitKind::BadType) {
             return Ok(None);
         }
         self.check_callee(callee, target)?;
-        let (lhs, rhs) = (self.int32(lhs), self.int32(rhs));
-        // NB: Phis the builder makes merge tagged values, which
-        //     representation selection unboxes.
-        let boxed = [lhs, rhs].map(|value| self.emit(Op::BoxInt32, vec![value], Some(Repr::Tagged)));
-        let (left, right) = self.branch_both_ways(BranchCondition::Int32(comparison), vec![lhs, rhs]);
-        self.join_blocks(vec![left, right]);
-        let result = self.add_phi(boxed.to_vec());
+        let result = if int32 {
+            let op = if max { Op::Int32Max } else { Op::Int32Min };
+            let result = values
+                .into_iter()
+                .map(|value| self.int32(value))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .reduce(|result, value| self.emit(op.clone(), vec![result, value], Some(Repr::Int32)))
+                .expect("there are arguments");
+            self.emit(Op::BoxInt32, vec![result], Some(Repr::Tagged))
+        } else {
+            let op = if max { Op::Float64Max } else { Op::Float64Min };
+            let result = values
+                .into_iter()
+                .map(|value| self.number(value))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .reduce(|result, number| self.emit(op.clone(), vec![result, number], Some(Repr::Float64)))
+                .expect("there are arguments");
+            self.emit(Op::BoxFloat64, vec![result], Some(Repr::Tagged))
+        };
+        self.write(dst, result)?;
+        Ok(Some(Flow::Continue))
+    }
+
+    /// Builds `Math.imul(a, b)` calls, if the site saw only that function
+    /// and int32 arguments, as the low 32 bits of the int32 product.
+    /// Returns `None`, having built nothing, if the `Call` is no such call.
+    pub(super) fn try_build_math_imul(&mut self, instruction: &Instruction) -> Result<Option<Flow>, CompileFailure> {
+        let Instruction::Call {
+            call_feedback,
+            dst,
+            callee,
+            ref arguments,
+            ..
+        } = *instruction
+        else {
+            return Ok(None);
+        };
+        // NB: ToInt32 of an absent argument (undefined) is 0, which the slow
+        //     path handles like any other call.
+        if arguments.len() < 2 || arguments.iter().any(|operand| self.holds_virtual_arguments(*operand)) {
+            return Ok(None);
+        }
+        let Some((target, Intrinsic::MathImul)) = self
+            .call_feedback(call_feedback)
+            .and_then(|feedback| feedback.monomorphic_intrinsic())
+        else {
+            return Ok(None);
+        };
+        if !self.may_speculate(ExitKind::BadCallTarget) || !self.may_speculate(ExitKind::NotInt32) {
+            return Ok(None);
+        }
+        // NB: Only the first two arguments matter; the others are only read.
+        let values = [self.read_value(arguments[0])?, self.read_value(arguments[1])?];
+        if !self.may_be_int32(&values) {
+            return Ok(None);
+        }
+        self.check_callee(callee, target)?;
+        let [lhs, rhs] = values.map(|value| self.int32(value));
+        let product = self.emit(
+            Op::Int32WrappingBinary { op: BinaryOp::Mul },
+            vec![lhs, rhs],
+            Some(Repr::Int32),
+        );
+        let result = self.emit(Op::BoxInt32, vec![product], Some(Repr::Tagged));
         self.write(dst, result)?;
         Ok(Some(Flow::Continue))
     }
@@ -557,6 +624,96 @@ impl GraphBuilder<'_> {
         };
         self.end_hot_path(&mut slow_paths, vec![result]);
         let result = self.join_hot_paths(slow_paths).expect("calls have a value");
+        self.write(*dst, result)?;
+        Ok(Some(Flow::Continue))
+    }
+
+    /// Builds calls of builtins that JIT code calls through their runtime
+    /// helpers (see `Intrinsic::helper_call()`), if the site saw only that
+    /// builtin, as a `CallIntrinsic` node for a `this` value and arguments
+    /// of the kinds the helper takes. The call runs in a cold slow path
+    /// otherwise. Returns `None`, having built nothing, if the `Call` is no
+    /// such call.
+    pub(super) fn try_build_helper_call(&mut self, instruction: &Instruction) -> Result<Option<Flow>, CompileFailure> {
+        let Instruction::Call {
+            call_feedback,
+            dst,
+            callee,
+            this_value,
+            arguments,
+            ..
+        } = instruction
+        else {
+            return Ok(None);
+        };
+        let Some((intrinsic, call)) = self
+            .peek_intrinsic_callee(*call_feedback)
+            .and_then(|intrinsic| Some((intrinsic, intrinsic.helper_call()?)))
+        else {
+            return Ok(None);
+        };
+        assert_ne!(
+            (self.runtime.helper_calls.0)(intrinsic),
+            0,
+            "{intrinsic:?} has a HelperCall but no runtime helper"
+        );
+        // NB: Helpers run in the realm of the calling code.
+        let realm = self
+            .function
+            .executable
+            .function
+            .map_or(self.runtime.realm, |function| function.realm);
+        let builtin_realm = self
+            .call_feedback(*call_feedback)
+            .and_then(|feedback| feedback.native_call)
+            .map(|native| native.realm);
+        if builtin_realm != Some(realm) {
+            return Ok(None);
+        }
+        // NB: Calls without a required argument pass undefined, which the
+        //     slow path converts.
+        let passes_required_arguments = call
+            .arguments
+            .iter()
+            .skip(arguments.len())
+            .all(|operand| matches!(operand, HelperOperand::Int32 { absent: Some(_) }));
+        if !passes_required_arguments
+            || self.holds_virtual_arguments(*this_value)
+            || arguments.iter().any(|operand| self.holds_virtual_arguments(*operand))
+            || self.checked_intrinsic_callee(*call_feedback, *callee)?.is_none()
+        {
+            return Ok(None);
+        }
+        let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
+        let mut inputs = Vec::with_capacity(1 + call.arguments.len());
+        let operands = std::iter::once(Some(*this_value))
+            .chain((0..call.arguments.len()).map(|index| arguments.get(index).copied()));
+        for (operand, kind) in operands.zip(std::iter::once(call.receiver).chain(call.arguments.iter().copied())) {
+            let input = match (operand, kind) {
+                (Some(operand), HelperOperand::Value) => self.read(operand)?,
+                (Some(operand), HelperOperand::String) => {
+                    let value = self.read(operand)?;
+                    self.branch_to_slow_path(&mut slow_paths, BranchCondition::String, vec![value], true)
+                }
+                (Some(operand), HelperOperand::Int32 { .. }) => {
+                    let value = self.read(operand)?;
+                    self.int32_or_slow_path(&mut slow_paths, value)
+                }
+                (None, HelperOperand::Int32 { absent: Some(absent) }) => self.int32_constant(absent),
+                (None, _) => unreachable!("calls pass the required arguments"),
+            };
+            inputs.push(input);
+        }
+        let result = self.emit(Op::CallIntrinsic { intrinsic }, inputs, Some(call.result.repr()));
+        let result = match call.result {
+            HelperResult::Int32 => self.emit(Op::BoxInt32, vec![result], Some(Repr::Tagged)),
+            HelperResult::Bool => self.emit(Op::BoxBool, vec![result], Some(Repr::Tagged)),
+            HelperResult::String => result,
+            HelperResult::Value => self.branch_if_empty(&mut slow_paths, result),
+        };
+        let result = self
+            .join_slow_paths(slow_paths, Some(result))
+            .expect("calls have a value");
         self.write(*dst, result)?;
         Ok(Some(Flow::Continue))
     }

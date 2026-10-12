@@ -2172,9 +2172,7 @@ fn font_metrics_for_length_resolution(style: StyleValues<'_>) -> crate::css::sty
 }
 
 /// Snapshot the document element's font metrics before a layout run narrows its read scope.
-pub(super) fn document_root_font_metrics(
-    arena: &LayoutNodeArena,
-) -> Option<crate::css::style_compute::FfiFontMetrics> {
+pub(super) fn document_root_font_metrics(arena: &LayoutNodeArena) -> Option<crate::css::style_compute::FfiFontMetrics> {
     let viewport = arena.layout_root();
     if viewport.is_invalid() {
         return None;
