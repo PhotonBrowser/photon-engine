@@ -6,11 +6,17 @@
 
 #pragma once
 
-#include <AK/kmalloc.h>
 #include <AK/HashTable.h>
+#include <AK/kmalloc.h>
 #include <LibCore/Timer.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/TabPerformanceStats.h>
+
+namespace Requests {
+
+class RequestControlClient;
+
+}
 
 namespace WebView {
 
@@ -22,13 +28,14 @@ public:
     bool enabled() const { return m_enabled; }
     static void did_present(u64 view_id);
     static void forget_view(u64 view_id);
-    static void request_server_did_restart();
     static void set_view_enabled(u64 view_id, bool enabled);
+    // Every RequestServer reports its clients' network use to the monitor.
+    static void configure(Requests::RequestControlClient&);
 
 private:
     TabPerformanceMonitor();
     virtual void config_variable_changed(ConfigVariableID) override;
-    void update_monitoring(bool restart = false);
+    void update_monitoring();
     void sample();
 
     bool m_enabled { false };

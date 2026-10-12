@@ -10,6 +10,7 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/ProcessManager.h>
+#include <LibWebView/RequestServerManager.h>
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -27,10 +28,34 @@ TabPerformanceMonitor& TabPerformanceMonitor::the()
     return *s_monitor;
 }
 
-void TabPerformanceMonitor::request_server_did_restart()
+void TabPerformanceMonitor::configure(Requests::RequestControlClient& requests)
 {
-    if (s_monitor && s_monitor->m_enabled)
-        s_monitor->update_monitoring(true);
+    if (!s_monitor)
+        return;
+    requests.async_set_performance_monitor_enabled(s_monitor->m_enabled);
+    if (!s_monitor->m_enabled) {
+        requests.on_network_usage = nullptr;
+        return;
+    }
+    requests.on_network_usage = [](Vector<Requests::NetworkUsage> usage, u64 interval_microseconds) {
+        if (!s_monitor || !s_monitor->m_enabled)
+            return;
+        auto now = MonotonicTime::now();
+        for (auto const& entry : usage) {
+            Optional<u64> owner;
+            WebContentClient::for_each_client([&](WebContentClient& client) {
+                if (client.pid() != entry.process_id)
+                    return IterationDecision::Continue;
+                if (auto* page = client.page(entry.page_id))
+                    owner = page->view().view_id();
+                return IterationDecision::Break;
+            });
+            if (!owner.has_value())
+                owner = WorkerProcessManager::the().exclusive_performance_owner(entry.process_id);
+            if (owner.has_value())
+                s_monitor->m_tabs.ensure(*owner).add_network_bytes(now, interval_microseconds, entry.download_bytes, entry.upload_bytes);
+        }
+    };
 }
 
 void TabPerformanceMonitor::forget_view(u64 view_id)
@@ -65,43 +90,24 @@ void TabPerformanceMonitor::config_variable_changed(ConfigVariableID id)
     update_monitoring();
 }
 
-void TabPerformanceMonitor::update_monitoring(bool restart)
+void TabPerformanceMonitor::update_monitoring()
 {
     auto should_enable = m_setting_enabled || !m_explicitly_enabled_views.is_empty();
-    if (!restart && should_enable == m_enabled)
+    if (should_enable == m_enabled)
         return;
 
-    auto& requests = Application::request_server_control_client();
-    if (m_enabled) {
+    if (m_enabled)
         m_timer = nullptr;
-        requests.on_network_usage = nullptr;
-        requests.async_set_performance_monitor_enabled(false);
-    }
     m_enabled = should_enable;
-    requests.async_set_performance_monitor_enabled(m_enabled);
+    Application::request_server_manager().for_each_instance([](RequestServerInstance& instance) {
+        configure(instance.control_client());
+        return IterationDecision::Continue;
+    });
     if (!m_enabled) {
         m_tabs.clear();
         return;
     }
-    requests.on_network_usage = [this](Vector<Requests::NetworkUsage> usage, u64 interval_microseconds) {
-        if (!m_enabled)
-            return;
-        auto now = MonotonicTime::now();
-        for (auto const& entry : usage) {
-            Optional<u64> owner;
-            WebContentClient::for_each_client([&](WebContentClient& client) {
-                if (client.pid() != entry.process_id)
-                    return IterationDecision::Continue;
-                if (auto* page = client.page(entry.page_id))
-                    owner = page->view().view_id();
-                return IterationDecision::Break;
-            });
-            if (!owner.has_value())
-                owner = WorkerProcessManager::the().exclusive_performance_owner(entry.process_id);
-            if (owner.has_value())
-                m_tabs.ensure(*owner).add_network_bytes(now, interval_microseconds, entry.download_bytes, entry.upload_bytes);
-        }
-    };
+
     m_timer = Core::Timer::create_repeating(500, [this] { sample(); });
     m_timer->start();
     sample();

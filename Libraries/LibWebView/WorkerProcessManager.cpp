@@ -12,6 +12,7 @@
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/RequestServerManager.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -204,14 +205,27 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
                 client->request_server_site_bindings().bind_sites_of(web_worker_owner.client->request_server_site_bindings());
             });
 
-        auto request_server_connection = TRY(connect_new_request_server_client(*session, RequestServer::SiteBinding::Bound));
+        // The worker's requests go through the RequestServer of its owner's site.
+        auto request_server_instance = [&]() -> RefPtr<RequestServerInstance> {
+            Optional<int> owner_client_id = owner.client.visit(
+                [&](WebContentOwner const& web_content_owner) { return web_content_owner.client ? web_content_owner.client->request_server_site_bindings().client_id() : Optional<int> {}; },
+                [&](WebWorkerOwner const& web_worker_owner) { return web_worker_owner.client->request_server_site_bindings().client_id(); });
+            if (owner_client_id.has_value()) {
+                if (auto instance = RequestServerManager::the().instance_for_client(*owner_client_id))
+                    return instance;
+            }
+            return nullptr;
+        }();
+        if (!request_server_instance)
+            request_server_instance = TRY(RequestServerManager::the().browser_instance(*session));
+        auto request_server_connection = TRY(RequestServerManager::the().connect_new_client(*request_server_instance, *session, RequestServer::SiteBinding::Bound));
         auto image_decoder = TRY(launch_image_decoder_process());
 #if defined(HAVE_WASM_COMPILER_SERVICE)
         auto wasm_compiler_handle = TRY(connect_new_wasm_compiler_client());
 #endif
 
         client->request_server_site_bindings().did_connect(request_server_connection.client_id);
-        client->async_connect_to_request_server(move(request_server_connection.handle));
+        client->async_connect_to_request_server(move(request_server_connection.handle), request_server_connection.client_id);
         client->async_set_site_compatibility_data(Application::the().site_compatibility_data());
         connect_to_image_decoder(*client, move(image_decoder));
 #if defined(HAVE_WASM_COMPILER_SERVICE)
@@ -404,16 +418,11 @@ void WorkerProcessManager::for_each_request_server_site_bindings(Function<Iterat
     }
 }
 
-ErrorOr<void> WorkerProcessManager::reconnect_to_request_server()
-{
-    return reconnect_to_request_server([](auto const&) { return true; });
-}
-
-ErrorOr<void> WorkerProcessManager::reconnect_to_request_server(Function<bool(WorkerAgent const&)> should_reconnect)
+ErrorOr<void> WorkerProcessManager::reconnect_to_request_server(RequestServerInstance& instance, Function<bool(RequestServerSiteBindings const&)> should_reconnect)
 {
     for (auto& entry : m_agents) {
         auto& agent = entry.value;
-        if (!agent.client->is_open() || !should_reconnect(agent))
+        if (!agent.client->is_open() || !should_reconnect(agent.client->request_server_site_bindings()))
             continue;
 
         // A worker whose session is gone has nothing left to fetch for.
@@ -421,9 +430,9 @@ ErrorOr<void> WorkerProcessManager::reconnect_to_request_server(Function<bool(Wo
         if (!session)
             continue;
 
-        auto request_server_connection = TRY(connect_new_request_server_client(*session, RequestServer::SiteBinding::Bound));
+        auto request_server_connection = TRY(RequestServerManager::the().connect_new_client(instance, *session, RequestServer::SiteBinding::Bound));
         agent.client->request_server_site_bindings().did_connect(request_server_connection.client_id);
-        agent.client->async_connect_to_request_server(move(request_server_connection.handle));
+        agent.client->async_connect_to_request_server(move(request_server_connection.handle), request_server_connection.client_id);
     }
     return {};
 }
@@ -447,9 +456,14 @@ ErrorOr<void> WorkerProcessManager::simulate_request_server_connection_loss_for_
     for (auto& client : clients) {
         auto session = client->session();
         VERIFY(session);
-        auto request_server_connection = TRY(connect_new_request_server_client(*session, RequestServer::SiteBinding::Bound));
+        RefPtr<RequestServerInstance> instance;
+        if (auto client_id = client->request_server_site_bindings().client_id(); client_id.has_value())
+            instance = RequestServerManager::the().instance_for_client(*client_id);
+        if (!instance)
+            instance = TRY(RequestServerManager::the().browser_instance(*session));
+        auto request_server_connection = TRY(RequestServerManager::the().connect_new_client(*instance, *session, RequestServer::SiteBinding::Bound));
         client->request_server_site_bindings().did_connect(request_server_connection.client_id);
-        auto response = client->send_sync_but_allow_failure<Messages::WebWorkerServer::SimulateRequestServerConnectionLossAndReconnectForTesting>(move(request_server_connection.handle));
+        auto response = client->send_sync_but_allow_failure<Messages::WebWorkerServer::SimulateRequestServerConnectionLossAndReconnectForTesting>(move(request_server_connection.handle), request_server_connection.client_id);
         if (!response)
             return Error::from_string_literal("WebWorker disconnected while reconnecting to RequestServer");
     }
