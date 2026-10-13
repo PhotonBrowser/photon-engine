@@ -96,24 +96,13 @@ static ErrorOr<GpuBackingStore> create_shared_gpu_backing_store(Gfx::IntSize siz
 }
 #endif
 
-// A published store is released by the UI when it presents the next one, but on macOS the UI hands the
-// surface itself to the window server, which keeps reading it until it has composited the replacement.
-// A third store lets the compositor keep rendering through that window instead of waiting for it.
-// A client that samples published stores on its own GPU holds two: the one it displays, and the next one until its
-// GPU work for that frame is under way. A fourth store lets the compositor render a frame while both are held.
-static size_t backing_store_count_for(bool should_publish, [[maybe_unused]] BackingStoreManager::ClientSamplesOnGpu client_samples_on_gpu)
-{
-#ifdef AK_OS_MACOS
-    if (should_publish)
-        return client_samples_on_gpu == BackingStoreManager::ClientSamplesOnGpu::Yes ? 4 : 3;
-#else
-    (void)should_publish;
-#endif
-    return 2;
-}
+// Keep the initial front buffer plus one render target. If the window server or the client GPU
+// still holds a replaced surface, the pending-frame path grows the pool on demand; its idle
+// retirement path gives those temporary stores back again.
+static constexpr size_t initial_backing_store_count = 2;
 
 Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_stores_if_needed(
-    Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress, bool should_publish, ClientSamplesOnGpu client_samples_on_gpu)
+    Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (viewport_size.is_empty())
         return {};
@@ -136,10 +125,9 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
     if (force_reallocate || m_allocated_size.is_empty() || !m_allocated_size.contains(viewport_size)) {
         m_allocated_size = allocation_size;
         ++m_pool_epoch;
-        auto buffer_count = backing_store_count_for(should_publish, client_samples_on_gpu);
         Vector<i32> bitmap_ids;
-        bitmap_ids.ensure_capacity(buffer_count);
-        for (size_t i = 0; i < buffer_count; ++i)
+        bitmap_ids.ensure_capacity(initial_backing_store_count);
+        for (size_t i = 0; i < initial_backing_store_count; ++i)
             bitmap_ids.append(m_next_bitmap_id++);
         return Allocation { .size = allocation_size, .bitmap_ids = move(bitmap_ids) };
     }
