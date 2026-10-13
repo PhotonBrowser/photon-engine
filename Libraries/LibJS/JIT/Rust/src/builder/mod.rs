@@ -326,7 +326,8 @@ fn decoded_function<'a>(
 
 struct FunctionAnalysis {
     cfg: Cfg,
-    liveness: Liveness,
+    /// Liveness without and with arguments observable through `f.arguments`.
+    liveness: [OnceCell<Liveness>; 2],
     loop_phi_slots: Vec<BitSet>,
     loops_replacing_environments: Vec<bool>,
     written_constants: BitSet,
@@ -387,6 +388,7 @@ impl<'a> Function<'a> {
         index: u32,
         executable: &'a ExecutableSnapshot,
         decoded: &'a DecodedFunction,
+        has_legacy_arguments: bool,
     ) -> Result<Self, CompileFailure> {
         let layout = executable.layout;
         let instructions = decoded.instructions.as_slice();
@@ -399,7 +401,6 @@ impl<'a> Function<'a> {
                         reason: "invalid control flow",
                     }
                 })?;
-                let liveness = Liveness::compute(instructions, &cfg, &layout);
                 let loop_phi_slots = loop_phi_slots(&cfg);
                 let loops_replacing_environments = loops_replacing_environments(&cfg, instructions);
                 let written_constants = written_constants(instructions, &layout);
@@ -414,7 +415,7 @@ impl<'a> Function<'a> {
                 }
                 Ok(FunctionAnalysis {
                     cfg,
-                    liveness,
+                    liveness: [OnceCell::new(), OnceCell::new()],
                     loop_phi_slots,
                     loops_replacing_environments,
                     written_constants,
@@ -424,6 +425,8 @@ impl<'a> Function<'a> {
             })
             .as_ref()
             .map_err(|error| *error)?;
+        let liveness = analysis.liveness[usize::from(has_legacy_arguments)]
+            .get_or_init(|| Liveness::compute(instructions, &analysis.cfg, &layout, has_legacy_arguments));
         let block_count = analysis.cfg.blocks.len();
         Ok(Self {
             index,
@@ -431,7 +434,7 @@ impl<'a> Function<'a> {
             layout,
             instructions,
             cfg: &analysis.cfg,
-            liveness: &analysis.liveness,
+            liveness,
             ir_blocks: vec![None; block_count],
             incoming: vec![Vec::new(); block_count],
             started: vec![false; block_count],
@@ -456,15 +459,9 @@ impl<'a> Function<'a> {
         self.inline.is_some()
     }
 
-    /// Whether this is an inlined callee with legacy `arguments`: a function
-    /// that is not strict.
+    /// Whether this inlined call must preserve legacy `arguments`.
     fn has_legacy_arguments(&self) -> bool {
-        self.is_virtual() && self.is_non_strict_function()
-    }
-
-    /// Whether this is a function that is not strict (and no builtin).
-    fn is_non_strict_function(&self) -> bool {
-        !self.executable.builtin && self.executable.function.is_some_and(|function| !function.strict)
+        self.inline.as_ref().is_some_and(|call| call.has_legacy_arguments)
     }
 }
 
@@ -512,14 +509,23 @@ impl<'a> GraphBuilder<'a> {
             pc: 0,
             reason: "no executable",
         })?;
-        let function = Function::new(0, executable, decoded_function(executable, &decoded[0])?)?;
+        let function = Function::new(0, executable, decoded_function(executable, &decoded[0])?, false)?;
         let slot_count = function.layout.tracked_slot_count();
+        let arguments_base = function.layout.arguments_base();
+        let legacy_arguments = if executable.supports_legacy_arguments {
+            arguments_base..arguments_base + function.layout.number_of_arguments
+        } else {
+            0..0
+        };
         Ok(Self {
             snapshot,
             runtime: &snapshot.runtime,
             has_run,
             decoded,
-            graph: Graph::default(),
+            graph: Graph {
+                legacy_arguments,
+                ..Graph::default()
+            },
             order: Vec::new(),
             constants: HashMap::default(),
             block: BlockId(0),
@@ -1182,16 +1188,19 @@ impl<'a> GraphBuilder<'a> {
         };
         // NB: Inlined frames have no memory to be out of sync with.
         let is_virtual = self.function.is_virtual();
-        let state = &mut self.frame.slots[slot];
-        if *state
+        let writes_memory = !is_virtual && self.graph.legacy_arguments.contains(&operand.raw());
+        if self.frame.slots[slot]
             != (SlotState::Value {
                 node: value,
                 in_sync: true,
             })
         {
-            *state = SlotState::Value {
+            if writes_memory {
+                self.emit(Op::StoreSlot { slot: operand.raw() }, vec![value], None);
+            }
+            self.frame.slots[slot] = SlotState::Value {
                 node: value,
-                in_sync: is_virtual,
+                in_sync: is_virtual || writes_memory,
             };
         }
         Ok(())

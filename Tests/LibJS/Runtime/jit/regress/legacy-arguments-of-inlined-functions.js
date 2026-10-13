@@ -62,3 +62,98 @@ test("a function called by an inlined function reads its legacy arguments withou
     );
     expect(failures).toEqual([]);
 });
+
+test("a function called by an inlined function adds a property to an object in its legacy arguments", () => {
+    const failures = compareCompiledWithInterpreter(
+        () => {
+            function addProperty(add) {
+                // A for-in loop keeps this function from being inlined.
+                for (const key in {}) {
+                }
+                if (add) middle.arguments[0].z = 3;
+            }
+            function middle(object, add) {
+                addProperty(add);
+                object.y = 2;
+            }
+            return add => {
+                const object = { x: 1 };
+                middle(object, add);
+                return object;
+            };
+        },
+        { warmUp: () => [false], probes: { add: () => [true] } }
+    );
+    expect(failures).toEqual([]);
+});
+
+test("a function called by an inlined function changes a property of an object in its legacy arguments", () => {
+    const failures = compareCompiledWithInterpreter(
+        () => {
+            function changeProperty(change) {
+                // A for-in loop keeps this function from being inlined.
+                for (const key in {}) {
+                }
+                if (change) middle.arguments[0].x = 2;
+            }
+            function middle(object, change) {
+                changeProperty(change);
+            }
+            return change => {
+                const object = { x: 1 };
+                middle(object, change);
+                return object.x;
+            };
+        },
+        { warmUp: () => [false], probes: { change: () => [true] } }
+    );
+    expect(failures).toEqual([]);
+});
+
+test("a function called by an inlined function reads its legacy arguments after a branch", () => {
+    const failures = compareCompiledWithInterpreter(
+        () => {
+            function readArguments(read) {
+                // A for-in loop keeps this function from being inlined.
+                for (const key in {}) {
+                }
+                if (read) return [...middle.arguments];
+            }
+            function middle(value, flag, read) {
+                if (flag) value = 1;
+                else value = 2;
+                return readArguments(read);
+            }
+            jit.neverCompile(middle);
+            return (flag, read) => middle(0, flag, read);
+        },
+        { warmUp: (log, i) => [i % 2 === 0, false], probes: { read: () => [true, true] } }
+    );
+    expect(failures).toEqual([]);
+});
+
+test("functions called by the compiled function read a parameter it reassigned from its legacy arguments", () => {
+    const failures = compareCompiledWithInterpreter(
+        () => {
+            function readArgument(read) {
+                // A for-in loop keeps this function from being inlined.
+                for (const key in {}) {
+                }
+                if (read) return outer.arguments[0].x;
+            }
+            function middle(read) {
+                return readArgument(read);
+            }
+            function outer(object, count, read) {
+                if (count > 1) object = { x: 1 };
+                else object = { x: 2 };
+                const afterBranch = readArgument(read);
+                for (let i = 0; i < count; ++i) object = { x: i + 3 };
+                return [afterBranch, middle(read)];
+            }
+            return outer;
+        },
+        { warmUp: (log, i) => [null, i % 3, false], probes: { read: () => [null, 2, true] } }
+    );
+    expect(failures).toEqual([]);
+});

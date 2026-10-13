@@ -12,9 +12,12 @@ snapshots, installs code, enters it and translates its state back into interpret
 
 LibJS has two tiers: the bytecode interpreter, whose instructions keep per-site caches and
 feedback, and this optimizing JIT. An executable that uses up its tier-up budget (calls and loop
-iterations) is snapshotted and compiled on the compile thread. The interpreter keeps running it
-meanwhile; the main thread installs the code when the job finishes. Loops that run long enough
-enter compiled code at their back edges (on-stack replacement).
+iterations) is snapshotted and compiled on one of the compile threads. The interpreter keeps running
+it meanwhile; the main thread installs the code when the job finishes. Loops that run long enough
+enter compiled code at their back edges (on-stack replacement). A call from compiled code into a
+function the interpreter runs counts as several invocations of it (`callee-boost`): code hot enough
+to be compiled calls it, so it is likely to be hot as well, and there is no baseline tier to run it
+in meanwhile.
 
 There is no baseline tier. The interpreter's caches are the baseline: the JIT translates what they
 saw into speculation, and leaves to the interpreter wherever a speculation fails.
@@ -47,8 +50,10 @@ memory holds it or which value holds it (and whether memory holds that too). Mer
 headers never write frame memory: a slot that every path leaves in memory stays there, a slot the
 paths disagree on (or a loop assigns) gets a phi, with loads at the predecessors that only have it
 in memory. Frame memory is written only where something reads it: before calls that read the
-frame (`StoreSlot`), and by exits and leaves through the translator. The this value register is
-the exception at loop headers: slow paths write it to memory, so loops keep it there.
+frame (`StoreSlot`), where the compiled function assigns an argument that its legacy `arguments`
+shows (which any code it calls can read), and by exits and leaves through the translator. The
+this value register is the exception at loop headers: slow paths write it to memory, so loops
+keep it there.
 
 ### 3.1 Effects
 
@@ -116,7 +121,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | Constant | A NaN-boxed constant. | | | | cse |
 | Phi | One input per predecessor, in predecessor order. | | | | |
 | LoadSlot | Reads a frame slot. | | Frame | | |
-| StoreSlot | Writes input 0 to a frame slot: a reserved register (the this value, the saved lexical environment), a written constant, or a slot the next call reading the frame reads. The verifier enforces this. | | | Frame | |
+| StoreSlot | Writes input 0 to a frame slot: a reserved register (the this value, the saved lexical environment), a written constant, an argument the legacy `arguments` shows, or a slot the next call reading the frame reads. The verifier enforces this. | | | Frame | |
 | BoxInt32, BoxBool | The tagged value of an unboxed input. | | | | cse |
 | CheckInt32 | Input 0 as an int32; exits unless it is one. | E | | | cse |
 | CheckNumber | Input 0 as a float64; exits unless it is a number. | E | | | cse |
@@ -414,6 +419,8 @@ LIBJS_JIT=threshold=100,help ./Build/release/bin/js script.js
 | `threshold=N`           | 400     | How many invocations make a function hot, after its warm-up. Loop iterations count as a fraction of an invocation. |
 | `warmup=N`              | 8       | How many invocations a function runs before the interpreter collects feedback for it.                              |
 | `sync`                  | off     | Compile on the main thread when a function gets hot, at the same points in every run, instead of on a compile thread. |
+| `compile-threads=N`     | 0       | How many threads compile hot functions; 0 starts one per processor core but one, up to 8.                         |
+| `callee-boost=N`        | 16      | How many invocations a call from compiled code into a function the interpreter runs counts as; 1 for one.          |
 | `inline-budget=N`       | 250     | How many bytecode instructions the inlined callees of one compile may have together.                               |
 | `inline-max-size=N`     | 30      | How many bytecode instructions one inlined callee may have.                                                        |
 | `inline-depth=N`        | 5       | How deeply inlined calls may nest; 0 turns inlining off.                                                           |

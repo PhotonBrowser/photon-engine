@@ -146,7 +146,7 @@ static DecoderErrorOr<void> initialize_format_context(AVFormatContext*& format_c
     AVDictionary* options = nullptr;
     ScopeGuard free_options = [&] { av_dict_free(&options); };
 
-    if (av_dict_set(&options, "format_whitelist", "flac,mov,ogg,wav", 0) < 0)
+    if (av_dict_set(&options, "format_whitelist", "flac,ogg,wav", 0) < 0)
         return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg format whitelist"sv);
 
     auto const& codecs = codec_whitelist();
@@ -437,11 +437,8 @@ void FFmpegDemuxer::start_buffered_scan_thread(AVFormatContext& context)
                 continue;
             auto* stream = context.streams[i];
             auto entry_count = avformat_index_get_entries_count(stream);
-            if (entry_count <= 0)
-                continue;
-
             Vector<IndexEntry> entries;
-            MUST(entries.try_ensure_capacity(entry_count));
+            MUST(entries.try_ensure_capacity(max(entry_count, 0)));
             for (int j = 0; j < entry_count; j++) {
                 auto const* entry = avformat_index_get_entry(stream, j);
                 entries.unchecked_append({
@@ -459,7 +456,7 @@ void FFmpegDemuxer::start_buffered_scan_thread(AVFormatContext& context)
                 }
             }
             if (!is_monotonic)
-                continue;
+                entries.clear();
 
             track_indices.empend(m_stream_info[i].track.identifier(), move(entries));
         }
@@ -473,9 +470,9 @@ void FFmpegDemuxer::start_buffered_scan_thread(AVFormatContext& context)
     initial_state.duration = m_total_duration;
     m_buffered_scan_thread = DemuxerScanThread<BufferedScanPayload>::start(m_stream, move(initial_state),
         BufferedScanPayload { navigator.release_nonnull(), m_total_duration },
-        [](MediaStream& stream, BufferedScanPayload& payload) {
-            auto scans = payload.navigator->buffered_time_ranges_by_track(stream.available_byte_ranges());
-            return DemuxerScanState::create_from_track_scans(move(scans), payload.initial_duration, stream.closing_bytes_are_available());
+        [](MediaStream::Availability const& availability, BufferedScanPayload& payload) {
+            auto scans = payload.navigator->buffered_time_ranges_by_track(availability.byte_ranges);
+            return DemuxerScanState::create_from_track_scans(move(scans), payload.initial_duration, availability.closing_bytes_are_available());
         });
 }
 

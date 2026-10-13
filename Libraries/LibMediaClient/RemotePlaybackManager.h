@@ -88,7 +88,7 @@ public:
     bool is_playing() const { return m_is_playing; }
     Media::PlaybackState state() const { return m_state; }
     Media::AvailableData available_data() const { return m_available_data; }
-    Media::TimeRanges buffered_time_ranges() const;
+    Media::BufferedRanges buffered_time_ranges() const;
 
     void set_volume(double);
     void set_playback_rate(float);
@@ -148,6 +148,7 @@ private:
     void dispatch_state_change() const;
     void dispatch_buffered_ranges_change() const;
     bool source_has_enabled_track(ReadonlySpan<Media::Track> audio_tracks, ReadonlySpan<Media::Track> video_tracks) const;
+    Media::CombinedScanState scan_state_for_enabled_tracks(Media::DemuxerScanState const&, ReadonlySpan<Media::Track> audio_tracks, ReadonlySpan<Media::Track> video_tracks) const;
 
     RefPtr<Client> m_client;
     u64 m_session_id { 0 };

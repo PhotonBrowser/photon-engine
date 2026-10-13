@@ -59,7 +59,7 @@ pub type EntryTrampoline = unsafe extern "C" fn(*const Vm, *mut ExecutionContext
 pub enum CompileState {
     /// Not compiled, or the code was discarded.
     None = 0,
-    /// A compile job for the executable is running on the compile thread.
+    /// A compile job for the executable is running on a compile thread.
     Queued = 1,
     Installed = crate::layout::executable::JIT_COMPILE_STATE_INSTALLED,
     /// The code was discarded while JIT code was still running frames of it. It stays attached (but is not entered)
@@ -386,9 +386,7 @@ impl Executable {
             return;
         }
         // NB: The interpreter tries again when it next considers compiling the executable.
-        self.head
-            .tier_up_budget
-            .set(super::tier_up::initial_tier_up_budget(&vm.jit));
+        self.head.tier_up_budget.set(super::tier_up::recompile_budget(&vm.jit));
     }
 
     /// Drops the JIT code of an executable whose code was discarded if no live frame of the executable is run by JIT
@@ -447,8 +445,6 @@ impl Executable {
             return;
         }
         self.set_jit_compile_state(CompileState::None);
-        self.head
-            .tier_up_budget
-            .set(super::tier_up::initial_tier_up_budget(&vm.jit));
+        self.head.tier_up_budget.set(super::tier_up::recompile_budget(&vm.jit));
     }
 }

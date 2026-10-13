@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
+#include <LibMedia/DemuxerScanState.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibTest/TestCase.h>
 
@@ -12,6 +14,123 @@ using Media::TimeRanges;
 static AK::Duration ms(i64 milliseconds)
 {
     return AK::Duration::from_milliseconds(milliseconds);
+}
+
+TEST_CASE(buffered_sources_without_sources_are_not_complete)
+{
+    auto report = Media::DemuxerScanState::buffered_ranges_of_sources({});
+    EXPECT(report.time_ranges.is_empty());
+    EXPECT(!report.resource_is_complete);
+}
+
+TEST_CASE(buffered_sources_intersect_ranges_and_completeness)
+{
+    Array<Media::CombinedScanState, 2> sources;
+    sources[0].time_ranges = TimeRanges { { ms(0), ms(800) } };
+    sources[0].duration = ms(1000);
+    sources[0].resource_is_complete = true;
+    sources[1].time_ranges = TimeRanges { { ms(200), ms(1000) } };
+    sources[1].duration = ms(1000);
+
+    auto report = Media::DemuxerScanState::buffered_ranges_of_sources(sources);
+    EXPECT_EQ(report.time_ranges, (TimeRanges { { ms(200), ms(800) } }));
+    EXPECT(!report.resource_is_complete);
+
+    sources[1].resource_is_complete = true;
+    report = Media::DemuxerScanState::buffered_ranges_of_sources(sources);
+    EXPECT_EQ(report.time_ranges, (TimeRanges { { ms(200), ms(800) } }));
+    EXPECT(report.resource_is_complete);
+
+    // Completeness is not inferred from EOF or time coverage, and must include every source.
+    sources[0].resource_is_complete = false;
+    sources[0].reached_end_of_stream = true;
+    report = Media::DemuxerScanState::buffered_ranges_of_sources(sources);
+    EXPECT_EQ(report.time_ranges, (TimeRanges { { ms(200), ms(1000) } }));
+    EXPECT(!report.resource_is_complete);
+}
+
+TEST_CASE(buffered_sources_with_disjoint_ranges_can_still_be_complete)
+{
+    Array<Media::CombinedScanState, 2> sources;
+    sources[0].time_ranges = TimeRanges { { ms(0), ms(100) } };
+    sources[1].time_ranges = TimeRanges { { ms(200), ms(300) } };
+    for (auto& source : sources) {
+        source.duration = ms(300);
+        source.resource_is_complete = true;
+    }
+    auto report = Media::DemuxerScanState::buffered_ranges_of_sources(sources);
+    EXPECT(report.time_ranges.is_empty());
+    EXPECT(report.resource_is_complete);
+}
+
+TEST_CASE(file_buffering_uses_enabled_track_identifiers)
+{
+    Media::DemuxerScanState state;
+    state.duration = ms(1000);
+    state.track_buffered_ranges = {
+        { 41, TimeRanges { { ms(100), ms(1000) } }, false },
+        { 7, TimeRanges { { ms(200), ms(1000) } }, false },
+        { 99, TimeRanges { { ms(0), ms(1000) } }, false },
+    };
+    EXPECT_EQ(state.combined_scan_state([](u64 id) { return id == 99 || id == 41; }).time_ranges, (TimeRanges { { ms(100), ms(1000) } }));
+    EXPECT_EQ(state.combined_scan_state([](u64 id) { return id == 7 || id == 99; }).time_ranges, (TimeRanges { { ms(200), ms(1000) } }));
+    EXPECT_EQ(state.track_buffered_ranges.size(), 3u);
+}
+
+TEST_CASE(file_buffering_includes_empty_tracks)
+{
+    Vector<Media::BufferedRangesScan> scans {
+        { TimeRanges { { ms(0), ms(1000) } }, true, 4 },
+        { {}, false, 8 },
+    };
+    auto state = Media::DemuxerScanState::create_from_track_scans(move(scans), ms(1000), true);
+    EXPECT_EQ(state.track_buffered_ranges.size(), 2u);
+    state.resource_is_complete = true;
+    auto filtered = state.combined_scan_state();
+    EXPECT(filtered.time_ranges.is_empty());
+    EXPECT(!filtered.reached_end_of_stream);
+    EXPECT(filtered.resource_is_complete);
+    auto none = state.combined_scan_state([](u64) { return false; });
+    EXPECT(none.time_ranges.is_empty());
+    EXPECT(!none.reached_end_of_stream);
+    EXPECT(none.resource_is_complete);
+    EXPECT_EQ(state.combined_scan_state([](u64 id) { return id == 4; }).time_ranges, (TimeRanges { { ms(0), ms(1000) } }));
+}
+
+TEST_CASE(inactive_file_tracks_do_not_limit_the_playback_endpoint)
+{
+    Media::DemuxerScanState state;
+    state.duration = ms(1000);
+    state.resource_is_complete = false;
+    state.track_buffered_ranges = {
+        { 1, TimeRanges { { ms(0), ms(900) } }, true },
+        { 2, TimeRanges { { ms(200), ms(500) } }, false },
+    };
+    auto filtered = state.combined_scan_state([](u64 id) { return id == 1; });
+    EXPECT(filtered.reached_end_of_stream);
+    EXPECT(!filtered.resource_is_complete);
+    Array<Media::CombinedScanState, 1> sources { filtered };
+    EXPECT_EQ(Media::DemuxerScanState::buffered_ranges_of_sources(sources).time_ranges, (TimeRanges { { ms(0), ms(1000) } }));
+}
+
+TEST_CASE(file_tracks_extend_independently_but_mse_tracks_do_not)
+{
+    Media::DemuxerScanState state;
+    state.track_buffered_ranges = {
+        { 1, TimeRanges { { ms(0), ms(500) } }, true },
+        { 2, TimeRanges { { ms(100), ms(900) } }, false },
+    };
+    EXPECT_EQ(state.combined_scan_state().time_ranges, (TimeRanges { { ms(100), ms(900) } }));
+
+    state.buffered_ranges_policy = Media::BufferedRangesPolicy::AllTracks;
+    Function<bool(u64)> reject_all = [](u64) -> bool { VERIFY_NOT_REACHED(); };
+    auto mse = state.combined_scan_state(reject_all);
+    EXPECT(!mse.reached_end_of_stream);
+    EXPECT_EQ(mse.time_ranges, (TimeRanges { { ms(100), ms(500) } }));
+    state.reached_end_of_stream = true;
+    mse = state.combined_scan_state(reject_all);
+    EXPECT(mse.reached_end_of_stream);
+    EXPECT_EQ(mse.time_ranges, (TimeRanges { { ms(100), ms(900) } }));
 }
 
 // add_range()

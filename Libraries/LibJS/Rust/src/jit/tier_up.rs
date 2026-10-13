@@ -68,10 +68,43 @@ fn warmup_budget(jit: &JitState) -> i32 {
     randomized_budget(jit, i32::try_from(budget.max(1)).unwrap_or(i32::MAX))
 }
 
-/// How much budget an executable gets while it waits for its compile job. Its next tier-up check installs the code if
-/// the job has finished.
+/// How much budget an executable gets once it has code while frames of it may still run in the interpreter, which
+/// keep counting so that their loops can continue in the code at an on-stack replacement entry.
 fn compile_wait_budget(options: &Options) -> i32 {
     (threshold_budget(options) / 8).max(tier_up_costs::FUNCTION_ENTRY)
+}
+
+/// The budget of an executable whose code was discarded, or not installed. It compiles again sooner than it first did:
+/// it collected feedback for longer, and its exit sites keep the new code from speculating where the old code exited.
+pub fn recompile_budget(jit: &JitState) -> i32 {
+    if !jit.options.collects_feedback() {
+        return i32::MAX;
+    }
+    randomized_budget(jit, compile_wait_budget(&jit.options))
+}
+
+/// How much budget an executable gets while it waits for its compile job: one function entry, so that the next call
+/// or the next few loop iterations install the code if the job has finished, and run it.
+const QUEUED_BUDGET: i32 = tier_up_costs::FUNCTION_ENTRY;
+
+/// Charges the tier-up budget of `executable`, which the interpreter is about to run from its entry for a call from
+/// compiled code, for the extra invocations the "callee-boost" option counts such a call as. Code that is hot enough
+/// to be compiled calls the function, so the function is likely to be hot as well.
+pub fn charge_call_from_compiled_code(vm: &Vm, executable: &Executable) {
+    let boost = vm.jit.options.callee_boost;
+    if boost <= 1
+        || !matches!(
+            executable.jit_compile_state(),
+            CompileState::None | CompileState::Discarding
+        )
+    {
+        return;
+    }
+    let extra = i32::try_from(boost - 1)
+        .unwrap_or(i32::MAX)
+        .saturating_mul(tier_up_costs::FUNCTION_ENTRY);
+    let budget = &executable.head.tier_up_budget;
+    budget.set(budget.get().saturating_sub(extra));
 }
 
 /// The function to compile the running frame's executable for, if it should be compiled at all.
@@ -113,6 +146,18 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
     let executable = vm.current_executable();
     let options = &vm.jit.options;
 
+    // NB: An executable whose compile job is queued checks at every call whether the job finished, so it does nothing
+    //     else here.
+    if executable.jit_compile_state() == CompileState::Queued {
+        install_finished_compiles(vm);
+        match executable.jit_compile_state() {
+            CompileState::Queued => executable.head.tier_up_budget.set(QUEUED_BUDGET),
+            CompileState::Installed => executable.head.tier_up_budget.set(compile_wait_budget(options)),
+            _ => {}
+        }
+        return;
+    }
+
     // A warm executable starts collecting feedback, and the tier-up threshold counts from here, unless the JIT would
     // never compile it.
     if executable.interpreter_tier() == InterpreterTier::WarmingUp {
@@ -151,14 +196,11 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
     install_finished_compiles(vm);
     match executable.jit_compile_state() {
         CompileState::None => {}
-        CompileState::Queued => {
-            executable.head.tier_up_budget.set(compile_wait_budget(options));
-            return;
-        }
+        CompileState::Queued => unreachable!("queued executables return early"),
         CompileState::Discarding => {
             // NB: Once no frame may still run the discarded code, the executable is compiled again.
             if !executable.detach_discarded_jit_code_if_unused(vm) {
-                executable.head.tier_up_budget.set(initial_tier_up_budget(&vm.jit));
+                executable.head.tier_up_budget.set(recompile_budget(&vm.jit));
                 return;
             }
             if executable.jit_compile_state() != CompileState::None {
@@ -183,7 +225,7 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
     };
     compile(vm, executable, function, is_loop.then_some(pc), options.sync);
     if executable.jit_compile_state() == CompileState::Queued {
-        executable.head.tier_up_budget.set(compile_wait_budget(options));
+        executable.head.tier_up_budget.set(QUEUED_BUDGET);
     }
 }
 
@@ -312,11 +354,11 @@ fn finish_compile(
     }
     if executable.jit_compile_state() != CompileState::Installed {
         executable.set_jit_compile_state(CompileState::None);
-        executable.head.tier_up_budget.set(initial_tier_up_budget(&vm.jit));
+        executable.head.tier_up_budget.set(recompile_budget(&vm.jit));
     }
 }
 
-/// Compiles `executable`, whose frames run `function`: right away if `sync`, otherwise on the compile thread, whose
+/// Compiles `executable`, whose frames run `function`: right away if `sync`, otherwise on a compile thread, whose
 /// code a later tier-up check installs.
 fn compile(
     vm: &Vm,

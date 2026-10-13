@@ -72,3 +72,56 @@ test("doubles that are both compared and used as indices keep their checks", () 
     expect(lookup(keys, table, 2)).toBe(40);
     expect(lookup(keys, table, 4)).toBeNaN();
 });
+
+test("compiled identities of doubles that held int32 values convert them", () => {
+    const midpoint = new Function("low", "high", "return ((low + high) / 2) | 0;");
+    const plusZero = new Function("values", "return values[0] + 0;");
+    const shifted = new Function("values", "return (values[0] << 0) + (values[0] >> 0) + (values[0] ^ 0);");
+    const values = new Float64Array([4]);
+    for (const f of [midpoint, plusZero, shifted]) jit.prepare(f);
+    for (let k = 0; k < 10; ++k) {
+        midpoint(k, k + 2);
+        plusZero(values);
+        shifted(values);
+    }
+    for (const f of [midpoint, plusZero, shifted]) expect(jit.compile(f)).toBe(jit.enabled);
+    expect(midpoint(1, 2)).toBe(1);
+    expect(midpoint(-1, -2)).toBe(-1);
+    expect(midpoint(0, NaN)).toBe(0);
+    expect(midpoint(2 ** 32, 2 ** 32 + 6)).toBe(3);
+    values[0] = -0;
+    expect(Object.is(plusZero(values), 0)).toBeTrue();
+    values[0] = 2.5;
+    expect(plusZero(values)).toBe(2.5);
+    expect(shifted(values)).toBe(6);
+    values[0] = -(2 ** 31) - 1.5;
+    expect(shifted(values)).toBe(3 * (2 ** 31 - 1));
+});
+
+test("folds that give doubles checked to be int32 values int32 users keep the checks", () => {
+    const sum = new Function(
+        "a",
+        "b",
+        "count",
+        "start",
+        `let y = +(a * b);
+        let s = start;
+        for (let i = 0; i < count; i++) {
+            let t = y;
+            if (i > 1000) t = y;
+            y = t;
+            s = s + y;
+        }
+        return s;`
+    );
+    jit.prepare(sum);
+    for (let k = 0; k < 10; ++k) {
+        sum(1.5, 2, 3, 0);
+        sum(1.5, 2, 2, "a");
+    }
+    expect(jit.compile(sum)).toBe(jit.enabled);
+    expect(sum(1.5, 2, 3, 0)).toBe(9);
+    expect(sum(1.5, 2, 2, "a")).toBe("a33");
+    expect(sum(1.25, 2, 2, 1)).toBe(6);
+    expect(sum(1.25, 2, 2, "b")).toBe("b2.52.5");
+});
