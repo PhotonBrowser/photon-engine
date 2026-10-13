@@ -21,6 +21,7 @@ struct PresentedFrame {
     int height { 0 };
     size_t stride { 0 };
     double device_pixel_ratio { 1.0 };
+    uint64_t buffer_allocation_microseconds { 0 };
     uint64_t copy_time_microseconds { 0 };
     uint64_t engine_paint_interval_microseconds { 0 };
     uint64_t bitmap_acquisition_microseconds { 0 };

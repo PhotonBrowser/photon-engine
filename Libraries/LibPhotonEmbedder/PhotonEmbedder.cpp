@@ -61,6 +61,46 @@ static uint64_t next_native_backing_id()
 
 class PhotonHeadlessWebView;
 
+class CpuFallbackFramePool : public std::enable_shared_from_this<CpuFallbackFramePool> {
+public:
+    std::shared_ptr<Photon::PresentedFrame> acquire()
+    {
+        std::unique_ptr<Photon::PresentedFrame> frame;
+        {
+            std::lock_guard lock(m_mutex);
+            if (!m_available.empty()) {
+                frame = move(m_available.back());
+                m_available.pop_back();
+            }
+        }
+        if (!frame)
+            frame = std::make_unique<Photon::PresentedFrame>();
+
+        auto* raw_frame = frame.release();
+        return std::shared_ptr<Photon::PresentedFrame>(raw_frame,
+            [pool = shared_from_this()](Photon::PresentedFrame* released) {
+                pool->recycle(released);
+            });
+    }
+
+private:
+    void recycle(Photon::PresentedFrame* frame)
+    {
+        {
+            std::lock_guard lock(m_mutex);
+            if (m_available.size() < maximum_cached_frames) {
+                m_available.emplace_back(frame);
+                return;
+            }
+        }
+        delete frame;
+    }
+
+    static constexpr size_t maximum_cached_frames = 2;
+    std::mutex m_mutex;
+    std::vector<std::unique_ptr<Photon::PresentedFrame>> m_available;
+};
+
 class PhotonApplication final : public Application {
     WEB_VIEW_APPLICATION(PhotonApplication)
 
@@ -844,7 +884,16 @@ private:
                 dbgln("Photon embedder: shared image has no CPU bitmap");
                 return;
             }
-            auto frame = std::make_shared<Photon::PresentedFrame>();
+            if (!m_cpu_fallback_frame_pool)
+                m_cpu_fallback_frame_pool = std::make_shared<CpuFallbackFramePool>();
+            auto const pixel_data_size = bitmap->data_size();
+            auto allocation_started = std::chrono::steady_clock::now();
+            auto frame = m_cpu_fallback_frame_pool->acquire();
+            frame->pixels.resize(pixel_data_size);
+            frame->buffer_allocation_microseconds = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - allocation_started)
+                    .count());
             frame->width = bitmap->width();
             frame->height = bitmap->height();
             frame->stride = bitmap->pitch();
@@ -854,7 +903,6 @@ private:
             m_last_paint_completed = paint_completed;
             frame->bitmap_acquisition_microseconds = static_cast<uint64_t>(bitmap_acquisition_time);
             auto copy_started = std::chrono::steady_clock::now();
-            frame->pixels.resize(bitmap->data_size());
             for (int row = 0; row < frame->height; ++row)
                 std::copy_n(bitmap->scanline_u8(row), frame->stride, frame->pixels.data() + row * frame->stride);
             frame->copy_time_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - copy_started).count();
@@ -867,6 +915,7 @@ private:
     virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) override { return nullptr; }
 
     Photon::ViewCallbacks m_callbacks;
+    std::shared_ptr<CpuFallbackFramePool> m_cpu_fallback_frame_pool;
     // The shown context menu's actions, with null for separators.
     Vector<RefPtr<Action>> m_context_menu_actions;
     Optional<std::chrono::steady_clock::time_point> m_last_paint_completed;
