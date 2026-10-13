@@ -292,11 +292,6 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
         if constexpr (requires { new_client->set_pid(pid_t {}); })
             new_client->set_pid(process.pid());
 
-        if constexpr (requires { new_client->transport().set_peer_pid(0); }) {
-            auto response = new_client->template send_sync<typename ClientType::InitTransport>(Core::System::getpid());
-            new_client->transport().set_peer_pid(response->peer_pid());
-        }
-
         client = move(new_client);
         return move(process);
     }));
@@ -654,7 +649,7 @@ ErrorOr<IPC::TransportHandle> connect_new_audio_server_client(RefPtr<AudioServer
     return response->take_handle().release_value();
 }
 
-ErrorOr<IPC::TransportHandle> connect_new_media_server_client(RefPtr<MediaClient::Client>& controller, Function<ErrorOr<IPC::TransportHandle>()> connect_audio_server)
+ErrorOr<MediaServerClientConnection> connect_new_media_server_client(RefPtr<MediaClient::Client>& controller, Function<ErrorOr<IPC::TransportHandle>()> connect_audio_server)
 {
     if (!controller || !controller->is_open()) {
         controller = TRY(launch_media_server_process());
@@ -664,7 +659,7 @@ ErrorOr<IPC::TransportHandle> connect_new_media_server_client(RefPtr<MediaClient
     auto response = controller->send_sync_but_allow_failure<Messages::MediaServer::ConnectNewClient>();
     if (!response || !response->handle().has_value())
         return Error::from_string_literal("Failed to connect to MediaServer");
-    return response->take_handle().release_value();
+    return MediaServerClientConnection { response->take_handle().release_value(), response->client_id() };
 }
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)

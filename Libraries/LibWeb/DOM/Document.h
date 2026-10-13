@@ -960,6 +960,9 @@ public:
     bool is_initial_about_blank() const { return m_is_initial_about_blank; }
     void set_is_initial_about_blank(bool b) { m_is_initial_about_blank = b; }
 
+    HTML::CrossProcessId id() const { return m_id.value(); }
+    void set_id(HTML::CrossProcessId);
+
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-about-base-url
     Optional<URL::URL> about_base_url() const { return m_about_base_url; }
     void set_about_base_url(Optional<URL::URL> url)
@@ -1586,6 +1589,9 @@ public:
     RefPtr<SelectorQuery const> selector_query_for(Utf16View) const;
     QuerySelectorResultCache& query_selector_result_cache();
 
+    // Whether the aria-labelledby or aria-describedby of an element in the tree of root references id.
+    bool tree_references_id_from_aria(Node const& root, Utf16FlyString const& id) const;
+
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> custom_element_registry) { m_custom_element_registry = custom_element_registry; }
     GC::Ptr<HTML::CustomElementRegistry> effective_global_custom_element_registry() const;
@@ -1912,6 +1918,7 @@ private:
 
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool m_is_initial_about_blank { false };
+    Optional<HTML::CrossProcessId> m_id;
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-about-base-url
     Optional<URL::URL> m_about_base_url;
@@ -2248,6 +2255,15 @@ private:
 
     // Cache of querySelectorAll results, validated lazily against the query root's dom_tree_version/character_data_version.
     OwnPtr<QuerySelectorResultCache> m_query_selector_result_cache;
+
+    // The ids that aria-labelledby and aria-describedby reference in a tree, validated lazily against the tree's
+    // dom_tree_version. Computing accessible names asks this for the parent and the ancestors of every text node.
+    struct IdsReferencedFromAria {
+        GC::Weak<Node> root;
+        u64 dom_tree_version { 0 };
+        HashTable<Utf16FlyString> ids;
+    };
+    mutable HashMap<GC::RawPtr<Node const>, IdsReferencedFromAria> m_ids_referenced_from_aria;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

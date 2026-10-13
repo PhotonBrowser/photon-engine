@@ -245,11 +245,10 @@ impl StyleEngine {
     /// Those of `properties` that a box with the style record `record` takes from its parent rather than declares, or
     /// none where the engine holds no such record.
     pub(crate) fn properties_inherited_by_record(&self, record: u64, properties: &[u16]) -> Option<SmallVec<[u16; 8]>> {
-        // SAFETY: A record's longhand table lives as long as the record, which the engine holds while it views it.
         let table = self
             .computed_group_sets
             .style_record_view(record)
-            .and_then(|view| unsafe { view.longhand_table.as_ref() })?;
+            .and_then(|view| view.longhand_table)?;
         Some(
             properties
                 .iter()
@@ -727,10 +726,13 @@ impl StyleEngine {
         ) else {
             return true;
         };
-        crate::css::computed_values::style_group_payloads_move_image_values(
-            SharedPayload::as_pointer_slice(old),
-            SharedPayload::as_pointer_slice(new),
-        )
+        // SAFETY: Published style-group payloads stay live while their records do.
+        unsafe {
+            crate::css::computed_values::style_group_payloads_move_image_values(
+                SharedPayload::as_pointer_slice(old),
+                SharedPayload::as_pointer_slice(new),
+            )
+        }
     }
 
     /// Whether `row` owes its element no more than a moved inherited custom-property environment, which its style reads
@@ -782,8 +784,7 @@ impl StyleEngine {
                 else {
                     continue;
                 };
-                // SAFETY: A live record's table lives as long as the record.
-                let Some(table) = (unsafe { view.longhand_table.as_ref() }) else {
+                let Some(table) = view.longhand_table else {
                     continue;
                 };
                 let inherits: SmallVec<[u16; 2]> = inherited
@@ -962,12 +963,8 @@ impl StyleEngine {
 /// Takes the element the style node `target` names, or none for 0, as the element the hover of `host`'s document
 /// targets, as the events of a mouse move hover it, and stages the move of the engine's hover to it for the input the
 /// host submits next, where it moves. Answers whether it does.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_request_hover(host: &crate::render_state::DocumentHost, target: u32) -> bool {
+pub extern "C" fn style_engine_request_hover(host: &crate::render_state::DocumentHost, target: u32) -> bool {
     let target = StyleNodeID::from_raw(target);
     let moves = host.request_hover(target);
     if moves {

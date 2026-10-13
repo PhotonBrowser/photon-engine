@@ -9,7 +9,7 @@ use core::ops::Deref;
 
 use libjs_runtime_macros::Trace;
 
-use crate::gc::class::{Finalize, GcCell, define_cell};
+use crate::gc::class::{Finalize, GcCell, cast_ref, define_cell};
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::root::MarkedVec;
 use crate::interpreter::vm::Vm;
@@ -135,11 +135,10 @@ impl IteratorHelper {
         closure: IteratorHelperClosure,
     ) -> Gc<IteratorHelper> {
         let prototype = realm.intrinsics().iterator_helper_prototype();
-        let running_execution_context = vm
-            .running_execution_context()
-            .expect("an iterator helper is created by a running built-in");
-        // SAFETY: The running execution context is live.
-        let execution_context = unsafe { running_execution_context.as_ref() }.copy();
+        let execution_context = vm
+            .running_execution_context_if_any()
+            .expect("an iterator helper is created by a running built-in")
+            .copy();
         let iterator = realm.create_object(
             vm,
             IteratorHelper {
@@ -179,9 +178,7 @@ impl IteratorHelper {
     }
 
     fn execute(generator: &GeneratorObject, vm: &Vm, completion: Completion) -> ThrowCompletionOr<IterationResult> {
-        assert!(generator.is::<IteratorHelper>());
-        // SAFETY: Only iterator helpers execute through this, and an IteratorHelper starts with its GeneratorObject.
-        let iterator = unsafe { &*core::ptr::from_ref(generator).cast::<IteratorHelper>() };
+        let iterator: &IteratorHelper = cast_ref(generator);
         let result = iterator.execute_closure(vm, completion);
         vm.pop_execution_context();
         result

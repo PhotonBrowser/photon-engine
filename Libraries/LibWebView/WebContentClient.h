@@ -74,8 +74,6 @@ class WEBVIEW_API WebContentClient final
     friend class WebContentTestClient;
 
 public:
-    using InitTransport = Messages::WebContentServer::InitTransport;
-
     template<CallableAs<IterationDecision, WebContentClient&> Callback>
     static void for_each_client(Callback callback);
 
@@ -99,7 +97,11 @@ public:
     // Null outside test mode: the test endpoint is only connected when the UI process runs tests.
     WebContentTestClient* test_connection() { return m_test_connection; }
 
-    void set_initial_top_level_history_entry(Badge<Application>, Web::HTML::SessionHistoryEntryDescriptor entry) { m_initial_top_level_history_entry = move(entry); }
+    void set_initial_top_level_history_entry(Badge<Application>, Web::HTML::SessionHistoryEntryDescriptor entry, Web::HTML::CrossProcessId document_id)
+    {
+        m_initial_top_level_history_entry = move(entry);
+        m_initial_top_level_document_id = document_id;
+    }
     WebContentPage& open_initial_page_for_new_top_level_traversable();
     WebContentPage& open_page_for_new_top_level_traversable(Web::PageId, CanonicalTraversable&);
     void discard_page_of_undisplayed_top_level_traversable(Web::PageId);
@@ -196,6 +198,7 @@ private:
     virtual Messages::WebContentClient::DidLoseRequestServerConnectionResponse did_lose_request_server_connection() override;
     virtual Messages::WebContentClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
     virtual Messages::WebContentClient::RequestAudioServerConnectionResponse request_audio_server_connection() override;
+    virtual void request_video_presentation_channel() override;
     virtual void did_start_using_gamepads() override;
     virtual void gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect) override;
     virtual void gamepad_stop_effects(Web::Gamepad::GamepadHandle handle) override;
@@ -226,6 +229,7 @@ private:
     Optional<Web::PageId> m_unassigned_initial_page_id;
     Web::HTML::CrossProcessId m_root_navigable_id;
     Optional<Web::HTML::SessionHistoryEntryDescriptor> m_initial_top_level_history_entry;
+    Web::HTML::CrossProcessId m_initial_top_level_document_id;
 
     ProcessHandle m_process_handle;
 
@@ -239,6 +243,7 @@ private:
     // The controller connections to the MediaServer and AudioServer spawned for this process, from its first media use
     // until it exits. The AudioServer mixes for this process alone, so a compromised one hears only its own site.
     RefPtr<MediaClient::Client> m_media_server_client;
+    Optional<int> m_media_server_client_id;
     RefPtr<AudioServerControlClient> m_audio_server_client;
     u64 m_audio_tab_id { 0 };
     // The pages the user let capture audio, and whether an open page is one of them; the AudioServer is told of the latter,

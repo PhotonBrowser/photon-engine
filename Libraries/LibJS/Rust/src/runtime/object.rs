@@ -16,7 +16,6 @@ use libjs_runtime_macros::Trace;
 use crate::bytecode::executable::{PropertyLookupCache, StaticPropertyLookupCacheSite};
 use crate::bytecode::property_access::{Strict, put_by_property_key};
 use crate::embedding::abi_types::JSRealm;
-use crate::gc::capi;
 use crate::gc::class::{Class, Extends, ExternalMemorySize, GcCell, define_cell};
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::heap::{Heap, RuntimeClassAllocator, SizeClassAllocator};
@@ -345,7 +344,8 @@ unsafe impl Trace for Object {
         }
         if !named_properties.is_null()
             && !self.named_storage_is_inline()
-            && let Some(storage) = value_storage::cell(named_properties)
+            // SAFETY: Out-of-line named storage is storage value_storage::allocate() returned.
+            && let Some(storage) = unsafe { value_storage::cell(named_properties) }
         {
             visitor.visit(storage);
         }
@@ -364,7 +364,8 @@ unsafe impl Trace for Object {
             self.indexed_storage_kind(),
             IndexedStorageKind::Packed | IndexedStorageKind::Holey
         ) && !indexed_elements.is_null()
-            && let Some(storage) = value_storage::cell(indexed_elements)
+            // SAFETY: Packed and holey indexed storage is storage value_storage::allocate() returned.
+            && let Some(storage) = unsafe { value_storage::cell(indexed_elements) }
         {
             visitor.visit(storage);
         }
@@ -451,7 +452,12 @@ pub enum IntrinsicAccessor {
 pub type NativeIntrinsicAccessor = fn(&Vm, Gc<Realm>) -> Value;
 
 /// An intrinsic accessor that an embedder defines through the C ABI, which returns the encoded value.
+#[cfg(not(target_os = "windows"))]
 pub type HostIntrinsicAccessor = unsafe extern "C" fn(realm: *mut JSRealm) -> JSValue;
+
+/// An intrinsic accessor that an embedder defines through the C ABI, which returns the encoded value.
+#[cfg(target_os = "windows")]
+pub type HostIntrinsicAccessor = unsafe extern "C" fn(result: *mut JSValue, realm: *mut JSRealm);
 
 impl IntrinsicAccessor {
     fn compute_value(self, vm: &Vm, realm: Gc<Realm>) -> Value {
@@ -745,8 +751,7 @@ impl Object {
     }
 
     pub(crate) fn as_gc(&self) -> Gc<Object> {
-        // SAFETY: Objects only exist as cells once constructed, since allocate_object() moves every one into the heap.
-        unsafe { Gc::from_ref(self) }
+        Gc::from_ref(self)
     }
 
     pub fn class(&self) -> &'static Class {
@@ -841,9 +846,8 @@ impl Object {
         cache: &PropertyLookupCache,
     ) -> ThrowCompletionOr<()> {
         let mut strict = Strict::No;
-        if let Some(context) = vm.running_execution_context()
-            // SAFETY: The running execution context is live.
-            && let Some(function) = unsafe { context.as_ref() }.function.get()
+        if let Some(context) = vm.running_execution_context_if_any()
+            && let Some(function) = context.function.get()
             && function_object_as_object(function).is_strict_mode()
         {
             strict = Strict::Yes;
@@ -3612,7 +3616,8 @@ impl Object {
         if self.named_properties.get().is_null() || self.named_storage_is_inline() {
             return 0;
         }
-        value_storage::external_memory_size_of(self.named_properties.get())
+        // SAFETY: Out-of-line named storage is storage value_storage::allocate() returned.
+        unsafe { value_storage::external_memory_size_of(self.named_properties.get()) }
     }
 
     fn indexed_storage_external_memory_size(&self) -> usize {
@@ -3623,7 +3628,8 @@ impl Object {
                 if elements.is_null() {
                     return 0;
                 }
-                value_storage::external_memory_size_of(elements)
+                // SAFETY: Packed and holey indexed storage is storage value_storage::allocate() returned.
+                unsafe { value_storage::external_memory_size_of(elements) }
             }
             IndexedStorageKind::Dictionary => {
                 size_of::<GenericIndexedPropertyStorage>() + self.indexed_dictionary().borrow().external_memory_size()
@@ -3637,13 +3643,13 @@ impl Object {
         if self.named_storage_is_inline() {
             return self.inline_named_capacity.get().into();
         }
-        value_storage::capacity(self.named_properties.get())
+        // SAFETY: Out-of-line named storage is storage value_storage::allocate() returned.
+        unsafe { value_storage::capacity(self.named_properties.get()) }
     }
 
     /// The VM whose heap the object lives in, for operations that allocate storage without being handed the VM.
     fn vm(&self) -> &Vm {
-        // SAFETY: The VM creates its heap with itself as the context, and outlives every cell in it.
-        unsafe { &*capi::gc_cell_heap_context(core::ptr::from_ref(self).cast()).cast::<Vm>() }
+        Vm::of_cell(self)
     }
 
     /// Replaces the named or indexed storage `storage` points at with `new_storage`, and frees the old storage if it is
@@ -3652,7 +3658,8 @@ impl Object {
         let old_storage = storage.get();
         let old_storage_is_malloc = self.has_flag(malloc_flag);
         storage.set(new_storage);
-        if value_storage::kind(new_storage) == ValueStorageKind::Malloc {
+        // SAFETY: Callers pass storage value_storage::allocate() returned.
+        if unsafe { value_storage::kind(new_storage) } == ValueStorageKind::Malloc {
             self.set_flag(malloc_flag);
         } else {
             self.clear_flag(malloc_flag);
@@ -3724,7 +3731,8 @@ impl Object {
             self.indexed_storage_kind(),
             IndexedStorageKind::Packed | IndexedStorageKind::Holey
         ));
-        value_storage::capacity(elements)
+        // SAFETY: Packed and holey indexed storage is storage value_storage::allocate() returned.
+        unsafe { value_storage::capacity(elements) }
     }
 
     /// Whether the packed or holey indexed storage holds an element (not a hole) at `index`.
@@ -4432,6 +4440,6 @@ fn create_data_property_for_set(
 impl Object {
     /// Whether the object was allocated as a `T`.
     pub fn is<T: GcCell + Extends<Object>>(&self) -> bool {
-        self.class().is_subclass_of(T::CLASS)
+        self.class().is_class_of::<T>()
     }
 }

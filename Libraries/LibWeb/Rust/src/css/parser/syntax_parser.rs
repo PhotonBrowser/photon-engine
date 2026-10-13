@@ -3580,7 +3580,7 @@ pub(crate) unsafe fn parse_shared_stylesheet(
     parse_context: *const ParseContext,
 ) -> Arc<ParsedStyleSheet> {
     unsafe {
-        parse_with_cache(source, parse_context, || {
+        parse_with_cache(source, parse_context.as_ref(), || {
             let mut parser = Parser::streaming(source);
             let mut parse = SyntaxParseBuilder::new(parse_context, false);
             while let Some(rule) = parser.consume_next_stylesheet_rule() {
@@ -3739,15 +3739,12 @@ pub unsafe extern "C" fn rust_page_selector_list_serialize(
 }
 
 /// Retains a normalized declaration block from parsed block contents, ignoring rules.
-///
-/// # Safety
-/// `parse` must be a live result of `rust_parse_css_block_syntax`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_css_syntax_parse_declaration_block(
-    parse: *const ParsedStyleSheet,
+pub extern "C" fn rust_css_syntax_parse_declaration_block(
+    parse: &ParsedStyleSheet,
 ) -> *mut crate::css::declaration_block::DeclarationBlock {
     use crate::css::declaration_block::DeclarationBlock;
-    let parsed = unsafe { &*parse };
+    let parsed = parse;
     let declarations = declaration_block_from_blocks(parsed.items.iter().filter_map(|item| match item {
         ParsedRuleChild::Declarations(list) => list.declaration_block.as_ref(),
         ParsedRuleChild::Rule(_) => None,
@@ -3921,7 +3918,7 @@ mod tests {
                 let context = parse_context();
                 let input = crate::css::css_tokenizer::TokenizerInput::Utf16(&source);
                 unsafe {
-                    super::super::stylesheet_cache::parse_with_cache(input, &raw const context, || {
+                    super::super::stylesheet_cache::parse_with_cache(input, Some(&context), || {
                         parses.fetch_add(1, Ordering::SeqCst);
                         if let Some((started, may_finish)) = &held {
                             started.wait();

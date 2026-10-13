@@ -233,17 +233,17 @@ impl StyleEngine {
         ) else {
             return u32::MAX;
         };
-        let Some(groups) = crate::css::computed_values::changed_style_groups(
-            [old.base_payloads, old.payloads],
-            [new.base_payloads, new.payloads],
-            INHERITED_STYLE_GROUP_COUNT..old.payloads.len(),
-        ) else {
+        // SAFETY: Published style-group payloads stay live while their records do.
+        let Some(groups) = (unsafe {
+            crate::css::computed_values::changed_style_groups(
+                [old.base_payloads, old.payloads],
+                [new.base_payloads, new.payloads],
+                INHERITED_STYLE_GROUP_COUNT..old.payloads.len(),
+            )
+        }) else {
             return u32::MAX;
         };
-        // SAFETY: Live records retain their immutable base tables throughout this borrow.
-        let (Some(old_table), Some(new_table)) = (unsafe { old.longhand_table.as_ref() }, unsafe {
-            new.longhand_table.as_ref()
-        }) else {
+        let (Some(old_table), Some(new_table)) = (old.longhand_table, new.longhand_table) else {
             return u32::MAX;
         };
         groups | old_table.non_inherited_inheritance_changes(new_table)

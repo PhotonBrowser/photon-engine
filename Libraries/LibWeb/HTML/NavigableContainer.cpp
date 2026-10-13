@@ -113,7 +113,13 @@ void NavigableContainer::create_new_child_navigable()
     // 10. Let historyEntry be navigable's active session history entry.
     auto history_entry = navigable->active_session_history_entry();
 
-    page.client().page_did_create_child_frame(parent_navigable->id(), navigable->id(), navigable->hosted_state(), create_pending_session_history_entry_descriptor(*history_entry), document->origin(), document->relevant_settings_object().id);
+    page.client().page_did_create_child_frame(parent_navigable->id(), this->document(), navigable->id(), navigable->hosted_state(), create_pending_session_history_entry_descriptor(*history_entry), document->origin(), document->relevant_settings_object().id, document->id());
+
+    // NB: An SVG image's page has no UI process to run the traversal steps.
+    if (page.client().is_svg_page_client()) {
+        navigable->set_has_session_history_entry_and_ready_for_navigation();
+        return;
+    }
 
     // 12. Append the following session history traversal steps to traversable:
     page.history_executor().request_history_operation(
@@ -228,17 +234,7 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
     // 4. If url matches about:blank and initialInsertion is true, then perform the URL and history update steps given element's content navigable's active document and url.
     if (url_matches_about_blank(url) && initial_insertion == InitialInsertion::Yes) {
         // NB: A newly inserted element's content navigable was created in this process.
-        auto& local_navigable = as<LocalNavigable>(*m_content_navigable);
-
-        // AD-HOC: If the content navigable already has a navigation in progress or pending, skip the initial
-        //         about:blank URL update. Without this, the URL update creates a state machine that clobbers the
-        //         navigable's ongoing_navigation, causing the real navigation to be dropped when its populate completion
-        //         callback checks ongoing_navigation != navigation_id. Non-blank src navigations must still be processed
-        //         here, and will be queued by LocalNavigable::navigate() until the child navigable is ready for navigation.
-        if (local_navigable.has_pending_navigations() || !local_navigable.ongoing_navigation().has<Empty>())
-            return {};
-
-        perform_url_and_history_update_steps(*local_navigable.active_document(), url);
+        perform_url_and_history_update_steps(*as<LocalNavigable>(*m_content_navigable).active_document(), url);
     }
 
     // 5. Return url.
@@ -323,12 +319,6 @@ void NavigableContainer::destroy_the_child_navigable()
         //         Without this, the delayer lingers until GC collects the LocalNavigable, which can
         //         block the parent document's load event indefinitely.
         local_navigable->set_delaying_load_events(false);
-
-        // AD-HOC: Clear the navigation load event guard that may have been set by
-        //         finalize_a_cross_document_navigation. Without this, the guard's
-        //         DocumentLoadEventDelayer on the parent document persists until GC,
-        //         blocking the parent's load event indefinitely.
-        local_navigable->clear_navigation_load_event_guard();
 
         // 4. Inform the navigation API about child navigable destruction given navigable.
         local_navigable->inform_the_navigation_api_about_child_navigable_destruction();
@@ -438,7 +428,6 @@ void NavigableContainer::swap_content_navigable_to_remote(Badge<Page>, Replicate
 
     local_navigable.set_container({}, nullptr);
     local_navigable.set_delaying_load_events(false);
-    local_navigable.clear_navigation_load_event_guard();
     local_navigable.set_has_been_destroyed();
     local_navigable.remove_from_all_local_navigables();
 }

@@ -338,8 +338,6 @@ pub(crate) enum LayoutWrite<'a> {
     DetachRemainingRowsForRemoval(&'a [u32]),
     /// The row takes the derived style record `record` its layout node made.
     AdoptDerivedNodeStyle { node: NodeSlotId, record: u64 },
-    /// The row's layout style takes the display `display`.
-    SetLayoutDisplay { node: NodeSlotId, display: u32 },
     /// The anonymous rows below the row inherit its style again.
     ReinheritAnonymousDescendants { node: NodeSlotId },
     /// The viewport and the boxes of the root element and its body take the styles viewport propagation gives them.
@@ -391,12 +389,6 @@ impl LayoutWrite<'_> {
                 arena.apply_reinherited_style_record(host_calls, node, derived);
                 false
             }
-            Self::SetLayoutDisplay { node, display } => {
-                arena.update_layout_style(host_calls, node, |style| {
-                    style.set_display(crate::css::display::FfiDisplay::from_raw(display));
-                });
-                false
-            }
             Self::ReinheritAnonymousDescendants { node } => {
                 arena.reinherit_anonymous_descendants(host_calls, node);
                 false
@@ -443,33 +435,23 @@ pub(crate) fn write(wait: impl RenderWait, host: &DocumentHost, write: LayoutWri
 }
 
 /// Queues `change` for the render state of `host`'s document.
-///
-/// # Safety
-///
-/// `host` must come from `document_host_create` and not be destroyed yet, on the document's thread.
-pub(crate) unsafe fn queue(host: &DocumentHost, change: LayoutChange) {
+pub(crate) fn queue(host: &DocumentHost, change: LayoutChange) {
     host.queue_change(ArenaChange::Layout(change));
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_needs_layout_update(
+pub extern "C" fn render_state_set_needs_layout_update(
     host: &DocumentHost,
     node: NodeSlotId,
     propagate_through_ancestors: bool,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        queue(
-            host,
-            LayoutChange::SetNeedsLayoutUpdate {
-                node,
-                propagate_through_ancestors,
-            },
-        );
-    }
+    queue(
+        host,
+        LayoutChange::SetNeedsLayoutUpdate {
+            node,
+            propagate_through_ancestors,
+        },
+    );
 }
 
 /// Detaches what is left of the boxes of the `count` nodes `style_nodes` names as they leave the document (see
@@ -493,34 +475,22 @@ pub unsafe extern "C" fn render_state_detach_remaining_rows_for_removal(
     host.queue_change(ArenaChange::DetachForRemoval(style_nodes.into()));
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_needs_full_layout_tree_update(host: &DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetNeedsFullLayoutTreeUpdate) };
+pub extern "C" fn render_state_set_needs_full_layout_tree_update(host: &DocumentHost) {
+    queue(host, LayoutChange::SetNeedsFullLayoutTreeUpdate);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_reset_cached_intrinsic_sizes_of_self_and_ancestors(
+pub extern "C" fn render_state_reset_cached_intrinsic_sizes_of_self_and_ancestors(
     host: &DocumentHost,
     node: NodeSlotId,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::ResetCachedIntrinsicSizesOfSelfAndAncestors { node }) };
+    queue(host, LayoutChange::ResetCachedIntrinsicSizesOfSelfAndAncestors { node });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_record_partial_relayout_escape(host: &DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::RecordPartialRelayoutEscape) };
+pub extern "C" fn render_state_record_partial_relayout_escape(host: &DocumentHost) {
+    queue(host, LayoutChange::RecordPartialRelayoutEscape);
 }
 
 /// # Safety
@@ -547,8 +517,7 @@ pub unsafe extern "C" fn render_state_style_node_changed(
         new,
         generated_for,
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
     if let Some(new) = new {
         host.write_marks(super::tree_update_marks::LayoutTreeUpdateMarkWrite::Clear(new));
     }
@@ -577,32 +546,20 @@ pub unsafe extern "C" fn render_state_set_anchor_name_elements(
         anchor_name,
         elements: elements.iter().copied().filter_map(StyleNodeID::from_raw).collect(),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_element_scroll_offset(
-    host: &DocumentHost,
-    element: u32,
-    offset: FfiCssPixelPoint,
-) {
+pub extern "C" fn render_state_set_element_scroll_offset(host: &DocumentHost, element: u32, offset: FfiCssPixelPoint) {
     let Some(element) = StyleNodeID::from_raw(element) else {
         return;
     };
     let offset = offset.into();
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetElementScrollOffset { element, offset }) };
+    queue(host, LayoutChange::SetElementScrollOffset { element, offset });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_pseudo_element_scroll_offset(
+pub extern "C" fn render_state_set_pseudo_element_scroll_offset(
     host: &DocumentHost,
     generator: u32,
     generated_for: u8,
@@ -616,24 +573,15 @@ pub unsafe extern "C" fn render_state_set_pseudo_element_scroll_offset(
         generated_for,
         offset: offset.into(),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_identity_in_focused_text_control(
-    host: &DocumentHost,
-    node: u32,
-    value: bool,
-) {
+pub extern "C" fn render_state_set_identity_in_focused_text_control(host: &DocumentHost, node: u32, value: bool) {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return;
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetIdentityInFocusedTextControl { node, value }) };
+    queue(host, LayoutChange::SetIdentityInFocusedTextControl { node, value });
 }
 
 /// Publishes what the SVG element `element` names parses to. A `<polyline>` or `<polygon>` passes its `points` list
@@ -664,19 +612,14 @@ pub unsafe extern "C" fn render_state_set_svg_attribute_facts(
         facts: Box::new(facts),
         points: points.into(),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
 /// Publishes only the resources a graphics element's style names, leaving what its attributes parse to alone. Style
 /// records are replaced far more often than an SVG attribute changes, and parsing every presentation attribute again
 /// to carry four names would make every style change pay for it.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_svg_style_references(
+pub extern "C" fn render_state_set_svg_style_references(
     host: &DocumentHost,
     element: u32,
     mask: u32,
@@ -691,38 +634,21 @@ pub unsafe extern "C" fn render_state_set_svg_style_references(
         element,
         references: [mask, clip_path, fill, stroke],
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_document_is_decoded_svg(host: &DocumentHost, is_decoded_svg: bool) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetDocumentIsDecodedSvg(is_decoded_svg)) };
+pub extern "C" fn render_state_set_document_is_decoded_svg(host: &DocumentHost, is_decoded_svg: bool) {
+    queue(host, LayoutChange::SetDocumentIsDecodedSvg(is_decoded_svg));
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_node_flag(
-    host: &DocumentHost,
-    node: NodeSlotId,
-    flag: NodeFlag,
-    value: bool,
-) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetNodeFlag { node, flag, value }) };
+pub extern "C" fn render_state_set_node_flag(host: &DocumentHost, node: NodeSlotId, flag: NodeFlag, value: bool) {
+    queue(host, LayoutChange::SetNodeFlag { node, flag, value });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_owned_image_natural_size(
+pub extern "C" fn render_state_set_owned_image_natural_size(
     host: &DocumentHost,
     node: NodeSlotId,
     natural_size: FfiNaturalSize,
@@ -731,26 +657,17 @@ pub unsafe extern "C" fn render_state_set_owned_image_natural_size(
         node,
         natural_size: natural_size.into(),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_invalidate_searchable_text(host: &DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::InvalidateSearchableText) };
+pub extern "C" fn render_state_invalidate_searchable_text(host: &DocumentHost) {
+    queue(host, LayoutChange::InvalidateSearchableText);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_restamp_table_spans(host: &DocumentHost, node: NodeSlotId) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::RestampTableSpans { node }) };
+pub extern "C" fn render_state_restamp_table_spans(host: &DocumentHost, node: NodeSlotId) {
+    queue(host, LayoutChange::RestampTableSpans { node });
 }
 
 #[cfg(test)]

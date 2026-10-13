@@ -57,12 +57,9 @@ pub(crate) enum CallType {
 }
 
 fn running_execution_context(vm: &Vm) -> &ExecutionContext {
-    let context = vm
-        .running_execution_context()
-        .expect("a slow path runs in a running frame");
-    // SAFETY: The running execution context is live while the slow path runs in it. Callers only use the reference
-    // before anything can unwind the frame.
-    unsafe { context.as_ref() }
+    // NB: Callers only use the reference before anything can unwind the frame.
+    vm.running_execution_context_if_any()
+        .expect("a slow path runs in a running frame")
 }
 
 fn strict_of(header: &InstructionHeader) -> Strict {
@@ -158,13 +155,7 @@ pub fn get_super_constructor(vm: &Vm, pc: u32, values: &mut op::GetSuperConstruc
 
 /// The element key operands NewClass stores after its fixed fields.
 fn element_key_operands(instruction: &op::NewClass) -> &[OptionalOperand] {
-    // SAFETY: The bytecode stores the instruction's element_keys_count element key operands right after it.
-    unsafe {
-        core::slice::from_raw_parts(
-            instruction.element_keys.as_ptr(),
-            instruction.element_keys_count as usize,
-        )
-    }
+    instruction.element_keys()
 }
 
 pub fn new_class(
@@ -1055,8 +1046,7 @@ pub(crate) fn record_callback(
         vm,
         frame,
         pc,
-        // SAFETY: Every cell starts with a cell header.
-        unsafe { Gc::<CellHeader>::from_non_null(builtin.as_non_null().cast()) },
+        builtin.upcast::<CellHeader>(),
         callback.as_cell(),
         CallFeedbackForwarding::Callback,
         0,

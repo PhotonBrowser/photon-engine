@@ -42,7 +42,7 @@ include!(concat!(env!("OUT_DIR"), "/length_units_generated.rs"));
 /// The font metrics needed for font-relative length resolution, as unrounded
 /// CSS pixel values.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct FfiFontMetrics {
     pub font_size: f64,
     pub x_height: f64,
@@ -72,6 +72,28 @@ pub struct FfiLengthResolutionContext {
     /// resolution here consumed viewport metrics. Callers that report the
     /// dependency through their return value may leave this null.
     pub resolved_viewport_relative_length: *mut bool,
+}
+
+/// A context with no viewport, font metrics or container basis, which tracks no viewport dependency.
+impl Default for FfiLengthResolutionContext {
+    fn default() -> Self {
+        Self {
+            viewport_width: 0.0,
+            viewport_height: 0.0,
+            font_metrics: FfiFontMetrics::default(),
+            root_font_metrics: FfiFontMetrics::default(),
+            font_metrics_depend_on_viewport_metrics: false,
+            root_font_metrics_depend_on_viewport_metrics: false,
+            has_container_width_basis: false,
+            has_container_height_basis: false,
+            container_width_basis: 0.0,
+            container_height_basis: 0.0,
+            container_width_basis_depends_on_viewport_metrics: false,
+            container_height_basis_depends_on_viewport_metrics: false,
+            subject_inline_axis_is_horizontal: false,
+            resolved_viewport_relative_length: std::ptr::null_mut(),
+        }
+    }
 }
 
 /// Records a viewport metric dependency on the context's tracking flag, if one is set.
@@ -394,14 +416,15 @@ pub(crate) fn absolutize_length(value: f64, unit: usize, context: &FfiLengthReso
 /// Absolutizes a length during style computation.
 ///
 /// # Safety
-/// `context` must be a valid pointer.
+/// `context.resolved_viewport_relative_length` must be null or point to a live flag, which the
+/// absolutization may set.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_absolutize_length(
     value: f64,
     unit: u8,
-    context: *const FfiLengthResolutionContext,
+    context: &FfiLengthResolutionContext,
 ) -> FfiAbsolutizedLength {
-    absolutize_length(value, unit as usize, unsafe { &*context })
+    absolutize_length(value, unit as usize, context)
 }
 
 /// Result of computing a property that resolves to a number.
@@ -2256,9 +2279,6 @@ fn value_contains_percentage(value: &StyleValueData) -> bool {
 /// inheritance-dependency decision; the property-agnostic parts
 /// (depends-on-current-color and computational independence) stay with the
 /// value's own operations.
-///
-/// # Safety
-/// `value` must point at a valid StyleValueData.
 pub(crate) fn value_depends_on_inherited_info_for_property(value: &StyleValueData, property_id: u16) -> bool {
     use crate::css::property_metadata::property_id as prop;
     match property_id {
@@ -2405,9 +2425,7 @@ fn compute_position_area(value: &StyleValueData) -> Option<Arc<StyleValueData>> 
         return None;
     }
 
-    let retained_keyword = |keyword| unsafe {
-        RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(StyleValueData::Keyword { keyword })))
-    };
+    let retained_keyword = |keyword| RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Keyword { keyword }));
     Some(Arc::new(StyleValueData::ValueList {
         values: RetainedStyleValueDataList::from_retained_values(vec![
             retained_keyword(short_block_keyword),
@@ -2440,12 +2458,10 @@ fn stroke_dasharray_numbers_as_lengths(value: &StyleValueData) -> Option<Arc<Sty
     let computed_dashes = dashes
         .iter()
         .map(|dash| match dash.data() {
-            StyleValueData::Number { value } => unsafe {
-                RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(StyleValueData::Length {
-                    value: *value,
-                    unit: px_length_unit(),
-                })))
-            },
+            StyleValueData::Number { value } => RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Length {
+                value: *value,
+                unit: px_length_unit(),
+            })),
             _ => dash.clone_retained(),
         })
         .collect();
@@ -2459,7 +2475,7 @@ fn stroke_dasharray_numbers_as_lengths(value: &StyleValueData) -> Option<Arc<Sty
 /// The computed two-value list for a `border-spacing` member used for both axes.
 #[allow(clippy::arc_with_non_send_sync)]
 fn border_spacing_pair(single: StyleValueData) -> Arc<StyleValueData> {
-    let single = unsafe { RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(single))) };
+    let single = RetainedStyleValueData::from_arc(Arc::new(single));
     Arc::new(StyleValueData::ValueList {
         values: RetainedStyleValueDataList::from_retained_values(vec![single.clone_retained(), single]),
         separator: 0,
@@ -2544,7 +2560,11 @@ pub(crate) fn initial_value(property_id: u16) -> Option<&'static crate::css::sty
 }
 
 pub(crate) fn initial_value_data(property_id: u16) -> *const crate::css::style_value::StyleValueData {
-    initial_value_table().values[longhand_index(property_id)].pointer()
+    initial_value_handle(property_id).pointer()
+}
+
+pub(crate) fn initial_value_handle(property_id: u16) -> &'static crate::css::style_value::RetainedStyleValueData {
+    &initial_value_table().values[longhand_index(property_id)]
 }
 
 fn initial_value_dependencies(property_id: u16) -> ExternalValueDependencies {
@@ -2961,10 +2981,9 @@ fn compute_animation_name(value: &StyleValueData) -> Option<Arc<StyleValueData>>
                 string,
                 is_valid_animation_name_custom_ident,
             } => Some(if *is_valid_animation_name_custom_ident {
-                let pointer = Arc::into_raw(Arc::new(StyleValueData::CustomIdent {
+                RetainedStyleValueData::from_arc(Arc::new(StyleValueData::CustomIdent {
                     custom_ident: string.clone(),
-                }));
-                unsafe { RetainedStyleValueData::from_retained_pointer(pointer) }
+                }))
             } else {
                 entry.clone_retained()
             }),
@@ -3008,8 +3027,7 @@ fn compute_transform_origin(value: &StyleValueData) -> Option<Arc<StyleValueData
         .iter()
         .map(|offset| match offset_percentage(offset) {
             Some(percentage) => {
-                let pointer = Arc::into_raw(Arc::new(StyleValueData::Percentage { value: percentage }));
-                unsafe { RetainedStyleValueData::from_retained_pointer(pointer) }
+                RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Percentage { value: percentage }))
             }
             None => offset.clone_retained(),
         })
@@ -3078,15 +3096,13 @@ pub(crate) fn parent_snapshot_for_style_record<'a>(
     let view = style_engine
         .style_record_view(style_record)
         .expect("the inheritance parent style record must remain live during computation");
-    let table = unsafe {
-        view.longhand_table
-            .as_ref()
-            .expect("the inheritance parent style record must carry a longhand table")
-    };
+    let table = view
+        .longhand_table
+        .expect("the inheritance parent style record must carry a longhand table");
     ParentSnapshot {
         table,
         inherited_value_overlay: animated_overlay,
-        stored_animated_overlay: unsafe { view.animated_overlay.as_ref() },
+        stored_animated_overlay: view.animated_overlay,
         font_metrics_depend_on_viewport_metrics: view.dependency_flags & (1 << 1) != 0,
         highlight_colors_authored: view.dependency_flags & HIGHLIGHT_COLORS_AUTHORED != 0,
         highlight_color_is_current_color: view.dependency_flags & HIGHLIGHT_COLOR_IS_CURRENT_COLOR != 0,
@@ -3229,7 +3245,7 @@ fn clear_longhand_bit(words: &mut [u64], property_id: u16) {
 
 #[allow(clippy::arc_with_non_send_sync)]
 fn retained_new(value: StyleValueData) -> RetainedStyleValueData {
-    unsafe { RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(value))) }
+    RetainedStyleValueData::from_arc(Arc::new(value))
 }
 
 fn needs_computed_style_sheet_context(value: *const StyleValueData) -> bool {
@@ -3300,7 +3316,7 @@ fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: &Comp
         COMPUTED_KIND_PERCENTAGE => StyleValueData::Percentage { value: entry.value },
         COMPUTED_KIND_FONT_STYLE => StyleValueData::FontStyle {
             font_style: entry.value as u8,
-            angle_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(std::ptr::null()) },
+            angle_value: RetainedStyleValueData::none(),
         },
         COMPUTED_KIND_KEYWORD => StyleValueData::Keyword {
             keyword: entry.value as u16,
@@ -4790,7 +4806,7 @@ fn settled_animation_plan(
     record: u64,
 ) -> Option<(smallvec::SmallVec<[FfiComputedAnimation; 1]>, bool)> {
     let view = style_engine.style_record_view(record)?;
-    let table = unsafe { view.longhand_table.as_ref() }?;
+    let table = view.longhand_table?;
     let declaration_scope = style_engine.animation_name_declaration_scope_of(node, pseudo_kind)?;
     let existing_animations = style_engine.element_css_defined_animations(node, animation_slot(pseudo_kind));
     let element_tree_scope = style_engine.tree().tree_scope(node);
@@ -4997,9 +5013,8 @@ pub(crate) fn effective_display(table: &ComputedLonghandTable, overlay: Option<&
 /// returned pointer transfers one strong reference to the caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_create_document_longhand_table(
-    input: *const FfiDocumentLonghandInput,
+    input: &FfiDocumentLonghandInput,
 ) -> *mut ComputedLonghandTable {
-    let input = unsafe { &*input };
     let mut longhand_table = ComputedLonghandTable::new();
     let store = CascadedPropertyStore::new();
     let environment = FfiStyleComputationEnvironment {
@@ -5135,14 +5150,13 @@ pub unsafe extern "C" fn rust_intern_document_style(
 /// duration of the call. Every returned value transfers one strong reference
 /// to the caller.
 pub(crate) unsafe fn compute_animation_keyframe_longhands(
-    input: *const FfiAnimationKeyframeLonghandInput,
+    input: &FfiAnimationKeyframeLonghandInput,
 ) -> FfiAnimationKeyframeLonghandResult {
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::AnimationKeyframeLonghandEntry);
     use crate::css::property_metadata::{
         FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID, NUMBER_OF_LONGHAND_PROPERTIES,
     };
 
-    let input = unsafe { &*input };
     let properties = if input.property_count == 0 {
         &[][..]
     } else {
@@ -5640,13 +5654,12 @@ impl FfiHostAnimationSample {
 /// engine.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_sample_animation_effects(
-    input: *const FfiHostAnimationSample,
+    input: &FfiHostAnimationSample,
     read: &crate::render_state::BegunRead,
 ) -> FfiHostAnimationSampleResult {
     use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
 
     // SAFETY: Guaranteed by the caller.
-    let input = unsafe { &*input };
     // SAFETY: As above.
     let host = unsafe { document_host(input.host) };
     // The first sample of the transitions a step just started rides the style job that decided the step.
@@ -5970,7 +5983,7 @@ unsafe fn begin_animation_sample(
             custom_results: std::ptr::null_mut(),
             custom_result_count: std::ptr::null_mut(),
         };
-        unsafe { anim::evaluate_animations(&raw const batch) };
+        unsafe { anim::evaluate_animations(&batch) };
         return finished(Evaluated);
     }
 
@@ -6134,7 +6147,7 @@ unsafe fn finish_animation_sample(
         remaining_length_resolution_context: &raw const length_contexts.remaining,
         custom_property_values: custom_value_pointers.as_ptr(),
     };
-    let computed_keyframes = unsafe { compute_animation_keyframe_longhands(&raw const keyframe_input) };
+    let computed_keyframes = unsafe { compute_animation_keyframe_longhands(&keyframe_input) };
     result.depends_on_viewport_metrics = computed_keyframes.depends_on_viewport_metrics;
     result.font_metrics_depend_on_viewport_metrics = computed_keyframes.font_metrics_depend_on_viewport_metrics;
     // A custom property's keyframe that asks where the element sits among its siblings makes the
@@ -6179,7 +6192,7 @@ unsafe fn finish_animation_sample(
         custom_results: custom_results.as_mut_ptr(),
         custom_result_count: &raw mut custom_result_count,
     };
-    unsafe { anim::evaluate_animations(&raw const batch) };
+    unsafe { anim::evaluate_animations(&batch) };
     result.outcome = FfiHostAnimationSampleOutcome::Evaluated;
     if custom_result_count != 0 {
         let retained = custom_results[..custom_result_count]
@@ -6592,11 +6605,8 @@ pub(crate) fn rust_box_type_transformation_input(
 /// samples over the record the engine holds for it: the same input the engine drives the record
 /// against, read from the element's published facts and its parent's record. A target the engine
 /// does not know is transformed with no facts and no parent display.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_animated_box_type_transformation_input(
+pub extern "C" fn rust_animated_box_type_transformation_input(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     node: u32,
@@ -6957,12 +6967,11 @@ fn resolve_effective_color_scheme(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_resolve_effective_color_scheme(
     value: *const c_void,
-    input: *const FfiEffectiveColorSchemeInput,
+    input: &FfiEffectiveColorSchemeInput,
 ) -> u8 {
     let StyleValueData::ColorScheme { scheme_codes, .. } = (unsafe { &*(value as *const StyleValueData) }) else {
         unreachable!("computed color-scheme must have color-scheme data");
     };
-    let input = unsafe { &*input };
     resolve_effective_color_scheme(scheme_codes.as_slice(), input.preferred_color_scheme, unsafe {
         input.document_supported_schemes()
     })
@@ -7120,23 +7129,14 @@ fn finalize_animated_box_type(
 
 /// Applies the box type transformation and element adjustments to the animated composition `animated_overlay` holds
 /// over `longhand_table`.
-///
-/// # Safety
-/// `longhand_table` and `animated_overlay` must be live, and `input_line_height_metrics` a live metrics snapshot when
-/// `box_type` asks to check an input's line-height.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_finalize_animated_box_type(
+pub extern "C" fn rust_finalize_animated_box_type(
     box_type: FfiBoxTypeTransformationInput,
-    longhand_table: *const ComputedLonghandTable,
-    animated_overlay: *mut AnimatedOverlay,
-    input_line_height_metrics: *const FfiInputLineHeightMetrics,
+    longhand_table: &ComputedLonghandTable,
+    animated_overlay: &mut AnimatedOverlay,
+    input_line_height_metrics: Option<&FfiInputLineHeightMetrics>,
 ) {
-    finalize_animated_box_type(
-        box_type,
-        unsafe { &*longhand_table },
-        unsafe { &mut *animated_overlay },
-        unsafe { input_line_height_metrics.as_ref() },
-    );
+    finalize_animated_box_type(box_type, longhand_table, animated_overlay, input_line_height_metrics);
 }
 
 /// Computes the font-weight property from its absolutized value.

@@ -35,11 +35,7 @@ crate::render_state::held_node_entries!();
 /// Answers `answer` from the render state of `host`'s document and `args`, as of every change the host queued,
 /// spending `wait`: the host's painting, input, editing and devtools code reads what the render state laid out and
 /// painted.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-pub(crate) unsafe fn read_arena<A, R>(
+pub(crate) fn read_arena<A, R>(
     host: &DocumentHost,
     wait: impl RenderWait,
     args: A,
@@ -119,23 +115,14 @@ pub unsafe extern "C" fn document_host_set_chrome_state_callback(
 
 /// Copies the row in `slot` to `row`, where it is populated. The host reads it from the rows it holds where they still
 /// read as the arena, and asks otherwise.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_row(
-    host: &DocumentHost,
-    slot: NodeSlotId,
-    row: &mut PaintableData,
-) -> bool {
+pub extern "C" fn render_state_paintable_row(host: &DocumentHost, slot: NodeSlotId, row: &mut PaintableData) -> bool {
     let known = host.read_known_rows(|rows, _| {
         rows.paintable
             .paintable_row_is_populated(slot)
             .then(|| *rows.paintable.paintable_data(slot))
     });
-    // SAFETY: Guaranteed by the caller.
-    let answer = known.unwrap_or_else(|| unsafe {
+    let answer = known.unwrap_or_else(|| {
         read_arena(host, node_read(), slot, |arena, slot| {
             let paintable_rows = arena.paintable_rows();
             paintable_rows
@@ -151,21 +138,14 @@ pub unsafe extern "C" fn render_state_paintable_row(
 }
 
 /// Whether the row in `slot` is populated, which the host answers without asking where it knows.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_has_paintable_row(host: &DocumentHost, slot: NodeSlotId) -> bool {
+pub extern "C" fn render_state_has_paintable_row(host: &DocumentHost, slot: NodeSlotId) -> bool {
     if let Some(populated) = host.known_paintable_row_is_populated(slot) {
         return populated;
     }
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), slot, |arena, slot| {
-            arena.paintable_rows().paintable_row_is_populated(slot)
-        })
-    }
+    read_arena(host, node_read(), slot, |arena, slot| {
+        arena.paintable_rows().paintable_row_is_populated(slot)
+    })
 }
 
 #[repr(C)]
@@ -186,29 +166,27 @@ pub unsafe extern "C" fn document_host_set_geometry_host(
     host.host_tables().geometry_host.set(Some(callbacks));
 }
 
-/// # Safety
-///
-/// `arena` must be a live arena used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_scrollable_overflow(
+pub extern "C" fn render_state_paintable_scrollable_overflow(
     host: &DocumentHost,
     slot: NodeSlotId,
-) -> FfiOptionalOverflowData {
+    out: &mut FfiOptionalOverflowData,
+) {
     // The host reads the overflow from the rows it holds, where they were measured and still read as the arena.
     let known = host.read_known_rows(|rows, source| {
         rows.overflow_is_measured()
             .then(|| FfiOptionalOverflowData::of(source, slot))
     });
     if let Some(Some(overflow)) = known {
-        return overflow;
+        *out = overflow;
+        return;
     }
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+    *out = {
         read_arena(host, node_read(), slot, |arena, slot| {
             arena.measure_scrollable_overflow();
             FfiOptionalOverflowData::of(&arena.paintable_rows(), slot)
         })
-    }
+    };
 }
 
 #[derive(Default)]
@@ -239,16 +217,13 @@ pub struct FfiBoxModelMetrics {
     pub inset: crate::painting::paintable_data::FfiPixelBox,
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_svg_viewport_size(
+pub extern "C" fn render_state_paintable_svg_viewport_size(
     host: &DocumentHost,
     slot: NodeSlotId,
-) -> FfiCssPixelSize {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+    out: &mut FfiCssPixelSize,
+) {
+    *out = {
         read_arena(host, node_read(), slot, |arena, slot| {
             let paintable_rows = arena.paintable_rows();
             if !paintable_rows.paintable_row_is_populated(slot) {
@@ -256,7 +231,7 @@ pub unsafe extern "C" fn render_state_paintable_svg_viewport_size(
             }
             crate::painting::paintable_geometry::committed_svg_viewport_size(&paintable_rows, slot)
         })
-    }
+    };
 }
 
 #[repr(C)]
@@ -265,72 +240,57 @@ pub struct FfiOptionalAffineTransform {
     pub transform: svg_formatting_context::FfiAffineTransform,
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_svg_viewport_transform(
+pub extern "C" fn render_state_paintable_svg_viewport_transform(
     host: &DocumentHost,
     slot: NodeSlotId,
 ) -> FfiOptionalAffineTransform {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), slot, |arena, slot| {
-            let transform = if arena.paintable_row_is_populated(slot) {
-                crate::painting::paintable_geometry::committed_svg_viewport_transform(arena, slot)
-            } else {
-                None
-            };
-            FfiOptionalAffineTransform {
-                has_value: transform.is_some(),
-                transform: transform.unwrap_or_default(),
-            }
-        })
-    }
+    read_arena(host, node_read(), slot, |arena, slot| {
+        let transform = if arena.paintable_row_is_populated(slot) {
+            crate::painting::paintable_geometry::committed_svg_viewport_transform(arena, slot)
+        } else {
+            None
+        };
+        FfiOptionalAffineTransform {
+            has_value: transform.is_some(),
+            transform: transform.unwrap_or_default(),
+        }
+    })
 }
 
 /// The transform an SVG element's box was laid out with: its own CSS transform reduced to 2D, with a <use> element's
 /// x/y translation multiplied in.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_svg_element_transform(
+pub extern "C" fn render_state_paintable_svg_element_transform(
     host: &DocumentHost,
     slot: NodeSlotId,
 ) -> svg_formatting_context::FfiAffineTransform {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), slot, |arena, slot| {
-            if !arena.paintable_row_is_populated(slot) {
-                return svg_formatting_context::FfiAffineTransform::default();
-            }
-            crate::painting::paintable_geometry::committed_svg_element_transform(arena, slot).unwrap_or_default()
-        })
-    }
+    read_arena(host, node_read(), slot, |arena, slot| {
+        if !arena.paintable_row_is_populated(slot) {
+            return svg_formatting_context::FfiAffineTransform::default();
+        }
+        crate::painting::paintable_geometry::committed_svg_element_transform(arena, slot).unwrap_or_default()
+    })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_transform_reference_box(
+pub extern "C" fn render_state_paintable_transform_reference_box(
     host: &DocumentHost,
     slot: NodeSlotId,
-) -> FfiCssPixelRect {
+    out: &mut FfiCssPixelRect,
+) {
     fn reference_box(rows: &impl PaintRead, slot: NodeSlotId) -> FfiCssPixelRect {
         committed_transform_reference_box(rows, slot).map_or_else(FfiCssPixelRect::default, Into::into)
     }
     if let Some(rect) = host.read_rows_between_jobs(node_read(), |rows| reference_box(rows, slot)) {
-        return rect;
+        *out = rect;
+        return;
     }
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+    *out = {
         read_arena(host, node_read(), slot, |arena, slot| {
             reference_box(&arena.paintable_rows(), slot)
         })
-    }
+    };
 }
 
 /// The transform reference box of the box in `slot`, where the box was laid out.
@@ -344,70 +304,52 @@ pub(crate) fn committed_transform_reference_box(rows: &impl PaintRead, slot: Nod
     ))
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_physical_overflow_directions(
+pub extern "C" fn render_state_physical_overflow_directions(
     host: &DocumentHost,
     paintable: NodeSlotId,
 ) -> FfiPhysicalOverflowDirections {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), paintable, |arena, paintable| {
-            let directions = if arena.paintable_row_is_populated(paintable) {
-                crate::painting::scrollable_overflow::physical_overflow_directions(arena, paintable)
-            } else {
-                crate::painting::scrollable_overflow::PhysicalOverflowDirections::default()
-            };
-            FfiPhysicalOverflowDirections {
-                horizontal_axis_is_positive: directions.horizontal_axis_is_positive,
-                vertical_axis_is_positive: directions.vertical_axis_is_positive,
-            }
-        })
-    }
+    read_arena(host, node_read(), paintable, |arena, paintable| {
+        let directions = if arena.paintable_row_is_populated(paintable) {
+            crate::painting::scrollable_overflow::physical_overflow_directions(arena, paintable)
+        } else {
+            crate::painting::scrollable_overflow::PhysicalOverflowDirections::default()
+        };
+        FfiPhysicalOverflowDirections {
+            horizontal_axis_is_positive: directions.horizontal_axis_is_positive,
+            vertical_axis_is_positive: directions.vertical_axis_is_positive,
+        }
+    })
 }
 
-/// # Safety
-///
-/// `arena` must be a live layout arena handle used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_background_color_can_be_compositor_animated(
+pub extern "C" fn render_state_background_color_can_be_compositor_animated(
     host: &DocumentHost,
     slot: NodeSlotId,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), slot, |arena, slot| {
-            crate::painting::record::paint::background_resolution::background_color_can_be_compositor_animated(
-                &arena.paintable_rows(),
-                slot,
-                crate::layout::viewport_propagation::root_background_source(arena),
-            )
-        })
-    }
+    read_arena(host, node_read(), slot, |arena, slot| {
+        crate::painting::record::paint::background_resolution::background_color_can_be_compositor_animated(
+            &arena.paintable_rows(),
+            slot,
+            crate::layout::viewport_propagation::root_background_source(arena),
+        )
+    })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_visual_context_node_count(
+pub extern "C" fn render_state_paintable_visual_context_node_count(
     host: &DocumentHost,
     slot: NodeSlotId,
     list: crate::painting::host::FfiVisualContextBoxNodeList,
 ) -> usize {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), (slot, list), |arena, (slot, list)| {
-            use crate::painting::host::FfiVisualContextBoxNodeList;
-            arena.with_paintable_visual_context_node_handles(slot, |handles| match list {
-                FfiVisualContextBoxNodeList::SpatialNodes => handles.spatial.len(),
-                FfiVisualContextBoxNodeList::ClipNodes => handles.clip_handles().count(),
-                FfiVisualContextBoxNodeList::EffectNodes => handles.effects.len(),
-            })
+    read_arena(host, node_read(), (slot, list), |arena, (slot, list)| {
+        use crate::painting::host::FfiVisualContextBoxNodeList;
+        arena.with_paintable_visual_context_node_handles(slot, |handles| match list {
+            FfiVisualContextBoxNodeList::SpatialNodes => handles.spatial.len(),
+            FfiVisualContextBoxNodeList::ClipNodes => handles.clip_handles().count(),
+            FfiVisualContextBoxNodeList::EffectNodes => handles.effects.len(),
         })
-    }
+    })
 }
 
 /// # Safety
@@ -421,8 +363,7 @@ pub unsafe extern "C" fn render_state_paintable_visual_context_copy_node_indices
     out: *mut u32,
     capacity: usize,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let indices = unsafe {
+    let indices = {
         read_arena(host, node_read(), (slot, list), |arena, (slot, list)| {
             use crate::painting::host::FfiVisualContextBoxNodeList;
             arena.with_paintable_visual_context_node_handles(slot, |handles| -> Vec<u32> {
@@ -452,25 +393,18 @@ pub(super) fn apply_walk_assignments(
 /// The index of the sticky node the accumulated visual context tree holds for `paintable`, which
 /// is where the scroll state snapshot keeps its resolved sticky offset, or `u32::MAX` when the tree
 /// holds none.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_sticky_spatial_node_index(host: &DocumentHost, paintable: NodeSlotId) -> u32 {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), paintable, |arena, paintable| {
-            let paint_state = arena.paint_state().borrow();
-            paint_state
-                .visual_context
-                .scroll_state
-                .states()
-                .iter()
-                .find(|state| state.is_sticky && state.paintable == paintable)
-                .map_or(u32::MAX, |state| state.node_index.0)
-        })
-    }
+pub extern "C" fn render_state_sticky_spatial_node_index(host: &DocumentHost, paintable: NodeSlotId) -> u32 {
+    read_arena(host, node_read(), paintable, |arena, paintable| {
+        let paint_state = arena.paint_state().borrow();
+        paint_state
+            .visual_context
+            .scroll_state
+            .states()
+            .iter()
+            .find(|state| state.is_sticky && state.paintable == paintable)
+            .map_or(u32::MAX, |state| state.node_index.0)
+    })
 }
 
 /// Marks the entry the event loop calls between two tasks to take a finished recording in.
@@ -696,7 +630,7 @@ pub struct FfiImagePaintRecordInputs {
 /// storage and visual context tree handles.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
-    inputs: *const FfiImagePaintRecordInputs,
+    inputs: &FfiImagePaintRecordInputs,
     context: *mut c_void,
     consume: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void),
 ) {
@@ -709,7 +643,6 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
     };
     use crate::painting::visual_context::{TransformData, TransformDataRole, VisualContextTree};
     use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint};
-    let inputs = unsafe { &*inputs };
     let tree = VisualContextTree::create(TransformData {
         matrix: FloatMatrix4x4::identity(),
         origin: FloatPoint::default(),
@@ -771,25 +704,19 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
     }
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_computed_svg_path(
+pub extern "C" fn render_state_paintable_computed_svg_path(
     host: &DocumentHost,
     paintable: NodeSlotId,
 ) -> *const c_void {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), paintable, |arena, paintable| {
-            let paintable_rows = arena.paintable_rows();
-            if !paintable_rows.paintable_row_is_populated(paintable) {
-                return std::ptr::null();
-            }
-            crate::painting::paintable_geometry::committed_svg_path(&paintable_rows, paintable)
-                .map_or(std::ptr::null(), |path| path.as_raw())
-        })
-    }
+    read_arena(host, node_read(), paintable, |arena, paintable| {
+        let paintable_rows = arena.paintable_rows();
+        if !paintable_rows.paintable_row_is_populated(paintable) {
+            return std::ptr::null();
+        }
+        crate::painting::paintable_geometry::committed_svg_path(&paintable_rows, paintable)
+            .map_or(std::ptr::null(), |path| path.as_raw())
+    })
 }
 
 /// The glyph cells a text content element's box committed for its own characters, one per code
@@ -800,35 +727,28 @@ pub struct FfiSvgTextCharacterCells {
     pub count: usize,
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread. The cells the result points at
-/// belong to the committed fragment, so the caller reads them before the next commit.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_svg_text_character_cells(
+pub extern "C" fn render_state_paintable_svg_text_character_cells(
     host: &DocumentHost,
     paintable: NodeSlotId,
 ) -> FfiSvgTextCharacterCells {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), paintable, |arena, paintable| {
-            let none = FfiSvgTextCharacterCells {
-                cells: std::ptr::null(),
-                count: 0,
-            };
-            let paintable_rows = arena.paintable_rows();
-            if !paintable_rows.paintable_row_is_populated(paintable) {
-                return none;
-            }
-            match crate::painting::paintable_geometry::committed_svg_text_character_cells(&paintable_rows, paintable) {
-                Some(cells) => FfiSvgTextCharacterCells {
-                    cells: cells.as_ptr(),
-                    count: cells.len(),
-                },
-                None => none,
-            }
-        })
-    }
+    read_arena(host, node_read(), paintable, |arena, paintable| {
+        let none = FfiSvgTextCharacterCells {
+            cells: std::ptr::null(),
+            count: 0,
+        };
+        let paintable_rows = arena.paintable_rows();
+        if !paintable_rows.paintable_row_is_populated(paintable) {
+            return none;
+        }
+        match crate::painting::paintable_geometry::committed_svg_text_character_cells(&paintable_rows, paintable) {
+            Some(cells) => FfiSvgTextCharacterCells {
+                cells: cells.as_ptr(),
+                count: cells.len(),
+            },
+            None => none,
+        }
+    })
 }
 
 #[repr(C)]
@@ -872,20 +792,15 @@ pub(crate) unsafe fn rect_to_viewport_transform_from_ffi(
 
 /// Whether a row has ever been given a style with `content-visibility: auto`, which is when a
 /// layout commit collects the boxes with it. The host knows without asking right after the round that committed it.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_may_have_auto_content_visibility(
+pub extern "C" fn render_state_may_have_auto_content_visibility(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
 ) -> bool {
     if let Some(facts) = host.known_arena_facts() {
         return facts.may_have_auto_content_visibility;
     }
-    // SAFETY: Guaranteed by the caller.
-    unsafe { read_arena(host, read, (), |arena, ()| arena.may_have_auto_content_visibility()) }
+    read_arena(host, read, (), |arena, ()| arena.may_have_auto_content_visibility())
 }
 
 /// # Safety
@@ -899,8 +814,7 @@ pub unsafe extern "C" fn render_state_collect_boxes_with_auto_content_visibility
     context: *mut c_void,
     push_box: unsafe extern "C" fn(*mut c_void, NodeSlotId),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let boxes = unsafe {
+    let boxes = {
         read_arena(host, read, root, |arena, root| {
             let mut boxes = Vec::new();
             crate::painting::content_visibility::for_each_box_with_auto_content_visibility(
@@ -917,28 +831,22 @@ pub unsafe extern "C" fn render_state_collect_boxes_with_auto_content_visibility
     }
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_inline_paintable_has_content_pieces(
+pub extern "C" fn render_state_inline_paintable_has_content_pieces(
     host: &DocumentHost,
     inline_paintable: NodeSlotId,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), inline_paintable, |arena, inline_paintable| {
-            let mut has_content = false;
-            with_inline_pieces(&arena.paintable_rows(), inline_paintable, |piece, _| {
-                if !piece.is_geometry_only_placeholder {
-                    has_content = true;
-                    return false;
-                }
-                true
-            });
-            has_content
-        })
-    }
+    read_arena(host, node_read(), inline_paintable, |arena, inline_paintable| {
+        let mut has_content = false;
+        with_inline_pieces(&arena.paintable_rows(), inline_paintable, |piece, _| {
+            if !piece.is_geometry_only_placeholder {
+                has_content = true;
+                return false;
+            }
+            true
+        });
+        has_content
+    })
 }
 
 #[repr(C)]
@@ -948,16 +856,13 @@ pub struct FfiOptionalCssPixelPoint {
     pub y: CssPixels,
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_inline_paintable_first_piece_position(
+pub extern "C" fn render_state_inline_paintable_first_piece_position(
     host: &DocumentHost,
     inline_paintable: NodeSlotId,
-) -> FfiOptionalCssPixelPoint {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+    out: &mut FfiOptionalCssPixelPoint,
+) {
+    *out = {
         read_arena(host, node_read(), inline_paintable, |arena, inline_paintable| {
             let mut result = FfiOptionalCssPixelPoint {
                 has_value: false,
@@ -986,7 +891,7 @@ pub unsafe extern "C" fn render_state_inline_paintable_first_piece_position(
             });
             result
         })
-    }
+    };
 }
 
 #[repr(C)]
@@ -1009,8 +914,7 @@ pub unsafe extern "C" fn render_state_text_visual_lines(
     context: *mut c_void,
     push: unsafe extern "C" fn(*mut c_void, FfiVisualLine),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let lines = unsafe {
+    let lines = {
         read_arena(host, node_read(), primary, |arena, primary| {
             let fragments = arena.text_fragments(primary);
             crate::painting::visual_lines::collect_visual_lines(&arena.paintable_rows(), fragments.as_slice())
@@ -1050,46 +954,34 @@ fn has_rendered_text_matching(
     found
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_text_has_rendered_text_before(
+pub extern "C" fn render_state_text_has_rendered_text_before(
     host: &DocumentHost,
     primary: NodeSlotId,
     offset: usize,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), (primary, offset), |arena, (primary, offset)| {
-            let fragments = arena.text_fragments(primary);
-            let node_slots = fragments.as_slice();
-            has_rendered_text_matching(&arena.paintable_rows(), node_slots, |fragment| {
-                fragment.dom_start_offset_in_node < offset
-            })
+    read_arena(host, node_read(), (primary, offset), |arena, (primary, offset)| {
+        let fragments = arena.text_fragments(primary);
+        let node_slots = fragments.as_slice();
+        has_rendered_text_matching(&arena.paintable_rows(), node_slots, |fragment| {
+            fragment.dom_start_offset_in_node < offset
         })
-    }
+    })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_text_has_rendered_text_after(
+pub extern "C" fn render_state_text_has_rendered_text_after(
     host: &DocumentHost,
     primary: NodeSlotId,
     offset: usize,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), (primary, offset), |arena, (primary, offset)| {
-            let fragments = arena.text_fragments(primary);
-            let node_slots = fragments.as_slice();
-            has_rendered_text_matching(&arena.paintable_rows(), node_slots, |fragment| {
-                fragment.dom_end_offset_in_node > offset
-            })
+    read_arena(host, node_read(), (primary, offset), |arena, (primary, offset)| {
+        let fragments = arena.text_fragments(primary);
+        let node_slots = fragments.as_slice();
+        has_rendered_text_matching(&arena.paintable_rows(), node_slots, |fragment| {
+            fragment.dom_end_offset_in_node > offset
         })
-    }
+    })
 }
 
 #[repr(C)]
@@ -1098,19 +990,16 @@ pub struct FfiOptionalCssPixels {
     pub value: CssPixels,
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_visual_line_caret_inline_coordinate(
+pub extern "C" fn render_state_visual_line_caret_inline_coordinate(
     host: &DocumentHost,
     owner_paintable: u32,
     line_index: u32,
     primary: NodeSlotId,
     offset: usize,
-) -> FfiOptionalCssPixels {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+    out: &mut FfiOptionalCssPixels,
+) {
+    *out = {
         read_arena(
             host,
             node_read(),
@@ -1135,14 +1024,11 @@ pub unsafe extern "C" fn render_state_visual_line_caret_inline_coordinate(
                 }
             },
         )
-    }
+    };
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_visual_line_offset_closest_to_inline_coordinate(
+pub extern "C" fn render_state_visual_line_offset_closest_to_inline_coordinate(
     host: &DocumentHost,
     owner_paintable: u32,
     line_index: u32,
@@ -1150,27 +1036,24 @@ pub unsafe extern "C" fn render_state_visual_line_offset_closest_to_inline_coord
     inline_coordinate: CssPixels,
     fallback_offset: usize,
 ) -> usize {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(
-            host,
-            node_read(),
-            (owner_paintable, line_index, primary, inline_coordinate, fallback_offset),
-            |arena, (owner_paintable, line_index, primary, inline_coordinate, fallback_offset)| {
-                let paintable_rows = arena.paintable_rows();
-                let fragments = arena.text_fragments(primary);
-                let node_slots = fragments.as_slice();
-                crate::painting::visual_lines::offset_closest_to_inline_coordinate(
-                    &paintable_rows,
-                    owner_paintable,
-                    line_index,
-                    node_slots,
-                    inline_coordinate,
-                )
-                .unwrap_or(fallback_offset)
-            },
-        )
-    }
+    read_arena(
+        host,
+        node_read(),
+        (owner_paintable, line_index, primary, inline_coordinate, fallback_offset),
+        |arena, (owner_paintable, line_index, primary, inline_coordinate, fallback_offset)| {
+            let paintable_rows = arena.paintable_rows();
+            let fragments = arena.text_fragments(primary);
+            let node_slots = fragments.as_slice();
+            crate::painting::visual_lines::offset_closest_to_inline_coordinate(
+                &paintable_rows,
+                owner_paintable,
+                line_index,
+                node_slots,
+                inline_coordinate,
+            )
+            .unwrap_or(fallback_offset)
+        },
+    )
 }
 
 #[repr(C)]
@@ -1190,8 +1073,7 @@ pub unsafe extern "C" fn render_state_paintable_grid_layout_json(
     context: *mut c_void,
     consume: unsafe extern "C" fn(*mut c_void, *const u8, usize),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let data = unsafe {
+    let data = {
         read_arena(host, node_read(), paintable, |arena, paintable| {
             if !arena.paintable_row_is_populated(paintable) {
                 return None;
@@ -1218,8 +1100,7 @@ pub unsafe extern "C" fn render_state_paintable_flex_layout_json(
     document_context: *const c_void,
     resolve_node_id: unsafe extern "C" fn(*const c_void, u32) -> i64,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let data = unsafe {
+    let data = {
         read_arena(host, node_read(), paintable, |arena, paintable| {
             if !arena.paintable_row_is_populated(paintable) {
                 return None;
@@ -1237,43 +1118,31 @@ pub unsafe extern "C" fn render_state_paintable_flex_layout_json(
     }
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_used_grid_tracks(
+pub extern "C" fn render_state_paintable_used_grid_tracks(
     host: &DocumentHost,
     paintable: NodeSlotId,
     columns: bool,
 ) -> *const c_void {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(
-            host,
-            node_read(),
-            (paintable, columns),
-            |arena, (paintable, columns)| {
-                if !arena.paintable_row_is_populated(paintable) {
-                    return std::ptr::null();
-                }
-                let Some(tracks) = crate::painting::paintable_geometry::committed_used_grid_tracks(arena, paintable)
-                else {
-                    return std::ptr::null();
-                };
-                let list = if columns { &tracks.columns } else { &tracks.rows };
-                std::sync::Arc::into_raw(std::sync::Arc::new(list.style_value())).cast()
-            },
-        )
-    }
+    read_arena(
+        host,
+        node_read(),
+        (paintable, columns),
+        |arena, (paintable, columns)| {
+            if !arena.paintable_row_is_populated(paintable) {
+                return std::ptr::null();
+            }
+            let Some(tracks) = crate::painting::paintable_geometry::committed_used_grid_tracks(arena, paintable) else {
+                return std::ptr::null();
+            };
+            let list = if columns { &tracks.columns } else { &tracks.rows };
+            std::sync::Arc::into_raw(std::sync::Arc::new(list.style_value())).cast()
+        },
+    )
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread. The
-/// returned tree is retained; the caller owns one reference and releases it with
-/// `visual_context_tree_release`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_main_visual_context_tree_retain(
+pub extern "C" fn render_state_main_visual_context_tree_retain(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
 ) -> *const c_void {
@@ -1285,36 +1154,24 @@ pub unsafe extern "C" fn render_state_main_visual_context_tree_retain(
     if let Some(tree) = host.read_known_rows(|rows, _| retain(rows.visual_context_tree.as_ref())) {
         return tree;
     }
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, read, (), |arena, ()| {
-            retain(arena.paint_state().borrow().visual_context.tree.as_ref())
-        })
-    }
+    read_arena(host, read, (), |arena, ()| {
+        retain(arena.paint_state().borrow().visual_context.tree.as_ref())
+    })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_has_visual_context_tree(
+pub extern "C" fn render_state_has_visual_context_tree(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, read, (), |arena, ()| {
-            let paint_state = arena.paint_state().borrow();
-            paint_state.visual_context.tree.is_some()
-        })
-    }
+    read_arena(host, read, (), |arena, ()| {
+        let paint_state = arena.paint_state().borrow();
+        paint_state.visual_context.tree.is_some()
+    })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_visual_context_tree_structural_epoch(
+pub extern "C" fn render_state_visual_context_tree_structural_epoch(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
 ) -> u64 {
@@ -1323,8 +1180,7 @@ pub unsafe extern "C" fn render_state_visual_context_tree_structural_epoch(
             .as_ref()
             .map_or(0, |tree| tree.structural_epoch)
     });
-    // SAFETY: Guaranteed by the caller.
-    known.unwrap_or_else(|| unsafe {
+    known.unwrap_or_else(|| {
         read_arena(host, read, (), |arena, ()| {
             let paint_state = arena.paint_state().borrow();
             paint_state.visual_context.structural_epoch()
@@ -1332,25 +1188,19 @@ pub unsafe extern "C" fn render_state_visual_context_tree_structural_epoch(
     })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_visual_context_tree_has_visual_animations(
+pub extern "C" fn render_state_visual_context_tree_has_visual_animations(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, read, (), |arena, ()| {
-            let paint_state = arena.paint_state().borrow();
-            paint_state
-                .visual_context
-                .tree
-                .as_deref()
-                .is_some_and(|tree| tree.has_visual_animations())
-        })
-    }
+    read_arena(host, read, (), |arena, ()| {
+        let paint_state = arena.paint_state().borrow();
+        paint_state
+            .visual_context
+            .tree
+            .as_deref()
+            .is_some_and(|tree| tree.has_visual_animations())
+    })
 }
 
 /// Hands `push_keyframe_color` the keyframe colors of each background color animation the visual context tree runs on
@@ -1394,11 +1244,8 @@ pub unsafe extern "C" fn render_state_background_color_animation_keyframe_colors
     }
 }
 
-/// # Safety
-///
-/// The returned handle is owned by the caller until `compositor_animation_effect_state_destroy`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_state_create() -> *mut c_void {
+pub extern "C" fn compositor_animation_effect_state_create() -> *mut c_void {
     Box::into_raw(Box::new(
         crate::painting::visual_animation_builder::CompositorAnimationEffectState::default(),
     ))
@@ -1439,18 +1286,15 @@ pub unsafe extern "C" fn compositor_animation_effect_build(
     let host = Host::new(unsafe { &*host });
     let layout_node = request.layout_node();
     state.build(&request, &host, |kind| {
-        // SAFETY: Guaranteed by the caller.
-        unsafe {
-            read_arena(
-                document_host,
-                node_read(),
-                (layout_node, kind),
-                |arena, (layout_node, kind)| {
-                    let tree = arena.paint_state().borrow().visual_context.tree.clone();
-                    arena.paintable_visual_animation_target_indices(layout_node, tree.as_deref(), kind)
-                },
-            )
-        }
+        read_arena(
+            document_host,
+            node_read(),
+            (layout_node, kind),
+            |arena, (layout_node, kind)| {
+                let tree = arena.paint_state().borrow().visual_context.tree.clone();
+                arena.paintable_visual_animation_target_indices(layout_node, tree.as_deref(), kind)
+            },
+        )
     })
 }
 
@@ -1511,11 +1355,11 @@ pub unsafe extern "C" fn compositor_animation_effect_reset(state: *mut c_void) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn compositor_animation_effect_only_translates_horizontally(
     request: *const crate::painting::host::FfiCompositorAnimationRequest,
-    host: *const crate::painting::host::FfiCompositorAnimationHost,
+    host: &crate::painting::host::FfiCompositorAnimationHost,
 ) -> bool {
     use crate::painting::visual_animation_builder::{Host, Request, effect_only_translates_horizontally};
     let request = unsafe { Request::new(&*request) };
-    effect_only_translates_horizontally(&request, &Host::new(unsafe { &*host }))
+    effect_only_translates_horizontally(&request, &Host::new(host))
 }
 
 /// # Safety
@@ -1524,11 +1368,11 @@ pub unsafe extern "C" fn compositor_animation_effect_only_translates_horizontall
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn compositor_animation_effect_transform_preserves_axes(
     request: *const crate::painting::host::FfiCompositorAnimationRequest,
-    host: *const crate::painting::host::FfiCompositorAnimationHost,
+    host: &crate::painting::host::FfiCompositorAnimationHost,
 ) -> bool {
     use crate::painting::visual_animation_builder::{Host, Request, effect_transform_preserves_axes};
     let request = unsafe { Request::new(&*request) };
-    effect_transform_preserves_axes(&request, &Host::new(unsafe { &*host }))
+    effect_transform_preserves_axes(&request, &Host::new(host))
 }
 
 /// Starts an update pass: the effects publish into an empty document list.
@@ -1593,16 +1437,11 @@ pub unsafe extern "C" fn layout_arena_paint_push_svg_filter_primitive(
 
 /// Notes that the SVG paint resources the document's rows enrolled may have changed, and answers whether any row
 /// enrolled one, which only then are synced again. A row a frame in flight enrolls is synced as it enrolls.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_note_svg_paint_resources_changed(host: &DocumentHost) -> bool {
+pub extern "C" fn render_state_note_svg_paint_resources_changed(host: &DocumentHost) -> bool {
     let enrolled = host.svg_paint_resources_may_be_enrolled();
     if enrolled {
-        // SAFETY: As above.
-        unsafe { queue(host, PaintChange::SvgPaintResourcesChanged) };
+        queue(host, PaintChange::SvgPaintResourcesChanged);
     }
     enrolled
 }

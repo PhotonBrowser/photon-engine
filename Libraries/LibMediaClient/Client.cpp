@@ -6,7 +6,6 @@
 
 #include <AK/Checked.h>
 #include <AK/NeverDestroyed.h>
-#include <LibCore/System.h>
 #include <LibCore/Timer.h>
 #include <LibMediaClient/Client.h>
 #include <LibMediaClient/RemoteMediaStream.h>
@@ -34,10 +33,6 @@ ErrorOr<NonnullRefPtr<Client>> Client::acquire()
 
     auto transport = TRY((*s_transport_factory)());
     auto client = TRY(try_make_ref_counted<Client>(move(transport)));
-#ifdef AK_OS_WINDOWS
-    auto response = client->send_sync<InitTransport>(Core::System::getpid());
-    client->transport().set_peer_pid(response->peer_pid());
-#endif
     *s_client = client;
     client->update_idle_timer();
     return client;
@@ -91,14 +86,6 @@ Messages::MediaClient::RequestAudioServerConnectionResponse Client::request_audi
 u64 Client::allocate_id()
 {
     return m_next_id++;
-}
-
-ErrorOr<IPC::TransportHandle> Client::create_video_presentation_channel()
-{
-    auto response = send_sync_but_allow_failure<Messages::MediaServer::CreateVideoPresentationChannel>();
-    if (!response || !response->handle().has_value())
-        return Error::from_string_literal("The media server did not create a video presentation channel");
-    return response->take_handle().release_value();
 }
 
 Media::MediaSupportInfo Client::query_file_media_support(StringView type, StringView subtype, Optional<String> codecs_parameter)

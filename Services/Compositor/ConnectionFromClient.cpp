@@ -11,7 +11,6 @@
 #include <LibCompositing/FontServiceClient.h>
 #include <LibCompositing/PausedDebuggerOverlay.h>
 #include <LibCore/Process.h>
-#include <LibCore/System.h>
 #include <LibIPC/Transport.h>
 
 namespace Compositor {
@@ -67,15 +66,6 @@ void ConnectionFromClient::did_detect_history_swipe_candidate(Web::CompositorCon
     async_did_detect_history_swipe_candidate(context_id, gesture_id, back, unconsumed_delta);
 }
 
-Messages::CompositorControlServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
-{
-#ifdef AK_OS_WINDOWS
-    m_transport->set_peer_pid(peer_pid);
-    return Core::System::getpid();
-#endif
-    VERIFY_NOT_REACHED();
-}
-
 void ConnectionFromClient::set_font_service(IPC::TransportHandle handle, IPC::File catalog, u64 catalog_size, u64 generation)
 {
     MUST(Compositing::install_font_service(move(handle), move(catalog), catalog_size, generation));
@@ -93,6 +83,18 @@ Messages::CompositorControlServer::ConnectWebContentResponse ConnectionFromClien
     });
     m_web_content_connections.set(web_content_connection_id, move(connection));
     return { move(paired_transport.remote_handle), web_content_connection_id };
+}
+
+void ConnectionFromClient::connect_render_clock(i32 web_content_connection_id, IPC::TransportHandle handle)
+{
+    if (auto connection = m_web_content_connections.get(web_content_connection_id); connection.has_value())
+        (*connection)->install_render_clock_channel(move(handle));
+}
+
+void ConnectionFromClient::connect_video_presentation(i32 web_content_connection_id, IPC::TransportHandle handle)
+{
+    if (auto connection = m_web_content_connections.get(web_content_connection_id); connection.has_value())
+        (*connection)->install_video_presentation_channel(move(handle));
 }
 
 void ConnectionFromClient::create_context(Web::CompositorContextId context_id, Optional<u64> page_id, i32 web_content_connection_id)

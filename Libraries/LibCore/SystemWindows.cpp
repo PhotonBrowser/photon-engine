@@ -12,8 +12,11 @@
  */
 
 #include <AK/Array.h>
+#include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Checked.h>
+#include <AK/Random.h>
+#include <AK/ScopeGuard.h>
 #include <LibCore/MappedFile.h>
 #include <LibCore/Process.h>
 #include <LibCore/SocketAddress.h>
@@ -21,6 +24,7 @@
 #include <direct.h>
 
 #include <AK/Windows.h>
+#include <sddl.h>
 #include <ws2tcpip.h>
 
 namespace Core::System {
@@ -151,8 +155,9 @@ ErrorOr<int> dup(int handle)
 
 bool is_socket(int handle)
 {
-    // FILE_TYPE_PIPE is returned for sockets and pipes. We don't use Windows pipes.
-    return GetFileType(to_handle(handle)) == FILE_TYPE_PIPE;
+    int type = 0;
+    int length = sizeof(type);
+    return ::getsockopt(static_cast<SOCKET>(handle), SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type), &length) == 0;
 }
 
 ErrorOr<void> bind(int sockfd, struct sockaddr const* name, socklen_t name_size)
@@ -258,6 +263,112 @@ ErrorOr<void> socketpair(int domain, int type, int protocol, int sv[2])
     return {};
 }
 
+// A security descriptor that admits only the user this process runs as, where the default would let every user on
+// the machine open what it protects for reading.
+class CurrentUserOnlySecurityAttributes {
+    AK_MAKE_NONCOPYABLE(CurrentUserOnlySecurityAttributes);
+    AK_MAKE_NONMOVABLE(CurrentUserOnlySecurityAttributes);
+
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    static ErrorOr<NonnullOwnPtr<CurrentUserOnlySecurityAttributes>> create()
+    {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+            return Error::from_windows_error();
+        ScopeGuard close_token = [&] { CloseHandle(token); };
+
+        DWORD size = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        auto user_buffer = TRY(ByteBuffer::create_zeroed(size));
+        if (!GetTokenInformation(token, TokenUser, user_buffer.data(), size, &size))
+            return Error::from_windows_error();
+
+        LPSTR user_sid = nullptr;
+        if (!ConvertSidToStringSidA(reinterpret_cast<TOKEN_USER*>(user_buffer.data())->User.Sid, &user_sid))
+            return Error::from_windows_error();
+        ScopeGuard free_sid = [&] { LocalFree(user_sid); };
+
+        auto descriptor_string = ByteString::formatted("D:P(A;;GA;;;{})", user_sid);
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(descriptor_string.characters(), SDDL_REVISION_1, &descriptor, nullptr))
+            return Error::from_windows_error();
+        return adopt_own(*new CurrentUserOnlySecurityAttributes(descriptor));
+    }
+
+    ~CurrentUserOnlySecurityAttributes()
+    {
+        LocalFree(m_attributes.lpSecurityDescriptor);
+    }
+
+    SECURITY_ATTRIBUTES* attributes() { return &m_attributes; }
+
+private:
+    explicit CurrentUserOnlySecurityAttributes(PSECURITY_DESCRIPTOR descriptor)
+    {
+        m_attributes.nLength = sizeof(m_attributes);
+        m_attributes.lpSecurityDescriptor = descriptor;
+        m_attributes.bInheritHandle = FALSE;
+    }
+
+    SECURITY_ATTRIBUTES m_attributes {};
+};
+
+static ErrorOr<void> wait_for_pipe_client(HANDLE server)
+{
+    OVERLAPPED overlapped {};
+    overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!overlapped.hEvent)
+        return Error::from_windows_error();
+    ScopeGuard close_event = [&] { CloseHandle(overlapped.hEvent); };
+
+    if (ConnectNamedPipe(server, &overlapped))
+        return {};
+    auto error = GetLastError();
+    if (error == ERROR_PIPE_CONNECTED)
+        return {};
+    if (error != ERROR_IO_PENDING)
+        return Error::from_windows_error(error);
+    DWORD ignored = 0;
+    if (!GetOverlappedResult(server, &overlapped, &ignored, TRUE))
+        return Error::from_windows_error();
+    return {};
+}
+
+// Two ends of one connection, as socketpair() gives on other systems. A named pipe, rather than a loopback socket,
+// keeps what one end wrote readable after that end has closed, however the other end behaves meanwhile. Both ends
+// are overlapped, so that a Notifier can watch them, and neither is inherited by a spawned process unless asked to.
+ErrorOr<Array<int, 2>> duplex_pipe()
+{
+    auto security_attributes = TRY(CurrentUserOnlySecurityAttributes::create());
+    auto name = ByteString::formatted("\\\\.\\pipe\\ladybird-{}-{:016x}", GetCurrentProcessId(), get_random<u64>());
+
+    constexpr DWORD buffer_size = 1 * MiB;
+    HANDLE server = CreateNamedPipeA(name.characters(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, buffer_size, buffer_size, 0, security_attributes->attributes());
+    if (server == INVALID_HANDLE_VALUE)
+        return Error::from_windows_error();
+    ArmedScopeGuard close_server = [&] { CloseHandle(server); };
+
+    HANDLE client = CreateFileA(name.characters(), GENERIC_READ | GENERIC_WRITE, 0, security_attributes->attributes(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    if (client == INVALID_HANDLE_VALUE)
+        return Error::from_windows_error();
+    ArmedScopeGuard close_client = [&] { CloseHandle(client); };
+
+    TRY(wait_for_pipe_client(server));
+
+    // The name was ours alone to know, but a stranger that raced us to it must not get a channel for it.
+    DWORD client_process_id = 0;
+    if (!GetNamedPipeClientProcessId(server, &client_process_id))
+        return Error::from_windows_error();
+    if (client_process_id != GetCurrentProcessId())
+        return Error::from_string_literal("Another process connected to our pipe");
+
+    close_server.disarm();
+    close_client.disarm();
+    return Array<int, 2> { to_fd(server), to_fd(client) };
+}
+
 ErrorOr<void> sleep_ms(u32 milliseconds)
 {
     Sleep(milliseconds);
@@ -292,16 +403,30 @@ ErrorOr<void> set_close_on_exec(int handle, bool enabled)
     return {};
 }
 
-ErrorOr<Array<int, 2>> pipe2(int flags)
+ErrorOr<Array<int, 2>> pipe2(int flags, PipeReadEnd read_end)
 {
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = (flags & O_CLOEXEC) ? FALSE : TRUE;
 
-    HANDLE read_handle = nullptr;
-    HANDLE write_handle = nullptr;
-    if (!CreatePipe(&read_handle, &write_handle, &sa, 0))
+    // Only a named pipe can have an overlapped end, which a Notifier needs to watch it. The name is unpredictable, and
+    // the pipe has a single instance, so no other process can take either end of it.
+    auto name = ByteString::formatted("\\\\.\\pipe\\ladybird-{}-{:016x}", GetCurrentProcessId(), get_random<u64>());
+
+    DWORD read_end_flags = PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE;
+    if (read_end == PipeReadEnd::ReadInternally)
+        read_end_flags |= FILE_FLAG_OVERLAPPED;
+    constexpr DWORD buffer_size = 64 * KiB;
+    HANDLE read_handle = CreateNamedPipeA(name.characters(), read_end_flags, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 0, buffer_size, 0, &sa);
+    if (read_handle == INVALID_HANDLE_VALUE)
         return Error::from_windows_error();
+
+    HANDLE write_handle = CreateFileA(name.characters(), GENERIC_WRITE, 0, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (write_handle == INVALID_HANDLE_VALUE) {
+        auto error = GetLastError();
+        CloseHandle(read_handle);
+        return Error::from_windows_error(error);
+    }
 
     return Array<int, 2> { to_fd(read_handle), to_fd(write_handle) };
 }

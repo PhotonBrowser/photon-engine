@@ -15,6 +15,7 @@ use crate::breakpoint::BreakpointID;
 use crate::bytecode::basic_block::SourceMapEntry;
 use crate::bytecode::class_blueprint::ClassBlueprint;
 use crate::bytecode::constant::{AbstractOperationKind, WellKnownSymbolKind};
+use crate::bytecode::dump::{count_basic_blocks, dump_bytecode};
 use crate::bytecode::encoding::{IdentifierTableIndex, PropertyKeyTableIndex, StringTableIndex};
 use crate::bytecode::executable_data::ExecutableCacheCounts as FrontendExecutableCacheCounts;
 use crate::bytecode::executable_data::ExecutableData;
@@ -22,7 +23,6 @@ use crate::bytecode::feedback::{ExecutableFeedback, FeedbackSlotCounts};
 use crate::bytecode::generator::{ConstantValue, ExceptionHandler};
 use crate::bytecode::generator::{LocalVariable, PendingClassBlueprint};
 use crate::bytecode_cache::{DecodedBytecodeBytes, DecodedExecutableRecord};
-use crate::frontend_host::{count_bytecode_basic_blocks, dump_bytecode, rust_free_compiled_regex};
 use crate::gc::class::{Finalize, GcCell, define_cell};
 use crate::gc::heap::cell_is_dead;
 use crate::gc::root::MarkedVec;
@@ -1531,11 +1531,6 @@ impl Executable {
             ));
         }
 
-        // The regexes were only compiled to report early errors; the runtime compiles them again when it runs.
-        for regex in data.compiled_regexes {
-            // SAFETY: Each handle came from rust_compile_regex and is freed once.
-            unsafe { rust_free_compiled_regex(regex.into_raw()) };
-        }
         let parts = ExecutableParts {
             bytecode: ExecutableBytecode::Owned(data.bytecode.into_boxed_slice()),
             number_of_registers: data.number_of_registers,
@@ -1966,10 +1961,12 @@ impl Executable {
     }
 
     pub fn environment_shape_cache(&self, index: u32) -> EnvironmentShapeCache {
-        let slot = &self.environment_shape_caches[index as usize];
-        // SAFETY: Executables are only reached through the heap, and the slot is part of this one's caches, which
-        // live as long as it does.
-        unsafe { EnvironmentShapeCache::new(Gc::from_ref(self), slot) }
+        assert!((index as usize) < self.environment_shape_caches.len());
+        EnvironmentShapeCache::Executable(Gc::from_ref(self), index)
+    }
+
+    pub(crate) fn environment_shape_cache_slot(&self, index: u32) -> &Cell<Option<Gc<EnvironmentShape>>> {
+        &self.environment_shape_caches[index as usize]
     }
 
     pub fn name(&self) -> Utf16FlyString {
@@ -2112,11 +2109,7 @@ fn dump_metadata(output: &mut Vec<u8>, executable: &Executable) {
     const RESET: &str = "\x1b[0m";
 
     let _ = writeln!(output, "  {GREEN}Registers{RESET}: {}", executable.number_of_registers);
-    let _ = writeln!(
-        output,
-        "  {GREEN}Blocks{RESET}:    {}",
-        count_bytecode_basic_blocks(executable)
-    );
+    let _ = writeln!(output, "  {GREEN}Blocks{RESET}:    {}", count_basic_blocks(executable));
 
     if !executable.local_variable_names.is_empty() {
         let _ = write!(output, "  {GREEN}Locals{RESET}:    ");

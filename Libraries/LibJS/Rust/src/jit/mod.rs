@@ -55,14 +55,6 @@ fn frame_of<'a>(frame: NonNull<ExecutionContext>) -> &'a ExecutionContext {
     unsafe { frame.as_ref() }
 }
 
-/// The cell as a `T`, if it is one.
-fn cell_as<T: crate::gc::class::GcCell>(cell: Gc<CellHeader>) -> Option<Gc<T>> {
-    crate::gc::class::class_of(cell)
-        .is_subclass_of(T::CLASS)
-        // SAFETY: The cell was allocated as a T or a subclass of it.
-        .then(|| unsafe { Gc::from_non_null(cell.as_non_null().cast()) })
-}
-
 /// A field offset as JIT code takes it.
 fn offset(offset: usize) -> u32 {
     u32::try_from(offset).expect("field offsets fit in u32")
@@ -468,16 +460,15 @@ pub(crate) struct DeferGc<'vm>(&'vm Vm);
 
 impl<'vm> DeferGc<'vm> {
     pub(crate) fn new(vm: &'vm Vm) -> Self {
-        // SAFETY: The VM's heap is live.
-        unsafe { capi::gc_heap_defer_gc(vm.heap().raw()) };
+        capi::gc_heap_defer_gc(vm.heap().handle());
         Self(vm)
     }
 }
 
 impl Drop for DeferGc<'_> {
     fn drop(&mut self) {
-        // SAFETY: As above; this undoes the deferral of new().
-        unsafe { capi::gc_heap_undefer_gc(self.0.heap().raw()) };
+        // NB: This undoes the deferral of new().
+        capi::gc_heap_undefer_gc(self.0.heap().handle());
     }
 }
 

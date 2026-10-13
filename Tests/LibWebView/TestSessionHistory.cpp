@@ -17,7 +17,7 @@
 
 static void give_active_document(WebView::CanonicalNavigable& navigable)
 {
-    navigable.set_active_session_history_entry(WebView::CanonicalSessionHistoryEntry::create(WebView::CanonicalDocumentState::create({}, WebView::CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document().document)));
+    navigable.set_active_session_history_entry(WebView::CanonicalSessionHistoryEntry::create(WebView::CanonicalDocumentState::create({}, WebView::CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document({}).document)));
 }
 
 static Web::HTML::CrossProcessId navigable_id(StringView id)
@@ -469,6 +469,27 @@ TEST_CASE(queued_same_document_entries_are_addressed_by_identity)
     EXPECT_EQ(updated_current_entry->document_state->navigable_target_name, Utf16String::from_utf8("updated-name"sv));
 }
 
+TEST_CASE(update_leaves_the_origins_of_a_document_state_alone)
+{
+    auto descriptor = entry(0, "https://a.example/"sv);
+    auto origin = URL::Parser::basic_parse("https://a.example/"sv).release_value().origin();
+    descriptor.document_state.origin = origin;
+    descriptor.document_state.initiator_origin = origin;
+    WebView::CanonicalSessionHistoryEntry::DocumentStates document_states;
+    auto held_entry = MUST(WebView::CanonicalSessionHistoryEntry::create_from_descriptor(descriptor, document_states));
+
+    auto other_origin = URL::Parser::basic_parse("https://b.example/"sv).release_value().origin();
+    descriptor.document_state.origin = other_origin;
+    descriptor.document_state.initiator_origin = other_origin;
+    descriptor.document_state.ever_populated = true;
+    auto updated_entry = MUST(WebView::CanonicalSessionHistoryEntry::create_from_descriptor(descriptor, document_states, WebView::CanonicalSessionHistoryEntry::UpdateDocumentState::Yes));
+
+    EXPECT_EQ(updated_entry->document_state.ptr(), held_entry->document_state.ptr());
+    EXPECT(held_entry->document_state->ever_populated);
+    EXPECT(held_entry->document_state->origin->is_same_origin(origin));
+    EXPECT(held_entry->document_state->initiator_origin->is_same_origin(origin));
+}
+
 TEST_CASE(entry_among_its_own_nested_histories_is_rejected)
 {
     auto parent_entry = entry(0, "https://parent.example/"sv, 10, "main"sv, { nested_history("frame"sv, { entry(0, "https://child.example/"sv, 10, ""sv) }) });
@@ -828,28 +849,6 @@ TEST_CASE(history_log_entries_marks_nested_histories)
                                                          "document_state={id=3:7, target_name=main} "
                                                          "nested={1:2=[2:https://frame.example/]}] "
                                                          "used_steps=[0:0, 1:1, *2:2]"sv });
-}
-
-TEST_CASE(mark_current_entry_reload_pending)
-{
-    WebView::TraversableSessionHistory history;
-
-    auto update_result = history.initialize_for_testing({
-                                                            entry(0, "https://a.example/"sv),
-                                                            entry(1, "https://b.example/"sv),
-                                                        },
-        { 0, 1 }, 1);
-    EXPECT_EQ(update_result, true);
-
-    auto current_entry = history.current_entry();
-    VERIFY(current_entry);
-    EXPECT(!current_entry->document_state->reload_pending);
-
-    history.mark_current_entry_reload_pending();
-
-    current_entry = history.current_entry();
-    VERIFY(current_entry);
-    EXPECT(current_entry->document_state->reload_pending);
 }
 
 TEST_CASE(cross_document_push_preserves_document_resource)

@@ -409,8 +409,7 @@ pub(crate) fn visit_declaration_images(data: &DeclarationBlockData, visit: &mut 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_is_empty(block: *const DeclarationBlock) -> bool {
-    let block = unsafe { &*block };
+pub extern "C" fn rust_declaration_block_is_empty(block: &DeclarationBlock) -> bool {
     let data = block.data();
     data.properties.is_empty() && data.custom_properties.is_empty()
 }
@@ -477,7 +476,7 @@ pub unsafe extern "C" fn rust_declaration_block_create(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_share(block: &DeclarationBlock) -> *mut DeclarationBlock {
+pub extern "C" fn rust_declaration_block_share(block: &DeclarationBlock) -> *mut DeclarationBlock {
     Box::into_raw(Box::new(DeclarationBlock::new(block.data())))
 }
 
@@ -597,7 +596,7 @@ pub unsafe extern "C" fn rust_declaration_block_set_custom(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_remove(block: &mut DeclarationBlock, property_id: u16) -> bool {
+pub extern "C" fn rust_declaration_block_remove(block: &mut DeclarationBlock, property_id: u16) -> bool {
     block.remove(property_id)
 }
 
@@ -622,7 +621,7 @@ pub unsafe extern "C" fn rust_declaration_block_remove_custom(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_external_memory_size(block: &DeclarationBlock) -> usize {
+pub extern "C" fn rust_declaration_block_external_memory_size(block: &DeclarationBlock) -> usize {
     let data = block.data();
     let mut size = size_of::<DeclarationBlock>().saturating_add(data.external_memory_size());
     if matches!(*block.state.borrow(), DeclarationBlockState::Mutable(_)) {
@@ -643,7 +642,7 @@ mod tests {
         let units: Vec<_> = format!(".target {{ {text} }}").encode_utf16().collect();
         let input = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
         // All context fields are booleans, integers, or nullable pointers.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
+        let context = ParseContext::default();
         let parse = unsafe { parse_shared_stylesheet(input, &context) };
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
         let rule = unsafe { &*rust_rule_list_at(&rules, 0) };
@@ -687,8 +686,8 @@ mod tests {
         let original = DeclarationBlock::new(data.clone());
         let mut fork = unsafe { Box::from_raw(rust_declaration_block_share(&original)) };
         let expected = rust_declaration_data_dependencies(&data);
-        assert!(unsafe { rust_declaration_block_remove(&mut fork, property_id::WIDTH) });
-        assert!(unsafe { rust_declaration_block_remove(&mut fork, property_id::ANIMATION_NAME) });
+        assert!(rust_declaration_block_remove(&mut fork, property_id::WIDTH));
+        assert!(rust_declaration_block_remove(&mut fork, property_id::ANIMATION_NAME));
         let mut retained = unsafe { Box::from_raw(rust_declaration_block_retain(&fork)) };
         let owners = DECLARATION_OWNER_ALLOCATIONS.with(|count| count.get());
         assert_eq!(
@@ -723,7 +722,7 @@ mod tests {
         let units: Vec<_> = ".親 { .子 {} width: 13px; --幅: 19px; }".encode_utf16().collect();
         let input = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
         // All context fields are booleans, integers, or nullable pointers.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
+        let context = ParseContext::default();
         let parse = unsafe { parse_shared_stylesheet(input, &context) };
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
         let rule = unsafe { &*rust_rule_list_at(&rules, 0) };
@@ -735,18 +734,18 @@ mod tests {
         let borrowed = block.data();
         assert_eq!(borrowed.properties.len(), 1);
         assert_eq!(borrowed.custom_properties.len(), 1);
-        assert!(!unsafe { rust_declaration_block_is_empty(block) });
+        assert!(!rust_declaration_block_is_empty(block));
         assert_eq!(rust_declaration_block_revision(block), 0);
-        assert!(unsafe { rust_declaration_block_external_memory_size(block) } > 0);
+        assert!(rust_declaration_block_external_memory_size(block) > 0);
         let mut fork = unsafe { Box::from_raw(rust_declaration_block_share(block)) };
-        assert!(!unsafe { rust_declaration_block_remove(&mut fork, property_id::HEIGHT) });
+        assert!(!rust_declaration_block_remove(&mut fork, property_id::HEIGHT));
         assert!(matches!(*block.state.borrow(), DeclarationBlockState::Immutable(_)));
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Immutable(_)));
         assert!(Arc::ptr_eq(&snapshot, &fork.data()));
 
         let mut retained = unsafe { Box::from_raw(rust_declaration_block_retain(block)) };
         assert!(Rc::ptr_eq(&block.owner(), &retained.owner()));
-        assert!(unsafe { rust_declaration_block_remove(&mut retained, property_id::WIDTH) });
+        assert!(rust_declaration_block_remove(&mut retained, property_id::WIDTH));
         assert!(block.data().properties.is_empty());
         assert_eq!(rust_declaration_block_revision(block), 1);
         // A different handle's mutation cannot invalidate a pinned snapshot.
@@ -761,7 +760,7 @@ mod tests {
         assert_eq!(rust_declaration_block_revision(block), 2);
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Immutable(_)));
         drop(rules);
-        assert!(unsafe { rust_declaration_block_remove(&mut fork, property_id::WIDTH) });
+        assert!(rust_declaration_block_remove(&mut fork, property_id::WIDTH));
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Mutable(_)));
         assert!(fork.data().properties.is_empty());
         assert_eq!(retained.data().properties.len(), 1);

@@ -266,7 +266,6 @@ pub struct JSVmHostHooks {
         ) -> JSCompletion,
     >,
     /// HostSystemUTCEpochNanoseconds ( global ): the current time in nanoseconds since the epoch.
-    /// js_vm_default_host_system_utc_epoch_nanoseconds() is the runtime's own.
     pub system_utc_epoch_nanoseconds:
         Option<unsafe extern "C" fn(data: *mut c_void, vm: *mut JSVM, global: *mut JSObject) -> i64>,
     /// VM::on_unimplemented_property_access: code looked for a property of the object that the embedder declared
@@ -496,8 +495,7 @@ impl CompletionPayload for HandledByHost {
 
 /// The address of an object that the VM lends a hook.
 fn lent_object_into_abi(object: &Object) -> *mut JSObject {
-    // SAFETY: The VM only lends a hook objects that are cells of its heap.
-    object_into_abi(unsafe { Gc::from_ref(object) })
+    object_into_abi(Gc::from_ref(object))
 }
 
 fn ensure_can_add_private_element(vm: &Vm, object: &Object) -> ThrowCompletionOr<()> {

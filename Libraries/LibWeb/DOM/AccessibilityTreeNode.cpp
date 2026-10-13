@@ -395,7 +395,9 @@ void AccessibilityTreeNode::serialize_tree_as_node_data(Vector<WebView::Accessib
             node_data.value_maximum = meter->max();
         } else if (auto const* input = as_if<HTML::HTMLInputElement>(element)) {
             if (input->value_as_number_applies()) {
-                node_data.value_numeric = input->value_as_number();
+                // NB: An input whose value is not a number, such as an empty one, has a NaN valueAsNumber.
+                if (auto number = input->value_as_number(); !isnan(number))
+                    node_data.value_numeric = number;
                 if (auto min_attr = input->get_attribute(HTML::AttributeNames::min); min_attr.has_value()) {
                     if (auto parsed = min_attr->to_number<double>(); parsed.has_value())
                         node_data.value_minimum = *parsed;
@@ -627,8 +629,9 @@ void AccessibilityTreeNode::serialize_tree_as_node_data(Vector<WebView::Accessib
                 auto line_rect_at_offset = [&](size_t offset) -> Optional<CSSPixelRect> {
                     if (!layout)
                         return {};
-                    auto result = Layout::RustFFI::layout_script_text_caret_rect_in_dom_range(
-                        layout->document_host(), Layout::Node::slot_id(layout), offset);
+                    Layout::RustFFI::FfiOptionalCssPixelRect result;
+                    Layout::RustFFI::layout_script_text_caret_rect_in_dom_range(
+                        layout->document_host(), Layout::Node::slot_id(layout), offset, &result);
                     if (!result.has_value)
                         return {};
                     return result.rect;

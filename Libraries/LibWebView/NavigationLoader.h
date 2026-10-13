@@ -9,6 +9,7 @@
 #include <AK/Function.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
+#include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Weakable.h>
 #include <LibRequests/Forward.h>
@@ -24,13 +25,15 @@ namespace WebView {
 
 // UI-process owner of navigation population state. It keeps the pending entry
 // and response body alive while the document host is being selected.
-class WEBVIEW_API NavigationLoader final : public Weakable<NavigationLoader> {
+class WEBVIEW_API NavigationLoader final
+    : public RefCounted<NavigationLoader>
+    , public Weakable<NavigationLoader> {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    static NonnullOwnPtr<NavigationLoader> create(IsPrivate is_private, Web::HTML::NavigationPopulationRequest request)
+    static NonnullRefPtr<NavigationLoader> create(IsPrivate is_private, Web::HTML::NavigationPopulationRequest request)
     {
-        return adopt_own(*new NavigationLoader(is_private, move(request)));
+        return adopt_ref(*new NavigationLoader(is_private, move(request)));
     }
 
     ~NavigationLoader();
@@ -43,8 +46,10 @@ public:
         Optional<URL::URL> request_current_url;
         URL::Origin origin;
         Web::HTML::OpenerPolicy opener_policy;
+        Web::HTML::SandboxingFlagSet final_sandboxing_flag_set {};
         // The id of the window environment a process created the document with before the UI process heard of it.
         Optional<Web::HTML::EnvironmentId> environment_id;
+        Web::HTML::CrossProcessId document_id;
     };
     Optional<ResponseDocument> response_document() const;
     void set_document(CanonicalDocument const&, CanonicalNavigable const&);

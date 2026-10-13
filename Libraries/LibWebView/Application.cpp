@@ -77,6 +77,10 @@
 #    include <LibIPC/TransportBootstrapMach.h>
 #endif
 
+#if defined(AK_OS_WINDOWS)
+#    include <LibIPC/HandleBrokerServer.h>
+#endif
+
 #ifdef USE_DIRECTX
 #    include <LibGfx/Direct3DContext.h>
 #endif
@@ -1066,6 +1070,7 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
     auto root_navigable_id = navigable_to_adopt.has_value() ? *navigable_to_adopt : cross_process_id_allocator.allocate();
     if (!initial_document_state_id.has_value())
         initial_document_state_id = cross_process_id_allocator.allocate();
+    auto initial_document_id = cross_process_id_allocator.allocate();
 
     auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_navigable_id));
     TRY(Application::the().connect_web_content_to_compositor(*client));
@@ -1081,10 +1086,10 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
         entry.document_state.origin = URL::Origin::create_opaque();
         return entry;
     }();
-    client->async_initialize(initial_page_id, move(remote_navigables), root_navigable_id, cross_process_id_allocator, initial_history_entry, system_visibility_state);
+    client->async_initialize(initial_page_id, move(remote_navigables), root_navigable_id, cross_process_id_allocator, initial_history_entry, initial_document_id, system_visibility_state);
 
     if (!navigable_to_adopt.has_value())
-        client->set_initial_top_level_history_entry({}, move(initial_history_entry));
+        client->set_initial_top_level_history_entry({}, move(initial_history_entry), initial_document_id);
 
     client->request_server_site_bindings().did_connect(request_server_connection.client_id);
     client->async_connect_to_request_server(move(request_server_connection.handle), request_server_connection.client_id);
@@ -1321,9 +1326,22 @@ ErrorOr<void> Application::connect_web_content_to_compositor(WebContentClient& w
         return Error::from_string_literal("Compositor process disconnected while connecting WebContent");
     auto response = response_or_error.release_value();
 
+    // The render clock channel is made here, so neither process is handed an end of the other's choosing.
+    auto render_clock_channel = TRY(IPC::TransportHandle::create_pair());
+
     web_content_client.set_compositor_connection_id({}, response.web_content_connection_id());
-    web_content_client.async_connect_to_compositor_process(response.take_handle());
+    m_compositor_client->async_connect_render_clock(response.web_content_connection_id(), move(render_clock_channel.first));
+    web_content_client.async_connect_to_compositor_process(response.take_handle(), move(render_clock_channel.second));
     return {};
+}
+
+bool Application::connect_video_presentation_to_compositor(WebContentClient& web_content_client, IPC::TransportHandle compositor_end)
+{
+    auto compositor_connection_id = web_content_client.compositor_connection_id({});
+    if (!compositor_connection_id.has_value() || !can_send_compositor_process_ipc(m_compositor_client))
+        return false;
+    m_compositor_client->async_connect_video_presentation(*compositor_connection_id, move(compositor_end));
+    return true;
 }
 
 ErrorOr<IPC::TransportHandle> Application::connect_new_compositor_canvas_client()
@@ -1530,6 +1548,9 @@ ErrorOr<void> Application::launch_services()
     m_settings_observer = make<ApplicationSettingsObserver>();
     m_bookmark_store_observer = make<ApplicationBookmarkStoreObserver>();
 
+#if defined(AK_OS_WINDOWS)
+    m_handle_broker_server = IPC::HandleBrokerServer::create();
+#endif
     m_process_manager = make<ProcessManager>();
     m_process_manager->on_process_exited = [this](Process&& process, Optional<int> exit_status) {
         process_did_exit(move(process), exit_status);

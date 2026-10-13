@@ -9,7 +9,6 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/NumericLimits.h>
 #include <LibCore/Process.h>
-#include <LibCore/System.h>
 #include <LibMedia/CodecParameters.h>
 #include <LibMedia/DecodeAudioStream.h>
 #include <LibMedia/DecoderRegistry.h>
@@ -49,17 +48,6 @@ void ConnectionFromClient::die()
     Core::Process::terminate_immediately(0);
 }
 
-Messages::MediaServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
-{
-#ifdef AK_OS_WINDOWS
-    m_transport->set_peer_pid(peer_pid);
-    return Core::System::getpid();
-#else
-    did_misbehave("Unexpected media server transport initialization");
-    return 0;
-#endif
-}
-
 ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_audio_server_transport()
 {
     VERIFY(m_role == Role::Controller);
@@ -69,7 +57,7 @@ ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_audio_serve
     return response->take_handle()->create_transport();
 }
 
-ErrorOr<IPC::TransportHandle> ConnectionFromClient::create_renderer_connection()
+ErrorOr<ConnectionFromClient::RendererConnection> ConnectionFromClient::create_renderer_connection()
 {
     auto paired_transports = TRY(IPC::Transport::create_paired());
     auto handle = move(paired_transports.remote_handle);
@@ -77,22 +65,22 @@ ErrorOr<IPC::TransportHandle> ConnectionFromClient::create_renderer_connection()
     // The static connection map owns this connection until its peer disconnects.
     auto client = adopt_ref(*new ConnectionFromClient(move(paired_transports.local), Role::Renderer));
 
-    return handle;
+    return RendererConnection { move(handle), client->client_id() };
 }
 
 Messages::MediaServer::ConnectNewClientResponse ConnectionFromClient::connect_new_client()
 {
     if (m_role != Role::Controller) {
         did_misbehave("Only the controller may connect a new media client");
-        return OptionalNone {};
+        return { OptionalNone {}, -1 };
     }
 
-    auto handle = create_renderer_connection();
-    if (handle.is_error()) {
-        dbgln("Failed to connect a media client: {}", handle.error());
-        return OptionalNone {};
+    auto connection = create_renderer_connection();
+    if (connection.is_error()) {
+        dbgln("Failed to connect a media client: {}", connection.error());
+        return { OptionalNone {}, -1 };
     }
-    return handle.release_value();
+    return { move(connection.value().handle), connection.value().client_id };
 }
 
 bool ConnectionFromClient::verify_renderer_role()
@@ -103,24 +91,31 @@ bool ConnectionFromClient::verify_renderer_role()
     return false;
 }
 
-Messages::MediaServer::CreateVideoPresentationChannelResponse ConnectionFromClient::create_video_presentation_channel()
+void ConnectionFromClient::connect_video_presentation_channel(int client_id, IPC::TransportHandle handle)
 {
-    if (!verify_renderer_role())
-        return OptionalNone {};
-
-    auto paired_transports_or_error = IPC::Transport::create_paired();
-    if (paired_transports_or_error.is_error()) {
-        dbgln("Failed to create a video presentation channel: {}", paired_transports_or_error.error());
-        return OptionalNone {};
+    if (m_role != Role::Controller) {
+        did_misbehave("Only the controller may connect a video presentation channel");
+        return;
     }
-    auto paired_transports = paired_transports_or_error.release_value();
+
+    auto renderer = s_connections->get(client_id);
+    if (!renderer.has_value() || (*renderer)->m_role != Role::Renderer) {
+        dbgln("MediaServer: No renderer connection {} to take a video presentation channel", client_id);
+        return;
+    }
+    (*renderer)->install_video_presentation_channel(move(handle));
+}
+
+void ConnectionFromClient::install_video_presentation_channel(IPC::TransportHandle handle)
+{
+    auto transport = handle.create_transport();
+    if (transport.is_error()) {
+        dbgln("MediaServer: Could not take up a video presentation channel: {}", transport.error());
+        return;
+    }
 
     // A replaced connection releases its edges; the presentation client that held them is gone or will ask again.
-    m_video_presentation_connection = Media::VideoPresentationServerConnection::construct(move(paired_transports.local));
-#ifdef AK_OS_WINDOWS
-    m_video_presentation_connection->transport().set_peer_pid(transport().peer_pid());
-#endif
-    return move(paired_transports.remote_handle);
+    m_video_presentation_connection = Media::VideoPresentationServerConnection::construct(transport.release_value());
 }
 
 static Media::MediaSupportInfo file_media_support_for(String type, String subtype, Optional<String> codecs_parameter)

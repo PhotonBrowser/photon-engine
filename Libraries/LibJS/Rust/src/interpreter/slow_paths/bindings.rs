@@ -154,10 +154,8 @@ pub fn create_variable_environment(
 
 fn running_execution_context_environment(vm: &Vm, mode: EnvironmentMode) -> Gc<Environment> {
     let context = vm
-        .running_execution_context()
+        .running_execution_context_if_any()
         .expect("bindings are created in an execution context");
-    // SAFETY: The running execution context is live.
-    let context = unsafe { context.as_ref() };
     match mode {
         EnvironmentMode::Lexical => context.lexical_environment.get(),
         EnvironmentMode::Var => context.variable_environment.get(),
@@ -231,11 +229,8 @@ pub fn create_variable(
 }
 
 fn running_execution_context(vm: &Vm) -> &ExecutionContext {
-    let context = vm
-        .running_execution_context()
-        .expect("slow paths run in an execution context");
-    // SAFETY: The running execution context is live while its slow paths run.
-    unsafe { context.as_ref() }
+    vm.running_execution_context_if_any()
+        .expect("slow paths run in an execution context")
 }
 
 /// VM::current_executable(): the executable of the running frame.
@@ -244,8 +239,7 @@ fn current_executable(vm: &Vm) -> Gc<Executable> {
         .executable
         .get()
         .expect("a running frame has an executable");
-    // SAFETY: An executable starts with its head, which is all the frame points to.
-    unsafe { Gc::from_non_null(executable.as_non_null().cast()) }
+    Executable::from_head(executable)
 }
 
 /// VM::get_identifier(), copied out of the executable's identifier table.

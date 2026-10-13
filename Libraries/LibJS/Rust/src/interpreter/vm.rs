@@ -624,8 +624,8 @@ impl Vm {
     /// `storage` must be valid for writes of a Vm and aligned for one. The VM must stay there until it is dropped in
     /// place, which only the thread that constructed it may do.
     pub unsafe fn create_at(storage: *mut Vm, options: VmOptions) {
-        // SAFETY: Initializes the region cell pointers are relative to.
-        let heap_region_base = unsafe { capi::gc_heap_region_base() };
+        // NB: Initializes the region cell pointers are relative to.
+        let heap_region_base = capi::gc_heap_region_base();
         let primitive_storage_cage_base = crate::runtime::array_buffer::primitive_storage_cage_base();
         let interpreter_stack_memory = InterpreterStackMemory::allocate();
         // SAFETY: An all-zero NativeFunctionTableEntry is valid: no function and the first function type.
@@ -814,9 +814,7 @@ impl Vm {
 
     /// The Realm of the running execution context.
     pub fn current_realm(&self) -> Option<Gc<Realm>> {
-        let context = self.running_execution_context()?;
-        // SAFETY: The running execution context is live.
-        unsafe { context.as_ref() }.realm.get()
+        self.running_execution_context_if_any()?.realm.get()
     }
 
     /// Whether so little of the native stack is left that running more JavaScript could overflow it.
@@ -1402,16 +1400,12 @@ impl Vm {
 
     /// The executable of the running execution context.
     pub fn current_executable(&self) -> Gc<Executable> {
-        let context = self
-            .running_execution_context()
-            .expect("there is a running execution context");
-        // SAFETY: The running execution context is live.
-        let executable = unsafe { context.as_ref() }
+        let executable = self
+            .running_execution_context_ref()
             .executable
             .get()
             .expect("the running execution context runs an executable");
-        // SAFETY: An Executable starts with its head.
-        unsafe { Gc::from_non_null(executable.as_non_null().cast()) }
+        Executable::from_head(executable)
     }
 
     pub fn host_ensure_can_add_private_element(&self) -> HostEnsureCanAddPrivateElement {
@@ -1795,13 +1789,32 @@ impl Vm {
         script_or_module
     }
 
+    /// The VM whose heap `cell` lives in.
+    pub(crate) fn of_cell<T: GcCell>(cell: &T) -> &Vm {
+        assert!(
+            crate::gc::class::is_in_heap_region(core::ptr::from_ref(cell).addr()),
+            "a {} that has yet to be allocated is in no heap",
+            T::CLASS.name
+        );
+        // SAFETY: The cell is in the heap region, so it is a cell of a heap, which the VM creates with itself as the
+        //         context and outlives every cell in.
+        unsafe { &*capi::gc_cell_heap_context(core::ptr::from_ref(cell).cast()).cast::<Vm>() }
+    }
+
     pub(crate) fn running_execution_context_ref(&self) -> &ExecutionContext {
-        let context = self
-            .running_execution_context()
-            .expect("there is a running execution context");
+        self.running_execution_context_if_any()
+            .expect("there is a running execution context")
+    }
+
+    /// The running execution context, if there is one.
+    ///
+    /// NB: Callers that deallocate the running frame keep using running_execution_context(), since the reference
+    ///     would outlive the frame.
+    pub(crate) fn running_execution_context_if_any(&self) -> Option<&ExecutionContext> {
         // SAFETY: The running execution context is live while it runs, which outlasts any use of this reference by
         // the code running in it.
-        unsafe { context.as_ref() }
+        self.running_execution_context()
+            .map(|context| unsafe { context.as_ref() })
     }
 
     /// The number of arguments the running execution context has slots for.

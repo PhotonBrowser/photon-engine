@@ -11,6 +11,7 @@
 #include <LibWebView/ApplyHistoryStep.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalNavigable.h>
+#include <LibWebView/CanonicalNavigation.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/WebContentClient.h>
 
@@ -20,6 +21,13 @@ static Web::HTML::CrossProcessId first_operation_id() { return { 2, 1 }; }
 static Web::HTML::CrossProcessId second_operation_id() { return { 2, 2 }; }
 static Web::HTML::CrossProcessId third_operation_id() { return { 2, 3 }; }
 
+static Web::HTML::NavigationSourceSnapshot source_snapshot_params(Web::HTML::SandboxingFlagSet sandboxing_flags = {})
+{
+    Web::HTML::NavigationSourceSnapshot snapshot;
+    snapshot.sandboxing_flags = sandboxing_flags;
+    return snapshot;
+}
+
 static URL::URL parse_url(StringView url)
 {
     auto parsed_url = URL::Parser::basic_parse(url);
@@ -28,6 +36,37 @@ static URL::URL parse_url(StringView url)
 }
 
 // Each test entry has a document state of its own, unless a test gives it one.
+// A navigation whose steps are checking if unloading is canceled, in no page.
+static WebView::CanonicalNavigation::Start navigation_for_testing(Utf16String navigation_id, u64 sequence_number = 0, RefPtr<WebView::CanonicalSessionHistoryEntry> history_entry = {})
+{
+    return {
+        .url = URL::about_blank(),
+        .navigation_id = navigation_id,
+        .sequence_number = sequence_number,
+        .state = WebView::CanonicalNavigation::CheckingIfUnloadingIsCanceled { Web::HTML::NavigationStartRequest {
+            .navigable_id = {},
+            .url = URL::about_blank(),
+            .document_resource = {},
+            .request_referrer = Web::Fetch::Infrastructure::RequestReferrer::Client,
+            .request_referrer_policy = Web::ReferrerPolicy::ReferrerPolicy::EmptyString,
+            .initiator_origin = URL::Origin::create_opaque(),
+            .initiator_base_url = {},
+            .navigable_target_name = {},
+            .source_snapshot_params = Web::HTML::create_navigation_source_snapshot_without_a_source_document(),
+            .target_snapshot_params = {},
+            .csp_navigation_type = Web::ContentSecurityPolicy::Directives::NavigationType::Other,
+            .history_handling = Web::Bindings::NavigationHistoryBehavior::Auto,
+            .user_involvement = Web::HTML::UserNavigationInvolvement::None,
+            .navigation_id = navigation_id,
+            .classic_history_api_state = {},
+            .navigation_api_state = {},
+            .navigation_api_key = {},
+            .navigation_api_id = {},
+        } },
+        .history_entry = move(history_entry),
+    };
+}
+
 static u64 s_next_test_document_state_local_id = 1000000;
 
 static Web::HTML::SessionHistoryEntryDescriptor entry(i32 step, StringView url)
@@ -69,7 +108,7 @@ public:
     struct UnloadingCheck {
         NonnullRefPtr<WebView::CanonicalSessionHistoryEntry> target_entry;
         Vector<Web::HTML::CrossProcessId> navigables_that_need_before_unload;
-        Function<void(Web::HTML::HistoryStepResult)> on_complete;
+        Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)> on_complete;
     };
     struct ChangingJob {
         ChangingNavigableHistoryStepJob job;
@@ -88,7 +127,7 @@ public:
     WebView::ApplyHistoryStepJobs jobs()
     {
         return {
-            .check_if_unloading_is_canceled = [this](Vector<Web::HTML::CrossProcessId> navigables_that_need_before_unload, NonnullRefPtr<WebView::CanonicalSessionHistoryEntry> target_entry, Web::HTML::UserNavigationInvolvement, Function<void(Web::HTML::HistoryStepResult)> on_complete) { unloading_checks.append({ move(target_entry), move(navigables_that_need_before_unload), move(on_complete) }); },
+            .check_if_unloading_is_canceled = [this](Vector<Web::HTML::CrossProcessId> navigables_that_need_before_unload, NonnullRefPtr<WebView::CanonicalSessionHistoryEntry> target_entry, Web::HTML::UserNavigationInvolvement, Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)> on_complete) { unloading_checks.append({ move(target_entry), move(navigables_that_need_before_unload), move(on_complete) }); },
             .queue_navigation_api_state_clear_task = [this](Web::HTML::CrossProcessId navigable_id) { navigation_api_state_clear_tasks.append(navigable_id); },
             .select_changing_navigable_history_step_job_endpoint = [this](ChangingNavigableHistoryStepJob& job) {
                 selected_changing_job_endpoints.append(job.navigable_id);
@@ -111,13 +150,13 @@ struct TestTraversable {
     TestTraversable()
     {
         traversable.set_id(root_id());
-        traversable.set_active_session_history_entry(WebView::CanonicalSessionHistoryEntry::create(WebView::CanonicalDocumentState::create({}, WebView::CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document().document)));
+        traversable.set_active_session_history_entry(WebView::CanonicalSessionHistoryEntry::create(WebView::CanonicalDocumentState::create({}, WebView::CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document({}).document)));
     }
 
     WebView::CanonicalNavigable& add_child(Web::HTML::CrossProcessId id)
     {
         auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(id));
-        child.set_active_session_history_entry(WebView::CanonicalSessionHistoryEntry::create(WebView::CanonicalDocumentState::create({}, WebView::CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document().document)));
+        child.set_active_session_history_entry(WebView::CanonicalSessionHistoryEntry::create(WebView::CanonicalDocumentState::create({}, WebView::CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document({}).document)));
         return child;
     }
 
@@ -185,19 +224,19 @@ struct TestTraversable {
         VERIFY(history.replace_session_history_entry(traversable, *current_entry, MUST(WebView::CanonicalSessionHistoryEntry::create_from_descriptor(entry(0, "https://b.example/"sv)))));
     }
 
-    WebView::ApplyHistoryStep& apply_step(i32 step, Optional<Web::Bindings::NavigationType> navigation_type, bool check_for_cancelation = false, Optional<Web::HTML::CrossProcessId> initiator_to_check = {}, Optional<Web::InitiatorSourceSnapshot> initiator_source_snapshot = {})
+    WebView::ApplyHistoryStep& apply_step(i32 step, Optional<Web::Bindings::NavigationType> navigation_type, bool check_for_cancelation = false, Optional<Web::HTML::CrossProcessId> initiator_to_check = {}, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params = {})
     {
         operation = make<WebView::ApplyHistoryStep>(history, traversable, queue, state, runner.jobs(), second_operation_id(), 2, step,
-            check_for_cancelation, initiator_to_check, initiator_source_snapshot, Web::HTML::UserNavigationInvolvement::BrowserUI,
+            check_for_cancelation, initiator_to_check, move(source_snapshot_params), Web::HTML::UserNavigationInvolvement::BrowserUI,
             navigation_type,
             [this](Web::HTML::HistoryStepResult history_step_result) { result = history_step_result; });
         operation->apply_the_history_step();
         return *operation;
     }
 
-    WebView::ApplyHistoryStep& traverse_to_step(i32 step, bool check_for_cancelation = false, Optional<Web::HTML::CrossProcessId> initiator_to_check = {}, Optional<Web::InitiatorSourceSnapshot> initiator_source_snapshot = {})
+    WebView::ApplyHistoryStep& traverse_to_step(i32 step, bool check_for_cancelation = false, Optional<Web::HTML::CrossProcessId> initiator_to_check = {}, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params = {})
     {
-        return apply_step(step, Web::Bindings::NavigationType::Traverse, check_for_cancelation, initiator_to_check, initiator_source_snapshot);
+        return apply_step(step, Web::Bindings::NavigationType::Traverse, check_for_cancelation, initiator_to_check, move(source_snapshot_params));
     }
 
     Optional<i32> current_step() const
@@ -240,14 +279,14 @@ TEST_CASE(ongoing_traversal_is_owned_by_its_history_operation)
     navigable.set_ongoing_navigation_to_traversal(first_operation_id());
     navigable.set_ongoing_navigation_to_traversal(second_operation_id());
     navigable.clear_ongoing_navigation_traversal(first_operation_id());
-    EXPECT(navigable.ongoing_navigation_is_traversal());
+    EXPECT(navigable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
 
     navigable.clear_ongoing_navigation_traversal(second_operation_id());
-    EXPECT(!navigable.ongoing_navigation_is_traversal());
+    EXPECT(!navigable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
 
     navigable.set_ongoing_navigation_to_traversal(first_operation_id());
     navigable.clear_ongoing_navigation();
-    EXPECT(!navigable.ongoing_navigation_is_traversal());
+    EXPECT(!navigable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
 }
 
 TEST_CASE(finalized_replacement_is_selected_from_the_navigables_current_entry)
@@ -278,7 +317,7 @@ TEST_CASE(traversal_runs_the_changing_root_job_and_commits_the_target_step)
     EXPECT(!test.traversable.active_document_is(*target_entry));
     EXPECT_EQ(test.runner.navigation_api_state_clear_tasks.size(), 1uz);
     EXPECT_EQ(test.runner.navigation_api_state_clear_tasks[0], root_id());
-    EXPECT(test.traversable.ongoing_navigation_is_traversal());
+    EXPECT(test.traversable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
     auto& job = test.runner.changing_jobs[0];
     EXPECT_EQ(job.job.navigable_id, root_id());
     EXPECT_EQ(job.job.target_entry->url, parse_url("https://a.example/"sv));
@@ -296,7 +335,7 @@ TEST_CASE(traversal_runs_the_changing_root_job_and_commits_the_target_step)
     EXPECT(test.result == Web::HTML::HistoryStepResult::Applied);
     EXPECT_EQ(test.current_step(), 0);
     EXPECT(operation.completed());
-    EXPECT(!test.traversable.ongoing_navigation_is_traversal());
+    EXPECT(!test.traversable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
 }
 
 TEST_CASE(same_document_traversal_does_not_clear_the_navigation_api_state)
@@ -315,7 +354,7 @@ TEST_CASE(same_document_traversal_yields_to_a_navigation_awaiting_admission)
     test.with_two_same_document_top_level_entries();
 
     test.traverse_to_step(0);
-    EXPECT(!test.traversable.ongoing_navigation_is_traversal());
+    EXPECT(!test.traversable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
     EXPECT_EQ(test.runner.changing_jobs.size(), 1uz);
     auto const& job = test.runner.changing_jobs[0].job;
     EXPECT(job.traversal_yields_to == Web::HTML::TraversalYieldsTo::UnadmittedNavigation);
@@ -326,11 +365,11 @@ TEST_CASE(same_document_traversal_names_the_older_navigation_it_cancels)
 {
     TestTraversable test;
     test.with_two_same_document_top_level_entries();
-    test.traversable.set_ongoing_navigation({ .navigation_id = "older"_utf16, .sequence_number = 1 });
+    test.traversable.set_ongoing_navigation(navigation_for_testing("older"_utf16, 1));
 
     test.traverse_to_step(0);
-    EXPECT(!test.traversable.ongoing_navigation().has_value());
-    EXPECT(!test.traversable.ongoing_navigation_is_traversal());
+    EXPECT(!test.traversable.ongoing_navigation_id().has_value());
+    EXPECT(!test.traversable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
     EXPECT_EQ(test.runner.changing_jobs.size(), 1uz);
     auto const& job = test.runner.changing_jobs[0].job;
     EXPECT(job.traversal_yields_to == Web::HTML::TraversalYieldsTo::UnadmittedNavigation);
@@ -341,10 +380,10 @@ TEST_CASE(same_document_traversal_yields_to_a_newer_admitted_navigation)
 {
     TestTraversable test;
     test.with_two_same_document_top_level_entries();
-    test.traversable.set_ongoing_navigation({ .navigation_id = "newer"_utf16, .sequence_number = 3 });
+    test.traversable.set_ongoing_navigation(navigation_for_testing("newer"_utf16, 3));
 
     test.traverse_to_step(0);
-    EXPECT(test.traversable.ongoing_navigation().has_value());
+    EXPECT(test.traversable.ongoing_navigation_id().has_value());
     EXPECT_EQ(test.runner.changing_jobs.size(), 1uz);
     auto const& job = test.runner.changing_jobs[0].job;
     EXPECT(job.traversal_yields_to == Web::HTML::TraversalYieldsTo::AdmittedNavigation);
@@ -355,11 +394,11 @@ TEST_CASE(cross_document_traversal_cancels_a_newer_navigation)
 {
     TestTraversable test;
     test.with_two_top_level_entries();
-    test.traversable.set_ongoing_navigation({ .navigation_id = "newer"_utf16, .sequence_number = 3 });
+    test.traversable.set_ongoing_navigation(navigation_for_testing("newer"_utf16, 3));
 
     test.traverse_to_step(0);
-    EXPECT(!test.traversable.ongoing_navigation().has_value());
-    EXPECT(test.traversable.ongoing_navigation_is_traversal());
+    EXPECT(!test.traversable.ongoing_navigation_id().has_value());
+    EXPECT(test.traversable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
     EXPECT_EQ(test.runner.changing_jobs.size(), 1uz);
     auto const& job = test.runner.changing_jobs[0].job;
     EXPECT(job.traversal_yields_to == Web::HTML::TraversalYieldsTo::Nothing);
@@ -381,7 +420,7 @@ TEST_CASE(canceled_unloading_returns_before_any_changing_jobs)
     EXPECT_EQ(job.target_entry->url, parse_url("https://a.example/"sv));
     EXPECT_EQ(job.navigables_that_need_before_unload.size(), 1uz);
     EXPECT_EQ(job.navigables_that_need_before_unload[0], root_id());
-    job.on_complete(Web::HTML::HistoryStepResult::CanceledByBeforeUnload);
+    job.on_complete(Web::HTML::CheckIfUnloadingIsCanceledResult::CanceledByBeforeUnload);
 
     EXPECT(test.runner.changing_jobs.is_empty());
     EXPECT(test.result == Web::HTML::HistoryStepResult::CanceledByBeforeUnload);
@@ -396,7 +435,7 @@ TEST_CASE(disallowed_initiator_returns_before_the_cancelation_check)
     test.add_child(child_id());
 
     test.traverse_to_step(0, true, child_id(),
-        Web::InitiatorSourceSnapshot { .sandboxing_flags = Web::HTML::SandboxingFlagSet::SandboxedTopLevelNavigationWithoutUserActivation, .has_transient_activation = false });
+        source_snapshot_params(Web::HTML::SandboxingFlagSet::SandboxedTopLevelNavigationWithoutUserActivation));
 
     EXPECT(test.runner.unloading_checks.is_empty());
     EXPECT(test.runner.changing_jobs.is_empty());
@@ -410,7 +449,7 @@ TEST_CASE(allowed_initiator_proceeds_to_the_cancelation_check)
     test.with_two_top_level_entries();
     test.add_child(child_id());
 
-    test.traverse_to_step(0, true, child_id(), Web::InitiatorSourceSnapshot {});
+    test.traverse_to_step(0, true, child_id(), source_snapshot_params());
 
     EXPECT_EQ(test.runner.unloading_checks.size(), 1uz);
     EXPECT(!test.result.has_value());
@@ -434,7 +473,7 @@ TEST_CASE(sandboxed_removed_initiator_is_disallowed)
     TestTraversable test;
     test.with_two_top_level_entries();
 
-    test.traverse_to_step(0, true, child_id(), Web::InitiatorSourceSnapshot { .sandboxing_flags = Web::HTML::SandboxingFlagSet::SandboxedNavigation });
+    test.traverse_to_step(0, true, child_id(), source_snapshot_params(Web::HTML::SandboxingFlagSet::SandboxedNavigation));
 
     EXPECT(test.runner.unloading_checks.is_empty());
     EXPECT(test.runner.changing_jobs.is_empty());
@@ -446,7 +485,7 @@ TEST_CASE(unsandboxed_removed_initiator_proceeds_to_the_cancelation_check)
     TestTraversable test;
     test.with_two_top_level_entries();
 
-    test.traverse_to_step(0, true, child_id(), Web::InitiatorSourceSnapshot {});
+    test.traverse_to_step(0, true, child_id(), source_snapshot_params());
 
     EXPECT_EQ(test.runner.unloading_checks.size(), 1uz);
     EXPECT(!test.result.has_value());
@@ -503,7 +542,7 @@ TEST_CASE(skipped_changing_job_still_applies_the_history_step)
 
     EXPECT(test.result == Web::HTML::HistoryStepResult::Applied);
     EXPECT_EQ(test.current_step(), 0);
-    EXPECT(!child.ongoing_navigation_is_traversal());
+    EXPECT(!child.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
 }
 
 TEST_CASE(ready_continuations_interleave_with_still_running_changing_jobs)
@@ -542,7 +581,7 @@ TEST_CASE(stale_changing_job_completes_without_committing_the_target_step)
     EXPECT(test.runner.nonchanging_updates.is_empty());
     EXPECT(test.result == Web::HTML::HistoryStepResult::Applied);
     EXPECT_EQ(test.current_step(), 1);
-    EXPECT(!test.traversable.ongoing_navigation_is_traversal());
+    EXPECT(!test.traversable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
 }
 
 TEST_CASE(synchronous_navigation_steps_jump_the_queue_before_continuations)
@@ -628,7 +667,7 @@ TEST_CASE(canceled_run_does_not_resume_after_synchronous_navigation)
 
     test.operation = nullptr;
     EXPECT(!test.state.running_nested_apply_history_step);
-    EXPECT(!test.traversable.ongoing_navigation_is_traversal());
+    EXPECT(!test.traversable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
 
     synchronous_steps_signal->resolve({});
     EXPECT(test.runner.continuations.is_empty());
@@ -677,7 +716,7 @@ TEST_CASE(a_paused_run_commits_after_a_newer_run_recommits_the_current_step)
     Optional<Web::HTML::HistoryStepResult> nested_result;
     test.queue.append_session_history_synchronous_navigation_steps(child_id(), {}, [&](NonnullRefPtr<Core::Promise<Empty>> signal) {
         nested_operation = make<WebView::ApplyHistoryStep>(test.history, test.traversable, test.queue, test.state, test.runner.jobs(), third_operation_id(), 3, 1,
-            false, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::InitiatorSourceSnapshot> {}, Web::HTML::UserNavigationInvolvement::None, Web::Bindings::NavigationType::Replace,
+            false, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::HTML::NavigationSourceSnapshot> {}, Web::HTML::UserNavigationInvolvement::None, Web::Bindings::NavigationType::Replace,
             [&, signal](Web::HTML::HistoryStepResult result) {
                 nested_result = result;
                 signal->resolve({});
@@ -725,7 +764,7 @@ TEST_CASE(a_paused_traversal_is_abandoned_once_a_jumping_push_removes_its_target
         pushed_entry->url = parse_url("https://b.example/pushed"sv);
         VERIFY(test.history.push_session_history_entry(test.traversable, move(pushed_entry)) == 2);
         nested_operation = make<WebView::ApplyHistoryStep>(test.history, test.traversable, test.queue, test.state, test.runner.jobs(), third_operation_id(), 3, 2,
-            false, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::InitiatorSourceSnapshot> {}, Web::HTML::UserNavigationInvolvement::None, Web::Bindings::NavigationType::Push,
+            false, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::HTML::NavigationSourceSnapshot> {}, Web::HTML::UserNavigationInvolvement::None, Web::Bindings::NavigationType::Push,
             [&, signal](Web::HTML::HistoryStepResult result) {
                 nested_result = result;
                 signal->resolve({});
@@ -755,7 +794,7 @@ TEST_CASE(a_paused_traversal_is_abandoned_once_a_jumping_push_removes_its_target
     EXPECT(!test.operation->committed_step().has_value());
     EXPECT_EQ(test.current_step(), 2);
     EXPECT_EQ(test.history.current_entry()->url, parse_url("https://b.example/pushed"sv));
-    EXPECT(!test.traversable.ongoing_navigation_is_traversal());
+    EXPECT(!test.traversable.ongoing_navigation().has<WebView::CanonicalNavigable::Traversal>());
 }
 
 TEST_CASE(a_paused_push_appends_its_entry_again_once_a_jumping_push_clears_it)
@@ -778,7 +817,7 @@ TEST_CASE(a_paused_push_appends_its_entry_again_once_a_jumping_push_clears_it)
         pushed_entry->url = parse_url("https://b.example/pushed"sv);
         VERIFY(test.history.push_session_history_entry(test.traversable, move(pushed_entry)) == 2);
         nested_operation = make<WebView::ApplyHistoryStep>(test.history, test.traversable, test.queue, test.state, test.runner.jobs(), third_operation_id(), 3, 2,
-            false, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::InitiatorSourceSnapshot> {}, Web::HTML::UserNavigationInvolvement::None, Web::Bindings::NavigationType::Push,
+            false, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::HTML::NavigationSourceSnapshot> {}, Web::HTML::UserNavigationInvolvement::None, Web::Bindings::NavigationType::Push,
             [&, signal](Web::HTML::HistoryStepResult result) {
                 nested_result = result;
                 signal->resolve({});
@@ -826,7 +865,7 @@ TEST_CASE(a_paused_reload_continues_with_the_entry_that_a_jumping_replace_put_in
     Core::EventLoop event_loop;
     TestTraversable test;
     test.with_two_top_level_entries();
-    test.history.mark_current_entry_reload_pending();
+    test.history.current_entry()->document_state->reload_pending = true;
 
     // A same-document replace from the page being reloaded is queued behind the reload, and jumps the queue while the
     // reload waits on its changing job. It replaces the entry that the reload has claimed, keeping its navigation API
@@ -842,7 +881,7 @@ TEST_CASE(a_paused_reload_continues_with_the_entry_that_a_jumping_replace_put_in
     test.queue.append_session_history_synchronous_navigation_steps(child_id(), {}, [&](NonnullRefPtr<Core::Promise<Empty>> signal) {
         VERIFY(test.history.replace_session_history_entry(test.traversable, *reloading_entry, replacement_entry));
         nested_operation = make<WebView::ApplyHistoryStep>(test.history, test.traversable, test.queue, test.state, test.runner.jobs(), third_operation_id(), 3, 1,
-            false, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::InitiatorSourceSnapshot> {}, Web::HTML::UserNavigationInvolvement::None, Web::Bindings::NavigationType::Replace,
+            false, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::HTML::NavigationSourceSnapshot> {}, Web::HTML::UserNavigationInvolvement::None, Web::Bindings::NavigationType::Replace,
             [&, signal](Web::HTML::HistoryStepResult result) {
                 nested_result = result;
                 signal->resolve({});

@@ -80,6 +80,13 @@ elseif (NOT CMAKE_CROSSCOMPILING)
     set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=native)
 endif()
 
+# Stack walks such as the crash handler's follow frame pointers. Apple platforms keep them by default, and Windows
+# unwinds through the unwind tables its ABI requires instead, so only other platforms need to ask for them.
+if (NOT APPLE AND NOT WIN32)
+    add_cxx_compile_options(-fno-omit-frame-pointer)
+    set(RUSTC_TARGET_FRAME_POINTER_FLAGS -Cforce-frame-pointers=yes)
+endif()
+
 add_cxx_compile_options(-Wcast-qual)
 add_cxx_compile_options(-Wformat=2)
 add_cxx_compile_options(-Wimplicit-fallthrough)
@@ -182,8 +189,8 @@ elseif (MSVC)
     # Compiler options
     # disable exceptions
     add_cxx_compile_options(/EHs-)
-    # disable floating-point expression contraction
-    add_cxx_compile_options(/fp:precise)
+    # disable floating-point expression contraction, which the default /fp:precise allows
+    add_cxx_compile_options(/clang:-ffp-contract=off)
     # reduces object size
     add_cxx_compile_options(/Zc:inline)
     # equivalent of -fvisibility-inlines-hidden
@@ -308,8 +315,4 @@ if (ENABLE_LAGOM_COVERAGE_COLLECTION)
         message(FATAL_ERROR
             "Collecting code coverage is unsupported in this configuration.")
     endif()
-endif()
-
-if (ENABLE_FUZZERS)
-    add_cxx_compile_options(-fno-omit-frame-pointer)
 endif()

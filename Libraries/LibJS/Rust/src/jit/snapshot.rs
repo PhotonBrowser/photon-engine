@@ -27,12 +27,12 @@ use super::allocation::{
     allocation_infos, closure_template_snapshots, closure_templates, function_environment_template,
     lexical_environment_templates,
 };
-use super::cell_as;
 use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable};
 use super::runtime_info::RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS;
 use crate::bytecode::executable::{Executable, PropertyLookupCacheEntryData, PropertyLookupCacheTier};
 use crate::bytecode::feedback::{CallFeedback, CallFeedbackForwarding, call_feedback_flags};
 use crate::bytecode::instruction::instruction_length_from_bytes;
+use crate::gc::class::Extends;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::DeclarativeEnvironment;
@@ -121,7 +121,7 @@ fn instruction_count(executable: &Executable, limit: u32) -> u32 {
 }
 
 pub(crate) fn ecmascript_function(cell: Option<Gc<CellHeader>>) -> Option<Gc<EcmascriptFunctionObject>> {
-    as_ecmascript_function_object(cell_as::<Object>(cell?)?)
+    as_ecmascript_function_object(cell?.downcast::<Object>()?)
 }
 
 /// The target of a call site if it is a builtin written in JavaScript that JIT code can inline: a normal function
@@ -130,7 +130,7 @@ fn builtin_inlining_candidate(
     target: Option<Gc<CellHeader>>,
     caller_realm: Gc<Realm>,
 ) -> Option<Gc<NativeJavaScriptBackedFunction>> {
-    let builtin = cell_as::<NativeJavaScriptBackedFunction>(target?)?;
+    let builtin = target?.downcast::<NativeJavaScriptBackedFunction>()?;
     let shared_data = builtin.shared_data();
     (shared_data.kind() == FunctionKind::Normal
         && !builtin.function_environment_needed()
@@ -142,19 +142,19 @@ fn builtin_inlining_candidate(
 /// The intrinsic the compiler knows an object as, if it is one.
 fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
     let cell = cell?;
-    if cell_as::<StringConstructor>(cell).is_some() {
+    if cell.downcast::<StringConstructor>().is_some() {
         return Some(Intrinsic::StringConstructor);
     }
-    if cell_as::<ArrayConstructor>(cell).is_some() {
+    if cell.downcast::<ArrayConstructor>().is_some() {
         return Some(Intrinsic::ArrayConstructor);
     }
-    if cell_as::<ObjectConstructor>(cell).is_some() {
+    if cell.downcast::<ObjectConstructor>().is_some() {
         return Some(Intrinsic::ObjectConstructor);
     }
-    if cell_as::<BooleanConstructor>(cell).is_some() {
+    if cell.downcast::<BooleanConstructor>().is_some() {
         return Some(Intrinsic::BooleanConstructor);
     }
-    let function = cell_as::<RawNativeFunction>(cell)?;
+    let function = cell.downcast::<RawNativeFunction>()?;
     match function.builtin() {
         Some(Builtin::StringFromCharCode) => return Some(Intrinsic::StringFromCharCode),
         Some(Builtin::RegExpPrototypeExec) => return Some(Intrinsic::RegExpPrototypeExec),
@@ -312,7 +312,7 @@ fn native_call_target(vm: &Vm, feedback: &CallFeedback) -> Option<Gc<RawNativeFu
     if !RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS || feedback.flags.get() & call_feedback_flags::POLYMORPHIC != 0 {
         return None;
     }
-    let function = cell_as::<RawNativeFunction>(feedback.target()?)?;
+    let function = feedback.target()?.downcast::<RawNativeFunction>()?;
     (!FunctionPrototype::is_call_function(vm, &function) && !FunctionPrototype::is_apply_function(vm, &function))
         .then_some(function)
 }
@@ -336,14 +336,13 @@ fn word_of<T>(cell: Gc<T>, offset: usize) -> u64 {
 }
 
 impl SnapshotBuilder<'_> {
-    fn cell<T>(&mut self, cell: Gc<T>) -> CellId {
-        // SAFETY: Every cell starts with a cell header.
-        let header = unsafe { Gc::<CellHeader>::from_non_null(cell.as_non_null().cast()) };
+    fn cell<T: Extends<CellHeader>>(&mut self, cell: Gc<T>) -> CellId {
+        let header = cell.upcast::<CellHeader>();
         self.cells.push(header);
         CellId(cell.as_ptr() as u64)
     }
 
-    fn optional_cell<T>(&mut self, cell: Option<Gc<T>>) -> Option<CellId> {
+    fn optional_cell<T: Extends<CellHeader>>(&mut self, cell: Option<Gc<T>>) -> Option<CellId> {
         cell.map(|cell| self.cell(cell))
     }
 
@@ -691,7 +690,7 @@ impl SnapshotBuilder<'_> {
             bound_argument_count: 0,
         };
         if snapshot.forwarding == Forwarding::Bound {
-            let bound = cell_as::<BoundFunction>(call.target()?)?;
+            let bound = call.target()?.downcast::<BoundFunction>()?;
             let bound_argument_count = bound.bound_arguments_count();
             if bound_argument_count > snapshot.bound_arguments.len() {
                 return None;
@@ -1155,8 +1154,7 @@ pub fn capture_snapshot(
         let Some(sample) = sample else {
             continue;
         };
-        // SAFETY: Every cell starts with a cell header.
-        let sample_cell = unsafe { Gc::<CellHeader>::from_non_null(sample.as_non_null().cast()) };
+        let sample_cell = sample.upcast::<CellHeader>();
         let inline_executable = builder.inline_executable_index(Some(sample_cell), &root);
         if let Some(Some(template)) = executables[0].closure_templates.get_mut(template_index) {
             template.inline_executable = inline_executable;

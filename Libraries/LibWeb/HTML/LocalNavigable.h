@@ -117,9 +117,6 @@ public:
     void stop_delaying_load_events_for_navigation(Utf16String const& navigation_id);
     bool is_delaying_load_events() const { return m_is_delaying_load_events; }
 
-    void set_navigation_load_event_guard(DOM::Document& parent_doc);
-    void clear_navigation_load_event_guard();
-
     RefPtr<SessionHistoryEntry> active_session_history_entry() const;
     void set_active_session_history_entry(RefPtr<SessionHistoryEntry>);
     RefPtr<SessionHistoryEntry> current_session_history_entry() const;
@@ -193,14 +190,11 @@ public:
     void clear_ongoing_history_traversal();
 
     bool resume_navigation_params_creation(Utf16String const& navigation_id, Optional<NavigationPopulationRequest>);
-    void continue_navigation_from_another_process(PreparedNavigationDescriptor);
     void adopt_navigation_started_in_ui_process(Utf16String navigation_id);
     void navigate_to_a_javascript_url_from_ui_process(URL::URL const&, HistoryHandlingBehavior, URL::Origin const& initiator_origin, NavigationSourceSnapshot const&, UserNavigationInvolvement, ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, Utf16String navigation_id);
     void navigate_to_a_fragment(URL::URL const&, HistoryHandlingBehavior, UserNavigationInvolvement, GC::Ptr<DOM::Element> source_element, Optional<StorageSerializationRecord> navigation_api_state, Utf16String navigation_id, GC::Ptr<NavigationAPIMethodTracker> api_method_tracker);
     void deliver_posted_message_from_another_process(PostedMessageDescriptor);
     void run_navigation_unload_check(Utf16String const& navigation_id, UnloadPromptShown, GC::Ref<GC::Function<void(bool)>> completion_steps);
-    void request_population_for_reconstructed_history_entry(NavigationPopulationRequest);
-    void route_child_created_during_history_reconstruction(Web::ReconstructedChildNavigation);
     void continue_navigation_at_population(NavigationPopulationRequest, NavigationPopulationResult);
 
     void populate_session_history_entry_document(
@@ -300,10 +294,7 @@ public:
 
     void inform_the_navigation_api_about_child_navigable_destruction();
 
-    bool has_pending_navigations() const { return !m_pending_navigations.is_empty(); }
     bool has_navigation_parked_for_population(Utf16String const& navigation_id) const;
-    void clear_pending_navigations();
-    void prepare_to_populate_reconstructed_history_entry(Utf16String navigation_api_key);
 
     // Commits the frame that brings the compositor context up to date to the render owner, which presents it beside the
     // event loop: a new display list, or what changed for the one it has. Answers whether it committed one.
@@ -463,24 +454,18 @@ private:
     void finish_recording_in_flight(RecordingInFlight&, Layout::RustFFI::FfiRecordingLanding, Layout::RustFFI::FfiPresentation);
     Gfx::IntRect present_viewport_rect() const;
 
-    enum class PendingNavigationBehavior {
-        Append,
-        Replace
-    };
-
-    struct PendingNavigation {
+    // A navigation the UI process is to continue: it checks unloading, then asks for the navigation params.
+    struct NavigationParkedForPopulation {
+        Utf16String navigation_id;
         Optional<PreparedNavigation> navigation;
-        Optional<Utf16String> population_navigation_id;
-        GC::Ptr<GC::Function<void(Optional<PreparedNavigation>, Optional<NavigationPopulationRequest>)>> continue_steps;
     };
 
     void begin_navigation(PreparedNavigation);
     virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(PreparedNavigation) override;
     void continue_navigation_after_population_dispatch(PreparedNavigation, NavigationPopulationRequest);
-    void queue_pending_navigation(PreparedNavigation, PendingNavigationBehavior);
-    void park_navigation_for_population(Utf16String navigation_id, Optional<PreparedNavigation>, GC::Ref<GC::Function<void(Optional<PreparedNavigation>, Optional<NavigationPopulationRequest>)>> continue_steps);
-    Optional<PendingNavigation> take_navigation_parked_for_population(Utf16String const& navigation_id);
-    void process_pending_navigations();
+    void park_navigation_for_population(Utf16String navigation_id, Optional<PreparedNavigation>);
+    void clear_parked_navigations();
+    Optional<NavigationParkedForPopulation> take_navigation_parked_for_population(Utf16String const& navigation_id);
     void navigate_to_a_javascript_url(GC::Ref<Fetch::Infrastructure::Request>, HistoryHandlingBehavior, URL::Origin const& initiator_origin, UserNavigationInvolvement, ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, InitialInsertion, Utf16String navigation_id);
 
     void reset_cursor_blink_cycle();
@@ -586,9 +571,6 @@ private:
     bool m_is_delaying_load_events { false };
     Optional<DOM::DocumentLoadEventDelayer> m_container_document_load_event_delayer;
 
-    // AD-HOC: Guards the parent document's load event delay count during cross-document navigation.
-    Optional<DOM::DocumentLoadEventDelayer> m_navigation_load_event_guard;
-
     NavigationObserver::NavigationObserversList m_navigation_observers;
 
     bool m_has_been_destroyed { false };
@@ -611,7 +593,7 @@ private:
 
     bool m_has_session_history_entry_and_ready_for_navigation { false };
 
-    Vector<PendingNavigation> m_pending_navigations;
+    Vector<NavigationParkedForPopulation> m_navigations_parked_for_population;
 
     // The navigation IDs of javascript: URL navigations whose navigate to a javascript: URL task is queued.
     Vector<Utf16String> m_queued_javascript_url_navigations;
@@ -723,6 +705,7 @@ public:
     RefPtr<DocumentState> replacement_document_state;
     bool resource_cleared = false;
     Optional<URL::Origin> inline_content_origin;
+    Optional<CrossProcessId> document_id;
 
     void apply_to(NonnullRefPtr<SessionHistoryEntry> entry);
 
@@ -734,13 +717,8 @@ WEB_API HashTable<GC::RawRef<LocalNavigable>>& all_local_navigables();
 WEB_API GC::Ptr<LocalNavigable> local_navigable_with_id(CrossProcessId);
 
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document);
-void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Optional<Utf16String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete);
+void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Utf16String navigation_id);
 
-enum class CheckIfUnloadingIsCanceledResult {
-    CanceledByBeforeUnload,
-    CanceledByNavigate,
-    Continue,
-};
 WEB_API void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ptr<LocalTraversableNavigable> traversable, RefPtr<SessionHistoryEntry> target_entry, Optional<UserNavigationInvolvement> user_involvement_for_navigate_events, UnloadPromptShown, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback);
 WEB_API void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult)>> callback);
 void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<StorageSerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);

@@ -16,6 +16,8 @@
 
 #include <ApplicationServices/ApplicationServices.h>
 
+extern "C" void NSAccessibilityUnregisterUniqueIdForUIElement(id element);
+
 // Text marker: encodes a node ID and character offset for cursor-level text navigation.
 struct TextMarkerData {
     i64 node_id { -1 };
@@ -215,10 +217,29 @@ static NSString* nsStringFromAK(String const& string)
     return _manager->node(_nodeID);
 }
 
+- (void)dealloc
+{
+    // An element the tree dropped gave up its id then (invalidate); one that goes with its view gives it up here.
+    if (_manager)
+        NSAccessibilityUnregisterUniqueIdForUIElement(self);
+}
+
 - (void)invalidate
 {
+    // AppKit's table of ids doesn't retain the elements, so give up the id while this element is still alive — and an
+    // AT holding this element learns that it's gone.
+    NSAccessibilityUnregisterUniqueIdForUIElement(self);
     _manager = nullptr;
     _view = nil;
+}
+
+// Without a unique id, AppKit identifies an element to an AT by its path of child indices from the window. So every
+// request resolves that path again, computing the AXChildren of each ancestor on the way down — and the AXWebArea's
+// children skip through every unnamed div and paragraph in the page. And a handle the AT holds then names a position,
+// not an element: Once a sibling is inserted before the element, it resolves to whatever moved into its place.
+- (BOOL)accessibilityShouldUseUniqueId
+{
+    return YES;
 }
 
 #pragma mark - NSAccessibility informal protocol
@@ -498,11 +519,11 @@ static NSString* nsStringFromAK(String const& string)
     if ([attribute isEqualToString:NSAccessibilityFocusedAttribute]) {
         if (!data)
             return @NO;
-        // The document AXWebArea reports focused when its containing view is first responder. VoiceOver uses this to
-        // know which web area is the active reading target on the page. Without it, AXLoadComplete fires — but
-        // VoiceOver doesn't move its cursor into the web content.
+        // The document AXWebArea is focused exactly when it's the page's focused UI element: when nothing in the page
+        // has the focus. VoiceOver expects the element reported as focused to say so itself — and when it doesn't,
+        // VoiceOver sets AXFocused on it, and again after every tree update, announcing the web area each time.
         if (data->role.bytes_as_string_view() == "document"sv)
-            return [_view accessibilityViewIsFirstResponder] ? @YES : @NO;
+            return [_view accessibilityFocusedUIElement] == self ? @YES : @NO;
         return data->is_focused ? @YES : @NO;
     }
 

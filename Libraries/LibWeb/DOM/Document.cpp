@@ -481,6 +481,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->m_was_created_via_cross_origin_redirects = navigation_params.response->redirect_taint() != Fetch::Infrastructure::RedirectTaint::SameOrigin;
     document->m_about_base_url = navigation_params.about_base_url;
     document->set_url(*creation_url);
+    document->set_id(navigation_params.document_id.has_value() ? *navigation_params.document_id : browsing_context->page().client().allocate_cross_process_id());
 
     // AD-HOC: Record when the readiness becomes "loading" for PerformanceTiming's domLoading. The window is not yet
     //         associated with document, so relate the time to loadTimingInfo directly.
@@ -1245,12 +1246,8 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<Utf16String> const&, Opti
         return this;
 
     // 8. If document's node navigable is non-null and document's node navigable's ongoing navigation is a navigation ID, then stop loading document's node navigable.
-    // AD-HOC: Pending navigations can also sit in m_pending_navigations, so we need to cancel those too.
-    if (auto navigable = this->navigable()) {
-        navigable->clear_pending_navigations();
-        if (navigable->ongoing_navigation().has<Utf16String>())
-            navigable->stop_loading();
-    }
+    if (auto navigable = this->navigable(); navigable && navigable->ongoing_navigation().has<Utf16String>())
+        navigable->stop_loading();
 
     // 9. For each shadow-including inclusive descendant node of document, erase all event listeners and handlers given node.
     for_each_shadow_including_inclusive_descendant([](Node& node) {
@@ -1871,6 +1868,12 @@ void Document::respond_to_base_url_changes(URL::URL const& old_document_url, URL
     //        ...
 
     // FIXME: 4. Consider speculative loads given document.
+}
+
+void Document::set_id(HTML::CrossProcessId id)
+{
+    VERIFY(!m_id.has_value());
+    m_id = id;
 }
 
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#set-the-url
@@ -4694,7 +4697,7 @@ void Document::completely_finish_loading()
     //     document, reached through the UI process, which mirrors that the document is completely loaded.
     if (container)
         container->content_navigable_completely_finished_loading();
-    navigable->page().client().page_did_completely_finish_loading(navigable->id());
+    navigable->page().client().page_did_completely_finish_loading(navigable->id(), *this);
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-cookie
@@ -5389,11 +5392,6 @@ void Document::set_ready_for_post_load_tasks(bool ready)
     m_ready_for_post_load_tasks = ready;
     if (ready) {
         if (auto navigable = this->navigable()) {
-            // AD-HOC: Clear the navigation load event guard now that the document is ready.
-            //         This guard was set in finalize_a_cross_document_navigation to prevent the parent's
-            //         load event from firing while the about:blank was still the active document.
-            navigable->clear_navigation_load_event_guard();
-
             if (auto container = navigable->container())
                 container->document().schedule_html_parser_end_check();
             else
@@ -6646,11 +6644,13 @@ static CSSPixelRect compute_intersection(Layout::BegunRead const& read, GC::Ref<
             scroll_margin[3].to_px(clip_rect.width()));
         return clip_rect;
     };
-    return Layout::RustFFI::layout_script_intersection_observer_intersection_rect(
+    CSSPixelRect rect;
+    Layout::RustFFI::layout_script_intersection_observer_intersection_rect(
         document.layout_node_arena().host(), Layout::Node::slot_id(target->layout_node(read)), target_rect,
         Layout::Node::slot_id(root_layout_box), root_bounds,
         Painting::rect_to_viewport_transform(document, visual_context_tree),
-        const_cast<Vector<CSS::LengthPercentage>*>(&scroll_margin), inflate_scroll_container_clip_rect_by_scroll_margin);
+        const_cast<Vector<CSS::LengthPercentage>*>(&scroll_margin), inflate_scroll_container_clip_rect_by_scroll_margin, &rect);
+    return rect;
 }
 
 // https://www.w3.org/TR/intersection-observer/#run-the-update-intersection-observations-steps
@@ -7894,8 +7894,10 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         auto viewport_bounds = CSSPixelRect { { 0, 0 }, viewport_rect().size() };
         auto rect_to_viewport_transform = Painting::rect_to_viewport_transform(*this, *visual_context_tree);
         auto bounds_in_viewport = [&](Layout::Node const& node) -> CSSPixelRect {
-            return Layout::RustFFI::layout_script_bounding_client_rect(
-                node.document_host(), Layout::Node::slot_id(&node), rect_to_viewport_transform);
+            CSSPixelRect rect;
+            Layout::RustFFI::layout_script_bounding_client_rect(
+                node.document_host(), Layout::Node::slot_id(&node), rect_to_viewport_transform, &rect);
+            return rect;
         };
         HashTable<Layout::Node const*> containing_blocks;
         for (auto const* container = layout_node->containing_block(); container; container = container->containing_block())
@@ -10078,8 +10080,9 @@ Optional<CSSPixelRect> Document::current_caret_rect()
     };
 
     if (is<DOM::Text>(dom_node)) {
-        auto result = Layout::RustFFI::layout_script_text_caret_rect_in_dom_range(
-            layout_node->document_host(), Layout::Node::slot_id(layout_node), position->offset());
+        Layout::RustFFI::FfiOptionalCssPixelRect result;
+        Layout::RustFFI::layout_script_text_caret_rect_in_dom_range(
+            layout_node->document_host(), Layout::Node::slot_id(layout_node), position->offset(), &result);
         if (result.has_value)
             return to_viewport_rect(result.rect);
     }
@@ -11331,6 +11334,27 @@ QuerySelectorResultCache& Document::query_selector_result_cache()
     if (!m_query_selector_result_cache)
         m_query_selector_result_cache = make<QuerySelectorResultCache>();
     return *m_query_selector_result_cache;
+}
+
+bool Document::tree_references_id_from_aria(Node const& root, Utf16FlyString const& id) const
+{
+    auto dom_tree_version = root.dom_tree_version();
+    if (auto entry = m_ids_referenced_from_aria.get(&root); entry.has_value() && entry->root.ptr().ptr() == &root && entry->dom_tree_version == dom_tree_version)
+        return entry->ids.contains(id);
+
+    m_ids_referenced_from_aria.remove_all_matching([](auto const&, auto const& entry) { return !entry.root; });
+
+    IdsReferencedFromAria entry { root, dom_tree_version, {} };
+    root.for_each_in_subtree_of_type<HTML::HTMLElement>([&](auto const& element) {
+        for (auto& reference : element.parse_id_reference_list(element.aria_labelled_by()))
+            entry.ids.set(Utf16FlyString { move(reference) });
+        for (auto& reference : element.parse_id_reference_list(element.aria_described_by()))
+            entry.ids.set(Utf16FlyString { move(reference) });
+        return TraversalDecision::Continue;
+    });
+    auto is_referenced = entry.ids.contains(id);
+    m_ids_referenced_from_aria.set(&root, move(entry));
+    return is_referenced;
 }
 
 }

@@ -32,11 +32,14 @@ impl Default for RootBackgroundSource {
 
 /// What geometry tells the document. The fields are private, so the callbacks are reached only
 /// through the methods below, which take the main thread token.
+///
+/// NB: The callbacks are typed as safe functions because the table only comes from the host through an export
+///     whose safety contract keeps them callable, and the private fields let nothing else call them.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiGeometryHostCallbacks {
     context: *mut std::ffi::c_void,
-    set_scroll_offset: unsafe extern "C" fn(
+    set_scroll_offset: extern "C" fn(
         *mut std::ffi::c_void,
         &crate::render_state::BegunRead,
         crate::layout::node_data::NodeSlotId,
@@ -46,19 +49,13 @@ pub struct FfiGeometryHostCallbacks {
 
 impl FfiGeometryHostCallbacks {
     /// Stores a scroll offset the overflow pass settled on, after the pass, in `read`.
-    ///
-    /// # Safety
-    ///
-    /// `slot` must name a live row. The host re-enters geometry queries and writes the store the
-    /// offset lives in, so no mutable arena or cache borrow may be held across this call.
-    pub(crate) unsafe fn set_scroll_offset(
+    pub(crate) fn set_scroll_offset(
         &self,
         _: &crate::stage::MainThread,
         read: &crate::render_state::BegunRead,
         slot: crate::layout::node_data::NodeSlotId,
         offset: crate::layout::used_values::FfiCssPixelPoint,
     ) {
-        // SAFETY: Guaranteed by the caller.
-        unsafe { (self.set_scroll_offset)(self.context, read, slot, offset) };
+        (self.set_scroll_offset)(self.context, read, slot, offset);
     }
 }

@@ -175,9 +175,9 @@ pub(crate) struct StyleRecordView<'a> {
     pub payloads: &'a [SharedPayload],
     pub base_payloads: &'a [SharedPayload],
     /// Always the base record's table: animation overlays store no table entries.
-    pub longhand_table: HostShared<ComputedLonghandTable>,
+    pub longhand_table: Option<&'a ComputedLonghandTable>,
     pub longhand_values: &'a [SharedPayload],
-    pub animated_overlay: HostShared<crate::css::animated_overlay::AnimatedOverlay>,
+    pub animated_overlay: Option<&'a crate::css::animated_overlay::AnimatedOverlay>,
     pub pseudo_element_styles: u64,
     pub counter_style_environment_identity: u64,
     pub animation_overlay_identity: u64,
@@ -186,11 +186,9 @@ pub(crate) struct StyleRecordView<'a> {
 
 impl StyleRecordView<'_> {
     pub(crate) fn longhand_table_for_partial_drive(&self) -> ComputedLonghandTable {
-        let source = unsafe {
-            self.longhand_table
-                .as_ref()
-                .expect("a retained style record must carry a longhand table")
-        };
+        let source = self
+            .longhand_table
+            .expect("a retained style record must carry a longhand table");
         ComputedLonghandTable::copied_for_partial_drive(source)
     }
 }
@@ -1135,11 +1133,14 @@ impl ComputedGroupSets {
         // A payload nobody has interned yet is asked for its content, which is what decides its
         // identity: an equal payload built by another record is the same group, however the two
         // builds were ordered.
-        let payload_content_hash = style_group_payloads_hash(index, payload.as_ptr());
+        // SAFETY: Published style-group payloads stay live while their records do.
+        let payload_content_hash = unsafe { style_group_payloads_hash(index, payload.as_ptr()) };
         let groups = &self.groups;
         if let Some(identity) = self.groups_by_content.find(payload_content_hash, |identity, ()| {
             let group = &groups[identity];
-            group.index == index && style_group_payloads_equal(index, group.payload.as_ptr(), payload.as_ptr())
+            // SAFETY: Published style-group payloads stay live while their records do.
+            group.index == index
+                && unsafe { style_group_payloads_equal(index, group.payload.as_ptr(), payload.as_ptr()) }
         }) {
             return (identity, false);
         }
@@ -1651,7 +1652,7 @@ impl ComputedGroupSets {
                         crate::css::table_group_builder::rebuild_group_for_inherited_current_color(
                             table,
                             group,
-                            old_payload.as_ptr(),
+                            crate::css::computed_values::GroupPayloadRef::new(group, old_payload.as_ptr()),
                             inherited_text.color,
                             inherited_ui.color_scheme,
                         )
@@ -1776,11 +1777,9 @@ impl ComputedGroupSets {
                 debug_assert!(false, "a currentcolor-relative color does not resolve");
                 continue;
             };
-            let resolved = unsafe {
-                RetainedStyleValueData::from_retained_pointer(std::sync::Arc::into_raw(std::sync::Arc::new(
-                    crate::css::color_resolution::resolved_srgb_style_value(resolved),
-                )))
-            };
+            let resolved = RetainedStyleValueData::from_arc(std::sync::Arc::new(
+                crate::css::color_resolution::resolved_srgb_style_value(resolved),
+            ));
             let source_slot = table.source_slot(property).map_or(-1, i64::from);
             table.set(property, resolved, source_slot);
         }
@@ -1803,7 +1802,7 @@ impl ComputedGroupSets {
                     &table,
                     group,
                     font,
-                    old_payload.as_ptr(),
+                    crate::css::computed_values::GroupPayloadRef::new(group, old_payload.as_ptr()),
                     color_inputs,
                     length,
                 )
@@ -1811,7 +1810,8 @@ impl ComputedGroupSets {
             // An equal payload keeps the old identity, as a C++ build adopts its parent's and
             // predecessor's identical payloads.
             let identity = if payload == old_payload
-                || style_group_payloads_equal(group, old_payload.as_ptr(), payload.as_ptr())
+                // SAFETY: Published style-group payloads stay live while their records do.
+                || unsafe { style_group_payloads_equal(group, old_payload.as_ptr(), payload.as_ptr()) }
             {
                 canonicalized_groups += 1;
                 release_group_payload(group, payload.as_ptr());
@@ -1830,7 +1830,10 @@ impl ComputedGroupSets {
         let holds_image_values = self
             .sets
             .get_index(group_set.0 as usize)
-            .is_some_and(|set| style_group_payloads_hold_image_values(SharedPayload::as_pointer_slice(&set.payloads)));
+            // SAFETY: Published style-group payloads stay live while their records do.
+            .is_some_and(|set| unsafe {
+                style_group_payloads_hold_image_values(SharedPayload::as_pointer_slice(&set.payloads))
+            });
         let old_metadata = self.computed_fixed_metadata[old_record.fixed_metadata];
         let counter_style_environment_identity =
             counter_style_environment_identity.unwrap_or(old_metadata.counter_style_environment_identity);
@@ -2038,7 +2041,8 @@ impl ComputedGroupSets {
             .get_index(base_style_record.index())
             .expect("base style-record is live");
         let mut dependency_flags = self.computed_fixed_metadata.get(base.fixed_metadata).dependency_flags;
-        if style_group_payloads_hold_image_values(SharedPayload::as_pointer_slice(payloads)) {
+        // SAFETY: Published style-group payloads stay live while their records do.
+        if unsafe { style_group_payloads_hold_image_values(SharedPayload::as_pointer_slice(payloads)) } {
             dependency_flags |= HOLDS_IMAGE_VALUES;
         }
         if let Some(in_display_none_subtree) = in_display_none_subtree {
@@ -2396,7 +2400,8 @@ impl ComputedGroupSets {
             assert!(!payload.is_null(), "computed group payload is null");
             let previous_identity = previous_group_set.and_then(|set| self.sets[set].groups.get(index).copied());
             let previous_equal_identity = previous_identity.filter(|identity| {
-                style_group_payloads_equal(index, payload.as_ptr(), self.groups[*identity].payload.as_ptr())
+                // SAFETY: Published style-group payloads stay live while their records do.
+                unsafe { style_group_payloads_equal(index, payload.as_ptr(), self.groups[*identity].payload.as_ptr()) }
             });
             let identity = match previous_equal_identity {
                 Some(identity) => {
@@ -2780,7 +2785,9 @@ impl ComputedGroupSets {
                     .zip(second_groups.iter())
                     .enumerate()
                     .any(|(index, (&first, &second))| {
-                        first != second && !style_group_payloads_equal(index, first.as_ptr(), second.as_ptr())
+                        // SAFETY: Published style-group payloads stay live while their records do.
+                        first != second
+                            && !unsafe { style_group_payloads_equal(index, first.as_ptr(), second.as_ptr()) }
                     })
             {
                 return false;
@@ -2878,11 +2885,12 @@ impl ComputedGroupSets {
             let node_payload = node_groups[group];
             let parent_payload = parent_groups[group];
             node_payload == parent_payload
-                || crate::css::computed_values::style_group_payloads_equal(
+                // SAFETY: Published style-group payloads stay live while their records do.
+                || unsafe { crate::css::computed_values::style_group_payloads_equal(
                     group,
                     node_payload.as_ptr(),
                     parent_payload.as_ptr(),
-                )
+                ) }
         }))
     }
 
@@ -2908,11 +2916,12 @@ impl ComputedGroupSets {
         (0..ENGINE_INHERITED_GROUP_COUNT).all(|group| {
             let sampled = overlay.payloads[group];
             sampled == base_groups[group]
-                || crate::css::computed_values::style_group_payloads_equal(
+                // SAFETY: Published style-group payloads stay live while their records do.
+                || unsafe { crate::css::computed_values::style_group_payloads_equal(
                     group,
                     sampled.as_ptr(),
                     base_groups[group].as_ptr(),
-                )
+                ) }
         })
     }
 
@@ -2948,11 +2957,12 @@ impl ComputedGroupSets {
             let record_payload = record_groups[group];
             let node_payload = node_groups[group];
             record_payload == node_payload
-                || crate::css::computed_values::style_group_payloads_equal(
+                // SAFETY: Published style-group payloads stay live while their records do.
+                || unsafe { crate::css::computed_values::style_group_payloads_equal(
                     group,
                     record_payload.as_ptr(),
                     node_payload.as_ptr(),
-                )
+                ) }
         })
     }
 
@@ -3058,7 +3068,7 @@ impl ComputedGroupSets {
     /// Read dependencies from a retained record even if its original node has been restyled.
     pub(crate) fn record_current_color_dependencies(&self, record: FinalStyleRecordID) -> Option<(u32, [u64; 6])> {
         let view = self.style_record_view(record.raw())?;
-        let table = unsafe { view.longhand_table.as_ref()? };
+        let table = view.longhand_table?;
         Some((
             Self::specified_value_dependency_mask(table, retained_value_depends_on_current_color),
             Self::specified_value_dependency_properties(table, retained_value_depends_on_current_color)?,
@@ -3270,7 +3280,7 @@ impl ComputedGroupSets {
             || self
                 .assigned_style_record(node)
                 .and_then(|record| self.style_record_view(record.raw()))
-                .is_some_and(|view| !view.animated_overlay.is_null())
+                .is_some_and(|view| view.animated_overlay.is_some())
     }
 
     pub(super) fn node_inherited_group_swap_eligible(&self, node: StyleNodeID) -> bool {
@@ -3783,7 +3793,7 @@ impl ComputedGroupSets {
                     style_record,
                     self.sets[record.groups].payloads.as_ref(),
                     0_u64,
-                    HostShared::null(),
+                    None,
                     None,
                 )
             } else {
@@ -3793,7 +3803,7 @@ impl ComputedGroupSets {
                     overlay.base_style_record,
                     overlay.payloads.as_ref(),
                     overlay.source_identity,
-                    HostShared::new(std::ptr::from_ref(overlay.animated_overlay.as_ref())),
+                    Some(overlay.animated_overlay.as_ref()),
                     Some(overlay.dependency_flags),
                 )
             };
@@ -3809,7 +3819,9 @@ impl ComputedGroupSets {
         let retained_longhand_table = record
             .longhand_table
             .and_then(|identity| self.computed_longhand_tables.get_index(identity.0 as usize));
-        let longhand_table = retained_longhand_table.map_or(HostShared::null(), |table| table.table);
+        // SAFETY: A retained table holds a reference to its table for as long as the table set
+        //         holds the entry, which the view borrows.
+        let longhand_table = retained_longhand_table.and_then(|table| unsafe { table.table.as_ref() });
         let longhand_values = retained_longhand_table.map_or(&[][..], RetainedLonghandTable::value_view);
         Some(StyleRecordView {
             payloads,
@@ -4020,8 +4032,7 @@ fn longhand_table_hash(table: &ComputedLonghandTable) -> u64 {
     table.publication_sidecars().hash(&mut hasher);
     table.publication_dependency_flags().hash(&mut hasher);
     table.pseudo_element_styles().hash(&mut hasher);
-    unsafe { crate::css::style_value::style_value_content_hash(table.raw_cascaded_font_size().cast()) }
-        .hash(&mut hasher);
+    crate::css::style_value::style_value_content_hash(table.raw_cascaded_font_size_value()).hash(&mut hasher);
     // NB: Inheritance-dependent values compare independently of insertion order. Sum the
     //     property-mixed hashes, as for longhand slots, without copying and sorting the values.
     let mut inheritance_dependent_hash_sum = 0_u64;
@@ -4116,7 +4127,7 @@ mod tests {
         assert!(publication.transferred.table);
         let view = sets.style_record_view(publication.style_record_identity.raw()).unwrap();
         assert_eq!(view.payloads, payloads.as_slice());
-        assert_eq!(view.longhand_table, table);
+        assert_eq!(HostShared::from_option(view.longhand_table), table);
         // Interning took the caller's reference instead of retaining a second one, so each
         // component still has exactly one owner: the catalog.
         for (index, &payload) in payloads.iter().enumerate() {
@@ -4187,7 +4198,7 @@ mod tests {
         assert!(!republished.transferred.table);
         let view = sets.style_record_view(republished.style_record_identity.raw()).unwrap();
         assert_eq!(view.payloads, payloads.as_slice());
-        assert_eq!(view.longhand_table, table);
+        assert_eq!(HostShared::from_option(view.longhand_table), table);
         assert_eq!(longhand_table_owners(table.as_ptr()), 1);
         // The catalog kept the components it already held, so the caller releases its own.
         for (index, &payload) in equal_payloads.iter().enumerate() {

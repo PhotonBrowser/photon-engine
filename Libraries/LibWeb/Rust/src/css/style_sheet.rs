@@ -526,8 +526,7 @@ pub unsafe extern "C" fn rust_style_sheet_evaluate_media_queries(
     let result = sheet.evaluate_media_queries(unsafe { environment.borrow() }, state, &mut |identity, holds| {
         conditions.push((identity, holds));
     });
-    // SAFETY: Guaranteed by the caller.
-    unsafe { write_rule_conditions(host, conditions) };
+    write_rule_conditions(host, conditions);
     result
 }
 
@@ -546,15 +545,11 @@ pub unsafe extern "C" fn rust_style_sheet_publish_conditions(
     sheet.visit_conditions(unsafe { environment.borrow() }, true, &mut |identity, holds| {
         conditions.push((identity, holds));
     });
-    // SAFETY: Guaranteed by the caller.
-    unsafe { write_rule_conditions(host, conditions) };
+    write_rule_conditions(host, conditions);
 }
 
 /// Writes whether the conditions of each rule hold, for the rules the engine has.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread.
-unsafe fn write_rule_conditions(host: &crate::render_state::DocumentHost, conditions: Vec<(u64, bool)>) {
+fn write_rule_conditions(host: &crate::render_state::DocumentHost, conditions: Vec<(u64, bool)>) {
     if conditions.is_empty() {
         return;
     }
@@ -666,7 +661,7 @@ mod tests {
     fn parse(source: &str) -> std::sync::Arc<ParsedStyleSheet> {
         let units: Vec<_> = source.encode_utf16().collect();
         // All fields are booleans, integers, or nullable pointers; zero is an empty parser context.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
+        let context = ParseContext::default();
         unsafe { parse_shared_stylesheet(crate::css::css_tokenizer::TokenizerInput::Utf16(&units), &context) }
     }
 
@@ -770,7 +765,7 @@ mod tests {
         rust_rule_list_remove(&first.rules, 0);
         set_media(&first, "print, screen");
         assert_eq!(rust_rule_list_count(&second.rules), 2);
-        assert_eq!(unsafe { rust_media_list_length(&second.media) }, 1);
+        assert_eq!(rust_media_list_length(&second.media), 1);
         assert_eq!(rust_rule_list_count(&sheet(&parsed).rules), 2);
         drop(parsed);
 
@@ -780,7 +775,7 @@ mod tests {
         let media = retained.media.clone();
         drop(retained);
         assert_eq!(rust_rule_list_count(&rules), 1);
-        assert_eq!(unsafe { rust_media_list_length(&media) }, 2);
+        assert_eq!(rust_media_list_length(&media), 2);
     }
 
     fn layer_names(sheet: &NativeStyleSheet) -> Vec<Vec<u16>> {

@@ -49,8 +49,7 @@ mod tests {
         let shell = std::ptr::without_provenance_mut(8);
         host.host_tables().attach_shell(child, shell);
         let read = host.read_for_test();
-        // SAFETY: The host lives on this thread until the test host is dropped.
-        assert_eq!(unsafe { render_state_node_shell_if_live(host, read, child) }, shell);
+        assert_eq!(render_state_node_shell_if_live(host, read, child), shell);
 
         let sibling = FfiDetachedBoxSibling {
             style_node: 0,
@@ -71,8 +70,7 @@ mod tests {
             );
         }
         // A recording can still name the removed image. Resolving it must apply the removal before answering.
-        // SAFETY: As above; the entry point accepts a stale slot.
-        let resolved = unsafe { render_state_node_shell_if_live(host, read, child) };
+        let resolved = render_state_node_shell_if_live(host, read, child);
         let shell_was_destroyed = !host.host_tables().shells.borrow().contains_key(&child);
         host.run(ScriptForcedRead::for_test(), true, |state| {
             state.arena_mut().free_subtree(parent)
@@ -85,12 +83,8 @@ mod tests {
 
 /// The row's layout node, which the host's shell factory makes the first time it is asked for, or null for a row that
 /// is not live.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread. `id` may be invalid or stale.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_node_shell_if_live(
+pub extern "C" fn render_state_node_shell_if_live(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     id: NodeSlotId,
@@ -103,8 +97,7 @@ pub unsafe extern "C" fn render_state_node_shell_if_live(
             .shell_facts(id)
             .map_or(std::ptr::null_mut(), |facts| host.host_tables().shell_of(facts));
     }
-    // SAFETY: Guaranteed by the caller.
-    let facts = unsafe {
+    let facts = {
         read_arena(host, read, id, |arena, id| {
             let kind = arena.node_kind_if_live(id)?;
             (kind != NodeKind::Unset).then_some(super::super::host_tables::ShellFacts { id, kind })
@@ -122,17 +115,6 @@ pub unsafe extern "C" fn render_state_node_shell_if_live(
 pub unsafe extern "C" fn render_state_adopt_derived_node_style(host: &DocumentHost, node: NodeSlotId, record: u64) {
     // SAFETY: Guaranteed by the caller.
     unsafe { write_and_pay(host, node_read(), LayoutWrite::AdoptDerivedNodeStyle { node, record }) };
-}
-
-/// The row's layout style takes the display `display`.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_layout_display(host: &DocumentHost, node: NodeSlotId, display: u32) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { write_and_pay(host, node_read(), LayoutWrite::SetLayoutDisplay { node, display }) };
 }
 
 /// The anonymous rows below the row inherit its style again, which their layout nodes hear of once the host has its next
@@ -183,11 +165,8 @@ pub unsafe extern "C" fn document_host_set_owned_image_provider(
     host.host_tables().set_owned_image_provider(slot, provider);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_owned_image_provider(host: &DocumentHost, slot: NodeSlotId) -> *mut c_void {
+pub extern "C" fn document_host_owned_image_provider(host: &DocumentHost, slot: NodeSlotId) -> *mut c_void {
     host.host_tables().owned_image_provider(slot)
 }
 
@@ -207,12 +186,8 @@ pub unsafe extern "C" fn document_host_replace_image_observers(
     host.host_tables().replace_image_observers(slot, observers)
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-// SAFETY: Guaranteed by the caller.
-pub unsafe extern "C" fn document_host_image_observers(host: &DocumentHost, slot: NodeSlotId) -> *mut c_void {
+pub extern "C" fn document_host_image_observers(host: &DocumentHost, slot: NodeSlotId) -> *mut c_void {
     host.host_tables().image_observers(slot)
 }
 

@@ -32,7 +32,7 @@ mod grid_tests {
     /// unchanged.
     fn absolutize_for_test(value: &StyleValueData) -> Arc<StyleValueData> {
         // All fields are scalars or nullable pointers.
-        let length: FfiLengthResolutionContext = unsafe { std::mem::zeroed() };
+        let length = FfiLengthResolutionContext::default();
         let context = AbsolutizationContext {
             length: &length,
             scheme: None,
@@ -55,7 +55,7 @@ mod grid_tests {
         let units: Vec<_> = source.encode_utf16().collect();
         let values = consume_a_list_of_component_values(tokenize_for_parser(TokenizerInput::Utf16(&units))).unwrap();
         // All fields are scalars or nullable pointers.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
+        let context = ParseContext::default();
         let ParseOutcome::Parsed(value) = parse_css_value(&context, property, &values) else {
             panic!("invalid test value");
         };
@@ -255,9 +255,7 @@ pub(crate) enum Absolutized {
 }
 
 fn retain_new(value: StyleValueData) -> RetainedStyleValueData {
-    let pointer = Arc::into_raw(Arc::new(value));
-    // SAFETY: The freshly leaked Arc reference is exactly one strong reference.
-    unsafe { RetainedStyleValueData::from_retained_pointer(pointer) }
+    RetainedStyleValueData::from_arc(Arc::new(value))
 }
 
 /// Absolutizes one retained child slot. Returns the child for the rebuilt parent, whether any
@@ -307,8 +305,7 @@ fn currentcolor_keyword() -> StyleValueData {
 // ColorStyleValue.h: ColorSyntax::Legacy = 0, Modern = 1.
 
 fn retained_null() -> RetainedStyleValueData {
-    // SAFETY: null encodes an absent optional value.
-    unsafe { RetainedStyleValueData::from_retained_optional_pointer(std::ptr::null()) }
+    RetainedStyleValueData::none()
 }
 
 fn absolutize_image(value: &StyleValueData, context: &AbsolutizationContext) -> Option<Absolutized> {

@@ -361,8 +361,8 @@ static ErrorOr<void> generate_result_files(ReadonlySpan<Test> tests, ReadonlySpa
         auto base_path = TRY(prepare_output_path(test));
         bool has_std_logs = FileSystem::exists(ByteString::formatted("{}.logs.html", base_path));
 
-        js.appendff("    {{ \"name\": \"{}\", \"result\": \"{}\", \"mode\": \"{}\", \"hasLogs\": {}",
-            test.safe_relative_path,
+        js.appendff("    {{ \"name\": {}, \"result\": \"{}\", \"mode\": \"{}\", \"hasLogs\": {}",
+            JsonValue(test.safe_relative_path.view()).serialized(),
             test_result_to_string(result.result),
             test_mode_to_string(test.mode),
             has_std_logs ? "true" : "false");
@@ -1062,6 +1062,11 @@ static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& contex
     };
 }
 
+static bool test_run_was_stopped()
+{
+    return s_all_tests_complete && s_all_tests_complete->is_rejected();
+}
+
 static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePixelSize window_size)
 {
     auto& app = Application::the();
@@ -1103,11 +1108,9 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             "*/wpt-import/common/*"sv,
             "*/wpt-import/images/*"sv,
         };
-        auto normalize_path = [](ByteString const& path) { return path.replace("\\"sv, "/"sv); };
-        auto const test_input_path = normalize_path(test.input_path);
-        auto const test_relative_path = normalize_path(test.relative_path);
+        auto const test_input_path = test.input_path.replace("\\"sv, "/"sv);
         bool is_support_file = any_of(support_file_patterns, [&](auto pattern) { return test_input_path.matches(pattern); });
-        bool match_glob = any_of(app.test_globs, [&](auto const& glob) { return test_relative_path.matches(glob, CaseSensitivity::CaseSensitive); });
+        bool match_glob = any_of(app.test_globs, [&](auto const& glob) { return test.relative_path.matches(glob, CaseSensitivity::CaseSensitive); });
         return is_support_file || !match_glob;
     });
 
@@ -1152,7 +1155,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
                 Test test = base_test;
                 test.run_index = run_index;
                 test.total_runs = app.repeat_count;
-                test.safe_relative_path = LexicalPath::join(ByteString::formatted("run-{}", run_index), test.safe_relative_path).string();
+                test.safe_relative_path = ByteString::formatted("run-{}/{}", run_index, test.safe_relative_path);
                 tests.append(move(test));
             }
         }
@@ -1273,7 +1276,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
         // run_next_test handles: reset promise, attach callback, pick test, run test
         auto run_next_test = [&, view = view.ptr(), cleanup_test, view_id]() {
-            if (app.fail_fast && fail_fast_triggered) {
+            if (test_run_was_stopped()) {
                 if (view_id < s_view_display_states.size())
                     s_view_display_states[view_id].active = false;
                 return;
@@ -1356,6 +1359,8 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             });
 
             Core::deferred_invoke([&, index]() mutable {
+                if (test_run_was_stopped())
+                    return;
                 if (s_skipped_tests.contains_slow(tests[index].input_path))
                     view->on_test_complete({ index, TestResult::Skipped });
                 else

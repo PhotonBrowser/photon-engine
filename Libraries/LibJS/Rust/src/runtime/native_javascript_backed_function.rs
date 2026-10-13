@@ -10,7 +10,7 @@ use core::ops::Deref;
 use libjs_runtime_macros::Trace;
 
 use crate::bytecode::executable::Executable;
-use crate::gc::class::{GcCell, define_cell};
+use crate::gc::class::{GcCell, cast_ref, define_cell};
 use crate::interpreter::run::should_dump_bytecode;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
@@ -74,9 +74,7 @@ impl Deref for NativeJavaScriptBackedFunction {
 
 /// The function an internal method of a NativeJavaScriptBackedFunction was called on.
 fn as_native_javascript_backed_function(object: &Object) -> &NativeJavaScriptBackedFunction {
-    assert!(object.is::<NativeJavaScriptBackedFunction>());
-    // SAFETY: The object is a NativeJavaScriptBackedFunction, which starts with its Object.
-    unsafe { &*core::ptr::from_ref(object).cast::<NativeJavaScriptBackedFunction>() }
+    cast_ref(object)
 }
 
 impl NativeJavaScriptBackedFunction {
@@ -125,8 +123,7 @@ impl NativeJavaScriptBackedFunction {
     }
 
     pub fn as_native_javascript_backed_function_gc(&self) -> Gc<NativeJavaScriptBackedFunction> {
-        // SAFETY: NativeJavaScriptBackedFunctions only exist as cells once constructed.
-        unsafe { Gc::from_ref(self) }
+        Gc::from_ref(self)
     }
 
     fn get_stack_frame_info(object: &Object, vm: &Vm, stack_frame_info: &mut StackFrameInfo) {
@@ -198,17 +195,12 @@ impl NativeJavaScriptBackedFunction {
         // NB: The abstract operations a builtin file calls are functions of the realm that is current while its
         //     executable is compiled, and ArraySpeciesCreate depends on its realm. The builtin may first be called from
         //     another realm, so it is compiled in its own.
-        let running_execution_context = vm.running_execution_context();
-        let caller_realm = running_execution_context.and_then(|context| {
-            // SAFETY: The running execution context is live.
-            let context = unsafe { context.as_ref() };
-            context.realm.replace(Some(self.realm()))
-        });
+        let running_execution_context = vm.running_execution_context_if_any();
+        let caller_realm = running_execution_context.and_then(|context| context.realm.replace(Some(self.realm())));
         let rust_executable = SharedFunctionInstanceData::compile_function(vm, shared_data, true)
             .expect("a builtin written in JavaScript compiles to an executable");
         if let Some(context) = running_execution_context {
-            // SAFETY: As above.
-            unsafe { context.as_ref() }.realm.set(caller_realm);
+            context.realm.set(caller_realm);
         }
         shared_data.set_executable(Some(rust_executable));
         rust_executable.set_name(shared_data.name());

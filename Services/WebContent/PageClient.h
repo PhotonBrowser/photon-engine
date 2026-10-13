@@ -145,9 +145,8 @@ public:
     void navigate_to_a_fragment(Web::HTML::CrossProcessId navigable_id, URL::URL const&, Web::HTML::HistoryHandlingBehavior, Web::HTML::UserNavigationInvolvement, Utf16String navigation_id);
     void navigate_to_a_javascript_url(Web::HTML::CrossProcessId navigable_id, URL::URL const&, Web::HTML::HistoryHandlingBehavior, URL::Origin const& initiator_origin, Web::HTML::NavigationSourceSnapshot const&, Web::HTML::UserNavigationInvolvement, Web::ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, Utf16String navigation_id);
     void run_navigation_unload_check(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id, Web::HTML::UnloadPromptShown);
-    void did_receive_unload_check_result(Web::HTML::CrossProcessId check_id, Web::HTML::HistoryStepResult);
+    void did_receive_unload_check_result(Web::HTML::CrossProcessId check_id, Web::HTML::CheckIfUnloadingIsCanceledResult);
     void create_navigation_params(Web::HTML::NavigationPopulationRequest);
-    void navigate_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PreparedNavigationDescriptor);
     void deliver_posted_message(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor);
     void cancel_navigation_params_creation(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id);
     void populate_navigation(Web::HTML::NavigationPopulationRequest, Web::HTML::NavigationPopulationResult);
@@ -187,8 +186,7 @@ private:
     // ^PageClient
     virtual bool is_connection_open() const override;
     virtual void request_navigation_start(Web::HTML::LocalNavigable&, Web::NavigationTarget, URL::URL const& url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest>) override;
-    virtual void request_navigation_population(Web::HTML::LocalNavigable&, Web::NavigationTarget, Web::HTML::NavigationPopulationRequest) override;
-    virtual void request_navigation_of_navigable(Web::HTML::Navigable&, Web::HTML::PreparedNavigationDescriptor) override;
+    virtual void request_navigation_of_navigable(Web::HTML::Navigable&, Web::HTML::Navigable& source_navigable, Web::DOM::Document const& source_document, Web::HTML::PreparedNavigationDescriptor) override;
     virtual void request_post_message_to_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::PostedMessageDescriptor) override;
     virtual void request_close_of_remote_traversable(Web::HTML::RemoteNavigable&, Web::HTML::LocalNavigable const& source) override;
     virtual void request_focusing_steps_for_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::FocusTrigger) override;
@@ -199,10 +197,10 @@ private:
     virtual void navigation_population_failed(Web::HTML::CrossProcessId, Utf16String const&) override;
     virtual void page_did_change_hosted_navigable_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::HostedNavigableState const&) override;
     virtual void page_did_set_opener_browsing_context(Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::CrossProcessId> opener_navigable_id) override;
-    virtual void page_did_completely_finish_loading(Web::HTML::CrossProcessId navigable_id) override;
+    virtual void page_did_completely_finish_loading(Web::HTML::CrossProcessId navigable_id, Web::DOM::Document const&) override;
     virtual void page_did_change_navigable_container_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState const&) override;
-    virtual void page_did_create_populated_document_with_an_origin_of_its_own(Web::HTML::CrossProcessId navigable_id, Web::HTML::PopulatedDocumentOrigin, Web::HTML::EnvironmentId const& environment_id) override;
-    virtual void page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState const&, Web::HTML::PendingSessionHistoryEntryDescriptor const& initial_history_entry, URL::Origin const& origin, Web::HTML::EnvironmentId const& environment_id) override;
+    virtual void page_did_create_populated_document_with_an_origin_of_its_own(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id, Web::HTML::PopulatedDocumentOrigin, Web::HTML::EnvironmentId const& environment_id) override;
+    virtual void page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::DOM::Document const& container_document, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState const&, Web::HTML::PendingSessionHistoryEntryDescriptor const& initial_history_entry, URL::Origin const& origin, Web::HTML::EnvironmentId const& environment_id, Web::HTML::CrossProcessId document_id) override;
     virtual void page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection) override;
     virtual void forward_mouse_event_to_remote_navigable(Web::PageId, Web::HTML::CrossProcessId navigable_id, Web::MouseEvent) override;
     virtual void page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
@@ -309,6 +307,7 @@ private:
     virtual void page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId local_root_id, Web::MouseEvent, GC::Ref<GC::Function<void()>> on_handled) override;
     virtual void page_did_request_set_system_visibility_state(Web::HTML::VisibilityState) override;
     virtual void page_did_request_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters) override;
+    virtual void page_did_revoke_history_operation(Web::HTML::CrossProcessId operation_id) override;
     virtual void page_did_request_child_navigable_unload(Web::HTML::CrossProcessId navigable_id) override;
     virtual void page_did_request_remote_document_abort(Web::HTML::CrossProcessId navigable_id) override;
     virtual void page_did_request_remote_document_unfullscreen(Web::HTML::CrossProcessId navigable_id) override;

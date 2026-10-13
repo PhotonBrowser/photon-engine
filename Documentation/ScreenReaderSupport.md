@@ -167,6 +167,8 @@ Chromium uses `NSAccessibilityElement` as its base class. We tried that but enco
 
 `NSObject` with the “informal” protocol gives us full control. Tradeoff: we have to override certain “modern” property API methods that `NSAccessibilityElement` would provide automatically. In particular, we found that missing overrides for `accessibilityWindow` and `accessibilityTopLevelUIElement` caused VoiceOver to treat nested elements as orphaned (not part of any window) — breaking VoiceOver forward navigation into nested groups.
 
+Likewise `accessibilityShouldUseUniqueId`, which `NSAccessibilityElement` answers `YES` and `NSObject` answers `NO`. Without a unique id, AppKit identifies an element to an assistive technology by its path of child indices from the window: Every request resolves that path again, asking each ancestor for its `AXChildren` on the way down — enough work on a big page for VoiceOver to report “Ladybird not responding”. And a handle VoiceOver holds then names a position, not an element. So `LadybirdAccessibilityElement` answers `YES`, as WebKit’s wrappers do, and gives the id up (`NSAccessibilityUnregisterUniqueIdForUIElement`) when its node leaves the tree or it’s deallocated — AppKit’s table of ids doesn’t retain the elements.
+
 ### Dual API support: “informal” and “modern”
 
 The macOS accessibility system queries objects via two code paths:
@@ -253,7 +255,7 @@ On the `AXWebArea` itself, three text-marker-related attributes work together to
 
 Beyond text markers, the document `AXWebArea` element exposes a small set of attributes that VoiceOver uses to recognize it as the active reading target after page load:
 
-- `AXFocused`: returns `YES` when the containing view is window first responder. VoiceOver uses this to identify which web area is currently the active reading target.
+- `AXFocused`: returns `YES` exactly when the `AXWebArea` is the page’s focused UI element — that is, when nothing in the page has the focus. VoiceOver expects the element the application reports as focused to say so itself. When it doesn’t, VoiceOver sets `AXFocused` on it, and then again after every tree update — announcing “web content” each time.
 - `AXURL`: the page URL. VoiceOver compares this against its own page-identity tracking — to decide whether the load is a new page worth re-reading.
 - `AXVisibleCharacterRange`: a non-empty range — so that VoiceOver doesn’t treat the `AXWebArea` as skippable empty content.
 
@@ -275,7 +277,7 @@ Until that first request, WebContent reports nothing: `Page::accessibility_inter
 
 - Load finish (a navigation listener) → `request_accessibility_tree()`, but only while an assistive technology is present, which Qt reports as `QAccessible::isActive()`: on macOS, `-[QNSView activateQtAccessibility]` turns that on at the first accessibility query into any Qt window. Without one, the view never requests the tree — so WebContent never sends it tree updates or focus changes (see _Live DOM-mutation updates_ above).
 - An assistive technology that turns up later → `accessibilityActiveChanged()` (the view is a `QAccessible::ActivationObserver`) → `request_accessibility_tree()`, if the view hasn’t requested the tree yet. That tree doesn’t take the first responder.
-- `on_accessibility_tree_received` → update manager; then `update_accessibility_tree()` drops the cached elements of the nodes that left the tree (invalidating them first) and keeps the rest, so an assistive technology’s handles survive a DOM mutation; posts `NSAccessibilityLayoutChangedNotification` and `@"AXLoadComplete"` (matching what Chromium and Firefox do), and calls `NSAccessibilityHandleFocusChanged()` — so AppKit refreshes its cached focused-UI-element. For the first tree after each load only, it first makes the widget’s NSView the window’s first responder, so AppKit resolves `accessibilityFocusedUIElement` through it (and thus into the `AXWebArea`).
+- `on_accessibility_tree_received` → update manager; then `update_accessibility_tree()` drops the cached elements of the nodes that left the tree (invalidating them first) and keeps the rest, so an assistive technology’s handles survive a DOM mutation. For the first tree after each load only, it makes the widget’s NSView the window’s first responder, so AppKit resolves `accessibilityFocusedUIElement` through it (and thus into the `AXWebArea`); posts `@"AXLoadComplete"` (matching what Chromium and Firefox do); and calls `NSAccessibilityHandleFocusChanged()` — so AppKit refreshes its cached focused-UI-element. Any other tree posts no notification at all, and no tree posts `NSAccessibilityLayoutChangedNotification`: VoiceOver answers that one by moving its cursor back to the `AXWebArea`, announcing “frame” — and by setting `AXFocused` there, which takes the focus from whatever element in the page had it.
 - `on_accessibility_focus_changed` → update manager, post `NSAccessibilityFocusedUIElementChangedNotification` on the node’s element (`post_accessibility_focus_changed()`)
 - `on_live_region_changed` → post `NSAccessibilityAnnouncementRequestedNotification` (`post_accessibility_announcement()`)
 

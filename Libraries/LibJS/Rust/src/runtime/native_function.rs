@@ -12,7 +12,7 @@ use ak::{Utf16FlyString, Utf16String};
 use libjs_abi::Builtin;
 use libjs_runtime_macros::Trace;
 
-use crate::gc::class::{Class, GcCell, define_cell};
+use crate::gc::class::{Class, GcCell, cast_ref, define_cell};
 use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
@@ -89,9 +89,7 @@ fn as_native_javascript_backed_function(function: &NativeFunction) -> Gc<NativeJ
 
 /// The native function an internal method of a native function was called on.
 fn as_native_function(object: &Object) -> &NativeFunction {
-    assert!(object.is::<NativeFunction>());
-    // SAFETY: The object is a NativeFunction, which starts with its Object.
-    unsafe { &*core::ptr::from_ref(object).cast::<NativeFunction>() }
+    cast_ref(object)
 }
 
 impl NativeFunction {
@@ -241,8 +239,7 @@ impl NativeFunction {
     }
 
     pub fn as_native_function_gc(&self) -> Gc<NativeFunction> {
-        // SAFETY: Native functions only exist as cells once constructed.
-        unsafe { Gc::from_ref(self) }
+        Gc::from_ref(self)
     }
 
     fn methods(&self) -> &'static NativeFunctionMethods {
@@ -261,10 +258,8 @@ impl NativeFunction {
 
         // 1. Let callerContext be the running execution context.
         let caller_context = vm
-            .running_execution_context()
+            .running_execution_context_if_any()
             .expect("a native function is called from a running execution context");
-        // SAFETY: The running execution context is live.
-        let caller_context = unsafe { caller_context.as_ref() };
 
         // 2. If callerContext is not already suspended, suspend callerContext.
         // 3. Let calleeContext be a new execution context.
@@ -346,10 +341,8 @@ impl NativeFunction {
 
         // 1. Let callerContext be the running execution context.
         let caller_context = vm
-            .running_execution_context()
+            .running_execution_context_if_any()
             .expect("a native function is constructed from a running execution context");
-        // SAFETY: The running execution context is live.
-        let caller_context = unsafe { caller_context.as_ref() };
 
         // 2. If callerContext is not already suspended, suspend callerContext.
         // 3. Let calleeContext be a new execution context.
@@ -450,8 +443,7 @@ impl NativeFunction {
 
 impl FunctionObject {
     pub fn as_function_object_gc(&self) -> Gc<FunctionObject> {
-        // SAFETY: Function objects only exist as cells once constructed.
-        unsafe { Gc::from_ref(self) }
+        Gc::from_ref(self)
     }
 }
 
@@ -538,8 +530,7 @@ impl CapturingNativeFunction {
     }
 
     fn call(function: &NativeFunction, vm: &Vm) -> ThrowCompletionOr<Value> {
-        // SAFETY: Only CapturingNativeFunction has these methods.
-        let function = unsafe { &*core::ptr::from_ref(function).cast::<CapturingNativeFunction>() };
+        let function: &CapturingNativeFunction = cast_ref(function);
         // NB: The behaviour is borrowed for the whole call. That is sound: the function is the [[Function]] of the
         //     running execution context, which keeps it and its behaviour alive, and the behaviour is never replaced.
         function
@@ -638,7 +629,9 @@ pub fn call_raw_native_function(function: RawNativeFunctionPointer, vm: &Vm) -> 
 }
 
 /// Turns a `fn(&Vm) -> ThrowCompletionOr<Value>` into the RawNativeFunctionPointer the interpreter calls a raw native
-/// function through, with the calling convention of LibJS's NativeFunctionPointer on the target.
+/// function through, with the calling convention of LibJS's NativeFunctionPointer on the target. Embedders reach it
+/// as api::raw_native.
+#[macro_export]
 macro_rules! raw_native {
     ($function:expr) => {{
         #[cfg(not(any(all(target_arch = "x86_64", target_vendor = "apple"), target_os = "windows")))]
@@ -676,7 +669,7 @@ macro_rules! raw_native {
     }};
 }
 
-pub(crate) use raw_native;
+pub(crate) use crate::raw_native;
 
 pub static RAW_NATIVE_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFunctionMethods {
     call: RawNativeFunction::call,
@@ -785,9 +778,7 @@ impl RawNativeFunction {
     }
 
     fn call(function: &NativeFunction, vm: &Vm) -> ThrowCompletionOr<Value> {
-        assert!(function.is::<RawNativeFunction>());
-        // SAFETY: The function is a RawNativeFunction, which starts with its NativeFunction.
-        let function = unsafe { &*core::ptr::from_ref(function).cast::<RawNativeFunction>() };
+        let function: &RawNativeFunction = cast_ref(function);
         call_raw_native_function(function.native_function(vm), vm)
     }
 

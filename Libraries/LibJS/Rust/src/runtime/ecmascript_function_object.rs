@@ -13,7 +13,7 @@ use ak::{Utf16FlyString, Utf16String};
 use libjs_runtime_macros::Trace;
 
 use crate::bytecode::executable::Executable;
-use crate::gc::class::{Extends, GcCell, define_cell};
+use crate::gc::class::{Extends, GcCell, cast_ref, define_cell};
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::root::MarkedVec;
 use crate::gc::visitor::{Trace, Visitor};
@@ -121,18 +121,12 @@ impl Deref for EcmascriptFunctionObject {
 
 /// The function an internal method of an ECMAScript function object was called on.
 fn as_ecmascript_function(object: &Object) -> &EcmascriptFunctionObject {
-    assert!(object.is_ecmascript_function_object());
-    // SAFETY: Only ECMAScript function objects have the flag, and they start with their Object.
-    unsafe { &*core::ptr::from_ref(object).cast::<EcmascriptFunctionObject>() }
+    cast_ref(object)
 }
 
-/// The object as an ECMAScript function object, if its flag says that it is one.
+/// The object as an ECMAScript function object, if it is one.
 pub fn as_ecmascript_function_object<T: Extends<Object>>(cell: Gc<T>) -> Option<Gc<EcmascriptFunctionObject>> {
-    let object = cell.upcast::<Object>();
-    object
-        .is_ecmascript_function_object()
-        // SAFETY: Only ECMAScript function objects have the flag.
-        .then(|| unsafe { Gc::from_non_null(object.as_non_null().cast()) })
+    cell.upcast::<Object>().downcast()
 }
 
 /// Value::as_if<ECMAScriptFunctionObject>().
@@ -285,8 +279,7 @@ impl EcmascriptFunctionObject {
     }
 
     pub fn as_ecmascript_function_gc(&self) -> Gc<EcmascriptFunctionObject> {
-        // SAFETY: ECMAScript function objects only exist as cells once constructed.
-        unsafe { Gc::from_ref(self) }
+        Gc::from_ref(self)
     }
 
     /// The function's executable, compiled first if the function never ran.

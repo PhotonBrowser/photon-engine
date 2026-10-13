@@ -17,6 +17,7 @@ use super::{frame_of, frames_above};
 use crate::bytecode::encoding::Operand;
 use crate::bytecode::executable::Executable;
 use crate::bytecode::instruction::OpCode;
+use crate::bytecode::instruction_at;
 use crate::bytecode::op;
 use crate::gc::root::MarkedVec;
 use crate::interpreter::runtime_functions::{Runtime, RuntimeFunctions, SlowPathControl, handle_asm_exception};
@@ -549,16 +550,6 @@ impl<'vm> ArgumentStorage<'vm> {
     }
 }
 
-/// The operands that follow a call instruction with an argument list.
-///
-/// # Safety
-///
-/// `arguments` is the trailing operand array of an instruction with `count` operands after it.
-unsafe fn trailing_operands(arguments: &[Operand; 0], count: u32) -> &[Operand] {
-    // SAFETY: As above.
-    unsafe { core::slice::from_raw_parts(arguments.as_ptr(), count as usize) }
-}
-
 /// Runs the generic slow path of a call instruction, and stores its result in the frame if the call returned normally.
 /// A callee frame the slow path pushed for the interpreter to run runs to completion here, since the frame's JIT code
 /// waits for the call.
@@ -594,13 +585,11 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
     let executable = Executable::from_head(frame_ref.executable.get().expect("the frame runs an executable"));
     let slots = frame_ref.slots();
     let load = |operand: Operand| slots[operand.0 as usize].get();
-    let instruction = &executable.bytecode()[pc as usize..];
-    let opcode = instruction[0];
+    let opcode = executable.bytecode()[pc as usize];
 
     macro_rules! instruction {
         ($op:ident) => {
-            // SAFETY: The bytes at pc are an instruction of this kind.
-            unsafe { &*instruction.as_ptr().cast::<op::$op>() }
+            instruction_at::<op::$op>(&executable, pc)
         };
     }
     let site = |dst: Operand, length: u32| JitCallSite {
@@ -614,8 +603,7 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
         _ if opcode == OpCode::Call as u8 => {
             let call = instruction!(Call);
             let site = site(call.dst, call.length());
-            // SAFETY: Call instructions are followed by their argument operands.
-            let operands = unsafe { trailing_operands(&call.arguments, call.argument_count) };
+            let operands = call.arguments();
             let mut storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let callee = load(call.callee);
@@ -635,8 +623,7 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
         _ if opcode == OpCode::CallConstruct as u8 => {
             let call = instruction!(CallConstruct);
             let site = site(call.dst, call.length());
-            // SAFETY: CallConstruct instructions are followed by their argument operands.
-            let operands = unsafe { trailing_operands(&call.arguments, call.argument_count) };
+            let operands = call.arguments();
             let mut storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let callee = load(call.callee);
@@ -658,8 +645,7 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
         _ if opcode == OpCode::CallDirectEval as u8 => {
             let call = instruction!(CallDirectEval);
             let site = site(call.dst, call.length());
-            // SAFETY: CallDirectEval instructions are followed by their argument operands.
-            let operands = unsafe { trailing_operands(&call.arguments, call.argument_count) };
+            let operands = call.arguments();
             let mut storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let mut values = op::CallDirectEvalValues {
@@ -780,15 +766,11 @@ pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
     let frame_ref = frame_of(frame);
     frame_ref.program_counter.set(pc);
     let executable = Executable::from_head(frame_ref.executable.get().expect("the frame runs an executable"));
-    let instruction = &executable.bytecode()[pc as usize..];
-    if instruction[0] == OpCode::CallWithArgumentArray as u8 {
-        // SAFETY: The bytes at pc are a CallWithArgumentArray instruction.
-        let call = unsafe { &*instruction.as_ptr().cast::<op::CallWithArgumentArray>() };
+    if executable.bytecode()[pc as usize] == OpCode::CallWithArgumentArray as u8 {
+        let call = instruction_at::<op::CallWithArgumentArray>(&executable, pc);
         return call_spreading_arguments_from_jit(vm, frame, pc, call).0;
     }
-    assert_eq!(instruction[0], OpCode::Call as u8);
-    // SAFETY: The bytes at pc are a Call instruction.
-    let call = unsafe { &*instruction.as_ptr().cast::<op::Call>() };
+    let call = instruction_at::<op::Call>(&executable, pc);
     assert_eq!(call.argument_count, 2);
     let slots = frame_ref.slots();
     let site = JitCallSite {
@@ -806,8 +788,7 @@ pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
         return throw_error(vm, pc, ErrorKind::TypeError, ErrorType::NotAFunction, &[&function]).0;
     }
     // NB: The argument list of the arguments object is the frame's passed arguments, which nothing changed.
-    // SAFETY: Call instructions are followed by their argument operands.
-    let operands = unsafe { trailing_operands(&call.arguments, call.argument_count) };
+    let operands = call.arguments();
     let this_argument = slots[operands[0].0 as usize].get();
     let passed_argument_count = frame_ref.passed_argument_count.get() as usize;
     let callee = slots[call.callee.0 as usize].get();
@@ -850,10 +831,7 @@ pub unsafe extern "C" fn libjs_jit_finish_direct_call(
     let frame = NonNull::new(frame).expect("JIT code passes its frame");
     let frame_ref = frame_of(frame);
     let executable = Executable::from_head(frame_ref.executable.get().expect("the frame runs an executable"));
-    let instruction = &executable.bytecode()[pc as usize..];
-    assert_eq!(instruction[0], OpCode::Call as u8);
-    // SAFETY: The bytes at pc are a Call instruction.
-    let call = unsafe { &*instruction.as_ptr().cast::<op::Call>() };
+    let call = instruction_at::<op::Call>(&executable, pc);
 
     // NB: The callee's frame, and the frames of the calls it inlined that its exit materialized, run in the
     //     interpreter from now on.
@@ -930,12 +908,8 @@ pub unsafe extern "C" fn libjs_jit_prepare_call_environment(
 /// `u64 libjs_jit_array_push(Array*, u64 value)`: appends `value` to the array, which Array.prototype.push would
 /// append it to without any observable step, and returns the new length as a value.
 ///
-/// # Safety
-///
 /// JIT code calls this with a live array whose elements are packed.
-pub unsafe extern "C" fn libjs_jit_array_push(array: *const Array, value: u64) -> u64 {
-    // SAFETY: JIT code passes a live array.
-    let array = unsafe { &*array };
+pub extern "C" fn libjs_jit_array_push(array: &Array, value: u64) -> u64 {
     assert!(matches!(
         array.indexed_storage_kind(),
         IndexedStorageKind::None | IndexedStorageKind::Packed
@@ -947,12 +921,8 @@ pub unsafe extern "C" fn libjs_jit_array_push(array: *const Array, value: u64) -
 /// `u64 libjs_jit_primitive_to_string(VM*, u64 primitive)`: `String(primitive)`, which is ToString of the primitive,
 /// but the descriptive string of a symbol.
 ///
-/// # Safety
-///
 /// JIT code calls this with its VM and a primitive.
-pub unsafe extern "C" fn libjs_jit_primitive_to_string(vm: *const Vm, primitive: u64) -> u64 {
-    // SAFETY: JIT code passes its VM.
-    let vm = unsafe { &*vm };
+pub extern "C" fn libjs_jit_primitive_to_string(vm: &Vm, primitive: u64) -> u64 {
     let primitive = Value(primitive);
     assert!(!primitive.is_object());
     // 22.1.1.1 String ( value ), https://tc39.es/ecma262/#sec-string-constructor-string-value
@@ -966,12 +936,8 @@ pub unsafe extern "C" fn libjs_jit_primitive_to_string(vm: *const Vm, primitive:
 /// `u64 libjs_jit_to_object(VM*, u64 primitive, u64 function)`: ToObject of a primitive other than undefined and
 /// null, as the builtin function `function` makes it, or the empty value if that function is of another realm.
 ///
-/// # Safety
-///
 /// JIT code calls this with its VM, a function object and such a primitive.
-pub unsafe extern "C" fn libjs_jit_to_object(vm: *const Vm, primitive: u64, function: u64) -> u64 {
-    // SAFETY: JIT code passes its VM.
-    let vm = unsafe { &*vm };
+pub extern "C" fn libjs_jit_to_object(vm: &Vm, primitive: u64, function: u64) -> u64 {
     let (function, primitive) = (Value(function).as_object(), Value(primitive));
     assert!(!primitive.is_object() && !primitive.is_nullish());
     if vm.current_realm() != Some(function.shape().realm()) {
@@ -984,12 +950,8 @@ pub unsafe extern "C" fn libjs_jit_to_object(vm: *const Vm, primitive: u64, func
 /// `u64 libjs_jit_array_create(VM*, u32 length, u64 function)`: ArrayCreate(length) as the builtin function `function`
 /// (the Array constructor) makes it, or the empty value if that function is of another realm.
 ///
-/// # Safety
-///
 /// JIT code calls this with its VM, a length below 2^31 and a function object.
-pub unsafe extern "C" fn libjs_jit_array_create(vm: *const Vm, length: u32, function: u64) -> u64 {
-    // SAFETY: JIT code passes its VM.
-    let vm = unsafe { &*vm };
+pub extern "C" fn libjs_jit_array_create(vm: &Vm, length: u32, function: u64) -> u64 {
     let realm = Value(function).as_object().shape().realm();
     if vm.current_realm() != Some(realm) {
         return Value::EMPTY.0;
@@ -1001,12 +963,8 @@ pub unsafe extern "C" fn libjs_jit_array_create(vm: *const Vm, length: u32, func
 /// `u64 libjs_jit_slice_arguments(VM*, ExecutionContext* frame, i32 start)`: `Array.prototype.slice.call(arguments,
 /// start)` with the arguments object of the frame, which the code never created, as an array value.
 ///
-/// # Safety
-///
 /// JIT code calls this with its VM and its frame.
-pub unsafe extern "C" fn libjs_jit_slice_arguments(vm: *const Vm, frame: *const ExecutionContext, start: i32) -> u64 {
-    // SAFETY: JIT code passes live pointers.
-    let (vm, frame) = unsafe { (&*vm, &*frame) };
+pub extern "C" fn libjs_jit_slice_arguments(vm: &Vm, frame: &ExecutionContext, start: i32) -> u64 {
     // 23.1.3.28 Array.prototype.slice ( start, end ), https://tc39.es/ecma262/#sec-array.prototype.slice
     // NB: The arguments object has every passed argument, and its length is their count.
     let length = i64::from(frame.passed_argument_count.get());

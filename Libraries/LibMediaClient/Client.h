@@ -31,7 +31,6 @@ class Client final
     C_OBJECT_ABSTRACT(Client);
 
 public:
-    using InitTransport = Messages::MediaServer::InitTransport;
     using TransportFactory = Function<ErrorOr<NonnullOwnPtr<IPC::Transport>>()>;
 
     // Installed by the process that reaches the Browser, which spawns the process's MediaServer and brokers the
@@ -50,8 +49,6 @@ public:
 
     // Set by the Browser on the controller connection; a server's request for an AudioServer connection goes here.
     Function<ErrorOr<IPC::TransportHandle>()> on_request_audio_server_connection;
-
-    ErrorOr<IPC::TransportHandle> create_video_presentation_channel();
 
     // The synchronous queries serve APIs that must answer on the spot; everything else asks through a promise.
     Media::MediaSupportInfo query_file_media_support(StringView type, StringView subtype, Optional<String> codecs_parameter);

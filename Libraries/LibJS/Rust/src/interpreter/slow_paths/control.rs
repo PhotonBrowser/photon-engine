@@ -85,9 +85,7 @@ fn iterator_record_from_registers(
 
 /// The primitive values a NewPrimitiveArray instruction carries after its fixed fields.
 fn primitive_array_elements(instruction: &op::NewPrimitiveArray) -> &[Value] {
-    // SAFETY: The bytecode holds element_count values right after the fixed fields of the instruction, within the
-    // length it records, and it does not change while the executable that holds it is alive.
-    unsafe { core::slice::from_raw_parts(instruction.elements.as_ptr(), instruction.element_count as usize) }
+    instruction.elements()
 }
 
 pub fn debugger_check_breakpoint(vm: &Vm, pc: u32) {
@@ -668,7 +666,6 @@ pub fn yield_iterator_result(
 }
 
 fn running_execution_context(vm: &Vm) -> &ExecutionContext {
-    let context = vm.running_execution_context().expect("a generator's frame is running");
-    // SAFETY: The running context is live while the slow path runs in it.
-    unsafe { context.as_ref() }
+    vm.running_execution_context_if_any()
+        .expect("a generator's frame is running")
 }

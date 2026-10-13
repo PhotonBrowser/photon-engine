@@ -42,6 +42,8 @@ pub struct Class {
     pub parent: Option<&'static Class>,
     /// The internal methods of the objects of this class. Cells that are not objects have none.
     pub object_methods: Option<&'static ObjectMethods>,
+    /// The kind of the cells of this class, which type_info also holds for LibGC.
+    kind: CellKind,
 }
 
 // The layout module's mirror of the class, through which Layout.h tells an embedder where a class keeps its id and
@@ -58,7 +60,7 @@ const _: () = {
 };
 
 /// LibGC hands out cells in the slots of fixed-size blocks, whose free list needs room for its own entry in each.
-const MIN_CELL_SIZE: usize = 24;
+pub(crate) const MIN_CELL_SIZE: usize = 24;
 const MAX_CELL_ALIGNMENT: usize = 16;
 
 impl Class {
@@ -96,12 +98,12 @@ impl Class {
             id,
             parent,
             object_methods,
+            kind,
         }
     }
 
     pub fn kind(&self) -> CellKind {
-        // SAFETY: The kind was stored from a CellKind.
-        unsafe { core::mem::transmute::<u8, CellKind>(self.type_info.kind) }
+        self.kind
     }
 
     /// What Cell::class_name() returns for the cells of this class, which printing and messages show. It is the name
@@ -204,6 +206,7 @@ impl Class {
             id: parent.id,
             parent: Some(parent),
             object_methods,
+            kind: parent.kind,
         }));
         #[cfg(feature = "address-sanitizer")]
         // SAFETY: The class is a live allocation, which the process keeps for as long as it runs.
@@ -216,6 +219,13 @@ impl Class {
     /// Whether Class::derive_runtime() created the class. Every class define_cell! defines has an id of its own.
     pub fn is_derived_at_run_time(&self) -> bool {
         self.parent.is_some_and(|parent| parent.id == self.id)
+    }
+
+    /// Whether the class is that of the cell type `T` or a subclass of it. Classes derived at run time have the id of
+    /// the class they extend, and every cell type has an id of its own, so a class with the id of `T` is the class of
+    /// `T` or one derived from it at run time. That covers the long chains of host classes without walking them.
+    pub fn is_class_of<T: GcCell>(&self) -> bool {
+        self.id == T::CLASS.id || self.is_subclass_of(T::CLASS)
     }
 
     pub fn is_subclass_of(&self, ancestor: &Class) -> bool {
@@ -262,10 +272,34 @@ pub unsafe trait Extends<Base> {}
 // SAFETY: Every type starts with itself.
 unsafe impl<T: GcCell> Extends<T> for T {}
 
+// SAFETY: Every cell starts with its header.
+unsafe impl<T: GcCell> Extends<CellHeader> for T {}
+
+// SAFETY: A header starts with itself.
+unsafe impl Extends<CellHeader> for CellHeader {}
+
 /// The class a cell was allocated with, which may be a subclass of its static type.
 pub fn class_of<T>(cell: crate::layout::cell::Gc<T>) -> &'static Class {
     // SAFETY: Every cell starts with its class.
     unsafe { cell.as_ptr().cast::<&'static Class>().read() }
+}
+
+/// The cell as a `Derived`, if it was allocated as one or as a subclass of it.
+///
+/// NB: A cell carries the class it is constructed with from the start, and is only ever constructed as part of a
+///     value of that class, so its class tells what the memory around it is.
+pub fn downcast_ref<Base: GcCell, Derived: GcCell + Extends<Base>>(cell: &Base) -> Option<&Derived> {
+    // SAFETY: Every cell starts with its class.
+    let class = unsafe { core::ptr::from_ref(cell).cast::<&'static Class>().read() };
+    class
+        .is_class_of::<Derived>()
+        // SAFETY: The cell is a Derived or a subclass of it, which starts with a Derived.
+        .then(|| unsafe { &*core::ptr::from_ref(cell).cast::<Derived>() })
+}
+
+/// The cell as a `Derived`, which it has to have been allocated as, or as a subclass of.
+pub fn cast_ref<Base: GcCell, Derived: GcCell + Extends<Base>>(cell: &Base) -> &Derived {
+    downcast_ref(cell).unwrap_or_else(|| panic!("cell is not a {}", Derived::CLASS.name))
 }
 
 impl<T: ?Sized> core::fmt::Debug for crate::layout::cell::Gc<T> {
@@ -285,15 +319,27 @@ impl<T: GcCell> core::ops::Deref for crate::layout::cell::Gc<T> {
 }
 
 impl<T: GcCell> crate::layout::cell::Gc<T> {
-    /// The Gc of a cell the caller only has a reference to, like the receiver of a method.
-    ///
-    /// # Safety
-    ///
-    /// `cell` must be a cell in the heap, not a value that has yet to be allocated.
-    pub unsafe fn from_ref(cell: &T) -> Self {
-        // SAFETY: The caller guarantees that the reference is to a live cell.
-        unsafe { Self::from_non_null(core::ptr::NonNull::from(cell)) }
+    /// The Gc of a cell the caller only has a reference to, like the receiver of a method. Panics if the reference is
+    /// to a value that has yet to be allocated.
+    pub fn from_ref(cell: &T) -> Self {
+        assert!(
+            is_in_heap_region(core::ptr::from_ref(cell).addr()),
+            "a {} that has yet to be allocated is not a cell",
+            T::CLASS.name
+        );
+        // SAFETY: The reference is into the heap region, where every value of a cell type is a cell that was allocated
+        //         as one, since cells only ever embed the cell they extend, at their start.
+        let gc = unsafe { Self::from_non_null(core::ptr::NonNull::from(cell)) };
+        debug_assert!(class_of(gc).is_subclass_of(T::CLASS));
+        gc
     }
+}
+
+/// Whether `address` is in the region LibGC allocates every cell in, which has no cells before it is set up.
+pub(crate) fn is_in_heap_region(address: usize) -> bool {
+    // SAFETY: LibGC sets the base once, when it sets up the region, before any cell exists.
+    let base = unsafe { super::capi::js_heap_region_base };
+    base != 0 && address.wrapping_sub(base) as u64 <= crate::build_configuration::HEAP_REGION_OFFSET_MASK
 }
 
 impl<T> crate::layout::cell::Gc<T> {
@@ -307,7 +353,7 @@ impl<T> crate::layout::cell::Gc<T> {
 
     pub fn downcast<Derived: GcCell + Extends<T>>(self) -> Option<crate::layout::cell::Gc<Derived>> {
         class_of(self)
-            .is_subclass_of(Derived::CLASS)
+            .is_class_of::<Derived>()
             // SAFETY: The cell was allocated as a Derived or a subclass of it.
             .then(|| unsafe { crate::layout::cell::Gc::from_non_null(self.as_non_null().cast()) })
     }

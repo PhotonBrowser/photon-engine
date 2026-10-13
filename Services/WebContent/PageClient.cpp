@@ -251,14 +251,9 @@ void PageClient::request_navigation_start(Web::HTML::LocalNavigable& navigable, 
     client().async_did_request_navigation_start(m_id, navigable.id(), target, url, move(navigation_id), move(start_request));
 }
 
-void PageClient::request_navigation_population(Web::HTML::LocalNavigable& navigable, Web::NavigationTarget target, Web::HTML::NavigationPopulationRequest request)
+void PageClient::request_navigation_of_navigable(Web::HTML::Navigable& navigable, Web::HTML::Navigable& source_navigable, Web::DOM::Document const& source_document, Web::HTML::PreparedNavigationDescriptor navigation)
 {
-    client().async_did_request_navigation_population(m_id, navigable.id(), target, move(request));
-}
-
-void PageClient::request_navigation_of_navigable(Web::HTML::Navigable& navigable, Web::HTML::PreparedNavigationDescriptor navigation)
-{
-    client().async_did_request_navigation_of_navigable(m_id, navigable.id(), move(navigation));
+    client().async_did_request_navigation_of_navigable(m_id, navigable.id(), source_navigable.id(), source_document.id(), move(navigation));
 }
 
 void PageClient::request_post_message_to_remote_navigable(Web::HTML::RemoteNavigable& navigable, Web::HTML::PostedMessageDescriptor message)
@@ -284,13 +279,6 @@ void PageClient::request_window_focus_of_remote_navigable(Web::HTML::RemoteNavig
 void PageClient::request_set_opener_of_remote_navigable(Web::HTML::RemoteNavigable& navigable, Web::HTML::Navigable const& opener)
 {
     client().async_did_request_set_opener_of_navigable(m_id, navigable.id(), opener.id());
-}
-
-void PageClient::navigate_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PreparedNavigationDescriptor navigation)
-{
-    // A navigable the page represents without hosting its document is addressed by the page hosting it.
-    if (auto* navigable = as_if<Web::HTML::LocalNavigable>(page().navigable_with_id(navigable_id).ptr()))
-        navigable->continue_navigation_from_another_process(move(navigation));
 }
 
 void PageClient::deliver_posted_message(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor message)
@@ -392,9 +380,9 @@ void PageClient::page_did_set_opener_browsing_context(Web::HTML::CrossProcessId 
     client().async_did_set_opener_browsing_context(m_id, navigable_id, opener_navigable_id);
 }
 
-void PageClient::page_did_completely_finish_loading(Web::HTML::CrossProcessId navigable_id)
+void PageClient::page_did_completely_finish_loading(Web::HTML::CrossProcessId navigable_id, Web::DOM::Document const& document)
 {
-    client().async_did_completely_finish_loading(m_id, navigable_id);
+    client().async_did_completely_finish_loading(m_id, navigable_id, document.id());
 }
 
 void PageClient::page_did_change_navigable_container_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState const& state)
@@ -402,14 +390,14 @@ void PageClient::page_did_change_navigable_container_state(Web::HTML::CrossProce
     client().async_did_change_navigable_container_state(m_id, navigable_id, state);
 }
 
-void PageClient::page_did_create_populated_document_with_an_origin_of_its_own(Web::HTML::CrossProcessId navigable_id, Web::HTML::PopulatedDocumentOrigin origin, Web::HTML::EnvironmentId const& environment_id)
+void PageClient::page_did_create_populated_document_with_an_origin_of_its_own(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id, Web::HTML::PopulatedDocumentOrigin origin, Web::HTML::EnvironmentId const& environment_id)
 {
-    client().async_did_create_populated_document_with_an_origin_of_its_own(m_id, navigable_id, origin, environment_id);
+    client().async_did_create_populated_document_with_an_origin_of_its_own(m_id, navigable_id, document_id, origin, environment_id);
 }
 
-void PageClient::page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState const& replicated_state, Web::HTML::PendingSessionHistoryEntryDescriptor const& initial_history_entry, URL::Origin const& origin, Web::HTML::EnvironmentId const& environment_id)
+void PageClient::page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::DOM::Document const& container_document, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState const& replicated_state, Web::HTML::PendingSessionHistoryEntryDescriptor const& initial_history_entry, URL::Origin const& origin, Web::HTML::EnvironmentId const& environment_id, Web::HTML::CrossProcessId document_id)
 {
-    client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state, initial_history_entry, origin, environment_id);
+    client().async_did_create_child_frame(m_id, parent_frame_id, container_document.id(), frame_id, replicated_state, initial_history_entry, origin, environment_id, document_id);
 }
 
 void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection)
@@ -1569,10 +1557,11 @@ PageClient::NewWebViewResult PageClient::page_did_request_new_web_view(Web::HTML
     VERIFY(response->root_navigable_id().has_value());
     VERIFY(response->initial_history_entry().has_value());
     VERIFY(response->initial_environment_id().has_value());
+    VERIFY(response->initial_document_id().has_value());
 
     auto& new_client = m_owner.create_page(*response->new_page_id(), *response->root_navigable_id());
     new_client.page().set_system_visibility_state(response->system_visibility_state());
-    return { &new_client.page(), response->take_handle(), response->take_initial_history_entry(), response->take_initial_environment_id(), response->browsing_context_group_id() };
+    return { &new_client.page(), response->take_handle(), response->take_initial_history_entry(), response->take_initial_environment_id(), response->initial_document_id(), response->browsing_context_group_id() };
 }
 
 void PageClient::page_did_close()
@@ -1662,6 +1651,11 @@ void PageClient::page_did_request_history_operation(Web::HTML::CrossProcessId op
     client().async_request_history_operation(m_id, operation_id, move(parameters));
 }
 
+void PageClient::page_did_revoke_history_operation(Web::HTML::CrossProcessId operation_id)
+{
+    client().async_revoke_history_operation(m_id, operation_id);
+}
+
 void PageClient::page_did_request_child_navigable_unload(Web::HTML::CrossProcessId navigable_id)
 {
     client().async_request_child_navigable_unload(m_id, navigable_id);
@@ -1704,12 +1698,12 @@ void PageClient::page_did_request_unload_check(Web::HTML::CrossProcessId navigab
     client().async_request_unload_check(m_id, navigable_id, check_id);
 }
 
-void PageClient::did_receive_unload_check_result(Web::HTML::CrossProcessId check_id, Web::HTML::HistoryStepResult result)
+void PageClient::did_receive_unload_check_result(Web::HTML::CrossProcessId check_id, Web::HTML::CheckIfUnloadingIsCanceledResult result)
 {
     auto on_complete = m_pending_unload_checks.take(check_id);
     if (!on_complete.has_value())
         return;
-    (*on_complete)->function()(result == Web::HTML::HistoryStepResult::Applied ? Web::HTML::CheckIfUnloadingIsCanceledResult::Continue : Web::HTML::CheckIfUnloadingIsCanceledResult::CanceledByBeforeUnload);
+    (*on_complete)->function()(result);
 }
 
 String PageClient::page_did_request_ui_process_session_history_for_testing()

@@ -6,14 +6,18 @@
 
 #pragma once
 
+#include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
+#include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
 #include <AK/Utf16String.h>
+#include <AK/Variant.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CanonicalDocument.h>
 #include <LibWebView/CanonicalSessionHistoryEntry.h>
 #include <LibWebView/NavigationLoader.h>
@@ -21,41 +25,95 @@
 
 namespace WebView {
 
-struct PopulatedDocument {
-    NonnullRefPtr<CanonicalDocumentState> document_state;
-    NonnullRefPtr<CanonicalDocument> document;
-    // The origin of a document the hosting process creates for inline content in place of the response.
-    Optional<URL::Origin> inline_content_origin {};
-};
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
+// One navigation, from its admission until its document is activated or it ends without one.
+class CanonicalNavigation final : public RefCounted<CanonicalNavigation> {
+    AK_ALLOC_WITH_KMALLOC;
 
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#ongoing-navigation
-// A navigable's navigation, from its admission until its document is activated or it is canceled or superseded, with
-// what it acquires on the way.
-class CanonicalNavigation {
 public:
-    enum class Phase : u8 {
-        Started,
-        AwaitingUnloadCheck,
-        Populating,
-        AwaitingResponseBody,
+    // The worker is the page with the source document; the host is the page to host the new one.
+    enum class RunsIn : u8 {
+        Worker,
+        Host,
     };
 
-    Optional<URL::URL> url {};
-    Optional<Utf16String> navigation_id {};
-    Optional<Web::HTML::NavigationStartRequest> start_request {};
+    // Step 20.
+    struct EvaluatingJavaScriptURL {
+        static constexpr auto runs_in = RunsIn::Host;
+    };
+    // Step 23.1.
+    struct CheckingIfUnloadingIsCanceled {
+        static constexpr auto runs_in = RunsIn::Worker;
+        Web::HTML::NavigationStartRequest start_request;
+    };
+    // Attempt to populate the history entry's document, steps 1 to 4.
+    struct CreatingNavigationParams {
+        static constexpr auto runs_in = RunsIn::Worker;
+        NonnullRefPtr<NavigationLoader> loader;
+    };
+    // NB: The worker hands the response body over to the host.
+    struct AcquiringResponseBody {
+        static constexpr auto runs_in = RunsIn::Worker;
+        NonnullRefPtr<NavigationLoader> loader;
+    };
+    // Attempt to populate the history entry's document, step 5 on.
+    struct Populating {
+        static constexpr auto runs_in = RunsIn::Host;
+        NonnullRefPtr<NavigationLoader> loader;
+    };
+    // The completion steps appended finalizing the navigation to the traversal queue.
+    struct Finalizing {
+        static constexpr auto runs_in = RunsIn::Host;
+        RefPtr<NavigationLoader> loader;
+    };
+    using State = Variant<EvaluatingJavaScriptURL, CheckingIfUnloadingIsCanceled, CreatingNavigationParams, AcquiringResponseBody, Populating, Finalizing>;
+
+    struct Start {
+        URL::URL url;
+        Utf16String navigation_id;
+        Optional<Web::HTML::PreparedNavigationDescriptor> retry {};
+        u64 sequence_number { 0 };
+        State state;
+        RefPtr<WebContentPage> page {};
+        RefPtr<CanonicalSessionHistoryEntry> history_entry {};
+    };
+    static NonnullRefPtr<CanonicalNavigation> create(Start start)
+    {
+        return adopt_ref(*new CanonicalNavigation(move(start)));
+    }
+
+    URL::URL url;
+    Utf16String navigation_id;
     // The navigation to make again if the user stops this one and reloads, or a crash cuts it short. Kept from the start
     // request, which population uses up. A javascript: URL has none.
     Optional<Web::HTML::PreparedNavigationDescriptor> retry {};
     u64 sequence_number { 0 };
-    bool has_started { false };
-    Phase phase { Phase::Started };
-    OwnPtr<NavigationLoader> loader {};
-    RefPtr<WebContentPage> population_worker {};
-    RefPtr<WebContentPage> host {};
-    // AD-HOC: The session history entry whose document a navigation reconstructing a child navigable's history
-    //         populates.
-    RefPtr<CanonicalSessionHistoryEntry> reconstructed_entry {};
-    Optional<PopulatedDocument> populated_document {};
+    State state;
+    // The page running the navigation's steps.
+    RefPtr<WebContentPage> page {};
+    // Navigate's historyEntry, whose document state holds the document populated for it.
+    RefPtr<CanonicalSessionHistoryEntry> history_entry {};
+    // Held so that revoking the blob URL the navigation is to cannot take the entry away from it.
+    BlobURLHandle blob_url;
+
+    RefPtr<WebContentPage> worker() const;
+    RefPtr<WebContentPage> host() const;
+    RefPtr<NavigationLoader> loader() const;
+    bool is_finalizing() const { return state.has<Finalizing>(); }
+    // AD-HOC: A later navigation doesn't end a javascript: URL's evaluation, only stopping does (whatwg/html#12120).
+    bool ends_when_superseded() const { return !is_finalizing() && !state.has<EvaluatingJavaScriptURL>(); }
+
+private:
+    explicit CanonicalNavigation(Start start)
+        : url(move(start.url))
+        , navigation_id(move(start.navigation_id))
+        , retry(move(start.retry))
+        , sequence_number(start.sequence_number)
+        , state(move(start.state))
+        , page(move(start.page))
+        , history_entry(move(start.history_entry))
+    {
+    }
 };
 
 WEBVIEW_API Web::HTML::PreparedNavigationDescriptor prepare_navigation_to_retry(Web::HTML::PreparedNavigationDescriptor);

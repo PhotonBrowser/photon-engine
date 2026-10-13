@@ -548,17 +548,9 @@ fn import_preludes_outlive_the_worker_and_shared_sheet() {
     assert!(anonymous.layer.as_ref().unwrap().units().is_empty());
     assert!(unlayered.layer.is_none());
     assert!(unlayered.supports.is_none());
-    unsafe {
-        assert_eq!(
-            css_query_evaluate_supports(Arc::as_ptr(named.supports.as_ref().unwrap())),
-            1
-        );
-        assert_eq!(
-            css_query_evaluate_supports(Arc::as_ptr(anonymous.supports.as_ref().unwrap())),
-            0
-        );
-        assert_eq!(css_query_evaluate_supports(Arc::as_ptr(&supports)), 1);
-    }
+    assert_eq!(css_query_evaluate_supports(named.supports.as_deref()), 1);
+    assert_eq!(css_query_evaluate_supports(anonymous.supports.as_deref()), 0);
+    assert_eq!(css_query_evaluate_supports(Some(&*supports)), 1);
     assert_eq!(
         serialize_style_value_to_utf16(&named.url).unwrap(),
         utf16("url(\"a.css\")")
@@ -702,7 +694,7 @@ fn cached_calculated_descriptors_keep_their_length_resolution_context() {
     let source =
         utf16("@counter-style contextual { system: numeric; symbols: 'a' 'b'; pad: calc(sign(1em - 1px) + 1) '0'; }");
     let mut context = super::tests::parse_context();
-    let mut lengths: crate::css::style_compute::FfiLengthResolutionContext = unsafe { std::mem::zeroed() };
+    let mut lengths = crate::css::style_compute::FfiLengthResolutionContext::default();
     context.length_resolution_context = (&raw const lengths).cast();
     let first = parse(&source, &context);
     lengths.font_metrics.font_size = 16.0;
@@ -732,7 +724,7 @@ fn cache_keys_include_parsing_context_and_replay_side_effects() {
     context.document_base_url = std::ptr::null();
     context.document_base_url_length = 0;
 
-    let mut lengths: crate::css::style_compute::FfiLengthResolutionContext = unsafe { std::mem::zeroed() };
+    let mut lengths = crate::css::style_compute::FfiLengthResolutionContext::default();
     context.length_resolution_context = (&raw const lengths).cast();
     let with_lengths = parse(&source, &context);
     lengths.viewport_width = 800.0;
@@ -829,7 +821,7 @@ fn independent_workers_read_the_same_immutable_graph() {
                     1
                 );
                 assert_eq!(
-                    css_query_evaluate_supports(Arc::as_ptr(sheet.rules[1].supports_condition.as_ref().unwrap())),
+                    css_query_evaluate_supports(sheet.rules[1].supports_condition.as_deref()),
                     1
                 );
             }
@@ -1139,7 +1131,7 @@ fn declaration_mutation_does_not_change_cached_or_nested_shared_blocks() {
     let shared = DeclarationBlock::new(original);
     assert_eq!(changed.data().properties.len(), 5);
     assert_eq!(changed.data().custom_properties.len(), 1);
-    unsafe { assert!(rust_declaration_block_remove(&mut changed, property_id::MARGIN_LEFT)) };
+    assert!(rust_declaration_block_remove(&mut changed, property_id::MARGIN_LEFT));
     assert_eq!(shared.data().properties.len(), 5);
 }
 

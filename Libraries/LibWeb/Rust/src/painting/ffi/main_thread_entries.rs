@@ -17,11 +17,7 @@ crate::stage::main_thread_ffi_entries!();
 
 /// Answers `read` from the rows of `host`'s document as of every write the host made, spending `wait`, with every
 /// row's overflow measured, as input and chrome read boxes: scroll limits, wheel targets, scrollbars and snap areas.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-unsafe fn read_measured_rows<R>(
+fn read_measured_rows<R>(
     host: &crate::render_state::DocumentHost,
     wait: impl crate::render_state::RenderWait,
     read: impl FnOnce(&crate::painting::paint_read::PaintSource<'_>) -> R,
@@ -29,31 +25,22 @@ unsafe fn read_measured_rows<R>(
     host.read_rows(wait, true, read)
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_row_paintable_physical_resize_axes(
+pub extern "C" fn layout_row_paintable_physical_resize_axes(
     host: &crate::render_state::DocumentHost,
     slot: NodeSlotId,
 ) -> FfiPhysicalResizeAxes {
-    // SAFETY: Guaranteed by the caller.
-    let axes = unsafe {
-        read_measured_rows(host, super::node_read(), |rows| {
-            crate::painting::chrome_geometry::physical_resize_axes(rows, slot)
-        })
-    };
+    let axes = read_measured_rows(host, super::node_read(), |rows| {
+        crate::painting::chrome_geometry::physical_resize_axes(rows, slot)
+    });
     FfiPhysicalResizeAxes {
         horizontal: axes.horizontal,
         vertical: axes.vertical,
     }
 }
 
-/// # Safety
-///
-/// As for [`layout_row_paintable_physical_resize_axes`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_row_paintable_compute_scrollbar_data(
+pub extern "C" fn layout_row_paintable_compute_scrollbar_data(
     host: &crate::render_state::DocumentHost,
     slot: NodeSlotId,
     direction: ScrollDirection,
@@ -62,25 +49,24 @@ pub unsafe extern "C" fn layout_row_paintable_compute_scrollbar_data(
     has_device_scroll_offset: bool,
     device_scroll_offset: f32,
     device_pixels_per_css_pixel: f64,
-) -> FfiOptionalScrollbarData {
-    // SAFETY: Guaranteed by the caller.
-    let data = unsafe {
-        read_measured_rows(host, super::node_read(), |rows| {
-            crate::painting::chrome_geometry::ChromeGeometry { arena: rows, metrics }.compute_scrollbar_data(
-                slot,
-                direction,
-                enlarged,
-                has_device_scroll_offset.then_some(crate::painting::chrome_geometry::ScrollbarScrollState {
-                    device_scroll_offset,
-                    device_pixels_per_css_pixel,
-                }),
-            )
-        })
-    };
+    out: &mut FfiOptionalScrollbarData,
+) {
+    let data = read_measured_rows(host, super::node_read(), |rows| {
+        crate::painting::chrome_geometry::ChromeGeometry { arena: rows, metrics }.compute_scrollbar_data(
+            slot,
+            direction,
+            enlarged,
+            has_device_scroll_offset.then_some(crate::painting::chrome_geometry::ScrollbarScrollState {
+                device_scroll_offset,
+                device_pixels_per_css_pixel,
+            }),
+        )
+    });
     let Some(data) = data else {
-        return FfiOptionalScrollbarData::default();
+        *out = FfiOptionalScrollbarData::default();
+        return;
     };
-    FfiOptionalScrollbarData {
+    *out = FfiOptionalScrollbarData {
         has_value: true,
         value: FfiScrollbarData {
             gutter_rect: data.gutter_rect.into(),
@@ -88,57 +74,45 @@ pub unsafe extern "C" fn layout_row_paintable_compute_scrollbar_data(
             track_rect: data.track_rect.into(),
             thumb_travel_to_scroll_ratio: data.thumb_travel_to_scroll_ratio.to_double(),
         },
-    }
+    };
 }
 
-/// # Safety
-///
-/// As for [`layout_row_paintable_physical_resize_axes`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_row_paintable_minimum_scroll_offset(
+pub extern "C" fn layout_row_paintable_minimum_scroll_offset(
     host: &crate::render_state::DocumentHost,
     slot: NodeSlotId,
-) -> FfiCssPixelPoint {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+    out: &mut FfiCssPixelPoint,
+) {
+    *out = {
         read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::chrome_geometry::minimum_scroll_offset(rows, slot)
         })
     }
-    .into()
+    .into();
 }
 
-/// # Safety
-///
-/// As for [`layout_row_paintable_physical_resize_axes`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_row_paintable_maximum_scroll_offset(
+pub extern "C" fn layout_row_paintable_maximum_scroll_offset(
     host: &crate::render_state::DocumentHost,
     slot: NodeSlotId,
-) -> FfiCssPixelPoint {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+    out: &mut FfiCssPixelPoint,
+) {
+    *out = {
         read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::chrome_geometry::maximum_scroll_offset(rows, slot)
         })
     }
-    .into()
+    .into();
 }
 
-/// # Safety
-///
-/// As for [`layout_row_paintable_physical_resize_axes`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_row_paintable_wheel_scrollable_axes(
+pub extern "C" fn layout_row_paintable_wheel_scrollable_axes(
     host: &crate::render_state::DocumentHost,
     slot: NodeSlotId,
 ) -> FfiPhysicalResizeAxes {
-    // SAFETY: Guaranteed by the caller.
-    let axes = unsafe {
-        read_measured_rows(host, super::node_read(), |rows| {
-            crate::painting::chrome_geometry::wheel_scrollable_axes(rows, slot)
-        })
-    };
+    let axes = read_measured_rows(host, super::node_read(), |rows| {
+        crate::painting::chrome_geometry::wheel_scrollable_axes(rows, slot)
+    });
     FfiPhysicalResizeAxes {
         horizontal: axes.horizontal,
         vertical: axes.vertical,
@@ -154,12 +128,9 @@ pub unsafe extern "C" fn layout_row_snap_container_geometry(
     snap_container: NodeSlotId,
     out_geometry: *mut crate::painting::host::FfiSnapContainerGeometry,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    let geometry = unsafe {
-        read_measured_rows(host, super::node_read(), |rows| {
-            crate::painting::scroll_snap::snap_container_geometry(rows, snap_container)
-        })
-    };
+    let geometry = read_measured_rows(host, super::node_read(), |rows| {
+        crate::painting::scroll_snap::snap_container_geometry(rows, snap_container)
+    });
     let Some(geometry) = geometry else {
         return false;
     };
@@ -168,48 +139,35 @@ pub unsafe extern "C" fn layout_row_snap_container_geometry(
     true
 }
 
-/// # Safety
-///
-/// As for [`layout_row_paintable_physical_resize_axes`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_row_scroll_snapport_rect(
+pub extern "C" fn layout_row_scroll_snapport_rect(
     host: &crate::render_state::DocumentHost,
     snap_container: NodeSlotId,
     scrollport: FfiCssPixelRect,
-) -> FfiCssPixelRect {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+    out: &mut FfiCssPixelRect,
+) {
+    *out = {
         read_measured_rows(host, super::node_read(), |rows| {
             crate::painting::scroll_snap::scroll_snapport_rect(rows, snap_container, scrollport.into())
         })
     }
-    .into()
+    .into();
 }
 
-/// # Safety
-///
-/// As for [`layout_row_paintable_physical_resize_axes`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_row_scroll_snap_axes(
+pub extern "C" fn layout_row_scroll_snap_axes(
     host: &crate::render_state::DocumentHost,
     snap_container: NodeSlotId,
 ) -> crate::painting::host::FfiSnapAxes {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_measured_rows(host, super::node_read(), |rows| {
-            crate::painting::scroll_snap::snap_axes_of_scroll_container(rows, snap_container)
-        })
-    }
+    read_measured_rows(host, super::node_read(), |rows| {
+        crate::painting::scroll_snap::snap_axes_of_scroll_container(rows, snap_container)
+    })
 }
 
 /// The box a scroll brings the caret at `offset` in the text of `text` into view in, which it scrolls to `*offset_out`, or
 /// an invalid slot for none.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_scroll_target_for_text_position(
+pub extern "C" fn render_state_scroll_target_for_text_position(
     host: &crate::render_state::DocumentHost,
     text: NodeSlotId,
     offset: usize,
@@ -217,8 +175,7 @@ pub unsafe extern "C" fn render_state_scroll_target_for_text_position(
     scroll_block_axis: bool,
     offset_out: &mut FfiCssPixelPoint,
 ) -> NodeSlotId {
-    // SAFETY: Guaranteed by the caller.
-    let target = unsafe {
+    let target = {
         read_arena(
             host,
             super::node_read(),
@@ -242,33 +199,27 @@ pub unsafe extern "C" fn render_state_scroll_target_for_text_position(
     container
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_scrolling_box_for_scroll_step(
+pub extern "C" fn render_state_scrolling_box_for_scroll_step(
     host: &crate::render_state::DocumentHost,
     target: NodeSlotId,
     viewport: NodeSlotId,
     delta: FfiCssPixelPoint,
 ) -> NodeSlotId {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(
-            host,
-            super::node_read(),
-            (target, viewport, delta),
-            |arena, (target, viewport, delta)| {
-                arena.measure_scrollable_overflow();
-                crate::painting::scroll_chain::scrolling_box_for_scroll_step(
-                    &arena.paintable_rows(),
-                    target,
-                    viewport,
-                    delta.into(),
-                )
-            },
-        )
-    }
+    read_arena(
+        host,
+        super::node_read(),
+        (target, viewport, delta),
+        |arena, (target, viewport, delta)| {
+            arena.measure_scrollable_overflow();
+            crate::painting::scroll_chain::scrolling_box_for_scroll_step(
+                &arena.paintable_rows(),
+                target,
+                viewport,
+                delta.into(),
+            )
+        },
+    )
 }
 
 /// # Safety
@@ -283,8 +234,7 @@ pub unsafe extern "C" fn render_state_for_each_wheel_scrollable_box_in_containin
     context: *mut c_void,
     push_scrollable_box: unsafe extern "C" fn(*mut c_void, NodeSlotId, f64, f64),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let boxes = unsafe {
+    let boxes = {
         read_arena(
             host,
             super::node_read(),
@@ -309,47 +259,35 @@ pub unsafe extern "C" fn render_state_for_each_wheel_scrollable_box_in_containin
     }
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_box_ending_scroll_chain(
+pub extern "C" fn render_state_box_ending_scroll_chain(
     host: &crate::render_state::DocumentHost,
     start: NodeSlotId,
     delta_x: f64,
     delta_y: f64,
 ) -> NodeSlotId {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(
-            host,
-            node_read(),
-            (start, delta_x, delta_y),
-            |arena, (start, delta_x, delta_y)| {
-                crate::painting::scroll_chain::box_ending_scroll_chain(&arena.paintable_rows(), start, delta_x, delta_y)
-            },
-        )
-    }
+    read_arena(
+        host,
+        node_read(),
+        (start, delta_x, delta_y),
+        |arena, (start, delta_x, delta_y)| {
+            crate::painting::scroll_chain::box_ending_scroll_chain(&arena.paintable_rows(), start, delta_x, delta_y)
+        },
+    )
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_first_wheel_scrollable_box_in_containing_block_chain(
+pub extern "C" fn render_state_first_wheel_scrollable_box_in_containing_block_chain(
     host: &crate::render_state::DocumentHost,
     start: NodeSlotId,
 ) -> NodeSlotId {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, node_read(), start, |arena, start| {
-            arena.measure_scrollable_overflow();
-            crate::painting::scroll_chain::first_wheel_scrollable_box_in_containing_block_chain(
-                &arena.paintable_rows(),
-                start,
-            )
-        })
-    }
+    read_arena(host, node_read(), start, |arena, start| {
+        arena.measure_scrollable_overflow();
+        crate::painting::scroll_chain::first_wheel_scrollable_box_in_containing_block_chain(
+            &arena.paintable_rows(),
+            start,
+        )
+    })
 }
 
 /// Prepares the document of `host` for rendering, and stores the scroll offsets the new overflow moved out of range.
@@ -380,19 +318,15 @@ pub unsafe extern "C" fn render_state_prepare_for_rendering(
         let main_thread = unsafe { main_thread(host) };
         if let Some(geometry_host) = host.host_tables().geometry_host.get() {
             for (slot, offset) in prepared.clamped_scroll_offsets {
-                // SAFETY: The pass clamped the offsets of live rows, and the host holds no borrow of the arena.
-                unsafe { geometry_host.set_scroll_offset(&main_thread, read, slot, offset.into()) };
+                geometry_host.set_scroll_offset(&main_thread, read, slot, offset.into());
             }
         }
     }
     prepared.outcome
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_update_accumulated_visual_contexts(
+pub extern "C" fn render_state_update_accumulated_visual_contexts(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
@@ -403,11 +337,8 @@ pub unsafe extern "C" fn render_state_update_accumulated_visual_contexts(
     })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_update_visual_viewport_transform(
+pub extern "C" fn render_state_update_visual_viewport_transform(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     inputs: FfiVisualContextTreeInputs,
@@ -418,12 +349,8 @@ pub unsafe extern "C" fn render_state_update_visual_viewport_transform(
 }
 
 /// Starts an update pass of the compositor animations of `host`'s document, with none published.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_begin_compositor_animation_update(host: &crate::render_state::DocumentHost) {
+pub extern "C" fn render_state_begin_compositor_animation_update(host: &crate::render_state::DocumentHost) {
     host.begin_compositor_animation_update();
 }
 
@@ -442,18 +369,13 @@ pub unsafe extern "C" fn compositor_animation_effect_publish_pending(
     // SAFETY: Guaranteed by the caller.
     let animations = unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }
         .publish_pending(reuse_retained_timing_anchors);
-    // SAFETY: As above.
     host.publish_compositor_animations(animations);
 }
 
 /// Ends the current update pass of the compositor animations of `host`'s document, and gives the visual context tree
 /// what its effects published where `publish_pending`, or none.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_publish_compositor_animations(
+pub extern "C" fn render_state_publish_compositor_animations(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     publish_pending: bool,
@@ -571,8 +493,7 @@ pub unsafe extern "C" fn render_state_for_each_snap_area(
     context: *mut c_void,
     push_snap_area: unsafe extern "C" fn(*mut c_void, *const crate::painting::host::FfiSnapAreaGeometry),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let areas = unsafe {
+    let areas = {
         read_arena(host, super::node_read(), snap_container, |arena, snap_container| {
             let mut areas = Vec::new();
             crate::painting::scroll_snap::for_each_snap_area(
@@ -612,11 +533,9 @@ pub unsafe extern "C" fn render_state_publish_recording(
         crate::painting::record::publish::publish_recording(host, publication, &main_thread, &publish);
     }
     drop(recording);
-    let presented = unsafe {
-        read_arena(host, read, (), |arena, ()| {
-            crate::painting::ffi::FfiPresentedRecording::of_last_recording(arena)
-        })
-    };
+    let presented = read_arena(host, read, (), |arena, ()| {
+        crate::painting::ffi::FfiPresentedRecording::of_last_recording(arena)
+    });
     // SAFETY: The caller provides writable storage for what it reads of the recording.
     unsafe { out.write(presented) };
 }
@@ -636,12 +555,9 @@ pub unsafe extern "C" fn render_state_take_recording_trace(
     let Some(pending) = host.recording().take_pending_recording_trace() else {
         return false;
     };
-    // SAFETY: As above.
-    let recording = unsafe {
-        read_arena(host, read, (), |arena, ()| {
-            arena.paint_state().borrow().last_recording.clone()
-        })
-    };
+    let recording = read_arena(host, read, (), |arena, ()| {
+        arena.paint_state().borrow().last_recording.clone()
+    });
     let Some(recording) = recording else {
         return false;
     };
@@ -677,8 +593,7 @@ pub unsafe extern "C" fn render_state_for_each_subtree_fragment_rect(
     context: *mut c_void,
     consume: unsafe extern "C" fn(*mut c_void, NodeSlotId, FfiCssPixelRect),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let rects = unsafe {
+    let rects = {
         read_arena(host, super::node_read(), root, |arena, root| {
             let paintable_rows = arena.paintable_rows();
             let mut rects = Vec::new();
@@ -753,15 +668,12 @@ pub unsafe extern "C" fn render_state_record_display_list(
     let frame_inputs = frame_inputs(host, viewport, &inputs, &recorder);
     // SAFETY: The host lends the input arrays and buffers for this call, and the inputs copy what they read of them.
     let inputs = unsafe { inputs.recording_inputs() };
-    // SAFETY: Guaranteed by the caller.
-    let Some(frame) = (unsafe {
-        read_arena(
-            host,
-            read,
-            frame_inputs,
-            crate::painting::recording_slot::freeze_recording_frame,
-        )
-    }) else {
+    let Some(frame) = read_arena(
+        host,
+        read,
+        frame_inputs,
+        crate::painting::recording_slot::freeze_recording_frame,
+    ) else {
         host.recording().give_back_recorder(recorder);
         return FfiRecordingStart::NothingToRecord;
     };
@@ -1039,7 +951,6 @@ fn with_hit_test_list<R>(
         &crate::painting::paint_read::PaintSource<'_>,
     ) -> R,
 ) -> R {
-    // SAFETY: The host is live.
     let rows = host.fresh_measured_rows(read);
     let absolute_rects = std::cell::RefCell::default();
     let source = crate::painting::paint_read::PaintSource::over_rows(&rows.paintable, &absolute_rects);
@@ -1137,45 +1048,32 @@ pub unsafe extern "C" fn layout_hit_test_visit_chrome_widgets(
     });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_hit_test_list_generation(host: &crate::render_state::DocumentHost) -> u64 {
+pub extern "C" fn layout_hit_test_list_generation(host: &crate::render_state::DocumentHost) -> u64 {
     let mut recording = host.recording();
     recording.hit_test_list().as_ref().map_or(0, |list| list.generation)
 }
 
 /// The DOM node a hit on the paintable dispatches events to.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_paintable_event_dispatch_target(
+pub extern "C" fn layout_paintable_event_dispatch_target(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     slot: NodeSlotId,
 ) -> crate::painting::host::FfiNodeIdentity {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_measured_rows(host, read, |rows| {
-            crate::painting::hit_test::resolve::event_dispatch_target_of_paintable(rows, slot)
-        })
-    }
+    read_measured_rows(host, read, |rows| {
+        crate::painting::hit_test::resolve::event_dispatch_target_of_paintable(rows, slot)
+    })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread;
-/// `index` in range.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_hit_test_item_facts(
+pub extern "C" fn layout_hit_test_item_facts(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     index: usize,
-) -> crate::painting::host::FfiHitTestItemExport {
-    with_hit_test_list_items_only(host, read, None, |list, arena| {
+    out: &mut crate::painting::host::FfiHitTestItemExport,
+) {
+    *out = with_hit_test_list_items_only(host, read, None, |list, arena| {
         let item = &list.items[index];
         assert!(
             arena.paintable_row_is_populated(item.paintable),
@@ -1194,15 +1092,11 @@ pub unsafe extern "C" fn layout_hit_test_item_facts(
             context: item.context,
         })
     })
-    .expect("no hit-test list")
+    .expect("no hit-test list");
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread;
-/// `item_index` must be in range for the current hit-test list.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_hit_test_resolve_hit(
+pub extern "C" fn layout_hit_test_resolve_hit(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     item_index: usize,
@@ -1222,14 +1116,15 @@ pub unsafe extern "C" fn layout_hit_test_find_topmost_item(
     read: &crate::render_state::BegunRead,
     callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
     point: FfiCssPixelPoint,
-) -> crate::painting::host::FfiTopmostItem {
-    with_hit_test_list_spatial_indexes_and_visual_context_tree(
+    out: &mut crate::painting::host::FfiTopmostItem,
+) {
+    *out = with_hit_test_list_spatial_indexes_and_visual_context_tree(
         host,
         read,
         false,
         Default::default(),
         |list, tree, arena| ffi_topmost(list.find_topmost_item(arena, tree, &callbacks, point.into())),
-    )
+    );
 }
 
 /// # Safety
@@ -1271,11 +1166,12 @@ pub unsafe extern "C" fn layout_hit_test_caret_position_from_point(
     point: FfiCssPixelPoint,
     mode: u8,
     constraint_scope: crate::painting::host::FfiNodeIdentity,
-) -> FfiCaretAt {
+    out: &mut FfiCaretAt,
+) {
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { main_thread(host) };
     let mode = crate::painting::hit_test::caret::CaretPositionMode::from_u8(mode);
-    with_hit_test_list_spatial_indexes_and_visual_context_tree(host, read, true, None, |list, tree, arena| {
+    *out = with_hit_test_list_spatial_indexes_and_visual_context_tree(host, read, true, None, |list, tree, arena| {
         list.caret_position_from_point(
             &main_thread,
             arena,
@@ -1286,7 +1182,7 @@ pub unsafe extern "C" fn layout_hit_test_caret_position_from_point(
             constraint_scope,
         )
     })
-    .unwrap_or_else(FfiCaretAt::none)
+    .unwrap_or_else(FfiCaretAt::none);
 }
 
 /// The caret position at the start (`edge` 1) or end (`edge` 2) of the painted line holding the position `query`
@@ -1303,12 +1199,13 @@ pub unsafe extern "C" fn layout_hit_test_caret_at_line_edge(
     offset: usize,
     affinity_is_downstream: bool,
     edge: u8,
-) -> FfiCaretAt {
+    out: &mut FfiCaretAt,
+) {
     let edge = crate::painting::hit_test::caret::CaretPositionType::from_u8(edge);
-    with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
+    *out = with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
         list.caret_at_line_edge(arena, &query, offset, affinity_is_downstream, edge)
     })
-    .unwrap_or_else(FfiCaretAt::none)
+    .unwrap_or_else(FfiCaretAt::none);
 }
 
 /// The caret position on the line visually after (`direction` 1) or before (`direction` 0) the line holding the
@@ -1329,7 +1226,8 @@ pub unsafe extern "C" fn layout_hit_test_caret_on_adjacent_line(
     direction: u8,
     inline_coordinate: i32,
     scope: crate::painting::host::FfiNodeIdentity,
-) -> FfiCaretAt {
+    out: &mut FfiCaretAt,
+) {
     let direction = if direction == 1 {
         crate::painting::hit_test::caret::CaretLineDirection::Next
     } else {
@@ -1337,7 +1235,7 @@ pub unsafe extern "C" fn layout_hit_test_caret_on_adjacent_line(
     };
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { main_thread(host) };
-    with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
+    *out = with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
         list.caret_on_adjacent_line(
             &main_thread,
             arena,
@@ -1350,7 +1248,7 @@ pub unsafe extern "C" fn layout_hit_test_caret_on_adjacent_line(
             scope,
         )
     })
-    .unwrap_or_else(FfiCaretAt::none)
+    .unwrap_or_else(FfiCaretAt::none);
 }
 
 /// The block-axis middle of the painted line holding the position `query` describes, if a line holds it.
@@ -1380,12 +1278,8 @@ pub unsafe extern "C" fn layout_hit_test_caret_line_block_coordinate(
 
 /// The style-tree identity of the first `<area>` of the image's map, in tree order, whose shape
 /// covers the point. Zero when the image has no map, or when no shape covers the point.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_image_map_area_for_point(
+pub extern "C" fn layout_image_map_area_for_point(
     host: &crate::render_state::DocumentHost,
     slot: NodeSlotId,
     x: f32,

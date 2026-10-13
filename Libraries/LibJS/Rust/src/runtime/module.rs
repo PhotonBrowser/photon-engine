@@ -253,16 +253,12 @@ impl Module {
     }
 
     pub fn as_gc(&self) -> Gc<Module> {
-        // SAFETY: Modules only exist as cells once constructed.
-        unsafe { Gc::from_ref(self) }
+        Gc::from_ref(self)
     }
 
     /// The module as a `T`, if it was allocated as one.
     pub fn downcast_ref<T: GcCell + crate::gc::class::Extends<Module>>(&self) -> Option<&T> {
-        self.class()
-            .is_subclass_of(T::CLASS)
-            // SAFETY: The module was allocated as a T or a subclass of it, which starts with a Module.
-            .then(|| unsafe { &*core::ptr::from_ref(self).cast::<T>() })
+        crate::gc::class::downcast_ref(self)
     }
 
     pub fn as_cyclic_module(&self) -> Option<&CyclicModule> {

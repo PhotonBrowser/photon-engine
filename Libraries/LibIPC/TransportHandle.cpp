@@ -4,12 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCore/Socket.h>
+#include <LibCore/System.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibIPC/Transport.h>
 #include <LibIPC/TransportHandle.h>
+
+#if !defined(AK_OS_WINDOWS)
+#    include <sys/socket.h>
+#endif
 
 namespace IPC {
 
@@ -32,6 +36,23 @@ ErrorOr<NonnullOwnPtr<Transport>> TransportHandle::create_transport() const
     VERIFY(MACH_PORT_VALID(m_receive_right.port()));
     VERIFY(m_send_right.port() != MACH_PORT_NULL);
     return make<Transport>(move(m_receive_right), move(m_send_right));
+}
+
+ErrorOr<TransportHandlePair> TransportHandle::create_pair()
+{
+    auto port_a_receive_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+    auto port_a_send_right = TRY(port_a_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
+    auto port_b_receive_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+    auto port_b_send_right = TRY(port_b_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
+
+    // Either end may be written to before the other has constructed its transport.
+    TransportMachPort::raise_receive_queue_limit(port_a_receive_right);
+    TransportMachPort::raise_receive_queue_limit(port_b_receive_right);
+
+    return TransportHandlePair {
+        TransportHandle { move(port_a_receive_right), move(port_b_send_right) },
+        TransportHandle { move(port_b_receive_right), move(port_a_send_right) },
+    };
 }
 
 template<>
@@ -71,9 +92,19 @@ TransportHandle::TransportHandle(File file)
 
 ErrorOr<NonnullOwnPtr<Transport>> TransportHandle::create_transport() const
 {
-    auto socket = TRY(Core::LocalSocket::adopt_fd(m_file.take_fd()));
-    TRY(socket->set_blocking(false));
-    return make<Transport>(move(socket));
+    return Transport::adopt_fd(m_file.take_fd());
+}
+
+ErrorOr<TransportHandlePair> TransportHandle::create_pair()
+{
+#    if defined(AK_OS_WINDOWS)
+    auto handles = TRY(Core::System::duplex_pipe());
+    return TransportHandlePair { TransportHandle { File::adopt_fd(handles[0]) }, TransportHandle { File::adopt_fd(handles[1]) } };
+#    else
+    int fds[2] {};
+    TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, fds));
+    return TransportHandlePair { TransportHandle { File::adopt_fd(fds[0]) }, TransportHandle { File::adopt_fd(fds[1]) } };
+#    endif
 }
 
 template<>

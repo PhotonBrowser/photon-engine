@@ -782,11 +782,12 @@ fn style_payloads_equal_in_groups(a: StylePayloadsRef, b: StylePayloadsRef, comp
     (0..a.groups.len()).all(|group_index| {
         !compares(group_index)
             || a.groups[group_index] == b.groups[group_index]
-            || crate::css::computed_values::style_group_payloads_equal(
+            // SAFETY: Published style-group payloads stay live while their records do.
+            || unsafe { crate::css::computed_values::style_group_payloads_equal(
                 group_index,
                 a.groups[group_index],
                 b.groups[group_index],
-            )
+            ) }
     })
 }
 
@@ -5565,12 +5566,8 @@ pub(crate) struct NodeAllocation {
 
 /// Whether the counter styles the generated content of the element `style_node` names, or of its
 /// pseudo-element `generated_for`, names now differ from the ones its box was built with.
-///
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_content_counter_styles_changed(
+pub extern "C" fn render_state_content_counter_styles_changed(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     style_node: u32,
@@ -5579,12 +5576,9 @@ pub unsafe extern "C" fn render_state_content_counter_styles_changed(
     let Some(owner) = counter_owner(style_node, generated_for) else {
         return false;
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        read_arena(host, read, owner, |arena, owner| {
-            super::generated_content::content_counter_styles_changed(arena, owner)
-        })
-    }
+    read_arena(host, read, owner, |arena, owner| {
+        super::generated_content::content_counter_styles_changed(arena, owner)
+    })
 }
 
 fn counter_owner(style_node: u32, generated_for: u8) -> Option<super::counters::CounterOwner> {
@@ -5607,34 +5601,26 @@ pub unsafe extern "C" fn style_resets_forward_list_item_counter(payloads: *const
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_node_needs_compositor_animation_frame(
+pub extern "C" fn render_state_set_node_needs_compositor_animation_frame(
     host: &DocumentHost,
     id: NodeSlotId,
     kind: super::node_data::CompositorAnimationFrameKind,
     value: bool,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        queue(
-            host,
-            LayoutChange::SetNodeNeedsCompositorAnimationFrame { node: id, kind, value },
-        );
-    }
+    queue(
+        host,
+        LayoutChange::SetNodeNeedsCompositorAnimationFrame { node: id, kind, value },
+    );
 }
 
 /// What the row is scrolled to, as the document published it.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_row_scroll_offset(host: &DocumentHost, slot: NodeSlotId) -> FfiCssPixelPoint {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
+pub extern "C" fn render_state_row_scroll_offset(host: &DocumentHost, slot: NodeSlotId, out: &mut FfiCssPixelPoint) {
+    *out = {
         read_arena(host, node_read(), slot, |arena, slot| {
             arena.row_scroll_offset(slot).into()
         })
-    }
+    };
 }
 
 #[unsafe(no_mangle)]
@@ -5649,8 +5635,7 @@ pub unsafe extern "C" fn render_state_set_node_style(
         record: style_record,
         payloads: StylePayloadsRef::new(payloads.cast()),
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, change) };
+    queue(host, change);
 }
 
 /// Prepares `row` for leaving the layout tree. A detached box is read until its row is freed, so
@@ -5697,12 +5682,8 @@ pub(crate) fn prepare_subtree_for_detach(host_calls: HostCalls<'_>, arena: &Layo
 /// bound to, or of the box of its pseudo-element `generated_for`, so that the box keeps its style
 /// readable once the node has left the document. The row is found by identity, so this makes no
 /// shell.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_pin_bound_box_style_record_for_detachment(
+pub extern "C" fn render_state_pin_bound_box_style_record_for_detachment(
     host: &DocumentHost,
     style_node: u32,
     generated_for: u8,
@@ -5710,41 +5691,25 @@ pub unsafe extern "C" fn render_state_pin_bound_box_style_record_for_detachment(
     let Some(style_node) = StyleNodeID::from_raw(style_node) else {
         return;
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        queue(
-            host,
-            LayoutChange::PinBoundBoxStyleRecordForDetachment {
-                style_node,
-                generated_for,
-            },
-        );
-    }
+    queue(
+        host,
+        LayoutChange::PinBoundBoxStyleRecordForDetachment {
+            style_node,
+            generated_for,
+        },
+    );
 }
 
 /// Pins the style record `record` for the host's readers of the row `slot`, until the host
 /// releases it or the row is freed.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, and `slot` a live row.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_pin_node_style_record_for_host(
-    host: &DocumentHost,
-    slot: NodeSlotId,
-    record: u64,
-) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::PinNodeStyleRecordForHost { node: slot, record }) };
+pub extern "C" fn render_state_pin_node_style_record_for_host(host: &DocumentHost, slot: NodeSlotId, record: u64) {
+    queue(host, LayoutChange::PinNodeStyleRecordForHost { node: slot, record });
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, and `slot` a live row.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_release_node_style_record_pin_for_host(host: &DocumentHost, slot: NodeSlotId) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::ReleaseNodeStyleRecordPinForHost { node: slot }) };
+pub extern "C" fn render_state_release_node_style_record_pin_for_host(host: &DocumentHost, slot: NodeSlotId) {
+    queue(host, LayoutChange::ReleaseNodeStyleRecordPinForHost { node: slot });
 }
 
 #[unsafe(no_mangle)]
@@ -5766,22 +5731,15 @@ pub unsafe extern "C" fn render_state_set_box_presence_host(
     context: *mut c_void,
     callback: unsafe extern "C" fn(*mut c_void, u32, u8),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        queue(
-            host,
-            LayoutChange::SetBoxPresenceHost(Some(BoxPresenceHost(context, callback))),
-        );
-    }
+    queue(
+        host,
+        LayoutChange::SetBoxPresenceHost(Some(BoxPresenceHost(context, callback))),
+    );
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_clear_box_presence_host(host: &DocumentHost) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, LayoutChange::SetBoxPresenceHost(None)) };
+pub extern "C" fn render_state_clear_box_presence_host(host: &DocumentHost) {
+    queue(host, LayoutChange::SetBoxPresenceHost(None));
 }
 
 /// Forgets every callback the document registered with its host, as the document is finalized.
@@ -5806,27 +5764,21 @@ pub unsafe extern "C" fn document_host_set_style_record_host_callbacks(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_layout_pass_is_running(host: &DocumentHost) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { read_arena(host, node_read(), (), |arena, ()| arena.layout_pass_is_running()) }
+pub extern "C" fn render_state_layout_pass_is_running(host: &DocumentHost) -> bool {
+    read_arena(host, node_read(), (), |arena, ()| arena.layout_pass_is_running())
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_needs_full_layout_tree_update(
+pub extern "C" fn render_state_needs_full_layout_tree_update(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { read_arena(host, read, (), |arena, ()| arena.needs_full_layout_tree_update()) }
+    read_arena(host, read, (), |arena, ()| arena.needs_full_layout_tree_update())
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_layout_root(
-    host: &DocumentHost,
-    read: &crate::render_state::BegunRead,
-) -> NodeSlotId {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { read_arena(host, read, (), |arena, ()| arena.layout_root()) }
+pub extern "C" fn render_state_layout_root(host: &DocumentHost, read: &crate::render_state::BegunRead) -> NodeSlotId {
+    read_arena(host, read, (), |arena, ()| arena.layout_root())
 }
 
 /// Whether the layout of `host`'s document is up to date, where the host knows it without asking and no frame brings
@@ -5845,7 +5797,7 @@ fn known_layout_is_up_to_date(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_layout_is_up_to_date(host: &DocumentHost, document_style_node: u32) -> bool {
+pub extern "C" fn render_state_layout_is_up_to_date(host: &DocumentHost, document_style_node: u32) -> bool {
     // A frame in flight, or a round that flew and is not paid yet, brings layout the host waits for. The document's
     // layout tree update marks are the frame's, so they are read only once no frame holds them.
     let Some(here) = host.layout_waits_for_no_frame() else {
@@ -5867,12 +5819,8 @@ pub unsafe extern "C" fn render_state_layout_is_up_to_date(host: &DocumentHost, 
 
 /// Whether the host knows, without asking, that the layout of `host`'s document is not up to date: a frame brings
 /// layout it waits for, or what it knows of the render state says so.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_layout_is_known_stale(host: &DocumentHost, document_style_node: u32) -> bool {
+pub extern "C" fn render_state_layout_is_known_stale(host: &DocumentHost, document_style_node: u32) -> bool {
     let Some(here) = host.layout_waits_for_no_frame() else {
         return true;
     };

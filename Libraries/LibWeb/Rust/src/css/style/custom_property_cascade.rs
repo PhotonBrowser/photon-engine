@@ -1193,7 +1193,7 @@ impl RetainedState {
     ) -> Option<RegisteredValueContext> {
         let view = self.computed_group_sets.style_record_view(record.raw())?;
         let length = self.record_length_resolution_context(&view)?;
-        let table = unsafe { view.longhand_table.as_ref() }?;
+        let table = view.longhand_table?;
         Some(RegisteredValueContext {
             length,
             color_scheme: u8::try_from(table.effective_color_scheme())
@@ -1892,9 +1892,7 @@ fn substitute_against_stores(
                 outcome => outcome,
             };
             match outcome {
-                ParseOutcome::Parsed(value) => unsafe {
-                    RetainedStyleValueData::from_retained_pointer(std::sync::Arc::into_raw(value))
-                },
+                ParseOutcome::Parsed(value) => RetainedStyleValueData::from_arc(value),
                 ParseOutcome::Invalid | ParseOutcome::NotHandled => invalid(),
             }
         }

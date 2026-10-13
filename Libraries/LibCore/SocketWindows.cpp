@@ -41,7 +41,7 @@ ErrorOr<Bytes> PosixSocketHelper::read(Bytes buffer, int flags)
     DWORD fl = 0;
 
     if (WSARecv(m_fd, &buf, 1, &nread, &fl, NULL, NULL) == SOCKET_ERROR) {
-        if (GetLastError() == WSAECONNRESET)
+        if (GetLastError() == WSAECONNRESET || GetLastError() == WSAECONNABORTED)
             return Error::from_errno(ECONNRESET);
         if (GetLastError() == WSAEWOULDBLOCK)
             return Error::from_errno(EWOULDBLOCK);
@@ -142,8 +142,6 @@ void PosixSocketHelper::close()
     if (m_notifier)
         m_notifier->set_enabled(false);
 
-    // shutdown is required for another end to receive FD_CLOSE
-    shutdown(m_fd, SD_BOTH);
     closesocket(m_fd);
     m_fd = -1;
 }

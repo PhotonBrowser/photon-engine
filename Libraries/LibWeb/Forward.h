@@ -554,8 +554,6 @@ enum class HistoryAction : u8;
 
 namespace Web::Encoding {
 
-class TextDecoder;
-class TextEncoder;
 class TextEncoderStream;
 
 }
@@ -1080,7 +1078,6 @@ class SpeechGrammarList;
 class SpeechRecognition;
 class SpeechRecognitionAlternative;
 class SpeechRecognitionEvent;
-class SpeechRecognitionPhrase;
 class SpeechRecognitionResult;
 class SpeechRecognitionResultList;
 class SpeechSynthesis;
@@ -1091,8 +1088,6 @@ class SpeechSynthesisVoice;
 
 namespace Web::Streams {
 
-class ByteLengthQueuingStrategy;
-class CountQueuingStrategy;
 class ReadableByteStreamController;
 class ReadableStream;
 class ReadableStreamAsyncIterator;
@@ -1194,12 +1189,6 @@ class MouseEvent;
 class PointerEvent;
 class TextEvent;
 class UIEvent;
-
-}
-
-namespace Web::URLPattern {
-
-class URLPattern;
 
 }
 

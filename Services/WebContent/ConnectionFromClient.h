@@ -94,9 +94,8 @@ private:
     Optional<PageClient&> page(Web::PageId index, SourceLocation = SourceLocation::current());
     Optional<PageClient const&> page(Web::PageId index, SourceLocation = SourceLocation::current()) const;
 
-    virtual Messages::WebContentServer::InitTransportResponse init_transport(int peer_pid) override;
     virtual void set_font_service(IPC::TransportHandle, IPC::File catalog, u64 catalog_size, u64 generation) override;
-    virtual void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
+    virtual void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::CrossProcessId initial_document_id, Web::HTML::VisibilityState system_visibility_state) override;
     virtual void create_representing_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables) override;
     virtual void create_embedded_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
     virtual void continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType>, Web::HTML::HistoryNavigationPopulation) override;
@@ -117,7 +116,7 @@ private:
     virtual void connect_to_test_endpoint(IPC::TransportHandle handle) override;
     virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
     virtual void connect_to_wasm_compiler(IPC::TransportHandle handle) override;
-    virtual void connect_to_compositor_process(IPC::TransportHandle handle) override;
+    virtual void connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle) override;
     virtual void set_site_compatibility_data(JsonValue data) override;
     virtual void compositor_process_reconnected() override;
     virtual void update_system_theme(Web::PageId page_id, Core::AnonymousBuffer) override;
@@ -131,7 +130,6 @@ private:
     virtual void run_navigation_unload_check(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Web::HTML::UnloadPromptShown) override;
     virtual void create_navigation_params(Web::PageId page_id, Web::HTML::NavigationPopulationRequest) override;
     virtual void cancel_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) override;
-    virtual void navigate_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PreparedNavigationDescriptor) override;
     virtual void deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor) override;
     virtual void close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id) override;
     virtual void run_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger) override;
@@ -141,18 +139,16 @@ private:
     virtual void discard_provisional_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void stop_hosting_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedNavigableState) override;
     virtual void set_hosted_root_viewport(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::DevicePixelSize, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio) override;
-    virtual void history_operation_started(Web::PageId page_id, Web::HTML::CrossProcessId operation_id) override;
-    virtual void reconstruct_child_navigable_history(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::ReconstructedChildNavigation navigation) override;
     virtual void run_beforeunload_check(Web::PageId page_id, Web::HTML::CrossProcessId check_id, Vector<Web::HTML::CrossProcessId> navigable_ids, Optional<Web::HTML::SessionHistoryEntryDescriptor> target_entry, Optional<Web::HTML::UserNavigationInvolvement> user_involvement_for_navigate_event, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
     virtual void discard_embedded_page(Web::PageId page_id) override;
     virtual void queue_navigation_api_state_clear_task(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Web::HTML::TraversalYieldsTo traversal_yields_to, Optional<Utf16String> canceled_navigation_id) override;
+    virtual void run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Web::HTML::TraversalYieldsTo traversal_yields_to, Optional<Utf16String> canceled_navigation_id, Optional<Utf16String> finalized_navigation_id, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params) override;
     virtual void prepare_changing_navigable_for_unload(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, Web::HTML::UnloadDisplayedDocument unload_displayed_document) override;
     virtual void run_descendant_unload_task(Web::PageId page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChildNavigableDestruction, Web::HTML::StopHostingAfterUnload) override;
     virtual void continue_child_navigable_destruction(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void abort_navigable_document(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void unload_check_result(Web::PageId page_id, Web::HTML::CrossProcessId check_id, Web::HTML::HistoryStepResult) override;
+    virtual void unload_check_result(Web::PageId page_id, Web::HTML::CrossProcessId check_id, Web::HTML::CheckIfUnloadingIsCanceledResult) override;
     virtual void unfullscreen_navigable_document(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void fullscreen_navigable_container(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId requesting_navigable_id, Web::Fullscreen::RequestType request_type) override;
     virtual void container_fullscreen_complete(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -160,7 +156,7 @@ private:
     virtual void container_unfullscreen_complete(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void run_traversable_close_unload_task(Web::PageId page_id, Web::HTML::CrossProcessId operation_id) override;
     virtual void update_nonchanging_navigable_history_state(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, u64 script_history_length, u64 script_history_index) override;
-    virtual void complete_history_operation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Optional<i32> committed_step, u64 session_history_entry_count) override;
+    virtual void complete_history_operation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Optional<i32> target_entry_step, u64 session_history_entry_count) override;
     virtual void set_viewport(Web::PageId page_id, Web::DevicePixelSize, double device_pixel_ratio, Web::ViewportIsFullscreen is_fullscreen) override;
     virtual void set_viewport_is_fullscreen(Web::PageId page_id, Web::ViewportIsFullscreen is_fullscreen) override;
     virtual void deny_fullscreen_window(Web::PageId page_id) override;

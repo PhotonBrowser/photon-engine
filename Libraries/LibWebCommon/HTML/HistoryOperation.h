@@ -13,6 +13,7 @@
 #include <LibWebCommon/HTML/ApplyHistoryStep.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/HistoryHandlingBehavior.h>
+#include <LibWebCommon/HTML/NavigationSourceSnapshot.h>
 #include <LibWebCommon/HTML/SameDocumentNavigationEntry.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
@@ -25,18 +26,12 @@ namespace Web {
 struct FinalizeCrossDocumentNavigationHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
     HTML::PendingSessionHistoryEntryDescriptor history_entry;
-    Optional<Utf16String> navigation_id;
+    Utf16String navigation_id;
     HTML::HistoryHandlingBehavior history_handling;
     HTML::UserNavigationInvolvement user_involvement;
     Optional<Web::HTML::EnvironmentId> environment_id;
+    Optional<HTML::CrossProcessId> document_id;
 };
-
-struct ReconstructedChildNavigation {
-    HTML::SessionHistoryEntryDescriptor target_entry;
-    Utf16String navigation_id;
-};
-
-using HistoryOperationReadyResult = Variant<Empty, HTML::HistoryStepResult>;
 
 struct ReloadHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
@@ -51,7 +46,7 @@ struct InitiatorSourceSnapshot {
 struct TraverseByDeltaHistoryOperationParameters {
     i32 delta;
     Optional<HTML::CrossProcessId> initiator_to_check;
-    Optional<InitiatorSourceSnapshot> initiator_source_snapshot;
+    Optional<HTML::NavigationSourceSnapshot> source_snapshot_params;
     HTML::UserNavigationInvolvement user_involvement;
 };
 
@@ -63,7 +58,7 @@ struct TraverseToStepHistoryOperationParameters {
 struct NavigationAPITraverseHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
     Utf16String key;
-    Optional<InitiatorSourceSnapshot> initiator_source_snapshot;
+    HTML::NavigationSourceSnapshot source_snapshot_params;
     HTML::UserNavigationInvolvement user_involvement;
 };
 
@@ -122,19 +117,9 @@ template<>
 WEBCOMMON_API ErrorOr<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters> decode(Decoder&);
 
 template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::ReconstructedChildNavigation const&);
-template<>
-WEBCOMMON_API ErrorOr<Web::ReconstructedChildNavigation> decode(Decoder&);
-
-template<>
 WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::ReloadHistoryOperationParameters const&);
 template<>
 WEBCOMMON_API ErrorOr<Web::ReloadHistoryOperationParameters> decode(Decoder&);
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::InitiatorSourceSnapshot const&);
-template<>
-WEBCOMMON_API ErrorOr<Web::InitiatorSourceSnapshot> decode(Decoder&);
 
 template<>
 WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::TraverseByDeltaHistoryOperationParameters const&);

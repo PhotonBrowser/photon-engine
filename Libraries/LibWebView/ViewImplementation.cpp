@@ -465,16 +465,6 @@ void ViewImplementation::reload()
         on_before_browser_initiated_navigation();
 
     set_loading_state(true);
-    auto const* current_entry = traversable().session_history().current_entry();
-    Optional<URL::URL> ongoing_url;
-    if (traversable().ongoing_navigation().has_value())
-        ongoing_url = move(traversable().ongoing_navigation()->url);
-    else if (current_entry)
-        ongoing_url = current_entry->url;
-    traversable().set_ongoing_navigation(CanonicalNavigation {
-        .url = move(ongoing_url),
-        .sequence_number = traversable().next_sequence_number(),
-    });
     if (m_crash_state.has_value()) {
         prepare_for_navigation_after_crash();
         recover_current_session_history_entry_with_history_operation();
@@ -482,8 +472,11 @@ void ViewImplementation::reload()
     }
 
     traversable().reload([this](Web::HTML::HistoryStepResult result, Optional<i32> committed_step) {
-        if (result != Web::HTML::HistoryStepResult::Applied)
-            did_cancel_navigation({});
+        if (result != Web::HTML::HistoryStepResult::Applied && !traversable().has_uncommitted_navigation()) {
+            set_loading_state(false);
+            if (m_webdriver_navigation_observation.has_value())
+                complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
+        }
         if (committed_step.has_value())
             update_navigation_action_state();
         dump_session_history("reload-complete"sv);
@@ -497,14 +490,30 @@ void ViewImplementation::stop_loading()
     if (!m_is_loading)
         return;
     // Only a stopped navigation that never activated its document needs reissuing on reload; a stopped
-    // active-document load reloads through the session history.
-    m_last_stopped_navigation = navigation_to_retry_for_ongoing_navigation();
-    if (cancel_uncommitted_top_level_navigation("stop-loading"sv, true))
-        return;
+    // active-document load reloads through the session history. A navigation a history operation is finalizing is
+    // not stopped, and activates its document.
+    m_last_stopped_navigation = traversable().has_uncommitted_navigation() ? navigation_to_retry_for_ongoing_navigation() : Optional<NavigationToRetry> {};
+    traversable().stop_loading();
+}
+
+void ViewImplementation::did_stop_loading(Badge<CanonicalTraversable>, bool stopped_navigation)
+{
     set_loading_state(false);
-    traversable().clear_ongoing_navigation();
-    traversable().clear_active_document_load();
-    page().async_stop_loading();
+    if (!stopped_navigation) {
+        m_last_stopped_navigation.clear();
+        return;
+    }
+    did_end_uncommitted_navigation("stop-loading"sv);
+}
+
+// The address shown is the current entry's again, and a navigation WebDriver waits on is over.
+void ViewImplementation::did_end_uncommitted_navigation(StringView reason)
+{
+    if (auto const* current_entry = traversable().session_history().current_entry())
+        set_url(current_entry->url);
+    if (m_webdriver_navigation_observation.has_value())
+        complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
+    dump_session_history(reason);
 }
 
 void ViewImplementation::traverse_the_history_by_delta(
@@ -517,12 +526,6 @@ void ViewImplementation::traverse_the_history_by_delta(
 
     prepare_for_navigation_after_crash();
     traversable().traverse_the_history_by_delta(delta, check_for_cancelation, move(on_ready));
-}
-
-void ViewImplementation::cancel_uncommitted_top_level_navigation_for_browser_traversal()
-{
-    auto canceled = cancel_uncommitted_top_level_navigation("traverse-canceled-pending-navigation"sv, true);
-    VERIFY(canceled);
 }
 
 void ViewImplementation::traverse_the_history_to_step(
@@ -2671,49 +2674,19 @@ void ViewImplementation::cancel_all_native_geolocation_requests()
         Application::the().stop_watching_geolocation_position(watch.value);
 }
 
-void ViewImplementation::did_start_navigation(Optional<Utf16String> navigation_id, URL::URL const& url)
+void ViewImplementation::did_start_navigation()
 {
-    auto& ongoing = traversable().ensure_ongoing_navigation();
-    if (ongoing.sequence_number == 0)
-        ongoing.sequence_number = traversable().next_sequence_number();
-    ongoing.navigation_id = move(navigation_id);
-    ongoing.url = url;
-    ongoing.has_started = true;
-
     set_loading_state(true);
     dump_session_history("did-start-navigation"sv);
 }
 
-bool ViewImplementation::did_cancel_navigation(Optional<Utf16String> const& navigation_id)
+void ViewImplementation::did_cancel_loading(Badge<CanonicalNavigable>, bool canceled_ongoing_navigation)
 {
-    // A cancel may arrive before a UI-issued load reports its start. A started navigation's cancel must name it.
-    auto const& ongoing = traversable().ongoing_navigation();
-    auto stale = ongoing.has_value()
-        ? ongoing->has_started && navigation_id != ongoing->navigation_id
-        : navigation_id != traversable().active_document_load().navigation_id;
-    if (stale)
-        return false;
-
     set_loading_state(false);
-    if (cancel_uncommitted_top_level_navigation("did-cancel-navigation"sv, false))
-        return true;
-
-    traversable().clear_ongoing_navigation();
-    traversable().clear_active_document_load();
-    if (m_webdriver_navigation_observation.has_value()) {
-        auto webdriver_navigation_id = m_webdriver_navigation_observation->navigation_id;
-        complete_webdriver_navigation(webdriver_navigation_id);
-        return true;
-    }
-
-    dump_session_history("did-cancel-navigation-ignored"sv);
-    return true;
-}
-
-void ViewImplementation::did_cancel_loading(Optional<Utf16String> const& navigation_id)
-{
-    if (!did_cancel_navigation(navigation_id))
-        return;
+    if (canceled_ongoing_navigation)
+        did_end_uncommitted_navigation("did-cancel-navigation"sv);
+    else if (m_webdriver_navigation_observation.has_value())
+        complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
 
     auto const& client_url = url();
     if (on_load_finish)
@@ -2725,16 +2698,9 @@ void ViewImplementation::did_cancel_loading(Optional<Utf16String> const& navigat
     }
 }
 
-bool ViewImplementation::matches_ongoing_navigation(Optional<Utf16String> const& navigation_id) const
-{
-    return traversable().matches_ongoing_navigation(navigation_id);
-}
-
 void ViewImplementation::did_finish_navigation()
 {
     set_loading_state(false);
-    traversable().clear_ongoing_navigation();
-    traversable().clear_active_document_load();
 
     if (!m_webdriver_navigation_observation.has_value())
         return;
@@ -2761,32 +2727,6 @@ void ViewImplementation::set_loading_state(bool is_loading)
     m_is_loading = is_loading;
     if (on_loading_state_change)
         on_loading_state_change(is_loading);
-}
-
-bool ViewImplementation::cancel_uncommitted_top_level_navigation(StringView reason, bool stop_loading)
-{
-    if (!traversable().has_uncommitted_navigation())
-        return false;
-
-    // The document populated for the navigation is abandoned, with the page chosen to host it.
-    traversable().clear_ongoing_navigation();
-    set_loading_state(false);
-    if (stop_loading)
-        page().async_stop_loading();
-
-    auto const* current_entry = traversable().session_history().current_entry();
-    if (!current_entry) {
-        if (m_webdriver_navigation_observation.has_value())
-            complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
-        dump_session_history(reason);
-        return true;
-    }
-
-    set_url(current_entry->url);
-    if (m_webdriver_navigation_observation.has_value())
-        complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
-    dump_session_history(reason);
-    return true;
 }
 
 void ViewImplementation::run_webdriver_content_command(u64 command_id, Web::WebDriver::SessionBrowsingContext browsing_context, String const& name, JsonValue payload, Vector<String> arguments)
@@ -3459,8 +3399,11 @@ void ViewImplementation::request_history_operation(Badge<WebContentPage>, WebCon
         },
         [](auto const&) { return false; });
     auto requested_operation_completion = [this, reloads_top_level, finalizes_top_level_cross_document_navigation](Web::HTML::HistoryStepResult result, Optional<i32> committed_step) {
-        if (reloads_top_level && result != Web::HTML::HistoryStepResult::Applied)
-            did_cancel_navigation({});
+        if (reloads_top_level && result != Web::HTML::HistoryStepResult::Applied && !traversable().tracked_load_navigation_id().has_value()) {
+            set_loading_state(false);
+            if (m_webdriver_navigation_observation.has_value())
+                complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
+        }
         if (finalizes_top_level_cross_document_navigation && result == Web::HTML::HistoryStepResult::Applied) {
             if (auto const* current_entry = traversable().session_history().current_entry())
                 set_url(current_entry->url);
@@ -3497,12 +3440,14 @@ void ViewImplementation::dump_session_history(StringView reason, SessionHistoryD
     auto traversal = traversable().browser_history_traversal_for_testing();
 
     Optional<URL::URL> loading_url;
-    if (traversable().ongoing_navigation().has_value())
-        loading_url = traversable().ongoing_navigation()->url;
+    if (auto navigation = traversable().uncommitted_navigation())
+        loading_url = navigation->url;
 
+    // The page displaying the tab can have lost its process, as when a crash recovery ends.
+    auto const* connection = page().routed_connection();
     dbgln("[History] UI session history page={} pid={} reason={} url='{}' uncommitted_navigation={} loading_url={} pending_traversal_target={} pending_traversal_stage={} queued_same_document_entries={} back={} forward={} entries={}",
         page().id(),
-        page().client().pid(),
+        connection ? connection->pid() : -1,
         reason,
         m_url,
         traversable().has_uncommitted_navigation(),
@@ -3588,13 +3533,13 @@ void ViewImplementation::handle_web_content_process_crash()
     if (recovery_mode == RecoveryMode::Restore && !crashed_repeatedly) {
         recover_current_session_history_entry_with_history_operation();
     } else if (recovery_mode == RecoveryMode::ShowOverlay) {
-        traversable().abandon_after_web_content_process_crash();
+        traversable().abandon_history_operations();
         set_crash_state(CrashState {
             .failed_url = move(failed_url),
             .navigation_to_retry = move(navigation_to_retry),
         });
     } else {
-        traversable().abandon_after_web_content_process_crash();
+        traversable().abandon_history_operations();
     }
 
     for (auto const& command : pending_crash_commands)
@@ -3623,10 +3568,12 @@ void ViewImplementation::respawn_web_content_process_after_crash()
 
 Optional<ViewImplementation::NavigationToRetry> ViewImplementation::navigation_to_retry_for_ongoing_navigation() const
 {
-    auto const& ongoing_navigation = traversable().ongoing_navigation();
-    if (!ongoing_navigation.has_value() || !ongoing_navigation->url.has_value())
+    auto navigation = traversable().uncommitted_navigation();
+    if (!navigation)
+        navigation = traversable().navigation_being_finalized();
+    if (!navigation)
         return {};
-    return NavigationToRetry { *ongoing_navigation->url, ongoing_navigation->retry };
+    return NavigationToRetry { navigation->url, navigation->retry };
 }
 
 void ViewImplementation::retry_navigation(NavigationToRetry retry, Web::Bindings::NavigationHistoryBehavior history_handling)
