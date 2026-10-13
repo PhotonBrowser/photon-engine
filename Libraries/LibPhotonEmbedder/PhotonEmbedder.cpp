@@ -74,6 +74,11 @@ public:
     // one most recently focused or asked for a context menu.
     void set_active_view(PhotonHeadlessWebView&);
     void set_clipboard(Photon::Clipboard clipboard) { m_system_clipboard = move(clipboard); }
+    void set_elastic_scroll_enabled(bool enabled)
+    {
+        m_elastic_scroll_enabled = enabled;
+        set_scrolls_elastically(enabled);
+    }
 
 private:
     virtual Optional<ViewImplementation&> active_web_view() const override;
@@ -83,11 +88,7 @@ private:
 
     virtual bool platform_scrolls_elastically() const override
     {
-#if defined(AK_OS_MACOS)
-        return true;
-#else
-        return false;
-#endif
+        return m_elastic_scroll_enabled;
     }
 
     virtual Utf16String clipboard_text(ClipboardType type) const override
@@ -159,6 +160,7 @@ private:
 
     Photon::Clipboard m_system_clipboard;
     WeakPtr<PhotonHeadlessWebView> m_active_view;
+    bool m_elastic_scroll_enabled { false };
 };
 
 class PhotonHeadlessWebView final : public HeadlessWebView {
@@ -1064,6 +1066,11 @@ void Runtime::pump()
 void Runtime::set_system_reduced_motion_preference(bool reduce_motion)
 {
     m_impl->application->set_system_reduced_motion_preference(reduce_motion);
+}
+
+void Runtime::set_elastic_scroll_enabled(bool enabled)
+{
+    m_impl->application->set_elastic_scroll_enabled(enabled);
 }
 
 void Runtime::set_service_callback(std::function<void(EngineService, bool restarted)> callback)

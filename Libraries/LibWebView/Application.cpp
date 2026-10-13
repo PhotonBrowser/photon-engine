@@ -1713,8 +1713,8 @@ ErrorOr<void> Application::launch_compositor_process()
 
     if (!platform_reports_scroll_momentum())
         m_compositor_client->async_set_synthesizes_scroll_momentum(true);
-    if (platform_scrolls_elastically())
-        m_compositor_client->async_set_scrolls_elastically(true);
+    m_compositor_client->async_set_scrolls_elastically(
+        m_scrolls_elastically_override.value_or(platform_scrolls_elastically()));
 
 #ifdef USE_DIRECTX
     m_reported_compositor_gpu_presentation_unavailable = false;
@@ -1723,6 +1723,13 @@ ErrorOr<void> Application::launch_compositor_process()
 #endif
 
     return {};
+}
+
+void Application::set_scrolls_elastically(bool enabled)
+{
+    m_scrolls_elastically_override = enabled;
+    if (m_compositor_client)
+        m_compositor_client->async_set_scrolls_elastically(enabled);
 }
 
 void Application::notify_compositor_gpu_presentation_unavailable()

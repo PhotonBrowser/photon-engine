@@ -133,6 +133,7 @@ public:
     // Returns true if a touchpad may pull a scroller past the edges of its scroll range, from where it springs back.
     // This needs the platform to say when the fingers lift from the touchpad, or the scroller would stay stretched.
     virtual bool platform_scrolls_elastically() const { return false; }
+    void set_scrolls_elastically(bool);
 
     void appearance_changed(Badge<ApplicationSettingsObserver>);
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
@@ -596,6 +597,7 @@ private:
     RefPtr<WasmCompilerClient::Client> m_wasm_compiler_client;
 #endif
     RefPtr<CompositorClient> m_compositor_client;
+    Optional<bool> m_scrolls_elastically_override;
     bool m_reported_compositor_gpu_presentation_unavailable { false };
     bool m_compositor_metal_presentation_enabled { false };
     size_t m_compositor_restart_count { 0 };

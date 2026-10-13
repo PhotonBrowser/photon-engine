@@ -303,6 +303,8 @@ public:
     // Set the host system's reduced-motion preference used by the app's Auto
     // setting. Call again when the system accessibility setting changes.
     void set_system_reduced_motion_preference(bool reduce_motion);
+    // Enables the platform's elastic scroll effect when supported.
+    void set_elastic_scroll_enabled(bool enabled);
     // Called with `restarted` false when a service process stops and true once
     // its replacement is running. The network service reports only its restart.
     void set_service_callback(std::function<void(EngineService, bool restarted)>);
