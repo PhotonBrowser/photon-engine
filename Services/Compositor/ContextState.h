@@ -280,6 +280,12 @@ private:
         Compositing::ScrollStateSnapshot scroll_state_snapshot;
         Gfx::IntSize viewport_size;
         HashMap<Compositing::CanvasId, u64> canvas_content_generations;
+        u64 raster_content_epoch { 0 };
+    };
+
+    struct ScrollBlit {
+        Gfx::IntPoint translation;
+        Gfx::IntRect exposed_damage;
     };
 
     void stop_backing_store_shrink_timer();
@@ -347,8 +353,10 @@ private:
     void paint_current_display_list(DisplayListPlayerSkia&, Gfx::PaintingSurface&, CompositedContextResolver const*, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot, Optional<Gfx::IntRect> damage_rect = {}, PaintUIOverlay = PaintUIOverlay::Yes, bool apply_raster_transform = true);
     Gfx::IntSize raster_size() const;
     Gfx::IntRect raster_damage_rect(Gfx::IntRect) const;
-    Gfx::IntRect frame_damage_for(PendingFrame const&, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot);
-    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot);
+    Gfx::IntRect frame_damage_for(PendingFrame const&, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot, Optional<ScrollBlit>* = nullptr);
+    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot, Optional<ScrollBlit>* = nullptr);
+    Optional<ScrollBlit> scroll_blit_for(Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot, Gfx::IntSize viewport_size);
+    void shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::IntPoint translation);
     void remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot);
     void update_caret_blink_timer();
     void schedule_next_caret_blink();
@@ -376,6 +384,7 @@ private:
     RefPtr<Gfx::PaintingSurface> m_latest_rendered_surface;
     RefPtr<Gfx::PaintingSurface> m_damage_surface;
     Optional<RasterizedFrame> m_last_rasterized_frame;
+    u64 m_raster_content_epoch { 0 };
     Gfx::FloatSize m_raster_scale { 1, 1 };
     Gfx::FloatPoint m_raster_translation;
 

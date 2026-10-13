@@ -87,6 +87,12 @@ DisplayList::ReferencedResourceIds DisplayList::referenced_resource_ids() const
     };
 }
 
+bool DisplayList::can_reuse_after_viewport_scroll(AccumulatedVisualContextTree const& visual_context_tree, SpatialNodeIndex viewport_scroll_node) const
+{
+    VERIFY(m_compatible_visual_context_tree_structural_epoch == visual_context_tree.structural_epoch());
+    return RustFFI::display_list_storage_can_reuse_after_viewport_scroll(visual_context_tree.rust_handle(), m_storage, viewport_scroll_node);
+}
+
 bool DisplayList::requires_direct_replay_without_nested_lists(AccumulatedVisualContextTree const& visual_context_tree) const
 {
     VERIFY(m_compatible_visual_context_tree_structural_epoch == visual_context_tree.structural_epoch());

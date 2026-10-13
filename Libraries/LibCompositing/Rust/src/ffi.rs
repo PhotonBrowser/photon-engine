@@ -7,7 +7,10 @@
 //! The entry points the compositor process shares with WebContent: retaining and querying visual
 //! context trees, replaying display lists, computing their damage, and the tree builder tests use.
 
-use crate::display_list::commands::{ClipNodeIndex, ContextRef, EffectNodeIndex, SpatialNodeIndex};
+use crate::display_list::builder::for_each_command;
+use crate::display_list::commands::{
+    ClipNodeIndex, ContextRef, DisplayListCommandType, EffectNodeIndex, SpatialNodeIndex,
+};
 use crate::display_list::storage::storage_from_handle;
 use crate::node_slot_id::NodeSlotId;
 use std::ffi::c_void;
@@ -106,6 +109,257 @@ pub unsafe extern "C" fn display_list_compute_damage(
             true
         }
         None => false,
+    }
+}
+
+fn command_can_be_reused_after_viewport_scroll(command_type: DisplayListCommandType) -> bool {
+    use DisplayListCommandType as T;
+    matches!(
+        command_type,
+        T::DrawGlyphRun
+            | T::FillRect
+            | T::DrawScaledDecodedImageFrame
+            | T::DrawRepeatedDecodedImageFrame
+            | T::DrawTiledDecodedImageFrame
+            | T::PaintLinearGradient
+            | T::PaintRadialGradient
+            | T::PaintConicGradient
+            | T::PaintOuterBoxShadow
+            | T::PaintInnerBoxShadow
+            | T::PaintTextShadow
+            | T::FillRectWithRoundedCorners
+            | T::FillRoundedRectRing
+            | T::DrawEllipse
+            | T::DrawLine
+            | T::DrawRect
+    )
+}
+
+fn spatial_context_can_be_reused_after_viewport_scroll(
+    tree: &crate::visual_context::VisualContextTree,
+    in_scroll_subtree: &[bool],
+    spatial: SpatialNodeIndex,
+    viewport_scroll_node: SpatialNodeIndex,
+) -> bool {
+    let spatial_index = spatial.0 as usize;
+    if !in_scroll_subtree.get(spatial_index).copied().unwrap_or(false) {
+        return false;
+    }
+
+    let mut current = spatial;
+    for _ in 0..tree.spatial_nodes.len() {
+        let Some(node) = tree.spatial_nodes.get(current.0 as usize) else {
+            return false;
+        };
+        if matches!(&node.data, crate::visual_context::SpatialData::Sticky(_)) {
+            return false;
+        }
+        if current == viewport_scroll_node {
+            return true;
+        }
+        current = node.parent;
+    }
+    false
+}
+
+fn effect_context_can_be_reused_after_viewport_scroll(
+    tree: &crate::visual_context::VisualContextTree,
+    mut effect: EffectNodeIndex,
+) -> bool {
+    for _ in 0..tree.effect_nodes.len() {
+        if effect.is_none() {
+            return true;
+        }
+        let Some(node) = tree.effect_nodes.get(effect.0 as usize) else {
+            return false;
+        };
+        match &node.data {
+            crate::visual_context::EffectNodeData::Effects(effects)
+                if effects.opacity == 1.0
+                    && effects.blend_mode == libgfx_rust::CompositingAndBlendingOperator::Normal
+                    && effects.filter.is_none()
+                    && effects.backdrop_filter.is_none() => {}
+            _ => return false,
+        }
+        effect = node.parent;
+    }
+    effect.is_none()
+}
+
+/// # Safety
+///
+/// `tree` and `storage` must be live handles, and `viewport_scroll_node` must be a valid spatial-node index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn display_list_storage_can_reuse_after_viewport_scroll(
+    tree: *const c_void,
+    storage: *const c_void,
+    viewport_scroll_node: SpatialNodeIndex,
+) -> bool {
+    let (tree, storage) = unsafe { (tree_from_handle(tree), storage_from_handle(storage)) };
+    let Some(root) = tree.spatial_nodes.get(viewport_scroll_node.0 as usize) else {
+        return false;
+    };
+    if !matches!(&root.data, crate::visual_context::SpatialData::Scroll(_)) {
+        return false;
+    }
+
+    let in_scroll_subtree = tree.spatial_nodes_in_subtrees_of(&[viewport_scroll_node]);
+
+    for run in storage.command_runs() {
+        let records = &storage.bytes()[run.offset as usize..run.offset as usize + run.size as usize];
+        let mut safe = true;
+        let mut has_raster_content = false;
+        for_each_command(records, |header, _, _| {
+            if !header.command_type.is_compositor_metadata() {
+                has_raster_content = true;
+                safe &= command_can_be_reused_after_viewport_scroll(header.command_type);
+            }
+        });
+        if !safe
+            || (has_raster_content
+                && (!spatial_context_can_be_reused_after_viewport_scroll(
+                    tree,
+                    &in_scroll_subtree,
+                    run.context.spatial,
+                    viewport_scroll_node,
+                ) || !effect_context_can_be_reused_after_viewport_scroll(tree, run.context.effect)))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod viewport_scroll_reuse_tests {
+    use super::*;
+    use crate::node_slot_id::NodeSlotId;
+    use crate::visual_context::{
+        ClipNodeIndex, EffectNodeData, EffectNodeIndex, EffectsData, ScrollData, SpatialData, StickyData,
+        TransformData, TransformDataRole, scroll_state::NO_SCROLL_STATE_SLOT,
+    };
+    use libgfx_rust::{FloatMatrix4x4, FloatPoint};
+
+    fn tree_with_viewport_scroll_node() -> (crate::visual_context::VisualContextTree, SpatialNodeIndex) {
+        let mut tree = crate::visual_context::VisualContextTree::create(TransformData {
+            matrix: FloatMatrix4x4::identity(),
+            origin: FloatPoint::default(),
+            sorting_context_root_index: None,
+            flattens_inherited_transform: false,
+            role: TransformDataRole::CssTransform,
+            synthetic_plane: false,
+            establishes_sorting_context: false,
+        });
+        let viewport_scroll_node = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: SpatialNodeIndex(0),
+            }),
+            SpatialNodeIndex(0),
+        );
+        (tree, viewport_scroll_node)
+    }
+
+    #[test]
+    fn only_static_paint_commands_are_reused() {
+        assert!(command_can_be_reused_after_viewport_scroll(
+            DisplayListCommandType::DrawGlyphRun
+        ));
+        assert!(command_can_be_reused_after_viewport_scroll(
+            DisplayListCommandType::DrawScaledDecodedImageFrame
+        ));
+        assert!(command_can_be_reused_after_viewport_scroll(
+            DisplayListCommandType::FillRect
+        ));
+        assert!(!command_can_be_reused_after_viewport_scroll(
+            DisplayListCommandType::PaintCaret
+        ));
+        assert!(!command_can_be_reused_after_viewport_scroll(
+            DisplayListCommandType::DrawCanvas
+        ));
+        assert!(!command_can_be_reused_after_viewport_scroll(
+            DisplayListCommandType::DrawVideoFrame
+        ));
+        assert!(!command_can_be_reused_after_viewport_scroll(
+            DisplayListCommandType::PaintNestedDisplayList
+        ));
+    }
+
+    #[test]
+    fn scroll_reuse_rejects_fixed_and_sticky_content_contexts() {
+        let (mut tree, viewport_scroll_node) = tree_with_viewport_scroll_node();
+        let scrolling_content = tree.append_spatial(
+            SpatialData::Transform(TransformData {
+                matrix: FloatMatrix4x4::identity(),
+                origin: FloatPoint::default(),
+                sorting_context_root_index: None,
+                flattens_inherited_transform: false,
+                role: TransformDataRole::CssTransform,
+                synthetic_plane: false,
+                establishes_sorting_context: false,
+            }),
+            viewport_scroll_node,
+        );
+        let sticky_content = tree.append_spatial(
+            SpatialData::Sticky(StickyData::unconstrained(
+                viewport_scroll_node,
+                None,
+                NO_SCROLL_STATE_SLOT,
+                NodeSlotId::INVALID,
+                viewport_scroll_node,
+            )),
+            viewport_scroll_node,
+        );
+        let in_scroll_subtree = tree.spatial_nodes_in_subtrees_of(&[viewport_scroll_node]);
+
+        assert!(spatial_context_can_be_reused_after_viewport_scroll(
+            &tree,
+            &in_scroll_subtree,
+            scrolling_content,
+            viewport_scroll_node,
+        ));
+        assert!(!spatial_context_can_be_reused_after_viewport_scroll(
+            &tree,
+            &in_scroll_subtree,
+            sticky_content,
+            viewport_scroll_node,
+        ));
+        assert!(!spatial_context_can_be_reused_after_viewport_scroll(
+            &tree,
+            &in_scroll_subtree,
+            SpatialNodeIndex(0),
+            viewport_scroll_node,
+        ));
+    }
+
+    #[test]
+    fn scroll_reuse_allows_only_no_op_effect_contexts() {
+        let (mut tree, _) = tree_with_viewport_scroll_node();
+        let root_isolation = tree.append_effect(
+            EffectNodeData::layer_blending_with(libgfx_rust::CompositingAndBlendingOperator::Normal),
+            EffectNodeIndex::NONE,
+            SpatialNodeIndex(0),
+            ClipNodeIndex::NONE,
+        );
+        let filtered = tree.append_effect(
+            EffectNodeData::Effects(EffectsData {
+                opacity: 1.0,
+                blend_mode: libgfx_rust::CompositingAndBlendingOperator::Normal,
+                filter: Some(std::sync::Arc::new(Vec::new())),
+                backdrop_filter: None,
+            }),
+            root_isolation,
+            SpatialNodeIndex(0),
+            ClipNodeIndex::NONE,
+        );
+
+        assert!(effect_context_can_be_reused_after_viewport_scroll(
+            &tree,
+            root_isolation
+        ));
+        assert!(!effect_context_can_be_reused_after_viewport_scroll(&tree, filtered));
     }
 }
 

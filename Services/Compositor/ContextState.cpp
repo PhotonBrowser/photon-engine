@@ -177,6 +177,7 @@ void ContextState::set_parent_context(Optional<Web::CompositorContextId> parent_
 
 void ContextState::apply_display_list_resource_transaction(Compositing::DisplayListResourceTransaction&& resource_transaction)
 {
+    ++m_raster_content_epoch;
     m_raster_cache.evict(m_display_list_resource_storage.apply_transaction(move(resource_transaction)));
 }
 
@@ -313,6 +314,7 @@ void ContextState::update_visual_context_tree(Compositing::AccumulatedVisualCont
             m_display_list ? m_display_list->compatible_visual_context_tree_structural_epoch() : 0);
         return;
     }
+    ++m_raster_content_epoch;
     invalidate_visual_context_tree_for_compositing();
     apply_display_list_resource_transaction(move(resource_transaction));
     m_visual_context_tree = move(visual_context_tree);
@@ -1978,7 +1980,8 @@ Optional<ContextState::PreparedFrame> ContextState::prepare_frame(DisplayListPla
     auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
     auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
 
-    auto damage_rect = frame_damage_for(pending_frame, presented_scroll_state_snapshot);
+    Optional<ScrollBlit> scroll_blit;
+    auto damage_rect = frame_damage_for(pending_frame, presented_scroll_state_snapshot, &scroll_blit);
     // NB: A changed content rect must still reach the client even if the pixels are identical.
     if (damage_rect.is_empty() && m_presented_frame == pending_frame.viewport_rect) {
         remember_rasterized_frame(pending_frame.viewport_rect.size(), presented_scroll_state_snapshot);
@@ -1990,6 +1993,11 @@ Optional<ContextState::PreparedFrame> ContextState::prepare_frame(DisplayListPla
         return {};
     }
     auto& back_store = render_target->surface;
+    if (scroll_blit.has_value()) {
+        VERIFY(m_latest_rendered_surface);
+        shift_surface_for_scroll(back_store, *m_latest_rendered_surface, scroll_blit->translation);
+        render_target->damage_rect = raster_damage_rect(damage_rect);
+    }
     paint_current_display_list(display_list_player, back_store, composited_context_resolver, presented_scroll_state_snapshot, render_target->damage_rect);
     remember_rasterized_frame(pending_frame.viewport_rect.size(), presented_scroll_state_snapshot);
 
@@ -2022,10 +2030,17 @@ bool ContextState::present_synchronously(DisplayListPlayerSkia& display_list_pla
     auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
     auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
 
-    auto render_target = m_backing_store_manager.acquire_render_target(raster_damage_rect(frame_damage_for(*pending_frame, presented_scroll_state_snapshot)));
+    Optional<ScrollBlit> scroll_blit;
+    auto damage_rect = frame_damage_for(*pending_frame, presented_scroll_state_snapshot, &scroll_blit);
+    auto render_target = m_backing_store_manager.acquire_render_target(raster_damage_rect(damage_rect));
     if (!render_target.has_value())
         return false;
     auto& back_store = render_target->surface;
+    if (scroll_blit.has_value()) {
+        VERIFY(m_latest_rendered_surface);
+        shift_surface_for_scroll(back_store, *m_latest_rendered_surface, scroll_blit->translation);
+        render_target->damage_rect = raster_damage_rect(damage_rect);
+    }
     paint_current_display_list(display_list_player, back_store, composited_context_resolver, presented_scroll_state_snapshot, render_target->damage_rect);
     remember_rasterized_frame(pending_frame->viewport_rect.size(), presented_scroll_state_snapshot);
     display_list_player.flush(back_store);
@@ -2402,18 +2417,20 @@ Compositing::AccumulatedVisualContextTree const& ContextState::visual_context_tr
     return *m_sampled_visual_context_tree;
 }
 
-Gfx::IntRect ContextState::frame_damage_for(PendingFrame const& pending_frame, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot)
+Gfx::IntRect ContextState::frame_damage_for(PendingFrame const& pending_frame, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot, Optional<ScrollBlit>* scroll_blit)
 {
+    if (scroll_blit)
+        scroll_blit->clear();
     Gfx::IntRect viewport_rect { {}, pending_frame.viewport_rect.size() };
     auto forced_damage_rect = pending_frame.forced_damage_rect.intersected(viewport_rect);
     if (forced_damage_rect.contains(viewport_rect))
         return viewport_rect;
-    auto damage_rect = damage_since_last_raster(viewport_rect.size(), presented_scroll_state_snapshot);
+    auto damage_rect = damage_since_last_raster(viewport_rect.size(), presented_scroll_state_snapshot, scroll_blit);
     damage_rect.unite(forced_damage_rect);
     return damage_rect;
 }
 
-Gfx::IntRect ContextState::damage_since_last_raster(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot)
+Gfx::IntRect ContextState::damage_since_last_raster(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot, Optional<ScrollBlit>* scroll_blit)
 {
     Gfx::IntRect viewport_rect { {}, viewport_size };
     if (!m_last_rasterized_frame.has_value())
@@ -2425,8 +2442,14 @@ Gfx::IntRect ContextState::damage_since_last_raster(Gfx::IntSize viewport_size, 
         return viewport_rect;
     if (auto viewport_scroll_node_id = m_async_scroll_tree.viewport_scroll_node_id(); viewport_scroll_node_id.has_value()) {
         auto index = viewport_scroll_node_id->scroll_node_index;
-        if (last_frame.scroll_state_snapshot.device_offset_for_index(index) != presented_scroll_state_snapshot.device_offset_for_index(index))
+        if (last_frame.scroll_state_snapshot.device_offset_for_index(index) != presented_scroll_state_snapshot.device_offset_for_index(index)) {
+            if (auto reusable_scroll = scroll_blit_for(presented_scroll_state_snapshot, viewport_size); reusable_scroll.has_value()) {
+                if (scroll_blit)
+                    *scroll_blit = *reusable_scroll;
+                return reusable_scroll->exposed_damage;
+            }
             return viewport_rect;
+        }
     }
 
     auto const& visual_context_tree = visual_context_tree_for_compositing();
@@ -2467,6 +2490,99 @@ Gfx::IntRect ContextState::damage_since_last_raster(Gfx::IntSize viewport_size, 
     return damage_rect;
 }
 
+Optional<ContextState::ScrollBlit> ContextState::scroll_blit_for(Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot, Gfx::IntSize viewport_size)
+{
+    if (!m_presents_to_client || !m_latest_rendered_surface || !m_last_rasterized_frame.has_value()
+        || m_paused_debugger_overlay_visible || m_has_active_visual_animations || !m_elastic_overscrolls.is_empty()
+        || m_async_visual_viewport_transform.has_value() || visual_viewport_scale_for_compositing().value_or(1.0f) != 1.0f
+        || m_raster_scale != Gfx::FloatSize { 1, 1 } || m_raster_translation != Gfx::FloatPoint {})
+        return {};
+
+    auto const& last_frame = *m_last_rasterized_frame;
+    if (last_frame.viewport_size != viewport_size || last_frame.raster_content_epoch != m_raster_content_epoch
+        || last_frame.display_list->id() != m_display_list->id()
+        || last_frame.visual_context_tree.structural_epoch() != visual_context_tree_for_compositing().structural_epoch()
+        || last_frame.visual_context_tree.has_visual_animations() || visual_context_tree_for_compositing().has_visual_animations()
+        || m_latest_rendered_surface->size() != viewport_size)
+        return {};
+
+    auto viewport_scroll_node_id = m_async_scroll_tree.viewport_scroll_node_id();
+    if (!viewport_scroll_node_id.has_value())
+        return {};
+    auto scroll_node_index = viewport_scroll_node_id->scroll_node_index;
+    auto index = scroll_node_index.value();
+    auto previous_offsets = last_frame.scroll_state_snapshot.device_offsets();
+    auto presented_offsets = presented_scroll_state_snapshot.device_offsets();
+    if (index >= previous_offsets.size() || index >= presented_offsets.size() || previous_offsets.size() != presented_offsets.size())
+        return {};
+    for (size_t i = 0; i < previous_offsets.size(); ++i) {
+        if (i != index && previous_offsets[i] != presented_offsets[i])
+            return {};
+    }
+    if (!m_display_list->can_reuse_after_viewport_scroll(visual_context_tree_for_compositing(), scroll_node_index))
+        return {};
+
+    auto const& previous_offset = previous_offsets[index];
+    auto const& presented_offset = presented_offsets[index];
+    auto shift_x = presented_offset.x() - previous_offset.x();
+    auto shift_y = presented_offset.y() - previous_offset.y();
+    if (!isfinite(shift_x) || !isfinite(shift_y))
+        return {};
+    auto rounded_shift_x = roundf(shift_x);
+    auto rounded_shift_y = roundf(shift_y);
+    if (fabsf(shift_x - rounded_shift_x) > 0.001f || fabsf(shift_y - rounded_shift_y) > 0.001f)
+        return {};
+    if (rounded_shift_x == 0 && rounded_shift_y == 0)
+        return {};
+    if (fabsf(rounded_shift_x) >= viewport_size.width() || fabsf(rounded_shift_y) >= viewport_size.height())
+        return {};
+
+    Gfx::IntPoint translation { static_cast<int>(rounded_shift_x), static_cast<int>(rounded_shift_y) };
+    Gfx::IntRect exposed_damage;
+    if (translation.x() > 0)
+        exposed_damage.unite({ 0, 0, translation.x(), viewport_size.height() });
+    else if (translation.x() < 0)
+        exposed_damage.unite({ viewport_size.width() + translation.x(), 0, -translation.x(), viewport_size.height() });
+    if (translation.y() > 0)
+        exposed_damage.unite({ 0, 0, viewport_size.width(), translation.y() });
+    else if (translation.y() < 0)
+        exposed_damage.unite({ 0, viewport_size.height() + translation.y(), viewport_size.width(), -translation.y() });
+
+    for (auto const& scrollbar : m_scrollbar_controller.scrollbars()) {
+        if (!scrollbar.is_painted_by_compositor)
+            continue;
+        if (last_frame.scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index) == presented_scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index))
+            continue;
+        exposed_damage.unite(scrollbar.gutter_rect.united(scrollbar.expanded_gutter_rect));
+    }
+    exposed_damage.intersect({ {}, viewport_size });
+    return ScrollBlit { translation, exposed_damage };
+}
+
+void ContextState::shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::IntPoint translation)
+{
+    VERIFY(&destination != &source);
+    VERIFY(destination.size() == source.size());
+    // The latest surface is only published after its flush completion, so snapshotting it here does not
+    // need another flush (which would read back the full Vulkan surface on CPU-shareable paths).
+    auto image = source.sk_image_snapshot<sk_sp<SkImage>>();
+    VERIFY(image);
+
+    auto& canvas = destination.canvas();
+    auto save_count = canvas.save();
+    canvas.clipIRect(SkIRect::MakeWH(destination.size().width(), destination.size().height()));
+    SkPaint paint;
+    paint.setBlendMode(SkBlendMode::kSrc);
+    canvas.drawImageRect(
+        image.get(),
+        SkRect::MakeIWH(source.size().width(), source.size().height()),
+        SkRect::MakeXYWH(translation.x(), translation.y(), source.size().width(), source.size().height()),
+        SkSamplingOptions {},
+        &paint,
+        SkCanvas::kStrict_SrcRectConstraint);
+    canvas.restoreToCount(save_count);
+}
+
 void ContextState::remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot)
 {
     HashMap<Compositing::CanvasId, u64> canvas_content_generations;
@@ -2479,6 +2595,7 @@ void ContextState::remember_rasterized_frame(Gfx::IntSize viewport_size, Composi
         .scroll_state_snapshot = presented_scroll_state_snapshot,
         .viewport_size = viewport_size,
         .canvas_content_generations = move(canvas_content_generations),
+        .raster_content_epoch = m_raster_content_epoch,
     };
 }
 
