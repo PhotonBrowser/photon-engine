@@ -63,6 +63,13 @@ struct ViewState {
     bool can_go_forward { false };
 };
 
+enum class NavigationTimingEvent : int {
+    Started = 0,
+    DocumentCommitted = 1,
+    LoadFinished = 2,
+    FirstFrameReady = 3,
+};
+
 // A page's icon. Pixels are BGRA8888 with straight (unpremultiplied) alpha,
 // tightly packed rows, and owned by this value.
 struct Favicon {
@@ -195,6 +202,9 @@ enum class Cursor : uint8_t {
 struct ViewCallbacks {
     std::function<void(ViewState const&)> state_changed;
     std::function<void(std::shared_ptr<PresentedFrame const>)> frame_ready;
+    // Opt-in navigation diagnostics. Response receipt and DOM milestones are
+    // not currently exposed at the embedder boundary.
+    std::function<void(NavigationTimingEvent, std::string const&)> navigation_timing;
     std::function<void(PerformanceStats const&)> performance_stats_changed;
 #if defined(__APPLE__)
     // Enable only after the shell has an operational native surface consumer.

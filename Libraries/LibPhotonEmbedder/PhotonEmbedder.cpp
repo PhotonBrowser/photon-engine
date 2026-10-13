@@ -422,6 +422,17 @@ public:
         file_picker_closed(move(selected_files));
     }
 
+    void notify_navigation_timing(Photon::NavigationTimingEvent event, URL::URL const& url)
+    {
+        if (!m_callbacks.navigation_timing)
+            return;
+        auto serialized_url = url.serialize().bytes_as_string_view();
+        std::string url_string(
+            serialized_url.characters_without_null_termination(),
+            serialized_url.length());
+        m_callbacks.navigation_timing(event, url_string);
+    }
+
     void notify_state()
     {
         if (!m_callbacks.state_changed)
@@ -652,6 +663,10 @@ private:
             }
             notify_state();
         };
+        on_load_start = [this] {
+            m_navigation_timing_waiting_for_first_frame = false;
+            notify_navigation_timing(Photon::NavigationTimingEvent::Started, url());
+        };
 #if defined(AK_OS_MACOS)
         on_backing_store_pool_changed = [this] {
             ++m_native_generation;
@@ -790,8 +805,15 @@ private:
             notify_state();
             notify_navigation_committed();
         };
-        on_top_level_navigation_commit = [this] { notify_navigation_committed(); };
-        on_load_finish = [this](URL::URL const&) { notify_navigation_committed(); };
+        on_top_level_navigation_commit = [this] {
+            m_navigation_timing_waiting_for_first_frame = true;
+            notify_navigation_timing(Photon::NavigationTimingEvent::DocumentCommitted, url());
+            notify_navigation_committed();
+        };
+        on_load_finish = [this](URL::URL const& loaded_url) {
+            notify_navigation_timing(Photon::NavigationTimingEvent::LoadFinished, loaded_url);
+            notify_navigation_committed();
+        };
         on_find_in_page = [this](size_t current_match_index, Optional<size_t> const& total_match_count) {
             if (!m_callbacks.find_result)
                 return;
@@ -812,6 +834,10 @@ private:
             m_callbacks.crashed(crashed_url);
         };
         on_ready_to_paint = [this] {
+            if (m_navigation_timing_waiting_for_first_frame) {
+                m_navigation_timing_waiting_for_first_frame = false;
+                notify_navigation_timing(Photon::NavigationTimingEvent::FirstFrameReady, url());
+            }
             auto paint_completed = std::chrono::steady_clock::now();
             static uint64_t trace_frame_id = 0;
             auto current_trace_frame_id = ++trace_frame_id;
@@ -915,6 +941,7 @@ private:
     virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) override { return nullptr; }
 
     Photon::ViewCallbacks m_callbacks;
+    bool m_navigation_timing_waiting_for_first_frame { false };
     std::shared_ptr<CpuFallbackFramePool> m_cpu_fallback_frame_pool;
     // The shown context menu's actions, with null for separators.
     Vector<RefPtr<Action>> m_context_menu_actions;
