@@ -31,6 +31,8 @@ public:
         size_t misses { 0 };
         size_t hits { 0 };
         size_t stores { 0 };
+        size_t warm_list_writes { 0 };
+        size_t eviction_scans { 0 };
         Vector<uint64_t> descriptor_hashes;
     };
 
@@ -62,13 +64,17 @@ private:
     static uint64_t key_hash(SkData const& key);
     void evict_if_needed();
     void note_program_used(uint64_t hash);
-    void save_warm_list() const;
+    void save_warm_list();
     ByteString warm_list_path() const;
 
     // The programs this session has asked for, in first-use order, up to `max_warm_entries`.
     static constexpr size_t max_warm_entries = 256;
+    static constexpr size_t warm_list_save_batch_size = 16;
     Vector<uint64_t> m_used_hashes;
     HashTable<uint64_t> m_used_hash_set;
+    size_t m_unsaved_warm_entries { 0 };
+    uint64_t m_bytes_written_since_eviction_check { 0 };
+    bool m_has_checked_cache_size { false };
 
     uint64_t m_size_limit { 128ull * 1024 * 1024 };
     ByteString m_root_directory;

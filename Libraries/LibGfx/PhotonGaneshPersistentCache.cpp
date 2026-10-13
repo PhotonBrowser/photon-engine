@@ -70,7 +70,11 @@ PhotonGaneshPersistentCache::Diagnostics PhotonGaneshPersistentCache::diagnostic
     return cache_diagnostics();
 }
 
-PhotonGaneshPersistentCache::~PhotonGaneshPersistentCache() = default;
+PhotonGaneshPersistentCache::~PhotonGaneshPersistentCache()
+{
+    if (m_unsaved_warm_entries > 0)
+        save_warm_list();
+}
 
 sk_sp<SkData> PhotonGaneshPersistentCache::load(SkData const& key)
 {
@@ -171,7 +175,20 @@ void PhotonGaneshPersistentCache::store(SkData const& key, SkData const& data, S
         std::lock_guard diagnostics_guard(diagnostics_lock());
         ++cache_diagnostics().stores;
     }
-    evict_if_needed();
+
+    // Cache pressure changes only as new shader programs are stored. Walking and sorting the full cache directory on
+    // every store puts disk I/O directly on Skia's synchronous flush path. Check once on the first store to enforce
+    // the existing on-disk limit, then amortize later checks across 1/16 of the cache budget in new data.
+    auto stored_bytes = static_cast<uint64_t>(sizeof(key_size) + sizeof(data_size) + key.size() + data.size());
+    m_bytes_written_since_eviction_check += stored_bytes;
+    auto eviction_check_interval = m_size_limit / 16;
+    if (eviction_check_interval == 0)
+        eviction_check_interval = 1;
+    if (!m_has_checked_cache_size || m_bytes_written_since_eviction_check >= eviction_check_interval) {
+        m_has_checked_cache_size = true;
+        m_bytes_written_since_eviction_check = 0;
+        evict_if_needed();
+    }
 }
 
 uint64_t PhotonGaneshPersistentCache::key_hash(SkData const& key)
@@ -192,6 +209,11 @@ ByteString PhotonGaneshPersistentCache::file_path_for_key(SkData const& key) con
 
 void PhotonGaneshPersistentCache::evict_if_needed()
 {
+    {
+        std::lock_guard diagnostics_guard(diagnostics_lock());
+        ++cache_diagnostics().eviction_scans;
+    }
+
     struct CacheEntry {
         std::filesystem::path path;
         std::filesystem::file_time_type last_used;
@@ -232,15 +254,16 @@ void PhotonGaneshPersistentCache::evict_if_needed()
     }
 }
 
-// Remembers the programs this session asks for, in the order it first does. The list is saved whenever it grows, as
-// the Compositor is often ended rather than shut down; a program is asked for once a session, so this is rare.
+// Remembers programs in first-use order. Persisting every new program writes and renames a file synchronously while
+// Skia is resolving a pipeline during flush, so checkpoint in batches and flush any remaining entries at destruction.
 void PhotonGaneshPersistentCache::note_program_used(uint64_t hash)
 {
     if (m_used_hashes.size() >= max_warm_entries || m_used_hash_set.contains(hash))
         return;
     m_used_hash_set.set(hash);
     m_used_hashes.append(hash);
-    save_warm_list();
+    if (++m_unsaved_warm_entries % warm_list_save_batch_size == 0)
+        save_warm_list();
 }
 
 ByteString PhotonGaneshPersistentCache::warm_list_path() const
@@ -248,7 +271,7 @@ ByteString PhotonGaneshPersistentCache::warm_list_path() const
     return ByteString::formatted("{}/warm-list", m_directory);
 }
 
-void PhotonGaneshPersistentCache::save_warm_list() const
+void PhotonGaneshPersistentCache::save_warm_list()
 {
     if (m_directory.is_empty() || m_used_hashes.is_empty())
         return;
@@ -268,8 +291,14 @@ void PhotonGaneshPersistentCache::save_warm_list() const
     }
     std::error_code error;
     std::filesystem::rename(temporary_path.characters(), path.characters(), error);
-    if (error)
+    if (error) {
         std::filesystem::remove(temporary_path.characters(), error);
+        return;
+    }
+
+    m_unsaved_warm_entries = 0;
+    std::lock_guard diagnostics_guard(diagnostics_lock());
+    ++cache_diagnostics().warm_list_writes;
 }
 
 // Reads a cached program's key and data from its file.

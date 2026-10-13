@@ -191,3 +191,32 @@ TEST_CASE(persistent_cache_keeps_warmed_programs_ahead_of_new_ones)
     EXPECT(data_equals(*entries[1].key, *added));
     std::filesystem::remove_all(root.characters());
 }
+
+TEST_CASE(persistent_cache_batches_synchronous_disk_work)
+{
+    auto root = test_cache_root("batched-disk-work"sv);
+    std::filesystem::remove_all(root.characters());
+    auto diagnostics_before = Gfx::PhotonGaneshPersistentCache::diagnostics_snapshot();
+
+    {
+        Gfx::PhotonGaneshPersistentCache cache(root, ByteString("namespace-a"), 1024 * 1024);
+        SkString description("batch");
+        char payload[8 * 1024] {};
+
+        for (uint64_t index = 0; index < 32; ++index) {
+            auto key = SkData::MakeWithCopy(&index, sizeof(index));
+            auto value = SkData::MakeWithCopy(payload, sizeof(payload));
+            EXPECT(key);
+            EXPECT(value);
+            if (!key || !value)
+                return;
+            EXPECT(!cache.load(*key));
+            cache.store(*key, *value, description);
+        }
+    }
+
+    auto diagnostics_after = Gfx::PhotonGaneshPersistentCache::diagnostics_snapshot();
+    EXPECT_EQ(diagnostics_after.warm_list_writes - diagnostics_before.warm_list_writes, 2u);
+    EXPECT_EQ(diagnostics_after.eviction_scans - diagnostics_before.eviction_scans, 4u);
+    std::filesystem::remove_all(root.characters());
+}
