@@ -26,6 +26,11 @@ static bool photon_frame_trace_enabled()
     return enabled;
 }
 
+static bool photon_frame_profile_enabled()
+{
+    return std::getenv("PHOTON_VERBOSE") || std::getenv("PHOTON_FRAME_PROFILE");
+}
+
 static constexpr int gpu_completion_check_interval_ms = 1;
 
 struct CompositorFrameProfile {
@@ -77,7 +82,7 @@ struct CompositorFrameProfile {
     {
         // Keep low-volume frame timing available without enabling the much
         // noisier per-operation diagnostics used by PHOTON_VERBOSE.
-        if (!std::getenv("PHOTON_VERBOSE") && !std::getenv("PHOTON_FRAME_PROFILE"))
+        if (!photon_frame_profile_enabled())
             return;
         auto now = Clock::now();
         ++frames;
@@ -957,7 +962,8 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
     auto self = NonnullRefPtr { *this };
     RefPtr<Gfx::PaintingSurface> rendered_surface = prepared_frame->rendered_surface;
     auto& surface = *rendered_surface;
-    m_display_list_player->flush_async(surface, [self = move(self), &event_loop, pending_present, rendered_surface = move(rendered_surface)]() mutable {
+    auto skia_flush_started_at = std::chrono::steady_clock::now();
+    auto on_gpu_flush_completed = [self = move(self), &event_loop, pending_present, rendered_surface = move(rendered_surface)]() mutable {
         auto gpu_completed_at = std::chrono::steady_clock::now();
         event_loop.deferred_invoke([self = move(self), pending_present, rendered_surface = move(rendered_surface), gpu_completed_at] {
             // Read back CPU-shareable frames only after the GPU completion
@@ -969,6 +975,16 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
             auto readback_started_at = std::chrono::steady_clock::now();
             rendered_surface->flush();
             pending_present->readback_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - readback_started_at).count();
+            auto* context = self->context_if_present(pending_present->context_id);
+            if (!pending_present->was_cancelled && context && !context->has_completed_first_present() && photon_frame_profile_enabled()) {
+                auto total_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pending_present->paint_started_at).count();
+                dbgln("Photon first-paint profile: context={} raster={}x{} damage={}x{}+{},{} prepare_us={} skia_flush_submit_us={} submit_us={} gpu_wait_us={} cpu_readback_us={} total_us={}",
+                    pending_present->context_id,
+                    rendered_surface->size().width(), rendered_surface->size().height(),
+                    pending_present->damage_rect.width(), pending_present->damage_rect.height(), pending_present->damage_rect.x(), pending_present->damage_rect.y(),
+                    pending_present->paint_duration_microseconds, pending_present->skia_flush_submit_microseconds, pending_present->submit_duration_microseconds,
+                    pending_present->gpu_completion_microseconds, pending_present->readback_microseconds, total_microseconds);
+            }
             compositor_frame_profile().record_frame(
                 pending_present->paint_started_at,
                 pending_present->paint_duration_microseconds,
@@ -977,7 +993,9 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
                 pending_present->readback_microseconds);
             self->did_finish_async_present(*pending_present);
         });
-    }, presentation_signal_value);
+    };
+    m_display_list_player->flush_async(surface, move(on_gpu_flush_completed), presentation_signal_value);
+    pending_present->skia_flush_submit_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - skia_flush_started_at).count();
     auto submit_returned_at = std::chrono::steady_clock::now();
     pending_present->submit_duration_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(submit_returned_at - submit_started_at).count();
     pending_present->submit_completed_at = submit_returned_at;

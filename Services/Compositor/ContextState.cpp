@@ -2047,6 +2047,7 @@ bool ContextState::present_synchronously(DisplayListPlayerSkia& display_list_pla
     m_backing_store_manager.complete_rendering(render_target->bitmap_id, false);
     m_latest_rendered_surface = m_backing_store_manager.latest_rendered_surface();
     m_presented_frame = pending_frame->viewport_rect;
+    m_has_completed_first_present = true;
     m_pending_present_frame.clear();
     m_pending_present_frame_scheduled = false;
     return true;
@@ -2081,6 +2082,7 @@ void ContextState::did_finish_gpu_present(i32 bitmap_id)
 {
     m_backing_store_manager.complete_rendering(bitmap_id, presents_to_client());
     m_latest_rendered_surface = m_backing_store_manager.latest_rendered_surface();
+    m_has_completed_first_present = true;
 }
 
 void ContextState::stop_backing_store_shrink_timer()

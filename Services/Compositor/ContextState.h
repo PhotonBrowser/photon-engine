@@ -228,6 +228,7 @@ public:
     bool draws_canvas(Compositing::CanvasId) const;
     Optional<PreparedFrame> prepare_frame(DisplayListPlayerSkia&, PendingFrame, CompositedContextResolver const*);
     void did_submit_prepared_frame(Gfx::IntRect);
+    bool has_completed_first_present() const { return m_has_completed_first_present; }
     bool present_synchronously(DisplayListPlayerSkia&, CompositedContextResolver const*);
     bool can_paint_screenshot(Gfx::ShareableBitmap&) const;
     void paint_screenshot(DisplayListPlayerSkia&, Gfx::ShareableBitmap&, CompositedContextResolver const*);
@@ -385,6 +386,7 @@ private:
     RefPtr<Gfx::PaintingSurface> m_damage_surface;
     Optional<RasterizedFrame> m_last_rasterized_frame;
     u64 m_raster_content_epoch { 0 };
+    bool m_has_completed_first_present { false };
     Gfx::FloatSize m_raster_scale { 1, 1 };
     Gfx::FloatPoint m_raster_translation;
 

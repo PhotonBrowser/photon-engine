@@ -168,6 +168,7 @@ private:
         Clock::time_point submit_completed_at;
         u64 paint_duration_microseconds { 0 };
         u64 submit_duration_microseconds { 0 };
+        u64 skia_flush_submit_microseconds { 0 };
         u64 gpu_completion_microseconds { 0 };
         u64 readback_microseconds { 0 };
         bool published_before_gpu_completion { false };
