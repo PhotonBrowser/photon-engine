@@ -96,13 +96,24 @@ static ErrorOr<GpuBackingStore> create_shared_gpu_backing_store(Gfx::IntSize siz
 }
 #endif
 
-// Keep the initial front buffer plus one render target. If the window server or the client GPU
-// still holds a replaced surface, the pending-frame path grows the pool on demand; its idle
-// retirement path gives those temporary stores back again.
-static constexpr size_t initial_backing_store_count = 2;
+// The window server can keep reading a replaced surface after the client presents its replacement.
+// A third store lets the compositor render through that interval. A client that samples published
+// stores on its own GPU also holds two: the displayed store and the next one until its GPU work is
+// under way. A fourth store lets the compositor keep rendering while both are held.
+static size_t backing_store_count_for(bool should_publish, [[maybe_unused]] BackingStoreManager::ClientSamplesOnGpu client_samples_on_gpu)
+{
+#ifdef AK_OS_MACOS
+    if (should_publish)
+        return client_samples_on_gpu == BackingStoreManager::ClientSamplesOnGpu::Yes ? 4 : 3;
+#else
+    (void)should_publish;
+#endif
+    return 2;
+}
 
 Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_stores_if_needed(
-    Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+    Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress,
+    bool should_publish, ClientSamplesOnGpu client_samples_on_gpu)
 {
     if (viewport_size.is_empty())
         return {};
@@ -126,8 +137,9 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
         m_allocated_size = allocation_size;
         ++m_pool_epoch;
         Vector<i32> bitmap_ids;
-        bitmap_ids.ensure_capacity(initial_backing_store_count);
-        for (size_t i = 0; i < initial_backing_store_count; ++i)
+        auto buffer_count = backing_store_count_for(should_publish, client_samples_on_gpu);
+        bitmap_ids.ensure_capacity(buffer_count);
+        for (size_t i = 0; i < buffer_count; ++i)
             bitmap_ids.append(m_next_bitmap_id++);
         return Allocation { .size = allocation_size, .bitmap_ids = move(bitmap_ids) };
     }

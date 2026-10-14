@@ -46,10 +46,16 @@ public:
         Allowed,
     };
 
+    enum class ClientSamplesOnGpu {
+        No,
+        Yes,
+    };
+
     BackingStoreManager() = default;
 
     Optional<Allocation> resize_backing_stores_if_needed(
-        Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress);
+        Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress,
+        bool should_publish = false, ClientSamplesOnGpu = ClientSamplesOnGpu::No);
     Optional<Publication> allocate_backing_stores(Allocation const&, RefPtr<Gfx::SkiaBackendContext> const&, bool should_publish, GpuSharing);
 
     void invalidate() { m_allocated_size = {}; }
