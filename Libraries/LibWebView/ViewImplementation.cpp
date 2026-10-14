@@ -112,6 +112,7 @@ ViewImplementation::~ViewImplementation()
     if (!m_window_handle.is_empty())
         Application::the().notify_webdriver_window_closed(m_window_handle);
 
+    reset_spell_checking();
     all_views().remove(m_view_id);
 
     if (m_top_level_traversable) {
@@ -1322,6 +1323,7 @@ void ViewImplementation::send_preferences_to_page(WebContentPage& page)
     send_browsing_behavior(page);
     send_autoplay_settings(page);
     send_global_privacy_control(page);
+    page.async_set_spell_checking_available(Application::the().spell_checker() != nullptr);
     send_geolocation_emulated_position(page);
 }
 
@@ -3992,7 +3994,31 @@ void ViewImplementation::initialize_context_menus()
         menu.add_action(application.select_all_action());
     };
 
+    for (size_t index = 0; index < MAX_SPELLING_GUESSES; ++index) {
+        auto action = Action::create(""sv, ActionID::SpellingGuess, [this, index] {
+            if (index >= m_spelling_guesses.size() || !m_spelling_context_menu_page || !m_spelling_context_menu_page->is_open())
+                return;
+            m_spelling_context_menu_page->async_replace_context_menu_misspelling(m_spelling_guesses[index]);
+        });
+        action->set_visible(false);
+        m_spelling_guess_actions.append(move(action));
+    }
+    m_no_spelling_guesses_action = Action::create("No Guesses Found"sv, ActionID::NoSpellingGuesses, [] { });
+    m_no_spelling_guesses_action->set_enabled(false);
+    m_no_spelling_guesses_action->set_visible(false);
+    m_ignore_spelling_action = Action::create("Ignore Spelling"sv, ActionID::IgnoreSpelling, [this] { ignore_context_menu_misspelling(); });
+    m_ignore_spelling_action->set_visible(false);
+    m_learn_spelling_action = Action::create("Learn Spelling"sv, ActionID::LearnSpelling, [this] { learn_context_menu_misspelling(); });
+    m_learn_spelling_action->set_visible(false);
+
     m_page_context_menu = Menu::create("Page Context Menu"sv);
+    for (auto& action : m_spelling_guess_actions)
+        m_page_context_menu->add_action(action);
+    m_page_context_menu->add_action(*m_no_spelling_guesses_action);
+    m_page_context_menu->add_separator();
+    m_page_context_menu->add_action(*m_ignore_spelling_action);
+    m_page_context_menu->add_action(*m_learn_spelling_action);
+    m_page_context_menu->add_separator();
     m_page_context_menu->add_action(*m_look_up_selected_text_action);
     m_page_context_menu->add_action(*m_navigate_back_action);
     m_page_context_menu->add_action(*m_navigate_forward_action);
@@ -4224,8 +4250,150 @@ void ViewImplementation::reject_pending_selection_requests()
     reject_requests(m_pending_cut_selected_text_requests);
 }
 
-void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
+SpellChecker::DocumentTag ViewImplementation::spell_document_tag()
 {
+    auto* spell_checker = Application::the().spell_checker();
+    VERIFY(spell_checker);
+    if (!m_spell_document_tag.has_value())
+        m_spell_document_tag = spell_checker->create_document_tag();
+    return *m_spell_document_tag;
+}
+
+void ViewImplementation::did_request_spell_check(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, Utf16String text)
+{
+    auto* spell_checker = Application::the().spell_checker();
+    if (!spell_checker) {
+        requesting_page.async_did_check_spelling(request_id, {});
+        return;
+    }
+    spell_checker->check(spell_document_tag(), text, [page = NonnullRefPtr { requesting_page }, request_id](Vector<Web::SpellingError> errors) {
+        if (page->is_open())
+            page->async_did_check_spelling(request_id, move(errors));
+    });
+}
+
+// Forgets what the user told the spellchecker to ignore or learn in this tab.
+void ViewImplementation::reset_spell_checking()
+{
+    if (auto* spell_checker = Application::the().spell_checker(); spell_checker && m_spell_document_tag.has_value())
+        spell_checker->close_document_tag(*m_spell_document_tag);
+    m_spell_document_tag.clear();
+    if (m_top_level_traversable) {
+        traversable().for_each_hosting_page([](WebContentPage& page) {
+            if (page.is_open())
+                page.async_forget_accepted_spelling_words();
+        });
+    }
+}
+
+void ViewImplementation::update_spelling_menu_actions(Optional<Utf16String> misspelled_word)
+{
+    auto* spell_checker = Application::the().spell_checker();
+    m_context_menu_misspelled_word = spell_checker ? move(misspelled_word) : OptionalNone {};
+    m_spelling_guesses.clear();
+    if (m_context_menu_misspelled_word.has_value())
+        m_spelling_guesses = spell_checker->guesses(spell_document_tag(), *m_context_menu_misspelled_word);
+    if (m_spelling_guesses.size() > MAX_SPELLING_GUESSES)
+        m_spelling_guesses.shrink(MAX_SPELLING_GUESSES);
+
+    auto shows_block = m_context_menu_misspelled_word.has_value();
+    for (size_t index = 0; index < m_spelling_guess_actions.size(); ++index) {
+        auto shows_guess = shows_block && index < m_spelling_guesses.size();
+        if (shows_guess)
+            m_spelling_guess_actions[index]->set_text(MUST(m_spelling_guesses[index].utf16_view().to_utf8()));
+        m_spelling_guess_actions[index]->set_visible(shows_guess);
+    }
+    m_no_spelling_guesses_action->set_visible(shows_block && m_spelling_guesses.is_empty());
+    m_ignore_spelling_action->set_visible(shows_block);
+    m_learn_spelling_action->set_visible(shows_block);
+}
+
+void ViewImplementation::ignore_context_menu_misspelling()
+{
+    auto* spell_checker = Application::the().spell_checker();
+    if (!spell_checker || !m_context_menu_misspelled_word.has_value())
+        return;
+    auto word = *m_context_menu_misspelled_word;
+    spell_checker->ignore(spell_document_tag(), word);
+    // An ignored word holds for this tab, so every page of the tab drops its markers for it.
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        page.async_accept_spelling_word(word);
+    });
+}
+
+void ViewImplementation::learn_context_menu_misspelling()
+{
+    auto* spell_checker = Application::the().spell_checker();
+    if (!spell_checker || !m_context_menu_misspelled_word.has_value())
+        return;
+    auto word = *m_context_menu_misspelled_word;
+    spell_checker->learn(spell_document_tag(), word);
+    // A learned word goes in the user's dictionary for every app, so every page of every tab drops its markers for it.
+    // A spellchecker that learns for this tab's tag alone gets the word dropped from this tab alone.
+    if (!spell_checker->learns_for_every_tag()) {
+        traversable().for_each_hosting_page([&](WebContentPage& page) {
+            page.async_accept_spelling_word(word);
+        });
+        return;
+    }
+    for_each_view([&](ViewImplementation& view) {
+        if (view.m_top_level_traversable) {
+            view.traversable().for_each_hosting_page([&](WebContentPage& page) {
+                page.async_accept_spelling_word(word);
+            });
+        }
+        return IterationDecision::Continue;
+    });
+}
+
+String ViewImplementation::describe_spelling_menu_for_testing() const
+{
+    StringBuilder builder;
+    auto append = [&](Action const& action) {
+        if (!action.visible())
+            return;
+        if (!builder.is_empty())
+            builder.append(" | "sv);
+        builder.append(action.text());
+    };
+    for (auto const& action : m_spelling_guess_actions)
+        append(action);
+    append(*m_no_spelling_guesses_action);
+    append(*m_ignore_spelling_action);
+    append(*m_learn_spelling_action);
+    if (builder.is_empty())
+        return "(no spelling items)"_string;
+    return MUST(builder.to_string());
+}
+
+void ViewImplementation::activate_spelling_menu_action_for_testing(Badge<WebContentPage>, WebContentPage& requesting_page, Web::SpellingMenuActionForTesting action, u32 guess_index)
+{
+    auto menu = describe_spelling_menu_for_testing();
+    switch (action) {
+    case Web::SpellingMenuActionForTesting::None:
+        break;
+    case Web::SpellingMenuActionForTesting::Guess:
+        if (guess_index < m_spelling_guess_actions.size() && m_spelling_guess_actions[guess_index]->visible())
+            m_spelling_guess_actions[guess_index]->activate();
+        break;
+    case Web::SpellingMenuActionForTesting::IgnoreSpelling:
+        if (m_ignore_spelling_action->visible())
+            m_ignore_spelling_action->activate();
+        break;
+    case Web::SpellingMenuActionForTesting::LearnSpelling:
+        if (m_learn_spelling_action->visible())
+            m_learn_spelling_action->activate();
+        break;
+    }
+    // The page gets this after whatever the action sent it, on the same connection.
+    requesting_page.async_did_complete_spelling_menu_action_for_testing(menu);
+}
+
+void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word)
+{
+    m_spelling_context_menu_page = requesting_page;
+    update_spelling_menu_actions(move(misspelled_word));
+
     auto request_id = ++m_context_menu_request_id;
     auto weak_this = make_weak_ptr();
     request_context_menu_dictionary_lookup([weak_this, request_id, content_position, for_input_events_target](auto const& lookup) {

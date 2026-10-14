@@ -337,7 +337,14 @@ public:
     Vector<GC::Ref<Range>> const& find_in_page_highlighted_matches() const { return m_find_in_page_highlighted_matches; }
     void set_find_in_page_highlighted_matches(Vector<GC::Ref<Range>>);
     void remove_find_in_page_highlighted_matches_whose_text_changed();
+
+    Editing::SpellingMarkers& spelling_markers();
+    Editing::SpellCheckController& spell_check_controller();
+    Editing::SpellCheckController* spell_check_controller_if_exists() { return m_spell_check_controller.ptr(); }
+    bool has_spelling_markers() const;
     void recompute_search_text_paint_states(Layout::BegunRead const&);
+    void note_spelling_markers_changed();
+    void recompute_spelling_error_paint_states(Layout::BegunRead const&);
 
     WebIDL::ExceptionOr<Utf16String> cookie();
     WebIDL::ExceptionOr<void> set_cookie(Utf16View);
@@ -1087,6 +1094,10 @@ public:
     void register_resize_observer(Badge<ResizeObserver::ResizeObserver>, ResizeObserver::ResizeObserver&);
     bool has_resize_observers() const { return !m_resize_observers.is_empty(); }
     void unregister_resize_observer(Badge<ResizeObserver::ResizeObserver>, ResizeObserver::ResizeObserver&);
+
+    void add_shadow_root_needing_slot_assignment(Badge<ShadowRoot>, ShadowRoot&);
+    void remove_shadow_root_needing_slot_assignment(Badge<ShadowRoot>, ShadowRoot&);
+    void assign_slottables_if_needed();
 
     void run_the_update_intersection_observations_steps(HighResolutionTime::DOMHighResTimeStamp time);
 
@@ -1983,8 +1994,11 @@ private:
     GC::Ptr<Range> m_find_in_page_active_match;
     bool m_selection_states_are_stale { false };
     bool m_search_text_states_are_stale { false };
+    bool m_spelling_error_states_are_stale { false };
     Utf16String m_find_in_page_active_match_text;
     Vector<GC::Ref<Range>> m_find_in_page_highlighted_matches;
+    OwnPtr<Editing::SpellingMarkers> m_spelling_markers;
+    OwnPtr<Editing::SpellCheckController> m_spell_check_controller;
     Vector<Utf16String> m_find_in_page_highlighted_match_texts;
     u64 m_find_in_page_highlighted_matches_dom_tree_version { 0 };
     u64 m_find_in_page_highlighted_matches_character_data_version { 0 };
@@ -1993,7 +2007,7 @@ private:
         bool observable { false };
         bool needs_update { true };
     };
-    Array<HighlightStyleObservability, 2> m_highlight_style_observability;
+    Array<HighlightStyleObservability, 3> m_highlight_style_observability;
     HighlightStyleObservability& highlight_style_observability(CSS::PseudoElement);
     void update_highlight_style_observability(CSS::PseudoElement);
     void update_highlight_style_observability();
@@ -2026,6 +2040,8 @@ private:
     GC::Ptr<IntersectionObserver::IntersectionObserver> m_lazy_load_intersection_observer;
 
     Vector<GC::Weak<ResizeObserver::ResizeObserver>> m_resize_observers;
+
+    ShadowRoot::DocumentSlotAssignmentList m_shadow_roots_needing_slot_assignment;
 
     // https://html.spec.whatwg.org/multipage/semantics.html#will-declaratively-refresh
     // A Document object has an associated will declaratively refresh (a boolean). It is initially false.

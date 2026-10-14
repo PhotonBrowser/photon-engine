@@ -214,6 +214,9 @@ public:
     bool is_editing_host() const;
     bool is_editable_or_editing_host() const { return is_editable() || is_editing_host(); }
     GC::Ptr<Node> editing_host();
+
+    bool has_spelling_markers() const { return m_has_spelling_markers; }
+    void set_has_spelling_markers(Badge<Editing::SpellingMarkers>, bool value) { m_has_spelling_markers = value; }
     CSS::UserSelect user_select_used_value() const;
 
     bool in_editable_subtree() const { return m_in_editable_subtree; }
@@ -285,6 +288,13 @@ public:
     void insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_observers = false);
     void parser_insert_before(GC::Ref<Node> node, GC::Ptr<Node> child);
     void parser_append_child(GC::Ref<Node> node) { parser_insert_before(node, nullptr); }
+    // Links a node the parser has just created into a new subtree that is not yet in any tree. The caller must
+    // insert the subtree's root, which runs the insertion steps for every node of the subtree.
+    void parser_append_child_without_insertion_steps(GC::Ref<Node> node)
+    {
+        VERIFY(!is_connected() && &node->document() == &document());
+        append_child_impl(node);
+    }
     void remove(bool suppress_observers = false);
     void remove_all_children(bool suppress_observers = false);
 
@@ -688,6 +698,7 @@ protected:
     bool m_inside_blocking_wheel_event_handler : 1 { false };
     bool m_style_arrival_pending : 1 { false };
     bool m_descendant_style_arrival_pending : 1 { false };
+    bool m_has_spelling_markers : 1 { false };
     u32 m_child_index_generation { 1 };
     // The slot of the node directory that names the node by its unique id, or 0 before anything asked for the id.
     mutable u32 m_node_directory_slot { 0 };
@@ -712,7 +723,8 @@ private:
     bool schedule_list_item_renumber_for_removal();
     void report_removal_to_style_engine(Node& parent);
     void update_layout_tree_for_removal(Layout::BegunRead const& read, Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
-    void assign_slottables_after_removal(Node& parent, Node& parent_root);
+    Vector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
+    void assign_slottables_after_removal(Node& parent, Node& parent_root, ReadonlySpan<GC::Ref<HTML::HTMLSlotElement>> descendant_slots);
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);
     void add_transient_registered_observers_for_removal(Node& parent);
     void queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling);

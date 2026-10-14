@@ -58,6 +58,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Geolocation/Geolocation.h>
@@ -2572,6 +2573,96 @@ GC::Ptr<JS::Object> Internals::take_context_menu_request()
     auto target = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, request->target);
     object->define_direct_property("target"_utf16_fly_string, target, JS::default_attributes);
     return object;
+}
+
+// The text node a spellchecking test names: the node itself, or the inner text node of a text control.
+static GC::Ptr<DOM::Text> spelling_test_text_node(DOM::Node& node)
+{
+    if (auto* text = as_if<DOM::Text>(node))
+        return text;
+    if (auto* text_control = as_if<HTML::FormAssociatedTextControlElement>(node))
+        return text_control->form_associated_element_to_text_node();
+    return nullptr;
+}
+
+WebIDL::ExceptionOr<void> Internals::add_spelling_error_for_testing(GC::Ref<DOM::Node> node, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end)
+{
+    auto text = spelling_test_text_node(node);
+    if (!text || start >= end || end > text->length_in_utf16_code_units())
+        return WebIDL::IndexSizeError::create("No text to flag in that range"_utf16);
+    text->document().spelling_markers().add(*text, start, end);
+    return {};
+}
+
+Utf16String Internals::spelling_error_ranges(GC::Ref<DOM::Node> node)
+{
+    auto text = spelling_test_text_node(node);
+    if (!text)
+        return {};
+    StringBuilder builder;
+    for (auto const& marker : text->document().spelling_markers().markers_for(*text)) {
+        if (!builder.is_empty())
+            builder.append(' ');
+        builder.appendff("{}-{}", marker.start, marker.end);
+    }
+    return Utf16String::from_utf8(builder.string_view());
+}
+
+GC::Ref<WebIDL::Promise> Internals::check_spelling_for_testing(Utf16String const& text)
+{
+    auto& realm = window().principal_realm();
+    auto promise = WebIDL::create_promise_for(window());
+    auto& page = this->page();
+    if (!page.spell_checking_available()) {
+        WebIDL::reject_promise(realm, promise, JS::PrimitiveString::create(vm(), "Spellchecking is unavailable"_utf16));
+        return promise;
+    }
+    page.request_spell_check(text, GC::create_function(heap(), [&realm, promise](Vector<SpellingError> errors) {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        StringBuilder builder;
+        for (auto const& error : errors) {
+            if (!builder.is_empty())
+                builder.append(' ');
+            builder.appendff("{}-{}", error.offset, error.offset + error.length);
+        }
+        WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(builder.string_view())));
+    }));
+    return promise;
+}
+
+GC::Ref<WebIDL::Promise> Internals::spell_check_settled()
+{
+    auto& realm = window().principal_realm();
+    auto promise = WebIDL::create_promise_for(window());
+    page().when_spell_checking_settled(GC::create_function(heap(), [&realm, promise] {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        WebIDL::resolve_promise(promise);
+    }));
+    return promise;
+}
+
+GC::Ref<WebIDL::Promise> Internals::activate_spelling_menu_item(Bindings::SpellingMenuItem item, WebIDL::UnsignedLong guess_index)
+{
+    auto& realm = window().principal_realm();
+    auto promise = WebIDL::create_promise_for(window());
+    auto action = [&] {
+        switch (item) {
+        case Bindings::SpellingMenuItem::None:
+            return SpellingMenuActionForTesting::None;
+        case Bindings::SpellingMenuItem::Guess:
+            return SpellingMenuActionForTesting::Guess;
+        case Bindings::SpellingMenuItem::Ignore:
+            return SpellingMenuActionForTesting::IgnoreSpelling;
+        case Bindings::SpellingMenuItem::Learn:
+            return SpellingMenuActionForTesting::LearnSpelling;
+        }
+        VERIFY_NOT_REACHED();
+    }();
+    page().request_spelling_menu_action_for_testing(action, guess_index, GC::create_function(heap(), [&realm, promise](String menu) {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(menu)));
+    }));
+    return promise;
 }
 
 GC::Ptr<JS::Object> Internals::hit_test_result(double x, double y)

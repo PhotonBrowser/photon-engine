@@ -265,6 +265,7 @@ private:
     virtual void did_set_session_history_entry_document_state_reload_pending(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, bool reload_pending) override;
     virtual void did_change_focused_navigable(Web::HTML::CrossProcessId navigable_id) override;
     virtual void did_request_key_event_for_testing(Web::KeyEvent event) override;
+    virtual void did_request_spelling_menu_action_for_testing(Web::SpellingMenuActionForTesting action, u32 guess_index) override;
     virtual void request_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters parameters) override;
     virtual void revoke_history_operation(Web::HTML::CrossProcessId operation_id) override;
     virtual void beforeunload_check_result(Web::HTML::CrossProcessId operation_id, Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
@@ -292,6 +293,7 @@ private:
     virtual void did_change_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String url, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value) override;
     virtual void did_update_indexed_database(String update) override;
     virtual void did_request_clipboard_entries(u64 request_id) override;
+    virtual void did_request_spell_check(u64 request_id, Utf16String text) override;
     virtual void did_request_set_system_focus(bool has_system_focus) override;
     virtual void did_request_set_system_visibility_state(Web::HTML::VisibilityState visibility_state) override;
     virtual void did_respond_to_page_responsiveness_check(u64 request_id) override;
@@ -313,7 +315,7 @@ private:
     virtual void did_fail_download(u64 download_id, String error) override;
     virtual void did_finish_loading(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id) override;
     virtual void did_change_title(Utf16String title) override;
-    virtual void did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target) override;
+    virtual void did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word) override;
     virtual void did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned) override;
     virtual void did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap) override;
     virtual void did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor navigation) override;

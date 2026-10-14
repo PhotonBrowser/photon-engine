@@ -1,8 +1,12 @@
-Compared 6399 fragments
+Compared 6480 fragments
 Replacement: 1 record, childList, 1 added
 Reset: true, initial, true
 Form context: true, true, inside form
 Registry scoped: true
 Registry null: true
 Custom: constructor, data-value:test, connected
+Collection before: 0
+Collection after: 2, true, true, rgb(0, 128, 0)
+Contextual: 2, true, false
+Shared whitespace: "\n          x", "\ny        "
 Customized input: true, custom

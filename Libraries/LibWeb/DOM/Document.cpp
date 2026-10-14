@@ -130,6 +130,8 @@
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/Editing/EditingHistory.h>
+#include <LibWeb/Editing/SpellCheckController.h>
+#include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
@@ -921,6 +923,10 @@ void Document::visit_edges(Cell::Visitor& visitor)
     m_anchor_name_map.visit_edges(visitor);
     if (m_query_selector_result_cache)
         m_query_selector_result_cache->visit_edges(visitor);
+    if (m_spelling_markers)
+        m_spelling_markers->visit_edges(visitor);
+    if (m_spell_check_controller)
+        m_spell_check_controller->visit_edges(visitor);
 
     for (auto& event : m_pending_animation_event_queue) {
         visitor.visit(event.event);
@@ -1066,6 +1072,8 @@ void Document::note_selection_changed()
 {
     m_selection_states_are_stale = true;
     request_frame_for_pending_repaint();
+    if (m_spell_check_controller)
+        m_spell_check_controller->did_change_selection();
 }
 
 void Document::update_highlight_states_if_needed(Layout::BegunRead const& read)
@@ -1082,6 +1090,10 @@ void Document::update_highlight_states_if_needed(Layout::BegunRead const& read)
     }
     if (exchange(m_search_text_states_are_stale, false) && has_committed_viewport_box()) {
         recompute_search_text_paint_states(read);
+        Node::set_needs_repaint(InvalidateDisplayList::PaintCommands);
+    }
+    if (exchange(m_spelling_error_states_are_stale, false) && has_committed_viewport_box()) {
+        recompute_spelling_error_paint_states(read);
         Node::set_needs_repaint(InvalidateDisplayList::PaintCommands);
     }
 }
@@ -1131,6 +1143,42 @@ void Document::collapse_find_in_page_active_match_if_its_text_changed()
     if (!match || match->collapsed() || realign_find_in_page_match_to_its_text(*match, m_find_in_page_active_match_text))
         return;
     set_find_in_page_active_match(Range::create(match->start_container(), match->start_offset(), match->start_container(), match->start_offset()));
+}
+
+Editing::SpellingMarkers& Document::spelling_markers()
+{
+    if (!m_spelling_markers)
+        m_spelling_markers = make<Editing::SpellingMarkers>(*this);
+    return *m_spelling_markers;
+}
+
+Editing::SpellCheckController& Document::spell_check_controller()
+{
+    if (!m_spell_check_controller)
+        m_spell_check_controller = make<Editing::SpellCheckController>(*this);
+    return *m_spell_check_controller;
+}
+
+bool Document::has_spelling_markers() const
+{
+    return m_spelling_markers && !m_spelling_markers->is_empty();
+}
+
+void Document::note_spelling_markers_changed()
+{
+    set_needs_highlight_style_update(CSS::PseudoElement::SpellingError);
+    // The boxes the markers paint through are found at the next read of the paint state, as for find-in-page matches.
+    m_spelling_error_states_are_stale = true;
+    request_frame_for_pending_repaint();
+}
+
+void Document::recompute_spelling_error_paint_states(Layout::BegunRead const& read)
+{
+    if (!has_spelling_markers()) {
+        paint_state().reset_spelling_error_states();
+        return;
+    }
+    paint_state().recompute_spelling_error_states(read, *this, spelling_markers());
 }
 
 void Document::remove_find_in_page_highlighted_matches_whose_text_changed()
@@ -2094,6 +2142,7 @@ void Document::after_layout_commit(Layout::BegunRead const& read, LayoutTreeChan
     collapse_find_in_page_active_match_if_its_text_changed();
     remove_find_in_page_highlighted_matches_whose_text_changed();
     recompute_search_text_paint_states(read);
+    recompute_spelling_error_paint_states(read);
 
     if (layout_tree_changed == LayoutTreeChanged::Yes) {
         // Broadcast the current viewport rect to any new committed boxes, so they know whether
@@ -3931,6 +3980,9 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     update_active_element();
+
+    if (navigable() && page().spell_checking_available())
+        spell_check_controller().did_focus(m_focused_area);
 }
 
 Element const* Document::active_element() const
@@ -6570,6 +6622,22 @@ void Document::register_resize_observer(Badge<ResizeObserver::ResizeObserver>, R
 void Document::unregister_resize_observer(Badge<ResizeObserver::ResizeObserver>, ResizeObserver::ResizeObserver& observer)
 {
     m_resize_observers.remove_all_matching([&](auto const& entry) { return !entry || entry.ptr().ptr() == &observer; });
+}
+
+void Document::add_shadow_root_needing_slot_assignment(Badge<ShadowRoot>, ShadowRoot& shadow_root)
+{
+    m_shadow_roots_needing_slot_assignment.append(shadow_root);
+}
+
+void Document::remove_shadow_root_needing_slot_assignment(Badge<ShadowRoot>, ShadowRoot& shadow_root)
+{
+    m_shadow_roots_needing_slot_assignment.remove(shadow_root);
+}
+
+void Document::assign_slottables_if_needed()
+{
+    while (auto* shadow_root = m_shadow_roots_needing_slot_assignment.first())
+        shadow_root->assign_slottables_if_needed();
 }
 
 // https://www.w3.org/TR/intersection-observer/#queue-an-intersection-observer-task
