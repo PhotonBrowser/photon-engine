@@ -797,7 +797,7 @@ void HTMLParserEndState::check_progress()
         // 8. Spin the event loop until there is nothing that delays the load event in the Document.
         // AD-HOC: Update layout first so font loads selected by text shaping can delay the load event.
         // INTEROP: Gecko also flushes layout before firing the load event — so lazily-started font loads hold it back.
-        m_document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
+        m_document->update_layout_for_document_readiness_complete();
         if (m_document->anything_is_delaying_the_load_event())
             return;
 
@@ -893,7 +893,7 @@ void HTMLParserEndState::complete()
         //         layout otherwise wait for the next rendering update, and a load handler that
         //         changes style would fold its change into the document's very first style pass,
         //         where a transition it expects to start has no before-change style to start from.
-        document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
+        document->update_layout_for_document_readiness_complete();
 
         // 3. Let window be the Document's relevant global object.
         auto& window = relevant_window(*document);

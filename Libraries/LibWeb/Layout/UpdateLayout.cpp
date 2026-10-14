@@ -128,6 +128,36 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
         update_style_and_layout();
 }
 
+void Document::update_layout_for_document_readiness_complete()
+{
+    bool layout_is_clean = [&] {
+        Layout::ForcedReadScope read { style_computer().style_engine().render_document() };
+        drain_flown_style_transaction(read);
+        flush_throttled_animation_style_update();
+
+        // Parser progress checks can run repeatedly as load-event blockers finish. Once layout has run,
+        // no further font loads can be discovered until one of its inputs changes. Preserve the extra
+        // work that a normal update performs for scroll-state queries, list counters and resource handoff.
+        return is_clean_for_layout_geometry_read(read)
+            && !m_needs_accumulated_visual_contexts_update
+            && !m_image_map_areas_need_publication
+            && !m_needs_scroll_container_resnap
+            && m_list_owners_pending_item_renumber.is_empty()
+            && m_list_owners_with_stale_item_counters.is_empty()
+            && !m_owed_image_provider_arrived_with_image
+            && !m_requested_wanted_font_faces
+            && !m_scroll_state_query_containers.has_containers();
+    }();
+
+    if (!layout_is_clean) {
+        update_layout(UpdateLayoutReason::DocumentReadinessComplete);
+        return;
+    }
+
+    // update_style_and_layout_once() also drains pending inspector mutations after the layout becomes current.
+    page().client().flush_pending_dom_mutations();
+}
+
 // The first round of the rendering update's layout reads the document's facts as they are before its style flies, and
 // runs after the style in the frame. List items that wait to be renumbered and top layer work are the layout update's
 // to do first, so nothing is sealed while either waits.
