@@ -1643,10 +1643,14 @@ void WebContentPage::request_history_operation(Web::HTML::CrossProcessId operati
 {
     // Only the process hosting a navigable's active document appends its synchronous navigation steps.
     if (auto const* same_document = parameters.get_pointer<Web::FinalizeSameDocumentNavigationHistoryOperationParameters>(); same_document && !hosted_navigable(same_document->navigable_id).has_value()) {
-        async_complete_history_operation(operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {}, traversable().session_history().size());
+        async_complete_history_operation(operation_id, {}, traversable().session_history().size());
         return;
     }
-    view().request_history_operation({}, *this, operation_id, move(parameters));
+    if (auto const* resume = parameters.get_pointer<Web::ResumeTraverseHistoryOperationParameters>(); resume && !traversable().session_history().get_the_used_step(resume->target_step).has_value()) {
+        client().did_misbehave("request_history_operation"sv, "resumed traversal to a step before every used step"sv);
+        return;
+    }
+    traversable().enqueue_history_operation(operation_id, move(parameters), *this);
 }
 
 void WebContentPage::revoke_history_operation(Web::HTML::CrossProcessId operation_id)

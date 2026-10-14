@@ -29,8 +29,9 @@ static Vector<NonnullOwnPtr<CanonicalTraversable>>& user_agent_top_level_travers
     return *set;
 }
 
-CanonicalTraversable::CanonicalTraversable(Web::HTML::CrossProcessId id)
+CanonicalTraversable::CanonicalTraversable(Web::HTML::CrossProcessId id, NonnullRefPtr<CanonicalSessionHistoryEntry> initial_history_entry)
     : CanonicalNavigable(id)
+    , m_session_history(move(initial_history_entry))
     , m_session_storage(StorageJar::create())
 {
 }
@@ -443,11 +444,7 @@ ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalTraversable::obtain_page_to_host
     if (host && display_page && display_page->is_open() && host == &display_page->client())
         return display_page.release_nonnull();
 
-    auto current_step = m_session_history.current_step();
-    VERIFY(current_step.has_value());
-    auto const* current_entry = m_session_history.get_the_target_history_entry(*this, *current_step);
-    VERIFY(current_entry);
-    auto current_entry_descriptor = current_entry->descriptor();
+    auto current_entry_descriptor = m_session_history.current_entry().descriptor();
 
     Web::PageId page_id;
     if (host && host->page_id_for_traversable(*this).has_value()) {
@@ -575,11 +572,8 @@ void CanonicalTraversable::stand_in_for_lost_document(CanonicalNavigable& naviga
     navigable.did_lose_active_document();
     if (auto state = navigable.replicated_state(); state.has_value())
         reporting_page->async_update_remote_navigable(navigable.id(), *state);
-    auto current_step = m_session_history.current_step();
-    if (!current_step.has_value())
-        return;
     // NB: The canonical session history can still lack the nested history of a newly created navigable.
-    auto const* current_entry = m_session_history.get_the_target_history_entry(navigable, *current_step);
+    auto const* current_entry = m_session_history.get_the_target_history_entry(navigable, m_session_history.current_step());
     if (!current_entry)
         return;
     reporting_page->async_begin_hosting_navigable(navigable.id(), current_entry->descriptor(), system_visibility_state());
@@ -655,7 +649,7 @@ ByteString CanonicalTraversable::queued_same_document_session_history_entries_fo
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#reload
 // NB: This is a reload from the browser's UI. One by script fires the navigate event in the process hosting the active
 //     document, which then asks for the reload history step.
-void CanonicalTraversable::reload(OnHistoryOperationComplete on_complete)
+void CanonicalTraversable::reload()
 {
     auto user_involvement = Web::HTML::UserNavigationInvolvement::BrowserUI;
 
@@ -666,8 +660,7 @@ void CanonicalTraversable::reload(OnHistoryOperationComplete on_complete)
     clear_active_document_load();
 
     // 2. Set navigable's active session history entry's document state's reload pending to true.
-    NonnullRefPtr reloading_entry = *active_session_history_entry();
-    reloading_entry->document_state->reload_pending = true;
+    active_session_history_entry()->document_state->reload_pending = true;
     session_history_changed();
 
     // 3. Let traversable be navigable's traversable navigable.
@@ -677,15 +670,7 @@ void CanonicalTraversable::reload(OnHistoryOperationComplete on_complete)
         .navigable_id = id(),
         .user_involvement = user_involvement,
     };
-    enqueue_history_operation(Application::the().allocate_ui_process_cross_process_id(), parameters, {}, next_sequence_number(), [this, reloading_entry, on_complete = move(on_complete)](Web::HTML::HistoryStepResult result, Optional<i32> committed_step) {
-        // NB: A reload that did not apply leaves no navigation behind to clear the pending flag.
-        if (result != Web::HTML::HistoryStepResult::Applied && reloading_entry->document_state->reload_pending) {
-            reloading_entry->document_state->reload_pending = false;
-            session_history_changed();
-        }
-        if (on_complete)
-            on_complete(result, committed_step);
-    });
+    enqueue_history_operation(Application::the().allocate_ui_process_cross_process_id(), parameters, {});
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#nav-stop
@@ -754,7 +739,9 @@ CanonicalTraversable& CanonicalTraversable::create_a_new_top_level_traversable(W
     history_entry->document_state->origin = document->origin();
 
     // 5. Let traversable be a new traversable navigable.
-    auto traversable = make<CanonicalTraversable>(id);
+    // NB: Its session history entries start out as steps 7-9 leave them.
+    history_entry->step = 0;
+    auto traversable = make<CanonicalTraversable>(id, history_entry);
 
     // 6. Initialize the navigable traversable given documentState.
     traversable->set_current_session_history_entry(history_entry);
@@ -772,10 +759,8 @@ CanonicalTraversable& CanonicalTraversable::create_a_new_top_level_traversable(W
 
     // 7. Let initialHistoryEntry be traversable's active session history entry.
     // 8. Set initialHistoryEntry's step to 0.
-    history_entry->step = 0;
-
     // 9. Append initialHistoryEntry to traversable's session history entries.
-    traversable->m_session_history.initialize_with_initial_history_entry(move(history_entry));
+    // NB: Done as traversable was created.
 
     // 10. If opener is non-null, then legacy-clone a traversable storage shed given opener's top-level traversable and traversable. [STORAGE]
     if (opener.has_value())
@@ -918,12 +903,7 @@ void CanonicalTraversable::reconstruct_the_history_to_step(i32 step)
             return;
         }
         set_current_session_history_entry({});
-        run_browser_history_traversal_at_queue_position(
-            Web::TraverseToStepHistoryOperationParameters {
-                .target_step = step,
-                .user_involvement = Web::HTML::UserNavigationInvolvement::BrowserUI,
-            },
-            false, next_sequence_number(), nullptr, nullptr, move(promise));
+        run_browser_history_traversal_at_queue_position(step, false, next_sequence_number(), nullptr, move(promise));
     });
 }
 
@@ -932,21 +912,18 @@ ErrorOr<URL::URL> CanonicalTraversable::restore_session_history_from_ui_snapshot
     TRY(m_session_history.restore_from_ui_snapshot(move(snapshot.entries), move(snapshot.used_steps), snapshot.current_used_step_index, [] { return Application::the().allocate_ui_process_cross_process_id(); }));
     session_history_changed();
 
-    auto* current_entry = m_session_history.current_entry();
-    VERIFY(current_entry);
-    return current_entry->url;
+    return m_session_history.current_entry().url;
 }
 
 void CanonicalTraversable::reset_session_history_for_testing(
     Web::HTML::SessionHistoryEntryDescriptor active_entry)
 {
     abandon_history_operations();
-    m_session_history.clear();
     auto entry = MUST(CanonicalSessionHistoryEntry::create_from_descriptor(active_entry));
     entry->document_state->document = active_document();
     set_current_session_history_entry(entry);
     set_active_session_history_entry(entry);
-    m_session_history.initialize_with_initial_history_entry(move(entry));
+    m_session_history = TraversableSessionHistory(move(entry));
     session_history_changed();
 }
 
@@ -955,10 +932,9 @@ bool CanonicalTraversable::initialize_session_history_for_testing(Vector<Web::HT
     abandon_history_operations();
     if (!m_session_history.initialize_for_testing(move(entries), move(used_steps), current_used_step_index))
         return false;
-    auto* active_entry = m_session_history.current_entry();
-    VERIFY(active_entry);
+    auto& active_entry = m_session_history.current_entry();
     if (auto const& previous_active_entry = active_session_history_entry())
-        active_entry->document_state->document = previous_active_entry->document_state->document;
+        active_entry.document_state->document = previous_active_entry->document_state->document;
     set_current_session_history_entry(active_entry);
     set_active_session_history_entry(active_entry);
     session_history_changed();
@@ -979,33 +955,34 @@ StringView CanonicalTraversable::browser_history_traversal_stage_to_string(Brows
 struct CanonicalTraversable::HistoryOperation {
     AK_ALLOC_WITH_KMALLOC;
 
-    HistoryOperation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters parameters, RefPtr<WebContentPage> initiating_page, u64 sequence_number, RefPtr<CanonicalSessionHistoryEntry> target_entry, OnHistoryOperationComplete on_complete)
+    // A traversal from the browser's UI, to the step selected at its queue position.
+    struct BrowserTraversal {
+        i32 target_step { 0 };
+        bool check_for_cancelation { false };
+        Function<void()> on_ready;
+    };
+
+    using Parameters = FlattenVariant<Web::HistoryOperationParameters, Variant<BrowserTraversal>>;
+
+    HistoryOperation(Web::HTML::CrossProcessId operation_id, Parameters parameters, RefPtr<WebContentPage> requesting_page, u64 sequence_number, RefPtr<CanonicalSessionHistoryEntry> target_entry)
         : operation_id(operation_id)
         , parameters(move(parameters))
         , target_entry(move(target_entry))
-        , on_complete(move(on_complete))
-        , initiating_page(move(initiating_page))
+        , requesting_page(move(requesting_page))
         , sequence_number(sequence_number)
     {
     }
 
     Web::HTML::CrossProcessId operation_id;
-    Web::HistoryOperationParameters parameters;
+    Parameters parameters;
     // The entry synchronous navigation steps finalize.
     RefPtr<CanonicalSessionHistoryEntry> target_entry;
-    OnHistoryOperationComplete on_complete;
-    // Jobs resolve their endpoints at dispatch. This endpoint owns the process-local operation state.
-    RefPtr<WebContentPage> initiating_page;
+    // Jobs resolve their endpoints at dispatch. The requesting page owns the process-local operation state.
+    RefPtr<WebContentPage> requesting_page;
     Vector<NonnullRefPtr<WebContentPage>> completion_endpoints;
     u64 sequence_number;
     // The jobs of a finished operation do nothing until it is destroyed.
     bool finished { false };
-    // A traversal from the browser's UI: whether it checks for cancelation, and what waits for it to be under way.
-    struct BrowserTraversal {
-        bool check_for_cancelation { false };
-        Function<void()> on_ready;
-    };
-    Optional<BrowserTraversal> browser_traversal;
     Optional<Web::HTML::CrossProcessId> beforeunload_check_id;
 
     struct PendingChangingJob {
@@ -1040,8 +1017,9 @@ struct CanonicalTraversable::HistoryOperation {
     OwnPtr<ApplyHistoryStep> algorithm;
     RefPtr<Core::Promise<Empty>> queue_promise;
 
-    bool is_browser_traversal() const { return browser_traversal.has_value(); }
-    bool was_initiated_by(WebContentPage const& page) const { return initiating_page.ptr() == &page; }
+    bool is_browser_traversal() const { return parameters.has<BrowserTraversal>(); }
+    BrowserTraversal& browser_traversal() { return parameters.get<BrowserTraversal>(); }
+    BrowserTraversal const& browser_traversal() const { return parameters.get<BrowserTraversal>(); }
 };
 
 CanonicalTraversable::~CanonicalTraversable()
@@ -1062,11 +1040,10 @@ CanonicalTraversable::~CanonicalTraversable()
     });
 }
 
-Optional<size_t> CanonicalTraversable::effective_current_session_history_step_index() const
+size_t CanonicalTraversable::effective_current_session_history_step_index() const
 {
     if (m_browser_history_traversal) {
-        auto const& parameters = m_browser_history_traversal->parameters.get<Web::TraverseToStepHistoryOperationParameters>();
-        if (auto target = m_session_history.traversal_target_for_step(parameters.target_step); target.has_value())
+        if (auto target = m_session_history.traversal_target_for_step(m_browser_history_traversal->browser_traversal().target_step); target.has_value())
             return target->target_step_index;
     }
     return m_session_history.current_used_step_index();
@@ -1097,7 +1074,7 @@ void CanonicalTraversable::traverse_the_history_by_delta(int delta, CheckForCanc
     // INTEROP: A press while a traversal from the browser's UI is applying supersedes it, and counts from the step
     //          that traversal was to reach, as in Chromium.
     if (auto* operation = ongoing_browser_history_traversal()) {
-        auto target_step = used_step_at_delta(m_session_history, operation->parameters.get<Web::TraverseToStepHistoryOperationParameters>().target_step, delta);
+        auto target_step = used_step_at_delta(m_session_history, operation->browser_traversal().target_step, delta);
         if (!target_step.has_value()) {
             if (on_ready)
                 on_ready();
@@ -1118,10 +1095,7 @@ void CanonicalTraversable::traverse_the_history_by_delta(int delta, CheckForCanc
             // 4. If allSteps[targetStepIndex] does not exist, then abort these steps.
             // 5. Apply the traverse history step allSteps[targetStepIndex] to traversable, given sourceSnapshotParams,
             //    initiatorToCheck, and userInvolvement.
-            auto current_step = m_session_history.current_step();
-            if (!current_step.has_value())
-                return {};
-            return used_step_at_delta(m_session_history, *current_step, delta);
+            return used_step_at_delta(m_session_history, m_session_history.current_step(), delta);
         },
             check_for_cancelation, move(on_ready), move(promise));
     });
@@ -1175,12 +1149,7 @@ void CanonicalTraversable::run_browser_ui_traversal_at_queue_position(Function<O
         return;
     }
 
-    run_browser_history_traversal_at_queue_position(
-        Web::TraverseToStepHistoryOperationParameters {
-            .target_step = *target_step,
-            .user_involvement = Web::HTML::UserNavigationInvolvement::BrowserUI,
-        },
-        check_for_cancelation == CheckForCancelation::Yes, next_sequence_number(), move(on_ready), nullptr, move(promise));
+    run_browser_history_traversal_at_queue_position(*target_step, check_for_cancelation == CheckForCancelation::Yes, next_sequence_number(), move(on_ready), move(promise));
 }
 
 void CanonicalTraversable::supersede_browser_history_traversal(HistoryOperation& operation, i32 target_step, Function<void()> on_ready)
@@ -1191,25 +1160,20 @@ void CanonicalTraversable::supersede_browser_history_traversal(HistoryOperation&
 
     if (has_uncommitted_navigation())
         stop_loading();
-    finish_history_operation(operation_id, Web::HTML::HistoryStepResult::CanceledByNavigate, {});
-    run_browser_history_traversal_at_queue_position(
-        Web::TraverseToStepHistoryOperationParameters {
-            .target_step = target_step,
-            .user_involvement = Web::HTML::UserNavigationInvolvement::BrowserUI,
-        },
-        true, next_sequence_number(), move(on_ready), nullptr, move(promise));
+    end_history_operation(operation_id);
+    run_browser_history_traversal_at_queue_position(target_step, true, next_sequence_number(), move(on_ready), move(promise));
 }
 
 Optional<CanonicalTraversable::BrowserHistoryTraversalDiagnostic> CanonicalTraversable::browser_history_traversal_for_testing() const
 {
     if (!m_browser_history_traversal)
         return {};
-    auto const& parameters = m_browser_history_traversal->parameters.get<Web::TraverseToStepHistoryOperationParameters>();
-    auto target = m_session_history.traversal_target_for_step(parameters.target_step);
+    auto target_step = m_browser_history_traversal->browser_traversal().target_step;
+    auto target = m_session_history.traversal_target_for_step(target_step);
     if (!target.has_value())
         return {};
     return BrowserHistoryTraversalDiagnostic {
-        .target_step = parameters.target_step,
+        .target_step = target_step,
         .target_step_index = target->target_step_index,
         .changes_top_level_entry = target->changes_top_level_entry,
         .stage = m_browser_history_traversal->beforeunload_check_id.has_value()
@@ -1231,43 +1195,24 @@ RefPtr<CanonicalNavigation> CanonicalTraversable::finalized_navigation(HistoryOp
     return navigation && navigation->is_finalizing() ? navigation : nullptr;
 }
 
-void CanonicalTraversable::recover_from_web_content_process_crash(OnHistoryOperationComplete on_complete)
+void CanonicalTraversable::recover_from_web_content_process_crash()
 {
     if (has_uncommitted_navigation())
         clear_ongoing_navigation();
     clear_active_document_load();
 
     // The step a traversal the crash interrupted was applying is applied again, otherwise the current step is.
-    Optional<i32> target_step;
+    auto target_step = m_session_history.current_step();
     if (auto* traversal = ongoing_browser_history_traversal())
-        target_step = traversal->parameters.get<Web::TraverseToStepHistoryOperationParameters>().target_step;
+        target_step = traversal->browser_traversal().target_step;
     abandon_history_operations();
-    if (!target_step.has_value())
-        target_step = m_session_history.current_step();
-    if (!target_step.has_value()) {
-        if (on_complete)
-            on_complete(Web::HTML::HistoryStepResult::CanceledByMissingPage, {});
-        return;
-    }
 
     // The tab's document is reloaded, the crashed process having destroyed the one its entry holds.
-    NonnullRefPtr reloading_entry = *m_session_history.get_the_target_history_entry(*this, *target_step);
+    auto* reloading_entry = m_session_history.get_the_target_history_entry(*this, target_step);
+    VERIFY(reloading_entry);
     reloading_entry->document_state->reload_pending = true;
     session_history_changed();
-    enqueue_browser_history_traversal(
-        Web::TraverseToStepHistoryOperationParameters {
-            .target_step = *target_step,
-            .user_involvement = Web::HTML::UserNavigationInvolvement::BrowserUI,
-        },
-        false,
-        [this, reloading_entry, on_complete = move(on_complete)](Web::HTML::HistoryStepResult result, Optional<i32> committed_step) {
-            if (result != Web::HTML::HistoryStepResult::Applied && reloading_entry->document_state->reload_pending) {
-                reloading_entry->document_state->reload_pending = false;
-                session_history_changed();
-            }
-            if (on_complete)
-                on_complete(result, committed_step);
-        });
+    enqueue_browser_history_traversal(target_step, false);
 }
 
 RefPtr<WebContentPage> CanonicalTraversable::page_hosting(CanonicalNavigable const& navigable) const
@@ -1368,8 +1313,8 @@ bool CanonicalTraversable::select_changing_navigable_history_step_job_endpoint(H
     if (!endpoint || !endpoint->is_open())
         return false;
 
-    if (navigable->is_top_level_traversable() && operation.browser_traversal.has_value()) {
-        if (auto callback = move(operation.browser_traversal->on_ready))
+    if (navigable->is_top_level_traversable() && operation.is_browser_traversal()) {
+        if (auto callback = move(operation.browser_traversal().on_ready))
             callback();
     }
 
@@ -2043,14 +1988,14 @@ ApplyHistoryStepJobs CanonicalTraversable::create_apply_history_step_jobs(Histor
     };
 }
 
-void CanonicalTraversable::run_history_operation_at_queue_position(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters request, RefPtr<WebContentPage> requesting_page, u64 sequence_number, RefPtr<CanonicalSessionHistoryEntry> target_entry, OnHistoryOperationComplete on_complete, NonnullRefPtr<Core::Promise<Empty>> promise)
+void CanonicalTraversable::run_history_operation_at_queue_position(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters request, RefPtr<WebContentPage> requesting_page, u64 sequence_number, RefPtr<CanonicalSessionHistoryEntry> target_entry, NonnullRefPtr<Core::Promise<Empty>> promise)
 {
     // The traversal queue can outlive an embedded page which appended work to it. Such a page cannot receive
     // completion, so discard its queued operation instead of waiting forever.
     if (requesting_page && !requesting_page->is_open()) {
         if (auto const* parameters = request.get_pointer<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>()) {
             if (auto navigable = find(parameters->navigable_id); navigable.has_value())
-                navigable->did_finish_finalizing_navigation(parameters->navigation_id, Web::HTML::HistoryStepResult::CanceledByMissingPage);
+                navigable->did_finish_finalizing_navigation(parameters->navigation_id);
         }
         promise->resolve({});
         return;
@@ -2063,18 +2008,17 @@ void CanonicalTraversable::run_history_operation_at_queue_position(Web::HTML::Cr
         promise->resolve({});
         return;
     }
-    m_history_operations.set(operation_id, make<HistoryOperation>(operation_id, move(request), move(requesting_page), sequence_number, move(target_entry), move(on_complete)));
+    m_history_operations.set(operation_id, make<HistoryOperation>(operation_id, move(request), move(requesting_page), sequence_number, move(target_entry)));
     auto* operation = find_history_operation(operation_id);
     VERIFY(operation);
     operation->queue_promise = promise;
-    start_history_operation(*operation, promise);
+    run_history_operation(*operation);
 }
 
-void CanonicalTraversable::run_browser_history_traversal_at_queue_position(Web::TraverseToStepHistoryOperationParameters parameters, bool check_for_cancelation, u64 sequence_number, Function<void()> on_ready, OnHistoryOperationComplete on_complete, NonnullRefPtr<Core::Promise<Empty>> promise)
+void CanonicalTraversable::run_browser_history_traversal_at_queue_position(i32 target_step, bool check_for_cancelation, u64 sequence_number, Function<void()> on_ready, NonnullRefPtr<Core::Promise<Empty>> promise)
 {
     auto operation_id = Application::the().allocate_ui_process_cross_process_id();
-    auto owned_operation = make<HistoryOperation>(operation_id, Web::HistoryOperationParameters { move(parameters) }, RefPtr<WebContentPage> {}, sequence_number, RefPtr<CanonicalSessionHistoryEntry> {}, move(on_complete));
-    owned_operation->browser_traversal = HistoryOperation::BrowserTraversal { check_for_cancelation, move(on_ready) };
+    auto owned_operation = make<HistoryOperation>(operation_id, HistoryOperation::BrowserTraversal { target_step, check_for_cancelation, move(on_ready) }, RefPtr<WebContentPage> {}, sequence_number, RefPtr<CanonicalSessionHistoryEntry> {});
     m_history_operations.set(operation_id, move(owned_operation));
     auto* operation = find_history_operation(operation_id);
     VERIFY(operation);
@@ -2084,7 +2028,7 @@ void CanonicalTraversable::run_browser_history_traversal_at_queue_position(Web::
     auto view = this->view();
     VERIFY(view.has_value());
     view->will_apply_history_traversal_step(operation_id);
-    start_history_operation(*operation, promise);
+    run_history_operation(*operation);
 }
 
 void CanonicalTraversable::append_history_queue_steps(SessionHistoryTraversalSteps steps)
@@ -2193,8 +2137,10 @@ void CanonicalTraversable::did_attempt_to_populate_the_history_entry_document(We
     navigable->populate_document_for_javascript_url(*navigation, move(history_entry), navigable->create_and_initialize_a_document(response_document));
 }
 
-void CanonicalTraversable::enqueue_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters request, RefPtr<WebContentPage> requesting_page, u64 sequence_number, OnHistoryOperationComplete on_complete)
+void CanonicalTraversable::enqueue_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters request, RefPtr<WebContentPage> requesting_page)
 {
+    auto sequence_number = next_sequence_number();
+
     // https://html.spec.whatwg.org/multipage/document-sequences.html#destroy-a-child-navigable
     // Steps 6-7 remove the nested history before step 9 appends traversal steps. Apply the canonical counterpart while
     // admitting the destruction request, rather than deferring it to the operation's eventual queue position.
@@ -2209,14 +2155,13 @@ void CanonicalTraversable::enqueue_history_operation(Web::HTML::CrossProcessId o
     //         navigation's start arrives after this request, and is canceled before it fetches anything.
     if (auto const* parameters = request.get_pointer<Web::NavigableCreationHistoryOperationParameters>()) {
         auto navigable = find(parameters->navigable_id);
-        auto current_step = m_session_history.current_step();
-        if (navigable.has_value() && current_step.has_value() && !navigable->ongoing_navigation_id().has_value()
-            && m_session_history.get_the_target_history_entry(*navigable, *current_step)) {
+        if (navigable.has_value() && !navigable->ongoing_navigation_id().has_value()
+            && m_session_history.get_the_target_history_entry(*navigable, m_session_history.current_step())) {
             navigable->set_ongoing_navigation_to_traversal(operation_id);
         }
     }
 
-    if (auto const* parameters = request.get_pointer<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>(); parameters && requesting_page)
+    if (auto const* parameters = request.get_pointer<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>())
         did_attempt_to_populate_the_history_entry_document(*requesting_page, *parameters);
 
     Optional<Web::HTML::CrossProcessId> synchronous_navigation_target;
@@ -2240,11 +2185,11 @@ void CanonicalTraversable::enqueue_history_operation(Web::HTML::CrossProcessId o
 
     // A page that aborts an intercepted traverse before its resumption runs revokes the resumption.
     Optional<SessionHistoryTraversalQueue::RevocableOperation> revocable_operation;
-    if (request.has<Web::ResumeTraverseHistoryOperationParameters>() && requesting_page)
+    if (request.has<Web::ResumeTraverseHistoryOperationParameters>())
         revocable_operation = SessionHistoryTraversalQueue::RevocableOperation { requesting_page->id(), operation_id };
 
-    auto steps = [this, operation_id, request = move(request), requesting_page = move(requesting_page), sequence_number, target_entry, on_complete = move(on_complete)](NonnullRefPtr<Core::Promise<Empty>> promise) mutable {
-        run_history_operation_at_queue_position(operation_id, move(request), move(requesting_page), sequence_number, move(target_entry), move(on_complete), move(promise));
+    auto steps = [this, operation_id, request = move(request), requesting_page = move(requesting_page), sequence_number, target_entry](NonnullRefPtr<Core::Promise<Empty>> promise) mutable {
+        run_history_operation_at_queue_position(operation_id, move(request), move(requesting_page), sequence_number, move(target_entry), move(promise));
     };
 
     if (synchronous_navigation_target.has_value())
@@ -2258,14 +2203,14 @@ void CanonicalTraversable::revoke_history_operation(WebContentPage& source_page,
     // Steps that have started run to completion.
     if (!m_history_traversal_queue.remove_steps_of_revoked_operation({ source_page.id(), operation_id }))
         return;
-    source_page.async_complete_history_operation(operation_id, Web::HTML::HistoryStepResult::Applied, {}, m_session_history.size());
+    source_page.async_complete_history_operation(operation_id, {}, m_session_history.size());
 }
 
-void CanonicalTraversable::enqueue_browser_history_traversal(Web::TraverseToStepHistoryOperationParameters parameters, bool check_for_cancelation, OnHistoryOperationComplete on_complete)
+void CanonicalTraversable::enqueue_browser_history_traversal(i32 target_step, bool check_for_cancelation)
 {
     auto sequence_number = next_sequence_number();
-    auto steps = [this, parameters = move(parameters), check_for_cancelation, sequence_number, on_complete = move(on_complete)](NonnullRefPtr<Core::Promise<Empty>> promise) mutable {
-        run_browser_history_traversal_at_queue_position(move(parameters), check_for_cancelation, sequence_number, nullptr, move(on_complete), move(promise));
+    auto steps = [this, target_step, check_for_cancelation, sequence_number](NonnullRefPtr<Core::Promise<Empty>> promise) mutable {
+        run_browser_history_traversal_at_queue_position(target_step, check_for_cancelation, sequence_number, nullptr, move(promise));
     };
     m_history_traversal_queue.append_session_history_traversal_steps(move(steps));
 }
@@ -2281,7 +2226,7 @@ void CanonicalTraversable::apply_history_step(HistoryOperation& operation, i32 s
         [this, &operation](Web::HTML::HistoryStepResult result) {
             if (operation.finished)
                 return;
-            finish_history_operation(operation.operation_id, result, operation.algorithm->committed_step());
+            finish_history_operation(operation.operation_id, result);
         });
     operation.algorithm->apply_the_history_step();
 }
@@ -2302,13 +2247,9 @@ void CanonicalTraversable::apply_the_reload_history_step(HistoryOperation& opera
 {
     // 1. Let step be traversable's current session history step.
     auto step = m_session_history.current_step();
-    if (!step.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
-        return;
-    }
 
     // 2. Return the result of applying the history step step to traversable given true, null, null, userInvolvement, and "reload".
-    apply_history_step(operation, *step, true, {}, user_involvement, Web::Bindings::NavigationType::Reload);
+    apply_history_step(operation, step, true, {}, user_involvement, Web::Bindings::NavigationType::Reload);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-traverse-history-step
@@ -2330,13 +2271,9 @@ void CanonicalTraversable::update_for_navigable_creation_or_destruction(HistoryO
 {
     // 1. Let step be traversable's current session history step.
     auto step = m_session_history.current_step();
-    if (!step.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
-        return;
-    }
 
     // 2. Return the result of applying the history step step to traversable given false, null, null, "none", and null.
-    apply_history_step(operation, *step, false, {}, Web::HTML::UserNavigationInvolvement::None, {});
+    apply_history_step(operation, step, false, {}, Web::HTML::UserNavigationInvolvement::None, {});
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#traverse-the-history-by-a-delta
@@ -2349,12 +2286,7 @@ void CanonicalTraversable::traverse_the_history_by_a_delta_at_queue_position(His
     auto all_steps = m_session_history.used_steps();
 
     // 2. Let currentStepIndex be the index of traversable's current session history step within allSteps.
-    auto current_step = m_session_history.current_step();
-    if (!current_step.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::Applied, {});
-        return;
-    }
-    auto current_step_index = all_steps.find_first_index(*current_step);
+    auto current_step_index = all_steps.find_first_index(m_session_history.current_step());
     VERIFY(current_step_index.has_value());
 
     // 3. Let targetStepIndex be currentStepIndex plus delta.
@@ -2362,7 +2294,7 @@ void CanonicalTraversable::traverse_the_history_by_a_delta_at_queue_position(His
 
     // 4. If allSteps[targetStepIndex] does not exist, then abort these steps.
     if (target_step_index < 0 || static_cast<size_t>(target_step_index) >= all_steps.size()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::Applied, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
@@ -2374,41 +2306,46 @@ void CanonicalTraversable::traverse_the_history_by_a_delta_at_queue_position(His
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#performing-a-navigation-api-traversal
 void CanonicalTraversable::perform_a_navigation_api_traversal_at_queue_position(HistoryOperation& operation, Web::NavigationAPITraverseHistoryOperationParameters const& request)
 {
-    auto navigable = find(request.navigable_id);
-    if (!navigable.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
-        return;
-    }
+    // The substeps of steps 12.2 and 12.3:
+    // 1. Queue a global task on the navigation and traversal task source given navigation's relevant global object to
+    //    reject the finished promise for apiMethodTracker with an "InvalidStateError" DOMException.
+    // 2. Abort these steps.
+    auto reject_and_abort = [&] {
+        operation.requesting_page->async_reject_navigation_api_traversal(operation.operation_id);
+        end_history_operation(operation.operation_id);
+    };
 
     // 12.1. Let navigableSHEs be the result of getting session history entries given navigable.
-    auto navigable_session_history_entries = m_session_history.get_session_history_entries(*navigable);
-    if (!navigable_session_history_entries.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+    // 12.2. Let targetSHE be the session history entry in navigableSHEs whose navigation API key is key. If no such
+    //       entry exists, then:
+    // NB: The requesting process can still have a navigable this session history no longer has.
+    auto navigable = find(request.navigable_id);
+    RefPtr<CanonicalSessionHistoryEntry> target_entry;
+    if (navigable.has_value()) {
+        if (auto navigable_session_history_entries = m_session_history.get_session_history_entries(*navigable); navigable_session_history_entries.has_value()) {
+            auto entry = navigable_session_history_entries->find_if([&](auto const& entry) {
+                return entry->navigation_api_key == request.key;
+            });
+            if (entry != navigable_session_history_entries->end())
+                target_entry = *entry;
+        }
+    }
+    if (!target_entry) {
+        reject_and_abort();
         return;
     }
 
-    // 12.2. Let targetSHE be the session history entry in navigableSHEs whose navigation API key is key. If no
-    //       such entry exists, queue rejection of the finished promise and abort these steps.
-    auto target_entry = navigable_session_history_entries->find_if([&](auto const& entry) {
-        return entry->navigation_api_key == request.key;
-    });
-    if (target_entry == navigable_session_history_entries->end()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
-        return;
-    }
-
-    // 12.3. If targetSHE is navigable's active session history entry, queue rejection of the finished promise and
-    //       abort these steps.
-    if (auto const& active_entry = navigable->active_session_history_entry(); active_entry && active_entry->identity() == (*target_entry)->identity()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+    // 12.3. If targetSHE is navigable's active session history entry, then:
+    if (auto const& active_entry = navigable->active_session_history_entry(); active_entry && active_entry->identity() == target_entry->identity()) {
+        reject_and_abort();
         return;
     }
 
     // 12.4. Let result be the result of applying the traverse history step targetSHE's step to traversable, given
     //       sourceSnapshotParams, navigable, and "none".
-    apply_the_traverse_history_step(operation, (*target_entry)->step, request.source_snapshot_params, request.navigable_id, Web::HTML::UserNavigationInvolvement::None);
+    apply_the_traverse_history_step(operation, target_entry->step, request.source_snapshot_params, request.navigable_id, Web::HTML::UserNavigationInvolvement::None);
 
-    // Steps 12.5-12.6 are handled in Navigation's relevant realm when the operation completes.
+    // Steps 12.5-12.6 are handled in Navigation's relevant realm when the requesting process learns the result.
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-same-document-navigation
@@ -2417,7 +2354,7 @@ void CanonicalTraversable::finalize_a_same_document_navigation(HistoryOperation&
     VERIFY(request.entry_to_replace.has_value() == (request.history_handling == Web::HTML::HistoryHandlingBehavior::Replace));
     auto target_navigable = find(request.navigable_id);
     if (!target_navigable.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
@@ -2440,7 +2377,7 @@ void CanonicalTraversable::finalize_a_same_document_navigation(HistoryOperation&
     //         document that is no longer active, so applying it would traverse across documents and populate the
     //         unloaded document again, replacing the one that just committed.
     if (!target_entry || target_entry->document_state != target_navigable->active_session_history_entry()->document_state) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
@@ -2450,22 +2387,18 @@ void CanonicalTraversable::finalize_a_same_document_navigation(HistoryOperation&
     // 4. Let targetEntries be the result of getting session history entries for targetNavigable.
     auto target_entries = m_session_history.get_session_history_entries(*target_navigable);
     if (!target_entries.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
     // AD-HOC: The active entry of a navigable whose history is being reconstructed, which is that of its initial
     //         about:blank, is not among its session history entries.
     if (!any_of(*target_entries, [&](auto const& entry) { return entry->document_state == target_entry->document_state; })) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
     auto current_step = m_session_history.current_step();
-    if (!current_step.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
-        return;
-    }
 
     // 5. If entryToReplace is null:
     if (!request.entry_to_replace.has_value()) {
@@ -2475,7 +2408,7 @@ void CanonicalTraversable::finalize_a_same_document_navigation(HistoryOperation&
         // 5.4. Append targetEntry to targetEntries.
         target_step = m_session_history.push_session_history_entry(*target_navigable, *target_entry);
         if (!target_step.has_value()) {
-            finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+            end_history_operation(operation.operation_id);
             return;
         }
     }
@@ -2485,19 +2418,17 @@ void CanonicalTraversable::finalize_a_same_document_navigation(HistoryOperation&
             return entry->identity() == *request.entry_to_replace;
         });
         if (entry_to_replace == target_entries->end()) {
-            finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+            end_history_operation(operation.operation_id);
             return;
         }
 
         // 5.1. Replace entryToReplace with targetEntry in targetEntries.
         // 5.2. Set targetEntry's step to entryToReplace's step.
-        if (!m_session_history.replace_session_history_entry(*target_navigable, **entry_to_replace, *target_entry)) {
-            finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
-            return;
-        }
+        auto replaced = m_session_history.replace_session_history_entry(*target_navigable, **entry_to_replace, *target_entry);
+        VERIFY(replaced);
 
         // 5.3. Set targetStep to traversable's current session history step.
-        target_step = *current_step;
+        target_step = current_step;
     }
 
     target_navigable->set_active_session_history_entry(target_entry);
@@ -2508,26 +2439,22 @@ void CanonicalTraversable::finalize_a_same_document_navigation(HistoryOperation&
 
 void CanonicalTraversable::run_history_operation(HistoryOperation& operation)
 {
+    if (operation.requesting_page)
+        add_history_operation_completion_endpoint(operation, *operation.requesting_page);
+
     operation.parameters.visit(
         [&](Web::ReloadHistoryOperationParameters const& parameters) {
-            auto current_step = m_session_history.current_step();
-            auto navigable = find(parameters.navigable_id);
-            auto* target_entry = current_step.has_value() && navigable.has_value()
-                ? m_session_history.get_the_target_history_entry(*navigable, *current_step)
-                : nullptr;
-            if (!target_entry) {
-                finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
-                return;
-            }
-            target_entry->document_state->reload_pending = true;
-            session_history_changed();
             apply_the_reload_history_step(operation, parameters.user_involvement);
         },
         [&](Web::TraverseByDeltaHistoryOperationParameters const& request) {
             traverse_the_history_by_a_delta_at_queue_position(operation, request);
         },
-        [&](Web::TraverseToStepHistoryOperationParameters const& parameters) {
-            apply_the_traverse_history_step(operation, parameters.target_step, {}, {}, parameters.user_involvement);
+        [&](HistoryOperation::BrowserTraversal const& traversal) {
+            if (!page_hosting(*this)) {
+                end_history_operation(operation.operation_id);
+                return;
+            }
+            apply_history_step(operation, traversal.target_step, traversal.check_for_cancelation, {}, Web::HTML::UserNavigationInvolvement::BrowserUI, Web::Bindings::NavigationType::Traverse);
         },
         [&](Web::NavigationAPITraverseHistoryOperationParameters const& request) {
             perform_a_navigation_api_traversal_at_queue_position(operation, request);
@@ -2538,15 +2465,14 @@ void CanonicalTraversable::run_history_operation(HistoryOperation& operation)
         [&](Web::NavigableCreationHistoryOperationParameters const& parameters) {
             auto parent_navigable = find(parameters.parent_navigable_id);
             auto child_navigable = find(parameters.navigable_id);
-            auto current_step = m_session_history.current_step();
-            if (!parent_navigable.has_value() || !child_navigable.has_value() || !current_step.has_value() || !operation.initiating_page) {
-                finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+            if (!parent_navigable.has_value() || !child_navigable.has_value()) {
+                end_history_operation(operation.operation_id);
                 return;
             }
 
             // A navigable created by a document repopulated for its entry already has the nested history that entry
             // kept. Updating for its creation populates the entry the history holds for it at the current step.
-            if (m_session_history.get_the_target_history_entry(*child_navigable, *current_step)) {
+            if (m_session_history.get_the_target_history_entry(*child_navigable, m_session_history.current_step())) {
                 update_for_navigable_creation_or_destruction(operation);
                 return;
             }
@@ -2561,7 +2487,7 @@ void CanonicalTraversable::run_history_operation(HistoryOperation& operation)
             // 5. Let nestedHistory be a new nested history whose id is navigable's id and entries list is « historyEntry ».
             // 6. Append nestedHistory to parentDocState's nested histories.
             if (!append_nested_history(*parent_navigable, parent_document_state, parameters.navigable_id).has_value()) {
-                finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+                end_history_operation(operation.operation_id);
                 return;
             }
 
@@ -2585,12 +2511,12 @@ void CanonicalTraversable::run_history_operation(HistoryOperation& operation)
                     return;
                 if (auto host = page_hosting(*this))
                     host->async_run_traversable_close_unload_task(operation_id);
-                finish_history_operation(operation_id, Web::HTML::HistoryStepResult::Applied, {});
+                end_history_operation(operation_id);
             });
         },
         [&](Web::FlushSessionHistoryTraversalQueueOperationParameters const&) {
             // Flush is a queue barrier; completing at the queue position is the whole operation.
-            finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::Applied, {});
+            end_history_operation(operation.operation_id);
         },
         [&](Web::ResumeTraverseHistoryOperationParameters const& parameters) {
             resume_applying_the_traverse_history_step(operation, parameters.target_step, parameters.user_involvement);
@@ -2598,34 +2524,12 @@ void CanonicalTraversable::run_history_operation(HistoryOperation& operation)
         [&](Web::FinalizeCrossDocumentNavigationHistoryOperationParameters const&) {
             // A navigation that ended before its completion steps appended this has nothing to finalize.
             auto navigation = finalized_navigation(operation);
-            if (!navigation || navigation->host() != operation.initiating_page.ptr()) {
-                finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::Applied, {});
+            if (!navigation || navigation->host() != operation.requesting_page.ptr()) {
+                end_history_operation(operation.operation_id);
                 return;
             }
             finalize_a_cross_document_navigation(operation);
         });
-}
-
-void CanonicalTraversable::start_history_operation(HistoryOperation& operation, NonnullRefPtr<Core::Promise<Empty>>)
-{
-    if (!operation.initiating_page)
-        operation.initiating_page = page_hosting(*this);
-
-    if (operation.is_browser_traversal()) {
-        if (!operation.initiating_page) {
-            finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::CanceledByMissingPage, {});
-            return;
-        }
-        VERIFY(operation.parameters.has<Web::TraverseToStepHistoryOperationParameters>());
-        auto const& parameters = operation.parameters.get<Web::TraverseToStepHistoryOperationParameters>();
-        apply_history_step(operation, parameters.target_step, operation.browser_traversal->check_for_cancelation, {}, parameters.user_involvement, Web::Bindings::NavigationType::Traverse);
-        return;
-    }
-
-    if (operation.initiating_page)
-        add_history_operation_completion_endpoint(operation, *operation.initiating_page);
-
-    run_history_operation(operation);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
@@ -2634,14 +2538,14 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
     auto const& parameters = operation.parameters.get<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>();
     auto navigable = find(parameters.navigable_id);
     if (!navigable.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
     // NB: historyEntry is the navigation's. A javascript: URL navigation whose document was refused has none.
     auto navigation = finalized_navigation(operation);
     if (!navigation || !navigation->history_entry) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+        end_history_operation(operation.operation_id);
         return;
     }
     NonnullRefPtr history_entry = *navigation->history_entry;
@@ -2662,7 +2566,7 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
         document = populated_document->document;
     if (!document) {
         navigable->did_cancel_navigation(parameters.navigation_id);
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::Applied, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
@@ -2683,18 +2587,12 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
         history_entry->document_state->navigable_target_name = {};
     }
 
-    auto current_step = m_session_history.current_step();
-    if (!current_step.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
-        return;
-    }
-
     // 5. Let entryToReplace be navigable's active session history entry if historyHandling is "replace", otherwise null.
     RefPtr<CanonicalSessionHistoryEntry> entry_to_replace;
     if (parameters.history_handling == Web::HTML::HistoryHandlingBehavior::Replace)
         entry_to_replace = navigable->active_session_history_entry();
     if (parameters.history_handling == Web::HTML::HistoryHandlingBehavior::Replace && !entry_to_replace) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
@@ -2707,7 +2605,7 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
     // 8. Let targetEntries be the result of getting session history entries for navigable.
     auto target_entries = m_session_history.get_session_history_entries(*navigable);
     if (!target_entries.has_value()) {
-        finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+        end_history_operation(operation.operation_id);
         return;
     }
 
@@ -2719,7 +2617,7 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
         // 4. Append historyEntry to targetEntries.
         target_step = m_session_history.push_session_history_entry(*navigable, move(history_entry));
         if (!target_step.has_value()) {
-            finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+            end_history_operation(operation.operation_id);
             return;
         }
     }
@@ -2728,7 +2626,7 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
         // 1. Replace entryToReplace with historyEntry in targetEntries.
         // 2. Set historyEntry's step to entryToReplace's step.
         if (!m_session_history.replace_session_history_entry(*navigable, *entry_to_replace, history_entry)) {
-            finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
+            end_history_operation(operation.operation_id);
             return;
         }
 
@@ -2741,65 +2639,88 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
         }
 
         // 4. Set targetStep to traversable's current session history step.
-        target_step = *current_step;
+        target_step = m_session_history.current_step();
     }
 
     // 10. Apply the push/replace history step targetStep to traversable given historyHandling and userInvolvement.
     apply_the_push_or_replace_history_step(operation, *target_step, parameters.history_handling, parameters.user_involvement);
 }
 
-void CanonicalTraversable::finish_history_operation(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Optional<i32> committed_step)
+void CanonicalTraversable::did_not_apply_reload(Web::HTML::CrossProcessId navigable_id)
+{
+    // AD-HOC: The spec leaves reload pending set when the reload does not apply, so a later history step would reload
+    //         the document anyway.
+    if (auto navigable = find(navigable_id); navigable.has_value()) {
+        if (auto const& entry = navigable->active_session_history_entry())
+            entry->document_state->reload_pending = false;
+    }
+
+    if (navigable_id != id())
+        return;
+    if (auto view = this->view(); view.has_value())
+        view->did_not_apply_reload();
+}
+
+// The operation's apply the history step returned result.
+void CanonicalTraversable::finish_history_operation(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result)
+{
+    auto operation = take_history_operation(operation_id);
+    if (!operation)
+        return;
+
+    // The requesting page learns the result before the operation completes.
+    if (operation->requesting_page)
+        operation->requesting_page->async_history_step_applied(operation_id, result);
+    if (auto const* reload = operation->parameters.get_pointer<Web::ReloadHistoryOperationParameters>(); reload && result != Web::HTML::HistoryStepResult::Applied)
+        did_not_apply_reload(reload->navigable_id);
+    report_history_operation_completion(*operation);
+    settle_history_operation(operation.release_nonnull());
+}
+
+// The operation's steps ended without applying a history step.
+void CanonicalTraversable::end_history_operation(Web::HTML::CrossProcessId operation_id)
+{
+    auto operation = take_history_operation(operation_id);
+    if (!operation)
+        return;
+
+    report_history_operation_completion(*operation);
+    settle_history_operation(operation.release_nonnull());
+}
+
+OwnPtr<CanonicalTraversable::HistoryOperation> CanonicalTraversable::take_history_operation(Web::HTML::CrossProcessId operation_id)
 {
     auto operation = m_history_operations.take(operation_id);
     if (!operation.has_value())
-        return;
+        return nullptr;
 
-    // The operation lets go of what it holds and reports its result before the traversal queue moves on, and what
-    // waited for its traversal to be over runs after.
-    release_history_operation(**operation, result);
-    report_history_operation_result(**operation, result, committed_step);
-
-    // NB: Resolving the queue promise can synchronously start the next queued operation.
-    if ((*operation)->queue_promise)
-        (*operation)->queue_promise->resolve({});
-
-    if (auto view = this->view(); view.has_value())
-        view->run_webdriver_commands_waiting_for_a_document({});
-
-    // The completion callback that brought us here can be running inside the algorithm object; destroy the
-    // operation only once the stack has unwound.
-    Core::deferred_invoke([operation = operation.release_value()] { });
-}
-
-void CanonicalTraversable::release_history_operation(HistoryOperation& operation, Web::HTML::HistoryStepResult result)
-{
-    operation.finished = true;
-    if (m_browser_history_traversal == &operation)
+    (*operation)->finished = true;
+    if (m_browser_history_traversal == operation->ptr())
         m_browser_history_traversal = nullptr;
-    if (operation.beforeunload_check_id.has_value())
-        m_pending_beforeunload_checks.remove(*operation.beforeunload_check_id);
+    if ((*operation)->beforeunload_check_id.has_value())
+        m_pending_beforeunload_checks.remove(*(*operation)->beforeunload_check_id);
 
     // A changing job still pending when its operation finishes never activates the document it populated. The job
     // stays with the operation: its completion can be what finished it.
-    for (auto const& [navigable_id, pending_job] : operation.pending_changing_jobs)
+    for (auto const& [navigable_id, pending_job] : (*operation)->pending_changing_jobs)
         pending_job->abandon(find(navigable_id));
-    if (auto const* parameters = operation.parameters.get_pointer<Web::NavigableCreationHistoryOperationParameters>()) {
+    if (auto const* parameters = (*operation)->parameters.get_pointer<Web::NavigableCreationHistoryOperationParameters>()) {
         if (auto navigable = find(parameters->navigable_id); navigable.has_value())
-            navigable->clear_ongoing_navigation_traversal(operation.operation_id);
+            navigable->clear_ongoing_navigation_traversal(operation_id);
     }
-    if (auto const* parameters = operation.parameters.get_pointer<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>()) {
+    if (auto const* parameters = (*operation)->parameters.get_pointer<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>()) {
         if (auto navigable = find(parameters->navigable_id); navigable.has_value())
-            navigable->did_finish_finalizing_navigation(parameters->navigation_id, result);
+            navigable->did_finish_finalizing_navigation(parameters->navigation_id);
     }
+    return operation.release_value();
 }
 
-void CanonicalTraversable::report_history_operation_result(HistoryOperation& operation, Web::HTML::HistoryStepResult result, Optional<i32> committed_step)
+void CanonicalTraversable::report_history_operation_completion(HistoryOperation& operation)
 {
+    auto committed_step = operation.algorithm ? operation.algorithm->committed_step() : Optional<i32> {};
     if (committed_step.has_value()) {
-        if (auto view = this->view(); view.has_value()) {
-            if (auto* current_entry = m_session_history.current_entry())
-                view->set_url(current_entry->url);
-        }
+        if (auto view = this->view(); view.has_value())
+            view->did_commit_history_step();
     }
 
     // The step of the entry the requesting page's operation targets: the committed step, but for a created child's
@@ -2811,28 +2732,39 @@ void CanonicalTraversable::report_history_operation_result(HistoryOperation& ope
     }
 
     for (auto& endpoint : operation.completion_endpoints)
-        endpoint->async_complete_history_operation(operation.operation_id, result, target_entry_step, m_session_history.size());
+        endpoint->async_complete_history_operation(operation.operation_id, target_entry_step, m_session_history.size());
 
     // All apply-driven mutations have settled at operation completion.
     session_history_changed();
+}
 
-    if (operation.on_complete)
-        operation.on_complete(result, committed_step);
-
-    if (operation.is_browser_traversal()) {
-        if (auto callback = move(operation.browser_traversal->on_ready))
+// The operation has let go of what it holds and reported its completion. What waited for its traversal to be over runs
+// now.
+void CanonicalTraversable::settle_history_operation(NonnullOwnPtr<HistoryOperation> operation)
+{
+    if (operation->is_browser_traversal()) {
+        if (auto callback = move(operation->browser_traversal().on_ready))
             callback();
         if (auto view = this->view(); view.has_value())
-            view->did_finish_history_traversal(operation.operation_id, result);
+            view->did_finish_history_traversal(operation->operation_id);
     }
+
+    // NB: Resolving the queue promise can synchronously start the next queued operation.
+    if (operation->queue_promise)
+        operation->queue_promise->resolve({});
+
+    if (auto view = this->view(); view.has_value())
+        view->run_webdriver_commands_waiting_for_a_document({});
+
+    // The completion callback that brought us here can be running inside the algorithm object; destroy the
+    // operation only once the stack has unwound.
+    Core::deferred_invoke([operation = move(operation)] { });
 }
 
 void CanonicalTraversable::abandon_history_operations()
 {
-    while (!m_history_operations.is_empty()) {
-        auto operation_id = m_history_operations.begin()->key;
-        finish_history_operation(operation_id, Web::HTML::HistoryStepResult::CanceledByMissingPage, {});
-    }
+    while (!m_history_operations.is_empty())
+        end_history_operation(m_history_operations.begin()->key);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled

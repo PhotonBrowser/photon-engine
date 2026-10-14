@@ -56,13 +56,7 @@ void ApplyHistoryStep::apply_the_history_step()
     // FIXME: 1. Assert: This is running within traversable's session history traversal queue.
 
     // 2. Let targetStep be the result of getting the used step given traversable and step.
-    auto target_step = m_session_history.get_the_used_step(m_step);
-    if (!target_step.has_value()) {
-        // AD-HOC: An empty canonical session history has no used steps to resolve against.
-        return_result(Web::HTML::HistoryStepResult::CanceledByMissingPage);
-        return;
-    }
-    m_target_step = *target_step;
+    m_target_step = m_session_history.get_the_used_step(m_step).value();
 
     // 3. If initiatorToCheck is not null, then:
     if (m_initiator_to_check.has_value()) {
@@ -114,10 +108,7 @@ void ApplyHistoryStep::apply_the_history_step()
     }
 
     auto* target_entry = m_session_history.get_the_target_history_entry(m_traversable_navigable, m_target_step);
-    if (!target_entry) {
-        return_result(Web::HTML::HistoryStepResult::CanceledByMissingPage);
-        return;
-    }
+    VERIFY(target_entry);
 
     m_jobs.check_if_unloading_is_canceled(move(navigables_crossing_documents), *target_entry, m_user_involvement,
         [this](Web::HTML::CheckIfUnloadingIsCanceledResult result) {
@@ -336,7 +327,7 @@ void ApplyHistoryStep::process_changing_navigable_continuations()
 
         // NB: targetStep was computed before the asynchronous parts of this algorithm. Re-normalize it in case a
         //     child navigable's removal made it unused meanwhile.
-        m_target_step = m_session_history.get_the_used_step(m_step).value_or(m_target_step);
+        m_target_step = m_session_history.get_the_used_step(m_step).value();
 
         auto* navigable = find_navigable(navigable_id);
 
@@ -374,8 +365,11 @@ void ApplyHistoryStep::process_changing_navigable_continuations()
             } else if (m_navigation_type == Web::Bindings::NavigationType::Push) {
                 target_entry = append_the_claimed_target_entry_again(*navigable, *claimed_target_entry);
                 if (!target_entry) {
-                    return_result(Web::HTML::HistoryStepResult::NoMatchingEntry);
-                    return;
+                    // NB: The push left the navigable no entries to append to. As for a navigable that is gone, its
+                    //     continuation cannot be applied.
+                    clear_ongoing_navigation_traversal(navigable_id);
+                    m_completed_change_jobs++;
+                    continue;
                 }
                 updated_target_entry = target_entry;
             }
@@ -451,7 +445,7 @@ CanonicalSessionHistoryEntry* ApplyHistoryStep::append_the_claimed_target_entry_
 void ApplyHistoryStep::update_nonchanging_navigables()
 {
     // NB: targetStep is re-normalized once more; the continuation loop can have removed child navigables.
-    m_target_step = m_session_history.get_the_used_step(m_step).value_or(m_target_step);
+    m_target_step = m_session_history.get_the_used_step(m_step).value();
 
     // 17. Let (scriptHistoryLength, scriptHistoryIndex) be the result of getting the history object length and index
     //     given traversable and targetStep.
@@ -488,14 +482,11 @@ void ApplyHistoryStep::set_current_session_history_step()
     //         See https://github.com/whatwg/html/issues/12576.
     if (m_generation > m_traversable_state.committed_generation) {
         // 20. Set traversable's current session history step to targetStep.
-        auto used_target_step = m_session_history.get_the_used_step(m_target_step);
-        if (used_target_step.has_value()) {
-            auto current_step = m_session_history.current_step();
-            if (!current_step.has_value() || *current_step != *used_target_step)
-                m_traversable_state.committed_generation = m_generation;
-            m_session_history.set_current_session_history_step(*used_target_step);
-            m_committed_step = *used_target_step;
-        }
+        auto used_target_step = m_session_history.get_the_used_step(m_target_step).value();
+        if (m_session_history.current_step() != used_target_step)
+            m_traversable_state.committed_generation = m_generation;
+        m_session_history.set_current_session_history_step(used_target_step);
+        m_committed_step = used_target_step;
     }
 
     // 21. Return "applied".

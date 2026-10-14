@@ -4273,16 +4273,13 @@ void LocalNavigable::reload(Optional<StorageSerializationRecord> navigation_api_
             .user_involvement = user_involvement,
         },
         {
-            .on_complete = GC::create_function(heap(), [this, reloading_entry](HistoryStepResult result) {
+            .on_apply_history_step_complete = GC::create_function(heap(), [reloading_entry](HistoryStepResult result) {
                 if (result == HistoryStepResult::Applied)
                     return;
 
-                // NB: A reload that did not apply leaves no navigation behind to clear the pending flag.
-                if (reloading_entry->document_state()->reload_pending()) {
-                    reloading_entry->document_state()->set_reload_pending(false);
-                    page().client().page_did_set_session_history_entry_document_state_reload_pending(
-                        id(), reloading_entry->navigation_api_key(), false);
-                }
+                // AD-HOC: The spec leaves reload pending set when the reload does not apply, so a later history step would
+                //         reload the document anyway. The UI process clears its own.
+                reloading_entry->document_state()->set_reload_pending(false);
             }),
         });
 }
@@ -4566,7 +4563,7 @@ void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, His
             .pending_document = pending_document,
             .local_target_navigable_id = navigable->id(),
             .local_target_entry = history_entry,
-            .on_complete = GC::create_function(navigable->heap(), [navigable, navigation_id, has_document = !!pending_document](HistoryStepResult) {
+            .on_complete = GC::create_function(navigable->heap(), [navigable, navigation_id, has_document = !!pending_document] {
                 // AD-HOC: Step 2 runs as the navigation's document is activated. When the steps end without activating
                 //         it, the navigation is dropped, and stops delaying load events.
                 if (has_document && !navigable->has_been_destroyed() && navigable->is_delaying_load_events())

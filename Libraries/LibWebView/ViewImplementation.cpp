@@ -471,16 +471,7 @@ void ViewImplementation::reload()
         return;
     }
 
-    traversable().reload([this](Web::HTML::HistoryStepResult result, Optional<i32> committed_step) {
-        if (result != Web::HTML::HistoryStepResult::Applied && !traversable().has_uncommitted_navigation()) {
-            set_loading_state(false);
-            if (m_webdriver_navigation_observation.has_value())
-                complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
-        }
-        if (committed_step.has_value())
-            update_navigation_action_state();
-        dump_session_history("reload-complete"sv);
-    });
+    traversable().reload();
     update_navigation_action_state();
     dump_session_history("reload-mark-current-entry-reload-pending"sv);
 }
@@ -509,8 +500,7 @@ void ViewImplementation::did_stop_loading(Badge<CanonicalTraversable>, bool stop
 // The address shown is the current entry's again, and a navigation WebDriver waits on is over.
 void ViewImplementation::did_end_uncommitted_navigation(StringView reason)
 {
-    if (auto const* current_entry = traversable().session_history().current_entry())
-        set_url(current_entry->url);
+    set_url(traversable().session_history().current_entry().url);
     if (m_webdriver_navigation_observation.has_value())
         complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
     dump_session_history(reason);
@@ -558,32 +548,43 @@ void ViewImplementation::did_apply_top_level_history_traversal_step(Web::HTML::C
     complete_webdriver_history_traversal(operation_id);
 }
 
-void ViewImplementation::did_finish_history_traversal(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result)
+// A reload of the tab's document that did not apply leaves the tab loading only if something else is.
+void ViewImplementation::did_not_apply_reload()
 {
-    if (result == Web::HTML::HistoryStepResult::Applied) {
-        if (auto const* current_entry = traversable().session_history().current_entry())
-            set_url(current_entry->url);
-    }
+    if (traversable().tracked_load_navigation_id().has_value())
+        return;
+    set_loading_state(false);
+    if (m_webdriver_navigation_observation.has_value())
+        complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
+}
 
+void ViewImplementation::did_commit_history_step()
+{
+    set_url(traversable().session_history().current_entry().url);
+    update_navigation_action_state();
+}
+
+void ViewImplementation::did_finish_history_traversal(Web::HTML::CrossProcessId operation_id)
+{
     complete_webdriver_history_traversal(operation_id);
     update_navigation_action_state();
     if (on_browser_history_traversal_complete)
         on_browser_history_traversal_complete();
-    dump_session_history(result == Web::HTML::HistoryStepResult::Applied
-            ? "webcontent-history-step-applied"sv
-            : "webcontent-history-step-canceled"sv);
+    dump_session_history("webcontent-history-traversal-complete"sv);
 }
 
 Vector<ViewImplementation::SessionHistoryTraversalMenuItem> ViewImplementation::session_history_traversal_menu_items(int direction) const
 {
     VERIFY(direction == -1 || direction == 1);
 
-    auto current_used_step_index = traversable().session_history().current_used_step_index();
-    if (!current_used_step_index.has_value())
-        return {};
+    auto const& session_history = traversable().session_history();
+    auto used_steps = session_history.used_steps();
+    auto current_used_step_index = session_history.current_used_step_index();
 
     Vector<SessionHistoryTraversalMenuItem> items;
-    auto append_item = [&](i32 target_step, CanonicalSessionHistoryEntry const& target_entry) {
+    auto append_item = [&](size_t target_step_index) {
+        auto target_step = used_steps[target_step_index];
+        auto const& target_entry = *session_history.top_level_entry_for_step(target_step);
         auto history_entry = m_session->history_store->entry_for_url(target_entry.url);
         auto url = target_entry.url.serialize();
         auto title = history_entry.has_value() && history_entry->title.has_value() && !history_entry->title->is_empty()
@@ -598,25 +599,11 @@ Vector<ViewImplementation::SessionHistoryTraversalMenuItem> ViewImplementation::
     };
 
     if (direction < 0) {
-        for (size_t target_step_index = *current_used_step_index; target_step_index > 0; --target_step_index) {
-            auto target_step = traversable().session_history().step_at(target_step_index - 1);
-            if (!target_step.has_value())
-                continue;
-            auto const* target_entry = traversable().session_history().top_level_entry_for_step(*target_step);
-            if (!target_entry)
-                continue;
-            append_item(*target_step, *target_entry);
-        }
+        for (size_t target_step_index = current_used_step_index; target_step_index > 0; --target_step_index)
+            append_item(target_step_index - 1);
     } else {
-        for (size_t target_step_index = *current_used_step_index + 1; target_step_index < traversable().session_history().used_step_count(); ++target_step_index) {
-            auto target_step = traversable().session_history().step_at(target_step_index);
-            if (!target_step.has_value())
-                continue;
-            auto const* target_entry = traversable().session_history().top_level_entry_for_step(*target_step);
-            if (!target_entry)
-                continue;
-            append_item(*target_step, *target_entry);
-        }
+        for (size_t target_step_index = current_used_step_index + 1; target_step_index < used_steps.size(); ++target_step_index)
+            append_item(target_step_index);
     }
 
     return items;
@@ -2680,10 +2667,10 @@ void ViewImplementation::did_start_navigation()
     dump_session_history("did-start-navigation"sv);
 }
 
-void ViewImplementation::did_cancel_loading(Badge<CanonicalNavigable>, bool canceled_ongoing_navigation)
+void ViewImplementation::did_cancel_loading(Badge<CanonicalNavigable>, bool canceled_navigation)
 {
     set_loading_state(false);
-    if (canceled_ongoing_navigation)
+    if (canceled_navigation)
         did_end_uncommitted_navigation("did-cancel-navigation"sv);
     else if (m_webdriver_navigation_observation.has_value())
         complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
@@ -3171,13 +3158,23 @@ void ViewImplementation::complete_webdriver_navigation(u64 navigation_id)
 
 void ViewImplementation::complete_webdriver_history_traversal(Web::HTML::CrossProcessId operation_id)
 {
-    if (!m_webdriver_navigation_observation.has_value()
-        || m_webdriver_navigation_observation->completion_source != WebDriverNavigationCompletionSource::HistoryTraversal
-        || m_webdriver_navigation_observation->history_operation_id != operation_id) {
+    if (!m_webdriver_navigation_observation.has_value() || m_webdriver_navigation_observation->history_operation_id != operation_id)
         return;
-    }
 
-    complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
+    auto& observation = *m_webdriver_navigation_observation;
+    switch (observation.completion_source) {
+    case WebDriverNavigationCompletionSource::HistoryTraversal:
+        complete_webdriver_navigation(observation.navigation_id);
+        break;
+    // A crash recovery is over once both its traversal and the load it starts are.
+    case WebDriverNavigationCompletionSource::CrashRecovery:
+        observation.history_operation_completed = true;
+        if (observation.load_completed)
+            complete_webdriver_navigation(observation.navigation_id);
+        break;
+    case WebDriverNavigationCompletionSource::Load:
+        break;
+    }
 }
 
 JsonValue ViewImplementation::webdriver_session_history() const
@@ -3190,10 +3187,7 @@ JsonValue ViewImplementation::webdriver_session_history() const
     serialized.set("crashOverlayActive"sv, crash_overlay_active());
     serialized.set("hasOnlyTopLevelUsedSteps"sv, traversable().session_history().has_only_top_level_used_steps());
 
-    if (auto current_used_step_index = traversable().session_history().current_used_step_index(); current_used_step_index.has_value())
-        serialized.set("currentUsedStepIndex"sv, *current_used_step_index);
-    else
-        serialized.set("currentUsedStepIndex"sv, JsonValue {});
+    serialized.set("currentUsedStepIndex"sv, traversable().session_history().current_used_step_index());
 
     if (auto traversal = traversable().browser_history_traversal_for_testing(); traversal.has_value()) {
         JsonObject pending_traversal;
@@ -3219,67 +3213,34 @@ String ViewImplementation::ui_process_session_history_for_testing(Badge<WebConte
 void ViewImplementation::update_navigation_action_state()
 {
     auto effective_current_index = traversable().effective_current_session_history_step_index();
-    m_navigate_back_action->set_enabled(effective_current_index.has_value() && *effective_current_index > 0);
-    m_navigate_forward_action->set_enabled(effective_current_index.has_value()
-        && *effective_current_index + 1 < traversable().session_history().used_step_count());
+    m_navigate_back_action->set_enabled(effective_current_index > 0);
+    m_navigate_forward_action->set_enabled(effective_current_index + 1 < traversable().session_history().used_step_count());
 }
 
 void ViewImplementation::recover_current_session_history_entry_with_history_operation()
 {
     m_history_visit_transition_for_next_load = HistoryVisitTransition::Restore;
-    auto const* current_entry = traversable().session_history().current_entry();
-    auto current_url = current_entry ? current_entry->url : m_url;
-    set_url(current_url);
-    auto navigation_id = begin_webdriver_navigation(WebDriverNavigationCompletionSource::CrashRecovery);
-    traversable().recover_from_web_content_process_crash([this, navigation_id](Web::HTML::HistoryStepResult result, Optional<i32> committed_step) {
-        if (result == Web::HTML::HistoryStepResult::Applied) {
-            if (committed_step.has_value())
-                update_navigation_action_state();
-            auto const* current_entry = traversable().session_history().current_entry();
-            if (current_entry)
-                set_url(current_entry->url);
-
-            if (m_webdriver_navigation_observation.has_value()
-                && m_webdriver_navigation_observation->navigation_id == navigation_id
-                && m_webdriver_navigation_observation->completion_source == WebDriverNavigationCompletionSource::CrashRecovery) {
-                m_webdriver_navigation_observation->history_operation_completed = true;
-                if (m_webdriver_navigation_observation->load_completed)
-                    complete_webdriver_navigation(navigation_id);
-            }
-        } else {
-            complete_webdriver_navigation(navigation_id);
-        }
-        dump_session_history("recovered-web-content-process-with-history-operation"sv);
-    });
+    set_url(traversable().session_history().current_entry().url);
+    begin_webdriver_navigation(WebDriverNavigationCompletionSource::CrashRecovery);
+    traversable().recover_from_web_content_process_crash();
 }
 
 void ViewImplementation::reconstruct_current_session_history_entry_with_history_operation(StringView reason)
 {
     m_history_visit_transition_for_next_load = HistoryVisitTransition::Restore;
-    auto const* current_entry = traversable().session_history().current_entry();
-    if (!current_entry)
-        return;
-
-    auto current_step = traversable().session_history().current_step();
-    VERIFY(current_step.has_value());
-    set_url(current_entry->url);
+    set_url(traversable().session_history().current_entry().url);
     begin_webdriver_navigation(WebDriverNavigationCompletionSource::HistoryTraversal);
-    traversable().reconstruct_the_history_to_step(*current_step);
+    traversable().reconstruct_the_history_to_step(traversable().session_history().current_step());
     dump_session_history(reason);
 }
 
-Optional<SessionHistorySnapshot> ViewImplementation::session_history_snapshot() const
+SessionHistorySnapshot ViewImplementation::session_history_snapshot() const
 {
     auto const& session_history = traversable().session_history();
-
-    auto current_used_step_index = session_history.current_used_step_index();
-    if (!current_used_step_index.has_value())
-        return {};
-
     return SessionHistorySnapshot {
         .entries = session_history.entries(),
         .used_steps = session_history.used_steps(),
-        .current_used_step_index = *current_used_step_index,
+        .current_used_step_index = session_history.current_used_step_index(),
     };
 }
 
@@ -3295,7 +3256,7 @@ ErrorOr<void> ViewImplementation::restore_session_history_from_snapshot(SessionH
 bool ViewImplementation::capture_session_history_snapshot_for_testing(Badge<WebContentPage>)
 {
     m_captured_session_history_snapshot_for_testing = session_history_snapshot();
-    return m_captured_session_history_snapshot_for_testing.has_value();
+    return true;
 }
 
 bool ViewImplementation::restore_captured_session_history_snapshot_for_testing(Badge<WebContentPage>)
@@ -3360,9 +3321,7 @@ void ViewImplementation::notify_session_history_changed()
 {
     if (!m_session_tab_id.has_value())
         return;
-    auto url = m_url;
-    if (auto const* current_entry = traversable().session_history().current_entry())
-        url = current_entry->url;
+    auto url = traversable().session_history().current_entry().url;
     SessionStore::TabStateUpdate update {
         .tab_id = *m_session_tab_id,
         .history = session_history_snapshot(),
@@ -3382,38 +3341,6 @@ NonnullRefPtr<Core::Promise<Empty>> ViewImplementation::reset_session_history_fo
         page().reset_session_history_for_testing();
     });
     return *m_pending_session_history_reset_for_testing;
-}
-
-void ViewImplementation::request_history_operation(Badge<WebContentPage>, WebContentPage& requesting_page, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters parameters)
-{
-    auto sequence_number = traversable().next_sequence_number();
-
-    auto reloads_top_level = parameters.visit(
-        [this](Web::ReloadHistoryOperationParameters const& parameters) {
-            return parameters.navigable_id == traversable().id();
-        },
-        [](auto const&) { return false; });
-    auto finalizes_top_level_cross_document_navigation = parameters.visit(
-        [this](Web::FinalizeCrossDocumentNavigationHistoryOperationParameters const& parameters) {
-            return parameters.navigable_id == traversable().id();
-        },
-        [](auto const&) { return false; });
-    auto requested_operation_completion = [this, reloads_top_level, finalizes_top_level_cross_document_navigation](Web::HTML::HistoryStepResult result, Optional<i32> committed_step) {
-        if (reloads_top_level && result != Web::HTML::HistoryStepResult::Applied && !traversable().tracked_load_navigation_id().has_value()) {
-            set_loading_state(false);
-            if (m_webdriver_navigation_observation.has_value())
-                complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
-        }
-        if (finalizes_top_level_cross_document_navigation && result == Web::HTML::HistoryStepResult::Applied) {
-            if (auto const* current_entry = traversable().session_history().current_entry())
-                set_url(current_entry->url);
-        }
-        if (committed_step.has_value())
-            update_navigation_action_state();
-        dump_session_history("requested-history-operation-complete"sv);
-    };
-
-    traversable().enqueue_history_operation(operation_id, move(parameters), requesting_page, sequence_number, move(requested_operation_completion));
 }
 
 void ViewImplementation::did_reset_session_history_for_testing(
@@ -3464,8 +3391,7 @@ void ViewImplementation::handle_web_content_process_crash()
 {
     auto failed_url = m_url;
     Optional<NavigationToRetry> navigation_to_retry;
-    auto const* current_entry = traversable().session_history().current_entry();
-    if (!current_entry || current_entry->url != failed_url) {
+    if (traversable().session_history().current_entry().url != failed_url) {
         navigation_to_retry = NavigationToRetry { failed_url, {} };
         if (auto ongoing = navigation_to_retry_for_ongoing_navigation(); ongoing.has_value() && ongoing->url == failed_url)
             navigation_to_retry = ongoing.release_value();

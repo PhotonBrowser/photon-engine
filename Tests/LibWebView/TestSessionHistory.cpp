@@ -15,6 +15,11 @@
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/WebContentClient.h>
 
+static NonnullRefPtr<WebView::CanonicalSessionHistoryEntry> initial_history_entry()
+{
+    return MUST(WebView::CanonicalSessionHistoryEntry::create_from_descriptor(Web::HTML::create_initial_session_history_entry_descriptor({}, {}, {})));
+}
+
 static void give_active_document(WebView::CanonicalNavigable& navigable)
 {
     navigable.set_active_session_history_entry(WebView::CanonicalSessionHistoryEntry::create(WebView::CanonicalDocumentState::create({}, WebView::CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document({}).document)));
@@ -242,12 +247,7 @@ static Web::HTML::SameDocumentNavigationEntry same_document_entry(Web::HTML::Ses
     };
 }
 
-struct HistoryOperationResult {
-    Web::HTML::HistoryStepResult result;
-    Optional<i32> committed_step;
-};
-
-static HistoryOperationResult run_canonical_history_operation(WebView::CanonicalTraversable& traversable, Web::HistoryOperationParameters request)
+static void run_canonical_history_operation(WebView::CanonicalTraversable& traversable, Web::HistoryOperationParameters request)
 {
     auto operation_id = Web::HTML::CrossProcessId { 8, 1 };
     RefPtr<WebView::CanonicalSessionHistoryEntry> target_entry;
@@ -258,17 +258,9 @@ static HistoryOperationResult run_canonical_history_operation(WebView::Canonical
             target_entry = traversable.session_history_entry_for(*navigable, parameters.target_entry);
     }
 
-    Optional<HistoryOperationResult> result;
     auto queue_promise = Core::Promise<Empty>::construct();
-    traversable.run_history_operation_at_queue_position(
-        operation_id, move(request), {}, {}, move(target_entry),
-        [&](auto operation_result, auto committed_step) {
-            result = HistoryOperationResult { operation_result, committed_step };
-        },
-        queue_promise);
-    VERIFY(result.has_value());
+    traversable.run_history_operation_at_queue_position(operation_id, move(request), {}, {}, move(target_entry), queue_promise);
     VERIFY(queue_promise->is_resolved());
-    return result.release_value();
 }
 
 static void expect_entry(WebView::TraversableSessionHistory const& history, size_t index, i32 expected_step, StringView expected_url)
@@ -281,8 +273,7 @@ static void expect_entry(WebView::TraversableSessionHistory const& history, size
 
 static void expect_current_entry(WebView::TraversableSessionHistory const& history, i32 expected_step, StringView expected_url)
 {
-    auto* entry = history.current_entry();
-    VERIFY(entry);
+    auto* entry = &history.current_entry();
     EXPECT_EQ(entry->step, expected_step);
     EXPECT_EQ(entry->url, parse_url(expected_url));
 }
@@ -347,7 +338,7 @@ static void expect_nested_entry(WebView::CanonicalNestedHistory const& nested_hi
 
 TEST_CASE(entry_updates_address_the_navigables_session_history_entries)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
     auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame-1"sv)));
@@ -387,7 +378,7 @@ TEST_CASE(entry_updates_address_the_navigables_session_history_entries)
 
 TEST_CASE(entry_updates_require_entry_and_document_state_identity)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
 
@@ -409,15 +400,14 @@ TEST_CASE(entry_updates_require_entry_and_document_state_identity)
     entry_identity.navigation_api_id = Utf16String::from_utf8("current-id"sv);
     EXPECT(traversable.update_session_history_entry_scroll_restoration_mode(traversable, entry_identity, Web::HTML::ScrollRestorationMode::Manual));
 
-    auto const* updated_entry = traversable.session_history().current_entry();
-    VERIFY(updated_entry);
+    auto const* updated_entry = &traversable.session_history().current_entry();
     EXPECT_EQ(updated_entry->scroll_restoration_mode, Web::HTML::ScrollRestorationMode::Manual);
 }
 
 TEST_CASE(queued_same_document_entries_are_addressed_by_identity)
 {
     Core::EventLoop event_loop;
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
 
@@ -445,7 +435,7 @@ TEST_CASE(queued_same_document_entries_are_addressed_by_identity)
             .history_handling = Web::HTML::HistoryHandlingBehavior::Push,
             .user_involvement = Web::HTML::UserNavigationInvolvement::None,
         };
-        traversable.enqueue_history_operation(operation_id, move(parameters), {}, 0);
+        traversable.enqueue_history_operation(operation_id, move(parameters), {});
     };
     enqueue_push({ 8, 1 }, move(first_entry));
     enqueue_push({ 8, 2 }, move(replacement_entry));
@@ -464,8 +454,7 @@ TEST_CASE(queued_same_document_entries_are_addressed_by_identity)
     EXPECT_EQ(queued_entries[0]->scroll_restoration_mode, Web::HTML::ScrollRestorationMode::Auto);
     EXPECT(queued_entries[1]->navigation_api_state == state_record(9));
     EXPECT_EQ(queued_entries[1]->scroll_restoration_mode, Web::HTML::ScrollRestorationMode::Manual);
-    auto const* updated_current_entry = traversable.session_history().current_entry();
-    VERIFY(updated_current_entry);
+    auto const* updated_current_entry = &traversable.session_history().current_entry();
     EXPECT_EQ(updated_current_entry->document_state->navigable_target_name, Utf16String::from_utf8("updated-name"sv));
 }
 
@@ -498,13 +487,13 @@ TEST_CASE(entry_among_its_own_nested_histories_is_rejected)
 
 TEST_CASE(failed_push_keeps_entries_and_document_states)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
     auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv)));
 
     // The child's session history entries are in the forward history, which pushing an entry clears.
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     EXPECT(history.initialize_for_testing({ entry(0, "https://parent.example/"sv), entry(1, "https://parent.example/next"sv, 10, "main"sv, { nested_history("frame"sv, { entry(1, "https://child.example/"sv) }) }) }, { 0, 1 }, 0));
     auto const* forward_entry = history.entry_at(1);
     VERIFY(forward_entry);
@@ -524,11 +513,11 @@ TEST_CASE(failed_push_keeps_entries_and_document_states)
 
 TEST_CASE(child_history_mutations_use_the_reported_parent_document_state)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
 
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     auto earlier_parent_entry = entry(0, "https://parent.example/earlier"sv, 10, "main"sv);
     auto current_parent_entry = entry(1, "https://parent.example/current"sv, 11, "main"sv);
     current_parent_entry.document_state.nested_histories.append(nested_history("frame"sv, {
@@ -564,7 +553,7 @@ TEST_CASE(child_history_mutations_use_the_reported_parent_document_state)
 
 TEST_CASE(used_steps_include_nested_history_steps)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto update_result = history.initialize_for_testing({
                                                             entry(0, "https://a.example/"sv, {
@@ -614,7 +603,7 @@ TEST_CASE(used_steps_include_nested_history_steps)
 
 TEST_CASE(traversal_target_for_top_level_step)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     auto update_result = history.initialize_for_testing({
                                                             entry(0, "https://a.example/"sv),
                                                             entry(1, "https://b.example/"sv),
@@ -636,7 +625,7 @@ TEST_CASE(traversal_target_for_top_level_step)
 
 TEST_CASE(traversal_target_for_nested_step_in_current_top_level_entry)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto update_result = history.initialize_for_testing({
                                                             entry(0, "https://a.example/"sv, {
@@ -664,7 +653,7 @@ TEST_CASE(traversal_target_for_nested_step_in_current_top_level_entry)
 
 TEST_CASE(traversal_target_for_nested_step_in_earlier_top_level_entry)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto update_result = history.initialize_for_testing({
                                                             entry(0, "https://a.example/"sv, 7, "main"sv, {
@@ -707,7 +696,7 @@ TEST_CASE(traversal_target_for_nested_step_in_earlier_top_level_entry)
 
 TEST_CASE(traversal_target_for_delta_outside_used_steps)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     auto update_result = history.initialize_for_testing(
         { entry(0, "https://a.example/"sv) }, { 0 }, 0);
     EXPECT_EQ(update_result, true);
@@ -719,7 +708,7 @@ TEST_CASE(traversal_target_for_delta_outside_used_steps)
 
 TEST_CASE(clear_forward_session_history_rebuilds_traversal_state)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     Vector<Web::HTML::SessionHistoryEntryDescriptor> child_entries {
         entry(0, "https://frame.example/a"sv),
         entry(1, "https://frame.example/b"sv),
@@ -743,8 +732,7 @@ TEST_CASE(clear_forward_session_history_rebuilds_traversal_state)
     expect_used_step(history, 1, 1);
     EXPECT(!history.step_at(2).has_value());
 
-    auto* current_entry = history.current_entry();
-    VERIFY(current_entry);
+    auto* current_entry = &history.current_entry();
     expect_nested_history(*current_entry, 0, "frame-1"sv, 2);
     expect_nested_entry(current_entry->document_state->nested_histories[0], 0, 0, "https://frame.example/a"sv);
     expect_nested_entry(current_entry->document_state->nested_histories[0], 1, 1, "https://frame.example/b"sv);
@@ -752,10 +740,10 @@ TEST_CASE(clear_forward_session_history_rebuilds_traversal_state)
 
 TEST_CASE(cross_document_push_clears_forward_history_at_finalization)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto update_result = history.initialize_for_testing({
                                                             entry(0, "https://a.example/"sv, {
@@ -796,7 +784,7 @@ TEST_CASE(cross_document_push_clears_forward_history_at_finalization)
 
 TEST_CASE(history_log_entries_marks_current_entries_steps_and_reload_pending)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     auto post_entry = entry_with_post_resource(1, "https://b.example/"sv);
     post_entry.document_state.id = test_document_state_id(1001);
 
@@ -818,8 +806,7 @@ TEST_CASE(history_log_entries_marks_current_entries_steps_and_reload_pending)
                                                          "nested={1:2=[3:https://frame.example/]}] "
                                                          "used_steps=[0:0, *1:1, 2:2, 3:3]"sv });
 
-    auto current_entry = history.current_entry();
-    VERIFY(current_entry);
+    auto* current_entry = &history.current_entry();
     auto serialized_entry = WebView::history_json_entry(current_entry->descriptor(), true);
     EXPECT_EQ(serialized_entry.get_string("resource"sv), "post"sv);
 
@@ -832,7 +819,7 @@ TEST_CASE(history_log_entries_marks_current_entries_steps_and_reload_pending)
 
 TEST_CASE(history_log_entries_marks_nested_histories)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto update_result = history.initialize_for_testing({
                                                             entry(0, "https://a.example/"sv),
@@ -853,10 +840,10 @@ TEST_CASE(history_log_entries_marks_nested_histories)
 
 TEST_CASE(cross_document_push_preserves_document_resource)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto update_result = history.initialize_for_testing(
         { entry(0, "https://a.example/"sv) }, { 0 }, 0);
@@ -868,17 +855,16 @@ TEST_CASE(cross_document_push_preserves_document_resource)
     EXPECT_EQ(*target_step, 1);
     history.set_current_session_history_step(1);
 
-    auto current_entry = history.current_entry();
-    VERIFY(current_entry);
+    auto* current_entry = &history.current_entry();
     expect_entry_resource(current_entry->descriptor(), "post"sv);
 }
 
 TEST_CASE(cross_document_replacement_preserves_forward_history)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto entry_to_replace = entry(0, "https://a.example/"sv, 7, "main"sv, {
                                                                               nested_history("frame-1"sv, {
@@ -908,8 +894,7 @@ TEST_CASE(cross_document_replacement_preserves_forward_history)
     expect_used_step(history, 0, 0);
     expect_used_step(history, 1, 2);
 
-    auto* current_entry = history.current_entry();
-    VERIFY(current_entry);
+    auto* current_entry = &history.current_entry();
     EXPECT(current_entry->document_state->id.namespace_id > 0);
     EXPECT(current_entry->document_state->id.local_id > 0);
     EXPECT(current_entry->document_state->navigable_target_name.is_empty());
@@ -919,10 +904,10 @@ TEST_CASE(cross_document_replacement_preserves_forward_history)
 
 TEST_CASE(cross_document_replacement_in_a_parent_keeps_a_current_step_in_a_child_history)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     // The frame of the parent's document navigated, so the current step is in the frame's session history entries.
     auto parent_entry = entry(0, "https://a.example/"sv, 7, "main"sv, {
@@ -953,11 +938,11 @@ TEST_CASE(cross_document_replacement_in_a_parent_keeps_a_current_step_in_a_child
 
 TEST_CASE(nested_cross_document_push_updates_copied_session_histories)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
     auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv)));
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto child_entry = entry(0, "https://frame.example/first"sv, 20, ""sv);
     child_entry.navigation_api_key = Utf16String::from_utf8("child-current"sv);
@@ -989,11 +974,11 @@ TEST_CASE(nested_cross_document_push_updates_copied_session_histories)
 
 TEST_CASE(nested_cross_document_replacement_updates_copied_session_histories)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
     auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv)));
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto child_entry = entry(0, "https://frame.example/first"sv, 20, ""sv);
     child_entry.navigation_api_key = Utf16String::from_utf8("child-current"sv);
@@ -1027,7 +1012,7 @@ TEST_CASE(nested_cross_document_replacement_updates_copied_session_histories)
 TEST_CASE(same_document_push_clears_forward_history_at_queue_position)
 {
     Core::EventLoop event_loop;
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
 
@@ -1049,10 +1034,8 @@ TEST_CASE(same_document_push_clears_forward_history_at_queue_position)
         .history_handling = Web::HTML::HistoryHandlingBehavior::Push,
         .user_involvement = Web::HTML::UserNavigationInvolvement::None,
     };
-    auto operation_result = run_canonical_history_operation(traversable, move(request));
+    run_canonical_history_operation(traversable, move(request));
 
-    EXPECT_EQ(operation_result.result, Web::HTML::HistoryStepResult::Applied);
-    EXPECT_EQ(operation_result.committed_step, 1);
     auto const& history = traversable.session_history();
     EXPECT_EQ(history.current_step(), 1);
     EXPECT_EQ(history.size(), 2uz);
@@ -1064,7 +1047,7 @@ TEST_CASE(same_document_push_clears_forward_history_at_queue_position)
 TEST_CASE(failed_nested_same_document_push_preserves_forward_history)
 {
     Core::EventLoop event_loop;
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
     auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv)));
@@ -1089,10 +1072,8 @@ TEST_CASE(failed_nested_same_document_push_preserves_forward_history)
         .history_handling = Web::HTML::HistoryHandlingBehavior::Push,
         .user_involvement = Web::HTML::UserNavigationInvolvement::None,
     };
-    auto operation_result = run_canonical_history_operation(traversable, move(request));
+    run_canonical_history_operation(traversable, move(request));
 
-    EXPECT_EQ(operation_result.result, Web::HTML::HistoryStepResult::NoMatchingEntry);
-    EXPECT(!operation_result.committed_step.has_value());
     auto const& history = traversable.session_history();
     EXPECT_EQ(history.current_step(), 0);
     EXPECT_EQ(history.size(), 2uz);
@@ -1105,11 +1086,11 @@ TEST_CASE(failed_nested_same_document_push_preserves_forward_history)
 
 TEST_CASE(failed_nested_cross_document_push_preserves_forward_history)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
     auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv)));
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto update_result = history.initialize_for_testing(
         {
@@ -1135,7 +1116,7 @@ TEST_CASE(failed_nested_cross_document_push_preserves_forward_history)
 TEST_CASE(same_document_replacement_replaces_the_active_entry)
 {
     Core::EventLoop event_loop;
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
 
@@ -1160,10 +1141,8 @@ TEST_CASE(same_document_replacement_replaces_the_active_entry)
         .history_handling = Web::HTML::HistoryHandlingBehavior::Replace,
         .user_involvement = Web::HTML::UserNavigationInvolvement::None,
     };
-    auto operation_result = run_canonical_history_operation(traversable, move(request));
+    run_canonical_history_operation(traversable, move(request));
 
-    EXPECT_EQ(operation_result.result, Web::HTML::HistoryStepResult::Applied);
-    EXPECT_EQ(operation_result.committed_step, 0);
     auto const& history = traversable.session_history();
     EXPECT_EQ(history.current_step(), 0);
     EXPECT_EQ(history.size(), 2uz);
@@ -1173,11 +1152,11 @@ TEST_CASE(same_document_replacement_replaces_the_active_entry)
 
 TEST_CASE(nested_finalization_rejects_a_changed_initial_entry_identity)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
     auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv)));
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     auto initial_entry = entry(0, "about:blank"sv);
     initial_entry.navigation_api_key = Utf16String::from_utf8("canonical-initial"sv);
     auto live_initial_entry = initial_entry;
@@ -1205,11 +1184,11 @@ TEST_CASE(nested_finalization_rejects_a_changed_initial_entry_identity)
 
 TEST_CASE(nested_finalization_rejects_wrong_active_entry_for_populated_history)
 {
-    WebView::CanonicalTraversable traversable;
+    WebView::CanonicalTraversable traversable { {}, initial_history_entry() };
     traversable.set_id({ 9, 1 });
     give_active_document(traversable);
     auto& child = traversable.append_child(make<WebView::CanonicalNavigable>(navigable_id("frame"sv)));
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     auto populated_entry = entry(0, "https://frame.example/first"sv, 2, ""sv);
     populated_entry.navigation_api_key = Utf16String::from_utf8("canonical"sv);
     auto update_result = history.initialize_for_testing({ entry(0, "https://top.example/"sv, {
@@ -1235,7 +1214,7 @@ static constexpr auto restore_error_no_document_state = "Session history snapsho
 
 TEST_CASE(restore_from_ui_snapshot_installs_a_valid_snapshot)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto result = history.restore_from_ui_snapshot({
                                                        entry(0, "https://a.example/"sv, 1, "main"sv),
@@ -1257,7 +1236,7 @@ TEST_CASE(restore_from_ui_snapshot_installs_a_valid_snapshot)
 
 TEST_CASE(restore_from_ui_snapshot_installs_a_valid_nested_snapshot)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     // Nested step 1 lives under the step-0 entry, which is the correct top-level entry for step 1.
     Vector<Web::HTML::SessionHistoryEntryDescriptor> entries;
@@ -1277,7 +1256,7 @@ TEST_CASE(restore_from_ui_snapshot_installs_a_valid_nested_snapshot)
 
 TEST_CASE(restore_from_ui_snapshot_preserves_shared_document_state_identity)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     auto original_id = test_document_state_id(1);
 
     auto result = history.restore_from_ui_snapshot({
@@ -1297,11 +1276,11 @@ TEST_CASE(restore_from_ui_snapshot_preserves_shared_document_state_identity)
 TEST_CASE(restore_from_ui_snapshot_rejects_structurally_invalid_snapshots)
 {
     auto restore = [](Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index) {
-        WebView::TraversableSessionHistory history;
+        WebView::TraversableSessionHistory history { initial_history_entry() };
         auto result = history.restore_from_ui_snapshot(move(entries), move(used_steps), current_used_step_index, allocate_test_ui_process_document_state_id);
         EXPECT(result.is_error());
         EXPECT_EQ(result.error().string_literal(), restore_error_structurally_invalid);
-        EXPECT_EQ(history.size(), 0uz);
+        EXPECT_EQ(history.size(), 1uz);
     };
 
     restore({}, { 0 }, 0);
@@ -1321,16 +1300,16 @@ TEST_CASE(restore_from_ui_snapshot_rejects_excessive_nesting_before_restoration)
         nested_entry = entry_with_reload_pending(0, "https://nested.example/"sv, depth + 2, "frame"sv, { move(nested_history) });
     }
 
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     auto result = history.restore_from_ui_snapshot({ move(nested_entry) }, { 0 }, 0, allocate_test_ui_process_document_state_id);
     EXPECT(result.is_error());
     EXPECT_EQ(result.error().string_literal(), restore_error_structurally_invalid);
-    EXPECT_EQ(history.size(), 0uz);
+    EXPECT_EQ(history.size(), 1uz);
 }
 
 TEST_CASE(restore_from_ui_snapshot_rejects_current_entry_without_document_state)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     auto result = history.restore_from_ui_snapshot({
                                                        entry(0, "https://a.example/"sv, 1, "main"sv),
@@ -1340,12 +1319,12 @@ TEST_CASE(restore_from_ui_snapshot_rejects_current_entry_without_document_state)
 
     EXPECT(result.is_error());
     EXPECT_EQ(result.error().string_literal(), restore_error_no_document_state);
-    EXPECT_EQ(history.size(), 0uz);
+    EXPECT_EQ(history.size(), 1uz);
 }
 
 TEST_CASE(restore_from_ui_snapshot_rejects_used_step_without_top_level_entry)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     // The only top-level entry is at step 5, but used step 1 (a nested step) has no top-level entry,
     // so a later back traversal to step 1 would crash. The step set is internally consistent.
@@ -1357,12 +1336,12 @@ TEST_CASE(restore_from_ui_snapshot_rejects_used_step_without_top_level_entry)
 
     EXPECT(result.is_error());
     EXPECT_EQ(result.error().string_literal(), restore_error_step_not_reachable);
-    EXPECT_EQ(history.size(), 0uz);
+    EXPECT_EQ(history.size(), 1uz);
 }
 
 TEST_CASE(restore_from_ui_snapshot_rejects_used_step_under_shadowed_top_level_entry)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     // Nested step 4 lives under the step-0 entry, but the step-2 top-level entry shadows it, so
     // top_level_entry_for_step(4) resolves to page 2, which does not contain step 4.
@@ -1375,12 +1354,12 @@ TEST_CASE(restore_from_ui_snapshot_rejects_used_step_under_shadowed_top_level_en
 
     EXPECT(result.is_error());
     EXPECT_EQ(result.error().string_literal(), restore_error_step_not_reachable);
-    EXPECT_EQ(history.size(), 0uz);
+    EXPECT_EQ(history.size(), 1uz);
 }
 
 TEST_CASE(restore_from_ui_snapshot_rejects_step_under_inactive_nested_sibling)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
 
     // The child history's active entry for step 4 is the sibling at step 2, but the step-4 grandchild
     // lives under the inactive child at step 0, so step 4 is unreachable on the active path.
@@ -1396,12 +1375,12 @@ TEST_CASE(restore_from_ui_snapshot_rejects_step_under_inactive_nested_sibling)
 
     EXPECT(result.is_error());
     EXPECT_EQ(result.error().string_literal(), restore_error_step_not_reachable);
-    EXPECT_EQ(history.size(), 0uz);
+    EXPECT_EQ(history.size(), 1uz);
 }
 
 TEST_CASE(restore_from_ui_snapshot_leaves_history_untouched_on_failure)
 {
-    WebView::TraversableSessionHistory history;
+    WebView::TraversableSessionHistory history { initial_history_entry() };
     MUST(history.restore_from_ui_snapshot({ entry(0, "https://a.example/"sv, 1, "main"sv) }, { 0 }, 0, allocate_test_ui_process_document_state_id));
     EXPECT_EQ(history.size(), 1uz);
 
