@@ -9,10 +9,18 @@
 #include <AK/ByteString.h>
 #include <AK/Error.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/Optional.h>
 #include <LibWebView/Forward.h>
 #include <sys/types.h>
 
 namespace WebView {
+
+struct ProcessReaperIdentity {
+    pid_t pid;
+    uint64_t start_time_in_microseconds;
+    Optional<pid_t> parent_pid;
+    Optional<uint64_t> parent_start_time_in_microseconds;
+};
 
 // Starts the ProcessReaper helper, which kills the processes that it is told about once this process is gone. The
 // kernel does that for us on Linux, but not on macOS.
@@ -24,6 +32,7 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static ErrorOr<NonnullOwnPtr<ProcessReaper>> start(ByteString const& executable_path);
+    static Optional<ProcessReaperIdentity> active_identity();
     ~ProcessReaper();
 
     ErrorOr<void> watch(pid_t);

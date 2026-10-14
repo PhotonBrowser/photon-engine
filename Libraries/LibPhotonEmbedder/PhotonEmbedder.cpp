@@ -3,9 +3,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWebCommon/Page/InputEvent.h>
-#include <LibWebCommon/PixelUnits.h>
-#include <LibWebCommon/WebView/ConsoleOutput.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/MachPort.h>
 #include <LibGfx/Bitmap.h>
@@ -13,16 +10,24 @@
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
+#include <LibPhotonEmbedder/PhotonEmbedder.h>
 #include <LibURL/Parser.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/Page/InputEvent.h>
+#include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/WebView/ConsoleOutput.h>
 #include <LibWebView/Application.h>
-#include <LibWebView/Menu.h>
 #include <LibWebView/HeadlessWebView.h>
+#include <LibWebView/Menu.h>
 #include <LibWebView/PlatformColors.h>
+#include <LibWebView/ProcessManager.h>
+#include <LibWebView/ProcessType.h>
+#if defined(AK_OS_MACOS)
+#    include <LibWebView/ProcessReaper.h>
+#endif
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
-#include <LibPhotonEmbedder/PhotonEmbedder.h>
 
 #if defined(__APPLE__)
 #    include <CoreFoundation/CoreFoundation.h>
@@ -205,6 +210,8 @@ private:
 
 class PhotonHeadlessWebView final : public HeadlessWebView {
 public:
+    bool has_completed_document_load() const { return m_document_load_finished; }
+
     static OwnPtr<PhotonHeadlessWebView> create(int width, int height, double dpr, Photon::ViewCallbacks callbacks)
     {
         auto resource_root = s_ladybird_resource_root;
@@ -446,6 +453,10 @@ public:
         state.loading = is_loading();
         state.can_go_back = navigate_back_action().enabled();
         state.can_go_forward = navigate_forward_action().enabled();
+        if (url().scheme() == "https"sv)
+            state.connection_secure = true;
+        else if (url().scheme() == "http"sv)
+            state.connection_secure = false;
         m_callbacks.state_changed(state);
     }
 
@@ -664,6 +675,7 @@ private:
             notify_state();
         };
         on_load_start = [this] {
+            m_document_load_finished = false;
             m_navigation_timing_waiting_for_first_frame = false;
             notify_navigation_timing(Photon::NavigationTimingEvent::Started, url());
         };
@@ -703,27 +715,62 @@ private:
                 [this](Gfx::StandardCursor standard) {
                     auto mapped = Photon::Cursor::Arrow;
                     switch (standard) {
-                    case Gfx::StandardCursor::Hidden: mapped = Photon::Cursor::Hidden; break;
-                    case Gfx::StandardCursor::Crosshair: mapped = Photon::Cursor::Crosshair; break;
-                    case Gfx::StandardCursor::IBeam: mapped = Photon::Cursor::IBeam; break;
-                    case Gfx::StandardCursor::ResizeHorizontal: mapped = Photon::Cursor::ResizeHorizontal; break;
-                    case Gfx::StandardCursor::ResizeVertical: mapped = Photon::Cursor::ResizeVertical; break;
-                    case Gfx::StandardCursor::ResizeDiagonalTLBR: mapped = Photon::Cursor::ResizeDiagonalTLBR; break;
-                    case Gfx::StandardCursor::ResizeDiagonalBLTR: mapped = Photon::Cursor::ResizeDiagonalBLTR; break;
-                    case Gfx::StandardCursor::ResizeColumn: mapped = Photon::Cursor::ResizeColumn; break;
-                    case Gfx::StandardCursor::ResizeRow: mapped = Photon::Cursor::ResizeRow; break;
-                    case Gfx::StandardCursor::Hand: mapped = Photon::Cursor::Hand; break;
-                    case Gfx::StandardCursor::Help: mapped = Photon::Cursor::Help; break;
-                    case Gfx::StandardCursor::OpenHand: mapped = Photon::Cursor::OpenHand; break;
-                    case Gfx::StandardCursor::Drag: mapped = Photon::Cursor::Drag; break;
-                    case Gfx::StandardCursor::DragCopy: mapped = Photon::Cursor::DragCopy; break;
-                    case Gfx::StandardCursor::Move: mapped = Photon::Cursor::Move; break;
-                    case Gfx::StandardCursor::Wait: mapped = Photon::Cursor::Wait; break;
-                    case Gfx::StandardCursor::Disallowed: mapped = Photon::Cursor::Disallowed; break;
+                    case Gfx::StandardCursor::Hidden:
+                        mapped = Photon::Cursor::Hidden;
+                        break;
+                    case Gfx::StandardCursor::Crosshair:
+                        mapped = Photon::Cursor::Crosshair;
+                        break;
+                    case Gfx::StandardCursor::IBeam:
+                        mapped = Photon::Cursor::IBeam;
+                        break;
+                    case Gfx::StandardCursor::ResizeHorizontal:
+                        mapped = Photon::Cursor::ResizeHorizontal;
+                        break;
+                    case Gfx::StandardCursor::ResizeVertical:
+                        mapped = Photon::Cursor::ResizeVertical;
+                        break;
+                    case Gfx::StandardCursor::ResizeDiagonalTLBR:
+                        mapped = Photon::Cursor::ResizeDiagonalTLBR;
+                        break;
+                    case Gfx::StandardCursor::ResizeDiagonalBLTR:
+                        mapped = Photon::Cursor::ResizeDiagonalBLTR;
+                        break;
+                    case Gfx::StandardCursor::ResizeColumn:
+                        mapped = Photon::Cursor::ResizeColumn;
+                        break;
+                    case Gfx::StandardCursor::ResizeRow:
+                        mapped = Photon::Cursor::ResizeRow;
+                        break;
+                    case Gfx::StandardCursor::Hand:
+                        mapped = Photon::Cursor::Hand;
+                        break;
+                    case Gfx::StandardCursor::Help:
+                        mapped = Photon::Cursor::Help;
+                        break;
+                    case Gfx::StandardCursor::OpenHand:
+                        mapped = Photon::Cursor::OpenHand;
+                        break;
+                    case Gfx::StandardCursor::Drag:
+                        mapped = Photon::Cursor::Drag;
+                        break;
+                    case Gfx::StandardCursor::DragCopy:
+                        mapped = Photon::Cursor::DragCopy;
+                        break;
+                    case Gfx::StandardCursor::Move:
+                        mapped = Photon::Cursor::Move;
+                        break;
+                    case Gfx::StandardCursor::Wait:
+                        mapped = Photon::Cursor::Wait;
+                        break;
+                    case Gfx::StandardCursor::Disallowed:
+                        mapped = Photon::Cursor::Disallowed;
+                        break;
                     case Gfx::StandardCursor::None:
                     case Gfx::StandardCursor::Arrow:
                     case Gfx::StandardCursor::Eyedropper:
-                    case Gfx::StandardCursor::Zoom: break;
+                    case Gfx::StandardCursor::Zoom:
+                        break;
                     }
                     m_callbacks.cursor_changed(mapped);
                 },
@@ -811,6 +858,7 @@ private:
             notify_navigation_committed();
         };
         on_load_finish = [this](URL::URL const& loaded_url) {
+            m_document_load_finished = true;
             notify_navigation_timing(Photon::NavigationTimingEvent::LoadFinished, loaded_url);
             notify_navigation_committed();
         };
@@ -821,6 +869,8 @@ private:
                 total_match_count.has_value() ? std::optional<size_t>(*total_match_count) : std::nullopt);
         };
         on_crash_overlay_state_change = [this](bool crashed) {
+            if (crashed)
+                m_document_load_finished = false;
             if (!crashed && m_callbacks.crash_recovered)
                 m_callbacks.crash_recovered();
         };
@@ -842,13 +892,14 @@ private:
             static uint64_t trace_frame_id = 0;
             auto current_trace_frame_id = ++trace_frame_id;
             auto const& front = m_front_bitmap;
-            if (photon_frame_trace_enabled()) dbgln("[Photon] frame_callback id={} at_ns={} bitmap={} native={}", current_trace_frame_id, MonotonicTime::now().nanoseconds(), front.id,
+            if (photon_frame_trace_enabled())
+                dbgln("[Photon] frame_callback id={} at_ns={} bitmap={} native={}", current_trace_frame_id, MonotonicTime::now().nanoseconds(), front.id,
 #if defined(AK_OS_MACOS)
-                m_callbacks.native_metal_presentation && !m_native_presentation_failed
+                    m_callbacks.native_metal_presentation && !m_native_presentation_failed
 #else
-                false
+                    false
 #endif
-            );
+                );
 #if defined(AK_OS_MACOS)
             if (m_callbacks.native_metal_presentation && m_native_metal_presentation && !m_native_presentation_failed
                 && m_callbacks.native_backing_registered
@@ -873,7 +924,7 @@ private:
                         Application::the().notify_compositor_gpu_presentation_unavailable();
                         dbgln("Photon embedder: native Metal backing registration failed; using CPU frames");
                     } else {
-                    m_registered_native_backings.emplace(backing_id, generation);
+                        m_registered_native_backings.emplace(backing_id, generation);
                     }
                 }
 
@@ -971,6 +1022,7 @@ private:
     bool m_native_presentation_failed { false };
     bool m_native_metal_presentation { false };
 #endif
+    bool m_document_load_finished { false };
 };
 
 void PhotonApplication::set_active_view(PhotonHeadlessWebView& view)
@@ -1115,13 +1167,10 @@ std::unique_ptr<Runtime> Runtime::create(std::string const& helper_directory, st
         auto delay_ms = std::strtol(delay_text, &end, 10);
         if (end != delay_text && *end == '\0' && delay_ms > 0 && delay_ms <= 60000) {
             CFRunLoopTimerContext context {};
-            impl->diagnostic_pump_timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + static_cast<double>(delay_ms) / 1000.0, 0, 0, 0,
-                [](CFRunLoopTimerRef, void*) {
+            impl->diagnostic_pump_timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + static_cast<double>(delay_ms) / 1000.0, 0, 0, 0, [](CFRunLoopTimerRef, void*) {
                     dbgln("[DiagnosticPump] event=BEGIN at_ns={} one_shot=true", MonotonicTime::now().nanoseconds());
                     auto processed = Core::EventLoop::current().pump(Core::EventLoop::WaitMode::PollForEvents);
-                    dbgln("[DiagnosticPump] event=END at_ns={} processed={}", MonotonicTime::now().nanoseconds(), processed);
-                },
-                &context);
+                    dbgln("[DiagnosticPump] event=END at_ns={} processed={}", MonotonicTime::now().nanoseconds(), processed); }, &context);
             if (impl->diagnostic_pump_timer)
                 CFRunLoopAddTimer(impl->owner_run_loop, impl->diagnostic_pump_timer, kCFRunLoopCommonModes);
         }
@@ -1164,6 +1213,75 @@ void Runtime::set_service_callback(std::function<void(EngineService, bool restar
     application.on_request_server_restarted = [callback] {
         callback(EngineService::Network, true);
     };
+}
+
+std::vector<RegisteredEngineProcess> Runtime::registered_engine_processes() const
+{
+    std::vector<RegisteredEngineProcess> processes;
+    WebView::Application::process_manager().for_each_process([&](WebView::Process& process) {
+        char const* role = nullptr;
+        switch (process.type()) {
+        case WebView::ProcessType::Browser:
+            role = "application";
+            break;
+        case WebView::ProcessType::Compositor:
+            role = "compositor";
+            break;
+        case WebView::ProcessType::WebContent:
+            role = "web_content";
+            break;
+        case WebView::ProcessType::WebWorker:
+            role = "web_worker";
+            break;
+        case WebView::ProcessType::RequestServer:
+            role = "request_server";
+            break;
+        case WebView::ProcessType::ImageDecoder:
+            role = "image_decoder";
+            break;
+        case WebView::ProcessType::MediaServer:
+            role = "media_server";
+            break;
+        case WebView::ProcessType::AudioServer:
+            role = "audio_server";
+            break;
+        case WebView::ProcessType::WasmCompiler:
+            role = "wasm_compiler";
+            break;
+        }
+        processes.push_back({
+            .pid = static_cast<int32_t>(process.pid()),
+            .role = role,
+            .start_time_in_microseconds = process.start_time_in_microseconds().has_value()
+                ? std::optional<uint64_t> { *process.start_time_in_microseconds() }
+                : std::nullopt,
+            .parent_pid = process.parent_pid().has_value()
+                ? std::optional<int32_t> { static_cast<int32_t>(*process.parent_pid()) }
+                : std::nullopt,
+            .parent_start_time_in_microseconds = process.parent_start_time_in_microseconds().has_value()
+                ? std::optional<uint64_t> { *process.parent_start_time_in_microseconds() }
+                : std::nullopt,
+        });
+    });
+#if defined(AK_OS_MACOS)
+    if (auto process_reaper = WebView::ProcessReaper::active_identity(); process_reaper.has_value()) {
+        processes.push_back({
+            .pid = static_cast<int32_t>(process_reaper->pid),
+            .role = "process_reaper",
+            .start_time_in_microseconds = process_reaper->start_time_in_microseconds,
+            .parent_pid = process_reaper->parent_pid.has_value()
+                ? std::optional<int32_t> { static_cast<int32_t>(*process_reaper->parent_pid) }
+                : std::nullopt,
+            .parent_start_time_in_microseconds = process_reaper->parent_start_time_in_microseconds.has_value()
+                ? std::optional<uint64_t> { *process_reaper->parent_start_time_in_microseconds }
+                : std::nullopt,
+        });
+    }
+#endif
+    std::sort(processes.begin(), processes.end(), [](auto const& left, auto const& right) {
+        return left.pid < right.pid;
+    });
+    return processes;
 }
 
 void Runtime::set_clipboard(Clipboard clipboard)
@@ -1250,6 +1368,50 @@ View::~View() = default;
 View::View(View&&) noexcept = default;
 View& View::operator=(View&&) noexcept = default;
 void View::navigate(std::string const& url) { m_impl->view->navigate({ url.data(), url.size() }); }
+bool View::install_speedometer_result_observer()
+{
+    if (!m_impl || !m_impl->view || !m_impl->view->has_completed_document_load())
+        return false;
+    static constexpr auto script = R"JS((() => {
+        const prefix = "VelocitySpeedometer3.1:";
+        const root = document.documentElement;
+        if (!root || globalThis.__velocitySpeedometerObserverInstalled)
+            return;
+        globalThis.__velocitySpeedometerObserverInstalled = true;
+        const publish = () => {
+            const section = root.getAttribute("data-visible-section");
+            const warning = document.querySelector("#screen-size-warning");
+            const viewportWarning = !!warning && getComputedStyle(warning).display !== "none";
+            if (section === "running") {
+                const title = prefix + JSON.stringify({ state: "running", version: "3.1", viewport_warning: viewportWarning });
+                if (document.title !== title)
+                    document.title = title;
+                return;
+            }
+            if (section !== "summary")
+                return;
+            const summary = document.querySelector("#summary");
+            const invalid = summary && summary.classList.contains("invalid");
+            const scoreMetric = globalThis.benchmarkClient?.metrics?.Score;
+            const score = scoreMetric && Number.isFinite(scoreMetric.mean) ? scoreMetric.mean : null;
+            const internalScores = scoreMetric && Array.isArray(scoreMetric.values) ? scoreMetric.values : [];
+            const payload = invalid
+                ? { state: "failed", version: "3.1", error: document.querySelector("#invalid-score-text")?.innerText?.trim() || "Speedometer reported an invalid score", viewport_warning: viewportWarning }
+                : { state: "complete", version: "3.1", score, internal_scores: internalScores, viewport_warning: viewportWarning };
+            const title = prefix + JSON.stringify(payload);
+            if (document.title !== title)
+                document.title = title;
+        };
+        const observer = new MutationObserver(publish);
+        observer.observe(root, { attributes: true, attributeFilter: ["data-visible-section"] });
+        const summary = document.querySelector("#summary");
+        if (summary)
+            observer.observe(summary, { attributes: true, attributeFilter: ["class"] });
+        publish();
+    })())JS";
+    m_impl->view->run_javascript(MUST(String::from_utf8(StringView { script, sizeof(script) - 1 })));
+    return true;
+}
 void View::reload() { m_impl->view->reload(); }
 void View::stop_loading() { m_impl->view->stop_loading(); }
 void View::go_back() { m_impl->view->traverse_the_history_by_delta(-1); }
@@ -1329,12 +1491,18 @@ static Web::UIEvents::KeyModifier modifiers(bool shift, bool control, bool alt, 
 static Web::UIEvents::MouseButton mouse_button(PointerButton button)
 {
     switch (button) {
-    case PointerButton::None: return Web::UIEvents::MouseButton::None;
-    case PointerButton::Primary: return Web::UIEvents::MouseButton::Primary;
-    case PointerButton::Secondary: return Web::UIEvents::MouseButton::Secondary;
-    case PointerButton::Middle: return Web::UIEvents::MouseButton::Middle;
-    case PointerButton::Back: return Web::UIEvents::MouseButton::Backward;
-    case PointerButton::Forward: return Web::UIEvents::MouseButton::Forward;
+    case PointerButton::None:
+        return Web::UIEvents::MouseButton::None;
+    case PointerButton::Primary:
+        return Web::UIEvents::MouseButton::Primary;
+    case PointerButton::Secondary:
+        return Web::UIEvents::MouseButton::Secondary;
+    case PointerButton::Middle:
+        return Web::UIEvents::MouseButton::Middle;
+    case PointerButton::Back:
+        return Web::UIEvents::MouseButton::Backward;
+    case PointerButton::Forward:
+        return Web::UIEvents::MouseButton::Forward;
     }
     return Web::UIEvents::MouseButton::None;
 }
@@ -1343,11 +1511,21 @@ void View::send_pointer_event(PointerEvent const& event)
 {
     auto type = Web::MouseEvent::Type::MouseMove;
     switch (event.type) {
-    case PointerType::Move: type = Web::MouseEvent::Type::MouseMove; break;
-    case PointerType::Leave: type = Web::MouseEvent::Type::MouseLeave; break;
-    case PointerType::Press: type = Web::MouseEvent::Type::MouseDown; break;
-    case PointerType::Release: type = Web::MouseEvent::Type::MouseUp; break;
-    case PointerType::Wheel: type = Web::MouseEvent::Type::MouseWheel; break;
+    case PointerType::Move:
+        type = Web::MouseEvent::Type::MouseMove;
+        break;
+    case PointerType::Leave:
+        type = Web::MouseEvent::Type::MouseLeave;
+        break;
+    case PointerType::Press:
+        type = Web::MouseEvent::Type::MouseDown;
+        break;
+    case PointerType::Release:
+        type = Web::MouseEvent::Type::MouseUp;
+        break;
+    case PointerType::Wheel:
+        type = Web::MouseEvent::Type::MouseWheel;
+        break;
     }
     auto to_device = [&](double value) { return Web::DevicePixels(static_cast<int>(std::lround(value * m_impl->view->device_pixel_ratio()))); };
     auto button = mouse_button(event.button);

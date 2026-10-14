@@ -22,6 +22,7 @@
 #    include <LibIPC/TransportBootstrapMach.h>
 #    include <LibWebView/Application.h>
 #    include <LibWebView/ProcessReaper.h>
+#    include <LibWebView/ProcessReaperProtocol.h>
 #    include <LibWebView/Utilities.h>
 #endif
 
@@ -39,6 +40,16 @@ Process::Process(ProcessType type, RefPtr<IPC::ConnectionBase> connection, Core:
     , m_type(type)
     , m_connection(move(connection))
 {
+#if defined(AK_OS_MACOS)
+    ProcessIdentitySnapshot identity {};
+    if (process_identity_snapshot(m_process.pid(), identity)) {
+        m_start_time_in_microseconds = identity.start_time_in_microseconds;
+        if (identity.parent_pid > 0)
+            m_parent_pid = identity.parent_pid;
+        if (identity.has_parent_start_time)
+            m_parent_start_time_in_microseconds = identity.parent_start_time_in_microseconds;
+    }
+#endif
 }
 
 void Process::save_crash_report(Optional<int> exit_status)

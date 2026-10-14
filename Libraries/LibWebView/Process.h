@@ -45,6 +45,9 @@ public:
     static ErrorOr<ProcessAndTransport> spawn_with_transport(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output);
 
     ProcessType type() const { return m_type; }
+    Optional<u64> start_time_in_microseconds() const { return m_start_time_in_microseconds; }
+    Optional<pid_t> parent_pid() const { return m_parent_pid; }
+    Optional<u64> parent_start_time_in_microseconds() const { return m_parent_start_time_in_microseconds; }
 
     Optional<Utf16String> const& title() const { return m_title; }
     void set_title(Optional<Utf16String> title) { m_title = move(title); }
@@ -102,6 +105,9 @@ private:
     OwnPtr<Sandbox::ConnectBroker> m_connect_broker;
 #endif
     Core::Process m_process;
+    Optional<u64> m_start_time_in_microseconds;
+    Optional<pid_t> m_parent_pid;
+    Optional<u64> m_parent_start_time_in_microseconds;
     ProcessType m_type;
     Optional<Utf16String> m_title;
     Optional<pid_t> m_owner_pid;

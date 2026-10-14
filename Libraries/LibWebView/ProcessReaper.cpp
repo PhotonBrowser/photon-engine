@@ -16,6 +16,7 @@ namespace WebView {
 
 // The reaper reads the helper records from this descriptor.
 static constexpr int reaper_pipe_fd = 3;
+static Optional<ProcessReaperIdentity> s_active_process_reaper_identity;
 
 ErrorOr<NonnullOwnPtr<ProcessReaper>> ProcessReaper::start(ByteString const& executable_path)
 {
@@ -49,9 +50,29 @@ ErrorOr<NonnullOwnPtr<ProcessReaper>> ProcessReaper::start(ByteString const& exe
         },
     }));
 
+    ProcessIdentitySnapshot process_identity {};
+    Optional<uint64_t> start_time_identity;
+    Optional<pid_t> parent_pid;
+    Optional<uint64_t> parent_start_time;
+    if (process_identity_snapshot(process.pid(), process_identity)) {
+        start_time_identity = process_identity.start_time_in_microseconds;
+        if (process_identity.parent_pid > 0)
+            parent_pid = process_identity.parent_pid;
+        if (process_identity.has_parent_start_time)
+            parent_start_time = process_identity.parent_start_time_in_microseconds;
+    }
     auto process_reaper = TRY(adopt_nonnull_own_or_enomem(new (nothrow) ProcessReaper(pipe_fds[1], process.pid())));
+    if (start_time_identity.has_value())
+        s_active_process_reaper_identity = ProcessReaperIdentity {
+            process.pid(), *start_time_identity, parent_pid, parent_start_time
+        };
     close_write_end.disarm();
     return process_reaper;
+}
+
+Optional<ProcessReaperIdentity> ProcessReaper::active_identity()
+{
+    return s_active_process_reaper_identity;
 }
 
 ProcessReaper::ProcessReaper(int pipe_fd, pid_t pid)
@@ -62,6 +83,8 @@ ProcessReaper::ProcessReaper(int pipe_fd, pid_t pid)
 
 ProcessReaper::~ProcessReaper()
 {
+    if (s_active_process_reaper_identity.has_value() && s_active_process_reaper_identity->pid == m_pid)
+        s_active_process_reaper_identity.clear();
     // Closing the pipe tells the reaper that we are gone, as our exit or death would.
     if (m_pipe_fd >= 0)
         (void)Core::System::close(m_pipe_fd);

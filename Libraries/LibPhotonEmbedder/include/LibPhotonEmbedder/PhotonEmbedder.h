@@ -61,6 +61,8 @@ struct ViewState {
     bool loading { false };
     bool can_go_back { false };
     bool can_go_forward { false };
+    // Present only for HTTP(S) documents; true means the committed page uses HTTPS.
+    std::optional<bool> connection_secure;
 };
 
 enum class NavigationTimingEvent : int {
@@ -79,9 +81,12 @@ struct Favicon {
 };
 
 // An Engine service process that is restarted when it stops.
-enum class EngineService : uint8_t { Compositor, Network };
+enum class EngineService : uint8_t { Compositor,
+    Network };
 
-enum class DialogType : uint8_t { Alert, Confirm, Prompt };
+enum class DialogType : uint8_t { Alert,
+    Confirm,
+    Prompt };
 
 // A JavaScript alert, confirm or prompt. The page waits until the embedder
 // answers with the matching View::*_closed call.
@@ -194,9 +199,24 @@ struct ClearBrowsingData {
 };
 
 enum class Cursor : uint8_t {
-    Arrow, Hidden, Crosshair, IBeam, ResizeHorizontal, ResizeVertical,
-    ResizeDiagonalTLBR, ResizeDiagonalBLTR, ResizeColumn, ResizeRow, Hand,
-    Help, OpenHand, Drag, DragCopy, Move, Wait, Disallowed,
+    Arrow,
+    Hidden,
+    Crosshair,
+    IBeam,
+    ResizeHorizontal,
+    ResizeVertical,
+    ResizeDiagonalTLBR,
+    ResizeDiagonalBLTR,
+    ResizeColumn,
+    ResizeRow,
+    Hand,
+    Help,
+    OpenHand,
+    Drag,
+    DragCopy,
+    Move,
+    Wait,
+    Disallowed,
 };
 
 struct ViewCallbacks {
@@ -249,9 +269,21 @@ struct ViewCallbacks {
     std::function<void(std::string const& url)> peek_requested;
 };
 
-enum class PointerType { Move, Leave, Press, Release, Wheel };
-enum class PointerButton : uint8_t { None = 0, Primary = 1, Secondary = 2, Middle = 4, Back = 8, Forward = 16 };
-enum class ScrollPhase { None, Ongoing, Momentum, Ended };
+enum class PointerType { Move,
+    Leave,
+    Press,
+    Release,
+    Wheel };
+enum class PointerButton : uint8_t { None = 0,
+    Primary = 1,
+    Secondary = 2,
+    Middle = 4,
+    Back = 8,
+    Forward = 16 };
+enum class ScrollPhase { None,
+    Ongoing,
+    Momentum,
+    Ended };
 struct PointerEvent {
     PointerType type { PointerType::Move };
     double x { 0 };
@@ -275,21 +307,84 @@ struct PointerEvent {
 };
 
 enum class Key : uint16_t {
-    Unknown = 0, Backspace = 0x08, Tab = 0x09, Enter = 0x0D,
-    Escape = 0x1B, Space = 0x20, PageUp = 0x21, PageDown = 0x22,
-    End = 0x23, Home = 0x24, Left = 0x25, Up = 0x26, Right = 0x27,
-    Down = 0x28, Delete = 0x2E,
-    Digit0 = '0', Digit1 = '1', Digit2 = '2', Digit3 = '3', Digit4 = '4',
-    Digit5 = '5', Digit6 = '6', Digit7 = '7', Digit8 = '8', Digit9 = '9',
-    A = 'A', B = 'B', C = 'C', D = 'D', E = 'E', F = 'F', G = 'G', H = 'H',
-    I = 'I', J = 'J', K = 'K', L = 'L', M = 'M', N = 'N', O = 'O', P = 'P',
-    Q = 'Q', R = 'R', S = 'S', T = 'T', U = 'U', V = 'V', W = 'W', X = 'X',
-    Y = 'Y', Z = 'Z', F1 = 0x70, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12
+    Unknown = 0,
+    Backspace = 0x08,
+    Tab = 0x09,
+    Enter = 0x0D,
+    Escape = 0x1B,
+    Space = 0x20,
+    PageUp = 0x21,
+    PageDown = 0x22,
+    End = 0x23,
+    Home = 0x24,
+    Left = 0x25,
+    Up = 0x26,
+    Right = 0x27,
+    Down = 0x28,
+    Delete = 0x2E,
+    Digit0 = '0',
+    Digit1 = '1',
+    Digit2 = '2',
+    Digit3 = '3',
+    Digit4 = '4',
+    Digit5 = '5',
+    Digit6 = '6',
+    Digit7 = '7',
+    Digit8 = '8',
+    Digit9 = '9',
+    A = 'A',
+    B = 'B',
+    C = 'C',
+    D = 'D',
+    E = 'E',
+    F = 'F',
+    G = 'G',
+    H = 'H',
+    I = 'I',
+    J = 'J',
+    K = 'K',
+    L = 'L',
+    M = 'M',
+    N = 'N',
+    O = 'O',
+    P = 'P',
+    Q = 'Q',
+    R = 'R',
+    S = 'S',
+    T = 'T',
+    U = 'U',
+    V = 'V',
+    W = 'W',
+    X = 'X',
+    Y = 'Y',
+    Z = 'Z',
+    F1 = 0x70,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12
 };
 
-enum class PreferredColorScheme : uint8_t { Auto, Dark, Light };
+enum class PreferredColorScheme : uint8_t { Auto,
+    Dark,
+    Light };
 
 class View;
+
+struct RegisteredEngineProcess {
+    int32_t pid { 0 };
+    std::string role;
+    std::optional<uint64_t> start_time_in_microseconds;
+    std::optional<int32_t> parent_pid;
+    std::optional<uint64_t> parent_start_time_in_microseconds;
+};
 
 class PHOTONEMBEDDER_API Runtime {
 public:
@@ -319,6 +414,9 @@ public:
     // Called with `restarted` false when a service process stops and true once
     // its replacement is running. The network service reports only its restart.
     void set_service_callback(std::function<void(EngineService, bool restarted)>);
+    // Returns a snapshot of active processes registered by WebView's process
+    // manager. The scope is limited to that manager's process records.
+    std::vector<RegisteredEngineProcess> registered_engine_processes() const;
     // Use the host's system clipboard for copying and pasting.
     void set_clipboard(Clipboard);
     // Deletes website data, then calls `done`.
@@ -341,6 +439,9 @@ public:
     View& operator=(View const&) = delete;
 
     void navigate(std::string const&);
+    // Installs a fixed, read-only observer for the official Speedometer 3.1
+    // result object. This is used only by authenticated automation sessions.
+    bool install_speedometer_result_observer();
     void reload();
     void stop_loading();
     void go_back();
