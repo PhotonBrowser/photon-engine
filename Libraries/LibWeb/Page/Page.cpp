@@ -694,6 +694,15 @@ GC::Ref<HTML::LocalNavigable> Page::local_traversable() const
     return as<HTML::LocalNavigable>(*m_top_level_traversable);
 }
 
+bool Page::set_viewport_size_from_device_pixels_if_local(DevicePixelSize size, InvalidateDisplayList invalidate)
+{
+    if (!has_local_traversable())
+        return false;
+
+    local_traversable()->set_viewport_size(device_to_css_size(size), invalidate);
+    return true;
+}
+
 Vector<GC::Ref<HTML::LocalNavigable>> Page::local_roots() const
 {
     Vector<GC::Ref<HTML::LocalNavigable>> roots;

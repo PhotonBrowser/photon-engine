@@ -134,6 +134,7 @@ public:
 
     GC::Ref<HTML::LocalNavigable> local_traversable() const;
     bool has_local_traversable() const;
+    bool set_viewport_size_from_device_pixels_if_local(DevicePixelSize, InvalidateDisplayList);
     Vector<GC::Ref<HTML::LocalNavigable>> local_roots() const;
     Vector<GC::Root<HTML::LocalNavigable>> hosted_navigables() const;
     GC::Ptr<HTML::Navigable> navigable_with_id(HTML::CrossProcessId) const;

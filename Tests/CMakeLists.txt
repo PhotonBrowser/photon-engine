@@ -101,6 +101,10 @@ if (ENABLE_GUI_TARGETS AND ENABLE_LADYBIRD_UI)
     add_subdirectory(UI)
 endif()
 
+if (ENABLE_PHOTON_EMBEDDER)
+    add_subdirectory(PhotonEmbedder)
+endif()
+
 if (ENABLE_CLANG_PLUGINS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang$")
     add_subdirectory(ClangPlugins)
 endif()

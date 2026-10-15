@@ -545,7 +545,7 @@ void PageClient::set_viewport(Web::DevicePixelSize const& size, double device_pi
     if (m_pending_device_pixel_ratio_for_testing == device_pixel_ratio)
         m_pending_device_pixel_ratio_for_testing.clear();
 
-    page().local_traversable()->set_viewport_size(page().device_to_css_size(size), invalidate);
+    page().set_viewport_size_from_device_pixels_if_local(size, invalidate);
     if (invalidate == Web::InvalidateDisplayList::PaintCommandsAndHitTestList)
         device_pixels_per_css_pixel_did_change();
     hurry_outstanding_rendering_opportunity();
