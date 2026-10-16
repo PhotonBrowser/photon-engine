@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/CharacterTypes.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibJS/Runtime/Value.h>
@@ -21,9 +22,34 @@ static Utf16String generate_random_uuid_utf16()
     return Utf16String::from_ascii_without_validation(uuid.bytes());
 }
 
+static CrossProcessId generate_directive_state_id()
+{
+    auto uuid = Crypto::generate_random_uuid();
+    u64 namespace_id = 0;
+    u64 local_id = 0;
+    size_t digit_count = 0;
+    for (auto byte : uuid.bytes()) {
+        if (byte == '-')
+            continue;
+        auto const nibble = parse_ascii_hex_digit(byte);
+        if (digit_count < 16)
+            namespace_id = (namespace_id << 4) | nibble;
+        else
+            local_id = (local_id << 4) | nibble;
+        ++digit_count;
+    }
+    VERIFY(digit_count == 32);
+    return { namespace_id, local_id };
+}
+
 NonnullRefPtr<SessionHistoryEntry> SessionHistoryEntry::create()
 {
-    return adopt_ref(*new SessionHistoryEntry());
+    return create(DirectiveState::create(generate_directive_state_id()));
+}
+
+NonnullRefPtr<SessionHistoryEntry> SessionHistoryEntry::create(NonnullRefPtr<DirectiveState> directive_state)
+{
+    return adopt_ref(*new SessionHistoryEntry(move(directive_state)));
 }
 
 SessionHistoryEntry::~SessionHistoryEntry() = default;
@@ -42,10 +68,16 @@ UniqueNodeID SessionHistoryEntry::document_id() const
 }
 
 SessionHistoryEntry::SessionHistoryEntry()
+    : SessionHistoryEntry(DirectiveState::create(generate_directive_state_id()))
+{
+}
+
+SessionHistoryEntry::SessionHistoryEntry(NonnullRefPtr<DirectiveState> directive_state)
     : m_classic_history_api_state(structured_serialize_undefined_or_null_for_storage(JS::js_null()))
     , m_navigation_api_state(structured_serialize_undefined_or_null_for_storage(JS::js_undefined()))
     , m_navigation_api_key(generate_random_uuid_utf16())
     , m_navigation_api_id(generate_random_uuid_utf16())
+    , m_directive_state(move(directive_state))
 {
 }
 
@@ -86,6 +118,8 @@ SessionHistoryEntryDescriptor create_session_history_entry_descriptor(SessionHis
         .navigation_api_id = entry.navigation_api_id(),
         .scroll_restoration_mode = entry.scroll_restoration_mode(),
         .scroll_position_data = entry.scroll_position_data(),
+        .directive_state_id = entry.directive_state()->cross_process_id(),
+        .directive_state_value = entry.directive_state()->value(),
     };
 }
 
@@ -127,6 +161,8 @@ PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descri
         .navigation_api_id = entry.navigation_api_id(),
         .scroll_restoration_mode = entry.scroll_restoration_mode(),
         .scroll_position_data = entry.scroll_position_data(),
+        .directive_state_id = entry.directive_state()->cross_process_id(),
+        .directive_state_value = entry.directive_state()->value(),
     };
 }
 
@@ -143,6 +179,8 @@ SameDocumentNavigationEntry create_same_document_navigation_entry(SessionHistory
         .navigation_api_id = entry.navigation_api_id(),
         .scroll_restoration_mode = entry.scroll_restoration_mode(),
         .scroll_position_data = entry.scroll_position_data(),
+        .directive_state_id = entry.directive_state()->cross_process_id(),
+        .directive_state_value = entry.directive_state()->value(),
     };
 }
 
@@ -156,6 +194,10 @@ void apply_session_history_entry_descriptor_from_ui_process(SessionHistoryEntry&
     entry.set_navigation_api_id(move(entry_descriptor.navigation_api_id));
     entry.set_scroll_restoration_mode(entry_descriptor.scroll_restoration_mode);
     entry.set_scroll_position_data(move(entry_descriptor.scroll_position_data));
+    if (entry.directive_state()->cross_process_id() == entry_descriptor.directive_state_id)
+        entry.directive_state()->set_value(move(entry_descriptor.directive_state_value));
+    else
+        entry.set_directive_state(DirectiveState::create(entry_descriptor.directive_state_id, move(entry_descriptor.directive_state_value)));
 }
 
 void apply_session_history_document_state_descriptor_from_ui_process(DocumentState& document_state, SessionHistoryDocumentStateDescriptor const& document_state_descriptor)
@@ -191,7 +233,11 @@ RefPtr<DocumentState> get_or_create_document_state_from_ui_process(SessionHistor
 
 NonnullRefPtr<SessionHistoryEntry> create_session_history_entry_from_ui_process(SessionHistoryEntryDescriptor entry_descriptor, SessionHistoryEntryReconstructionState& reconstruction_state)
 {
-    auto entry = SessionHistoryEntry::create();
+    auto& directive_state = reconstruction_state.directive_states.ensure(entry_descriptor.directive_state_id, [&] {
+        return DirectiveState::create(entry_descriptor.directive_state_id, entry_descriptor.directive_state_value);
+    });
+    directive_state->set_value(entry_descriptor.directive_state_value);
+    auto entry = SessionHistoryEntry::create(directive_state);
     apply_session_history_entry_descriptor_from_ui_process(*entry, entry_descriptor);
 
     auto document_state = get_or_create_document_state_from_ui_process(entry_descriptor.document_state, reconstruction_state);

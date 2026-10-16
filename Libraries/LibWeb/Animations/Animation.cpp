@@ -18,6 +18,7 @@
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSNumericValue.h>
+#include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/Length.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
 #include <LibWeb/DOM/Document.h>
@@ -700,15 +701,19 @@ void Animation::cancel(ShouldInvalidate should_invalidate)
         // 1. Run the procedure to reset an animation’s pending tasks on animation.
         reset_an_animations_pending_tasks();
 
-        // 2. Reject the current finished promise with a DOMException named "AbortError".
-        auto dom_exception = WebIDL::AbortError::create("Animation was cancelled"_utf16);
-        WebIDL::reject_promise(current_finished_promise(), dom_exception);
+        // OPTIMIZATION: A current finished promise that was never created is a pending promise nothing can observe,
+        //               and the new promise of step 4 is just like it, so steps 2 to 4 only matter for a created one.
+        if (m_current_finished_promise) {
+            // 2. Reject the current finished promise with a DOMException named "AbortError".
+            auto dom_exception = WebIDL::AbortError::create("Animation was cancelled"_utf16);
+            WebIDL::reject_promise(*m_current_finished_promise, dom_exception);
 
-        // 3. Set the [[PromiseIsHandled]] internal slot of the current finished promise to true.
-        WebIDL::mark_promise_as_handled(current_finished_promise());
+            // 3. Set the [[PromiseIsHandled]] internal slot of the current finished promise to true.
+            WebIDL::mark_promise_as_handled(*m_current_finished_promise);
 
-        // 4. Let current finished promise be a new promise in the relevant Realm of animation.
-        m_current_finished_promise = WebIDL::create_promise_for(relevant_global_object());
+            // 4. Let current finished promise be a new promise in the relevant Realm of animation.
+            m_current_finished_promise = nullptr;
+        }
         m_is_finished = false;
 
         // 5. Create an AnimationPlaybackEvent, cancelEvent.
@@ -1548,16 +1553,22 @@ void Animation::reset_an_animations_pending_tasks()
     // 4. Apply any pending playback rate on animation.
     apply_any_pending_playback_rate();
 
+    // OPTIMIZATION: A current ready promise that was never created is a resolved promise nothing can observe. Rejecting
+    //               it does nothing, and the new resolved promise of step 7 is just like it, so steps 5 to 7 only
+    //               matter for a created one.
+    if (!m_current_ready_promise)
+        return;
+
     // 5. Reject animation’s current ready promise with a DOMException named "AbortError".
     auto dom_exception = WebIDL::AbortError::create("Animation was cancelled"_utf16);
-    WebIDL::reject_promise(current_ready_promise(), dom_exception);
+    WebIDL::reject_promise(*m_current_ready_promise, dom_exception);
 
     // 6. Set the [[PromiseIsHandled]] internal slot of animation’s current ready promise to true.
-    WebIDL::mark_promise_as_handled(current_ready_promise());
+    WebIDL::mark_promise_as_handled(*m_current_ready_promise);
 
     // 7. Let animation’s current ready promise be the result of creating a new resolved Promise object with value
     //    animation in the relevant Realm of animation.
-    m_current_ready_promise = Bindings::create_resolved_animation_promise(*this);
+    m_current_ready_promise = nullptr;
 }
 
 // https://drafts.csswg.org/web-animations-2/#ready
@@ -1591,6 +1602,14 @@ void Animation::run_pending_play_task()
     // FIXME: We can get a more accurate time here if we record the actual instant we became ready rather than waiting
     //        to try and run this task
     auto ready_time = m_timeline->current_time().value();
+    // AD-HOC: A new CSS transition of properties the compositor may run stays pending past the rendering update of its
+    //         style change event, which already rendered it, on the compositor or here. It became ready at the time of
+    //         its style change event, from which the compositor runs it, so that a style change a frame later starts
+    //         the next transition from the value on the screen rather than from this transition's start value.
+    if (auto const* keyframe_effect = as_if<KeyframeEffect>(m_effect.ptr());
+        is_css_transition() && keyframe_effect && keyframe_effect->may_run_on_the_compositor()
+        && as<CSS::CSSTransition>(*this).previous_phase() == CSS::CSSTransition::Phase::Idle)
+        ready_time = { TimeValue::Type::Milliseconds, as<CSS::CSSTransition>(*this).style_change_event_time() };
 
     // 3. Perform the steps corresponding to the first matching condition below, if any:
 

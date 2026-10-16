@@ -565,7 +565,7 @@ void HTMLLinkElement::fetch_and_process_linked_dns_prefetch_resource()
     // FIXME: This should go through Fetch: https://fetch.spec.whatwg.org/#resolve-an-origin
     if (!ResourceLoader::is_initialized())
         return;
-    ResourceLoader::the().prefetch_dns(url.value(), document().fallback_base_url());
+    ResourceLoader::the().prefetch_dns(document(), url.value(), document().fallback_base_url());
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#link-type-preconnect:fetch-and-process-the-linked-resource-2
@@ -821,8 +821,9 @@ void HTMLLinkElement::preconnect(LinkProcessingOptions const& options)
     // FIXME: This should go through Fetch: https://fetch.spec.whatwg.org/#concept-connection-obtain
     if (!ResourceLoader::is_initialized())
         return;
+
     auto source_url = options.document ? options.document->fallback_base_url() : options.environment->api_base_url();
-    ResourceLoader::the().preconnect(*url, source_url);
+    ResourceLoader::the().preconnect(options.document, *url, source_url);
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#match-preload-type
@@ -1144,8 +1145,11 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
                         link->cancel_pending_stylesheet_processing();
                         return;
                     }
+                    // NB: The task's function keeps the element and the document alive as cells it holds, not as GC
+                    //     roots: the roots of a function that died would keep them alive through the collection that
+                    //     finds it dead.
                     link->queue_an_element_task(Task::Source::Networking,
-                        [link = move(link), loaded_document = move(loaded_document), fetch_generation, location = move(location), base_url = move(base_url), parsed = move(parsed), origin_clean] {
+                        [link = GC::Ref { *link }, loaded_document = GC::Ref { *loaded_document }, fetch_generation, location = move(location), base_url = move(base_url), parsed = move(parsed), origin_clean] {
                             if (fetch_generation != link->m_current_fetch_generation || !link->m_stylesheet_processing_pending)
                                 return;
                             if (&link->document() != loaded_document.ptr() || !loaded_document->is_fully_active()

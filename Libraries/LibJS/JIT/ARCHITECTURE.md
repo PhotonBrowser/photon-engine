@@ -185,7 +185,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | ConcatenateStrings | The concatenation of two strings, a rope or a cached short string, or the empty value where only the slow path makes it. | | | | allocates |
 | IntegerToString | The VM's cached string of an int32, or the empty value. | | | | cse |
 | LoadPropertyIteratorKeyCount, LoadPropertyIteratorKey | The keys of a property iterator cache, at an index refined to be in bounds. The keys never change. | | | | cse |
-| CreateArrayIterator | `GetIterator` of an array that iterates with `%Array.prototype.values%` and the builtin `next` (input 1), through a runtime call that preserves every register: a new array iterator over its values, or the empty value for anything else. | | Any | | allocates |
+| OpenArrayIteration | `GetIterator` in fast array mode, through a runtime call that preserves every register: the iterable, if it is an array that iterates with `%Array.prototype.values%` and whose array iterators have the builtin `next`, or the empty value. The iteration then keeps the index of the next element in the iterator operand and the array in the next operand, and makes no iterator. | | Any | | |
 | LoadArrayIteratorArray, LoadArrayIteratorIndex | The iterated array (`undefined` once done) and the low 32 bits of the next index of an array iterator (a `Repr::Pointer` that `BranchCondition::ArrayIterator` established is one). | | Iterators | | |
 | StoreArrayIteratorIndex, FinishArrayIterator | Sets the next index of an array iterator, or makes it done. | | | Iterators | |
 | LoadGlobalBinding | A binding of the global declarative environment; exits while uninitialized. | E | Global | | cse |
@@ -274,7 +274,9 @@ the prologue's resumption in the interpreter publishes it inline.
 Compiled code may assume facts that hold until a rare runtime event (`code::Dependency`): a
 prototype chain stays valid, a shape stays stable, a global binding or a property of the global
 object is never assigned, the global declarative environment gets no bindings, no `[[IsHTMLDDA]]`
-object exists.
+object exists. Each of the first and the last kinds is a `WatchpointSet` that stays valid
+(`runtime/watchpoint_set.rs`), such as one of a realm for the iterator protocol
+(`runtime/realm_watchpoints.rs`).
 
 - The builder and check elimination record the dependencies they rely on in
   `Graph::dependencies`.
@@ -308,12 +310,14 @@ unreachable. Each one keeps the graph valid (`passes/verify.rs`), and IR tests i
 |---|---|
 | Trivial phi removal | Phis whose inputs are all one value (or the phi itself) become that value. |
 | Truncation | Int32 additions, subtractions and unsigned right shifts whose users only read the low 32 bits of their results (bitwise operations, shifts, wrapping arithmetic, integer typed array stores) and no frame state holds become `Int32WrappingBinary`, which never exits. Comparisons of uint32 values (`x >>> 0`) first become unsigned comparisons of the shifted values. |
-| Simplification | Constant folding and strength reduction; branches on constants become jumps; unboxing a box is the boxed value; int32 operations that leave their left-hand side as it is, like `x \| 0`, become it. |
+| Simplification | Constant folding and strength reduction; branches on constants become jumps; unboxing a box is the boxed value, and so is an int32 check of the boxed double of an int32; int32 operations that leave their left-hand side as it is, like `x \| 0`, become it. |
 | Representation selection | Phis of int32, bool or float64 values become unboxed phis, and int32 inputs of float64 phis are converted. Tagged inputs of an int32 phi that the code checks somewhere (or of the phis connected to it) are checked where they enter, exiting to the start of the phi's block, unless such a check exited there before. |
 | Simplification | Again, for what unboxing made foldable. |
-| Check elimination | A forward dataflow of facts removes checks that passed already and reuses loads whose value is known; may turn shape checks into `AssumeValid` plus a stable shape dependency. |
-| Global value numbering | A CSE-able node computing what a dominating node computed is replaced by it. Memory reads are left to check elimination. |
-| Loop invariant code motion | Gives loops entered from several blocks a merged preheader, then moves effect-free nodes with inputs from outside the loop to it; nodes that may exit only from blocks every iteration runs, exiting to the loop header, and not where that kind of exit was taken there before. |
+| Global value numbering | A CSE-able node computing what a dominating node computed is replaced by it, so that check elimination sees one value where the builder computed it twice (like the index of `k[Math.abs(j)]` in two expressions). Memory reads are left to check elimination. |
+| Check elimination | A forward dataflow of facts removes checks that passed already, decides branches that a branch on the same values decided before, and reuses loads whose value is known; may turn shape checks into `AssumeValid` plus a stable shape dependency. |
+| Simplification | Again, for what the branches that check elimination decided left foldable (like the double path of `Math.abs` of an int32). |
+| Global value numbering | Again, for the nodes that check elimination and simplification made the same. |
+| Loop invariant code motion | Gives loops entered from several blocks a merged preheader, then moves effect-free nodes with inputs from outside the loop to it; nodes that may exit too, exiting to the loop header, and not where that kind of exit was taken there before. Those from blocks that not every iteration runs, but for cold ones, move speculatively: they exit with `Hoisted`, and stay in the loop where such an exit was taken there before. |
 | Bounds check elimination | Bounds checks against constant counts go away where the index is known to be in range: induction variables of loops whose back edge compares the grown counter with a constant bound, merges of values from outside a loop, and int32 arithmetic on them that cannot overflow. The counter an on-stack replacement entry brings is checked against the bound once where it enters, unless such a check exited there before. With the same ranges, `((x << k) + c) >> k` becomes `x + (c >> k)` where nothing overflows and `c` is a multiple of 2^k. Int32 additions, subtractions and multiplications become `Int32WrappingBinary` where the ranges of their operands keep the result an int32 (and not -0), with operands also bounded by the masks and shifts of any int32, and by the dominating bounds checks and in-bounds branches of indices. |
 | Exit unboxing | Frame states take the unboxed value of an int32, float64 or bool boxing that only frame states use, so that exits box it instead of the fast path. |
 | Dead code elimination | Removes nodes without uses and without effects; frame states count as uses. Branches whose edges lead to the same place doing the same thing become jumps. |

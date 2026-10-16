@@ -187,7 +187,10 @@ def write_forward_header(out: TextIO, modules: List[Module], usage: DefinitionUs
 
     for module in modules:
         interface = module.interface
-        if interface is None or interface.is_namespace or rust_bindings.is_implemented_in_rust(interface):
+        if interface is None or interface.is_namespace:
+            continue
+        # NB: An interface implemented in Rust has a C++ class only if the C++ bindings convert objects of it.
+        if rust_bindings.is_implemented_in_rust(interface) and interface.name not in usage.rust_interfaces_named_by_cpp:
             continue
 
         namespace_name = cpp_namespace_for_module_path(interface.path)
@@ -269,10 +272,10 @@ def main() -> int:
     context = GenerationContext(modules)
     modules = context.modules
 
-    usage = DefinitionUsage(context)
     interface_sets = collect_interface_sets(modules)
 
     try:
+        usage = DefinitionUsage(context)
         rust_bindings.check_rust_bindings(context, usage, interface_sets.intrinsics)
     except rust_bindings.UnsupportedByRustBindings as error:
         print(f"error: {error}", file=sys.stderr)

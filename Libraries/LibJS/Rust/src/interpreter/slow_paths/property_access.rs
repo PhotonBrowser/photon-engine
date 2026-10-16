@@ -30,7 +30,7 @@ use crate::gc::root::MarkedVec;
 use crate::interpreter::runtime_functions::{SlowPathControl, asm_try, handle_asm_exception};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
-use crate::layout::shape::{PrototypeChainValidity, Shape};
+use crate::layout::shape::{Shape, WatchpointSet};
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::function_object_as_object;
 use crate::runtime::array::Array;
@@ -457,7 +457,8 @@ pub fn get_length_with_this(
 pub fn get_method(vm: &Vm, pc: u32, instruction: &op::GetMethod, values: &mut op::GetMethodValues) -> SlowPathControl {
     let executable = vm.current_executable();
     let property_key = executable.get_property_key(instruction.property);
-    let method = asm_try!(vm, pc, values.object.get_method(vm, property_key));
+    let cache = executable.property_lookup_cache(instruction.cache as usize);
+    let method = asm_try!(vm, pc, values.object.get_method_with_cache(vm, property_key, cache));
     values.dst = method.map_or(Value::UNDEFINED, Value::from_object);
     SlowPathControl::continue_at(pc + op::GetMethod::LENGTH)
 }
@@ -563,7 +564,7 @@ fn put_by_value_with_keyed_store_cache(
                 if (!shape.is_dictionary() || shape.dictionary_generation() == entry.shape_dictionary_generation)
                     && !object.get_direct(entry.property_offset).is_accessor()
                 {
-                    object.put_direct(entry.property_offset, value);
+                    object.put_direct_from_cache(entry.property_offset, value);
                     return Ok(());
                 }
             }
@@ -579,7 +580,7 @@ fn put_by_value_with_keyed_store_cache(
                         .is_none_or(|validity| validity.is_valid())
                 {
                     object.unsafe_set_shape(new_shape);
-                    object.put_direct(entry.property_offset, value);
+                    object.initialize_direct(entry.property_offset, value);
                     return Ok(());
                 }
             }
@@ -795,7 +796,7 @@ pub fn init_object_literal_property(
         && object.shape() == cached_shape
         && let Some(property_offset) = cached_property_offset
     {
-        object.put_direct(property_offset, value);
+        object.initialize_direct(property_offset, value);
         return SlowPathControl::continue_at(pc + op::InitObjectLiteralProperty::LENGTH);
     }
 
@@ -904,7 +905,7 @@ struct FastPropertyNameIteratorData<'vm> {
     indexed_property_count: u32,
     receiver_has_magical_length_property: bool,
     shape: Gc<Shape>,
-    prototype_chain_validity: Option<Gc<PrototypeChainValidity>>,
+    prototype_chain_validity: Option<Gc<WatchpointSet>>,
 }
 
 fn shape_has_enumerable_string_property(shape: &Shape) -> bool {
@@ -1478,7 +1479,7 @@ pub fn try_put_by_id_cache(vm: &Vm, instruction: &op::PutById, values: &op::PutB
                 if current.is_accessor() || !entry.writes_data_property.get() {
                     return false;
                 }
-                object.put_direct(entry.property_offset.get(), value);
+                object.put_direct_from_cache(entry.property_offset.get(), value);
                 return true;
             }
             PropertyLookupCacheEntryType::AddOwnProperty => {
@@ -1512,7 +1513,7 @@ pub fn try_put_by_id_cache(vm: &Vm, instruction: &op::PutById, values: &op::PutB
                     continue;
                 }
                 object.unsafe_set_shape(cached_shape);
-                object.put_direct(entry.property_offset.get(), value);
+                object.initialize_direct(entry.property_offset.get(), value);
                 return true;
             }
             _ => continue,
@@ -1608,7 +1609,7 @@ pub fn try_put_by_value_cache(vm: &Vm, instruction: &op::PutByValue, values: &op
                 if current.is_accessor() || !entry.writes_data_property.get() {
                     return false;
                 }
-                object.put_direct(entry.property_offset.get(), value);
+                object.put_direct_from_cache(entry.property_offset.get(), value);
                 return true;
             }
             PropertyLookupCacheEntryType::AddOwnProperty => {
@@ -1638,7 +1639,7 @@ pub fn try_put_by_value_cache(vm: &Vm, instruction: &op::PutByValue, values: &op
                     continue;
                 }
                 object.unsafe_set_shape(cached_shape);
-                object.put_direct(entry.property_offset.get(), value);
+                object.initialize_direct(entry.property_offset.get(), value);
                 return true;
             }
             _ => continue,

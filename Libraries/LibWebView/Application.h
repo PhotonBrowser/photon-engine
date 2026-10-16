@@ -128,6 +128,7 @@ public:
 
     virtual bool supports_system_menu_bar() const { return false; }
     virtual bool supports_vertical_tabs() const { return false; }
+    virtual bool supports_content_blocking_controls() const { return false; }
     virtual bool supports_private_browsing_windows() const { return false; }
     virtual bool supports_client_side_window_decorations() const { return false; }
     // Returns true if the platform sends momentum scroll events after a touchpad flick.
@@ -145,8 +146,14 @@ public:
     void update_bookmark_action_for_current_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
     void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
+
     void background_networking_settings_changed(Badge<ApplicationSettingsObserver>);
+
+    bool content_blocking_enabled() const;
+    bool has_content_blocking_rules() const;
+    void apply_content_blocking_policy(WebContentPage&);
     void content_blocker_settings_changed(Badge<ApplicationSettingsObserver>);
+
     bool content_blocker_list_update_in_progress() const;
     void update_content_blocker_lists(Badge<SettingsUI>);
     void download_content_blocker_list_if_needed(Badge<Application, SettingsUI>, StringView identifier);
@@ -436,7 +443,8 @@ private:
     ErrorOr<void> launch_wasm_compiler_server();
 #endif
     ErrorOr<void> launch_devtools_server();
-    ErrorOr<void> load_content_blocker_lists();
+    // Returns whether the combined rules changed.
+    ErrorOr<bool> load_content_blocker_lists();
     void apply_content_blocker_settings();
     void rebuild_content_blocker_list_paths();
     ByteString content_blocker_list_path(StringView identifier) const;
@@ -692,7 +700,6 @@ private:
     RefPtr<Action> m_show_line_box_borders_action;
     RefPtr<Action> m_show_caret_hit_test_debug_overlay_action;
     RefPtr<Action> m_enable_scripting_action;
-    RefPtr<Action> m_enable_content_blocking_action;
     RefPtr<Action> m_block_pop_ups_action;
     StringView m_user_agent_string;
     StringView m_navigator_compatibility_mode;

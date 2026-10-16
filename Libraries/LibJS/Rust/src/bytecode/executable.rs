@@ -42,7 +42,7 @@ pub use crate::layout::property_lookup_cache::{
     PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG, PropertyLookupCache, PropertyLookupCacheEntry,
     PropertyLookupCacheEntryType,
 };
-use crate::layout::shape::{PrototypeChainValidity, Shape};
+use crate::layout::shape::{Shape, WatchpointSet};
 use crate::layout::value::Value;
 use crate::layout_forward::FlyStringSlot;
 use crate::runtime::array::Array;
@@ -69,7 +69,7 @@ pub struct PropertyLookupCacheEntryData {
     pub from_shape: Option<Gc<Shape>>,
     pub shape: Option<Gc<Shape>>,
     pub prototype: Option<Gc<Object>>,
-    pub prototype_chain_validity: Option<Gc<PrototypeChainValidity>>,
+    pub prototype_chain_validity: Option<Gc<WatchpointSet>>,
     /// See PropertyLookupCacheEntry::key.
     pub key: u64,
 }
@@ -277,6 +277,17 @@ fn megamorphic_secondary_index(shape: Gc<Shape>, key: u64) -> usize {
         & (MEGAMORPHIC_SECONDARY_CACHE_SIZE - 1)
 }
 
+/// The slot of a megamorphic cache's hash tables that holds the entry for `shape` and `key`, if one does.
+fn megamorphic_slot_for_shape(data: &MegamorphicData, shape: Gc<Shape>, key: u64) -> Option<&PropertyLookupCacheEntry> {
+    let is_for_shape = |slot: &&PropertyLookupCacheEntry| {
+        let entry = slot.get();
+        entry.lookup_shape() == Some(shape) && entry.key == key
+    };
+    Some(&data.primary_entries[megamorphic_primary_index(shape, key)])
+        .filter(is_for_shape)
+        .or_else(|| Some(&data.secondary_entries[megamorphic_secondary_index(shape, key)]).filter(is_for_shape))
+}
+
 fn insert_megamorphic_entry(data: &MegamorphicData, entry: &PropertyLookupCacheEntryData) {
     let lookup_shape = entry.lookup_shape().expect("a megamorphic entry has a lookup shape");
 
@@ -416,20 +427,18 @@ impl PropertyLookupCache {
         let Some(data) = self.megamorphic_data() else {
             return self.entries();
         };
-
-        let find_entry = |entries: &[PropertyLookupCacheEntry], index: usize| {
-            let entry = entries[index].get();
-            (entry.lookup_shape() == Some(shape) && entry.key == key).then_some(entry)
-        };
-
-        let entry = find_entry(&data.primary_entries, megamorphic_primary_index(shape, key))
-            .or_else(|| find_entry(&data.secondary_entries, megamorphic_secondary_index(shape, key)));
-        let Some(entry) = entry else {
+        let Some(slot) = megamorphic_slot_for_shape(data, shape, key) else {
             return &[];
         };
 
-        data.entry.set(entry);
+        data.entry.set(slot.get());
         core::slice::from_ref(&data.entry)
+    }
+
+    /// The entry a megamorphic cache has for `shape` and `key`, if it has one, without moving it to the front like
+    /// `entry_slots_for_shape()` does.
+    pub fn megamorphic_entry_for_shape(&self, shape: Gc<Shape>, key: u64) -> Option<&PropertyLookupCacheEntry> {
+        megamorphic_slot_for_shape(self.megamorphic_data()?, shape, key)
     }
 
     /// Records an entry of `entry_type`, filled in by `callback`, moving the cache to the next tier when it has no
@@ -722,10 +731,6 @@ define_static_property_lookup_cache_sites! {
     SpeciesConstructorConstructor,
     SpeciesConstructorSpecies,
     ValueToPrimitive,
-    ValueDefaultConversionsToString,
-    ValueDefaultConversionsValueOf,
-    ValueDefaultConversionsToPrimitive,
-    ValueDefaultConversionsToStringTag,
     GetPrototypeFromConstructorPrototype,
     ValueIsRegExp,
     InstanceOfHasInstance,
@@ -737,16 +742,15 @@ define_static_property_lookup_cache_sites! {
     GetIteratorFlattenableMethod,
     IteratorCompleteDone,
     IteratorValueValue,
+    IteratorCloseReturn,
     ArrayAppendIteratorMethod,
-    ArrayAppendNextMethod,
-    CreateArrayIteratorOwnIteratorMethod,
-    CreateArrayIteratorIteratorMethod,
-    CreateArrayIteratorNextMethod,
     ObjectPrototypeToStringToStringTag,
     ArrayFromIteratorMethod,
     ArraySpeciesCreateConstructor,
     ArraySpeciesCreateSpecies,
     JSONSerializeToJSON,
+    PromiseResolveConstructor,
+    PromiseResolveFunctionThen,
     StringPrototypeMatchMatcher,
     StringPrototypeMatchAllMatcher,
     StringPrototypeReplaceReplacer,
@@ -757,16 +761,6 @@ define_static_property_lookup_cache_sites! {
     SetIterationIsUnobservableNextMethod,
     RegExpIncrementLastIndexGetLastIndex,
     RegExpIncrementLastIndexSetLastIndex,
-    RegExpUnmodifiedInstanceExec,
-    RegExpFlagsUnobservableFlags,
-    RegExpFlagsUnobservableHasIndices,
-    RegExpFlagsUnobservableGlobal,
-    RegExpFlagsUnobservableIgnoreCase,
-    RegExpFlagsUnobservableMultiline,
-    RegExpFlagsUnobservableDotAll,
-    RegExpFlagsUnobservableUnicode,
-    RegExpFlagsUnobservableUnicodeSets,
-    RegExpFlagsUnobservableSticky,
     RegExpLastIndexUnobservableLastIndex,
     RegExpBuiltinExecGetLastIndex,
     RegExpBuiltinExecResetLastIndexPastEnd,
@@ -849,7 +843,7 @@ pub struct KeyedPropertyLookup {
     pub shape_dictionary_generation: u32,
     pub shape: Option<Gc<Shape>>,
     pub prototype: Option<Gc<Object>>,
-    pub prototype_chain_validity: Option<Gc<PrototypeChainValidity>>,
+    pub prototype_chain_validity: Option<Gc<WatchpointSet>>,
     /// The shape that adding the property to an object of `shape` gives it, for `AddOwnProperty` entries of the
     /// keyed property store cache.
     pub new_shape: Option<Gc<Shape>>,
@@ -1084,7 +1078,7 @@ impl ObjectPropertyIteratorCacheData {
         indexed_property_count: u32,
         receiver_has_magical_length_property: bool,
         shape: Gc<Shape>,
-        prototype_chain_validity: Option<Gc<PrototypeChainValidity>>,
+        prototype_chain_validity: Option<Gc<WatchpointSet>>,
     ) -> Gc<ObjectPropertyIteratorCacheData> {
         let (shape_is_dictionary, shape_dictionary_generation) = if shape.is_dictionary() {
             (true, shape.dictionary_generation())
@@ -1168,7 +1162,7 @@ impl ObjectPropertyIteratorCacheData {
         self.shape.get()
     }
 
-    pub fn prototype_chain_validity(&self) -> Option<Gc<PrototypeChainValidity>> {
+    pub fn prototype_chain_validity(&self) -> Option<Gc<WatchpointSet>> {
         self.prototype_chain_validity.get()
     }
 

@@ -967,11 +967,10 @@ static bool property_computed_value_may_be_stored_as_style_value_handle(Property
 }
 
 // Serialize native value data without constructing a C++ style value wrapper.
-static Optional<Utf16String> serialize_style_value_handle(RustStyleValueHandle const& handle, SerializationMode mode)
+static Utf16String serialize_style_value_handle(RustStyleValueHandle const& handle, SerializationMode mode)
 {
     auto text = StyleValueFFI::rust_style_value_serialize(handle.data(), to_underlying(mode));
-    if (!text)
-        return {};
+    VERIFY(text);
     return Utf16String::adopt_raw(text);
 }
 
@@ -1779,6 +1778,13 @@ Utf16String CSSStyleProperties::serialize_a_css_value_to_utf16(Vector<StylePrope
 
     // 2. If there is no such shorthand or shorthand cannot exactly represent the values of all the properties in list, return the empty string.
     if (!shorthand.has_value())
+        return {};
+
+    // https://drafts.csswg.org/css-values-5/#pending-substitution-value
+    // If any of the component longhand properties for a given shorthand are pending-substitution
+    // values, or contain arbitrary substitution functions of their own that have not yet been substituted, the
+    // shorthand property must serialize to the empty string.
+    if (any_of(list, [](auto const& declaration) { return declaration.value->is_pending_substitution() || declaration.value->is_unresolved(); }))
         return {};
 
     // 3. Otherwise, serialize a CSS value from a hypothetical declaration of the property shorthand with its value representing the combined values of the declarations in list.

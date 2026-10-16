@@ -24,6 +24,13 @@ pub struct CompiledCode {
     /// can continue there, with the same calling convention as the entry
     /// point.
     pub osr_entries: Vec<(u32, u32)>,
+    /// The loop back edges from where a frame running in the interpreter
+    /// reaches one of the `osr_entries` without leaving the loop it is in.
+    pub osr_loop_back_edges: Vec<u32>,
+    /// The loop back edges in the loops around those of the `osr_entries`,
+    /// from where a frame running in the interpreter may reach one of them
+    /// on a later iteration.
+    pub osr_outer_loop_back_edges: Vec<u32>,
     /// The sites of the code, by index: exit and leave stubs pass the index of
     /// theirs to the runtime, and calls in inlined callees name theirs.
     pub sites: Vec<Site>,
@@ -80,9 +87,11 @@ pub enum ExitKind {
     /// compile time (a method on a prototype, the key of a keyed access)
     /// was another value.
     UnexpectedValue,
-    /// An instruction whose slow path cannot run from compiled code met a
-    /// case only its slow path handles (like an append that needs to grow
-    /// an array, or a probe that cannot tell), so the interpreter runs it.
+    /// An instruction whose slow path cannot run from compiled code, or that
+    /// was compiled to exit instead of running its slow path, met a case only
+    /// its slow path handles (like an append that needs to grow an array, a
+    /// probe that cannot tell, or `Math.abs` of a string), so the
+    /// interpreter runs it.
     SlowPath,
     /// An `arguments[i]` the compiled code read from the frame's arguments
     /// had an index that is not an int32 within the passed arguments.
@@ -100,6 +109,12 @@ pub enum ExitKind {
     OutOfBounds,
     /// A value had another type than the instruction's feedback had seen.
     BadType,
+    /// A node that may exit, which loop invariant code motion moved out of a
+    /// block that not every iteration of its loop runs, exited before the
+    /// loop. Exits of this kind are recorded at the loop header, and keep
+    /// such nodes in that loop, but not the nodes from blocks every iteration
+    /// runs.
+    Hoisted,
     /// Something the code depended on stopped holding while it ran other
     /// code (see `Dependency`), so the code was invalidated.
     Invalidated,
@@ -112,8 +127,8 @@ pub enum ExitKind {
 /// path breaking it needs first, so fast paths never break it unnoticed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dependency {
-    /// The `PrototypeChainValidity` cell stays valid.
-    PrototypeChainValid(CellId),
+    /// The `WatchpointSet` cell stays valid.
+    WatchpointSetValid(CellId),
     /// The global declarative environment `environment` keeps the serial
     /// number `serial`: it gets no bindings, which could shadow properties of
     /// the global object.

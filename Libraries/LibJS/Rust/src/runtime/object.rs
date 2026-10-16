@@ -13,7 +13,7 @@ use ak::{Utf16FlyString, Utf16String};
 use libjs_abi::{Builtin, PutKind};
 use libjs_runtime_macros::Trace;
 
-use crate::bytecode::executable::{PropertyLookupCache, StaticPropertyLookupCacheSite};
+use crate::bytecode::executable::PropertyLookupCache;
 use crate::bytecode::property_access::{Strict, put_by_property_key};
 use crate::embedding::abi_types::JSRealm;
 use crate::gc::class::{Class, Extends, ExternalMemorySize, GcCell, define_cell};
@@ -46,6 +46,7 @@ use crate::runtime::indexed_properties::{GenericIndexedPropertyStorage, ValueAnd
 use crate::runtime::iterator::BuiltinIteratorNext;
 use crate::runtime::native_function::{NativeFunction, NativeFunctionMethods, RawNativeFunction};
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
+use crate::runtime::object_prototype::ObjectPrototype;
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::private_environment::PrivateName;
 use crate::runtime::property_attributes::{DEFAULT_ATTRIBUTES, PropertyAttributes};
@@ -53,6 +54,7 @@ use crate::runtime::property_descriptor::{PropertyDescriptor, to_property_descri
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::shape::{AssignCopy, Shape};
+use crate::runtime::special_property_cache::{self, SpecialPropertyKey};
 use crate::runtime::symbol::Symbol;
 use crate::runtime::value::{PreferredType, is_strictly_equal, same_value};
 use crate::runtime::value_storage::{self, ValueStorageKind};
@@ -1461,7 +1463,7 @@ impl Object {
         let mut offset = 0;
         from_shape.for_each_property_in_insertion_order(|_, metadata| {
             if metadata.attributes.is_enumerable() {
-                self.put_direct(offset, from.get_direct(metadata.offset));
+                self.initialize_direct(offset, from.get_direct(metadata.offset));
                 offset += 1;
             }
             ControlFlow::Continue(())
@@ -1530,7 +1532,7 @@ impl Object {
                 self.shape().mark_unstable(vm);
                 self.unsafe_set_shape(from.shape());
                 from.shape().for_each_property_in_insertion_order(|_, metadata| {
-                    self.put_direct(metadata.offset, from.get_direct(metadata.offset));
+                    self.initialize_direct(metadata.offset, from.get_direct(metadata.offset));
                     ControlFlow::Continue(())
                 });
                 return Ok(());
@@ -2551,7 +2553,7 @@ impl Object {
                 match phase {
                     PropertyLookupPhase::OwnProperty => {
                         // NB: Caches may only write to the slots of a global object that may have been assigned
-                        //     already, since the runtime notes assignments to them (see `storage_set()`).
+                        //     already, since the runtime notes assignments to them (see `replace_direct()`).
                         if writes_data_property
                             && self.has_global_object_flag()
                             && !crate::jit::dependencies::global_object_slot_may_have_been_assigned(
@@ -2561,6 +2563,11 @@ impl Object {
                             )
                         {
                             return;
+                        }
+                        // NB: Caches write to slots without telling what relies on their values, so nothing may rely
+                        //     on the value of a slot of a prototype once a cache may write to it.
+                        if writes_data_property {
+                            self.shape().note_slot_written_by_caches(vm, property_offset);
                         }
                         *cacheable_metadata = CacheableSetPropertyMetadata {
                             r#type: CacheableSetPropertyMetadataType::ChangeOwnProperty,
@@ -2782,7 +2789,7 @@ impl Object {
             && let Some(accessor) = find_intrinsic_accessor(vm, self, property_key)
         {
             let value = accessor.compute_value(vm, self.shape().realm());
-            self.put_direct(metadata.offset, value);
+            self.initialize_direct(metadata.offset, value);
         }
 
         Some(ValueAndAttributes {
@@ -2841,18 +2848,7 @@ impl Object {
             }
         }
 
-        // NB: JIT code may take the values of global object properties that were never assigned as constants.
-        if self.has_global_object_flag() {
-            let previous = self.get_direct(metadata.offset);
-            if !previous.is_undefined() && previous != value {
-                crate::jit::dependencies::note_global_object_slot_assignments(
-                    vm,
-                    self,
-                    metadata.offset..metadata.offset + 1,
-                );
-            }
-        }
-        self.put_direct(metadata.offset, value);
+        self.replace_direct(vm, metadata.offset, value);
         Some(metadata.offset)
     }
 
@@ -2885,7 +2881,7 @@ impl Object {
         }
         let new_offset = self.shape().property_count() - 1;
         self.ensure_named_storage_capacity(self.shape().property_count());
-        self.put_direct(new_offset, value);
+        self.initialize_direct(new_offset, value);
         Some(new_offset)
     }
 
@@ -3192,6 +3188,13 @@ impl Object {
             if setter.is_some() {
                 accessor.set_setter(setter);
             }
+            // NB: Changing the accessor in its slot changes the value of the property, as replacing it would.
+            let shape = self.shape();
+            if shape.has_watched_slots()
+                && let Some(metadata) = shape.lookup(property_key)
+            {
+                shape.note_slot_replacement(vm, metadata.offset);
+            }
         } else {
             let accessor = Accessor::create(vm, getter, setter, None);
             self.define_direct_property(vm, property_key, Value::from_accessor(accessor), attributes);
@@ -3366,33 +3369,31 @@ impl Object {
         let method_names = if preferred_type == PreferredType::String {
             // 1. If hint is string, then
             // a. Let methodNames be « "toString", "valueOf" ».
-            [vm.names.toString.clone(), vm.names.valueOf.clone()]
+            [SpecialPropertyKey::ToString, SpecialPropertyKey::ValueOf]
         } else {
             // 2. Else,
             // a. Let methodNames be « "valueOf", "toString" ».
-            [vm.names.valueOf.clone(), vm.names.toString.clone()]
+            [SpecialPropertyKey::ValueOf, SpecialPropertyKey::ToString]
         };
 
         // 3. For each element name of methodNames, do
-        for method_name in &method_names {
+        for method_name in method_names {
             // a. Let method be ? Get(O, name).
-            let method = if *method_name == vm.names.toString {
-                self.get_with_cache(
-                    vm,
-                    method_name,
-                    vm.static_property_lookup_cache(StaticPropertyLookupCacheSite::ObjectOrdinaryToPrimitiveToString),
-                )?
-            } else {
-                debug_assert!(*method_name == vm.names.valueOf);
-                self.get_with_cache(
-                    vm,
-                    method_name,
-                    vm.static_property_lookup_cache(StaticPropertyLookupCacheSite::ObjectOrdinaryToPrimitiveValueOf),
-                )?
-            };
+            let method = special_property_cache::get(vm, self, method_name)?;
 
             // b. If IsCallable(method) is true, then
             if method.is_function() {
+                // OPTIMIZATION: %Object.prototype.valueOf% gives the object, and %Object.prototype.toString% gives
+                //               what the special property cache knows, if it does, without running code.
+                if ObjectPrototype::is_value_of_function(vm, method.as_function()) {
+                    continue;
+                }
+                if ObjectPrototype::is_to_string_function(vm, method.as_function())
+                    && let Some(string) = special_property_cache::object_to_string(self)
+                {
+                    return Ok(Value::from_string(string));
+                }
+
                 // i. Let result be ? Call(method, O).
                 let result = call(vm, method, Value::from_object(self.as_gc()), &[])?;
 
@@ -3562,7 +3563,7 @@ impl Object {
         self.set_flag(object_flag::HAS_INTRINSIC_ACCESSORS);
     }
 
-    fn has_unimplemented_properties(&self) -> bool {
+    pub(crate) fn has_unimplemented_properties(&self) -> bool {
         self.has_flag(object_flag::HAS_UNIMPLEMENTED_PROPERTIES)
     }
 
@@ -3595,10 +3596,46 @@ impl Object {
         unsafe { self.named_properties.get().add(index as usize).read() }
     }
 
-    pub fn put_direct(&self, index: u32, value: Value) {
+    // NB: Every write to a named-property slot goes through one of the three methods below, each of which says why
+    //     the write needs no more than it does, so that what depends on a slot keeping its value is told of each write
+    //     that changes it.
+    fn write_direct(&self, index: u32, value: Value) {
         assert!(index < self.named_storage_capacity());
         // SAFETY: The index is within the named storage.
         unsafe { self.named_properties.get().add(index as usize).write(value) };
+    }
+
+    /// Gives a slot its first value, which nothing can have read yet: a slot of an object that is being created, a
+    /// slot of a property that was just added, or the slot of an intrinsic accessor that computes its value the first
+    /// time it is read.
+    pub fn initialize_direct(&self, index: u32, value: Value) {
+        debug_assert!(!self.shape().is_slot_watched(index));
+        self.write_direct(index, value);
+    }
+
+    /// Writes a value to the slot of an own writable data property where a property lookup cache recorded a write.
+    /// Caches only record writes that need nothing but the write itself (see `replace_direct()`), and nothing relies on
+    /// the value of a slot that caches write to (see `Shape::note_slot_written_by_caches()`).
+    pub fn put_direct_from_cache(&self, index: u32, value: Value) {
+        debug_assert!(!self.shape().is_slot_watched(index));
+        self.write_direct(index, value);
+    }
+
+    /// Changes the value of the own named property in slot `index`, and tells what depends on the slot keeping its
+    /// value.
+    pub fn replace_direct(&self, vm: &Vm, index: u32, value: Value) {
+        let shape = self.shape();
+        if shape.has_watched_slots() && self.get_direct(index) != value {
+            shape.note_slot_replacement(vm, index);
+        }
+        // NB: JIT code may take the values of global object properties that were never assigned as constants.
+        if self.has_global_object_flag() {
+            let previous = self.get_direct(index);
+            if !previous.is_undefined() && previous != value {
+                crate::jit::dependencies::note_global_object_slot_assignments(vm, self, index..index + 1);
+            }
+        }
+        self.write_direct(index, value);
     }
 
     fn inline_named_storage_pointer(&self) -> *mut Value {

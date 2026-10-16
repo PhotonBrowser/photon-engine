@@ -10,10 +10,12 @@ from dataclasses import dataclass
 from typing import Dict
 from typing import Iterable
 from typing import List
-from typing import Optional
 from typing import Set
 
 from Generators.libweb_bindings.context import GenerationContext
+from Generators.libweb_bindings.rust_members import rust_members
+from Generators.libweb_bindings.rust_types import cpp_interface
+from Generators.libweb_bindings.rust_types import is_implemented_in_rust
 from Generators.libweb_bindings.rust_types import is_named_union
 from Generators.libweb_bindings.rust_types import runtime_union_type
 from Utils.webidl_parser import Dictionary
@@ -23,15 +25,20 @@ from Utils.webidl_parser import Interface
 from Utils.webidl_parser import Module
 
 
-def is_implemented_in_rust(interface: Optional[Interface]) -> bool:
-    return interface is not None and interface.extended_attributes.get("ImplementedIn") == "Rust"
+def types_named_by_interface(interface: Interface, with_unimplemented_members: bool = True) -> List[IDLType]:
+    """Every type that the members of the interface name. The bindings of the interface convert them, except those of
+    the members marked [FIXME], which they only record as not implemented."""
 
+    def is_wanted(extended_attributes: Dict[str, str]) -> bool:
+        return with_unimplemented_members or "FIXME" not in extended_attributes
 
-def types_named_by_interface(interface: Interface) -> List[IDLType]:
-    """Every type that the members of the interface name, which the bindings of the interface convert."""
     types = []
-    types.extend(attribute.type for attribute in interface.regular_attributes + interface.static_attributes)
+    for attribute in interface.regular_attributes + interface.static_attributes:
+        if is_wanted(attribute.extended_attributes):
+            types.append(attribute.type)
     for operation in interface.regular_operations + interface.static_operations:
+        if not is_wanted(operation.extended_attributes):
+            continue
         types.append(operation.return_type)
         types.extend(parameter.type for parameter in operation.parameters)
     for constructor in interface.constructors:
@@ -70,16 +77,25 @@ class ConversionDirections:
 
 
 class DefinitionUsage:
+    """Raises the errors of rust_members() for the interfaces implemented in Rust, whose members it reads."""
+
     def __init__(self, context: GenerationContext) -> None:
         self.context = context
         # The dictionaries that the interfaces implemented in Rust name, in the order of their first use.
         self.rust_dictionaries: Dict[str, ConversionDirections] = {}
         # The unions that the interfaces implemented in Rust name and that have an enum of their own, by their type.
         self.rust_unions: Dict[IDLUnionType, ConversionDirections] = {}
+        # The enumerations that the interfaces implemented in Rust name.
+        self.rust_enumerations: Dict[str, ConversionDirections] = {}
+        # The interfaces that LibWeb implements in C++ and that the interfaces implemented in Rust name.
+        self.cpp_interfaces_named_by_rust: Dict[str, Interface] = {}
         # The dictionaries that have a C++ representation.
         self.cpp_dictionary_names: Set[str] = set()
+        # The interfaces implemented in Rust that the C++ bindings convert objects of, and so need a C++ class for.
+        self.rust_interfaces_named_by_cpp: Dict[str, Interface] = {}
         self._collect_rust_dictionaries()
         self._collect_cpp_dictionaries()
+        self._collect_rust_interfaces_named_by_cpp()
 
     def cpp_dictionaries(self, module: Module) -> List[Dictionary]:
         """The dictionaries of the module that the C++ bindings declare and convert."""
@@ -90,14 +106,17 @@ class DefinitionUsage:
             interface = module.interface
             if interface is None or not is_implemented_in_rust(interface):
                 continue
-            for attribute in interface.regular_attributes:
-                self._name_for_rust(attribute.type, from_js=not attribute.readonly, to_js=True)
-            for operation in interface.regular_operations:
-                self._name_for_rust(operation.return_type, from_js=False, to_js=True)
-                for parameter in operation.parameters:
-                    self._name_for_rust(parameter.type, from_js=True, to_js=False)
-            for constructor in interface.constructors:
-                for parameter in constructor.parameters:
+            members = rust_members(interface)
+            for attribute in members.attributes:
+                has_setter = attribute.setter_method is not None
+                self._name_for_rust(attribute.attribute.type, from_js=has_setter, to_js=True)
+            for operation_set in members.operation_sets:
+                for overload in operation_set.overloads:
+                    self._name_for_rust(overload.operation.return_type, from_js=False, to_js=True)
+                    for parameter in overload.operation.parameters:
+                        self._name_for_rust(parameter.type, from_js=True, to_js=False)
+            for constructor in members.constructors:
+                for parameter in constructor.constructor.parameters:
                     self._name_for_rust(parameter.type, from_js=True, to_js=False)
 
     def _name_for_rust(self, idl_type: IDLType, from_js: bool, to_js: bool) -> None:
@@ -116,6 +135,15 @@ class DefinitionUsage:
             return
         for child_type in idl_type.child_types():
             self._name_for_rust(child_type, from_js, to_js)
+        named_cpp_interface = cpp_interface(idl_type, self.context)
+        if named_cpp_interface is not None:
+            self.cpp_interfaces_named_by_rust[named_cpp_interface.name] = named_cpp_interface
+            return
+        if idl_type.name in self.context.enumerations:
+            directions = self.rust_enumerations.setdefault(idl_type.name, ConversionDirections())
+            directions.from_js = directions.from_js or from_js
+            directions.to_js = directions.to_js or to_js
+            return
         dictionary = self.context.dictionaries.get(idl_type.name)
         if dictionary is None:
             return
@@ -145,11 +173,26 @@ class DefinitionUsage:
                     self._name_for_cpp(dictionary.name)
             self._name_types_for_cpp(self.types_named_by_cpp_module(module))
 
-    def types_named_by_cpp_module(self, module: Module) -> List[IDLType]:
+    def _collect_rust_interfaces_named_by_cpp(self) -> None:
+        def name(types: Iterable[IDLType]) -> None:
+            for idl_type in types:
+                for nested_type in idl_type.nested_types():
+                    interface = self.context.interfaces.get(nested_type.name)
+                    if is_implemented_in_rust(interface):
+                        assert interface is not None
+                        self.rust_interfaces_named_by_cpp[interface.name] = interface
+
+        for module in self.context.modules:
+            if not is_implemented_in_rust(module.interface):
+                name(self.types_named_by_cpp_module(module, with_unimplemented_members=False))
+            for dictionary in self.cpp_dictionaries(module):
+                name(member.type for member in dictionary.members)
+
+    def types_named_by_cpp_module(self, module: Module, with_unimplemented_members: bool = True) -> List[IDLType]:
         """The types that the interface, typedefs and callback functions of a module of the C++ bindings name."""
         types = []
         if module.interface is not None:
-            types.extend(types_named_by_interface(module.interface))
+            types.extend(types_named_by_interface(module.interface, with_unimplemented_members))
         types.extend(typedef.type for typedef in module.typedefs)
         for callback_function in module.callback_functions:
             types.append(callback_function.return_type)

@@ -70,32 +70,55 @@ impl GraphBuilder<'_> {
             }
             Instruction::ResolveThisBinding => self.build_resolve_this_binding(),
             Instruction::CallBuiltinMathAbs {
-                dst, callee, argument, ..
-            } => self.build_math_function(Float64UnaryOp::Abs, dst, callee, argument),
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_function(Float64UnaryOp::Abs, dst, callee, argument, call_feedback),
             Instruction::CallBuiltinMathFloor {
-                dst, callee, argument, ..
-            } => self.build_math_function(Float64UnaryOp::Floor, dst, callee, argument),
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_function(Float64UnaryOp::Floor, dst, callee, argument, call_feedback),
             Instruction::CallBuiltinMathCeil {
-                dst, callee, argument, ..
-            } => self.build_math_function(Float64UnaryOp::Ceil, dst, callee, argument),
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_function(Float64UnaryOp::Ceil, dst, callee, argument, call_feedback),
             Instruction::CallBuiltinMathRound {
-                dst, callee, argument, ..
-            } => self.build_math_function(Float64UnaryOp::Round, dst, callee, argument),
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_function(Float64UnaryOp::Round, dst, callee, argument, call_feedback),
             Instruction::CallBuiltinMathSqrt {
-                dst, callee, argument, ..
-            } => self.build_math_function(Float64UnaryOp::Sqrt, dst, callee, argument),
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_function(Float64UnaryOp::Sqrt, dst, callee, argument, call_feedback),
             Instruction::GetIterator {
                 dst_iterator_object,
                 dst_iterator_next,
                 dst_iterator_done,
                 iterable,
                 hint,
+                fast_array_mode_allowed,
+                ..
             } => match self.try_build_get_iterator(
                 dst_iterator_object,
                 dst_iterator_next,
                 dst_iterator_done,
                 iterable,
                 hint,
+                fast_array_mode_allowed,
             )? {
                 Some(flow) => Ok(flow),
                 None => self.build_generic(instruction, info),
@@ -142,6 +165,7 @@ impl GraphBuilder<'_> {
             Instruction::GetLength { .. } => self.build_get_length(instruction),
             Instruction::GetById { .. } => self.build_get_by_id(instruction),
             Instruction::PutById { .. } => self.build_put_by_id(instruction),
+            Instruction::IteratorClose { .. } => self.build_iterator_close(instruction),
             Instruction::GetGlobal { .. } => self.build_get_global(instruction),
             Instruction::SetGlobal { .. } => self.build_set_global(instruction),
             _ => match super::speculation::Operation::of(instruction) {
@@ -324,7 +348,17 @@ impl GraphBuilder<'_> {
             hot: Vec::new(),
             cold: Vec::new(),
             next_case: Vec::new(),
+            exits: false,
         })
+    }
+
+    /// Makes the cold edges of `slow_paths` exit to the interpreter instead of
+    /// running the instruction's slow path, unless such an exit was taken there
+    /// before. The code after the instruction then joins no path that ran
+    /// other code, so it keeps what it knew before the instruction. For
+    /// instructions whose slow path only handles rare cases.
+    pub(super) fn exit_instead_of_slow_path(&mut self, slow_paths: &mut SlowPaths) {
+        slow_paths.exits = self.may_speculate(ExitKind::SlowPath);
     }
 
     /// Ends the current block with a branch on `condition` of `inputs`,
@@ -549,7 +583,7 @@ impl GraphBuilder<'_> {
         });
         predecessors.extend(slow.as_ref().map(|(block, _)| *block));
         self.join_blocks(predecessors);
-        debug_assert!(
+        assert!(
             values.is_empty() || values.len() == slow_paths.output_count,
             "the slow path writes the same operands"
         );
@@ -579,6 +613,19 @@ impl GraphBuilder<'_> {
     /// edge they took jumps to, with the operands the slow path wrote, if
     /// any edge was taken.
     fn build_slow_path(&mut self, slow_paths: &SlowPaths) -> Option<(BlockId, Vec<NodeId>)> {
+        if slow_paths.exits {
+            for edge in &slow_paths.cold {
+                self.block = *edge;
+                let exit = self.set_control(
+                    Op::Exit {
+                        kind: ExitKind::SlowPath,
+                    },
+                    Vec::new(),
+                );
+                self.graph.nodes[exit.index()].frame_state = Some(slow_paths.frame_state);
+            }
+            return None;
+        }
         let slow = match slow_paths.cold.as_slice() {
             [] => return None,
             [edge] => *edge,
@@ -617,6 +664,9 @@ pub(in crate::builder) struct SlowPaths {
     /// The edges that `GraphBuilder::branch_to_next_case()` took since the
     /// last case started.
     next_case: Vec<BlockId>,
+    /// Whether the cold edges exit instead (see
+    /// `GraphBuilder::exit_instead_of_slow_path()`).
+    exits: bool,
 }
 
 impl SlowPaths {

@@ -18,9 +18,9 @@ thread-sanitizer = []
 #   python3 Meta/CMake/flatpak/generate-cargo-sources.py
 [dependencies]
 ak = { path = "../../../AK/Rust" }
-foldhash = "0.1"
+foldhash = "0.2"
 getrandom = "0.4"
-hashbrown = { version = "0.16.1", default-features = false }
+hashbrown = { version = "0.17.1", default-features = false }
 indexmap = "2"
 ladybird_allocator = { path = "../../RustAllocator", optional = true }
 libc = "0.2"
@@ -30,7 +30,7 @@ libjs_runtime_macros = { path = "macros" }
 memchr = "2"
 libregex_rust = { path = "../../LibRegex/Rust", default-features = false }
 libunicode_rust = { path = "../../LibUnicode/Rust", default-features = false }
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-integer = "0.1"
 num-traits = "0.2"
 rustc-demangle = "0.1"

@@ -10,6 +10,7 @@ use core::cell::{Cell, RefCell};
 use core::ffi::{c_char, c_int};
 use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -21,11 +22,11 @@ use ak::{Utf16FlyString, Utf16String};
 use libjs_runtime_macros::Trace;
 
 use crate::ast::ProgramType;
-use crate::breakpoint::Breakpoint;
+use crate::breakpoint::{Breakpoint, BreakpointID};
 use crate::compile::parse;
 use crate::console::{Console, ConsoleClient, ConsoleClientMethods, LogLevel, PrinterArguments};
 use crate::contrib::test262::global_object::Test262GlobalObject;
-use crate::debugger::{Debugger, PauseInfo, PauseReason, ResumeMode};
+use crate::debugger::{Debugger, PauseInfo, PauseOnExceptions, PauseReason, ResumeMode, UpdateOriginalBindings};
 use crate::gc::class::{GcCell, cast_ref, define_cell};
 use crate::gc::root::Root;
 use crate::hash_table::HashTable;
@@ -74,6 +75,7 @@ struct Options {
     disable_syntax_highlight: bool,
     disable_debug_printing: bool,
     debug: bool,
+    pause_on_exceptions: Option<String>,
     evaluate_script: String,
     use_test262_global: bool,
     expose_jit_testing: bool,
@@ -96,6 +98,7 @@ enum OptionTarget {
     DisableSyntaxHighlight,
     DisableDebugPrinting,
     Debug,
+    PauseOnExceptions,
     EvaluateScript,
     UseTest262Global,
     ExposeJitTesting,
@@ -190,6 +193,15 @@ const OPTIONS: &[OptionDescription] = &[
     ),
     option("Run with the JavaScript debugger", "debug", None, OptionTarget::Debug),
     OptionDescription {
+        value_name: Some("none|unhandled|all"),
+        ..option(
+            "Pause on JavaScript exceptions while debugging",
+            "pause-on-exceptions",
+            None,
+            OptionTarget::PauseOnExceptions,
+        )
+    },
+    OptionDescription {
         value_name: Some("script"),
         ..option(
             "Evaluate argument as a script",
@@ -237,6 +249,7 @@ impl OptionDescription {
             OptionTarget::DisableSyntaxHighlight => options.disable_syntax_highlight = true,
             OptionTarget::DisableDebugPrinting => options.disable_debug_printing = true,
             OptionTarget::Debug => options.debug = true,
+            OptionTarget::PauseOnExceptions => options.pause_on_exceptions = value.map(str::to_owned),
             OptionTarget::EvaluateScript => options.evaluate_script = value.unwrap_or_default().to_string(),
             OptionTarget::UseTest262Global => options.use_test262_global = true,
             OptionTarget::ExposeJitTesting => options.expose_jit_testing = true,
@@ -378,6 +391,12 @@ fn parse_arguments(arguments: &[String], output: &mut dyn Write) -> Result<Optio
     if options.show_help {
         let _ = print_usage(output, argv0);
         return Err(0);
+    }
+    if let Some(value) = &options.pause_on_exceptions
+        && parse_pause_on_exceptions(value.as_bytes()).is_none()
+    {
+        eprintln!("Invalid --pause-on-exceptions value '{value}'. Expected none, unhandled, or all.");
+        return Err(1);
     }
     Ok(options)
 }
@@ -709,7 +728,11 @@ fn parse_breakpoint_location(input: &[u8], current_filename: Utf16View<'_>) -> O
     })
 }
 
-fn print_breakpoint(debugger: &Debugger, breakpoint: &Breakpoint) {
+fn print_breakpoint(
+    debugger: &Debugger,
+    breakpoint: &Breakpoint,
+    breakpoint_conditions: &RefCell<HashMap<BreakpointID, Utf16String>>,
+) {
     let state = if debugger.is_breakpoint_resolved(breakpoint.id) {
         "resolved"
     } else {
@@ -718,20 +741,72 @@ fn print_breakpoint(debugger: &Debugger, breakpoint: &Breakpoint) {
     let mut line = format!("{}: ", breakpoint.id).into_bytes();
     line.extend(Utf16View::of_string(&breakpoint.filename).to_wtf8());
     match breakpoint.column {
-        Some(column) => line.extend_from_slice(format!(":{}:{column} ({state})", breakpoint.line).as_bytes()),
-        None => line.extend_from_slice(format!(":{} ({state})", breakpoint.line).as_bytes()),
+        Some(column) => line.extend_from_slice(format!(":{}:{column}", breakpoint.line).as_bytes()),
+        None => line.extend_from_slice(format!(":{}", breakpoint.line).as_bytes()),
     }
+    line.extend_from_slice(format!(" ({state}").as_bytes());
+    if let Some(condition) = breakpoint_conditions.borrow().get(&breakpoint.id) {
+        line.extend_from_slice(b", condition: ");
+        line.extend(Utf16View::of_string(condition).to_wtf8());
+    }
+    line.push(b')');
     standard_output::outln(&line);
+}
+
+fn parse_pause_on_exceptions(value: &[u8]) -> Option<PauseOnExceptions> {
+    match value {
+        b"none" => Some(PauseOnExceptions::None),
+        b"unhandled" => Some(PauseOnExceptions::Uncaught),
+        b"all" => Some(PauseOnExceptions::All),
+        _ => None,
+    }
+}
+
+fn pause_on_exceptions_name(mode: PauseOnExceptions) -> &'static [u8] {
+    match mode {
+        PauseOnExceptions::None => b"none",
+        PauseOnExceptions::Uncaught => b"unhandled",
+        PauseOnExceptions::All => b"all",
+    }
+}
+
+fn print_backtrace(pause_info: &PauseInfo) {
+    for (index, frame) in pause_info.stack_trace.iter().enumerate() {
+        let context = unsafe { frame.execution_context.as_ref() };
+        let executable = context
+            .executable
+            .get()
+            .map(crate::bytecode::executable::Executable::from_head);
+        let function_name = executable.as_ref().map(|executable| executable.name());
+        let mut line = format!("#{index} ").into_bytes();
+        match function_name {
+            None => line.extend_from_slice(b"<native>"),
+            Some(name) if name.is_empty() => line.extend_from_slice(b"<global>"),
+            Some(name) => line.extend(Utf16View::of_fly_string(&name).to_wtf8()),
+        }
+        if let Some(source_range) = &frame.source_range {
+            line.extend_from_slice(b" at ");
+            line.extend(Utf16View::of_string(source_range.filename()).to_wtf8());
+            line.extend_from_slice(format!(":{}:{}", source_range.start.line, source_range.start.column).as_bytes());
+        }
+        standard_output::outln(&line);
+    }
 }
 
 fn print_debugger_help() {
     standard_output::outln(b"Debugger commands:");
-    standard_output::outln(b"    .break <line>[:column]");
-    standard_output::outln(b"    .break <file>:<line>[:column]");
-    standard_output::outln(b"    .breakpoints");
-    standard_output::outln(b"    .continue");
-    standard_output::outln(b"    .delete <id>");
-    standard_output::outln(b"    .help");
+    standard_output::outln(b"    backtrace (bt)");
+    standard_output::outln(b"    break (b) [file:]<line>[:column] [condition]");
+    standard_output::outln(b"    breakpoints");
+    standard_output::outln(b"    continue (c)");
+    standard_output::outln(b"    delete <id>");
+    standard_output::outln(b"    help");
+    standard_output::outln(b"    print (p) <expression>");
+    standard_output::outln(b"    set pause-on-exceptions <none|unhandled|all>");
+    standard_output::outln(b"    show pause-on-exceptions");
+    standard_output::outln(b"    step-into (step, s)");
+    standard_output::outln(b"    step-out (finish, fin)");
+    standard_output::outln(b"    step-over (next, n)");
 }
 
 /// warnln() of bytes that need not be UTF-8.
@@ -741,8 +816,83 @@ fn warn_bytes_line(bytes: &[u8]) {
     let _ = io::stderr().write_all(&line);
 }
 
-fn run_debugger_prompt(vm: &Vm, pause_info: &PauseInfo, line_editor: Option<&JSLineEditor>) {
+struct DebuggerCommandLexer<'a> {
+    input: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> DebuggerCommandLexer<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, cursor: 0 }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.input.get(self.cursor).is_some_and(u8::is_ascii_whitespace) {
+            self.cursor += 1;
+        }
+    }
+
+    fn consume_command_name(&mut self) -> &'a [u8] {
+        self.skip_whitespace();
+        let start = self.cursor;
+        while self
+            .input
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            self.cursor += 1;
+        }
+        &self.input[start..self.cursor]
+    }
+
+    fn consume_remaining(&mut self) -> &'a [u8] {
+        let remaining = &self.input[self.cursor..];
+        self.cursor = self.input.len();
+        remaining
+    }
+
+    fn is_eof(&self) -> bool {
+        self.cursor == self.input.len()
+    }
+}
+
+fn run_debugger_prompt(
+    vm: &Vm,
+    pause_info: &PauseInfo,
+    line_editor: Option<&JSLineEditor>,
+    pause_on_exceptions: &Cell<PauseOnExceptions>,
+    breakpoint_conditions: &RefCell<HashMap<BreakpointID, Utf16String>>,
+) {
     let debugger = vm.debugger().expect("execution pauses in the attached debugger");
+    if pause_info.reason == PauseReason::Breakpoint {
+        let context = unsafe { pause_info.stack_trace[0].execution_context.as_ref() };
+        let conditions = breakpoint_conditions.borrow();
+        let mut should_pause = false;
+        for breakpoint_id in &pause_info.breakpoint_ids {
+            let Some(condition) = conditions.get(breakpoint_id) else {
+                should_pause = true;
+                break;
+            };
+            match debugger.evaluate_in_frame(vm, context, Utf16View::of_string(condition), UpdateOriginalBindings::No) {
+                Ok(value) if value.to_boolean() => {
+                    should_pause = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(throw) => {
+                    eprint!("Breakpoint condition threw: ");
+                    let _ = print_value(vm, throw.value(), PrintTarget::StandardError, PrintEnd::Newline);
+                    should_pause = true;
+                    break;
+                }
+            }
+        }
+        drop(conditions);
+        if !should_pause {
+            debugger.continue_execution_preserving_step_state();
+            return;
+        }
+    }
     let reason = debugger_pause_reason(pause_info.reason);
     if let Some(range) = &pause_info.source_range {
         let filename = Utf16View::of_string(range.filename()).to_wtf8();
@@ -772,19 +922,35 @@ fn run_debugger_prompt(vm: &Vm, pause_info: &PauseInfo, line_editor: Option<&JSL
             debugger.continue_execution(ResumeMode::Continue);
             return;
         };
-        let command = trim_whitespace(&raw_line);
+        let command_line = trim_whitespace(&raw_line);
+        let mut command = DebuggerCommandLexer::new(command_line);
+        let command_name = command.consume_command_name();
+        command.skip_whitespace();
 
-        if command == b".continue" {
+        if (command_name == b"continue" || command_name == b"c") && command.is_eof() {
             debugger.continue_execution(ResumeMode::Continue);
             return;
         }
 
-        if command == b".help" {
+        if command.is_eof() {
+            let resume_mode = match command_name {
+                b"step-into" | b"step" | b"s" => Some(ResumeMode::StepInto),
+                b"step-out" | b"finish" | b"fin" => Some(ResumeMode::StepOut),
+                b"step-over" | b"next" | b"n" => Some(ResumeMode::StepOver),
+                _ => None,
+            };
+            if let Some(resume_mode) = resume_mode {
+                debugger.continue_execution(resume_mode);
+                return;
+            }
+        }
+
+        if command_name == b"help" && command.is_eof() {
             print_debugger_help();
             continue;
         }
 
-        if command == b".breakpoints" {
+        if command_name == b"breakpoints" && command.is_eof() {
             let mut breakpoints = debugger.breakpoints();
             if breakpoints.is_empty() {
                 standard_output::outln(b"No breakpoints.");
@@ -792,12 +958,65 @@ fn run_debugger_prompt(vm: &Vm, pause_info: &PauseInfo, line_editor: Option<&JSL
             }
             breakpoints.sort_by_key(|breakpoint| breakpoint.id);
             for breakpoint in &breakpoints {
-                print_breakpoint(&debugger, breakpoint);
+                print_breakpoint(&debugger, breakpoint, breakpoint_conditions);
             }
             continue;
         }
 
-        if let Some(location) = command.strip_prefix(b".break ") {
+        if (command_name == b"backtrace" || command_name == b"bt") && command.is_eof() {
+            print_backtrace(pause_info);
+            continue;
+        }
+
+        if command_name == b"print" || command_name == b"p" {
+            let expression = trim_whitespace(command.consume_remaining());
+            if expression.is_empty() {
+                eprintln!("Usage: print <expression>");
+                continue;
+            }
+            let Some(expression) = utf16_from_wtf8(expression) else {
+                eprintln!("Expression is not valid UTF-8.");
+                continue;
+            };
+            let context = unsafe { pause_info.stack_trace[0].execution_context.as_ref() };
+            match debugger.evaluate_in_frame(vm, context, Utf16View::Utf16(&expression), UpdateOriginalBindings::No) {
+                Ok(value) => {
+                    let _ = print_value(vm, value, PrintTarget::StandardOutput, PrintEnd::Newline);
+                }
+                Err(throw) => {
+                    eprint!("Evaluation threw: ");
+                    let _ = print_value(vm, throw.value(), PrintTarget::StandardError, PrintEnd::Newline);
+                }
+            }
+            continue;
+        }
+
+        if command_name == b"set" {
+            let setting = command.consume_command_name();
+            command.skip_whitespace();
+            let mode = parse_pause_on_exceptions(trim_whitespace(command.consume_remaining()));
+            if setting != b"pause-on-exceptions" || mode.is_none() {
+                eprintln!("Usage: set pause-on-exceptions <none|unhandled|all>");
+                continue;
+            }
+            let mode = mode.expect("mode was checked");
+            pause_on_exceptions.set(mode);
+            debugger.set_pause_on_exceptions(mode);
+            continue;
+        }
+
+        if command_name == b"show" {
+            if trim_whitespace(command.consume_remaining()) != b"pause-on-exceptions" {
+                eprintln!("Usage: show pause-on-exceptions");
+                continue;
+            }
+            let mut line = b"pause-on-exceptions: ".to_vec();
+            line.extend_from_slice(pause_on_exceptions_name(pause_on_exceptions.get()));
+            standard_output::outln(&line);
+            continue;
+        }
+
+        if command_name == b"break" || command_name == b"b" {
             let current_filename = pause_info
                 .source_range
                 .as_ref()
@@ -805,10 +1024,21 @@ fn run_debugger_prompt(vm: &Vm, pause_info: &PauseInfo, line_editor: Option<&JSL
                     Utf16View::of_string(source_range.filename())
                 });
 
-            let location = parse_breakpoint_location(location, current_filename);
+            let arguments = command.consume_remaining();
+            let location_end = arguments
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .unwrap_or(arguments.len());
+            let location_text = &arguments[..location_end];
+            let condition_text = trim_whitespace(&arguments[location_end..]);
+            let location = parse_breakpoint_location(location_text, current_filename);
             let Some(location) = location.filter(|location| !Utf16View::of_string(&location.filename).is_empty())
             else {
-                eprintln!("Usage: .break <line>[:column] or .break <file>:<line>[:column]");
+                eprintln!("Usage: break <line>[:column] [condition] or break <file>:<line>[:column] [condition]");
+                continue;
+            };
+            let Some(condition) = utf16_from_wtf8(condition_text) else {
+                eprintln!("Breakpoint condition is not valid UTF-8.");
                 continue;
             };
 
@@ -822,31 +1052,40 @@ fn run_debugger_prompt(vm: &Vm, pause_info: &PauseInfo, line_editor: Option<&JSL
                     }
                 };
 
+            if condition.is_empty() {
+                breakpoint_conditions.borrow_mut().remove(&breakpoint_id);
+            } else {
+                breakpoint_conditions
+                    .borrow_mut()
+                    .insert(breakpoint_id, Utf16String::from_utf16(&condition));
+            }
+
             let breakpoints = debugger.breakpoints();
             let breakpoint = breakpoints
                 .iter()
                 .find(|breakpoint| breakpoint.id == breakpoint_id)
                 .expect("the debugger has the breakpoint it returned");
-            print_breakpoint(&debugger, breakpoint);
+            print_breakpoint(&debugger, breakpoint, breakpoint_conditions);
             continue;
         }
 
-        if let Some(breakpoint_id) = command.strip_prefix(b".delete ") {
-            let Some(breakpoint_id) = to_number(trim_whitespace(breakpoint_id)) else {
-                eprintln!("Usage: .delete <id>");
+        if command_name == b"delete" {
+            let Some(breakpoint_id) = to_number(trim_whitespace(command.consume_remaining())) else {
+                eprintln!("Usage: delete <id>");
                 continue;
             };
             if !debugger.remove_breakpoint(breakpoint_id) {
                 eprintln!("No breakpoint with id {breakpoint_id}.");
                 continue;
             }
+            breakpoint_conditions.borrow_mut().remove(&breakpoint_id);
             standard_output::outln(format!("Deleted breakpoint {breakpoint_id}.").as_bytes());
             continue;
         }
 
         let mut message = b"Unknown debugger command '".to_vec();
-        message.extend_from_slice(command);
-        message.extend_from_slice(b"'. Enter .help for a list of commands.");
+        message.extend_from_slice(command_line);
+        message.extend_from_slice(b"'. Enter help for a list of commands.");
         warn_bytes_line(&message);
     }
 }
@@ -1831,10 +2070,25 @@ fn ladybird_main(arguments: &[String], line_editor: Option<JSLineEditor>) -> c_i
     vm.set_dynamic_imports_allowed(true);
 
     if options.debug {
+        let pause_on_exceptions = Cell::new(
+            options
+                .pause_on_exceptions
+                .as_deref()
+                .and_then(|value| parse_pause_on_exceptions(value.as_bytes()))
+                .unwrap_or(PauseOnExceptions::None),
+        );
+        let breakpoint_conditions = RefCell::new(HashMap::new());
         vm.enable_debugging();
         let debugger = vm.debugger().expect("debugging was just enabled");
+        debugger.set_pause_on_exceptions(pause_on_exceptions.get());
         debugger.set_pause_callback(move |vm, pause_info| {
-            run_debugger_prompt(vm, pause_info, line_editor.as_ref());
+            run_debugger_prompt(
+                vm,
+                pause_info,
+                line_editor.as_ref(),
+                &pause_on_exceptions,
+                &breakpoint_conditions,
+            );
         });
         debugger.request_pause_on_next_bytecode_execution();
     }

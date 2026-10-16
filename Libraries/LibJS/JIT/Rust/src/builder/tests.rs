@@ -838,6 +838,7 @@ pub(crate) mod property_access {
             key_value: 0,
             prototype_property: None,
             prototype_property_intrinsic: None,
+            prototype_property_inline_executable: None,
             accessor_function: None,
             holds_accessor: false,
         }
@@ -1103,7 +1104,7 @@ pub(crate) mod property_access {
         assert_eq!(text.matches("AssumeValid").count(), 1, "{text}");
         assert_eq!(
             graph.dependencies,
-            vec![crate::code::Dependency::PrototypeChainValid(CellId(0x8000))]
+            vec![crate::code::Dependency::WatchpointSetValid(CellId(0x8000))]
         );
     }
 

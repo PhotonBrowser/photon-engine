@@ -111,6 +111,7 @@ use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
 use crate::runtime::property_key::{PropertyKey, StringMayBeNumber};
 use crate::runtime::proxy_constructor::ProxyConstructor;
 use crate::runtime::realm::Realm;
+use crate::runtime::realm_watchpoints;
 use crate::runtime::reflect_object::ReflectObject;
 use crate::runtime::regexp_constructor::RegExpConstructor;
 use crate::runtime::regexp_prototype::RegExpPrototype;
@@ -261,6 +262,7 @@ define_intrinsics! {
     // Namespace/constructor object functions
     array_prototype_values_function: Cell<Option<Gc<FunctionObject>>>,
     date_constructor_now_function: Cell<Option<Gc<FunctionObject>>>,
+    generator_prototype_next_function: Cell<Option<Gc<FunctionObject>>>,
     json_parse_function: Cell<Option<Gc<FunctionObject>>>,
     json_stringify_function: Cell<Option<Gc<FunctionObject>>>,
     object_prototype_to_string_function: Cell<Option<Gc<FunctionObject>>>,
@@ -514,6 +516,7 @@ created_intrinsics! {
         unescape_function: FunctionObject => "%unescape%",
         array_prototype_values_function: FunctionObject => "%Array.prototype.values%",
         date_constructor_now_function: FunctionObject => "%Date.now%",
+        generator_prototype_next_function: FunctionObject => "%GeneratorFunction.prototype.prototype.next%",
         json_parse_function: FunctionObject => "%JSON.parse%",
         json_stringify_function: FunctionObject => "%JSON.stringify%",
         object_prototype_to_string_function: FunctionObject => "%Object.prototype.toString%",
@@ -1087,6 +1090,8 @@ impl Intrinsics {
         // 3. Perform AddRestrictedFunctionProperties(realmRec.[[Intrinsics]].[[%Function.prototype%]], realmRec).
         add_restricted_function_properties(vm, &realm.intrinsics().function_prototype(vm), realm);
 
+        realm_watchpoints::arm(vm, realm);
+
         // 4. Return unused.
         intrinsics
     }
@@ -1477,6 +1482,11 @@ impl Intrinsics {
         self.date_constructor_now_function.set(Some(
             self.date_constructor(vm)
                 .get_without_side_effects(vm, &names.now)
+                .as_function(),
+        ));
+        self.generator_prototype_next_function.set(Some(
+            self.generator_prototype()
+                .get_without_side_effects(vm, &names.next)
                 .as_function(),
         ));
 

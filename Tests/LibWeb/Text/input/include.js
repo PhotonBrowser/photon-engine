@@ -101,6 +101,50 @@ async function scrollSettled(target, action) {
     await scrollend;
 }
 
+function __describeNodeOfInputHook(node, documentName = "document") {
+    if (node instanceof Document) return node === document ? documentName : `nested ${documentName}`;
+    if (node.id) return `#${node.id}`;
+    return node.nodeName.toLowerCase();
+}
+
+function __describeScrollerOfInputHook(result) {
+    if (!result.scroller) return "";
+    let description = ` scroller=${__describeNodeOfInputHook(result.scroller, "viewport")}`;
+    if (result.scrollerPseudoElement) description += `::${result.scrollerPseudoElement}`;
+    return description;
+}
+
+// Describes where internals.compositorWheelTargetAt() or internals.recordedDisplayListWheelTargetAt() says a wheel step
+// goes.
+function wheelTargetToString(target) {
+    return `${target.decision}${__describeScrollerOfInputHook(target)}`;
+}
+
+// Whether the compositor, holding a frame of this document, would scroll the first step of a wheel gesture at the
+// position itself.
+function compositorScrollsWheelStepAt(x, y, deltaX, deltaY) {
+    const target = internals.compositorWheelTargetAt(x, y, deltaX, deltaY);
+    return target.document === document && target.decision === "latched";
+}
+
+// Prints what internals.takeInputTrace() returned, one routing decision per line, optionally only those of the given
+// stages. Input events are numbered in the order they first appear, as the ids the UI gives them keep growing from test
+// to test; input that did not come from the UI is marked "-".
+function printInputTrace(trace, { stages } = {}) {
+    const eventNumbers = new Map();
+    for (const record of trace) {
+        let eventNumber = "-";
+        if (record.id !== 0) {
+            if (!eventNumbers.has(record.id)) eventNumbers.set(record.id, eventNumbers.size + 1);
+            eventNumber = `#${eventNumbers.get(record.id)}`;
+        }
+        if (stages && !stages.includes(record.stage)) continue;
+        let line = `${eventNumber} ${record.stage}: ${record.decision}${__describeScrollerOfInputHook(record)}`;
+        if (record.target) line += ` target=${__describeNodeOfInputHook(record.target)}`;
+        println(line);
+    }
+}
+
 async function scrollOffsetStopsChanging(readScrollOffset) {
     let previousScrollOffset = null;
     while (previousScrollOffset !== readScrollOffset()) {

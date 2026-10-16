@@ -25,6 +25,7 @@ set(SOURCES
     Bindings/MainThreadVM.cpp
     Bindings/OptionConstructor.cpp
     Bindings/PlatformObject.cpp
+    Bindings/RustBindingsServices.cpp
     Bindings/PrincipalHostDefined.cpp
     Bindings/Wrappable.cpp
     Bindings/WrapperWorld.cpp
@@ -290,6 +291,7 @@ set(SOURCES
     DOM/Event.cpp
     DOM/EventDispatcher.cpp
     DOM/EventTarget.cpp
+    DOM/FragmentDirective.cpp
     DOM/HTMLCollection.cpp
     DOM/IDLEventListener.cpp
     DOM/LiveNodeList.cpp
@@ -450,6 +452,7 @@ set(SOURCES
     HTML/CanvasGradient.cpp
     HTML/CanvasPattern.cpp
     HTML/CanvasRenderingContext2D.cpp
+    HTML/CheckUnloadingCanceledState.cpp
     HTML/CloseEvent.cpp
     HTML/CloseWatcher.cpp
     HTML/CloseWatcherManager.cpp
@@ -671,6 +674,8 @@ set(SOURCES
     HTML/SupportedImageTypes.cpp
     HTML/SyntaxHighlighter/SyntaxHighlighter.cpp
     HTML/TagNames.cpp
+    HTML/TextDirective.cpp
+    HTML/TextDirectiveGenerator.cpp
     HTML/TextMetrics.cpp
     HTML/TextTrack.cpp
     HTML/TextTrackCue.cpp
@@ -738,6 +743,7 @@ set(SOURCES
     Layout/Node.cpp
     Layout/NodeArena.cpp
     Layout/RenderDocument.cpp
+    Layout/SearchableText.cpp
     Layout/TextNode.cpp
     Layout/TreeBuilder.cpp
     Layout/UpdateLayout.cpp
@@ -1047,45 +1053,10 @@ set(SOURCES
     WebDriver/Screenshot.cpp
     WebDriver/UserPrompt.cpp
     WebGL/EventNames.cpp
-    WebGL/Extensions/ANGLEInstancedArrays.cpp
-    WebGL/Extensions/EXTBlendMinMax.cpp
-    WebGL/Extensions/EXTColorBufferFloat.cpp
-    WebGL/Extensions/EXTRenderSnorm.cpp
-    WebGL/Extensions/EXTTextureFilterAnisotropic.cpp
-    WebGL/Extensions/EXTTextureNorm16.cpp
-    WebGL/Extensions/OESElementIndexUint.cpp
-    WebGL/Extensions/OESStandardDerivatives.cpp
-    WebGL/Extensions/OESVertexArrayObject.cpp
-    WebGL/Extensions/WebGLCompressedTextureS3tc.cpp
-    WebGL/Extensions/WebGLCompressedTextureS3tcSrgb.cpp
-    WebGL/Extensions/WebGLDebugRendererInfo.cpp
-    WebGL/Extensions/WebGLDrawBuffers.cpp
-    WebGL/Extensions/WebGLVertexArrayObjectOES.cpp
-    WebGL/WebGL2RenderingContext.cpp
-    WebGL/WebGL2RenderingContextImpl.cpp
-    WebGL/WebGL2RenderingContextOverloads.cpp
-    WebGL/WebGLActiveInfo.cpp
-    WebGL/WebGLBuffer.cpp
+    WebGL/RemoteWebGLTransportFFI.cpp
     WebGL/WebGLContextAttributes.cpp
     WebGL/WebGLContextEvent.cpp
-    WebGL/WebGLContextProxyBase.cpp
-    WebGL/WebGLFramebuffer.cpp
-    WebGL/WebGLObject.cpp
-    WebGL/WebGLProgram.cpp
-    WebGL/WebGLQuery.cpp
-    WebGL/WebGLRenderbuffer.cpp
-    WebGL/WebGLRenderingContext.cpp
     WebGL/WebGLRenderingContextBase.cpp
-    WebGL/WebGLRenderingContextImpl.cpp
-    WebGL/WebGLRenderingContextOverloads.cpp
-    WebGL/WebGLSampler.cpp
-    WebGL/WebGLShader.cpp
-    WebGL/WebGLShaderPrecisionFormat.cpp
-    WebGL/WebGLSync.cpp
-    WebGL/WebGLTexture.cpp
-    WebGL/WebGLTransformFeedback.cpp
-    WebGL/WebGLUniformLocation.cpp
-    WebGL/WebGLVertexArrayObject.cpp
     WebIDL/AbstractOperations.cpp
     WebIDL/AsyncIterator.cpp
     WebIDL/Buffers.cpp
@@ -1136,7 +1107,6 @@ generate_css_implementation()
 
 generate_html_implementation()
 
-generate_webgl_implementation()
 
 set(GENERATED_SOURCES
     ARIA/AriaRoles.cpp
@@ -1159,7 +1129,6 @@ set(GENERATED_SOURCES
     SVG/SVGStyleSheetSource.cpp
     HTML/MediaControlsDOM.cpp
     HTML/Parser/NamedCharacterReferences.cpp
-    WebGL/WebGLContextProxy.cpp
 )
 
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)

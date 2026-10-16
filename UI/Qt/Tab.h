@@ -41,6 +41,8 @@ namespace Ladybird {
 class BrowserWindow;
 enum class ChromeIcon;
 class DownloadsPopover;
+class ContentBlockingButton;
+class ContentBlockingPopover;
 class JavaScriptDialog;
 class MessagePopover;
 class WindowControlButton;
@@ -94,6 +96,9 @@ public:
     BookmarksBar& bookmarks_bar() { return *m_bookmarks_bar; }
 
     void request_close();
+    void request_window_close_preflight(Function<void(bool)> on_complete);
+    void cancel_window_close_preflight();
+    Function<void()> prepare_for_window_close();
 
     QIcon const& favicon() const { return m_favicon; }
     QIcon tab_icon() const;
@@ -133,6 +138,7 @@ private:
 
     virtual void tab_settings_changed() override;
     virtual void config_variable_changed(WebView::ConfigVariableID) override;
+    virtual void content_blocker_count_visibility_changed() override;
 
     void recreate_toolbar_icons();
     void update_vertical_tabs_toolbar_button_placement();
@@ -143,8 +149,11 @@ private:
     void update_downloads_popover();
     void show_downloads_popover();
     void position_downloads_popover();
+    void show_content_blocking_popover();
+    void update_content_blocking_controls(WebView::ContentBlockingSnapshot const&);
     void show_private_session_popover();
     void position_private_session_popover();
+    void hide_hover_label();
     void set_loading(bool);
     void update_tab_icon();
     int tab_index();
@@ -168,6 +177,8 @@ private:
     BookmarksBar* m_bookmarks_bar { nullptr };
     QPushButton* m_private_badge { nullptr };
     QToolButton* m_hamburger_button { nullptr };
+    ContentBlockingButton* m_content_blocking_button { nullptr };
+    QPointer<ContentBlockingPopover> m_content_blocking_popover;
     QToolButton* m_downloads_button { nullptr };
     QPointer<DownloadsPopover> m_downloads_popover;
     QPointer<MessagePopover> m_private_session_popover;
@@ -204,6 +215,7 @@ private:
     QString m_downloads_button_tooltip;
 
     JavaScriptDialog* m_javascript_dialog { nullptr };
+    Function<void(bool)> m_before_unload_completion;
     QPointer<QColorDialog> m_color_picker_dialog;
     QPointer<QFileDialog> m_file_picker_dialog;
     QPointer<QMessageBox> m_external_url_confirmation_dialog;
@@ -216,6 +228,8 @@ private:
 
     bool m_suppress_javascript_dialogs_until_navigation { false };
     bool m_already_requested_close { false };
+    bool m_preserve_close_retry_state_on_dialog_dismissal { false };
+    bool m_window_is_closing { false };
 };
 
 }

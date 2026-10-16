@@ -205,15 +205,11 @@ pub extern "C" fn rust_descriptor_block_item(block: &FfiDescriptorBlock, index: 
 
 // https://drafts.csswg.org/cssom/#serialize-a-css-declaration-block
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_descriptor_block_serialize(block: &FfiDescriptorBlock, result: &mut usize) -> bool {
-    let Some(sink) = serialize_descriptors(&block.data()) else {
-        return false;
-    };
-    *result = sink_into_raw(sink);
-    true
+pub extern "C" fn rust_descriptor_block_serialize(block: &FfiDescriptorBlock) -> usize {
+    sink_into_raw(serialize_descriptors(&block.data()))
 }
 
-fn serialize_descriptors(data: &DescriptorBlockData) -> Option<TextSink> {
+fn serialize_descriptors(data: &DescriptorBlockData) -> TextSink {
     let mut sink = TextSink::new();
     for (index, descriptor) in data.descriptors.iter().enumerate() {
         if index != 0 {
@@ -224,15 +220,13 @@ fn serialize_descriptors(data: &DescriptorBlockData) -> Option<TextSink> {
         serialize_an_identifier(&mut sink, &StringUnits::Utf16(descriptor.name.units()));
         sink.push_ascii(": ");
         let mut value = TextSink::new();
-        if !serialize_style_value(&mut value, &descriptor.value, SerializationMode::Normal) {
-            return None;
-        }
+        serialize_style_value(&mut value, &descriptor.value, SerializationMode::Normal);
         if !value.is_ascii_whitespace() {
             sink.push_sink(&value);
         }
         sink.push_ascii(";");
     }
-    Some(sink)
+    sink
 }
 
 #[unsafe(no_mangle)]
@@ -292,7 +286,7 @@ mod tests {
     use super::*;
     use crate::css::parser::syntax_parser::parse_shared_stylesheet;
     use crate::css::parser::value_parser::ParseContext;
-    use crate::css::rule::{rust_rule_list_at, rust_rule_payload};
+    use crate::css::rule::rust_rule_payload;
 
     #[test]
     fn descriptor_snapshots_can_be_mutated_on_a_worker() {
@@ -338,8 +332,8 @@ mod tests {
         let context = ParseContext::default();
         let parse = unsafe { parse_shared_stylesheet(input, &context) };
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
-        let rule = unsafe { &*rust_rule_list_at(&rules, 0) };
-        let block = unsafe { &*rust_rule_payload(rule).descriptors };
+        let rule = rules.rule_at(0);
+        let block = unsafe { &*rust_rule_payload(&rule).descriptors };
         let snapshot = block.data();
         let old_data = Arc::downgrade(&snapshot);
         assert_eq!(snapshot.descriptors.len(), 2);
@@ -349,7 +343,7 @@ mod tests {
         let value = unsafe { rust_descriptor_block_get(block, descriptor.id, descriptor.name) };
         assert_eq!(value, descriptor.value);
         assert_eq!(
-            serialize_descriptors(&block.data()).unwrap().into_utf16(),
+            serialize_descriptors(&block.data()).into_utf16(),
             "font-family: 文字; src: url(\"font.woff\");"
                 .encode_utf16()
                 .collect::<Vec<_>>()
@@ -377,7 +371,7 @@ mod tests {
         rust_descriptor_block_replace(&mut retained, &fork);
         assert_eq!(rust_descriptor_block_length(block), 2);
         assert!(matches!(*fork.state.borrow(), DescriptorBlockState::Immutable(_)));
-        drop(rules);
+        drop((rule, rules));
         let first = &snapshot.descriptors[0];
         assert!(unsafe { rust_descriptor_block_remove(&mut fork, first.id, FfiUtf16View::default()) });
         assert!(matches!(*fork.state.borrow(), DescriptorBlockState::Mutable(_)));

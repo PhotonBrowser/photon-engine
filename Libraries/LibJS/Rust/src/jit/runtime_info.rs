@@ -54,7 +54,7 @@ use crate::layout::property_lookup_cache::{
     PropertyLookupCacheEntryType,
 };
 use crate::layout::realm::Realm;
-use crate::layout::shape::{PrototypeChainValidity, Shape};
+use crate::layout::shape::{Shape, WatchpointSet};
 use crate::layout::value::Value;
 use crate::layout::vm::VmHead;
 use crate::runtime::array::{ARRAY_IS_PROXY_TARGET_OFFSET, ARRAY_LENGTH_WRITABLE_OFFSET};
@@ -122,7 +122,7 @@ fn runtime_offsets() -> RuntimeOffsets {
         object_shape: offset(offset_of!(Object, shape)),
         object_named_properties: offset(offset_of!(Object, named_properties)),
         shape_dictionary_generation: offset(offset_of!(Shape, dictionary_generation)),
-        prototype_chain_validity_valid: offset(offset_of!(PrototypeChainValidity, valid)),
+        prototype_chain_validity_valid: offset(offset_of!(WatchpointSet, valid)),
         accessor_getter: offset(offset_of!(Accessor, getter)),
         accessor_setter: offset(offset_of!(Accessor, setter)),
         execution_context_function: offset(offset_of!(ExecutionContext, function)),
@@ -454,9 +454,10 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
         },
         array_push: super::calls::libjs_jit_array_push as *const () as u64,
         slice_arguments: super::calls::libjs_jit_slice_arguments as *const () as u64,
-        create_array_iterator: super::intrinsics::libjs_jit_create_array_iterator as *const () as u64,
+        open_array_iteration: super::intrinsics::libjs_jit_open_array_iteration as *const () as u64,
         // NB: Filled in by capture_snapshot(), which lists it as an embedded cell.
         array_iterator_next: None,
+        array_iterator_return_watchpoint_set: None,
         jit_exit: super::entry_exit::libjs_jit_exit as *const () as u64,
         to_boolean: addresses.to_boolean,
         primitive_to_string: super::calls::libjs_jit_primitive_to_string as *const () as u64,

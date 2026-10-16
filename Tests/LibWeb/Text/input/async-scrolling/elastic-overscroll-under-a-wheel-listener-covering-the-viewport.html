@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    body {
+        margin: 0;
+        height: 2000px;
+    }
+</style>
+<script>
+    promiseTest(async () => {
+        let wheelEvents = 0;
+        let cancelableWheelEvents = 0;
+        window.addEventListener("wheel", event => {
+            ++wheelEvents;
+            if (event.cancelable)
+                ++cancelableWheelEvents;
+        }, { passive: false });
+        await animationFrame();
+        await animationFrame();
+
+        // The page sees the first step before anything scrolls and does not cancel it. The compositor then stretches the
+        // page past its top, and scrolls the rest of the gesture without asking the page again.
+        await internals.wheelThroughUIProcess(400, 300, 0, -200, true, "ongoing");
+        await internals.wheelThroughUIProcess(400, 300, 0, -200, true, "ongoing");
+        println(`pulled past the top: viewport stretch=${internals.compositorScrollState().stretch.y} window.scrollY=${window.scrollY}`);
+        println(`wheel events the page could have canceled: ${cancelableWheelEvents} of ${wheelEvents}`);
+
+        await internals.wheelThroughUIProcess(400, 300, 0, 0, true, "ended");
+        while (internals.compositorScrollState().stretch.y !== 0)
+            await animationFrame();
+        println(`sprung back: viewport stretch=${internals.compositorScrollState().stretch.y} window.scrollY=${window.scrollY}`);
+    });
+</script>

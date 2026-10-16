@@ -31,6 +31,7 @@ use super::Flow;
 use super::Function;
 use super::GraphBuilder;
 use super::SlotState;
+use super::arguments;
 use crate::CompileFailure;
 use crate::bitset::BitSet;
 use crate::builder::Handling;
@@ -87,6 +88,9 @@ pub(super) struct InlineCall {
     /// The values returned, one per predecessor of the continuation, with
     /// what was known at each return.
     pub returns: Vec<NodeId>,
+    /// The shapes every return knew objects have (see
+    /// `AbstractFrame::fresh_shapes`), once the first return is built.
+    pub return_fresh_shapes: Option<Vec<(NodeId, CellId)>>,
     /// Interpreter stack bytes of this callee's frame and those of the
     /// inlined calls it is in.
     pub frame_bytes: u64,
@@ -107,12 +111,16 @@ pub(super) struct CallbackTarget {
 /// needed in memory outside generic nodes, its environments must stay those
 /// of its function object, it must be fully compilable, and it must not step
 /// for-in loops.
-fn can_inline(callee: &Function<'_>) -> bool {
+fn can_inline(callee: &Function<'_>, virtual_arguments: bool) -> bool {
     if !callee.written_constants.is_empty() {
         return false;
     }
     callee.instructions.iter().all(|instruction| {
         let opcode = instruction.instruction.opcode();
+        // NB: An arguments object the callee never creates reads no frame (see `arguments`).
+        if virtual_arguments && arguments::can_create_virtual_arguments(callee, &instruction.instruction) {
+            return true;
+        }
         let reads_frame_fields = matches!(
             opcode,
             OpCode::GetLexicalEnvironment
@@ -158,12 +166,14 @@ fn returns_no_object(callee: &Function<'_>) -> bool {
 
 /// Where the `this` value or an argument of an inlined call comes from.
 #[derive(Debug, Clone, Copy)]
-enum InlineValue {
+pub(super) enum InlineValue {
     Operand(Operand),
     Constant(u64),
     /// The running frame's argument at this index, whose arguments object
     /// the code never created.
     FrameArgument(u32),
+    /// A value the code has, like an argument of an inlined callee.
+    Node(NodeId),
 }
 
 /// A call to inline.
@@ -193,6 +203,32 @@ struct InlinedCallSite {
 }
 
 impl InlinedCallSite {
+    /// A call of snapshot executable `index` through
+    /// `Function.prototype.call` with `arguments`, whose first is `this`.
+    fn through_call(index: u32, arguments: &[Operand], argument_count: u32, dst: Operand) -> Self {
+        let this = arguments
+            .first()
+            .map_or(InlineValue::Constant(value::UNDEFINED), |this| {
+                InlineValue::Operand(*this)
+            });
+        Self::forwarded(
+            index,
+            this,
+            arguments.iter().skip(1).copied().map(InlineValue::Operand).collect(),
+            argument_count.saturating_sub(1),
+            dst,
+        )
+    }
+
+    /// A call of snapshot executable `index` that gets other arguments than
+    /// the `Call` instruction's.
+    fn forwarded(index: u32, this: InlineValue, arguments: Vec<InlineValue>, count: u32, dst: Operand) -> Self {
+        Self {
+            forwarded: true,
+            ..Self::new(index, this, arguments, count, dst)
+        }
+    }
+
     /// A call of snapshot executable `index` with `this` and `arguments`,
     /// into `dst`, which checks no callee and forwards nothing.
     fn new(
@@ -632,6 +668,11 @@ impl GraphBuilder<'_> {
             };
             return self.inline_call(call);
         }
+        if feedback.forwarded.is_none()
+            && let Some(flow) = self.try_inline_constant_callee(instruction)?
+        {
+            return Ok(Some(flow));
+        }
         let Some(forwarded) = feedback.forwarded else {
             return Ok(None);
         };
@@ -647,18 +688,7 @@ impl GraphBuilder<'_> {
                 }
                 InlinedCallSite {
                     callee: Some(*this_value),
-                    forwarded: true,
-                    ..InlinedCallSite::new(
-                        index,
-                        arguments
-                            .first()
-                            .map_or(InlineValue::Constant(value::UNDEFINED), |this| {
-                                InlineValue::Operand(*this)
-                            }),
-                        arguments.iter().skip(1).copied().map(InlineValue::Operand).collect(),
-                        argument_count.saturating_sub(1),
-                        *dst,
-                    )
+                    ..InlinedCallSite::through_call(index, arguments, *argument_count, *dst)
                 }
             }
             Forwarding::Apply => {
@@ -667,20 +697,20 @@ impl GraphBuilder<'_> {
                 };
                 if self.constant_intrinsic(*callee) != Some(Intrinsic::FunctionPrototypeApply)
                     || !self.holds_virtual_arguments(*forwarded_arguments)
-                    || !self.may_speculate(ExitKind::UnexpectedValue)
                 {
                     return Ok(None);
                 }
-                InlinedCallSite {
-                    callee: Some(*this_value),
-                    forwarded: true,
-                    ..InlinedCallSite::new(
-                        index,
-                        InlineValue::Operand(*this),
+                let (arguments, count) = match self.inlined_call_arguments() {
+                    Some(arguments) => arguments,
+                    None if self.may_speculate(ExitKind::UnexpectedValue) => (
                         (0..forwarded.argument_count).map(InlineValue::FrameArgument).collect(),
                         forwarded.argument_count,
-                        *dst,
-                    )
+                    ),
+                    None => return Ok(None),
+                };
+                InlinedCallSite {
+                    callee: Some(*this_value),
+                    ..InlinedCallSite::forwarded(index, InlineValue::Operand(*this), arguments, count, *dst)
                 }
             }
             Forwarding::Bound => {
@@ -708,6 +738,54 @@ impl GraphBuilder<'_> {
             }
         };
         self.inline_call(call)
+    }
+
+    /// Inlines a `Call` of a function the code holds as a constant, which
+    /// needs no feedback: called itself (`f(...)`), through
+    /// `Function.prototype.call` (`f.call(this_arg, ...)`), or in an inlined
+    /// callee, through `Function.prototype.apply` with its virtual arguments
+    /// object (`f.apply(this_arg, arguments)`). Sites that call
+    /// several functions, like a method of a constructor every class shares,
+    /// call one of them where the code knows which. Returns `None`, having
+    /// built nothing that matters, if it does not.
+    fn try_inline_constant_callee(&mut self, instruction: &Instruction) -> Result<Option<Flow>, CompileFailure> {
+        let Instruction::Call {
+            dst,
+            callee,
+            this_value,
+            argument_count,
+            arguments,
+            ..
+        } = instruction
+        else {
+            return Ok(None);
+        };
+        if let Some(index) = self.constant_inlinable_function(*callee) {
+            let call = InlinedCallSite::new(
+                index,
+                InlineValue::Operand(*this_value),
+                arguments.iter().copied().map(InlineValue::Operand).collect(),
+                *argument_count,
+                *dst,
+            );
+            return self.inline_call(call);
+        }
+        let Some(index) = self.constant_inlinable_function(*this_value) else {
+            return Ok(None);
+        };
+        // NB: An inlined callee forwards what its call passed it.
+        if self.constant_intrinsic(*callee) == Some(Intrinsic::FunctionPrototypeApply)
+            && let [this, forwarded_arguments] = arguments.as_slice()
+            && self.holds_virtual_arguments(*forwarded_arguments)
+            && let Some((arguments, count)) = self.inlined_call_arguments()
+        {
+            let call = InlinedCallSite::forwarded(index, InlineValue::Operand(*this), arguments, count, *dst);
+            return self.inline_call(call);
+        }
+        if self.constant_intrinsic(*callee) != Some(Intrinsic::FunctionPrototypeCall) {
+            return Ok(None);
+        }
+        self.inline_call(InlinedCallSite::through_call(index, arguments, *argument_count, *dst))
     }
 
     /// Inlines the call of the getter whose executable is snapshot executable
@@ -872,6 +950,7 @@ impl GraphBuilder<'_> {
         match value {
             InlineValue::Operand(operand) => self.read(operand),
             InlineValue::Constant(bits) => Ok(self.constant(bits)),
+            InlineValue::Node(node) => Ok(node),
             InlineValue::FrameArgument(index) => {
                 let index = self.constant(value::int32(index.cast_signed()));
                 let arguments_base = self.function.layout.arguments_base();
@@ -937,13 +1016,22 @@ impl GraphBuilder<'_> {
             return Ok(None);
         }
         // NB: CheckClosure checks shared data, not legacy-property eligibility.
-        //     Keep non-strict closure calls conservative.
+        //     Keep non-strict closure calls conservative. Frames with a virtual
+        //     arguments object keep every passed argument too, which exits
+        //     create the object from.
+        let virtual_arguments =
+            self.virtualize_arguments.compiled_function && self.virtualize_arguments.inlined_callees;
+        let creates_arguments = decoded
+            .instructions
+            .iter()
+            .any(|instruction| instruction.instruction.opcode() == OpCode::CreateArguments);
         let has_legacy_arguments = callee_executable.supports_legacy_arguments
-            || (closure.is_some() && callee_executable.is_non_strict_function());
+            || (closure.is_some() && callee_executable.is_non_strict_function())
+            || (virtual_arguments && creates_arguments);
         let Ok(mut callee_function) = Function::new(index, callee_executable, decoded, has_legacy_arguments) else {
             return Ok(None);
         };
-        if !can_inline(&callee_function) {
+        if !can_inline(&callee_function, virtual_arguments) {
             return Ok(None);
         }
         if construct.is_some() && !returns_no_object(&callee_function) {
@@ -1064,6 +1152,7 @@ impl GraphBuilder<'_> {
         let callee_frame = AbstractFrame {
             slots,
             fields: Default::default(),
+            fresh_shapes: self.frame.fresh_shapes.clone(),
         };
         callee_function.inline = Some(InlineCall {
             caller_frame_state,
@@ -1083,6 +1172,7 @@ impl GraphBuilder<'_> {
             },
             continuation: None,
             returns: Vec::new(),
+            return_fresh_shapes: None,
             frame_bytes,
             construct: construct.is_some(),
         });
@@ -1107,6 +1197,7 @@ impl GraphBuilder<'_> {
         self.order.push(continuation);
         self.block = continuation;
         self.frame = call.caller_frame;
+        self.frame.fresh_shapes = call.return_fresh_shapes.unwrap_or_default();
         let values = call.returns;
         let result = if values.iter().all(|value| *value == values[0]) {
             values[0]
@@ -1151,12 +1242,13 @@ impl GraphBuilder<'_> {
                 continuation
             }
         };
-        self.function
-            .inline
-            .as_mut()
-            .expect("returns from inlined callees")
-            .returns
-            .push(value);
+        let call = self.function.inline.as_mut().expect("returns from inlined callees");
+        call.returns.push(value);
+        let fresh_shapes = &self.frame.fresh_shapes;
+        match &mut call.return_fresh_shapes {
+            Some(shapes) => shapes.retain(|shape| fresh_shapes.contains(shape)),
+            None => call.return_fresh_shapes = Some(fresh_shapes.clone()),
+        }
         self.set_control(Op::Jump { target: continuation }, Vec::new());
         self.graph.blocks[continuation.index()].predecessors.push(self.block);
         Flow::Ended

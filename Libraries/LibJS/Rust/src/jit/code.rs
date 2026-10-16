@@ -120,6 +120,12 @@ pub struct JitCode {
     snapshot_executables: Vec<SnapshotExecutable>,
     /// Where a frame running in the interpreter at the loop back edge `pc` can continue in this code.
     osr_entries: Vec<(u32, JitEntry)>,
+    /// The loop back edges from where a frame running in the interpreter reaches one of the `osr_entries` without
+    /// leaving the loop it is in.
+    osr_loop_back_edges: Vec<u32>,
+    /// The loop back edges in the loops around those of the `osr_entries`, from where a frame running in the
+    /// interpreter may reach one of them on a later iteration.
+    osr_outer_loop_back_edges: Vec<u32>,
     /// Identifies the code among all code the VM installed, for the dependencies it registers (see
     /// `super::dependencies`).
     id: u64,
@@ -134,6 +140,7 @@ impl JitCode {
         memory: ExecutableMemory,
         entry_offset: u32,
         osr_entry_offsets: &[(u32, u32)],
+        osr_loop_back_edges: Vec<u32>,
         sites: Vec<Site>,
         embedded_cells: Vec<Gc<CellHeader>>,
         snapshot_executables: Vec<SnapshotExecutable>,
@@ -156,6 +163,8 @@ impl JitCode {
             embedded_cells,
             snapshot_executables,
             osr_entries,
+            osr_loop_back_edges,
+            osr_outer_loop_back_edges: Vec::new(),
             id: 0,
             invalidation_patches: Vec::new(),
             invalidated: Cell::new(false),
@@ -166,6 +175,12 @@ impl JitCode {
     pub fn with_invalidation(mut self, id: u64, invalidation_patches: Vec<(u32, Vec<u8>)>) -> Self {
         self.id = id;
         self.invalidation_patches = invalidation_patches;
+        self
+    }
+
+    /// Gives the code the loop back edges in the loops around those of its on-stack replacement entries.
+    pub fn with_osr_outer_loop_back_edges(mut self, osr_outer_loop_back_edges: Vec<u32>) -> Self {
+        self.osr_outer_loop_back_edges = osr_outer_loop_back_edges;
         self
     }
 
@@ -198,12 +213,25 @@ impl JitCode {
             .map(|(_, entry)| *entry)
     }
 
-    pub fn has_osr_entries(&self) -> bool {
-        !self.osr_entries.is_empty()
+    /// Whether a frame running in the interpreter at the loop back edge `pc` reaches an on-stack replacement entry
+    /// without leaving the loop it is in.
+    pub fn reaches_osr_entry_from(&self, pc: u32) -> bool {
+        self.osr_loop_back_edges.contains(&pc)
+    }
+
+    /// Whether a frame running in the interpreter at the loop back edge `pc` may reach an on-stack replacement entry
+    /// on a later iteration of a loop it is in.
+    pub fn may_reach_osr_entry_from(&self, pc: u32) -> bool {
+        self.osr_outer_loop_back_edges.contains(&pc)
     }
 
     pub fn site(&self, index: u32) -> &Site {
         &self.sites[index as usize]
+    }
+
+    /// Takes the sites of code that died, so that they can be dropped elsewhere.
+    pub fn take_sites(&mut self) -> Vec<Site> {
+        core::mem::take(&mut self.sites)
     }
 
     pub fn snapshot_executable(&self, index: u32) -> SnapshotExecutable {
@@ -270,6 +298,11 @@ pub(crate) struct CapturedBindingAccesses {
 /// it.
 pub const EXIT_COUNT_BEFORE_DISCARD: u32 = 10;
 
+/// After this many exits, JIT code is discarded sooner, once a frame runs a loop in the interpreter from where it
+/// reaches no on-stack replacement entry of the code. Code that exits and leaves frames looping in the interpreter
+/// costs more than code that exits as often elsewhere.
+pub const EXIT_COUNT_BEFORE_DISCARD_FROM_LOOP: u32 = 5;
+
 /// An executable whose code was discarded this often is not compiled again.
 pub const MAX_DISCARD_COUNT: u32 = 8;
 
@@ -321,9 +354,18 @@ impl Executable {
 
     /// Frees the slot of the executable, which died, and drops its JIT code.
     pub fn free_jit_entry_slot(&self, vm: &Vm) {
-        if let Some(table) = vm.jit.entry_table.as_ref() {
-            table.free(self.head.jit_entry_slot.get(), core::ptr::from_ref(&self.head) as u64);
+        let Some(table) = vm.jit.entry_table.as_ref() else {
+            return;
+        };
+        let Some(mut code) = table.free(self.head.jit_entry_slot.get(), core::ptr::from_ref(&self.head) as u64) else {
+            return;
+        };
+        // OPTIMIZATION: The compile threads allocated the sites, so one of them frees them, outside the collection
+        //               this runs in.
+        if let Some(queue) = vm.jit.started_compile_queue() {
+            queue.drop_sites(code.take_sites());
         }
+        drop(code);
     }
 
     /// The executable's attached JIT code, if any.

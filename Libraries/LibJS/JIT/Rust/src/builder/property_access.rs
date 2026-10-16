@@ -91,8 +91,15 @@ impl GraphBuilder<'_> {
         node
     }
 
-    /// `value`, refined: known to be an object, or the code exits.
+    /// `value`, refined: known to be an object, or the code exits. Objects
+    /// the code allocated need no check.
     pub(super) fn check_object(&mut self, value: NodeId) -> NodeId {
+        if matches!(
+            self.graph.node(self.graph.unrefined(value)).op,
+            Op::AllocateObject { .. } | Op::AllocateArray { .. } | Op::AllocateFunction { .. }
+        ) {
+            return value;
+        }
         self.emit_checked(Op::CheckObject, vec![value], None)
     }
 
@@ -111,13 +118,13 @@ impl GraphBuilder<'_> {
         )
     }
 
-    /// Makes sure that the `PrototypeChainValidity` cell `validity` is still
+    /// Makes sure that the `WatchpointSet` cell `validity` is still
     /// valid: the code depends on it staying valid if it was when the
     /// snapshot was taken (`valid`), and checks it otherwise.
     pub(super) fn check_prototype_chain(&mut self, validity: CellId, valid: bool) {
         self.embed(validity);
         if valid {
-            self.assume(Dependency::PrototypeChainValid(validity));
+            self.assume(Dependency::WatchpointSetValid(validity));
             return;
         }
         self.emit_checked(Op::CheckPrototypeChainValid { validity }, Vec::new(), None);
@@ -171,9 +178,12 @@ impl GraphBuilder<'_> {
         let holder = self.constant(holder);
         match entry.prototype_property {
             Some((expected, intrinsic)) if self.may_speculate(ExitKind::UnexpectedValue) => {
+                let bits = self.boxed_object(expected);
                 if let Some(intrinsic) = intrinsic {
-                    let bits = self.boxed_object(expected);
                     self.intrinsics.insert(bits, intrinsic);
+                }
+                if let Some(index) = entry.prototype_property_inline_executable {
+                    self.inlinable_functions.insert(bits, index);
                 }
                 self.load_constant_named(holder, offset, expected)
             }
@@ -207,7 +217,10 @@ impl GraphBuilder<'_> {
         base: Operand,
         cache: u32,
     ) -> Result<bool, CompileFailure> {
-        let Some(entries) = self.cache_entries(cache) else {
+        let Some(entries) = self
+            .cache_entries(cache)
+            .or_else(|| self.megamorphic_entries_for_known_shape(cache, base))
+        else {
             return Ok(false);
         };
         self.build_get(dst, base, entries, None)

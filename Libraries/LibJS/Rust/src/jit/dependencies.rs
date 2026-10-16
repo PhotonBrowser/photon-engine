@@ -28,7 +28,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::environment::DeclarativeEnvironment;
 use crate::layout::object::Object;
-use crate::layout::shape::PrototypeChainValidity;
+use crate::layout::shape::WatchpointSet;
 use crate::runtime::shape::Shape;
 
 /// Installed code that depends on something, as its executable and its id. Once the executable died or has other
@@ -51,9 +51,9 @@ pub struct Dependents {
     /// assignment, and neither is storing the value it holds, as CreateGlobalFunctionBinding does after defining the
     /// property.
     ///
-    /// Nothing but the runtime (`Object::storage_set()` and `Object::storage_delete()`) writes to the slots of a global
-    /// object that are not assigned yet, while its shape is a dictionary: property lookup caches only write to slots
-    /// whose writes they cached, and the runtime caches no write to such a slot (see
+    /// Nothing but the runtime (`Object::replace_direct()` and `Object::storage_delete()`) writes to the slots of a
+    /// global object that are not assigned yet, while its shape is a dictionary: property lookup caches only write to
+    /// slots whose writes they cached, and the runtime caches no write to such a slot (see
     /// `global_object_slot_may_have_been_assigned()`). And no other object ever gets one of the shapes of a global
     /// object once it has a dictionary shape, which belongs to it alone, as do the shapes it gets from that one, so
     /// that writes the caches made for other objects never apply to it.
@@ -75,7 +75,7 @@ impl Dependents {
                     declarative_environment(*environment).set_has_dependent_code();
                 }
                 Dependency::StableShape(shape) => shape_of(*shape).set_has_dependent_code(),
-                Dependency::PrototypeChainValid(_)
+                Dependency::WatchpointSetValid(_)
                 | Dependency::GlobalPropertyUnassigned { .. }
                 | Dependency::NoHtmlDdaObjects => {}
             }
@@ -152,9 +152,9 @@ fn declarative_environment(environment: CellId) -> &'static DeclarativeEnvironme
 /// Whether `dependency` still holds.
 pub fn holds(vm: &Vm, dependency: &Dependency) -> bool {
     match dependency {
-        Dependency::PrototypeChainValid(validity) => {
+        Dependency::WatchpointSetValid(validity) => {
             // SAFETY: Code that depends on the cell embeds it, which keeps it alive.
-            unsafe { &*(validity.0 as *const PrototypeChainValidity) }.is_valid()
+            unsafe { &*(validity.0 as *const WatchpointSet) }.is_valid()
         }
         Dependency::GlobalDeclarations { environment, serial } => {
             declarative_environment(*environment).environment_serial_number() == *serial

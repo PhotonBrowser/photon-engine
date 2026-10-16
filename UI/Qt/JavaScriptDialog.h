@@ -27,6 +27,7 @@ public:
 
     enum class Type {
         Alert,
+        BeforeUnload,
         Confirm,
         Prompt,
     };
@@ -34,8 +35,10 @@ public:
     explicit JavaScriptDialog(QWidget* parent);
 
     bool is_open() const { return m_type.has_value(); }
+    Optional<Type> type() const { return m_type; }
 
     void show_alert(QString const& title, QString const& message);
+    void show_before_unload(QString const& title);
     void show_confirm(QString const& title, QString const& message);
     void show_prompt(QString const& title, QString const& message, QString const& default_text);
     void set_prompt_text(QString const& text);

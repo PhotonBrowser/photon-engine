@@ -1,4 +1,5 @@
 #include <LibCore/SharedVersion.h>
+#include <LibGfx/Color.h>
 #include <LibGfx/Rect.h>
 #include <LibHTTP/Cookie/Cookie.h>
 #include <LibIPC/File.h>
@@ -115,11 +116,12 @@ endpoint WebContentServer routed by Web::PageId page_id
     set_hosted_root_viewport(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::DevicePixelSize size, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio) =|
     run_beforeunload_check(Web::PageId page_id, Web::HTML::CrossProcessId check_id, Vector<Web::HTML::CrossProcessId> navigable_ids, Optional<Web::HTML::SessionHistoryEntryDescriptor> target_entry, Optional<Web::HTML::UserNavigationInvolvement> user_involvement_for_navigate_event, Web::HTML::UnloadPromptShown unload_prompt_shown) =|
     discard_embedded_page(Web::PageId page_id) =|
-    queue_navigation_api_state_clear_task(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) =|
-    continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType> navigation_type, Web::HTML::HistoryNavigationPopulation population) =|
-    run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Web::HTML::TraversalYieldsTo traversal_yields_to, Optional<Utf16String> canceled_navigation_id, Optional<Utf16String> finalized_navigation_id, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params) =|
-    prepare_changing_navigable_for_unload(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) =|
-    apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, Web::HTML::UnloadDisplayedDocument unload_displayed_document) =|
+    queue_navigation_api_state_clear_task(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
+    continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType> navigation_type, bool ongoing_navigation_is_traversal, Web::HTML::HistoryNavigationPopulation population) =|
+    run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Optional<Utf16String> finalized_navigation_id, bool ongoing_navigation_is_traversal, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params) =|
+    clear_ongoing_history_traversal(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) =|
+    apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api) =|
+    unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api) =|
     run_descendant_unload_task(Web::PageId page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChildNavigableDestruction child_navigable_destruction, Web::HTML::StopHostingAfterUnload stop_hosting_after_unload) =|
     continue_child_navigable_destruction(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     abort_navigable_document(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
@@ -128,7 +130,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     container_fullscreen_complete(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     unfullscreen_navigable_container(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     container_unfullscreen_complete(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
-    run_traversable_close_unload_task(Web::PageId page_id, Web::HTML::CrossProcessId operation_id) =|
+    run_traversable_close_unload_task(Web::PageId page_id) =|
     update_nonchanging_navigable_history_state(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, u64 script_history_length, u64 script_history_index) =|
     history_step_applied(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result) =|
     reject_navigation_api_traversal(Web::PageId page_id, Web::HTML::CrossProcessId operation_id) =|
@@ -221,6 +223,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     request_internal_page_info(Web::PageId page_id, WebView::PageInfoType type) =|
 
     get_selected_text(Web::PageId page_id, u64 request_id) =|
+    generate_text_fragment_url(Web::PageId page_id, u64 request_id, u64 generation_id) =|
     get_selected_text_for_lookup(Web::PageId page_id, u64 request_id) =|
     select_word_for_dictionary_lookup(Web::PageId page_id, u64 request_id, Web::DevicePixelPoint position) =|
     cut_selected_text(Web::PageId page_id, u64 request_id) =|
@@ -238,7 +241,9 @@ endpoint WebContentServer routed by Web::PageId page_id
     find_in_page_previous_match(Web::PageId page_id) =|
     find_in_page_end(Web::PageId page_id) =|
 
+    set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) =|
     set_content_blockers(Core::AnonymousBuffer patterns) =|
+
     set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) =|
     set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme color_scheme) =|
     set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast contrast) =|
@@ -271,6 +276,7 @@ endpoint WebContentServer routed by Web::PageId page_id
 
     did_open_dialog_in_another_process(Web::PageId page_id, Web::PendingDialog dialog, Utf16String message) =|
     alert_closed(Web::PageId page_id) =|
+    before_unload_closed(Web::PageId page_id, bool accepted) =|
     confirm_closed(Web::PageId page_id, bool accepted) =|
     prompt_closed(Web::PageId page_id, Optional<Utf16String> response) =|
     color_picker_update(Web::PageId page_id, Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state) =|
@@ -308,6 +314,8 @@ endpoint WebContentServer routed by Web::PageId page_id
     did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) =|
 
     request_close(Web::PageId page_id) =|
+    request_close_preflight(Web::PageId page_id, u64 request_id) =|
+    request_close_without_prompting(Web::PageId page_id) =|
     unload_check_result(Web::PageId page_id, Web::HTML::CrossProcessId check_id, Web::HTML::CheckIfUnloadingIsCanceledResult result) =|
     force_close(Web::PageId page_id) =|
 

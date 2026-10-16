@@ -113,6 +113,7 @@
 #include <LibWeb/DOM/ElementByIdMap.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
+#include <LibWeb/DOM/FragmentDirective.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/InputEventsTarget.h>
 #include <LibWeb/DOM/LiveNodeList.h>
@@ -203,6 +204,7 @@
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/StorageEvent.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
+#include <LibWeb/HTML/TextDirective.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WindowProxy.h>
@@ -531,6 +533,13 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         if (referrer.has<URL::URL>()) {
             document->m_referrer = utf16_string_from_url_ascii(referrer.get<URL::URL>().serialize());
         }
+
+        // https://wicg.github.io/scroll-to-text-fragment/#restricting-the-text-fragment
+        document->m_text_directive_user_activation = navigation_params.user_involvement == HTML::UserNavigationInvolvement::Activation
+            || navigation_params.user_involvement == HTML::UserNavigationInvolvement::BrowserUI
+            || navigation_params.request->text_directive_user_activation();
+        navigation_params.request->set_text_directive_user_activation(false);
+        document->m_browsing_context_group_has_remote_contexts = navigation_params.request->browsing_context_group_has_multiple_contexts();
     }
 
     // NOTE: Step 16 is treated as the else branch of step 15. Otherwise, redirectCount is undefined when the fetch
@@ -617,6 +626,70 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     return document;
 }
 
+// https://wicg.github.io/scroll-to-text-fragment/#check-if-a-text-directive-can-be-scrolled
+bool Document::check_if_a_text_directive_can_be_scrolled(Optional<URL::Origin> const& initiator_origin, Optional<HTML::UserNavigationInvolvement> user_involvement)
+{
+    // 1. If document's pending text directives field is null or empty, return false.
+    if (!m_pending_text_directives.has_value() || m_pending_text_directives->is_empty())
+        return false;
+
+    // 2. Let is user involved be true if document's text directive user activation is true, or user involvement is
+    //    one of "activation" or "browser UI"; false otherwise.
+    auto const is_user_involved = m_text_directive_user_activation
+        || user_involvement == HTML::UserNavigationInvolvement::Activation
+        || user_involvement == HTML::UserNavigationInvolvement::BrowserUI;
+
+    // 3. Set document's text directive user activation to false.
+    m_text_directive_user_activation = false;
+
+    // 4. If document's content type is not a text directive allowing MIME type, return false.
+    if (m_content_type != "text/html"_utf16_fly_string && m_content_type != "text/plain"_utf16_fly_string)
+        return false;
+
+    // 5. If user involvement is "browser UI", return true.
+    if (user_involvement == HTML::UserNavigationInvolvement::BrowserUI)
+        return true;
+
+    // 6. If is user involved is false, return false.
+    if (!is_user_involved)
+        return false;
+
+    // 7. If document's node navigable has a parent, return false.
+    if (!navigable() || navigable()->parent())
+        return false;
+
+    // 8. If initiator origin is non-null and document's origin is same origin with initiator origin, return true.
+    if (initiator_origin.has_value() && origin().is_same_origin(*initiator_origin))
+        return true;
+
+    // 9. If document's browsing context's browsing context group's browsing context set has length 1, return true.
+    if (!browsing_context_group_has_multiple_contexts())
+        return true;
+
+    // 10. Otherwise, return false.
+    return false;
+}
+
+bool Document::browsing_context_group_has_multiple_contexts() const
+{
+    if (m_browsing_context_group_has_remote_contexts)
+        return true;
+
+    auto local_navigable = navigable();
+    if (!local_navigable)
+        return true;
+    auto group_id = local_navigable->browsing_context_group_id();
+    if (!group_id.has_value())
+        return true;
+
+    size_t matching_navigable_count = 0;
+    for (auto& candidate : HTML::all_local_navigables()) {
+        if (candidate->browsing_context_group_id() == group_id && ++matching_navigable_count > 1)
+            return true;
+    }
+    return false;
+}
+
 GC::Ref<Document> Document::create(Page& page, GC::Ref<EventTarget> relevant_global_event_target, URL::URL const& url)
 {
     auto document = GC::Heap::the().allocate<Document>(page, relevant_global_event_target, url);
@@ -642,7 +715,6 @@ GC::Ref<Document> Document::create_for_fragment_parsing(Page& page, GC::Ref<Even
 Document::Document(Page& page, GC::Ref<EventTarget> relevant_global_event_target, URL::URL const& url, TemporaryDocumentForFragmentParsing temporary_document_for_fragment_parsing)
     : ParentNode(*this, NodeType::DOCUMENT_NODE)
     , m_page(page)
-    , m_style_computer(GC::Heap::the().allocate<CSS::StyleComputer>(*this))
     , m_font_computer(GC::Heap::the().allocate<CSS::FontComputer>(*this))
     , m_url(url)
     , m_relevant_global_event_target(relevant_global_event_target)
@@ -662,6 +734,14 @@ Document::Document(Page& page, GC::Ref<EventTarget> relevant_global_event_target
 }
 
 Document::~Document() = default;
+
+void Document::create_style_computer()
+{
+    m_style_computer = GC::Heap::the().allocate<CSS::StyleComputer>(*this);
+    // NB: A quirks mode set before the style computer existed told no engine about it.
+    if (in_quirks_mode())
+        CSS::StyleEngineFFI::style_engine_set_fold_id_and_class_name_case(m_style_computer->style_engine().host(), true);
+}
 
 void Document::mark_style_attribute_dirty(Element& element)
 {
@@ -749,8 +829,10 @@ void Document::reset_style_invalidation_counters(Layout::BegunRead const& read) 
 {
     m_style_invalidation_counters = {};
     (void)CSS::StyleEngineFFI::style_engine_size_query_container_scan_visits(style_computer().style_engine().host(), &read, true);
-    if (m_layout_node_arena)
+    if (m_layout_node_arena) {
         Layout::RustFFI::render_state_scrollable_overflow_recalculation_count(m_layout_node_arena->host(), true);
+        Layout::RustFFI::render_state_overflow_contained_box_index_refill_count(m_layout_node_arena->host(), true);
+    }
     CSS::reset_longhand_wrappers_minted();
 }
 
@@ -807,10 +889,6 @@ void Document::initialize_document()
     m_selection = Selection::Selection::create(*this);
 
     m_list_of_available_images = HTML::ListOfAvailableImages::create();
-
-    page().client().page_did_create_new_document(*this);
-
-    ensure_cookie_version_index(m_url);
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#populate-with-html/head/body
@@ -858,11 +936,14 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_active_favicon);
     visitor.visit(m_browsing_context);
     visitor.visit(m_focused_area);
+    visitor.visit(m_sequential_focus_navigation_starting_point);
     visitor.visit(m_active_element);
     visitor.visit(m_target_element);
     visitor.visit(m_autofocus_candidates);
     visitor.visit(m_accessibility_focus_target);
     visitor.visit(m_implementation);
+    visitor.visit(m_fragment_directive);
+    visitor.visit(m_text_fragment_ranges);
     visitor.visit(m_current_script);
     visitor.visit(m_associated_inert_template_document);
     visitor.visit(m_appropriate_template_contents_owner_document);
@@ -973,9 +1054,14 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_ancestor_origins_list);
 }
 
+bool Document::content_blocking_enabled() const
+{
+    return page().content_blocking_enabled_for_url(relevant_settings_object().top_level_creation_url);
+}
+
 Utf16String const& Document::content_blocker_style_sheet()
 {
-    if (is_decoded_svg()) {
+    if (is_decoded_svg() || !content_blocking_enabled()) {
         if (!m_content_blocker_style_sheet.has_value())
             m_content_blocker_style_sheet = Utf16String {};
         return m_content_blocker_style_sheet.value();
@@ -1020,7 +1106,7 @@ void Document::invalidate_content_blocker_style_sheet()
 
 bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names)
 {
-    if (is_decoded_svg())
+    if (is_decoded_svg() || !content_blocking_enabled())
         return false;
 
     if (!m_content_blocker_style_sheet.has_value())
@@ -1738,6 +1824,11 @@ Layout::Node* Document::layout_root_if_live(Layout::BegunRead const& read) const
 
 void Document::tear_down_layout_tree()
 {
+    // NB: A document that never made a style computer never built a layout tree. This also runs from finalizers, where
+    //     making one would allocate while the heap sweeps.
+    if (!m_style_computer)
+        return;
+
     // A frame in flight lands first, and the host pays the layout round it ran, whose build may have replaced boxes the
     // host still holds, before the tree goes.
     Layout::ForcedReadScope read { *this };
@@ -2130,6 +2221,11 @@ void Document::after_layout_commit(Layout::BegunRead const& read, LayoutTreeChan
     bool const collects_boxes_with_auto_content_visibility = layout_tree_changed == LayoutTreeChanged::Yes
         && Layout::RustFFI::render_state_may_have_auto_content_visibility(layout_node_arena().host(), &read);
     Layout::RustFFI::render_state_invalidate_searchable_text(layout_node_arena().host());
+    // A committed layout may be stale relative to style changes made while its frame was in flight. This callback
+    // reconciles caches against that committed tree, so use the node from the read rather than asking whether it is
+    // the latest tree for the document.
+    if (auto* viewport = unsafe_layout_node(read))
+        viewport->invalidate_searchable_text_cache();
 
     set_needs_to_record_display_list();
 
@@ -2236,7 +2332,10 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
 
 void Document::flush_deferred_style_change_event()
 {
-    auto& style_engine = style_computer().style_engine();
+    auto* style_computer = style_computer_if_created();
+    if (!style_computer)
+        return;
+    auto& style_engine = style_computer->style_engine();
     // Only a geometry read defers a transaction, so until one has, the flush has nothing to read.
     if (!style_engine.may_have_deferred_geometry_transaction())
         return;
@@ -2406,7 +2505,8 @@ void Document::set_quirks_mode(QuirksMode mode)
 
     // It also changes which case a rule cache buckets id and class selectors under, and brings a user
     // agent stylesheet with it, so no scope's rule cache and no element's style survives it either.
-    CSS::StyleEngineFFI::style_engine_set_fold_id_and_class_name_case(style_computer().style_engine().host(), in_quirks_mode());
+    if (auto* style_computer = style_computer_if_created())
+        CSS::StyleEngineFFI::style_engine_set_fold_id_and_class_name_case(style_computer->style_engine().host(), in_quirks_mode());
     style_scope().invalidate_style_cache();
     for_each_shadow_root([](auto& shadow_root) {
         shadow_root.style_scope().invalidate_style_cache();
@@ -3955,6 +4055,9 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
         return;
 
     page().invalidate_compositor_keyboard_scroll_state_for_document(*this);
+    if (node)
+        m_sequential_focus_navigation_starting_point = nullptr;
+
     GC::Ptr old_focused_area = m_focused_area;
 
     if (auto* old_focused_element = as_if<Element>(old_focused_area.ptr()))
@@ -4165,42 +4268,126 @@ void Document::set_accessibility_focus_target(GC::Ptr<Element> element)
     set_needs_repaint();
 }
 
+// https://wicg.github.io/scroll-to-text-fragment/#urls-in-ua-features
+void Document::update_text_fragment_indication_visibility(bool visible)
+{
+    auto navigable = this->navigable();
+    if (!navigable || !navigable->is_top_level_traversable() || !is_fully_active())
+        return;
+    page().client().page_did_set_text_fragment_indication_visibility(visible);
+}
+
+static void invalidate_text_fragment_range_paint(Vector<GC::Ref<Range>> const& ranges)
+{
+    // Text-fragment indication spans are generated while recording foreground paint commands.
+    // Invalidate the paintables covered by the ranges so cached commands cannot retain an old
+    // indication or omit a new one.
+    for (auto const& range : ranges) {
+        range->common_ancestor_container()->for_each_in_inclusive_subtree_of_type<Text>([&](Text& text) {
+            if (range->intersects_node(text))
+                text.set_needs_repaint(InvalidateDisplayList::PaintCommands);
+            return TraversalDecision::Continue;
+        });
+    }
+}
+
+// https://wicg.github.io/scroll-to-text-fragment/#applying-directives-to-a-document
+void Document::set_pending_text_directives(Optional<Vector<HTML::TextDirective>> directives)
+{
+    invalidate_text_fragment_range_paint(m_text_fragment_ranges);
+    m_text_fragment_ranges.clear();
+    m_pending_text_directives = move(directives);
+    if (m_pending_text_directives.has_value())
+        update_text_fragment_indication_visibility(!m_pending_text_directives->is_empty());
+}
+
+// https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+void Document::clear_pending_text_directives()
+{
+    // 1. Set pending text directives to null.
+    m_pending_text_directives.clear();
+    if (m_text_fragment_ranges.is_empty())
+        update_text_fragment_indication_visibility(false);
+}
+
+// https://wicg.github.io/scroll-to-text-fragment/#indicating-the-text-match
+void Document::dismiss_text_fragment_indication()
+{
+    invalidate_text_fragment_range_paint(m_text_fragment_ranges);
+    m_text_fragment_ranges.clear();
+    m_pending_text_directives.clear();
+    update_text_fragment_indication_visibility(false);
+}
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#the-indicated-part-of-the-document
-Document::IndicatedPart Document::determine_the_indicated_part() const
+// https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+Document::IndicatedPart Document::determine_the_indicated_part()
 {
     // For an HTML document document, the following processing model must be followed to determine its indicated part:
 
-    // 1. Let fragment be document's URL's fragment.
+    // 1. Let text directives be the document's pending text directives.
+    auto const& text_directives = m_pending_text_directives;
+
+    // 2. If text directives is non-null then:
+    if (text_directives.has_value() && !text_directives->is_empty()) {
+        // 1. Let ranges be a list that is the result of running the invoke text directives steps
+        //    with text directives and the document.
+        auto ranges = HTML::invoke_text_directives(*text_directives, *this);
+        invalidate_text_fragment_range_paint(m_text_fragment_ranges);
+        m_text_fragment_ranges.clear();
+        m_text_fragment_ranges.extend(ranges);
+        invalidate_text_fragment_range_paint(m_text_fragment_ranges);
+
+        // 2. If ranges is non-empty, then:
+        if (!ranges.is_empty()) {
+            // 1. Let firstRange be the first item of ranges.
+            auto first_range = ranges.first();
+
+            // 2. Visually indicate each range in ranges in an implementation-defined way. The
+            //    indication must not be observable from author script. See Indicating The Text Match.
+            // NB: The ranges are retained privately and painted in the text-fragment indication pass.
+            update_text_fragment_indication_visibility(true);
+
+            // 3. Set firstRange as document's indicated part, return.
+            return GC::Ptr<Range> { first_range };
+        }
+
+        // AD-HOC: Do not fall back to an element fragment until parsing has stopped and the final
+        //         text search has completed.
+        return static_cast<Element*>(nullptr);
+    }
+
+    // 3. Let fragment be document's URL's fragment.
     auto fragment = url().fragment();
 
-    // 2. If fragment is the empty string, then return the special value top of the document.
+    // 4. If fragment is the empty string, then return the special value top of the document.
     if (!fragment.has_value() || fragment->is_empty())
         return Document::TopOfTheDocument {};
 
-    // 3. Let potentialIndicatedElement be the result of finding a potential indicated element given document and fragment.
+    // 5. Let potentialIndicatedElement be the result of finding a potential indicated element given document and fragment.
     auto fragment_as_utf16 = utf16_string_from_url_ascii(*fragment);
     auto* potential_indicated_element = find_a_potential_indicated_element(fragment_as_utf16);
 
-    // 4. If potentialIndicatedElement is not null, then return potentialIndicatedElement.
+    // 6. If potentialIndicatedElement is not null, then return potentialIndicatedElement.
     if (potential_indicated_element)
         return potential_indicated_element;
 
-    // 5. Let fragmentBytes be the result of percent-decoding fragment.
-    // 6. Let decodedFragment be the result of running UTF-8 decode without BOM on fragmentBytes.
+    // 7. Let fragmentBytes be the result of percent-decoding fragment.
+    // 8. Let decodedFragment be the result of running UTF-8 decode without BOM on fragmentBytes.
     auto decoded_fragment = Utf16String::from_utf8_with_replacement_character(URL::percent_decode(*fragment), Utf16String::WithBOMHandling::No);
 
-    // 7. Set potentialIndicatedElement to the result of finding a potential indicated element given document and decodedFragment.
+    // 9. Set potentialIndicatedElement to the result of finding a potential indicated element given document and decodedFragment.
     potential_indicated_element = find_a_potential_indicated_element(decoded_fragment);
 
-    // 8. If potentialIndicatedElement is not null, then return potentialIndicatedElement.
+    // 10. If potentialIndicatedElement is not null, then return potentialIndicatedElement.
     if (potential_indicated_element)
         return potential_indicated_element;
 
-    // 9. If decodedFragment is an ASCII case-insensitive match for the string top, then return the top of the document.
+    // 11. If decodedFragment is an ASCII case-insensitive match for the string top, then return the top of the document.
     if (decoded_fragment.utf16_view().equals_ignoring_ascii_case(u"top"sv))
         return Document::TopOfTheDocument {};
 
-    // 10. Return null.
+    // 12. Return null.
     return nullptr;
 }
 
@@ -4505,7 +4692,7 @@ void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::An
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-the-fragment-identifier
-void Document::scroll_to_the_fragment()
+void Document::scroll_to_the_fragment(bool allow_text_directive_scroll)
 {
     // To scroll to the fragment given a Document document:
 
@@ -4529,47 +4716,291 @@ void Document::scroll_to_the_fragment()
 
     // 3. Otherwise:
     else {
-        // 1. Assert: document's indicated part is an element.
-        VERIFY(indicated_part.has<Element*>());
+        // 1. Assert: document's indicated part is an element or it is a range.
+        VERIFY(indicated_part.has<Element*>() || indicated_part.has<GC::Ptr<Range>>());
 
-        // 2. Let target be document's indicated part.
-        auto target = indicated_part.get<Element*>();
+        // 2. Let scrollTarget be document's indicated part.
+        auto scroll_target = indicated_part;
 
-        // 3. Set document's target element to target.
+        // 3. Let target be scrollTarget.
+        GC::Ptr<Element> target;
+        if (scroll_target.has<Element*>())
+            target = scroll_target.get<Element*>();
+
+        auto const is_text_directive = scroll_target.has<GC::Ptr<Range>>();
+
+        // 4. If target is a range, then:
+        if (is_text_directive) {
+            // 1. If allow text directive scroll is false, return.
+            if (!allow_text_directive_scroll)
+                return;
+
+            auto range = scroll_target.get<GC::Ptr<Range>>();
+            VERIFY(range);
+
+            // INTEROP: The first common ancestor can be far larger than the matched passage. Other
+            //          engines use the start container's nearest element so that :target, reveal,
+            //          and focus effects stay attached to the beginning that is scrolled into view.
+            //          https://github.com/WICG/scroll-to-text-fragment/issues/259
+            //          The draft also does not define how to cross a shadow root when finding that
+            //          element. Follow the shadow host so a range beginning in a direct Text child
+            //          of a ShadowRoot still has a target.
+            //          https://github.com/WICG/scroll-to-text-fragment/issues/190
+            GC::Ptr<Node> target_node = range->start_container();
+            while (target_node && !is<Element>(*target_node))
+                target_node = target_node->parent_or_shadow_host();
+            if (target_node)
+                target = static_cast<Element*>(target_node.ptr());
+        }
+
+        // 5. Assert: target is an element.
+        if (!target)
+            return;
+
+        // 6. Set document's target element to target.
         set_target_element(target);
 
-        // FIXME: 4. Run the ancestor revealing algorithm on target.
+        // 7. Run the ancestor details revealing algorithm on target.
+        // 8. Run the ancestor hidden-until-found revealing algorithm on target.
+        //
+        // INTEROP: HTML has since combined those two algorithms into the ancestor revealing
+        //          algorithm. Run that current algorithm once so nested details and hidden=until-found
+        //          ancestors are revealed in tree order.
+        // https://html.spec.whatwg.org/multipage/interaction.html#ancestor-revealing-algorithm
+        auto run_the_ancestor_revealing_algorithm = [&] {
+            enum class RevealType {
+                UntilFound,
+                Details,
+            };
 
-        // 5. Scroll target into view, with behavior set to "auto", block set to "start", and inline set to "nearest". [CSSOMVIEW]
-        Element::ScrollIntoViewOptions scroll_options;
-        scroll_options.block = Element::ScrollLogicalPosition::Start;
-        scroll_options.inline_ = Element::ScrollLogicalPosition::Nearest;
-        target->scroll_into_view(scroll_options, nullptr);
+            // 1. Let ancestorsToReveal be « ».
+            GC::RootVector<GC::Ref<Element>> ancestors_to_reveal;
+            Vector<RevealType> reveal_types;
 
-        // 6. Run the focusing steps for target, with the Document's viewport as the fallback target.
-        HTML::run_focusing_steps(target, this);
+            // 2. Let ancestor be target.
+            GC::Ptr<Node> ancestor = target;
 
-        // FIXME: 7. Move the sequential focus navigation starting point to target.
+            // 3. While ancestor has a parent node within the flat tree:
+            while (ancestor && ancestor->flat_tree_parent()) {
+                // 1. If ancestor has a hidden attribute in the Hidden Until Found state, then
+                //    append (ancestor, "until-found") to ancestorsToReveal.
+                if (auto* element = as_if<Element>(ancestor.ptr())) {
+                    auto const& hidden = element->get_attribute(HTML::AttributeNames::hidden);
+                    if (hidden.has_value() && hidden->equals_ignoring_ascii_case(u"until-found"sv)) {
+                        ancestors_to_reveal.append(*element);
+                        reveal_types.append(RevealType::UntilFound);
+                    }
+                }
+
+                // 2. If ancestor is slotted into the second slot of a details element which
+                //    does not have an open attribute, then append (ancestor's parent node,
+                //    "details") to ancestorsToReveal.
+                auto* parent_element = as_if<Element>(ancestor->flat_tree_parent());
+                if (parent_element
+                    && parent_element->namespace_uri() == Namespace::HTML
+                    && parent_element->local_name() == HTML::TagNames::details
+                    && !parent_element->has_attribute(HTML::AttributeNames::open)) {
+                    GC::Ptr<Node> first_summary;
+                    for (auto* child = parent_element->first_child(); child; child = child->next_sibling()) {
+                        auto* child_element = as_if<Element>(child);
+                        if (child_element
+                            && child_element->namespace_uri() == Namespace::HTML
+                            && child_element->local_name() == HTML::TagNames::summary) {
+                            first_summary = child;
+                            break;
+                        }
+                    }
+                    if (ancestor != first_summary) {
+                        ancestors_to_reveal.append(*parent_element);
+                        reveal_types.append(RevealType::Details);
+                    }
+                }
+
+                // 3. Set ancestor to the parent node of ancestor within the flat tree.
+                ancestor = ancestor->flat_tree_parent();
+            }
+
+            // 4. For each (ancestorToReveal, revealType) of ancestorsToReveal:
+            for (size_t i = 0; i < ancestors_to_reveal.size(); ++i) {
+                auto& ancestor_to_reveal = ancestors_to_reveal[i];
+                auto reveal_type = reveal_types[i];
+
+                // 1. If ancestorToReveal is not connected, then return.
+                if (!ancestor_to_reveal->is_connected())
+                    return;
+
+                // 2. If revealType is "until-found":
+                if (reveal_type == RevealType::UntilFound) {
+                    // 1. If ancestorToReveal's hidden attribute is not in the Hidden Until
+                    //    Found state, then return.
+                    auto const& hidden = ancestor_to_reveal->get_attribute(HTML::AttributeNames::hidden);
+                    if (!hidden.has_value() || !hidden->equals_ignoring_ascii_case(u"until-found"sv))
+                        return;
+
+                    // 2. Fire an event named beforematch at ancestorToReveal with the bubbles
+                    //    attribute initialized to true.
+                    ancestor_to_reveal->dispatch_event(Event::create(HTML::relevant_global_object(*ancestor_to_reveal), HTML::EventNames::beforematch, { .bubbles = true }));
+
+                    // 3. If ancestorToReveal is not connected, then return.
+                    if (!ancestor_to_reveal->is_connected())
+                        return;
+
+                    // 4. If ancestorToReveal's hidden attribute is not in the Hidden Until
+                    //    Found state, then return.
+                    auto const& hidden_after_event = ancestor_to_reveal->get_attribute(HTML::AttributeNames::hidden);
+                    if (!hidden_after_event.has_value() || !hidden_after_event->equals_ignoring_ascii_case(u"until-found"sv))
+                        return;
+
+                    // 5. Remove the hidden attribute from ancestorToReveal.
+                    ancestor_to_reveal->remove_attribute(HTML::AttributeNames::hidden);
+                }
+
+                // 3. Otherwise:
+                else {
+                    // 1. Assert: revealType is "details".
+                    VERIFY(reveal_type == RevealType::Details);
+
+                    // 2. If ancestorToReveal has an open attribute, then return.
+                    if (ancestor_to_reveal->has_attribute(HTML::AttributeNames::open))
+                        return;
+
+                    // 3. Set ancestorToReveal's open attribute to the empty string.
+                    ancestor_to_reveal->set_attribute_value(HTML::AttributeNames::open, Utf16String {});
+                }
+            }
+        };
+        run_the_ancestor_revealing_algorithm();
+
+        // AD-HOC: Revealing ancestors changes their layout participation. Refresh layout before
+        //         computing the range geometry used for scrolling.
+        if (is_text_directive)
+            update_layout(UpdateLayoutReason::RangeGetClientRects);
+
+        // 9. Let blockPosition be "center" if scrollTarget is a range, "start" otherwise.
+        auto const block_position = scroll_target.has<GC::Ptr<Range>>()
+            ? Bindings::ScrollLogicalPosition::Center
+            : Bindings::ScrollLogicalPosition::Start;
+
+        // 10. Scroll a target into view, with target set to scrollTarget, behavior set to "auto",
+        //     block set to blockPosition, and inline set to "nearest".
+        if (is_text_directive) {
+            Layout::ForcedReadScope read { *this };
+            (void)scroll_a_target_into_view(
+                read,
+                ScrollIntoViewTarget { scroll_target.get<GC::Ptr<Range>>().ptr() },
+                Bindings::ScrollBehavior::Auto,
+                block_position,
+                Bindings::ScrollLogicalPosition::Nearest);
+        } else {
+            Bindings::ScrollIntoViewOptions scroll_options;
+            scroll_options.block = block_position;
+            scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
+            target->scroll_into_view(scroll_options, nullptr);
+        }
+
+        // 11. Run the focusing steps for target, with the Document's viewport as the fallback
+        //     target.
+        // NB: Text-fragment focus and the sequential focus navigation starting point are handled
+        //     without focusing a matching link in the dedicated text-fragment focus pass.
+        if (!is_text_directive)
+            HTML::run_focusing_steps(target, this);
+
+        // 12. Move the sequential focus navigation starting point to target.
+        move_sequential_focus_navigation_starting_point_to(target);
     }
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#try-to-scroll-to-the-fragment
-void Document::try_to_scroll_to_the_fragment()
+void Document::try_to_scroll_to_the_fragment([[maybe_unused]] bool allow_text_directive_scroll)
 {
-    // FIXME: According to the spec we should only scroll here if document has no parser or parsing has stopped.
-    //        It should be ok to remove this after we implement navigation events and scrolling will happen in
-    //        "process scroll behavior".
-    //  To try to scroll to the fragment for a Document document, perform the following steps in parallel:
-    //  1. Wait for an implementation-defined amount of time. (This is intended to allow the user agent to
-    //     optimize the user experience in the face of performance concerns.)
-    //  2. Queue a global task on the navigation and traversal task source given document's relevant global
-    //     object to run these steps:
-    //      1. If document has no parser, or its parser has stopped parsing, or the user agent has reason to
-    //         believe the user is no longer interested in scrolling to the fragment, then abort these steps.
-    //      2. Scroll to the fragment given document.
-    //      3. If document's indicated part is still null, then try to scroll to the fragment for document.
+    m_pending_text_directive_scroll_allowed = allow_text_directive_scroll;
 
+    // AD-HOC: The implementation-defined wait and queued navigation task from this algorithm are
+    //         supplied by the parser-progress, DOMContentLoaded, and load-completion lifecycle callers.
+
+    // 1. If the user agent has reason to believe the user is no longer interested in scrolling to
+    //    the fragment, then:
+    if (!is_fully_active()) {
+        // 1. Set pending text directives to null.
+        clear_pending_text_directives();
+
+        // 2. Abort these steps.
+        return;
+    }
+
+    // AD-HOC: Once a directive has matched, parser-progress retries only need to correct the
+    //         range's position after layout shifts. The DOMContentLoaded and load-completion passes still
+    //         repeat the search so script-driven changes to the matching text are observed.
+    if (!m_text_fragment_ranges.is_empty()) {
+        if (allow_text_directive_scroll) {
+            update_layout(UpdateLayoutReason::RangeGetClientRects);
+            Layout::ForcedReadScope read { *this };
+            (void)scroll_a_target_into_view(
+                read,
+                ScrollIntoViewTarget { m_text_fragment_ranges.first().ptr() },
+                Bindings::ScrollBehavior::Auto,
+                Bindings::ScrollLogicalPosition::Center,
+                Bindings::ScrollLogicalPosition::Nearest);
+        }
+    } else {
+        scroll_to_the_fragment(allow_text_directive_scroll);
+    }
+
+    // AD-HOC: Ordinary element fragments retain Ladybird's existing eager attempt and parser-end
+    //         retry. The additional lifecycle retries are only needed when there is unmatched text to
+    //         find.
+    if (!m_pending_text_directives.has_value() || m_pending_text_directives->is_empty())
+        return;
+    if (!m_text_fragment_ranges.is_empty()) {
+        // AD-HOC: While a document is still loading, retain a successful directive so the parser's
+        //         load-completion pass can correct layout shifts in the absence of CSS scroll anchoring.
+        // https://drafts.csswg.org/css-scroll-anchoring/
+        if (is_completely_loaded()) {
+            clear_pending_text_directives();
+
+            // https://wicg.github.io/scroll-to-text-fragment/#scroll-on-navigation
+            // If a UA chooses not to scroll automatically, it must scroll a fallback element-id
+            // into view, if provided, regardless of whether a text fragment was matched.
+            if (!allow_text_directive_scroll)
+                scroll_to_the_fragment();
+        }
+        return;
+    }
+
+    // A same-document navigation in a completely loaded document has no further parser or load
+    // lifecycle milestones at which to retry. This is therefore its final search.
+    if (!is_completely_loaded())
+        return;
+
+    clear_pending_text_directives();
+
+    // https://wicg.github.io/scroll-to-text-fragment/#scroll-on-navigation
+    // If a UA chooses not to scroll automatically, it must scroll a fallback element-id into
+    // view, if provided, regardless of whether a text fragment was matched.
     scroll_to_the_fragment();
+}
+
+void Document::schedule_text_fragment_search_after_parser_progress(Badge<HTML::HTMLParser>)
+{
+    // AD-HOC: Retry unmatched text directives when the parser yields after making progress, rather
+    //         than polling on a timer. Coalesce parser runs until the queued task observes the resulting
+    //         DOM, mirroring the lifecycle-driven approach used by other engines.
+    if (m_text_fragment_parser_progress_search_pending
+        || !m_pending_text_directives.has_value()
+        || m_pending_text_directives->is_empty()
+        || policy_container()->force_load_at_top)
+        return;
+
+    m_text_fragment_parser_progress_search_pending = true;
+    HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(*this), GC::create_function(heap(), [document = GC::Ref { *this }] {
+        document->m_text_fragment_parser_progress_search_pending = false;
+        if (!document->m_pending_text_directives.has_value()
+            || document->m_pending_text_directives->is_empty()
+            || document->policy_container()->force_load_at_top)
+            return;
+
+        document->try_to_scroll_to_the_fragment(document->m_pending_text_directive_scroll_allowed);
+    }));
 }
 
 // https://drafts.csswg.org/cssom-view-1/#scroll-to-the-beginning-of-the-document
@@ -4915,7 +5346,16 @@ void Document::set_referrer(Utf16String referrer)
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#fully-active
-bool Document::is_fully_active() const
+u64 Document::s_full_activity_epoch = 1;
+
+bool Document::update_is_fully_active() const
+{
+    m_is_fully_active = compute_is_fully_active();
+    m_full_activity_epoch = s_full_activity_epoch;
+    return m_is_fully_active;
+}
+
+bool Document::compute_is_fully_active() const
 {
     // A Document d is said to be fully active when d is the active document of a navigable navigable, and either
     // navigable is a top-level traversable or navigable's container document is fully active.
@@ -4925,10 +5365,12 @@ bool Document::is_fully_active() const
 
     // NB: A destroyed navigable has no container, but its document keeps its navigable until it has unloaded, which
     //     happens after a round-trip through the UI process.
-    // INTEROP: Other engines unload the document of a removed iframe before they detach it, so its pagehide and unload
-    //          handlers see a fully active document.
-    if (navigable->is_in_a_destroyed_subtree() && m_unload_counter == 0)
-        return false;
+    // INTEROP: Other engines unload the documents of a removed iframe — its own and its descendants' — before they
+    //          detach it, so their pagehide, visibilitychange, and unload handlers see fully active documents. So a
+    //          document in a destroyed subtree is fully active exactly while it's unloading, whether or not the document
+    //          its container belongs to has started unloading yet.
+    if (navigable->is_in_a_destroyed_subtree())
+        return m_unload_counter > 0;
 
     if (navigable->is_top_level_traversable())
         return true;
@@ -5175,6 +5617,14 @@ DOMImplementation* Document::implementation()
     return m_implementation.ptr();
 }
 
+// https://wicg.github.io/scroll-to-text-fragment/#feature-detectability
+GC::Ref<FragmentDirective> Document::fragment_directive()
+{
+    if (!m_fragment_directive)
+        m_fragment_directive = FragmentDirective::create();
+    return *m_fragment_directive;
+}
+
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
 bool Document::has_focus_for_bindings() const
 {
@@ -5381,6 +5831,12 @@ void Document::increment_number_of_things_delaying_the_load_event(Badge<Document
 {
     ++m_number_of_things_delaying_the_load_event;
     page().client().page_did_update_resource_count(m_number_of_things_delaying_the_load_event);
+
+    // A newly added load-event delayer can make this document's container wait again, including when that container
+    // lives in another process. Publish the new state immediately, and wake any same-process ancestor parser checks.
+    if (auto navigable = this->navigable())
+        navigable->report_state_to_remote_container();
+    schedule_html_parser_end_check();
 }
 
 void Document::decrement_number_of_things_delaying_the_load_event(Badge<DocumentLoadEventDelayer>)
@@ -6165,9 +6621,15 @@ GC::Ptr<HTML::HTMLParser> Document::active_parser() const
 
 void Document::set_browsing_context(GC::Ptr<HTML::BrowsingContext> browsing_context)
 {
+    auto had_browsing_context = m_browsing_context != nullptr;
     m_browsing_context = browsing_context;
-    if (browsing_context)
+    if (browsing_context) {
         ensure_style_engine_tracks_tree();
+        // NB: A document without a browsing context is cookie-averse, so the version index that lets document.cookie
+        //     skip asking for unchanged cookies is requested once it first has one.
+        if (!had_browsing_context)
+            ensure_cookie_version_index(m_url, m_url);
+    }
 }
 
 void Document::set_style_node_id(CSS::StyleNodeID style_node_id)
@@ -6219,6 +6681,7 @@ void Document::unload(GC::Ptr<Document> new_document)
 
     // 8. Increase oldDocument's unload counter by 1.
     m_unload_counter += 1;
+    invalidate_full_activity();
 
     // 9. If intendToKeepInBfcache is false, then set oldDocument's salvageable state to false.
     if (!intend_to_store_in_bfcache)
@@ -6295,6 +6758,7 @@ void Document::unload(GC::Ptr<Document> new_document)
 
     // 21. Decrease oldDocument's unload counter by 1.
     m_unload_counter -= 1;
+    invalidate_full_activity();
 
     // 22. If newDocument is given, newDocument's was created via cross-origin redirects is false, and newDocument's
     //     origin is the same as oldDocument's origin, then set newDocument's previous document unload timing to
@@ -7179,7 +7643,7 @@ void Document::restore_the_history_object_state(NonnullRefPtr<HTML::SessionHisto
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#update-document-for-history-step-application
-void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHistoryEntry> entry, bool do_not_reactivate, size_t script_history_length, size_t script_history_index, Optional<HTML::NavigationType> navigation_type, Optional<Vector<NonnullRefPtr<HTML::SessionHistoryEntry>>> entries_for_navigation_api, RefPtr<HTML::SessionHistoryEntry> previous_entry_for_activation, bool previous_entry_for_activation_document_is_initial_about_blank)
+void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHistoryEntry> entry, bool do_not_reactivate, size_t script_history_length, size_t script_history_index, Optional<HTML::NavigationType> navigation_type, Optional<Vector<NonnullRefPtr<HTML::SessionHistoryEntry>>> entries_for_navigation_api, RefPtr<HTML::SessionHistoryEntry> previous_entry_for_activation, bool previous_entry_for_activation_document_is_initial_about_blank, bool allow_text_directive_scroll, Optional<URL::Origin> initiator_origin, Optional<HTML::UserNavigationInvolvement> user_involvement)
 {
     // 1. Let documentIsNew be true if document's latest entry is null; otherwise false.
     auto document_is_new = !m_latest_entry;
@@ -7193,24 +7657,63 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
     // 4. Set document's history object's length to scriptHistoryLength.
     history()->m_length = script_history_length;
 
-    // 5. Let navigation be history's relevant global object's navigation API.
+    // https://wicg.github.io/scroll-to-text-fragment/#restricting-scroll-on-load
+    // 5. Let scrollingBlockedInNewDocument be the result of getting the policy value for
+    //    force-load-at-top for document.
+    auto const scrolling_blocked_in_new_document = policy_container()->force_load_at_top;
+
+    // 6. Let navigation be history's relevant global object's navigation API.
     auto navigation = HTML::relevant_window(*this).navigation();
 
-    // 6. If documentsEntryChanged is true, then:
+    // 7. If documentsEntryChanged is true, then:
     // NOTE: documentsEntryChanged can be false for one of two reasons: either we are restoring from bfcache,
     //      or we are asynchronously finishing up a synchronous navigation which already synchronously set document's latest entry.
     //      The doNotReactivate argument distinguishes between these two cases.
     if (documents_entry_changed) {
+        bool text_directive_state_changed = false;
+
         // 1. Let oldURL be document's latest entry's URL.
         auto old_url = m_latest_entry ? m_latest_entry->url() : URL::URL {};
 
-        // 2. Set document's latest entry to entry.
+        // https://wicg.github.io/scroll-to-text-fragment/#applying-directives-to-a-document
+        // 2. If document's latest entry's directive state is not entry's directive state then:
+        auto latest_entry_directive_state = [&] -> RefPtr<HTML::DirectiveState> {
+            if (m_latest_entry)
+                return m_latest_entry->directive_state();
+            if (previous_entry_for_activation)
+                return previous_entry_for_activation->directive_state();
+
+            return nullptr;
+        }();
+        if (!latest_entry_directive_state || latest_entry_directive_state.ptr() != entry->directive_state().ptr()) {
+            text_directive_state_changed = true;
+            // 1. Let fragment directive be entry's directive state's value.
+            auto const& fragment_directive = entry->directive_state()->value();
+
+            // 2. Set document's pending text directives to the result of parsing fragment directive.
+            m_text_fragment_ranges.clear();
+            m_pending_text_directives = fragment_directive.has_value()
+                ? Optional<Vector<HTML::TextDirective>> { HTML::parse_the_fragment_directive(*fragment_directive) }
+                : Optional<Vector<HTML::TextDirective>> { Vector<HTML::TextDirective> {} };
+        }
+
+        // 3. Set document's latest entry to entry.
         m_latest_entry = entry;
 
-        // 3. Restore the history object state given document and entry.
+        // 4. Restore the history object state given document and entry.
         restore_the_history_object_state(entry);
 
-        // 4. If documentIsNew is false, then:
+        // https://wicg.github.io/scroll-to-text-fragment/#restricting-the-text-fragment
+        // Check permission after applying the entry's directive state so the check sees this entry's pending directives.
+        if (user_involvement.has_value() && text_directive_state_changed)
+            allow_text_directive_scroll = check_if_a_text_directive_can_be_scrolled(initiator_origin, user_involvement);
+
+        // A traversal can reactivate an existing Document with a different directive state. Unlike a newly-created
+        // Document, it will not reach the parser-completion scrolling path, so retry it here.
+        if (!document_is_new && user_involvement.has_value() && text_directive_state_changed)
+            try_to_scroll_to_the_fragment(allow_text_directive_scroll);
+
+        // 5. If documentIsNew is false, then:
         if (!document_is_new) {
             // NOTE: Not in the spec, but otherwise document's url won't be updated in case of a same-document back/forward navigation.
             set_url(entry->url());
@@ -7235,7 +7738,7 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
 
             // 4. Restore persisted state given entry.
             if (auto navigable = this->navigable())
-                navigable->restore_persisted_state_from_session_history_entry(*entry);
+                navigable->restore_persisted_state_from_session_history_entry(*entry, false);
 
             // 5. If oldURL's fragment is not equal to entry's URL's fragment, then queue a global task on the DOM manipulation task source
             //    given document's relevant global object to fire an event named hashchange at document's relevant global object,
@@ -7253,15 +7756,16 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
             }
         }
 
-        // 5. Otherwise:
+        // 6. Otherwise:
         else {
             // 1. Assert: entriesForNavigationAPI is given.
             VERIFY(entries_for_navigation_api.has_value());
 
             // 2. Restore persisted state given entry.
             if (auto navigable = this->navigable()) {
-                navigable->restore_persisted_state_from_session_history_entry(*entry);
-                navigable->schedule_persisted_state_restoration_retry(*entry);
+                navigable->restore_persisted_state_from_session_history_entry(*entry, scrolling_blocked_in_new_document);
+                if (!scrolling_blocked_in_new_document)
+                    navigable->schedule_persisted_state_restoration_retry(*entry);
             }
 
             // 3. Initialize the navigation API entries for a new document given navigation, entriesForNavigationAPI, and entry.
@@ -7269,7 +7773,7 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
         }
     }
 
-    // 7. If all the following are true:
+    // 8. If all the following are true:
     //    - previousEntryForActivation is given;
     //    - navigationType is non-null; and
     //    - navigationType is "reload" or previousEntryForActivation's document is not document,
@@ -7313,20 +7817,21 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
         }
     }
 
-    // 8. If documentIsNew is true, then:
+    // 9. If documentIsNew is true, then:
     if (document_is_new) {
         // FIXME: 1. Assert: document's during-loading navigation ID for WebDriver BiDi is not null.
         // FIXME: 2. Invoke WebDriver BiDi navigation committed with navigable and a new WebDriver BiDi navigation
         //           status whose id is document's during-loading navigation ID for WebDriver BiDi, status is "committed", and url is document's URL
 
-        // 3. Try to scroll to the fragment for document.
-        try_to_scroll_to_the_fragment();
+        // 3. If scrollingBlockedInNewDocument is false, try to scroll to the fragment for document.
+        if (!scrolling_blocked_in_new_document)
+            try_to_scroll_to_the_fragment(allow_text_directive_scroll);
 
         // 4. At this point scripts may run for the newly-created document document.
         set_ready_to_run_scripts();
     }
 
-    // 9. Otherwise, if documentsEntryChanged is false and doNotReactivate is false, then:
+    // 10. Otherwise, if documentsEntryChanged is false and doNotReactivate is false, then:
     // NOTE: This is for bfcache restoration
     if (!documents_entry_changed && !do_not_reactivate) {
         // FIXME: 1. Assert: entriesForNavigationAPI is given.
@@ -7589,10 +8094,9 @@ static Painting::CompositorAnimationEffectState::BuildOutcome build_compositor_a
 
         // OPTIMIZATION: A new CSS transition is play-pending until the next animation update. Start its compositor
         //               descriptor at the style change event time without resolving the Animation's pending task.
-        auto const& transition = as<CSS::CSSTransition>(*animation);
         auto style_change_event_time = Animations::TimeValue {
             Animations::TimeValue::Type::Milliseconds,
-            transition.transition_start_time() - effect.start_delay().value,
+            as<CSS::CSSTransition>(*animation).style_change_event_time(),
         };
         if (!timeline->can_convert_a_timeline_time_to_an_origin_relative_time())
             return {};
@@ -10067,6 +10571,10 @@ void Document::parse_html_from_a_string(Utf16View html)
     // 1. Set document's type to "html".
     set_document_type(DOM::Document::Type::HTML);
 
+    // OPTIMIZATION: Simple markup builds the document directly, without a parser.
+    if (HTML::HTMLParser::try_parse_document_fast(*this, html))
+        return;
+
     // 2. Let parser be a new HTML parser whose allow declarative shadow roots is document's allow declarative shadow roots,
     //    associated with document.
     // 3. Place html into the input stream for parser. The encoding confidence is irrelevant.
@@ -10148,10 +10656,10 @@ Optional<CSSPixelRect> Document::current_caret_rect()
     };
 
     if (is<DOM::Text>(dom_node)) {
-        Layout::RustFFI::FfiOptionalCssPixelRect result;
-        Layout::RustFFI::layout_script_text_caret_rect_in_dom_range(
-            layout_node->document_host(), Layout::Node::slot_id(layout_node), position->offset(), &result);
-        if (result.has_value)
+        Layout::RustFFI::FfiCaretRectResult result;
+        Layout::RustFFI::layout_script_text_caret_rect_for_position(
+            layout_node->document_host(), Layout::Node::slot_id(layout_node), position->offset(), position->affinity() == TextAffinity::Downstream, &result);
+        if (result.found)
             return to_viewport_rect(result.rect);
     }
 
@@ -10211,6 +10719,7 @@ void Document::set_navigable(GC::Ptr<HTML::LocalNavigable> navigable)
 
     GC::Ptr<Page> previous_page = m_navigable ? &m_navigable->page() : nullptr;
     m_navigable = navigable.ptr();
+    invalidate_full_activity();
     HTML::main_thread_event_loop().document_navigable_did_change({});
 
     if (previous_page)
@@ -10521,10 +11030,14 @@ Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunR
 
     // A hit test only reads a recording of the document as it is now: it presents nothing, so the compositor never
     // shows a frame a hit test made in place of one the render clock sampled later. The next frame records again.
+    // It copies from the published recording only where it records with the paint config the frames record with.
     auto rebuild_hit_test_display_list = [&] {
         set_needs_to_record_display_list();
+        HTML::PaintConfig paint_config { .paint_overlay = true };
+        if (auto navigable = this->navigable())
+            paint_config = navigable->stamp_paint_config(paint_config);
         Compositing::DisplayListResourceStorage throwaway_resource_storage_for_hit_test_only_recording;
-        (void)record_display_list(read, HTML::PaintConfig { .paint_overlay = true }, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
+        (void)record_display_list(read, paint_config, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
     };
 
     // The paint properties were prepared above, and a query reads them as they were left there: preparing them again
@@ -10658,6 +11171,19 @@ Unicode::Segmenter& Document::word_segmenter() const
     return *m_word_segmenter;
 }
 
+bool Document::showing_an_unload_prompt_is_unlikely_to_be_annoying_deceptive_or_pointless() const
+{
+    // FIXME: Propagate enough WebDriver session information to test for exactly one active HTTP-only,
+    //        non-BiDi session instead of treating any active WebDriver session as equivalent.
+    if (page().is_webdriver_active())
+        return false;
+
+    // FIXME: Revisit this approximation of "unlikely to be annoying, deceptive, or pointless".
+    return is_active()
+        && is_fully_active()
+        && visibility_state() == HTML::VisibilityState::Visible;
+}
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#steps-to-fire-beforeunload
 Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(bool unload_prompt_shown)
 {
@@ -10666,6 +11192,7 @@ Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(boo
 
     // 2. Increase the document's unload counter by 1.
     m_unload_counter++;
+    invalidate_full_activity();
 
     // 3. Increase document's relevant agent's event loop's termination nesting level by 1.
     auto& event_loop = *HTML::relevant_agent(*this).event_loop;
@@ -10691,18 +11218,26 @@ Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(boo
         && window.has_sticky_activation()
         //    - eventFiringResult is false, or the returnValue attribute of event is not the empty string; and
         && (!event_firing_result || !beforeunload_event->return_value().is_empty())
-        //    - FIXME: showing an unload prompt is unlikely to be annoying, deceptive, or pointless
-    ) {
+        //    - showing an unload prompt is unlikely to be annoying, deceptive, or pointless,
+        && showing_an_unload_prompt_is_unlikely_to_be_annoying_deceptive_or_pointless()) {
         // 1. Set unloadPromptShown to true.
         unload_prompt_shown = true;
 
         // FIXME: 2. Invoke WebDriver BiDi user prompt opened with document's relevant global object, "beforeunload", and "".
-        // FIXME: 3. Ask the user to confirm that they wish to unload the document, and pause while waiting for the user's response.
-
-        auto user_prompt_handler = WebDriver::get_the_prompt_handler(WebDriver::PromptType::BeforeUnload);
+        // 3. Ask the user to confirm that they wish to unload the document, and pause while waiting for the user's response.
+        auto top_level_traversable = page().top_level_traversable();
+        auto top_level_origin = top_level_traversable->active_document_origin();
+        auto top_level_url = top_level_traversable->active_document_url();
+        VERIFY(top_level_origin.has_value());
+        VERIFY(top_level_url.has_value());
+        auto source = top_level_origin->is_opaque()
+            ? MUST(String::formatted("{}://", top_level_url->scheme()))
+            : top_level_origin->serialize();
+        HTML::TemporaryExecutionContext context { relevant_settings_object() };
+        auto confirmed = page().did_request_before_unload(source, event_loop);
 
         // 4. If the user did not confirm the page navigation, set unloadPromptCanceled to true.
-        if (user_prompt_handler.handler == WebDriver::PromptHandler::Dismiss)
+        if (!confirmed)
             unload_prompt_canceled = true;
 
         // FIXME: 5. Invoke WebDriver BiDi user prompt closed with document's relevant global object and true if unloadPromptCanceled is false or false otherwise.
@@ -10710,6 +11245,7 @@ Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(boo
 
     // 7. Decrease document's unload counter by 1.
     m_unload_counter--;
+    invalidate_full_activity();
 
     // 8. Return (unloadPromptShown, unloadPromptCanceled).
     return { unload_prompt_shown, unload_prompt_canceled };
@@ -11167,6 +11703,12 @@ void Document::build_registered_properties_cache()
 
 void Document::ensure_cookie_version_index(URL::URL const& new_url, URL::URL const& old_url)
 {
+    // NB: A cookie-averse document never uses the index; set_browsing_context() asks for it once it can.
+    if (!browsing_context()) {
+        m_cookie_version_index = {};
+        return;
+    }
+
     auto new_domain = HTTP::Cookie::canonicalize_domain(new_url);
     if (!new_domain.has_value()) {
         m_cookie_version_index = {};

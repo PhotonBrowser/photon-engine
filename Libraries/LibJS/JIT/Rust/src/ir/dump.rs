@@ -74,7 +74,9 @@ fn condition_text(condition: BranchCondition) -> String {
         BranchCondition::IndexInBounds => "IndexInBounds".to_string(),
         BranchCondition::MagicalLength => "MagicalLength".to_string(),
         BranchCondition::Extensible => "Extensible".to_string(),
+        BranchCondition::HoleFillableArray => "HoleFillableArray".to_string(),
         BranchCondition::ArrayIterator => "ArrayIterator".to_string(),
+        BranchCondition::PlainArrayPrototypeChain => "PlainArrayPrototypeChain".to_string(),
         BranchCondition::Shape(shape) => format!("Shape {}", shapes_text(std::iter::once(&shape))),
         BranchCondition::NonNegativeInt32 => "NonNegativeInt32".to_string(),
         BranchCondition::Int32(comparison) => format!("Int32{comparison:?}"),
@@ -289,7 +291,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::LoadElementsCapacity
         | Op::AppendElement
         | Op::CallArrayPush
-        | Op::CreateArrayIterator
+        | Op::OpenArrayIteration
         | Op::LoadArrayIteratorArray
         | Op::LoadArrayIteratorIndex
         | Op::StoreArrayIteratorIndex

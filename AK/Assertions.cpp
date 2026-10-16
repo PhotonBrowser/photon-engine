@@ -90,6 +90,13 @@ char const* AK::current_rust_panic_message()
 
 void ladybird_rust_panic_will_abort()
 {
+    // The panic hooks of the process's Rust crates chain into each other, and each of them that knows the panic is
+    // fatal asks for the backtrace.
+    static thread_local bool s_backtrace_captured;
+    if (s_backtrace_captured)
+        return;
+    s_backtrace_captured = true;
+
     if (__atomic_load_n(&s_rust_is_panicking, __ATOMIC_ACQUIRE)) {
         if (auto callback = __atomic_load_n(&s_assertion_failure_callback, __ATOMIC_ACQUIRE))
             callback(AK::AssertionFailureKind::RustPanic, s_rust_panic_message.data());
@@ -115,10 +122,18 @@ void dump_backtrace(unsigned frames_to_skip, unsigned max_depth)
     // We should be using cpptrace for everything but android.
     auto stacktrace = cpptrace::generate_trace(frames_to_skip, max_depth);
 
-    // cpptrace only demangles C++ names.
     for (auto& frame : stacktrace.frames) {
-        if (auto demangled = demangle_rust_symbol({ frame.symbol.data(), frame.symbol.size() }); demangled.has_value())
+        if (frame.symbol.empty()) {
+            // A sandboxed process can't read the debug info that cpptrace resolves symbols from, but dladdr still names
+            // what the loaded image exports or keeps in its symbol table.
+            if (!frame.is_inline) {
+                if (auto symbol = symbol_at_address(frame.raw_address); symbol.has_value())
+                    frame.symbol.assign(symbol->name.characters(), symbol->name.length());
+            }
+        } else if (auto demangled = demangle_rust_symbol({ frame.symbol.data(), frame.symbol.size() }); demangled.has_value()) {
+            // cpptrace only demangles C++ names.
             frame.symbol.assign(demangled->characters(), demangled->length());
+        }
     }
 
     if (auto callback = __atomic_load_n(&s_assertion_backtrace_callback, __ATOMIC_ACQUIRE)) {

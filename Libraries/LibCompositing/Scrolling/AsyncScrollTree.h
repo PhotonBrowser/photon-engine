@@ -15,19 +15,49 @@
 #include <LibCompositing/Forward.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
+#include <LibCompositing/Types.h>
 #include <LibGfx/CornerRadii.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 
 namespace Compositing {
 
+enum class WheelHitTestOutcome : u8 {
+    FoundScrollTarget,
+    NoScrollTarget,
+    BlockedByMainThreadRegion,
+    BlockedByWheelEventRegion,
+    HitTestTargetsOfAnotherVisualContextTree,
+};
+
 struct WheelHitTestResult {
-    Optional<AsyncScrollNodeID> node_id;
-    bool blocked_by_main_thread_region { false };
-    bool blocked_by_wheel_event_region { false };
+    WheelHitTestOutcome outcome { WheelHitTestOutcome::NoScrollTarget };
+    // Set exactly when the outcome is FoundScrollTarget.
+    Optional<AsyncScrollNodeID> node_id {};
     // The scroller the wheel is over, which is where the search for `node_id` started. It is set even if neither it
     // nor any scroller around it can scroll by the delta.
     Optional<AsyncScrollNodeID> innermost_scroll_node_id {};
+
+    bool is_blocked_by_a_region() const
+    {
+        return outcome == WheelHitTestOutcome::BlockedByMainThreadRegion || outcome == WheelHitTestOutcome::BlockedByWheelEventRegion;
+    }
+};
+
+// A first step of a wheel gesture is latched to the scroller the hit test found, and is otherwise left to the main
+// thread for the outcome's reason.
+COMPOSITING_API Web::InputRoutingDecision input_routing_decision_for_first_wheel_step(WheelHitTestOutcome);
+
+// Where the first step of a wheel gesture over a position goes, as far as the admission and the hit test decide it.
+struct FirstWheelStepRoute {
+    Web::InputRoutingDecision decision;
+    Optional<Web::AsyncScrollNodeStableID> scroller {};
+};
+
+struct FirstWheelStepRouteForTesting {
+    FirstWheelStepRoute route;
+    // The document whose scrolling state decided the route.
+    Optional<Web::UniqueNodeID> document_id;
 };
 
 struct WheelScrollTarget {
@@ -98,13 +128,16 @@ public:
     Gfx::FloatPoint device_offset_from_css_pixels(Web::CSSPixelPoint) const;
     Optional<Web::CSSPixelPoint> css_scroll_offset_for_node(AsyncScrollNodeID, Compositing::ScrollStateSnapshot const&) const;
     bool blocks_wheel_event_at_position(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
-    WheelHitTestResult hit_test_scroll_node_for_wheel(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for = {}) const;
+    WheelHitTestResult hit_test_scroll_node_for_wheel(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for = {}, WheelStepDispatch = WheelStepDispatch::NotYetDispatched) const;
     WheelHitTestResult hit_test_scroll_node_for_history_swipe(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta) const;
     bool has_wheel_hit_test_targets_for(Compositing::AccumulatedVisualContextTree const& visual_context_tree) const { return m_visual_context_tree_structural_epoch == visual_context_tree.structural_epoch(); }
     // Whether something painted above the given place in paint order takes pointer input at the position. It is taken
     // to be covered whenever that cannot be told.
     bool is_covered_by_hit_test_target_painted_after(u32 paint_order_index, Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
     bool scroll_node_is_viewport(AsyncScrollNodeID) const;
+    // Leaves out what only a compositor holding a gesture decides: whether a step continues a latched gesture, which
+    // scroller fingers at its edge stretch, and whether a zoomed page pans its visual viewport.
+    FirstWheelStepRoute route_first_wheel_step(WheelRoutingAdmission, Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta) const;
     // Of the scroller and the scrollers around it that a scroll by the delta may be passed on to, the outermost one a
     // wheel can scroll along the main axis of the delta at all, wherever it is scrolled to.
     Optional<AsyncScrollNodeID> outermost_scroll_node_wheel_scrollable_along_main_axis_of(AsyncScrollNodeID innermost_node_id, Gfx::FloatPoint delta) const;

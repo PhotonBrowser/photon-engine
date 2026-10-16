@@ -125,7 +125,7 @@ public:
     NonnullRefPtr<SessionHistoryEntry> resolve_local_session_history_entry(SessionHistoryEntryDescriptor);
     Vector<NonnullRefPtr<SessionHistoryEntry>> session_history_entries_for_navigation_api_from_ui_process(Vector<SessionHistoryEntryDescriptor>, NonnullRefPtr<SessionHistoryEntry> target_entry);
 
-    void activate_history_entry(RefPtr<SessionHistoryEntry>, GC::Ref<DOM::Document>);
+    void activate_history_entry(NonnullRefPtr<SessionHistoryEntry>, GC::Ref<DOM::Document>);
     void update_nonchanging_navigable_history_step_state(HistoryObjectLengthAndIndex, GC::Ref<GC::Function<void()>> on_complete);
     void queue_navigation_api_state_clear_task();
     void run_ui_descendant_unload_task(ChildNavigableDestruction, StopHostingAfterUnload, GC::Ref<GC::Function<void()>> on_complete);
@@ -156,7 +156,7 @@ public:
     HostedNavigableState hosted_state() const;
 
     void save_persisted_state_to_active_session_history_entry();
-    void restore_persisted_state_from_session_history_entry(SessionHistoryEntry const&);
+    void restore_persisted_state_from_session_history_entry(SessionHistoryEntry const&, bool suppress_scrolling);
     void schedule_persisted_state_restoration_retry(SessionHistoryEntry const&);
     void restore_pending_persisted_state_for_completed_document(GC::Ref<DOM::Document>);
     void restore_scroll_position_data(SessionHistoryEntry const&);
@@ -192,33 +192,12 @@ public:
     bool resume_navigation_params_creation(Utf16String const& navigation_id, Optional<NavigationPopulationRequest>);
     void adopt_navigation_started_in_ui_process(Utf16String navigation_id);
     void navigate_to_a_javascript_url_from_ui_process(URL::URL const&, HistoryHandlingBehavior, URL::Origin const& initiator_origin, NavigationSourceSnapshot const&, UserNavigationInvolvement, ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, Utf16String navigation_id);
-    void navigate_to_a_fragment(URL::URL const&, HistoryHandlingBehavior, UserNavigationInvolvement, GC::Ptr<DOM::Element> source_element, Optional<StorageSerializationRecord> navigation_api_state, Utf16String navigation_id, GC::Ptr<NavigationAPIMethodTracker> api_method_tracker);
+    void navigate_to_a_fragment(URL::URL const&, HistoryHandlingBehavior, UserNavigationInvolvement, GC::Ptr<DOM::Element> source_element, Optional<StorageSerializationRecord> navigation_api_state, Utf16String navigation_id, GC::Ptr<NavigationAPIMethodTracker> api_method_tracker, Optional<URL::Origin> initiator_origin);
     void deliver_posted_message_from_another_process(PostedMessageDescriptor);
     void run_navigation_unload_check(Utf16String const& navigation_id, UnloadPromptShown, GC::Ref<GC::Function<void(bool)>> completion_steps);
     void continue_navigation_at_population(NavigationPopulationRequest, NavigationPopulationResult);
 
-    void populate_session_history_entry_document(
-        URL::URL url,
-        DocumentResource document_resource,
-        Fetch::Infrastructure::Request::ReferrerType request_referrer,
-        ReferrerPolicy::ReferrerPolicy request_referrer_policy,
-        Optional<URL::Origin> initiator_origin,
-        Optional<URL::Origin> origin,
-        Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container,
-        Optional<URL::URL> about_base_url,
-        Utf16String navigable_target_name,
-        bool reload_pending,
-        bool ever_populated,
-        UserAgentInitiated user_agent_initiated,
-        GC::Ref<SourceSnapshotParams> source_snapshot_params,
-        TargetSnapshotParams const& target_snapshot_params,
-        UserNavigationInvolvement user_involvement,
-        Optional<Utf16String> navigation_id,
-        NavigationParamsVariant navigation_params,
-        ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type,
-        bool allow_POST,
-        GC::Ptr<GC::Function<void(GC::Ptr<PopulateSessionHistoryEntryDocumentOutput>)>> completion_steps,
-        GC::Ptr<GC::Function<void(NavigationPopulationResult)>> response_steps = {});
+    void populate_session_history_entry_document(NavigationPopulationRequest const&, GC::Ref<SourceSnapshotParams>, bool allow_POST, GC::Ref<GC::Function<void(NavigationPopulationResult)>> response_steps);
 
     void queue_navigation_and_traversal_task_for_session_history_entry_population(
         URL::URL url,
@@ -367,6 +346,7 @@ public:
     bool active_document_opts_out_of_force_dark() const;
     bool force_dark_applies_to_active_document() const;
     bool force_dark_enabled() const { return m_force_dark_enabled; }
+    PaintConfig stamp_paint_config(PaintConfig) const;
     void set_should_show_caret_hit_test_debug_overlay(bool);
     bool should_show_caret_hit_test_debug_overlay() const { return m_should_show_caret_hit_test_debug_overlay; }
 
@@ -446,7 +426,6 @@ private:
     // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
     struct RecordingInFlight;
 
-    PaintConfig stamp_paint_config(PaintConfig) const;
     Compositor::FlightPresentation take_presentation(Compositor::SealedPresentation);
     void commit_unrecorded_frame(Layout::BegunRead const&, DOM::Document&, Compositor::SealedPresentation);
     Compositor::SealedPresentation seal_presentation(DOM::Document&, PaintConfig const&, bool records_display_list);
@@ -701,6 +680,7 @@ public:
     bool download_handled = false;
 
     Optional<URL::URL> redirected_url;
+    bool redirect_replaced_fragment { false };
     Optional<StorageSerializationRecord> classic_history_api_state;
     RefPtr<DocumentState> replacement_document_state;
     bool resource_cleared = false;
@@ -719,8 +699,7 @@ WEB_API GC::Ptr<LocalNavigable> local_navigable_with_id(CrossProcessId);
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document);
 void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Utf16String navigation_id);
 
-WEB_API void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ptr<LocalTraversableNavigable> traversable, RefPtr<SessionHistoryEntry> target_entry, Optional<UserNavigationInvolvement> user_involvement_for_navigate_events, UnloadPromptShown, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback);
-WEB_API void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult)>> callback);
+WEB_API void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ptr<LocalTraversableNavigable> owner, GC::Ptr<LocalTraversableNavigable> traversable, RefPtr<SessionHistoryEntry> target_entry, Optional<UserNavigationInvolvement> user_involvement_for_navigate_events, UnloadPromptShown, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback);
 void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<StorageSerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);
 
 }

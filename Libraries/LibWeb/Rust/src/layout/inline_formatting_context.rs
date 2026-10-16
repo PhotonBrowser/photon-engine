@@ -118,7 +118,9 @@ fn apply_text_overflow_to_line(line: &mut line_box::LineBoxData) {
             length_in_code_units: 1,
             glyph_width: ellipsis_inline_size,
             glyph_id: font.glyph_id_for_code_point(ELLIPSIS_CODE_POINT),
+            cluster_start: 0,
             should_paint: true,
+            is_rtl: false,
         });
         line.fragments[index].inline_length = CssPixels::nearest_value_for_f32(last_kept_end + ellipsis_inline_size);
         line.fragments[index].has_text_overflow_ellipsis = true;
@@ -2090,7 +2092,10 @@ impl<'context> InlineFormattingContext<'context> {
                 self.min_content_inline_size_from_max_content_items(iterator.items());
             self.automatic_content_inline_size = inline_size;
             self.run.records.note_omitted_line_layout();
-            self.callbacks.arena().note_intrinsic_inline_measurement();
+            self.callbacks
+                .arena()
+                .layout_trace
+                .inline_size_from_items(self.containing_block);
             iterator.stash_for_reuse(self);
         } else {
             self.generate_line_boxes(iterator);

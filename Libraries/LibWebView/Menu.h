@@ -41,6 +41,7 @@ enum class ActionID {
 
     LookUpSelectedText,
     SearchSelectedText,
+    CopyLinkToHighlight,
     SpellingGuess,
     NoSpellingGuesses,
     IgnoreSpelling,
@@ -128,7 +129,6 @@ enum class ActionID {
     SpoofUserAgent,
     NavigatorCompatibilityMode,
     EnableScripting,
-    EnableContentBlocking,
     BlockPopUps,
 };
 

@@ -48,6 +48,7 @@
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
+#include <LibWebCommon/Loader/ContentBlocking.h>
 
 namespace Web {
 
@@ -444,9 +445,9 @@ EventResult Page::handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint 
     return root.event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, remote_target);
 }
 
-EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const& scrollbar_dragged_by_compositor)
+EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count)
 {
-    return handle_mousedown(local_traversable(), position, screen_position, button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, nullptr);
+    return handle_mousedown(local_traversable(), position, screen_position, button, buttons, modifiers, click_count, {}, nullptr);
 }
 
 void Page::set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNavigable& navigable)
@@ -528,7 +529,7 @@ EventResult Page::handle_pinch_event(DevicePixelPoint position, unsigned modifie
     return handle_pinch_event(local_traversable(), position, modifiers, scale);
 }
 
-EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action)
+EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved)
 {
     // The compositor forwards these updates ahead of keyboard events. Both DOM listeners and a main-thread
     // fallback default action must observe the offsets that have already been presented.
@@ -536,7 +537,7 @@ EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 
     if (!navigable)
         return EventResult::Dropped;
     navigable->local_root()->adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
-    return navigable->event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text, async_scroll_performed_default_action);
+    return navigable->event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text, async_scroll_performed_default_action, editing_commands, native_editing_binding_resolved);
 }
 
 EventResult Page::handle_keyup(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat)
@@ -1065,10 +1066,10 @@ void Page::did_complete_window_rect_request(u64 completion_id)
 }
 
 template<typename ResponseType>
-static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Optional<ResponseType>& response, SourceLocation location = SourceLocation::current())
+static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Optional<ResponseType>& response, HTML::EventLoop* event_loop = nullptr, SourceLocation location = SourceLocation::current())
 {
-    auto& event_loop = Web::HTML::current_settings_object().responsible_event_loop();
-    auto pause_handle = event_loop.pause();
+    auto& responsible_event_loop = event_loop ? *event_loop : Web::HTML::current_settings_object().responsible_event_loop();
+    auto pause_handle = responsible_event_loop.pause();
 
     Web::Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), [&]() {
         return response.has_value() || !client.is_connection_open();
@@ -1097,6 +1098,22 @@ void Page::alert_closed()
 {
     if (m_pending_dialog == PendingDialog::Alert) {
         m_pending_alert_response = Empty {};
+        on_pending_dialog_closed();
+    }
+}
+
+bool Page::did_request_before_unload(String const& source, HTML::EventLoop& event_loop)
+{
+    m_pending_dialog = PendingDialog::BeforeUnload;
+    m_client->page_did_request_before_unload(source);
+
+    return spin_event_loop_until_dialog_closed(*m_client, m_pending_before_unload_response, &event_loop);
+}
+
+void Page::before_unload_closed(bool accepted)
+{
+    if (m_pending_dialog == PendingDialog::BeforeUnload) {
+        m_pending_before_unload_response = accepted;
         on_pending_dialog_closed();
     }
 }
@@ -1142,6 +1159,11 @@ void Page::prompt_closed(Optional<Utf16String> response)
 // NB: A dialog blocks the whole tab, so every page of the tab holds the one a document of any of them opened.
 void Page::did_open_dialog_in_another_process(PendingDialog dialog, Utf16String const& message)
 {
+    if (dialog == PendingDialog::None) {
+        on_pending_dialog_closed();
+        return;
+    }
+
     m_pending_dialog = dialog;
     m_pending_dialog_text.clear();
     if (!message.is_empty())
@@ -1158,6 +1180,7 @@ void Page::dismiss_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed)
     case PendingDialog::Alert:
         m_client->page_did_request_accept_dialog();
         break;
+    case PendingDialog::BeforeUnload:
     case PendingDialog::Confirm:
     case PendingDialog::Prompt:
         m_client->page_did_request_dismiss_dialog();
@@ -1173,6 +1196,7 @@ void Page::accept_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed)
     case PendingDialog::None:
         break;
     case PendingDialog::Alert:
+    case PendingDialog::BeforeUnload:
     case PendingDialog::Confirm:
     case PendingDialog::Prompt:
         m_client->page_did_request_accept_dialog();
@@ -1723,18 +1747,6 @@ void Page::set_user_style(Utf16String source)
     invalidate_user_style();
 }
 
-void Page::set_content_blocking_enabled(bool enabled)
-{
-    auto& blocker = ContentBlocker::the();
-    if (blocker.filtering_enabled() == enabled)
-        return;
-
-    auto has_cosmetic_rules = blocker.has_cosmetic_rules();
-    blocker.set_filtering_enabled(enabled);
-    if (has_cosmetic_rules)
-        invalidate_user_style();
-}
-
 void Page::invalidate_user_style()
 {
     if (!has_top_level_traversable())
@@ -1771,6 +1783,32 @@ void Page::invalidate_style_for_preference_change()
         if (auto document = navigable->active_document())
             invalidate_document(*document);
     }
+}
+
+bool Page::content_blocking_enabled_for_url(Optional<URL::URL> const& url) const
+{
+    if (!m_content_blocking_enabled)
+        return false;
+    if (!url.has_value())
+        return true;
+
+    auto host = content_blocking_site(*url);
+    return !host.has_value() || !m_content_blocking_disabled_sites.contains(*host);
+}
+
+void Page::set_content_blocking_policy(bool enabled, ReadonlySpan<String> disabled_sites)
+{
+    HashTable<String> sites;
+    sites.ensure_capacity(disabled_sites.size());
+
+    for (auto const& site : disabled_sites) {
+        if (auto host = canonical_content_blocking_host(site); host.has_value())
+            sites.set(host.release_value());
+    }
+
+    m_content_blocking_enabled = enabled;
+    m_content_blocking_disabled_sites = move(sites);
+    invalidate_user_style();
 }
 
 Vector<GC::Root<DOM::Document>> Page::documents_in_active_window() const

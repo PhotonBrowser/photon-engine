@@ -24,6 +24,7 @@
 #include <LibWeb/DOM/Comment.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
+#include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/DocumentType.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ElementFactory.h>
@@ -51,6 +52,7 @@
 #include <LibWeb/HTML/Parser/HTMLToken.h>
 #include <LibWeb/HTML/Parser/ParserScriptingMode.h>
 #include <LibWeb/HTML/Parser/SpeculativeHTMLParser.h>
+#include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
@@ -301,6 +303,9 @@ void HTMLParser::run(HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point
     }
 
     m_tokenizer.parser_did_run({});
+
+    if (m_document->parser().ptr() == this)
+        m_document->schedule_text_fragment_search_after_parser_progress({});
 }
 
 void HTMLParser::run(URL::URL const& url, HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point)
@@ -818,9 +823,16 @@ void HTMLParserEndState::advance_to_dom_content_loaded_phase()
     // But a script that ran in step 5 above may have scrolled the page already,
     // so only do this if there is an actual fragment to avoid resetting the scroll position unexpectedly.
     // Spec bug: https://github.com/whatwg/html/issues/10914
-    auto indicated_part = m_document->determine_the_indicated_part();
-    if (indicated_part.has<DOM::Element*>() && indicated_part.get<DOM::Element*>() != nullptr) {
-        m_document->scroll_to_the_fragment();
+    // https://wicg.github.io/scroll-to-text-fragment/#restricting-scroll-on-load
+    // https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+    if (!m_document->policy_container()->force_load_at_top) {
+        if (m_document->pending_text_directives().has_value() && !m_document->pending_text_directives()->is_empty()) {
+            m_document->scroll_to_the_fragment(m_document->pending_text_directive_scroll_allowed());
+        } else {
+            auto indicated_part = m_document->determine_the_indicated_part();
+            if (indicated_part.has<DOM::Element*>() && indicated_part.get<DOM::Element*>() != nullptr)
+                m_document->scroll_to_the_fragment();
+        }
     }
 
     m_phase = Phase::WaitingForDOMContentLoaded;
@@ -838,6 +850,18 @@ void HTMLParserEndState::advance_to_dom_content_loaded_phase()
             HighResolutionTime::current_high_resolution_time(relevant_global_object(*document)));
         content_loaded_event->set_bubbles(true);
         document->dispatch_event(content_loaded_event);
+
+        // https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+        // If the document has no parser, or its parser has stopped parsing, then:
+        if (document->pending_text_directives().has_value() && !document->pending_text_directives()->is_empty()) {
+            auto const scrolling_blocked_in_new_document = document->policy_container()->force_load_at_top;
+            if (!scrolling_blocked_in_new_document)
+                document->scroll_to_the_fragment(document->pending_text_directive_scroll_allowed());
+
+            // AD-HOC: Retain unmatched directives through the rest of the loading lifecycle. A
+            //         load handler or load-delaying resource can make additional searchable content
+            //         available, and the load-completion pass below performs the final search.
+        }
 
         // 3. Set the Document's load timing info's DOM content loaded event end time to the current high resolution time given the Document's relevant global object.
         document->load_timing_info().dom_content_loaded_event_end_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(*document));
@@ -870,9 +894,27 @@ void HTMLParserEndState::complete()
         // parser mark the replacement document ready for post-load tasks.
         if (parser_was_replaced(document, parser, parser_generation))
             return;
+        // NB: Step 8 can stop spinning and queue this task before an already-queued task reopens a descendant document.
+        //     Recheck its condition here and resume waiting using the same parser end state.
+        // INTEROP: Blink and WebKit recheck descendant completeness at their final load-completion gate. Gecko's
+        //          document loader likewise remains busy while a child loader is waiting to complete.
+        if (document->is_fully_active() && document->anything_is_delaying_the_load_event()) {
+            state->m_phase = Phase::WaitingForLoadEventDelay;
+            state->schedule_progress_check();
+            return;
+        }
 
         state->m_timeout->stop();
         document->set_html_parser_end_state(nullptr);
+
+        // 11. The Document is now ready for post-load tasks.
+        // NB: The spec sets this synchronously after queueing this task, and relies on "spin the event loop"
+        //     continuations being queued tasks to keep an ancestor document's load event behind this document's own
+        //     load event and its container's load event. Our parser end state machine checks its progress from
+        //     deferred invocations, which run ahead of queued tasks, so flip readiness inside this task instead;
+        //     an ancestor then cannot complete until this task (and everything it queues) is already in the queue.
+        //     WebKit and Blink time their equivalent flag the same way.
+        document->set_ready_for_post_load_tasks(true);
 
         // 1. Update the current document readiness to "complete".
         document->update_readiness(HTML::DocumentReadyState::Complete);
@@ -904,6 +946,10 @@ void HTMLParserEndState::complete()
         // 5. Fire an event named load at window, with legacy target override flag set.
         // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
         //        We should reorganize this so that the flag appears explicitly here instead.
+        // Keep the container's load event delayed until this event dispatch completes. Load handlers can start new
+        // resources, and a remote container must not observe a gap between the document becoming ready and those
+        // resources beginning to delay its load event.
+        DOM::DocumentLoadEventDelayer load_event_delayer(*document);
         window.dispatch_event(DOM::Event::create(
             HTML::EventNames::load,
             HighResolutionTime::current_high_resolution_time(relevant_global_object(window))));
@@ -912,6 +958,32 @@ void HTMLParserEndState::complete()
         //          parser was detached above. Do not let this completion continue into the replacement document.
         if (document->parser_generation() != parser_generation)
             return;
+
+        // AD-HOC: Perform the final lifecycle-driven text-fragment search after all
+        //         load-event-delaying resources have settled and the load event has run. This also
+        //         observes content added by a load handler and corrects layout shifts in the absence of
+        //         CSS scroll anchoring.
+        // https://drafts.csswg.org/css-scroll-anchoring/
+        if (document->pending_text_directives().has_value() && !document->pending_text_directives()->is_empty()) {
+            auto const scrolling_blocked_in_new_document = document->policy_container()->force_load_at_top;
+            if (!scrolling_blocked_in_new_document)
+                document->scroll_to_the_fragment(document->pending_text_directive_scroll_allowed());
+
+            auto const text_fragment_was_found = !document->text_fragment_ranges().is_empty();
+
+            // https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+            // 1. If pending text directives is not null, then:
+            // 1. Set pending text directives to null.
+            document->clear_pending_text_directives();
+
+            if (!scrolling_blocked_in_new_document
+                && (!text_fragment_was_found || !document->pending_text_directive_scroll_allowed())) {
+                // https://wicg.github.io/scroll-to-text-fragment/#scroll-on-navigation
+                // If a UA chooses not to scroll automatically, it must scroll a fallback element-id
+                // into view, if provided, regardless of whether a text fragment was matched.
+                document->scroll_to_the_fragment();
+            }
+        }
 
         // FIXME: 6. Invoke WebDriver BiDi load complete with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "complete", and url is the Document object's URL.
 
@@ -933,9 +1005,6 @@ void HTMLParserEndState::complete()
         //          do not let this completion continue into the replacement document contents.
         if (document->parser_generation() != parser_generation)
             return;
-
-        // 11. The Document is now ready for post-load tasks.
-        document->set_ready_for_post_load_tasks(true);
 
         // 12. Completely finish loading the Document.
         document->completely_finish_loading();
@@ -1340,6 +1409,12 @@ Utf16FlyString const* supported_fragment_tag(ReadonlySpan<CharT> name)
     }
 }
 
+// The whitespace the scanner skips between attributes and the tree builder drops before the html element.
+constexpr bool is_fragment_whitespace(u32 code_unit)
+{
+    return code_unit == ' ' || code_unit == '\t' || code_unit == '\n' || code_unit == '\f';
+}
+
 template<typename CharT>
 class FragmentScanner {
 public:
@@ -1472,7 +1547,7 @@ private:
 
     void skip_whitespace()
     {
-        while (peek() == ' ' || peek() == '\t' || peek() == '\n' || peek() == '\f')
+        while (is_fragment_whitespace(peek()))
             ++m_offset;
     }
 
@@ -1490,12 +1565,18 @@ private:
 
 }
 
-template<typename CharT>
-static bool parse_fast_fragment_into_detached_nodes(DOM::Element& context, ReadonlySpan<CharT> source, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes)
-{
-    if (!FragmentScanner<CharT> { source }.parse([](auto const&, auto, bool) { }, [] { }, [](auto) { }))
-        return false;
+static void insert_node_for_parser(DOM::Node& parent, DOM::Node& node, DOM::Node* child);
 
+template<typename CharT>
+static bool can_parse_fragment_fast(ReadonlySpan<CharT> source)
+{
+    return FragmentScanner<CharT> { source }.parse([](auto const&, auto, bool) { }, [] { }, [](auto) { });
+}
+
+// Builds the nodes of source, which can_parse_fragment_fast() has accepted, for parsing in context.
+template<typename CharT>
+static void build_fast_fragment_into_detached_nodes(DOM::Element& context, ReadonlySpan<CharT> source, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes)
+{
     auto& document = context.document();
     auto registry = look_up_a_custom_element_registry(context);
     GC::RootVector<GC::Ref<DOM::Node>, 32> parents;
@@ -1529,7 +1610,24 @@ static bool parse_fast_fragment_into_detached_nodes(DOM::Element& context, Reado
             append(DOM::Text::create(document, text_node_data_from_span(text)));
         });
     VERIFY(success);
-    return true;
+}
+
+template<typename Callback>
+static decltype(auto) with_code_unit_span(Utf16View input, Callback&& callback)
+{
+    if (input.has_ascii_storage())
+        return callback(ReadonlySpan<char> { input.ascii_span().data(), input.length_in_code_units() });
+    return callback(input.utf16_span());
+}
+
+static bool can_parse_fragment_fast_in_context(DOM::Element const& context)
+{
+    if (context.namespace_uri() != Namespace::HTML || context.document().is_xml_document())
+        return false;
+    if (!context.local_name().is_one_of(TagNames::body, TagNames::div, TagNames::span, TagNames::ul, TagNames::ol,
+            TagNames::li, TagNames::footer, TagNames::button, TagNames::label, TagNames::p))
+        return false;
+    return !context.first_ancestor_of_type<HTMLFormElement>();
 }
 
 bool HTMLParser::try_parse_html_fragment_fast_into_detached_nodes(DOM::Element& context, Utf16View input, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes)
@@ -1542,17 +1640,63 @@ bool HTMLParser::try_parse_html_fragment_fast_into_detached_nodes(DOM::Element& 
     //               Nothing can observe the skipped steps: the nodes are new, so no script, observer, live range or
     //               collection can reach them, and the children changed steps of a new element have nothing to update.
     VERIFY(top_level_nodes.is_empty());
-    if (context.namespace_uri() != Namespace::HTML || context.document().is_xml_document())
+    if (!can_parse_fragment_fast_in_context(context))
         return false;
-    if (!context.local_name().is_one_of(TagNames::body, TagNames::div, TagNames::span, TagNames::ul, TagNames::ol,
-            TagNames::li, TagNames::footer, TagNames::button, TagNames::label, TagNames::p))
-        return false;
-    if (context.first_ancestor_of_type<HTMLFormElement>())
+    return with_code_unit_span(input, [&](auto source) {
+        if (!can_parse_fragment_fast(source))
+            return false;
+        build_fast_fragment_into_detached_nodes(context, source, top_level_nodes);
+        return true;
+    });
+}
+
+bool HTMLParser::try_parse_document_fast(DOM::Document& document, Utf16View input)
+{
+    // OPTIMIZATION: Markup without a doctype whose content is in the fragment fast path's subset of in-body markup,
+    //               such as a template given to DOMParser, gets the same document as from the tree builder: the
+    //               document is in quirks mode, leading whitespace is dropped, and an html element holds an empty head
+    //               and a body with the content. Like innerHTML's fast path, the nodes below each top-level node of the
+    //               content are linked without the insertion steps, which inserting that node into the body then runs
+    //               for its whole subtree. No parser is created, so the input is not copied into a tokenizer that
+    //               would keep it for as long as the document keeps its parser.
+    //               Nothing can observe the difference, since no script runs while the document is parsed.
+    if (document.has_children() || document.parser_cannot_change_the_mode() || document.is_xml_document())
         return false;
 
-    if (input.has_ascii_storage())
-        return parse_fast_fragment_into_detached_nodes(context, ReadonlySpan<char> { input.ascii_span().data(), input.length_in_code_units() }, top_level_nodes);
-    return parse_fast_fragment_into_detached_nodes(context, input.utf16_span(), top_level_nodes);
+    // NB: The tree builder drops whitespace before the html element, and leaves carriage returns to the scanner,
+    //     which rejects them.
+    size_t content_start = 0;
+    while (content_start < input.length_in_code_units() && is_fragment_whitespace(input.code_unit_at(content_start)))
+        ++content_start;
+    auto content = input.substring_view(content_start);
+
+    auto can_parse_content = with_code_unit_span(content, [](auto source) { return can_parse_fragment_fast(source); });
+    if (!can_parse_content)
+        return false;
+
+    // NB: These are what creating the parser for a decoded string and running it would have set.
+    document.set_encoding("UTF-8"_utf16);
+    document.set_source(Utf16String::from_utf16(input));
+    document.set_quirks_mode(DOM::QuirksMode::Yes);
+
+    auto registry = look_up_a_custom_element_registry(document);
+    auto create_html_element = [&](Utf16FlyString const& local_name) {
+        return MUST(DOM::create_element(document, local_name, Namespace::HTML, {}, {}, false, registry));
+    };
+    auto html = create_html_element(TagNames::html);
+    insert_node_for_parser(document, html, nullptr);
+    insert_node_for_parser(html, create_html_element(TagNames::head), nullptr);
+    auto body = create_html_element(TagNames::body);
+    insert_node_for_parser(html, body, nullptr);
+    VERIFY(can_parse_fragment_fast_in_context(body));
+
+    GC::RootVector<GC::Ref<DOM::Node>> body_children;
+    with_code_unit_span(content, [&](auto source) { build_fast_fragment_into_detached_nodes(*body, source, body_children); });
+    for (auto child : body_children)
+        insert_node_for_parser(body, child, nullptr);
+
+    the_end(document, parserless_completion_token(document));
+    return true;
 }
 
 GC::Ptr<DOM::DocumentFragment> HTMLParser::try_parse_html_fragment_fast(DOM::Element& context, Utf16View input)

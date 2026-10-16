@@ -24,6 +24,7 @@
 #include <LibWebCommon/CSS/SystemColor.h>
 #include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
 #include <LibWebCommon/Infra/Strings.h>
+#include <LibWebCommon/Loader/ContentBlocking.h>
 #include <LibWebCommon/WebDriver/Error.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
@@ -160,17 +161,50 @@ WebContentPage& ViewImplementation::page() const
 
 void ViewImplementation::set_url(URL::URL url)
 {
-    if (m_url == url)
+    if (url.fragment().has_value() && url.fragment()->contains(":~:"sv))
+        m_text_fragment_indication_is_visible = true;
+
+    if (m_url != url) {
+        clear_page_response_watchdog();
+        m_url = move(url);
+        update_bookmark_action();
+        if (auto page = traversable().display_page(); page && page->routed_connection())
+            page->routed_connection()->update_audio_capture_permission();
+    }
+
+    update_displayed_url();
+}
+
+void ViewImplementation::update_displayed_url()
+{
+    auto displayed_url = m_url;
+    auto displayed_url_without_fragment_directive = displayed_url;
+    if (auto const& raw_fragment = displayed_url_without_fragment_directive.fragment(); raw_fragment.has_value()) {
+        if (auto position = raw_fragment->find(":~:"sv); position.has_value())
+            displayed_url_without_fragment_directive.set_fragment(raw_fragment->substring_view(0, *position));
+    }
+    if (!m_text_fragment_indication_is_visible)
+        displayed_url = displayed_url_without_fragment_directive;
+
+    if (m_top_level_traversable) {
+        auto const& current_entry = traversable().session_history().current_entry();
+        if (current_entry.url == displayed_url_without_fragment_directive)
+            displayed_url = display_url_for_session_history_entry(current_entry.descriptor(), m_text_fragment_indication_is_visible);
+    }
+
+    if (m_displayed_url == displayed_url)
         return;
-
-    clear_page_response_watchdog();
-    m_url = move(url);
-    update_bookmark_action();
-    if (auto page = traversable().display_page(); page && page->routed_connection())
-        page->routed_connection()->update_audio_capture_permission();
-
+    m_displayed_url = move(displayed_url);
     if (on_url_change)
-        on_url_change(m_url);
+        on_url_change(m_displayed_url);
+}
+
+void ViewImplementation::set_text_fragment_indication_visibility(Badge<WebContentPage>, bool visible)
+{
+    if (m_text_fragment_indication_is_visible == visible)
+        return;
+    m_text_fragment_indication_is_visible = visible;
+    update_displayed_url();
 }
 
 void ViewImplementation::set_title(Badge<WebContentPage>, Utf16String title)
@@ -503,7 +537,7 @@ void ViewImplementation::did_end_uncommitted_navigation(StringView reason)
 {
     set_url(traversable().session_history().current_entry().url);
     if (m_webdriver_navigation_observation.has_value())
-        complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
+        complete_webdriver_navigation();
     dump_session_history(reason);
 }
 
@@ -556,7 +590,7 @@ void ViewImplementation::did_not_apply_reload()
         return;
     set_loading_state(false);
     if (m_webdriver_navigation_observation.has_value())
-        complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
+        complete_webdriver_navigation();
 }
 
 void ViewImplementation::did_commit_history_step()
@@ -741,7 +775,7 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         mouse_event->wheel_delta_y /= zoom_level();
     }
 
-    if (key_event && Web::is_keyboard_scroll_key(key_event->key, Web::UIEvents::Mod_None)) {
+    if (key_event && !key_event->native_editing_binding_resolved && Web::is_keyboard_scroll_key(key_event->key, Web::UIEvents::Mod_None)) {
         bool preceding_input_may_change_target = false;
         for (auto const& pending : m_pending_input_events) {
             auto const* key = pending.event.get_pointer<Web::KeyEvent>();
@@ -2133,6 +2167,51 @@ void ViewImplementation::request_style_sheet_source(Web::CSS::StyleSheetIdentifi
     page().async_request_style_sheet_source(identifier);
 }
 
+void ViewImplementation::did_block_resource(Badge<WebContentPage>)
+{
+    if (m_blocked_request_count != NumericLimits<u64>::max())
+        ++m_blocked_request_count;
+    notify_content_blocking_changed();
+}
+
+void ViewImplementation::reset_blocked_request_count()
+{
+    m_blocked_request_count = 0;
+    notify_content_blocking_changed();
+}
+
+void ViewImplementation::notify_content_blocking_changed()
+{
+    if (on_content_blocking_change)
+        on_content_blocking_change(content_blocking_snapshot());
+}
+
+ContentBlockingSnapshot ViewImplementation::content_blocking_snapshot() const
+{
+    ContentBlockingSnapshot snapshot;
+    snapshot.blocked_request_count = m_blocked_request_count;
+
+    if (m_crash_state.has_value() || !traversable().active_document().host())
+        return snapshot;
+
+    auto entry = traversable().active_session_history_entry();
+    if (!entry)
+        return snapshot;
+
+    snapshot.site = Web::content_blocking_site(entry->url);
+    if (!snapshot.site.has_value())
+        return snapshot;
+
+    if (!Application::the().content_blocking_enabled())
+        snapshot.state = ContentBlockingState::Disabled;
+    else if (!Application::settings().content_blocker_enabled_for_site(*snapshot.site))
+        snapshot.state = ContentBlockingState::SiteDisabled;
+    else
+        snapshot.state = Application::the().has_content_blocking_rules() ? ContentBlockingState::Enabled : ContentBlockingState::NoRules;
+
+    return snapshot;
+}
+
 void ViewImplementation::debug_request(ByteString const& request, ByteString const& argument)
 {
     if (request == "dump-session-history"sv)
@@ -2182,6 +2261,11 @@ void ViewImplementation::alert_closed()
     traversable().for_each_hosting_page([&](WebContentPage& page) {
         page.async_alert_closed();
     });
+}
+
+void ViewImplementation::before_unload_closed(bool accepted)
+{
+    page().routed_proxy()->async_before_unload_closed(page().id(), accepted);
 }
 
 void ViewImplementation::confirm_closed(bool accepted)
@@ -2665,6 +2749,7 @@ void ViewImplementation::cancel_all_native_geolocation_requests()
 
 void ViewImplementation::did_start_navigation()
 {
+    reset_blocked_request_count();
     set_loading_state(true);
     dump_session_history("did-start-navigation"sv);
 }
@@ -2675,7 +2760,7 @@ void ViewImplementation::did_cancel_loading(Badge<CanonicalNavigable>, bool canc
     if (canceled_navigation)
         did_end_uncommitted_navigation("did-cancel-navigation"sv);
     else if (m_webdriver_navigation_observation.has_value())
-        complete_webdriver_navigation(m_webdriver_navigation_observation->navigation_id);
+        complete_webdriver_navigation();
 
     auto const& client_url = url();
     if (on_load_finish)
@@ -2694,15 +2779,14 @@ void ViewImplementation::did_finish_navigation()
     if (!m_webdriver_navigation_observation.has_value())
         return;
 
-    auto navigation_id = m_webdriver_navigation_observation->navigation_id;
     switch (m_webdriver_navigation_observation->completion_source) {
     case WebDriverNavigationCompletionSource::CrashRecovery:
         m_webdriver_navigation_observation->load_completed = true;
         if (m_webdriver_navigation_observation->history_operation_completed)
-            complete_webdriver_navigation(navigation_id);
+            complete_webdriver_navigation();
         break;
     case WebDriverNavigationCompletionSource::Load:
-        complete_webdriver_navigation(navigation_id);
+        complete_webdriver_navigation();
         break;
     case WebDriverNavigationCompletionSource::HistoryTraversal:
         break;
@@ -2803,6 +2887,17 @@ void ViewImplementation::did_change_display_page(Badge<CanonicalNavigable>, RefP
 // The tab is displayed by the page hosting its document from now on.
 void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_page)
 {
+    auto new_page_id = page().id();
+    Vector<u64> stale_close_preflight_requests;
+    for (auto const& [request_id, request] : m_pending_close_preflight_requests) {
+        if (request.page_id != new_page_id)
+            stale_close_preflight_requests.append(request_id);
+    }
+    for (auto request_id : stale_close_preflight_requests) {
+        if (auto request = m_pending_close_preflight_requests.take(request_id); request.has_value())
+            request->on_complete(false);
+    }
+
     // Screenshot and page info requests went to the outgoing page, so only it could answer them.
     if (auto pending_screenshot = move(m_pending_screenshot))
         pending_screenshot->reject(Error::from_string_literal("The displayed page changed before taking the screenshot"));
@@ -2871,6 +2966,16 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
 
 void ViewImplementation::did_lose_page(Badge<CanonicalTraversable>, WebContentPage& page, WebContentProcessLost process_lost)
 {
+    Vector<u64> lost_close_preflight_requests;
+    for (auto const& [request_id, request] : m_pending_close_preflight_requests) {
+        if (request.page_id == page.id())
+            lost_close_preflight_requests.append(request_id);
+    }
+    for (auto request_id : lost_close_preflight_requests) {
+        if (auto request = m_pending_close_preflight_requests.take(request_id); request.has_value())
+            request->on_complete(false);
+    }
+
     // NB: The view fails the commands of its own page when it recovers from its process's crash.
     if (traversable().display_page() == &page)
         return;
@@ -3124,20 +3229,17 @@ void ViewImplementation::complete_webdriver_navigation_completion(u64 request_id
     request->on_complete(move(response));
 }
 
-u64 ViewImplementation::begin_webdriver_navigation(WebDriverNavigationCompletionSource completion_source, Optional<Web::HTML::CrossProcessId> history_operation_id)
+void ViewImplementation::begin_webdriver_navigation(WebDriverNavigationCompletionSource completion_source, Optional<Web::HTML::CrossProcessId> history_operation_id)
 {
     m_webdriver_navigation_observation = WebDriverNavigationObservation {
         .completion_source = completion_source,
-        .navigation_id = m_next_webdriver_navigation_id++,
         .history_operation_id = history_operation_id,
     };
-    return m_webdriver_navigation_observation->navigation_id;
 }
 
-void ViewImplementation::complete_webdriver_navigation(u64 navigation_id)
+void ViewImplementation::complete_webdriver_navigation()
 {
-    if (!m_webdriver_navigation_observation.has_value()
-        || m_webdriver_navigation_observation->navigation_id != navigation_id)
+    if (!m_webdriver_navigation_observation.has_value())
         return;
 
     m_webdriver_navigation_observation.clear();
@@ -3166,13 +3268,13 @@ void ViewImplementation::complete_webdriver_history_traversal(Web::HTML::CrossPr
     auto& observation = *m_webdriver_navigation_observation;
     switch (observation.completion_source) {
     case WebDriverNavigationCompletionSource::HistoryTraversal:
-        complete_webdriver_navigation(observation.navigation_id);
+        complete_webdriver_navigation();
         break;
     // A crash recovery is over once both its traversal and the load it starts are.
     case WebDriverNavigationCompletionSource::CrashRecovery:
         observation.history_operation_completed = true;
         if (observation.load_completed)
-            complete_webdriver_navigation(observation.navigation_id);
+            complete_webdriver_navigation();
         break;
     case WebDriverNavigationCompletionSource::Load:
         break;
@@ -3528,6 +3630,7 @@ void ViewImplementation::set_crash_state(Optional<CrashState> state)
 {
     auto active = state.has_value();
     m_crash_state = move(state);
+    notify_content_blocking_changed();
     if (on_crash_overlay_state_change)
         on_crash_overlay_state_change(active);
 }
@@ -3856,6 +3959,14 @@ void ViewImplementation::initialize_context_menus()
     });
     m_search_selected_text_action->set_visible(false);
 
+    m_copy_link_to_highlight_action = Action::create("Copy Link to Highlight"sv, ActionID::CopyLinkToHighlight, [this] {
+        if (!m_text_fragment_url.has_value())
+            return;
+        Application::the().insert_clipboard_entry({ "text/plain"_string, url_text_to_copy(*m_text_fragment_url) });
+    });
+    m_copy_link_to_highlight_action->set_visible(false);
+    m_copy_link_to_highlight_action->set_enabled(false);
+
     m_look_up_selected_text_action = Action::create("Look Up"sv, ActionID::LookUpSelectedText, [this] {
         if (!m_look_up.has_value() || !on_request_dictionary_lookup)
             return;
@@ -4027,6 +4138,7 @@ void ViewImplementation::initialize_context_menus()
     add_text_edit_actions(*m_page_context_menu);
     m_page_context_menu->add_separator();
     m_page_context_menu->add_action(*m_search_selected_text_action);
+    m_page_context_menu->add_action(*m_copy_link_to_highlight_action);
     m_page_context_menu->add_separator();
     m_page_context_menu->add_action(*m_take_visible_screenshot_action);
     m_page_context_menu->add_action(*m_take_full_screenshot_action);
@@ -4041,6 +4153,7 @@ void ViewImplementation::initialize_context_menus()
     m_link_context_menu->add_action(*m_download_linked_file_as_action);
     m_link_context_menu->add_separator();
     m_link_context_menu->add_action(*m_copy_url_action);
+    m_link_context_menu->add_action(*m_copy_link_to_highlight_action);
 
     m_selected_text_link_context_menu = Menu::create("Selected Text Link Context Menu"sv);
     m_selected_text_link_context_menu->add_action(*m_look_up_selected_text_action);
@@ -4049,6 +4162,7 @@ void ViewImplementation::initialize_context_menus()
     add_text_edit_actions(*m_selected_text_link_context_menu);
     m_selected_text_link_context_menu->add_separator();
     m_selected_text_link_context_menu->add_action(*m_search_selected_text_action);
+    m_selected_text_link_context_menu->add_action(*m_copy_link_to_highlight_action);
 
     m_image_context_menu = Menu::create("Image Context Menu"sv);
     m_image_context_menu->add_action(*m_look_up_selected_text_action);
@@ -4389,8 +4503,32 @@ void ViewImplementation::activate_spelling_menu_action_for_testing(Badge<WebCont
     requesting_page.async_did_complete_spelling_menu_action_for_testing(menu);
 }
 
-void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word)
+void ViewImplementation::request_text_fragment_url(Optional<u64> generation_id)
 {
+    m_text_fragment_url.clear();
+    m_pending_text_fragment_url_request_id.clear();
+    m_copy_link_to_highlight_action->set_enabled(false);
+    m_copy_link_to_highlight_action->set_visible(generation_id.has_value());
+    if (!generation_id.has_value())
+        return;
+
+    auto request_id = m_next_text_fragment_url_request_id++;
+    m_pending_text_fragment_url_request_id = request_id;
+    page().client().async_generate_text_fragment_url(page().id(), request_id, *generation_id);
+}
+
+void ViewImplementation::did_generate_text_fragment_url(u64 request_id, Optional<URL::URL> url)
+{
+    if (!m_pending_text_fragment_url_request_id.has_value() || *m_pending_text_fragment_url_request_id != request_id)
+        return;
+    m_pending_text_fragment_url_request_id.clear();
+    m_text_fragment_url = move(url);
+    m_copy_link_to_highlight_action->set_enabled(m_text_fragment_url.has_value());
+}
+
+void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id)
+{
+    request_text_fragment_url(text_fragment_generation_id);
     m_spelling_context_menu_page = requesting_page;
     update_spelling_menu_actions(move(misspelled_word));
 
@@ -4447,8 +4585,9 @@ void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, We
     });
 }
 
-void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation)
+void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<u64> text_fragment_generation_id)
 {
+    request_text_fragment_url(text_fragment_generation_id);
     auto request_id = ++m_context_menu_request_id;
     auto weak_this = make_weak_ptr();
     request_context_menu_dictionary_lookup([weak_this, request_id, content_position, navigation = move(navigation)](auto const& lookup) mutable {
@@ -4594,6 +4733,34 @@ void ViewImplementation::request_close()
 void ViewImplementation::force_close()
 {
     page().async_force_close();
+}
+
+void ViewImplementation::request_close_preflight(Function<void(bool)> on_complete)
+{
+    auto request_id = m_next_close_preflight_request_id++;
+    auto page_id = page().id();
+    m_pending_close_preflight_requests.set(request_id, { page_id, move(on_complete) });
+    page().async_request_close_preflight(request_id);
+}
+
+void ViewImplementation::did_complete_close_preflight(Badge<WebContentPage>, u64 request_id, bool approved)
+{
+    if (auto request = m_pending_close_preflight_requests.take(request_id); request.has_value())
+        request->on_complete(approved);
+}
+
+Function<void()> ViewImplementation::prepare_for_close_without_prompting()
+{
+    if (m_debugger_paused) {
+        resume_debugger(DebuggerResumeMode::Continue);
+        set_debugger_paused(false);
+    }
+
+    NonnullRefPtr closing_page = page();
+    closing_page->set_detached_close_pending(true);
+    return [closing_page = move(closing_page)] {
+        closing_page->async_request_close_without_prompting();
+    };
 }
 
 Function<void()> ViewImplementation::prepare_for_immediate_close()

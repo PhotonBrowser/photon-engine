@@ -37,7 +37,7 @@
         {
           "type": "git",
           "url": "https://github.com/simdjson/simdjson.git",
-          "tag": "v4.6.4"
+          "tag": "v5.0.2"
         }
       ],
       "config-opts": [
@@ -56,7 +56,7 @@
         {
           "type": "git",
           "url": "https://github.com/simdutf/simdutf.git",
-          "tag": "v9.1.0"
+          "tag": "v9.1.1"
         }
       ],
       "config-opts": [
@@ -76,18 +76,18 @@
         {
           "type": "git",
           "url": "https://github.com/pnggroup/libpng.git",
-          "tag": "v1.6.58"
+          "tag": "v1.6.59"
         },
         {
           "type": "file",
-          "url": "https://downloads.sourceforge.net/project/libpng-apng/libpng16/1.6.58/libpng-1.6.58-apng.patch.gz",
-          "sha512": "95a6f5bb7148b5c48dccd73811d7bcf9752a631a7bb4f4856670a7da12a7159581ac1bce1749318343794e0f5cb86972711ba2ec0f523c168f0991fa940687d5"
+          "url": "https://downloads.sourceforge.net/project/libpng-apng/libpng16/1.6.59/libpng-1.6.59-apng.patch.gz",
+          "sha512": "a27ed2769b3c8d1703267b807663aa8e543b62355237e223d7731662034dd126951b88117c1038dc976750cf515d7e0e26e4a9278bf951f96ec4ed8f74105db7"
         },
         {
           "type": "shell",
           "commands": [
-            "gunzip -k libpng-1.6.58-apng.patch.gz",
-            "patch -p1 -i libpng-1.6.58-apng.patch"
+            "gunzip -k libpng-1.6.59-apng.patch.gz",
+            "patch -p1 -i libpng-1.6.59-apng.patch"
           ]
         }
       ],
@@ -275,7 +275,7 @@
         {
           "type": "git",
           "url": "https://github.com/GNOME/libxml2.git",
-          "tag": "v2.15.3"
+          "tag": "v2.15.4"
         }
       ],
       "config-opts": [
@@ -383,7 +383,7 @@
         {
           "type": "git",
           "url": "https://code.videolan.org/videolan/dav1d.git",
-          "tag": "1.5.3"
+          "tag": "1.5.4"
         }
       ],
       "config-opts": [
@@ -533,7 +533,7 @@
           {
             "type": "git",
             "url": "https://github.com/fastfloat/fast_float.git",
-            "tag": "v8.2.10"
+            "tag": "v8.3.1"
           }
         ],
         "config-opts": [
@@ -549,7 +549,7 @@
         {
           "type": "git",
           "url": "https://github.com/libsdl-org/SDL.git",
-          "tag": "release-3.2.28"
+          "tag": "release-3.4.18"
         }
       ],
       "config-opts": [
@@ -565,7 +565,7 @@
         {
           "type": "git",
           "url": "https://github.com/davea42/libdwarf-code.git",
-          "tag": "v2.3.1"
+          "tag": "v2.3.3"
         }
       ],
       "config-opts": [
@@ -601,7 +601,7 @@
         {
           "type": "git",
           "url": "https://github.com/jeremy-rifkin/cpptrace.git",
-          "tag": "v1.0.2"
+          "tag": "v1.0.4"
         }
       ],
       "config-opts": [
@@ -625,8 +625,8 @@
         {
           "type": "git",
           "url": "https://github.com/openssl/openssl.git",
-          "commit": "aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f",
-          "tag": "openssl-3.6.3"
+          "commit": "c8bd5a57108599ac650bbae77fcabe3109dab2e8",
+          "tag": "openssl-3.6.5"
         }
       ]
     },
@@ -634,7 +634,7 @@
       "name": "ffmpeg",
       "buildsystem": "simple",
       "build-commands": [
-        "./configure --prefix=/app --libdir=/app/lib --enable-shared --disable-static --enable-pic --disable-doc --enable-debug --enable-runtime-cpudetect --disable-autodetect --build-suffix=-ladybird --disable-everything --disable-network --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-avdevice --enable-avformat --disable-avfilter --disable-postproc --enable-swresample --disable-swscale --enable-libdav1d --enable-zlib --enable-decoder=vp8,vp9,libdav1d,theora,vorbis,opus,flac,mp3float,pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_alaw,pcm_mulaw --enable-parser=vp8,vp9,av1,flac,mpegaudio --enable-demuxer=ogg,flac,wav --disable-optimizations",
+        "./configure --prefix=/app --libdir=/app/lib --enable-shared --disable-static --enable-pic --disable-doc --enable-debug --enable-runtime-cpudetect --disable-autodetect --build-suffix=-ladybird --disable-everything --disable-network --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-avdevice --enable-avformat --disable-avfilter --enable-swresample --disable-swscale --enable-libdav1d --enable-zlib --enable-decoder=vp8,vp9,libdav1d,theora,vorbis,opus,flac,mp3float,pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_alaw,pcm_mulaw --enable-parser=vp8,vp9,av1,flac,mpegaudio --enable-demuxer=ogg,flac,wav --disable-optimizations",
         "make -j$(nproc) V=1",
         "make install"
       ],
@@ -642,8 +642,8 @@
         {
           "type": "git",
           "url": "https://github.com/FFmpeg/FFmpeg.git",
-          "commit": "db69d06eeeab4f46da15030a80d539efb4503ca8",
-          "tag": "n7.1.1"
+          "commit": "946fcce07b6dcd0331c8cc609192aeff5e1924f8",
+          "tag": "n9.0.2"
         },
         {
           "type": "patch",
@@ -685,7 +685,7 @@
         {
           "type": "git",
           "url": "https://github.com/google/wuffs-mirror-release-c.git",
-          "tag": "v0.3.4"
+          "tag": "v0.3.5"
         }
       ]
     },
@@ -705,13 +705,13 @@
         {
           "type": "git",
           "url": "https://github.com/mozilla/pdf.js.git",
-          "tag": "v5.6.205",
+          "tag": "v6.4.299",
           "dest": "pdfjs-src"
         },
         {
           "type": "archive",
-          "url": "https://github.com/mozilla/pdf.js/releases/download/v5.6.205/pdfjs-5.6.205-dist.zip",
-          "sha256": "0555ef47464e456125dcd0b9742cfa2aaed6d282e804e4dd1f1b99316b46ac00",
+          "url": "https://github.com/mozilla/pdf.js/releases/download/v6.4.299/pdfjs-6.4.299-dist.zip",
+          "sha256": "f2245eb7ef3f674c872fe568a177bfec15874f5c034613e55d8e307f93ebd86d",
           "dest": ".",
           "strip-components": 0
         },

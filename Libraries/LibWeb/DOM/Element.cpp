@@ -73,6 +73,7 @@
 #include <LibWeb/DOM/MutationObserver.h>
 #include <LibWeb/DOM/MutationType.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
+#include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/SelectorQuery.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
@@ -283,7 +284,7 @@ static void invalidate_content_blocker_style_if_needed(Element& element)
 {
     if (!element.is_connected())
         return;
-    if (!ContentBlocker::the().filtering_enabled() || !ContentBlocker::the().has_cosmetic_rules())
+    if (!element.document().content_blocking_enabled() || !ContentBlocker::the().has_cosmetic_rules())
         return;
 
     auto const& id = element.id();
@@ -306,6 +307,53 @@ static void for_each_ascii_whitespace_separated_token(Utf16View input, Function<
     }
 }
 
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::create(size_t capacity)
+{
+    VERIFY(capacity > 0 && capacity <= NumericLimits<u32>::max());
+    auto allocation_size = Checked<size_t>(capacity);
+    allocation_size *= sizeof(Attribute);
+    allocation_size += sizeof(AttributeList);
+    auto* memory = AttributeList::operator new(allocation_size.value());
+    return adopt_own(*new (memory) AttributeList(static_cast<u32>(capacity)));
+}
+
+Element::AttributeList::~AttributeList()
+{
+    for (auto& attribute : span())
+        attribute.~Attribute();
+}
+
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::ensure_room_for_one_more(NonnullOwnPtr<AttributeList> list)
+{
+    if (list->m_size < list->m_capacity)
+        return list;
+    return list->moved_into_new_list(max(static_cast<size_t>(list->m_capacity) * 2, static_cast<size_t>(4)));
+}
+
+NonnullOwnPtr<Element::AttributeList> Element::AttributeList::moved_into_new_list(size_t capacity)
+{
+    VERIFY(capacity >= m_size);
+    auto new_list = create(capacity);
+    for (auto& attribute : span())
+        new (&new_list->attributes()[new_list->m_size++]) Attribute(move(attribute));
+    return new_list;
+}
+
+void Element::AttributeList::unchecked_append(QualifiedName name, Utf16String value)
+{
+    VERIFY(m_size < m_capacity);
+    new (&attributes()[m_size++]) Attribute(move(name), move(value));
+}
+
+void Element::AttributeList::remove(size_t index)
+{
+    VERIFY(index < m_size);
+    auto* attributes = this->attributes();
+    for (size_t i = index; i + 1 < m_size; ++i)
+        attributes[i] = move(attributes[i + 1]);
+    attributes[--m_size].~Attribute();
+}
+
 Element::Element(Document& document, DOM::QualifiedName qualified_name)
     : ParentNode(document, NodeType::ELEMENT_NODE)
     , m_qualified_name(move(qualified_name))
@@ -314,17 +362,14 @@ Element::Element(Document& document, DOM::QualifiedName qualified_name)
 
 Element::~Element() = default;
 
-Element::AttributeList& Element::ensure_attribute_list()
-{
-    if (!m_attributes)
-        m_attributes = make<AttributeList>();
-    return *m_attributes;
-}
-
 void Element::append_to_attribute_list(QualifiedName name, Utf16String value)
 {
     add_to_subtree_attribute_name_filter(attribute_name_filter_bit(name.local_name()));
-    ensure_attribute_list().empend(move(name), move(value));
+    if (!m_attributes)
+        m_attributes = AttributeList::create(1);
+    else
+        m_attributes = AttributeList::ensure_room_for_one_more(m_attributes.release_nonnull());
+    m_attributes->unchecked_append(move(name), move(value));
 }
 
 void Element::add_to_subtree_attribute_name_filter(u64 bits)
@@ -338,7 +383,10 @@ void Element::ensure_attribute_capacity(size_t capacity)
 {
     if (capacity == 0)
         return;
-    ensure_attribute_list().ensure_capacity(capacity);
+    if (!m_attributes)
+        m_attributes = AttributeList::create(capacity);
+    else if (m_attributes->capacity() < capacity)
+        m_attributes = m_attributes->moved_into_new_list(capacity);
 }
 
 void Element::synchronize_attribute(Utf16FlyString const& qualified_name) const
@@ -413,9 +461,8 @@ size_t Element::external_memory_size() const
     if (!m_attributes)
         return size;
 
-    size = JS::saturating_add_external_memory_size(size, sizeof(AttributeList));
-    size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(*m_attributes));
-    for (auto const& attribute : *m_attributes)
+    size = JS::saturating_add_external_memory_size(size, sizeof(AttributeList) + m_attributes->capacity() * sizeof(Attribute));
+    for (auto const& attribute : m_attributes->span())
         size = JS::saturating_add_external_memory_size(size, JS::utf16_string_external_memory_size(attribute.value));
     return size;
 }
@@ -1176,7 +1223,7 @@ Vector<Utf16FlyString> Element::get_attribute_names() const
     if (!m_attributes)
         return {};
     Vector<Utf16FlyString> names;
-    for (auto const& attribute : *m_attributes)
+    for (auto const& attribute : m_attributes->span())
         names.append(attribute.name.as_string());
     return names;
 }
@@ -2896,7 +2943,7 @@ void Element::did_update_inline_style()
     bool had_style_attribute = m_style_attribute_is_dirty;
     Optional<Utf16String> old_value;
     if (m_attributes) {
-        for (auto const& attribute : *m_attributes) {
+        for (auto const& attribute : m_attributes->span()) {
             if (!attribute.name.namespace_().has_value() && attribute.name.local_name() == HTML::AttributeNames::style) {
                 had_style_attribute = true;
                 old_value = attribute.value;
@@ -4304,7 +4351,7 @@ WebIDL::ExceptionOr<void> Element::insert_adjacent_text(Utf16View where, Utf16Vi
 }
 
 // https://drafts.csswg.org/cssom-view-1/#determine-the-scroll-into-view-position
-static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead const& read, Element& target, CSSPixelRect target_bounding_border_box, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, Node& scrolling_box)
+static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead const& read, ScrollIntoViewTarget target, CSSPixelRect target_bounding_border_box, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, Node& scrolling_box)
 {
     // To determine the scroll-into-view position of a target, which is an Element, pseudo-element, or Range, with a
     // block flow direction position block, an inline base direction position inline, and a scrolling box scrolling box,
@@ -4342,16 +4389,18 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
 
     // AD-HOC: The spec doesn't specify when to do this, but we need to apply scroll-margin and scroll-margin to target
     //         bounding border box (https://drafts.csswg.org/cssom-view-1/#example-51af1565).
-    auto scroll_margin = target.computed_style()->scroll_margin();
-    auto scroll_margin_top = scroll_margin.top().to_px_or_zero(CSSPixels { 0 });
-    auto scroll_margin_right = scroll_margin.right().to_px_or_zero(CSSPixels { 0 });
-    auto scroll_margin_bottom = scroll_margin.bottom().to_px_or_zero(CSSPixels { 0 });
-    auto scroll_margin_left = scroll_margin.left().to_px_or_zero(CSSPixels { 0 });
+    if (target.has<Element*>()) {
+        auto scroll_margin = target.get<Element*>()->computed_style()->scroll_margin();
+        auto scroll_margin_top = scroll_margin.top().to_px_or_zero(CSSPixels { 0 });
+        auto scroll_margin_right = scroll_margin.right().to_px_or_zero(CSSPixels { 0 });
+        auto scroll_margin_bottom = scroll_margin.bottom().to_px_or_zero(CSSPixels { 0 });
+        auto scroll_margin_left = scroll_margin.left().to_px_or_zero(CSSPixels { 0 });
 
-    target_bounding_border_box.set_top(target_bounding_border_box.top() - scroll_margin_top);
-    target_bounding_border_box.set_right(target_bounding_border_box.right() + scroll_margin_left + scroll_margin_right);
-    target_bounding_border_box.set_bottom(target_bounding_border_box.bottom() + scroll_margin_top + scroll_margin_bottom);
-    target_bounding_border_box.set_left(target_bounding_border_box.left() - scroll_margin_left);
+        target_bounding_border_box.set_top(target_bounding_border_box.top() - scroll_margin_top);
+        target_bounding_border_box.set_right(target_bounding_border_box.right() + scroll_margin_left + scroll_margin_right);
+        target_bounding_border_box.set_bottom(target_bounding_border_box.bottom() + scroll_margin_top + scroll_margin_bottom);
+        target_bounding_border_box.set_left(target_bounding_border_box.left() - scroll_margin_left);
+    }
 
     // 2. Let scrolling box edge A be the beginning edge in the block flow direction of scrolling box, and
     //    let element edge A be target bounding border box’s edge on the same physical side as that of
@@ -4472,8 +4521,20 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
 }
 
 // https://drafts.csswg.org/cssom-view-1/#scroll-a-target-into-view
-static void scroll_an_element_into_view(Layout::BegunRead const& read, Element& target, Element::ScrollBehavior behavior, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, GC::Ptr<Element> container, GC::Ptr<WebIDL::Promise> promise)
+void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarget target, Element::ScrollBehavior behavior, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, GC::Ptr<Element> container, GC::Ptr<WebIDL::Promise> promise)
 {
+    auto target_document = [](ScrollIntoViewTarget current_target) -> Document& {
+        return current_target.visit(
+            [](Element* element) -> Document& { return element->document(); },
+            [](Range* range) -> Document& { return range->start_container()->document(); });
+    };
+
+    // AD-HOC: This algorithm is also invoked by internal navigation and parser tasks, which do
+    //         not necessarily have a JavaScript execution context. The scrolling algorithms create
+    //         promises even when their caller does not request one, so provide the target Document's
+    //         relevant settings object while those promises are created and resolved.
+    HTML::TemporaryExecutionContext temporary_execution_context { target_document(target).relevant_settings_object() };
+
     // 1. Let ancestorPromises be an empty set of Promises.
     GC::RootVector<GC::Ref<WebIDL::Promise>> ancestor_promises;
 
@@ -4489,29 +4550,59 @@ static void scroll_an_element_into_view(Layout::BegunRead const& read, Element& 
         auto const* containing_block = layout_node->containing_block();
         return containing_block && containing_block->is_viewport();
     };
-    Vector<Node&> scrolling_boxes;
-    if (!is_fixed_to_the_viewport(target)) {
-        for (auto* ancestor = target.parent(); ancestor; ancestor = ancestor->parent()) {
-            auto const* ancestor_layout_node = ancestor->layout_node(read);
-            if (ancestor_layout_node && Painting::has_committed_box(*ancestor_layout_node) && Painting::has_scrollable_overflow(*ancestor_layout_node))
-                scrolling_boxes.append(*ancestor);
-            if (is_fixed_to_the_viewport(*ancestor))
-                break;
-        }
-    }
+    auto current_target = target;
+    bool reached_container = false;
 
-    auto target_bounding_border_box = target.get_bounding_client_rect();
+    auto target_is_fixed_to_the_viewport = [&](ScrollIntoViewTarget current_target) {
+        return current_target.visit(
+            [&](Element* element) {
+                for (Node const* node = element; node; node = node->flat_tree_parent()) {
+                    if (is_fixed_to_the_viewport(*node))
+                        return true;
+                }
+                return false;
+            },
+            [&](Range* range) {
+                for (auto* node = range->start_container().ptr(); node; node = node->flat_tree_parent()) {
+                    if (is_fixed_to_the_viewport(*node))
+                        return true;
+                }
+                return false;
+            });
+    };
 
-    for (auto& scrolling_box : scrolling_boxes) {
+    auto get_target_bounding_border_box = [](ScrollIntoViewTarget current_target) {
+        return current_target.visit(
+            [](Element* element) {
+                return element->get_bounding_client_rect();
+            },
+            [](Range* range) {
+                // AD-HOC: Text-fragment scrolling centers the beginning of a match. Using the union
+                //         of every client rect can put the beginning of a long passage outside the viewport.
+                auto rects = range->get_client_rects();
+                auto const* rect = rects->length() > 0 ? rects->item(0) : nullptr;
+                if (!rect)
+                    return CSSPixelRect {};
+                return CSSPixelRect {
+                    CSSPixels::nearest_value_for(rect->x()),
+                    CSSPixels::nearest_value_for(rect->y()),
+                    CSSPixels::nearest_value_for(rect->width()),
+                    CSSPixels::nearest_value_for(rect->height()),
+                };
+            });
+    };
+    auto target_bounding_border_box = get_target_bounding_border_box(current_target);
+
+    auto scroll_scrolling_box = [&](Node& scrolling_box) {
         // 1. If the Document associated with target is not same origin with the Document associated with the element
         //    or viewport associated with scrolling box, abort any remaining iteration of this loop.
-        if (target.document().origin() != scrolling_box.document().origin())
-            break;
+        if (target_document(current_target).origin() != scrolling_box.document().origin())
+            return IterationDecision::Break;
 
         // 2. Let position be the scroll position resulting from running the steps to determine the scroll-into-view
         //    position of target with behavior as the scroll behavior, block as the block flow position, inline as the
         //    inline base direction position and scrolling box as the scrolling box.
-        auto position = determine_the_scroll_into_view_position(read, target, target_bounding_border_box, block, inline_, scrolling_box);
+        auto position = determine_the_scroll_into_view_position(read, current_target, target_bounding_border_box, block, inline_, scrolling_box);
 
         // AD-HOC: A smooth scroll leaves the scrolling box at its old scroll position while the outer scrolling boxes
         //         are considered, so move the target to where this scroll is going to leave it. The viewport is always
@@ -4526,10 +4617,16 @@ static void scroll_an_element_into_view(Layout::BegunRead const& read, Element& 
             }
         }
 
-        // 3. If position is not the same as scrolling box’s current scroll position, or scrolling box has an ongoing
-        //    smooth scroll,
-        // FIXME: Actually check this condition.
-        if (true) {
+        // 3. If position is not the same as scrolling box's current scroll position, then:
+        auto current_scroll_position = [&] {
+            if (scrolling_box.is_document()) {
+                auto& document = static_cast<Document&>(scrolling_box);
+                return document.navigable()->viewport_scroll_offset() + document.visual_viewport()->offset();
+            }
+            auto const* layout_node = scrolling_box.layout_node(read);
+            return layout_node ? Painting::scroll_offset(*layout_node) : CSSPixelPoint {};
+        }();
+        if (position != current_scroll_position) {
             // -> If scrolling box is associated with an element
             if (auto* element = as_if<Element>(scrolling_box)) {
                 if (auto navigable = element->document().navigable())
@@ -4551,8 +4648,48 @@ static void scroll_an_element_into_view(Layout::BegunRead const& read, Element& 
         //    or is a viewport whose document is a shadow-including inclusive ancestor of container, abort any
         //    remaining iteration of this loop.
         // NB: Our viewports *are* Documents in the DOM, so both checks are equivalent.
-        if (container != nullptr && scrolling_box.is_shadow_including_inclusive_ancestor_of(*container))
+        if (container != nullptr && scrolling_box.is_shadow_including_inclusive_ancestor_of(*container)) {
+            reached_container = true;
+            return IterationDecision::Break;
+        }
+
+        return IterationDecision::Continue;
+    };
+
+    for (;;) {
+        auto* ancestor = current_target.visit(
+            [](Element* element) -> Node* { return element->flat_tree_parent(); },
+            [](Range* range) -> Node* { return range->common_ancestor_container().ptr(); });
+
+        auto const target_is_fixed = target_is_fixed_to_the_viewport(current_target);
+        for (; ancestor && !ancestor->is_document(); ancestor = ancestor->flat_tree_parent()) {
+            auto const* ancestor_layout_node = ancestor->layout_node(read);
+            if (ancestor_layout_node && Painting::has_committed_box(*ancestor_layout_node) && Painting::has_scrollable_overflow(*ancestor_layout_node)) {
+                if (scroll_scrolling_box(*ancestor) == IterationDecision::Break)
+                    break;
+            }
+            if (is_fixed_to_the_viewport(*ancestor))
+                break;
+        }
+        if (reached_container)
             break;
+
+        auto& document = target_document(current_target);
+        if (!target_is_fixed && scroll_scrolling_box(document) == IterationDecision::Break)
+            break;
+
+        // Element scrolling retains CSSOM View's per-document behavior. Text-fragment ranges
+        // additionally bubble through same-origin iframe containers to bring the match into view.
+        if (current_target.has<Element*>())
+            break;
+
+        auto navigable = document.navigable();
+        auto container_element = navigable ? navigable->container() : nullptr;
+        if (!container_element || document.origin() != container_element->document().origin())
+            break;
+
+        current_target = ScrollIntoViewTarget { container_element.ptr() };
+        target_bounding_border_box = get_target_bounding_border_box(current_target);
     }
 
     // 4. Return scrollPromise, and run the remaining steps in parallel.
@@ -4601,7 +4738,7 @@ void Element::scroll_into_view(Element::ScrollIntoViewOptions const& options, GC
 
     // 8. Scroll the element into view with behavior, block, inline, and container. Let scrollPromise be the Promise
     //    returned from this step.
-    scroll_an_element_into_view(read, *this, behavior, block, inline_, container, promise);
+    scroll_a_target_into_view(read, ScrollIntoViewTarget { this }, behavior, block, inline_, container, promise);
 
     // FIXME: 9. Optionally perform some other action that brings the element to the user’s attention.
 }
@@ -5168,7 +5305,12 @@ ReadonlySpan<Element::Attribute> Element::attribute_list() const
 
 CSS::ComputedStyleRecordView Element::computed_style(Optional<CSS::PseudoElement> pseudo_element_type) const
 {
-    return document().style_computer().computed_style_record_view(installed_style(pseudo_element_type));
+    // NB: An element that was never styled has no record to view, which keeps a document that styles nothing from
+    //     needing a style computer.
+    auto const& style = installed_style(pseudo_element_type);
+    if (!style)
+        return {};
+    return document().style_computer().computed_style_record_view(style);
 }
 
 CSS::InstalledStyle const& Element::installed_style(Optional<CSS::PseudoElement> pseudo_element_type) const
@@ -5203,10 +5345,10 @@ void Element::update_animated_properties_for_abstract_element(Badge<Web::Animati
 
 void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
 {
-    Layout::ForcedReadScope read { document() };
     VERIFY(!style_record_identity || style_node_id() != 0);
     if (m_installed_style.record() == style_record_identity)
         return;
+    Layout::ForcedReadScope read { document() };
     auto held_before = exchange(m_installed_style, document().style_computer().install_style(read, style_record_identity));
     // The element holds the record it installed before until the engine takes the new one in, so the layout node reads
     // what it moves from before the element lets go of it.

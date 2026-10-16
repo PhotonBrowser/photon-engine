@@ -48,6 +48,7 @@
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
+#include <LibWeb/HTML/TextDirectiveGenerator.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Infra/SerializedURL.h>
@@ -160,6 +161,8 @@ void PageClient::visit_edges(JS::Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_page);
     visitor.visit(m_top_level_document_console_client);
+    for (auto& range : m_pending_text_fragment_generation_ranges)
+        visitor.visit(range.value);
     for (auto& promise : m_pending_delete_all_cookies_promises)
         visitor.visit(promise.value);
     for (auto& check : m_pending_unload_checks)
@@ -338,7 +341,7 @@ void PageClient::navigate_to_a_fragment(Web::HTML::CrossProcessId navigable_id, 
     auto* navigable = as_if<Web::HTML::LocalNavigable>(page().navigable_with_id(navigable_id).ptr());
     if (!navigable || navigable->has_been_destroyed() || !navigable->active_window())
         return;
-    navigable->navigate_to_a_fragment(url, history_handling, user_involvement, nullptr, {}, move(navigation_id), nullptr);
+    navigable->navigate_to_a_fragment(url, history_handling, user_involvement, nullptr, {}, move(navigation_id), nullptr, {});
 }
 
 void PageClient::navigate_to_a_javascript_url(Web::HTML::CrossProcessId navigable_id, URL::URL const& url, Web::HTML::HistoryHandlingBehavior history_handling, URL::Origin const& initiator_origin, Web::HTML::NavigationSourceSnapshot const& source_snapshot_params, Web::HTML::UserNavigationInvolvement user_involvement, Web::ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, Utf16String navigation_id)
@@ -860,6 +863,10 @@ void PageClient::page_did_update_editing_history_state(bool can_undo, bool can_r
     client().async_did_update_editing_history_state(m_id, can_undo, can_redo);
 }
 
+void PageClient::page_did_set_text_fragment_indication_visibility(bool visible)
+{
+    client().async_did_set_text_fragment_indication_visibility(m_id, visible);
+}
 void PageClient::page_did_request_refresh()
 {
     client().async_did_request_refresh(m_id);
@@ -946,11 +953,6 @@ void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin 
     client().async_did_request_external_url(m_id, url, initiator_origin, has_transient_activation);
 }
 
-void PageClient::page_did_create_new_document(Web::DOM::Document& document)
-{
-    initialize_js_console(document);
-}
-
 void PageClient::page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document& document)
 {
     auto& realm = document.relevant_settings_object().realm();
@@ -959,6 +961,12 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
 
     if (m_web_ui && &m_web_ui->document() != &document)
         m_web_ui.clear();
+
+    // NB: Only the active document of the top-level browsing context has its console client read, so a document gets
+    //     one when it becomes that, and the many documents that never do (such as those DOMParser creates) never pay
+    //     for one.
+    if (!document.console_client())
+        initialize_js_console(document);
 
     if (auto console_client = document.console_client()) {
         auto& web_content_console_client = as<WebContentConsoleClient>(*console_client);
@@ -1141,9 +1149,38 @@ void PageClient::page_did_set_device_pixel_ratio_for_testing(double ratio)
     }));
 }
 
-void PageClient::page_did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word)
+Optional<u64> PageClient::prepare_text_fragment_generation(GC::Ptr<Web::DOM::Range> range)
 {
-    client().async_did_request_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target, move(misspelled_word));
+    // Only the latest context menu can request a URL; release ranges from earlier requests.
+    m_pending_text_fragment_generation_ranges.clear();
+    if (!range)
+        return {};
+
+    auto generation_id = m_next_text_fragment_generation_id++;
+    m_pending_text_fragment_generation_ranges.set(generation_id, *range);
+    return generation_id;
+}
+
+Optional<URL::URL> PageClient::generate_text_fragment_url(u64 generation_id)
+{
+    auto range = m_pending_text_fragment_generation_ranges.take(generation_id);
+    if (!range.has_value())
+        return {};
+
+    auto navigable = page().hosted_focused_navigable();
+    GC::Ptr<Web::DOM::Document> document;
+    if (navigable)
+        document = navigable->active_document();
+    if (!document || &(*range)->start_container()->document() != document.ptr() || &(*range)->end_container()->document() != document.ptr())
+        return {};
+
+    return Web::HTML::generate_text_fragment_url(*document, **range, document->url());
+}
+
+void PageClient::page_did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, GC::Ptr<Web::DOM::Range> selected_text_range)
+{
+    auto text_fragment_generation_id = prepare_text_fragment_generation(selected_text_range);
+    client().async_did_request_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target, move(misspelled_word), text_fragment_generation_id);
 }
 
 void PageClient::page_did_request_spelling_menu_action_for_testing(Web::SpellingMenuActionForTesting action, u32 guess_index)
@@ -1151,9 +1188,10 @@ void PageClient::page_did_request_spelling_menu_action_for_testing(Web::Spelling
     client().async_did_request_spelling_menu_action_for_testing(m_id, action, guess_index);
 }
 
-void PageClient::page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers)
+void PageClient::page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers, GC::Ptr<Web::DOM::Range> selected_text_range)
 {
-    client().async_did_request_link_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers);
+    auto text_fragment_generation_id = prepare_text_fragment_generation(selected_text_range);
+    client().async_did_request_link_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, text_fragment_generation_id);
 }
 
 void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
@@ -1231,6 +1269,14 @@ void PageClient::page_did_request_alert(Utf16String const& message)
 void PageClient::alert_closed()
 {
     page().alert_closed();
+}
+
+void PageClient::page_did_request_before_unload(String const& source)
+{
+    client().async_did_request_before_unload(m_id, source);
+
+    if (m_webdriver)
+        m_webdriver->page_did_open_dialog({});
 }
 
 void PageClient::page_did_request_confirm(Utf16String const& message)
@@ -2107,6 +2153,11 @@ void PageClient::received_message_from_web_ui(Utf16String const& name, JS::Value
 {
     if (m_web_ui)
         m_web_ui->received_message_from_web_ui(name, data);
+}
+
+void PageClient::page_did_block_resource()
+{
+    client().async_did_block_resource(id());
 }
 
 void PageClient::page_did_start_network_request(u64 request_id, URL::URL const& url, ByteString const& method, Vector<HTTP::Header> const& request_headers, ReadonlyBytes request_body, Optional<String> initiator_type, String const& referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority priority)

@@ -109,12 +109,13 @@ impl SealedStyleInputs {
             )
         };
         // Every context's base URL goes into one buffer.
-        let resource_context_urls: Box<[u8]> = lent_contexts
-            .iter()
+        let mut resource_context_urls =
+            Vec::with_capacity(lent_contexts.iter().map(|entry| entry.base_url_length).sum());
+        for entry in lent_contexts {
             // SAFETY: Guaranteed by the caller.
-            .flat_map(|entry| unsafe { lent_values(entry.base_url, entry.base_url_length) })
-            .copied()
-            .collect();
+            resource_context_urls.extend_from_slice(unsafe { lent_values(entry.base_url, entry.base_url_length) });
+        }
+        let resource_context_urls = resource_context_urls.into_boxed_slice();
         let mut offset = 0;
         let resource_contexts: Box<[_]> = lent_contexts
             .iter()
@@ -429,13 +430,6 @@ pub extern "C" fn style_engine_note_style_node_beside_flown_transaction(host: &D
     if let Some(node) = StyleNodeID::from_raw(node) {
         host.engine_memo().beside_flown_transaction.borrow_mut().insert(node);
     }
-}
-
-/// Whether the element `node` names arrived, moved or retired beside the style transaction of `host`'s document that
-/// flew.
-#[unsafe(no_mangle)]
-pub extern "C" fn style_engine_style_node_is_beside_flown_transaction(host: &DocumentHost, node: u32) -> bool {
-    StyleNodeID::from_raw(node).is_some_and(|node| host.engine_memo().beside_flown_transaction.borrow().contains(&node))
 }
 
 /// Whether the frame whose style transaction `host`'s document drains applied the element `style_node` names its record

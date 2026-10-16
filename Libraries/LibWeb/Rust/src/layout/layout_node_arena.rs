@@ -1237,9 +1237,6 @@ pub(crate) struct LayoutNodeArena {
     live_count: u32,
     /// The slots whose intrinsic size cache entries the layout stage drops before its next run.
     intrinsic_size_cache_drops: RefCell<Vec<u32>>,
-    table_cell_measurement_cache_misses: Cell<u64>,
-    intrinsic_measurements: Cell<u64>,
-    intrinsic_inline_measurements: Cell<u64>,
     default_scroll_shift_anchors: RefCell<Vec<DefaultScrollShiftAnchorSlot>>,
     any_default_scroll_shift_anchor_ever_stored: Cell<bool>,
     text_slots: TextSlots,
@@ -1254,6 +1251,7 @@ pub(crate) struct LayoutNodeArena {
     /// under a key so that it survives the node's identity being retired and re-issued.
     next_rows_built_for_same_node: Vec<Cell<NodeSlotId>>,
     fc_run_cache_store: super::fc_run_cache::FcRunCacheArenaStore,
+    in_flow_block_cache_store: super::in_flow_block_cache::InFlowBlockCacheStore,
     pub(super) layout_trace: super::trace::LayoutTrace,
     pub(super) innermost_run: Cell<(NodeSlotId, NodeSlotId)>,
     pub(crate) paintable_rows: crate::painting::paintable_rows::PaintableRowStore,
@@ -1353,9 +1351,6 @@ impl LayoutNodeArena {
             next_index: 0,
             live_count: 0,
             intrinsic_size_cache_drops: RefCell::new(Vec::new()),
-            table_cell_measurement_cache_misses: Cell::new(0),
-            intrinsic_measurements: Cell::new(0),
-            intrinsic_inline_measurements: Cell::new(0),
             default_scroll_shift_anchors: RefCell::new(Vec::new()),
             any_default_scroll_shift_anchor_ever_stored: Cell::new(false),
             text_slots: TextSlots::default(),
@@ -1367,6 +1362,7 @@ impl LayoutNodeArena {
             svg_paint_resources: crate::painting::svg_paint_resources::SvgPaintResources::default(),
             next_rows_built_for_same_node: Vec::new(),
             fc_run_cache_store: super::fc_run_cache::FcRunCacheArenaStore::default(),
+            in_flow_block_cache_store: super::in_flow_block_cache::InFlowBlockCacheStore::default(),
             layout_trace: super::trace::LayoutTrace::default(),
             innermost_run: Cell::new((NodeSlotId::INVALID, NodeSlotId::INVALID)),
             paintable_rows: crate::painting::paintable_rows::PaintableRowStore::default(),
@@ -1434,6 +1430,10 @@ impl LayoutNodeArena {
 
     pub(crate) fn fc_run_cache_store(&self) -> &super::fc_run_cache::FcRunCacheArenaStore {
         &self.fc_run_cache_store
+    }
+
+    pub(crate) fn in_flow_block_cache_store(&self) -> &super::in_flow_block_cache::InFlowBlockCacheStore {
+        &self.in_flow_block_cache_store
     }
 
     pub(crate) fn end_layout_pass(&self) {
@@ -1605,9 +1605,8 @@ impl LayoutNodeArena {
             self.pending_rebuilt_subtree_roots.get_mut().clear();
             self.pending_layout_tree_update_escaped_rebuild_roots.set(false);
         }
-        if !self.scrollable_overflow.non_child_boxes.borrow().is_empty() {
-            self.scrollable_overflow.contained_boxes_dirty.set(true);
-        }
+        // NB: The root was unlinked through remove_child(), which already noted what its subtree takes out of the
+        //     overflow index.
         if self.scrollable_overflow.viewport.get() == Some(root) {
             self.scrollable_overflow.viewport.set(None);
             self.scrollable_overflow.non_child_boxes.borrow_mut().clear();
@@ -1709,6 +1708,7 @@ impl LayoutNodeArena {
         self.owned_image_natural_sizes.get_mut().remove(&id);
         self.owned_image_providers.get_mut().remove(&id);
         self.fc_run_cache_store.remove_entry(index);
+        self.in_flow_block_cache_store.remove_entry(index);
         self.remove_layout_update_flag_node(id);
         self.raw_table_column_spans.get_mut().remove(&id);
         if self.replaced_paint_facts.get_mut().contains_key(&id) {
@@ -4677,32 +4677,6 @@ impl LayoutNodeArena {
         self.node_pre_order_label(node) < self.node_pre_order_label(other)
     }
 
-    pub(crate) fn note_table_cell_measurement_cache_miss(&self) {
-        self.table_cell_measurement_cache_misses
-            .set(self.table_cell_measurement_cache_misses.get() + 1);
-    }
-
-    pub(crate) fn table_cell_measurement_cache_miss_count(&self) -> u64 {
-        self.table_cell_measurement_cache_misses.get()
-    }
-
-    pub(crate) fn note_intrinsic_inline_measurement(&self) {
-        self.intrinsic_inline_measurements
-            .set(self.intrinsic_inline_measurements.get() + 1);
-    }
-
-    pub(crate) fn intrinsic_inline_measurement_count(&self) -> u64 {
-        self.intrinsic_inline_measurements.get()
-    }
-
-    pub(crate) fn note_intrinsic_measurement(&self) {
-        self.intrinsic_measurements.set(self.intrinsic_measurements.get() + 1);
-    }
-
-    pub(crate) fn intrinsic_measurement_count(&self) -> u64 {
-        self.intrinsic_measurements.get()
-    }
-
     pub(crate) fn saved_abspos_layout_inputs(&self, data: &NodeData) -> Option<AbsposLayoutInputs> {
         let (index, metadata) = self.slot_for_data(data);
         self.paintable_rows
@@ -4839,7 +4813,7 @@ impl LayoutNodeArena {
     pub(crate) fn with_current_committed_fragment<R>(
         &self,
         node: NodeSlotId,
-        read: impl FnOnce(&super::fragment_tree::Fragment) -> R,
+        read: impl FnOnce(&std::sync::Arc<super::fragment_tree::Fragment>) -> R,
     ) -> Option<R> {
         self.paintable_rows.with_current_committed_fragment(
             node.slot_index(),
@@ -5206,12 +5180,11 @@ impl LayoutNodeArena {
             self.fragment_cache_epoch_changed_during_layout_pass.set(true);
         }
         self.fc_run_cache_store.note_invalidated_entry(node);
+        // NB: An in-flow block entry is valid for one epoch only, so it never matches again.
+        self.in_flow_block_cache_store.remove_entry(node.slot_index());
     }
 
     pub(crate) fn note_structural_change_at_and_above(&self, node: NodeSlotId) {
-        if !self.scrollable_overflow.non_child_boxes.borrow().is_empty() {
-            self.scrollable_overflow.contained_boxes_dirty.set(true);
-        }
         self.invalidate_at_and_above(node, AncestorInvalidation::StructuralChange);
     }
 
@@ -5284,6 +5257,7 @@ impl LayoutNodeArena {
         self.assign_pre_order_labels_to_inserted_subtree(parent, child);
         self.note_layout_subtree_attached(child);
         self.pending_attached_subtree_roots.borrow_mut().push(child);
+        self.note_overflow_contained_boxes_may_move_with_subtree(child);
         self.note_structural_change_at_and_above(parent);
     }
 
@@ -5291,6 +5265,7 @@ impl LayoutNodeArena {
         if self.paintable_row_count() > 0 {
             self.push_enclosing_paint_order_damage(child);
         }
+        self.note_overflow_contained_boxes_may_move_with_subtree(child);
         self.unlink_child(parent, child);
         self.note_structural_change_at_and_above(parent);
     }

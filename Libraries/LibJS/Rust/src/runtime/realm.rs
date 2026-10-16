@@ -25,6 +25,7 @@ use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::global_object::{GlobalObject, set_default_global_bindings};
 use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::object::allocate_object;
+use crate::runtime::realm_watchpoints::WatchedCondition;
 use crate::runtime::shape::Shape;
 
 /// The parts of a realm the interpreter does not read.
@@ -33,6 +34,16 @@ pub struct RealmStorage {
     /// The cell that an embedder written in Rust keeps its data of the realm in, next to [[HostDefined]], which an
     /// embedder written in C++ sets.
     embedder_data: ForeignCellSlot,
+    /// Whether %RegExp.prototype% and %RegExp% have the properties the fast paths of RegExp skip reading as the realm
+    /// made them (see `runtime::realm_watchpoints`).
+    pub(crate) regexp_primordial_properties: WatchedCondition,
+    /// Whether ArraySpeciesCreate makes plain arrays (see `runtime::realm_watchpoints`).
+    pub(crate) array_species: WatchedCondition,
+    /// Whether %Array.prototype%[@@iterator] is %Array.prototype.values% (see `runtime::realm_watchpoints`).
+    pub(crate) array_iterator_method: WatchedCondition,
+    /// Whether %Array.prototype% and %Object.prototype% have no @@isConcatSpreadable (see
+    /// `runtime::realm_watchpoints`).
+    pub(crate) array_prototypes_without_is_concat_spreadable: WatchedCondition,
 }
 
 define_cell!(Realm, Other);
@@ -46,6 +57,14 @@ unsafe impl Trace for Realm {
         self.global_declarative_environment.trace(visitor);
         self.host_defined.trace(visitor);
         self.storage.embedder_data.trace(visitor);
+        self.storage.regexp_primordial_properties.trace(visitor);
+        self.storage.array_species.trace(visitor);
+        self.storage.array_iterator_method.trace(visitor);
+        self.storage
+            .array_prototypes_without_is_concat_spreadable
+            .trace(visitor);
+        self.array_iterator_next_watchpoint_set.trace(visitor);
+        self.array_iterator_return_watchpoint_set.trace(visitor);
     }
 }
 
@@ -84,6 +103,7 @@ realm_intrinsic_accessors! {
         throw_type_error_accessor: Accessor,
         throw_type_error_function: FunctionObject,
         array_prototype_values_function: FunctionObject,
+        generator_prototype_next_function: FunctionObject,
         eval_function: FunctionObject,
         array_iterator_prototype: Object,
     }
@@ -119,6 +139,8 @@ impl Realm {
             global_environment: Cell::new(None),
             intrinsics: Cell::new(None),
             host_defined: ForeignCellSlot::empty(),
+            array_iterator_next_watchpoint_set: Cell::new(None),
+            array_iterator_return_watchpoint_set: Cell::new(None),
             storage: RealmStorage::default(),
         })
     }

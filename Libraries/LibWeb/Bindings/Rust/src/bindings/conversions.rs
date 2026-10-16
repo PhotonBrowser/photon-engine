@@ -8,19 +8,24 @@
 //! https://webidl.spec.whatwg.org/#es-type-mapping
 
 use core::mem::MaybeUninit;
+use core::ops::Range;
+use std::borrow::Cow;
 
 use ak::{Utf16String, Utf16StringUnits, convert_valid_utf16_to_utf8, utf8_length_from_valid_utf16};
 use libjs_rust::api::{
     Array, ArrayBuffer, ArrayBufferOrder, DataView, ErrorKind, ErrorType, FunctionObject, Gc, Object, PrimitiveString,
-    PropertyKey, ThrowCompletionOr, TypedArrayBase, TypedArrayKind, Value, Vm, get_view_byte_length,
-    is_typed_array_out_of_bounds, is_view_out_of_bounds, make_data_view_with_buffer_witness_record,
-    make_typed_array_with_buffer_witness_record, to_well_formed, typed_array_byte_length,
+    PropertyKey, Root, ThrowCompletionOr, Trace, TypedArrayBase, TypedArrayKind, Value, Vm,
+    get_iterator_from_method_impl, get_view_byte_length, is_typed_array_out_of_bounds, is_view_out_of_bounds,
+    iterator_step_value, make_data_view_with_buffer_witness_record, make_typed_array_with_buffer_witness_record,
+    to_well_formed, typed_array_byte_length,
 };
 
 use crate::bindings::CallContext;
-use crate::bindings::interface::create_dictionary_object;
+use crate::bindings::interface::{Interface, Ref, create_dictionary_object, wrap};
+use crate::bindings::services::web_bindings_object_implements_interface;
 
 /// A USVString, a string without lone surrogates. Its UTF-16 code units are always well-formed.
+#[derive(Clone)]
 pub(crate) struct UsvString(Utf16String);
 
 impl UsvString {
@@ -82,7 +87,7 @@ impl UsvString {
 
     /// The string of the code units, with U+FFFD in place of every surrogate that is not part of a pair.
     pub(crate) fn from_utf16_replacing_lone_surrogates(code_units: &[u16]) -> Self {
-        Self(Utf16String::well_formed_from_utf16(code_units))
+        Self(to_well_formed(&Utf16String::from_utf16(code_units)))
     }
 }
 
@@ -106,6 +111,43 @@ pub(crate) fn to_usv_string(vm: &Vm, value: Value) -> ThrowCompletionOr<UsvStrin
     Ok(UsvString(to_well_formed(&string)))
 }
 
+/// The value of an enumeration that a JS value names, https://webidl.spec.whatwg.org/#js-enumeration: the index of
+/// the string that the value converts to among the values of the enumeration, which are ASCII.
+pub(crate) fn to_enumeration_value(
+    vm: &Vm,
+    value: Value,
+    enumeration_name: &str,
+    enumeration_values: &[&str],
+) -> ThrowCompletionOr<usize> {
+    // 1. Let S be the result of calling ? ToString(V).
+    let string = value.to_utf16_string(vm)?;
+
+    // 2. If S is not one of E's enumeration values, then throw a TypeError.
+    // 3. Return the enumeration value of type E that is equal to S.
+    let index = enumeration_values
+        .iter()
+        .position(|enumeration_value| match string.as_units() {
+            Utf16StringUnits::Ascii(units) => units == enumeration_value.as_bytes(),
+            Utf16StringUnits::Utf16(units) => units.iter().copied().eq(enumeration_value.bytes().map(u16::from)),
+        });
+    match index {
+        Some(index) => Ok(index),
+        None => vm.throw_completion(
+            ErrorKind::TypeError,
+            ErrorType::InvalidEnumerationValue,
+            &[&string, &enumeration_name],
+        ),
+    }
+}
+
+/// A value of an enumeration converted to a JS value, https://webidl.spec.whatwg.org/#js-enumeration
+pub(crate) fn enumeration_value_to_js(cx: &CallContext, enumeration_value: &str) -> Value {
+    Value::from_string(PrimitiveString::create_from_ascii(
+        cx.vm(),
+        enumeration_value.as_bytes(),
+    ))
+}
+
 /// A JS value converted to a boolean, https://webidl.spec.whatwg.org/#js-boolean
 #[expect(
     clippy::unnecessary_wraps,
@@ -116,6 +158,85 @@ pub(crate) fn to_boolean(value: Value) -> ThrowCompletionOr<bool> {
     // 2. Return the IDL boolean value that is the one that represents the same truth value as the JavaScript Boolean
     //    value x.
     Ok(value.to_boolean())
+}
+
+/// A JS value converted to a long, https://webidl.spec.whatwg.org/#js-long
+pub(crate) fn to_long(vm: &Vm, value: Value) -> ThrowCompletionOr<i32> {
+    // 1. Let x be ? ConvertToInt(V, 32, "signed"), which is ToInt32 without the extended attributes that change it.
+    // 2. Return the IDL long value that represents the same numeric value as x.
+    value.to_i32(vm)
+}
+
+/// A JS value converted to an unsigned long, https://webidl.spec.whatwg.org/#js-unsigned-long
+pub(crate) fn to_unsigned_long(vm: &Vm, value: Value) -> ThrowCompletionOr<u32> {
+    // 1. Let x be ? ConvertToInt(V, 32, "unsigned"), which is ToUint32 without the extended attributes that change
+    //    it.
+    // 2. Return the IDL unsigned long value that represents the same numeric value as x.
+    value.to_u32(vm)
+}
+
+/// The number that https://webidl.spec.whatwg.org/#abstract-opdef-converttoint has after step 10 for a bit length of
+/// 64, as WebIDL::convert_to_int() of the C++ bindings computes it.
+///
+/// FIXME: The C++ bindings do the arithmetic in doubles, which cannot represent most integers near 2^64, so a
+///        negative number does not wrap around to the integer the spec asks for: -1 becomes 2^64. The Rust bindings
+///        do the same, so that an interface behaves the same in either language, until both are corrected together.
+fn to_number_modulo_two_to_the_64(vm: &Vm, value: Value) -> ThrowCompletionOr<f64> {
+    const TWO_TO_THE_64: f64 = 18_446_744_073_709_551_616.0;
+
+    // 4. Let x be ? ToNumber(V).
+    // 5. If x is −0, then set x to +0.
+    let x = value.to_double(vm)?;
+
+    // 8. If x is NaN, +0, +∞, or −∞, then return +0.
+    if x.is_nan() || x == 0.0 || x.is_infinite() {
+        return Ok(0.0);
+    }
+
+    // 9. Set x to IntegerPart(x).
+    let x = x.trunc();
+
+    // 10. Set x to x modulo 2^bitLength.
+    let remainder = x % TWO_TO_THE_64;
+    Ok(if remainder < 0.0 {
+        remainder + TWO_TO_THE_64
+    } else {
+        remainder
+    })
+}
+
+/// A JS value converted to a long long, https://webidl.spec.whatwg.org/#js-long-long
+pub(crate) fn to_long_long(vm: &Vm, value: Value) -> ThrowCompletionOr<i64> {
+    const TWO_TO_THE_63: f64 = 9_223_372_036_854_775_808.0;
+    const TWO_TO_THE_64: f64 = 18_446_744_073_709_551_616.0;
+
+    // 1. Let x be ? ConvertToInt(V, 64, "signed").
+    let x = to_number_modulo_two_to_the_64(vm, value)?;
+
+    // 11. If signedness is "signed" and x ≥ 2^(bitLength − 1), then return x − 2^(bitLength).
+    // NB: The C++ bindings compare with the largest long long, which is 2^63 as a double, and with greater than.
+    let x = if x > TWO_TO_THE_63 { x - TWO_TO_THE_64 } else { x };
+
+    // 2. Return the IDL long long value that represents the same numeric value as x.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "x is an integer of at most 2^63, which saturates"
+    )]
+    Ok(x as i64)
+}
+
+/// A JS value converted to an unsigned long long, https://webidl.spec.whatwg.org/#js-unsigned-long-long
+pub(crate) fn to_unsigned_long_long(vm: &Vm, value: Value) -> ThrowCompletionOr<u64> {
+    // 1. Let x be ? ConvertToInt(V, 64, "unsigned").
+    let x = to_number_modulo_two_to_the_64(vm, value)?;
+
+    // 2. Return the IDL unsigned long long value that represents the same numeric value as x.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "x is an integer from 0 to 2^64, which saturates"
+    )]
+    Ok(x as u64)
 }
 
 /// A JS value converted to a float, https://webidl.spec.whatwg.org/#js-float
@@ -145,6 +266,27 @@ pub(crate) fn to_float(vm: &Vm, value: Value, identifier: &str) -> ThrowCompleti
         );
     }
     Ok(y)
+}
+
+/// A JS value converted to an unrestricted float, https://webidl.spec.whatwg.org/#js-unrestricted-float
+pub(crate) fn to_unrestricted_float(vm: &Vm, value: Value) -> ThrowCompletionOr<f32> {
+    // 1. Let x be ? ToNumber(V).
+    let x = value.to_double(vm)?;
+
+    // 2. If x is NaN, then return the IDL unrestricted float value that represents the IEEE 754 NaN value with the
+    //    bit pattern 0x7fc00000.
+    // 3. Let S be the set of finite IEEE 754 single-precision floating point values except −0, but with two special
+    //    values added: 2^128 and −2^128.
+    // 4. Let y be the number in S that is closest to x, selecting the number with an even significand if there are two
+    //    equally close values. (The two special values 2^128 and −2^128 are considered to have even significands for
+    //    this purpose.)
+    // 5. If y is 2^128, return +∞.
+    // 6. If y is −2^128, return −∞.
+    // 7. If y is +0 and x is negative, return −0.
+    // 8. Return y.
+    // NB: Rounding x to the nearest float gives an infinity where step 4 gives one of the two special values.
+    #[allow(clippy::cast_possible_truncation, reason = "the spec rounds to the closest float")]
+    Ok(x as f32)
 }
 
 /// A JS value converted to an unrestricted double, https://webidl.spec.whatwg.org/#js-unrestricted-double
@@ -214,64 +356,158 @@ fn check_buffer_of_buffer_source(
 }
 
 /// An IDL BufferSource value, https://webidl.spec.whatwg.org/#BufferSource
+#[derive(Clone, Copy)]
 pub(crate) enum BufferSource {
     ArrayBuffer(Gc<ArrayBuffer>),
     DataView(Gc<DataView>),
     TypedArray(Gc<TypedArrayBase>),
 }
 
+/// An IDL ArrayBufferView value, https://webidl.spec.whatwg.org/#ArrayBufferView
+#[derive(Clone, Copy)]
+pub(crate) enum ArrayBufferView {
+    DataView(Gc<DataView>),
+    TypedArray(Gc<TypedArrayBase>),
+}
+
+impl From<ArrayBufferView> for BufferSource {
+    fn from(view: ArrayBufferView) -> Self {
+        match view {
+            ArrayBufferView::DataView(view) => Self::DataView(view),
+            ArrayBufferView::TypedArray(typed_array) => Self::TypedArray(typed_array),
+        }
+    }
+}
+
+pub(crate) struct BufferSourceExtent {
+    pub(crate) buffer: Gc<ArrayBuffer>,
+    pub(crate) is_out_of_bounds: bool,
+    pub(crate) byte_offset: usize,
+    pub(crate) byte_length: usize,
+    pub(crate) element_size: usize,
+}
+
 impl BufferSource {
-    /// Calls the function with the bytes that the buffer source holds, https://webidl.spec.whatwg.org/#dfn-get-buffer-source-copy,
-    /// without copying them unless their buffer is shared. A detached buffer and a view that is out of bounds hold
-    /// no bytes.
+    pub(crate) fn extent(&self) -> BufferSourceExtent {
+        match self {
+            Self::TypedArray(typed_array) => {
+                let record = make_typed_array_with_buffer_witness_record(typed_array, ArrayBufferOrder::SeqCst);
+                // AD-HOC: The WebIDL spec has not been updated for resizable ArrayBuffer objects. This check follows
+                //         the behavior of step 7 of the TypedArray.prototype.buffer getter.
+                let is_out_of_bounds = is_typed_array_out_of_bounds(&record);
+                let byte_length = if is_out_of_bounds {
+                    0
+                } else {
+                    typed_array_byte_length(&record) as usize
+                };
+                BufferSourceExtent {
+                    buffer: typed_array.viewed_array_buffer(),
+                    is_out_of_bounds,
+                    byte_offset: typed_array.byte_offset() as usize,
+                    byte_length,
+                    element_size: typed_array.element_size() as usize,
+                }
+            }
+            Self::DataView(view) => {
+                let record = make_data_view_with_buffer_witness_record(*view, ArrayBufferOrder::SeqCst);
+                // AD-HOC: The WebIDL spec has not been updated for resizable ArrayBuffer objects. This check follows
+                //         the behavior of step 7 of the DataView.prototype.buffer getter.
+                let is_out_of_bounds = is_view_out_of_bounds(&record);
+                let byte_length = if is_out_of_bounds {
+                    0
+                } else {
+                    get_view_byte_length(&record) as usize
+                };
+                BufferSourceExtent {
+                    buffer: view.viewed_array_buffer(),
+                    is_out_of_bounds,
+                    byte_offset: view.byte_offset() as usize,
+                    byte_length,
+                    element_size: 1,
+                }
+            }
+            Self::ArrayBuffer(buffer) => BufferSourceExtent {
+                buffer: *buffer,
+                is_out_of_bounds: false,
+                byte_offset: 0,
+                byte_length: buffer.byte_length(),
+                element_size: 1,
+            },
+        }
+    }
+
+    /// https://webidl.spec.whatwg.org/#dfn-get-buffer-source-copy, without copying the bytes unless their buffer is
+    /// shared.
     ///
     /// # Safety
     ///
     /// The function must not run script or allocate a cell, either of which could detach, resize or free the buffer
     /// that the bytes are in.
     pub(crate) unsafe fn with_bytes<R>(&self, function: impl FnOnce(&[u8]) -> R) -> R {
-        let (buffer, offset, length) = match self {
-            Self::TypedArray(typed_array) => {
-                let record = make_typed_array_with_buffer_witness_record(typed_array, ArrayBufferOrder::SeqCst);
-                // AD-HOC: The WebIDL spec has not been updated for resizable ArrayBuffer objects. This check follows
-                //         the behavior of step 7 of the TypedArray.prototype.buffer getter.
-                if is_typed_array_out_of_bounds(&record) {
-                    return function(&[]);
-                }
-                let length = typed_array_byte_length(&record) as usize;
-                (
-                    typed_array.viewed_array_buffer(),
-                    typed_array.byte_offset() as usize,
-                    length,
-                )
-            }
-            Self::DataView(view) => {
-                let record = make_data_view_with_buffer_witness_record(*view, ArrayBufferOrder::SeqCst);
-                // AD-HOC: The WebIDL spec has not been updated for resizable ArrayBuffer objects. This check follows
-                //         the behavior of step 7 of the DataView.prototype.buffer getter.
-                if is_view_out_of_bounds(&record) {
-                    return function(&[]);
-                }
-                let length = get_view_byte_length(&record) as usize;
-                (view.viewed_array_buffer(), view.byte_offset() as usize, length)
-            }
-            Self::ArrayBuffer(buffer) => (*buffer, 0, buffer.byte_length()),
-        };
-
+        let extent = self.extent();
         // 7. If IsDetachedBuffer(jsArrayBuffer) is true, then return the empty byte sequence.
-        if buffer.is_detached() || length == 0 {
-            return function(&[]);
-        }
+        let held_byte_length = if extent.buffer.is_detached() {
+            0
+        } else {
+            extent.byte_length
+        };
+        let held_bytes = extent.byte_offset..extent.byte_offset + held_byte_length;
+        // SAFETY: The caller keeps the function from running script and from allocating.
+        unsafe { with_bytes_of_buffer(&extent.buffer, held_bytes, function) }
+            .expect("a buffer has the bytes of its views that are in bounds")
+    }
+}
 
-        // NB: Another thread can write the bytes of a shared buffer at any time, so the function gets a copy of them.
-        if buffer.is_shared_array_buffer() {
-            return function(&buffer.copy_to_byte_buffer(offset, length));
-        }
-        let bytes = buffer.with_data_block(|data_block| data_block.data_at(offset));
-        assert!(!bytes.is_null());
-        // SAFETY: The buffer is not detached and holds `length` bytes from `offset`, which nothing writes while the
-        //         function runs, as the buffer is not shared and the caller keeps script from running.
-        function(unsafe { core::slice::from_raw_parts(bytes, length) })
+/// # Safety
+///
+/// The function must not run script or allocate a cell, either of which could detach, resize or free the buffer that
+/// the bytes are in.
+pub(crate) unsafe fn with_bytes_of_buffer<R>(
+    buffer: &ArrayBuffer,
+    bytes: Range<usize>,
+    function: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
+    // SAFETY: The caller keeps the function from running script and from allocating.
+    unsafe { borrowed_or_copied_bytes_of_buffer(buffer, bytes) }.map(|bytes| function(&bytes))
+}
+
+/// `None` when the buffer does not have the bytes.
+pub(crate) fn copy_of_bytes_of_buffer(buffer: &ArrayBuffer, bytes: Range<usize>) -> Option<Vec<u8>> {
+    // SAFETY: The bytes are borrowed only while they are copied, which neither runs script nor allocates a cell.
+    unsafe { borrowed_or_copied_bytes_of_buffer(buffer, bytes) }.map(Cow::into_owned)
+}
+
+/// # Safety
+///
+/// Nothing may run script or allocate a cell while the bytes are borrowed, either of which could detach, resize or
+/// free the buffer that they are in.
+unsafe fn borrowed_or_copied_bytes_of_buffer(buffer: &ArrayBuffer, bytes: Range<usize>) -> Option<Cow<'_, [u8]>> {
+    if bytes.is_empty() {
+        return Some(Cow::Borrowed(&[]));
+    }
+    if buffer.is_detached() || bytes.end > buffer.byte_length() {
+        return None;
+    }
+
+    // NB: Another thread can write the bytes of a shared buffer at any time, so they are copied.
+    if buffer.is_shared_array_buffer() {
+        return Some(Cow::Owned(buffer.copy_to_byte_buffer(bytes.start, bytes.len())));
+    }
+    let data = buffer.with_data_block(|data_block| data_block.data_at(bytes.start));
+    assert!(!data.is_null());
+    // SAFETY: The buffer is not detached and has the bytes, which nothing writes while they are borrowed, as the
+    //         buffer is not shared and the caller keeps script from running.
+    Some(Cow::Borrowed(unsafe { core::slice::from_raw_parts(data, bytes.len()) }))
+}
+
+impl ArrayBufferView {
+    /// # Safety
+    ///
+    /// The function must not run script or allocate a cell, either of which could detach, resize or free the buffer
+    /// that the bytes are in.
+    pub(crate) unsafe fn with_bytes<R>(&self, function: impl FnOnce(&[u8]) -> R) -> R {
+        // SAFETY: The caller keeps the function from running script and from allocating.
+        unsafe { BufferSource::from(*self).with_bytes(function) }
     }
 }
 
@@ -311,7 +547,97 @@ pub(crate) fn to_buffer_source(vm: &Vm, value: Value, rules: &BufferSourceRules)
     }
 
     // 19. Throw a TypeError.
+    throw_no_union_types_matched(vm)
+}
+
+/// A JS value converted to an ArrayBufferView, with the steps of the conversion to a union type that apply to the
+/// types of the views, https://webidl.spec.whatwg.org/#js-union
+pub(crate) fn to_array_buffer_view(
+    vm: &Vm,
+    value: Value,
+    rules: &BufferSourceRules,
+) -> ThrowCompletionOr<ArrayBufferView> {
+    if value.is_object() {
+        let object = value.as_object();
+
+        // 8. If V is an Object and V has a [[DataView]] internal slot, then:
+        //     1. If types includes DataView, then return the result of converting V to DataView.
+        if let Some(view) = object.downcast::<DataView>() {
+            check_buffer_of_buffer_source(vm, &view.viewed_array_buffer(), "DataView", rules)?;
+            return Ok(ArrayBufferView::DataView(view));
+        }
+
+        // 9. If V is an Object and V has a [[TypedArrayName]] internal slot, then:
+        //     1. If types includes a typed array type whose name is the value of V's [[TypedArrayName]] internal slot,
+        //        then return the result of converting V to that type.
+        if let Some(typed_array) = object.downcast::<TypedArrayBase>() {
+            let type_name = format!("{:?}", typed_array.kind());
+            check_buffer_of_buffer_source(vm, &typed_array.viewed_array_buffer(), &type_name, rules)?;
+            return Ok(ArrayBufferView::TypedArray(typed_array));
+        }
+    }
+
+    // 19. Throw a TypeError.
+    throw_no_union_types_matched(vm)
+}
+
+/// The last step of the conversion of a JS value to a union type, https://webidl.spec.whatwg.org/#js-union, with
+/// the message of the C++ bindings.
+pub(crate) fn throw_no_union_types_matched<T>(vm: &Vm) -> ThrowCompletionOr<T> {
+    // 19. Throw a TypeError.
     vm.throw_completion_with_message(ErrorKind::TypeError, "No union types matched".to_string())
+}
+
+/// A JS value converted to an IDL sequence, https://webidl.spec.whatwg.org/#js-sequence, with the conversion of its
+/// elements. The elements are in a Vec, which hides cells from the collector, so their type holds none.
+pub(crate) fn sequence_from_js<T>(
+    vm: &Vm,
+    value: Value,
+    element_from_js: impl FnMut(Value) -> ThrowCompletionOr<T>,
+) -> ThrowCompletionOr<Vec<T>> {
+    // 1. If V is not an Object, throw a TypeError.
+    if !value.is_object() {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&value]);
+    }
+
+    // 2. Let method be ? GetMethod(V, %Symbol.iterator%).
+    // 3. If method is undefined, throw a TypeError.
+    let Some(method) = iterator_method(vm, value)? else {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotIterable, &[&value]);
+    };
+
+    // 4. Return the result of creating a sequence from V and method.
+    sequence_from_iterable(vm, value, method, element_from_js)
+}
+
+/// ? GetMethod(V, %Symbol.iterator%), which decides whether a JS value converts to a sequence type.
+pub(crate) fn iterator_method(vm: &Vm, value: Value) -> ThrowCompletionOr<Option<Gc<FunctionObject>>> {
+    value.get_method(vm, &PropertyKey::from(vm.well_known_symbols().iterator))
+}
+
+/// An IDL sequence created from an iterable and its iterator getter method,
+/// https://webidl.spec.whatwg.org/#create-sequence-from-iterable
+pub(crate) fn sequence_from_iterable<T>(
+    vm: &Vm,
+    iterable: Value,
+    method: Gc<FunctionObject>,
+    mut element_from_js: impl FnMut(Value) -> ThrowCompletionOr<T>,
+) -> ThrowCompletionOr<Vec<T>> {
+    // 1. Let iteratorRecord be ? GetIteratorFromMethod(iterable, method).
+    let iterator_record = get_iterator_from_method_impl(vm, iterable, method)?;
+
+    // 2. Initialize i to be 0.
+    // 3. Repeat
+    let mut sequence = Vec::new();
+    //     1. Let next be ? IteratorStepValue(iteratorRecord).
+    //     2. If next is done, then return an IDL sequence value of type sequence<T> of length i, where the value of the
+    //        element at index j is Sj.
+    while let Some(next) = iterator_step_value(vm, &iterator_record)? {
+        //     3. Initialize Si to the result of converting next to an IDL value of type T.
+        //     4. Set i to i + 1.
+        sequence.push(element_from_js(next)?);
+    }
+    Ok(sequence)
 }
 
 /// The types of the IDL definitions that a JS value converts to, with the conversions that the generated bindings
@@ -373,6 +699,43 @@ impl ToJs for bool {
     }
 }
 
+/// https://webidl.spec.whatwg.org/#js-any
+impl ToJs for Value {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(self)
+    }
+}
+
+/// An object converted to a JS value: https://webidl.spec.whatwg.org/#js-object, and what an implementation returns
+/// for a promise type, https://webidl.spec.whatwg.org/#js-promise, which is the promise object.
+impl ToJs for Gc<Object> {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(Value::from_object(self))
+    }
+}
+
+/// https://webidl.spec.whatwg.org/#js-long
+impl ToJs for i32 {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(Value::from_i32(self))
+    }
+}
+
+/// https://webidl.spec.whatwg.org/#js-unsigned-long
+impl ToJs for u32 {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(Value::from_f64(f64::from(self)))
+    }
+}
+
+/// https://webidl.spec.whatwg.org/#js-long-long
+impl ToJs for i64 {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        #[allow(clippy::cast_precision_loss, reason = "the spec converts to the closest double")]
+        Ok(Value::from_f64(self as f64))
+    }
+}
+
 /// https://webidl.spec.whatwg.org/#js-unsigned-long-long
 impl ToJs for u64 {
     fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
@@ -420,6 +783,66 @@ impl ToJs for Gc<TypedArrayBase> {
     }
 }
 
+/// An object of an interface converted to a JS value, https://webidl.spec.whatwg.org/#js-interface
+impl<T: Interface> ToJs for Ref<T> {
+    fn to_js(self, cx: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(Value::from_object(wrap(cx, self)))
+    }
+}
+
+/// An object of an interface that LibWeb implements in C++, as its wrapper. Only the C++ code knows the object
+/// behind the wrapper, so an implementation hands the wrapper to a service of LibWeb to have something done with it.
+#[derive(Clone, Copy, Trace)]
+#[gc(crate = libjs_rust)]
+pub(crate) struct CppInterface(Gc<Object>);
+
+impl CppInterface {
+    /// The object whose wrapper a service of LibWeb returned.
+    ///
+    /// # Safety
+    ///
+    /// `wrapper` must be a wrapper of an object of the interface that the IDL names where the value is used.
+    pub(crate) unsafe fn from_wrapper(wrapper: Gc<Object>) -> Self {
+        Self(wrapper)
+    }
+
+    pub(crate) fn wrapper(self) -> Gc<Object> {
+        self.0
+    }
+}
+
+/// Whether the object is a wrapper of an object that implements the interface, which LibWeb implements in C++ and
+/// knows by the value of its Web::Bindings::InterfaceName.
+pub(crate) fn implements_cpp_interface(object: Gc<Object>, interface_name: u16) -> bool {
+    // SAFETY: The object is live.
+    object.is_platform_object()
+        && unsafe { web_bindings_object_implements_interface(object.as_ptr().cast(), interface_name) }
+}
+
+/// An object of an interface that LibWeb implements in C++ converted from a JS value,
+/// https://webidl.spec.whatwg.org/#js-interface
+pub(crate) fn to_cpp_interface(
+    vm: &Vm,
+    value: Value,
+    interface_name: u16,
+    name: &str,
+) -> ThrowCompletionOr<CppInterface> {
+    // 1. If V implements I, then return the IDL interface type value that represents a reference to that platform
+    //    object.
+    if value.is_object() && implements_cpp_interface(value.as_object(), interface_name) {
+        return Ok(CppInterface(value.as_object()));
+    }
+    // 2. Throw a TypeError.
+    vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&name])
+}
+
+/// https://webidl.spec.whatwg.org/#js-interface
+impl ToJs for CppInterface {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(Value::from_object(self.0))
+    }
+}
+
 /// An IDL sequence converted to a JS value, https://webidl.spec.whatwg.org/#js-sequence, with the conversion of its
 /// elements.
 pub(crate) fn sequence_to_js<T>(
@@ -446,6 +869,23 @@ pub(crate) fn sequence_to_js<T>(
     }
 
     // 5. Return A.
+    Ok(Value::from_object(array))
+}
+
+/// sequence_to_js() for a sequence whose elements are cells, such as objects of interfaces. The conversion of an
+/// element can allocate, and a Vec hides the elements after it from the collector, so the sequence is kept alive.
+pub(crate) fn rooted_sequence_to_js<T: Trace + Clone + 'static>(
+    cx: &CallContext,
+    sequence: Vec<T>,
+    mut element_to_js: impl FnMut(T) -> ThrowCompletionOr<Value>,
+) -> ThrowCompletionOr<Value> {
+    let sequence = Root::new(cx.vm(), sequence);
+    let array = Array::create(cx.vm(), cx.realm(), sequence.get().len() as u64, None)?;
+    for (index, element) in sequence.get().iter().enumerate() {
+        let element = element_to_js(element.clone())?;
+        let index = u32::try_from(index).expect("an array of the length of the sequence was created");
+        array.create_data_property(cx.vm(), &PropertyKey::from(index), element, None, None)?;
+    }
     Ok(Value::from_object(array))
 }
 

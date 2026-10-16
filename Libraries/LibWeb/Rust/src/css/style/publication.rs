@@ -1450,9 +1450,10 @@ impl RetainedState {
         };
         let pseudo_styles = self.pseudo_style_mask_or_rematch(node);
         // A record whose winners read beyond its environment is the element's alone.
+        let element_alone = self.state_reads_beyond_environment(node, state);
         let cache_key = parent
             .zip(parent_record)
-            .filter(|_| !self.state_reads_beyond_environment(node, state))
+            .filter(|_| !element_alone)
             .and_then(|(parent, parent_record)| self.cold_record_parent(node, parent, parent_record, state))
             .map(|parent| ColdRecordKey {
                 monospace_recascaded_font_size: self
@@ -1510,7 +1511,6 @@ impl RetainedState {
         // it: a record C++ computed for a per-element value, such as a `random()` draw, is that
         // element's alone. A store with substituted values is the environment's as well as the
         // state's, and admits nothing for the state alone.
-        let element_alone = self.state_reads_beyond_environment(node, state);
         let mut store = match scratch.stores.get(&(state, environment)).filter(|_| !element_alone) {
             Some(store) => store.clone(),
             None => {
@@ -1548,25 +1548,11 @@ impl RetainedState {
         };
         self.note_node_substitution(node, scratch, state, environment);
         // A record whose winners read beyond its environment is the element's alone, as is one
-        // declaring registered custom properties, which its own font decides.
-        let cache_key = parent
-            .zip(parent_record)
-            .filter(|_| !element_alone && !has_registered_declarations)
-            .and_then(|(parent, parent_record)| self.cold_record_parent(node, parent, parent_record, state))
-            .map(|parent| ColdRecordKey {
-                monospace_recascaded_font_size: self
-                    .monospace_cohort_key(computed::ComputedStyleTarget::new(node, u8::MAX), state),
-                sibling_position: self.sibling_position_key(node, state),
-                parent,
-                previous_style_record: 0,
-                generation: cascade_state.0,
-                state,
-                facts: cold_record_facts(facts),
-                pseudo_styles,
-                environment,
-                font_environment_generation: inputs.font_environment_generation,
-                root_font_inputs: RootFontInputs::from_document(&inputs),
-            });
+        // declaring registered custom properties, which its own font decides. The key is the one
+        // above, with the environment the element's declarations resolved.
+        let cache_key = cache_key
+            .filter(|_| !has_registered_declarations)
+            .map(|key| ColdRecordKey { environment, ..key });
         if let Some(delta) = self.assign_cached_cold_record(
             node,
             target,
@@ -2770,7 +2756,9 @@ impl RetainedState {
         let dependency_flags = view.dependency_flags;
         let environment = self.inherited_custom_property_environment(parent)?;
         let inherited_groups = self.computed_group_sets.node_inherited_groups_identity(parent)?;
-        let parent_display = self.box_type_parent_display(parent)?;
+        // C++ styles the children of a display:none element on demand, past the engine's view of
+        // the parent, so no first record is computed under one.
+        let parent_display = self.box_type_parent_display(parent, UnderDisplayNone::NoKey)?;
         let record = if self.state_explicitly_inherits_non_inherited_property(node, state) {
             parent_record.raw()
         } else {
@@ -2786,17 +2774,16 @@ impl RetainedState {
     }
 
     /// The display the box-type transformation reads as the parent's for a child of the parent:
-    /// the parent's own, past any display:contents ancestor, packed into one word.
-    fn box_type_parent_display(&self, parent: StyleNodeID) -> Option<u32> {
+    /// the parent's own, past any display:contents ancestor, packed into one word. Under a
+    /// display:none parent, `display_none` says whether there is one.
+    fn box_type_parent_display(&self, parent: StyleNodeID, display_none: UnderDisplayNone) -> Option<u32> {
         let mut ancestor = Some(parent);
         while let Some(current) = ancestor {
             let record = self.computed_group_sets.assigned_style_record(current)?;
             let view = self.computed_group_sets.style_record_view(record.raw())?;
             let table = view.longhand_table?;
             let display = crate::css::style_compute::effective_display(table, None);
-            // C++ styles the children of a display:none element on demand, past the engine's
-            // view of the parent, so no first record is computed under one.
-            if display.is_none() {
+            if display.is_none() && display_none == UnderDisplayNone::NoKey {
                 return None;
             }
             if !display.is_contents() {
@@ -2838,58 +2825,83 @@ impl RetainedState {
     }
 
     fn state_explicitly_inherits_non_inherited_property(&self, node: StyleNodeID, state: CascadeStateID) -> bool {
-        self.state_explicitly_inherited_group_masks(node, state)
-            .next()
-            .is_some()
+        self.state_summary(node, state).explicitly_inherited_groups != 0
     }
 
     /// The non-inherited style groups a winner state reads straight from the parent: what C++
     /// marks the parent with when it computes a record from the state.
     fn state_explicitly_inherited_groups(&self, node: StyleNodeID, state: CascadeStateID) -> u32 {
-        self.state_explicitly_inherited_group_masks(node, state)
-            .fold(0, |groups, mask| groups | mask)
+        self.state_summary(node, state).explicitly_inherited_groups
     }
 
-    /// The style groups of each non-inherited property a winner state declares `inherit` for, and
-    /// every group for a value the engine cannot see the spelling of.
-    fn state_explicitly_inherited_group_masks(
-        &self,
-        node: StyleNodeID,
-        state: CascadeStateID,
-    ) -> impl Iterator<Item = u32> + '_ {
-        let is_inherit_keyword = |value: Option<&crate::css::style_value::RetainedStyleValueData>| {
-            value.is_none_or(|value| {
-                matches!(value.data(), crate::css::style_value::StyleValueData::Keyword { keyword }
-                    if *keyword == crate::css::style_compute::keyword::INHERIT)
-            })
-        };
-        self.winner_groups.winners_in_state(state).filter_map(move |winner| {
-            if crate::css::property_metadata::property_is_inherited(winner.property) {
-                return None;
+    /// What the engine asks of a state's winners' written values, decided once for each state where `node` finds
+    /// every winner's written value: the style groups of each non-inherited property the state declares `inherit` for,
+    /// and every group for a value the engine cannot see the spelling of, and whether any longhand winner was written
+    /// with a substitution.
+    fn state_summary(&self, node: StyleNodeID, state: CascadeStateID) -> cascade::StateSummary {
+        use crate::css::style_value::StyleValueData;
+        if let Some(summary) = self.winner_groups.state_summary(state) {
+            return summary;
+        }
+        let mut summary = cascade::StateSummary::default();
+        // NB: A winner whose written value `node` does not find, such as an element declaration hidden for a demand,
+        //     says nothing of other nodes, so the summary is only kept when every value was found.
+        let mut every_value_found = true;
+        for winner in self.winner_groups.winners_in_state(state) {
+            let inherited = crate::css::property_metadata::property_is_inherited(winner.property);
+            let Some(winner) = self.winner_groups.resolved_winner(winner) else {
+                continue;
+            };
+            let longhand = winner.property >= crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID;
+            if inherited && !longhand {
+                continue;
             }
-            let winner = self.winner_groups.resolved_winner(winner)?;
             let group_mask = || match crate::css::computed_values::StyleGroupMasks::get().dependencies(winner.property)
             {
                 0 => u32::MAX,
                 mask => mask,
             };
-            match winner.source {
-                WinnerSource::Rule(rule) => is_inherit_keyword(self.program.written_winner_value(
-                    rule,
-                    winner.property,
-                    winner.important,
-                    winner.key.value,
-                ))
-                .then(group_mask),
-                WinnerSource::Element(kind) => {
-                    is_inherit_keyword(self.facts.element_declarations(node, kind).and_then(|declarations| {
-                        declarations.winner_value(winner.property, winner.important, winner.key.value)
-                    }))
-                    .then(group_mask)
+            let value = match winner.source {
+                WinnerSource::Rule(rule) => {
+                    self.program
+                        .written_winner_value(rule, winner.property, winner.important, winner.key.value)
                 }
-                WinnerSource::ExactCascade => Some(u32::MAX),
+                WinnerSource::Element(kind) => self.facts.element_declarations(node, kind).and_then(|declarations| {
+                    declarations.winner_value(winner.property, winner.important, winner.key.value)
+                }),
+                WinnerSource::ExactCascade => {
+                    if !inherited {
+                        summary.explicitly_inherited_groups = u32::MAX;
+                    }
+                    continue;
+                }
+            };
+            let Some(value) = value else {
+                every_value_found = false;
+                if !inherited {
+                    summary.explicitly_inherited_groups |= group_mask();
+                }
+                continue;
+            };
+            if !inherited
+                && matches!(value.data(), StyleValueData::Keyword { keyword }
+                    if *keyword == crate::css::style_compute::keyword::INHERIT)
+            {
+                summary.explicitly_inherited_groups |= group_mask();
             }
-        })
+            if longhand
+                && matches!(
+                    value.data(),
+                    StyleValueData::Unresolved { .. } | StyleValueData::PendingSubstitution { .. }
+                )
+            {
+                summary.has_substitutions = true;
+            }
+        }
+        if every_value_found {
+            self.winner_groups.note_state_summary(state, summary);
+        }
+        summary
     }
 
     /// Keep a record C++ published for an element as a first record a later alike element can
@@ -3143,7 +3155,7 @@ impl RetainedState {
     /// Whether any winner of a state was written with a substitution, so the record computed
     /// from it reads the node's custom-property environment.
     pub(super) fn state_has_substitutions(&self, node: StyleNodeID, state: CascadeStateID) -> bool {
-        self.state_substitution_values(node, state).next().is_some()
+        self.state_summary(node, state).has_substitutions
     }
 
     /// What a state's winners read beyond the cascade, as `cascade::STATE_READS_*` bits, decided
@@ -3167,12 +3179,22 @@ impl RetainedState {
                 reads |= cascade::STATE_READS_CUSTOM_FUNCTION;
             }
         }
-        for (_, value, _) in self
+        // NB: As with the state's summary, what a node that does not find a winner's written value reads says nothing
+        //     of other nodes.
+        let mut every_value_found = true;
+        for winner in self
             .winner_groups
             .winners_in_state(state)
             .filter_map(|winner| self.winner_groups.resolved_winner(winner))
-            .filter_map(|winner| self.written_winner_value(node, &winner).ok().flatten())
         {
+            let (_, value, _) = match self.written_winner_value(node, &winner) {
+                Ok(Some(written)) => written,
+                Ok(None) => {
+                    every_value_found = false;
+                    continue;
+                }
+                Err(_) => continue,
+            };
             let dependencies = crate::css::style_compute::collect_external_value_dependencies(value.data());
             if dependencies.uses_tree_counting_function {
                 reads |= cascade::STATE_READS_SIBLING_POSITION;
@@ -3184,7 +3206,9 @@ impl RetainedState {
                 reads |= cascade::STATE_READS_CONTAINER_UNITS;
             }
         }
-        self.winner_groups.note_state_reads(state, reads);
+        if every_value_found {
+            self.winner_groups.note_state_reads(state, reads);
+        }
         reads
     }
 
@@ -3528,7 +3552,7 @@ impl RetainedState {
                             )?;
                             continue 'winners;
                         };
-                        (location, Some(value))
+                        (location, Some(value.data()))
                     }
                     // A value with var() references substitutes under the node's environment, as
                     // the C++ cascade substitutes it; a value invalid at computed-value time is
@@ -4411,6 +4435,13 @@ pub(super) struct SiblingPosition {
     pub(super) index: u32,
 }
 
+/// Whether a record derived under a display:none parent is keyed by the parent's display.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnderDisplayNone {
+    NoKey,
+    Keyed,
+}
+
 /// What a first record was derived from: the parent's side of the computation, the winner state
 /// (with the generation its identity belongs to), the element facts, the pseudo-elements the
 /// element has rules for, and the font environment.
@@ -4978,20 +5009,11 @@ fn expanded_longhand_value(
     value: &crate::css::style_value::RetainedStyleValueData,
 ) -> Option<crate::css::style_value::RetainedStyleValueData> {
     let mut found = None;
-    crate::css::style_compute::expand_shorthands_with(
-        shorthand,
-        value.pointer().cast(),
-        false,
-        &mut |longhand, data, _| {
-            if longhand == property && found.is_none() {
-                found = Some(unsafe {
-                    crate::css::style_value::RetainedStyleValueData::from_retained_pointer(
-                        crate::css::style_value::retain_style_value(data.cast()),
-                    )
-                });
-            }
-        },
-    );
+    crate::css::style_compute::expand_shorthands_with(shorthand, value, false, &mut |longhand, data, _| {
+        if longhand == property && found.is_none() {
+            found = Some(data.clone());
+        }
+    });
     found
 }
 
@@ -5006,15 +5028,10 @@ fn shorthand_longhand_value(
         return None;
     };
     for (&sub_property, sub_value) in sub_properties.as_slice().iter().zip(values.as_slice()) {
-        let sub_data = unsafe { &*sub_value.pointer().cast::<crate::css::style_value::StyleValueData>() };
         if sub_property == property {
-            return Some(unsafe {
-                crate::css::style_value::RetainedStyleValueData::from_retained_pointer(
-                    crate::css::style_value::retain_style_value(sub_data),
-                )
-            });
+            return Some(sub_value.clone());
         }
-        if let Some(found) = shorthand_longhand_value(property, sub_data) {
+        if let Some(found) = shorthand_longhand_value(property, sub_value.data()) {
             return Some(found);
         }
     }

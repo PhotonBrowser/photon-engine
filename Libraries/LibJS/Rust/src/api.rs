@@ -9,10 +9,12 @@
 //! the runtime only through this module (Meta/Linters/check_libjs_rust_api.py), so the rest of the crate stays the
 //! runtime's own business.
 
-pub use crate::embedding::host::host_object::{HostObject, host_class_of, host_data_of};
+pub use crate::embedding::host::host_object::{HostObject, host_class_of, host_data_of, is_host_instance_of};
 pub use crate::gc::embedder_cell::{EmbedderCell, EmbedderClass, EmbedderValue};
+pub use crate::gc::foreign::ForeignCellSlot;
 pub use crate::gc::root::{MarkedVec, Root};
 pub use crate::gc::visitor::{Trace, Visitor};
+pub use crate::gc::weak::GcWeak;
 pub use crate::interpreter::vm::{TypeErrorRealmScope, Vm};
 pub use crate::layout::cell::Gc;
 pub use crate::layout::function_object::FunctionObject;
@@ -33,6 +35,7 @@ pub use crate::runtime::data_view::{
 pub use crate::runtime::error::ErrorKind;
 pub use crate::runtime::error_types::ErrorType;
 pub use crate::runtime::intrinsics::Intrinsics;
+pub use crate::runtime::iterator::{get_iterator_from_method_impl, iterator_step_value};
 pub use crate::runtime::native_function::RawNativeFunction;
 pub use crate::runtime::object::Object;
 pub use crate::runtime::primitive_string::PrimitiveString;

@@ -43,6 +43,8 @@ static bool should_show_config_variable(ConfigVariableID id)
 {
     if (id == ConfigVariableID::UseClientSideWindowDecorations)
         return Application::the().supports_client_side_window_decorations();
+    if (id == ConfigVariableID::VerticalTabsHoverExpandDelay || id == ConfigVariableID::VerticalTabsHoverExpandAnimationDuration)
+        return Application::the().supports_vertical_tabs();
     return true;
 }
 
@@ -153,6 +155,9 @@ void SettingsUI::register_interfaces()
     register_interface("setContentBlockerEnabled"sv, [this](auto const& data) {
         set_content_blocker_enabled(data);
     });
+    register_interface("setShowContentBlockerCount"sv, [this](auto const& data) {
+        set_show_content_blocker_count(data);
+    });
     register_interface("addCustomContentBlockerSubscription"sv, [this](auto const& data) {
         add_custom_content_blocker_subscription(data);
     });
@@ -180,6 +185,7 @@ void SettingsUI::load_features()
     features.set("primaryPaste"_string, application.supports_clipboard_type(Application::ClipboardType::Selection));
     features.set("verticalTabs"_string, application.supports_vertical_tabs());
     features.set("geolocation"_string, Core::GeolocationProvider::is_available());
+    features.set("contentBlockingControls"_string, application.supports_content_blocking_controls());
 
     async_send_message("loadFeatures"sv, move(features));
 }
@@ -247,12 +253,16 @@ void SettingsUI::complete_first_run(JsonValue const& data)
         return;
 
     auto& settings = Application::settings();
+
     auto tab_settings = settings.tab_settings();
     if (Application::the().supports_vertical_tabs())
         tab_settings.vertical_tabs_enabled = *vertical_tabs_enabled;
     settings.set_tab_settings(tab_settings);
+
     set_search_engine_settings(*search_engine_settings);
+
     settings.set_content_blocker_enabled(*content_blocker_enabled);
+    settings.set_filter_list_updates_enabled(*content_blocker_enabled);
     lists->for_each([&](auto const& list) {
         set_content_blocker_list_enabled(list);
     });
@@ -631,6 +641,15 @@ void SettingsUI::set_content_blocker_enabled(JsonValue const& enabled)
                 Application::the().download_content_blocker_list_if_needed({}, list.identifier);
         }
     }
+    load_current_settings();
+}
+
+void SettingsUI::set_show_content_blocker_count(JsonValue const& show)
+{
+    if (!show.is_bool() || !Application::the().supports_content_blocking_controls())
+        return;
+
+    Application::settings().set_show_content_blocker_count(show.as_bool());
     load_current_settings();
 }
 

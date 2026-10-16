@@ -40,12 +40,15 @@ set(SOURCES
     HTML/WebViewHints.cpp
     HTML/WorkerAgentTypes.cpp
     Infra/Strings.cpp
+    Loader/ContentBlocking.cpp
     Loader/DownloadFilename.cpp
     Loader/SiteCompatibility.cpp
     MimeSniff/MimeType.cpp
     Page/AsyncScrollNodeStableID.cpp
     Page/DragEvent.cpp
     Page/InputEvent.cpp
+    Page/InputRoutingDecision.cpp
+    Page/InputTrace.cpp
     Page/MediaContextMenu.cpp
     Page/SpellingError.cpp
     PixelUnits.cpp
@@ -136,7 +139,7 @@ endif()
 ladybird_lib(LibWebCommon webcommon EXPLICIT_SYMBOL_EXPORT)
 # NB: The enumerations of LibWeb's IDL modules are generated into LibWebCommon along with LibWeb's bindings.
 add_dependencies(LibWebCommon generate_bindings)
-target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibFileSystem LibGfx LibHTTP LibIPC LibURL)
+target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibFileSystem LibGfx LibHTTP LibIPC LibRequests LibURL)
 
 if (ENABLE_INSTALL_HEADERS)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/CSS/PropertyList.h" "${CMAKE_CURRENT_BINARY_DIR}/CSS/PseudoElement.h" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibWebCommon/CSS")

@@ -69,6 +69,7 @@
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/ContentBlocking.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HistoryVisitTransition.h>
@@ -116,7 +117,9 @@ public:
     void did_stop_loading(Badge<CanonicalTraversable>, bool stopped_navigation);
 
     void set_url(Badge<WebContentPage>, URL::URL url) { set_url(move(url)); }
+    void set_text_fragment_indication_visibility(Badge<WebContentPage>, bool);
     URL::URL const& url() const { return m_url; }
+    URL::URL const& displayed_url() const { return m_displayed_url; }
 
     void set_title(Badge<WebContentPage>, Utf16String title);
     Utf16String const& title() const { return m_title; }
@@ -331,6 +334,11 @@ public:
     void list_style_sheets();
     void request_style_sheet_source(Web::CSS::StyleSheetIdentifier const&);
 
+    void did_block_resource(Badge<WebContentPage>);
+    void reset_blocked_request_count();
+    void notify_content_blocking_changed();
+    ContentBlockingSnapshot content_blocking_snapshot() const;
+
     void debug_request(ByteString const& request, ByteString const& argument = {});
 
     void run_javascript(String const&);
@@ -341,6 +349,7 @@ public:
     Web::ViewportIsFullscreen is_fullscreen() const { return m_is_fullscreen; }
 
     void alert_closed();
+    void before_unload_closed(bool accepted);
     void confirm_closed(bool accepted);
     void prompt_closed(Optional<Utf16String> const& response);
     void color_picker_update(Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state);
@@ -421,6 +430,9 @@ public:
     void set_user_style_sheet(String const& source);
 
     void request_close();
+    void request_close_preflight(Function<void(bool)> on_complete);
+    void did_complete_close_preflight(Badge<WebContentPage>, u64 request_id, bool approved);
+    Function<void()> prepare_for_close_without_prompting();
     void force_close();
     Function<void()> prepare_for_immediate_close();
     bool needs_beforeunload_check() const;
@@ -455,7 +467,9 @@ public:
     Function<void()> on_stop_tooltip_override;
     Function<void(ByteString const&)> on_enter_tooltip_area;
     Function<void()> on_leave_tooltip_area;
+    Function<void(ContentBlockingSnapshot const&)> on_content_blocking_change;
     Function<void(Utf16String const& message)> on_request_alert;
+    Function<void(String const& source, Function<void(bool)> on_complete)> on_request_before_unload;
     Function<void(Utf16String const& message)> on_request_confirm;
     Function<void(Utf16String const& message, Utf16String const& default_)> on_request_prompt;
     Function<void(Utf16String const& message)> on_request_set_prompt_text;
@@ -537,12 +551,13 @@ public:
     Menu& bookmark_context_menu() { return *m_bookmark_context_menu; }
     Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
 
-    void did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word);
+    void did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id);
     void activate_spelling_menu_action_for_testing(Badge<WebContentPage>, WebContentPage& requesting_page, Web::SpellingMenuActionForTesting, u32 guess_index);
 
     void did_request_spell_check(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, Utf16String text);
     void reset_spell_checking();
-    void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor);
+    void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<u64> text_fragment_generation_id);
+    void did_generate_text_fragment_url(u64 request_id, Optional<URL::URL>);
     void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap);
     void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor);
     void send_to_media_context_menu_page(Function<void(WebContentPage&)> const&);
@@ -585,6 +600,7 @@ protected:
     explicit ViewImplementation(IsPrivate = IsPrivate::No);
 
     void set_url(URL::URL);
+    void update_displayed_url();
     void did_start_navigation();
     void did_finish_navigation();
     void did_end_uncommitted_navigation(StringView reason);
@@ -596,8 +612,8 @@ protected:
         Load,
         HistoryTraversal,
     };
-    u64 begin_webdriver_navigation(WebDriverNavigationCompletionSource, Optional<Web::HTML::CrossProcessId> history_operation_id = {});
-    void complete_webdriver_navigation(u64 navigation_id);
+    void begin_webdriver_navigation(WebDriverNavigationCompletionSource, Optional<Web::HTML::CrossProcessId> history_operation_id = {});
+    void complete_webdriver_navigation();
     void complete_webdriver_history_traversal(Web::HTML::CrossProcessId operation_id);
     void update_navigation_action_state();
     void did_not_apply_reload();
@@ -668,6 +684,7 @@ protected:
     void complete_external_url_request();
     void process_next_external_url_request();
     void update_look_up_selected_text_action(Optional<DictionaryLookup> const& lookup, Gfx::IntPoint content_position);
+    void request_text_fragment_url(Optional<u64> generation_id);
     void request_context_menu_dictionary_lookup(Function<void(Optional<DictionaryLookup> const&)> on_complete);
     NonnullRefPtr<Core::Promise<bool>> select_word_for_dictionary_lookup(Gfx::IntPoint widget_position);
     void reject_pending_selection_requests();
@@ -697,6 +714,8 @@ protected:
     NonnullRefPtr<BrowsingSession> m_session;
 
     URL::URL m_url { URL::about_blank() };
+    URL::URL m_displayed_url { URL::about_blank() };
+    bool m_text_fragment_indication_is_visible { false };
     Utf16String m_title;
     Optional<String> m_favicon_hash;
 
@@ -739,7 +758,11 @@ protected:
     Gfx::IntPoint m_look_up_position;
 
     RefPtr<Action> m_search_selected_text_action;
+    RefPtr<Action> m_copy_link_to_highlight_action;
     Optional<String> m_search_text;
+    Optional<URL::URL> m_text_fragment_url;
+    u64 m_next_text_fragment_url_request_id { 1 };
+    Optional<u64> m_pending_text_fragment_url_request_id;
 
     u64 m_next_selection_request_id { 1 };
     HashMap<u64, NonnullRefPtr<Core::Promise<ByteString>>> m_pending_selected_text_requests;
@@ -847,13 +870,11 @@ protected:
     // canonical traversable's ongoing navigation record.
     struct WebDriverNavigationObservation {
         WebDriverNavigationCompletionSource completion_source;
-        u64 navigation_id { 0 };
         Optional<Web::HTML::CrossProcessId> history_operation_id;
         bool history_operation_completed { false };
         bool load_completed { false };
     };
     Optional<WebDriverNavigationObservation> m_webdriver_navigation_observation;
-    u64 m_next_webdriver_navigation_id { 1 };
     Optional<NavigationToRetry> m_last_stopped_navigation;
 
     size_t m_crash_count = 0;
@@ -864,6 +885,12 @@ protected:
 
     u64 m_next_webdriver_user_prompt_request_id { 0 };
     HashMap<u64, Function<void(Web::WebDriver::Response)>> m_pending_webdriver_user_prompt_requests;
+    u64 m_next_close_preflight_request_id { 0 };
+    struct PendingClosePreflightRequest {
+        Web::PageId page_id;
+        Function<void(bool)> on_complete;
+    };
+    HashMap<u64, PendingClosePreflightRequest> m_pending_close_preflight_requests;
     struct PendingWebDriverCommand {
         NonnullRefPtr<WebContentPage> page;
         String name;
@@ -972,6 +999,8 @@ protected:
 
     HashMap<u64, NavigationListener> m_navigation_listeners;
     u64 m_next_navigation_listener_id { 1 };
+
+    u64 m_blocked_request_count { 0 };
 
     enum class NodePickerRequestType : u8 {
         Hovered,

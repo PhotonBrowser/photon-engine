@@ -28,6 +28,8 @@ static Web::HTML::SessionHistoryEntryDescriptor make_entry(i32 step, StringView 
     entry.document_state.history_policy_container = Web::HTML::DocumentStateClient::Tag;
     entry.classic_history_api_state = Web::HTML::StorageSerializationRecord { MUST(ByteBuffer::copy({ &state_byte, 1 })) };
     entry.navigation_api_state = Web::HTML::StorageSerializationRecord { MUST(ByteBuffer::copy({ &state_byte, 1 })) };
+    entry.directive_state_id = { 2, document_state_id };
+    entry.directive_state_value = "text=target"_string;
     return entry;
 }
 
@@ -73,7 +75,7 @@ TEST_CASE(fresh_database_migrates_to_the_latest_schema)
     for (auto table : { "Sessions"sv, "SessionTabs"sv, "SessionUsedSteps"sv, "SessionHistories"sv, "SessionNestedHistories"sv, "SessionEntries"sv })
         EXPECT(TRY_OR_FAIL(database->table_exists(table)));
 
-    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 2u });
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 4u });
 }
 
 TEST_CASE(deleting_a_session_cascades_through_its_tabs)

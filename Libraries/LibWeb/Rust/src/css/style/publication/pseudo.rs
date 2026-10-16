@@ -449,7 +449,9 @@ impl RetainedState {
             let key = self
                 .computed_group_sets
                 .node_inherited_groups_identity(node)
-                .zip(self.box_type_parent_display(node))
+                // NB: The pseudo-elements of a display:none element are derived here like any others, so the
+                //     element's display keys them as well.
+                .zip(self.box_type_parent_display(node, UnderDisplayNone::Keyed))
                 .filter(|_| !element_alone && !has_registered_declarations)
                 .map(|(inherited_groups, parent_display)| PseudoCohortKey {
                     monospace_recascaded_font_size: state.map_or(0, |state| self.monospace_cohort_key(target, state)),
@@ -1313,10 +1315,7 @@ fn pseudo_content_generates_nothing(store: &impl crate::css::cascaded_properties
     use crate::css::property_metadata::property_id as prop;
     use crate::css::style_compute::keyword;
     let generated = matches!(kind, pseudo_kind::BEFORE | pseudo_kind::AFTER);
-    match store
-        .winning_declaration(prop::CONTENT)
-        .map(|(value, ..)| unsafe { &*value.cast::<StyleValueData>() })
-    {
+    match store.winning_declaration(prop::CONTENT).map(|(value, ..)| value.data()) {
         None => generated,
         Some(StyleValueData::Keyword { keyword }) => {
             *keyword == keyword::NONE || (*keyword == keyword::NORMAL && generated)

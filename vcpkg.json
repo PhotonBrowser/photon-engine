@@ -1,5 +1,5 @@
 {
-  "builtin-baseline": "7f3781e19cc7d4e4882a4caec01668c6f7b5c163",
+  "builtin-baseline": "20ceb8adbf0504d4b0d5e4058a32f9d4fc896391",
   "dependencies": [
     {
       "name": "angle",
@@ -22,7 +22,6 @@
       "default-features": false,
       "features": [
         "brotli",
-        "non-http",
         "http2",
         "http3",
         "openssl",
@@ -250,7 +249,7 @@
   "overrides": [
     {
       "name": "angle",
-      "version": "chromium_7258#0"
+      "version": "chromium_7258#2"
     },
     {
       "name": "brotli",
@@ -258,19 +257,19 @@
     },
     {
       "name": "cpptrace",
-      "version": "1.0.2#0"
+      "version": "1.0.4#2"
     },
     {
       "name": "curl",
-      "version": "8.21.0#1"
+      "version": "8.23.0#0"
     },
     {
       "name": "dav1d",
-      "version": "1.5.3#0"
+      "version": "1.5.4#0"
     },
     {
       "name": "dbus",
-      "version": "1.16.2#2"
+      "version": "1.16.2#5"
     },
     {
       "name": "dirent",
@@ -278,11 +277,11 @@
     },
     {
       "name": "fast-float",
-      "version": "8.2.10#1"
+      "version": "8.3.1#0"
     },
     {
       "name": "ffmpeg",
-      "version": "7.1.1#5"
+      "version": "9.0.2#1"
     },
     {
       "name": "fmt",
@@ -290,19 +289,21 @@
     },
     {
       "name": "fontconfig",
-      "version": "2.17.1#1"
+      "version": "2.17.1#2"
     },
     {
       "name": "freetype",
-      "version": "2.13.3#0"
+      "version": "2.13.3#0",
+      "$comment": "freetype is not updated yet to avoid major font rendering differences. See: https://github.com/LadybirdBrowser/ladybird/pull/10165#issuecomment-4747336594"
     },
     {
       "name": "harfbuzz",
-      "version": "10.2.0#0"
+      "version": "10.2.0#0",
+      "$comment": "harfbuzz is not updated to avoid conflicts with Qt. See: https://github.com/LadybirdBrowser/ladybird/pull/5273"
     },
     {
       "name": "icu",
-      "version": "78.3#1"
+      "version": "78.3#2"
     },
     {
       "name": "libavif",
@@ -310,19 +311,19 @@
     },
     {
       "name": "libdwarf",
-      "version": "2.3.1#0"
+      "version": "2.3.3#0"
     },
     {
       "name": "libedit",
-      "version": "2024-08-08#0"
+      "version": "2024-08-08#1"
     },
     {
       "name": "libjpeg-turbo",
-      "version": "3.2.0#0"
+      "version": "3.2.0#1"
     },
     {
       "name": "libpng",
-      "version": "1.6.58#0"
+      "version": "1.6.59#0"
     },
     {
       "name": "libproxy",
@@ -334,15 +335,20 @@
     },
     {
       "name": "libtommath",
-      "version": "1.3.0#2"
+      "version": "1.3.0#3"
     },
     {
       "name": "libwebp",
-      "version": "1.6.0#1"
+      "version": "1.6.0#3"
     },
     {
       "name": "libxml2",
-      "version": "2.15.3#0"
+      "version": "2.15.4#0"
+    },
+    {
+      "name": "md4c",
+      "version": "0.5.3#0",
+      "$comment": "md4c 0.6.0 is incompatible with the pinned Qt 6.10.0 Markdown importer."
     },
     {
       "name": "mimalloc",
@@ -354,15 +360,15 @@
     },
     {
       "name": "nghttp2",
-      "version": "1.69.0#0"
+      "version": "1.70.0#0"
     },
     {
       "name": "openssl",
-      "version": "3.6.3#0"
+      "version": "3.6.5#1"
     },
     {
       "name": "pdfjs",
-      "version": "5.6.205#0"
+      "version": "6.4.299#0"
     },
     {
       "name": "pthread",
@@ -370,27 +376,27 @@
     },
     {
       "name": "qtbase",
-      "version": "6.10.0#1"
+      "version": "6.10.2#0"
     },
     {
       "name": "qtpositioning",
-      "version": "6.10.0#0"
+      "version": "6.10.2#0"
     },
     {
       "name": "qtserialport",
-      "version": "6.10.0#0"
+      "version": "6.10.2#0"
     },
     {
       "name": "sdl3",
-      "version": "3.2.28#0"
+      "version": "3.4.18#0"
     },
     {
       "name": "simdjson",
-      "version": "4.6.4#0"
+      "version": "5.0.2#0"
     },
     {
       "name": "simdutf",
-      "version": "9.1.0#0"
+      "version": "9.1.1#0"
     },
     {
       "name": "skia",
@@ -398,7 +404,7 @@
     },
     {
       "name": "sqlite3",
-      "version": "3.53.3#1"
+      "version": "3.53.4#2"
     },
     {
       "name": "tiff",
@@ -422,11 +428,11 @@
     },
     {
       "name": "wuffs",
-      "version": "0.3.4#0"
+      "version": "0.3.5#0"
     },
     {
       "name": "zlib",
-      "version": "1.3.1#0"
+      "version": "1.3.2#2"
     }
   ]
 }

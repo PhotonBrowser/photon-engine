@@ -17,6 +17,7 @@
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Page/CompositorContextId.h>
+#include <LibWebCommon/Page/InputRoutingDecision.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/PixelUnits.h>
 
@@ -90,12 +91,22 @@ struct PendingAsyncScrollUpdates {
 
 struct AsyncScrollEnqueueResult {
     bool accepted { false };
-    Optional<AsyncScrollOperationID> operation_id;
+    Optional<AsyncScrollOperationID> operation_id {};
+    // Why the compositor took or turned away a wheel step, and the scroller it routed the step to.
+    Optional<Web::InputRoutingDecision> routing_decision {};
+    Optional<Web::AsyncScrollNodeStableID> routed_scroller {};
 };
 
 enum class AsyncScrollOperationTracking {
     No,
     Yes,
+};
+
+// Blocking wheel event listeners hold a wheel step back from the compositor until the page has dispatched it. A step
+// that the page dispatched and did not cancel has nothing left to wait for.
+enum class WheelStepDispatch : u8 {
+    NotYetDispatched,
+    DispatchedAndNotCanceled,
 };
 
 // A later keyboard step continues from the destination of a smooth scroll the user started, rather than from its

@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Utf16View.h>
+#include <AK/JsonArray.h>
+#include <AK/JsonObject.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
-#include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
 
@@ -203,6 +203,106 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
     return async_scrolling_state;
 }
 
+static StringView snap_strictness_name(SnapStrictness strictness)
+{
+    switch (strictness) {
+    case SnapStrictness::None:
+        return "none"sv;
+    case SnapStrictness::Proximity:
+        return "proximity"sv;
+    case SnapStrictness::Mandatory:
+        return "mandatory"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static StringView snap_align_name(SnapAlign align)
+{
+    switch (align) {
+    case SnapAlign::None:
+        return "none"sv;
+    case SnapAlign::Start:
+        return "start"sv;
+    case SnapAlign::End:
+        return "end"sv;
+    case SnapAlign::Center:
+        return "center"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static JsonObject rect_to_json(Web::CSSPixelRect const& rect)
+{
+    JsonObject object;
+    object.set("x"sv, rect.x().to_double());
+    object.set("y"sv, rect.y().to_double());
+    object.set("width"sv, rect.width().to_double());
+    object.set("height"sv, rect.height().to_double());
+    return object;
+}
+
+static JsonObject point_to_json(Web::CSSPixelPoint const& point)
+{
+    JsonObject object;
+    object.set("x"sv, point.x().to_double());
+    object.set("y"sv, point.y().to_double());
+    return object;
+}
+
+JsonObject async_scrolling_state_to_json(AsyncScrollingState const& state)
+{
+    JsonArray scroll_nodes;
+    for (auto const& scroll_node : state.scroll_nodes) {
+        JsonObject node;
+        node.set("documentID"sv, scroll_node.node_id.document_id.value());
+        node.set("scrollNodeIndex"sv, scroll_node.node_id.scroll_node_index.value());
+        node.set("parentDocumentID"sv, scroll_node.parent_node_id.has_value() ? scroll_node.parent_node_id->document_id.value() : 0);
+        node.set("parentScrollNodeIndex"sv, scroll_node.parent_node_id.has_value() ? scroll_node.parent_node_id->scroll_node_index.value() : 0);
+        node.set("isViewport"sv, scroll_node.is_viewport);
+        scroll_nodes.must_append(move(node));
+    }
+
+    JsonArray snap_containers;
+    for (auto const& snap_container : state.snap_containers) {
+        JsonObject container;
+        container.set("documentID"sv, snap_container.node_id.document_id.value());
+        container.set("scrollNodeIndex"sv, snap_container.node_id.scroll_node_index.value());
+        container.set("snapport"sv, rect_to_json(snap_container.geometry.snapport));
+        container.set("minScrollOffset"sv, point_to_json(snap_container.geometry.min_scroll_offset));
+        container.set("maxScrollOffset"sv, point_to_json(snap_container.geometry.max_scroll_offset));
+        container.set("strictness"sv, snap_strictness_name(snap_container.geometry.strictness));
+        container.set("snapsX"sv, snap_container.geometry.axes.x);
+        container.set("snapsY"sv, snap_container.geometry.axes.y);
+        container.set("horizontalWritingMode"sv, snap_container.geometry.horizontal_writing_mode);
+        JsonArray areas;
+        for (auto const& snap_area : snap_container.areas) {
+            JsonObject area;
+            area.set("nodeID"sv, snap_area.identity.node_id.value());
+            area.set("pseudoElementType"sv, snap_area.identity.pseudo_element_type);
+            area.set("rect"sv, rect_to_json(snap_area.rect));
+            area.set("alignX"sv, snap_align_name(snap_area.align_x));
+            area.set("alignY"sv, snap_align_name(snap_area.align_y));
+            area.set("alwaysStop"sv, snap_area.always_stop);
+            areas.must_append(move(area));
+        }
+        container.set("areas"sv, move(areas));
+        snap_containers.must_append(move(container));
+    }
+
+    JsonObject object;
+    object.set("documentID"sv, state.document_id.has_value() ? JsonValue { state.document_id->value() } : JsonValue {});
+    object.set("scrollNodeCount"sv, state.scroll_nodes.size());
+    object.set("scrollNodes"sv, move(scroll_nodes));
+    object.set("snapContainers"sv, move(snap_containers));
+    object.set("devicePixelsPerCssPixel"sv, state.device_pixels_per_css_pixel);
+    object.set("hasBlockingWheelEventListeners"sv, state.has_blocking_wheel_event_listeners);
+    object.set("blockingWheelEventRegionCount"sv, state.blocking_wheel_event_regions.size());
+    object.set("mainThreadWheelEventRegionCount"sv, state.main_thread_wheel_event_regions.size());
+    object.set("wheelEventListenerStateGeneration"sv, state.wheel_event_listener_state_generation);
+    object.set("hasBlockingWheelEventRegionCoveringViewport"sv, state.has_blocking_wheel_event_region_covering_viewport);
+    return object;
+}
+
 WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const& state)
 {
     if (state.has_blocking_wheel_event_region_covering_viewport)
@@ -213,70 +313,28 @@ WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const& sta
     return WheelRoutingAdmission::Accepted;
 }
 
-Utf16View wheel_routing_admission_to_utf16_view(WheelRoutingAdmission admission)
+Web::InputRoutingDecision input_routing_decision_for_wheel_step_not_admitted_by(WheelRoutingAdmission admission)
 {
     switch (admission) {
     case WheelRoutingAdmission::Accepted:
-        return u"accepted"sv;
+        VERIFY_NOT_REACHED();
     case WheelRoutingAdmission::NoAsyncScrollingState:
-        return u"no async scrolling state"sv;
+        return Web::InputRoutingDecision::NoAsyncScrollingState;
     case WheelRoutingAdmission::BlockingWheelEventListeners:
-        return u"blocking wheel event listeners"sv;
+        return Web::InputRoutingDecision::BlockingWheelEventListeners;
     case WheelRoutingAdmission::NoScrollNode:
-        return u"no scroll node"sv;
+        return Web::InputRoutingDecision::NoScrollNode;
     case WheelRoutingAdmission::StaleWheelEventListeners:
-        return u"stale wheel event listeners"sv;
+        return Web::InputRoutingDecision::StaleWheelEventListeners;
     }
     VERIFY_NOT_REACHED();
 }
 
-static AsyncScrollTree scroll_tree_for_hit_testing(AsyncScrollingState async_scrolling_state, RefPtr<Compositing::DisplayList const> const& display_list, Compositing::AccumulatedVisualContextTree const* visual_context_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot)
+WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const& state, u64 newest_wheel_event_listener_state_generation)
 {
-    AsyncScrollTree scroll_tree;
-    scroll_tree.set_state(move(async_scrolling_state));
-    scroll_tree.rebuild_wheel_hit_test_targets(display_list, visual_context_tree, scroll_state_snapshot);
-    return scroll_tree;
-}
-
-bool blocks_wheel_event_at_position(AsyncScrollingState const& async_scrolling_state, RefPtr<Compositing::DisplayList const> const& display_list, Compositing::AccumulatedVisualContextTree const* visual_context_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position)
-{
-    if (async_scrolling_state.has_blocking_wheel_event_region_covering_viewport)
-        return true;
-
-    // If a caller knows blocking wheel listeners exist but cannot provide a display list for visual-context hit
-    // testing, async scrolling must fail closed. Sending the input to the main thread is slower, but it preserves
-    // cancelability.
-    if (!display_list || !visual_context_tree)
-        return async_scrolling_state.has_blocking_wheel_event_listeners;
-
-    auto scroll_tree = scroll_tree_for_hit_testing(async_scrolling_state, display_list, visual_context_tree, scroll_state_snapshot);
-    return scroll_tree.blocks_wheel_event_at_position(*visual_context_tree, position);
-}
-
-WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const& async_scrolling_state, RefPtr<Compositing::DisplayList const> const& display_list, Compositing::AccumulatedVisualContextTree const* visual_context_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool blocking_wheel_event_regions_are_current)
-{
-    WheelHitTestResult hit_test_result;
-    if (display_list && visual_context_tree) {
-        auto scroll_tree = scroll_tree_for_hit_testing(async_scrolling_state, display_list, visual_context_tree, scroll_state_snapshot);
-        hit_test_result = scroll_tree.hit_test_scroll_node_for_wheel(*visual_context_tree, position, delta);
-    } else {
-        hit_test_result.blocked_by_wheel_event_region = async_scrolling_state.has_blocking_wheel_event_listeners;
-    }
-    if (hit_test_result.blocked_by_main_thread_region)
-        return WheelScrollAdmission::BlockedByMainThreadRegion;
-
-    // Async scrolling may only start when the snapshot can prove that the wheel event cannot be canceled by script
-    // at this position. Stale or missing blocker information sends the event back to the main thread.
-    if (async_scrolling_state.has_blocking_wheel_event_listeners) {
-        if (!blocking_wheel_event_regions_are_current)
-            return WheelScrollAdmission::StaleBlockingWheelEventRegions;
-        if (hit_test_result.blocked_by_wheel_event_region)
-            return WheelScrollAdmission::BlockedByWheelEventRegion;
-    }
-
-    if (!hit_test_result.node_id.has_value())
-        return WheelScrollAdmission::NoScrollableTarget;
-    return WheelScrollAdmission::Accepted;
+    if (state.wheel_event_listener_state_generation < newest_wheel_event_listener_state_generation)
+        return WheelRoutingAdmission::StaleWheelEventListeners;
+    return wheel_routing_admission_for(state);
 }
 
 }

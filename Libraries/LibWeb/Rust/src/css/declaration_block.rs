@@ -144,13 +144,13 @@ impl DeclarationBlockData {
         // the one with greatest cascading order must be represented, at the same relative position as it was specified.
         expand_shorthands_with(
             declaration.property_id,
-            Arc::as_ptr(&declaration.value).cast(),
+            &crate::css::style_value::RetainedStyleValueData::from_arc(declaration.value),
             false,
             &mut |property_id, value, _| {
                 self.append_normalized_property(DeclaredProperty {
                     property_id,
                     important: declaration.important,
-                    value: unsafe { retain_value(value) },
+                    value: value.clone().into_arc(),
                 });
             },
         );
@@ -636,7 +636,7 @@ mod tests {
     use crate::css::parser::syntax_parser::parse_shared_stylesheet;
     use crate::css::parser::value_parser::ParseContext;
     use crate::css::property_metadata::property_id;
-    use crate::css::rule::{rust_rule_children, rust_rule_list_at, rust_rule_payload};
+    use crate::css::rule::rust_rule_payload;
 
     fn parsed_declarations(text: &str) -> Arc<DeclarationBlockData> {
         let units: Vec<_> = format!(".target {{ {text} }}").encode_utf16().collect();
@@ -645,7 +645,7 @@ mod tests {
         let context = ParseContext::default();
         let parse = unsafe { parse_shared_stylesheet(input, &context) };
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
-        let rule = unsafe { &*rust_rule_list_at(&rules, 0) };
+        let rule = &rules.rule_at(0);
         rule.cascade_declarations().unwrap()
     }
 
@@ -725,10 +725,9 @@ mod tests {
         let context = ParseContext::default();
         let parse = unsafe { parse_shared_stylesheet(input, &context) };
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
-        let rule = unsafe { &*rust_rule_list_at(&rules, 0) };
-        let children = unsafe { &*rust_rule_children(rule) };
-        let nested = unsafe { &*rust_rule_list_at(children, 1) };
-        let block = unsafe { &*rust_rule_payload(nested).declarations };
+        let rule = rules.rule_at(0);
+        let nested = rule.child_rules().unwrap().rule_at(1);
+        let block = unsafe { &*rust_rule_payload(&nested).declarations };
         let snapshot = nested.cascade_declarations().unwrap();
         let old_data = Arc::downgrade(&snapshot);
         let borrowed = block.data();
@@ -759,7 +758,7 @@ mod tests {
         assert_eq!(block.data().properties.len(), 1);
         assert_eq!(rust_declaration_block_revision(block), 2);
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Immutable(_)));
-        drop(rules);
+        drop((nested, rule, rules));
         assert!(rust_declaration_block_remove(&mut fork, property_id::WIDTH));
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Mutable(_)));
         assert!(fork.data().properties.is_empty());

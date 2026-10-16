@@ -63,9 +63,9 @@ void CompositorContextHandle::invalidate_wheel_event_listener_state(u64 generati
 }
 
 Compositing::AsyncScrollEnqueueResult CompositorContextHandle::async_scroll_by(UniqueNodeID expected_document_id, Gfx::FloatPoint position,
-    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
+    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
 {
-    return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking);
+    return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking, wheel_step_dispatch, input_event_id);
 }
 
 Compositing::AsyncScrollEnqueueResult CompositorContextHandle::smooth_scroll_to(Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue)
@@ -78,9 +78,29 @@ void CompositorContextHandle::cancel_smooth_scroll(Web::AsyncScrollNodeStableID 
     m_host.cancel_smooth_scroll(m_context_id, stable_node_id);
 }
 
-Gfx::FloatPoint CompositorContextHandle::elastic_overscroll_stretch_for_testing(Web::AsyncScrollNodeStableID stable_node_id)
+String CompositorContextHandle::scroll_state_for_testing(Web::AsyncScrollNodeStableID stretched_scroller)
 {
-    return m_host.elastic_overscroll_stretch_for_testing(m_context_id, stable_node_id);
+    return m_host.scroll_state_for_testing(m_context_id, stretched_scroller);
+}
+
+void CompositorContextHandle::synchronize_for_testing()
+{
+    m_host.synchronize_for_testing();
+}
+
+Optional<Compositing::FirstWheelStepRouteForTesting> CompositorContextHandle::route_first_wheel_step_for_testing(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels)
+{
+    return m_host.route_first_wheel_step_for_testing(m_context_id, position, delta_in_css_pixels);
+}
+
+void CompositorContextHandle::begin_input_trace_for_testing()
+{
+    m_host.begin_input_trace_for_testing(m_context_id);
+}
+
+Vector<Web::InputTraceRecord> CompositorContextHandle::take_input_trace_for_testing()
+{
+    return m_host.take_input_trace_for_testing(m_context_id);
 }
 
 Compositing::PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates(Compositing::AsyncScrollUpdateFreshness freshness)
@@ -187,7 +207,7 @@ private:
         return m_connection->drain_webgl_command_buffer(*m_canvas_id);
     }
 
-    virtual void send_commands(ByteBuffer const& commands, Vector<Gfx::DecodedImageFrame> const& bitmaps) override
+    virtual void send_commands(ReadonlyBytes commands, Vector<Gfx::DecodedImageFrame> const& bitmaps) override
     {
         if (!m_canvas_id.has_value())
             return;
@@ -409,10 +429,10 @@ void CompositorHost::invalidate_wheel_event_listener_state(Web::CompositorContex
 }
 
 Compositing::AsyncScrollEnqueueResult CompositorHost::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID expected_document_id, Gfx::FloatPoint position,
-    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
+    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
 {
     if (auto* connection = compositor_connection())
-        return connection->async_scroll_by(context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking);
+        return connection->async_scroll_by(context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking, wheel_step_dispatch, input_event_id);
     return {};
 }
 
@@ -429,10 +449,36 @@ void CompositorHost::cancel_smooth_scroll(Web::CompositorContextId context_id, W
         connection->cancel_smooth_scroll(context_id, stable_node_id);
 }
 
-Gfx::FloatPoint CompositorHost::elastic_overscroll_stretch_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
+String CompositorHost::scroll_state_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stretched_scroller)
 {
     if (auto* connection = compositor_connection())
-        return connection->elastic_overscroll_stretch_for_testing(context_id, stable_node_id);
+        return connection->scroll_state_for_testing(context_id, stretched_scroller);
+    return {};
+}
+
+void CompositorHost::synchronize_for_testing()
+{
+    if (auto* connection = compositor_connection())
+        connection->synchronize_for_testing();
+}
+
+Optional<Compositing::FirstWheelStepRouteForTesting> CompositorHost::route_first_wheel_step_for_testing(Web::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels)
+{
+    if (auto* connection = compositor_connection())
+        return connection->route_first_wheel_step_for_testing(context_id, position, delta_in_css_pixels);
+    return {};
+}
+
+void CompositorHost::begin_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->begin_input_trace_for_testing(context_id);
+}
+
+Vector<Web::InputTraceRecord> CompositorHost::take_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        return connection->take_input_trace_for_testing(context_id);
     return {};
 }
 

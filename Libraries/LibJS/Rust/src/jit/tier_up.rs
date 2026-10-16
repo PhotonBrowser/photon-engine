@@ -25,6 +25,7 @@ use crate::layout::function_object::EcmascriptFunctionObject;
 use crate::layout::value::Value;
 use crate::runtime::ecmascript_function_object::as_ecmascript_function_object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
+use crate::runtime::realm_watchpoints;
 use crate::runtime::shared_function_instance_data::FunctionKind;
 
 /// `threshold` invocations.
@@ -307,11 +308,13 @@ fn install(
         memory,
         compiled.entry_offset,
         &compiled.osr_entries,
+        compiled.osr_loop_back_edges,
         compiled.sites,
         embedded_cells,
         snapshot,
     )
-    .with_invalidation(id, compiled.invalidation_patches);
+    .with_invalidation(id, compiled.invalidation_patches)
+    .with_osr_outer_loop_back_edges(compiled.osr_outer_loop_back_edges);
     vm.jit.dependents.register(vm, executable, id, &compiled.dependencies);
     // NB: Code may be installed while frames of the executable loop in the interpreter, because the compile was
     //     queued (from the tier-up check of another executable, like a callee's), or because they exited from the
@@ -377,6 +380,10 @@ fn compile(
 ) {
     assert_eq!(executable.jit_compile_state(), CompileState::None);
     executable.set_jit_compile_state(CompileState::Queued);
+
+    // NB: The snapshot captures the set only while it is valid, and capturing it may not allocate a new one.
+    let realm = function.realm().expect("an ECMAScript function has a realm");
+    realm_watchpoints::array_iterators_have_no_return(vm, realm);
 
     // NB: Nothing may collect the cells the snapshot captured before something keeps them alive.
     let defer_gc = DeferGc::new(vm);

@@ -48,6 +48,30 @@ pub(crate) mod streams;
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
 pub(crate) mod url_pattern;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod web_gl;
+
+// The generators of the build script, whose tests run with those of the crate.
+#[cfg(test)]
+#[path = "../generate/webgl_constants.rs"]
+mod webgl_constants;
+#[cfg(test)]
+#[path = "../generate/webgl_proxy.rs"]
+mod webgl_proxy;
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the tests do not run the writer of the vocabulary, which the model is for as well"
+)]
+#[path = "../generate/webgl_wire_model.rs"]
+mod webgl_wire_model;
 
 // NB: Only C++ calls into libweb_rust, so nothing in this crate names it. Linking it keeps its extern "C" functions in
 //     the static library.

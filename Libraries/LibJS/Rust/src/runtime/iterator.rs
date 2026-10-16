@@ -11,7 +11,7 @@ use core::ops::Deref;
 
 use libjs_runtime_macros::Trace;
 
-use crate::bytecode::executable::StaticPropertyLookupCacheSite;
+use crate::bytecode::executable::{PropertyLookupCache, StaticPropertyLookupCacheSite};
 use crate::gc::class::{GcCell, define_cell};
 use crate::gc::root::MarkedVec;
 use crate::interpreter::vm::Vm;
@@ -20,13 +20,18 @@ use crate::layout::function_object::FunctionObject;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{call, call_function_object};
+use crate::runtime::array::Array;
+use crate::runtime::array_iterator::{ArrayIterator, iterated_array_like_element, iterated_array_like_length};
 use crate::runtime::async_from_sync_iterator_prototype::create_async_from_sync_iterator;
 use crate::runtime::completion::{Completion, ThrowCompletionOr};
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
-use crate::runtime::object::{MayInterfereWithIndexedPropertyAccess, ShouldThrowExceptions, allocate_object};
+use crate::runtime::object::{
+    MayInterfereWithIndexedPropertyAccess, PropertyKind, ShouldThrowExceptions, allocate_object,
+};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
+use crate::runtime::realm_watchpoints;
 
 pub use libjs_abi::IteratorHint;
 
@@ -150,9 +155,23 @@ pub enum PrimitiveHandling {
     RejectPrimitives,
 }
 
-/// The step of an iterator the runtime takes without calling its next method, given the iterator. It sets `done`, or
-/// the value the step produces.
-pub type BuiltinIteratorNext = fn(&Object, &Vm, &mut bool, &mut Value) -> ThrowCompletionOr<()>;
+/// What the step of a built-in iterator produces.
+#[derive(Clone, Copy)]
+pub enum BuiltinIteratorStep {
+    Done,
+    Value(Value),
+    /// An iterator result object, which IteratorStep reads done and value from as it does with the result of next.
+    IteratorResult(Gc<Object>),
+}
+
+impl BuiltinIteratorStep {
+    pub fn from_done_and_value(done: bool, value: Value) -> Self {
+        if done { Self::Done } else { Self::Value(value) }
+    }
+}
+
+/// The step of an iterator the runtime takes without calling its next method, given the iterator.
+pub type BuiltinIteratorNext = fn(&Object, &Vm) -> ThrowCompletionOr<BuiltinIteratorStep>;
 
 /// What IteratorStep produces: DONE, or a value.
 #[derive(Clone, Copy, Debug)]
@@ -250,6 +269,21 @@ pub fn get_iterator_from_method(
 
 // 7.4.4 GetIterator ( obj, kind ), https://tc39.es/ecma262/#sec-getiterator
 pub fn get_iterator_impl(vm: &Vm, object: Value, kind: IteratorHint) -> ThrowCompletionOr<IteratorRecordImpl> {
+    get_iterator_impl_with_cache(
+        vm,
+        object,
+        kind,
+        vm.static_property_lookup_cache(StaticPropertyLookupCacheSite::GetIteratorMethod),
+    )
+}
+
+/// GetIterator, with the cache that the lookup of @@iterator for synchronous iteration uses.
+pub fn get_iterator_impl_with_cache(
+    vm: &Vm,
+    object: Value,
+    kind: IteratorHint,
+    iterator_method_cache: &PropertyLookupCache,
+) -> ThrowCompletionOr<IteratorRecordImpl> {
     let method;
     let iterator_symbol = PropertyKey::from(vm.well_known_symbols().iterator);
 
@@ -282,11 +316,7 @@ pub fn get_iterator_impl(vm: &Vm, object: Value, kind: IteratorHint) -> ThrowCom
     // 2. Else,
     else {
         // a. Let method be ? GetMethod(obj, @@iterator).
-        method = object.get_method_with_cache(
-            vm,
-            &iterator_symbol,
-            vm.static_property_lookup_cache(StaticPropertyLookupCacheSite::GetIteratorMethod),
-        )?;
+        method = object.get_method_with_cache(vm, &iterator_symbol, iterator_method_cache)?;
     }
 
     // 3. If method is undefined, throw a TypeError exception.
@@ -296,6 +326,28 @@ pub fn get_iterator_impl(vm: &Vm, object: Value, kind: IteratorHint) -> ThrowCom
 
     // 4. Return ? GetIteratorFromMethod(obj, method).
     get_iterator_from_method_impl(vm, object, method)
+}
+
+/// Steps 2 and 3 of GetIterator for synchronous iteration: the iterator method of `object`, through the cache
+/// `iterator_method_cache`.
+pub fn get_sync_iterator_method(
+    vm: &Vm,
+    object: Value,
+    iterator_method_cache: &PropertyLookupCache,
+) -> ThrowCompletionOr<Gc<FunctionObject>> {
+    // 2. Else,
+    // a. Let method be ? GetMethod(obj, @@iterator).
+    let method = object.get_method_with_cache(
+        vm,
+        &PropertyKey::from(vm.well_known_symbols().iterator),
+        iterator_method_cache,
+    )?;
+
+    // 3. If method is undefined, throw a TypeError exception.
+    let Some(method) = method else {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotIterable, &[&object]);
+    };
+    Ok(method)
 }
 
 pub fn get_iterator(vm: &Vm, object: Value, kind: IteratorHint) -> ThrowCompletionOr<Gc<IteratorRecord>> {
@@ -432,16 +484,29 @@ fn iterator_step_impl(
     if next_method.is_function() && next_method.as_function().realm() == vm.current_realm() {
         let iterator = iterator_record.iterator();
         if let Some(builtin_iterator_next) = iterator.as_builtin_iterator_if_next_is_not_redefined(next_method) {
-            let mut value = Value::UNDEFINED;
-            let mut done = false;
-            builtin_iterator_next(&iterator, vm, &mut done, &mut value)?;
+            let step = match builtin_iterator_next(&iterator, vm) {
+                // 7.4.6 IteratorNext ( iteratorRecord [ , value ] ), https://tc39.es/ecma262/#sec-iteratornext
+                // 3. If result is a throw completion, then
+                Err(throw) => {
+                    // a. Set iteratorRecord.[[Done]] to true.
+                    iterator_record.set_done(true);
 
-            if done {
-                iterator_record.set_done(true);
-                return Ok(IterationResult::Done);
-            }
+                    // b. Return ? result.
+                    return Err(throw);
+                }
+                Ok(step) => step,
+            };
 
-            return Ok(IterationResult::Value(value));
+            return match step {
+                BuiltinIteratorStep::Done => {
+                    iterator_record.set_done(true);
+                    Ok(IterationResult::Done)
+                }
+                BuiltinIteratorStep::Value(value) => Ok(IterationResult::Value(value)),
+                BuiltinIteratorStep::IteratorResult(result) => {
+                    complete_iterator_step(vm, iterator_record, result, with_value)
+                }
+            };
         }
     }
 
@@ -449,6 +514,17 @@ fn iterator_step_impl(
     // 1. Let result be ? IteratorNext(iteratorRecord).
     let result = iterator_next(vm, iterator_record, None)?;
 
+    complete_iterator_step(vm, iterator_record, result, with_value)
+}
+
+/// The steps of IteratorStep and IteratorStepValue that follow IteratorNext, given its result.
+fn complete_iterator_step(
+    vm: &Vm,
+    iterator_record: &IteratorRecordImpl,
+    result: Gc<Object>,
+    with_value: WithValue,
+) -> ThrowCompletionOr<IterationResult> {
+    // 7.4.9 IteratorStep ( iteratorRecord ), https://tc39.es/ecma262/#sec-iteratorstep
     // 2. Let done be Completion(IteratorComplete(result)).
     let done = iterator_complete(vm, result);
 
@@ -515,7 +591,12 @@ pub fn iterator_step_value(vm: &Vm, iterator_record: &IteratorRecordImpl) -> Thr
 // NB: AsyncIteratorClose is not implemented here. It is inlined as bytecode
 //     by the codegen, using the Await bytecode op to yield naturally instead of
 //     spinning the event loop synchronously.
-fn iterator_close_impl(vm: &Vm, iterator_record: &IteratorRecordImpl, completion: Completion) -> Completion {
+fn iterator_close_impl(
+    vm: &Vm,
+    iterator_record: &IteratorRecordImpl,
+    completion: Completion,
+    return_method_cache: &PropertyLookupCache,
+) -> Completion {
     // 1. Assert: Type(iteratorRecord.[[Iterator]]) is Object.
 
     // 2. Let iterator be iteratorRecord.[[Iterator]].
@@ -523,7 +604,7 @@ fn iterator_close_impl(vm: &Vm, iterator_record: &IteratorRecordImpl, completion
 
     // 3. Let innerResult be Completion(GetMethod(iterator, "return")).
     let mut inner_result: ThrowCompletionOr<Value> = Ok(Value::UNDEFINED);
-    let get_method_result = iterator.get_method(vm, &vm.names.return_);
+    let get_method_result = iterator.get_method_with_cache(vm, &vm.names.return_, return_method_cache);
     if let Err(throw) = get_method_result {
         inner_result = Err(throw);
     }
@@ -564,7 +645,22 @@ fn iterator_close_impl(vm: &Vm, iterator_record: &IteratorRecordImpl, completion
 
 // 7.4.11 IteratorClose ( iteratorRecord, completion , https://tc39.es/ecma262/#sec-iteratorclose
 pub fn iterator_close(vm: &Vm, iterator_record: &IteratorRecordImpl, completion: Completion) -> Completion {
-    iterator_close_impl(vm, iterator_record, completion)
+    iterator_close_impl(
+        vm,
+        iterator_record,
+        completion,
+        vm.static_property_lookup_cache(StaticPropertyLookupCacheSite::IteratorCloseReturn),
+    )
+}
+
+/// IteratorClose, with the cache that the lookup of the return method uses.
+pub fn iterator_close_with_cache(
+    vm: &Vm,
+    iterator_record: &IteratorRecordImpl,
+    completion: Completion,
+    return_method_cache: &PropertyLookupCache,
+) -> Completion {
+    iterator_close_impl(vm, iterator_record, completion, return_method_cache)
 }
 
 // 7.4.12 IteratorCloseAll ( iters, completion ), https://tc39.es/ecma262/#sec-iteratorclose
@@ -591,10 +687,10 @@ pub fn create_iterator_result_object(vm: &Vm, realm: Gc<Realm>, value: Value, do
     let object = Object::create_with_premade_shape(vm, realm.iterator_result_object_shape());
 
     // 2. Perform ! CreateDataPropertyOrThrow(obj, "value", value).
-    object.put_direct(realm.iterator_result_object_value_offset(), value);
+    object.initialize_direct(realm.iterator_result_object_value_offset(), value);
 
     // 3. Perform ! CreateDataPropertyOrThrow(obj, "done", done).
-    object.put_direct(realm.iterator_result_object_done_offset(), Value::from_bool(done));
+    object.initialize_direct(realm.iterator_result_object_done_offset(), Value::from_bool(done));
 
     // 4. Return obj.
     object
@@ -665,6 +761,44 @@ pub fn setter_that_ignores_prototype_properties(
     Ok(())
 }
 
+/// get_iterator_values() for an array that is iterated with the array iterators of `realm` without anything observing
+/// them (see `realm_watchpoints::array_is_iterated_unobservably()`).
+fn get_array_values(
+    vm: &Vm,
+    realm: Gc<Realm>,
+    array: Gc<Object>,
+    mut callback: impl FnMut(Value) -> Option<Completion>,
+) -> Completion {
+    let mut index = 0;
+    loop {
+        let length = match iterated_array_like_length(vm, &array) {
+            Ok(length) => length,
+            Err(throw) => return throw.into(),
+        };
+        if index >= length {
+            return Completion::normal(Value::UNDEFINED);
+        }
+        let value = match iterated_array_like_element(vm, &array, index) {
+            Ok(value) => value,
+            Err(throw) => return throw.into(),
+        };
+        index += 1;
+
+        if let Some(completion) = callback(value) {
+            if realm_watchpoints::array_iterators_have_no_return(vm, realm) {
+                return completion;
+            }
+            // NB: The callback gave array iterators a return method. The iterator that it gets as its this value is
+            //     one that nothing saw before, so it may be made now.
+            let iterator = ArrayIterator::create(vm, realm, Value::from_object(array), PropertyKind::Value);
+            iterator.index.set(index);
+            // NB: IteratorClose does not use the next method.
+            let iterator_record = IteratorRecordImpl::new(Some(iterator.upcast()), Value::UNDEFINED, false);
+            return iterator_close(vm, &iterator_record, completion);
+        }
+    }
+}
+
 // Non-standard
 /// Iterates `iterable`, handing each value to `callback`, and closes the iterator with the completion the callback
 /// returns to stop early.
@@ -673,6 +807,16 @@ pub fn get_iterator_values(
     iterable: Value,
     mut callback: impl FnMut(Value) -> Option<Completion>,
 ) -> Completion {
+    // OPTIMIZATION: Nothing can observe the iterator of an array that is iterated with the array iterators of the
+    //               realm, so its elements are read like the iterator would read them, without making it.
+    if iterable.is_object()
+        && iterable.as_object().downcast::<Array>().is_some()
+        && let Some(realm) = vm.current_realm()
+        && realm_watchpoints::array_is_iterated_unobservably(vm, realm, &iterable.as_object())
+    {
+        return get_array_values(vm, realm, iterable.as_object(), callback);
+    }
+
     let iterator_record = match get_iterator_impl(vm, iterable, IteratorHint::Sync) {
         Ok(iterator_record) => iterator_record,
         Err(throw) => return throw.into(),

@@ -162,6 +162,11 @@ WebContentPage::WebContentPage(WebContentClient& client, Web::PageId id, Canonic
 
 WebContentPage::~WebContentPage() = default;
 
+WebContentServerProxy* WebContentPage::routed_proxy() const
+{
+    return routed_connection();
+}
+
 WebContentClient& WebContentPage::client() const
 {
     VERIFY(m_client);
@@ -873,6 +878,12 @@ void WebContentPage::did_update_editing_history_state(bool can_undo, bool can_re
     view().set_editing_history_state(can_undo, can_redo);
 }
 
+void WebContentPage::did_set_text_fragment_indication_visibility(bool visible)
+{
+    if (displays_tab())
+        view().set_text_fragment_indication_visibility({}, visible);
+}
+
 void WebContentPage::did_request_tooltip_override(Gfx::IntPoint position, ByteString title)
 {
     if (displays_tab()) {
@@ -1178,6 +1189,11 @@ void WebContentPage::did_output_js_console_message(ConsoleOutput console_output)
         if (view().on_console_message)
             view().on_console_message(move(console_output));
     }
+}
+
+void WebContentPage::did_block_resource()
+{
+    view().did_block_resource({});
 }
 
 void WebContentPage::did_start_network_request(u64 request_id, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::RequestPriority priority)
@@ -1663,14 +1679,9 @@ void WebContentPage::beforeunload_check_result(Web::HTML::CrossProcessId operati
     traversable().did_receive_beforeunload_check_result(*this, operation_id, result, unload_prompt_shown);
 }
 
-void WebContentPage::changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, Web::HTML::UnloadDisplayedDocument unload_displayed_document)
+void WebContentPage::changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only, Optional<Web::HTML::CrossProcessId> target_document_id)
 {
-    traversable().did_receive_changing_navigable_history_job_ready(*this, operation_id, navigable_id, disposition, unload_displayed_document);
-}
-
-void WebContentPage::changing_navigable_unload_preparation_complete(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id)
-{
-    traversable().did_receive_changing_navigable_unload_preparation_complete(*this, operation_id, navigable_id);
+    traversable().did_receive_changing_navigable_history_job_ready(*this, operation_id, navigable_id, disposition, update_only, target_document_id);
 }
 
 void WebContentPage::descendant_unload_task_complete(Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id)
@@ -2262,16 +2273,14 @@ void WebContentPage::did_fail_download(u64 download_id, String error)
 
 void WebContentPage::did_finish_loading(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id)
 {
-    auto navigable = hosted_navigable(navigable_id);
-    if (!navigable.has_value())
+    // NB: Only the page hosting the active document finishes loading it. A page standing in for a document the
+    //     navigable lost, as the page displaying the tab after its process crashed does, finishes loading the stand-in;
+    //     that must not surface in the view.
+    auto navigable = traversable().find(navigable_id);
+    if (!navigable.has_value() || navigable->active_document().host() != this)
         return;
 
     if (navigation_id != navigable->tracked_load_navigation_id())
-        return;
-
-    // A page standing in for a document the navigable lost, as the page displaying the tab after its process crashed
-    // does, finishes loading the stand-in; that must not surface in the view.
-    if (navigable->active_document().host() != this)
         return;
 
     navigable->clear_active_document_load();
@@ -2342,10 +2351,10 @@ void WebContentPage::did_change_title(Utf16String title)
     }
 }
 
-void WebContentPage::did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word)
+void WebContentPage::did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id)
 {
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_page_context_menu({}, *this, target->position, for_input_events_target, move(misspelled_word));
+        target->view.did_request_page_context_menu({}, *this, target->position, for_input_events_target, move(misspelled_word), text_fragment_generation_id);
 }
 
 void WebContentPage::did_request_spelling_menu_action_for_testing(Web::SpellingMenuActionForTesting action, u32 guess_index)
@@ -2358,13 +2367,18 @@ void WebContentPage::did_request_spelling_menu_action_for_testing(Web::SpellingM
     view().activate_spelling_menu_action_for_testing({}, *this, action, guess_index);
 }
 
-void WebContentPage::did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned)
+void WebContentPage::did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<u64> text_fragment_generation_id)
 {
     auto verified_navigation = navigation_from_page(client(), move(navigation));
     if (!verified_navigation.has_value())
         return;
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_link_context_menu({}, target->position, verified_navigation.release_value());
+        target->view.did_request_link_context_menu({}, target->position, verified_navigation.release_value(), text_fragment_generation_id);
+}
+
+void WebContentPage::did_generate_text_fragment_url(u64 request_id, Optional<URL::URL> url)
+{
+    view().did_generate_text_fragment_url(request_id, move(url));
 }
 
 void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap)
@@ -2461,6 +2475,31 @@ void WebContentPage::did_request_alert(Utf16String message)
     did_open_dialog(Web::PendingDialog::Alert, message);
     if (view().on_request_alert)
         view().on_request_alert(message);
+}
+
+void WebContentPage::did_request_before_unload(String source)
+{
+    did_open_dialog(Web::PendingDialog::BeforeUnload, {});
+    auto weak_traversable = m_traversable;
+    auto origin_page_id = id();
+    auto close_prompt = [weak_traversable, origin_page_id](bool accepted) {
+        if (!weak_traversable)
+            return;
+
+        weak_traversable->for_each_hosting_page([&](WebContentPage& page) {
+            if (page.id() != origin_page_id)
+                page.async_did_open_dialog_in_another_process(Web::PendingDialog::None, Utf16View {});
+            else
+                page.routed_proxy()->async_before_unload_closed(origin_page_id, accepted);
+        });
+    };
+
+    if (view().on_request_before_unload) {
+        view().on_request_before_unload(source, move(close_prompt));
+        return;
+    }
+
+    close_prompt(true);
 }
 
 void WebContentPage::did_request_confirm(Utf16String message)
@@ -2568,6 +2607,12 @@ void WebContentPage::did_close_browsing_context()
         if (view.on_close)
             view.on_close();
     }
+}
+
+void WebContentPage::did_complete_close_preflight(u64 request_id, bool approved)
+{
+    if (displays_tab())
+        view().did_complete_close_preflight({}, request_id, approved);
 }
 
 void WebContentPage::did_request_select_dropdown(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)

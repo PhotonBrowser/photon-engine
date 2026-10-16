@@ -1,24 +1,32 @@
 set(SOURCES
+    AsyncScrollUpdateOutbox.cpp
     BackingStoreManager.cpp
     CanvasHost.cpp
+    CaretBlinkTimer.cpp
     CompositorState.cpp
+    ContextPresenter.cpp
+    ContextScene.cpp
     ContextState.cpp
     DisplayListPlayer.cpp
     DisplayListPlayerSkia.cpp
     DisplayListRasterCache.cpp
     ConnectionFromClient.cpp
     ConnectionFromWebContent.cpp
+    ElasticOverscrollController.cpp
     FramePacer.cpp
     HostWebGLContext.cpp
+    KeyboardScrollController.cpp
     OpenGLContext.cpp
     PausedDebuggerOverlay.cpp
     RasterizeDisplayList.cpp
     RenderClockConnection.cpp
+    ScrollFlingController.cpp
     ScrollSnapController.cpp
     ScrollbarController.cpp
     VideoFrameSkia.cpp
     VSyncScheduler.cpp
     WebGLObjectMap.cpp
+    WheelGestureRouting.cpp
 )
 
 invoke_py_generator(

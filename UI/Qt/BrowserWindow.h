@@ -19,6 +19,7 @@
 #include <UI/Qt/FullscreenDebounce.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
+#include <UI/Qt/WindowCloseCoordinator.h>
 
 #include <QMainWindow>
 #include <QPushButton>
@@ -150,6 +151,14 @@ public:
     void duplicate_tab(Tab&);
     Tab* current_tab() const { return m_current_tab; }
     bool activate_tab_with_url(URL::URL const&);
+    // Asks every tab's page if the window may close, without closing it, and reports the answer. Once the pages agree,
+    // a close() goes straight through.
+    void request_close_preflight_for_quit(Function<void(bool approved)> on_complete);
+    // Brings the window forward for a page's beforeunload prompt, when the prompt is part of a quit's check.
+    void raise_for_quit_prompt();
+    bool is_window_close_approved() const { return m_window_close_approved; }
+    void cancel_window_close_preflight();
+    void on_tab_load_start(Tab&);
     FullscreenMode& fullscreen_mode();
 
     QMenu& hamburger_menu() const { return *m_hamburger_menu; }
@@ -216,6 +225,7 @@ private:
     void update_window_title(QString const&);
     void register_window_with_session_store();
     void sync_session_tab_order();
+    void begin_window_close_preflight(Function<void(bool approved)> on_complete = {});
 
     void set_current_tab(Tab* tab);
     Qt::Edges resize_edges_for_position(QPoint const&) const;
@@ -279,6 +289,13 @@ private:
     IsPopupWindow m_is_popup_window { IsPopupWindow::No };
 
     Optional<WebView::SessionWindowId> m_session_window_id;
+    Optional<i64> m_window_close_active_tab_index;
+    QPointer<Tab> m_window_close_original_active_tab;
+    QPointer<Tab> m_window_close_current_preflight_tab;
+    Vector<QPointer<Tab>> m_window_close_approved_tabs;
+    WindowCloseCoordinator m_window_close_coordinator;
+    Function<void(bool approved)> m_window_close_preflight_on_complete;
+    bool m_window_close_approved { false };
 
     ExitFullscreenButton* m_exit_button { nullptr };
     FullscreenMode* m_fullscreen_mode { nullptr };

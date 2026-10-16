@@ -338,6 +338,14 @@ impl CallFeedbackSnapshot {
         Some((self.target?, self.target_intrinsic?))
     }
 
+    /// The site's single callee, if it is the builtin function `builtin`.
+    pub fn monomorphic_builtin(&self, builtin: u8) -> Option<CellId> {
+        if self.flags & call_feedback_flags::POLYMORPHIC != 0 || self.target_builtin != Some(builtin) {
+            return None;
+        }
+        self.target
+    }
+
     /// The site's single callee if it is `Function.prototype.call`, whose
     /// calls JIT code makes by calling the `this` value directly.
     pub fn function_prototype_call_target(&self) -> Option<CellId> {
@@ -399,6 +407,9 @@ pub struct CallFeedbackSnapshot {
     pub forwarded: Option<ForwardedCallSnapshot>,
     /// Which intrinsic `target` is, if it is one the compiler knows.
     pub target_intrinsic: Option<Intrinsic>,
+    /// The `Builtin` id of `target` (see `RuntimeLayout::builtin_math_abs`), if
+    /// it is a builtin function.
+    pub target_builtin: Option<u8>,
     /// `target`, if JIT code can inline its constructs.
     pub construct: Option<ConstructTarget>,
 }
@@ -644,6 +655,10 @@ pub struct PropertyCacheEntrySnapshot {
     /// Which intrinsic `prototype_property` is, if it is one the compiler
     /// knows.
     pub prototype_property_intrinsic: Option<Intrinsic>,
+    /// The executable of `prototype_property` as an inlining candidate, if
+    /// it is a function JIT code may inline: code that calls the property's
+    /// value as a constant can inline the call without feedback for it.
+    pub prototype_property_inline_executable: Option<u32>,
     /// The function of the accessor the access calls: for `GetPropertyInPrototypeChain` entries, the getter of the
     /// accessor `prototype` held in the property when the snapshot was
     /// taken, for `ChangePropertyInPrototypeChain` entries its setter, and
@@ -978,16 +993,20 @@ pub struct RuntimeInfo {
     /// `Array.prototype.slice.call(arguments, start)` with the arguments
     /// object of `frame`, which the code never created, as an array value.
     pub slice_arguments: u64,
-    /// `u64 libjs_jit_create_array_iterator(VM*, u64 iterable, u64 next)`:
-    /// `GetIterator` of an array whose iterator method is
-    /// `%Array.prototype.values%`, if the iterators it makes have the method
-    /// `next`, as a new array iterator over its values; the empty value,
-    /// having done nothing, otherwise.
-    pub create_array_iterator: u64,
+    /// `u64 libjs_jit_open_array_iteration(VM*, u64 iterable)`:
+    /// `GetIterator` in fast array mode: the iterable, if it is an array whose
+    /// iterator method is `%Array.prototype.values%` and whose iterators have
+    /// the builtin `next` method; the empty value otherwise.
+    pub open_array_iteration: u64,
     /// The builtin `%ArrayIteratorPrototype%.next` of the realm of the
     /// compiled code, if `%ArrayIteratorPrototype%` holds it. Code that
     /// embeds it must list it in `CompiledCode::embedded_cells`.
     pub array_iterator_next: Option<CellId>,
+    /// The watchpoint set of the realm of the compiled code that stays valid
+    /// while its array iterators have no `return` method, if it was valid.
+    /// Code that depends on it must list it in
+    /// `CompiledCode::embedded_cells`.
+    pub array_iterator_return_watchpoint_set: Option<CellId>,
     /// The realm of the compiled code.
     pub realm: CellId,
     /// `%Array.prototype%` and `%Object.prototype%` of the realm of the
@@ -1130,16 +1149,22 @@ pub struct DynamicCallLayout {
 ///    `allocated + cell_size` > the u64 at `heap + heap_threshold_offset`,
 ///    take the slow path (the heap collects garbage there).
 /// 3. Let `cell` = the pointer at `allocator + local_free_list_offset`. If
-///    `cell & freelist_link_mask` is 0, the list is empty: take the slow
-///    path (it refills the list).
-/// 4. Let `link` = the u64 at `cell + freelist_next_offset`. Store
+///    `cell & freelist_link_mask` is 0, the list is empty: go to step 4.
+///    Otherwise let `link` = the u64 at `cell + freelist_next_offset`, store
 ///    `(cell & !freelist_link_mask) | (link & freelist_link_mask)`, the next
 ///    cell, which is in the block of `cell` whatever `link` is (cells are in
 ///    the heap region, where anything may have been corrupted), to
-///    `allocator + local_free_list_offset`, `allocated + cell_size` to
-///    `heap + heap_allocated_bytes_offset`, and add `cell_size` to the u64 at
+///    `allocator + local_free_list_offset`, and go to step 5.
+/// 4. Let `cell` = the pointer at `allocator + local_cursor_offset`. If it is
+///    not below the pointer at `allocator + local_end_offset`, take the slow
+///    path (it refills the list and the cursor). Otherwise store `cell` plus
+///    the u64 at `allocator + local_cell_size_offset` to
+///    `allocator + local_cursor_offset`. These words are outside the heap
+///    region.
+/// 5. Store `allocated + cell_size` to `heap + heap_allocated_bytes_offset`,
+///    and add `cell_size` to the u64 at
 ///    `heap + heap_total_allocated_bytes_offset`.
-/// 5. Copy `template` (`8 * template.len()` bytes, the start of every cell) to
+/// 6. Copy `template` (`8 * template.len()` bytes, the start of every cell) to
 ///    `cell`. Then store `inline_capacity` (a u8) at
 ///    `cell + inline_capacity_offset`, the shape at `cell + shape_offset`,
 ///    `cell + inline_storage_offset` (the address) at
@@ -1149,9 +1174,9 @@ pub struct DynamicCallLayout {
 ///    initialized yet) followed by NaN-boxed `undefined` up to
 ///    `inline_capacity` values.
 ///
-/// No garbage can be collected between steps 2 and 5, and the cell needs no
-/// marking: local free lists only ever hold cells of blocks that the
-/// incremental sweep is done with.
+/// No garbage can be collected between steps 2 and 6, and the cell needs no
+/// marking: local free lists and never-allocated cells only ever come from
+/// blocks that the incremental sweep is done with.
 ///
 /// Slow path: `Object* libjs_jit_allocate_object(VM*, Shape*, u32 reserve)`
 /// returns a complete object of that shape with every named property
@@ -1170,6 +1195,11 @@ pub struct ObjectAllocationInfo {
     pub local_free_list_offset: u32,
     pub freelist_next_offset: u32,
     pub freelist_link_mask: u32,
+    /// Where the cursor, the end and the cell size of an allocator's
+    /// never-allocated cells are, relative to its `allocator` address.
+    pub local_cursor_offset: u32,
+    pub local_end_offset: u32,
+    pub local_cell_size_offset: u32,
     /// The bytes every new plain object starts with, as u64 words.
     pub template: Vec<u64>,
     pub shape_offset: u32,
@@ -1341,7 +1371,7 @@ pub struct RuntimeOffsets {
     pub object_named_properties: u32,
     /// `Shape::dictionary_generation` (u32).
     pub shape_dictionary_generation: u32,
-    /// `PrototypeChainValidity::valid` (bool).
+    /// `WatchpointSet::valid` (bool).
     pub prototype_chain_validity_valid: u32,
     /// `Accessor::getter` and `Accessor::setter` (cell pointers, null if
     /// none).

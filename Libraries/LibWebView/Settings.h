@@ -87,6 +87,8 @@ enum class ConfigVariableID : u8 {
     ShowAdvancedDebugMenu,
     ShowTabPerformanceMonitor,
     UseClientSideWindowDecorations,
+    VerticalTabsHoverExpandDelay,
+    VerticalTabsHoverExpandAnimationDuration,
     MaximumConnectionsPerDownload,
     SplitDownloadsWithoutValidators,
     RestartStalledConnections,
@@ -103,7 +105,8 @@ struct ConfigVariableDefinition {
     Optional<JsonValue::Type> array_element_type;
 };
 
-WEBVIEW_API ReadonlySpan<ConfigVariableDefinition const> config_variable_definitions();
+WEBVIEW_API ReadonlySpan<ConfigVariableDefinition> config_variable_definitions();
+WEBVIEW_API ConfigVariableDefinition const& config_variable_definition(ConfigVariableID);
 WEBVIEW_API Optional<ConfigVariableID> config_variable_id_from_name(StringView);
 
 class WEBVIEW_API SettingsObserver {
@@ -126,6 +129,7 @@ public:
     virtual void geolocation_settings_changed() { }
     virtual void background_networking_settings_changed() { }
     virtual void content_blocker_settings_changed() { }
+    virtual void content_blocker_count_visibility_changed() { }
 };
 
 class WEBVIEW_API Settings {
@@ -204,6 +208,13 @@ public:
     bool content_blocker_enabled() const { return m_content_blocker_enabled; }
     void set_content_blocker_enabled(bool);
 
+    bool show_content_blocker_count() const { return m_show_content_blocker_count; }
+    void set_show_content_blocker_count(bool);
+
+    HashTable<String> const& content_blocker_disabled_sites() const { return m_content_blocker_disabled_sites; }
+    bool content_blocker_enabled_for_site(StringView) const;
+    ErrorOr<void> set_content_blocker_enabled_for_site(StringView, bool enabled);
+
     Vector<ContentBlockerList> const& content_blocker_lists() const { return m_content_blocker_lists; }
     Optional<ContentBlockerList const&> content_blocker_list(StringView identifier) const;
     String add_content_blocker_list(String name, Optional<URL::URL> = {});
@@ -218,9 +229,18 @@ public:
 
     JsonValue const& config_variable(ConfigVariableID) const;
     bool config_variable_as_bool(ConfigVariableID) const;
-    u32 config_variable_as_u32(ConfigVariableID) const;
     void set_config_variable(ConfigVariableID, JsonValue);
     void set_config_variable(StringView name, JsonValue const&);
+
+    template<Integral T>
+    T config_variable_as_integer(ConfigVariableID id) const
+    {
+        auto const& variable = config_variable_definition(id);
+        VERIFY(variable.default_value.is_number());
+
+        auto value = config_variable(id).get_integer<T>();
+        return value.value_or_lazy_evaluated([&] { return variable.default_value.get_integer<T>().value(); });
+    }
 
     static void add_observer(Badge<SettingsObserver>, SettingsObserver&);
     static void remove_observer(Badge<SettingsObserver>, SettingsObserver&);
@@ -256,6 +276,8 @@ private:
     bool m_background_networking_enabled { true };
     bool m_filter_list_updates_enabled { false };
     bool m_content_blocker_enabled { false };
+    bool m_show_content_blocker_count { false };
+    HashTable<String> m_content_blocker_disabled_sites;
     Vector<ContentBlockerList> m_content_blocker_lists;
     String m_custom_content_blocker_filters;
 

@@ -47,6 +47,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/CheckUnloadingCanceledState.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/DragDataStore.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
@@ -183,6 +184,7 @@ struct NavigationParamsFetchStateHolder : public JS::Cell {
 
     // Accumulated redirect output
     Optional<URL::URL> redirected_url;
+    bool redirect_replaced_fragment { false };
     Optional<StorageSerializationRecord> redirect_classic_history_api_state;
     RefPtr<DocumentState> replacement_document_state;
     bool resource_cleared = false;
@@ -221,6 +223,7 @@ public:
 
     // Redirect mutations (only set by fetch path)
     Optional<URL::URL> redirected_url;
+    bool redirect_replaced_fragment { false };
     Optional<StorageSerializationRecord> classic_history_api_state;
     RefPtr<DocumentState> replacement_document_state;
     bool resource_cleared = false;
@@ -593,8 +596,22 @@ void PopulateSessionHistoryEntryDocumentOutput::apply_to(NonnullRefPtr<SessionHi
 {
     if (replacement_document_state)
         entry->set_document_state(replacement_document_state);
-    if (redirected_url.has_value())
-        entry->set_url(redirected_url.value());
+    if (redirected_url.has_value()) {
+        // https://wicg.github.io/scroll-to-text-fragment/#extracting-the-fragment-directive
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#create-navigation-params-by-fetching
+        // Let fragment directive be the result of running remove the fragment directive on locationURL.
+        auto fragment_directive = remove_the_fragment_directive(*redirected_url);
+
+        // Set entry's URL to locationURL.
+        entry->set_url(redirected_url.release_value());
+
+        // Set entry's directive state's value to fragment directive.
+        // NOTE: A redirect location without a fragment inherits the request URL's fragment. The
+        //       fragment directive was already removed from that URL and stored in the directive state,
+        //       so leaving the state unchanged performs that inheritance.
+        if (fragment_directive.has_value() || redirect_replaced_fragment)
+            entry->directive_state()->set_value(move(fragment_directive));
+    }
     if (classic_history_api_state.has_value())
         entry->set_classic_history_api_state(classic_history_api_state.release_value());
     if (resource_cleared)
@@ -708,6 +725,7 @@ void LocalNavigable::set_has_been_destroyed()
     cancel_hover_update_after_async_scroll();
     destroy_compositor_context();
     m_has_been_destroyed = true;
+    DOM::Document::invalidate_full_activity();
     resolve_all_pending_async_scroll_operations();
     cancel_user_scroll_settlement();
 }
@@ -928,6 +946,7 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
 
     auto output = navigable->heap().allocate<PopulateSessionHistoryEntryDocumentOutput>();
     output->redirected_url = move(result.redirected_url);
+    output->redirect_replaced_fragment = result.redirect_replaced_fragment;
     output->classic_history_api_state = move(result.classic_history_api_state);
     output->resource_cleared = result.resource_cleared;
     output->inline_content_origin = move(result.inline_content_origin);
@@ -951,18 +970,18 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
         Bindings::NavigationTimingType::Navigate,
         output,
         GC::create_function(navigable->heap(), [navigable, history_entry, history_handling = request.history_handling, navigation_id = request.navigation_id, user_involvement = request.user_involvement](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) mutable {
+            // AD-HOC: This check is not in the spec but we should not continue navigation if ongoing navigation id has changed.
+            if (navigable->ongoing_navigation() != navigation_id) {
+                navigable->stop_delaying_load_events_for_navigation(navigation_id);
+                navigable->page().client().navigation_population_failed(navigable->id(), navigation_id);
+                return;
+            }
+
             if (output && output->download_handled) {
                 // NB: The UI process ended the recorded load and its transaction when the download adopted this
                 //     population's response body.
                 navigable->set_ongoing_navigation({});
                 navigable->set_delaying_load_events(false);
-                return;
-            }
-
-            // AD-HOC: This check is not in the spec but we should not continue navigation if ongoing navigation id has changed.
-            if (navigable->ongoing_navigation() != navigation_id) {
-                navigable->stop_delaying_load_events_for_navigation(navigation_id);
-                navigable->page().client().navigation_population_failed(navigable->id(), navigation_id);
                 return;
             }
 
@@ -1097,6 +1116,7 @@ void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_
     // 4. Set navigable's active session history entry to entry.
     m_active_session_history_entry = entry;
     m_active_document = document;
+    DOM::Document::invalidate_full_activity();
     document->set_navigable(this);
 
     // 5. Set navigable's parent to parent.
@@ -1121,7 +1141,7 @@ void LocalNavigable::inherit_page_state_from(LocalNavigable const& parent)
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#activate-history-entry
-void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, GC::Ref<DOM::Document> document)
+void LocalNavigable::activate_history_entry(NonnullRefPtr<SessionHistoryEntry> entry, GC::Ref<DOM::Document> document)
 {
     // AD-HOC: The document a provisional navigable populated activates: the navigable takes its container over first,
     //         so that the document is the content navigable's active document, and the WindowProxy's [[Window]], from
@@ -1140,28 +1160,11 @@ void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, G
     //    navigate away from it.
     VERIFY(!new_document->is_initial_about_blank());
 
-    // DocumentState identifies its associated Document by a process-local ID. Restore that association at the
-    // transition that makes a reconstructed entry's Document active.
-    VERIFY(entry);
-    auto document_state = entry->document_state();
-    VERIFY(document_state);
-    document_state->set_document_id(new_document->unique_id());
-
     // 4. Set navigable's active session history entry to entry.
+    // NB: Which also makes newDocument the active document, and records it as entry's document state's document, which
+    //     a reconstructed entry only knows by ID.
     m_active_session_history_entry = entry;
-    if (m_active_document && m_active_document != new_document) {
-        // The outgoing document's frame in flight reaches the compositor before any of the new one's.
-        (void)presenter();
-        // The pending post-scroll hover refresh and scrollend settlement belong to the outgoing document; drop them.
-        // And so does the hover the page reported to its client; end it.
-        cancel_hover_update_after_async_scroll();
-        cancel_user_scroll_settlement();
-        m_event_handler.reset_hover_for_document_replacement({});
-        m_active_document->set_navigable(nullptr);
-    }
-    m_active_document = new_document;
-    new_document->set_navigable(this);
-    set_needs_to_record_display_list();
+    set_active_document(new_document);
 
     // 5. Make active newDocument.
     new_document->make_active();
@@ -1188,12 +1191,6 @@ void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, G
 // The steps queued for one navigable of nonchangingNavigablesThatStillNeedUpdates.
 void LocalNavigable::update_nonchanging_navigable_history_step_state(HistoryObjectLengthAndIndex history_object_length_and_index, GC::Ref<GC::Function<void()>> on_complete)
 {
-    // AD-HOC: The navigable may have been destroyed while the UI process dispatched this job.
-    if (has_been_destroyed() || !active_document()) {
-        on_complete->function()();
-        return;
-    }
-
     // AD-HOC: Queue with null document instead of using queue_global_task. A document-associated task can become
     //         unrunnable while the UI process waits for completion, so validate the document when the task runs.
     queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr, GC::create_function(heap(), [navigable = GC::Ref { *this }, history_object_length_and_index, on_complete] {
@@ -1219,7 +1216,8 @@ void LocalNavigable::update_nonchanging_navigable_history_step_state(HistoryObje
 // The steps queued for a navigable of changingNavigables whose targetEntry's document is not its active document.
 void LocalNavigable::queue_navigation_api_state_clear_task()
 {
-    if (has_been_destroyed() || !active_window())
+    // AD-HOC: The UI process can ask this while the navigable has no active document.
+    if (!active_window())
         return;
 
     queue_global_task(Task::Source::NavigationAndTraversal, relevant_global_object(*active_window()), GC::create_function(heap(), [navigable = GC::Ref { *this }] {
@@ -1300,14 +1298,15 @@ void LocalNavigable::save_persisted_state_to_active_session_history_entry()
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-persisted-user-state
-void LocalNavigable::restore_persisted_state_from_session_history_entry(SessionHistoryEntry const& entry)
+// https://wicg.github.io/scroll-to-text-fragment/#restricting-scroll-on-load
+void LocalNavigable::restore_persisted_state_from_session_history_entry(SessionHistoryEntry const& entry, bool suppress_scrolling)
 {
     m_pending_persisted_state_restoration.clear();
 
-    // 1. If entry's scroll restoration mode is "auto", and entry's document's relevant global object's navigation
-    //    API's suppress normal scroll restoration during ongoing navigation is false, then restore scroll position
-    //    data given entry.
-    if (entry.scroll_restoration_mode() == ScrollRestorationMode::Auto) {
+    // 1. If entry's scroll restoration mode is "auto", suppressScrolling is false, and entry's
+    //    document's relevant global object's navigation API's suppress normal scroll restoration
+    //    during ongoing navigation is false, then restore scroll position data given entry.
+    if (entry.scroll_restoration_mode() == ScrollRestorationMode::Auto && !suppress_scrolling) {
         if (auto window = active_window()) {
             if (!window->navigation()->suppress_normal_scroll_restoration_during_ongoing_navigation()) {
                 restore_scroll_position_data(entry);
@@ -1350,7 +1349,7 @@ void LocalNavigable::restore_pending_persisted_state_for_completed_document(GC::
     auto document_state = entry->document_state();
     if (!document_state || document_state->cross_process_id() != restoration.document_state_id)
         return;
-    restore_persisted_state_from_session_history_entry(*entry);
+    restore_persisted_state_from_session_history_entry(*entry, false);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-scroll-position-data
@@ -1569,6 +1568,7 @@ void LocalNavigable::set_active_document(GC::Ptr<DOM::Document> document)
         m_active_document->set_navigable(nullptr);
     }
     m_active_document = document;
+    DOM::Document::invalidate_full_activity();
     if (document)
         document->set_navigable(this);
     set_needs_to_record_display_list();
@@ -2420,6 +2420,12 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
         //       This is because we care about the same-originness of the embedded content against the parent context, not the navigation source.
 
         // 14. Set locationURL to response's location URL given currentURL's fragment.
+        auto location_url_without_an_inherited_fragment = state_holder->response->location_url({});
+        if (!location_url_without_an_inherited_fragment.is_error()
+            && location_url_without_an_inherited_fragment.value().has_value()
+            && location_url_without_an_inherited_fragment.value()->fragment().has_value()) {
+            state_holder->redirect_replaced_fragment = true;
+        }
         state_holder->location_url = state_holder->response->location_url(state_holder->current_url.fragment());
 
         // 15. If locationURL is failure or null, then break.
@@ -2477,20 +2483,11 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
     });
 }
 
+// https://wicg.github.io/scroll-to-text-fragment/#extracting-the-fragment-directive
+// https://wicg.github.io/scroll-to-text-fragment/#restricting-the-text-fragment
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#create-navigation-params-by-fetching
 static void create_navigation_params_by_fetching(
-    URL::URL url,
-    DocumentResource document_resource,
-    Fetch::Infrastructure::Request::ReferrerType request_referrer,
-    ReferrerPolicy::ReferrerPolicy request_referrer_policy,
-    Optional<URL::Origin> initiator_origin,
-    Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container,
-    Optional<URL::URL> about_base_url,
-    Optional<URL::Origin> origin,
-    Utf16String navigable_target_name,
-    bool reload_pending,
-    bool ever_populated,
-    UserAgentInitiated user_agent_initiated,
+    PendingSessionHistoryEntryDescriptor const& entry,
     GC::Ptr<LocalNavigable> navigable,
     GC::Ref<SourceSnapshotParams> source_snapshot_params,
     TargetSnapshotParams const& target_snapshot_params,
@@ -2508,7 +2505,8 @@ static void create_navigation_params_by_fetching(
     // FIXME: 1. Assert: this is running in parallel.
 
     // 2. Let documentResource be entry's document state's resource.
-    // NOTE: documentResource is passed as a parameter.
+    auto const& document_state = entry.document_state;
+    auto const& document_resource = document_state.resource;
 
     // 3. Let request be a new request, with
     //    url: entry's URL
@@ -2523,7 +2521,7 @@ static void create_navigation_params_by_fetching(
     //    referrer policy: entry's document state's request referrer policy
     //    policy container: sourceSnapshotParams's source policy container
     auto request = Fetch::Infrastructure::Request::create(vm);
-    request->set_url(url);
+    request->set_url(entry.url);
     request->set_client(source_snapshot_params->fetch_client);
     request->set_destination(Fetch::Infrastructure::Request::Destination::Document);
     request->set_credentials_mode(Fetch::Infrastructure::Request::CredentialsMode::Include);
@@ -2531,14 +2529,17 @@ static void create_navigation_params_by_fetching(
     request->set_redirect_mode(Fetch::Infrastructure::Request::RedirectMode::Manual);
     request->set_replaces_client_id(active_document.relevant_settings_object().id);
     request->set_mode(Fetch::Infrastructure::Request::Mode::Navigate);
-    request->set_referrer(request_referrer);
-    request->set_referrer_policy(request_referrer_policy);
+    request->set_referrer(document_state.request_referrer);
+    request->set_referrer_policy(document_state.request_referrer_policy);
     request->set_policy_container(source_snapshot_params->source_policy_container);
+    request->set_text_directive_user_activation(source_snapshot_params->text_directive_user_activation);
+    request->set_browsing_context_group_has_multiple_contexts(source_snapshot_params->browsing_context_group_has_multiple_contexts);
+    active_document.set_text_directive_user_activation(false);
 
     // 4. If navigable is a top-level traversable, then set request's top-level navigation initiator origin to entry's
     //    document state's initiator origin.
     if (navigable->is_top_level_traversable())
-        request->set_top_level_navigation_initiator_origin(initiator_origin);
+        request->set_top_level_navigation_initiator_origin(document_state.initiator_origin);
 
     // 5. If request's client is null:
     if (request->client() == nullptr) {
@@ -2567,8 +2568,8 @@ static void create_navigation_params_by_fetching(
     // NB: For any other navigation, the entry's initiator origin is its source document's — the fetch client's. An
     //     opaque one is left to HTML's behavior: It's what a navigation from the browser's UI records — which sends
     //     Sec-Fetch-Site:none anyway, and must still reach a file: URL — as well as what a sandboxed document does.
-    if (initiator_origin.has_value() && !initiator_origin->is_opaque())
-        request->set_origin(*initiator_origin);
+    if (document_state.initiator_origin.has_value() && !document_state.initiator_origin->is_opaque())
+        request->set_origin(*document_state.initiator_origin);
 
     // 6. If documentResource is a POST resource:
     if (auto* post_resource = document_resource.get_pointer<POSTResource>()) {
@@ -2607,7 +2608,7 @@ static void create_navigation_params_by_fetching(
     }
 
     // 7. If entry's document state's reload pending is true, then set request's reload-navigation flag.
-    if (reload_pending) {
+    if (document_state.reload_pending) {
         request->set_reload_navigation(true);
 
         // AD-HOC: The specs don't define HTTP cache behavior for reloads. But every major engine forces at least re-
@@ -2620,7 +2621,7 @@ static void create_navigation_params_by_fetching(
     }
 
     // 8. Otherwise, if entry's document state's ever populated is true, then set request's history-navigation flag.
-    else if (ever_populated)
+    else if (document_state.ever_populated)
         request->set_history_navigation(true);
 
     // 9. If sourceSnapshotParams's has transient activation is true, then set request's user-activation to true.
@@ -2640,7 +2641,7 @@ static void create_navigation_params_by_fetching(
     //
     //         Blink GetInitiatorRelation() finds that the entry has no initiator, and Gecko
     //         IsUserTriggeredForSecFetchSite() that its triggering principal is the system's.
-    if (user_agent_initiated == UserAgentInitiated::Yes && navigable && navigable->is_top_level_traversable())
+    if (document_state.user_agent_initiated == UserAgentInitiated::Yes && navigable && navigable->is_top_level_traversable())
         request->set_user_agent_initiated(true);
 
     // 10. If navigable's container is non-null:
@@ -2685,7 +2686,7 @@ static void create_navigation_params_by_fetching(
         .url = active_document.url(),
         .origin = active_document.origin(),
         .opener_policy = active_document.opener_policy(),
-        .current_context_is_navigation_source = initiator_origin.has_value() && active_document.origin().is_same_origin(*initiator_origin)
+        .current_context_is_navigation_source = document_state.initiator_origin.has_value() && active_document.origin().is_same_origin(*document_state.initiator_origin)
     };
 
     // 15. Let finalSandboxFlags be an empty sandboxing flag set.
@@ -2696,9 +2697,9 @@ static void create_navigation_params_by_fetching(
     // 20. Let commitEarlyHints be null.
     // AD-HOC: Store required variables on the state holder to keep them alive whilst waiting on the fetch to complete.
     auto state_holder = realm.heap().allocate<NavigationParamsFetchStateHolder>(move(coop_enforcement_result), request->current_url(), request,
-        move(initiator_origin), move(history_policy_container), move(about_base_url), source_snapshot_params,
-        request_referrer, request_referrer_policy, move(origin), move(document_resource), ever_populated, user_agent_initiated,
-        move(navigable_target_name));
+        document_state.initiator_origin, document_state.history_policy_container, document_state.about_base_url, source_snapshot_params,
+        document_state.request_referrer, document_state.request_referrer_policy, document_state.origin, document_resource, document_state.ever_populated, document_state.user_agent_initiated,
+        document_state.navigable_target_name);
     state_holder->navigable = navigable;
     state_holder->csp_navigation_type = csp_navigation_type;
     state_holder->navigation_timing_type = navigation_timing_type;
@@ -2708,6 +2709,7 @@ static void create_navigation_params_by_fetching(
     perform_navigation_params_fetch(realm, state_holder, completion_steps, GC::create_function(realm.heap(), [&realm, state_holder, user_involvement, completion_steps] {
         auto result = realm.heap().allocate<InternalNavigationResult>();
         result->redirected_url = move(state_holder->redirected_url);
+        result->redirect_replaced_fragment = state_holder->redirect_replaced_fragment;
         result->classic_history_api_state = move(state_holder->redirect_classic_history_api_state);
         result->replacement_document_state = state_holder->replacement_document_state;
         result->resource_cleared = state_holder->resource_cleared;
@@ -2816,18 +2818,7 @@ using NavigationParamsCreationCompletion = GC::Function<void(GC::Ref<InternalNav
 
 static void create_navigation_params_for_population(
     LocalNavigable& navigable,
-    URL::URL url,
-    DocumentResource document_resource,
-    Fetch::Infrastructure::Request::ReferrerType request_referrer,
-    ReferrerPolicy::ReferrerPolicy request_referrer_policy,
-    Optional<URL::Origin> initiator_origin,
-    Optional<URL::Origin> origin,
-    Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container,
-    Optional<URL::URL> about_base_url,
-    Utf16String navigable_target_name,
-    bool reload_pending,
-    bool ever_populated,
-    UserAgentInitiated user_agent_initiated,
+    PendingSessionHistoryEntryDescriptor const& entry,
     GC::Ref<SourceSnapshotParams> source_snapshot_params,
     TargetSnapshotParams const& target_snapshot_params,
     UserNavigationInvolvement user_involvement,
@@ -2850,12 +2841,13 @@ static void create_navigation_params_for_population(
         // 1. If documentResource is a string, then set navigationParams to the result of creating navigation params
         //    from a srcdoc resource given entry, navigable, targetSnapshotParams, userInvolvement, navigationId, and
         //    navTimingType.
-        if (document_resource.has<Utf16String>()) {
+        auto const& document_state = entry.document_state;
+        if (document_state.resource.has<Utf16String>()) {
             wrap_navigation_params(create_navigation_params_from_a_srcdoc_resource(
-                document_resource,
-                origin,
-                history_policy_container,
-                about_base_url,
+                document_state.resource,
+                document_state.origin,
+                document_state.history_policy_container,
+                document_state.about_base_url,
                 &navigable, source_snapshot_params, target_snapshot_params, user_involvement, navigation_id, navigation_timing_type));
         }
         // 2. Otherwise, if all of the following are true:
@@ -2865,20 +2857,9 @@ static void create_navigation_params_for_population(
         //    then set navigationParams to the result of creating navigation params by fetching given entry, navigable,
         //    sourceSnapshotParams, targetSnapshotParams, cspNavigationType, userInvolvement, navigationId, and
         //    navTimingType.
-        else if (Fetch::Infrastructure::is_fetch_scheme(url.scheme()) && (document_resource.has<Empty>() || allow_POST)) {
+        else if (Fetch::Infrastructure::is_fetch_scheme(entry.url.scheme()) && (document_state.resource.has<Empty>() || allow_POST)) {
             create_navigation_params_by_fetching(
-                url,
-                document_resource,
-                request_referrer,
-                request_referrer_policy,
-                initiator_origin,
-                history_policy_container,
-                about_base_url,
-                origin,
-                navigable_target_name,
-                reload_pending,
-                ever_populated,
-                user_agent_initiated,
+                entry,
                 &navigable,
                 source_snapshot_params,
                 target_snapshot_params,
@@ -2890,7 +2871,7 @@ static void create_navigation_params_for_population(
         }
         // 3. Otherwise, if entry's URL's scheme is not a fetch scheme, then set navigationParams to a new non-fetch
         //    scheme navigation params, with:
-        else if (!Fetch::Infrastructure::is_fetch_scheme(url.scheme())) {
+        else if (!Fetch::Infrastructure::is_fetch_scheme(entry.url.scheme())) {
             // - id: navigationId
             // - navigable: navigable
             // - URL: entry's URL
@@ -2902,10 +2883,10 @@ static void create_navigation_params_for_population(
             wrap_navigation_params(navigable.vm().heap().allocate<NonFetchSchemeNavigationParams>(
                 navigation_id,
                 &navigable,
-                url,
+                entry.url,
                 target_snapshot_params.sandboxing_flags,
                 source_snapshot_params->has_transient_activation,
-                *initiator_origin,
+                *document_state.initiator_origin,
                 navigation_timing_type,
                 user_involvement));
         }
@@ -2914,118 +2895,63 @@ static void create_navigation_params_for_population(
     }
 }
 
+// The navigation params a navigation or a history step created, as the UI process receives them.
+static void create_navigation_population_result(Window& window, GC::Ref<InternalNavigationResult> result, GC::Ref<GC::Function<void(NavigationPopulationResult)>> on_complete)
+{
+    auto& realm = window.principal_realm();
+    create_navigation_params_descriptor(realm, result->navigation_params, GC::create_function(realm.heap(), [result, on_complete](NavigationParamsVariantDescriptor navigation_params) {
+        Optional<SessionHistoryDocumentStateDescriptor> replacement_document_state;
+        if (result->replacement_document_state)
+            replacement_document_state = create_session_history_document_state_descriptor(*result->replacement_document_state);
+        on_complete->function()({
+            .navigation_params = move(navigation_params),
+            .redirected_url = move(result->redirected_url),
+            .redirect_replaced_fragment = result->redirect_replaced_fragment,
+            .classic_history_api_state = move(result->classic_history_api_state),
+            .replacement_document_state = move(replacement_document_state),
+            .resource_cleared = result->resource_cleared,
+        });
+    }));
+}
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#populating-a-session-history-entry
-void LocalNavigable::populate_session_history_entry_document(
-    URL::URL url,
-    DocumentResource document_resource,
-    Fetch::Infrastructure::Request::ReferrerType request_referrer,
-    ReferrerPolicy::ReferrerPolicy request_referrer_policy,
-    Optional<URL::Origin> initiator_origin,
-    Optional<URL::Origin> origin,
-    Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container,
-    Optional<URL::URL> about_base_url,
-    Utf16String navigable_target_name,
-    bool reload_pending,
-    bool ever_populated,
-    UserAgentInitiated user_agent_initiated,
-    GC::Ref<SourceSnapshotParams> source_snapshot_params,
-    TargetSnapshotParams const& target_snapshot_params,
-    UserNavigationInvolvement user_involvement,
-    Optional<Utf16String> navigation_id,
-    NavigationParamsVariant navigation_params,
-    ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type,
-    bool allow_POST,
-    GC::Ptr<GC::Function<void(GC::Ptr<PopulateSessionHistoryEntryDocumentOutput>)>> completion_steps,
-    GC::Ptr<GC::Function<void(NavigationPopulationResult)>> response_steps)
+// NB: This creates the navigation params for request's entry, and the UI process chooses the process that creates the
+//     document from them.
+void LocalNavigable::populate_session_history_entry_document(NavigationPopulationRequest const& request, GC::Ref<SourceSnapshotParams> source_snapshot_params, bool allow_POST, GC::Ref<GC::Function<void(NavigationPopulationResult)>> response_steps)
 {
     // AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
+    auto respond_without_an_active_window = [response_steps] {
+        response_steps->function()({
+            .navigation_params = NavigationParamsNullOrError { "Navigable has no active window"_utf16 },
+            .redirected_url = {},
+            .classic_history_api_state = {},
+            .replacement_document_state = {},
+        });
+    };
     if (!active_window()) {
-        stop_or_resume_response_body_delivery(navigation_params);
-        if (response_steps) {
-            response_steps->function()({
-                .navigation_params = NavigationParamsNullOrError { "Navigable has no active window"_utf16 },
-                .redirected_url = {},
-                .classic_history_api_state = {},
-                .replacement_document_state = {},
-            });
-        }
+        respond_without_an_active_window();
         return;
     }
 
-    auto navigation_timing_type = reload_pending ? Bindings::NavigationTimingType::Reload : Bindings::NavigationTimingType::BackForward;
-    auto received_navigation_params = GC::create_function(heap(), [this, url, navigation_id, navigation_timing_type, user_involvement, completion_steps, csp_navigation_type, source_snapshot_params, response_steps](GC::Ref<InternalNavigationResult> result) {
-        // AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
+    auto received_navigation_params = GC::create_function(heap(), [this, response_steps, respond_without_an_active_window](GC::Ref<InternalNavigationResult> result) {
         if (!active_window()) {
             stop_or_resume_response_body_delivery(result->navigation_params);
-            if (response_steps) {
-                response_steps->function()({
-                    .navigation_params = NavigationParamsNullOrError { "Navigable has no active window"_utf16 },
-                    .redirected_url = {},
-                    .classic_history_api_state = {},
-                    .replacement_document_state = {},
-                });
-            }
+            respond_without_an_active_window();
             return;
         }
-
-        if (response_steps) {
-            auto& realm = active_window()->principal_realm();
-            create_navigation_params_descriptor(realm, result->navigation_params, GC::create_function(heap(), [result, response_steps](NavigationParamsVariantDescriptor params) {
-                Optional<SessionHistoryDocumentStateDescriptor> replacement_document_state;
-                if (result->replacement_document_state)
-                    replacement_document_state = create_session_history_document_state_descriptor(*result->replacement_document_state);
-                response_steps->function()({
-                    .navigation_params = move(params),
-                    .redirected_url = move(result->redirected_url),
-                    .classic_history_api_state = move(result->classic_history_api_state),
-                    .replacement_document_state = move(replacement_document_state),
-                    .resource_cleared = result->resource_cleared,
-                });
-            }));
-            return;
-        }
-
-        auto output = heap().allocate<PopulateSessionHistoryEntryDocumentOutput>();
-        // NB: result's redirect fields are moved into output here; population must read them from output rather than
-        //     the moved-from result.
-        output->redirected_url = move(result->redirected_url);
-        output->classic_history_api_state = move(result->classic_history_api_state);
-        output->replacement_document_state = result->replacement_document_state;
-        output->resource_cleared = result->resource_cleared;
-
-        queue_navigation_and_traversal_task_for_session_history_entry_population(
-            url,
-            source_snapshot_params->allows_downloading,
-            source_snapshot_params->fetch_client ? Optional<URL::Origin> { source_snapshot_params->fetch_client->origin() } : Optional<URL::Origin> {},
-            user_involvement,
-            navigation_id,
-            move(result->navigation_params),
-            csp_navigation_type,
-            navigation_timing_type,
-            output,
-            completion_steps);
+        create_navigation_population_result(*active_window(), result, response_steps);
     });
 
+    auto navigation_timing_type = request.history_entry.document_state.reload_pending ? Bindings::NavigationTimingType::Reload : Bindings::NavigationTimingType::BackForward;
     create_navigation_params_for_population(
         *this,
-        move(url),
-        move(document_resource),
-        move(request_referrer),
-        request_referrer_policy,
-        move(initiator_origin),
-        move(origin),
-        move(history_policy_container),
-        move(about_base_url),
-        move(navigable_target_name),
-        reload_pending,
-        ever_populated,
-        user_agent_initiated,
+        request.history_entry,
         source_snapshot_params,
-        target_snapshot_params,
-        user_involvement,
-        move(navigation_id),
-        move(navigation_params),
-        csp_navigation_type,
+        request.target_snapshot_params,
+        request.user_involvement,
+        {},
+        NullOrError {},
+        request.csp_navigation_type,
         navigation_timing_type,
         allow_POST,
         received_navigation_params);
@@ -3264,43 +3190,18 @@ void LocalNavigable::create_navigation_params_for_navigation(NavigationPopulatio
             return;
         }
 
-        auto& realm = active_window()->principal_realm();
-        create_navigation_params_descriptor(realm, result->navigation_params, GC::create_function(heap(), [this, request = move(request), navigation_id, result](NavigationParamsVariantDescriptor navigation_params) mutable {
+        create_navigation_population_result(*active_window(), result, GC::create_function(heap(), [this, request = move(request), navigation_id, result](NavigationPopulationResult population_result) mutable {
             if (!active_window() || ongoing_navigation() != navigation_id) {
                 stop_or_resume_response_body_delivery(result->navigation_params);
                 return;
             }
-
-            Optional<SessionHistoryDocumentStateDescriptor> replacement_document_state;
-            if (result->replacement_document_state)
-                replacement_document_state = create_session_history_document_state_descriptor(*result->replacement_document_state);
-
-            auto population_result = NavigationPopulationResult {
-                .navigation_params = move(navigation_params),
-                .redirected_url = move(result->redirected_url),
-                .classic_history_api_state = move(result->classic_history_api_state),
-                .replacement_document_state = move(replacement_document_state),
-                .resource_cleared = result->resource_cleared,
-            };
             page().client().navigation_params_creation_finished(*this, move(request), move(population_result));
         }));
     });
 
-    auto const& document_state = request.history_entry.document_state;
     create_navigation_params_for_population(
         *this,
-        request.history_entry.url,
-        document_state.resource,
-        document_state.request_referrer,
-        document_state.request_referrer_policy,
-        document_state.initiator_origin,
-        document_state.origin,
-        document_state.history_policy_container,
-        document_state.about_base_url,
-        document_state.navigable_target_name,
-        document_state.reload_pending,
-        document_state.ever_populated,
-        document_state.user_agent_initiated,
+        request.history_entry,
         source_snapshot_params,
         request.target_snapshot_params,
         request.user_involvement,
@@ -3650,7 +3551,7 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
         // 1. Navigate to a fragment given navigable, url, historyHandling, userInvolvement, sourceElement, navigationAPIState, and navigationId.
         // AD-HOC: The spec does not pass apiMethodTracker along here, which would leave a navigation.navigate() to a
         //         fragment without an ongoing API method tracker, so its promises would never settle.
-        navigate_to_a_fragment(url, to_history_handling_behavior(history_handling), user_involvement, source_element, navigation_api_state, navigation_id, api_method_tracker);
+        navigate_to_a_fragment(url, to_history_handling_behavior(history_handling), user_involvement, source_element, navigation_api_state, navigation_id, api_method_tracker, initiator_origin_snapshot);
 
         // 2. Return.
         return;
@@ -3765,13 +3666,19 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
 
     // 23. In parallel, run these steps:
     auto source_snapshot = create_navigation_source_snapshot(source_snapshot_params);
+    source_snapshot.text_directive_user_activation = active_document.text_directive_user_activation();
+    source_snapshot.browsing_context_group_has_multiple_contexts = active_document.browsing_context_group_has_multiple_contexts();
+    source_snapshot.browsing_context_group_has_remote_contexts = active_document.browsing_context_group_has_remote_contexts();
+    active_document.set_text_directive_user_activation(false);
 
     // Session history entry state is structured-serialized in WebContent, where the JavaScript VM lives. The UI
     // process owns the pending entry and document state created from these initial values.
     auto entry_defaults = SessionHistoryEntry::create();
+    auto stripped_url = url;
+    auto directive_state_value = remove_the_fragment_directive(stripped_url);
     auto start_request = NavigationStartRequest {
         .navigable_id = id(),
-        .url = url,
+        .url = stripped_url,
         .document_resource = document_resource,
         .request_referrer = Fetch::Infrastructure::Request::Referrer::Client,
         .request_referrer_policy = referrer_policy,
@@ -3788,11 +3695,13 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
         .navigation_api_state = entry_defaults->navigation_api_state(),
         .navigation_api_key = entry_defaults->navigation_api_key(),
         .navigation_api_id = entry_defaults->navigation_api_id(),
+        .directive_state_id = entry_defaults->directive_state()->cross_process_id(),
+        .directive_state_value = move(directive_state_value),
     };
     park_navigation_for_population(navigation_id, move(navigation));
 
     auto target = is_top_level_traversable() ? NavigationTarget::TopLevel : NavigationTarget::IFrame;
-    active_browsing_context()->page().client().request_navigation_start(*this, target, url, navigation_id, move(start_request));
+    active_browsing_context()->page().client().request_navigation_start(*this, target, stripped_url, navigation_id, move(start_request));
     return;
 }
 
@@ -3811,7 +3720,7 @@ void LocalNavigable::run_navigation_unload_check(Utf16String const& navigation_i
     // 1. Let unloadPromptCanceled be the result of checking if unloading is user-canceled for navigable's active document's inclusive descendant navigables.
     // NB: This page checks the documents it hosts, last: the UI process, which requested the check, ran it in the
     //     pages hosting the others first, and whether one of them showed the prompt comes with the request.
-    check_if_unloading_is_canceled(hosted_inclusive_descendant_navigables(), {}, {}, {}, unload_prompt_shown,
+    check_if_unloading_is_canceled(hosted_inclusive_descendant_navigables(), as_if<LocalTraversableNavigable>(this), {}, {}, {}, unload_prompt_shown,
         GC::create_function(heap(), [this, navigation_id, completion_steps](CheckIfUnloadingIsCanceledResult unload_prompt_canceled, UnloadPromptShown) {
             if (has_been_destroyed() || !active_window()) {
                 completion_steps->function()(false);
@@ -3887,8 +3796,16 @@ bool LocalNavigable::resume_navigation_params_creation(Utf16String const& naviga
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-fragid
-void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandlingBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ptr<DOM::Element> source_element, Optional<StorageSerializationRecord> navigation_api_state, Utf16String navigation_id, GC::Ptr<NavigationAPIMethodTracker> api_method_tracker)
+void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandlingBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ptr<DOM::Element> source_element, Optional<StorageSerializationRecord> navigation_api_state, Utf16String navigation_id, GC::Ptr<NavigationAPIMethodTracker> api_method_tracker, Optional<URL::Origin> initiator_origin)
 {
+    // https://wicg.github.io/scroll-to-text-fragment/#extracting-the-fragment-directive
+    auto directive_state = active_session_history_entry()->directive_state();
+    auto stripped_url = url;
+    auto fragment_directive = remove_the_fragment_directive(stripped_url);
+    auto const has_fragment_directive = fragment_directive.has_value();
+    if (fragment_directive.has_value())
+        directive_state = DirectiveState::create(page().client().allocate_cross_process_id(), move(fragment_directive));
+
     // 1. Let navigation be navigable's active window's navigation API.
     VERIFY(active_window());
     auto navigation = active_window()->navigation();
@@ -3902,11 +3819,17 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
     //    to sourceElement, destinationURL set to url, and navigationAPIState set to destinationNavigationAPIState.
     // AD-HOC: Also pass apiMethodTracker, see the caller.
     auto navigation_type = history_handling == HistoryHandlingBehavior::Push ? Bindings::NavigationType::Push : Bindings::NavigationType::Replace;
-    bool const continue_ = navigation->fire_a_push_replace_reload_navigate_event(navigation_type, url, true, user_involvement, source_element, {}, destination_navigation_api_state, {}, api_method_tracker);
+    bool const continue_ = navigation->fire_a_push_replace_reload_navigate_event(navigation_type, stripped_url, true, user_involvement, source_element, {}, destination_navigation_api_state, {}, api_method_tracker);
 
     // 5. If continue is false, then return.
     if (!continue_)
         return;
+
+    if (!has_fragment_directive && source_element) {
+        // AD-HOC: A trusted in-page link dismisses the current indication without changing the
+        //         directive state's identity in session history.
+        active_document()->dismiss_text_fragment_indication();
+    }
 
     save_persisted_state_to_active_session_history_entry();
     auto active_entry = active_session_history_entry();
@@ -3917,8 +3840,8 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
     //      document state: navigable's active session history entry's document state
     //      navigation API state: destinationNavigationAPIState
     //      scroll restoration mode: navigable's active session history entry's scroll restoration mode
-    auto history_entry = SessionHistoryEntry::create();
-    history_entry->set_url(url);
+    auto history_entry = SessionHistoryEntry::create(directive_state);
+    history_entry->set_url(stripped_url);
     history_entry->set_document_state(active_entry->document_state());
     history_entry->set_navigation_api_state(destination_navigation_api_state);
     history_entry->set_scroll_restoration_mode(active_entry->scroll_restoration_mode());
@@ -3953,7 +3876,7 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
     }
 
     // 13. Set navigable's active document's URL to url.
-    active_document()->set_url(url);
+    active_document()->set_url(stripped_url);
 
     // 14. Set navigable's active session history entry to historyEntry.
     m_active_session_history_entry = history_entry;
@@ -3977,11 +3900,32 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
     //     scriptHistoryIndex, scriptHistoryLength, and historyHandling.
     active_document()->update_for_history_step_application(*history_entry, true, script_history_length, script_history_index, navigation_type);
 
-    // 16. Scroll to the fragment given navigable's active document.
-    active_document()->scroll_to_the_fragment();
+    // https://wicg.github.io/scroll-to-text-fragment/#restricting-the-text-fragment
+    // 18. Let allow text directive scroll be the result of checking if a text directive can be scrolled, given
+    //     navigable's active document, initiator origin, and user involvement.
+    auto allow_text_directive_scroll = active_document()->check_if_a_text_directive_can_be_scrolled(initiator_origin, user_involvement);
 
-    // 17. Let traversable be navigable's traversable navigable.
-    // 18. Append the following session history synchronous navigation steps involving navigable to traversable:
+    // 19. Scroll to the fragment given navigable's active document, and allow text directive scroll.
+    if (active_document()->parser() && !active_document()->parser()->stopped()) {
+        // AD-HOC: A same-document navigation can run from a parser-inserted script before the
+        //         directive's target has been parsed. In that case, use the parser-aware retry lifecycle
+        //         also used for a newly-created Document.
+        active_document()->try_to_scroll_to_the_fragment(allow_text_directive_scroll);
+    } else {
+        active_document()->scroll_to_the_fragment(allow_text_directive_scroll);
+        // https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+        // 20. Set navigable's active document's pending text directives to null.
+        auto const text_fragment_was_found = !active_document()->text_fragment_ranges().is_empty();
+        active_document()->clear_pending_text_directives();
+
+        // https://wicg.github.io/scroll-to-text-fragment/#scroll-on-navigation
+        // If a UA chooses not to scroll automatically, it must scroll a fallback element-id into
+        // view, if provided, regardless of whether a text fragment was matched.
+        if (!text_fragment_was_found || !allow_text_directive_scroll)
+            active_document()->scroll_to_the_fragment();
+    }
+
+    // Append the following session history synchronous navigation steps involving navigable to its traversable:
     // 1. Finalize a same-document navigation given traversable, navigable, historyEntry, entryToReplace,
     //    historyHandling, and userInvolvement.
     page().history_executor().finalize_same_document_navigation(*this, history_entry, entry_to_replace, history_handling, user_involvement, move(previous_entry_persisted_state));
@@ -4291,225 +4235,10 @@ bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& docu
     return url.scheme() == "javascript"sv || document.is_initial_about_blank();
 }
 
-class CheckUnloadingCanceledState : public GC::Cell {
-    GC_CELL(CheckUnloadingCanceledState, GC::Cell);
-    GC_DECLARE_ALLOCATOR(CheckUnloadingCanceledState);
-
-public:
-    using Result = CheckIfUnloadingIsCanceledResult;
-    static constexpr int TIMEOUT_MS = 15000;
-
-    CheckUnloadingCanceledState(
-        GC::Ptr<LocalTraversableNavigable> traversable,
-        Optional<UserNavigationInvolvement> user_involvement,
-        UnloadPromptShown unload_prompt_shown,
-        GC::Ref<GC::Function<void(Result, UnloadPromptShown)>> callback)
-        : m_unload_prompt_shown(unload_prompt_shown)
-        , m_traversable(traversable)
-        , m_user_involvement(user_involvement)
-        , m_callback(callback)
-        , m_timeout(Platform::Timer::create_single_shot(heap(), TIMEOUT_MS, GC::create_function(heap(), [this] {
-            if (!m_completed) {
-                dbgln("FIXME: check_if_unloading_is_canceled timed out");
-                finish(Result::Continue);
-            }
-        })))
-    {
-        m_timeout->start();
-    }
-
-    virtual void visit_edges(Visitor& visitor) override
-    {
-        Base::visit_edges(visitor);
-        for (auto& doc : m_phase2_documents)
-            visitor.visit(doc);
-        visitor.visit(m_traversable);
-        visitor.visit(m_callback);
-        visitor.visit(m_timeout);
-    }
-
-    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled
-    void start(Vector<GC::Root<LocalNavigable>> const& navigables_that_need_before_unload, RefPtr<SessionHistoryEntry> target_entry)
-    {
-        // 1. Let documentsToFireBeforeunload be the active document of each item in navigablesThatNeedBeforeUnload.
-        for (auto& navigable : navigables_that_need_before_unload)
-            m_phase2_documents.append(*navigable->active_document());
-
-        // 2. Let unloadPromptShown be false.
-
-        // 3. Let finalStatus be "continue".
-
-        // 4. If traversable was given, then:
-        if (m_traversable) {
-            // 1. Assert: targetStep and userInvolvementForNavigateEvent were given.
-            VERIFY(target_entry);
-            VERIFY(m_user_involvement.has_value());
-
-            // 2. Let targetEntry be the result of getting the target history entry given traversable and targetStep.
-            m_target_entry = move(target_entry);
-
-            // 3. If targetEntry is not traversable's current session history entry, and targetEntry's document state's origin is the same as
-            //    traversable's current session history entry's document state's origin:
-            if (m_target_entry != m_traversable->current_session_history_entry() && m_target_entry->document_state()->origin() == m_traversable->current_session_history_entry()->document_state()->origin()) {
-
-                // 1. Let eventsFired be false.
-
-                // 2. Let needsBeforeunload be true if navigablesThatNeedBeforeUnload contains traversable; otherwise false.
-                m_needs_beforeunload = navigables_that_need_before_unload.find_if([this](auto const& navigable) {
-                    return navigable.ptr() == m_traversable.ptr();
-                }) != navigables_that_need_before_unload.end();
-
-                // 3. If needsBeforeunload is true, then remove traversable's active document from documentsToFireBeforeunload.
-                if (m_needs_beforeunload) {
-                    m_phase2_documents.remove_first_matching([this](auto& document) {
-                        return document.ptr() == m_traversable->active_document().ptr();
-                    });
-                }
-
-                start_phase1();
-                return;
-            }
-        }
-
-        start_phase2();
-    }
-
-private:
-    void start_phase1()
-    {
-        // 4. Queue a global task on the navigation and traversal task source given traversable's active window to perform the following steps:
-        VERIFY(m_traversable->active_window());
-        queue_global_task(Task::Source::NavigationAndTraversal, relevant_global_object(*m_traversable->active_window()), GC::create_function(GC::Heap::the(), [this] {
-            // 1. if needsBeforeunload is true, then:
-            if (m_needs_beforeunload) {
-                // 1. Let (unloadPromptShownForThisDocument, unloadPromptCanceledByThisDocument) be the result of running the steps to fire beforeunload given traversable's active document and false.
-                auto [unload_prompt_shown_for_this_document, unload_prompt_canceled_by_this_document] = m_traversable->active_document()->steps_to_fire_beforeunload(false);
-
-                // 2. If unloadPromptShownForThisDocument is true, then set unloadPromptShown to true.
-                if (unload_prompt_shown_for_this_document)
-                    m_unload_prompt_shown = UnloadPromptShown::Yes;
-
-                // 3. If unloadPromptCanceledByThisDocument is true, then set finalStatus to "canceled-by-beforeunload".
-                if (unload_prompt_canceled_by_this_document)
-                    m_final_status = Result::CanceledByBeforeUnload;
-            }
-
-            // 2. If finalStatus is "canceled-by-beforeunload", then abort these steps.
-            if (m_final_status == Result::CanceledByBeforeUnload) {
-                finish(m_final_status);
-                return;
-            }
-
-            // 3. Let navigation be traversable's active window's navigation API.
-            VERIFY(m_traversable->active_window());
-            auto navigation = m_traversable->active_window()->navigation();
-
-            // 4. Let navigateEventResult be the result of firing a traverse navigate event at navigation given targetEntry and userInvolvementForNavigateEvent.
-            VERIFY(m_target_entry);
-            auto navigate_event_result = navigation->fire_a_traverse_navigate_event(*m_target_entry, *m_user_involvement);
-
-            // 5. If navigateEventResult is false, then set finalStatus to "canceled-by-navigate".
-            if (!navigate_event_result)
-                m_final_status = Result::CanceledByNavigate;
-
-            // 6. Set eventsFired to true.
-
-            phase1_completed();
-        }));
-    }
-
-    void phase1_completed()
-    {
-        // 5. Wait for eventsFired to be true.
-
-        // 6. If finalStatus is not "continue", then return finalStatus.
-        if (m_final_status != Result::Continue) {
-            finish(m_final_status);
-            return;
-        }
-        start_phase2();
-    }
-
-    void start_phase2()
-    {
-        if (m_phase2_documents.is_empty()) {
-            finish(m_final_status);
-            return;
-        }
-
-        // 5. Let totalTasks be the size of documentsToFireBeforeunload.
-
-        // 6. Let completedTasks be 0.
-        m_remaining_phase2_tasks = m_phase2_documents.size();
-
-        // 7. For each document of documentsToFireBeforeunload, queue a global task on the navigation and traversal task source given document's relevant global object to run the steps:
-        for (auto& document : m_phase2_documents) {
-            // AD-HOC: Queue with a null document instead of using queue_global_task. Tasks associated with a document
-            //         are only runnable when fully active. In the async state machine, documents can become non
-            //         fully-active between queue and execution time, causing the task to be permanently stuck.
-            //         A null-document task is always runnable; we check validity inside.
-            queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr, GC::create_function(heap(), [this, document] {
-                if (document->has_been_destroyed() || !document->is_fully_active()) {
-                    did_complete_phase2_task();
-                    return;
-                }
-
-                // 1. Let (unloadPromptShownForThisDocument, unloadPromptCanceledByThisDocument) be the result of running the steps to fire beforeunload given document and unloadPromptShown.
-                auto [unload_prompt_shown_for_this_document, unload_prompt_canceled_by_this_document] = document->steps_to_fire_beforeunload(m_unload_prompt_shown == UnloadPromptShown::Yes);
-
-                // 2. If unloadPromptShownForThisDocument is true, then set unloadPromptShown to true.
-                if (unload_prompt_shown_for_this_document)
-                    m_unload_prompt_shown = UnloadPromptShown::Yes;
-
-                // 3. If unloadPromptCanceledByThisDocument is true, then set finalStatus to "canceled-by-beforeunload".
-                if (unload_prompt_canceled_by_this_document)
-                    m_final_status = Result::CanceledByBeforeUnload;
-
-                // 4. Increment completedTasks.
-                did_complete_phase2_task();
-            }));
-        }
-    }
-
-    void did_complete_phase2_task()
-    {
-        VERIFY(m_remaining_phase2_tasks > 0);
-        if (--m_remaining_phase2_tasks > 0)
-            return;
-
-        // 8. Wait for completedTasks to be totalTasks.
-
-        // 9. Return finalStatus.
-        finish(m_final_status);
-    }
-
-    void finish(Result final_result)
-    {
-        if (m_completed)
-            return;
-        m_completed = true;
-        m_timeout->stop();
-        m_callback->function()(final_result, m_unload_prompt_shown);
-    }
-
-    Result m_final_status { Result::Continue };
-    UnloadPromptShown m_unload_prompt_shown { UnloadPromptShown::No };
-    bool m_completed { false };
-    bool m_needs_beforeunload { false };
-    size_t m_remaining_phase2_tasks { 0 };
-    Vector<GC::Ref<DOM::Document>> m_phase2_documents;
-    GC::Ptr<LocalTraversableNavigable> m_traversable;
-    RefPtr<SessionHistoryEntry> m_target_entry;
-    Optional<UserNavigationInvolvement> m_user_involvement;
-    GC::Ref<GC::Function<void(Result, UnloadPromptShown)>> m_callback;
-    GC::Ref<Platform::Timer> m_timeout;
-};
-
-GC_DEFINE_ALLOCATOR(CheckUnloadingCanceledState);
-
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled
 void check_if_unloading_is_canceled(
     Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload,
+    GC::Ptr<LocalTraversableNavigable> owner,
     GC::Ptr<LocalTraversableNavigable> traversable,
     RefPtr<SessionHistoryEntry> target_entry,
     Optional<UserNavigationInvolvement> user_involvement_for_navigate_events,
@@ -4517,6 +4246,7 @@ void check_if_unloading_is_canceled(
     GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback)
 {
     auto state = GC::Heap::the().allocate<CheckUnloadingCanceledState>(
+        owner,
         traversable,
         user_involvement_for_navigate_events,
         unload_prompt_shown,
@@ -4524,12 +4254,33 @@ void check_if_unloading_is_canceled(
     state->start(navigables_that_need_before_unload, move(target_entry));
 }
 
-void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult)>> callback)
+void LocalTraversableNavigable::request_close_preflight(GC::Ref<GC::Function<void(bool)>> callback)
 {
-    check_if_unloading_is_canceled(move(navigables_that_need_before_unload), {}, {}, {}, UnloadPromptShown::No,
-        GC::create_function(GC::Heap::the(), [callback](CheckIfUnloadingIsCanceledResult result, UnloadPromptShown) {
-            callback->function()(result);
-        }));
+    if (page().pending_dialog() != Page::PendingDialog::None) {
+        if (page().pending_dialog() == Page::PendingDialog::BeforeUnload && m_active_beforeunload_check) {
+            m_active_beforeunload_check->adopt_for_close(callback);
+            return;
+        }
+        callback->function()(false);
+        return;
+    }
+
+    auto document = active_document();
+    if (!document) {
+        callback->function()(true);
+        return;
+    }
+
+    auto state_callback = GC::create_function(heap(), [callback](CheckIfUnloadingIsCanceledResult result, UnloadPromptShown) {
+        callback->function()(result == CheckIfUnloadingIsCanceledResult::Continue);
+    });
+    auto state = heap().allocate<CheckUnloadingCanceledState>(GC::Ptr<LocalTraversableNavigable> { this }, GC::Ptr<LocalTraversableNavigable> {}, Optional<UserNavigationInvolvement> {}, UnloadPromptShown::No, state_callback);
+    Vector<GC::Root<LocalNavigable>> local_navigables;
+    for (auto& navigable : document->inclusive_descendant_navigables()) {
+        if (auto* local_navigable = as_if<LocalNavigable>(navigable.ptr()))
+            local_navigables.append(*local_navigable);
+    }
+    state->start(local_navigables, {});
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
@@ -4588,13 +4339,23 @@ void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_
     navigable->save_persisted_state_to_active_session_history_entry();
     auto previous_entry_persisted_state = create_session_history_entry_persisted_state(*active_entry);
 
+    // https://wicg.github.io/scroll-to-text-fragment/#the-fragment-directive
+    // Keep the directive in session history state while exposing only the stripped URL to the document.
+    auto directive_state = active_entry->directive_state();
+    bool has_fragment_directive = false;
+    if (auto const& fragment = new_url.fragment(); fragment.has_value())
+        has_fragment_directive = fragment->find(":~:"sv).has_value();
+    auto directive_state_value = remove_the_fragment_directive(new_url);
+    if (has_fragment_directive)
+        directive_state = DirectiveState::create(navigable->page().client().allocate_cross_process_id(), move(directive_state_value));
+
     // 3. Let newEntry be a new session history entry, with
     //      URL: newURL
     //      serialized state: if serializedData is not null, serializedData; otherwise activeEntry's classic history API state
     //      document state: activeEntry's document state
     //      scroll restoration mode: activeEntry's scroll restoration mode
     // FIXME: persisted user state: activeEntry's persisted user state
-    auto new_entry = SessionHistoryEntry::create();
+    auto new_entry = SessionHistoryEntry::create(directive_state);
     new_entry->set_url(new_url);
     new_entry->set_classic_history_api_state(serialized_data.value_or(active_entry->classic_history_api_state()));
     new_entry->set_document_state(active_entry->document_state());

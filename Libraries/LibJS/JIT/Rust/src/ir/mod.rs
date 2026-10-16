@@ -129,9 +129,22 @@ pub enum BranchCondition {
     MagicalLength,
     /// The input is the `Repr::Pointer` of an object: is it extensible?
     Extensible,
+    /// The input is the `Repr::Pointer` of an object: is it an array that a
+    /// `[[Set]]` of an element it does not have defines that element on
+    /// without running any code, because it is extensible, does not
+    /// interfere with indexed access, is no proxy target, and its prototype
+    /// chain is the realm's default one without indexed properties (like
+    /// `Op::CheckAppendableArray` checks, whatever its length and storage)?
+    HoleFillableArray,
     /// The input is the `Repr::Pointer` of an object: is it an array
     /// iterator over values, like `%Array.prototype.values%` makes?
     ArrayIterator,
+    /// The input is the `Repr::Pointer` of an object: is it an array whose
+    /// prototype is the realm's `%Array.prototype%`, and do that and
+    /// `%Object.prototype%` have no indexed properties and nothing that may
+    /// interfere with indexed property access, so that indices it has no
+    /// element at read undefined?
+    PlainArrayPrototypeChain,
     /// Input 0 is an object and input 1 its address: does it have the
     /// shape, like `Op::ShapeSwitch` cases test it? Only the refinements of
     /// those cases have this condition; no branch does.
@@ -742,7 +755,7 @@ pub enum Op {
     CheckShape {
         shapes: Vec<ShapeCheck>,
     },
-    /// Exits unless the `PrototypeChainValidity` cell `validity` is still valid.
+    /// Exits unless the `WatchpointSet` cell `validity` is still valid.
     CheckPrototypeChainValid {
         validity: CellId,
     },
@@ -1013,13 +1026,11 @@ pub enum Op {
     CallArrayPush,
 
     // For-of loops over arrays.
-    /// `RuntimeInfo::create_array_iterator` of the tagged iterable input 0
-    /// and the builtin `next` method input 1: a new array iterator over the
-    /// values of the iterable, or the empty value where it is no array such
-    /// iterators can iterate. It saves the registers the call clobbers and
-    /// restores them afterwards, so it is no call for the register
-    /// allocator.
-    CreateArrayIterator,
+    /// `RuntimeInfo::open_array_iteration` of the tagged iterable input 0:
+    /// the iterable, where `GetIterator` iterates it in fast array mode, or
+    /// the empty value. It saves the registers the call clobbers and restores
+    /// them afterwards, so it is no call for the register allocator.
+    OpenArrayIteration,
     /// The `[[IteratedArrayLike]]` of the array iterator at the
     /// `Repr::Pointer` input 0, as a tagged value: the array, or `undefined`
     /// once the iterator is done.
@@ -1474,8 +1485,8 @@ impl Op {
                 allocates: true,
                 ..P::PURE
             },
-            // NB: The new iterator is no location anything reads before.
-            Op::CreateArrayIterator => P {
+            // NB: The runtime watches the intrinsics anew with new watchpoint sets once the old ones fired.
+            Op::OpenArrayIteration => P {
                 reads: Locations::ALL,
                 allocates: true,
                 ..P::PURE
@@ -1608,7 +1619,7 @@ impl Op {
             Op::LoadElementsCapacity => "LoadElementsCapacity",
             Op::AppendElement => "AppendElement",
             Op::CallArrayPush => "CallArrayPush",
-            Op::CreateArrayIterator => "CreateArrayIterator",
+            Op::OpenArrayIteration => "OpenArrayIteration",
             Op::LoadArrayIteratorArray => "LoadArrayIteratorArray",
             Op::LoadArrayIteratorIndex => "LoadArrayIteratorIndex",
             Op::StoreArrayIteratorIndex => "StoreArrayIteratorIndex",
@@ -1904,12 +1915,24 @@ pub struct Graph {
     /// already running in the interpreter enters compiled code, with the pc of
     /// the loop back edge each one starts at. The frame holds every value.
     pub osr_entries: Vec<(u32, BlockId)>,
+    /// The pcs of the loop back edges in the loops of the on-stack
+    /// replacement entries (including those of the entries), from where a
+    /// frame running in the interpreter reaches an entry.
+    pub osr_loop_back_edges: Vec<u32>,
+    /// The pcs of the loop back edges in the loops around the loops of the
+    /// on-stack replacement entries, from where a frame running in the
+    /// interpreter may reach an entry on a later iteration.
+    pub osr_outer_loop_back_edges: Vec<u32>,
     /// The register-saving `CallSlowPath` nodes that may run before the
     /// frame is initialized, and so initialize it first if it is not.
     pub slow_paths_initializing_frame: Vec<NodeId>,
     /// Where exits of each executable were taken before, as (executable,
     /// pc, kind), for passes that must not repeat a failed speculation.
     pub exit_sites: Vec<(u32, u32, ExitKind)>,
+    /// The nodes that loop invariant code motion moved out of blocks that not
+    /// every iteration of their loop runs, which exit with
+    /// `ExitKind::Hoisted` instead of their own kind of exit.
+    pub speculatively_hoisted: Vec<NodeId>,
     /// The argument slots of the compiled function that its legacy
     /// `arguments` shows. Empty for functions without legacy `arguments`.
     pub legacy_arguments: core::ops::Range<u32>,

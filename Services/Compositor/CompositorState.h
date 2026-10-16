@@ -109,7 +109,7 @@ public:
     bool dispatch_key_event_to_web_content(Web::CompositorContextId, Web::KeyEvent const&);
     void handle_and_dispatch_mouse_event(Web::CompositorContextId, Web::MouseEvent);
     void handle_pinch_event(Web::CompositorContextId, Web::PinchEvent const&);
-    Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking);
+    Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking, Compositing::WheelStepDispatch, u64 input_event_id);
     Compositing::AsyncScrollEnqueueResult smooth_scroll_to(Web::CompositorContextId, Web::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue);
     void cancel_smooth_scroll(Web::CompositorContextId, Web::AsyncScrollNodeStableID);
     void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, Compositing::WindowResizingInProgress);
@@ -128,7 +128,10 @@ public:
     void set_client_gpu_presentation_capability(bool supported, u64 adapter_luid);
     void set_synthesizes_scroll_momentum(bool);
     void set_scrolls_elastically(bool);
-    Gfx::FloatPoint elastic_overscroll_stretch_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID) const;
+    String scroll_state_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID stretched_scroller) const;
+    Optional<Compositing::FirstWheelStepRouteForTesting> route_first_wheel_step_for_testing(Web::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels);
+    void begin_input_trace_for_testing(Web::CompositorContextId);
+    Vector<Web::InputTraceRecord> take_input_trace_for_testing(Web::CompositorContextId);
 
     struct PlaceholderCanvasAllocation {
         Compositing::CanvasId canvas_id;
@@ -227,8 +230,8 @@ private:
         ContextState::ContextUpdateResult const&);
     void schedule_animation_frames_if_needed(ContextState&);
     void dispatch_scroll_fling_step(Web::CompositorContextId, ContextState&, Optional<ContextState::ScrollFlingStep>);
-    void present_frame(Web::CompositorContextId, ContextState&, ContextState::PendingFrame);
-    void schedule_present_frame(Web::CompositorContextId, ContextState&, ContextState::PendingFrame);
+    void present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
+    void schedule_present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
     void schedule_present_frame(Web::CompositorContextId, ContextState&, Gfx::IntRect viewport_rect);
     void schedule_pending_present_frame(Web::CompositorContextId, ContextState&);
     void schedule_pending_present_frame_on_vsync(Web::CompositorContextId, ContextState&);

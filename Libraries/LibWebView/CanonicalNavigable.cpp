@@ -182,7 +182,7 @@ void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescripto
     // 9. If navigable's active document's unload counter is greater than 0, then invoke WebDriver BiDi navigation failed
     //    with navigable and a WebDriver BiDi navigation status whose id is navigationId, status is "canceled", and url
     //    is url, and return.
-    if (traversable.is_unloading_document_of(id()))
+    if (active_document().unload_counter() > 0)
         return;
 
     // NB: The page hosting navigable's active document, which has its container if any process does, runs steps 10,
@@ -304,6 +304,8 @@ void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescripto
         .navigation_api_state = Web::HTML::storage_serialization_record_for_undefined(),
         .navigation_api_key = generate_a_random_uuid(),
         .navigation_api_id = generate_a_random_uuid(),
+        .directive_state_id = {},
+        .directive_state_value = {},
     };
     auto retry = prepare_navigation_to_retry(start_request);
     set_ongoing_navigation({
@@ -769,7 +771,10 @@ ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalNavigable::obtain_page_to_host_i
         traversable.represent_group_in(*host);
     }
 
-    return *host->page(page_id);
+    auto& page = *host->page(page_id);
+    if (traversable.view().has_value())
+        Application::the().apply_content_blocking_policy(page);
+    return page;
 }
 
 ErrorOr<CanonicalNavigable::PageToPopulateDocument> CanonicalNavigable::obtain_page_to_populate_document(CanonicalSessionHistoryEntry& entry, NavigationLoader& loader, WebContentPage& page_that_created_navigation_params)
@@ -1007,6 +1012,10 @@ void CanonicalNavigable::update_hosted_state(Web::HTML::HostedNavigableState sta
         state.container = m_hosted_state->container;
     set_hosted_state(move(state));
     send_replicated_state();
+    if (is_top_level_traversable()) {
+        if (auto view = top_level_traversable().view(); view.has_value())
+            view->notify_content_blocking_changed();
+    }
 }
 
 Optional<Web::HTML::ReplicatedNavigableState> CanonicalNavigable::replicated_state() const
@@ -1149,7 +1158,7 @@ bool CanonicalNavigable::active_document_is(CanonicalSessionHistoryEntry const& 
 
 void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& entry, Web::HTML::HostedNavigableState hosted_state, u64 operation_sequence_number, Optional<Utf16String const&> navigation_id, RefPtr<WebContentPage> host)
 {
-    // A navigation admitted after the operation, such as one a same-document traversal yields to, is newer than it.
+    // A navigation admitted after the operation, such as one admitted during a same-document traversal, is newer than it.
     auto ongoing_navigation_id = this->ongoing_navigation_id();
     auto ongoing_navigation = ongoing_navigation_id.has_value() ? navigation_with_id(*ongoing_navigation_id) : nullptr;
     auto commits_ongoing_navigation = !ongoing_navigation
@@ -1220,7 +1229,7 @@ void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& ent
     }
 
     // A navigation can commit while a newer navigation is already in flight. In that case update the replicated
-    // state for the committed document without changing the newer navigation's transaction.
+    // state for the committed document, and leave the newer navigation alone.
     if (!commits_ongoing_navigation)
         return;
 

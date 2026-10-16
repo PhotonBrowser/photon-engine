@@ -20,6 +20,8 @@
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/ContentBlockingButton.h>
+#include <UI/Qt/ContentBlockingPopover.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/JavaScriptDialog.h>
 #if defined(AK_OS_MACOS)
@@ -695,6 +697,14 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
     m_location_edit->set_zoom_action(create_application_action(*m_location_edit, view().reset_zoom_action(), IncludeActionIcon::No));
     location_edit_layout->addWidget(m_location_edit);
     toolbar_layout->addWidget(location_edit_container, 1);
+
+    m_content_blocking_button = new ContentBlockingButton(m_toolbar);
+    toolbar_layout->addWidget(m_content_blocking_button, 0, Qt::AlignVCenter);
+    QObject::connect(m_content_blocking_button, &QToolButton::clicked, this, [this] { show_content_blocking_popover(); });
+    view().on_content_blocking_change = [this](auto const& snapshot) { update_content_blocking_controls(snapshot); };
+    update_content_blocking_controls(view().content_blocking_snapshot());
+    content_blocker_count_visibility_changed();
+
     m_right_toggle_vertical_tabs_expanded_button = create_toolbar_button(*m_toolbar, *m_toggle_vertical_tabs_expanded_action);
     toolbar_layout->addWidget(m_right_toggle_vertical_tabs_expanded_button, 0, Qt::AlignVCenter);
 
@@ -728,7 +738,8 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
             if (auto index_to_activate = m_window->tab_index(m_tab_to_activate_on_close); index_to_activate >= 0)
                 m_window->activate_tab(index_to_activate);
         }
-        m_window->definitely_close_tab(index);
+        if (!m_window_is_closing)
+            m_window->definitely_close_tab(index);
     };
 
     view().on_link_hover = [this](auto const& url) {
@@ -745,6 +756,11 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
     view().on_loading_state_change = [this](bool is_loading) {
         set_loading(is_loading);
     };
+    view().on_load_start = [this] {
+        m_window->on_tab_load_start(*this);
+        if (m_content_blocking_popover)
+            m_content_blocking_popover->close();
+    };
     set_loading(view().is_loading());
 
     view().on_load_finish = [this](auto const&) {
@@ -752,6 +768,8 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
     };
 
     view().on_top_level_navigation_commit = [this] {
+        if (m_content_blocking_popover)
+            m_content_blocking_popover->close();
         m_suppress_javascript_dialogs_until_navigation = false;
     };
 
@@ -778,6 +796,8 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
     view().on_favicon_change = [this](auto const& bitmap) {
         if (!bitmap.has_value()) {
             m_favicon = {};
+            if (m_content_blocking_popover)
+                m_content_blocking_popover->set_favicon(m_favicon);
             update_tab_icon();
             return;
         }
@@ -790,6 +810,8 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
             return;
 
         m_favicon = qpixmap;
+        if (m_content_blocking_popover)
+            m_content_blocking_popover->set_favicon(m_favicon);
         update_tab_icon();
     };
 
@@ -805,7 +827,15 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
             view().alert_closed();
             return;
         }
+        hide_hover_label();
         m_javascript_dialog->show_alert(javascript_dialog_title(), qstring_from_utf16_string(message));
+    };
+
+    view().on_request_before_unload = [this](auto const& source, auto on_complete) {
+        hide_hover_label();
+        m_before_unload_completion = AK::move(on_complete);
+        m_window->raise_for_quit_prompt();
+        m_javascript_dialog->show_before_unload(qstring_from_ak_string(source));
     };
 
     view().on_request_confirm = [this, javascript_dialog_title](auto const& message) {
@@ -813,6 +843,7 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
             view().confirm_closed(false);
             return;
         }
+        hide_hover_label();
         m_javascript_dialog->show_confirm(javascript_dialog_title(), qstring_from_utf16_string(message));
     };
 
@@ -821,6 +852,7 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
             view().prompt_closed({});
             return;
         }
+        hide_hover_label();
         m_javascript_dialog->show_prompt(javascript_dialog_title(), qstring_from_utf16_string(message), qstring_from_utf16_string(default_));
     };
 
@@ -833,6 +865,17 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
         case JavaScriptDialog::Type::Alert:
             view().alert_closed();
             break;
+        case JavaScriptDialog::Type::BeforeUnload: {
+            auto on_complete = AK::move(m_before_unload_completion);
+            VERIFY(on_complete);
+            on_complete(accepted);
+            if (!accepted) {
+                if (!m_preserve_close_retry_state_on_dialog_dismissal)
+                    m_already_requested_close = false;
+                m_suppress_javascript_dialogs_until_navigation = false;
+            }
+            break;
+        }
         case JavaScriptDialog::Type::Confirm:
             view().confirm_closed(accepted);
             break;
@@ -883,6 +926,8 @@ Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> travers
             on_complete(false);
             return;
         }
+
+        hide_hover_label();
 
         auto initiator = initiator_origin.is_opaque() ? "This page"_string : initiator_origin.serialize();
         auto application_name = handler.application_name().is_empty() ? "another application"sv : handler.application_name().bytes_as_string_view();
@@ -1326,6 +1371,11 @@ void Tab::config_variable_changed(WebView::ConfigVariableID variable)
         update_tab_title();
 }
 
+void Tab::content_blocker_count_visibility_changed()
+{
+    m_content_blocking_button->set_show_count_badge(WebView::Application::settings().show_content_blocker_count());
+}
+
 void Tab::set_loading(bool is_loading)
 {
     if (m_is_loading == is_loading)
@@ -1390,6 +1440,8 @@ void Tab::hideEvent(QHideEvent* event)
     QWidget::hideEvent(event);
 
     m_hover_label->hide();
+    if (m_content_blocking_popover)
+        m_content_blocking_popover->close();
 }
 
 void Tab::update_hover_label()
@@ -1409,6 +1461,11 @@ void Tab::update_hover_label()
         m_hover_label->move(left_position);
 
     m_hover_label->raise();
+}
+
+void Tab::hide_hover_label()
+{
+    m_hover_label->hide();
 }
 
 bool Tab::event(QEvent* event)
@@ -1437,6 +1494,8 @@ void Tab::update_chrome_style()
         hover_surface, hover_text, hover_border));
     if (m_downloads_popover)
         m_downloads_popover->update_chrome_style(palette());
+    if (m_content_blocking_popover)
+        m_content_blocking_popover->update_chrome_style(palette());
     m_is_updating_chrome_style = false;
 }
 
@@ -1586,6 +1645,69 @@ void Tab::download_removed(u64, WebView::IsPrivate is_private)
     update_downloads_popover();
 }
 
+void Tab::update_content_blocking_controls(WebView::ContentBlockingSnapshot const& snapshot)
+{
+    m_content_blocking_button->set_snapshot(snapshot);
+    if (!m_content_blocking_popover || !m_content_blocking_popover->isVisible())
+        return;
+
+    if (snapshot.state == WebView::ContentBlockingState::Unavailable) {
+        m_content_blocking_popover->close();
+        return;
+    }
+
+    m_content_blocking_popover->set_snapshot(snapshot);
+    move_popover_below(*m_content_blocking_popover, *m_content_blocking_button);
+}
+
+void Tab::show_content_blocking_popover()
+{
+    if (m_content_blocking_popover && m_content_blocking_popover->isVisible()) {
+        m_content_blocking_popover->close();
+        m_content_blocking_button->setFocus(Qt::PopupFocusReason);
+        return;
+    }
+
+    auto snapshot = view().content_blocking_snapshot();
+    if (snapshot.state == WebView::ContentBlockingState::Unavailable)
+        return;
+
+    if (!m_content_blocking_popover) {
+        m_content_blocking_popover = new ContentBlockingPopover(this);
+        m_content_blocking_popover->on_keyboard_dismiss = [button = QPointer(m_content_blocking_button)] {
+            if (button && button->isVisible())
+                button->setFocus(Qt::PopupFocusReason);
+        };
+    }
+
+    m_content_blocking_popover->on_toggle = [this, site = snapshot.site](bool enabled) {
+        auto current = view().content_blocking_snapshot();
+        if (!site.has_value() || current.site != site || !current.can_toggle()) {
+            m_content_blocking_popover->close();
+            return;
+        }
+
+        if (auto result = WebView::Application::settings().set_content_blocker_enabled_for_site(*site, enabled); result.is_error()) {
+            m_content_blocking_popover->set_snapshot(view().content_blocking_snapshot());
+            m_content_blocking_popover->show_error("Unable to save the site preference.");
+            move_popover_below(*m_content_blocking_popover, *m_content_blocking_button);
+            return;
+        }
+
+        m_content_blocking_popover->close();
+        view().reload();
+    };
+
+    m_content_blocking_popover->update_chrome_style(palette());
+    m_content_blocking_popover->set_favicon(m_favicon);
+    m_content_blocking_popover->set_snapshot(snapshot);
+    move_popover_below(*m_content_blocking_popover, *m_content_blocking_button);
+    m_content_blocking_popover->show();
+    move_popover_below(*m_content_blocking_popover, *m_content_blocking_button);
+    m_content_blocking_popover->raise();
+    m_content_blocking_popover->focus_switch();
+}
+
 void Tab::update_vertical_tabs_toolbar_button_placement()
 {
     auto show_left_button = m_vertical_tabs_enabled && m_vertical_tabs_position == WebView::VerticalTabsPosition::Left;
@@ -1646,8 +1768,11 @@ void Tab::find_next()
 
 void Tab::request_close()
 {
+    m_window->cancel_window_close_preflight();
     m_suppress_javascript_dialogs_until_navigation = true;
+    m_preserve_close_retry_state_on_dialog_dismissal = m_already_requested_close;
     m_javascript_dialog->dismiss();
+    m_preserve_close_retry_state_on_dialog_dismissal = false;
 
     if (!view().needs_beforeunload_check()) {
         auto request_close = view().prepare_for_immediate_close();
@@ -1667,6 +1792,44 @@ void Tab::request_close()
     // If the user has already requested a close, then respect the user's request and just close the tab.
     // For example, the WebContent process may not be responding.
     m_window->definitely_close_tab(tab_index());
+}
+
+void Tab::request_window_close_preflight(Function<void(bool)> on_complete)
+{
+    m_suppress_javascript_dialogs_until_navigation = true;
+
+    if (m_javascript_dialog->type() != JavaScriptDialog::Type::BeforeUnload)
+        m_javascript_dialog->dismiss();
+
+    if (!view().needs_beforeunload_check()) {
+        on_complete(true);
+        return;
+    }
+
+    auto weak_this = QPointer<Tab>(this);
+    view().request_close_preflight([weak_this, on_complete = AK::move(on_complete)](bool approved) mutable {
+        if (!weak_this) {
+            on_complete(true);
+            return;
+        }
+        on_complete(approved);
+    });
+}
+
+void Tab::cancel_window_close_preflight()
+{
+    if (m_javascript_dialog->type() == JavaScriptDialog::Type::BeforeUnload)
+        m_javascript_dialog->dismiss();
+    m_already_requested_close = false;
+    m_suppress_javascript_dialogs_until_navigation = false;
+}
+
+Function<void()> Tab::prepare_for_window_close()
+{
+    m_window_is_closing = true;
+    m_suppress_javascript_dialogs_until_navigation = true;
+    m_javascript_dialog->dismiss();
+    return view().prepare_for_close_without_prompting();
 }
 
 }

@@ -65,7 +65,7 @@ fn native_selector_publication_and_replacement_outlive_the_source() {
     for (text, matches) in [(".別, .色 {}", true), (".別 {}", false), (".色 {}", true)] {
         let rules = native_rules(text);
         let rule = rules.rule_at(0);
-        let bound = unsafe { rule.matching_selectors() };
+        let bound = rule.matching_selectors();
         let selectors: Vec<_> = bound.selectors.iter().map(|selector| selector.as_ref()).collect();
         if published == 0 {
             published = publish_style_rule(
@@ -100,7 +100,7 @@ fn native_selector_publication_and_replacement_outlive_the_source() {
 #[test]
 fn native_scope_publication_outlives_the_rule_graph() {
     use super::bridge::{BoundScopeChain, publish_style_rule, publish_style_rule_selectors};
-    use crate::css::rule::{NativeRuleType, rust_rule_children, rust_rule_list_count};
+    use crate::css::rule::{NativeRuleType, rust_rule_list_count};
     for (source, matches) in [
         ("@scope (.根) {}", true),
         ("@scope (.別) {}", false),
@@ -129,18 +129,18 @@ fn native_scope_publication_outlives_the_rule_graph() {
                     crate::css::rule::rust_rule_type(&rule),
                     NativeRuleType::Scope | NativeRuleType::Import
                 ) {
-                    let start = unsafe { rule.scope_start_selectors() };
+                    let start = rule.scope_start_selectors();
                     let end = rule.scope_end_selectors();
                     scope.push(start.as_deref(), end.as_deref(), nodes[0].raw());
                 }
-                let children = unsafe { rust_rule_children(&rule).as_ref() };
+                let children = rule.child_rules().map(|children| &**children);
                 let Some(children) = children.filter(|children| rust_rule_list_count(children) > 0) else {
                     break;
                 };
                 rule = children.rule_at(0);
             }
             let universal = native_rules("* {}");
-            let bound = unsafe { universal.rule_at(0).matching_selectors() };
+            let bound = universal.rule_at(0).matching_selectors();
             let selectors: Vec<_> = bound.selectors.iter().map(|selector| selector.as_ref()).collect();
             if published == 0 {
                 published = publish_style_rule(
@@ -175,7 +175,7 @@ fn native_declaration_publication_reuses_values_and_observes_live_mutation() {
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
     let first = native_rules("* { color: #14181c; }");
-    let bound = unsafe { first.rule_at(0).matching_selectors() };
+    let bound = first.rule_at(0).matching_selectors();
     let selectors: Vec<_> = bound.selectors.iter().map(|selector| selector.as_ref()).collect();
     let rule = publish_style_rule(
         &mut engine,
@@ -834,7 +834,7 @@ fn retained_winners_construct_a_source_free_cascade_store() {
         .unwrap();
     let (stored, important, _, has_style_sheet_context, _) =
         store.winning_declaration(property_id::BACKGROUND_COLOR).unwrap();
-    assert_eq!(stored, value.pointer().cast());
+    assert_eq!(stored.pointer(), value.pointer());
     assert!(important);
     assert!(!has_style_sheet_context);
 }
@@ -6094,7 +6094,7 @@ fn prefix_relation_copies_only_dispatch_complete_predicates() {
         }
         discard_transaction(&mut engine);
         let before = engine.counters.get(Counter::PrefixCompoundsEvaluated);
-        let (_, relation) = test_prefix_relation(&mut engine, nodes[0]);
+        let (_, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
         let evaluated = engine.counters.get(Counter::PrefixCompoundsEvaluated) - before;
         if additional_tests {
             assert!(evaluated > 0);
@@ -6123,7 +6123,7 @@ fn prefix_completion_reuses_positive_and_negative_relation_answers() {
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(guard));
     add_feature(&mut engine, nodes[3], LocalFeatureKey::Class(target));
     discard_transaction(&mut engine);
-    let (dispatch, relation) = test_prefix_relation(&mut engine, nodes[0]);
+    let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
     let facts = engine.facts.primary();
     let mut evaluator = MatchEvaluator::new(&engine.tree, facts);
     let mut evaluation = PrefixEvaluation::new(
@@ -6448,7 +6448,7 @@ fn prefix_relation_local_fact_cache_separates_predicates_and_tracks_changes() {
         );
         assert_eq!(relation.changed_answers.len(), nodes.len());
         relation.install_answers(&mut states);
-        let (_, rebuilt) = test_prefix_relation(&mut engine, nodes[0]);
+        let (_, mut rebuilt) = test_prefix_relation(&mut engine, nodes[0]);
         let mut rebuilt_states = PrefixStates::new();
         rebuilt.install_answers(&mut rebuilt_states);
         for (index, &node) in nodes.iter().enumerate() {

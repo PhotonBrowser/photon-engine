@@ -634,6 +634,7 @@ pub(crate) struct ScrollableOverflowState {
     pub(crate) geometry_changed: Cell<bool>,
     pub(crate) scrollability_changed: Cell<bool>,
     pub(crate) recalculations: Cell<u64>,
+    pub(crate) contained_box_index_refills: Cell<u64>,
     /// Rows whose overflow a read could find unmeasured: new rows, and rows whose measurement was
     /// invalidated. Reading overflow never measures it, so the pass measures these first.
     pub(crate) rows_to_measure: RefCell<Vec<NodeSlotId>>,
@@ -663,12 +664,36 @@ impl LayoutNodeArena {
         }
     }
 
+    /// Notes that `root` is being linked into or out of the tree. The tree above a box decides its
+    /// containing block, so only boxes in this subtree can enter or leave the index, and only those
+    /// whose containing block differs from their parent are listed in it.
+    pub(crate) fn note_overflow_contained_boxes_may_move_with_subtree(&self, root: NodeSlotId) {
+        if self.scrollable_overflow.contained_boxes_dirty.get()
+            || self.scrollable_overflow.non_child_boxes.borrow().is_empty()
+        {
+            return;
+        }
+        let mut found = false;
+        self.for_each_node_in_layout_subtree_in_pre_order_with_pruning(root, |node| {
+            let data = self.data(node);
+            found = found
+                || (node_facts::kind_is_box(data.kind.get())
+                    && self.node_containing_block_if_live(node) != Some(data.parent.get()));
+            !found
+        });
+        if found {
+            self.scrollable_overflow.contained_boxes_dirty.set(true);
+        }
+    }
+
     pub(crate) fn ensure_overflow_contained_boxes(&self) {
         if !self.scrollable_overflow.contained_boxes_dirty.replace(false) {
             return;
         }
         let mut index = self.scrollable_overflow.non_child_boxes.borrow_mut();
         if let Some(viewport) = self.scrollable_overflow.viewport.get() {
+            let refills = &self.scrollable_overflow.contained_box_index_refills;
+            refills.set(refills.get() + 1);
             refill_contained_boxes_index(&self.paintable_rows(), viewport, &mut index);
         } else {
             index.clear();

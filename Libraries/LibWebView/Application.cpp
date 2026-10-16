@@ -313,6 +313,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<StringView> user_agent_preset;
     Optional<StringView> dns_server_address;
     Optional<StringView> default_time_zone;
+    Optional<StringView> proxy_autoconfig_url;
     Optional<u16> dns_server_port;
     bool use_dns_over_tls = false;
     bool enable_test_mode = false;
@@ -366,6 +367,19 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(window_width, "Set viewport width in pixels (default: 800) (currently only supported for headless mode)", "window-width", 0, "pixels");
     args_parser.add_option(window_height, "Set viewport height in pixels (default: 600) (currently only supported for headless mode)", "window-height", 0, "pixels");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
+    args_parser.add_option(Core::ArgsParser::Option {
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
+        .help_string = "URL of a PAC file (not supported yet, requests fail)",
+        .long_name = "proxy-autoconfig-url",
+        .value_name = "url",
+        .accept_value = [&](StringView value) {
+            if (!URL::Parser::basic_parse(value).has_value())
+                return false;
+            proxy_autoconfig_url = value;
+            return true;
+        },
+        .hide_mode = Core::ArgsParser::OptionHideMode::CommandLineAndMarkdown,
+    });
     args_parser.add_option(new_window, "Force opening in a new window", "new-window", 'n');
 #if !defined(AK_OS_ANDROID)
     args_parser.add_option(force_new_process, "Force creation of a new browser process", "force-new-process");
@@ -663,6 +677,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .paint_viewport_scrollbars = disable_scrollbar_painting ? PaintViewportScrollbars::No : PaintViewportScrollbars::Yes,
         .file_scheme_urls_have_tuple_origins = file_scheme_urls_have_tuple_origins ? FileSchemeUrlsHaveTupleOrigins::Yes : FileSchemeUrlsHaveTupleOrigins::No,
         .default_time_zone = default_time_zone,
+        .proxy_autoconfig_url = proxy_autoconfig_url.map([](auto value) { return value.to_byte_string(); }),
     };
 
     create_platform_options(m_browser_options, m_request_server_options, m_web_content_options);
@@ -742,14 +757,16 @@ void Application::rebuild_content_blocker_list_paths()
     }
 }
 
-ErrorOr<void> Application::load_content_blocker_lists()
+ErrorOr<bool> Application::load_content_blocker_lists()
 {
     StringView custom_filters;
     if (m_web_content_options.is_test_mode == IsTestMode::No)
         custom_filters = m_settings->custom_content_blocker_filters();
     if (m_browser_options.content_blocker_list_paths.is_empty() && custom_filters.is_empty()) {
+        if (m_content_blocker_list_buffer.has_value() && m_content_blocker_list_buffer->size() == 0)
+            return false;
         m_content_blocker_list_buffer = TRY(Core::AnonymousBuffer::create_with_size(0));
-        return {};
+        return true;
     }
 
     Checked<size_t> total_size = 0;
@@ -780,9 +797,11 @@ ErrorOr<void> Application::load_content_blocker_lists()
     bytes[offset++] = '\n';
     VERIFY(offset == bytes.size());
 
-    m_content_blocker_list_buffer = move(blocker_list_buffer);
+    if (m_content_blocker_list_buffer.has_value() && m_content_blocker_list_buffer->bytes() == blocker_list_buffer.bytes())
+        return false;
 
-    return {};
+    m_content_blocker_list_buffer = move(blocker_list_buffer);
+    return true;
 }
 
 void Application::start_content_blocker_list_update(ContentBlockerListUpdateTrigger trigger, Optional<StringView> requested_identifier)
@@ -1099,6 +1118,9 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     client->async_connect_to_wasm_compiler(wasm_compiler_handle);
 #endif
+
+    if (m_content_blocker_list_buffer.has_value())
+        client->async_set_content_blockers(*m_content_blocker_list_buffer);
 
     m_web_content_clients.set(client);
     return client;
@@ -2717,24 +2739,6 @@ void Application::initialize_actions()
     m_enable_scripting_action->set_checked(m_browser_options.disable_scripting == WebView::DisableScripting::No);
     m_debug_menu->add_action(*m_enable_scripting_action);
 
-    m_enable_content_blocking_action = Action::create_checkable("Enable Content Blocking"sv, ActionID::EnableContentBlocking, [this, toggle_views = check(m_enable_content_blocking_action, "content-blocking"sv)] {
-        if (m_web_content_options.is_test_mode == IsTestMode::Yes) {
-            toggle_views();
-            return;
-        }
-        m_settings->set_content_blocker_enabled(m_enable_content_blocking_action->checked());
-        if (m_enable_content_blocking_action->checked()) {
-            for (auto const& list : m_settings->content_blocker_lists()) {
-                if (list.enabled)
-                    download_content_blocker_list_if_needed({}, list.identifier);
-            }
-        }
-    });
-    // NB: Test mode supplies its own filter lists independently of profile preferences.
-    m_enable_content_blocking_action->set_checked(m_browser_options.enable_content_blocker == WebView::EnableContentBlocker::Yes
-        && (m_web_content_options.is_test_mode == IsTestMode::Yes || m_settings->content_blocker_enabled()));
-    m_debug_menu->add_action(*m_enable_content_blocking_action);
-
     m_block_pop_ups_action = Action::create_checkable("Block Pop-ups"sv, ActionID::BlockPopUps, check(m_block_pop_ups_action, "block-pop-ups"sv));
     m_block_pop_ups_action->set_checked(m_browser_options.allow_popups == AllowPopups::No);
     m_debug_menu->add_action(*m_block_pop_ups_action);
@@ -2774,12 +2778,11 @@ void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementati
         preferred_motion = m_system_preferred_motion;
     view.set_preferred_motion(preferred_motion);
 
+    apply_content_blocking_policy(page);
+
     page.async_debug_request("set-line-box-borders"sv, m_show_line_box_borders_action->checked() ? "on"sv : "off"sv);
     page.async_debug_request("set-caret-hit-test-debug-overlay"sv, m_show_caret_hit_test_debug_overlay_action->checked() ? "on"sv : "off"sv);
     page.async_debug_request("scripting"sv, m_enable_scripting_action->checked() ? "on"sv : "off"sv);
-    page.async_debug_request("content-blocking"sv, m_enable_content_blocking_action->checked() ? "on"sv : "off"sv);
-    if (m_content_blocker_list_buffer.has_value())
-        page.client().async_set_content_blockers(*m_content_blocker_list_buffer);
     page.async_debug_request("block-pop-ups"sv, m_block_pop_ups_action->checked() ? "on"sv : "off"sv);
     page.async_debug_request("spoof-user-agent"sv, m_user_agent_string);
     page.async_debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
@@ -2817,31 +2820,54 @@ void Application::background_networking_settings_changed(Badge<ApplicationSettin
     start_content_blocker_list_update(ContentBlockerListUpdateTrigger::Automatic);
 }
 
+bool Application::content_blocking_enabled() const
+{
+    // Test mode supplies its own filter lists independently of profile preferences.
+    return m_browser_options.enable_content_blocker == EnableContentBlocker::Yes
+        && (m_web_content_options.is_test_mode == IsTestMode::Yes || m_settings->content_blocker_enabled());
+}
+
+bool Application::has_content_blocking_rules() const
+{
+    return m_content_blocker_list_buffer.has_value() && m_content_blocker_list_buffer->size() > 0;
+}
+
+void Application::apply_content_blocking_policy(WebContentPage& page)
+{
+    auto disabled_sites = m_web_content_options.is_test_mode == IsTestMode::Yes ? Vector<String> {} : m_settings->content_blocker_disabled_sites().values();
+    page.async_set_content_blocking_policy(content_blocking_enabled(), disabled_sites);
+}
+
 void Application::content_blocker_settings_changed(Badge<ApplicationSettingsObserver>)
 {
-    if (m_web_content_options.is_test_mode == IsTestMode::Yes)
-        return;
-    auto enabled = m_browser_options.enable_content_blocker == EnableContentBlocker::Yes && m_settings->content_blocker_enabled();
-    m_enable_content_blocking_action->set_checked(enabled);
-    ViewImplementation::for_each_view([enabled](ViewImplementation& view) {
-        view.debug_request("content-blocking"sv, enabled ? "on"sv : "off"sv);
-        return IterationDecision::Continue;
-    });
     apply_content_blocker_settings();
 }
 
 void Application::apply_content_blocker_settings()
 {
-    if (m_web_content_options.is_test_mode == IsTestMode::Yes)
-        return;
-    rebuild_content_blocker_list_paths();
-    if (auto result = load_content_blocker_lists(); result.is_error()) {
-        warnln("Unable to apply content blocker settings: {}", result.error());
-        return;
+    bool rules_changed = false;
+    if (m_web_content_options.is_test_mode == IsTestMode::No) {
+        rebuild_content_blocker_list_paths();
+        if (auto result = load_content_blocker_lists(); result.is_error())
+            warnln("Unable to apply content blocker settings: {}", result.error());
+        else
+            rules_changed = result.release_value();
     }
 
+    auto enabled = content_blocking_enabled();
+    auto disabled_sites = m_web_content_options.is_test_mode == IsTestMode::Yes ? Vector<String> {} : m_settings->content_blocker_disabled_sites().values();
+
     WebContentClient::for_each_client([&](WebContentClient& client) {
-        client.async_set_content_blockers(*m_content_blocker_list_buffer);
+        client.for_each_page([&](WebContentPage& page) {
+            client.async_set_content_blocking_policy(page.id(), enabled, disabled_sites);
+            return IterationDecision::Continue;
+        });
+        if (rules_changed)
+            client.async_set_content_blockers(*m_content_blocker_list_buffer);
+        return IterationDecision::Continue;
+    });
+    ViewImplementation::for_each_view([](ViewImplementation& view) {
+        view.notify_content_blocking_changed();
         return IterationDecision::Continue;
     });
 }
