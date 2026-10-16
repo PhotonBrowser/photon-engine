@@ -447,6 +447,12 @@ public:
     // Installs a fixed, read-only observer for the official Speedometer 3.1
     // result object. This is used only by authenticated automation sessions.
     bool install_speedometer_result_observer(uint64_t expected_document_generation);
+    // Installs a fixed, read-only observer for the official JetStream 3.0
+    // result UI. This is used only by authenticated automation sessions.
+    bool install_jetstream_result_observer(uint64_t expected_document_generation);
+    // Activates only JetStream's built-in Start Test control on the expected
+    // document. This is used only by authenticated automation sessions.
+    bool request_jetstream_start(uint64_t expected_document_generation);
     void reload();
     void stop_loading();
     void go_back();

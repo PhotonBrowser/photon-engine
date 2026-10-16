@@ -1600,6 +1600,134 @@ bool View::install_speedometer_result_observer(uint64_t expected_document_genera
     m_impl->view->run_javascript(move(script));
     return true;
 }
+bool View::install_jetstream_result_observer(uint64_t expected_document_generation)
+{
+    if (!m_impl || !m_impl->view
+        || !m_impl->view->has_completed_document_load()
+        || m_impl->view->document_generation() != expected_document_generation)
+        return false;
+    StringBuilder script_builder;
+    script_builder.append(R"JS((() => {
+        const prefix = "VelocityJetStream3.0:";
+        const documentGeneration = )JS"sv);
+    auto generation = String::number(expected_document_generation);
+    script_builder.append(generation.bytes_as_string_view());
+    script_builder.append(R"JS(;
+        const root = document.documentElement;
+        if (!root || globalThis.__velocityJetStreamObserverGeneration === documentGeneration)
+            return;
+        globalThis.__velocityJetStreamObserverGeneration = documentGeneration;
+        const boundedText = value => String(value || "").slice(0, 192);
+        const observerErrors = [];
+        const recordError = error => {
+            observerErrors.push(boundedText(error?.message || error));
+            if (observerErrors.length > 4)
+                observerErrors.shift();
+            publish();
+        };
+        const publish = () => {
+            const driver = globalThis.JetStream;
+            const status = document.querySelector("#status");
+            const summary = document.querySelector("#result-summary");
+            const scoreText = summary?.querySelector(".score")?.textContent?.trim() || "";
+            const score = Number(scoreText);
+            const workloads = Array.isArray(driver?.benchmarks) ? driver.benchmarks : [];
+            const completed = workloads.filter(benchmark =>
+                document.getElementById(`benchmark-${benchmark.name}`)?.classList.contains("benchmark-done")
+            ).length;
+            const current = workloads.find(benchmark =>
+                document.getElementById(`benchmark-${benchmark.name}`)?.classList.contains("benchmark-running")
+            );
+            const driverErrors = Array.isArray(driver?.errors)
+                ? driver.errors.slice(0, 4).map(error => boundedText(error?.error || error))
+                : [];
+            const errors = [...driverErrors, ...observerErrors].slice(0, 8);
+            const statusText = boundedText(status?.innerText || status?.textContent || "");
+            const failed = globalThis.allIsGood === false
+                || status?.classList.contains("error") === true
+                || document.querySelector(".benchmark-error") !== null
+                || errors.length > 0;
+            const finished = driver?.isDone === true
+                && summary?.classList.contains("done") === true
+                && workloads.length > 0
+                && completed === workloads.length
+                && Number.isFinite(score)
+                && score > 0
+                && !failed;
+            const subtestScores = {};
+            for (const benchmark of workloads) {
+                const value = benchmark?.score;
+                if (typeof benchmark?.name === "string" && Number.isFinite(value) && value > 0)
+                    subtestScores[benchmark.name] = value;
+            }
+            const initialized = driver?.isReady === true && globalThis.allIsGood !== false;
+            const started = statusText.includes("Running") || !!current || finished;
+            const state = finished ? "complete" : failed ? "failed" : started ? "running" : initialized ? "ready" : "loading";
+            const title = prefix + JSON.stringify({
+                state,
+                initialized,
+                started,
+                completed: finished,
+                failed,
+                official_score: Number.isFinite(score) && score > 0 ? score : null,
+                completed_workloads: completed,
+                total_workloads: workloads.length,
+                current_workload: current?.name || null,
+                status_text: statusText,
+                errors,
+                subtest_scores: subtestScores,
+                document_generation: documentGeneration,
+                document_url: location.origin + location.pathname,
+            });
+            if (document.title !== title)
+                document.title = title;
+        };
+        addEventListener("JetStreamReady", publish);
+        addEventListener("JetStreamDone", publish);
+        addEventListener("error", event => recordError(event.error || event.message));
+        addEventListener("unhandledrejection", event => recordError(event.reason));
+        const observer = new MutationObserver(publish);
+        if (document.body)
+            observer.observe(document.body, { attributes: true, childList: true, characterData: true, subtree: true });
+        publish();
+    })())JS"sv);
+    auto script = MUST(script_builder.to_string());
+    m_impl->view->run_javascript(move(script));
+    return true;
+}
+bool View::request_jetstream_start(uint64_t expected_document_generation)
+{
+    if (!m_impl || !m_impl->view
+        || !m_impl->view->has_completed_document_load()
+        || m_impl->view->document_generation() != expected_document_generation)
+        return false;
+    StringBuilder script_builder;
+    script_builder.append(R"JS((() => {
+        const expectedGeneration = )JS"sv);
+    auto generation = String::number(expected_document_generation);
+    script_builder.append(generation.bytes_as_string_view());
+    script_builder.append(R"JS(;
+        if (globalThis.__velocityJetStreamObserverGeneration !== expectedGeneration)
+            return;
+        const officialHost = location.protocol === "https:" && location.hostname === "browserbench.org";
+        const loopbackHost = location.protocol === "http:" && location.hostname === "127.0.0.1";
+        const validPath = location.pathname === "/JetStream3.0"
+            || location.pathname === "/JetStream3.0/"
+            || location.pathname === "/JetStream3.0/index.html";
+        if (!(officialHost || loopbackHost) || !validPath || location.search.length)
+            return;
+        const driver = globalThis.JetStream;
+        const status = document.querySelector("#status");
+        if (driver?.isReady !== true || driver.isDone || !status
+            || typeof status.onclick !== "function"
+            || !status.querySelector("a.button"))
+            return;
+        status.click();
+    })())JS"sv);
+    auto script = MUST(script_builder.to_string());
+    m_impl->view->run_javascript(move(script));
+    return true;
+}
 void View::reload() { m_impl->view->reload(); }
 void View::stop_loading() { m_impl->view->stop_loading(); }
 void View::go_back() { m_impl->view->traverse_the_history_by_delta(-1); }
