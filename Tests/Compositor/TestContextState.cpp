@@ -6,6 +6,7 @@
 
 #include <Compositor/CompositorState.h>
 #include <Compositor/ContextState.h>
+#include <Compositor/DisplayListPlayerSkia.h>
 #include <LibCompositing/DisplayList/CanvasSurfaceRegistry.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/VisualContextTreeTestBuilder.h>
@@ -43,6 +44,17 @@ static Web::PinchEvent pinch_event(double scale_delta)
     event.position = { 400, 300 };
     event.scale_delta = scale_delta;
     return event;
+}
+
+TEST_CASE(frame_can_arrive_before_the_first_display_list)
+{
+    NullWebContentClient client;
+    Compositing::CanvasSurfaceRegistry canvas_surface_registry;
+    Compositor::ContextState context { Web::CompositorContextId { 1 }, 1, client, canvas_surface_registry };
+    Compositor::DisplayListPlayerSkia display_list_player;
+
+    auto prepared_frame = context.prepare_frame(display_list_player, { .viewport_rect = { 0, 0, 800, 600 }, .forced_damage_rect = {} }, nullptr);
+    EXPECT(!prepared_frame.has_value());
 }
 
 TEST_CASE(pinch_zooms_a_page_without_scroll_nodes)

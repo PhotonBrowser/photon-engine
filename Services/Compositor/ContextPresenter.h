@@ -133,7 +133,7 @@ public:
     bool has_available_backing_store_buffer() const { return m_backing_store_manager.has_available_buffer(); }
     void log_backing_store_pool_state(StringView event) const { m_backing_store_manager.log_pool_state(event); }
 
-    Optional<PreparedFrame> prepare_frame(DisplayListPlayerSkia&, PendingFrame, FrameContent const&);
+    Optional<PreparedFrame> prepare_frame(DisplayListPlayerSkia&, PendingFrame, Optional<FrameContent>);
     void did_submit_prepared_frame(Gfx::IntRect);
     bool present_synchronously(DisplayListPlayerSkia&, FrameContent const&);
     void paint_screenshot(DisplayListPlayerSkia&, Gfx::ShareableBitmap&, FrameContent const&);

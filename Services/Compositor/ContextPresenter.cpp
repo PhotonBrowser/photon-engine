@@ -271,7 +271,7 @@ bool ContextPresenter::draws_canvas(Compositing::CanvasId canvas_id) const
     return m_last_rasterized_frame.has_value() && m_last_rasterized_frame->canvas_content_generations.contains(canvas_id);
 }
 
-Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& display_list_player, PendingFrame pending_frame, FrameContent const& frame_content)
+Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& display_list_player, PendingFrame pending_frame, Optional<FrameContent> frame_content)
 {
     if (is_present_blocked()) {
         queue_present_frame(pending_frame);
@@ -283,11 +283,14 @@ Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& d
         return {};
     }
 
+    VERIFY(frame_content.has_value());
+    auto const& content = frame_content.value();
+
     Optional<ScrollBlit> scroll_blit;
-    auto damage_rect = frame_damage_for(pending_frame, frame_content, &scroll_blit);
+    auto damage_rect = frame_damage_for(pending_frame, content, &scroll_blit);
     // NB: A changed content rect must still reach the client even if the pixels are identical.
     if (damage_rect.is_empty() && m_presented_frame == pending_frame.viewport_rect) {
-        remember_rasterized_frame(pending_frame.viewport_rect.size(), frame_content.presented_scroll_state_snapshot);
+        remember_rasterized_frame(pending_frame.viewport_rect.size(), content.presented_scroll_state_snapshot);
         return {};
     }
     auto render_target = m_backing_store_manager.acquire_render_target(raster_damage_rect(damage_rect));
@@ -301,8 +304,8 @@ Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& d
         shift_surface_for_scroll(back_store, *m_latest_rendered_surface, scroll_blit->translation);
         render_target->damage_rect = raster_damage_rect(damage_rect);
     }
-    paint_current_display_list(display_list_player, back_store, frame_content, render_target->damage_rect);
-    remember_rasterized_frame(pending_frame.viewport_rect.size(), frame_content.presented_scroll_state_snapshot);
+    paint_current_display_list(display_list_player, back_store, content, render_target->damage_rect);
+    remember_rasterized_frame(pending_frame.viewport_rect.size(), content.presented_scroll_state_snapshot);
 
     return PreparedFrame {
         .rendered_surface = &back_store,

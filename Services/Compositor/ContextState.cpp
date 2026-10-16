@@ -1457,11 +1457,20 @@ Optional<PreparedFrame> ContextState::prepare_frame(DisplayListPlayerSkia& displ
 {
     auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
     auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
+
+    // A frame request may arrive before the first display list, or while a context is being torn down. The presenter
+    // handles that state without rendering; don't build frame content until a visual context tree exists.
+    if (!m_scene.visual_context_tree().has_value())
+        return m_presenter.prepare_frame(display_list_player, pending_frame, Optional<ContextPresenter::FrameContent> {});
+
     return m_presenter.prepare_frame(display_list_player, pending_frame, frame_content(presented_scroll_state_snapshot, composited_context_resolver));
 }
 
 bool ContextState::present_synchronously(DisplayListPlayerSkia& display_list_player, CompositedContextResolver const* composited_context_resolver)
 {
+    if (!m_scene.visual_context_tree().has_value())
+        return false;
+
     auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
     auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
     return m_presenter.present_synchronously(display_list_player, frame_content(presented_scroll_state_snapshot, composited_context_resolver));
