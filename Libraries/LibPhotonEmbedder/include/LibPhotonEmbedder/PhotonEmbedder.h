@@ -409,6 +409,9 @@ public:
     // Set the host system's reduced-motion preference used by the app's Auto
     // setting. Call again when the system accessibility setting changes.
     void set_system_reduced_motion_preference(bool reduce_motion);
+    // Avoid launching a spare WebContent process while the host reports
+    // memory pressure. Call again when pressure subsides.
+    void set_memory_pressure(bool pressured);
     // Enables the platform's elastic scroll effect when supported.
     void set_elastic_scroll_enabled(bool enabled);
     // Called with `restarted` false when a service process stops and true once
@@ -461,6 +464,12 @@ public:
     void resize(int logical_width, int logical_height, double device_pixel_ratio);
     void set_visible(bool visible);
     void set_performance_monitor_enabled(bool enabled);
+    void set_residency_monitor_enabled(bool enabled);
+    bool set_task_queue_diagnostics_enabled(bool enabled);
+    size_t copy_task_queue_diagnostics(char* output, size_t capacity) const;
+    void release_hidden_memory();
+    // Whether closing this view would currently require a beforeunload check.
+    bool needs_beforeunload_check() const;
     // Tell the engine which display shows this view and how often it refreshes.
     // Pace page rendering and compositor vsync from them. Call again when the
     // view moves to another display or the refresh rate changes. A display_id

@@ -6,6 +6,7 @@
 
 #include <AK/HashTable.h>
 #include <AK/ScopeGuard.h>
+#include <atomic>
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
@@ -13,6 +14,7 @@
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleUpdateInputs.h>
+#include <LibWeb/CSS/PerformanceDiagnostics.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -30,6 +32,18 @@
 #include <LibWeb/Selection/Selection.h>
 
 namespace Web::CSS {
+
+static std::atomic_bool s_performance_diagnostics_enabled { false };
+
+void set_performance_diagnostics_enabled(bool enabled)
+{
+    s_performance_diagnostics_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool performance_diagnostics_enabled()
+{
+    return s_performance_diagnostics_enabled.load(std::memory_order_relaxed);
+}
 
 using StyleUpdateMode = DOM::Document::StyleUpdateMode;
 
@@ -242,6 +256,13 @@ StyleEngineFFI::FfiTakenStyleTransaction StyleEngineFFI::web_css_take_style_tran
             return {};
         }
         transaction = style_engine.take_style_transaction(read, root->style_node_id());
+    }
+    if (performance_diagnostics_enabled() && !transaction.reactions.is_empty()) {
+        ++counters.style_engine_transaction_count;
+        if (!transaction.is_scoped) {
+            ++counters.style_unscoped_transaction_count;
+            counters.style_unscoped_transaction_reaction_entries += transaction.reactions.size();
+        }
     }
     counters.style_update_submission_microseconds += transaction.submission_microseconds;
     counters.style_update_bridge_microseconds += transaction.bridge_microseconds;
@@ -724,7 +745,7 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
     };
     StyleReactionApplication application { read, document };
     auto* root = document.document_element();
-    auto applied = StyleEngineFFI::style_engine_update_style(document.style_computer().style_engine().host(), &read, &application, drains_flown_transaction, root ? root->style_node_id().value() : 0);
+    auto applied = StyleEngineFFI::style_engine_update_style(document.style_computer().style_engine().host(), &read, &application, drains_flown_transaction, root ? root->style_node_id().value() : 0, performance_diagnostics_enabled());
     timing_counters.style_engine_reaction_batch_runs += applied.batch_runs;
     timing_counters.style_engine_reaction_elements += applied.reaction_elements;
     timing_counters.style_engine_published_reactions += applied.published_reactions;
@@ -732,6 +753,14 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
     timing_counters.style_engine_record_deltas_applied += applied.record_deltas_applied;
     timing_counters.style_update_pass_guard_hits += applied.pass_guard_hits;
     timing_counters.style_update_apply_microseconds += applied.apply_microseconds;
+    if (performance_diagnostics_enabled()) {
+        timing_counters.style_broad_matching_batch_runs += applied.broad_matching_batch_runs;
+        timing_counters.style_narrow_matching_batch_runs += applied.narrow_matching_batch_runs;
+        timing_counters.style_broad_matching_reaction_elements += applied.broad_matching_reaction_elements;
+        timing_counters.style_narrow_matching_reaction_elements += applied.narrow_matching_reaction_elements;
+        timing_counters.style_broad_matching_apply_microseconds += applied.broad_matching_apply_microseconds;
+        timing_counters.style_narrow_matching_apply_microseconds += applied.narrow_matching_apply_microseconds;
+    }
     if (!applied.had_reactions)
         return;
 

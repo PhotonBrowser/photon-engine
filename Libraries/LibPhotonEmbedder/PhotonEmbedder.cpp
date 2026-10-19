@@ -3,9 +3,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/StringBuilder.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/MachPort.h>
-#include <AK/StringBuilder.h>
+#include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Palette.h>
 #include <LibGfx/SharedImageBuffer.h>
@@ -58,6 +59,8 @@ static bool external_image_lease_trace_enabled()
     static bool enabled = std::getenv("EXTERNAL_IMAGE_LEASE_TRACE") != nullptr;
     return enabled;
 }
+
+static constexpr int hidden_page_gc_delay_ms = 10'000;
 
 static uint64_t next_native_backing_id()
 {
@@ -195,6 +198,10 @@ private:
 
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions& content) override
     {
+        // The per-WebContent HTTP memory cache retains complete response bodies and JavaScript bytecode without a
+        // size limit. Photon keeps the persistent profile cache in RequestServer, so avoid unbounded per-page copies.
+        content.enable_http_memory_cache = EnableMemoryHTTPCache::No;
+
         // Viewport scrollbars are painted into the page's shared GPU surface.
         content.paint_viewport_scrollbars = PaintViewportScrollbars::Yes;
 
@@ -517,10 +524,55 @@ public:
         TabPerformanceMonitor::set_view_enabled(view_id(), enabled);
     }
 
+    void set_residency_monitor_enabled(bool enabled)
+    {
+        TabPerformanceMonitor::set_view_residency_enabled(view_id(), enabled);
+    }
+
+    bool set_task_queue_diagnostics_enabled(bool enabled)
+    {
+        return TabPerformanceMonitor::set_view_task_queue_diagnostics_enabled(view_id(), enabled);
+    }
+
+    String task_queue_diagnostics_json() const
+    {
+        return TabPerformanceMonitor::task_queue_diagnostics_json(view_id());
+    }
+
+    void release_hidden_memory()
+    {
+        if (page().is_open() && !is_loading() && traversable().system_visibility_state() == Web::HTML::VisibilityState::Hidden) {
+            if (m_hidden_gc_timer)
+                m_hidden_gc_timer->stop();
+            debug_request("collect-garbage"sv, "release-hidden-layout"sv);
+        }
+    }
+
     void set_visible(bool visible)
     {
         auto was_hidden = traversable().system_visibility_state() == Web::HTML::VisibilityState::Hidden;
         set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+
+        if (visible) {
+            if (m_hidden_gc_timer)
+                m_hidden_gc_timer->stop();
+        } else {
+            // Give a background page time to become active again before discarding its rebuildable layout tree and
+            // collecting unreachable DOM and JavaScript objects.
+            if (!m_hidden_gc_timer) {
+                m_hidden_gc_timer = Core::Timer::create_single_shot(hidden_page_gc_delay_ms, [weak_this = make_weak_ptr<PhotonHeadlessWebView>()] {
+                    if (!weak_this || !weak_this->page().is_open() || weak_this->traversable().system_visibility_state() != Web::HTML::VisibilityState::Hidden)
+                        return;
+                    if (weak_this->is_loading()) {
+                        weak_this->m_hidden_gc_timer->start();
+                        return;
+                    }
+                    weak_this->debug_request("collect-garbage"sv, "release-hidden-layout"sv);
+                });
+            }
+            if (!m_hidden_gc_timer->is_active())
+                m_hidden_gc_timer->start();
+        }
 
         if (visible && was_hidden)
             start_page_responsiveness_check();
@@ -997,6 +1049,7 @@ private:
     virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) override { return nullptr; }
 
     Photon::ViewCallbacks m_callbacks;
+    RefPtr<Core::Timer> m_hidden_gc_timer;
     bool m_navigation_timing_waiting_for_first_frame { false };
     std::shared_ptr<CpuFallbackFramePool> m_cpu_fallback_frame_pool;
     // The shown context menu's actions, with null for separators.
@@ -1197,6 +1250,11 @@ void Runtime::pump()
 void Runtime::set_system_reduced_motion_preference(bool reduce_motion)
 {
     m_impl->application->set_system_reduced_motion_preference(reduce_motion);
+}
+
+void Runtime::set_memory_pressure(bool pressured)
+{
+    m_impl->application->set_memory_pressure(pressured);
 }
 
 void Runtime::set_elastic_scroll_enabled(bool enabled)
@@ -1748,6 +1806,38 @@ void View::set_performance_monitor_enabled(bool enabled)
 {
     VERIFY(m_impl && m_impl->view);
     m_impl->view->set_performance_monitor_enabled(enabled);
+}
+void View::set_residency_monitor_enabled(bool enabled)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->set_residency_monitor_enabled(enabled);
+}
+bool View::set_task_queue_diagnostics_enabled(bool enabled)
+{
+    VERIFY(m_impl && m_impl->view);
+    return m_impl->view->set_task_queue_diagnostics_enabled(enabled);
+}
+size_t View::copy_task_queue_diagnostics(char* output, size_t capacity) const
+{
+    VERIFY(m_impl && m_impl->view);
+    auto diagnostics = m_impl->view->task_queue_diagnostics_json();
+    auto bytes = diagnostics.bytes_as_string_view();
+    if (output && capacity > 0) {
+        auto copied = min(capacity - 1, bytes.length());
+        memcpy(output, bytes.characters_without_null_termination(), copied);
+        output[copied] = '\0';
+    }
+    return bytes.length();
+}
+void View::release_hidden_memory()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->release_hidden_memory();
+}
+bool View::needs_beforeunload_check() const
+{
+    VERIFY(m_impl && m_impl->view);
+    return m_impl->view->needs_beforeunload_check();
 }
 void View::set_display_metadata(uint64_t display_id, double refresh_rate)
 {

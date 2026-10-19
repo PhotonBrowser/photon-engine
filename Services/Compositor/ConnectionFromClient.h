@@ -57,6 +57,7 @@ private:
     virtual void set_client_gpu_presentation_capability(bool supported, u64 adapter_luid) override;
     virtual void set_synthesizes_scroll_momentum(bool) override;
     virtual void set_scrolls_elastically(bool) override;
+    virtual void purge_unused_gpu_resources() override;
     virtual void crash() override;
 
     ConnectionFromWebContent* web_content_connection(i32 web_content_connection_id);

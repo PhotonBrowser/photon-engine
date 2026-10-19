@@ -163,6 +163,12 @@ void CompositorState::set_client(CompositorStateClient& client)
     m_client = &client;
 }
 
+void CompositorState::purge_unused_gpu_resources()
+{
+    if (m_skia_backend_context)
+        m_skia_backend_context->purge_unlocked_scratch_resources();
+}
+
 CompositorState::ContextOwnerCheckResult CompositorState::check_context_owner(Web::CompositorContextId context_id, CompositorStateWebContentClient& client)
 {
     auto* context = context_if_present(context_id);

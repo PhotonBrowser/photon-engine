@@ -7,6 +7,7 @@
 #include <AK/ScopeGuard.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/PerformanceDiagnostics.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -41,6 +42,7 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
                 .document_needs_layout_tree_build = document.needs_layout_tree_update() || document.child_needs_layout_tree_update(),
                 .top_layer_work_pending = document.m_top_layer_needs_layout_zone_rebuild || !document.m_elements_with_pending_top_layer_membership_change.is_empty(),
                 .should_collect_devtools_layout_data = document.page().client().has_active_devtools_client(),
+                .should_collect_performance_diagnostics = CSS::performance_diagnostics_enabled(),
                 .document_in_quirks_mode = document.in_quirks_mode(),
                 .viewport_inline_size_raw = viewport_rect.width().raw_value(),
                 .viewport_block_size_raw = viewport_rect.height().raw_value(),

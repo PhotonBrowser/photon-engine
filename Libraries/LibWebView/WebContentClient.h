@@ -142,8 +142,12 @@ public:
     // message the connection sent while it had the page can arrive after the page is gone.
     virtual bool may_act_for_page(Web::PageId page_id) const override;
 
+    // Distinct views with open pages in this process.
+    Vector<u64> performance_owners() const;
     Optional<u64> exclusive_performance_owner() const;
     Optional<u64> managed_heap_bytes() const { return m_managed_heap_bytes; }
+    static bool set_task_queue_diagnostics_enabled(u64 view_id, bool enabled);
+    static String task_queue_diagnostics_json(u64 view_id);
 
     void did_lose_process();
     void did_save_crash_report(ByteString const& report_name);
@@ -162,6 +166,7 @@ public:
     Web::CompositorContextId allocate_compositor_context(Web::PageId page_id, Web::PagePresentationRegistration);
     Optional<Web::PageId> page_id_for_compositor_context_id(Web::CompositorContextId) const;
     void close_if_unused(Badge<CanonicalNavigable>) { close_server_if_unused(); }
+    void close_unassigned_spare(Badge<Application>) { close_server_if_unused(); }
     bool has_requested_close() const { return m_requested_close; }
 
     pid_t pid() const { return m_process_handle.pid; }
@@ -214,6 +219,7 @@ private:
     bool m_requested_close { false };
     bool m_rejected_ipc { false };
     Optional<u64> m_managed_heap_bytes;
+    HashTable<u64> m_task_queue_diagnostics_owners;
     bool m_has_hosted_local_file_content { false };
     Optional<String> m_hosted_web_ui;
     Vector<u64> m_crashed_view_ids;

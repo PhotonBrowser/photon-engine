@@ -51,13 +51,15 @@ constexpr bool AllocatedWithSystemAllocator<skgpu::VulkanExtensions> = true;
 namespace Gfx {
 
 #if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
-static constexpr size_t skia_resource_cache_limit = 256 * MiB;
+// The compositor has one Skia context shared by every tab. Keep its reusable GPU resources bounded so one heavy page
+// cannot retain hundreds of MiB outside the per-tab memory totals shown by the shell.
+static constexpr size_t skia_resource_cache_limit = 128 * MiB;
 #endif
 static constexpr auto skia_deferred_cleanup_interval = AK::Duration::from_seconds(1);
 static constexpr auto skia_aggressive_cleanup_interval = AK::Duration::from_seconds(5);
-static constexpr auto skia_deferred_cleanup_resource_age = std::chrono::seconds(5);
-static constexpr auto skia_resource_cache_high_watermark = 384 * MiB;
-static constexpr auto skia_resource_cache_critical_watermark = 512 * MiB;
+static constexpr auto skia_deferred_cleanup_resource_age = std::chrono::seconds(1);
+static constexpr auto skia_resource_cache_high_watermark = 192 * MiB;
+static constexpr auto skia_resource_cache_critical_watermark = 256 * MiB;
 
 static auto& main_thread_context()
 {
@@ -153,6 +155,20 @@ void SkiaBackendContext::purge_resources_unused_for(AK::Duration age)
         context->getResourceCacheUsage(nullptr, &resource_bytes_after);
         dbgln("Photon Skia idle purge: cache_bytes={}->{}", resource_bytes_before, resource_bytes_after);
     }
+}
+
+void SkiaBackendContext::purge_unlocked_scratch_resources()
+{
+    auto* context = sk_context();
+    if (!context)
+        return;
+
+    size_t resource_bytes_before = 0;
+    context->getResourceCacheUsage(nullptr, &resource_bytes_before);
+    context->purgeUnlockedResources(GrPurgeResourceOptions::kScratchResourcesOnly);
+    size_t resource_bytes_after = 0;
+    context->getResourceCacheUsage(nullptr, &resource_bytes_after);
+    dbgln("Photon memory-pressure GPU cache: {} -> {} bytes", resource_bytes_before, resource_bytes_after);
 }
 
 void SkiaBackendContext::perform_post_flush_cleanup()

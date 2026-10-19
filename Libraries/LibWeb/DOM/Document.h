@@ -107,6 +107,7 @@ enum class QuirksMode {
 
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASONS(X) \
     X(InternalsFullRebuildComparison)               \
+    X(BackgroundTabMemoryReclamation)                \
     X(TopLayerElementStillRenderedAfterRemoval)
 
 enum class InvalidateLayoutTreeReason {
@@ -1291,6 +1292,15 @@ public:
         u64 style_query_container_scans { 0 };
         u64 style_engine_transaction_setups { 0 };
         u64 style_engine_transaction_setup_microseconds { 0 };
+        u64 style_engine_transaction_count { 0 };
+        u64 style_unscoped_transaction_count { 0 };
+        u64 style_unscoped_transaction_reaction_entries { 0 };
+        u64 style_broad_matching_batch_runs { 0 };
+        u64 style_narrow_matching_batch_runs { 0 };
+        u64 style_broad_matching_reaction_elements { 0 };
+        u64 style_narrow_matching_reaction_elements { 0 };
+        u64 style_broad_matching_apply_microseconds { 0 };
+        u64 style_narrow_matching_apply_microseconds { 0 };
         // Exclusive intervals within style_update_microseconds. Rust phases subdivide bridge.
         u64 style_update_submission_microseconds { 0 };
         u64 style_update_bridge_microseconds { 0 };

@@ -18,11 +18,13 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16StringBuilder.h>
+#include <AK/kmalloc.h>
 #include <LibCompositing/FontServiceClient.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
 #include <LibDevTools/IndexedDBSerialization.h>
 #include <LibGC/Heap.h>
+#include <LibGC/PerformanceDiagnostics.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/Palette.h>
@@ -33,6 +35,7 @@
 #include <LibWasm/Types.h>
 #include <LibWeb/ARIA/RoleType.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/CSS/PerformanceDiagnostics.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -61,6 +64,7 @@
 #include <LibWeb/HTML/BroadcastChannel.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/EventLoop/TaskQueue.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
@@ -356,6 +360,185 @@ Optional<PageClient const&> ConnectionFromClient::page(Web::PageId index, Source
 void ConnectionFromClient::close_server()
 {
     shutdown();
+}
+
+void ConnectionFromClient::set_task_queue_diagnostics_enabled(bool enabled)
+{
+    if (enabled)
+        m_task_queue_diagnostics_document_baseline = collect_performance_document_counters();
+    else
+        m_task_queue_diagnostics_document_baseline.clear();
+    Web::HTML::TaskQueue::set_performance_diagnostics_enabled(enabled);
+    Web::CSS::set_performance_diagnostics_enabled(enabled);
+    GC::set_performance_diagnostics_enabled(Web::Bindings::main_thread_vm().heap(), enabled);
+}
+
+Messages::WebContentServer::GetTaskQueueDiagnosticsResponse ConnectionFromClient::get_task_queue_diagnostics()
+{
+    auto task_diagnostics = JsonValue::from_string(Web::HTML::TaskQueue::performance_diagnostics_json());
+    if (task_diagnostics.is_error())
+        return Web::HTML::TaskQueue::performance_diagnostics_json();
+    auto result = task_diagnostics.release_value().as_object();
+    result.set("style_and_layout"sv, style_and_layout_diagnostics());
+    result.set("gc"sv, GC::performance_diagnostics(Web::Bindings::main_thread_vm().heap()));
+    return result.serialized();
+}
+
+HashMap<void const*, ConnectionFromClient::PerformanceDocumentCounters> ConnectionFromClient::collect_performance_document_counters() const
+{
+    HashMap<void const*, PerformanceDocumentCounters> counters_by_document;
+    m_page_host->for_each_page([&](PageClient& page_client) {
+        for (auto& navigable : page_client.page().hosted_navigables()) {
+            auto document = navigable->active_document();
+            if (!document)
+                continue;
+            auto const& style = document->style_invalidation_counters();
+            auto const layout = document->layout_counts();
+            counters_by_document.set(document.ptr(), {
+                .style_update_microseconds = style.style_update_microseconds,
+                .style_reaction_elements = style.style_engine_reaction_elements,
+                .style_reaction_batches = style.style_engine_reaction_batch_runs,
+                .style_update_submission_microseconds = style.style_update_submission_microseconds,
+                .style_update_bridge_microseconds = style.style_update_bridge_microseconds,
+                .style_update_apply_microseconds = style.style_update_apply_microseconds,
+                .style_update_remainder_microseconds = style.style_update_remainder_microseconds,
+                .style_engine_transaction_setup_microseconds = style.style_engine_transaction_setup_microseconds,
+                .style_engine_transaction_setups = style.style_engine_transaction_setups,
+                .style_engine_transaction_count = style.style_engine_transaction_count,
+                .style_unscoped_transaction_count = style.style_unscoped_transaction_count,
+                .style_unscoped_transaction_reaction_entries = style.style_unscoped_transaction_reaction_entries,
+                .style_broad_matching_batch_runs = style.style_broad_matching_batch_runs,
+                .style_narrow_matching_batch_runs = style.style_narrow_matching_batch_runs,
+                .style_broad_matching_reaction_elements = style.style_broad_matching_reaction_elements,
+                .style_narrow_matching_reaction_elements = style.style_narrow_matching_reaction_elements,
+                .style_broad_matching_apply_microseconds = style.style_broad_matching_apply_microseconds,
+                .style_narrow_matching_apply_microseconds = style.style_narrow_matching_apply_microseconds,
+                .full_layout_count = layout.full_layouts,
+                .partial_layout_count = layout.partial_layouts,
+                .full_layout_microseconds = layout.full_layout_microseconds,
+                .partial_layout_microseconds = layout.partial_layout_microseconds,
+            });
+        }
+    });
+    return counters_by_document;
+}
+
+JsonObject ConnectionFromClient::style_and_layout_diagnostics() const
+{
+    auto current = collect_performance_document_counters();
+    bool document_set_unchanged = current.size() == m_task_queue_diagnostics_document_baseline.size();
+    bool counters_monotonic = true;
+    PerformanceDocumentCounters totals;
+
+    for (auto const& [document, counters] : current) {
+        auto baseline = m_task_queue_diagnostics_document_baseline.get(document);
+        if (!baseline.has_value()) {
+            document_set_unchanged = false;
+            continue;
+        }
+        auto const& start = *baseline;
+        auto add_delta = [&](u64 PerformanceDocumentCounters::*field) {
+            if (counters.*field < start.*field) {
+                counters_monotonic = false;
+                return;
+            }
+            totals.*field += counters.*field - start.*field;
+        };
+        for (auto field : {
+                 &PerformanceDocumentCounters::style_update_microseconds,
+                 &PerformanceDocumentCounters::style_reaction_elements,
+                 &PerformanceDocumentCounters::style_reaction_batches,
+                 &PerformanceDocumentCounters::style_update_submission_microseconds,
+                 &PerformanceDocumentCounters::style_update_bridge_microseconds,
+                 &PerformanceDocumentCounters::style_update_apply_microseconds,
+                 &PerformanceDocumentCounters::style_update_remainder_microseconds,
+                 &PerformanceDocumentCounters::style_engine_transaction_setup_microseconds,
+                 &PerformanceDocumentCounters::style_engine_transaction_setups,
+                 &PerformanceDocumentCounters::style_engine_transaction_count,
+                 &PerformanceDocumentCounters::style_unscoped_transaction_count,
+                 &PerformanceDocumentCounters::style_unscoped_transaction_reaction_entries,
+                 &PerformanceDocumentCounters::style_broad_matching_batch_runs,
+                 &PerformanceDocumentCounters::style_narrow_matching_batch_runs,
+                 &PerformanceDocumentCounters::style_broad_matching_reaction_elements,
+                 &PerformanceDocumentCounters::style_narrow_matching_reaction_elements,
+                 &PerformanceDocumentCounters::style_broad_matching_apply_microseconds,
+                 &PerformanceDocumentCounters::style_narrow_matching_apply_microseconds,
+                 &PerformanceDocumentCounters::full_layout_count,
+                 &PerformanceDocumentCounters::partial_layout_count,
+                 &PerformanceDocumentCounters::full_layout_microseconds,
+                 &PerformanceDocumentCounters::partial_layout_microseconds,
+             })
+            add_delta(field);
+    }
+
+    JsonObject result;
+    result.set("scope"sv, "webcontent_process_active_documents"sv);
+    result.set("document_count"sv, current.size());
+    result.set("document_set_unchanged"sv, document_set_unchanged);
+    result.set("available"sv, document_set_unchanged && counters_monotonic);
+    result.set("style_update_duration_semantics"sv, "sum of elapsed wall time for update_style() calls over active documents; includes the pre-style embedding-container layout check; nested document calls can overlap; not CPU time or a disjoint phase budget"sv);
+    result.set("style_reaction_elements_semantics"sv, "published style-reaction entries counted by the existing style engine; not every element visited or every computed style recomputed"sv);
+    result.set("style_reaction_batches_semantics"sv, "style application passes that contain published style reactions; not transaction count or full-document traversal count"sv);
+    result.set("style_unscoped_transaction_semantics"sv, "consumed transactions whose existing is_scoped flag is false; this is not a per-element traversal count or proof of full computed-style recomputation"sv);
+    result.set("style_broad_matching_semantics"sv, "passes selected by the existing Rust broad-matching heuristic; reaction element counts are published entries, not nodes visited; broad matching is not equivalent to a full-document style recomputation"sv);
+    result.set("style_fallback_reason_available"sv, false);
+    result.set("layout_duration_semantics"sv, "elapsed wall time inside classified full or partial render-state layout rounds, summed over active document arenas; includes round work and committed-layout preparation, excludes waiting before the render-state job and paint recording; not CPU time"sv);
+    if (document_set_unchanged && counters_monotonic) {
+        auto set_duration = [&](StringView name, u64 microseconds) {
+            result.set(name, static_cast<double>(microseconds) / 1000.0);
+        };
+        auto set_count = [&](StringView name, u64 count) { result.set(name, count); };
+        set_duration("style_update_duration_ms"sv, totals.style_update_microseconds);
+        set_count("style_reaction_elements"sv, totals.style_reaction_elements);
+        set_count("style_reaction_batches"sv, totals.style_reaction_batches);
+        set_duration("style_update_submission_duration_ms"sv, totals.style_update_submission_microseconds);
+        set_duration("style_update_bridge_duration_ms"sv, totals.style_update_bridge_microseconds);
+        set_duration("style_update_apply_duration_ms"sv, totals.style_update_apply_microseconds);
+        set_duration("style_update_remainder_duration_ms"sv, totals.style_update_remainder_microseconds);
+        set_duration("style_engine_transaction_setup_duration_ms"sv, totals.style_engine_transaction_setup_microseconds);
+        set_count("style_engine_transaction_setup_count"sv, totals.style_engine_transaction_setups);
+        set_count("style_engine_transaction_count"sv, totals.style_engine_transaction_count);
+        set_count("style_unscoped_transaction_count"sv, totals.style_unscoped_transaction_count);
+        set_count("style_unscoped_transaction_reaction_entries"sv, totals.style_unscoped_transaction_reaction_entries);
+        set_count("style_broad_matching_batch_count"sv, totals.style_broad_matching_batch_runs);
+        set_count("style_narrow_matching_batch_count"sv, totals.style_narrow_matching_batch_runs);
+        set_count("style_broad_reaction_elements"sv, totals.style_broad_matching_reaction_elements);
+        set_count("style_narrow_reaction_elements"sv, totals.style_narrow_matching_reaction_elements);
+        set_duration("style_broad_matching_apply_duration_ms"sv, totals.style_broad_matching_apply_microseconds);
+        set_duration("style_narrow_matching_apply_duration_ms"sv, totals.style_narrow_matching_apply_microseconds);
+        set_count("full_layout_count"sv, totals.full_layout_count);
+        set_count("partial_layout_count"sv, totals.partial_layout_count);
+        set_duration("layout_full_duration_ms"sv, totals.full_layout_microseconds);
+        set_duration("layout_partial_duration_ms"sv, totals.partial_layout_microseconds);
+    } else {
+        result.set("unavailable_reason"sv, document_set_unchanged ? "document_counters_were_reset"sv : "document_set_changed_during_session"sv);
+        for (StringView name : {
+                 "style_update_duration_ms"sv,
+                 "style_reaction_elements"sv,
+                 "style_reaction_batches"sv,
+                 "style_update_submission_duration_ms"sv,
+                 "style_update_bridge_duration_ms"sv,
+                 "style_update_apply_duration_ms"sv,
+                 "style_update_remainder_duration_ms"sv,
+                 "style_engine_transaction_setup_duration_ms"sv,
+                 "style_engine_transaction_setup_count"sv,
+                 "style_engine_transaction_count"sv,
+                 "style_unscoped_transaction_count"sv,
+                 "style_unscoped_transaction_reaction_entries"sv,
+                 "style_broad_matching_batch_count"sv,
+                 "style_narrow_matching_batch_count"sv,
+                 "style_broad_reaction_elements"sv,
+                 "style_narrow_reaction_elements"sv,
+                 "style_broad_matching_apply_duration_ms"sv,
+                 "style_narrow_matching_apply_duration_ms"sv,
+                 "full_layout_count"sv,
+                 "partial_layout_count"sv,
+                 "layout_full_duration_ms"sv,
+                 "layout_partial_duration_ms"sv,
+             })
+            result.set(name, JsonValue {});
+    }
+    return result;
 }
 
 Messages::WebContentServer::GetWindowHandleResponse ConnectionFromClient::get_window_handle(Web::PageId page_id)
@@ -1072,9 +1255,25 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
     }
 
     if (request == "collect-garbage") {
+        auto release_hidden_layout = argument == "release-hidden-layout"sv;
+        if (release_hidden_layout) {
+            if (page->page().system_visibility_state() != Web::HTML::VisibilityState::Hidden)
+                return;
+
+            // The DOM and JS state remain live while a tab is in the background, but its layout boxes can be rebuilt
+            // on the next visible frame. Drop those boxes now so the Layout allocator can return their pages.
+            for (auto const& navigable : page->page().hosted_navigables()) {
+                if (auto document = navigable->active_document())
+                    document->invalidate_layout_tree(Web::DOM::InvalidateLayoutTreeReason::BackgroundTabMemoryReclamation);
+            }
+        }
+
         // NOTE: We use deferred_invoke here to ensure that GC runs with as little on the stack as possible.
-        Core::deferred_invoke([] {
-            Web::Bindings::main_thread_vm().heap().collect_garbage(GC::Heap::CollectionType::CollectGarbage, true);
+        auto print_report = argument != "quiet"sv && !release_hidden_layout;
+        Core::deferred_invoke([print_report] {
+            Web::Bindings::main_thread_vm().heap().collect_garbage(GC::Heap::CollectionType::CollectGarbage, print_report);
+            // Return already-free pages held by the WebContent process's mimalloc heaps.
+            ak_kmalloc_collect();
         });
         return;
     }

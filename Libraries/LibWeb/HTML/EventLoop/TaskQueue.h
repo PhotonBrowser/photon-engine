@@ -8,6 +8,7 @@
 
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
+#include <AK/String.h>
 
 namespace Web::HTML {
 
@@ -34,6 +35,11 @@ public:
 
     Task const* last_added_task() const;
 
+    // Diagnostics are process-scoped, bounded, and disabled unless a controlled benchmark asks for them.
+    WEB_API static void set_performance_diagnostics_enabled(bool);
+    WEB_API static String performance_diagnostics_json();
+    void record_completed_task(Task const&, u64 execution_duration_microseconds);
+
 private:
     virtual void visit_edges(Visitor&) override;
 
@@ -47,6 +53,8 @@ private:
     Task::Queue m_idle_tasks;
     GC::Ptr<HTML::Task const> m_last_added_task;
     Vector<GC::Ref<HTML::Task>> m_discarded_tasks;
+    size_t m_normal_task_count { 0 };
+    size_t m_idle_task_count { 0 };
 };
 
 }

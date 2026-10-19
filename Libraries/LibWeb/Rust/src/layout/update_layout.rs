@@ -35,10 +35,20 @@ pub(crate) use main_thread_entries::MainThreadFfiEntry;
 /// host, in `read`.
 fn run_layout_round_job(host: &DocumentHost, read: &BegunRead, job: LayoutRoundJob) -> LayoutRoundAnswer {
     host.let_go_of_rows();
+    let should_collect_performance_diagnostics = job.facts.should_collect_performance_diagnostics;
     // The host keeps what the job's inputs name until it has the answer.
     let (answer, rows) = host.run(read, true, move |state| {
+        let started_at = should_collect_performance_diagnostics.then(std::time::Instant::now);
         let mut answer = job.run(state.arena_handle_mut());
         answer.prepare_committed_layout_for_rendering(state.arena_mut());
+        if let Some(started_at) = started_at {
+            let elapsed_microseconds = started_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            match &answer.end {
+                LayoutRoundEnd::FullLayout => state.arena_mut().add_full_layout_microseconds(elapsed_microseconds),
+                LayoutRoundEnd::PartialLayout => state.arena_mut().add_partial_layout_microseconds(elapsed_microseconds),
+                LayoutRoundEnd::Built { .. } | LayoutRoundEnd::NeedsDocumentStyle => {}
+            }
+        }
         // The host reads what each box owed an image is from rows published with the answer.
         let rows = (!answer.owed_images.is_empty()).then(|| state.arena_mut().publish_row_snapshot(false));
         (answer, rows)
@@ -121,6 +131,7 @@ pub struct FfiLayoutUpdateDocumentFacts {
     /// A top layer membership change or zone rebuild is waiting for the next pass.
     pub top_layer_work_pending: bool,
     pub should_collect_devtools_layout_data: bool,
+    pub should_collect_performance_diagnostics: bool,
     pub document_in_quirks_mode: bool,
     pub viewport_inline_size_raw: i32,
     pub viewport_block_size_raw: i32,
@@ -1162,6 +1173,7 @@ mod tests {
             document_needs_layout_tree_build: false,
             top_layer_work_pending: false,
             should_collect_devtools_layout_data: false,
+            should_collect_performance_diagnostics: false,
             document_in_quirks_mode: false,
             viewport_inline_size_raw: 0,
             viewport_block_size_raw: 0,

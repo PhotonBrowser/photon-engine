@@ -29,5 +29,6 @@ endpoint CompositorControlServer
     set_synthesizes_scroll_momentum(bool synthesizes_scroll_momentum) =|
     set_scrolls_elastically(bool scrolls_elastically) =|
     set_context_visibility(Web::CompositorContextId context_id, Compositing::ContextVisibility visibility) =|
+    purge_unused_gpu_resources() =|
     crash() =|
 }

@@ -89,6 +89,34 @@ public:
     void pump_and_dispatch_gamepad_events();
 
 private:
+    struct PerformanceDocumentCounters {
+        u64 style_update_microseconds { 0 };
+        u64 style_reaction_elements { 0 };
+        u64 style_reaction_batches { 0 };
+        u64 style_update_submission_microseconds { 0 };
+        u64 style_update_bridge_microseconds { 0 };
+        u64 style_update_apply_microseconds { 0 };
+        u64 style_update_remainder_microseconds { 0 };
+        u64 style_engine_transaction_setup_microseconds { 0 };
+        u64 style_engine_transaction_setups { 0 };
+        u64 style_engine_transaction_count { 0 };
+        u64 style_unscoped_transaction_count { 0 };
+        u64 style_unscoped_transaction_reaction_entries { 0 };
+        u64 style_broad_matching_batch_runs { 0 };
+        u64 style_narrow_matching_batch_runs { 0 };
+        u64 style_broad_matching_reaction_elements { 0 };
+        u64 style_narrow_matching_reaction_elements { 0 };
+        u64 style_broad_matching_apply_microseconds { 0 };
+        u64 style_narrow_matching_apply_microseconds { 0 };
+        u64 full_layout_count { 0 };
+        u64 partial_layout_count { 0 };
+        u64 full_layout_microseconds { 0 };
+        u64 partial_layout_microseconds { 0 };
+    };
+
+    HashMap<void const*, PerformanceDocumentCounters> collect_performance_document_counters() const;
+    JsonObject style_and_layout_diagnostics() const;
+
     ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, bool enable_test_mode);
 
     Optional<PageClient&> page(Web::PageId index, SourceLocation = SourceLocation::current());
@@ -105,6 +133,8 @@ private:
     virtual void content_navigable_completely_finished_loading(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void update_local_root_container_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState) override;
     virtual void close_server() override;
+    virtual void set_task_queue_diagnostics_enabled(bool enabled) override;
+    virtual Messages::WebContentServer::GetTaskQueueDiagnosticsResponse get_task_queue_diagnostics() override;
     virtual Messages::WebContentServer::GetWindowHandleResponse get_window_handle(Web::PageId page_id) override;
     virtual void set_window_handle(Web::PageId page_id, String handle) override;
     virtual void run_webdriver_command(Web::PageId page_id, u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String name, JsonValue payload, Vector<String> arguments) override;
@@ -358,6 +388,7 @@ private:
 
     Queue<Web::QueuedInputEvent> m_input_event_queue;
     bool m_enable_test_mode { false };
+    HashMap<void const*, PerformanceDocumentCounters> m_task_queue_diagnostics_document_baseline;
 };
 
 }

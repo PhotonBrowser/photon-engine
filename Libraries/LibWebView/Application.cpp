@@ -1520,6 +1520,26 @@ ErrorOr<NonnullRefPtr<WebContentPage>> Application::open_page_for_new_tab(IsPriv
     return web_content_client->open_initial_page_for_new_top_level_traversable();
 }
 
+void Application::set_memory_pressure(bool pressured)
+{
+    if (m_memory_pressure == pressured)
+        return;
+
+    m_memory_pressure = pressured;
+    TabPerformanceMonitor::set_memory_pressure(pressured);
+    if (pressured) {
+        if (can_send_compositor_process_ipc(m_compositor_client))
+            m_compositor_client->async_purge_unused_gpu_resources();
+        if (m_spare_web_content_process) {
+            auto spare = m_spare_web_content_process.release_nonnull();
+            spare->close_unassigned_spare({});
+        }
+        return;
+    }
+
+    launch_spare_web_content_process();
+}
+
 ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     auto page_id = allocate_page_id();
@@ -1533,6 +1553,9 @@ ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_fram
 
 void Application::launch_spare_web_content_process()
 {
+    if (m_memory_pressure)
+        return;
+
     // Spare WebContent processes inherit the active WebDriver endpoint, but they are not part of the
     // session and can race browser shutdown while bootstrapping.
     if (browser_options().webdriver_browser_endpoint.has_value())
@@ -1551,6 +1574,9 @@ void Application::launch_spare_web_content_process()
 
     Core::deferred_invoke([this]() {
         m_has_queued_task_to_launch_spare_web_content_process = false;
+
+        if (m_memory_pressure)
+            return;
 
         auto web_content_client = create_web_content_client(IsPrivate::No, allocate_page_id());
         if (web_content_client.is_error()) {
@@ -1759,6 +1785,8 @@ ErrorOr<void> Application::launch_compositor_process()
         m_compositor_client->async_set_synthesizes_scroll_momentum(true);
     m_compositor_client->async_set_scrolls_elastically(
         m_scrolls_elastically_override.value_or(platform_scrolls_elastically()));
+    if (m_memory_pressure)
+        m_compositor_client->async_purge_unused_gpu_resources();
 
 #ifdef USE_DIRECTX
     m_reported_compositor_gpu_presentation_unavailable = false;

@@ -8,6 +8,7 @@
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/NeverDestroyed.h>
+#include <AK/QuickSort.h>
 #include <AK/WeakPtr.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/EventLoop.h>
@@ -884,23 +885,94 @@ Messages::WebContentClient::RequestAudioServerConnectionResponse WebContentClien
     return handle.release_value();
 }
 
-Optional<u64> WebContentClient::exclusive_performance_owner() const
+Vector<u64> WebContentClient::performance_owners() const
 {
-    Optional<u64> owner;
-    auto add_owner = [&](u64 id) {
-        if (owner.has_value() && *owner != id)
-            return false;
-        owner = id;
-        return true;
-    };
+    Vector<u64> owners;
     for (auto const& it : m_pages) {
         auto const& page = it.value;
         if (!page->is_open())
             continue;
-        if (!add_owner(page->view().view_id()))
-            return {};
+        auto view_id = page->view().view_id();
+        if (!owners.contains([&](auto owner) { return owner == view_id; }))
+            owners.append(view_id);
     }
-    return owner;
+    quick_sort(owners);
+    return owners;
+}
+
+Optional<u64> WebContentClient::exclusive_performance_owner() const
+{
+    auto owners = performance_owners();
+    if (owners.size() != 1)
+        return {};
+    return owners.first();
+}
+
+bool WebContentClient::set_task_queue_diagnostics_enabled(u64 view_id, bool enabled)
+{
+    if (enabled) {
+        bool found_owner = false;
+        for (auto& client : clients()) {
+            if (!client->performance_owners().contains([&](auto owner) { return owner == view_id; }))
+                continue;
+            found_owner = true;
+            if (client->m_task_queue_diagnostics_owners.size() > 0
+                && !client->m_task_queue_diagnostics_owners.contains(view_id))
+                return false;
+        }
+        if (!found_owner)
+            return false;
+    }
+
+    for (auto& client : clients()) {
+        bool was_enabled = !client->m_task_queue_diagnostics_owners.is_empty();
+        if (enabled) {
+            if (!client->performance_owners().contains([&](auto owner) { return owner == view_id; }))
+                continue;
+            client->m_task_queue_diagnostics_owners.set(view_id);
+        } else {
+            client->m_task_queue_diagnostics_owners.remove(view_id);
+        }
+        bool is_enabled = !client->m_task_queue_diagnostics_owners.is_empty();
+        if (was_enabled != is_enabled)
+            client->async_set_task_queue_diagnostics_enabled(is_enabled);
+    }
+    return true;
+}
+
+String WebContentClient::task_queue_diagnostics_json(u64 view_id)
+{
+    JsonArray processes;
+    for (auto& client : clients()) {
+        if (!client->m_task_queue_diagnostics_owners.contains(view_id))
+            continue;
+
+        JsonObject process;
+        process.set("process_id"sv, static_cast<u64>(client->pid()));
+        auto owners = client->performance_owners();
+        process.set("scope"sv, "webcontent_process"sv);
+        process.set("shared_with_other_views"sv, owners.size() > 1);
+        if (auto response = client->send_sync_but_allow_failure<Messages::WebContentServer::GetTaskQueueDiagnostics>()) {
+            auto parsed = JsonValue::from_string(response->diagnostics_json());
+            if (!parsed.is_error()) {
+                process.set("available"sv, true);
+                process.set("diagnostics"sv, parsed.release_value());
+            } else {
+                process.set("available"sv, false);
+                process.set("error"sv, "invalid_engine_diagnostics_json"sv);
+            }
+        } else {
+            process.set("available"sv, false);
+            process.set("error"sv, "webcontent_process_unavailable"sv);
+        }
+        processes.must_append(move(process));
+    }
+
+    JsonObject result;
+    result.set("schema_version"sv, 1);
+    result.set("scope"sv, "webcontent_processes"sv);
+    result.set("processes"sv, move(processes));
+    return result.serialized();
 }
 
 }

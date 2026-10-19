@@ -7,6 +7,7 @@
 
 #include <AK/Platform.h>
 #include <AK/kmalloc.h>
+#include <atomic>
 
 #if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__) || defined(HAS_THREAD_SANITIZER)
 // LeakSanitizer does not reliably trace references stored in mimalloc-managed
@@ -115,20 +116,59 @@ void* ak_kmalloc(size_t size)
 static thread_local mi_heap_t* s_buffer_heap = nullptr;
 static thread_local mi_heap_t* s_string_heap = nullptr;
 
+struct PartitionHeap {
+    mi_heap_t* owner { mi_heap_get_backing() };
+    mi_heap_t* heap { mi_heap_new() };
+};
+
+static std::atomic<PartitionHeap*> s_array_buffer_heap { nullptr };
+static std::atomic<PartitionHeap*> s_js_object_storage_heap { nullptr };
+static std::atomic<PartitionHeap*> s_layout_heap { nullptr };
+
+static PartitionHeap& array_buffer_heap()
+{
+    static PartitionHeap heap;
+    static bool registered = [] {
+        s_array_buffer_heap.store(&heap, std::memory_order_release);
+        return true;
+    }();
+    (void)registered;
+    return heap;
+}
+
+static PartitionHeap& js_object_storage_heap()
+{
+    static PartitionHeap heap;
+    static bool registered = [] {
+        s_js_object_storage_heap.store(&heap, std::memory_order_release);
+        return true;
+    }();
+    (void)registered;
+    return heap;
+}
+
+static PartitionHeap& layout_heap()
+{
+    static PartitionHeap heap;
+    static bool registered = [] {
+        s_layout_heap.store(&heap, std::memory_order_release);
+        return true;
+    }();
+    (void)registered;
+    return heap;
+}
+
 static mi_heap_t* heap_for_partition(HeapPartition partition)
 {
     switch (partition) {
     case HeapPartition::General:
         return mi_heap_get_default();
     case HeapPartition::ArrayBuffer:
-        static mi_heap_t* array_buffer_heap = mi_heap_new();
-        return array_buffer_heap;
+        return array_buffer_heap().heap;
     case HeapPartition::JSObjectStorage:
-        static mi_heap_t* js_object_storage_heap = mi_heap_new();
-        return js_object_storage_heap;
+        return js_object_storage_heap().heap;
     case HeapPartition::Layout:
-        static mi_heap_t* layout_heap = mi_heap_new();
-        return layout_heap;
+        return layout_heap().heap;
     case HeapPartition::Buffer:
         if (!s_buffer_heap)
             s_buffer_heap = mi_heap_new();
@@ -178,14 +218,28 @@ void ak_kfree(void* ptr)
 
 void ak_kmalloc_collect()
 {
-    // mi_collect() only visits the calling thread's default heap, so the thread-local partitions have to be collected
-    // separately. The remaining partitions are shared between threads and are left to their owners.
+    // Custom mimalloc heaps can only be collected by the thread that created them. These partitions are process-wide,
+    // so collect each one only when running on its owner thread.
+    auto* current_thread_heap = mi_heap_get_backing();
+    auto collect_if_owned = [&](PartitionHeap& partition) {
+        if (partition.owner == current_thread_heap)
+            mi_heap_collect(partition.heap, true);
+    };
+    if (auto* partition = s_array_buffer_heap.load(std::memory_order_acquire))
+        collect_if_owned(*partition);
+    if (auto* partition = s_js_object_storage_heap.load(std::memory_order_acquire))
+        collect_if_owned(*partition);
+    if (auto* partition = s_layout_heap.load(std::memory_order_acquire))
+        collect_if_owned(*partition);
+
+    // The buffer and string heaps are thread-local, while mi_collect() visits the calling thread's default heap.
     if (s_buffer_heap)
         mi_heap_collect(s_buffer_heap, true);
     if (s_string_heap)
         mi_heap_collect(s_string_heap, true);
 
     mi_collect(true);
+
 }
 
 #endif

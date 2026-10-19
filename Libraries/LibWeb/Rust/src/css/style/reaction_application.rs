@@ -164,6 +164,12 @@ pub struct FfiStyleReactionCounts {
     pub record_deltas_applied: u32,
     pub pass_guard_hits: u32,
     pub apply_microseconds: u64,
+    pub broad_matching_batch_runs: u32,
+    pub narrow_matching_batch_runs: u32,
+    pub broad_matching_reaction_elements: u32,
+    pub narrow_matching_reaction_elements: u32,
+    pub broad_matching_apply_microseconds: u64,
+    pub narrow_matching_apply_microseconds: u64,
 }
 
 /// A style transaction the host took, whose reactions live until the host takes the next one.
@@ -644,6 +650,7 @@ fn update_style(
     application: Application<'_>,
     drains_flown_transaction: bool,
     root: Option<StyleNodeID>,
+    collect_diagnostics: bool,
 ) -> FfiStyleReactionCounts {
     let host = application.host;
     let mut counts = FfiStyleReactionCounts::default();
@@ -689,6 +696,7 @@ fn update_style(
             .iter()
             .filter(|reaction| reaction.reaction & STYLE_REACTION_PUBLISHED_STYLE != 0)
             .count() as u32;
+        let has_published_reactions = published_reactions > 0;
         if published_reactions > 0 && !only_derived_child_reactions {
             style_update_passes += 1;
             if style_update_passes > MAX_STYLE_UPDATE_PASSES {
@@ -703,11 +711,28 @@ fn update_style(
             if published_reactions > 0 {
                 counts.batch_runs += 1;
                 counts.reaction_elements += published_reactions;
+                if collect_diagnostics {
+                    if prefers_broad_matching_batch {
+                        counts.broad_matching_batch_runs += 1;
+                        counts.broad_matching_reaction_elements += published_reactions;
+                    } else {
+                        counts.narrow_matching_batch_runs += 1;
+                        counts.narrow_matching_reaction_elements += published_reactions;
+                    }
+                }
             }
             apply_style_reactions(application, &reactions, &mut counts);
             reactions.clear();
         }
-        counts.apply_microseconds += apply_started_at.elapsed().as_micros() as u64;
+        let apply_microseconds = apply_started_at.elapsed().as_micros() as u64;
+        counts.apply_microseconds += apply_microseconds;
+        if collect_diagnostics && has_published_reactions {
+            if prefers_broad_matching_batch {
+                counts.broad_matching_apply_microseconds += apply_microseconds;
+            } else {
+                counts.narrow_matching_apply_microseconds += apply_microseconds;
+            }
+        }
 
         // Exact consequences produced while recomputing become the next transaction in this stabilization epoch. Take
         // it only after consuming the current published answers, since a new transaction retires their scratch.
@@ -736,13 +761,19 @@ pub unsafe extern "C" fn style_engine_update_style(
     host_application: *mut HostStyleReactionApplication,
     drains_flown_transaction: bool,
     root: u32,
+    collect_diagnostics: bool,
 ) -> FfiStyleReactionCounts {
     let application = Application {
         host,
         read,
         host_application,
     };
-    update_style(application, drains_flown_transaction, StyleNodeID::from_raw(root))
+    update_style(
+        application,
+        drains_flown_transaction,
+        StyleNodeID::from_raw(root),
+        collect_diagnostics,
+    )
 }
 
 /// What an inheritance chain holds, by depth from its first element.

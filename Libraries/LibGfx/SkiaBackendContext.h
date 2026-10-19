@@ -65,6 +65,8 @@ public:
 
     // Frees cached GPU resources no frame has used for at least `age`, such as after a page stops drawing.
     void purge_resources_unused_for(AK::Duration age);
+    // Frees unlocked scratch resources promptly when the system reports memory pressure.
+    void purge_unlocked_scratch_resources();
 
     void flush_and_submit(PaintingSurface&);
     void flush_and_submit_async(PaintingSurface&, Function<void()>&&, uint64_t presentation_signal_value = 0);

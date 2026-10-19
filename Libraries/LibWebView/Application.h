@@ -217,6 +217,9 @@ public:
     void stop_watching_geolocation_position(Core::GeolocationProvider::WatchId);
 
     ErrorOr<NonnullRefPtr<WebContentPage>> open_page_for_new_tab(IsPrivate);
+    // Prevents launching a spare WebContent process while the host reports
+    // memory pressure. Call again when pressure subsides.
+    void set_memory_pressure(bool pressured);
     struct ChildFrameWebContentProcess {
         NonnullRefPtr<WebContentClient> client;
         Web::PageId page_id { 0 };
@@ -629,6 +632,7 @@ private:
     // Every WebContent client, from its launch until its process exits. A page keeps no hold on its client.
     HashTable<NonnullRefPtr<WebContentClient>> m_web_content_clients;
     bool m_has_queued_task_to_launch_spare_web_content_process { false };
+    bool m_memory_pressure { false };
     u64 m_next_page_or_compositor_context_id { 1 };
     u64 m_next_cross_process_id_namespace { 1 };
     Web::HTML::CrossProcessIdAllocator m_ui_process_cross_process_id_allocator;

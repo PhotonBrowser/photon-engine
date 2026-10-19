@@ -1229,6 +1229,8 @@ pub(crate) struct LayoutNodeArena {
     unresolved_container_lengths: RefCell<Vec<NodeSlotId>>,
     partial_layout_count: Cell<u64>,
     full_layout_count: Cell<u64>,
+    partial_layout_microseconds: Cell<u64>,
+    full_layout_microseconds: Cell<u64>,
     layout_tree_build_stats: Cell<FfiLayoutTreeBuildStats>,
     pre_order_labels: Vec<Cell<u64>>,
     pre_order_relabel_count: Cell<u64>,
@@ -1344,6 +1346,8 @@ impl LayoutNodeArena {
             unresolved_container_lengths: RefCell::new(Vec::new()),
             partial_layout_count: Cell::new(0),
             full_layout_count: Cell::new(0),
+            partial_layout_microseconds: Cell::new(0),
+            full_layout_microseconds: Cell::new(0),
             layout_tree_build_stats: Cell::new(FfiLayoutTreeBuildStats::default()),
             pre_order_labels: Vec::new(),
             pre_order_relabel_count: Cell::new(0),
@@ -3004,12 +3008,30 @@ impl LayoutNodeArena {
         self.full_layout_count.set(self.full_layout_count.get() + 1);
     }
 
+    pub(crate) fn add_partial_layout_microseconds(&self, microseconds: u64) {
+        self.partial_layout_microseconds
+            .set(self.partial_layout_microseconds.get().saturating_add(microseconds));
+    }
+
+    pub(crate) fn add_full_layout_microseconds(&self, microseconds: u64) {
+        self.full_layout_microseconds
+            .set(self.full_layout_microseconds.get().saturating_add(microseconds));
+    }
+
     pub(crate) fn partial_layout_count(&self) -> u64 {
         self.partial_layout_count.get()
     }
 
     pub(crate) fn full_layout_count(&self) -> u64 {
         self.full_layout_count.get()
+    }
+
+    pub(crate) fn partial_layout_microseconds(&self) -> u64 {
+        self.partial_layout_microseconds.get()
+    }
+
+    pub(crate) fn full_layout_microseconds(&self) -> u64 {
+        self.full_layout_microseconds.get()
     }
 
     pub(crate) fn record_layout_tree_build(&self, outcome: &FfiLayoutTreeBuildOutcome) {

@@ -223,6 +223,12 @@ void EventLoop::process()
     // 3. Let taskEndTime be the unsafe shared current time. [HRT]
     [[maybe_unused]] auto task_end_time = HighResolutionTime::unsafe_shared_current_time();
 
+    if (oldest_task) {
+        auto task_duration = task_end_time - task_start_time;
+        auto task_duration_microseconds = static_cast<u64>(task_duration * 1000.0);
+        m_task_queue->record_completed_task(*oldest_task, task_duration_microseconds);
+    }
+
     if (oldest_task && oldest_task->source() != Task::Source::Rendering) {
         auto task_duration = task_end_time - task_start_time;
         auto task_duration_microseconds = static_cast<u64>(task_duration * 1000.0);

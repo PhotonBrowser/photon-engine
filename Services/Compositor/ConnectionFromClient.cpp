@@ -181,6 +181,11 @@ void ConnectionFromClient::set_scrolls_elastically(bool scrolls_elastically)
     m_compositor_state->set_scrolls_elastically(scrolls_elastically);
 }
 
+void ConnectionFromClient::purge_unused_gpu_resources()
+{
+    m_compositor_state->purge_unused_gpu_resources();
+}
+
 void ConnectionFromClient::crash()
 {
     warnln("Crashing Compositor process by request from Browser");

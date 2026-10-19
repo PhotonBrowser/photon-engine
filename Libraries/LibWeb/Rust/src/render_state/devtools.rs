@@ -17,6 +17,8 @@ use std::ffi::c_void;
 pub struct FfiLayoutCounts {
     pub full_layouts: u64,
     pub partial_layouts: u64,
+    pub full_layout_microseconds: u64,
+    pub partial_layout_microseconds: u64,
     pub tree_builds: u64,
     pub last_tree_build_rebuilt_subtree_roots: u64,
     pub last_tree_build_escaped_rebuild_roots: bool,
@@ -54,6 +56,8 @@ pub extern "C" fn render_state_layout_counts(host: &DocumentHost) -> FfiLayoutCo
         FfiLayoutCounts {
             full_layouts: arena.full_layout_count(),
             partial_layouts: arena.partial_layout_count(),
+            full_layout_microseconds: arena.full_layout_microseconds(),
+            partial_layout_microseconds: arena.partial_layout_microseconds(),
             tree_builds: tree_builds.builds,
             last_tree_build_rebuilt_subtree_roots: tree_builds.last_build_rebuilt_subtree_roots,
             last_tree_build_escaped_rebuild_roots: tree_builds.last_build_escaped_rebuild_roots,

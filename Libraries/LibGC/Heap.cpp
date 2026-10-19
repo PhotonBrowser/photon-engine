@@ -17,6 +17,7 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/NumberFormat.h>
 #include <AK/Platform.h>
+#include <AK/QuickSort.h>
 #include <AK/ScopeGuard.h>
 #include <AK/StackInfo.h>
 #include <AK/StackUnwinder.h>
@@ -32,6 +33,7 @@
 #include <LibGC/HeapAccess.h>
 #include <LibGC/HeapBlock.h>
 #include <LibGC/NanBoxedValue.h>
+#include <LibGC/PerformanceDiagnostics.h>
 #include <LibGC/Root.h>
 #include <LibGC/Weak.h>
 #include <setjmp.h>
@@ -152,6 +154,48 @@ bool g_next_incremental_sweep_should_report { false };
 // Set by collect_garbage() while a reported collection is in flight. Used by
 // the GC's helpers to decide whether they should record subphase timings.
 bool g_recording_phase_timings { false };
+
+struct PerformanceGCTimingSample {
+    u64 mark_microseconds { 0 };
+    u64 synchronous_sweep_microseconds { 0 };
+    u64 pause_microseconds { 0 };
+};
+
+static constexpr size_t PERFORMANCE_GC_TIMING_SAMPLE_CAPACITY = 256;
+
+struct PerformanceGCDiagnosticsState {
+    Heap const* selected_heap { nullptr };
+    bool enabled { false };
+    u64 collection_count { 0 };
+    Vector<PerformanceGCTimingSample> timing_samples;
+    size_t timing_sample_cursor { 0 };
+    Optional<size_t> live_heap_bytes;
+};
+
+PerformanceGCDiagnosticsState& performance_gc_diagnostics()
+{
+    static NeverDestroyed<PerformanceGCDiagnosticsState> diagnostics;
+    return *diagnostics;
+}
+
+bool performance_diagnostics_enabled_for(Heap const& heap)
+{
+    auto const& diagnostics = performance_gc_diagnostics();
+    return diagnostics.enabled && diagnostics.selected_heap == &heap;
+}
+
+void record_performance_gc_timing(Heap const& heap, PerformanceGCTimingSample sample)
+{
+    auto& diagnostics = performance_gc_diagnostics();
+    if (!performance_diagnostics_enabled_for(heap))
+        return;
+    if (diagnostics.timing_samples.size() < PERFORMANCE_GC_TIMING_SAMPLE_CAPACITY) {
+        diagnostics.timing_samples.append(sample);
+    } else {
+        diagnostics.timing_samples[diagnostics.timing_sample_cursor] = sample;
+        diagnostics.timing_sample_cursor = (diagnostics.timing_sample_cursor + 1) % PERFORMANCE_GC_TIMING_SAMPLE_CAPACITY;
+    }
+}
 
 void print_gc_report(i64 total_us, size_t live_block_count)
 {
@@ -277,6 +321,79 @@ private:
 Heap& Heap::the()
 {
     return *s_the;
+}
+
+void set_performance_diagnostics_enabled(Heap& heap, bool enabled)
+{
+    auto& diagnostics = performance_gc_diagnostics();
+    if (!enabled) {
+        if (diagnostics.selected_heap == &heap)
+            diagnostics.enabled = false;
+        return;
+    }
+
+    diagnostics.selected_heap = &heap;
+    diagnostics.enabled = true;
+    diagnostics.collection_count = 0;
+    diagnostics.timing_samples.clear();
+    diagnostics.timing_samples.ensure_capacity(PERFORMANCE_GC_TIMING_SAMPLE_CAPACITY);
+    diagnostics.timing_sample_cursor = 0;
+    // This value belongs to the prior diagnostic interval. Wait for a sweep
+    // completed in this interval before exposing live heap bytes.
+    diagnostics.live_heap_bytes.clear();
+}
+
+AK::JsonObject performance_diagnostics(Heap const& heap)
+{
+    auto const& diagnostics = performance_gc_diagnostics();
+    if (diagnostics.selected_heap != &heap) {
+        AK::JsonObject unavailable;
+        unavailable.set("scope"sv, "main_thread_js_heap"sv);
+        unavailable.set("available"sv, false);
+        unavailable.set("unavailable_reason"sv, "heap_not_selected_for_diagnostics"sv);
+        return unavailable;
+    }
+
+    auto summarize = [&](auto duration_for_sample) {
+        Vector<u64> sorted_samples;
+        sorted_samples.ensure_capacity(diagnostics.timing_samples.size());
+        for (auto const& sample : diagnostics.timing_samples)
+            sorted_samples.append(duration_for_sample(sample));
+        quick_sort(sorted_samples);
+
+        auto percentile_ms = [&](size_t percentile) -> AK::JsonValue {
+            if (sorted_samples.is_empty())
+                return {};
+            // Nearest-rank percentile, including for a single sample.
+            auto rank = (sorted_samples.size() * percentile + 99) / 100;
+            auto index = max(static_cast<size_t>(1), rank) - 1;
+            return static_cast<double>(sorted_samples[index]) / 1000.0;
+        };
+
+        AK::JsonObject summary;
+        summary.set("sample_count"sv, sorted_samples.size());
+        summary.set("p50_ms"sv, percentile_ms(50));
+        summary.set("p95_ms"sv, percentile_ms(95));
+        summary.set("p99_ms"sv, percentile_ms(99));
+        summary.set("max_ms"sv, sorted_samples.is_empty() ? AK::JsonValue {} : AK::JsonValue { static_cast<double>(sorted_samples.last()) / 1000.0 });
+        return summary;
+    };
+
+    AK::JsonObject result;
+    result.set("scope"sv, "main_thread_js_heap"sv);
+    result.set("available"sv, true);
+    result.set("collection_count"sv, diagnostics.collection_count);
+    result.set("timing_sample_count"sv, diagnostics.timing_samples.size());
+    result.set("timing_sample_capacity"sv, PERFORMANCE_GC_TIMING_SAMPLE_CAPACITY);
+    result.set("gc_mark_duration_ms"sv, summarize([](auto const& sample) { return sample.mark_microseconds; }));
+    result.set("gc_synchronous_sweep_duration_ms"sv, summarize([](auto const& sample) { return sample.synchronous_sweep_microseconds; }));
+    result.set("gc_pause_duration_ms"sv, summarize([](auto const& sample) { return sample.pause_microseconds; }));
+    result.set("gc_live_heap_bytes"sv, diagnostics.live_heap_bytes.has_value() ? AK::JsonValue { diagnostics.live_heap_bytes.value() } : AK::JsonValue {});
+    result.set("gc_live_heap_available"sv, diagnostics.live_heap_bytes.has_value());
+    result.set("gc_live_heap_scope"sv, "cell plus external bytes after the most recently completed sweep"sv);
+    result.set("gc_synchronous_sweep_scope"sv, "post-mark finalization, weak processing, callbacks, and any synchronous cell sweep; excludes timer-driven incremental sweep"sv);
+    result.set("gc_pause_scope"sv, "collect_garbage call from local free-list return through post-GC tasks; includes a forced completion of the prior incremental sweep"sv);
+    return result;
 }
 
 void Heap::set_default_heap_for_testing(Heap& heap)
@@ -670,6 +787,13 @@ NO_SANITIZE_ADDRESS void Heap::collect_garbage(CollectionType collection_type, b
 
 void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType collection_type, bool print_report)
 {
+    bool collect_performance_diagnostics = performance_diagnostics_enabled_for(*this) && collection_type == CollectionType::CollectGarbage;
+    Core::ElapsedTimer performance_pause_timer { Core::TimerType::Precise };
+    if (collect_performance_diagnostics)
+        performance_pause_timer.start();
+    u64 mark_duration_microseconds = 0;
+    u64 synchronous_sweep_duration_microseconds = 0;
+
     ConservativeScanOrigin origin {
         .stack_floor = bit_cast<FlatPtr>(__builtin_frame_address(0)),
         .callee_saved_registers = callee_saved_registers,
@@ -704,6 +828,13 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
                 m_should_gc_when_deferral_ends = true;
                 return;
             }
+
+            if (collect_performance_diagnostics)
+                ++performance_gc_diagnostics().collection_count;
+
+            Core::ElapsedTimer mark_timer { Core::TimerType::Precise };
+            if (collect_performance_diagnostics)
+                mark_timer.start();
             HashMap<Cell*, HeapRoot> roots;
             {
                 ScopedPhaseTimer timer { report, g_phase_timings.gather_roots_us };
@@ -713,7 +844,13 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
                 ScopedPhaseTimer timer { report, g_phase_timings.mark_live_cells_us };
                 mark_live_cells(roots);
             }
+            if (collect_performance_diagnostics)
+                mark_duration_microseconds = static_cast<u64>(mark_timer.elapsed_time().to_microseconds());
         }
+
+        Core::ElapsedTimer synchronous_sweep_timer { Core::TimerType::Precise };
+        if (collect_performance_diagnostics)
+            synchronous_sweep_timer.start();
         run_post_mark_phases(report);
 
         // For CollectEverything we must finish sweeping synchronously so that
@@ -723,7 +860,11 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
         if (collection_type == CollectionType::CollectEverything || !m_incremental_sweep_enabled) {
             ScopedPhaseTimer timer { report, g_phase_timings.sweep_dead_cells_us };
             sweep_dead_cells(report, collection_measurement_timer);
+            if (collect_performance_diagnostics && !m_incremental_sweep_enabled)
+                performance_gc_diagnostics().live_heap_bytes = m_last_swept_live_bytes;
         }
+        if (collect_performance_diagnostics)
+            synchronous_sweep_duration_microseconds = static_cast<u64>(synchronous_sweep_timer.elapsed_time().to_microseconds());
 
         if (report) {
             size_t live_block_count = 0;
@@ -748,6 +889,14 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
         g_next_incremental_sweep_should_report = false;
 
     run_post_gc_tasks();
+
+    if (collect_performance_diagnostics) {
+        record_performance_gc_timing(*this, PerformanceGCTimingSample {
+            .mark_microseconds = mark_duration_microseconds,
+            .synchronous_sweep_microseconds = synchronous_sweep_duration_microseconds,
+            .pause_microseconds = static_cast<u64>(performance_pause_timer.elapsed_time().to_microseconds()),
+        });
+    }
 
     // A collection just happened: restart the idle policy's episode (peak rate and watchdog tick count) from here, so
     // a threshold-driven GC mid-episode doesn't leave it comparing against stale state.
@@ -1338,6 +1487,9 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
     else
         m_last_swept_live_bytes.clear();
 
+    if (performance_diagnostics_enabled_for(*this))
+        performance_gc_diagnostics().live_heap_bytes = m_last_swept_live_bytes;
+
     for (auto& callback : m_sweep_completed_callbacks)
         callback();
 
@@ -1477,6 +1629,13 @@ void Heap::finish_incremental_sweep()
         m_last_swept_live_bytes = live_bytes.value();
     else
         m_last_swept_live_bytes.clear();
+
+    // A normal collection starts an incremental sweep, so the exact live byte
+    // count is not available until this point. Publish it for the selected
+    // diagnostic heap even if the session was stopped while the sweep ran.
+    auto& diagnostics = performance_gc_diagnostics();
+    if (diagnostics.selected_heap == this)
+        diagnostics.live_heap_bytes = m_last_swept_live_bytes;
 
     for (auto& callback : m_sweep_completed_callbacks)
         callback();
