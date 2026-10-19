@@ -151,7 +151,11 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
         client.async_did_request_cursor_change(id, cursor);
     });
 
-    m_frame_timer = Core::Timer::create_single_shot(0, [this] { frame_timer_fired(); });
+    m_frame_timer = Core::Timer::create_single_shot(0, [this] {
+        if (m_is_closed)
+            return;
+        frame_timer_fired();
+    });
 }
 
 PageClient::~PageClient() = default;
@@ -505,6 +509,7 @@ void PageClient::did_handle_input_event(Web::PageId page_id, Web::InputEvent con
             switch (mouse_event.type) {
             case Web::MouseEvent::Type::MouseDown:
             case Web::MouseEvent::Type::MouseUp:
+            case Web::MouseEvent::Type::MouseCancel:
                 return true;
             case Web::MouseEvent::Type::MouseMove:
                 return mouse_event.buttons != Web::UIEvents::MouseButton::None;
@@ -907,6 +912,21 @@ void PageClient::page_did_request_exit_fullscreen()
     client().async_did_request_exit_fullscreen(m_id);
 }
 
+void PageClient::page_did_exit_picture_in_picture()
+{
+    client().async_did_exit_picture_in_picture(m_id);
+}
+
+void PageClient::page_did_change_picture_in_picture_video_size(Gfx::IntSize video_size)
+{
+    client().async_did_change_picture_in_picture_video_size(m_id, video_size);
+}
+
+void PageClient::page_did_change_picture_in_picture_player_controls_visibility(bool shown)
+{
+    client().async_did_change_picture_in_picture_player_controls_visibility(m_id, shown);
+}
+
 void PageClient::page_did_request_tooltip_override(Web::CSSPixelPoint position, ByteString const& title)
 {
     auto device_position = page().css_to_device_point(position);
@@ -977,9 +997,9 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
     }
 }
 
-void PageClient::page_did_finish_loading(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id)
+void PageClient::page_did_finish_loading(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id)
 {
-    client().async_did_finish_loading(m_id, navigable_id, navigation_id);
+    client().async_did_finish_loading(m_id, navigable_id, document_id);
 }
 
 Optional<u64> PageClient::page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const& url, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
@@ -1067,6 +1087,8 @@ void PageClient::page_did_change_accessibility_focus(Web::UniqueNodeID node_id)
     m_pending_accessibility_focus = static_cast<i64>(node_id.value());
     if (!m_accessibility_focus_timer) {
         m_accessibility_focus_timer = Core::Timer::create_single_shot(0, [this] {
+            if (m_is_closed)
+                return;
             if (auto pending = exchange(m_pending_accessibility_focus, {}); pending.has_value())
                 client().async_did_accessibility_focus_change(m_id, *pending);
         });
@@ -1087,6 +1109,8 @@ void PageClient::schedule_accessibility_tree_update()
 
     if (!m_accessibility_update_timer) {
         m_accessibility_update_timer = Core::Timer::create_single_shot(200, [this] {
+            if (m_is_closed)
+                return;
             if (auto doc = page().local_traversable()->active_document()) {
                 doc->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
                 client().async_did_get_accessibility_tree(m_id, doc->build_accessibility_node_data());
@@ -1203,7 +1227,7 @@ void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId l
     client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, bitmap);
 }
 
-void PageClient::page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu, Web::HTML::PreparedNavigationDescriptor navigation)
+void PageClient::page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)
 {
     client().async_did_request_media_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), target, modifiers, menu, move(navigation));
 }
@@ -1624,6 +1648,10 @@ void PageClient::page_did_close()
     client().async_did_close_browsing_context(m_id);
 
     page().drop_retired_page_compositor_context();
+
+    // The heap sweeps a closed page in slices, so its timers can still fire once the cells they would use are gone.
+    m_is_closed = true;
+
     // NOTE: This only removes the strong reference the PageHost has for this PageClient.
     //       It will be GC'd 'later'.
     m_owner.remove_page({}, m_id);

@@ -44,7 +44,7 @@ public:
     // The stores join the ones allocated last, and leave them again once retired.
     virtual void did_add_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores) = 0;
     virtual void did_retire_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids) = 0;
-    virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, u64 presentation_signal_value) = 0;
+    virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio, u64 presentation_signal_value) = 0;
     // The compositor performed the event's whole default action, so the UI hears nothing more about it.
     virtual void did_consume_input_event(Web::CompositorContextId, u64 event_id) = 0;
     // No context could take the event; the UI sends it to WebContent itself.
@@ -67,6 +67,8 @@ public:
     virtual void create_video_edge(Media::VideoSinkHandle) = 0;
     virtual void release_video_edge(Media::VideoSinkHandle) = 0;
     virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) = 0;
+    // The owner of this client's canvases, which are the only ones its contexts may draw.
+    virtual Compositing::CanvasSurfaceOwnerId canvas_surface_owner_id() const = 0;
 };
 
 class CompositorState final : public RefCounted<CompositorState> {
@@ -112,9 +114,9 @@ public:
     Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking, Compositing::WheelStepDispatch, u64 input_event_id);
     Compositing::AsyncScrollEnqueueResult smooth_scroll_to(Web::CompositorContextId, Web::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue);
     void cancel_smooth_scroll(Web::CompositorContextId, Web::AsyncScrollNodeStableID);
-    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, Compositing::WindowResizingInProgress);
+    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
     void request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
-    void set_paused_debugger_overlay(Web::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<Compositing::PausedDebuggerOverlayAction> hovered_action);
+    void set_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays);
     void set_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void set_context_visibility(Web::CompositorContextId, Compositing::ContextVisibility);
     void purge_unused_gpu_resources();
@@ -153,11 +155,12 @@ private:
     struct PendingAsyncPresent {
         using Clock = std::chrono::steady_clock;
 
-        PendingAsyncPresent(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id, u64 presentation_signal_value, Clock::time_point paint_started_at, u64 paint_duration_microseconds, u64 submit_duration_microseconds)
+        PendingAsyncPresent(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio, u64 presentation_signal_value, Clock::time_point paint_started_at, u64 paint_duration_microseconds, u64 submit_duration_microseconds)
             : context_id(context_id)
             , viewport_rect(viewport_rect)
             , damage_rect(damage_rect)
             , bitmap_id(bitmap_id)
+            , device_pixel_ratio(device_pixel_ratio)
             , presentation_signal_value(presentation_signal_value)
             , paint_started_at(paint_started_at)
             , paint_duration_microseconds(paint_duration_microseconds)
@@ -169,6 +172,7 @@ private:
         Gfx::IntRect viewport_rect;
         Gfx::IntRect damage_rect;
         i32 bitmap_id { 0 };
+        double device_pixel_ratio { 1.0 };
         u64 presentation_signal_value { 0 };
         Clock::time_point paint_started_at;
         Clock::time_point submit_completed_at;

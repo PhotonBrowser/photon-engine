@@ -19,6 +19,7 @@ use crate::ir::BinaryOp;
 use crate::ir::BranchCondition;
 use crate::ir::Comparison;
 use crate::ir::ElementsKind;
+use crate::ir::Float64Function;
 use crate::ir::Float64UnaryOp;
 use crate::ir::NodeId;
 use crate::ir::Op;
@@ -108,6 +109,57 @@ impl GraphBuilder<'_> {
         Ok(Flow::Continue)
     }
 
+    /// Builds `Math.<function>(arguments...)`, a `CallBuiltinMath*`
+    /// instruction, for numbers, like `build_math_function()`: the code
+    /// calls the runtime's function of doubles for it, which only computes,
+    /// so nothing after the call forgets what it knew.
+    pub(super) fn build_math_call(
+        &mut self,
+        function: Float64Function,
+        dst: Operand,
+        callee: Operand,
+        arguments: &[Operand],
+        call_feedback: u16,
+    ) -> Result<Flow, CompileFailure> {
+        let layout = &self.runtime.layout;
+        let builtin = match function {
+            Float64Function::Exp => layout.builtin_math_exp,
+            Float64Function::Log => layout.builtin_math_log,
+            Float64Function::Sin => layout.builtin_math_sin,
+            Float64Function::Cos => layout.builtin_math_cos,
+            Float64Function::Tan => layout.builtin_math_tan,
+            Float64Function::Pow => layout.builtin_math_pow,
+        };
+        let target = self
+            .call_feedback(call_feedback)
+            .and_then(|feedback| feedback.monomorphic_builtin(builtin))
+            .filter(|_| self.may_speculate(ExitKind::BadCallTarget));
+        if let Some(target) = target {
+            self.check_callee(callee, target)?;
+        }
+        let callee = self.read(callee)?;
+        let arguments = arguments
+            .iter()
+            .map(|argument| self.read(*argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
+        self.exit_instead_of_slow_path(&mut slow_paths);
+        if target.is_none() {
+            self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), vec![callee], true);
+        }
+        let numbers = arguments
+            .into_iter()
+            .map(|argument| self.float64_of_number(&mut slow_paths, argument))
+            .collect();
+        let result = self.emit(Op::CallFloat64Function { function }, numbers, Some(Repr::Float64));
+        let result = self.emit(Op::BoxFloat64, vec![result], Some(Repr::Tagged));
+        let result = self
+            .join_slow_paths(slow_paths, Some(result))
+            .expect("the instruction has a value");
+        self.write(dst, result)?;
+        Ok(Flow::Continue)
+    }
+
     /// The `Repr::Int32` value of `value`, if it is known to be an int32:
     /// itself, or what it boxes.
     pub(super) fn int32_value_of(&self, value: NodeId) -> Option<NodeId> {
@@ -160,9 +212,24 @@ impl GraphBuilder<'_> {
         double: fn(&mut Self, NodeId) -> NodeId,
         otherwise: impl FnOnce(&mut Self, BranchCondition, Vec<NodeId>) -> NodeId,
     ) -> NodeId {
-        let (int32_block, other) = self.branch_both_ways(BranchCondition::Int32Value, vec![value]);
+        self.on_integer_or_double(BranchCondition::Int32Value, value, repr, int32, double, otherwise)
+    }
+
+    /// Like `on_int32_or_double()`, with `integer` deciding the first case:
+    /// `BranchCondition::Int32Value`, or `BranchCondition::Int32OrBoolean`,
+    /// whose booleans `UnboxInt32` makes 0 or 1 of.
+    pub(super) fn on_integer_or_double(
+        &mut self,
+        integer: BranchCondition,
+        value: NodeId,
+        repr: Repr,
+        int32: fn(&mut Self, NodeId) -> NodeId,
+        double: fn(&mut Self, NodeId) -> NodeId,
+        otherwise: impl FnOnce(&mut Self, BranchCondition, Vec<NodeId>) -> NodeId,
+    ) -> NodeId {
+        let (int32_block, other) = self.branch_both_ways(integer, vec![value]);
         self.block = int32_block;
-        let refined = self.refine(BranchCondition::Int32Value, true, vec![value]);
+        let refined = self.refine(integer, true, vec![value]);
         let integer = self.emit(Op::UnboxInt32, vec![refined], Some(Repr::Int32));
         let int32_value = int32(self, integer);
         let int32_end = self.block;
@@ -218,7 +285,6 @@ impl GraphBuilder<'_> {
     /// if `callee` is the builtin of any realm. `charAt` makes the strings
     /// of ASCII code units, which the VM keeps. The instruction's slow path,
     /// which calls the callee, handles everything else.
-    #[expect(clippy::too_many_arguments, reason = "the operands of the instruction")]
     pub(super) fn build_string_character(
         &mut self,
         character: StringCharacter,

@@ -51,7 +51,6 @@ private:
     virtual void paintEvent(QPaintEvent*) override
     {
         static constexpr int hover_size = 23;
-        static constexpr int icon_y_offset = -1;
         static constexpr qreal hover_y_offset = 1.0;
 
         QPainter painter(this);
@@ -70,16 +69,16 @@ private:
 
         auto icon_rect = QRect(
             (width() - iconSize().width()) / 2,
-            (height() - iconSize().height()) / 2 + icon_y_offset,
+            (height() - iconSize().height()) / 2,
             iconSize().width(),
             iconSize().height());
         icon().paint(&painter, icon_rect, Qt::AlignCenter, isEnabled() ? QIcon::Normal : QIcon::Disabled, isDown() ? QIcon::On : QIcon::Off);
     }
 };
 
-static QColor location_focus_glow_color(QPalette const& palette, int alpha)
+static QColor location_focus_glow_color(int alpha)
 {
-    auto color = ChromeStyle::chrome_accent(palette);
+    auto color = ChromeStyle::chrome_accent();
     color.setAlpha(alpha);
     return color;
 }
@@ -151,6 +150,9 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
         if (m_zoom_action)
             m_zoom_action->trigger();
     });
+
+    for (auto* button : { m_leading_icon_button, m_trailing_action_button, m_zoom_indicator_button })
+        button->installEventFilter(this);
 
     update_text_margins();
     update_placeholder();
@@ -291,9 +293,45 @@ void LocationEdit::show_autocomplete()
 void LocationEdit::changeEvent(QEvent* event)
 {
     QLineEdit::changeEvent(event);
+    // NB: Repolishing for the hover look changes our palette to the hovered colors, which needs no new style.
+    if (event->type() == QEvent::PaletteChange && m_is_updating_field_hover)
+        return;
     if (event->type() == QEvent::PaletteChange || event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::ThemeChange) {
         schedule_chrome_style_update();
     }
+}
+
+bool LocationEdit::event(QEvent* event)
+{
+    if (event->type() == QEvent::Enter)
+        set_field_hovered(true);
+    else if (event->type() == QEvent::Leave)
+        set_field_hovered(false);
+    return QLineEdit::event(event);
+}
+
+bool LocationEdit::eventFilter(QObject* watched, QEvent* event)
+{
+    // The buttons inside the field have their own hover look, so the field itself does not look hovered under them.
+    if (event->type() == QEvent::Enter)
+        set_field_hovered(false);
+    else if (event->type() == QEvent::Leave)
+        set_field_hovered(underMouse());
+    return QLineEdit::eventFilter(watched, event);
+}
+
+// NB: The style sheet's :hover would also match while the mouse is over one of the buttons inside the field, so the
+//     field's hover look follows this property instead.
+void LocationEdit::set_field_hovered(bool hovered)
+{
+    if (property("fieldHovered").toBool() == hovered)
+        return;
+    setProperty("fieldHovered", hovered);
+    m_is_updating_field_hover = true;
+    style()->unpolish(this);
+    style()->polish(this);
+    m_is_updating_field_hover = false;
+    update();
 }
 
 void LocationEdit::contextMenuEvent(QContextMenuEvent* event)
@@ -340,8 +378,48 @@ void LocationEdit::contextMenuEvent(QContextMenuEvent* event)
     delete menu;
 }
 
+// Leaving a tab parks its omnibox's editing session: the suggestion popup closes, but everything else is kept,
+// including an inline completion and the suggestions, and the session picks up where it left off when the omnibox
+// gets focus again.
+void LocationEdit::park_editing_session()
+{
+    if (!hasFocus() || m_parked_editing_session.has_value())
+        return;
+
+    // NB: Only the popup's window closes. Dismissing the popup would end the omnibox's popup session, which drops an
+    //     inline completion from the text.
+    m_autocomplete->close();
+    m_omnibox.set_suspended(true);
+
+    m_parked_editing_session = ParkedEditingSession {
+        .cursor_position = cursorPosition(),
+        .selection_start = selectionStart(),
+        .selection_length = static_cast<int>(selectedText().length()),
+    };
+}
+
 void LocationEdit::focusInEvent(QFocusEvent* event)
 {
+    if (auto parked = m_parked_editing_session; parked.has_value()) {
+        m_parked_editing_session.clear();
+        NativeTextEditingLineEdit::focusInEvent(event);
+        m_omnibox.set_suspended(false);
+
+        // Restore the selection with the cursor at the end it was on.
+        if (parked->selection_length > 0) {
+            if (parked->cursor_position == parked->selection_start)
+                setSelection(parked->selection_start + parked->selection_length, -parked->selection_length);
+            else
+                setSelection(parked->selection_start, parked->selection_length);
+        } else {
+            setCursorPosition(parked->cursor_position);
+        }
+        if (m_omnibox.is_popup_visible())
+            m_autocomplete->show_with_suggestions(m_omnibox.suggestions(), m_omnibox.selected_suggestion());
+        animate_focus_glow(58);
+        return;
+    }
+
     if (event->reason() == Qt::PopupFocusReason) {
         NativeTextEditingLineEdit::focusInEvent(event);
         m_omnibox.set_suspended(false);
@@ -376,6 +454,9 @@ void LocationEdit::focusOutEvent(QFocusEvent* event)
 {
     QLineEdit::focusOutEvent(event);
 
+    if (m_parked_editing_session.has_value())
+        return;
+
     // A popup (for example the context menu) borrows focus without ending the editing session; late
     // suggestion deliveries must not rewrite the text or raise the suggestion popup while it is open.
     if (event->reason() == Qt::PopupFocusReason) {
@@ -406,7 +487,7 @@ void LocationEdit::update_focus_glow(int alpha)
 {
     m_focus_glow_alpha = alpha;
     if (m_focus_glow_effect)
-        m_focus_glow_effect->setColor(location_focus_glow_color(palette(), alpha));
+        m_focus_glow_effect->setColor(location_focus_glow_color(alpha));
 }
 
 void LocationEdit::animate_focus_glow(int target_alpha)
@@ -556,7 +637,8 @@ void LocationEdit::update_chrome_style()
         return;
 
     m_is_updating_chrome_style = true;
-    setStyleSheet(ChromeStyle::location_edit_style_sheet(palette()));
+    // Match the popup's palette without feeding our styled background into the next style update.
+    setStyleSheet(ChromeStyle::location_edit_style_sheet(QApplication::palette()));
     m_is_updating_chrome_style = false;
     update_zoom_indicator();
 }
@@ -764,6 +846,9 @@ void LocationEdit::highlight_location()
 void LocationEdit::set_text_and_restart_editing(QString const& text)
 {
     setText(text);
+    // The parked cursor and selection belonged to the text that was just replaced.
+    if (m_parked_editing_session.has_value())
+        m_parked_editing_session = ParkedEditingSession {};
     if (!m_omnibox.is_editing())
         return;
 
@@ -782,7 +867,9 @@ void LocationEdit::set_url(Optional<URL::URL> url)
         if (!m_has_user_edited_hidden_url)
             set_text_and_restart_editing({});
     } else if (m_url.has_value()) {
-        set_text_and_restart_editing(hasFocus() ? serialized_url() : display_url());
+        // NB: A parked editing session still owns the omnibox, so it gets the text a focused omnibox would.
+        auto is_editing = hasFocus() || m_parked_editing_session.has_value();
+        set_text_and_restart_editing(is_editing ? serialized_url() : display_url());
         setCursorPosition(0);
     }
 

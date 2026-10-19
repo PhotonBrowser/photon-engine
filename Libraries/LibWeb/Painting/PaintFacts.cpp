@@ -216,10 +216,20 @@ static void with_replaced_image_paint_facts(Layout::ImageProvider const& image_p
     queue(facts);
 }
 
-static Layout::RustFFI::FfiVideoPaintFacts video_paint_facts(HTML::HTMLVideoElement const& video_element)
+static Layout::RustFFI::FfiVideoPaintFacts video_paint_facts(HTML::HTMLVideoElement const& element)
 {
+    // An element that shows another element's frames paints whatever that element would.
+    auto const& video_element = element.visual_source() ? *element.visual_source() : element;
+
+    // https://w3c.github.io/picture-in-picture/#pip
+    // It is RECOMMENDED that video frames are not rendered in the page and in the Picture-in-Picture window at the
+    // same time but if they are, they MUST be kept in sync.
+    auto representation = element.is_picture_in_picture_element()
+        ? HTML::HTMLVideoElement::Representation::TransparentBlack
+        : video_element.current_representation();
+
     Layout::RustFFI::FfiVideoPaintFacts facts {};
-    switch (video_element.current_representation()) {
+    switch (representation) {
     case HTML::HTMLVideoElement::Representation::FirstVideoFrame:
     case HTML::HTMLVideoElement::Representation::VideoFrame: {
         facts.representation = Layout::RustFFI::FfiVideoRepresentation::VideoFrame;
@@ -317,6 +327,9 @@ void push_replaced_image_paint_facts(DOM::Element const& element, Layout::ImageP
 
 void push_video_paint_facts(HTML::HTMLVideoElement const& video_element)
 {
+    video_element.for_each_visual_clone([](HTML::HTMLVideoElement& clone) {
+        push_video_paint_facts(clone);
+    });
     if (!video_element.has_layout_box())
         return;
     queue_video_paint_facts(video_element, video_paint_facts(video_element));
@@ -327,6 +340,9 @@ void push_video_paint_facts(HTML::HTMLVideoElement const& video_element)
 // the display rate even while the video is paused.
 void push_video_paint_facts_if_changed(HTML::HTMLVideoElement const& video_element)
 {
+    video_element.for_each_visual_clone([](HTML::HTMLVideoElement& clone) {
+        push_video_paint_facts_if_changed(clone);
+    });
     if (!video_element.has_layout_box())
         return;
     auto facts = video_paint_facts(video_element);
@@ -401,6 +417,8 @@ void push_paint_facts_after_style_attach(Layout::NodeWithStyle& layout_node, Sty
         Layout::RustFFI::render_state_set_layer_image_paint_facts(layout_node.document_host(), Layout::Node::slot_id(&layout_node), nullptr, 0);
     // NB: A box a layout built beside the removal of its element has no DOM node left to take facts from. It paints from
     //     its style until the removal takes it away.
+    // NB: LayoutNodeArena::owe_style_image_resources_once() lists the kinds this switch takes facts for, and the two
+    //     must stay in sync.
     auto* dom_node = layout_node.dom_node();
     switch (layout_node.kind()) {
     case Layout::RustFFI::NodeKind::CheckBox:

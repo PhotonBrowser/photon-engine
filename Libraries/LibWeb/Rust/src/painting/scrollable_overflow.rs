@@ -342,7 +342,13 @@ fn measure_scrollable_overflow_impl(
             in_flow_and_floated_content_bounds.unite(line_rect);
         }
         for fragment in side_data.fragments() {
-            let mut fragment_rect = text_fragment::absolute_rect(layout_arena, fragment);
+            // NB: The box holding the line boxes is the containing block of each of their fragments, and their
+            //     offsets are relative to it, also for a fragment whose node left the tree since it was laid out.
+            debug_assert!(
+                text_fragment::containing_block_paintable(layout_arena, fragment)
+                    .is_none_or(|block| block == box_paintable)
+            );
+            let mut fragment_rect = text_fragment::rect_in_containing_block(fragment).translated_by(absolute_position);
             if layout_arena.node_is_in_focused_text_control(fragment.layout_node)
                 && let Some(style_source_style) =
                     layout_arena.node_style_if_live(text_fragment::style_source(layout_arena, fragment))
@@ -375,6 +381,7 @@ fn measure_scrollable_overflow_impl(
     //          its 3D rendering context. [CSS3-TRANSFORMS]
     // OPTIMIZATION: The layout tree already indexes direct children. Retain only boxes whose
     //               containing block differs from their parent in the supplemental index.
+    let box_has_line_clamp_point = style_queries::has_line_clamp_point(layout_arena, box_node);
     let direct_children = layout_arena.children(box_node);
     let other_contained_boxes = non_child_boxes_by_containing_block
         .get(&box_node)
@@ -409,9 +416,6 @@ fn measure_scrollable_overflow_impl(
         let child_flags = child_row.flags();
         let child_is_flex_or_grid_item = child_flags & (NodeFlag::IsFlexItem as u32 | NodeFlag::IsGridItem as u32) != 0;
         let child_is_floating = !child_is_flex_or_grid_item && child_style.is_some_and(|style| style.is_floating());
-        if style_queries::is_excluded_from_scrollable_overflow_by_line_clamp(layout_arena, child_node) {
-            continue;
-        }
         let child_display = child_style.map_or_else(FfiDisplay::block, |style| style.display());
 
         {
@@ -422,10 +426,8 @@ fn measure_scrollable_overflow_impl(
                 && child_display.is_inline_outside()
                 && !child_is_floating
                 && !child_has_css_transform
-                && !style_queries::has_line_clamp_point(layout_arena, box_node)
-                && layout_arena
-                    .committed_side_data(child_node)
-                    .overflow_valid_across_recommits
+                && !box_has_line_clamp_point
+                && child_data.overflow_valid_across_recommits
             {
                 let border = crate::painting::paintable_geometry::committed_border(layout_arena, child_node);
                 let zero = CssPixels::from_raw(0);
@@ -446,6 +448,9 @@ fn measure_scrollable_overflow_impl(
                     }
                 }
             }
+        }
+        if style_queries::is_excluded_from_scrollable_overflow_by_line_clamp(layout_arena, child_node) {
+            continue;
         }
 
         let untransformed_child_border_box = paintable_geometry::absolute_border_box_rect(layout_arena, child_node);

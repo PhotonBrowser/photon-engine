@@ -277,7 +277,9 @@ StyleEngineFFI::FfiTakenStyleTransaction StyleEngineFFI::web_css_take_style_tran
 
 bool StyleEngineFFI::web_css_has_pending_style_transaction(StyleReactionApplication* application)
 {
-    return application->document->style_computer().style_engine().has_pending_transaction(application->read);
+    auto& style_engine = application->document->style_computer().style_engine();
+    style_engine.note_waiting_arrivals_if_keys_moved(application->read);
+    return style_engine.has_pending_transaction(application->read);
 }
 
 void StyleEngineFFI::web_css_note_style_update_has_reactions(StyleReactionApplication* application)
@@ -380,17 +382,22 @@ static void move_pseudo_element_environments(Layout::BegunRead const& read, DOM:
     }
 }
 
-// An element's custom properties moved from `old_base` to `new_base`: the style engine moves what the element's
+// An element's custom properties moved from `old_data` to `new_data`: the style engine moves what the element's
 // descendants inherit, and calls back for what the move leaves the host.
-static void move_custom_property_environment_below(StyleReactionApplication& application, DOM::Element& element, RefPtr<CustomPropertyData const> const& old_base, RefPtr<CustomPropertyData const> const& new_base)
+static void move_custom_property_environment_below(StyleReactionApplication& application, DOM::Element& element, RefPtr<CustomPropertyData const> const& old_data, RefPtr<CustomPropertyData const> const& new_data)
 {
     auto const& read = application.read;
     auto& document = *application.document;
-    auto old_inheritable = old_base ? old_base->inheritable(read, document) : nullptr;
-    auto new_inheritable = new_base ? new_base->inheritable(read, document) : nullptr;
+    auto old_inheritable = old_data ? old_data->inheritable(read, document) : nullptr;
+    auto new_inheritable = new_data ? new_data->inheritable(read, document) : nullptr;
+    auto named = [](CustomPropertyData const* data) -> StyleEngineFFI::FfiNamedEnvironment {
+        return { .identity = data ? data->identity() : 0, .store = data ? data->rust_store() : nullptr };
+    };
     StyleEngineFFI::FfiEnvironmentMove const moved {
+        .old_environment = named(old_data.ptr()),
+        .new_environment = named(new_data.ptr()),
         .old_inheritable = old_inheritable ? old_inheritable->identity() : 0,
-        .new_inheritable = { .identity = new_inheritable ? new_inheritable->identity() : 0, .store = new_inheritable ? new_inheritable->rust_store() : nullptr },
+        .new_inheritable = named(new_inheritable.ptr()),
         .new_inheritable_data = new_inheritable.ptr(),
         .new_inheritable_declares = new_inheritable && new_inheritable->declared_count() > 0,
     };
@@ -402,8 +409,12 @@ static void move_custom_property_environment_below(StyleReactionApplication& app
 void StyleEngineFFI::web_css_republish_moved_environment(StyleReactionApplication* application, u32 style_node, u64 style_record, u64 replaced, void const* new_inheritable_data)
 {
     auto& style_engine = application->document->style_computer().style_engine();
-    auto element = application->document->style_computer().element_for_style_node(style_node);
-    VERIFY(element);
+    auto element = application->document->style_computer().element_for_lane_style_node(style_node);
+    // A task running beside a flown transaction can remove the element, whose style node the engine's tree still holds
+    // until the tree delta applies, and another element can have taken the style node's slot by then. Nothing is left
+    // to republish then.
+    if (!element)
+        return;
     RefPtr new_inheritable = static_cast<CustomPropertyData const*>(new_inheritable_data);
     for (auto kind = 0; kind < to_underlying(PseudoElement::KnownPseudoElementCount); ++kind) {
         auto pseudo_element = static_cast<PseudoElement>(kind);
@@ -428,8 +439,10 @@ void StyleEngineFFI::web_css_rebuild_custom_property_environment(StyleReactionAp
 {
     auto const& read = application->read;
     auto& document = *application->document;
-    auto element = document.style_computer().element_for_style_node(style_node);
-    VERIFY(element);
+    auto element = document.style_computer().element_for_lane_style_node(style_node);
+    // As above, the element can be gone, and its descendants with it.
+    if (!element)
+        return;
     auto existing_base = custom_property_environment_base(*element, element->custom_property_data({}));
     VERIFY(existing_base && existing_base->declared_count() > 0);
     if (existing_base->parent().ptr() == new_parent_inheritable_data)
@@ -446,7 +459,8 @@ void StyleEngineFFI::web_css_rebuild_custom_property_environment(StyleReactionAp
     move_pseudo_element_environments(read, document, *element, existing_base.ptr(), existing_inheritable.ptr(), moved);
     element->set_custom_property_data({}, moved);
     element->republish_style_record_environment(read);
-    move_custom_property_environment_below(*application, *element, existing_base, moved);
+    if (element->first_element_child() || element->shadow_root() || is<HTML::HTMLSlotElement>(*element))
+        move_custom_property_environment_below(*application, *element, existing_base, moved);
 }
 
 static void propagate_custom_property_environment_move(StyleReactionApplication& application, DOM::Element& origin, RefPtr<CustomPropertyData const> old_origin_data)
@@ -454,9 +468,7 @@ static void propagate_custom_property_environment_move(StyleReactionApplication&
     // Nothing inherits from an element with nothing below it in the flat tree.
     if (!origin.first_element_child() && !origin.shadow_root() && !is<HTML::HTMLSlotElement>(origin))
         return;
-    auto old_origin_base = custom_property_environment_base(origin, move(old_origin_data));
-    auto new_origin_base = custom_property_environment_base(origin, origin.custom_property_data({}));
-    move_custom_property_environment_below(application, origin, old_origin_base, new_origin_base);
+    move_custom_property_environment_below(application, origin, old_origin_data, origin.custom_property_data({}));
 }
 
 // Install the record the engine settled for a row, and the pseudo-element records beside it. A C++ computation applied
@@ -533,8 +545,17 @@ static RequiredInvalidationAfterStyleChange install_engine_computed_records(Layo
         auto changed_inherited_groups = StyleEngineFFI::style_engine_changed_style_groups(&old_record, &new_record, 0, ComputedValues::inherited_style_group_count);
         invalidation.set_inherited_style_groups_changed(static_cast<u8>(changed_inherited_groups & RequiredInvalidationAfterStyleChange::all_inherited_style_groups));
     }
-    if (old_computed_values)
+    if (old_computed_values) {
         element.apply_display_none_change(read, DOM::Element::DisplayNoneState::of(*old_computed_values));
+        // NB: The descendants of an element that stays display:none have no boxes, so their styles only serve a CSSOM
+        //     read or the subtree's reveal, both of which materialize them again. Where what they inherit moves, clear
+        //     them as entering display:none does rather than computing them all again. The SVG elements visible
+        //     content can reference keep their styles, and take what they inherit from styled ancestors.
+        if (old_computed_values->display().is_none() && element.computed_style()->display().is_none()
+            && invalidation.inherited_style_groups_changed() != 0 && !did_change_custom_properties
+            && !element.has_referenceable_svg_descendant())
+            element.clear_computed_styles_from_display_none_descendants(read);
+    }
     // The pseudo-elements of a record the host composes inherit the composition, so the engine settles them only now.
     if (reaction.composed_by_the_host)
         invalidation |= element.refresh_pseudo_element_styles_over_composition(read, old_computed_values ? &*old_computed_values : nullptr, did_change_custom_properties);
@@ -705,7 +726,7 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
     // since the last update under the identities they take here.
     // NB: What connected beside the transaction that flew is the next transaction's.
     if constexpr (!drains_flown_transaction)
-        take_in_pending_style_arrivals(document);
+        take_in_pending_style_arrivals(document, HiddenChildArrivals::MayWait);
     StyleUpdateScope style_update_scope { document.style_computer() };
 
     document.begin_style_stabilization_epoch();
@@ -894,6 +915,7 @@ static bool update_style_for_element(Layout::BegunRead const& read, DOM::Documen
     //               chain has style throughout, or a display:none element stops the read above every element without.
     if (mode != StyleUpdateMode::Normal
         && !abstract_element.pseudo_element().has_value()
+        && abstract_element.element().style_node_id() != 0
         && document_has_no_pending_style_work(read, document)
         && embedding_document_chain_has_no_pending_style_or_layout_work(document)) {
         StyleReactionApplication application { read, document };
@@ -902,7 +924,11 @@ static bool update_style_for_element(Layout::BegunRead const& read, DOM::Documen
             return answer_style_read(abstract_element, answer);
     }
 
-    take_in_pending_style_arrivals(document);
+    // A read of an element in a display:none subtree may be answered by the children waiting to arrive there.
+    auto const& read_element = abstract_element.element();
+    auto read_may_need_waiting_children = document.descendant_style_arrival_pending()
+        && read_element.has_inclusive_ancestor_with_display_none_ignoring_animations();
+    take_in_pending_style_arrivals(document, read_may_need_waiting_children ? HiddenChildArrivals::TakeIn : HiddenChildArrivals::MayWait);
     StyleUpdateScope style_update_scope { document.style_computer() };
     // Refresh computed properties for an abstract element. An ordinary read first consumes the complete exact
     // reaction batch. A reentrant layout read leaves that transaction untouched and walks the flat-tree inheritance

@@ -368,6 +368,7 @@ impl RetainedState {
         {
             return reusable;
         }
+        self.note_relational_arrival_keys(&compiled);
         let program = self.programs.add(compiled);
         self.selector_programs_need_sweep |= reusable.is_some();
         self.programs.settle_memory(&mut self.memory);
@@ -390,6 +391,66 @@ impl RetainedState {
         }
         Arc::make_mut(&mut self.attribute_value_text_names).extend(program.attribute_value_text_names());
         self.attribute_value_text_requirements_version += 1;
+    }
+
+    /// Record what an arrival has to carry to reach the anchor of one of `program`'s `:has()` arguments.
+    pub(super) fn note_relational_arrival_keys(&mut self, program: &SelectorProgram) {
+        if !program.contains_relational_selector() {
+            return;
+        }
+        for entry in 0..program.entries().len() {
+            program.collect_transpose_entry_points(entry, |site| {
+                if site.anchor.is_some() && !self.relational_arrival_keys.keys.contains(&site.key) {
+                    self.unresolved_relational_arrival_keys.insert(site.key);
+                }
+            });
+        }
+    }
+
+    /// Starts the keys over from `keys`, as a sweep that reclaimed some of their atoms leaves them.
+    pub(super) fn replace_relational_arrival_keys(&mut self, keys: HashSet<RoutingKey>) {
+        self.relational_arrival_keys = Arc::default();
+        self.unresolved_relational_arrival_keys = keys;
+        self.relational_arrival_keys_version += 1;
+    }
+
+    /// Resolves the keys rules added since the host last learned them to what it compares an element's names and
+    /// states with. The atom table is scanned once for all of them, however many rules added one.
+    pub(crate) fn resolve_relational_arrival_keys(&mut self) {
+        if self.unresolved_relational_arrival_keys.is_empty() {
+            return;
+        }
+        let mut resolved = (*self.relational_arrival_keys).clone();
+        let mut name_atoms = Vec::new();
+        for key in std::mem::take(&mut self.unresolved_relational_arrival_keys) {
+            if !resolved.keys.insert(key) {
+                continue;
+            }
+            match key {
+                RoutingKey::TagName(atom)
+                | RoutingKey::Id(atom)
+                | RoutingKey::Class(atom)
+                | RoutingKey::AttributeName(atom) => name_atoms.push(atom),
+                RoutingKey::State(fact) => resolved.states.push(fact as u8),
+                _ => resolved.reached_by_any_arrival = true,
+            }
+        }
+        match self.atoms.raw_identities_of(name_atoms) {
+            Some(raws) => resolved.names.extend(raws),
+            None => resolved.reached_by_any_arrival = true,
+        }
+        self.relational_arrival_keys = Arc::new(resolved);
+        self.relational_arrival_keys_version += 1;
+    }
+
+    /// Moves whenever what an arrival has to carry to reach a `:has()` anchor does, once resolved.
+    pub(crate) fn relational_arrival_keys_version(&self) -> u64 {
+        self.relational_arrival_keys_version
+    }
+
+    /// What an arrival has to carry to reach a `:has()` anchor, as last resolved.
+    pub(crate) fn relational_arrival_keys(&self) -> &Arc<RelationalArrivalKeys> {
+        &self.relational_arrival_keys
     }
 
     /// Moves whenever an attribute name comes to require its value text: a selector's here, or an
@@ -1132,6 +1193,24 @@ impl RetainedState {
         sheet
     }
 
+    /// Whether a sheet's rules keep their routing entry points: it is attached somewhere, or the host keeps it for
+    /// reattachment.
+    pub(super) fn sheet_keeps_routing(&self, sheet: SheetID) -> bool {
+        self.program.sheet_is_attached_somewhere(sheet) || self.sheets_kept_for_reattachment.contains(sheet.0 as usize)
+    }
+
+    /// Note that the host keeps a detached sheet compiled for reattachment, or no longer does.
+    pub(super) fn set_sheet_kept_for_reattachment(&mut self, sheet: SheetID, kept: bool) {
+        if !self.sheets_kept_for_reattachment.set(sheet.0 as usize, kept).0 {
+            return;
+        }
+        if kept {
+            self.restore_routing_for_reattached_sheet(sheet);
+        } else {
+            self.routing_needs_detachment_sweep = true;
+        }
+    }
+
     /// A sheet whose routes were shed while it was detached contributes routes again the moment
     /// it reattaches. The registry must be whole before the attachment's transaction plans, so
     /// this runs at recording time rather than waiting for the next sweep.
@@ -1307,6 +1386,12 @@ impl RetainedState {
         self.layout_style_snapshots.get(&node).copied()
     }
 
+    /// Whether any container's box is held. Size and scroll-state containers get rows, and an element that stops being
+    /// one keeps its row until it goes.
+    pub(crate) fn has_layout_style_snapshots(&self) -> bool {
+        !self.layout_style_snapshots.is_empty()
+    }
+
     /// Take the box geometry a completed layout commit gathered, keeping each row's scroll state.
     pub(crate) fn apply_layout_style_snapshot_commit(
         &mut self,
@@ -1365,6 +1450,35 @@ impl RetainedState {
         if self.computed_group_sets.adjustment_facts(node) & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0 {
             self.held_root_font_inputs = computed::FinalStyleRecordID::from_raw(style_record)
                 .and_then(|record| self.root_font_inputs_from_record(record));
+        }
+    }
+
+    /// Record the style record the pseudo-element of `pseudo_kind` of an element holds; zero is
+    /// none. Keep it alive until the host replaces it, as an element's, even when the engine
+    /// publishes a newer assignment.
+    pub fn set_held_pseudo_style_record(&mut self, node: StyleNodeID, pseudo_kind: u8, style_record: u64) {
+        let held = self.held_pseudo_style_records.entry(node).or_default();
+        let slot = held.iter().position(|&(kind, _)| kind == pseudo_kind);
+        let previous = match slot {
+            Some(slot) if style_record == 0 => Some(held.swap_remove(slot).1),
+            Some(slot) => Some(std::mem::replace(&mut held[slot].1, style_record)),
+            None if style_record == 0 => None,
+            None => {
+                held.push((pseudo_kind, style_record));
+                None
+            }
+        };
+        if held.is_empty() {
+            self.held_pseudo_style_records.remove(&node);
+        }
+        if previous == Some(style_record) {
+            return;
+        }
+        if style_record != 0 {
+            self.computed_group_sets.pin_style_record(style_record);
+        }
+        if let Some(previous) = previous {
+            self.computed_group_sets.unpin_style_record(previous);
         }
     }
 
@@ -1874,6 +1988,7 @@ impl StyleEngine {
                 declaration_block_version: Arc::new(std::sync::atomic::AtomicU32::new(1)),
                 last_transaction_only_derived_child_reactions: false,
                 sheets_excluded_from_routing: BitColumn::default(),
+                sheets_kept_for_reattachment: BitColumn::default(),
                 routing_needs_detachment_sweep: false,
                 match_workspace: MatchScratch::default(),
                 exact_covered_scratch: Vec::new(),
@@ -1904,6 +2019,7 @@ impl StyleEngine {
                 custom_property_environments: Default::default(),
                 nodes_with_substituted_records: HashSet::default(),
                 custom_declaration_reads: HashMap::default(),
+                custom_declaration_custom_property_reads: HashMap::default(),
                 nodes_with_tree_counting_records: HashMap::default(),
                 nodes_with_rolled_back_records: HashMap::default(),
                 nodes_with_element_relative_substitutions: HashMap::default(),
@@ -1919,6 +2035,7 @@ impl StyleEngine {
                 size_container_queries: Default::default(),
                 counter_style_environment_identities: HashMap::default(),
                 held_style_records: Default::default(),
+                held_pseudo_style_records: Default::default(),
                 tick_shown: Default::default(),
                 backing_elements: HashMap::default(),
                 children_explicitly_inherit_marks: HashMap::default(),
@@ -1969,6 +2086,9 @@ impl StyleEngine {
                 attribute_value_text_names: Arc::default(),
                 tested_attribute_names: Arc::default(),
                 attribute_value_text_requirements_version: 0,
+                relational_arrival_keys: Arc::default(),
+                unresolved_relational_arrival_keys: HashSet::default(),
+                relational_arrival_keys_version: 0,
                 selector_programs_need_sweep: false,
                 routing: Arc::new(RoutingRegistry::new()),
                 selector_truth_changes: SelectorTruthChanges::default(),
@@ -2000,6 +2120,7 @@ impl StyleEngine {
                 deferred_element_style_inputs: Vec::new(),
                 deferred_element_style_inputs_moved: false,
                 deferred_element_style_inputs_are_pending: false,
+                environment_move_changed_names: Default::default(),
                 deferred_element_style_input_memory: MemoryLease::new(MemoryCategory::NormalizationJournal),
                 initial_tree_batch_applied: false,
                 initial_tree_bulk_load_is_pending: false,
@@ -2579,6 +2700,25 @@ impl StyleEngine {
         self.host
             .tree_staging_memory
             .resize_required_to(&mut self.retained.memory, bytes);
+    }
+
+    /// Raises `deepest_element` to the depth of the deepest element the tree holds, and keeps `staged_rows` at how many
+    /// relation rows are staged and not settled yet, both of which the document's host reads, rather than counts of
+    /// the engine's own. Nothing is staged yet.
+    pub(crate) fn share_tree_depth(
+        &mut self,
+        deepest_element: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        staged_rows: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        self.retained.tree.share_deepest_element(deepest_element);
+        self.host.tree_staging.share_staged_rows(staged_rows);
+    }
+
+    /// Gives a fork counts of the tree's depth of its own in place of those it shares with the host, holding what they
+    /// hold now.
+    pub(crate) fn detach_tree_depth_for_fork(&mut self) {
+        self.retained.tree.detach_deepest_element_for_fork();
+        self.host.tree_staging.detach_staged_rows_for_fork();
     }
 
     /// Install final staged relation rows at the transaction barrier.
@@ -3254,6 +3394,7 @@ impl RetainedState {
             declaration_block_version: _,
             last_transaction_only_derived_child_reactions: _,
             sheets_excluded_from_routing: _,
+            sheets_kept_for_reattachment: _,
             routing_needs_detachment_sweep: _,
             match_workspace: _,
             // Scratch of one candidate evaluation.
@@ -3277,6 +3418,7 @@ impl RetainedState {
             custom_property_environments: _,
             nodes_with_substituted_records,
             custom_declaration_reads,
+            custom_declaration_custom_property_reads,
             nodes_with_tree_counting_records,
             nodes_with_rolled_back_records,
             nodes_with_element_relative_substitutions,
@@ -3292,6 +3434,7 @@ impl RetainedState {
             size_container_queries,
             counter_style_environment_identities: _,
             held_style_records,
+            held_pseudo_style_records,
             // Empty but while a clock frame runs, which no retirement reaches.
             tick_shown: _,
             backing_elements,
@@ -3353,6 +3496,9 @@ impl RetainedState {
             attribute_value_text_names: _,
             tested_attribute_names: _,
             attribute_value_text_requirements_version: _,
+            relational_arrival_keys: _,
+            unresolved_relational_arrival_keys: _,
+            relational_arrival_keys_version: _,
             selector_programs_need_sweep: _,
             routing: _,
             // Scratch of one transaction.
@@ -3385,6 +3531,7 @@ impl RetainedState {
         computed_group_sets.remove(node);
         nodes_with_substituted_records.remove(&node);
         custom_declaration_reads.remove(&node);
+        custom_declaration_custom_property_reads.remove(&node);
         nodes_with_tree_counting_records.remove(&node);
         nodes_with_rolled_back_records.remove(&node);
         nodes_with_element_relative_substitutions.remove(&node);
@@ -3407,6 +3554,9 @@ impl RetainedState {
         size_container_queries.retire(node);
         backing_elements.remove(&node);
         if let Some(style_record) = held_style_records.remove(&node) {
+            computed_group_sets.unpin_style_record(style_record);
+        }
+        for (_, style_record) in held_pseudo_style_records.remove(&node).into_iter().flatten() {
             computed_group_sets.unpin_style_record(style_record);
         }
         children_explicitly_inherit_marks.remove(&node);

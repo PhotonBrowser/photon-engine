@@ -57,6 +57,7 @@
 class QKeyEvent;
 class QLabel;
 class QPushButton;
+class QScreen;
 class QShortcut;
 class QSinglePointEvent;
 class QCursor;
@@ -87,6 +88,7 @@ struct WebContentViewInitialState {
     WebView::IsPrivate is_private { WebView::IsPrivate::No };
     double maximum_frames_per_second { 60.0 };
     Optional<u64> display_id;
+    WebView::ViewImplementation const* owner_view { nullptr };
 };
 
 class WebContentView final
@@ -135,9 +137,11 @@ public:
     void set_maximum_frames_per_second(double);
     void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second);
     void set_vertical_tab_overlay_insets(int left, int right);
+    void set_bookmarks_bar_overlay_height(int);
     void prepare_for_window_move();
     void finish_window_move();
     void close_select_dropdown_after_crash();
+    void cancel_mouse_press();
     void review_hidden_crash_report(ByteString const& report_name);
 
     enum class PaletteMode {
@@ -155,13 +159,17 @@ public:
 
     QPoint map_point_to_global_position(Gfx::IntPoint) const;
 
+    // On macOS, Qt ignores mouse movement while Ladybird is inactive, so a view that should still follow it opts in.
+    bool follows_mouse_while_inactive() const { return m_follows_mouse_while_inactive; }
+    void set_follows_mouse_while_inactive(bool follows) { m_follows_mouse_while_inactive = follows; }
+
 signals:
     void ready_to_paint();
     void urls_dropped(QList<QUrl> const&);
 
 private:
     // ^WebView::ViewImplementation
-    virtual void prepare_page_for_tab(WebView::WebContentPage&) override;
+    virtual void prepare_page_for_navigable(WebView::WebContentPage&) override;
     virtual void send_system_theme_to_page(WebView::WebContentPage&) override;
     virtual void update_zoom() override;
     virtual Web::DevicePixelSize viewport_size() const override;
@@ -204,6 +212,7 @@ private:
     void enqueue_native_event(Web::KeyEvent::Type, QKeyEvent const& event);
     void finish_handling_key_event(Web::KeyEvent const&);
 
+    void watch_screen_geometry(QScreen&);
     void update_screen_rects();
     void update_screen_rects(WebView::WebContentPage&);
 
@@ -221,7 +230,6 @@ private:
 #endif
 
     friend void install_accessibility(WebContentView*);
-    friend void update_accessibility_tree(WebContentView*);
     friend void post_accessibility_focus_changed(WebContentView*, i64);
 
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
@@ -238,6 +246,8 @@ private:
     // Set when an assistive technology turns up mid-page: The next tree to arrive reports the focus to it.
     bool m_report_accessibility_focus_with_next_tree { false };
 #endif
+
+    bool m_follows_mouse_while_inactive { false };
 
     bool m_tooltip_override { false };
     Optional<ByteString> m_tooltip_text;
@@ -324,6 +334,7 @@ private:
 
     int m_vertical_tab_overlay_left { 0 };
     int m_vertical_tab_overlay_right { 0 };
+    int m_bookmarks_bar_overlay_height { 0 };
 #endif
 };
 

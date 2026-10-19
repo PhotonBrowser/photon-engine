@@ -16,11 +16,7 @@ Hyphens in the time keep filenames compatible with Windows; the random suffix
 avoids collisions. Retention includes reports saved with the older filenames.
 Nothing is uploaded automatically.
 
-Sending crash reports is disabled in the current build. Reports can still be
-reviewed and opened locally, but the report server is never contacted.
-
 Once the report of a WebContent crash is saved, the crash screen shows a review
-of its local details with **Reload page** next to it. After the report is
 of its local details with **Reload page** next to it. After the report is
 reviewed, reloading is what the screen offers. Any other crash, such as one of
 the Compositor or RequestServer, shows a popover below the menu button as soon as

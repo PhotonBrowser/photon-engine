@@ -129,9 +129,19 @@ RENDER_STATE_ALLOWED = {
         ],
     ),
     **render_state_entries(
-        "the render owner's own states; only the owner's thread reaches its documents' render states",
-        ["render_state/owner.rs:STATES"],
+        "the render owner's slot; only the thread that holds it reaches its documents' render states",
+        ["render_state/owner.rs:SLOT"],
     ),
+    **render_state_entries(
+        "per-thread count of the holds of the render owner's slot the thread is in",
+        ["render_state/owner.rs:HOLDS"],
+    ),
+    **render_state_entries(
+        "per-thread list of what the thread let go of in its hold of the render owner's slot, dropped as the hold ends",
+        ["render_state/owner.rs:DROPPED_AFTER_HOLD"],
+    ),
+    f"{RENDER_STATE_CRATE}/src/render_state.rs:STACK_BASE": "per-thread cache of the thread's own stack bounds",
+    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:UNFINISHED_HANDED": "per-thread count of the jobs the thread made for each stage thread that have yet to run",
     **render_state_entries(
         BUILT_ONCE,
         [

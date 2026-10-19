@@ -812,6 +812,9 @@ set(SOURCES
     PermissionsAPI/Permissions.cpp
     PermissionsAPI/PermissionStore.cpp
     PermissionsAPI/PermissionStatus.cpp
+    PictureInPicture/PictureInPictureController.cpp
+    PictureInPicture/PictureInPictureEvent.cpp
+    PictureInPicture/PictureInPictureWindow.cpp
     Platform/EventLoopPlugin.cpp
     Platform/FontPlugin.cpp
     Platform/ImageCodecPlugin.cpp
@@ -1107,6 +1110,7 @@ generate_css_implementation()
 
 generate_html_implementation()
 
+generate_picture_in_picture_implementation()
 
 set(GENERATED_SOURCES
     ARIA/AriaRoles.cpp
@@ -1129,6 +1133,7 @@ set(GENERATED_SOURCES
     SVG/SVGStyleSheetSource.cpp
     HTML/MediaControlsDOM.cpp
     HTML/Parser/NamedCharacterReferences.cpp
+    PictureInPicture/PictureInPicturePlayerDOM.cpp
 )
 
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)

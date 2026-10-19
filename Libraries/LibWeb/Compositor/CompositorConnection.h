@@ -77,7 +77,7 @@ public:
     void begin_input_trace_for_testing(Web::CompositorContextId);
     Vector<Web::InputTraceRecord> take_input_trace_for_testing(Web::CompositorContextId);
     Compositing::PendingAsyncScrollUpdates take_pending_async_scroll_updates(Web::CompositorContextId, Compositing::AsyncScrollUpdateFreshness);
-    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, Compositing::WindowResizingInProgress);
+    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
     void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void()>&&);
@@ -131,6 +131,8 @@ private:
     Optional<PendingScreenshot> take_screenshot(Compositing::ScreenshotRequestId);
 
     NonnullRefPtr<CompositorConnectionFrameSink> m_frame_sink;
+    u64 m_next_reserved_canvas_id { 0 };
+    u64 m_reserved_canvas_ids_remaining { 0 };
 
     HashMap<Compositing::ScreenshotRequestId, PendingScreenshot> m_screenshots;
     // What the compositor process scrolled since the last rendering update adopted it, per context.

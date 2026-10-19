@@ -72,6 +72,14 @@ impl FcRunCacheKey {
         }
     }
 
+    pub(super) fn fc_type(&self) -> formatting_context::FormattingContextType {
+        self.fc_type
+    }
+
+    pub(super) fn has_no_table_cell_intrinsic_block_padding(&self) -> bool {
+        self.input.sizing.table_cell_intrinsic_block_padding.is_none()
+    }
+
     /// The key with the intrinsic block padding a table hands its cell taken out of the root's block paddings.
     fn without_table_cell_intrinsic_block_padding(&self) -> Self {
         let mut key = *self;
@@ -166,6 +174,7 @@ fn sizing_directives_match_ignoring_unobserved(
         table_cell_intrinsic_block_padding,
         table_box_content_block_offset_in_wrapper,
         adopt_automatic_content_block_size,
+        content_block_size_after_inside_layout,
         flex_self_block_size_resolution_space,
         float_avoidance_inline_size,
         outer_float_intrusion_before_list_item_children,
@@ -178,6 +187,7 @@ fn sizing_directives_match_ignoring_unobserved(
         && table_cell_intrinsic_block_padding == b.table_cell_intrinsic_block_padding
         && table_box_content_block_offset_in_wrapper == b.table_box_content_block_offset_in_wrapper
         && adopt_automatic_content_block_size == b.adopt_automatic_content_block_size
+        && content_block_size_after_inside_layout == b.content_block_size_after_inside_layout
         && float_avoidance_inline_size == b.float_avoidance_inline_size
         && outer_float_intrusion_before_list_item_children == b.outer_float_intrusion_before_list_item_children
         && treat_block_axis_percentage_insets_as_auto_beyond_root

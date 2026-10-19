@@ -488,12 +488,14 @@ void EventLoop::process_input_events() const
                         return page.handle_mousemove(*root, mouse_event.position, mouse_event.screen_position, mouse_event.buttons, mouse_event.modifiers, &remote_target);
                     case Web::MouseEvent::Type::MouseLeave:
                         return page.handle_mouseleave(*root);
+                    case Web::MouseEvent::Type::MouseCancel:
+                        return page.handle_mousecancel(*root);
                     case Web::MouseEvent::Type::MouseWheel:
                         if (mouse_event.async_scroll_performed_default_action) {
                             dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Main thread handling DOM wheel after async default action");
-                            return page.handle_mousewheel(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, mouse_event.wheel_delta_precision, mouse_event.scroll_gesture_phase, true, nullptr, &remote_target);
+                            return page.handle_mousewheel(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, mouse_event.wheel_tick_120ths_x, mouse_event.wheel_tick_120ths_y, mouse_event.wheel_delta_precision, mouse_event.scroll_gesture_phase, true, nullptr, &remote_target);
                         }
-                        return page.handle_mousewheel(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, mouse_event.wheel_delta_precision, mouse_event.scroll_gesture_phase, false, nullptr, &remote_target);
+                        return page.handle_mousewheel(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, mouse_event.wheel_tick_120ths_x, mouse_event.wheel_tick_120ths_y, mouse_event.wheel_delta_precision, mouse_event.scroll_gesture_phase, false, nullptr, &remote_target);
                     }
                     VERIFY_NOT_REACHED();
                 },

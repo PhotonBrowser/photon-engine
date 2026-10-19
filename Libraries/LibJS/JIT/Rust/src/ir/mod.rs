@@ -139,6 +139,10 @@ pub enum BranchCondition {
     /// The input is the `Repr::Pointer` of an object: is it an array
     /// iterator over values, like `%Array.prototype.values%` makes?
     ArrayIterator,
+    /// The input is the `Repr::Pointer` of an object: is it the generator
+    /// object of a generator or of an async function (and no async
+    /// generator)?
+    GeneratorObject,
     /// The input is the `Repr::Pointer` of an object: is it an array whose
     /// prototype is the realm's `%Array.prototype%`, and do that and
     /// `%Object.prototype%` have no indexed properties and nothing that may
@@ -157,6 +161,9 @@ pub enum BranchCondition {
     TaggedEquals { equal: bool },
     /// The input is a tagged value: is it an int32?
     Int32Value,
+    /// The input is a tagged value: is it an int32 or a boolean, whose low
+    /// 32 bits are its ToInt32 either way?
+    Int32OrBoolean,
     /// The input is a tagged value: is it a double, a number that is no
     /// int32?
     Double,
@@ -200,6 +207,20 @@ pub enum TypeofKind {
     Boolean,
     Bigint,
     Function,
+}
+
+/// Which bytecode a `Suspend` suspends the frame for, which tells the code
+/// resuming it what the returned value is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendKind {
+    /// A generator's `Yield`.
+    Yield,
+    /// A generator's `YieldIteratorResult`, whose value is an iterator
+    /// result already.
+    YieldIteratorResult,
+    /// An `Await` of an async function or async generator, whose value is
+    /// the awaited one.
+    Await,
 }
 
 /// Which function of an accessor property an access calls.
@@ -416,7 +437,12 @@ pub enum Op {
     Phi,
     /// The `Enter` bytecode: fills the registers and locals with the empty
     /// value, copies the constants into the frame and marks it initialized.
-    InitializeFrame,
+    /// If `clobbers_floats`, the node it initializes the frame for clobbers
+    /// the floating point registers anyway, so it stores through one of
+    /// them, two slots at a time.
+    InitializeFrame {
+        clobbers_floats: bool,
+    },
     /// Makes the frame the running execution context, where other code (the
     /// garbage collector, stack walks, runtime functions) sees it. Direct
     /// calls of compiled functions leave their frame unpublished until it
@@ -425,7 +451,20 @@ pub enum Op {
     PublishFrame,
     /// Does what `InitializeFrame` does, unless the frame is initialized
     /// already. See `passes::frame_initialization`.
-    EnsureFrameInitialized,
+    EnsureFrameInitialized {
+        clobbers_floats: bool,
+    },
+    /// The suspension of the `Yield`, `YieldIteratorResult` and `Await`
+    /// bytecodes, right before the `Return` of the yielded or awaited value:
+    /// records in the frame where its generator or async function resumes
+    /// (`continuation`, or nowhere once it completes) and what the value is
+    /// (`kind`). The `StoreSlot`s before it put every slot live at the
+    /// continuation in frame memory, from where the runtime resumes the
+    /// frame.
+    Suspend {
+        continuation: Option<u32>,
+        kind: SuspendKind,
+    },
     /// The environment the environment at the `Repr::Pointer` input 0 is in
     /// (its outer environment), as a `Repr::Pointer`. Environments keep
     /// their outer environment.
@@ -677,9 +716,12 @@ pub enum Op {
     /// properties (the inputs, in offset order), as an exit needs it: the
     /// runtime creates it with `shape` when the exit is taken. Frame states
     /// refer to it; it is in no block and has no code. An input may be
-    /// another virtual object.
+    /// another virtual object. Every frame state refers to the object the
+    /// `AllocateObject` node `allocation` made with a virtual object of its
+    /// own, and `allocation` tells the runtime they are the same object.
     VirtualObject {
         shape: CellId,
+        allocation: NodeId,
     },
     /// A new array of `count` packed elements, all `undefined`, of the
     /// realm of the compiled code (see `ArrayAllocationInfo`). Like
@@ -772,6 +814,16 @@ pub enum Op {
     /// one where it relies on its dependencies after other code ran, which
     /// is the only way they can stop holding.
     AssumeValid,
+    /// An `AssumeValid` after an instruction whose calls run code that may
+    /// read the legacy `arguments` of the frames of inlined calls the
+    /// instruction is in. Where those arguments are objects the code never
+    /// allocated, the runtime creates them for that code and invalidates the
+    /// code, so that the frame exits here and continues with the very objects
+    /// that code read. Escape analysis makes it an `AssumeValid` after calls
+    /// whose frame states have such objects, and removes the others (see
+    /// `Graph::legacy_arguments_guards`). Until then it is no `AssumeValid`,
+    /// so that check elimination does not rely on it.
+    AssumeLegacyArgumentsUnread,
     /// Loads binding `index` of the global declarative environment
     /// `environment`. Exits with `ExitKind::BadShape` if it is still
     /// uninitialized.
@@ -912,7 +964,8 @@ pub enum Op {
     },
     // Numbers and strings.
     /// The `Repr::Int32` of the tagged input 0, which must be an int32: a
-    /// branch on `BranchCondition::Int32Value` decides that first.
+    /// branch on `BranchCondition::Int32Value` decides that first. Of a
+    /// boolean (see `BranchCondition::Int32OrBoolean`), it is 0 or 1.
     UnboxInt32,
     /// The absolute value of the `Repr::Int32` input 0, which must not be
     /// `i32::MIN`, as a `Repr::Int32`.
@@ -949,6 +1002,13 @@ pub enum Op {
     /// `Repr::Float64`: NaN if either is NaN, and -0 below +0.
     Float64Min,
     Float64Max,
+    /// `Math.<function>` of the `Repr::Float64` inputs (two for Pow, one for
+    /// the others), as a `Repr::Float64`, through the runtime's function of
+    /// doubles for it (see `RuntimeInfo::float64_functions`), which only
+    /// computes.
+    CallFloat64Function {
+        function: Float64Function,
+    },
     /// `input 0 comparison input 1` of two `Repr::Float64` inputs, as a
     /// `Repr::Bool`: false if either is NaN, but for the inequalities.
     /// Equalities are strict and loose alike.
@@ -986,14 +1046,15 @@ pub enum Op {
     StringsEqual,
     /// The concatenation of the strings 0 and 1, or the empty value where
     /// only the slow path makes it. An empty string concatenates to the
-    /// other one; a rope string is allocated inline (see
-    /// `RopeAllocationInfo`), but for results short enough to be short
+    /// other one; a rope string is allocated inline, or by the runtime where
+    /// there is no local free cell (see `RopeAllocationInfo`), but for
+    /// results short enough to be short
     /// strings, which come from the VM's cache of fly strings (when both
     /// strings are short).
     ConcatenateStrings,
-    /// The VM's string of the `Repr::Int32` input 0, from its cache of the
-    /// strings of small non-negative integers, or the empty value if the
-    /// cache has none.
+    /// The VM's string of the `Repr::Int32` input 0, from its caches of the
+    /// strings of non-negative integers, or the empty value if they have
+    /// none.
     IntegerToString,
 
     // Arrays.
@@ -1045,6 +1106,13 @@ pub enum Op {
     /// Sets the `[[IteratedArrayLike]]` of the array iterator at the
     /// `Repr::Pointer` input 0 to `undefined`, which makes it done.
     FinishArrayIterator,
+    /// The type of the completion the generator object at the
+    /// `Repr::Pointer` input 0 resumed with, as the `Repr::Int32` that
+    /// `GetCompletionFields` writes.
+    LoadGeneratorCompletionType,
+    /// The value of the completion the generator object at the
+    /// `Repr::Pointer` input 0 resumed with, as a tagged value.
+    LoadGeneratorCompletionValue,
 
     // For-in loops.
     /// The number of keys of the property iterator cache input 0, as a
@@ -1158,6 +1226,39 @@ impl Float64UnaryOp {
     }
 }
 
+/// What `Op::CallFloat64Function` computes: the `Math` function of that
+/// name, of numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Float64Function {
+    Exp,
+    Log,
+    Sin,
+    Cos,
+    Tan,
+    Pow,
+}
+
+impl Float64Function {
+    pub fn name(self) -> &'static str {
+        match self {
+            Float64Function::Exp => "Exp",
+            Float64Function::Log => "Log",
+            Float64Function::Sin => "Sin",
+            Float64Function::Cos => "Cos",
+            Float64Function::Tan => "Tan",
+            Float64Function::Pow => "Pow",
+        }
+    }
+
+    /// How many numbers the function takes.
+    pub fn argument_count(self) -> usize {
+        match self {
+            Float64Function::Pow => 2,
+            _ => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeProperties {
     /// May need to exit to the interpreter after it returns, resuming after
@@ -1198,8 +1299,14 @@ impl Op {
                 writes: Locations::FRAME,
                 ..P::PURE
             },
+            // NB: It hands the frame's slots to the code that resumes it.
+            Op::Suspend { .. } => P {
+                reads: Locations::FRAME,
+                writes: Locations::FRAME,
+                ..P::PURE
+            },
             Op::Phi => P::PURE,
-            Op::InitializeFrame | Op::EnsureFrameInitialized | Op::PublishFrame => P {
+            Op::InitializeFrame { .. } | Op::EnsureFrameInitialized { .. } | Op::PublishFrame => P {
                 writes: Locations::FRAME,
                 ..P::PURE
             },
@@ -1218,7 +1325,7 @@ impl Op {
                 ..P::PURE
             },
             Op::IsCallable => P::PURE,
-            Op::ToBoolean => P {
+            Op::ToBoolean | Op::CallFloat64Function { .. } => P {
                 is_call: true,
                 ..P::PURE
             },
@@ -1321,7 +1428,7 @@ impl Op {
             },
             // NB: Reading everything keeps loops whose code may invalidate
             //     the code from hoisting it.
-            Op::AssumeValid => P {
+            Op::AssumeValid | Op::AssumeLegacyArgumentsUnread => P {
                 reads: Locations::ALL,
                 ..P::PURE
             },
@@ -1491,7 +1598,10 @@ impl Op {
                 allocates: true,
                 ..P::PURE
             },
-            Op::LoadArrayIteratorArray | Op::LoadArrayIteratorIndex => P {
+            Op::LoadArrayIteratorArray
+            | Op::LoadArrayIteratorIndex
+            | Op::LoadGeneratorCompletionType
+            | Op::LoadGeneratorCompletionValue => P {
                 reads: Locations::ITERATORS,
                 ..P::PURE
             },
@@ -1508,8 +1618,9 @@ impl Op {
             Op::LoadSlot { .. } => "LoadSlot",
             Op::StoreSlot { .. } => "StoreSlot",
             Op::Phi => "Phi",
-            Op::InitializeFrame => "InitializeFrame",
-            Op::EnsureFrameInitialized => "EnsureFrameInitialized",
+            Op::InitializeFrame { .. } => "InitializeFrame",
+            Op::EnsureFrameInitialized { .. } => "EnsureFrameInitialized",
+            Op::Suspend { .. } => "Suspend",
             Op::PublishFrame => "PublishFrame",
             Op::BoxCell => "BoxCell",
             Op::LoadOuterEnvironment => "LoadOuterEnvironment",
@@ -1571,6 +1682,7 @@ impl Op {
             Op::CheckShape { .. } => "CheckShape",
             Op::CheckPrototypeChainValid { .. } => "CheckPrototypeChainValid",
             Op::AssumeValid => "AssumeValid",
+            Op::AssumeLegacyArgumentsUnread => "AssumeLegacyArgumentsUnread",
             Op::HasInPrototypeChain => "HasInPrototypeChain",
             Op::LoadGlobalBinding { .. } => "LoadGlobalBinding",
             Op::StoreGlobalBinding { .. } => "StoreGlobalBinding",
@@ -1602,6 +1714,7 @@ impl Op {
             Op::Float64Binary { .. } => "Float64Binary",
             Op::Float64Min => "Float64Min",
             Op::Float64Max => "Float64Max",
+            Op::CallFloat64Function { .. } => "CallFloat64Function",
             Op::Float64Compare { .. } => "Float64Compare",
             Op::Float64ToInt32 => "Float64ToInt32",
             Op::Float64ToUint8Clamped => "Float64ToUint8Clamped",
@@ -1622,6 +1735,8 @@ impl Op {
             Op::OpenArrayIteration => "OpenArrayIteration",
             Op::LoadArrayIteratorArray => "LoadArrayIteratorArray",
             Op::LoadArrayIteratorIndex => "LoadArrayIteratorIndex",
+            Op::LoadGeneratorCompletionType => "LoadGeneratorCompletionType",
+            Op::LoadGeneratorCompletionValue => "LoadGeneratorCompletionValue",
             Op::StoreArrayIteratorIndex => "StoreArrayIteratorIndex",
             Op::FinishArrayIterator => "FinishArrayIterator",
             Op::SlowPathOutput { .. } => "SlowPathOutput",
@@ -1691,7 +1806,7 @@ impl Op {
             Op::CheckArray => Some(ExitKind::BadType),
             Op::CheckNonNegativeInt32 => Some(ExitKind::Overflow),
             Op::CheckNumber | Op::CheckIdentityComparable | Op::HasInPrototypeChain => Some(ExitKind::BadType),
-            Op::AssumeValid => Some(ExitKind::Invalidated),
+            Op::AssumeValid | Op::AssumeLegacyArgumentsUnread => Some(ExitKind::Invalidated),
             Op::Int32Binary { op } if op.int32_can_overflow() => Some(ExitKind::Overflow),
             Op::CheckValue { kind, .. } => Some(*kind),
             Op::LoadArgument { .. } | Op::SliceArguments => Some(ExitKind::ArgumentsIndex),
@@ -1912,8 +2027,10 @@ pub struct Graph {
     /// them, take at once. Compiled code checks at entry that they fit.
     pub materialized_frame_bytes: u64,
     /// On-stack replacement entries: blocks without predecessors where code
-    /// already running in the interpreter enters compiled code, with the pc of
-    /// the loop back edge each one starts at. The frame holds every value.
+    /// already running in the interpreter enters compiled code, with the pc
+    /// each one starts at: a loop back edge, the continuation of a generator,
+    /// or the instruction after the `Catch` of an exception handler. The frame
+    /// holds every value.
     pub osr_entries: Vec<(u32, BlockId)>,
     /// The pcs of the loop back edges in the loops of the on-stack
     /// replacement entries (including those of the entries), from where a
@@ -1923,6 +2040,10 @@ pub struct Graph {
     /// on-stack replacement entries, from where a frame running in the
     /// interpreter may reach an entry on a later iteration.
     pub osr_outer_loop_back_edges: Vec<u32>,
+    /// The pcs of the `Catch` of the exception handlers that got no catch
+    /// entry because they never caught an exception before the compile (see
+    /// `builder::osr`). A compile after they caught gives them one.
+    pub uncaught_handlers: Vec<u32>,
     /// The register-saving `CallSlowPath` nodes that may run before the
     /// frame is initialized, and so initialize it first if it is not.
     pub slow_paths_initializing_frame: Vec<NodeId>,
@@ -1936,6 +2057,9 @@ pub struct Graph {
     /// The argument slots of the compiled function that its legacy
     /// `arguments` shows. Empty for functions without legacy `arguments`.
     pub legacy_arguments: core::ops::Range<u32>,
+    /// The `AssumeLegacyArgumentsUnread` nodes, each with the nodes of its
+    /// instruction that run code.
+    pub legacy_arguments_guards: Vec<(NodeId, Vec<NodeId>)>,
 }
 
 impl Graph {
@@ -2018,7 +2142,10 @@ impl Graph {
         )
     }
 
-    pub fn legacy_argument_values_read_by(&self, node: NodeId) -> Vec<NodeId> {
+    /// The values that code `node` runs may read through the legacy
+    /// `arguments` of the frames of its frame state chain for which
+    /// `frames` holds.
+    pub fn legacy_argument_values_read_by(&self, node: NodeId, frames: impl Fn(&FrameState) -> bool) -> Vec<NodeId> {
         let data = self.node(node);
         let Some(frame_state) = data.frame_state.filter(|_| data.op.properties().runs_code) else {
             return Vec::new();
@@ -2026,6 +2153,9 @@ impl Graph {
         let mut values = Vec::new();
         for id in self.frame_state_chain(frame_state) {
             let frame_state = self.frame_state(id);
+            if !frames(frame_state) {
+                continue;
+            }
             for (slot, value) in &frame_state.values {
                 if frame_state.legacy_arguments.contains(slot) {
                     values.push(*value);
@@ -2033,6 +2163,16 @@ impl Graph {
             }
         }
         values
+    }
+
+    /// Whether code that `node` runs may read objects the code never
+    /// allocated through the legacy `arguments` of the frames of its frame
+    /// state chain, which the runtime then creates from the values of the
+    /// node's site (see `Op::AssumeLegacyArgumentsUnread`).
+    pub fn defers_legacy_argument_objects(&self, node: NodeId) -> bool {
+        self.legacy_argument_values_read_by(node, |_| true)
+            .into_iter()
+            .any(|value| matches!(self.node(value).op, Op::VirtualObject { .. }))
     }
 
     /// The values of every frame of a frame state chain, innermost frame first.
@@ -2252,13 +2392,19 @@ mod tests {
         let mut graph = Graph::default();
         let value = graph.add_node(Node::new(Op::Constant(value::UNDEFINED), vec![], Some(Repr::Tagged), 0));
         let inner = graph.add_node(Node::new(
-            Op::VirtualObject { shape: CellId(1) },
+            Op::VirtualObject {
+                shape: CellId(1),
+                allocation: NodeId(0),
+            },
             vec![value],
             Some(Repr::Tagged),
             0,
         ));
         let outer = graph.add_node(Node::new(
-            Op::VirtualObject { shape: CellId(2) },
+            Op::VirtualObject {
+                shape: CellId(2),
+                allocation: NodeId(1),
+            },
             vec![inner, value],
             Some(Repr::Tagged),
             0,

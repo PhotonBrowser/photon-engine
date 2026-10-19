@@ -15,8 +15,8 @@ use libjs_abi::value as nan_box;
 use libjs_jit::bytecode::OpCode;
 use libjs_jit::codegen::slow_path_symbol;
 use libjs_jit::snapshot::{
-    CellId, DynamicCallLayout, HelperCallAddresses, IntrinsicHelpers, RuntimeInfo, RuntimeLayout, RuntimeOffsets,
-    TypeofStrings,
+    CellId, DynamicCallLayout, Float64FunctionAddresses, HelperCallAddresses, IntrinsicHelpers, RuntimeInfo,
+    RuntimeLayout, RuntimeOffsets, TypeofStrings,
 };
 
 use super::allocation::{AllocationInfos, FUNCTION_ENVIRONMENT_FREE_LIST_COUNT};
@@ -29,7 +29,9 @@ use crate::bytecode::executable::{
 };
 use crate::gc::class::{Class, GcCell};
 use crate::interpreter::runtime_functions::runtime_function_addresses;
-use crate::interpreter::vm::{FLY_STRING_CACHE_SIZE, NUMERIC_STRING_CACHE_SIZE, Vm};
+use crate::interpreter::vm::{
+    FLY_STRING_CACHE_SIZE, LARGE_NUMERIC_STRING_CACHE_SIZE, NUMERIC_STRING_CACHE_SIZE, NumericStringCacheEntry, Vm,
+};
 use crate::layout::accessor::Accessor;
 use crate::layout::cell::Gc;
 use crate::layout::environment::{
@@ -62,6 +64,7 @@ use crate::runtime::array_iterator::ArrayIterator;
 use crate::runtime::function_environment::{
     FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET, FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET,
 };
+use crate::runtime::generator_object::GeneratorObject;
 use crate::runtime::module_environment::ModuleEnvironment;
 use crate::runtime::object::{ObjectMethods, PropertyKind};
 
@@ -220,12 +223,23 @@ fn runtime_layout() -> RuntimeLayout {
         builtin_math_ceil: Builtin::MathCeil as u8,
         builtin_math_round: Builtin::MathRound as u8,
         builtin_math_sqrt: Builtin::MathSqrt as u8,
+        builtin_math_exp: Builtin::MathExp as u8,
+        builtin_math_log: Builtin::MathLog as u8,
+        builtin_math_sin: Builtin::MathSin as u8,
+        builtin_math_cos: Builtin::MathCos as u8,
+        builtin_math_tan: Builtin::MathTan as u8,
+        builtin_math_pow: Builtin::MathPow as u8,
         // NB: Filled in by runtime_info().
         typeof_strings: TypeofStrings::default(),
         fly_string_cache: 0,
         fly_string_cache_mask: (FLY_STRING_CACHE_SIZE - 1) as u32,
         numeric_string_cache: 0,
         numeric_string_cache_size: NUMERIC_STRING_CACHE_SIZE as u32,
+        large_numeric_string_cache: 0,
+        large_numeric_string_cache_mask: (LARGE_NUMERIC_STRING_CACHE_SIZE - 1) as u32,
+        large_numeric_string_cache_entry_size: size_of::<NumericStringCacheEntry>() as u32,
+        large_numeric_string_cache_number: offset(offset_of!(NumericStringCacheEntry, number)),
+        large_numeric_string_cache_string: offset(offset_of!(NumericStringCacheEntry, string)),
         environment_outer: offset(offset_of!(Environment, outer)),
         environment_declarative: offset(offset_of!(Environment, declarative)),
         module_environment_class: core::ptr::from_ref(ModuleEnvironment::CLASS) as u64,
@@ -234,6 +248,9 @@ fn runtime_layout() -> RuntimeLayout {
         array_iterator_index: offset(offset_of!(ArrayIterator, index)),
         array_iterator_kind: offset(offset_of!(ArrayIterator, iteration_kind)),
         array_iterator_kind_value: PropertyKind::Value as u8,
+        generator_object_class: core::ptr::from_ref(GeneratorObject::CLASS) as u64,
+        generator_object_pending_completion_value: offset(offset_of!(GeneratorObject, pending_completion_value)),
+        generator_object_pending_completion_type: offset(offset_of!(GeneratorObject, pending_completion_type)),
         declarative_environment_binding_values_size: offset(offset_of!(DeclarativeEnvironment, binding_values.size)),
         declarative_environment_binding_values_capacity: offset(offset_of!(
             DeclarativeEnvironment,
@@ -344,6 +361,11 @@ fn runtime_layout() -> RuntimeLayout {
     }
 }
 
+const _: () = assert!(
+    libjs_jit::bytecode::NO_YIELD_CONTINUATION
+        == crate::layout::execution_context::ExecutionContext::NO_YIELD_CONTINUATION
+);
+
 // NB: The compiler has its own copy of the bits of the interpreter's feedback.
 const _: () = {
     assert!(libjs_jit::snapshot::value_feedback::INT32 == crate::layout::feedback::value_feedback::INT32);
@@ -356,6 +378,7 @@ const _: () = {
     assert!(libjs_jit::snapshot::arith_feedback::BIG_INT == crate::layout::feedback::arith_feedback::BIG_INT);
     assert!(libjs_jit::snapshot::arith_feedback::OTHER == crate::layout::feedback::arith_feedback::OTHER);
     assert!(libjs_jit::snapshot::arith_feedback::OBJECT_PAIR == crate::layout::feedback::arith_feedback::OBJECT_PAIR);
+    assert!(libjs_jit::snapshot::arith_feedback::BOOLEAN == crate::layout::feedback::arith_feedback::BOOLEAN);
     assert!(
         libjs_jit::snapshot::call_feedback_flags::POLYMORPHIC
             == crate::layout::feedback::call_feedback_flags::POLYMORPHIC
@@ -426,6 +449,7 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
     layout.single_ascii_character_strings = vm.single_ascii_character_strings_address();
     layout.fly_string_cache = vm.fly_string_cache().as_ptr().expose_provenance() as u64;
     layout.numeric_string_cache = vm.numeric_string_cache().as_ptr().expose_provenance() as u64;
+    layout.large_numeric_string_cache = vm.large_numeric_string_cache().as_ptr().expose_provenance() as u64;
     let strings = vm.cached_strings();
     let string = |string| Value::from_string(string).0;
     layout.typeof_strings = TypeofStrings {
@@ -462,6 +486,7 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
         to_boolean: addresses.to_boolean,
         primitive_to_string: super::calls::libjs_jit_primitive_to_string as *const () as u64,
         helper_calls: HelperCallAddresses(super::helper_calls::address),
+        float64_functions: Float64FunctionAddresses(super::calls::float64_function_address),
         to_object: super::calls::libjs_jit_to_object as *const () as u64,
         array_create: super::calls::libjs_jit_array_create as *const () as u64,
         intrinsic_helpers: IntrinsicHelpers {

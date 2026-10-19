@@ -10,7 +10,7 @@ use core::ptr::NonNull;
 
 use libjs_jit::code::CompiledCode;
 
-use super::code::{CompileState, EntryStatus, JitCode, SnapshotExecutable};
+use super::code::{CompileState, JitCode, SnapshotExecutable};
 use super::compile_queue::CompileResult;
 use super::executable_memory::ExecutableMemory;
 use super::snapshot::capture_snapshot;
@@ -22,11 +22,9 @@ use crate::jit::InterpreterTier;
 use crate::jit::options::Options;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::function_object::EcmascriptFunctionObject;
-use crate::layout::value::Value;
 use crate::runtime::ecmascript_function_object::as_ecmascript_function_object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::realm_watchpoints;
-use crate::runtime::shared_function_instance_data::FunctionKind;
 
 /// `threshold` invocations.
 fn threshold_budget(options: &Options) -> i32 {
@@ -113,9 +111,11 @@ fn function_to_compile(vm: &Vm) -> Option<Gc<EcmascriptFunctionObject>> {
     if vm.debugging_enabled() {
         return None;
     }
-    // NB: Generators and async functions resume in the middle, and top-level code runs once.
+    // NB: Top-level code runs once, like the body of a module with top-level await, which runs as an async function.
+    //     Generators, async functions and async generators resume in their code at the entries of their
+    //     continuations.
     let function = as_ecmascript_function_object(vm.running_execution_context_ref().function.get()?)?;
-    (function.kind() == FunctionKind::Normal).then_some(function)
+    (!function.shared_data().is_module_wrapper()).then_some(function)
 }
 
 /// Whether the running frame runs a builtin written in JavaScript.
@@ -263,18 +263,7 @@ pub fn tier_up_check(vm: &Vm, encoded_pc: u64) -> i64 {
         }
         return 0;
     };
-    match result.status {
-        EntryStatus::Returned => {
-            // NB: Like the interpreter's Return, a frame without a caller, or whose caller waits in native code,
-            //     returns from the interpreter.
-            let frame = vm.running_execution_context_ref();
-            let exits_interpreter = frame.caller_frame.get().is_null() || frame.returns_to_native_caller.get();
-            vm.return_from_running_frame(Value(result.value));
-            if exits_interpreter { -1 } else { 1 }
-        }
-        EntryStatus::Resume => 1,
-        EntryStatus::ExitInterpreter => -1,
-    }
+    super::entry_exit::control_after_entry(vm, result)
 }
 
 /// Whether the code of a finished compile goes into executable memory. Code whose dependencies stopped holding since
@@ -314,13 +303,15 @@ fn install(
         snapshot,
     )
     .with_invalidation(id, compiled.invalidation_patches)
-    .with_osr_outer_loop_back_edges(compiled.osr_outer_loop_back_edges);
+    .with_frame_offsets(compiled.site_index_frame_offset, compiled.register_dump_frame_offset)
+    .with_osr_outer_loop_back_edges(compiled.osr_outer_loop_back_edges)
+    .with_uncaught_handlers(compiled.uncaught_handlers);
     vm.jit.dependents.register(vm, executable, id, &compiled.dependencies);
     // NB: Code may be installed while frames of the executable loop in the interpreter, because the compile was
     //     queued (from the tier-up check of another executable, like a callee's), or because they exited from the
     //     code before. Those frames keep counting, so that they continue in the code at its on-stack replacement
     //     entry rather than run in the interpreter until they return.
-    executable.install_jit_code(Box::new(code), compile_wait_budget(&vm.jit.options));
+    executable.install_jit_code(vm, Box::new(code), compile_wait_budget(&vm.jit.options));
 }
 
 type SnapshotExecutables = Vec<SnapshotExecutable>;
@@ -420,7 +411,7 @@ fn compile(
 /// Compiles the executable of `function` right away, from the feedback it has, unless it has code, is being compiled or
 /// is never compiled. Returns whether it has code afterwards. For tests (see `jit::testing`).
 pub fn compile_now(vm: &Vm, function: Gc<EcmascriptFunctionObject>) -> bool {
-    if !vm.jit.options.enabled || vm.debugging_enabled() || function.kind() != FunctionKind::Normal {
+    if !vm.jit.options.enabled || vm.debugging_enabled() {
         return false;
     }
     let executable = function.compiled_executable(vm);

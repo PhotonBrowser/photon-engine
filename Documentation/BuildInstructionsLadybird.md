@@ -9,7 +9,7 @@ Qt6.10+ development packages, nasm, additional build tools, and a C++23 capable 
 
 A Rust toolchain is also required. You can install it via [rustup](https://rustup.rs/).
 
-We currently use gcc-14 and clang-21 in our CI pipeline. If these versions are not available on your system, see
+We currently use gcc-16 and clang-22 in our CI pipeline. If these versions are not available on your system, see
 [`find_compiler.py`](../Meta/Utils/find_compiler.py) for the minimum compatible version.
 
 CMake 3.30 or newer must be available in $PATH.
@@ -20,7 +20,7 @@ CMake 3.30 or newer must be available in $PATH.
 
 <!-- Note: If you change something here, please also change it in the `devcontainer/devcontainer.json` file. -->
 ```bash
-sudo apt install autoconf autoconf-archive automake build-essential ccache cmake curl fonts-liberation2 git glslang-tools libdrm-dev libgl1-mesa-dev libncurses-dev libpulse-dev libtool nasm ninja-build pkg-config python3-venv qt6-base-private-dev qt6-positioning-dev qt6-tools-dev-tools qt6-wayland tar unzip zip
+sudo apt install autoconf autoconf-archive automake build-essential ccache cmake curl fonts-liberation2 git glslang-tools libdrm-dev libgl1-mesa-dev libncurses-dev libpulse-dev libtool libxcb-icccm4-dev nasm ninja-build pkg-config python3-venv qt6-base-private-dev qt6-positioning-dev qt6-tools-dev-tools qt6-wayland tar unzip zip
 ```
 
 #### CMake 3.30 or newer:
@@ -54,35 +54,35 @@ sudo wget -O /usr/share/keyrings/llvm-snapshot.gpg.key https://apt.llvm.org/llvm
 # Optional: Verify the GPG key manually
 
 # Use the key to authorize an entry for apt.llvm.org in apt sources list
-echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg.key] https://apt.llvm.org/$(lsb_release -sc)/ llvm-toolchain-$(lsb_release -sc)-21 main" | sudo tee -a /etc/apt/sources.list.d/llvm.list
+echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg.key] https://apt.llvm.org/$(lsb_release -sc)/ llvm-toolchain-$(lsb_release -sc)-22 main" | sudo tee -a /etc/apt/sources.list.d/llvm.list
 
 # Update apt package list and install clang and associated packages
-sudo apt update -y && sudo apt install clang-21 clangd-21 clang-tools-21 clang-format-21 clang-tidy-21 lld-21 -y
+sudo apt update -y && sudo apt install clang-22 clangd-22 clang-tools-22 clang-format-22 clang-tidy-22 lld-22 -y
 ```
 
 - Alternative: Install gcc from [Ubuntu Toolchain PPA](https://launchpad.net/~ubuntu-toolchain-r/+archive/ubuntu/test):
 
 ```bash
 sudo add-apt-repository ppa:ubuntu-toolchain-r/test
-sudo apt update && sudo apt install g++-14 libstdc++-14-dev
+sudo apt update && sudo apt install g++-16 libstdc++-16-dev
 ```
 
 ### Arch Linux/Manjaro:
 
 ```
-sudo pacman -S --needed autoconf-archive base-devel ccache cmake curl git less libgl libpulse nasm ninja python qt6-base qt6-positioning qt6-tools ttf-liberation tar unzip zip
+sudo pacman -S --needed autoconf-archive base-devel ccache cmake curl git less libgl libpulse nasm ninja python qt6-base qt6-positioning qt6-tools ttf-liberation tar unzip xcb-util-wm zip
 ```
 
 ### Fedora or derivatives:
 
 ```
-sudo dnf install autoconf-archive automake ccache cmake curl git glslang libdrm-devel liberation-sans-fonts libglvnd-devel libtool nasm ncurses-devel ninja-build patchelf perl-FindBin perl-IPC-Cmd perl-lib perl-Time-Piece pulseaudio-libs-devel qt6-qtbase-private-devel qt6-qtpositioning-devel qt6-qttools-devel qt6-qtwayland-devel tar unzip zip zlib-ng-compat-static
+sudo dnf install autoconf-archive automake ccache cmake curl git glslang libdrm-devel liberation-sans-fonts libglvnd-devel libtool nasm ncurses-devel ninja-build patchelf perl-FindBin perl-IPC-Cmd perl-lib perl-Time-Piece pulseaudio-libs-devel qt6-qtbase-private-devel qt6-qtpositioning-devel qt6-qttools-devel qt6-qtwayland-devel tar unzip xcb-util-wm-devel zip zlib-ng-compat-static
 ```
 
 ### openSUSE:
 
 ```
-sudo zypper install autoconf-archive automake ccache cmake curl gcc14 gcc14-c++ git liberation-fonts libglvnd-devel libpulse-devel libtool nasm ncurses-devel ninja qt6-base-private-devel qt6-positioning-devel qt6-tools-devel qt6-wayland-devel tar unzip zip
+sudo zypper install autoconf-archive automake ccache cmake curl gcc16 gcc16-c++ git liberation-fonts libglvnd-devel libpulse-devel libtool nasm ncurses-devel ninja qt6-base-private-devel qt6-positioning-devel qt6-tools-devel qt6-wayland-devel tar unzip xcb-util-wm-devel zip
 ```
 
 If one or more of the base repository packages are flagged as having an out-of-date version during the build process, you may need add the `devel:tools:building` repository. For example, on Leap 15.6, the `autoconf` package might be version 2.69, whereas the `gperf` package requires 2.70 to build.
@@ -122,7 +122,7 @@ This virtual environment can be created once and reused in future shell sessions
 
 ```
 sudo xbps-install -Su # (optional) ensure packages are up to date to avoid "Transaction aborted due to unresolved dependencies."
-sudo xbps-install -S git bash gcc python3 curl cmake libtool zip unzip linux-headers make pkg-config autoconf automake autoconf-archive nasm ncurses-devel MesaLib-devel ninja pulseaudio-devel qt6-base-private-devel qt6-position-devel qt6-tools-devel qt6-wayland-devel
+sudo xbps-install -S git bash gcc python3 curl cmake libtool zip unzip linux-headers make pkg-config autoconf automake autoconf-archive nasm ncurses-devel MesaLib-devel ninja pulseaudio-devel qt6-base-private-devel qt6-position-devel qt6-tools-devel qt6-wayland-devel xcb-util-wm-devel
 ```
 
 ### NixOS or with Nix:
@@ -142,7 +142,7 @@ brew install autoconf autoconf-archive automake ccache cmake libtool nasm ninja 
 
 If you wish to use clang from homebrew instead:
 ```
-brew install llvm@21
+brew install llvm@22
 ```
 
 > [!NOTE]

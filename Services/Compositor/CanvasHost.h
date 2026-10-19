@@ -50,7 +50,7 @@ public:
     CanvasHost(RefPtr<Gfx::SkiaBackendContext>, Compositing::CanvasSurfaceRegistry&);
     ~CanvasHost();
 
-    Optional<Compositing::CanvasId> create_2d_context(Gfx::IntSize, bool alpha);
+    bool create_2d_context(Compositing::CanvasId, Gfx::IntSize, bool alpha);
     CreateWebGLContextResult create_webgl_context(Compositing::WebGL::WebGLVersion, Gfx::IntSize, bool depth, bool stencil, bool antialias);
     void destroy_context(Compositing::CanvasId);
     bool has_context(Compositing::CanvasId) const;
@@ -62,6 +62,8 @@ public:
     ErrorOr<ByteBuffer> execute_webgl_sync_call(Compositing::CanvasId, ByteBuffer request);
     Compositing::WebGL::ReadPixelsResult webgl_read_pixels_robust_angle(Compositing::CanvasId, Compositing::WebGL::GLint x, Compositing::WebGL::GLint y, Compositing::WebGL::GLsizei width, Compositing::WebGL::GLsizei height, Compositing::WebGL::GLenum format, Compositing::WebGL::GLenum type, Compositing::WebGL::GLsizei buf_size, Core::AnonymousBuffer pixels);
     bool webgl_read_buffer_sub_data(Compositing::CanvasId, Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer data);
+
+    Compositing::CanvasSurfaceOwnerId canvas_surface_owner_id() const { return m_canvas_surface_owner_id; }
 
     void present_webgl_canvas(Compositing::CanvasId, bool preserve_drawing_buffer);
     void clear_webgl_drawing_buffer(Compositing::CanvasId);
@@ -86,6 +88,7 @@ private:
 
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
     Compositing::CanvasSurfaceRegistry& m_canvas_surface_registry;
+    Compositing::CanvasSurfaceOwnerId m_canvas_surface_owner_id;
     HashMap<Compositing::CanvasId, Context> m_contexts;
     Compositing::DisplayListResourceStorage m_text_resources;
     DisplayListRasterCache m_text_blobs;

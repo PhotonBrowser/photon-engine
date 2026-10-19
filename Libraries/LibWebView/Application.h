@@ -15,6 +15,7 @@
 #include <AK/NonnullRawPtr.h>
 #include <AK/Optional.h>
 #include <AK/Variant.h>
+#include <LibCompositing/Forward.h>
 #include <LibCompositing/Types.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
@@ -39,6 +40,7 @@
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 #include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
+#include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/BlobURLStore.h>
@@ -131,6 +133,7 @@ public:
     virtual bool supports_content_blocking_controls() const { return false; }
     virtual bool supports_private_browsing_windows() const { return false; }
     virtual bool supports_client_side_window_decorations() const { return false; }
+    virtual bool supports_picture_in_picture() const;
     // Returns true if the platform sends momentum scroll events after a touchpad flick.
     // If it does not, the compositor makes the fling.
     virtual bool platform_reports_scroll_momentum() const { return true; }
@@ -139,8 +142,18 @@ public:
     virtual bool platform_scrolls_elastically() const { return false; }
     void set_scrolls_elastically(bool);
 
+    // The languages the user prefers, as the platform lists them (BCP 47 tags, most preferred first).
+    virtual Vector<String> platform_preferred_languages() const { return {}; }
+
+    virtual OwnPtr<PictureInPictureWindow> create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable&, Gfx::IntSize video_size);
+
     void appearance_changed(Badge<ApplicationSettingsObserver>);
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
+    void languages_changed(Badge<ApplicationSettingsObserver>);
+
+    // The spoofing choices in effect: what every page and worker reports from its navigator.
+    String user_agent_string() const;
+    Web::NavigatorCompatibilityMode navigator_compatibility_mode() const;
 
     static BookmarkStore& bookmark_store() { return *the().m_bookmark_store; }
     void update_bookmark_action_for_current_web_view();
@@ -248,8 +261,8 @@ public:
     ErrorOr<IPC::TransportHandle> connect_new_compositor_canvas_client();
     void register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
     ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
-    void update_compositor_viewport(Web::CompositorContextId, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
-    void update_compositor_paused_debugger_overlay(Web::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action);
+    void update_compositor_viewport(Web::CompositorContextId, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
+    void update_compositor_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays const&);
     void update_compositor_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void update_compositor_context_visibility(Web::CompositorContextId, Web::HTML::VisibilityState);
     bool handle_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&);
@@ -373,6 +386,7 @@ public:
 
     Menu& bookmarks_menu() { return *m_bookmarks_menu; }
     void toggle_bookmark_for_view(ViewImplementation&);
+    Action& toggle_bookmark_bar_action() { return *m_toggle_bookmark_bar_action; }
 
     Menu& history_menu() { return *m_history_menu; }
 
@@ -692,6 +706,10 @@ private:
     RefPtr<Menu> m_bookmarks_menu;
     RefPtr<Action> m_toggle_bookmark_action;
     RefPtr<Action> m_toggle_bookmark_bar_action;
+    RefPtr<Menu> m_show_bookmarks_bar_menu;
+    RefPtr<Action> m_show_bookmarks_bar_always_action;
+    RefPtr<Action> m_show_bookmarks_bar_never_action;
+    RefPtr<Action> m_show_bookmarks_bar_on_hover_action;
     size_t m_bookmarks_menu_static_size { 0 };
 
     RefPtr<Menu> m_history_menu;

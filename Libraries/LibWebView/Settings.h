@@ -11,6 +11,8 @@
 #include <AK/HashTable.h>
 #include <AK/JsonValue.h>
 #include <AK/Optional.h>
+#include <LibGfx/Point.h>
+#include <LibGfx/Size.h>
 #include <LibHTTP/Cache/DiskCacheSettings.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/HTML/AutoplayPolicy.h>
@@ -22,9 +24,21 @@
 
 namespace WebView {
 
+struct WindowSettings {
+    Optional<Gfx::IntPoint> position;
+    Gfx::IntSize size { 1200, 900 };
+    bool maximized { false };
+};
+
+enum class ShowBookmarksBar : u8 {
+    Always,
+    Never,
+    OnHover,
+};
+
 struct Appearance {
     bool show_menu_bar { false };
-    bool show_bookmarks_bar { true };
+    ShowBookmarksBar show_bookmarks_bar { ShowBookmarksBar::Always };
 };
 
 struct ContentSettings {
@@ -136,12 +150,17 @@ class WEBVIEW_API Settings {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    static Settings create(ByteString settings_path);
+    // The platform's languages stand in for the user's list until the settings file carries one.
+    static Settings create(ByteString settings_path, Vector<String> platform_languages = {});
 
     JsonValue serialize_json() const;
 
     bool first_run_complete() const { return m_first_run_complete; }
     ErrorOr<void> complete_first_run();
+
+    static WindowSettings parse_window_settings(JsonValue const&);
+    WindowSettings const& window_settings() const { return m_window_settings; }
+    void set_window_settings(WindowSettings);
 
     URL::URL const& new_tab_page_url() const { return m_new_tab_page_url; }
     void set_new_tab_page_url(URL::URL);
@@ -251,8 +270,10 @@ private:
     void persist_settings();
 
     ByteString m_settings_path;
-
     bool m_first_run_complete { false };
+
+    WindowSettings m_window_settings;
+
     URL::URL m_new_tab_page_url;
     Vector<String> m_languages;
 

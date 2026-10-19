@@ -9,7 +9,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/HashMap.h>
 #include <AK/Platform.h>
 #include <AK/StdLibExtras.h>
 #include <AK/TypeCasts.h>
@@ -26,7 +25,6 @@
 #if defined(AK_OS_MACOS)
 #    include <UI/Qt/MacWindow.h>
 #endif
-#include <UI/Qt/Settings.h>
 #include <UI/Qt/TabBar.h>
 #include <UI/Qt/WebContentView.h>
 #include <UI/Qt/WindowControlButton.h>
@@ -62,39 +60,8 @@ static constexpr int WINDOW_RESIZE_BORDER_WIDTH = 6;
 static constexpr int WINDOW_RESIZE_CORNER_WIDTH = WINDOW_RESIZE_BORDER_WIDTH * 2;
 #if defined(AK_OS_MACOS)
 static constexpr int NATIVE_WINDOW_CONTROL_X_OFFSET = 6;
-static constexpr int NATIVE_WINDOW_CONTROL_Y_OFFSET = 6;
+static constexpr int NATIVE_WINDOW_CONTROL_Y_OFFSET = 4;
 #endif
-
-static bool should_use_screen_signal_for_dpi_changes()
-{
-    return QGuiApplication::platformName() != "wayland";
-}
-
-#if !defined(AK_OS_MACOS)
-static Optional<u64> display_id_for_screen(QScreen* screen)
-{
-    if (!screen)
-        return {};
-
-    // Qt does not expose a portable physical display identifier. Away from macOS the compositor only needs a
-    // stable per-process grouping key for Qt-backed windows.
-    static u64 next_display_id = 1;
-    static HashMap<QScreen*, u64> display_ids;
-    return display_ids.ensure(screen, [] {
-        return next_display_id++;
-    });
-}
-#endif
-
-static Optional<u64> display_id_for_window([[maybe_unused]] QWidget& window, [[maybe_unused]] QScreen* screen)
-{
-#if defined(AK_OS_MACOS)
-    // The compositor drives a CVDisplayLink per display, which needs the CGDirectDisplayID of the window's screen.
-    return appkit_display_id_for_window(window);
-#else
-    return display_id_for_screen(screen);
-#endif
-}
 
 static int visible_browser_window_count()
 {
@@ -247,19 +214,17 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
 
     update_tabs_display();
 
-    // Listen for DPI changes
-    m_device_pixel_ratio = devicePixelRatio();
-    m_current_screen = screen();
-    m_display_id = display_id_for_window(*this, m_current_screen);
-    if (m_current_screen)
-        m_refresh_rate = m_current_screen->refreshRate();
-
-    if (should_use_screen_signal_for_dpi_changes()) {
-        setAttribute(Qt::WA_NativeWindow);
-        setAttribute(Qt::WA_DontCreateNativeAncestors);
-    }
-    connect_screen_signals(m_current_screen);
-    connect_window_screen_changed_signal();
+    m_screen_observer = new WindowScreenObserver(*this);
+    m_screen_observer->on_device_pixel_ratio_change = [this] {
+        for_each_tab([this](auto& tab) {
+            tab.view().set_device_pixel_ratio(m_screen_observer->device_pixel_ratio());
+        });
+    };
+    m_screen_observer->on_display_metadata_change = [this] {
+        for_each_tab([this](auto& tab) {
+            tab.view().set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate());
+        });
+    };
 
     initialize_application_actions();
     initialize_application_menu();
@@ -279,7 +244,9 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
         set_current_tab(tab);
         if (tab) {
             QWidget* focus_widget = &tab->view();
-            if (auto* tab_focus_widget = tab->focusWidget(); tab_focus_widget && tab->isAncestorOf(tab_focus_widget))
+            if (auto* location_edit = tab->location_edit_with_parked_editing())
+                focus_widget = location_edit;
+            else if (auto* tab_focus_widget = tab->focusWidget(); tab_focus_widget && tab->isAncestorOf(tab_focus_widget))
                 focus_widget = tab_focus_widget;
 #if defined(AK_OS_MACOS)
             make_appkit_window_first_responder(*focus_widget);
@@ -344,8 +311,9 @@ void BrowserWindow::initialize_application_actions()
     addAction(application.open_next_tab_action());
     addAction(application.open_previous_tab_action());
     addAction(application.open_file_action());
-    addAction(application.open_downloads_action());
     addAction(application.open_settings_action());
+    addAction(application.open_downloads_action());
+    addAction(application.toggle_bookmark_bar_action());
     addAction(application.find_in_page_action());
     addAction(application.zoom_in_action());
     addAction(application.zoom_out_action());
@@ -605,6 +573,12 @@ void BrowserWindow::initialize_tab(Tab* tab)
     QObject::connect(tab, &Tab::title_changed, this, &BrowserWindow::tab_title_changed);
     QObject::connect(tab, &Tab::favicon_changed, this, &BrowserWindow::tab_favicon_changed);
     QObject::connect(tab, &Tab::audio_play_state_changed, this, &BrowserWindow::tab_audio_play_state_changed);
+    QObject::connect(tab, &Tab::loading_changed, this, [this] {
+        m_tabs_container->tab_bar()->update_loading_swirl_animation();
+    });
+    QObject::connect(tab, &Tab::loading_finished, this, [this, tab] {
+        m_tabs_container->tab_bar()->play_load_sheen(*tab);
+    });
 
     QObject::connect(&tab->view(), &WebContentView::urls_dropped, this, [this](auto& urls) {
         VERIFY(urls.size());
@@ -676,8 +650,8 @@ void BrowserWindow::adopt_tab(Tab& tab, int index)
         }
     }
 
-    tab.view().set_device_pixel_ratio(m_device_pixel_ratio);
-    tab.view().set_display_metadata(m_display_id, m_refresh_rate);
+    tab.view().set_device_pixel_ratio(m_screen_observer->device_pixel_ratio());
+    tab.view().set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate());
 
     m_tabs_container->set_current_tab(&tab);
 }
@@ -856,91 +830,6 @@ void BrowserWindow::request_to_close_current_tab()
 int BrowserWindow::tab_index(Tab* tab)
 {
     return m_tabs_container->index_of(tab);
-}
-
-void BrowserWindow::device_pixel_ratio_changed(qreal dpi)
-{
-    m_device_pixel_ratio = dpi;
-    for_each_tab([this](auto& tab) {
-        tab.view().set_device_pixel_ratio(m_device_pixel_ratio);
-    });
-}
-
-bool BrowserWindow::connect_window_screen_changed_signal()
-{
-    auto* window = windowHandle();
-    if (!window)
-        return false;
-    if (m_window_screen_changed_signal_window == window)
-        return true;
-
-    disconnect_window_screen_changed_signal();
-
-    m_window_screen_changed_signal_window = window;
-    QObject::connect(window, &QWindow::screenChanged, this, [this](QScreen* screen) {
-        screen_changed(screen);
-    });
-    screen_changed(window->screen());
-    return true;
-}
-
-void BrowserWindow::disconnect_window_screen_changed_signal()
-{
-    if (!m_window_screen_changed_signal_window)
-        return;
-
-    QObject::disconnect(m_window_screen_changed_signal_window, &QWindow::screenChanged, this, nullptr);
-    m_window_screen_changed_signal_window = nullptr;
-}
-
-void BrowserWindow::connect_screen_signals(QScreen* screen)
-{
-    if (!screen)
-        return;
-
-    if (should_use_screen_signal_for_dpi_changes())
-        QObject::connect(screen, &QScreen::logicalDotsPerInchChanged, this, &BrowserWindow::device_pixel_ratio_changed);
-    QObject::connect(screen, &QScreen::refreshRateChanged, this, &BrowserWindow::refresh_rate_changed);
-}
-
-void BrowserWindow::disconnect_screen_signals(QScreen* screen)
-{
-    if (!screen)
-        return;
-
-    QObject::disconnect(screen, &QScreen::logicalDotsPerInchChanged, this, &BrowserWindow::device_pixel_ratio_changed);
-    QObject::disconnect(screen, &QScreen::refreshRateChanged, this, &BrowserWindow::refresh_rate_changed);
-}
-
-void BrowserWindow::screen_changed(QScreen* screen)
-{
-    if (m_current_screen != screen) {
-        disconnect_screen_signals(m_current_screen);
-        m_current_screen = screen;
-        connect_screen_signals(m_current_screen);
-    }
-
-    if (m_device_pixel_ratio != devicePixelRatio())
-        device_pixel_ratio_changed(devicePixelRatio());
-
-    auto display_id = display_id_for_window(*this, m_current_screen);
-    auto refresh_rate = m_current_screen ? m_current_screen->refreshRate() : m_refresh_rate;
-    if (m_display_id != display_id || m_refresh_rate != refresh_rate)
-        display_metadata_changed(display_id, refresh_rate);
-}
-
-void BrowserWindow::refresh_rate_changed(qreal refresh_rate)
-{
-    display_metadata_changed(m_display_id, refresh_rate);
-}
-
-void BrowserWindow::display_metadata_changed(Optional<u64> display_id, qreal refresh_rate)
-{
-    m_display_id = display_id;
-    m_refresh_rate = refresh_rate;
-    for_each_tab([this](auto& tab) {
-        tab.view().set_display_metadata(m_display_id, m_refresh_rate);
-    });
 }
 
 void BrowserWindow::update_window_title(QString const& title)
@@ -1210,10 +1099,13 @@ void BrowserWindow::set_window_rect(Optional<Web::DevicePixels> x, Optional<Web:
 void BrowserWindow::enter_fullscreen()
 {
     m_tabs_container->set_tab_bar_visible(false);
-    current_tab()->bookmarks_bar().setVisible(false);
 
     m_restore_to_maximized = isMaximized();
     showFullScreen();
+
+    for_each_tab([](Tab& tab) {
+        tab.update_bookmarks_bar_visibility();
+    });
 }
 
 void BrowserWindow::exit_fullscreen()
@@ -1222,12 +1114,15 @@ void BrowserWindow::exit_fullscreen()
         return;
 
     m_tabs_container->set_tab_bar_visible(true);
-    current_tab()->bookmarks_bar().setVisible(Application::settings().appearance().show_bookmarks_bar);
 
     if (m_restore_to_maximized)
         showMaximized();
     else
         showNormal();
+
+    for_each_tab([](Tab& tab) {
+        tab.update_bookmarks_bar_visibility();
+    });
 
     // A crash report that came in while the toolbar was hidden can be offered now, even on a tab other than the one
     // that was current back then.
@@ -1236,37 +1131,27 @@ void BrowserWindow::exit_fullscreen()
     });
 }
 
-void BrowserWindow::showEvent(QShowEvent* event)
-{
-    QMainWindow::showEvent(event);
-    // The native window exists by now and knows the screen it settled on.
-    screen_changed(screen());
-}
-
 bool BrowserWindow::event(QEvent* event)
 {
-    if (event->type() == QEvent::DevicePixelRatioChange) {
-        if (m_device_pixel_ratio != devicePixelRatio())
-            device_pixel_ratio_changed(devicePixelRatio());
+#if defined(AK_OS_MACOS)
+    // NB: Qt sends the show event before the native window appears, so it never shows with its controls unmoved.
+    if (event->type() == QEvent::Show) {
+        hide_appkit_window_title(*this);
+        offset_appkit_window_controls(*this, NATIVE_WINDOW_CONTROL_X_OFFSET, NATIVE_WINDOW_CONTROL_Y_OFFSET);
     }
-    if (event->type() == QEvent::WinIdChange)
-        connect_window_screen_changed_signal();
+    // NB: Qt sends this right after it sets the native title, which also puts the controls back in their default place.
+    if (event->type() == QEvent::WindowTitleChange)
+        reapply_appkit_window_control_offsets(*this);
     if (event->type() == QEvent::PlatformSurface) {
         auto* platform_surface_event = static_cast<QPlatformSurfaceEvent*>(event);
         if (platform_surface_event->surfaceEventType() == QPlatformSurfaceEvent::SurfaceCreated) {
-            connect_window_screen_changed_signal();
-#if defined(AK_OS_MACOS)
             QTimer::singleShot(0, this, [this] {
                 hide_appkit_window_title(*this);
                 offset_appkit_window_controls(*this, NATIVE_WINDOW_CONTROL_X_OFFSET, NATIVE_WINDOW_CONTROL_Y_OFFSET);
             });
-#endif
-        } else if (platform_surface_event->surfaceEventType() == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed) {
-            disconnect_window_screen_changed_signal();
         }
     }
-    if (event->type() == QEvent::ScreenChangeInternal)
-        screen_changed(screen());
+#endif
 
     if (event->type() == QEvent::WindowActivate) {
         Application::the().set_active_window(*this);
@@ -1542,8 +1427,8 @@ void BrowserWindow::appearance_changed()
 {
     update_menu_bar_visibility();
 
-    for_each_tab([&, show_bookmarks_bar = Application::settings().appearance().show_bookmarks_bar](Tab& tab) {
-        tab.bookmarks_bar().setVisible(show_bookmarks_bar);
+    for_each_tab([](Tab& tab) {
+        tab.update_bookmarks_bar_visibility();
     });
 }
 
@@ -1641,9 +1526,11 @@ void BrowserWindow::closeEvent(QCloseEvent* event)
 
     if (m_is_private == WebView::IsPrivate::No) {
         if (m_is_popup_window == IsPopupWindow::No) {
-            Settings::the()->set_last_position(pos());
-            Settings::the()->set_last_size(size());
-            Settings::the()->set_is_maximized(isMaximized());
+            WebView::Application::settings().set_window_settings({
+                .position = Gfx::IntPoint { pos().x(), pos().y() },
+                .size = Gfx::IntSize { width(), height() },
+                .maximized = isMaximized(),
+            });
         }
     }
 

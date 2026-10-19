@@ -1309,6 +1309,21 @@ impl AbsposEngine<'_> {
                 );
             }
         }
+        if let Some(limits) = sizing.transferred_inline_size_limits(node, available_space, constraints) {
+            let value = auto_px_value(used_inline_size);
+            let limited = limits.clamp(value);
+            if limited != value {
+                (used_inline_size, left, right, margin_left, margin_right) = self.solve_non_replaced_inline_once(
+                    node,
+                    containing_block_inline_size,
+                    available_space,
+                    constraints,
+                    static_position_rect,
+                    Some(limited),
+                    resolved_anchor_insets,
+                );
+            }
+        }
         if !style.min_width().is_auto() {
             let min_inline_size =
                 sizing.calculate_inner_inline_size(node, available_space.inline_size, style.min_width(), constraints);
@@ -1727,6 +1742,15 @@ impl AbsposEngine<'_> {
         let used = self.used(node);
         used.set_content_block_size(block_size);
         if style.height().is_auto() && pass == BlockSizePass::BeforeInsideLayout {
+            // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
+            // A block size transferred through the preferred aspect ratio from a definite inline size is definite, so
+            // the content resolves percentages against it.
+            if !self
+                .sizing()
+                .should_treat_block_size_as_auto(node, available_space, constraints)
+            {
+                used.has_definite_block_size.set(true);
+            }
             return;
         }
         if !style.height().is_intrinsic_sizing_constraint() {
@@ -1846,8 +1870,13 @@ impl<'pass> AbsposEngine<'pass> {
             }
         }
 
-        self.sizing()
-            .make_button_content_box_definite(node, LayoutMode::Normal, available_space, constraints, None);
+        self.sizing().make_form_control_content_box_definite(
+            node,
+            LayoutMode::Normal,
+            available_space,
+            constraints,
+            None,
+        );
     }
 
     pub(crate) fn finalize_out_of_flow_root_after_inside_layout(

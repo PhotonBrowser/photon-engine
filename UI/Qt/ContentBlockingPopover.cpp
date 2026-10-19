@@ -30,6 +30,9 @@ public:
         : QCheckBox("Block ads on this site", parent)
     {
         setAttribute(Qt::WA_MacShowFocusRect, false);
+        // NB: The macOS style widens a checkbox past its layout cell to make room for a focus ring. This switch draws
+        //     its own, so keep it inside its cell, where its text lines up with the site name above it.
+        setAttribute(Qt::WA_LayoutUsesWidgetRect);
         setFocusPolicy(Qt::StrongFocus);
     }
 
@@ -45,20 +48,22 @@ private:
     {
         QStylePainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing);
-        if (!isEnabled())
-            painter.setOpacity(0.45);
-
         auto track = QStyle::visualRect(layoutDirection(), rect(), QRect(width() - 43, (height() - 22) / 2, 40, 22));
-        auto track_color = isChecked() ? palette().color(QPalette::Active, QPalette::Highlight) : ChromeStyle::chrome_control_border(palette());
-        if (underMouse() && isEnabled())
-            track_color = ChromeStyle::mix(track_color, Qt::white, 0.12);
+        // Match the switch colors in Base/res/ladybird/ladybird.css, including disabled states.
+        auto dark = ChromeStyle::is_dark(palette());
+        auto track_color = isChecked() ? ChromeStyle::chrome_accent() : QColor(dark ? 0x6b6b6b : 0x8f8f8f);
+        auto thumb_color = QColor(Qt::white);
+        if (!isEnabled()) {
+            track_color = QColor(dark ? 0x353535 : 0xe0e0e0);
+            thumb_color = QColor(dark ? 0x7a7a7a : 0xfafafa);
+        }
 
         painter.setPen(Qt::NoPen);
         painter.setBrush(track_color);
         painter.drawRoundedRect(track, 11, 11);
 
         auto thumb_offset = isChecked() != (layoutDirection() == Qt::RightToLeft) ? 21 : 3;
-        painter.setBrush(palette().color(QPalette::Active, QPalette::HighlightedText));
+        painter.setBrush(thumb_color);
         painter.drawEllipse(QRect(track.x() + thumb_offset, track.y() + 3, 16, 16));
 
         auto text_rect = QStyle::visualRect(layoutDirection(), rect(), QRect(0, 0, width() - 56, height()));
@@ -66,7 +71,7 @@ private:
 
         if (hasFocus()) {
             painter.setBrush(Qt::NoBrush);
-            painter.setPen(QPen(palette().color(QPalette::Active, QPalette::Highlight), 2));
+            painter.setPen(QPen(ChromeStyle::chrome_accent(), 2));
             painter.drawRoundedRect(QRectF(track).adjusted(-2, -2, 2, 2), 13, 13);
         }
     }
@@ -134,6 +139,8 @@ ContentBlockingPopover::ContentBlockingPopover(QWidget* parent)
 
 void ContentBlockingPopover::set_favicon(QIcon const& favicon)
 {
+    // Without a favicon, the site name moves over to the edge rather than sitting next to an empty space.
+    m_favicon->setVisible(!favicon.isNull());
     m_favicon->setPixmap(favicon.pixmap(m_favicon->size(), devicePixelRatioF()));
 }
 

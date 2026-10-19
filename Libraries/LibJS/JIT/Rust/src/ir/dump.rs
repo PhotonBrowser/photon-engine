@@ -12,6 +12,7 @@ use super::Graph;
 use super::NodeId;
 use super::Op;
 use super::ShapeCheck;
+use super::SuspendKind;
 use super::value;
 use crate::bytecode::FrameLayout;
 use crate::bytecode::Operand;
@@ -76,6 +77,7 @@ fn condition_text(condition: BranchCondition) -> String {
         BranchCondition::Extensible => "Extensible".to_string(),
         BranchCondition::HoleFillableArray => "HoleFillableArray".to_string(),
         BranchCondition::ArrayIterator => "ArrayIterator".to_string(),
+        BranchCondition::GeneratorObject => "GeneratorObject".to_string(),
         BranchCondition::PlainArrayPrototypeChain => "PlainArrayPrototypeChain".to_string(),
         BranchCondition::Shape(shape) => format!("Shape {}", shapes_text(std::iter::once(&shape))),
         BranchCondition::NonNegativeInt32 => "NonNegativeInt32".to_string(),
@@ -84,6 +86,7 @@ fn condition_text(condition: BranchCondition) -> String {
         BranchCondition::TaggedEquals { equal: true } => "TaggedEquals".to_string(),
         BranchCondition::TaggedEquals { equal: false } => "TaggedNotEquals".to_string(),
         BranchCondition::Int32Value => "Int32Value".to_string(),
+        BranchCondition::Int32OrBoolean => "Int32OrBoolean".to_string(),
         BranchCondition::Double => "Double".to_string(),
         BranchCondition::String => "String".to_string(),
         BranchCondition::ResolvedString => "ResolvedString".to_string(),
@@ -108,9 +111,18 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         Op::LoadSlot { slot } => with_inputs(&format!("LoadSlot {}", slot_name(layout, *slot))),
         Op::StoreSlot { slot } => with_inputs(&format!("StoreSlot {}", slot_name(layout, *slot))),
         Op::Phi => with_inputs("Phi"),
-        Op::InitializeFrame => with_inputs("InitializeFrame"),
-        Op::EnsureFrameInitialized => with_inputs("EnsureFrameInitialized"),
+        Op::InitializeFrame { .. } => with_inputs("InitializeFrame"),
+        Op::EnsureFrameInitialized { .. } => with_inputs("EnsureFrameInitialized"),
         Op::PublishFrame => with_inputs("PublishFrame"),
+        Op::Suspend { continuation, kind } => {
+            let continuation = continuation.map_or("completed".to_string(), |pc| format!("pc {pc}"));
+            let kind = match kind {
+                SuspendKind::Yield => "",
+                SuspendKind::YieldIteratorResult => " iterator-result",
+                SuspendKind::Await => " await",
+            };
+            with_inputs(&format!("Suspend {continuation}{kind}"))
+        }
         Op::BoxCell => with_inputs("BoxCell"),
         Op::LoadOuterEnvironment => with_inputs("LoadOuterEnvironment"),
         Op::LoadEnvironmentBinding { index } => with_inputs(&format!("LoadEnvironmentBinding {index}")),
@@ -205,7 +217,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         }
         Op::InitializeNamed { offset } => with_inputs(&format!("InitializeNamed +{offset}")),
         Op::AllocateArray { count } => format!("AllocateArray with {count} elements"),
-        Op::VirtualObject { shape } => with_inputs(&format!("VirtualObject {:#x}", shape.0)),
+        Op::VirtualObject { shape, .. } => with_inputs(&format!("VirtualObject {:#x}", shape.0)),
         Op::AllocateEnvironment { shape_cache, capacity } => {
             with_inputs(&format!("AllocateEnvironment {shape_cache} capacity {capacity}"))
         }
@@ -227,6 +239,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         Op::CheckShape { shapes } => with_inputs(&format!("CheckShape [{}]", shapes_text(shapes.iter()))),
         Op::CheckPrototypeChainValid { validity } => format!("CheckPrototypeChainValid {:#x}", validity.0),
         Op::AssumeValid => "AssumeValid".to_string(),
+        Op::AssumeLegacyArgumentsUnread => "AssumeLegacyArgumentsUnread".to_string(),
         Op::HasInPrototypeChain => with_inputs("HasInPrototypeChain"),
         Op::LoadGlobalBinding { environment, index } => format!("LoadGlobalBinding {:#x}[{index}]", environment.0),
         Op::StoreGlobalBinding { environment, index } => {
@@ -257,6 +270,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
             with_inputs(&format!("{} {} {location}", op.name(), opcode.name()))
         }
         Op::Float64Unary { op } => with_inputs(&format!("Float64{}", op.name())),
+        Op::CallFloat64Function { function } => with_inputs(&format!("CallFloat64{}", function.name())),
         Op::Float64Binary { op } => with_inputs(&format!("Float64{op:?}")),
         Op::Float64Compare { comparison } => with_inputs(&format!("Float64{comparison:?}")),
         Op::Refine { condition, holds } => {
@@ -296,6 +310,8 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::LoadArrayIteratorIndex
         | Op::StoreArrayIteratorIndex
         | Op::FinishArrayIterator
+        | Op::LoadGeneratorCompletionType
+        | Op::LoadGeneratorCompletionValue
         | Op::LoadPropertyIteratorKeyCount
         | Op::LoadPropertyIteratorKey => with_inputs(op.name()),
         Op::CheckBounds

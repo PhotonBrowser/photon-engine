@@ -89,7 +89,7 @@ public:
         static ContextUpdateResult declined(Web::InputRoutingDecision decision) { return { .routing_decision = decision }; }
     };
 
-    ContextState(Web::CompositorContextId, Optional<u64> page_id, CompositorStateWebContentClient&, Compositing::CanvasSurfaceRegistry const&, Function<void(Gfx::IntRect)> schedule_caret_repaint = {});
+    ContextState(Web::CompositorContextId, Optional<u64> page_id, CompositorStateWebContentClient&, Compositing::OwnedCanvasSurfaces, Function<void(Gfx::IntRect)> schedule_caret_repaint = {});
     ~ContextState();
 
     bool is_owned_by(CompositorStateWebContentClient const&) const;
@@ -145,7 +145,7 @@ public:
     AsyncScrollResult smooth_scroll_to(Web::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue);
     void cancel_smooth_scroll(Web::AsyncScrollNodeStableID);
     Optional<Gfx::IntRect> advance_smooth_scroll_animations(MonotonicTime now);
-    bool needs_animation_frames() { return has_active_smooth_scroll_animations() || has_active_scroll_fling() || m_elastic_overscroll_controller.has_rebound() || visual_animations_need_frame(); }
+    bool needs_animation_frames() { return has_active_smooth_scroll_animations() || has_active_scroll_fling() || m_elastic_overscroll_controller.has_rebound() || visual_animations_need_frame() || m_presenter.ui_overlay_fades_need_frame(); }
 
     bool has_active_scroll_fling() const { return m_scroll_fling_controller.is_active(); }
     bool has_active_smooth_scroll_animations() const { return !m_smooth_scroll_animations.is_empty(); }
@@ -172,8 +172,8 @@ public:
     Compositing::PendingAsyncScrollUpdates take_pending_async_scroll_updates();
     bool has_pending_async_scroll_updates() const;
 
-    void viewport_size_updated(Gfx::IntSize, Compositing::WindowResizingInProgress);
-    bool set_paused_debugger_overlay(bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<Compositing::PausedDebuggerOverlayAction> hovered_action);
+    void viewport_size_updated(Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
+    bool set_ui_overlays(Compositing::UIOverlays);
 
     bool set_display_metadata(Optional<u64> display_id, double refresh_rate);
     Optional<u64> display_id() const { return m_display_id; }

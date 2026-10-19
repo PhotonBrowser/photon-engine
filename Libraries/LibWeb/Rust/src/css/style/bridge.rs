@@ -726,6 +726,8 @@ pub mod element_construction_fact {
     pub const IS_EDITING_HOST: u32 = 1 << 4;
     pub const IS_BODY: u32 = 1 << 5;
     pub const IS_DOCUMENT_ELEMENT: u32 = 1 << 6;
+    pub const IS_SVG_RESOURCE_ELEMENT: u32 = 1 << 7;
+    pub const IS_SVG_GEOMETRY_ELEMENT: u32 = 1 << 8;
 }
 
 /// Which principal box an element asks for before its computed style has a say. The element's own
@@ -2460,13 +2462,22 @@ pub unsafe extern "C" fn style_engine_republish_record_environment(
     store: *const c_void,
 ) -> u64 {
     // SAFETY: Guaranteed by the caller.
-    with_engine(read, host, |engine| {
+    let (style_record, view) = with_engine(read, host, |engine| {
         let Some(node) = StyleNodeID::from_raw(node) else {
-            return 0;
+            return (0, None);
         };
         unsafe { engine.custom_property_environments.retain(environment, store) };
-        engine.republish_record_environment(node, environment).unwrap_or(0)
-    })
+        let Some(style_record) = engine.republish_record_environment(node, environment) else {
+            return (0, None);
+        };
+        (style_record, Some(style_record_view(engine, style_record)))
+    });
+    if let Some(view) = view
+        && view.present
+    {
+        host.engine_memo().views.set(style_record, view);
+    }
+    style_record
 }
 
 /// An environment the host holds, as a custom-property environment move names it: its identity and
@@ -2484,6 +2495,8 @@ pub struct FfiNamedEnvironment {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiEnvironmentMove {
+    pub old_environment: FfiNamedEnvironment,
+    pub new_environment: FfiNamedEnvironment,
     pub old_inheritable: u64,
     pub new_inheritable: FfiNamedEnvironment,
     pub new_inheritable_data: *const c_void,

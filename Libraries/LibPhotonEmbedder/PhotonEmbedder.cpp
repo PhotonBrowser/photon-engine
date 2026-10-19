@@ -669,10 +669,12 @@ private:
     }
 
     // A tab can move to a page in another WebContent process; its compositor
-    // context needs the display metadata as well.
-    virtual void prepare_page_for_tab(WebContentPage& page) override
+    // context needs the display metadata as well. This hook runs both when a
+    // page starts hosting the tab's navigable and when it becomes the tab's
+    // displayed page.
+    void prepare_page_for_navigable(WebContentPage& page) override
     {
-        HeadlessWebView::prepare_page_for_tab(page);
+        HeadlessWebView::prepare_page_for_navigable(page);
         update_compositor_display_metadata(page);
     }
 

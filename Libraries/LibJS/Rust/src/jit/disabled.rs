@@ -153,7 +153,15 @@ pub mod entry_exit {
         unreachable!("no executable has JIT code");
     }
 
+    pub fn enter_jit_code_at_continuation(_vm: &Vm, _frame: NonNull<ExecutionContext>, _pc: u32) -> Option<JitResult> {
+        None
+    }
+
     pub fn helper_enter_jit_code(_vm: &Vm) -> i64 {
+        unreachable!("only the profiling interpreter enters JIT code");
+    }
+
+    pub fn helper_enter_jit_code_after_catch(_vm: &Vm, _pc: u32) -> i64 {
         unreachable!("only the profiling interpreter enters JIT code");
     }
 }
@@ -176,7 +184,12 @@ pub mod translate {
         u64::from(low_half)
     }
 
-    pub fn call_site_frames(_frame: &ExecutionContext, _index: u32, _frame_pointer: u64) -> Vec<CallSiteFrame> {
+    pub fn call_site_frames(
+        _vm: &Vm,
+        _frame: &ExecutionContext,
+        _index: u32,
+        _frame_pointer: u64,
+    ) -> Vec<CallSiteFrame> {
         Vec::new()
     }
 
@@ -189,6 +202,8 @@ pub mod translate {
     ) -> Vec<Value> {
         unreachable!("no frame runs JIT code");
     }
+
+    pub fn resolve_deferred_arguments(_vm: &Vm, _frame: &ExecutionContext) {}
 }
 
 pub mod snapshot {

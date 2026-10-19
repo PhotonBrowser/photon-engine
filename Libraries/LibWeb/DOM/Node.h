@@ -204,6 +204,8 @@ public:
     virtual bool is_svg_text_positioning_element() const { return false; }
     virtual bool is_svg_text_element() const { return false; }
     virtual bool is_svg_text_path_element() const { return false; }
+    virtual bool is_svg_geometry_element() const { return false; }
+    virtual bool is_svg_filter_element() const { return false; }
 
     bool in_a_document_tree() const;
 
@@ -387,6 +389,10 @@ public:
     void set_style_arrival_pending(bool value) { m_style_arrival_pending = value; }
     bool descendant_style_arrival_pending() const { return m_descendant_style_arrival_pending; }
     void set_descendant_style_arrival_pending(bool value) { m_descendant_style_arrival_pending = value; }
+    // Whether this element arrived alone in a display:none subtree, its children waiting to arrive until something
+    // could observe them. See CSS::take_in_pending_style_arrivals().
+    bool child_style_arrivals_wait() const { return m_child_style_arrivals_wait; }
+    void set_child_style_arrivals_wait(bool value) { m_child_style_arrivals_wait = value; }
 
     // Mirrors the slottable's assigned slot; see SlottableMixin::set_assigned_slot().
     bool has_assigned_slot() const { return m_has_assigned_slot; }
@@ -701,6 +707,7 @@ protected:
     bool m_inside_blocking_wheel_event_handler : 1 { false };
     bool m_style_arrival_pending : 1 { false };
     bool m_descendant_style_arrival_pending : 1 { false };
+    bool m_child_style_arrivals_wait : 1 { false };
     bool m_has_spelling_markers : 1 { false };
     u32 m_child_index_generation { 1 };
     // The slot of the node directory that names the node by its unique id, or 0 before anything asked for the id.
@@ -729,7 +736,7 @@ private:
     Vector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
     void assign_slottables_after_removal(Node& parent, Node& parent_root, ReadonlySpan<GC::Ref<HTML::HTMLSlotElement>> descendant_slots);
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);
-    void add_transient_registered_observers_for_removal(Node& parent);
+    void add_transient_registered_observers(Node& parent);
     void queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling);
 
     void queue_tree_mutation_record(ReadonlySpan<GC::Ref<Node>> added_nodes, ReadonlySpan<GC::Ref<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);

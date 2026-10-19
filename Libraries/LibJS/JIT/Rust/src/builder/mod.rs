@@ -92,6 +92,7 @@ use crate::ir::Locations;
 use crate::ir::Node;
 use crate::ir::NodeId;
 use crate::ir::Op;
+use crate::ir::SuspendKind;
 use crate::ir::value;
 use crate::snapshot::CallFeedbackSnapshot;
 use crate::snapshot::CellId;
@@ -608,6 +609,8 @@ impl<'a> GraphBuilder<'a> {
         self.enter_function(entry);
         if self.build_osr_entries {
             self.build_osr_entries()?;
+            self.build_resume_entries()?;
+            self.build_catch_entries()?;
         }
         self.build_function()?;
 
@@ -931,9 +934,11 @@ impl<'a> GraphBuilder<'a> {
                 self.function.skipped_instructions -= 1;
                 continue;
             }
+            let first_node = self.graph.nodes.len();
             if let Flow::Ended = self.build_instruction()? {
                 return Ok(());
             }
+            self.guard_legacy_arguments(instruction_index, first_node);
         }
         // NB: The block falls through into the next one.
         let next_pc = self.function.instructions[self.function.instruction_index].next_pc();
@@ -1383,7 +1388,7 @@ impl<'a> GraphBuilder<'a> {
             Instruction::Enter => {
                 // NB: Inlined frames are set up by the caller.
                 if !self.function.is_virtual() {
-                    self.emit(Op::InitializeFrame, Vec::new(), None);
+                    self.emit(Op::InitializeFrame { clobbers_floats: false }, Vec::new(), None);
                     let this_value = self.emit(
                         Op::LoadSlot {
                             slot: THIS_VALUE_REGISTER,
@@ -1502,6 +1507,30 @@ impl<'a> GraphBuilder<'a> {
                 }
                 self.set_control(Op::Return, vec![value]);
                 return Ok(Some(Flow::Ended));
+            }
+            Instruction::Yield {
+                continuation_label,
+                value,
+            } => {
+                return self
+                    .build_suspend(continuation_label, value, SuspendKind::Yield)
+                    .map(Some);
+            }
+            Instruction::YieldIteratorResult {
+                continuation_label,
+                value,
+            } => {
+                return self
+                    .build_suspend(Some(continuation_label), value, SuspendKind::YieldIteratorResult)
+                    .map(Some);
+            }
+            Instruction::Await {
+                continuation_label,
+                argument,
+            } => {
+                return self
+                    .build_suspend(Some(continuation_label), argument, SuspendKind::Await)
+                    .map(Some);
             }
             Instruction::GetLexicalEnvironment { dst } => {
                 let address = self.frame_field(FrameField::LexicalEnvironment)?;
@@ -1734,6 +1763,82 @@ impl<'a> GraphBuilder<'a> {
             _ => return Ok(None),
         }
         Ok(Some(Flow::Continue))
+    }
+
+    /// Builds a `Yield`, `YieldIteratorResult` or `Await`, which suspends
+    /// the generator or async function running the compiled function and
+    /// returns `value` to the code resuming it: puts the slots live at the
+    /// continuation in frame memory, where the resume entry of the
+    /// continuation (see `osr`) finds them, and records the continuation in
+    /// the frame like the interpreter's instruction.
+    fn build_suspend(
+        &mut self,
+        continuation: Option<Label>,
+        value: Operand,
+        kind: SuspendKind,
+    ) -> Result<Flow, CompileFailure> {
+        if self.function.is_virtual() {
+            return Err(CompileFailure::InvalidBytecode {
+                pc: self.function.pc,
+                reason: "suspension in an inlined callee",
+            });
+        }
+        let value = self.read(value)?;
+        self.check_not_returning_virtual_arguments(value)?;
+        if let Some(continuation) = continuation {
+            let block = self.block_for_label(continuation)?;
+            let start = self.function.cfg.blocks[block].instructions.start;
+            let live = self.function.liveness.live_in(start).clone();
+            for slot in live.iter() {
+                if self.tracks_slot(slot) {
+                    self.sync_slot(slot);
+                }
+            }
+        }
+        // NB: Like the interpreter's Yield and Await, an empty value yields
+        //     `undefined`.
+        let layout = self.function.layout;
+        let arguments = layout.arguments_base()..layout.arguments_base() + layout.number_of_arguments;
+        let value = if self.graph.is_known_non_empty(value, arguments) {
+            value
+        } else {
+            self.emit(Op::EmptyToUndefined, vec![value], Some(Repr::Tagged))
+        };
+        self.emit(
+            Op::Suspend {
+                continuation: continuation.map(|label| label.0),
+                kind,
+            },
+            Vec::new(),
+            None,
+        );
+        self.set_control(Op::Return, vec![value]);
+        Ok(Flow::Ended)
+    }
+
+    /// Builds `GetCompletionFields` (`Handling::Expanded`), which a
+    /// resumed generator or async function starts with: the type and the
+    /// value of the completion it resumed with, which the generator object
+    /// it finds in its accumulator holds, and the slow path for other
+    /// completion sources (async generators).
+    pub(super) fn build_get_completion_fields(
+        &mut self,
+        type_dst: Operand,
+        value_dst: Operand,
+        completion: Operand,
+    ) -> Result<Flow, CompileFailure> {
+        let source = self.read(completion)?;
+        let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
+        let object = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Object, vec![source], true);
+        let object = self.cell_address(object);
+        let generator = self.branch_to_slow_path(&mut slow_paths, BranchCondition::GeneratorObject, vec![object], true);
+        let completion_type = self.emit(Op::LoadGeneratorCompletionType, vec![generator], Some(Repr::Int32));
+        let completion_type = self.emit(Op::BoxInt32, vec![completion_type], Some(Repr::Tagged));
+        let value = self.emit(Op::LoadGeneratorCompletionValue, vec![generator], Some(Repr::Tagged));
+        let outputs = self.join_paths(slow_paths, vec![completion_type, value], |_, outputs| outputs);
+        self.write(type_dst, outputs[0])?;
+        self.write(value_dst, outputs[1])?;
+        Ok(Flow::Continue)
     }
 
     /// Builds an instruction as its handling table entry says.

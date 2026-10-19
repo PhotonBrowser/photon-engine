@@ -1961,7 +1961,7 @@ impl RetainedState {
         self.facts.apply_staged(&mut self.memory);
     }
 
-    /// Drop routing entry points for rules whose sheet is attached nowhere.
+    /// Drop routing entry points for rules whose sheet is attached nowhere and not kept for reattachment.
     ///
     /// The router already skips such rules one route at a time, but enumerating their entry points
     /// is itself a cost that grows with every sheet that ever came and went: a page that repeatedly
@@ -1976,7 +1976,7 @@ impl RetainedState {
         let mut excluded_sheets = BitColumn::default();
         let mut attached_sheets = Vec::new();
         for (sheet, attached) in self.program.sheets_with_attachment_state() {
-            if attached {
+            if attached || self.sheets_kept_for_reattachment.contains(sheet.0 as usize) {
                 attached_sheets.push(sheet);
             } else {
                 excluded_sheets.set(sheet.0 as usize, true);
@@ -2034,7 +2034,7 @@ impl RetainedState {
             // A detached sheet's rules keep no routing entry points; see
             // `shed_routing_for_detached_sheets`.
             let sheet = self.program.rule_sheet(rule);
-            if !self.program.sheet_is_attached_somewhere(sheet) {
+            if !self.sheet_keeps_routing(sheet) {
                 excluded_sheets.set(sheet.0 as usize, true);
                 continue;
             }
@@ -2200,6 +2200,7 @@ impl StyleEngine {
             .resize_required_to(&mut self.retained.memory, 0);
         self.retained.facts.release_staging(&mut self.retained.memory);
         self.host.program_staging.clear();
+        self.host.environment_move_changed_names.clear();
         self.sweep_selector_programs();
         self.shed_routing_for_detached_sheets();
     }
@@ -2251,6 +2252,19 @@ impl StyleEngine {
         let is_reclaimed = |atom: &StyleAtomID| reclaimable.binary_search(atom).is_ok();
         if self.retained.tested_attribute_names.iter().any(is_reclaimed) {
             Arc::make_mut(&mut self.retained.tested_attribute_names).retain(|atom| !is_reclaimed(atom));
+        }
+        let relational_arrival_key_is_reclaimed = |key: &RoutingKey| key.atom().is_some_and(|atom| is_reclaimed(&atom));
+        if self
+            .retained
+            .relational_arrival_keys
+            .keys
+            .iter()
+            .any(relational_arrival_key_is_reclaimed)
+        {
+            let mut keys = self.retained.relational_arrival_keys.keys.clone();
+            keys.extend(self.retained.unresolved_relational_arrival_keys.drain());
+            keys.retain(|key| !relational_arrival_key_is_reclaimed(key));
+            self.retained.replace_relational_arrival_keys(keys);
         }
         if self.retained.attribute_value_text_names.iter().any(is_reclaimed) {
             Arc::make_mut(&mut self.retained.attribute_value_text_names).retain(|atom| !is_reclaimed(atom));

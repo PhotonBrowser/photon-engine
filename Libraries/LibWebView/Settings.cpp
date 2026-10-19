@@ -17,6 +17,7 @@
 #include <LibURL/Parser.h>
 #include <LibUnicode/Locale.h>
 #include <LibWebCommon/Loader/ContentBlocking.h>
+#include <LibWebCommon/Loader/UserAgent.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/UserAgent.h>
@@ -28,11 +29,19 @@ static constexpr auto FIRST_RUN_COMPLETE_KEY = "firstRunComplete"sv;
 static constexpr auto NEW_TAB_PAGE_URL_KEY = "newTabPageURL"sv;
 
 static constexpr auto LANGUAGES_KEY = "languages"sv;
-static auto DEFAULT_LANGUAGE = "en"_string;
 
 static constexpr auto APPEARANCE_KEY = "appearance"sv;
 static constexpr auto SHOW_MENU_BAR_KEY = "showMenuBar"sv;
 static constexpr auto SHOW_BOOKMARKS_BAR_KEY = "showBookmarksBar"sv;
+
+static constexpr auto WINDOW_SETTINGS_KEY = "window"sv;
+static constexpr auto WINDOW_POSITION_KEY = "position"sv;
+static constexpr auto WINDOW_X_KEY = "x"sv;
+static constexpr auto WINDOW_Y_KEY = "y"sv;
+static constexpr auto WINDOW_SIZE_KEY = "size"sv;
+static constexpr auto WINDOW_WIDTH_KEY = "width"sv;
+static constexpr auto WINDOW_HEIGHT_KEY = "height"sv;
+static constexpr auto WINDOW_MAXIMIZED_KEY = "maximized"sv;
 
 static constexpr auto CONTENT_SETTINGS_KEY = "content"sv;
 static constexpr auto DEFAULT_ZOOM_LEVEL_FACTOR_KEY = "defaultZoomLevelFactor"sv;
@@ -196,7 +205,31 @@ Optional<ConfigVariableID> config_variable_id_from_name(StringView name)
     return {};
 }
 
-static StringView vertical_tabs_position_to_string(VerticalTabsPosition position)
+static constexpr StringView show_bookmarks_bar_to_string(ShowBookmarksBar show_bookmarks_bar)
+{
+    switch (show_bookmarks_bar) {
+    case ShowBookmarksBar::Always:
+        return "always"sv;
+    case ShowBookmarksBar::Never:
+        return "never"sv;
+    case ShowBookmarksBar::OnHover:
+        return "onHover"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static constexpr Optional<ShowBookmarksBar> bookmarks_bar_position_from_string(StringView show_bookmarks_bar)
+{
+    if (show_bookmarks_bar == "always"sv)
+        return ShowBookmarksBar::Always;
+    if (show_bookmarks_bar == "never"sv)
+        return ShowBookmarksBar::Never;
+    if (show_bookmarks_bar == "onHover"sv)
+        return ShowBookmarksBar::OnHover;
+    return {};
+}
+
+static constexpr StringView vertical_tabs_position_to_string(VerticalTabsPosition position)
 {
     switch (position) {
     case VerticalTabsPosition::Left:
@@ -207,7 +240,7 @@ static StringView vertical_tabs_position_to_string(VerticalTabsPosition position
     VERIFY_NOT_REACHED();
 }
 
-static Optional<VerticalTabsPosition> vertical_tabs_position_from_string(StringView position)
+static constexpr Optional<VerticalTabsPosition> vertical_tabs_position_from_string(StringView position)
 {
     if (position == "left"sv)
         return VerticalTabsPosition::Left;
@@ -264,9 +297,21 @@ static bool config_variable_value_is_valid(ConfigVariableDefinition const& varia
     return true;
 }
 
-Settings Settings::create(ByteString settings_path)
+Settings Settings::create(ByteString settings_path, Vector<String> platform_languages)
 {
     Settings settings { move(settings_path) };
+
+    // The user's first platform language, then that language alone (en-US, then en): the list a browser starts with.
+    platform_languages.remove_all_matching([](auto const& language) { return !Unicode::is_locale_available(language); });
+    if (!platform_languages.is_empty()) {
+        Vector<String> languages { platform_languages.first() };
+        if (auto separator = languages.first().find_byte_offset('-'); separator.has_value()) {
+            auto language = MUST(languages.first().substring_from_byte_offset(0, *separator));
+            if (Unicode::is_locale_available(language))
+                languages.append(move(language));
+        }
+        settings.m_languages = move(languages);
+    }
 
     auto settings_json = read_json_file(settings.m_settings_path);
     if (settings_json.is_error()) {
@@ -275,6 +320,9 @@ Settings Settings::create(ByteString settings_path)
     }
 
     settings.m_first_run_complete = settings_json.value().get_bool(FIRST_RUN_COMPLETE_KEY).value_or(false);
+
+    if (auto window_settings = settings_json.value().get(WINDOW_SETTINGS_KEY); window_settings.has_value())
+        settings.m_window_settings = parse_window_settings(*window_settings);
 
     if (auto new_tab_page_url = settings_json.value().get_string(NEW_TAB_PAGE_URL_KEY); new_tab_page_url.has_value()) {
         if (auto parsed_new_tab_page_url = URL::Parser::basic_parse(*new_tab_page_url); parsed_new_tab_page_url.has_value())
@@ -443,7 +491,7 @@ Settings Settings::create(ByteString settings_path)
 Settings::Settings(ByteString settings_path)
     : m_settings_path(move(settings_path))
     , m_new_tab_page_url(URL::about_newtab())
-    , m_languages({ DEFAULT_LANGUAGE })
+    , m_languages(Web::default_preferred_languages())
 {
     for (auto const& variable : config_variable_definitions()) {
         m_config_variables[static_cast<size_t>(variable.id)] = variable.default_value;
@@ -492,6 +540,21 @@ JsonValue Settings::serialize_json() const
     settings.set(FIRST_RUN_COMPLETE_KEY, m_first_run_complete);
     settings.set(NEW_TAB_PAGE_URL_KEY, m_new_tab_page_url.serialize());
 
+    JsonObject window_settings;
+    if (m_window_settings.position.has_value()) {
+        JsonObject position;
+        position.set(WINDOW_X_KEY, m_window_settings.position->x());
+        position.set(WINDOW_Y_KEY, m_window_settings.position->y());
+        window_settings.set(WINDOW_POSITION_KEY, move(position));
+    }
+
+    JsonObject window_size;
+    window_size.set(WINDOW_WIDTH_KEY, m_window_settings.size.width());
+    window_size.set(WINDOW_HEIGHT_KEY, m_window_settings.size.height());
+    window_settings.set(WINDOW_SIZE_KEY, move(window_size));
+    window_settings.set(WINDOW_MAXIMIZED_KEY, m_window_settings.maximized);
+    settings.set(WINDOW_SETTINGS_KEY, move(window_settings));
+
     JsonArray languages;
     languages.ensure_capacity(m_languages.size());
     for (auto const& language : m_languages)
@@ -500,7 +563,7 @@ JsonValue Settings::serialize_json() const
 
     JsonObject appearance;
     appearance.set(SHOW_MENU_BAR_KEY, m_appearance.show_menu_bar);
-    appearance.set(SHOW_BOOKMARKS_BAR_KEY, m_appearance.show_bookmarks_bar);
+    appearance.set(SHOW_BOOKMARKS_BAR_KEY, show_bookmarks_bar_to_string(m_appearance.show_bookmarks_bar));
     settings.set(APPEARANCE_KEY, move(appearance));
 
     JsonObject zoom_per_host;
@@ -683,6 +746,39 @@ ErrorOr<void> Settings::complete_first_run()
     return {};
 }
 
+WindowSettings Settings::parse_window_settings(JsonValue const& settings)
+{
+    if (!settings.is_object())
+        return {};
+
+    WindowSettings window_settings;
+
+    if (auto position = settings.as_object().get_object(WINDOW_POSITION_KEY); position.has_value()) {
+        auto x = position->get_integer<i32>(WINDOW_X_KEY);
+        auto y = position->get_integer<i32>(WINDOW_Y_KEY);
+        if (x.has_value() && y.has_value())
+            window_settings.position = Gfx::IntPoint { *x, *y };
+    }
+
+    if (auto size = settings.as_object().get_object(WINDOW_SIZE_KEY); size.has_value()) {
+        auto width = size->get_integer<i32>(WINDOW_WIDTH_KEY);
+        auto height = size->get_integer<i32>(WINDOW_HEIGHT_KEY);
+        if (width.has_value() && height.has_value() && *width > 0 && *height > 0)
+            window_settings.size = Gfx::IntSize { *width, *height };
+    }
+
+    if (auto maximized = settings.as_object().get_bool(WINDOW_MAXIMIZED_KEY); maximized.has_value())
+        window_settings.maximized = *maximized;
+
+    return window_settings;
+}
+
+void Settings::set_window_settings(WindowSettings window_settings)
+{
+    m_window_settings = move(window_settings);
+    persist_settings();
+}
+
 void Settings::set_new_tab_page_url(URL::URL new_tab_page_url)
 {
     m_new_tab_page_url = move(new_tab_page_url);
@@ -695,7 +791,7 @@ void Settings::set_new_tab_page_url(URL::URL new_tab_page_url)
 Vector<String> Settings::parse_json_languages(JsonValue const& languages)
 {
     if (!languages.is_array())
-        return { DEFAULT_LANGUAGE };
+        return Web::default_preferred_languages();
 
     Vector<String> parsed_languages;
     parsed_languages.ensure_capacity(languages.as_array().size());
@@ -706,7 +802,7 @@ Vector<String> Settings::parse_json_languages(JsonValue const& languages)
     });
 
     if (parsed_languages.is_empty())
-        return { DEFAULT_LANGUAGE };
+        return Web::default_preferred_languages();
 
     return parsed_languages;
 }
@@ -729,8 +825,10 @@ Appearance Settings::parse_appearance(JsonValue const& settings)
 
     if (auto show_menu_bar = settings.as_object().get_bool(SHOW_MENU_BAR_KEY); show_menu_bar.has_value())
         appearance.show_menu_bar = *show_menu_bar;
-    if (auto show_bookmarks_bar = settings.as_object().get_bool(SHOW_BOOKMARKS_BAR_KEY); show_bookmarks_bar.has_value())
-        appearance.show_bookmarks_bar = *show_bookmarks_bar;
+    if (auto show_bookmarks_bar = settings.as_object().get_string(SHOW_BOOKMARKS_BAR_KEY); show_bookmarks_bar.has_value()) {
+        if (auto parsed = bookmarks_bar_position_from_string(*show_bookmarks_bar); parsed.has_value())
+            appearance.show_bookmarks_bar = *parsed;
+    }
 
     return appearance;
 }

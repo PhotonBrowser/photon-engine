@@ -127,7 +127,7 @@ mod style_invalidation;
 pub(crate) use style_invalidation::SampleBounds;
 mod transition_baselines;
 mod user_agent_selectors;
-pub(crate) use computed::{ENGINE_INHERITED_GROUP_COUNT, StyleRecordLease};
+pub(crate) use computed::{ENGINE_INHERITED_GROUP_COUNT, ReleasedAnimationOverlayRecords, StyleRecordLease};
 pub(crate) use publication::RecordDemand;
 pub(crate) use transition_baselines::{InheritedAnimatedValue, TransitionBaselines};
 pub mod relative_selector;
@@ -161,6 +161,18 @@ use std::sync::Mutex;
 
 /// Attribute names a document's selectors read, which its engine shares with its host.
 pub(crate) type SelectorAttributeNames = Arc<HashSet<StyleAtomID>>;
+
+/// What an element's arrival has to carry to reach the anchor of a `:has()` argument: a name whose raw identity is
+/// among `names` as its tag, ID, class or attribute name, or a state among `states`. Where an argument can be reached
+/// by anything else, every arrival can reach one. The engine shares it with its host, which leaves the subtrees of
+/// elements in a display:none subtree out of the engine's tree for as long as nothing could observe them.
+#[derive(Clone, Default)]
+pub(crate) struct RelationalArrivalKeys {
+    keys: HashSet<RoutingKey>,
+    pub(crate) names: Vec<usize>,
+    pub(crate) states: Vec<u8>,
+    pub(crate) reached_by_any_arrival: bool,
+}
 
 use crate::css::cascaded_properties::CascadeOrigin;
 #[cfg(test)]
@@ -779,6 +791,9 @@ pub struct RetainedState {
     /// sheet's rules decide nothing, so routing every input past their entry points is pure cost
     /// that grows with every sheet that ever came and went.
     sheets_excluded_from_routing: BitColumn,
+    /// Detached sheets the host keeps compiled because it expects them back. Their routes stay registered, since
+    /// shedding them would only have reattachment derive them all again.
+    sheets_kept_for_reattachment: BitColumn,
     /// Whether a sheet detached since the last routing shed, so the registry may hold entry
     /// points for rules that can no longer decide.
     routing_needs_detachment_sweep: bool,
@@ -834,6 +849,10 @@ pub struct RetainedState {
     /// environment they resolve over, as `FfiNodeRecordReads` bits, for the elements whose
     /// declarations read anything: what the host notes beside their records.
     custom_declaration_reads: HashMap<StyleNodeID, u8>,
+    /// The custom properties the custom declarations of an element, or of its pseudo-elements,
+    /// declare or read through `var()`. `None` when they cannot be listed.
+    custom_declaration_custom_property_reads:
+        HashMap<StyleNodeID, Option<custom_property_cascade::CustomPropertyNames>>,
     /// Which of a node's records read its place among its siblings, written or produced by a
     /// substitution: a bit for its own record and one per synthetic pseudo-element kind, which
     /// each record the engine derives, or admits from C++, sets or clears as it is installed. A
@@ -889,6 +908,9 @@ pub struct RetainedState {
     /// The style record each element holds, for the elements that hold one, as the host reports
     /// every record it installs or clears.
     held_style_records: crate::fork::ForkShared<HashMap<StyleNodeID, u64>>,
+    /// The style record each pseudo-element holds, by its kind, for the elements whose pseudo-elements
+    /// hold one, as the host reports every record it installs or clears.
+    held_pseudo_style_records: crate::fork::ForkShared<HashMap<StyleNodeID, Vec<(u8, u64)>>>,
     /// The records a clock frame shows in place of the ones the host installed, which it lends the published reads
     /// for as long as it runs.
     tick_shown: engine_sample::TickShownRecords,
@@ -1010,6 +1032,12 @@ pub struct RetainedState {
     /// The attribute names a selector tests in any way, which the host holds a copy of between jobs.
     tested_attribute_names: SelectorAttributeNames,
     attribute_value_text_requirements_version: u64,
+    /// What an arrival has to carry to reach a `:has()` anchor, which the host holds a copy of between jobs.
+    relational_arrival_keys: Arc<RelationalArrivalKeys>,
+    /// The keys rules added since, which the host learns of once they are resolved.
+    unresolved_relational_arrival_keys: HashSet<RoutingKey>,
+    /// Moves whenever `relational_arrival_keys` does.
+    relational_arrival_keys_version: u64,
     selector_programs_need_sweep: bool,
     routing: Arc<RoutingRegistry>,
     /// Exact selector changes and refresh requests emitted by the current transaction.
@@ -1090,6 +1118,8 @@ pub struct HostState {
     /// Whether the deferred element style inputs are owed to the next transaction, as opposed to
     /// held back by a flush without a document root.
     deferred_element_style_inputs_are_pending: bool,
+    /// The custom properties that changed between pairs of environments during this transaction.
+    environment_move_changed_names: crate::fork::ForkReset<environment_move::ChangedCustomPropertyNames>,
     deferred_element_style_input_memory: MemoryLease,
     /// Whether any tree input batch has crossed into the engine. A first batch consisting entirely
     /// of unique arrivals can install its final relation rows as one bulk load.

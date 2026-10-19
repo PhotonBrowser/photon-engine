@@ -48,6 +48,9 @@ struct FlexItem<'pass> {
     used_flex_basis_is_definite: bool,
     main_size_was_resolved_from_aspect_ratio: bool,
     cross_size_was_resolved_from_aspect_ratio: bool,
+    // The cross size transferred through the aspect ratio before the automatic minimum size grew it to fit the
+    // content. The content resolves percentages against it.
+    cross_size_transferred_through_aspect_ratio: Option<CssPixels>,
     flex_base_size: CssPixels,
     hypothetical_main_size: CssPixels,
     hypothetical_cross_size: CssPixels,
@@ -80,6 +83,7 @@ impl FlexItem<'_> {
             used_flex_basis_is_definite: false,
             main_size_was_resolved_from_aspect_ratio: false,
             cross_size_was_resolved_from_aspect_ratio: false,
+            cross_size_transferred_through_aspect_ratio: None,
             flex_base_size: CssPixels::default(),
             hypothetical_main_size: CssPixels::default(),
             hypothetical_cross_size: CssPixels::default(),
@@ -348,27 +352,53 @@ impl<'pass> FlexFormattingContext<'pass> {
         reverse
     }
 
-    fn main_size_from_cross_size_and_aspect_ratio(
-        &self,
-        cross_size: CssPixels,
-        aspect_ratio: formatting_context::PixelFraction,
-    ) -> CssPixels {
+    // Both sizes are content sizes; the ratio applies to the border box under box-sizing: border-box.
+    fn main_size_from_cross_size_and_aspect_ratio(&self, node: Node, cross_size: CssPixels) -> CssPixels {
         if self.main_axis_is_horizontal() {
-            aspect_ratio.multiply(cross_size)
+            self.sizing().content_inline_size_from_aspect_ratio(node, cross_size)
         } else {
-            aspect_ratio.divide(cross_size)
+            self.sizing().content_block_size_from_aspect_ratio(node, cross_size)
         }
     }
 
-    fn cross_size_from_main_size_and_aspect_ratio(
-        &self,
-        main_size: CssPixels,
-        aspect_ratio: formatting_context::PixelFraction,
-    ) -> CssPixels {
+    fn cross_size_from_main_size_and_aspect_ratio(&self, node: Node, main_size: CssPixels) -> CssPixels {
         if self.main_axis_is_horizontal() {
-            aspect_ratio.divide(main_size)
+            self.sizing().content_block_size_from_aspect_ratio(node, main_size)
         } else {
-            aspect_ratio.multiply(main_size)
+            self.sizing().content_inline_size_from_aspect_ratio(node, main_size)
+        }
+    }
+
+    // The content size that a min/max size in an axis of the item allows, per its box-sizing.
+    fn inner_size_for_min_max_through_aspect_ratio(
+        &self,
+        node: Node,
+        size: &ComputedSize,
+        reference: CssPixels,
+        horizontal: bool,
+    ) -> CssPixels {
+        let value = size.to_px(reference);
+        let style = self.style(node);
+        if style.box_sizing() != box_sizing::BORDER_BOX {
+            return value;
+        }
+        let used = self.run.records.used_values(node);
+        if horizontal {
+            formatting_context::subtract_border_box_adjustment(
+                value,
+                style.border_left_width(),
+                used.padding_left.get(),
+                style.border_right_width(),
+                used.padding_right.get(),
+            )
+        } else {
+            formatting_context::subtract_border_box_adjustment(
+                value,
+                style.border_top_width(),
+                used.padding_top.get(),
+                style.border_bottom_width(),
+                used.padding_bottom.get(),
+            )
         }
     }
 
@@ -805,7 +835,10 @@ impl<'pass> FlexFormattingContext<'pass> {
         // For example, percentage values of flex-basis are resolved against the flex item’s containing block
         // (i.e. its flex container); and if that containing block’s size is indefinite,
         // the used value for flex-basis is content.
-        if value.is_percentage() && !self.has_definite_main_size_used(self.container_used()) {
+        // NB: A main size property that contains a percentage of an indefinite size behaves as auto, as in block layout.
+        let percentage_is_unresolvable =
+            value.is_percentage() || (property != SizingProperty::FlexBasis && value.contains_percentage());
+        if percentage_is_unresolvable && !self.has_definite_main_size_used(self.container_used()) {
             return UsedFlexBasis::Content;
         }
         UsedFlexBasis::Size { value, property }
@@ -820,17 +853,19 @@ impl<'pass> FlexFormattingContext<'pass> {
         min_cross_size: &ComputedSize,
         max_cross_size: &ComputedSize,
     ) -> CssPixels {
-        let ratio = self.facts(node).preferred_aspect_ratio().unwrap();
         let reference = self.inner_cross_size_used(self.container_used());
+        let cross_is_horizontal = !self.main_axis_is_horizontal();
         if !self.should_treat_max_size_as_none(node, true) {
-            main_size =
-                main_size.min(self.main_size_from_cross_size_and_aspect_ratio(max_cross_size.to_px(reference), ratio));
+            let max_cross =
+                self.inner_size_for_min_max_through_aspect_ratio(node, max_cross_size, reference, cross_is_horizontal);
+            main_size = main_size.min(self.main_size_from_cross_size_and_aspect_ratio(node, max_cross));
         }
         if !min_cross_size.is_auto()
             && (!min_cross_size.contains_percentage() || self.has_definite_cross_size_used(self.container_used()))
         {
-            main_size =
-                main_size.max(self.main_size_from_cross_size_and_aspect_ratio(min_cross_size.to_px(reference), ratio));
+            let min_cross =
+                self.inner_size_for_min_max_through_aspect_ratio(node, min_cross_size, reference, cross_is_horizontal);
+            main_size = main_size.max(self.main_size_from_cross_size_and_aspect_ratio(node, min_cross));
         }
         main_size
     }
@@ -842,15 +877,17 @@ impl<'pass> FlexFormattingContext<'pass> {
         min_main_size: &ComputedSize,
         max_main_size: &ComputedSize,
     ) -> CssPixels {
-        let ratio = self.facts(node).preferred_aspect_ratio().unwrap();
         let reference = self.inner_main_size_used(self.container_used());
+        let main_is_horizontal = self.main_axis_is_horizontal();
         if !self.should_treat_max_size_as_none(node, false) {
-            cross_size =
-                cross_size.min(self.cross_size_from_main_size_and_aspect_ratio(max_main_size.to_px(reference), ratio));
+            let max_main =
+                self.inner_size_for_min_max_through_aspect_ratio(node, max_main_size, reference, main_is_horizontal);
+            cross_size = cross_size.min(self.cross_size_from_main_size_and_aspect_ratio(node, max_main));
         }
         if !min_main_size.is_auto() {
-            cross_size =
-                cross_size.max(self.cross_size_from_main_size_and_aspect_ratio(min_main_size.to_px(reference), ratio));
+            let min_main =
+                self.inner_size_for_min_max_through_aspect_ratio(node, min_main_size, reference, main_is_horizontal);
+            cross_size = cross_size.max(self.cross_size_from_main_size_and_aspect_ratio(node, min_main));
         }
         cross_size
     }
@@ -1062,10 +1099,7 @@ impl<'pass> FlexFormattingContext<'pass> {
                 let (max_cross, _) = self.computed_cross_max_size(node);
                 self.adjust_main_size_through_aspect_ratio(
                     node,
-                    self.main_size_from_cross_size_and_aspect_ratio(
-                        self.inner_cross_size(index),
-                        self.facts(node).preferred_aspect_ratio().unwrap(),
-                    ),
+                    self.main_size_from_cross_size_and_aspect_ratio(node, self.inner_cross_size(index)),
                     min_cross,
                     max_cross,
                 )
@@ -1116,15 +1150,18 @@ impl<'pass> FlexFormattingContext<'pass> {
         //           intrinsic size and no cross size to resolve the ratio against.
         //         - in response to cross size min/max constraints.
         let facts = self.facts(node);
-        if facts.has_auto_content_aspect_ratio() {
-            if !basis_is_definite
-                && !facts.has_auto_content_width()
-                && !facts.has_auto_content_height()
-                && !self.has_definite_cross_size(index)
-                && self.has_definite_main_size_used(self.container_used())
-            {
-                flex_base_size = self.inner_main_size_used(self.container_used());
-            }
+        if facts.has_auto_content_aspect_ratio()
+            && !basis_is_definite
+            && !facts.has_auto_content_width()
+            && !facts.has_auto_content_height()
+            && !self.has_definite_cross_size(index)
+            && self.has_definite_main_size_used(self.container_used())
+        {
+            flex_base_size = self.inner_main_size_used(self.container_used());
+        }
+        // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-size-transfers
+        // NB: Cross axis limits transfer to an indefinite main size.
+        if facts.has_auto_content_aspect_ratio() || (facts.has_preferred_aspect_ratio() && !basis_is_definite) {
             let (min_cross, _) = self.computed_cross_min_size(node);
             let (max_cross, _) = self.computed_cross_max_size(node);
             flex_base_size = self.adjust_main_size_through_aspect_ratio(node, flex_base_size, min_cross, max_cross);
@@ -1185,14 +1222,14 @@ impl<'pass> FlexFormattingContext<'pass> {
         // If the item has a preferred aspect ratio and its preferred cross size is definite,
         // then the transferred size suggestion is that size
         // (clamped by its minimum and maximum cross sizes if they are definite), converted through the aspect ratio.
-        let ratio = self.facts(node).preferred_aspect_ratio()?;
+        self.facts(node).preferred_aspect_ratio()?;
         if !self.has_definite_cross_size(index) {
             // It is otherwise undefined.
             return None;
         }
         Some(self.adjust_main_size_through_aspect_ratio(
             node,
-            self.main_size_from_cross_size_and_aspect_ratio(self.inner_cross_size(index), ratio),
+            self.main_size_from_cross_size_and_aspect_ratio(node, self.inner_cross_size(index)),
             self.computed_cross_min_size(node).0,
             self.computed_cross_max_size(node).0,
         ))
@@ -1581,9 +1618,16 @@ impl<'pass> FlexFormattingContext<'pass> {
                 != self.inline_axis_is_horizontal(self.run.box_);
             let container_has_vertical_inline_main_axis =
                 self.is_row_layout() && !self.inline_axis_is_horizontal(self.run.box_);
+            // INTEROP: The block size of a non-replaced item with an aspect ratio follows from its inline size, so other
+            //          engines treat its post-flexing main size as definite when the main axis is its block axis.
+            let node = self.flex_items[index].box_;
+            let aspect_ratio_provides_block_main_size = !self.main_axis_is_parallel_to_inline_axis(node)
+                && !self.facts(node).is_replaced_box()
+                && self.facts(node).has_preferred_aspect_ratio();
             if self.has_definite_main_size_used(self.container_used())
                 || self.flex_items[index].used_flex_basis_is_definite
                 || self.flex_items[index].main_size_was_resolved_from_aspect_ratio
+                || aspect_ratio_provides_block_main_size
                 || container_has_vertical_inline_main_axis
                 || (item_is_orthogonal && self.main_axis_is_parallel_to_inline_axis(self.flex_items[index].box_))
             {
@@ -1664,7 +1708,7 @@ impl<'pass> FlexFormattingContext<'pass> {
             return;
         }
 
-        if let Some(ratio) = self.facts(node).preferred_aspect_ratio() {
+        if self.facts(node).has_preferred_aspect_ratio() {
             let facts = self.facts(node);
             // AD-HOC: For a replaced box whose only sizing information is a natural aspect ratio (e.g an SVG with a
             //         viewBox but no natural width or height) and an indefinite flex basis, we stretch-fit the cross size
@@ -1686,20 +1730,22 @@ impl<'pass> FlexFormattingContext<'pass> {
             // on this aspect ratio is called the ratio-dependent axis, and the resulting size is definite if its
             // input sizes are also definite.
             let main_size = self.flex_items[index].main_size.unwrap();
-            let transferred_cross_size = self.cross_size_from_main_size_and_aspect_ratio(main_size, ratio);
+            let transferred_cross_size = self.cross_size_from_main_size_and_aspect_ratio(node, main_size);
             // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum
-            let clamp_min = self
-                .sizing()
-                .automatic_minimum_size_from_aspect_ratio(
-                    node,
-                    self.cross_sizing_axis(),
-                    main_size,
-                    transferred_cross_size,
-                    self.available_space_for_items.unwrap().space,
-                    self.item_containing_block_constraints(),
-                    None,
-                )
-                .unwrap_or(clamp_min);
+            let automatic_minimum = self.sizing().automatic_minimum_size_from_aspect_ratio(
+                node,
+                self.cross_sizing_axis(),
+                main_size,
+                transferred_cross_size,
+                self.available_space_for_items.unwrap().space,
+                self.item_containing_block_constraints(),
+                None,
+            );
+            let transferred = css_clamp(transferred_cross_size, clamp_min, clamp_max);
+            self.flex_items[index].cross_size_transferred_through_aspect_ratio = automatic_minimum
+                .filter(|&minimum| minimum > transferred)
+                .map(|_| transferred);
+            let clamp_min = automatic_minimum.unwrap_or(clamp_min);
             self.flex_items[index].hypothetical_cross_size = css_clamp(transferred_cross_size, clamp_min, clamp_max);
             self.flex_items[index].cross_size_was_resolved_from_aspect_ratio = self.has_definite_main_size(index);
             return;
@@ -1885,7 +1931,16 @@ impl<'pass> FlexFormattingContext<'pass> {
                     // The axis in which the preferred size calculation depends on this aspect ratio is called the
                     // ratio-dependent axis, and the resulting size is definite if its input sizes are also definite.
                     if self.flex_items[index].cross_size_was_resolved_from_aspect_ratio {
-                        self.set_cross_size(index, size);
+                        // NB: When the automatic minimum size grew the transferred size to fit the content, the content
+                        //     is laid out against the transferred size, and the item takes its grown size afterwards.
+                        let percentage_basis = if self.cross_axis_is_horizontal() {
+                            size
+                        } else {
+                            self.flex_items[index]
+                                .cross_size_transferred_through_aspect_ratio
+                                .unwrap_or(size)
+                        };
+                        self.set_cross_size(index, percentage_basis);
                         self.set_has_definite_cross_size(index);
                     }
                 }
@@ -2402,7 +2457,18 @@ impl<'pass> FlexFormattingContext<'pass> {
                 used.border_bottom.set(style.border_bottom_width());
             }
             self.set_main_size(index, self.flex_items[index].main_size.unwrap());
-            self.set_cross_size(index, self.flex_items[index].cross_size.unwrap());
+            // NB: An item whose transferred cross size grows to fit its content lays out that content against the
+            //     transferred size, and grows to the used cross size in its own layout.
+            let cross_size = if self.flex_items[index].cross_size_was_resolved_from_aspect_ratio
+                && !self.cross_axis_is_horizontal()
+            {
+                self.flex_items[index]
+                    .cross_size_transferred_through_aspect_ratio
+                    .unwrap_or(self.flex_items[index].cross_size.unwrap())
+            } else {
+                self.flex_items[index].cross_size.unwrap()
+            };
+            self.set_cross_size(index, cross_size);
         }
     }
 
@@ -2451,6 +2517,15 @@ impl<'pass> FlexFormattingContext<'pass> {
             let stretched_table_box_block_size = self.flex_items[index].cross_size.unwrap() - captions_block_size;
             input.sizing.forced_min_border_box_block_size =
                 Some(stretched_table_box_block_size.max(sizes.table_box_border_box_block_size));
+        }
+
+        if self.flex_items[index].cross_size_was_resolved_from_aspect_ratio
+            && !self.cross_axis_is_horizontal()
+            && self.flex_items[index]
+                .cross_size_transferred_through_aspect_ratio
+                .is_some()
+        {
+            input.sizing.content_block_size_after_inside_layout = self.flex_items[index].cross_size;
         }
 
         self.flex_items[index].content_baselines =
@@ -2692,7 +2767,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         if self.facts(node).is_replaced_box() && self.facts(node).has_auto_content_width() {
             return None;
         }
-        let ratio = self.facts(node).preferred_aspect_ratio()?;
+        self.facts(node).preferred_aspect_ratio()?;
         let main_size = if self.has_definite_main_size_used(self.container_used()) {
             self.flex_items[index]
                 .main_size
@@ -2700,7 +2775,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         } else {
             self.flex_items[index].flex_base_size
         };
-        Some(self.cross_size_from_main_size_and_aspect_ratio(main_size, ratio))
+        Some(self.cross_size_from_main_size_and_aspect_ratio(node, main_size))
     }
 
     fn calculate_cross_content_contribution(
@@ -3234,8 +3309,18 @@ impl<'pass> FlexFormattingContext<'pass> {
         // https://drafts.csswg.org/css-flexbox-1/#definite-sizes
         // 4. Once the cross size of a flex line has been determined,
         //    the cross sizes of items in auto-sized flex containers are also considered definite for the purpose of layout.
+        // NB: This refers to step 11, which stretches items. Other engines leave the content-based cross size of an item
+        //     that is not stretched indefinite.
         if self.should_treat_cross_size_as_auto(self.run.box_) {
             for index in 0..self.flex_items.len() {
+                // NB: A button or a text input centers its content within its used block size, so it keeps it definite.
+                let item_facts = self.facts(self.flex_items[index].box_);
+                if !self.flex_item_is_stretched(index)
+                    && !item_facts.uses_button_layout()
+                    && !item_facts.is_text_input()
+                {
+                    continue;
+                }
                 let size = self.flex_items[index].cross_size.unwrap();
                 self.set_cross_size(index, size);
                 self.set_has_definite_cross_size(index);

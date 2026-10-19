@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <AK/StdLibExtras.h>
 #include <AK/kmalloc.h>
 #include <UI/Qt/Application.h>
@@ -62,9 +63,16 @@
 namespace Ladybird {
 
 static constexpr auto LADYBIRD_TAB_MIME_TYPE = "application/x-ladybird-tab";
-static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 42;
+static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 40;
 static constexpr int HORIZONTAL_TAB_HEIGHT = 36;
-static constexpr int HORIZONTAL_TAB_MIN_WIDTH = 128;
+// Horizontal tabs shrink until only their favicon is left, then overflow the strip and get clipped.
+static constexpr int HORIZONTAL_TAB_MIN_WIDTH = 40;
+// Narrower background tabs drop their close button to keep room for the title.
+static constexpr int HORIZONTAL_TAB_CLOSE_BUTTON_MIN_WIDTH = 96;
+// The active tab keeps its close button for as long as it fits next to the favicon.
+static constexpr int HORIZONTAL_ACTIVE_TAB_CLOSE_BUTTON_MIN_WIDTH = 68;
+// Below this content width, a horizontal tab shows its favicon alone.
+static constexpr int HORIZONTAL_TAB_MIN_CONTENT_WIDTH_FOR_TITLE = 48;
 static constexpr int HORIZONTAL_TAB_MAX_WIDTH = 232;
 static constexpr int VERTICAL_TAB_HEIGHT = 38;
 static constexpr int VERTICAL_TABS_COLLAPSED_WIDTH = browser_chrome_layout_policy().collapsed_sidebar_width;
@@ -87,6 +95,10 @@ static constexpr int TAB_PREVIEW_THUMBNAIL_HEIGHT = 180;
 static constexpr int TAB_PREVIEW_SHADOW_MARGIN = 12;
 static constexpr int TAB_PREVIEW_CARD_GAP = 6;
 static constexpr int TAB_BUTTON_SIZE = 22;
+static constexpr int TAB_BUTTON_ICON_SIZE = 14;
+static constexpr qreal LOAD_SHEEN_FADE_PROGRESS = 0.15;
+static constexpr int LOAD_SHEEN_DURATION_MS = 400;
+static constexpr int TAB_TITLE_FADE_WIDTH = 24;
 static constexpr int TAB_ICON_SIZE = 16;
 static constexpr int COLLAPSED_VERTICAL_TAB_BUTTON_SIZE = 16;
 static constexpr int COLLAPSED_VERTICAL_TAB_ICON_SIZE = 12;
@@ -133,25 +145,6 @@ static bool target_can_accept_tab_drop(QWidget& target, QDropEvent& event)
         return false;
 
     return source_window->is_private() == target_window->is_private();
-}
-
-static QPainterPath tab_shape_path(QRectF const& rect, qreal top_radius, qreal bottom_radius)
-{
-    top_radius = min(top_radius, rect.height() / 2.0);
-    bottom_radius = min(bottom_radius, rect.height() / 2.0);
-
-    QPainterPath path;
-    path.moveTo(rect.left() + top_radius, rect.top());
-    path.lineTo(rect.right() - top_radius, rect.top());
-    path.quadTo(rect.right(), rect.top(), rect.right(), rect.top() + top_radius);
-    path.lineTo(rect.right(), rect.bottom() - bottom_radius);
-    path.quadTo(rect.right(), rect.bottom(), rect.right() - bottom_radius, rect.bottom());
-    path.lineTo(rect.left() + bottom_radius, rect.bottom());
-    path.quadTo(rect.left(), rect.bottom(), rect.left(), rect.bottom() - bottom_radius);
-    path.lineTo(rect.left(), rect.top() + top_radius);
-    path.quadTo(rect.left(), rect.top(), rect.left() + top_radius, rect.top());
-    path.closeSubpath();
-    return path;
 }
 
 static void clear_layout(QLayout& layout)
@@ -216,6 +209,40 @@ static QRect tab_card_shape_rect(QRect const& rect)
     return rect.adjusted(TAB_CARD_SHAPE_HORIZONTAL_INSET, TAB_CARD_SHAPE_VERTICAL_INSET, -TAB_CARD_SHAPE_HORIZONTAL_INSET, -TAB_CARD_SHAPE_VERTICAL_INSET);
 }
 
+// When a tab finishes loading, a soft band of light sweeps across its pill from left to right.
+static void paint_load_sheen(QPainter& painter, QPalette const& palette, QPainterPath const& tab_path, QRectF const& shape_rect, qreal progress)
+{
+    // The bright middle of the band travels from the left edge of the tab to its right edge, so the sweep is seen to
+    // start at the very left. It fades out at the right edge rather than leaving the tab.
+    auto band_width = shape_rect.height() * 2.5;
+    auto center_x = shape_rect.left() + (shape_rect.width() * progress);
+    auto strength = min(1.0, (1.0 - progress) / LOAD_SHEEN_FADE_PROGRESS);
+
+    // NB: The gradient runs from the top left to the bottom right of the band, which slants the band like "/".
+    QLinearGradient sheen(QPointF(center_x - (band_width / 2.0), shape_rect.top()), QPointF(center_x + (band_width / 2.0), shape_rect.bottom()));
+    auto peak = ChromeStyle::is_dark(palette) ? QColor(255, 255, 255, 46) : QColor(0, 0, 0, 14);
+    peak.setAlphaF(peak.alphaF() * strength);
+    auto clear = peak;
+    clear.setAlpha(0);
+    sheen.setColorAt(0.0, clear);
+    sheen.setColorAt(0.5, peak);
+    sheen.setColorAt(1.0, clear);
+
+    painter.save();
+    painter.setClipPath(tab_path);
+    painter.fillRect(shape_rect, sheen);
+    painter.restore();
+}
+
+// NB: The macOS style gives tab bars a small font when it polishes them, so tab titles are drawn a point larger than
+//     the tab bar's font rather than by setting the tab bar's font.
+static QFont tab_title_font(QFont font)
+{
+    if (font.pointSizeF() > 0)
+        font.setPointSizeF(font.pointSizeF() + 1);
+    return font;
+}
+
 static QColor tab_hover_surface(QPalette const& palette, qreal hover_progress)
 {
     auto dark = ChromeStyle::is_dark(palette);
@@ -230,6 +257,15 @@ static QColor selected_tab_border(QPalette const& palette, bool collapsed)
     auto color = dark ? QColor(255, 255, 255) : QColor(0, 0, 0);
     color.setAlpha(collapsed ? (dark ? 32 : 30) : (dark ? 26 : 24));
     return color;
+}
+
+static QColor selected_tab_top_edge_highlight(QPalette const& palette, QColor border)
+{
+    if (!ChromeStyle::is_dark(palette))
+        return border;
+    auto highlight = QColor(255, 255, 255);
+    highlight.setAlpha(border.alpha() + 26);
+    return highlight;
 }
 
 static QColor selected_tab_shadow(QPalette const& palette, int layer)
@@ -295,7 +331,9 @@ private:
             : (is_horizontal_new_tab_button
                       ? horizontal_new_tab_button_shape_rect(QRectF(rect()))
                       : QRectF(rect()).adjusted(4.0, 3.0, -4.0, -3.0));
-        auto tab_path = tab_shape_path(shape_rect, 9.0, 9.0);
+        // NB: The horizontal new tab button's shape is square, so this pill is a circle.
+        QPainterPath tab_path;
+        tab_path.addRoundedRect(shape_rect, shape_rect.height() / 2.0, shape_rect.height() / 2.0);
         auto hovered = underMouse();
 
         if (isDown()) {
@@ -332,7 +370,7 @@ private:
         if (hovered || isDown())
             text_color = ChromeStyle::chrome_button_text(palette());
         painter.setPen(text_color);
-        auto text_font = m_tab_bar.font();
+        auto text_font = tab_title_font(m_tab_bar.font());
         painter.setFont(text_font);
 
         QFontMetrics font_metrics(text_font);
@@ -509,7 +547,7 @@ TabBar::TabBar(TabWidget* tab_widget)
     setAcceptDrops(true);
     setFocusPolicy(Qt::NoFocus);
     setIconSize({ 16, 16 });
-    setMinimumHeight(39);
+    setMinimumHeight(HORIZONTAL_TAB_HEIGHT);
     recreate_icons();
 
     m_tab_preview_timer = new QTimer(this);
@@ -518,6 +556,25 @@ TabBar::TabBar(TabWidget* tab_widget)
     connect(m_tab_preview_timer, &QTimer::timeout, this, &TabBar::show_tab_preview);
 
     m_tab_preview_popup = new TabPreviewPopup(this);
+
+    m_loading_swirl_animation = new QVariantAnimation(this);
+    m_loading_swirl_animation->setDuration(ChromeStyle::LOADING_SWIRL_PERIOD_MS);
+    m_loading_swirl_animation->setStartValue(0.0);
+    m_loading_swirl_animation->setEndValue(1.0);
+    m_loading_swirl_animation->setLoopCount(-1);
+    // NB: Each frame repaints only the loading tabs, and checks again, so the swirl also stops when the last loading tab
+    //     is closed.
+    connect(m_loading_swirl_animation, &QVariantAnimation::valueChanged, this, [this] {
+        auto any_tab_loading = false;
+        for (int index = 0; index < count(); ++index) {
+            if (!is_tab_loading(index))
+                continue;
+            any_tab_loading = true;
+            update(visual_tab_rect(index));
+        }
+        if (!any_tab_loading || !isVisible())
+            update_loading_swirl_animation();
+    });
 
     m_hover_animation = new QVariantAnimation(this);
     m_hover_animation->setDuration(120);
@@ -557,7 +614,7 @@ void TabBar::set_tab_layout(TabLayout tab_layout)
         setMinimumSize({ 0, HORIZONTAL_TAB_HEIGHT });
         setMaximumWidth(QWIDGETSIZE_MAX);
         setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-        setUsesScrollButtons(true);
+        setUsesScrollButtons(false);
         set_vertical_scroll_offset(0);
     } else {
         setShape(vertical_tabs_are_on_right() ? QTabBar::RoundedEast : QTabBar::RoundedWest);
@@ -665,6 +722,10 @@ void TabBar::tabLayoutChange()
 
 bool TabBar::event(QEvent* event)
 {
+    // The swirl stops while the tab bar is hidden, so it has to start again for tabs still loading when it is shown.
+    if (event->type() == QEvent::Show)
+        update_loading_swirl_animation();
+
     if (event->type() == QEvent::ToolTip) {
         auto* help_event = static_cast<QHelpEvent*>(event);
         auto hovered_tab = tab_index_at(help_event->pos());
@@ -686,7 +747,6 @@ void TabBar::paintEvent(QPaintEvent*)
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
 
-    auto border = ChromeStyle::chrome_border(palette());
     auto dark = ChromeStyle::is_dark(palette());
     auto text_color = ChromeStyle::chrome_text(palette());
     auto is_vertical = tab_layout() != TabLayout::Horizontal;
@@ -712,7 +772,8 @@ void TabBar::paintEvent(QPaintEvent*)
             shape_rect = horizontal_tab_card_shape_rect(QRectF(tab_rect));
         else
             shape_rect = tab_card_shape_rect(QRectF(tab_rect));
-        auto tab_path = tab_shape_path(shape_rect, 9.0, 9.0);
+        QPainterPath tab_path;
+        tab_path.addRoundedRect(shape_rect, shape_rect.height() / 2.0, shape_rect.height() / 2.0);
 
         if (is_selected) {
             painter.setPen(Qt::NoPen);
@@ -721,11 +782,13 @@ void TabBar::paintEvent(QPaintEvent*)
             painter.setBrush(selected_tab_shadow(palette(), 0));
             painter.drawPath(tab_path.translated(0, 1));
 
-            auto selected_gradient = QLinearGradient(shape_rect.topLeft(), shape_rect.bottomLeft());
-            selected_gradient.setColorAt(0.0, ChromeStyle::chrome_active_tab_surface_top(palette()));
-            selected_gradient.setColorAt(1.0, ChromeStyle::chrome_active_tab_surface_bottom(palette()));
-            painter.setBrush(selected_gradient);
-            painter.setPen(QPen(selected_tab_border(palette(), is_collapsed_vertical), 1));
+            // The fill is flat; only the border brightens toward the top edge, for a little depth.
+            auto border_color = selected_tab_border(palette(), is_collapsed_vertical);
+            auto border_gradient = QLinearGradient(shape_rect.topLeft(), shape_rect.bottomLeft());
+            border_gradient.setColorAt(0.0, selected_tab_top_edge_highlight(palette(), border_color));
+            border_gradient.setColorAt(0.45, border_color);
+            painter.setBrush(ChromeStyle::chrome_active_tab_surface(palette()));
+            painter.setPen(QPen(QBrush(border_gradient), 1));
             painter.drawPath(tab_path);
         } else if (is_hovered) {
             painter.setBrush(tab_hover_surface(palette(), hover_progress));
@@ -733,15 +796,10 @@ void TabBar::paintEvent(QPaintEvent*)
             painter.drawPath(tab_path);
         }
 
-        if (!is_selected && !is_hovered && index > 0 && index != currentIndex() + 1 && !is_collapsed_vertical) {
-            auto separator = border;
-            separator.setAlpha(dark ? 24 : 20);
-            painter.setPen(separator);
-            if (is_vertical)
-                painter.drawLine(QPoint(tab_rect.left() + 16, tab_rect.top()), QPoint(tab_rect.right() - 16, tab_rect.top()));
-            else
-                painter.drawLine(QPoint(tab_rect.left(), 15), QPoint(tab_rect.left(), height() - 15));
-        }
+        if (is_tab_loading(index))
+            ChromeStyle::paint_loading_swirl(painter, tab_path);
+        if (auto progress = load_sheen_progress(index); progress.has_value())
+            paint_load_sheen(painter, palette(), tab_path, shape_rect, *progress);
 
         auto icon = tabIcon(index);
         if (icon.isNull())
@@ -767,9 +825,13 @@ void TabBar::paintEvent(QPaintEvent*)
         if (auto* right_button = tabButton(index, QTabBar::RightSide); right_button && right_button->isVisible())
             contents_rect.setRight(min(contents_rect.right(), right_button->geometry().left() - 6));
 
-        if (is_vertical || contents_rect.width() > 26) {
+        if (!is_vertical && contents_rect.width() < HORIZONTAL_TAB_MIN_CONTENT_WIDTH_FOR_TITLE) {
+            // NB: A tab too narrow for its favicon next to its mute button shows the mute button alone, rather than
+            //     drawing the favicon over it.
+            if (contents_rect.width() < TAB_ICON_SIZE)
+                continue;
             QRect icon_rect {
-                contents_rect.left(),
+                contents_rect.left() + ((contents_rect.width() - TAB_ICON_SIZE) / 2),
                 contents_rect.top() + ((contents_rect.height() - TAB_ICON_SIZE) / 2),
                 TAB_ICON_SIZE,
                 TAB_ICON_SIZE,
@@ -778,25 +840,49 @@ void TabBar::paintEvent(QPaintEvent*)
                 painter.setOpacity(is_hovered ? 0.92 : (dark ? 0.88 : 0.84));
             icon.paint(&painter, icon_rect);
             painter.setOpacity(1.0);
-            contents_rect.setLeft(icon_rect.right() + 8);
+            continue;
         }
 
-        QFont tab_font = font();
-        if (is_selected)
-            tab_font.setWeight(QFont::DemiBold);
-        painter.setFont(tab_font);
+        QRect icon_rect {
+            contents_rect.left(),
+            contents_rect.top() + ((contents_rect.height() - TAB_ICON_SIZE) / 2),
+            TAB_ICON_SIZE,
+            TAB_ICON_SIZE,
+        };
+        if (!is_selected)
+            painter.setOpacity(is_hovered ? 0.92 : (dark ? 0.88 : 0.84));
+        icon.paint(&painter, icon_rect);
+        painter.setOpacity(1.0);
+        contents_rect.setLeft(icon_rect.right() + 8);
 
-        QFontMetrics font_metrics(tab_font);
-        auto title = font_metrics.elidedText(tabText(index), Qt::ElideRight, max(0, contents_rect.width()));
+        auto title_font = tab_title_font(font());
+        painter.setFont(title_font);
+
+        auto title = tabText(index);
         auto tab_text_color = text_color;
         if (!is_selected)
             tab_text_color.setAlpha(is_hovered ? (dark ? 236 : 228) : (dark ? 226 : 216));
-        painter.setPen(tab_text_color);
-        painter.drawText(contents_rect, Qt::AlignLeft | Qt::AlignVCenter, title);
+
+        // A title too long for its tab fades out toward the tab's end, rather than being cut short with an ellipsis.
+        // NB: Measure in fractional pixels, so a title that just fits is not taken for one that does not.
+        if (QFontMetricsF(title_font).horizontalAdvance(title) > contents_rect.width()) {
+            auto faded_text_color = tab_text_color;
+            faded_text_color.setAlpha(0);
+            QLinearGradient fade(contents_rect.right() + 1 - TAB_TITLE_FADE_WIDTH, 0, contents_rect.right() + 1, 0);
+            fade.setColorAt(0.0, tab_text_color);
+            fade.setColorAt(1.0, faded_text_color);
+            painter.setPen(QPen(QBrush(fade), 1));
+        } else {
+            painter.setPen(tab_text_color);
+        }
+        painter.save();
+        painter.setClipRect(contents_rect);
+        painter.drawText(contents_rect, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine, title);
+        painter.restore();
     }
 
     if (m_drop_indicator_index >= 0 && count() > 0) {
-        auto indicator_color = ChromeStyle::chrome_accent(palette());
+        auto indicator_color = ChromeStyle::chrome_accent();
         indicator_color.setAlpha(220);
         painter.setPen(QPen(indicator_color, 3, Qt::SolidLine, Qt::RoundCap));
 
@@ -1157,6 +1243,68 @@ void TabBar::start_hover_animation(int tab_index, qreal target_progress)
     m_hover_animation->start();
 }
 
+void TabBar::play_load_sheen(Tab& tab)
+{
+    m_load_sheens.remove_all_matching([&](auto const& sheen) {
+        if (sheen.tab != &tab)
+            return false;
+        sheen.animation->deleteLater();
+        return true;
+    });
+
+    auto* animation = new QVariantAnimation(this);
+    animation->setDuration(LOAD_SHEEN_DURATION_MS);
+    animation->setEasingCurve(QEasingCurve::InOutSine);
+    animation->setStartValue(0.0);
+    animation->setEndValue(1.0);
+    connect(animation, &QVariantAnimation::valueChanged, this, [this] { update(); });
+    connect(animation, &QVariantAnimation::finished, this, [this, animation] {
+        m_load_sheens.remove_first_matching([&](auto const& sheen) { return sheen.animation == animation; });
+        animation->deleteLater();
+        update();
+    });
+    m_load_sheens.append({ &tab, animation });
+    animation->start();
+}
+
+bool TabBar::is_tab_loading(int index) const
+{
+    if (!m_tab_widget || index < 0 || index >= count())
+        return false;
+    auto* tab = m_tab_widget->tab(index);
+    return tab && tab->is_loading();
+}
+
+// The swirl only needs repainting while a tab is loading and the tab bar can be seen.
+void TabBar::update_loading_swirl_animation()
+{
+    auto any_tab_loading = false;
+    for (int index = 0; index < count() && !any_tab_loading; ++index)
+        any_tab_loading = is_tab_loading(index);
+
+    auto should_run = any_tab_loading && isVisible();
+    if (should_run && m_loading_swirl_animation->state() != QAbstractAnimation::Running)
+        m_loading_swirl_animation->start();
+    else if (!should_run && m_loading_swirl_animation->state() != QAbstractAnimation::Stopped)
+        m_loading_swirl_animation->stop();
+    update();
+}
+
+Optional<qreal> TabBar::load_sheen_progress(int index) const
+{
+    if (m_load_sheens.is_empty() || !m_tab_widget)
+        return {};
+    // NB: A sheen whose tab was closed has a null tab, which must not match a missing one here.
+    auto* tab = m_tab_widget->tab(index);
+    if (!tab)
+        return {};
+    for (auto const& sheen : m_load_sheens) {
+        if (sheen.tab == tab)
+            return sheen.animation->currentValue().toReal();
+    }
+    return {};
+}
+
 void TabBar::schedule_tab_preview(int index)
 {
     if (!m_tab_preview_timer || !m_tab_preview_popup)
@@ -1379,8 +1527,28 @@ void TabBar::update_tab_button_geometry()
 
     if (tab_layout() == TabLayout::Horizontal) {
         for (int index = 0; index < count(); ++index) {
-            prepare_button(tabButton(index, QTabBar::LeftSide), false);
-            prepare_button(tabButton(index, QTabBar::RightSide), false);
+            auto shape_rect = horizontal_tab_card_shape_rect(QRectF(tabRect(index)));
+            auto* left_button = tabButton(index, QTabBar::LeftSide);
+            prepare_button(left_button, false);
+            // NB: The style puts a tab's left button 1pt inside the tab's pill, where its icon looks flush against the
+            //     pill's edge. Give it 3pt.
+            if (left_button) {
+                auto x = qRound(shape_rect.left()) + 3;
+                if (left_button->x() != x)
+                    left_button->move(x, left_button->y());
+            }
+            auto* close_button = tabButton(index, QTabBar::RightSide);
+            prepare_button(close_button, false);
+            if (!close_button)
+                continue;
+            // NB: Likewise, keep the close button's center 14pt in from the pill's right edge.
+            auto close_button_x = qRound(shape_rect.right()) - 14 - (close_button->width() / 2);
+            if (close_button->x() != close_button_x)
+                close_button->move(close_button_x, close_button->y());
+            auto minimum_width = index == currentIndex() ? HORIZONTAL_ACTIVE_TAB_CLOSE_BUTTON_MIN_WIDTH : HORIZONTAL_TAB_CLOSE_BUTTON_MIN_WIDTH;
+            auto show_close_button = tabRect(index).width() >= minimum_width;
+            if (close_button->isVisible() != show_close_button)
+                close_button->setVisible(show_close_button);
         }
         return;
     }
@@ -1400,7 +1568,8 @@ void TabBar::update_tab_button_geometry()
         if (button_size.isEmpty())
             return;
 
-        auto x = position == QTabBar::RightSide ? shape_rect.right() - button_size.width() - 6 : shape_rect.left() + 6;
+        // Buttons are centered 18pt in from the card's edges.
+        auto x = position == QTabBar::RightSide ? shape_rect.right() - 18 - (button_size.width() / 2) : shape_rect.left() + 18 - (button_size.width() / 2);
         auto icon_left = shape_rect.left() + TAB_CONTENT_HORIZONTAL_INSET;
         if (position == QTabBar::RightSide) {
             if (auto* left_button = tabButton(index, QTabBar::LeftSide); left_button && left_button->isVisible())
@@ -1527,7 +1696,7 @@ TabWidget::TabWidget(QWidget* parent)
     m_tab_bar->setMovable(false);
     m_tab_bar->setTabsClosable(true);
     m_tab_bar->setExpanding(false);
-    m_tab_bar->setUsesScrollButtons(true);
+    m_tab_bar->setUsesScrollButtons(false);
     m_tab_bar->setDrawBase(false);
     m_tab_bar->installEventFilter(this);
 
@@ -1631,11 +1800,16 @@ TabWidget::TabWidget(QWidget* parent)
     update_chrome_style();
 
     connect(m_tab_bar, &QTabBar::currentChanged, this, [this](int index) {
+        // The tab being left keeps its omnibox's editing session for when it is shown again.
+        if (auto* previous_tab = qobject_cast<Tab*>(m_stacked_widget->currentWidget()); previous_tab && m_stacked_widget->indexOf(previous_tab) != index)
+            previous_tab->park_location_editing();
+
         if (index >= 0 && index < m_stacked_widget->count())
             m_stacked_widget->setCurrentIndex(index);
 
-        emit current_tab_changed(index);
         m_toolbar_container->setCurrentIndex(index);
+        emit current_tab_changed(index);
+        update_vertical_tabs_content_separator();
         update_vertical_tabs_overlay_geometry();
         update_vertical_tabs_resize_handle();
         update_vertical_tabs_content_overlay();
@@ -1694,6 +1868,7 @@ void TabWidget::insert_tab(int index, Tab* widget, QString const& label)
     if (auto* current = as_if<Tab>(m_stacked_widget->currentWidget()); current && current != widget)
         size_page_like(*widget, *current);
     widget->view().installEventFilter(this);
+    widget->bookmarks_bar().installEventFilter(this);
 
     m_stacked_widget->insertWidget(index, widget);
     m_tab_bar->insertTab(index, label);
@@ -1706,6 +1881,9 @@ void TabWidget::insert_tab(int index, Tab* widget, QString const& label)
     update_toolbar_placement();
     update_tab_layout();
     update_tab_button_visibility();
+
+    // A tab moved here from another window can already be loading.
+    m_tab_bar->update_loading_swirl_animation();
 }
 
 void TabWidget::remove_tab(int index)
@@ -1721,6 +1899,7 @@ Tab* TabWidget::take_tab(int index)
 
     m_stacked_widget->removeWidget(widget);
     as<Tab>(widget)->view().removeEventFilter(this);
+    as<Tab>(widget)->bookmarks_bar().removeEventFilter(this);
     auto* toolbar = as<Tab>(widget)->toolbar_container();
     if (m_toolbar_container->indexOf(toolbar) != -1)
         m_toolbar_container->removeWidget(toolbar);
@@ -1857,6 +2036,9 @@ void TabWidget::dropEvent(QDropEvent* event)
 
 bool TabWidget::eventFilter(QObject* watched, QEvent* event)
 {
+    if (is<BookmarksBar>(watched) && (event->type() == QEvent::Show || event->type() == QEvent::Hide))
+        update_vertical_tabs_content_separator();
+
     if (watched == window() && event->type() == QEvent::Leave)
         defer_update_vertical_tabs_hover_expanded();
 
@@ -2110,6 +2292,30 @@ void TabWidget::update_tab_toolbar_window_controls_visibility()
 
 void TabWidget::rebuild_layout()
 {
+    // NB: Moving the page stack between layouts drops keyboard focus from the page, which leaves the window's keyboard
+    //     shortcuts dead until something is clicked. Give focus back to whatever had it.
+    QPointer<QWidget> focus_widget = QApplication::focusWidget();
+    if (focus_widget && !isAncestorOf(focus_widget))
+        focus_widget = nullptr;
+    ScopeGuard restore_focus = [&] {
+        if (!focus_widget)
+            return;
+        auto restore = [focus_widget = focus_widget] {
+            if (!focus_widget || !focus_widget->isVisible())
+                return;
+#if defined(AK_OS_MACOS)
+            make_appkit_window_first_responder(*focus_widget);
+#endif
+            focus_widget->setFocus();
+        };
+        // NB: A widget that moved under an already visible parent, like the toolbar does when the tabs move to the
+        //     side, is only shown again on the next turn of the event loop.
+        if (focus_widget->isVisible())
+            restore();
+        else
+            QTimer::singleShot(0, focus_widget.data(), restore);
+    };
+
     clear_layout(*m_main_layout);
     clear_layout(*m_tab_bar_row_layout);
     clear_layout(*m_page_column_layout);
@@ -2164,12 +2370,12 @@ void TabWidget::rebuild_layout_for_horizontal_tabs()
 
     if constexpr (use_native_macos_window_controls()) {
         m_tab_bar_row_layout->addWidget(m_window_controls, 0, Qt::AlignVCenter);
-        m_tab_bar_row_layout->addWidget(m_tab_bar);
-        m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
+        m_tab_bar_row_layout->addWidget(m_tab_bar, 0, Qt::AlignTop);
+        m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignTop);
         m_tab_bar_row_layout->addStretch(1);
     } else {
-        m_tab_bar_row_layout->addWidget(m_tab_bar);
-        m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
+        m_tab_bar_row_layout->addWidget(m_tab_bar, 0, Qt::AlignTop);
+        m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignTop);
         m_tab_bar_row_layout->addStretch(1);
         m_tab_bar_row_layout->addWidget(m_window_controls);
     }
@@ -2266,7 +2472,9 @@ void TabWidget::update_vertical_tabs_resize_handle()
 
 void TabWidget::update_vertical_tabs_content_separator()
 {
-    auto show_content_separator = m_tab_bar_visible && m_tab_bar->tab_layout() != TabLayout::Horizontal;
+    auto* current = as_if<Tab>(m_stacked_widget->currentWidget());
+    auto has_page_bookmarks_bar = current && current->has_bookmarks_bar_in_page();
+    auto show_content_separator = m_tab_bar_visible && m_tab_bar->tab_layout() != TabLayout::Horizontal && !has_page_bookmarks_bar;
     m_vertical_tabs_content_separator->setVisible(show_content_separator);
     if (!show_content_separator)
         return;
@@ -2544,7 +2752,7 @@ void TabBarButton::set_collapsed_vertical_overlay(bool enabled)
     setProperty(COLLAPSED_VERTICAL_TAB_BUTTON_PROPERTY, enabled);
 
     QSize button_size { TAB_BUTTON_SIZE, TAB_BUTTON_SIZE };
-    QSize icon_size { TAB_ICON_SIZE, TAB_ICON_SIZE };
+    QSize icon_size { TAB_BUTTON_ICON_SIZE, TAB_BUTTON_ICON_SIZE };
     if (enabled) {
         button_size = { COLLAPSED_VERTICAL_TAB_BUTTON_SIZE, COLLAPSED_VERTICAL_TAB_BUTTON_SIZE };
         icon_size = { COLLAPSED_VERTICAL_TAB_ICON_SIZE, COLLAPSED_VERTICAL_TAB_ICON_SIZE };
@@ -2562,7 +2770,7 @@ TabBarButton::TabBarButton(QIcon const& icon, QWidget* parent)
 {
     setObjectName("LadybirdTabButton");
     setFixedSize({ TAB_BUTTON_SIZE, TAB_BUTTON_SIZE });
-    setIconSize({ TAB_ICON_SIZE, TAB_ICON_SIZE });
+    setIconSize({ TAB_BUTTON_ICON_SIZE, TAB_BUTTON_ICON_SIZE });
     setFocusPolicy(Qt::NoFocus);
     setFlat(true);
     hide();
@@ -2591,6 +2799,8 @@ void TabBarButton::paintEvent(QPaintEvent*)
             ? ChromeStyle::CircularControlFrameStyle::ActiveTabOverlay
             : ChromeStyle::CircularControlFrameStyle::InteractionOnly;
         ChromeStyle::paint_circular_control_frame(painter, *this, frame_style);
+    } else if (objectName() == "LadybirdAudioState") {
+        ChromeStyle::paint_circular_control_frame(painter, *this);
     }
 
     painter.drawControl(QStyle::CE_PushButton, option);

@@ -9297,7 +9297,7 @@ fn the_same_type_arriving_routes_an_of_type_position() {
 
     let mut planned = Vec::new();
     assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
-    assert_eq!(planned, vec![nodes[3].raw(), inserted.raw()]);
+    assert_eq!(planned, vec![inserted.raw(), nodes[3].raw()]);
 }
 
 #[test]
@@ -9355,7 +9355,7 @@ fn an_arrival_with_no_type_facts_keeps_of_type_routing_conservative() {
 
     let mut planned = Vec::new();
     assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
-    assert_eq!(planned, vec![nodes[3].raw(), inserted.raw()]);
+    assert_eq!(planned, vec![inserted.raw(), nodes[3].raw()]);
 }
 
 fn nth_target_document() -> (StyleEngine, Vec<StyleNodeID>) {
@@ -9397,7 +9397,7 @@ fn an_arrival_routes_only_an_plus_b_positions_that_can_flip() {
 
     let mut planned = Vec::new();
     assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
-    assert_eq!(planned, vec![nodes[2].raw(), nodes[3].raw(), inserted.raw()]);
+    assert_eq!(planned, vec![inserted.raw(), nodes[2].raw(), nodes[3].raw()]);
 }
 
 #[test]
@@ -10962,6 +10962,41 @@ fn detachment_routing_rebuild_excludes_retired_rules() {
 }
 
 #[test]
+fn a_sheet_kept_for_reattachment_keeps_its_routes_while_detached() {
+    let mut engine = StyleEngine::new();
+    let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+    engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+    let program = engine
+        .programs
+        .add(test_selector_program(".target", &[("target", StyleAtomID(1))]));
+    let rule = engine.append_rule(sheet, None, RuleKind::Style);
+    engine.add_routing_rule(rule, program);
+    let mut version = engine.program.rule_version(rule);
+    version.selector_program = Some(program);
+    engine.replace_rule_version(rule, version);
+    discard_transaction(&mut engine);
+
+    engine.detach_sheet(sheet, TreeScopeID::DOCUMENT);
+    engine.set_sheet_kept_for_reattachment(sheet, true);
+    discard_transaction(&mut engine);
+    assert_eq!(engine.routing.len(), 1);
+    assert!(!engine.program.rule_can_decide(rule));
+
+    let routing_before_reattachment = Arc::clone(&engine.routing);
+    engine.set_sheet_kept_for_reattachment(sheet, false);
+    engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+    discard_transaction(&mut engine);
+    assert!(Arc::ptr_eq(&routing_before_reattachment, &engine.routing));
+
+    engine.detach_sheet(sheet, TreeScopeID::DOCUMENT);
+    engine.set_sheet_kept_for_reattachment(sheet, true);
+    discard_transaction(&mut engine);
+    engine.set_sheet_kept_for_reattachment(sheet, false);
+    discard_transaction(&mut engine);
+    assert_eq!(engine.routing.len(), 0);
+}
+
+#[test]
 fn a_declaration_edit_journals_only_the_declaration_field() {
     let (mut engine, _, rule) = authoring_engine();
     let mut contents = engine.program().rule_version(rule);
@@ -12028,6 +12063,63 @@ fn held_style_records_outlive_engine_assignments_and_release_on_retirement() {
     engine.retire_node_state(second);
     engine.computed_group_sets.reclaim_unreachable();
     assert!(!engine.computed_group_sets.final_style_record_is_live(held_record));
+}
+
+#[test]
+fn held_pseudo_style_records_outlive_engine_assignments_and_release_on_retirement() {
+    use super::publication::pseudo_kind::{AFTER, BEFORE};
+    let mut engine = StyleEngine::new();
+    let mut raw_node = [0];
+    engine.allocate_style_nodes(&mut raw_node);
+    let node = StyleNodeID::from_raw(raw_node[0]).unwrap();
+    let publish = |engine: &mut StyleEngine, pseudo_kind, pseudo_element_styles| {
+        engine
+            .publish_computed_groups(
+                computed::ComputedStyleTarget::new(node, pseudo_kind),
+                &[],
+                0,
+                0,
+                computed::ComputedMetadataInput {
+                    pseudo_element_styles,
+                    dependency_flags: 0,
+                    counter_style_environment_identity: 0,
+                    animation_overlay_identity: 0,
+                    animated_overlay: HostShared::null(),
+                    animation_overlay_payloads: &[],
+                    longhand_table: HostShared::null(),
+                },
+            )
+            .style_record_identity
+            .raw()
+    };
+    let held_record = publish(&mut engine, BEFORE, 1);
+    engine.set_held_pseudo_style_record(node, BEFORE, held_record);
+    engine.set_held_pseudo_style_record(node, BEFORE, held_record);
+
+    // The engine can publish a replacement before the host installs it.
+    let replacement = publish(&mut engine, BEFORE, 2);
+    engine.computed_group_sets.reclaim_unreachable();
+    assert!(engine.computed_group_sets.final_style_record_is_live(held_record));
+
+    // Installing the replacement lets go of the record it replaced, however often the host reported it.
+    engine.set_held_pseudo_style_record(node, BEFORE, replacement);
+    engine.computed_group_sets.reclaim_unreachable();
+    assert!(!engine.computed_group_sets.final_style_record_is_live(held_record));
+    assert!(engine.computed_group_sets.final_style_record_is_live(replacement));
+
+    // Clearing one pseudo-element's record must not release another's.
+    let after_record = publish(&mut engine, AFTER, 3);
+    engine.set_held_pseudo_style_record(node, AFTER, after_record);
+    engine.set_held_pseudo_style_record(node, BEFORE, 0);
+    engine.computed_group_sets.remove_pseudo(node, BEFORE);
+    engine.computed_group_sets.remove_pseudo(node, AFTER);
+    engine.computed_group_sets.reclaim_unreachable();
+    assert!(!engine.computed_group_sets.final_style_record_is_live(replacement));
+    assert!(engine.computed_group_sets.final_style_record_is_live(after_record));
+
+    engine.retire_node_state(node);
+    engine.computed_group_sets.reclaim_unreachable();
+    assert!(!engine.computed_group_sets.final_style_record_is_live(after_record));
 }
 
 #[test]

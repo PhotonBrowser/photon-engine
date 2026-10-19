@@ -63,7 +63,7 @@ pub(crate) mod hover;
 mod lane;
 pub(crate) use hover::PendingPointer;
 pub(crate) use lane::LaneDelivery;
-pub(super) use lane::{LaneSlot, note_host_write, seal_plan, take_lanes_in};
+pub(super) use lane::{LaneSlot, note_host_write, retire_slot, seal_plan, take_lanes_in};
 
 /// What the ticks of a lane sample, sealed at the end of the lane's frame's rendering update.
 pub(crate) struct ClockPlan {
@@ -731,7 +731,7 @@ impl ClockTicks {
         if cfg!(test) {
             return;
         }
-        crate::stage_thread::style_layout_thread().run(|| ());
+        super::wait_for_render_side();
         crate::paint_stage::paint_thread().run(|| ());
     }
 
@@ -1767,7 +1767,7 @@ pub(super) fn settle_lanes_for_testing() {
         }
     };
     settle_paint();
-    crate::stage_thread::style_layout_thread().run(|| ());
+    super::wait_for_render_side();
     settle_paint();
 }
 
@@ -1786,7 +1786,7 @@ pub unsafe extern "C" fn document_host_presented_color(
     generated_for: u8,
     color: *mut u32,
 ) -> bool {
-    crate::stage_thread::style_layout_thread().run(|| ());
+    super::wait_for_render_side();
     let Some(presented) =
         StyleNodeID::from_raw(element).and_then(|element| host.clock_ticks().presented_color(element, generated_for))
     else {
@@ -1825,7 +1825,7 @@ pub unsafe extern "C" fn document_host_presented_compositor_animation_count(
     element: u32,
     count: *mut u32,
 ) -> bool {
-    crate::stage_thread::style_layout_thread().run(|| ());
+    super::wait_for_render_side();
     let Some(presented) = StyleNodeID::from_raw(element)
         .and_then(|element| host.clock_ticks().presented_compositor_animation_count(element))
     else {
@@ -1845,7 +1845,7 @@ pub unsafe extern "C" fn document_host_presented_compositor_animation_count(
 /// be valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn document_host_presented_opacity(host: &DocumentHost, element: u32, opacity: *mut f32) -> bool {
-    crate::stage_thread::style_layout_thread().run(|| ());
+    super::wait_for_render_side();
     let Some(presented) =
         StyleNodeID::from_raw(element).and_then(|element| host.clock_ticks().presented_opacity(element))
     else {
@@ -1869,7 +1869,7 @@ pub unsafe extern "C" fn document_host_presented_border_box(
     element: u32,
     rect: *mut FfiCssPixelRect,
 ) -> bool {
-    crate::stage_thread::style_layout_thread().run(|| ());
+    super::wait_for_render_side();
     let Some(presented) =
         StyleNodeID::from_raw(element).and_then(|element| host.clock_ticks().presented_border_box(element))
     else {

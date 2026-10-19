@@ -19,7 +19,7 @@ use std::ffi::c_void;
 use std::hash::BuildHasherDefault;
 use std::hash::Hasher;
 
-use crate::css::custom_properties::CustomPropertyStore;
+use crate::css::custom_properties::{CustomPropertyStore, finalize_element_custom_property};
 use crate::css::parser::value_parser::{
     FfiValueParsingContext, FfiValueParsingContextKind, ParseContext, ParseOutcome, parse_css_value_from_source,
 };
@@ -341,103 +341,13 @@ thread_local! {
     static STORE_POOL: RefCell<Vec<CascadedPropertyStore>> = const { RefCell::new(Vec::new()) };
 }
 
-struct CallbackFreeParseInput {
-    in_quirks_mode: bool,
-    is_svg_presentation_attribute: bool,
-    contains_attr_tainted_values: bool,
-    is_ua_style_sheet: bool,
-    document_url: Vec<u8>,
-    document_base_url: Vec<u8>,
-    property_id: u16,
-    source: Vec<u16>,
-}
-
-pub(crate) struct CallbackFreeParseOutcome {
-    pub(crate) outcome: ParseOutcome,
-    pub(crate) source: Vec<u16>,
-}
-
-#[allow(clippy::arc_with_non_send_sync)]
-pub(crate) fn parse_substituted_without_callbacks(
-    base_context: &ParseContext,
-    property_id: u16,
-    source: Vec<u16>,
-    contains_attr_tainted_values: bool,
-) -> CallbackFreeParseOutcome {
-    let input = CallbackFreeParseInput {
-        in_quirks_mode: base_context.in_quirks_mode,
-        is_svg_presentation_attribute: base_context.is_svg_presentation_attribute,
-        contains_attr_tainted_values,
-        is_ua_style_sheet: base_context.is_ua_style_sheet,
-        document_url: unsafe { crate::bytes_from_raw(base_context.document_url, base_context.document_url_length) }
-            .unwrap_or_default()
-            .to_vec(),
-        document_base_url: unsafe {
-            crate::bytes_from_raw(base_context.document_base_url, base_context.document_base_url_length)
-        }
-        .unwrap_or_default()
-        .to_vec(),
-        property_id,
-        source,
-    };
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionCallbackFreeParse);
-    let mut random_function_index = 0;
-    let value_context = FfiValueParsingContext {
-        kind: FfiValueParsingContextKind::Property,
-        value: input.property_id,
-        secondary_value: 0,
-        name: Default::default(),
-    };
-    let context = ParseContext {
-        in_quirks_mode: input.in_quirks_mode,
-        is_svg_presentation_attribute: input.is_svg_presentation_attribute,
-        is_substituted_value: true,
-        contains_attr_tainted_values: input.contains_attr_tainted_values,
-        is_ua_style_sheet: input.is_ua_style_sheet,
-        value_contexts: &raw const value_context,
-        value_context_count: 1,
-        declared_namespaces: std::ptr::null(),
-        document_url: input.document_url.as_ptr(),
-        document_url_length: input.document_url.len(),
-        document_base_url: input.document_base_url.as_ptr(),
-        document_base_url_length: input.document_base_url.len(),
-        length_resolution_context: std::ptr::null(),
-        random_function_index: &raw mut random_function_index,
-    };
-    let outcome = match parse_css_value_from_source(&context, input.property_id, &input.source) {
-        // A callback-free parse can report Invalid when an Option-returning grammar could not
-        // retain a string. Report that as unhandled so the caller can retry with the callbacks.
-        ParseOutcome::Invalid => ParseOutcome::NotHandled,
-        outcome => outcome,
-    };
-    CallbackFreeParseOutcome {
-        outcome,
-        source: input.source,
-    }
-}
-
-#[allow(clippy::arc_with_non_send_sync)]
-fn parse_substituted_with_callbacks(
+pub(crate) fn parse_substituted_value(
     base_context: &ParseContext,
     property_id: u16,
     source: &[u16],
     contains_attr_tainted_values: bool,
-) -> std::sync::Arc<StyleValueData> {
-    match parse_substituted_source(base_context, property_id, source, contains_attr_tainted_values) {
-        ParseOutcome::Parsed(value) => value,
-        ParseOutcome::Invalid | ParseOutcome::NotHandled => std::sync::Arc::new(StyleValueData::GuaranteedInvalid),
-    }
-}
-
-/// Parses a substituted source as a property's value, with the base context's callbacks: what
-/// the grammar makes of it, or that the grammar is not one the Rust parser handles.
-pub(crate) fn parse_substituted_source(
-    base_context: &ParseContext,
-    property_id: u16,
-    source: &[u16],
-    contains_attr_tainted_values: bool,
-) -> ParseOutcome {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionCallbackParseRequest);
+) -> RetainedStyleValueData {
+    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionParse);
     let mut random_function_index = 0;
     let value_context = FfiValueParsingContext {
         kind: FfiValueParsingContextKind::Property,
@@ -451,7 +361,12 @@ pub(crate) fn parse_substituted_source(
     context.value_contexts = &raw const value_context;
     context.value_context_count = 1;
     context.random_function_index = &raw mut random_function_index;
-    parse_css_value_from_source(&context, property_id, source)
+    match parse_css_value_from_source(&context, property_id, source) {
+        ParseOutcome::Parsed(value) => RetainedStyleValueData::from_arc(value),
+        ParseOutcome::Invalid | ParseOutcome::NotHandled => {
+            RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid)
+        }
+    }
 }
 
 /// What resolving substituted values inside the Rust cascade reads beyond the values themselves.
@@ -461,17 +376,17 @@ pub(crate) struct CascadeResolutionContext<'a> {
     pub(crate) custom_functions: &'a [crate::css::custom_properties::SubstitutionFunctionDefinition],
     pub(crate) custom_function_scope_identity: usize,
     pub(crate) custom_function_visibilities: &'a [crate::css::custom_properties::FfiSubstitutionFunctionVisibility],
-    /// Where the custom properties style queries read are kept, if anywhere.
+    /// Where the custom properties and sibling position style queries read are kept, if anywhere.
     pub(crate) style_query_dependencies:
         Option<&'a mut Option<Box<crate::css::custom_properties::StyleQueryDependencies>>>,
 }
 
-/// What a `style()` query in a substitution resolves against, as the queried element's style
-/// computes it: its lengths, and the color scheme and currentcolor its colors resolve with.
+/// Length, tree-counting and color inputs used when evaluating style queries.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FfiStyleQueryInputs {
     pub length: crate::css::style_compute::FfiLengthResolutionContext,
+    pub tree_counting: Option<(u64, u64)>,
     /// A PreferredColorScheme code.
     pub color_scheme: u8,
     /// The packed currentcolor, as the C++ Color::value() packs it.
@@ -551,30 +466,8 @@ pub(crate) unsafe fn resolve_declared_custom_properties(
             }
         })
         .collect();
-    let registry = resolution_context
-        .inputs
-        .registry
-        .unwrap_or_else(|| crate::css::custom_properties::CustomPropertyRegistry::shared_empty());
-    let inherited = resolution_context.inputs.inheritance_store;
     let mut reads = crate::css::custom_properties::RegisteredValueReads::default();
-    let mut finalize_component = |members: &[u32], outputs: &mut [RetainedStyleValueData]| {
-        for &member in members {
-            let name_raw = names[member as usize];
-            let substituted = std::mem::replace(&mut outputs[member as usize], RetainedStyleValueData::none());
-            let (finalized, value_reads) = registry
-                .finalize_custom_property_value(
-                    inherited,
-                    name_raw,
-                    &own_entry(&name_raw).name,
-                    substituted,
-                    &finalization,
-                )
-                .unwrap_or_else(|fallback| (fallback, Default::default()));
-            reads |= value_reads;
-            outputs[member as usize] = finalized;
-        }
-    };
-    let outputs = resolve_unresolved_style_values(resolution_context, &inputs, Some(&mut finalize_component));
+    let outputs = resolve_unresolved_style_values(resolution_context, &inputs, &finalization, &mut reads);
     // SAFETY: Guaranteed by the caller.
     let resolved_parent = unsafe { resolved_parent_store.cast::<CustomPropertyStore>().as_ref() };
     let resolved_values: Vec<_> = names
@@ -597,7 +490,7 @@ pub(crate) unsafe fn resolve_declared_custom_properties(
 /// Sentinel passed when cascading for an element rather than a pseudo-element.
 pub(crate) const NO_PSEUDO_ELEMENT: u8 = u8::MAX;
 
-#[allow(clippy::arc_with_non_send_sync)]
+#[allow(clippy::too_many_arguments)]
 fn resolve_cascade_value(
     resolution_context: &mut CascadeResolutionContext,
     resolution_environment: &mut crate::css::custom_properties::VarResolutionEnvironment,
@@ -605,6 +498,8 @@ fn resolve_cascade_value(
     root_custom_property_name: &[u16],
     unresolved: &StyleValueData,
     final_custom_properties: Option<&HashMap<Vec<u16>, RetainedStyleValueData>>,
+    finalization: &crate::css::custom_properties::CustomPropertyFinalization,
+    reads: &mut crate::css::custom_properties::RegisteredValueReads,
 ) -> RetainedStyleValueData {
     let native_resolution = crate::css::custom_properties::resolve_vars(
         &resolution_context.inputs,
@@ -614,9 +509,11 @@ fn resolve_cascade_value(
         resolution_environment,
         resolution_context.style_query_dependencies.as_deref_mut(),
         final_custom_properties,
+        *finalization,
+        Some(reads),
     );
 
-    let parsed = match native_resolution {
+    match native_resolution {
         crate::css::custom_properties::NativeVarResolution::Resolved {
             source,
             contains_attr_tainted_values,
@@ -632,24 +529,13 @@ fn resolve_cascade_value(
                         ..
                     }
                 );
-            let CallbackFreeParseOutcome { outcome, source } =
-                parse_substituted_without_callbacks(base_context, property_id, source, contains_attr_tainted_values);
-            match outcome {
-                ParseOutcome::Parsed(value) => value,
-                ParseOutcome::Invalid => std::sync::Arc::new(StyleValueData::GuaranteedInvalid),
-                ParseOutcome::NotHandled => {
-                    parse_substituted_with_callbacks(base_context, property_id, &source, contains_attr_tainted_values)
-                }
-            }
+            parse_substituted_value(base_context, property_id, &source, contains_attr_tainted_values)
         }
-        crate::css::custom_properties::NativeVarResolution::Invalid => {
-            std::sync::Arc::new(StyleValueData::GuaranteedInvalid)
+        crate::css::custom_properties::NativeVarResolution::Invalid
+        | crate::css::custom_properties::NativeVarResolution::NotHandled => {
+            RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid)
         }
-        crate::css::custom_properties::NativeVarResolution::NotHandled => {
-            std::sync::Arc::new(StyleValueData::GuaranteedInvalid)
-        }
-    };
-    RetainedStyleValueData::from_arc(parsed)
+    }
 }
 
 fn custom_property_components(inputs: &[UnresolvedStyleValue]) -> (Vec<Vec<u32>>, bool) {
@@ -741,16 +627,13 @@ fn custom_property_components(inputs: &[UnresolvedStyleValue]) -> (Vec<Vec<u32>>
     (components, has_own_reference)
 }
 
-/// Finalizes the values of one component of custom properties, by their indices among the outputs.
-type FinalizeComponent<'a> = dyn FnMut(&[u32], &mut [RetainedStyleValueData]) + 'a;
-
-/// Resolves and parses unresolved values outside the longhand cascade, one output per input. When
-/// a finalizer is supplied, custom properties are resolved in dependency order and each component
-/// is finalized before later components can read it.
+/// Resolves and parses custom properties in dependency order, finalizing each component before
+/// later components can read it.
 fn resolve_unresolved_style_values(
     resolution_context: &mut CascadeResolutionContext,
     inputs: &[UnresolvedStyleValue],
-    mut finalize_component: Option<&mut FinalizeComponent>,
+    finalization: &crate::css::custom_properties::CustomPropertyFinalization,
+    reads: &mut crate::css::custom_properties::RegisteredValueReads,
 ) -> Vec<RetainedStyleValueData> {
     let mut outputs: Vec<_> = inputs.iter().map(|_| RetainedStyleValueData::none()).collect();
     let mut resolution_environment = crate::css::custom_properties::prepare_var_resolution_environment(
@@ -759,11 +642,15 @@ fn resolve_unresolved_style_values(
         resolution_context.custom_function_scope_identity,
         resolution_context.custom_function_visibilities,
     );
-    let (components, use_final_custom_properties) = if finalize_component.is_some() {
-        custom_property_components(inputs)
-    } else {
-        ((0..inputs.len() as u32).map(|index| vec![index]).collect(), false)
-    };
+    let (components, use_final_custom_properties) = custom_property_components(inputs);
+    let registry = resolution_context
+        .inputs
+        .registry
+        .unwrap_or_else(|| crate::css::custom_properties::CustomPropertyRegistry::shared_empty());
+    let store = resolution_context
+        .inputs
+        .store
+        .expect("declared custom properties have an element store");
     let mut final_custom_properties = HashMap::new();
     for mut component in components {
         component.sort_unstable();
@@ -780,16 +667,24 @@ fn resolve_unresolved_style_values(
                 input.root_custom_property_name,
                 input.value.data(),
                 use_final_custom_properties.then_some(&final_custom_properties),
+                finalization,
+                reads,
             );
         }
-        if let Some(finalize_component) = finalize_component.as_deref_mut() {
-            finalize_component(&component, &mut outputs);
-            for &member in &component {
-                final_custom_properties.insert(
-                    inputs[member as usize].root_custom_property_name.to_vec(),
-                    outputs[member as usize].clone(),
-                );
-            }
+        for &member in &component {
+            let index = member as usize;
+            let name = inputs[index].root_custom_property_name;
+            let substituted = std::mem::replace(&mut outputs[index], RetainedStyleValueData::none());
+            outputs[index] = finalize_element_custom_property(
+                registry,
+                resolution_context.inputs.inheritance_store,
+                finalization,
+                reads,
+                store.declared_names[index],
+                name,
+                substituted,
+            );
+            final_custom_properties.insert(name.to_vec(), outputs[index].clone());
         }
     }
     outputs

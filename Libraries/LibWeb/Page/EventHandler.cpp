@@ -929,7 +929,7 @@ void EventHandler::record_input_routing(InputRoutingDecision decision, Optional<
     });
 }
 
-EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 button, u32 buttons, u32 modifiers, double wheel_delta_x, double wheel_delta_y, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target)
+EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 button, u32 buttons, u32 modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target)
 {
     record_last_known_mouse_position(visual_viewport_position, screen_position, buttons, modifiers);
 
@@ -1018,8 +1018,10 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
     if (!has_committed_root_box())
         return EventResult::Dropped;
 
-    if (modifiers & UIEvents::KeyModifier::Mod_Shift)
+    if (modifiers & UIEvents::KeyModifier::Mod_Shift) {
         swap(wheel_delta_x, wheel_delta_y);
+        swap(wheel_tick_120ths_x, wheel_tick_120ths_y);
+    }
 
     Optional<Target> hit_test_target;
     GC::Ptr<DOM::Node> wheel_event_target_node;
@@ -1217,8 +1219,8 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
         // A gesture this navigable latched to a scrolling box of its own is not offered to a nested navigable again.
         bool offer_to_nested_navigable = !continues_latched_gesture || m_wheel_scroll_latch->gesture_handed_to_nested_navigable;
         if (offer_to_nested_navigable) {
-            if (auto result = dispatch_event_to_nested_navigable(*this, *wheel_event_target_layout_node, wheel_event_target_node, visual_viewport_position, remote_target, [screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, remote_target](EventHandler& event_handler, CSSPixelPoint position) -> EventResult {
-                    return event_handler.handle_mousewheel(position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, remote_target);
+            if (auto result = dispatch_event_to_nested_navigable(*this, *wheel_event_target_layout_node, wheel_event_target_node, visual_viewport_position, remote_target, [screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, remote_target](EventHandler& event_handler, CSSPixelPoint position) -> EventResult {
+                    return event_handler.handle_mousewheel(position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, remote_target);
                 });
                 result.has_value()) {
                 record_input_routing(InputRoutingDecision::HandedToNestedNavigable, {}, wheel_event_target_node);
@@ -1244,7 +1246,7 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
         }
 
         auto is_cancelable = async_scroll_performed_default_action ? UIEvents::WheelEventIsCancelable::No : UIEvents::WheelEventIsCancelable::Yes;
-        auto dispatch_result = dispatch_wheel_event(read, *wheel_event_target_layout_node, visual_viewport_position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, is_cancelable == UIEvents::WheelEventIsCancelable::Yes);
+        auto dispatch_result = dispatch_wheel_event(read, *wheel_event_target_layout_node, visual_viewport_position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, is_cancelable == UIEvents::WheelEventIsCancelable::Yes);
         if (dispatch_result == EventResult::Accepted)
             record_input_routing(InputRoutingDecision::DispatchedWheelEvent, {}, wheel_event_target_node);
         else if (dispatch_result == EventResult::Cancelled)
@@ -1270,7 +1272,7 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
     return handled_event;
 }
 
-EventResult EventHandler::dispatch_wheel_event(Layout::BegunRead const& read, Layout::Node& hit_layout_node, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 button, u32 buttons, u32 modifiers, double wheel_delta_x, double wheel_delta_y, bool is_cancelable)
+EventResult EventHandler::dispatch_wheel_event(Layout::BegunRead const& read, Layout::Node& hit_layout_node, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 button, u32 buttons, u32 modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, bool is_cancelable)
 {
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active())
@@ -1293,7 +1295,7 @@ EventResult EventHandler::dispatch_wheel_event(Layout::BegunRead const& read, La
     auto scroll_offset = document->navigable()->viewport_scroll_offset();
     auto offset = compute_mouse_event_offset(visual_viewport_position.translated(scroll_offset), *offset_layout_node);
     auto cancelability = is_cancelable ? UIEvents::WheelEventIsCancelable::Yes : UIEvents::WheelEventIsCancelable::No;
-    auto event = UIEvents::WheelEvent::create_from_platform_event(HTML::relevant_global_object(*node), m_navigable->active_window_proxy(), UIEvents::EventNames::wheel, screen_position, page_offset, viewport_position, offset, wheel_delta_x, wheel_delta_y, button, buttons, modifiers, cancelability).release_value_but_fixme_should_propagate_errors();
+    auto event = UIEvents::WheelEvent::create_from_platform_event(HTML::relevant_global_object(*node), m_navigable->active_window_proxy(), UIEvents::EventNames::wheel, screen_position, page_offset, viewport_position, offset, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, button, buttons, modifiers, cancelability).release_value_but_fixme_should_propagate_errors();
     return node->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
 }
 
@@ -1330,7 +1332,7 @@ EventResult EventHandler::dispatch_synthetic_pinch_wheel_event(CSSPixelPoint vis
     }
 
     modifiers |= UIEvents::KeyModifier::Mod_Ctrl;
-    return dispatch_wheel_event(read, *target_layout_node, visual_viewport_position, screen_position, UIEvents::MouseButton::None, UIEvents::MouseButton::None, modifiers, 0, wheel_delta_y, true);
+    return dispatch_wheel_event(read, *target_layout_node, visual_viewport_position, screen_position, UIEvents::MouseButton::None, UIEvents::MouseButton::None, modifiers, 0, wheel_delta_y, 0, Web::wheel_tick_120ths_from_pixel_delta(wheel_delta_y, Web::WheelDeltaPrecision::Precise), true);
 }
 
 EventResult EventHandler::handle_mouseleave()
@@ -1360,6 +1362,63 @@ EventResult EventHandler::handle_mouseleave()
 
     if (!m_mousedown_target)
         track_the_effective_position_of_the_legacy_mouse_pointer(nullptr);
+
+    return EventResult::Handled;
+}
+
+// https://w3c.github.io/pointerevents/#dfn-suppress-a-pointer-event-stream
+EventResult EventHandler::handle_mousecancel()
+{
+    if (should_ignore_device_input_event()) {
+        if (m_mousedown_target_is_drag_candidate)
+            return cancel_drag_and_drop_event(m_last_known_mouse_visual_viewport_position.value_or({}), m_last_known_mouse_screen_position, UIEvents::MouseButton::Primary, UIEvents::MouseButton::Primary, 0);
+
+        return EventResult::Dropped;
+    }
+
+    ScopeGuard clear_mousedown_tracking_and_stop_selection([&] {
+        clear_mousedown_tracking();
+        stop_updating_selection();
+    });
+
+    auto document = m_navigable->active_document();
+    if (!document)
+        return EventResult::Dropped;
+    if (!document->is_fully_active())
+        return EventResult::Dropped;
+
+    Layout::ForcedReadScope read { *document };
+    document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseCancel);
+
+    if (!has_committed_root_box())
+        return EventResult::Dropped;
+
+    // NB: The browser cancels the pointer that presses, so there is a stream to suppress only while a press lasts. The
+    //     last pointer event's target is the effective position of the legacy mouse pointer.
+    GC::Ptr<DOM::Node> target = m_effective_legacy_mouse_pointer_position.ptr();
+    if (!m_mousedown_target || !target || !m_last_dispatched_pointer_event_position.has_value())
+        return EventResult::Dropped;
+
+    // 1. Fire a pointercancel event.
+    // https://w3c.github.io/pointerevents/#dfn-pointercancel
+    // The values of the following properties of the pointercancel event MUST match the values of the last dispatched
+    // pointer event with the same pointerId: [...] and the coordinates inherited from Mouse Events.
+    auto const& last_position = *m_last_dispatched_pointer_event_position;
+    dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerCancel, target, nullptr, last_position.coordinates, last_position.screen_position, {}, UIEvents::MouseButton::Primary, m_last_known_mouse_buttons, m_last_known_mouse_modifiers);
+
+    // NB: Dispatching an event may have disturbed the world.
+    if (m_navigable->active_document() != document)
+        return EventResult::Handled;
+
+    // 2. Fire a pointerout event.
+    // 3. Fire a pointerleave event.
+    // NB: Moving the legacy mouse pointer out of the window fires both, along with the compatibility mouse events of
+    //     a pointerleave event at the window.
+    track_the_effective_position_of_the_legacy_mouse_pointer(nullptr);
+
+    // 4. Implicitly release the pointer capture if the pointer is currently captured.
+    // NB: The press is released as this returns.
+    // FIXME: Also end a drag that a chrome widget, such as a scrollbar, has captured.
 
     return EventResult::Handled;
 }
@@ -3481,20 +3540,31 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
             }
         } else if (is<HTML::HTMLMediaElement>(*context_menu_node)) {
             auto& media_element = as<HTML::HTMLMediaElement>(*context_menu_node);
-            auto is_video = is<HTML::HTMLVideoElement>(*context_menu_node);
+            auto* video_element = as_if<HTML::HTMLVideoElement>(*context_menu_node);
+            auto is_video = video_element != nullptr;
+
+            // A media element without a source, or one whose source does not resolve against the document's base
+            // URL, has no URL to open or copy.
+            Optional<URL::URL> media_url;
+            if (auto const& current_src = media_element.current_src(); !current_src.is_empty())
+                media_url = media_element.document().encoding_parse_url(current_src);
 
             Page::MediaContextMenu menu {
-                .media_url = *media_element.document().encoding_parse_url(media_element.current_src()),
+                .media_url = move(media_url),
                 .is_video = is_video,
                 .is_playing = media_element.potentially_playing(),
                 .is_muted = media_element.muted(),
                 .has_user_agent_controls = media_element.has_attribute(HTML::AttributeNames::controls),
                 .is_looping = media_element.has_attribute(HTML::AttributeNames::loop),
                 .is_fullscreen = is_video && media_element.is_fullscreen_element(),
+                .is_picture_in_picture = media_element.is_picture_in_picture_element(),
+                .can_enter_picture_in_picture = is_video && video_element->can_enter_picture_in_picture(),
             };
 
-            auto navigation = HTML::prepare_navigation_from_document(media_element.document(), menu.media_url, ReferrerPolicy::ReferrerPolicy::EmptyString);
-            m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Media, .target = media_element });
+            auto navigation = menu.media_url.map([&](auto const& url) {
+                return HTML::prepare_navigation_from_document(media_element.document(), url, ReferrerPolicy::ReferrerPolicy::EmptyString);
+            });
+            m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Media, .target = media_element, .media = menu });
             m_navigable->page().did_request_media_context_menu(media_element.unique_id(), local_root_id, page_viewport_position, "", modifiers, menu, move(navigation));
         } else {
             auto misspelling = select_context_menu_misspelling(read, document, coordinates.visual_viewport_position);
@@ -4167,6 +4237,11 @@ EventHandler::PointerEventDispatchResult EventHandler::dispatch_a_pointer_event_
     }();
     auto pointer_event = MUST(UIEvents::PointerEvent::create_from_platform_event(relevant_global_object, m_navigable->active_window_proxy(), pointer_event_name, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, movement, button, buttons, modifiers));
 
+    // https://w3c.github.io/pointerevents/#dfn-pointercancel
+    // The event's cancelable attribute MUST be false.
+    if (type == PointerEventType::PointerCancel)
+        pointer_event->set_cancelable(false);
+
     // FIXME: 1. If the isPrimary property for the pointer event to be dispatched is false then dispatch the
     //           pointer event and terminate these steps.
 
@@ -4206,6 +4281,7 @@ EventHandler::PointerEventDispatchResult EventHandler::dispatch_a_pointer_event_
     light_dismiss_activities(pointer_event, *node);
 
     // 3. Dispatch the pointer event.
+    m_last_dispatched_pointer_event_position = PointerEventPosition { coordinates, screen_position };
     bool pointer_event_cancelled = !node->dispatch_event(pointer_event);
 
     // 4. If the pointer event dispatched was pointerdown and event's canceled flag is set, then set the PREVENT MOUSE

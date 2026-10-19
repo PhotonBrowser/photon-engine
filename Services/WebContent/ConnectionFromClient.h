@@ -150,7 +150,7 @@ private:
     virtual void set_site_compatibility_data(JsonValue data) override;
     virtual void compositor_process_reconnected() override;
     virtual void update_system_theme(Web::PageId page_id, Core::AnonymousBuffer) override;
-    virtual void update_screen_rects(Web::PageId page_id, Vector<Web::DevicePixelRect>, u32) override;
+    virtual void update_screen_rects(Web::PageId page_id, Vector<Web::DevicePixelRect>, Vector<Web::DevicePixelRect>, u32) override;
     virtual void populate_navigation(Web::PageId page_id, Web::HTML::NavigationPopulationRequest, Web::HTML::NavigationPopulationResult) override;
     virtual void stop_loading(Web::PageId page_id) override;
     virtual void cancel_download(Web::PageId page_id, u64 download_id) override;
@@ -316,6 +316,7 @@ private:
     virtual void toggle_media_mute_state(Web::PageId page_id) override;
     virtual void toggle_media_loop_state(Web::PageId page_id) override;
     virtual void toggle_media_fullscreen_state(Web::PageId page_id) override;
+    virtual void toggle_media_picture_in_picture_state(Web::PageId page_id) override;
     virtual void toggle_media_controls_state(Web::PageId page_id) override;
 
     virtual void set_page_mute_state(Web::PageId page_id, Web::HTML::MuteState mute_state) override;
@@ -372,6 +373,12 @@ private:
     virtual void force_close(Web::PageId page_id) override;
 
     virtual void exit_fullscreen(Web::PageId page_id) override;
+
+    virtual void set_has_picture_in_picture_support(Web::PageId page_id, bool has_support) override;
+    virtual void did_open_picture_in_picture_window(Web::PageId page_id, Gfx::IntSize window_size) override;
+    virtual void picture_in_picture_window_did_resize(Web::PageId page_id, Gfx::IntSize window_size) override;
+    virtual void picture_in_picture_window_did_close(Web::PageId page_id, bool pause_video) override;
+    virtual void set_picture_in_picture_window_controls_in_use(Web::PageId page_id, bool in_use) override;
 
     RefPtr<TestConnection> m_test_connection;
     RefPtr<Web::Compositor::CompositorConnection> m_compositor_connection;

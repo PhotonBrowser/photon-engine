@@ -47,11 +47,11 @@ static void clamp_visual_viewport_transform_to_viewport(Compositing::TransformWi
     transform.matrix[1, 3] = clamp(transform.matrix[1, 3], min_y, 0.0f);
 }
 
-ContextState::ContextState(Web::CompositorContextId context_id, Optional<u64> page_id, CompositorStateWebContentClient& web_content_client, Compositing::CanvasSurfaceRegistry const& canvas_surface_registry, Function<void(Gfx::IntRect)> schedule_caret_repaint)
+ContextState::ContextState(Web::CompositorContextId context_id, Optional<u64> page_id, CompositorStateWebContentClient& web_content_client, Compositing::OwnedCanvasSurfaces canvas_surfaces, Function<void(Gfx::IntRect)> schedule_caret_repaint)
     : m_web_content_client(web_content_client)
     , m_context_id(context_id)
     , m_page_id(page_id)
-    , m_presenter(m_scene, canvas_surface_registry, page_id.has_value())
+    , m_presenter(m_scene, canvas_surfaces, page_id.has_value())
     , m_caret_blink_timer([this] { return damage_rect_of_blinking_carets(); }, move(schedule_caret_repaint))
 {
 }
@@ -252,7 +252,7 @@ ContextState::ContextUpdateResult ContextState::handle_key_event(Web::KeyEvent c
         return { .accepted = true, .frame_to_present = {}, .should_request_rendering_update = true };
     }
 
-    if (!presents_to_client() || m_presenter.paused_debugger_overlay_visible()
+    if (!presents_to_client() || m_presenter.ui_overlays().paused_debugger.has_value()
         || m_visibility != Compositing::ContextVisibility::Visible
         || !Web::is_keyboard_scroll_key(event.key, event.modifiers)
         || !m_keyboard_scroll_controller.has_target()
@@ -483,6 +483,22 @@ ContextState::ContextUpdateResult ContextState::handle_mouse_event(Web::MouseEve
             .scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list(),
             .routing_decision = had_capture ? Web::InputRoutingDecision::LeftDuringScrollbarDrag : Web::InputRoutingDecision::NoScrollbarDrag,
         };
+    }
+    case Web::MouseEvent::Type::MouseCancel: {
+        // A cancel ends a drag where it last scrolled to, as a cancel has no position of its own, and the pointer then
+        // counts as having left. The page still sees the cancel, so it is not accepted.
+        auto was_dragging_scrollbar = m_scrollbar_controller.has_captured_scrollbar();
+        auto scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list();
+        (void)m_scrollbar_controller.release_captured_drag(m_scene.visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
+        note_user_scroll_gesture_end_if_drag_ended(was_dragging_scrollbar);
+        auto hovered_scrollbar_changed = m_scrollbar_controller.set_hovered_scrollbar({});
+
+        ContextUpdateResult result;
+        // As for a release, the main thread learns that the drag ended from the next update it takes.
+        result.should_request_rendering_update = was_dragging_scrollbar;
+        if ((was_dragging_scrollbar && !scrollbar_dragged_by_compositor.has_value()) || hovered_scrollbar_changed)
+            result.frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
+        return result;
     }
     case Web::MouseEvent::Type::MouseWheel:
         return {};
@@ -1377,25 +1393,23 @@ bool ContextState::has_pending_async_scroll_updates() const
     return m_async_scroll_update_outbox.has_updates(user_scroll_gesture_in_progress());
 }
 
-void ContextState::viewport_size_updated(Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void ContextState::viewport_size_updated(Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     m_scene.forget_whether_animated_content_may_affect_viewport();
     if (m_presenter.viewport_size() != viewport_size)
         m_keyboard_scroll_controller.forget_target();
     auto is_page_presentation_context = m_page_id.has_value() && !m_parent_context_id.has_value();
-    m_presenter.set_viewport_size(viewport_size, is_page_presentation_context ? window_resize_in_progress : Compositing::WindowResizingInProgress::No);
+    m_presenter.set_viewport_size(viewport_size, device_pixel_ratio, is_page_presentation_context ? window_resize_in_progress : Compositing::WindowResizingInProgress::No);
 }
 
-bool ContextState::set_paused_debugger_overlay(bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<Compositing::PausedDebuggerOverlayAction> hovered_action)
+bool ContextState::set_ui_overlays(Compositing::UIOverlays overlays)
 {
-    VERIFY(device_pixel_ratio > 0);
-    PausedDebuggerOverlayState paused_debugger_overlay { visible, device_pixel_ratio, move(font_family), hovered_action };
-    if (m_presenter.paused_debugger_overlay() == paused_debugger_overlay)
+    if (m_presenter.ui_overlays() == overlays)
         return false;
 
-    if (visible)
+    if (overlays.paused_debugger.has_value())
         end_keyboard_scroll_gesture();
-    m_presenter.set_paused_debugger_overlay(move(paused_debugger_overlay));
+    m_presenter.set_ui_overlays(move(overlays));
     return true;
 }
 
@@ -1439,7 +1453,7 @@ ContextPresenter::FrameContent ContextState::frame_content(Compositing::ScrollSt
 {
     auto const& visual_context_tree = m_scene.visual_context_tree_for_compositing();
     bool can_blit_viewport_scroll = m_presenter.presents_to_client()
-        && !m_presenter.paused_debugger_overlay_visible()
+        && !m_presenter.ui_overlays().paused_debugger.has_value()
         && !visual_context_tree.has_visual_animations()
         && !m_elastic_overscroll_controller.has_active_overscroll()
         && !m_scene.has_async_visual_viewport_transform()

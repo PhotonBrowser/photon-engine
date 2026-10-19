@@ -17,8 +17,8 @@
 #include <UI/Qt/EventLoopImplementationQt.h>
 #include <UI/Qt/ExternalURLHandler.h>
 #include <UI/Qt/Menu.h>
+#include <UI/Qt/PictureInPictureWindow.h>
 #include <UI/Qt/ProcessManagerWindow.h>
-#include <UI/Qt/Settings.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WebContentView.h>
 
@@ -35,6 +35,7 @@
 #include <QFileOpenEvent>
 #include <QFont>
 #include <QKeySequence>
+#include <QLocale>
 #include <QLoggingCategory>
 #include <QMenu>
 #include <QMenuBar>
@@ -353,8 +354,10 @@ public:
         m_open_file_action->setShortcut(QKeySequence(QKeySequence::StandardKey::Open));
         QObject::connect(m_open_file_action, &QAction::triggered, this, []() { Application::the().open_file(); });
 
-        m_open_downloads_action = create_application_action(*m_application_widget, application.open_downloads_page_action(), IncludeActionIcon::No);
         m_open_settings_action = create_application_action(*m_application_widget, application.open_settings_page_action(), IncludeActionIcon::No);
+        m_open_downloads_action = create_application_action(*m_application_widget, application.open_downloads_page_action(), IncludeActionIcon::No);
+
+        m_toggle_bookmark_bar_action = create_application_action(*m_application_widget, application.toggle_bookmark_bar_action(), IncludeActionIcon::No);
 
         m_find_in_page_action = make_action("&Find in Page...");
         m_find_in_page_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Find));
@@ -514,6 +517,7 @@ private:
     QAction* m_open_file_action { nullptr };
     QAction* m_open_settings_action { nullptr };
     QAction* m_open_downloads_action { nullptr };
+    QAction* m_toggle_bookmark_bar_action { nullptr };
     QAction* m_find_in_page_action { nullptr };
     QAction* m_zoom_in_action { nullptr };
     QAction* m_zoom_out_action { nullptr };
@@ -531,11 +535,6 @@ void Application::show_process_manager()
     m_process_manager_window->show();
     m_process_manager_window->raise();
     m_process_manager_window->activateWindow();
-}
-
-void Application::create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&)
-{
-    Settings::initialize(profile().paths().config);
 }
 
 void Application::create_platform_actions()
@@ -612,6 +611,15 @@ bool Application::platform_scrolls_elastically() const
     if (!m_application)
         return false;
     return QGuiApplication::platformName() == QStringLiteral("cocoa");
+}
+
+Vector<String> Application::platform_preferred_languages() const
+{
+    // The system's UI languages, most preferred first, as BCP 47 tags ("en-US", then "en").
+    Vector<String> languages;
+    for (auto const& language : QLocale::system().uiLanguages())
+        languages.append(ak_string_from_qstring(language));
+    return languages;
 }
 
 #if !defined(AK_OS_MACOS)
@@ -692,15 +700,15 @@ WindowConfiguration Application::configuration_for_new_window() const
         };
     }
 
-    auto last_size = Settings::the()->last_size();
+    auto const& window_settings = WebView::Application::settings().window_settings();
     WindowConfiguration configuration {
-        .width = last_size.width(),
-        .height = last_size.height(),
-        .maximized = Settings::the()->is_maximized(),
+        .width = window_settings.size.width(),
+        .height = window_settings.size.height(),
+        .maximized = window_settings.maximized,
     };
-    if (auto last_position = Settings::the()->last_position(); last_position.has_value()) {
-        configuration.x = last_position->x();
-        configuration.y = last_position->y();
+    if (window_settings.position.has_value()) {
+        configuration.x = window_settings.position->x();
+        configuration.y = window_settings.position->y();
     }
     return configuration;
 }
@@ -960,6 +968,13 @@ bool Application::confirm_stop_active_downloads(QWidget* parent)
 
     downloader.pause_active_downloads();
     return true;
+}
+
+OwnPtr<WebView::PictureInPictureWindow> Application::create_picture_in_picture_window(WebView::WebContentPage& requesting_page, WebView::CanonicalTraversable& traversable, Gfx::IntSize video_size)
+{
+    if (browser_options().headless_mode.has_value())
+        return WebView::Application::create_picture_in_picture_window(requesting_page, traversable, video_size);
+    return Ladybird::create_picture_in_picture_window(traversable, requesting_page.view(), video_size);
 }
 
 Optional<WebView::ViewImplementation&> Application::active_web_view() const
@@ -1529,6 +1544,7 @@ DEFINE_APP_MENU_GETTER(QAction, open_previous_tab_action);
 DEFINE_APP_MENU_GETTER(QAction, open_file_action);
 DEFINE_APP_MENU_GETTER(QAction, open_settings_action);
 DEFINE_APP_MENU_GETTER(QAction, open_downloads_action);
+DEFINE_APP_MENU_GETTER(QAction, toggle_bookmark_bar_action);
 DEFINE_APP_MENU_GETTER(QAction, find_in_page_action);
 DEFINE_APP_MENU_GETTER(QAction, zoom_in_action);
 DEFINE_APP_MENU_GETTER(QAction, zoom_out_action);

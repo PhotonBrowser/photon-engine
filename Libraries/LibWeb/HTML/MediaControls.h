@@ -21,10 +21,13 @@ class HTMLMediaElement;
 
 class MediaControls {
 public:
-    explicit MediaControls(HTMLMediaElement&);
+    MediaControls(HTMLMediaElement& host, HTMLMediaElement& media_element);
     ~MediaControls();
 
     void visit_edges(GC::Cell::Visitor&);
+
+    void update_visibility();
+    void set_picture_in_picture_window_controls_in_use(bool);
 
 private:
     void create_shadow_tree();
@@ -72,6 +75,7 @@ private:
     void update_timestamp();
     void set_timestamp(double time, double duration);
     void request_timeline_update();
+    bool timeline_is_shown() const;
     void update_volume_and_mute_indicator();
     void update_fullscreen_icon();
     void update_placeholder_visibility();
@@ -80,7 +84,12 @@ private:
 
     void show_controls();
     void hide_controls();
+    bool is_picture_in_picture_player() const;
+    void control_bar_visibility_did_change();
 
+    // The controls live in the shadow tree of their host, and play the media of their media element. The two are one
+    // element unless the host shows another element's media.
+    GC::Weak<HTMLMediaElement> m_host;
     GC::Weak<HTMLMediaElement> m_media_element;
 
     Optional<MediaControlsDOM> m_dom;
@@ -103,6 +112,8 @@ private:
     RefPtr<Core::Timer> m_scrub_seek_preemption_timer;
     bool m_scrubbing_volume { false };
     bool m_hovering_controls { false };
+    bool m_picture_in_picture_window_controls_in_use { false };
+    bool m_control_bar_is_shown { false };
 
     RefPtr<Core::Timer> m_hover_timer;
 

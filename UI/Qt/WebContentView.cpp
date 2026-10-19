@@ -26,6 +26,7 @@
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CrashReport.h>
+#include <LibWebView/CrashReportStore.h>
 #include <LibWebView/PlatformColors.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
@@ -143,9 +144,13 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         update_screen_rects();
     });
 
-    QObject::connect(qGuiApp, &QGuiApplication::screenAdded, this, [this](QScreen*) {
+    QObject::connect(qGuiApp, &QGuiApplication::screenAdded, this, [this](QScreen* screen) {
+        watch_screen_geometry(*screen);
         update_screen_rects();
     });
+
+    for (auto* screen : QGuiApplication::screens())
+        watch_screen_geometry(*screen);
 
     QObject::connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this] {
         QTimer::singleShot(0, this, [this] {
@@ -164,6 +169,8 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
                 this);
     });
 
+    if (initial_state.owner_view)
+        set_owner_view(*initial_state.owner_view);
     initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
 
     m_accessibility_manager = make<WebView::AccessibilityTreeManager>();
@@ -187,7 +194,7 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         // Reset the document-root focus gate so that *each* page navigation posts a fresh accessibility focus event on
         // the newly-loaded document. Otherwise, without this reset, only the *first* page load (often an empty default
         // page) would trigger the gate — and subsequent user-initiated navigations (type URL, Enter) would never let
-        // Orca know that a new document is ready for browse-mode navigation. macOS gates its initial setFocus() on the
+        // Orca know that a new document is ready for browse-mode navigation. macOS gates its load announcement on the
         // same flag, so it needs the per-navigation reset too.
         m_posted_initial_accessibility_focus = false;
         m_report_accessibility_focus_with_next_tree = false;
@@ -206,22 +213,21 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         m_accessibility_manager->update_tree(AK::move(nodes));
 
 #if defined(Q_OS_MACOS)
-        // Only the first tree for a page may take focus. WebContent rebuilds the tree on DOM mutations too, so
-        // doing this on every update would yank focus out of the address bar mid-keystroke. Same reasoning, and
-        // the same gate, as the AT-SPI focus post in the branch below.
-        auto const take_initial_focus = !m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty();
-        if (take_initial_focus)
+        // Only the first tree for a page announces the load. WebContent rebuilds the tree on DOM mutations too, and
+        // announcing each of those would move VoiceOver's cursor back to the top of the page while the user is reading
+        // it. Same gate as the AT-SPI focus post in the branch below.
+        // NB: A page load never moves the keyboard focus, with or without an assistive technology. For example, a new
+        //     tab's location editor keeps the focus while the new tab page loads.
+        auto const announce_load = !m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty();
+        if (announce_load)
             m_posted_initial_accessibility_focus = true;
         // An assistive technology that turned up mid-page got no focused element from its first queries: The first tree
         // has AppKit look the focus up again — if the page has the keyboard focus (update_accessibility_tree() checks).
         auto const report_focus = m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty();
         if (report_focus)
             m_report_accessibility_focus_with_next_tree = false;
-        QTimer::singleShot(100, this, [this, take_initial_focus, report_focus] {
-            auto const focus_now = take_initial_focus && isVisible();
-            if (focus_now)
-                setFocus(Qt::OtherFocusReason);
-            update_accessibility_tree(this, focus_now, report_focus);
+        QTimer::singleShot(100, this, [this, announce_load, report_focus] {
+            update_accessibility_tree(this, announce_load, report_focus);
         });
 #elif !defined(Q_OS_WIN)
         // Prune interfaces for nodes no longer in the tree.
@@ -468,23 +474,54 @@ static Web::UIEvents::KeyModifier get_modifiers_from_qt_key_event(QKeyEvent cons
     return modifiers;
 }
 
-static QPointF wheel_delta_from_angle_delta(QPoint angle_delta)
-{
-    static constexpr double wheel_delta_units_per_step = static_cast<double>(QWheelEvent::DefaultDeltasPerStep);
-    double delta_x = -static_cast<double>(angle_delta.x()) / wheel_delta_units_per_step;
-    double delta_y = static_cast<double>(angle_delta.y()) / wheel_delta_units_per_step;
-
-    static constexpr double scroll_step_size = 40;
-    auto step_x = delta_x * static_cast<double>(QApplication::wheelScrollLines());
-    auto step_y = delta_y * static_cast<double>(QApplication::wheelScrollLines());
-
-    return { step_x * scroll_step_size, step_y * scroll_step_size };
-}
+static constexpr double wheel_scroll_line_size = 40;
+static constexpr double wheel_tick_120ths_per_tick = 120;
 
 struct WheelDelta {
     QPointF delta;
+    QPointF tick_120ths;
     Web::WheelDeltaPrecision precision { Web::WheelDeltaPrecision::Discrete };
 };
+
+static WheelDelta precise_wheel_delta(QPointF pixel_delta)
+{
+    auto precise_tick_120ths = [](double pixel_step) {
+        return Web::wheel_tick_120ths_from_pixel_delta(pixel_step, Web::WheelDeltaPrecision::Precise);
+    };
+    return { pixel_delta, { precise_tick_120ths(pixel_delta.x()), precise_tick_120ths(pixel_delta.y()) }, Web::WheelDeltaPrecision::Precise };
+}
+
+// Qt counts a wheel's angle delta in 120ths of a notch, as wheel input counts its ticks.
+static_assert(static_cast<double>(QWheelEvent::DefaultDeltasPerStep) == wheel_tick_120ths_per_tick);
+
+static WheelDelta wheel_delta_from_angle_delta(QPoint angle_delta)
+{
+    QPointF notch_120ths { -static_cast<double>(angle_delta.x()), static_cast<double>(angle_delta.y()) };
+    auto pixels_per_notch = static_cast<double>(QApplication::wheelScrollLines()) * wheel_scroll_line_size;
+    return { notch_120ths * (pixels_per_notch / wheel_tick_120ths_per_tick), notch_120ths, Web::WheelDeltaPrecision::Discrete };
+}
+
+#if defined(AK_OS_MACOS)
+// NB: Qt reports every macOS mouse-wheel event as exactly one notch of angle delta, which drops the scroll
+//     acceleration that macOS applies to fast wheel spins. The accelerated line count survives in the pixel delta,
+//     which Qt computes by multiplying it with an estimated line height.
+// INTEROP: Blink and WebKit count each accelerated line of a macOS mouse wheel as one wheel tick.
+static constexpr double qt_macos_mouse_wheel_pixel_delta_per_line = 20;
+
+static WheelDelta mouse_wheel_delta_with_macos_scroll_acceleration(QPoint angle_delta, QPoint qt_pixel_delta)
+{
+    auto notch = wheel_delta_from_angle_delta(angle_delta);
+    // A slow click is accelerated to only a tenth of a line, so a click scrolls at least one line.
+    auto accelerated_line_count = [](double notch_step, int qt_pixel_step) -> double {
+        if (notch_step == 0)
+            return 0;
+        auto line_count = max(AK::abs(qt_pixel_step) / qt_macos_mouse_wheel_pixel_delta_per_line, 1.0);
+        return notch_step < 0 ? -line_count : line_count;
+    };
+    QPointF line_counts { accelerated_line_count(notch.tick_120ths.x(), qt_pixel_delta.x()), accelerated_line_count(notch.tick_120ths.y(), qt_pixel_delta.y()) };
+    return { line_counts * wheel_scroll_line_size, line_counts * wheel_tick_120ths_per_tick, Web::WheelDeltaPrecision::Discrete };
+}
+#endif
 
 static bool is_running_on_wayland()
 {
@@ -524,19 +561,24 @@ static WheelDelta wheel_delta_from_qt_event(QWheelEvent const& wheel_event)
 {
     // NB: A slow touchpad movement can have a pixel delta of zero. It is still precise input, not a wheel step.
     if (is_running_on_wayland() && wheel_event_scrolls_continuously(wheel_event))
-        return { wayland_touchpad_delta(wheel_event), Web::WheelDeltaPrecision::Precise };
+        return precise_wheel_delta(wayland_touchpad_delta(wheel_event));
 
     auto pixel_delta = -wheel_event.pixelDelta();
     // NB: macOS can report a tiny pixel delta for mouse-wheel ticks. Use it only for continuous scrolling so physical
     //     wheels continue through the line-step conversion below.
     if (!pixel_delta.isNull() && wheel_event_scrolls_continuously(wheel_event))
-        return { pixel_delta, Web::WheelDeltaPrecision::Precise };
+        return precise_wheel_delta(pixel_delta);
 
     auto angle_delta = -wheel_event.angleDelta();
-    if (!angle_delta.isNull())
-        return { wheel_delta_from_angle_delta(angle_delta), Web::WheelDeltaPrecision::Discrete };
+    if (!angle_delta.isNull()) {
+#if defined(AK_OS_MACOS)
+        return mouse_wheel_delta_with_macos_scroll_acceleration(angle_delta, wheel_event.pixelDelta());
+#else
+        return wheel_delta_from_angle_delta(angle_delta);
+#endif
+    }
 
-    return { pixel_delta, Web::WheelDeltaPrecision::Precise };
+    return precise_wheel_delta(pixel_delta);
 }
 
 static Web::ScrollGesturePhase scroll_gesture_phase_from_qt_event(QWheelEvent const& wheel_event)
@@ -694,7 +736,7 @@ static Web::UIEvents::KeyCode get_keycode_from_qt_key_event(QKeyEvent const& eve
 
 static bool is_browser_reserved_shortcut(QKeyEvent const& event)
 {
-    // Browser chrome shortcuts that manage tabs, windows, or focus should not wait for
+    // Browser chrome shortcuts that manage tabs, windows, focus, or chrome visibility should not wait for
     // WebContent to decide whether the page wants to suppress them.
     if (event.matches(QKeySequence::StandardKey::Close)
         || event.matches(QKeySequence::StandardKey::New)
@@ -709,6 +751,8 @@ static bool is_browser_reserved_shortcut(QKeyEvent const& event)
     if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && key == Qt::Key_T)
         return true;
     if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && key == Qt::Key_N)
+        return true;
+    if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && key == Qt::Key_B)
         return true;
 
     if (modifiers == Qt::ControlModifier && (key == Qt::Key_L || key == Qt::Key_Tab || key == Qt::Key_PageDown))
@@ -801,6 +845,12 @@ void WebContentView::handle_pointer_leave()
 
     static QMouseEvent mouse_event { QEvent::Type::Leave, {}, {}, Qt::MouseButton::NoButton, Qt::MouseButton::NoButton, Qt::KeyboardModifier::NoModifier };
     enqueue_native_event(Web::MouseEvent::Type::MouseLeave, mouse_event);
+}
+
+void WebContentView::cancel_mouse_press()
+{
+    static QMouseEvent mouse_event { QEvent::Type::MouseButtonRelease, {}, {}, Qt::MouseButton::NoButton, Qt::MouseButton::NoButton, Qt::KeyboardModifier::NoModifier };
+    enqueue_native_event(Web::MouseEvent::Type::MouseCancel, mouse_event);
 }
 
 void WebContentView::mouseMoveEvent(QMouseEvent* event)
@@ -1052,10 +1102,21 @@ void WebContentView::paintEvent(QPaintEvent*)
 
     if (bitmap) {
         QImage q_image(bitmap->scanline_u8(0), bitmap->width(), bitmap->height(), bitmap->pitch(), QImage::Format_RGB32);
-        painter.drawImage(QPoint(0, 0), q_image, QRect(0, 0, bitmap_size.width(), bitmap_size.height()));
+        QRect source_rect(0, 0, bitmap_size.width(), bitmap_size.height());
 
         auto background_color = page_background_color();
         auto fallback_color = QColor(background_color.red(), background_color.green(), background_color.blue());
+
+        if (m_scales_frames_to_fit && !bitmap_size.is_empty()) {
+            auto destination = rect_fitting_frame(bitmap_size, m_viewport_size);
+            painter.fillRect(QRect(0, 0, m_viewport_size.width(), m_viewport_size.height()), fallback_color);
+            painter.setRenderHint(QPainter::SmoothPixmapTransform);
+            painter.drawImage(QRect(destination.x(), destination.y(), destination.width(), destination.height()), q_image, source_rect);
+            return;
+        }
+
+        painter.drawImage(QPoint(0, 0), q_image, source_rect);
+
         if (bitmap_size.width() < m_viewport_size.width()) {
             painter.fillRect(bitmap_size.width(), 0, m_viewport_size.width() - bitmap_size.width(), bitmap->height(), fallback_color);
         }
@@ -1363,8 +1424,11 @@ void WebContentView::show_crash_report_review(Optional<ByteString> const& hidden
         return;
     }
     m_crash_report_review->on_exit = [this, is_hidden_crash] {
-        // The tab was opened only for the review, and a report on its way keeps going without it.
+        // The tab was opened only for the review, and a report on its way keeps going without it. Closing it also
+        // declines the reports still waiting, so none of them is offered again.
         if (is_hidden_crash) {
+            if (auto result = WebView::CrashReportStore::the().mark_all_seen(); result.is_error())
+                warnln("Could not mark crash reports as seen: {}", result.error());
             if (on_close)
                 on_close();
             return;
@@ -1457,6 +1521,18 @@ void WebContentView::set_vertical_tab_overlay_insets([[maybe_unused]] int left, 
     m_vertical_tab_overlay_left = left;
     m_vertical_tab_overlay_right = right;
 
+    update_vulkan_window_mask();
+    schedule_repaint();
+#endif
+}
+
+void WebContentView::set_bookmarks_bar_overlay_height([[maybe_unused]] int height)
+{
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    if (m_bookmarks_bar_overlay_height == height)
+        return;
+
+    m_bookmarks_bar_overlay_height = height;
     update_vulkan_window_mask();
     schedule_repaint();
 #endif
@@ -1668,18 +1744,33 @@ void WebContentView::accessibilityActiveChanged(bool active)
 {
     if (!active || m_requested_accessibility_tree)
         return;
-    // An assistive technology turned up after this page's load finished, or during the load: Fetch the tree without the
-    // focus grab and the load announcement that only a page load gets. A page that's still loading gets both when its
-    // load finishes, as usual. For a page that's already loaded, its first tree reports where the focus is instead.
+    // An assistive technology turned up after this page's load finished, or during the load: Fetch the tree without
+    // what only a page load gets, the document-root focus event on Linux and the load announcement on macOS. A page
+    // that's still loading gets it when its load finishes, as usual. For a page that's already loaded, its first tree
+    // reports where the focus is instead.
     m_posted_initial_accessibility_focus = true;
     m_report_accessibility_focus_with_next_tree = !is_loading();
     fetch_accessibility_tree();
 }
 #endif
 
+// A screen's geometry changes when its resolution or scale does, and its available geometry when the dock or a
+// taskbar changes size, so each is reported as it happens.
+void WebContentView::watch_screen_geometry(QScreen& screen)
+{
+    QObject::connect(&screen, &QScreen::geometryChanged, this, [this](QRect const&) {
+        update_screen_rects();
+    });
+    QObject::connect(&screen, &QScreen::availableGeometryChanged, this, [this](QRect const&) {
+        update_screen_rects();
+    });
+}
+
 void WebContentView::update_screen_rects()
 {
-    update_screen_rects(page());
+    traversable().for_each_hosting_page([&](WebView::WebContentPage& page) {
+        update_screen_rects(page);
+    });
 }
 
 void WebContentView::update_screen_rects(WebView::WebContentPage& page)
@@ -1688,24 +1779,29 @@ void WebContentView::update_screen_rects(WebView::WebContentPage& page)
 
     if (!screens.empty()) {
         Vector<Web::DevicePixelRect> screen_rects;
+        Vector<Web::DevicePixelRect> available_screen_rects;
         for (auto const& screen : screens) {
             // NOTE: QScreen::geometry() returns the 'device-independent pixels', we multiply
             //       by the device pixel ratio to get the 'physical pixels' of the display.
-            auto geometry = screen->geometry();
             auto device_pixel_ratio = screen->devicePixelRatio();
-            screen_rects.append(Web::DevicePixelRect(geometry.x() * device_pixel_ratio, geometry.y() * device_pixel_ratio, geometry.width() * device_pixel_ratio, geometry.height() * device_pixel_ratio));
+            auto to_device_pixels = [&](QRect const& geometry) {
+                return Web::DevicePixelRect(geometry.x() * device_pixel_ratio, geometry.y() * device_pixel_ratio, geometry.width() * device_pixel_ratio, geometry.height() * device_pixel_ratio);
+            };
+            screen_rects.append(to_device_pixels(screen->geometry()));
+            // The available geometry leaves out what the system keeps for itself, such as a menu bar or a dock.
+            available_screen_rects.append(to_device_pixels(screen->availableGeometry()));
         }
 
         // NOTE: The first item in QGuiApplication::screens is always the primary screen.
         //       This is not specified in the documentation but QGuiApplication::primaryScreen
         //       always returns the first item in the list if it isn't empty.
-        page.async_update_screen_rects(screen_rects, 0);
+        page.async_update_screen_rects(screen_rects, available_screen_rects, 0);
     }
 }
 
-void WebContentView::prepare_page_for_tab(WebView::WebContentPage& page)
+void WebContentView::prepare_page_for_navigable(WebView::WebContentPage& page)
 {
-    ViewImplementation::prepare_page_for_tab(page);
+    ViewImplementation::prepare_page_for_navigable(page);
 
     update_compositor_display_metadata(page);
     update_screen_rects(page);
@@ -1987,6 +2083,8 @@ void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePoi
 
     double wheel_delta_x = 0;
     double wheel_delta_y = 0;
+    double wheel_tick_120ths_x = 0;
+    double wheel_tick_120ths_y = 0;
     auto wheel_delta_precision = Web::WheelDeltaPrecision::Discrete;
     auto scroll_gesture_phase = Web::ScrollGesturePhase::None;
 
@@ -1995,11 +2093,13 @@ void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePoi
         auto wheel_delta = wheel_delta_from_qt_event(wheel_event);
         wheel_delta_x = wheel_delta.delta.x();
         wheel_delta_y = wheel_delta.delta.y();
+        wheel_tick_120ths_x = wheel_delta.tick_120ths.x();
+        wheel_tick_120ths_y = wheel_delta.tick_120ths.y();
         wheel_delta_precision = wheel_delta.precision;
         scroll_gesture_phase = scroll_gesture_phase_from_qt_event(wheel_event);
     }
 
-    enqueue_input_event(Web::MouseEvent { type, position, screen_position.to_type<Web::DevicePixels>(), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, m_click_count, nullptr });
+    enqueue_input_event(Web::MouseEvent { type, position, screen_position.to_type<Web::DevicePixels>(), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, m_click_count, nullptr });
 }
 
 struct DragData : Web::BrowserInputData {

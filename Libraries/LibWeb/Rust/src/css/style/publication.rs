@@ -3158,6 +3158,22 @@ impl RetainedState {
         self.state_summary(node, state).has_substitutions
     }
 
+    pub(super) fn state_custom_property_reads(
+        &self,
+        node: StyleNodeID,
+        state: CascadeStateID,
+    ) -> Option<custom_property_cascade::CustomPropertyNames> {
+        self.winner_groups.state_custom_property_reads(state, || {
+            let mut names = Vec::new();
+            for value in self.state_substitution_values(node, state) {
+                if !custom_property_cascade::append_custom_property_reads(value.data(), &mut names) {
+                    return None;
+                }
+            }
+            Some(custom_property_cascade::sorted_custom_property_names(names))
+        })
+    }
+
     /// What a state's winners read beyond the cascade, as `cascade::STATE_READS_*` bits, decided
     /// once for each state.
     pub(super) fn state_reads(&self, node: StyleNodeID, state: CascadeStateID) -> u8 {
@@ -3726,12 +3742,16 @@ impl RetainedState {
             self.note_container_effects_for_host(node, effects);
         }
         declarations.sort_by_key(|(priority, index, ..)| (*priority, *index));
-        let store = WinnerStore::new(
+        let mut store = WinnerStore::new(
             declarations
                 .into_iter()
                 .map(|(_, _, declaration)| declaration)
                 .collect(),
         );
+        store.reads_sibling_position = style_query_references
+            .borrow()
+            .as_ref()
+            .is_some_and(|dependencies| dependencies.sibling_position);
         // A store built to drive a record says whether that record rolls back; one built to admit a
         // row only adds to what the node's records are known to do.
         let bit = rolled_back_bit(pseudo_kind);
@@ -3950,6 +3970,14 @@ impl RetainedState {
 
     pub(crate) fn style_record_view(&self, style_record: u64) -> Option<computed::StyleRecordView<'_>> {
         self.computed_group_sets.style_record_view(style_record)
+    }
+
+    pub(crate) fn take_released_animation_overlay_records(&mut self) -> computed::ReleasedAnimationOverlayRecords {
+        // Even an empty take copies the sets while a fork shares them.
+        if !self.computed_group_sets.has_released_animation_overlay_records() {
+            return computed::ReleasedAnimationOverlayRecords::default();
+        }
+        self.computed_group_sets.take_released_animation_overlay_records()
     }
 
     pub(crate) fn pin_style_record(&mut self, style_record: u64) {

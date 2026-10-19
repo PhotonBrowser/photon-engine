@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use crate::ir::Float64Function;
 use crate::ir::Locations;
 
 use crate::bytecode::EnvironmentCoordinate;
@@ -297,7 +298,10 @@ pub mod arith_feedback {
     pub const OTHER: u8 = 1 << 5;
     /// Equality comparisons where both operands are objects.
     pub const OBJECT_PAIR: u8 = 1 << 6;
-    pub const NON_NUMERIC: u8 = STRING | BIG_INT | OTHER | OBJECT_PAIR;
+    /// Boolean operands of arithmetic and bitwise operations, which `OTHER`
+    /// does not include there.
+    pub const BOOLEAN: u8 = 1 << 7;
+    pub const NON_NUMERIC: u8 = STRING | BIG_INT | OTHER | OBJECT_PAIR | BOOLEAN;
 }
 
 /// `value_feedback` bits: the types of the values an instruction produced.
@@ -744,6 +748,10 @@ pub enum Intrinsic {
     StringPrototypeTrimEnd,
     /// `RegExp.prototype.exec`.
     RegExpPrototypeExec,
+    /// `Map.prototype.get`.
+    MapPrototypeGet,
+    /// `Map.prototype.has`.
+    MapPrototypeHas,
 }
 
 /// A `this` value or argument of a builtin whose runtime helper JIT code
@@ -819,6 +827,17 @@ impl Default for HelperCallAddresses {
     }
 }
 
+/// `u64 (Float64Function)`: the address of the runtime's `double
+/// (double...)` function that computes a `Float64Function`, or 0.
+#[derive(Debug, Clone, Copy)]
+pub struct Float64FunctionAddresses(pub fn(Float64Function) -> u64);
+
+impl Default for Float64FunctionAddresses {
+    fn default() -> Self {
+        Self(|_| 0)
+    }
+}
+
 impl Intrinsic {
     /// How JIT code calls the builtin through its runtime helper, if it
     /// does.
@@ -860,6 +879,15 @@ impl Intrinsic {
                 result: HelperResult::Value,
                 reads: Locations::NAMED,
                 writes: Locations::NAMED_SLOTS,
+            }),
+            // NB: The helpers decline for receivers that are no Map, which
+            //     the slow path throws for.
+            Intrinsic::MapPrototypeGet | Intrinsic::MapPrototypeHas => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[HelperOperand::Value],
+                result: HelperResult::Value,
+                reads: Locations::COLLECTIONS,
+                writes: Locations::NONE,
             }),
             _ => None,
         }
@@ -930,6 +958,9 @@ pub struct RuntimeInfo {
     /// The runtime helpers of the intrinsics JIT code calls through them
     /// (see `Intrinsic::helper_call()`).
     pub helper_calls: HelperCallAddresses,
+    /// The runtime's functions of doubles that `Op::CallFloat64Function`
+    /// calls.
+    pub float64_functions: Float64FunctionAddresses,
     /// `u64 libjs_jit_to_object(VM*, u64 primitive, u64 function)`: ToObject
     /// of a primitive other than undefined and null, as the builtin
     /// `function` makes it, or the empty value if that function is of
@@ -1237,7 +1268,11 @@ impl ObjectAllocationInfo {
 /// `template` (`8 * template.len()` bytes) to it, and stores the length
 /// (u32) at `cell + length_offset` and the halves (cell pointers) at
 /// `cell + lhs_offset` and `cell + rhs_offset`. If `allocator` is 0, there is
-/// no fast path. The slow path is the interpreter's.
+/// no fast path. Where there is no local free cell or the heap wants to
+/// collect garbage, JIT code calls
+/// `PrimitiveString* slow_path(VM*, PrimitiveString* lhs, PrimitiveString* rhs)`
+/// instead, which returns the rope string; if `slow_path` is 0, the
+/// interpreter's slow path concatenates the strings.
 #[derive(Debug, Clone, Default)]
 pub struct RopeAllocationInfo {
     /// The `GC::CellAllocator` of rope strings.
@@ -1249,6 +1284,7 @@ pub struct RopeAllocationInfo {
     pub rhs_offset: u32,
     pub length_offset: u32,
     pub min_length: u32,
+    pub slow_path: u64,
 }
 
 /// The allocation contract for arrays with packed elements (`JS::Array`
@@ -1615,13 +1651,20 @@ pub struct RuntimeLayout {
     /// `Builtin` values.
     pub builtin_string_prototype_char_code_at: u8,
     pub builtin_string_prototype_char_at: u8,
-    /// `JS::Builtin::MathAbs`, `MathFloor`, `MathCeil`, `MathRound` and
-    /// `MathSqrt`.
+    /// `JS::Builtin::MathAbs`, `MathFloor`, `MathCeil`, `MathRound`,
+    /// `MathSqrt`, `MathExp`, `MathLog`, `MathSin`, `MathCos`, `MathTan` and
+    /// `MathPow`.
     pub builtin_math_abs: u8,
     pub builtin_math_floor: u8,
     pub builtin_math_ceil: u8,
     pub builtin_math_round: u8,
     pub builtin_math_sqrt: u8,
+    pub builtin_math_exp: u8,
+    pub builtin_math_log: u8,
+    pub builtin_math_sin: u8,
+    pub builtin_math_cos: u8,
+    pub builtin_math_tan: u8,
+    pub builtin_math_pow: u8,
     /// The strings `typeof` results in, as values, or all 0 for code
     /// without them.
     pub typeof_strings: TypeofStrings,
@@ -1636,6 +1679,18 @@ pub struct RuntimeLayout {
     /// none yet), or 0 for code without them.
     pub numeric_string_cache: u64,
     pub numeric_string_cache_size: u32,
+    /// The address of the VM's cache of the strings of larger integers, or
+    /// 0 for code without one: the entry of the integer `n` is at index
+    /// `n & large_numeric_string_cache_mask`, entries are
+    /// `large_numeric_string_cache_entry_size` bytes, and an entry has the
+    /// string (cell pointer, or null) at
+    /// `large_numeric_string_cache_string` if the integer (u64) at
+    /// `large_numeric_string_cache_number` is `n`.
+    pub large_numeric_string_cache: u64,
+    pub large_numeric_string_cache_mask: u32,
+    pub large_numeric_string_cache_entry_size: u32,
+    pub large_numeric_string_cache_number: u32,
+    pub large_numeric_string_cache_string: u32,
     /// `Environment::outer` (cell pointer).
     pub environment_outer: u32,
     /// `Environment::declarative` (bool): whether the environment is a
@@ -1654,6 +1709,14 @@ pub struct RuntimeLayout {
     pub array_iterator_kind: u32,
     /// The `[[ArrayLikeIterationKind]]` of iterators over values.
     pub array_iterator_kind_value: u8,
+    /// The class (pointer) of `GeneratorObject`s, which starts their cells.
+    pub generator_object_class: u64,
+    /// `GeneratorObject::pending_completion_value` (value): the value of
+    /// the completion a generator resumes with.
+    pub generator_object_pending_completion_value: u32,
+    /// `GeneratorObject::pending_completion_type` (u32): the type of that
+    /// completion, as `GetCompletionFields` writes it.
+    pub generator_object_pending_completion_type: u32,
     /// `DeclarativeEnvironment::binding_values.size` (u64).
     pub declarative_environment_binding_values_size: u32,
     /// The capacity (u64) of `DeclarativeEnvironment::binding_values`.

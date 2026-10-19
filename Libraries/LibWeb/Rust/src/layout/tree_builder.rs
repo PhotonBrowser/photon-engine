@@ -1479,9 +1479,43 @@ fn update_layout_tree_for_dom_children(
 ) {
     let mut node = host.first_dom_child(parent);
     while let Some(current) = node {
-        update_layout_tree(host, state, current, context, must_create_subtree, insertion_mode);
+        if !keeps_its_box_as_it_is(host, current, context, must_create_subtree) {
+            update_layout_tree(host, state, current, context, must_create_subtree, insertion_mode);
+        }
         node = host.next_dom_sibling(current);
     }
+}
+
+/// OPTIMIZATION: A node that holds no layout tree update mark, and has none below it, keeps its attached box as it
+/// is, so the walk passes it by without looking at its style, as it passes by every node outside the marked paths.
+/// Inside SVG and top-layer walks, where the walk itself decides which boxes the nodes get, it visits every node.
+fn keeps_its_box_as_it_is(
+    host: &TreeBuilderHost<'_>,
+    node: StyleNodeID,
+    context: &TreeBuilderContext,
+    must_create_subtree: bool,
+) -> bool {
+    if must_create_subtree
+        || context.document_needs_full_layout_tree_update
+        || context.has_svg_root
+        || context.layout_top_layer
+    {
+        return false;
+    }
+    let arena = host.arena();
+    if arena.needs_layout_tree_update(node) || arena.child_needs_layout_tree_update(Some(node)) {
+        return false;
+    }
+    let row = arena.bound_row(node);
+    if row.is_invalid() || host.parent(row).is_invalid() {
+        return false;
+    }
+    host.element_type_facts(Some(node))
+        & (element_adjustment_fact::IS_SVG_CONTAINER
+            | element_adjustment_fact::REQUIRES_SVG_CONTAINER
+            | element_adjustment_fact::IS_SVG_FOREIGN_OBJECT_ELEMENT
+            | element_adjustment_fact::RENDERED_IN_TOP_LAYER)
+        == 0
 }
 
 /// Updates every shadow-root child in tree order and clears the root's update flags.
@@ -2672,7 +2706,7 @@ fn update_principal_node_after_entry(
                     && node_facts::kind_is_box(new_data.kind.get())
                     && let Some(link) = arena.take_committed_fragment_link(old_data)
                 {
-                    arena.set_committed_fragment_link(new_data, link, None);
+                    arena.set_committed_fragment_link(layout_node, link, None);
                 }
                 transfer_fragments_to_replacement_box(arena, old_layout_node, layout_node);
                 super::layout_node_arena::prepare_subtree_for_detach(host.host_calls(), arena, old_layout_node);
@@ -4093,15 +4127,20 @@ fn insertion_parent_for_block_node(
 
     // Inline is fine for in-flow block children (interrupting blocks) and for out-of-flow children;
     // the inline formatting context emits items for both.
-    // Block-level pseudo-element boxes climb out of inline ancestors instead (see below). A table-internal
-    // pseudo-element box has to stay a child of its originating inline box though: table fixup generates one anonymous
-    // inline-table around the consecutive table-internal children of the inline, so e.g. a `display: table-cell`
-    // ::after joins the table of the table-cell siblings in the inline instead of starting a separate block-level
-    // table outside of it.
-    // https://drafts.csswg.org/css-tables-3/#fixup-algorithm
-    let is_table_internal_pseudo_element_box = node_facts::has_flag(host.data(node), NodeFlag::Anonymous)
-        && is_table_non_root_box_with_display(display_for_table_fixup(host, node));
-    if (!node_facts::has_flag(host.data(node), NodeFlag::Anonymous) || is_table_internal_pseudo_element_box)
+    // In-flow block-level pseudo-element boxes climb out of inline ancestors instead (see below). Two kinds of
+    // pseudo-element box stay a child of their originating inline box like a DOM child would:
+    // - A table-internal one: table fixup generates one anonymous inline-table around the consecutive table-internal
+    //   children of the inline, so e.g. a `display: table-cell` ::after joins the table of the table-cell siblings in
+    //   the inline instead of starting a separate block-level table outside of it.
+    //   https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+    // - An absolutely positioned one: its static position is inside the inline's content, not after its inline-end
+    //   edges.
+    let is_anonymous = node_facts::has_flag(host.data(node), NodeFlag::Anonymous);
+    let is_table_internal_pseudo_element_box =
+        is_anonymous && is_table_non_root_box_with_display(display_for_table_fixup(host, node));
+    let is_absolutely_positioned_pseudo_element_box = node_is_generated_for_pseudo_element(host.data(node))
+        && host.style(node).is_some_and(|style| style.is_absolutely_positioned());
+    if (!is_anonymous || is_table_internal_pseudo_element_box || is_absolutely_positioned_pseudo_element_box)
         && node_is_inline_outside(host, parent)
         && host.style(parent).is_some_and(|style| style.display().is_flow_inside())
     {

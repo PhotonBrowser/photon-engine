@@ -168,12 +168,14 @@
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
+#include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/HTMLMetaElement.h>
 #include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLStyleElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/HTMLTitleElement.h>
+#include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/HashChangeEvent.h>
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/ListOfAvailableImages.h>
@@ -228,8 +230,10 @@
 #include <LibWeb/Painting/CompositorAnimationEffectState.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/HitTestDisplayList.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
+#include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
@@ -1034,6 +1038,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
         visitor.visit(view_transition);
 
     visitor.visit(m_top_layer_elements);
+    visitor.visit(m_picture_in_picture_element);
     visitor.visit(m_top_layer_pending_removals);
     visitor.visit(m_elements_with_pending_top_layer_membership_change);
     visitor.visit(m_showing_auto_popover_list);
@@ -1426,7 +1431,10 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<Utf16String> const&, Opti
     // 13. Set document's is initial about:blank to false.
     set_is_initial_about_blank(false);
 
-    // FIXME: 14. If document's iframe load in progress flag is set, then set document's mute iframe load flag.
+    // 14. If document's iframe load in progress flag is set, then set document's mute iframe load flag.
+    // AD-HOC: Other engines only skip the load of a document opened during its iframe load, so opening it again
+    //         later unmutes it. See https://github.com/whatwg/html/issues/4292
+    set_mute_iframe_load(iframe_load_in_progress());
 
     // 15. Set document to no-quirks mode.
     set_quirks_mode(QuirksMode::No);
@@ -1584,6 +1592,17 @@ bool Document::is_child_allowed(Node const& node) const
     default:
         return false;
     }
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#the-document-object:concept-node-clone-ext
+WebIDL::ExceptionOr<void> Document::cloned(Node& copy, bool subtree) const
+{
+    TRY(Base::cloned(copy, subtree));
+
+    // The cloning steps for Document nodes given node, copy, and subtree are to set copy's about base URL to node's
+    // about base URL.
+    as<Document>(copy).set_about_base_url(m_about_base_url);
+    return {};
 }
 
 Element* Document::document_element()
@@ -2041,37 +2060,37 @@ void Document::set_url(URL::URL const& url)
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url
 URL::URL Document::fallback_base_url() const
 {
-    // 1. If document is an iframe srcdoc document, then:
-    if (HTML::url_matches_about_srcdoc(m_url)) {
-        // 1. Assert: document's about base URL is non-null.
-        // AD-HOC: Documents created by DOMParser or by cloning can have a URL that matches about:srcdoc
-        //         without an about base URL being set. Returning the document's URL in this case matches
-        //         the behavior of other engines.
-        if (!m_about_base_url.has_value())
-            return m_url;
-
-        // 2. Return document's about base URL.
-        return m_about_base_url.value();
-    }
-
-    // 2. If document's URL matches about:blank and document's about base URL is non-null, then return document's about base URL.
-    if (HTML::url_matches_about_blank(m_url) && m_about_base_url.has_value())
+    // 1. If document's URL matches about:blank or matches about:srcdoc, and document's about base URL is non-null,
+    //    then return document's about base URL.
+    if ((HTML::url_matches_about_blank(m_url) || HTML::url_matches_about_srcdoc(m_url)) && m_about_base_url.has_value())
         return m_about_base_url.value();
 
-    // 3. Return document's URL.
+    // 2. Return document's URL.
     return m_url;
 }
 
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
 URL::URL Document::base_url() const
 {
-    // 1. If document has no descendant base element that has an href attribute, then return document's fallback base URL.
-    auto base_element = first_base_element_with_href_in_tree_order();
-    if (!base_element)
-        return fallback_base_url();
+    // 1. If document has a descendant base element that has an href attribute, then return the frozen base URL of the
+    //    first such base element in tree order.
+    if (auto base_element = first_base_element_with_href_in_tree_order())
+        return base_element->frozen_base_url();
 
-    // 2. Otherwise, return the frozen base URL of the first base element in document that has an href attribute, in tree order.
-    return base_element->frozen_base_url();
+    // 2. If document's base URL override is non-null, then return document's base URL override.
+    if (m_base_url_override.has_value())
+        return m_base_url_override.value();
+
+    // 3. Return document's fallback base URL.
+    return fallback_base_url();
+}
+
+// https://dom.spec.whatwg.org/#get-the-base-url
+Optional<URL::URL> Document::get_the_base_url() const
+{
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#get-the-base-url
+    // A Document document's get the base URL algorithm returns document's document base URL.
+    return base_url();
 }
 
 String const& Document::serialized_url() const
@@ -3156,7 +3175,7 @@ Layout::Node* Document::highlighted_layout_node(Layout::BegunRead const& read)
     return element.pseudo_element_unsafe_layout_node(read, m_highlighted_pseudo_element.value());
 }
 
-static Node* find_common_ancestor(Node* a, Node* b)
+static Node* find_common_flat_tree_ancestor(Node* a, Node* b)
 {
     if (!a || !b)
         return nullptr;
@@ -3165,10 +3184,10 @@ static Node* find_common_ancestor(Node* a, Node* b)
         return a;
 
     HashTable<Node*> ancestors;
-    for (auto* node = a; node; node = node->parent_or_shadow_host())
+    for (auto* node = a; node; node = node->flat_tree_parent())
         ancestors.set(node);
 
-    for (auto* node = b; node; node = node->parent_or_shadow_host()) {
+    for (auto* node = b; node; node = node->flat_tree_parent()) {
         if (ancestors.contains(node))
             return node;
     }
@@ -3258,7 +3277,10 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
         return;
 
     GC::Ptr<Node> old_hovered_node = move(m_hovered_node);
-    auto* common_ancestor = find_common_ancestor(old_hovered_node.ptr(), node.ptr());
+    // AD-HOC: The boundary event steps in the Pointer Events spec walk the target's inclusive ancestors, which stop at
+    //         the shadow root and ignore slot assignment. Chromium and Gecko walk the flat tree instead, so content
+    //         assigned to a slot is inside the elements around that slot.
+    auto* common_ancestor = find_common_flat_tree_ancestor(old_hovered_node.ptr(), node.ptr());
     GC::Ptr<HTML::WindowProxy> window_proxy;
     if (auto navigable = this->navigable())
         window_proxy = navigable->active_window_proxy();
@@ -3283,23 +3305,13 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     if (node)
         hovered_node_offset = hover_event_offset_for_target(read, hover_event_data, *node);
 
-    Vector<HoverEventTarget> pointer_leave_targets;
-    if (old_hovered_node && (!node || !node->is_descendant_of(*old_hovered_node))) {
-        for (auto target = old_hovered_node; target && target.ptr() != common_ancestor; target = target->parent())
-            pointer_leave_targets.append(make_hover_event_target(*target));
-    }
-
-    Vector<HoverEventTarget> mouse_leave_targets;
-    if (old_hovered_node && (!node || !node->is_descendant_of(*old_hovered_node))) {
-        for (auto target = old_hovered_node; target && target.ptr() != common_ancestor; target = target->parent_or_shadow_host())
-            mouse_leave_targets.append(make_hover_event_target(*target));
-    }
+    Vector<HoverEventTarget> left_ancestors;
+    for (auto* target = old_hovered_node.ptr(); target && target != common_ancestor; target = target->flat_tree_parent())
+        left_ancestors.append(make_hover_event_target(*target));
 
     Vector<HoverEventTarget> entered_ancestors;
-    if (node && (!old_hovered_node || !node->is_ancestor_of(*old_hovered_node))) {
-        for (auto target = node; target && target.ptr() != common_ancestor; target = target->parent_or_shadow_host())
-            entered_ancestors.append(make_hover_event_target(*target));
-    }
+    for (auto* target = node.ptr(); target && target != common_ancestor; target = target->flat_tree_parent())
+        entered_ancestors.append(make_hover_event_target(*target));
 
     m_hovered_node = node;
 
@@ -3358,8 +3370,8 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     }
 
     // https://w3c.github.io/pointerevents/#the-pointerleave-event
-    if (!pointer_leave_targets.is_empty()) {
-        for (auto const& target : pointer_leave_targets) {
+    if (!left_ancestors.is_empty()) {
+        for (auto const& target : left_ancestors) {
             UIEvents::PointerEventOptions pointer_event_options;
             pointer_event_options.related_target = m_hovered_node;
             pointer_event_options.is_primary = true;
@@ -3375,8 +3387,8 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     }
 
     // https://w3c.github.io/uievents/#mouseleave
-    if (!mouse_leave_targets.is_empty()) {
-        for (auto const& target : mouse_leave_targets) {
+    if (!left_ancestors.is_empty()) {
+        for (auto const& target : left_ancestors) {
             UIEvents::MouseEventOptions mouse_event_options;
             mouse_event_options.related_target = m_hovered_node;
             if (hover_event_data.has_value())
@@ -3971,10 +3983,10 @@ void Document::adopt_node_steps(Node& node)
             });
         }
 
-        // AD-HOC: Transfer NodeIterators rooted at `node` from old_document to this document.
+        // AD-HOC: Transfer NodeIterators rooted in `node`'s subtree from old_document to this document.
         Vector<NodeIterator&> node_iterators_to_transfer;
         for (auto node_iterator : old_document.m_node_iterators) {
-            if (node_iterator->root().ptr() == &node)
+            if (node_iterator->root()->is_shadow_including_inclusive_descendant_of(node))
                 node_iterators_to_transfer.append(*node_iterator);
         }
 
@@ -5053,8 +5065,8 @@ void Document::update_readiness(HTML::DocumentReadyState readiness_value)
         if (navigable && navigable->is_traversable()) {
             if (!is_decoded_svg()) {
                 HTML::HTMLLinkElement::load_fallback_favicon_if_needed(*this);
+                navigable->page().client().page_did_finish_loading(navigable->id(), id());
             }
-            navigable->page().client().page_did_finish_loading(navigable->id(), m_navigation_id);
         } else {
             m_needs_to_call_page_did_load = true;
         }
@@ -6313,6 +6325,7 @@ void Document::run_unloading_cleanup_steps()
 
     FileAPI::run_unloading_cleanup_steps(*this);
     fully_exit_fullscreen();
+    PictureInPicture::run_unloading_cleanup_steps(*this);
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
@@ -6824,6 +6837,9 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
     case PolicyControlledFeature::Microphone:
         // FIXME: Implement allowlist for this.
         return true;
+    case PolicyControlledFeature::PictureInPicture:
+        // FIXME: Implement allowlist for this.
+        return true;
     case PolicyControlledFeature::WindowManagement:
         // FIXME: Implement allowlist for this.
         return true;
@@ -6981,7 +6997,7 @@ void Document::make_active()
     HTML::relevant_settings_object(window).execution_ready = true;
 
     if (m_needs_to_call_page_did_load) {
-        navigable()->page().client().page_did_finish_loading(navigable()->id(), m_navigation_id);
+        navigable()->page().client().page_did_finish_loading(navigable()->id(), id());
         m_needs_to_call_page_did_load = false;
     }
 
@@ -10545,6 +10561,84 @@ GC::Ref<GC::HeapVector<GC::Ref<Document>>> Document::collect_documents_to_unfull
 
     // 3. Return docs.
     return docs;
+}
+
+void Document::set_picture_in_picture_element(GC::Ptr<Element> element)
+{
+    if (m_picture_in_picture_element == element)
+        return;
+
+    auto old_element = exchange(m_picture_in_picture_element, element);
+    if (old_element)
+        CSS::record_element_state_changed(*old_element, CSS::PseudoClass::PictureInPicture, false);
+    if (element)
+        CSS::record_element_state_changed(*element, CSS::PseudoClass::PictureInPicture, true);
+
+    if (auto* media_element = as_if<HTML::HTMLMediaElement>(old_element.ptr()))
+        media_element->update_controls();
+    if (auto* media_element = as_if<HTML::HTMLMediaElement>(element.ptr()))
+        media_element->update_controls();
+
+    // Being the Picture-in-Picture element is part of a video's paint facts, apart from anything its controls change.
+    if (auto* video_element = as_if<HTML::HTMLVideoElement>(old_element.ptr()))
+        Painting::push_video_paint_facts(*video_element);
+    if (auto* video_element = as_if<HTML::HTMLVideoElement>(element.ptr()))
+        Painting::push_video_paint_facts(*video_element);
+}
+
+// https://w3c.github.io/picture-in-picture/#dom-documentorshadowroot-pictureinpictureelement
+GC::Ptr<Element> Document::retargeted_picture_in_picture_element() const
+{
+    // 1. If this is a shadow root and its host is not connected, return null and abort these steps.
+    // NB: We're not a shadow root. See ShadowRoot::retargeted_picture_in_picture_element().
+
+    // 2. Let candidate be the result of retargeting Picture-in-Picture element against this.
+    auto* candidate = as_if<Element>(retarget(m_picture_in_picture_element.ptr(), const_cast<Document*>(this)));
+    if (!candidate)
+        return nullptr;
+
+    // 3. If candidate and this are in the same tree, return candidate and abort these steps.
+    if (&candidate->root() == &root())
+        return candidate;
+
+    // AD-HOC: An element that was never inserted into this document is not in its tree, but the spec intends to
+    //         return it all the same. This adds the step proposed in
+    //         https://github.com/w3c/picture-in-picture/pull/253.
+    // If this is a Document and candidate's node document is this, return candidate.
+    if (&candidate->document() == this)
+        return candidate;
+
+    // 4. Return null.
+    return nullptr;
+}
+
+// https://w3c.github.io/picture-in-picture/#dom-document-pictureinpictureenabled
+bool Document::picture_in_picture_enabled() const
+{
+    // The pictureInPictureEnabled attribute's getter must return true if Picture-in-Picture support is true and this
+    // is allowed to use the feature indicated by attribute name picture-in-picture, and false otherwise.
+    return page().picture_in_picture_controller().has_picture_in_picture_support()
+        && is_allowed_to_use_feature(PolicyControlledFeature::PictureInPicture);
+}
+
+// https://w3c.github.io/picture-in-picture/#dom-document-exitpictureinpicture
+// AD-HOC: This follows the overhaul proposed in https://github.com/w3c/picture-in-picture/pull/260, since the current
+//         text mutates the DOM from its parallel steps.
+GC::Ref<WebIDL::Promise> Document::exit_picture_in_picture()
+{
+    auto& realm = HTML::relevant_realm(*this);
+
+    // 1. If this's Picture-in-Picture element is null or this is not fully active, return a promise rejected with
+    //    InvalidStateError DOMException.
+    if (!m_picture_in_picture_element || !is_fully_active())
+        return WebIDL::create_rejected_promise(realm, WebIDL::InvalidStateError::create("There is no Picture-in-Picture element to exit"_utf16));
+
+    // 2. Let p be a new promise created in this's relevant realm.
+    auto promise = WebIDL::create_promise(realm);
+
+    // 3. Return p, and enqueue the following steps to this's picture-in-picture parallel queue:
+    page().picture_in_picture_controller().enqueue_exit(*this, promise);
+    return promise;
 }
 
 // https://fullscreen.spec.whatwg.org/#unfullscreen-an-element

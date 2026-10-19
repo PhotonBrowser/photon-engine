@@ -70,18 +70,22 @@ pub(crate) fn site(
         .into_iter()
         .map(|frame_state| {
             let frame_state = graph.frame_state(frame_state);
-            let values = frame_state
+            let mut values = frame_state
                 .values
                 .iter()
                 .map(|(_, value)| location_of(*value))
-                .collect();
+                .collect::<Vec<_>>();
+            values.sort_unstable_by_key(|(slot, _)| *slot);
+            let mut in_frame = frame_state.in_frame.clone();
+            in_frame.sort_unstable();
             CodeFrameState {
                 executable: frame_state.executable,
                 pc: frame_state.pc,
                 mode: frame_state.mode,
                 values,
-                in_frame: frame_state.in_frame.clone(),
+                in_frame,
                 passed_argument_count: frame_state.passed_argument_count,
+                legacy_arguments: frame_state.legacy_arguments.clone(),
             }
         })
         .collect();
@@ -89,7 +93,7 @@ pub(crate) fn site(
     let objects = objects
         .iter()
         .map(|object| {
-            let Op::VirtualObject { shape } = graph.node(*object).op else {
+            let Op::VirtualObject { shape, allocation } = graph.node(*object).op else {
                 unreachable!("virtual objects are VirtualObject nodes");
             };
             let properties = graph
@@ -98,7 +102,11 @@ pub(crate) fn site(
                 .iter()
                 .map(|property| location_of(*property).1)
                 .collect();
-            VirtualObjectDescriptor { shape, properties }
+            VirtualObjectDescriptor {
+                shape,
+                allocation: allocation.0,
+                properties,
+            }
         })
         .collect();
     let inlined_frame_bytes = match graph.node(node).op {

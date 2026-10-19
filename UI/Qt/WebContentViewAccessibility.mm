@@ -8,6 +8,7 @@
 #include "WebContentView.h"
 
 #include <LibWebView/AccessibilityTreeManager.h>
+#include <UI/Qt/MacWindow.h>
 
 #import <AppKit/AppKit.h>
 #import <objc/message.h>
@@ -110,6 +111,19 @@ extern "C" void NSAccessibilityHandleFocusChanged();
 
 - (void)performAccessibilityAction:(NSString*)action forNodeID:(int64_t)nodeID
 {
+    // An assistive technology that moves the focus into the page moves the keyboard focus there too, as a click does.
+    // Otherwise, keys would go to the location editor, for example, while VoiceOver reports a text field in the page as
+    // focused. VoiceOver also sets the focus on what its cursor moves to when the keyboard focus follows that cursor,
+    // the AXWebArea first as the cursor enters the page. Leave the focus alone if the view or a child of it, such as
+    // the crash overlay's buttons, already has it.
+    auto& view = *_webContentView;
+    auto* focus_widget = view.window()->focusWidget();
+    auto focus_is_in_view = focus_widget && (focus_widget == &view || view.isAncestorOf(focus_widget));
+    if ([action isEqualToString:@"focus"] && view.isVisible() && !focus_is_in_view) {
+        Ladybird::make_appkit_window_first_responder(view);
+        view.setFocus(Qt::OtherFocusReason);
+    }
+
     auto action_string = MUST(String::from_utf8(StringView { [action UTF8String], strlen([action UTF8String]) }));
     _webContentView->perform_accessibility_action(nodeID, AK::move(action_string));
 }
@@ -434,7 +448,18 @@ void install_accessibility(WebContentView* view)
     [ns_view addSubview:overlay];
 }
 
-void update_accessibility_tree(WebContentView* view, bool take_initial_focus, bool report_focus)
+// Whether the view holds the keyboard focus in the key window, which is when Chrome fires focus events too
+// (RenderWidgetHostViewMac::AccessibilityHasFocus()). Only then may the page tell VoiceOver about its load or its
+// focus: VoiceOver moves into the web content when it gets either, which would otherwise pull it out of the location
+// editor of a new tab, or into a tab or window the user isn't in. And AppKit would re-post the focus of whatever else
+// holds it. Qt's focus is the one to ask: the window's first responder is the top-level QNSView, whichever widget has
+// the focus.
+static bool view_holds_keyboard_focus(WebContentView* view, WebContentAccessibilityView* overlay)
+{
+    return overlay.window.isKeyWindow && view->hasFocus();
+}
+
+void update_accessibility_tree(WebContentView* view, bool announce_load, bool report_focus)
 {
     auto* overlay = get_overlay(view);
     if (!overlay)
@@ -460,33 +485,32 @@ void update_accessibility_tree(WebContentView* view, bool take_initial_focus, bo
     // back to the AXWebArea inside it, announcing a "frame" — and by setting AXFocused there, which takes the focus
     // from whatever element in the page had it.
 
-    // Only a page's first tree takes the window's first responder and announces the load — the gate WebContentView
-    // puts on its setFocus(), for the same reason: WebContent rebuilds the tree on DOM mutations too, and doing this on
-    // each of those would yank keyboard focus out of the address bar mid-keystroke, and VoiceOver's cursor back to the
-    // top of the page while the user is reading it.
-    if (take_initial_focus) {
-        if (ns_view && ns_view.window)
-            [ns_view.window makeFirstResponder:ns_view];
+    // The rest is for a page's first tree only, the gate WebContentView puts on it: WebContent rebuilds the tree on DOM
+    // mutations too, and announcing each of those would move VoiceOver's cursor back to the top of the page while the
+    // user is reading it.
+    if (!announce_load && !report_focus)
+        return;
+    if (!view_holds_keyboard_focus(view, overlay))
+        return;
+
+    // Have AppKit look the focus up again now that there's a tree to find it in, as a focus change does: A loaded page
+    // has a new focused element, and an assistive technology that arrived mid-page got no focused element from its
+    // first queries.
+    if (announce_load)
         NSAccessibilityPostNotification(NSAccessibilityUnignoredAncestor(ns_view ?: (NSView*)overlay),
             @"AXLoadComplete");
-        NSAccessibilityHandleFocusChanged();
-        return;
-    }
-
-    // An assistive technology that arrived mid-page got no focused element from its first queries: Have AppKit look the
-    // focus up again now that there's a tree to find it in — as a focus change does. But only while the view holds the
-    // keyboard focus in the key window, which is when Chrome fires focus events too (RenderWidgetHostViewMac::
-    // AccessibilityHasFocus()); otherwise, AppKit would re-post the focus of whatever else holds it. Qt's focus is the
-    // one to ask: the window's first responder is the top-level QNSView, whichever widget has the focus.
-    NSWindow* window = ns_view ? ns_view.window : overlay.window;
-    if (report_focus && window && window.isKeyWindow && view->hasFocus())
-        NSAccessibilityHandleFocusChanged();
+    NSAccessibilityHandleFocusChanged();
 }
 
 void post_accessibility_focus_changed(WebContentView* view, i64 node_id)
 {
     auto* overlay = get_overlay(view);
     if (!overlay)
+        return;
+    // A page can call focus() at any time, from a timer for example. Once the view gets the keyboard focus, Qt's focus
+    // change has AppKit look up the page's focused element. An assistive technology's focus action gives the view the
+    // keyboard focus first (see performAccessibilityAction:forNodeID:), so the focus change it causes gets posted.
+    if (!view_holds_keyboard_focus(view, overlay))
         return;
 
     id element = [overlay accessibilityElementForNodeID:node_id];

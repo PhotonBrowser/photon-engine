@@ -76,9 +76,10 @@ public:
     void set_palette_impl(Gfx::PaletteImpl&);
     void set_viewport(Web::DevicePixelSize const&, double device_pixel_ratio);
     void set_hosted_root_viewport(Web::HTML::CrossProcessId, Web::DevicePixelSize const&, Web::DevicePixelRect const& viewport_intersection, double device_pixel_ratio);
-    void set_screen_rects(Vector<Web::DevicePixelRect> const& rects, size_t main_screen_index)
+    void set_screen_rects(Vector<Web::DevicePixelRect> const& rects, Vector<Web::DevicePixelRect> const& available_rects, size_t main_screen_index)
     {
         m_all_screen_rects = rects;
+        m_all_available_screen_rects = available_rects;
         m_main_screen_index = main_screen_index;
     }
     void set_zoom_level(double zoom_level);
@@ -214,6 +215,12 @@ private:
     virtual void send_bad_ipc_message_for_testing(StringView kind, URL::URL const& active_document_url) override;
     virtual Gfx::Palette palette() const override;
     virtual Web::DevicePixelRect screen_rect() const override { return m_all_screen_rects[m_main_screen_index]; }
+    virtual Web::DevicePixelRect available_screen_rect() const override
+    {
+        if (m_main_screen_index < m_all_available_screen_rects.size())
+            return m_all_available_screen_rects[m_main_screen_index];
+        return screen_rect();
+    }
     virtual size_t screen_count() const override { return m_all_screen_rects.size(); }
     virtual Web::CSS::PreferredColorScheme preferred_color_scheme() const override { return m_preferred_color_scheme; }
     virtual Web::CSS::PreferredContrast preferred_contrast() const override { return m_preferred_contrast; }
@@ -236,6 +243,9 @@ private:
     virtual void page_did_request_minimize_window() override;
     virtual void page_did_request_fullscreen_window() override;
     virtual void page_did_request_exit_fullscreen() override;
+    virtual void page_did_exit_picture_in_picture() override;
+    virtual void page_did_change_picture_in_picture_video_size(Gfx::IntSize) override;
+    virtual void page_did_change_picture_in_picture_player_controls_visibility(bool shown) override;
     virtual void page_did_request_tooltip_override(Web::CSSPixelPoint, ByteString const&) override;
     virtual void page_did_stop_tooltip_override() override;
     virtual void page_did_enter_tooltip_area(ByteString const&) override;
@@ -249,9 +259,9 @@ private:
     virtual void page_did_request_spelling_menu_action_for_testing(Web::SpellingMenuActionForTesting, u32 guess_index) override;
     virtual void page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers, GC::Ptr<Web::DOM::Range> selected_text_range) override;
     virtual void page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*>) override;
-    virtual void page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&, Web::HTML::PreparedNavigationDescriptor) override;
+    virtual void page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&, Optional<Web::HTML::PreparedNavigationDescriptor>) override;
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) override;
-    virtual void page_did_finish_loading(Web::HTML::CrossProcessId, Optional<Utf16String> const&) override;
+    virtual void page_did_finish_loading(Web::HTML::CrossProcessId, Web::HTML::CrossProcessId) override;
     virtual Optional<u64> page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data) override;
     virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size) override;
     virtual void page_did_receive_download_data(u64 download_id, ByteBuffer data) override;
@@ -386,6 +396,7 @@ private:
     GC::Ref<Web::Page> m_page;
     RefPtr<Gfx::PaletteImpl> m_palette_impl;
     Vector<Web::DevicePixelRect> m_all_screen_rects { Web::DevicePixelRect {} };
+    Vector<Web::DevicePixelRect> m_all_available_screen_rects { Web::DevicePixelRect {} };
     size_t m_main_screen_index { 0 };
     Web::DevicePixelSize m_viewport_size;
     double m_device_pixel_ratio { 1.0 };
@@ -403,6 +414,7 @@ private:
     HashMap<u64, GC::Ref<Web::Streams::ReadableStreamDefaultReader>> m_download_readers;
     HashTable<u64> m_canceled_downloads;
     bool m_has_focus { true };
+    bool m_is_closed { false };
 
     Web::CSS::PreferredColorScheme m_preferred_color_scheme { Web::CSS::PreferredColorScheme::Auto };
     Web::CSS::PreferredContrast m_preferred_contrast { Web::CSS::PreferredContrast::NoPreference };

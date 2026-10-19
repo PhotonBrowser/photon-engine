@@ -91,6 +91,7 @@
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
+#include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/Selection/Selection.h>
@@ -690,10 +691,10 @@ void ConnectionFromClient::set_site_compatibility_data(JsonValue data)
     Web::ResourceLoader::the().set_site_compatibility_data(parsed_data.release_value());
 }
 
-void ConnectionFromClient::update_screen_rects(Web::PageId page_id, Vector<Web::DevicePixelRect> rects, u32 main_screen)
+void ConnectionFromClient::update_screen_rects(Web::PageId page_id, Vector<Web::DevicePixelRect> rects, Vector<Web::DevicePixelRect> available_rects, u32 main_screen)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->set_screen_rects(rects, main_screen);
+        page->set_screen_rects(rects, available_rects, main_screen);
 }
 
 void ConnectionFromClient::populate_navigation(Web::PageId page_id, Web::HTML::NavigationPopulationRequest request, Web::HTML::NavigationPopulationResult result)
@@ -1077,6 +1078,8 @@ void ConnectionFromClient::enqueue_mouse_event(Web::PageId page_id, Optional<Web
     if (auto const* last_mouse_event = event_to_coalesce()) {
         event.wheel_delta_x += last_mouse_event->wheel_delta_x;
         event.wheel_delta_y += last_mouse_event->wheel_delta_y;
+        event.wheel_tick_120ths_x += last_mouse_event->wheel_tick_120ths_x;
+        event.wheel_tick_120ths_y += last_mouse_event->wheel_tick_120ths_y;
 
         auto coalesced_event_id = last_mouse_event->id;
         m_input_event_queue.tail().event = move(event);
@@ -1286,6 +1289,9 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
     }
 
     if (request == "set-force-dark") {
+        // Force dark is the traversable's, which only the page displaying the tab has.
+        if (!page->page().has_local_traversable())
+            return;
         bool state = argument == "on";
         auto traversable = page->page().local_traversable();
         traversable->set_force_dark_enabled(state);
@@ -1295,17 +1301,17 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
         return;
     }
 
+    // The debug overlays are drawn by the traversable, which only the page displaying the tab has; a page hosting a
+    // child frame of the tab gets the same requests and has nothing to draw them on.
     if (request == "set-line-box-borders") {
-        bool state = argument == "on";
-        auto traversable = page->page().local_traversable();
-        traversable->set_should_show_line_box_borders(state);
+        if (page->page().has_local_traversable())
+            page->page().local_traversable()->set_should_show_line_box_borders(argument == "on");
         return;
     }
 
     if (request == "set-caret-hit-test-debug-overlay") {
-        bool state = argument == "on";
-        auto traversable = page->page().local_traversable();
-        traversable->set_should_show_caret_hit_test_debug_overlay(state);
+        if (page->page().has_local_traversable())
+            page->page().local_traversable()->set_should_show_caret_hit_test_debug_overlay(argument == "on");
         return;
     }
 
@@ -3630,6 +3636,12 @@ void ConnectionFromClient::toggle_media_fullscreen_state(Web::PageId page_id)
         page->page().toggle_media_fullscreen_state();
 }
 
+void ConnectionFromClient::toggle_media_picture_in_picture_state(Web::PageId page_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().toggle_media_picture_in_picture_state();
+}
+
 void ConnectionFromClient::toggle_media_controls_state(Web::PageId page_id)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -3839,6 +3851,36 @@ void ConnectionFromClient::exit_fullscreen(Web::PageId page_id)
         Web::HTML::TemporaryExecutionContext context(page->page().local_traversable()->active_document()->relevant_settings_object(), Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
         page->page().local_traversable()->active_document()->fully_exit_fullscreen();
     }
+}
+
+void ConnectionFromClient::set_has_picture_in_picture_support(Web::PageId page_id, bool has_support)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().picture_in_picture_controller().set_has_picture_in_picture_support(has_support);
+}
+
+void ConnectionFromClient::did_open_picture_in_picture_window(Web::PageId page_id, Gfx::IntSize window_size)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().picture_in_picture_controller().did_open_window(window_size);
+}
+
+void ConnectionFromClient::picture_in_picture_window_did_resize(Web::PageId page_id, Gfx::IntSize window_size)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().picture_in_picture_controller().window_did_resize(window_size);
+}
+
+void ConnectionFromClient::picture_in_picture_window_did_close(Web::PageId page_id, bool pause_video)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().picture_in_picture_controller().window_did_close(pause_video);
+}
+
+void ConnectionFromClient::set_picture_in_picture_window_controls_in_use(Web::PageId page_id, bool in_use)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().set_picture_in_picture_window_controls_in_use(in_use);
 }
 
 }

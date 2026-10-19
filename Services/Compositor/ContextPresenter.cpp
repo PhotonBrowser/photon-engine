@@ -8,6 +8,7 @@
 #include <Compositor/ContextScene.h>
 #include <Compositor/DisplayListPlayerSkia.h>
 #include <Compositor/PausedDebuggerOverlay.h>
+#include <Compositor/PictureInPictureControls.h>
 #include <Compositor/ScrollbarController.h>
 #include <LibCompositing/DisplayList/CanvasSurfaceRegistry.h>
 #include <LibCompositing/DisplayList/DisplayListDamage.h>
@@ -39,9 +40,9 @@ static Gfx::FloatSize bounded_composited_raster_scale(Gfx::FloatSize scale, Gfx:
     return scale;
 }
 
-ContextPresenter::ContextPresenter(ContextScene& scene, Compositing::CanvasSurfaceRegistry const& canvas_surface_registry, bool presents_to_client)
+ContextPresenter::ContextPresenter(ContextScene& scene, Compositing::OwnedCanvasSurfaces canvas_surfaces, bool presents_to_client)
     : m_scene(scene)
-    , m_canvas_surface_registry(canvas_surface_registry)
+    , m_canvas_surfaces(canvas_surfaces)
     , m_presents_to_client(presents_to_client)
 {
 }
@@ -52,9 +53,10 @@ ContextPresenter::~ContextPresenter()
     stop_surplus_backing_store_retirement_timer();
 }
 
-void ContextPresenter::set_viewport_size(Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void ContextPresenter::set_viewport_size(Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     m_viewport_size = viewport_size;
+    m_device_pixel_ratio = device_pixel_ratio;
     m_window_resize_in_progress = window_resize_in_progress;
 }
 
@@ -75,9 +77,25 @@ void ContextPresenter::finish_window_resize()
     m_window_resize_in_progress = Compositing::WindowResizingInProgress::No;
 }
 
-void ContextPresenter::set_paused_debugger_overlay(PausedDebuggerOverlayState paused_debugger_overlay)
+void ContextPresenter::set_ui_overlays(Compositing::UIOverlays overlays)
 {
-    m_paused_debugger_overlay = move(paused_debugger_overlay);
+    m_ui_overlays = move(overlays);
+
+    auto const& picture_in_picture_controls = m_ui_overlays.picture_in_picture_controls;
+    auto shows_picture_in_picture_controls = picture_in_picture_controls.has_value() && picture_in_picture_controls->shown;
+    m_picture_in_picture_controls_fade.fade_to(shows_picture_in_picture_controls ? 1 : 0, MonotonicTime::now());
+}
+
+Optional<PendingFrame> ContextPresenter::advance_ui_overlay_fades(MonotonicTime frame_time)
+{
+    if (!m_picture_in_picture_controls_fade.advance_to(frame_time))
+        return {};
+
+    auto viewport_rect = viewport_rect_for_ui_overlay();
+    if (!viewport_rect.has_value())
+        return {};
+    auto geometry = Compositing::picture_in_picture_controls_geometry(m_viewport_size, m_device_pixel_ratio);
+    return PendingFrame { *viewport_rect, Compositing::overlay_buttons_bounds(geometry.buttons()) };
 }
 
 Optional<Gfx::IntRect> ContextPresenter::viewport_rect_for_ui_overlay() const
@@ -311,6 +329,7 @@ Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& d
         .rendered_surface = &back_store,
         .bitmap_id = render_target->bitmap_id,
         .damage_rect = damage_rect,
+        .device_pixel_ratio = m_device_pixel_ratio,
     };
 }
 
@@ -471,7 +490,7 @@ Gfx::IntRect ContextPresenter::damage_since_last_raster(Gfx::IntSize viewport_si
     }
     m_scene.display_list()->for_each_drawn_canvas([&](auto context, auto bounding_rect, auto const& draw_canvas) {
         auto last_content_generation = last_frame.canvas_content_generations.get(draw_canvas.canvas_id);
-        if (last_content_generation.has_value() && *last_content_generation == m_canvas_surface_registry.canvas_content_generation(draw_canvas.canvas_id))
+        if (last_content_generation.has_value() && *last_content_generation == m_canvas_surfaces.canvas_content_generation(draw_canvas.canvas_id))
             return;
         auto canvas_rect = visual_context_tree.transform_rect_to_viewport(context.spatial, bounding_rect.template to_type<float>(), presented_scroll_state_snapshot);
         if (!isfinite(canvas_rect.x()) || !isfinite(canvas_rect.y()) || !isfinite(canvas_rect.width()) || !isfinite(canvas_rect.height())) {
@@ -583,7 +602,7 @@ void ContextPresenter::remember_rasterized_frame(Gfx::IntSize viewport_size, Com
 {
     HashMap<Compositing::CanvasId, u64> canvas_content_generations;
     m_scene.display_list()->for_each_drawn_canvas([&](auto, auto, auto const& draw_canvas) {
-        canvas_content_generations.set(draw_canvas.canvas_id, m_canvas_surface_registry.canvas_content_generation(draw_canvas.canvas_id));
+        canvas_content_generations.set(draw_canvas.canvas_id, m_canvas_surfaces.canvas_content_generation(draw_canvas.canvas_id));
     });
     m_last_rasterized_frame = RasterizedFrame {
         .display_list = NonnullRefPtr { *m_scene.display_list() },
@@ -607,11 +626,16 @@ void ContextPresenter::paint_current_display_list(DisplayListPlayerSkia& display
             m_scene.raster_cache(),
             frame_content.presented_scroll_state_snapshot,
             target_surface,
-            &m_canvas_surface_registry,
+            &m_canvas_surfaces,
             frame_content.composited_context_resolver);
         frame_content.scrollbar_controller.paint(target_surface, display_list_player, frame_content.presented_scroll_state_snapshot);
-        if (paint_ui_overlay == PaintUIOverlay::Yes && m_paused_debugger_overlay.visible)
-            paint_paused_debugger_overlay(target_surface, m_viewport_size, m_paused_debugger_overlay.device_pixel_ratio, m_paused_debugger_overlay.font_family, m_paused_debugger_overlay.hovered_action);
+        if (paint_ui_overlay == PaintUIOverlay::No)
+            return;
+
+        if (m_ui_overlays.paused_debugger.has_value())
+            paint_paused_debugger_overlay(target_surface, m_viewport_size, m_device_pixel_ratio, *m_ui_overlays.paused_debugger);
+        if (auto opacity = m_picture_in_picture_controls_fade.opacity(); m_ui_overlays.picture_in_picture_controls.has_value() && opacity > 0)
+            paint_picture_in_picture_controls(target_surface, m_viewport_size, m_device_pixel_ratio, *m_ui_overlays.picture_in_picture_controls, opacity);
     };
 
     if (damage_rect.has_value() && !damage_rect->is_empty() && presents_to_client() && damage_rect->size() != surface.size() && surface.skia_backend_context() && !surface.on_flush) {

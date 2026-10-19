@@ -188,7 +188,7 @@ impl RetainedState {
         self.facts.materialize(nodes.iter().copied(), &mut batch);
         let mut expected_row_count = nodes.len();
         for scope_root in self.scope_roots.iter().flatten().copied() {
-            if self.tree.is_live(scope_root) && !nodes.contains(&scope_root) {
+            if self.tree.is_live(scope_root) && batch.row_of(scope_root).is_none() {
                 self.facts.materialize_missing(std::iter::once(scope_root), &mut batch);
                 expected_row_count += 1;
             }
@@ -314,6 +314,7 @@ impl RetainedState {
         self.memory
             .release(MemoryCategory::BatchScratch, traversal.dispatch_workspace_bytes);
         traversal.cascade_compaction_workspace_memory.release();
+        traversal.unbatched_facts_memory.release();
     }
 
     pub(super) fn discard_retained_prefix_caches(&mut self) {
@@ -447,6 +448,8 @@ impl RetainedState {
             dispatch_workspace_bytes: 0,
             cascade_compaction_workspace: ordering::CascadeCompactionWorkspace::default(),
             cascade_compaction_workspace_memory: MemoryLease::new(MemoryCategory::BatchScratch),
+            unbatched_facts: StyleNodeFacts::new(),
+            unbatched_facts_memory: MemoryLease::new(MemoryCategory::BatchScratch),
         }));
     }
 
@@ -484,6 +487,7 @@ impl RetainedState {
         self.memory
             .release(MemoryCategory::BatchScratch, traversal.dispatch_workspace_bytes);
         traversal.cascade_compaction_workspace_memory.release();
+        traversal.unbatched_facts_memory.release();
         let released_cascade_payload_bytes = self.match_answers.sweep_unreferenced();
         self.retained_match_answers
             .release_swept_cascade_payloads(released_cascade_payload_bytes);
@@ -537,6 +541,8 @@ impl RetainedState {
             dispatch_workspace_bytes: 0,
             cascade_compaction_workspace: ordering::CascadeCompactionWorkspace::default(),
             cascade_compaction_workspace_memory: MemoryLease::new(MemoryCategory::BatchScratch),
+            unbatched_facts: StyleNodeFacts::new(),
+            unbatched_facts_memory: MemoryLease::new(MemoryCategory::BatchScratch),
         })
     }
 
@@ -635,6 +641,8 @@ impl RetainedState {
             dispatch_workspace_bytes: 0,
             cascade_compaction_workspace: ordering::CascadeCompactionWorkspace::default(),
             cascade_compaction_workspace_memory: MemoryLease::new(MemoryCategory::BatchScratch),
+            unbatched_facts: StyleNodeFacts::new(),
+            unbatched_facts_memory: MemoryLease::new(MemoryCategory::BatchScratch),
         }));
     }
 
@@ -751,6 +759,7 @@ impl RetainedState {
             self.memory
                 .release(MemoryCategory::BatchScratch, traversal.dispatch_workspace_bytes);
             traversal.cascade_compaction_workspace_memory.release();
+            traversal.unbatched_facts_memory.release();
             self.discard_published_match_answers();
             self.finish_memory_evaluation_loop();
         }
@@ -1250,6 +1259,9 @@ impl RetainedState {
         match_workspace: Option<&mut MatchScratch>,
         mut retry: BatchMatchRetry<'_>,
     ) -> Result<(), Incomplete> {
+        fn prefix_states_bytes(states: &PrefixStates) -> u64 {
+            states.capacity_bytes() + states.relation_capacity_bytes()
+        }
         let (scope_program, _) = self.prepared_scope_program(scope);
         let dispatch = &self.scope_programs[scope_program].as_ref().unwrap().dispatch;
         if let Some(completed) = retry.completed.as_deref_mut() {
@@ -1259,16 +1271,19 @@ impl RetainedState {
         let mut local_prefix_context = None;
         let mut shared_prefix_caches = shared_prefix_caches.map(|caches| caches.borrow_mut());
         let mut shared_prefix_states = None;
+        let mut shared_prefix_states_bytes = 0;
+        let mut shared_prefix_context_bytes = None;
         let prefix_states = if self.tree.tree_scope(node) != scope || dispatch.prefixes().is_empty() {
             None
         } else if let Some(caches) = shared_prefix_caches.as_deref_mut() {
-            shared_prefix_states = Some(
-                caches
-                    .states
-                    .lookup_mut(scope_program)
-                    .sparse()
-                    .expect("prefix rows are prepared before matching"),
-            );
+            let states = caches
+                .states
+                .lookup_mut(scope_program)
+                .sparse()
+                .expect("prefix rows are prepared before matching");
+            shared_prefix_states_bytes = prefix_states_bytes(states);
+            shared_prefix_states = Some(states);
+            shared_prefix_context_bytes = Some(prefix_contexts.program_and_column_capacity_bytes(scope_program));
             shared_prefix_states.as_deref_mut().map(|states| {
                 prefix_contexts.rebind(scope_program, &mut *states, facts);
                 (states, prefix_contexts.get_mut(scope_program))
@@ -1301,11 +1316,17 @@ impl RetainedState {
                 cascade_only: retry.cascade_only,
             },
         );
-        let _ = shared_prefix_states;
-        if let Some(caches) = shared_prefix_caches.as_deref_mut() {
+        let shared_prefix_states_resized = shared_prefix_states
+            .as_deref()
+            .is_some_and(|states| prefix_states_bytes(states) != shared_prefix_states_bytes);
+        if shared_prefix_states_resized && let Some(caches) = shared_prefix_caches.as_deref_mut() {
             caches.states.settle_memory(&mut self.memory);
         }
-        prefix_contexts.settle_memory(&mut self.memory);
+        if shared_prefix_context_bytes
+            .is_some_and(|bytes| prefix_contexts.program_and_column_capacity_bytes(scope_program) != bytes)
+        {
+            prefix_contexts.settle_memory(&mut self.memory);
+        }
         if let Some(prefix_states) = local_prefix_states {
             let bytes = prefix_states.capacity_bytes() + local_prefix_context.as_ref().unwrap().capacity_bytes();
             self.memory.reserve_required(MemoryCategory::BatchScratch, bytes);
@@ -5179,10 +5200,13 @@ impl RetainedState {
             .unwrap_or_default();
         let mut completion_scratch_bytes = 0;
         let mut retained_match_answer_is_exact = compact_for_cascade;
-        let mut facts = StyleNodeFacts::new();
+        let mut facts = traversal
+            .as_deref_mut()
+            .map(|traversal| std::mem::take(&mut traversal.unbatched_facts))
+            .unwrap_or_default();
         let mut requests = Vec::new();
         loop {
-            self.facts.materialize(covered.iter().copied(), &mut facts);
+            self.facts.materialize_missing(covered.iter().copied(), &mut facts);
             let mut prefix_contexts = PrefixTransitionContexts::default();
             if !self.prepared_scope_program(scope).1.prefixes().is_empty() {
                 let (program, _) = self.prepared_scope_program(scope);
@@ -5296,6 +5320,12 @@ impl RetainedState {
                     if !prefix_caches_return_to_completion_batch {
                         prefix_caches.borrow_mut().states.release();
                     }
+                    if let Some(traversal) = traversal.as_deref_mut() {
+                        traversal
+                            .unbatched_facts_memory
+                            .resize_required_to(&mut self.memory, facts.capacity_bytes());
+                        traversal.unbatched_facts = facts;
+                    }
                     return Ok(all);
                 }
                 Err(incomplete) => {
@@ -5311,6 +5341,12 @@ impl RetainedState {
                             .release(MemoryCategory::BatchScratch, completion_scratch_bytes);
                         if !prefix_caches_return_to_completion_batch {
                             prefix_caches.borrow_mut().states.release();
+                        }
+                        if let Some(traversal) = traversal.as_deref_mut() {
+                            traversal
+                                .unbatched_facts_memory
+                                .resize_required_to(&mut self.memory, facts.capacity_bytes());
+                            traversal.unbatched_facts = facts;
                         }
                         return Err(Incomplete::MissingFacts(missing));
                     }

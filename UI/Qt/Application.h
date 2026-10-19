@@ -100,6 +100,7 @@ public:
     QAction* open_file_action();
     QAction* open_settings_action();
     QAction* open_downloads_action();
+    QAction* toggle_bookmark_bar_action();
     QAction* find_in_page_action();
     QAction* zoom_in_action();
     QAction* zoom_out_action();
@@ -114,7 +115,6 @@ private:
     void finish_quit();
     void cancel_quit();
 
-    virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
     virtual Core::EventLoop& create_platform_event_loop() override;
     virtual void create_platform_actions() override;
 
@@ -122,6 +122,9 @@ private:
 #if !defined(AK_OS_MACOS)
     virtual Optional<String> system_font_family() const override;
 #endif
+
+    virtual bool supports_picture_in_picture() const override { return true; }
+    virtual OwnPtr<WebView::PictureInPictureWindow> create_picture_in_picture_window(WebView::WebContentPage& requesting_page, WebView::CanonicalTraversable&, Gfx::IntSize video_size) override;
 
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
     virtual Vector<WebView::ViewImplementation&> active_window_web_views() const override;
@@ -166,6 +169,7 @@ private:
 
     virtual bool platform_reports_scroll_momentum() const override;
     virtual bool platform_scrolls_elastically() const override;
+    virtual Vector<String> platform_preferred_languages() const override;
 
     virtual void update_tabs_display() const override;
 

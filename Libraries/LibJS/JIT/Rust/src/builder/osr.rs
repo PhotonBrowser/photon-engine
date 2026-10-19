@@ -19,11 +19,27 @@
 //! update step of a for loop, which leads to the loop's header, the entry runs
 //! that step itself instead. Its edges are forward edges into the loop and the
 //! loop exit, so the values it loaded meet the other paths in phis.
+//!
+//! Generators and async functions resume the same way: a suspended frame holds
+//! every value live at the continuation it resumes at (see `build_suspend()`),
+//! so each continuation of a `Yield`, `YieldIteratorResult` or `Await` gets an
+//! entry block that loads them and jumps to the continuation's block, which
+//! compiled code reaches from nowhere else. The runtime enters there like at
+//! an on-stack replacement entry.
+//!
+//! Exception handlers are entered the same way. The frame state of an
+//! instruction that throws lists every value live into its handler. Each
+//! handler that caught an exception before the compile gets an entry block
+//! after its `Catch`, where compiled code continues after writing that frame
+//! state to the frame and running the `Catch` itself, or the interpreter
+//! after running the `Catch` (see `ARCHITECTURE.md`, section 4.2).
 
 use super::AbstractFrame;
 use super::Flow;
 use super::GraphBuilder;
 use crate::CompileFailure;
+use crate::bytecode::Instruction;
+use crate::bytecode::Label;
 use crate::bytecode::OpCode;
 use crate::bytecode::RESERVED_REGISTER_COUNT;
 use crate::bytecode::cfg::BlockIndex;
@@ -134,18 +150,123 @@ impl GraphBuilder<'_> {
             }
             self.graph.osr_entries.push((pc, block));
             self.record_osr_loop_back_edges(pc);
+            self.note_loops_entered_at(&targets);
+        }
+        Ok(())
+    }
 
-            // NB: The loops the entry leads into other than at their header may
-            //     only be reached from here over their back edges.
-            for target in targets {
-                for current_loop in &self.function.cfg.loops {
-                    if current_loop.blocks.contains(&target) && current_loop.header != target {
-                        self.function.osr_loop_headers[current_loop.header] = true;
-                    }
-                }
+    /// Builds an entry block for every continuation of a suspension of a
+    /// generator or async function in the compiled function, after the
+    /// on-stack replacement entries, before any of its bytecode blocks is
+    /// started.
+    pub(super) fn build_resume_entries(&mut self) -> Result<(), CompileFailure> {
+        debug_assert!(!self.function.is_virtual());
+        for index in 0..self.function.instructions.len() {
+            let (Instruction::Yield {
+                continuation_label: Some(continuation),
+                ..
+            }
+            | Instruction::YieldIteratorResult {
+                continuation_label: continuation,
+                ..
+            }
+            | Instruction::Await {
+                continuation_label: continuation,
+                ..
+            }) = self.function.instructions[index].instruction
+            else {
+                continue;
+            };
+            let pc = continuation.0;
+            let target = self.block_for_label(continuation)?;
+            let target_block = &self.function.cfg.blocks[target];
+            if target_block.start_pc != pc {
+                return Err(CompileFailure::InvalidBytecode {
+                    pc,
+                    reason: "continuation that does not start a block",
+                });
+            }
+            if target_block.rpo_number.is_some() {
+                self.build_entry_into_block(target)?;
             }
         }
         Ok(())
+    }
+
+    /// Builds an entry block for every exception handler of the compiled
+    /// function that caught an exception and whose handler range is
+    /// reachable, after the resume entries, before any of its bytecode blocks
+    /// is started. Handlers start with a `Catch`, which the interpreter runs:
+    /// compiled code never builds it, and is entered after it, where the
+    /// handler's block continues. Handlers that never caught anything get no
+    /// entry, which would merge into the paths after them.
+    pub(super) fn build_catch_entries(&mut self) -> Result<(), CompileFailure> {
+        debug_assert!(!self.function.is_virtual());
+        for handler in 0..self.function.cfg.blocks.len() {
+            let handler_block = &self.function.cfg.blocks[handler];
+            let reachable = handler_block
+                .exception_predecessors
+                .iter()
+                .any(|predecessor| self.function.cfg.blocks[*predecessor].rpo_number.is_some());
+            let catch = &self.function.instructions[handler_block.instructions.start];
+            if !reachable || catch.instruction.opcode() != OpCode::Catch {
+                continue;
+            }
+            if !(self.has_run)(catch.pc) {
+                self.graph.uncaught_handlers.push(catch.pc);
+                continue;
+            }
+            // NB: The Catch ends its block, which falls through to the block
+            //     that continues the handler.
+            let Ok(target) = self.block_for_label(Label(catch.next_pc())) else {
+                continue;
+            };
+            self.build_entry_into_block(target)?;
+        }
+        Ok(())
+    }
+
+    /// Builds an entry block for a frame whose memory holds every value live
+    /// at the start of `target`: it loads them and jumps there. The runtime
+    /// enters it like an on-stack replacement entry.
+    fn build_entry_into_block(&mut self, target: BlockIndex) -> Result<(), CompileFailure> {
+        let target_block = &self.function.cfg.blocks[target];
+        let pc = target_block.start_pc;
+        // NB: An on-stack replacement entry at a back edge that starts the
+        //     block enters the frame there just the same.
+        if self.graph.osr_entries.iter().any(|(entry_pc, _)| *entry_pc == pc) {
+            return Ok(());
+        }
+        let block = self.start_new_block(Vec::new());
+        self.frame = AbstractFrame::in_memory(self.function.layout.tracked_slot_count());
+        let start = target_block.instructions.start;
+        self.function.instruction_index = start;
+        self.function.pc = pc;
+        self.function.eager_frame_state = None;
+        let live = self.function.liveness.live_in(start).clone();
+        for slot in live.iter() {
+            if slot >= RESERVED_REGISTER_COUNT as usize {
+                let operand = self.function.layout.operand_for_tracked_index(slot);
+                self.read_tracked(slot, operand);
+            }
+        }
+        self.end_with_jump(target)?;
+        self.graph.osr_entries.push((pc, block));
+        self.note_loops_entered_at(&[target]);
+        Ok(())
+    }
+
+    /// Notes the loops that an entry leads into other than at their header,
+    /// over its edges to `targets`, which may only be reached from there over
+    /// their back edges.
+    fn note_loops_entered_at(&mut self, targets: &[BlockIndex]) {
+        for &target in targets {
+            for current_loop in &self.function.cfg.loops {
+                if current_loop.blocks.contains(&target) && current_loop.header != target {
+                    self.function.osr_loop_headers[current_loop.header] = true;
+                }
+            }
+        }
     }
 
     /// The block that the unconditional back edge at instruction `index` jumps

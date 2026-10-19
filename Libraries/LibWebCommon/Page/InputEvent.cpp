@@ -18,7 +18,7 @@ KeyEvent KeyEvent::clone_without_browser_data() const
 
 MouseEvent MouseEvent::clone_without_browser_data() const
 {
-    return { type, position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, click_count, nullptr, async_scroll_performed_default_action, history_swipe_back_enabled, history_swipe_forward_enabled, id, scrollbar_dragged_by_compositor, history_swipe_gesture_id };
+    return { type, position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, click_count, nullptr, async_scroll_performed_default_action, history_swipe_back_enabled, history_swipe_forward_enabled, id, scrollbar_dragged_by_compositor, history_swipe_gesture_id };
 }
 
 }
@@ -85,6 +85,8 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::MouseEvent const& event)
     TRY(encoder.encode(event.modifiers));
     TRY(encoder.encode(event.wheel_delta_x));
     TRY(encoder.encode(event.wheel_delta_y));
+    TRY(encoder.encode(event.wheel_tick_120ths_x));
+    TRY(encoder.encode(event.wheel_tick_120ths_y));
     TRY(encoder.encode(event.wheel_delta_precision));
     TRY(encoder.encode(event.scroll_gesture_phase));
     TRY(encoder.encode(event.click_count));
@@ -108,6 +110,8 @@ ErrorOr<Web::MouseEvent> IPC::decode(Decoder& decoder)
     auto modifiers = TRY(decoder.decode<Web::UIEvents::KeyModifier>());
     auto wheel_delta_x = TRY(decoder.decode<double>());
     auto wheel_delta_y = TRY(decoder.decode<double>());
+    auto wheel_tick_120ths_x = TRY(decoder.decode<double>());
+    auto wheel_tick_120ths_y = TRY(decoder.decode<double>());
     auto wheel_delta_precision = TRY(decoder.decode<Web::WheelDeltaPrecision>());
     auto scroll_gesture_phase = TRY(decoder.decode<Web::ScrollGesturePhase>());
     auto click_count = TRY(decoder.decode<int>());
@@ -118,7 +122,7 @@ ErrorOr<Web::MouseEvent> IPC::decode(Decoder& decoder)
     auto scrollbar_dragged_by_compositor = TRY(decoder.decode<Optional<Web::ScrollbarDraggedByCompositor>>());
     auto history_swipe_gesture_id = TRY(decoder.decode<u64>());
 
-    return Web::MouseEvent { type, position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, click_count, nullptr, async_scroll_performed_default_action, history_swipe_back_enabled, history_swipe_forward_enabled, id, scrollbar_dragged_by_compositor, history_swipe_gesture_id };
+    return Web::MouseEvent { type, position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, click_count, nullptr, async_scroll_performed_default_action, history_swipe_back_enabled, history_swipe_forward_enabled, id, scrollbar_dragged_by_compositor, history_swipe_gesture_id };
 }
 
 template<>

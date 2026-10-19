@@ -58,6 +58,7 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/PictureInPictureWindow.h>
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/SessionStore.h>
@@ -118,6 +119,11 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
     virtual void tab_settings_changed() override
     {
         Application::the().tab_settings_changed({});
+    }
+
+    virtual void languages_changed() override
+    {
+        Application::the().languages_changed({});
     }
 
     virtual void browsing_data_settings_changed() override
@@ -577,7 +583,9 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         }
     }
 
-    m_settings = make<Settings>(Settings::create(LexicalPath::join(profile().paths().config, "Settings.json"sv).string()));
+    // Test results must not depend on the languages of the machine running the tests.
+    auto platform_languages = enable_test_mode ? Vector<String> {} : platform_preferred_languages();
+    m_settings = make<Settings>(Settings::create(LexicalPath::join(profile().paths().config, "Settings.json"sv).string(), move(platform_languages)));
     m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(profile().paths().config, "Bookmarks.json"sv).string()));
 
     if (!dns_server_port.has_value())
@@ -1412,22 +1420,22 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     return {};
 }
 
-void Application::update_compositor_viewport(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void Application::update_compositor_viewport(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
     VERIFY(m_compositor_client);
 
-    m_compositor_client->async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
+    m_compositor_client->async_viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
 }
 
-void Application::update_compositor_paused_debugger_overlay(Web::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action)
+void Application::update_compositor_ui_overlays(Web::CompositorContextId context_id, Compositing::UIOverlays const& overlays)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
     VERIFY(m_compositor_client);
 
-    m_compositor_client->async_set_paused_debugger_overlay(context_id, visible, device_pixel_ratio, move(font_family), hovered_action);
+    m_compositor_client->async_set_ui_overlays(context_id, overlays);
 }
 
 void Application::update_compositor_display_metadata(Web::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
@@ -2334,6 +2342,21 @@ bool Application::supports_clipboard_type(ClipboardType type) const
     return type == ClipboardType::Text;
 }
 
+bool Application::supports_picture_in_picture() const
+{
+    return browser_options().headless_mode.has_value();
+}
+
+OwnPtr<PictureInPictureWindow> Application::create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable& traversable, Gfx::IntSize video_size)
+{
+    if (!browser_options().headless_mode.has_value())
+        return {};
+
+    // Every view in a headless browser is a HeadlessWebView.
+    auto& requesting_view = static_cast<HeadlessWebView&>(requesting_page.view());
+    return HeadlessWebView::create_picture_in_picture_window(requesting_view, traversable, video_size);
+}
+
 Utf16String Application::clipboard_text(ClipboardType) const
 {
     for (auto const& representation : m_clipboard.system_clipboard_representations) {
@@ -2463,10 +2486,12 @@ void Application::initialize_actions()
         };
     };
 
-    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto persist) {
-        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, persist]() {
+    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto persist, auto notify_workers) {
+        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, persist, notify_workers]() {
             cached_value = value;
             persist();
+            // Workers take no debug requests; the worker process manager hands the new value to every live worker.
+            notify_workers();
 
             ViewImplementation::for_each_view([&](ViewImplementation& view) {
                 view.debug_request(request, cached_value);
@@ -2618,6 +2643,24 @@ void Application::initialize_actions()
     m_bookmarks_menu->add_action(Action::create("Manage Bookmarks"sv, ActionID::ManageBookmarks, [this]() {
         open_url_in_new_tab(URL::about_bookmarks(), Web::HTML::ActivateTab::Yes);
     }));
+
+    auto add_show_bookmarks_bar_option = [&](auto name, auto value) {
+        auto action = Action::create_checkable(name, ActionID::ShowBookmarksBar, [this, value]() {
+            auto appearance = m_settings->appearance();
+            appearance.show_bookmarks_bar = value;
+            m_settings->set_appearance(appearance);
+        });
+
+        action->set_checked(m_settings->appearance().show_bookmarks_bar == value);
+        m_show_bookmarks_bar_menu->add_action(action);
+        return action;
+    };
+
+    m_show_bookmarks_bar_menu = Menu::create_group("Show Bookmarks Bar"sv);
+    m_show_bookmarks_bar_always_action = add_show_bookmarks_bar_option("Always"sv, ShowBookmarksBar::Always);
+    m_show_bookmarks_bar_never_action = add_show_bookmarks_bar_option("Never"sv, ShowBookmarksBar::Never);
+    m_show_bookmarks_bar_on_hover_action = add_show_bookmarks_bar_option("Only when hovering the navigation toolbar"sv, ShowBookmarksBar::OnHover);
+    m_bookmarks_menu->add_submenu(*m_show_bookmarks_bar_menu);
     m_bookmarks_menu->add_separator();
 
     m_toggle_bookmark_action = Action::create("Toggle Bookmark"sv, ActionID::ToggleBookmark, [this]() {
@@ -2648,11 +2691,11 @@ void Application::initialize_actions()
 
     m_toggle_bookmark_bar_action = Action::create_checkable("Show Bookmarks Bar"sv, ActionID::ToggleBookmarksBar, [this]() {
         auto appearance = m_settings->appearance();
-        appearance.show_bookmarks_bar = !appearance.show_bookmarks_bar;
+        appearance.show_bookmarks_bar = appearance.show_bookmarks_bar == WebView::ShowBookmarksBar::Always
+            ? WebView::ShowBookmarksBar::Never
+            : WebView::ShowBookmarksBar::Always;
         m_settings->set_appearance(appearance);
     });
-    m_toggle_bookmark_bar_action->set_checked(m_settings->appearance().show_bookmarks_bar);
-    m_bookmarks_menu->add_action(*m_toggle_bookmark_bar_action);
 
     m_bookmarks_menu->add_separator();
     m_bookmarks_menu_static_size = m_bookmarks_menu->size();
@@ -2739,11 +2782,10 @@ void Application::initialize_actions()
         ? *WebView::user_agents.get(*user_agent_preset)
         : Web::default_user_agent;
 
-    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv,
-        [this] { m_settings->set_user_agent_preset({}); });
+    auto notify_workers_of_user_agent = [this] { WorkerProcessManager::the().update_user_agent(user_agent_string()); };
+    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv, [this] { m_settings->set_user_agent_preset({}); }, notify_workers_of_user_agent);
     for (auto const& user_agent : WebView::user_agents) {
-        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv,
-            [this, name = user_agent.key] { m_settings->set_user_agent_preset(name); });
+        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv, [this, name = user_agent.key] { m_settings->set_user_agent_preset(name); }, notify_workers_of_user_agent);
     }
 
     auto navigator_compatibility_mode_menu = Menu::create_group("Navigator Compatibility Mode"sv);
@@ -2751,9 +2793,9 @@ void Application::initialize_actions()
             ? m_settings->navigator_compatibility_mode()
             : Web::default_navigator_compatibility_mode);
 
+    auto notify_workers_of_navigator_compatibility_mode = [this] { WorkerProcessManager::the().update_navigator_compatibility_mode(navigator_compatibility_mode()); };
     auto add_navigator_compatibility_mode = [&](StringView name, Web::NavigatorCompatibilityMode mode) {
-        add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv,
-            [this, mode] { m_settings->set_navigator_compatibility_mode(mode); });
+        add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv, [this, mode] { m_settings->set_navigator_compatibility_mode(mode); }, notify_workers_of_navigator_compatibility_mode);
     };
     add_navigator_compatibility_mode("Chrome"sv, Web::NavigatorCompatibilityMode::Chrome);
     add_navigator_compatibility_mode("Gecko"sv, Web::NavigatorCompatibilityMode::Gecko);
@@ -2816,6 +2858,21 @@ void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementati
     page.async_debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
 }
 
+void Application::languages_changed(Badge<ApplicationSettingsObserver>)
+{
+    WorkerProcessManager::the().update_preferred_languages(m_settings->languages());
+}
+
+String Application::user_agent_string() const
+{
+    return MUST(String::from_utf8(m_user_agent_string));
+}
+
+Web::NavigatorCompatibilityMode Application::navigator_compatibility_mode() const
+{
+    return navigator_compatibility_mode_from_string(m_navigator_compatibility_mode).value_or(Web::default_navigator_compatibility_mode);
+}
+
 void Application::update_vertical_tabs_action()
 {
     auto const& settings = m_settings->tab_settings();
@@ -2827,7 +2884,18 @@ void Application::update_vertical_tabs_action()
 void Application::appearance_changed(Badge<ApplicationSettingsObserver>)
 {
     m_toggle_menu_bar_action->set_checked(m_settings->appearance().show_menu_bar);
-    m_toggle_bookmark_bar_action->set_checked(m_settings->appearance().show_bookmarks_bar);
+
+    switch (m_settings->appearance().show_bookmarks_bar) {
+    case ShowBookmarksBar::Always:
+        m_show_bookmarks_bar_always_action->set_checked(true);
+        break;
+    case ShowBookmarksBar::Never:
+        m_show_bookmarks_bar_never_action->set_checked(true);
+        break;
+    case ShowBookmarksBar::OnHover:
+        m_show_bookmarks_bar_on_hover_action->set_checked(true);
+        break;
+    }
 }
 
 void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)
@@ -3143,7 +3211,8 @@ Vector<DevTools::TabDescription> Application::tab_list() const
     Vector<DevTools::TabDescription> tabs;
 
     ViewImplementation::for_each_view([&](ViewImplementation& view) {
-        tabs.empend(view.view_id(), view.title().to_utf8(), view.url().to_string());
+        if (!view.owner_view_id().has_value())
+            tabs.empend(view.view_id(), view.title().to_utf8(), view.url().to_string());
         return IterationDecision::Continue;
     });
 

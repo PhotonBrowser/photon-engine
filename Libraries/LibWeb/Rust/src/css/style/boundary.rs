@@ -254,6 +254,8 @@ style_boundary! {
             sheet: SheetID, tree_scope: TreeScopeID, identity: u64, before: u64, conditions_hold: bool
         };
         detach_sheet_occurrence => DetachSheetOccurrence { tree_scope: TreeScopeID, identity: u64 };
+        set_sheet_kept_for_reattachment => SetSheetKeptForReattachment { sheet: SheetID, kept: bool } =>
+            engine.retained.set_sheet_kept_for_reattachment(sheet, kept);
         set_sheet_occurrence_conditions => SetSheetOccurrenceConditions {
             tree_scope: TreeScopeID, identity: u64, conditions_hold: bool
         };
@@ -320,6 +322,7 @@ style_boundary! {
             tree_scope: TreeScopeID, identity: u64
         };
         set_held_style_record => SetHeldStyleRecord { node: StyleNodeID, style_record: u64 };
+        set_held_pseudo_style_record => SetHeldPseudoStyleRecord { node: StyleNodeID, pseudo_kind: u8, style_record: u64 };
         set_element_css_defined_animations => SetElementCssDefinedAnimations {
             node: StyleNodeID, slot: u8, names: Box<[CssString]>, definitions: Box<[FfiAppliedAnimationDefinition]>
         } => engine.set_element_css_defined_animations(node, slot, names, &definitions);
@@ -362,6 +365,7 @@ impl StyleChange {
             Self::BeginStyleRecordViewEpoch
                 | Self::EndStyleRecordViewEpoch
                 | Self::PinStyleRecord { .. }
+                | Self::SetHeldPseudoStyleRecord { .. }
                 | Self::UnpinStyleRecord { .. }
         )
     }

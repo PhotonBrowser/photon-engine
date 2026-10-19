@@ -96,7 +96,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     set_site_compatibility_data(JsonValue data) =|
 
     update_system_theme(Web::PageId page_id, Core::AnonymousBuffer theme_buffer) =|
-    update_screen_rects(Web::PageId page_id, Vector<Web::DevicePixelRect> rects, u32 main_screen_index) =|
+    update_screen_rects(Web::PageId page_id, Vector<Web::DevicePixelRect> rects, Vector<Web::DevicePixelRect> available_rects, u32 main_screen_index) =|
 
     populate_navigation(Web::PageId page_id, Web::HTML::NavigationPopulationRequest request, Web::HTML::NavigationPopulationResult result) =|
     stop_loading(Web::PageId page_id) =|
@@ -297,6 +297,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     toggle_media_mute_state(Web::PageId page_id) =|
     toggle_media_loop_state(Web::PageId page_id) =|
     toggle_media_fullscreen_state(Web::PageId page_id) =|
+    toggle_media_picture_in_picture_state(Web::PageId page_id) =|
     toggle_media_controls_state(Web::PageId page_id) =|
 
     set_page_mute_state(Web::PageId page_id, Web::HTML::MuteState mute_state) =|
@@ -323,4 +324,10 @@ endpoint WebContentServer routed by Web::PageId page_id
     force_close(Web::PageId page_id) =|
 
     exit_fullscreen(Web::PageId page_id) =|
+
+    set_has_picture_in_picture_support(Web::PageId page_id, bool has_support) =|
+    did_open_picture_in_picture_window(Web::PageId page_id, Gfx::IntSize window_size) =|
+    picture_in_picture_window_did_resize(Web::PageId page_id, Gfx::IntSize window_size) =|
+    picture_in_picture_window_did_close(Web::PageId page_id, bool pause_video) =|
+    set_picture_in_picture_window_controls_in_use(Web::PageId page_id, bool in_use) =|
 }

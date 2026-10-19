@@ -6,11 +6,53 @@
 
 #include <LibCore/EventLoop.h>
 #include <LibWebView/HeadlessWebView.h>
+#include <LibWebView/PictureInPictureWindow.h>
 
 namespace WebView {
 
 static Web::DevicePixelRect const screen_rect { 0, 0, 1920, 1080 };
 static constexpr auto child_close_timeout_ms = 1000;
+
+// A headless window is never shown, so it only changes size to keep the aspect ratio of its video.
+class HeadlessPictureInPictureWindow final : public PictureInPictureWindow {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    HeadlessPictureInPictureWindow(Gfx::IntSize size, NonnullOwnPtr<HeadlessWebView> view)
+        : m_size(size)
+        , m_view(move(view))
+    {
+        report_page_close_of(*m_view);
+    }
+
+    virtual Gfx::IntSize size() const override { return m_size; }
+    virtual String handle() const override { return m_view->handle(); }
+    virtual void hide() override { }
+
+    virtual void set_video_size(Gfx::IntSize video_size) override
+    {
+        auto size = size_for_video_size(m_size, video_size, screen_rect.size().to_type<int>());
+        if (size == m_size)
+            return;
+
+        m_size = size;
+        m_view->reset_viewport_size(size.to_type<Web::DevicePixels>());
+        if (on_resize)
+            on_resize(size);
+    }
+
+private:
+    Gfx::IntSize m_size;
+    NonnullOwnPtr<HeadlessWebView> m_view;
+};
+
+NonnullOwnPtr<PictureInPictureWindow> HeadlessWebView::create_picture_in_picture_window(HeadlessWebView& requesting_view, CanonicalTraversable& traversable, Gfx::IntSize video_size)
+{
+    auto size = PictureInPictureWindow::initial_size(video_size, screen_rect.size().to_type<int>());
+    auto view = create_child(requesting_view, traversable, IsOwnedByParent::Yes);
+    view->reset_viewport_size(size.to_type<Web::DevicePixels>());
+    return make<HeadlessPictureInPictureWindow>(size, move(view));
+}
 
 NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate is_private)
 {
@@ -20,9 +62,12 @@ NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer the
     return view;
 }
 
-NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create_child(HeadlessWebView& parent, CanonicalTraversable& traversable)
+NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create_child(HeadlessWebView& parent, CanonicalTraversable& traversable, IsOwnedByParent is_owned_by_parent)
 {
     auto view = adopt_own(*new HeadlessWebView(parent.m_theme, parent.m_viewport_size, parent.is_private()));
+    if (is_owned_by_parent == IsOwnedByParent::Yes)
+        view->set_owner_view(parent);
+
     view->initialize_tab(Web::HTML::VisibilityState::Visible, traversable);
 
     return view;
@@ -33,6 +78,9 @@ HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSi
     , m_theme(move(theme))
     , m_viewport_size(viewport_size)
 {
+    // A headless window is exactly its viewport, so every page gets the viewport as its window size.
+    m_window_size = viewport_size.to_type<int>();
+
     on_new_web_view = [this](auto, auto, CanonicalTraversable& traversable) {
         auto web_view = HeadlessWebView::create_child(*this, traversable);
 
@@ -41,13 +89,13 @@ HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSi
 
     on_reposition_window = [this](auto position) {
         m_previous_dimensions.set_location(position.template to_type<Web::DevicePixels>());
-        page().async_set_window_position(position.template to_type<Web::DevicePixels>());
+        set_window_position(position);
     };
 
     on_resize_window = [this](auto size) {
         m_viewport_size = size.template to_type<Web::DevicePixels>();
 
-        page().async_set_window_size(m_viewport_size);
+        set_window_size(size);
         handle_resize();
     };
 
@@ -63,8 +111,8 @@ HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSi
         m_viewport_size = screen_rect.size();
         m_previous_dimensions = screen_rect;
 
-        page().async_set_window_position(screen_rect.location());
-        page().async_set_window_size(screen_rect.size());
+        set_window_position(screen_rect.location().to_type<int>());
+        set_window_size(screen_rect.size().to_type<int>());
         handle_resize();
     };
 
@@ -72,16 +120,16 @@ HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSi
         m_previous_dimensions.set_size(m_viewport_size);
         m_viewport_size = screen_rect.size();
 
-        page().async_set_window_position(screen_rect.location());
-        page().async_set_window_size(screen_rect.size());
+        set_window_position(screen_rect.location().to_type<int>());
+        set_window_size(screen_rect.size().to_type<int>());
         set_is_fullscreen(Web::ViewportIsFullscreen::Yes);
     };
 
     on_exit_fullscreen_window = [this]() {
         m_viewport_size = m_previous_dimensions.size();
 
-        page().async_set_window_position(m_previous_dimensions.location());
-        page().async_set_window_size(m_previous_dimensions.size());
+        set_window_position(m_previous_dimensions.location().to_type<int>());
+        set_window_size(m_previous_dimensions.size().to_type<int>());
         set_is_fullscreen(Web::ViewportIsFullscreen::No);
     };
 
@@ -220,19 +268,18 @@ void HeadlessWebView::send_system_theme_to_page(WebContentPage& page)
     page.async_update_system_theme(m_theme);
 }
 
-void HeadlessWebView::prepare_page_for_tab(WebContentPage& page)
+void HeadlessWebView::prepare_page_for_navigable(WebContentPage& page)
 {
-    ViewImplementation::prepare_page_for_tab(page);
+    ViewImplementation::prepare_page_for_navigable(page);
 
-    page.async_set_window_size(viewport_size());
-    page.async_update_screen_rects({ { screen_rect } }, 0);
+    page.async_update_screen_rects({ { screen_rect } }, { { screen_rect } }, 0);
 }
 
 void HeadlessWebView::reset_viewport_size(Web::DevicePixelSize size)
 {
     m_viewport_size = size;
 
-    page().async_set_window_size(m_viewport_size);
+    set_window_size(size.to_type<int>());
     handle_resize();
 }
 

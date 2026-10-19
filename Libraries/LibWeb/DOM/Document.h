@@ -151,6 +151,7 @@ enum class InvalidateLayoutTreeReason {
     X(EventHandlerDispatchChromeWidgetEvent, false) \
     X(EventHandlerHandleDragAndDrop, false)         \
     X(EventHandlerHandleKeyDown, false)             \
+    X(EventHandlerHandleMouseCancel, false)         \
     X(EventHandlerHandleMouseDown, false)           \
     X(EventHandlerHandleMouseMove, false)           \
     X(EventHandlerHandleMouseUp, false)             \
@@ -266,6 +267,7 @@ enum class PolicyControlledFeature : u8 {
     Fullscreen,
     Gamepad,
     Microphone,
+    PictureInPicture,
     WindowManagement,
 };
 
@@ -379,6 +381,7 @@ public:
     URL::URL url() const { return m_url; }
     URL::URL fallback_base_url() const;
     URL::URL base_url() const;
+    Optional<URL::URL> get_the_base_url() const;
     String const& serialized_url() const;
     String const& serialized_base_url() const;
 
@@ -622,6 +625,7 @@ public:
     void tear_down_layout_tree_for_svg_image_document(Badge<SVG::SVGDecodedImageData>);
 
     virtual bool is_child_allowed(Node const&) const override;
+    virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const override;
 
     Layout::Viewport const* layout_node(Layout::BegunRead const& read) const;
     Layout::Viewport* layout_node(Layout::BegunRead const& read);
@@ -1011,6 +1015,12 @@ public:
     bool is_initial_about_blank() const { return m_is_initial_about_blank; }
     void set_is_initial_about_blank(bool b) { m_is_initial_about_blank = b; }
 
+    bool iframe_load_in_progress() const { return m_iframe_load_in_progress; }
+    void set_iframe_load_in_progress(bool value) { m_iframe_load_in_progress = value; }
+
+    bool mute_iframe_load() const { return m_mute_iframe_load; }
+    void set_mute_iframe_load(bool value) { m_mute_iframe_load = value; }
+
     HTML::CrossProcessId id() const { return m_id.value(); }
     void set_id(HTML::CrossProcessId);
 
@@ -1019,6 +1029,13 @@ public:
     void set_about_base_url(Optional<URL::URL> url)
     {
         m_about_base_url = move(url);
+        m_serialized_base_url.clear();
+    }
+
+    // https://dom.spec.whatwg.org/#document-base-url-override
+    void set_base_url_override(Optional<URL::URL> url)
+    {
+        m_base_url_override = move(url);
         m_serialized_base_url.clear();
     }
 
@@ -1629,6 +1646,12 @@ public:
     bool is_simple_fullscreen_document() const;
     GC::Ref<GC::HeapVector<GC::Ref<Document>>> collect_documents_to_unfullscreen();
 
+    GC::Ptr<Element> picture_in_picture_element() const { return m_picture_in_picture_element; }
+    void set_picture_in_picture_element(GC::Ptr<Element>);
+    GC::Ptr<Element> retargeted_picture_in_picture_element() const;
+    bool picture_in_picture_enabled() const;
+    GC::Ref<WebIDL::Promise> exit_picture_in_picture();
+
     auto& script_blocking_style_sheet_set() { return m_script_blocking_style_sheet_set; }
     auto const& script_blocking_style_sheet_set() const { return m_script_blocking_style_sheet_set; }
     void remove_from_script_blocking_style_sheet_set(Element&);
@@ -2009,10 +2032,20 @@ private:
 
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool m_is_initial_about_blank { false };
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-load-in-progress
+    bool m_iframe_load_in_progress { false };
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#mute-iframe-load
+    bool m_mute_iframe_load { false };
+
     Optional<HTML::CrossProcessId> m_id;
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-about-base-url
     Optional<URL::URL> m_about_base_url;
+
+    // https://dom.spec.whatwg.org/#document-base-url-override
+    Optional<URL::URL> m_base_url_override;
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-coop
     HTML::OpenerPolicy m_opener_policy;
@@ -2363,6 +2396,9 @@ private:
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;
+
+    // https://w3c.github.io/picture-in-picture/#picture-in-picture-element
+    GC::Ptr<Element> m_picture_in_picture_element;
 
     // https://dom.spec.whatwg.org/#document-custom-element-registry
     GC::Ptr<HTML::CustomElementRegistry> m_custom_element_registry;

@@ -276,10 +276,7 @@ void HTMLMediaElement::attribute_changed(Utf16FlyString const& name, Optional<Ut
     } else if (!namespace_.has_value() && name == HTML::AttributeNames::crossorigin) {
         m_crossorigin = cors_setting_attribute_from_keyword(value.map([](auto const& value) { return value.utf16_view(); }));
     } else if (name == HTML::AttributeNames::controls) {
-        if (value.has_value() || is_scripting_disabled())
-            create_controls();
-        else
-            destroy_controls();
+        update_controls();
     } else if (name == HTML::AttributeNames::loop) {
         // AD-HOC: Other browsers reflect the loop attribute in the ended attribute immediately, rather than once the
         //         event loop reaches step 1.
@@ -1692,7 +1689,7 @@ void HTMLMediaElement::load_local_resource(MediaProvider const& media_provider, 
             // FIXME: Support File objects.
             failure_callback("File objects are not supported"_utf16);
         },
-        [](Empty) {});
+        [](Empty) { });
 
     // The resource described by the current media resource, if any, contains the media data. It is
     // CORS-same-origin.
@@ -1862,8 +1859,7 @@ void HTMLMediaElement::attach_selected_video_track_sink(Media::Track const& trac
     m_active_video_sink = make<ActiveVideoSink>(handle, Compositing::allocate_video_sink_resource_id());
     m_video_sink_is_ticking = true;
     add_current_video_sink(handle);
-    if (document().hidden())
-        sync_video_sink_ticking();
+    video_sink_ticking_inputs_changed();
     if (auto* video_element = as_if<HTMLVideoElement>(this))
         Painting::push_video_paint_facts(*video_element);
 }
@@ -2702,6 +2698,9 @@ bool HTMLMediaElement::video_sink_should_tick() const
     Layout::ForcedReadScope read { document() };
     if (m_video_frame_was_recently_captured)
         return true;
+    // Another element, such as one in a Picture-in-Picture window, shows the frames whatever happens to this one's box.
+    if (is_shown_elsewhere())
+        return true;
     if (document().visibility_state() != VisibilityState::Visible)
         return false;
     auto const* layout_node = this->layout_node(read);
@@ -2723,6 +2722,14 @@ void HTMLMediaElement::sync_video_sink_ticking() const
         m_playback_manager->set_video_sink_ticking(*handle, should_tick);
     if (auto navigable = document().navigable(); navigable && navigable->has_compositor_context())
         navigable->compositor_context().set_video_sink_ticking(*handle, should_tick);
+}
+
+// Visible documents re-evaluate sink ticking in each rendering update, once layout has settled. Hidden documents skip
+// that update, but decide without layout, so they re-evaluate right away.
+void HTMLMediaElement::video_sink_ticking_inputs_changed() const
+{
+    if (document().hidden())
+        sync_video_sink_ticking();
 }
 
 void HTMLMediaElement::note_frame_captured() const
@@ -3469,15 +3476,40 @@ void HTMLMediaElement::reject_pending_play_promises(ReadonlySpan<GC::Ref<WebIDL:
         WebIDL::reject_promise(promise, error);
 }
 
-void HTMLMediaElement::create_controls()
+// https://html.spec.whatwg.org/multipage/media.html#attr-media-controls
+bool HTMLMediaElement::should_expose_user_interface() const
 {
-    if (!m_controls.has_value())
-        m_controls.emplace(*this);
+    // If the attribute is present, or if scripting is disabled for the media element, then the user agent should
+    // expose a user interface to the user.
+    return has_attribute(AttributeNames::controls) || is_scripting_disabled();
 }
 
-void HTMLMediaElement::destroy_controls()
+void HTMLMediaElement::update_controls()
 {
+    // The controls also show the Picture-in-Picture placeholder, so they exist while either is shown.
+    if (!should_expose_user_interface() && !is_picture_in_picture_element()) {
+        m_controls.clear();
+        return;
+    }
+
+    if (m_controls.has_value())
+        m_controls->update_visibility();
+    else
+        m_controls.emplace(*this, media_element_for_controls());
+}
+
+void HTMLMediaElement::media_element_for_controls_changed()
+{
+    if (!m_controls.has_value())
+        return;
     m_controls.clear();
+    update_controls();
+}
+
+void HTMLMediaElement::set_picture_in_picture_window_controls_in_use(bool in_use)
+{
+    if (m_controls.has_value())
+        m_controls->set_picture_in_picture_window_controls_in_use(in_use);
 }
 
 }

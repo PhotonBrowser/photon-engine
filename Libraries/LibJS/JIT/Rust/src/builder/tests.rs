@@ -384,11 +384,11 @@ fn instructions_whose_feedback_is_empty_never_ran() {
 
 #[test]
 fn unsupported_instructions_fail_cleanly() {
-    let program = assemble(|label| {
+    let program = assemble(|_| {
         vec![
-            Instruction::Yield {
-                continuation_label: Some(label(1)),
-                value: r(5),
+            Instruction::Catch {
+                value_feedback: 0,
+                dst: r(5),
             },
             Instruction::Return { value: r(5) },
         ]
@@ -399,7 +399,7 @@ fn unsupported_instructions_fail_cleanly() {
         failure,
         CompileFailure::UnsupportedInstruction {
             pc: 0,
-            opcode: crate::bytecode::OpCode::Yield,
+            opcode: crate::bytecode::OpCode::Catch,
             ..
         }
     ));
@@ -2107,26 +2107,39 @@ pub(crate) mod inlining {
             &creates_environment,
             function(true, false)
         )));
+    }
 
-        // A for-in loop, which leaves slots in frame memory.
-        let for_in = assemble(|_| {
+    #[test]
+    fn for_in_loops_are_inlined() {
+        // function f(o) { for (k in o) {} return k; }
+        let callee = assemble(|label| {
             vec![
                 Instruction::Enter,
+                Instruction::GetObjectPropertyIterator {
+                    dst_keys: r(5),
+                    dst_receiver: r(6),
+                    object: a(0),
+                    cache: 0,
+                },
+                Instruction::Mov { dst: r(7), src: c(0) },
                 Instruction::ObjectPropertyIteratorNext {
-                    dst_value: r(5),
-                    dst_done: r(6),
-                    receiver: a(0),
-                    keys: a(0),
+                    dst_value: l(0),
+                    dst_done: l(1),
+                    receiver: r(6),
+                    keys: r(5),
                     cursor: r(7),
                 },
-                Instruction::Return { value: r(5) },
+                Instruction::JumpIf {
+                    condition: l(1),
+                    true_target: label(5),
+                    false_target: label(3),
+                },
+                Instruction::Return { value: l(0) },
             ]
         });
-        assert!(!is_inlined(&snapshot_with_callee(
-            &caller(),
-            &for_in,
-            function(true, false)
-        )));
+        let dump = dump_inlined(&caller(), &callee, function(true, false));
+        assert!(!dump.contains("CallSlowPath Call"), "{dump}");
+        assert!(dump.contains("LoadPropertyIteratorKey"), "{dump}");
     }
 
     #[test]
@@ -2438,6 +2451,48 @@ mod arguments {
         let aliased = |snapshot: &mut Snapshot| snapshot.executables[0].mapped_arguments_alias_parameters = true;
         assert!(build(&reads_length(true), aliased).contains("ArgumentCount"));
     }
+}
+
+fn dump_bitwise_or(feedback: u8) -> String {
+    let program = assemble(|_| {
+        vec![
+            Instruction::BitwiseOr {
+                dst: r(5),
+                lhs: a(0),
+                rhs: r(6),
+                arith_feedback: 0,
+            },
+            Instruction::Return { value: r(5) },
+        ]
+    });
+    let mut snapshot = snapshot_for(&program, test_layout());
+    snapshot.executables[0].feedback.arith = vec![feedback];
+    dump(&optimized_graph(&snapshot), &test_layout())
+}
+
+#[test]
+fn bitwise_operands_that_were_booleans_are_read_as_int32s() {
+    use crate::snapshot::arith_feedback::{BOOLEAN, INT32, OTHER, STRING};
+    let text = dump_bitwise_or(INT32 | BOOLEAN);
+    assert_eq!(text.matches("BranchInt32OrBoolean").count(), 2, "{text}");
+    assert!(text.contains("Int32BitwiseOr"), "{text}");
+    // Operands of other kinds never came, so they exit rather than run the slow path.
+    assert!(
+        text.contains("Exit SlowPath") && !text.contains("CallSlowPath"),
+        "{text}"
+    );
+    // Other kinds that came, like undefined or strings, take the slow path.
+    for other in [OTHER, STRING] {
+        let text = dump_bitwise_or(INT32 | BOOLEAN | other);
+        assert_eq!(text.matches("CallSlowPath BitwiseOr").count(), 1, "{text}");
+    }
+    // Other operands, like undefined, are no booleans.
+    let text = dump_bitwise_or(INT32 | OTHER);
+    assert!(!text.contains("BranchInt32OrBoolean"), "{text}");
+    // Without booleans, int32 speculation checks the operands instead.
+    let text = dump_bitwise_or(INT32);
+    assert!(!text.contains("BranchInt32OrBoolean"), "{text}");
+    assert_eq!(text.matches("CheckInt32").count(), 2, "{text}");
 }
 
 #[test]

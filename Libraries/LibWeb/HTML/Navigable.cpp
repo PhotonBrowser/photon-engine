@@ -183,9 +183,15 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
         // 1. Assert: userInvolvement is not "browser UI".
         VERIFY(params.user_involvement != UserNavigationInvolvement::BrowserUI);
 
+        // AD-HOC: sourceDocument can have no node navigable, e.g. a document without a browsing context that a form
+        //         moved into after it planned a navigation. There is nothing to navigate from.
+        auto source_navigable = source_document->navigable();
+        if (!source_navigable)
+            return {};
+
         // 2. If sourceDocument's node navigable is not allowed by sandboxing to navigate navigable given
         //    sourceSnapshotParams:
-        if (!source_document->navigable()->allowed_by_sandboxing_to_navigate(*this, snapshots.source_snapshot_params)) {
+        if (!source_navigable->allowed_by_sandboxing_to_navigate(*this, snapshots.source_snapshot_params)) {
             // 1. If exceptionsEnabled is true, then throw a "SecurityError" DOMException.
             if (params.exceptions_enabled)
                 return WebIDL::SecurityError::create("Source document's node navigable is not allowed to navigate"_utf16);
@@ -310,6 +316,7 @@ GC::Ptr<Navigable> navigable_with_id_in_any_page(Page const& preferred_page, Cro
 
 // The top-level browsing contexts of a group, as the navigables they are active in: the traversables this process
 // hosts, and its stand-ins for those other processes host. A traversable hosted here stands ahead of any stand-in.
+// A provisional traversable is not active yet: the stand-in for the traversable another process hosts represents it.
 Vector<GC::Root<Navigable>> top_level_navigables_in_browsing_context_group(Optional<u64> browsing_context_group_id)
 {
     Vector<GC::Root<Navigable>> navigables;
@@ -317,6 +324,8 @@ Vector<GC::Root<Navigable>> top_level_navigables_in_browsing_context_group(Optio
         return navigables;
     auto consider = [&](Navigable& navigable) {
         if (!navigable.is_top_level_traversable() || navigable.has_been_destroyed() || navigable.browsing_context_group_id() != browsing_context_group_id)
+            return;
+        if (auto* local_navigable = as_if<LocalNavigable>(navigable); local_navigable && local_navigable->is_provisional())
             return;
         if (any_of(navigables, [&](auto const& seen) { return seen->id() == navigable.id(); }))
             return;

@@ -101,11 +101,47 @@ pub(crate) trait IntrinsicMeasurement: Copy {
     fn dependencies(&self) -> IntrinsicMeasurementDependencies;
 }
 
+/// The measurements of one intrinsic size of one box. A box is usually measured under one key, so they are kept inline
+/// and searched in order, which reads one cache line where a hash map reads several. As a cache it may forget: past
+/// a few keys, the oldest goes.
+struct IntrinsicMeasurements<V> {
+    entries: smallvec::SmallVec<[(IntrinsicSizeCacheKey, V); 1]>,
+}
+
+impl<V> Default for IntrinsicMeasurements<V> {
+    fn default() -> Self {
+        Self {
+            entries: smallvec::SmallVec::new(),
+        }
+    }
+}
+
+impl<V> IntrinsicMeasurements<V> {
+    const MAXIMUM_ENTRIES: usize = 8;
+
+    fn get(&self, key: &IntrinsicSizeCacheKey) -> Option<&V> {
+        self.entries
+            .iter()
+            .find_map(|(entry_key, value)| (entry_key == key).then_some(value))
+    }
+
+    fn insert(&mut self, key: IntrinsicSizeCacheKey, value: V) {
+        if let Some(entry) = self.entries.iter_mut().find(|(entry_key, _)| *entry_key == key) {
+            entry.1 = value;
+            return;
+        }
+        if self.entries.len() == Self::MAXIMUM_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, value));
+    }
+}
+
 // Measurements are stored under their key with every basis they never observed masked out. A
 // probe that had to mask a basis must skip entries that observed it: a measurement made without
 // that basis shares the masked key's shape.
 fn intrinsic_cache_lookup<V: IntrinsicMeasurement>(
-    map: &HashMap<IntrinsicSizeCacheKey, V>,
+    map: &IntrinsicMeasurements<V>,
     key: IntrinsicSizeCacheKey,
 ) -> Option<V> {
     if let Some(value) = map.get(&key) {
@@ -137,31 +173,11 @@ fn intrinsic_cache_lookup<V: IntrinsicMeasurement>(
 }
 
 fn intrinsic_cache_store<V: IntrinsicMeasurement>(
-    map: &mut HashMap<IntrinsicSizeCacheKey, V>,
+    map: &mut IntrinsicMeasurements<V>,
     key: IntrinsicSizeCacheKey,
     value: V,
 ) {
     map.insert(key.masked_for(value.dependencies()), value);
-}
-
-impl Hash for IntrinsicSizeCacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        fn hash_optional<H: Hasher>(value: Option<CssPixels>, state: &mut H) {
-            match value {
-                Some(value) => {
-                    true.hash(state);
-                    value.raw_value().hash(state);
-                }
-                None => false.hash(state),
-            }
-        }
-
-        hash_optional(self.measured_at_inline_size, state);
-        hash_optional(self.measured_at_block_size, state);
-        hash_optional(self.percentage_basis_inline_size, state);
-        hash_optional(self.percentage_basis_block_size, state);
-        hash_optional(self.quirks_mode_percentage_basis_block_size, state);
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,10 +290,10 @@ impl IntrinsicMeasurement for IntrinsicBlockSizeMeasurement {
 struct IntrinsicSizeMaps {
     // This is a subtree fact and shares the intrinsic cache's epoch so descendant changes invalidate it.
     inline_size_depends_on_block_size: Option<bool>,
-    min_content_inline_size: HashMap<IntrinsicSizeCacheKey, IntrinsicInlineSizeMeasurement>,
-    max_content_inline_size: HashMap<IntrinsicSizeCacheKey, IntrinsicInlineSizeMeasurement>,
-    min_content_block_size: HashMap<IntrinsicSizeCacheKey, IntrinsicBlockSizeMeasurement>,
-    max_content_block_size: HashMap<IntrinsicSizeCacheKey, IntrinsicBlockSizeMeasurement>,
+    min_content_inline_size: IntrinsicMeasurements<IntrinsicInlineSizeMeasurement>,
+    max_content_inline_size: IntrinsicMeasurements<IntrinsicInlineSizeMeasurement>,
+    min_content_block_size: IntrinsicMeasurements<IntrinsicBlockSizeMeasurement>,
+    max_content_block_size: IntrinsicMeasurements<IntrinsicBlockSizeMeasurement>,
     table_cell_measurements: HashMap<TableCellMeasurementKey, TableCellMeasurement>,
 }
 
@@ -285,7 +301,7 @@ impl IntrinsicSizeMaps {
     fn block_sizes(
         &self,
         kind: IntrinsicSizeCacheKind,
-    ) -> Option<&HashMap<IntrinsicSizeCacheKey, IntrinsicBlockSizeMeasurement>> {
+    ) -> Option<&IntrinsicMeasurements<IntrinsicBlockSizeMeasurement>> {
         match kind {
             IntrinsicSizeCacheKind::MinContentInline | IntrinsicSizeCacheKind::MaxContentInline => None,
             IntrinsicSizeCacheKind::MinContentBlock => Some(&self.min_content_block_size),
@@ -296,7 +312,7 @@ impl IntrinsicSizeMaps {
     fn block_sizes_mut(
         &mut self,
         kind: IntrinsicSizeCacheKind,
-    ) -> Option<&mut HashMap<IntrinsicSizeCacheKey, IntrinsicBlockSizeMeasurement>> {
+    ) -> Option<&mut IntrinsicMeasurements<IntrinsicBlockSizeMeasurement>> {
         match kind {
             IntrinsicSizeCacheKind::MinContentInline | IntrinsicSizeCacheKind::MaxContentInline => None,
             IntrinsicSizeCacheKind::MinContentBlock => Some(&mut self.min_content_block_size),
@@ -307,7 +323,7 @@ impl IntrinsicSizeMaps {
     fn inline_measurements(
         &self,
         kind: IntrinsicSizeCacheKind,
-    ) -> Option<&HashMap<IntrinsicSizeCacheKey, IntrinsicInlineSizeMeasurement>> {
+    ) -> Option<&IntrinsicMeasurements<IntrinsicInlineSizeMeasurement>> {
         match kind {
             IntrinsicSizeCacheKind::MinContentInline => Some(&self.min_content_inline_size),
             IntrinsicSizeCacheKind::MaxContentInline => Some(&self.max_content_inline_size),
@@ -318,7 +334,7 @@ impl IntrinsicSizeMaps {
     fn inline_measurements_mut(
         &mut self,
         kind: IntrinsicSizeCacheKind,
-    ) -> Option<&mut HashMap<IntrinsicSizeCacheKey, IntrinsicInlineSizeMeasurement>> {
+    ) -> Option<&mut IntrinsicMeasurements<IntrinsicInlineSizeMeasurement>> {
         match kind {
             IntrinsicSizeCacheKind::MinContentInline => Some(&mut self.min_content_inline_size),
             IntrinsicSizeCacheKind::MaxContentInline => Some(&mut self.max_content_inline_size),
@@ -1177,6 +1193,9 @@ pub(crate) struct LayoutNodeArena {
     chunks_by_address: Vec<ChunkAddress>,
     slot_metadata: Vec<SlotMetadata>,
     style_records: Vec<Cell<u64>>,
+    /// The style record whose image resources the host was last owed for each row, or zero. A row whose record has not
+    /// changed since holds those resources still, so a build that visits it again owes it nothing.
+    image_resources_owed_records: Vec<Cell<u64>>,
     style_record_pins: Vec<Cell<ArenaStylePin>>,
     /// The style record the host pinned for its readers of a row that outlive the row's place in
     /// the tree (a detached box is read until its row is freed), or zero. A pin is counted, so this
@@ -1325,6 +1344,7 @@ impl LayoutNodeArena {
             chunks_by_address: Vec::new(),
             slot_metadata: Vec::new(),
             style_records: Vec::new(),
+            image_resources_owed_records: Vec::new(),
             style_record_pins: Vec::new(),
             style_records_pinned_by_host: Vec::new(),
             style_nodes: Vec::new(),
@@ -1570,6 +1590,7 @@ impl LayoutNodeArena {
             }
             self.slot_metadata.push(SlotMetadata::default());
             self.style_records.push(Cell::new(0));
+            self.image_resources_owed_records.push(Cell::new(0));
             self.style_record_pins.push(Cell::new(ArenaStylePin::None));
             self.style_records_pinned_by_host.push(Cell::new(0));
             self.style_nodes.push(Cell::new(None));
@@ -1696,6 +1717,7 @@ impl LayoutNodeArena {
         self.unbind_row(id);
         self.set_node_style_node(id, None);
         self.style_records[index as usize].set(0);
+        self.image_resources_owed_records[index as usize].set(0);
         self.style_record_pins[index as usize].set(ArenaStylePin::None);
         self.style_records_pinned_by_host[index as usize].set(0);
 
@@ -2292,7 +2314,7 @@ impl LayoutNodeArena {
         self.note_row_style(id);
         self.set_node_flag(id, NodeFlag::FollowsPrincipalStyle, false);
         self.invalidate_overflow_after_style_change(id);
-        let previous = self.style_records[id.slot_index() as usize].replace(style_record);
+        let previous = self.replace_style_record(id.slot_index() as usize, style_record);
         self.shape_writes.note_style();
         self.write_shape(id).mark();
         if self.style_record_pins[id.slot_index() as usize].replace(ArenaStylePin::None) != ArenaStylePin::None {
@@ -2717,7 +2739,7 @@ impl LayoutNodeArena {
         relayout: StyleRelayout,
     ) {
         let previous_payloads = self.data(row).style.get();
-        self.style_records[row.slot_index() as usize].set(style.record);
+        self.replace_style_record(row.slot_index() as usize, style.record);
         let shape = self.write_shape(row);
         shape.set_style(style.payloads);
         shape.mark();
@@ -2817,6 +2839,39 @@ impl LayoutNodeArena {
     /// See [`crate::painting::svg_paint_resources::SvgPaintResources::share_enrolled_flag`].
     pub(crate) fn share_svg_paint_resources_enrolled(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.svg_paint_resources.share_enrolled_flag(flag);
+    }
+
+    /// Gives the row at `index` the style record `record`, answering the one it held. A row whose record changes no
+    /// longer holds the image resources it was owed for the old one.
+    fn replace_style_record(&self, index: usize, record: u64) -> u64 {
+        let previous = self.style_records[index].replace(record);
+        if previous != record {
+            self.image_resources_owed_records[index].set(0);
+        }
+        previous
+    }
+
+    /// Whether the host has to attach the image resources of `id`'s current style record, noting that it is owed them
+    /// if so. The host attached them already where it was owed them for the record the row still holds. Boxes whose
+    /// paint facts also follow their element's own state, such as a form control's or a media element's, are owed
+    /// them on every visit.
+    pub(crate) fn owe_style_image_resources_once(&self, id: NodeSlotId) -> bool {
+        // NB: These are the kinds whose paint facts push_paint_facts_after_style_attach() in Painting/PaintFacts.cpp
+        //     takes from their element, and the two must stay in sync.
+        if matches!(
+            self.data(id).kind.get(),
+            NodeKind::CheckBox
+                | NodeKind::RadioButton
+                | NodeKind::CanvasBox
+                | NodeKind::ImageBox
+                | NodeKind::SVGImageBox
+                | NodeKind::VideoBox
+        ) {
+            return true;
+        }
+        let index = id.slot_index() as usize;
+        let record = self.style_records[index].get();
+        record == 0 || self.image_resources_owed_records[index].replace(record) != record
     }
 
     pub(crate) fn node_style_record(&self, id: NodeSlotId) -> u64 {
@@ -3948,7 +4003,7 @@ impl LayoutNodeArena {
         assert!(derived.record != 0 && !derived.payloads.is_null());
         data.set_kind(kind);
         data.set_flags(super::node_facts::construction_flags(kind, true, 0));
-        self.style_records[slot.slot_index() as usize].set(derived.record);
+        self.replace_style_record(slot.slot_index() as usize, derived.record);
         self.style_record_pins[slot.slot_index() as usize].set(ArenaStylePin::Derived);
         data.set_style(derived.payloads);
         data.mark();
@@ -4053,7 +4108,7 @@ impl LayoutNodeArena {
         let previously_pinned =
             self.style_record_pins[slot.slot_index() as usize].replace(ArenaStylePin::Derived) != ArenaStylePin::None;
         assert!(derived.record != 0 && !derived.payloads.is_null());
-        let previous_style_record = self.style_records[slot.slot_index() as usize].replace(derived.record);
+        let previous_style_record = self.replace_style_record(slot.slot_index() as usize, derived.record);
         self.shape_writes.note_style();
         let shape = self.write_shape(slot);
         shape.set_style(derived.payloads);
@@ -4323,6 +4378,11 @@ impl LayoutNodeArena {
             self.remove_layout_update_flag_node(id);
         }
         data.set_flags(updated);
+        // A box that becomes a flex or grid item can lay out to the fragment it committed before, but orders its
+        // painting differently, so its committed geometry no longer lets its commit be skipped.
+        if matches!(flag, NodeFlag::IsFlexItem | NodeFlag::IsGridItem) && updated != previous {
+            self.paintable_rows.invalidate_committed_geometry(id.slot_index());
+        }
         // Retaining compositor-animated content decides whether a non-invertible transform
         // still records its stacking context.
         if flag == NodeFlag::HasAnimatedOpacityOrTransform && updated != previous {
@@ -4703,7 +4763,7 @@ impl LayoutNodeArena {
         let (index, metadata) = self.slot_for_data(data);
         self.paintable_rows
             .with_committed_fragment_link(index, metadata.generation, |link| {
-                link.and_then(|link| link.abspos_layout_inputs)
+                link.and_then(|link| link.abspos_layout_inputs.as_deref().copied())
             })
             .or_else(|| {
                 self.confined_abspos_layout_inputs
@@ -4816,20 +4876,33 @@ impl LayoutNodeArena {
 
     pub(crate) fn set_committed_fragment_link(
         &self,
-        data: &NodeData,
+        id: NodeSlotId,
         link: super::fragment_tree::FragmentLink,
         geometry_epoch: Option<u32>,
     ) {
-        let (index, metadata) = self.slot_for_data(data);
         self.paintable_rows
-            .set_committed_fragment_link(index, metadata.generation, geometry_epoch, link);
+            .set_committed_fragment_link(id.slot_index(), id.generation(), geometry_epoch, link);
 
-        let data = self.write_shape_of(data);
+        let data = self.write_shape(id);
         data.set_flags(data.flags.get() | NodeFlag::HasCommittedFragmentLink as u32);
     }
 
     pub(crate) fn epoch_of_geometry_laid_out_in_this_pass(&self, data: &NodeData) -> Option<u32> {
         (!self.fragment_cache_epoch_changed_during_layout_pass.get()).then(|| data.fragment_cache_epoch.get())
+    }
+
+    /// Whether `id` committed `link` already, placed the same way, in a layout its geometry is still current for.
+    pub(crate) fn holds_current_committed_fragment_link(
+        &self,
+        id: NodeSlotId,
+        link: &super::fragment_tree::FragmentLink,
+    ) -> bool {
+        self.paintable_rows.holds_current_committed_fragment_link(
+            id.slot_index(),
+            id.generation(),
+            self.data(id).fragment_cache_epoch.get(),
+            link,
+        )
     }
 
     pub(crate) fn with_current_committed_fragment<R>(
@@ -6575,11 +6648,10 @@ mod tests {
         let node = arena.allocate_for_test().slot;
         let current = |arena: &LayoutNodeArena| arena.with_current_committed_fragment(node, |fragment| fragment.node);
         let commit_from_layout = |arena: &LayoutNodeArena| {
-            let data = arena.data(node);
             arena.set_committed_fragment_link(
-                data,
+                node,
                 fragment_tree::FragmentLink::for_test(node),
-                arena.epoch_of_geometry_laid_out_in_this_pass(data),
+                arena.epoch_of_geometry_laid_out_in_this_pass(arena.data(node)),
             );
         };
         commit_from_layout(&arena);
@@ -6591,7 +6663,7 @@ mod tests {
         assert_eq!(current(&arena), Some(node));
 
         let moved = arena.take_committed_fragment_link(arena.data(node)).unwrap();
-        arena.set_committed_fragment_link(arena.data(node), moved, None);
+        arena.set_committed_fragment_link(node, moved, None);
         assert_eq!(current(&arena), None);
 
         arena.begin_active_layout_pass();
@@ -6929,8 +7001,8 @@ mod tests {
         let allocation = arena.allocate_for_test();
         let inputs = test_abspos_layout_inputs();
         let mut link = fragment_tree::FragmentLink::for_test(allocation.slot);
-        link.abspos_layout_inputs = Some(inputs);
-        arena.set_committed_fragment_link(arena.data(allocation.slot), link, None);
+        link.abspos_layout_inputs = Some(Box::new(inputs));
+        arena.set_committed_fragment_link(allocation.slot, link, None);
         assert!(arena.committed_fragment_link(arena.data(allocation.slot)).is_some());
         assert_eq!(
             arena.saved_abspos_layout_inputs(arena.data(allocation.slot)),
@@ -6958,15 +7030,15 @@ mod tests {
         let new = arena.allocate_for_test();
         let inputs = test_abspos_layout_inputs();
         let mut link = fragment_tree::FragmentLink::for_test(old.slot);
-        link.abspos_layout_inputs = Some(inputs);
+        link.abspos_layout_inputs = Some(Box::new(inputs));
         let retained_fragment = link.fragment.clone();
-        arena.set_committed_fragment_link(arena.data(old.slot), link, None);
+        arena.set_committed_fragment_link(old.slot, link, None);
 
         let moved = arena
             .take_committed_fragment_link(arena.data(old.slot))
             .expect("old slot must retain its committed fragment");
         assert!(std::sync::Arc::ptr_eq(&moved.fragment, &retained_fragment));
-        arena.set_committed_fragment_link(arena.data(new.slot), moved, None);
+        arena.set_committed_fragment_link(new.slot, moved, None);
 
         assert!(arena.committed_fragment_link(arena.data(old.slot)).is_none());
         assert_eq!(arena.saved_abspos_layout_inputs(arena.data(old.slot)), None);
@@ -6975,11 +7047,7 @@ mod tests {
             .committed_fragment_link(arena.data(new.slot))
             .expect("new slot must receive the committed fragment");
         assert!(std::sync::Arc::ptr_eq(&moved.fragment, &retained_fragment));
-        arena.set_committed_fragment_link(
-            arena.data(new.slot),
-            fragment_tree::FragmentLink::for_test(new.slot),
-            None,
-        );
+        arena.set_committed_fragment_link(new.slot, fragment_tree::FragmentLink::for_test(new.slot), None);
         assert_eq!(arena.saved_abspos_layout_inputs(arena.data(new.slot)), None);
         arena
             .free_subtree(old.slot)

@@ -21,6 +21,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::execution_context::ExecutionContext;
 use crate::layout::function_object::EcmascriptFunctionObject;
+use crate::layout::object::Object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 
 /// The status word of what JIT code returns, `libjs_jit::code::JitStatus`.
@@ -87,6 +88,11 @@ impl CompileState {
 pub struct SnapshotExecutable {
     pub executable: Gc<Executable>,
     pub function: Option<InlinedFunction>,
+    /// How many sites where JIT code exited the executable had recorded when the code was compiled, which the code
+    /// knew of (see `Executable::add_jit_exit_site()`). The sites are only ever appended to.
+    pub known_exit_sites: usize,
+    /// For the compiled executable, how many sites in inlined builtins it had recorded then.
+    pub known_builtin_exit_sites: usize,
 }
 
 /// The function object of an inlined executable, which its materialized frames run.
@@ -118,7 +124,7 @@ pub struct JitCode {
     /// keep their addresses for as long as the code may run.
     embedded_cells: Vec<Gc<CellHeader>>,
     snapshot_executables: Vec<SnapshotExecutable>,
-    /// Where a frame running in the interpreter at the loop back edge `pc` can continue in this code.
+    /// Where a frame running in the interpreter at `pc` can continue in this code (see `osr_entry()`).
     osr_entries: Vec<(u32, JitEntry)>,
     /// The loop back edges from where a frame running in the interpreter reaches one of the `osr_entries` without
     /// leaving the loop it is in.
@@ -126,6 +132,9 @@ pub struct JitCode {
     /// The loop back edges in the loops around those of the `osr_entries`, from where a frame running in the
     /// interpreter may reach one of them on a later iteration.
     osr_outer_loop_back_edges: Vec<u32>,
+    /// The pcs of the `Catch` of the exception handlers that have no catch entry only because they never caught an
+    /// exception before the compile.
+    uncaught_handlers: Vec<u32>,
     /// Identifies the code among all code the VM installed, for the dependencies it registers (see
     /// `super::dependencies`).
     id: u64,
@@ -133,6 +142,25 @@ pub struct JitCode {
     /// are no-ops until then.
     invalidation_patches: Vec<(u32, Vec<u8>)>,
     invalidated: Cell<bool>,
+    /// See `libjs_jit::code::CompiledCode::site_index_frame_offset`.
+    site_index_frame_offset: i32,
+    /// See `libjs_jit::code::CompiledCode::register_dump_frame_offset`.
+    register_dump_frame_offset: i32,
+    /// The objects the code never allocated that the runtime created for frames running the code while they were
+    /// suspended in a call, because code the call ran read them through the legacy `arguments` of a frame of an
+    /// inlined call (see `translate::resolve_deferred_arguments()`). Those frames continue in the interpreter with
+    /// these objects, which only they use. Exits and leaves forget a frame's objects; a frame an exception unwinds
+    /// past its compiled code leaves its objects here until the code detaches. Invalidated code is entered no more,
+    /// so no other frame that runs it can come to have the address of one of them.
+    materialized_objects: RefCell<Vec<MaterializedObject>>,
+}
+
+/// An object created for a frame running JIT code, standing for the object its code never allocated at `allocation`
+/// (see `libjs_jit::code::VirtualObjectDescriptor`).
+struct MaterializedObject {
+    frame: *const ExecutionContext,
+    allocation: u32,
+    object: Gc<Object>,
 }
 
 impl JitCode {
@@ -165,10 +193,65 @@ impl JitCode {
             osr_entries,
             osr_loop_back_edges,
             osr_outer_loop_back_edges: Vec::new(),
+            uncaught_handlers: Vec::new(),
             id: 0,
             invalidation_patches: Vec::new(),
             invalidated: Cell::new(false),
+            site_index_frame_offset: 0,
+            register_dump_frame_offset: 0,
+            materialized_objects: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Gives the code where its frames keep the index of a site and the register dump the runtime reads.
+    pub fn with_frame_offsets(mut self, site_index_frame_offset: i32, register_dump_frame_offset: i32) -> Self {
+        self.site_index_frame_offset = site_index_frame_offset;
+        self.register_dump_frame_offset = register_dump_frame_offset;
+        self
+    }
+
+    pub fn register_dump_frame_offset(&self) -> i32 {
+        self.register_dump_frame_offset
+    }
+
+    /// The index of the site whose values the runtime reads from the JIT frame at `frame_pointer` (see
+    /// `libjs_jit::code::CompiledCode::site_index_frame_offset`).
+    pub fn site_index_of_frame(&self, frame_pointer: u64) -> u32 {
+        let address = frame_pointer.wrapping_add_signed(i64::from(self.site_index_frame_offset)) as *const u32;
+        // SAFETY: The JIT frame is on the stack, suspended in a slow path or call that stored the index there.
+        unsafe { address.read() }
+    }
+
+    /// Stores `index` as the index of the site whose values the runtime reads from the JIT frame at `frame_pointer`.
+    pub fn set_site_index_of_frame(&self, frame_pointer: u64, index: u32) {
+        let address = frame_pointer.wrapping_add_signed(i64::from(self.site_index_frame_offset)) as *mut u32;
+        // SAFETY: The JIT frame is on the stack, suspended in a call, and the code reads the word only where it
+        //         stored it.
+        unsafe { address.write(index) }
+    }
+
+    /// The object created for `frame` that stands for the object its code never allocated at `allocation`, if any.
+    pub fn materialized_object(&self, frame: *const ExecutionContext, allocation: u32) -> Option<Gc<Object>> {
+        self.materialized_objects
+            .borrow()
+            .iter()
+            .find(|materialized| materialized.frame == frame && materialized.allocation == allocation)
+            .map(|materialized| materialized.object)
+    }
+
+    pub fn remember_materialized_object(&self, frame: *const ExecutionContext, allocation: u32, object: Gc<Object>) {
+        self.materialized_objects.borrow_mut().push(MaterializedObject {
+            frame,
+            allocation,
+            object,
+        });
+    }
+
+    /// Forgets the objects created for `frame`, which no longer runs the code.
+    pub fn forget_materialized_objects(&self, frame: *const ExecutionContext) {
+        self.materialized_objects
+            .borrow_mut()
+            .retain(|materialized| materialized.frame != frame);
     }
 
     /// Gives the code its id among all code the VM installed, and the bytes that invalidate it.
@@ -182,6 +265,17 @@ impl JitCode {
     pub fn with_osr_outer_loop_back_edges(mut self, osr_outer_loop_back_edges: Vec<u32>) -> Self {
         self.osr_outer_loop_back_edges = osr_outer_loop_back_edges;
         self
+    }
+
+    pub fn with_uncaught_handlers(mut self, uncaught_handlers: Vec<u32>) -> Self {
+        self.uncaught_handlers = uncaught_handlers;
+        self
+    }
+
+    /// Whether the handler whose `Catch` is at `pc` has no catch entry only because it never caught an exception
+    /// before the compile, so that a compile now would give it one.
+    pub fn compiled_before_handler_caught(&self, pc: u32) -> bool {
+        self.uncaught_handlers.contains(&pc)
     }
 
     pub fn id(&self) -> u64 {
@@ -206,6 +300,9 @@ impl JitCode {
         self.entry
     }
 
+    /// The entry at `pc` for a frame whose memory holds every value live there: an on-stack replacement entry at a
+    /// loop back edge, the resume entry at a continuation of a generator's suspension, or the catch entry after the
+    /// `Catch` of an exception handler.
     pub fn osr_entry(&self, pc: u32) -> Option<JitEntry> {
         self.osr_entries
             .iter()
@@ -256,6 +353,9 @@ unsafe impl Trace for JitCode {
         for cell in &self.embedded_cells {
             visitor.visit(*cell);
         }
+        for materialized in self.materialized_objects.borrow().iter() {
+            visitor.visit(materialized.object);
+        }
         for executable in &self.snapshot_executables {
             visitor.visit(executable.executable);
             if let Some(function) = executable.function {
@@ -276,6 +376,11 @@ pub struct ExecutableJitState {
     builtin_exit_sites: RefCell<Vec<(u64, u32, ExitKind)>>,
     /// How often the executable's code was discarded.
     discard_count: Cell<u32>,
+    /// How often in a row the executable's code was discarded without its exits having been at a site the code did not
+    /// know of, so that a recompile would learn nothing from them.
+    fruitless_discard_count: Cell<u32>,
+    /// Whether exits of the executable's code recorded a site it did not know of since its code was last discarded.
+    learned_exit_site: Cell<bool>,
     /// Whether the executable is refused once its discarded code is detached, because it was refused while frames
     /// still ran that code (see `refuse_jit_compile_once_detached()`).
     refused_once_detached: Cell<bool>,
@@ -303,8 +408,16 @@ pub const EXIT_COUNT_BEFORE_DISCARD: u32 = 10;
 /// costs more than code that exits as often elsewhere.
 pub const EXIT_COUNT_BEFORE_DISCARD_FROM_LOOP: u32 = 5;
 
-/// An executable whose code was discarded this often is not compiled again.
-pub const MAX_DISCARD_COUNT: u32 = 8;
+/// An executable whose code was discarded this often in a row without its exits teaching it anything is not compiled
+/// again. Discards after exits at sites the code did not know of make progress: each site is recorded once, and
+/// recompiles no longer speculate there, so code that keeps reaching new paths (like a dispatcher whose program moves
+/// on to new phases) keeps being compiled.
+pub const MAX_FRUITLESS_DISCARD_COUNT: u32 = 8;
+
+/// An executable whose code was discarded this often, whatever its exits taught it, is not compiled again either: each
+/// recompile compiles the whole executable, so code that keeps reaching new sites would otherwise cost compile time
+/// without bound.
+pub const MAX_DISCARD_COUNT: u32 = 64;
 
 impl Executable {
     pub fn jit_compile_state(&self) -> CompileState {
@@ -315,19 +428,14 @@ impl Executable {
         self.head.jit_compile_state.set(state as u8);
     }
 
-    /// The VM whose heap the executable lives in.
-    fn heap_vm(&self) -> &Vm {
-        Vm::of_cell(self)
-    }
-
-    /// The executable's slot in the JIT entry table and the table, if it has one.
-    fn jit_entry_table_slot(&self) -> Option<(&JitEntryTable, u32)> {
+    /// The executable's slot in the JIT entry table of `vm`, the VM whose heap the executable lives in, and the table,
+    /// if it has one.
+    fn jit_entry_table_slot<'vm>(&self, vm: &'vm Vm) -> Option<(&'vm JitEntryTable, u32)> {
         let slot = self.head.jit_entry_slot.get();
         if slot & JIT_ENTRY_SLOT_MASK == NO_JIT_ENTRY_SLOT {
             return None;
         }
-        let table = self
-            .heap_vm()
+        let table = vm
             .jit
             .entry_table
             .as_ref()
@@ -368,15 +476,15 @@ impl Executable {
         drop(code);
     }
 
-    /// The executable's attached JIT code, if any.
-    pub fn jit_code(&self) -> Option<&JitCode> {
-        let (table, slot) = self.jit_entry_table_slot()?;
+    /// The executable's attached JIT code, if any. `vm` is the VM whose heap the executable lives in.
+    pub fn jit_code<'vm>(&self, vm: &'vm Vm) -> Option<&'vm JitCode> {
+        let (table, slot) = self.jit_entry_table_slot(vm)?;
         table.code(slot)
     }
 
     /// Visits the cells the executable's attached JIT code keeps alive.
     pub fn trace_jit_code(&self, visitor: &mut Visitor) {
-        if let Some(code) = self.jit_code() {
+        if let Some(code) = self.jit_code(Vm::of_cell(self)) {
             code.trace(visitor);
         }
     }
@@ -385,33 +493,53 @@ impl Executable {
         self.jit_state().exit_sites.borrow().clone()
     }
 
-    pub fn add_jit_exit_site(&self, site: (u32, ExitKind)) {
+    pub fn jit_exit_site_count(&self) -> usize {
+        self.jit_state().exit_sites.borrow().len()
+    }
+
+    /// Records a site where JIT code exited, and returns its index among the sites.
+    pub fn add_jit_exit_site(&self, site: (u32, ExitKind)) -> usize {
         let mut sites = self.jit_state().exit_sites.borrow_mut();
-        if !sites.contains(&site) {
-            sites.push(site);
+        if let Some(index) = sites.iter().position(|recorded| *recorded == site) {
+            return index;
         }
+        sites.push(site);
+        sites.len() - 1
     }
 
     pub fn jit_builtin_exit_sites(&self) -> Vec<(u64, u32, ExitKind)> {
         self.jit_state().builtin_exit_sites.borrow().clone()
     }
 
-    pub fn add_jit_builtin_exit_site(&self, site: (u64, u32, ExitKind)) {
+    pub fn jit_builtin_exit_site_count(&self) -> usize {
+        self.jit_state().builtin_exit_sites.borrow().len()
+    }
+
+    /// Records a site where JIT code exited in an inlined builtin, and returns its index among those sites.
+    pub fn add_jit_builtin_exit_site(&self, site: (u64, u32, ExitKind)) -> usize {
         let mut sites = self.jit_state().builtin_exit_sites.borrow_mut();
-        if !sites.contains(&site) {
-            sites.push(site);
+        if let Some(index) = sites.iter().position(|recorded| *recorded == site) {
+            return index;
         }
+        sites.push(site);
+        sites.len() - 1
     }
 
     pub fn jit_discard_count(&self) -> u32 {
         self.jit_state().discard_count.get()
     }
 
+    /// Notes that an exit of the executable's installed code was at a site the code did not know of, which a
+    /// recompile learns from (see `MAX_FRUITLESS_DISCARD_COUNT`).
+    pub fn note_learned_jit_exit_site(&self) {
+        self.jit_state().learned_exit_site.set(true);
+    }
+
     /// Makes new frames of the executable run in its JIT code. Frames of it that run in the interpreter count down
     /// `tier_up_budget` from here, and continue in the code at an on-stack replacement entry once it runs out.
-    pub fn install_jit_code(&self, code: Box<JitCode>, tier_up_budget: i32) {
+    pub fn install_jit_code(&self, vm: &Vm, code: Box<JitCode>, tier_up_budget: i32) {
         let (table, slot) = self
-            .jit_entry_table_slot()
+            .jit_entry_table_slot(vm)
             .expect("only executables with a JIT entry slot are compiled");
         table.set_entry(slot, Some(code.entry() as *const c_void));
         assert!(table.set_code(slot, Some(code)).is_none());
@@ -423,7 +551,7 @@ impl Executable {
     /// anymore (see `detach_discarded_jit_code_if_unused()`). The executable may be compiled again later.
     pub fn discard_jit_code(&self, vm: &Vm) {
         assert_eq!(self.jit_compile_state(), CompileState::Installed);
-        let (table, slot) = self.jit_entry_table_slot().expect("the code is attached");
+        let (table, slot) = self.jit_entry_table_slot(vm).expect("the code is attached");
         table.set_entry(slot, None);
         self.set_jit_compile_state(CompileState::Discarding);
         if self.detach_discarded_jit_code_if_unused(vm) {
@@ -473,7 +601,7 @@ impl Executable {
     /// Drops the executable's discarded code, which no frame runs anymore.
     fn detach_jit_code(&self, vm: &Vm) {
         let state = self.jit_state();
-        let (table, slot) = self.jit_entry_table_slot().expect("the code is attached");
+        let (table, slot) = self.jit_entry_table_slot(vm).expect("the code is attached");
         drop(table.set_code(slot, None));
         vm.jit.count_coverage("discard");
         let discard_count = state.discard_count.get() + 1;
@@ -484,7 +612,17 @@ impl Executable {
                 super::describe_executable(self)
             );
         }
-        if discard_count >= MAX_DISCARD_COUNT || state.refused_once_detached.get() {
+        if state.learned_exit_site.replace(false) {
+            state.fruitless_discard_count.set(0);
+        } else {
+            state
+                .fruitless_discard_count
+                .set(state.fruitless_discard_count.get() + 1);
+        }
+        if discard_count >= MAX_DISCARD_COUNT
+            || state.fruitless_discard_count.get() >= MAX_FRUITLESS_DISCARD_COUNT
+            || state.refused_once_detached.get()
+        {
             super::tier_up::refuse_jit_compile(vm, self);
             return;
         }

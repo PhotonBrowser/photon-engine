@@ -47,7 +47,7 @@ public:
         DisplayListRasterCache&,
         Compositing::ScrollStateSnapshot const&,
         RefPtr<Gfx::PaintingSurface>,
-        Compositing::CanvasSurfaceRegistry const*,
+        Compositing::OwnedCanvasSurfaces const*,
         Compositing::CompositedContextResolver const*);
 
     void flush(Gfx::PaintingSurface&) override;

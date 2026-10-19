@@ -132,9 +132,12 @@ pub fn compile_for<M: asm::PortableMacroAssembler>(
         },
         osr_loop_back_edges: graph.osr_loop_back_edges,
         osr_outer_loop_back_edges: graph.osr_outer_loop_back_edges,
+        uncaught_handlers: graph.uncaught_handlers,
         embedded_cells: graph.embedded_cells,
         dependencies: graph.dependencies,
         invalidation_patches: generated.invalidation_patches,
+        site_index_frame_offset: generated.site_index_frame_offset,
+        register_dump_frame_offset: generated.register_dump_frame_offset,
         dump,
     })
 }

@@ -234,6 +234,16 @@ impl RetainedState {
                 {
                     continue;
                 }
+                let sheet = self.program.rule_sheet(rule);
+                if !self.programs.get(selector_program).can_leave_its_scope()
+                    && !changed_sheets.contains(&sheet)
+                    && !self
+                        .program
+                        .sheet_rules_apply_in_scope(sheet, self.tree.tree_scope(node))
+                {
+                    self.counters.bump(Counter::ScopeConfinedRoutesSkipped);
+                    continue;
+                }
                 let path = routing.path_of(route);
                 if !is_arrival
                     && point.anchor.is_none()
@@ -1716,6 +1726,64 @@ impl RetainedState {
                             false => count - 1,
                         };
                         name(self, at);
+                    }
+                }
+                false
+                    if nth.of_type
+                        && nth.step == 0
+                        && nth.offset >= 1
+                        && !change.has_unidentified_type
+                        && change.last_relocation.is_none() =>
+                {
+                    // The same bound holds within each subsequence of one type, whose count moved by
+                    // at most as much as the whole sequence did. Only the types that joined or left
+                    // moved at all, so their children are counted from the end the test counts from,
+                    // which stops once every such type is past the highest count that can have
+                    // crossed. A child whose type is unknown could be of any of them, which leaves
+                    // the moved side as the bound.
+                    let offset = nth.offset as usize;
+                    let lowest = offset.saturating_sub(change.departures as usize).max(1);
+                    let highest = offset.saturating_add(change.arrivals as usize);
+                    let mut counts: SmallVec<[usize; 4]> = smallvec::smallvec![0; change.changed_types.len()];
+                    let mut types_past_highest = 0;
+                    let mut crossing: SmallVec<[usize; 8]> = SmallVec::new();
+                    let mut bounded = true;
+                    for step in 0..children.len() {
+                        if types_past_highest == counts.len() {
+                            break;
+                        }
+                        let at = match nth.from_end {
+                            true => children.len() - 1 - step,
+                            false => step,
+                        };
+                        let child = children[at];
+                        let tag = self.facts.tag_of_node(child);
+                        if tag.is_none() {
+                            bounded = false;
+                            break;
+                        }
+                        let child_type = (tag, self.facts.namespace_of(child));
+                        let Some(type_index) = change.changed_types.iter().position(|&changed| changed == child_type)
+                        else {
+                            continue;
+                        };
+                        counts[type_index] += 1;
+                        let count = counts[type_index];
+                        if count == highest + 1 {
+                            types_past_highest += 1;
+                        }
+                        if (lowest..=highest).contains(&count) {
+                            crossing.push(at);
+                        }
+                    }
+                    if bounded {
+                        for at in crossing {
+                            name(self, at);
+                        }
+                    } else {
+                        for at in moved.clone() {
+                            name(self, at);
+                        }
                     }
                 }
                 false => {

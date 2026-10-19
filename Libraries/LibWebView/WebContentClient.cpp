@@ -39,6 +39,7 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
+#include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -284,6 +285,7 @@ void WebContentClient::close_page_of_closed_tab(Web::PageId page_id)
         // e.g. because the user requested a forced close.
         if (page->needs_beforeunload_check())
             page->set_detached_close_pending(false);
+        PictureInPictureManager::the().close_window_and_its_page(*page);
         page->close();
     }
     // Forgotten once the page is closed, so nothing registers it again.
@@ -484,10 +486,10 @@ void WebContentClient::replay_compositor_view_state_after_reconnect(Badge<Applic
         if (!m_compositor_contexts.contains(context_id))
             continue;
         auto& view = page->view();
-        Application::the().update_compositor_viewport(context_id, view.viewport_size().to_type<int>());
+        Application::the().update_compositor_viewport(context_id, view.viewport_size().to_type<int>(), view.device_pixel_ratio());
         Application::the().update_compositor_display_metadata(context_id, view.display_id(), view.maximum_frames_per_second());
         Application::the().update_compositor_context_visibility(context_id, view.traversable().system_visibility_state());
-        view.update_paused_debugger_overlay();
+        view.update_ui_overlays();
     }
 }
 
@@ -509,10 +511,19 @@ void WebContentClient::did_lose_process()
     struct LostPage {
         NonnullRefPtr<WebContentPage> page;
         Optional<u64> view_id;
+        // An owned view has no tab of its own to recover, so its owner decides what becomes of it, and the owner's
+        // crash screen is the one that offers the crash report.
+        bool shows_crash_screen { false };
     };
     Vector<LostPage> lost_pages;
     for_each_page([&](WebContentPage& page) {
-        lost_pages.append({ page, page.displays_tab() ? Optional<u64> { page.view().view_id() } : Optional<u64> {} });
+        LostPage lost { page, {} };
+        if (page.displays_tab()) {
+            auto const& view = page.view();
+            lost.view_id = view.view_id();
+            lost.shows_crash_screen = !view.owner_view_id().has_value();
+        }
+        lost_pages.append(move(lost));
         return IterationDecision::Continue;
     });
 
@@ -543,12 +554,14 @@ void WebContentClient::did_lose_process()
     for (auto const& lost : lost_pages) {
         if (!lost.view_id.has_value())
             continue;
-        m_crashed_view_ids.append(*lost.view_id);
-        Core::deferred_invoke([view_id = *lost.view_id, crash_reason] {
+        if (lost.shows_crash_screen)
+            m_crashed_view_ids.append(*lost.view_id);
+        Core::deferred_invoke([view_id = *lost.view_id, shows_crash_screen = lost.shows_crash_screen, crash_reason] {
             auto view = ViewImplementation::find_view_by_id(view_id);
             if (!view.has_value())
                 return;
-            view->handle_web_content_process_crash();
+            if (shows_crash_screen)
+                view->handle_web_content_process_crash();
             if (view->on_web_content_crashed)
                 view->on_web_content_crashed(crash_reason);
         });
@@ -892,7 +905,8 @@ Vector<u64> WebContentClient::performance_owners() const
         auto const& page = it.value;
         if (!page->is_open())
             continue;
-        auto view_id = page->view().view_id();
+        auto const& view = page->view();
+        auto view_id = view.owner_view_id().value_or(view.view_id());
         if (!owners.contains([&](auto owner) { return owner == view_id; }))
             owners.append(view_id);
     }

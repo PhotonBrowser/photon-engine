@@ -101,6 +101,7 @@
 #include <LibWeb/Painting/HitTestResult.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/Scrolling.h>
+#include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -134,6 +135,14 @@ static Web::ScrollGesturePhase scroll_gesture_phase_from(Bindings::ScrollGesture
         return Web::ScrollGesturePhase::Ended;
     }
     VERIFY_NOT_REACHED();
+}
+
+static double wheel_tick_120ths_from(Optional<double> wheel_ticks, double pixel_delta, Web::WheelDeltaPrecision wheel_delta_precision)
+{
+    static constexpr double wheel_tick_120ths_per_tick = 120;
+    if (wheel_ticks.has_value())
+        return *wheel_ticks * wheel_tick_120ths_per_tick;
+    return Web::wheel_tick_120ths_from_pixel_delta(pixel_delta, wheel_delta_precision);
 }
 
 GC_DEFINE_ALLOCATOR(Internals);
@@ -735,12 +744,14 @@ void Internals::mouse_event_through_ui_process(Bindings::MouseEventThroughUIProc
     send_mouse_events_through_ui_process(move(events), promise);
 }
 
-void Internals::wheel_through_ui_process(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, GC::Ref<WebIDL::Promise> promise)
+void Internals::wheel_through_ui_process(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, Bindings::WheelTicks const& ticks, GC::Ref<WebIDL::Promise> promise)
 {
     auto event = mouse_event_through_ui_process_at(Web::MouseEvent::Type::MouseWheel, x, y);
     event.wheel_delta_x = delta_x;
     event.wheel_delta_y = delta_y;
     event.wheel_delta_precision = wheel_delta_precision_from(precise);
+    event.wheel_tick_120ths_x = wheel_tick_120ths_from(ticks.x, delta_x, event.wheel_delta_precision);
+    event.wheel_tick_120ths_y = wheel_tick_120ths_from(ticks.y, delta_y, event.wheel_delta_precision);
     event.scroll_gesture_phase = scroll_gesture_phase_from(phase);
     Vector<Web::MouseEvent> events;
     events.append(move(event));
@@ -818,6 +829,11 @@ void Internals::mouse_leave()
     this->page().handle_mouseleave();
 }
 
+void Internals::mouse_cancel()
+{
+    this->page().handle_mousecancel();
+}
+
 void Internals::click(double x, double y, WebIDL::UnsignedShort click_count, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers)
 {
     click_and_hold(x, y, click_count, button, modifiers);
@@ -832,7 +848,7 @@ void Internals::click_and_hold(double x, double y, WebIDL::UnsignedShort click_c
     page.handle_mousedown(position, position, mouse_button, 0, modifiers, click_count);
 }
 
-void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase)
+void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, Bindings::WheelTicks const& ticks)
 {
     auto& page = this->page();
 
@@ -840,7 +856,9 @@ void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, doub
     auto scroll_gesture_phase = scroll_gesture_phase_from(phase);
     auto position = page.css_to_device_point({ x, y });
     Optional<AsyncScrollOperation> async_scroll_operation;
-    page.handle_mousewheel(position, position, 0, 0, 0, delta_x, delta_y, wheel_delta_precision, scroll_gesture_phase, false, &async_scroll_operation);
+    auto wheel_tick_120ths_x = wheel_tick_120ths_from(ticks.x, delta_x, wheel_delta_precision);
+    auto wheel_tick_120ths_y = wheel_tick_120ths_from(ticks.y, delta_y, wheel_delta_precision);
+    page.handle_mousewheel(position, position, 0, 0, 0, delta_x, delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, false, &async_scroll_operation);
 
     if (async_scroll_operation.has_value() && async_scroll_operation->navigable) {
         async_scroll_operation->navigable->wait_for_async_scroll_operation(async_scroll_operation->operation_id, promise);
@@ -860,9 +878,9 @@ void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, doub
     WebIDL::wait_for_all(realm, scroll_promises, [resolve](auto const&) { resolve(); }, [resolve](auto) { resolve(); });
 }
 
-void Internals::wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, GC::Ref<WebIDL::Promise> promise)
+void Internals::wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, Bindings::WheelTicks const& ticks, GC::Ref<WebIDL::Promise> promise)
 {
-    wheel(promise, x, y, delta_x, delta_y, precise, phase);
+    wheel(promise, x, y, delta_x, delta_y, precise, phase, ticks);
 }
 
 static JS::Value wrapped_node_with_unique_id(HTML::Window& window, Optional<UniqueNodeID> node_id)
@@ -1052,6 +1070,21 @@ WebIDL::ExceptionOr<bool> Internals::dispatch_user_activated_event(DOM::EventTar
 {
     event.set_is_trusted(true);
     return target.dispatch_event(event);
+}
+
+void Internals::set_navigator_compatibility_mode(Bindings::InternalsNavigatorCompatibilityMode mode)
+{
+    switch (mode) {
+    case Bindings::InternalsNavigatorCompatibilityMode::Chrome:
+        ResourceLoader::the().set_navigator_compatibility_mode(NavigatorCompatibilityMode::Chrome);
+        break;
+    case Bindings::InternalsNavigatorCompatibilityMode::Gecko:
+        ResourceLoader::the().set_navigator_compatibility_mode(NavigatorCompatibilityMode::Gecko);
+        break;
+    case Bindings::InternalsNavigatorCompatibilityMode::Webkit:
+        ResourceLoader::the().set_navigator_compatibility_mode(NavigatorCompatibilityMode::WebKit);
+        break;
+    }
 }
 
 void Internals::spoof_current_url(Utf16String const& url_string)
@@ -1572,6 +1605,11 @@ bool Internals::needs_repaint()
     return local_root && local_root->needs_repaint();
 }
 
+bool Internals::has_animation_frame_callbacks()
+{
+    return window().has_animation_frame_callbacks();
+}
+
 bool Internals::needs_display_list_record()
 {
     Layout::ForcedReadScope read { window().associated_document() };
@@ -1583,6 +1621,16 @@ bool Internals::needs_display_list_record()
 bool Internals::screen_wake_lock_active()
 {
     return page().is_screen_wake_lock_active();
+}
+
+Utf16String Internals::picture_in_picture_window_state()
+{
+    auto const& controller = page().picture_in_picture_controller();
+    if (controller.is_waiting_for_window_to_open())
+        return "opening"_utf16;
+    if (controller.has_open_window())
+        return "open"_utf16;
+    return "none"_utf16;
 }
 
 static Utf16String dump_string_to_utf16(String const& string)
@@ -2706,6 +2754,10 @@ GC::Ptr<JS::Object> Internals::take_context_menu_request()
     object->define_direct_property("kind"_utf16_fly_string, JS::PrimitiveString::create(vm(), context_menu_kind_to_string(request->kind)), JS::default_attributes);
     auto target = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, request->target);
     object->define_direct_property("target"_utf16_fly_string, target, JS::default_attributes);
+    if (request->media.has_value()) {
+        object->define_direct_property("isPictureInPicture"_utf16_fly_string, JS::Value(request->media->is_picture_in_picture), JS::default_attributes);
+        object->define_direct_property("canEnterPictureInPicture"_utf16_fly_string, JS::Value(request->media->can_enter_picture_in_picture), JS::default_attributes);
+    }
     return object;
 }
 
@@ -2797,6 +2849,11 @@ GC::Ref<WebIDL::Promise> Internals::activate_spelling_menu_item(Bindings::Spelli
         WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(menu)));
     }));
     return promise;
+}
+
+void Internals::toggle_media_context_menu_picture_in_picture()
+{
+    page().toggle_media_picture_in_picture_state();
 }
 
 GC::Ptr<JS::Object> Internals::hit_test_result(double x, double y)

@@ -146,6 +146,7 @@
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/SVG/SVGAElement.h>
 #include <LibWeb/SVG/SVGElement.h>
@@ -183,16 +184,16 @@ void Element::RareData::visit_edges(Cell::Visitor& visitor)
                 [&](CustomElementCallbackReaction const& callback_reaction) {
                     visitor.visit(callback_reaction.callback);
                     callback_reaction.arguments.visit(
-                        [](Empty) {},
+                        [](Empty) { },
                         [&](CustomElementAdoptedCallbackReactionArguments const& adopted_arguments) {
                             visitor.visit(adopted_arguments.old_document);
                             visitor.visit(adopted_arguments.new_document);
                         },
-                        [&](CustomElementAttributeChangedCallbackReactionArguments const&) {},
+                        [&](CustomElementAttributeChangedCallbackReactionArguments const&) { },
                         [&](CustomElementFormAssociatedCallbackReactionArguments const& form_associated_arguments) {
                             visitor.visit(form_associated_arguments.form);
                         },
-                        [&](CustomElementFormDisabledCallbackReactionArguments const&) {});
+                        [&](CustomElementFormDisabledCallbackReactionArguments const&) { });
                 },
                 [&](CustomElementConnectedMoveCallbackReaction const& connected_move_reaction) {
                     visitor.visit(connected_move_reaction.disconnected_callback);
@@ -2448,6 +2449,26 @@ void Element::apply_display_none_change(Layout::BegunRead const& read, DisplayNo
         clear_computed_styles_from_display_none_descendants(read);
 }
 
+bool Element::has_referenceable_svg_descendant() const
+{
+    bool found = false;
+    // NB: The traversal only reads the subtree.
+    const_cast<Element&>(*this).for_each_shadow_including_descendant([&found](auto const& node) {
+        auto const* element = as_if<Element>(node);
+        if (!element)
+            return TraversalDecision::Continue;
+        // NB: A resource keeps its style, and so do the elements it inherits from, so an unstyled subtree holds none.
+        if (!element->has_style())
+            return TraversalDecision::SkipChildrenAndContinue;
+        if (auto const* svg_element = as_if<SVG::SVGElement>(*element); svg_element && svg_element->is_referenceable_in_display_none_subtree()) {
+            found = true;
+            return TraversalDecision::Break;
+        }
+        return TraversalDecision::Continue;
+    });
+    return found;
+}
+
 void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunRead const& read)
 {
     for_each_shadow_including_descendant([&read](auto& node) {
@@ -2473,7 +2494,7 @@ void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunR
         //     Restore their styles in this style update, so painting never needs to materialize
         //     styles for referenced resources. The engine still holds their records and settles
         //     the reaction from them.
-        if (element->is_svg_element())
+        if (auto const* svg_element = as_if<SVG::SVGElement>(*element); svg_element && svg_element->is_referenceable_in_display_none_subtree())
             element->document().style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 
         element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
@@ -3310,9 +3331,15 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
                 pseudo_element.publish_scroll_offset();
         });
     }
-    // A newly minted identity holds none of what the element held under its previous one.
-    if (style_node_id != 0 && !!m_installed_style.record())
-        CSS::StyleEngineFFI::style_engine_set_held_style_record(style_engine.host(), style_node_id, m_installed_style.record().value());
+    // A newly minted identity holds none of what the element and its pseudo-elements held under its previous one.
+    if (style_node_id != 0) {
+        if (!!m_installed_style.record())
+            CSS::StyleEngineFFI::style_engine_set_held_style_record(style_engine.host(), style_node_id, m_installed_style.record().value());
+        for_each_synthetic_pseudo_element([&](CSS::PseudoElement type, SyntheticPseudoElement const& pseudo_element) {
+            if (auto style_record = pseudo_element.style_record_identity(); !!style_record)
+                CSS::StyleEngineFFI::style_engine_set_held_pseudo_style_record(style_engine.host(), style_node_id, to_underlying(type), style_record.value());
+        });
+    }
     if (style_node_id != 0)
         publish_children_explicitly_inherit_mark();
 }
@@ -5356,6 +5383,11 @@ void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
         layout_node->set_style_record_identity(m_installed_style, held_before);
     if (style_node_id() != 0)
         CSS::StyleEngineFFI::style_engine_set_held_style_record(document().style_computer().style_engine().host(), style_node_id(), style_record_identity.value());
+    // Children that wait to arrive in a display:none subtree may be revealed as the subtree's root, or an element
+    // between it and them, stops being display:none.
+    if ((child_style_arrivals_wait() || descendant_style_arrival_pending()) && m_installed_style && !m_installed_style.display_is_none()
+        && (!held_before || held_before.display_is_none()))
+        CSS::record_waiting_children_may_be_revealed(*this);
     // The resources an SVG graphics element's `mask`, `clip-path`, `fill` and `stroke` name are published beside its
     // attributes for the layout tree build to resolve, so they follow every record the element takes.
     if (is<SVG::SVGGraphicsElement>(*this) && !!style_record_identity)
@@ -6415,6 +6447,8 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
 
         if (old_style_engine_classes.has_value())
             CSS::record_element_class_list_changed(*this, *old_style_engine_classes, m_classes);
+        else if (is_connected())
+            CSS::record_waiting_element_classes_changed(*this);
     } else if (local_name == HTML::AttributeNames::style) {
         // https://drafts.csswg.org/cssom/#ref-for-cssstyledeclaration-updating-flag
         if (m_inline_style && m_inline_style->is_updating())
@@ -6949,6 +6983,24 @@ void Element::set_fullscreen_flag(bool is_fullscreen)
         return;
     m_fullscreen_flag = is_fullscreen;
     CSS::record_element_state_changed(*this, CSS::PseudoClass::Fullscreen, is_fullscreen);
+
+    // https://w3c.github.io/picture-in-picture/#fullscreen
+    // It is RECOMMENDED that when a Picture-in-Picture element's fullscreen flag is set, the user agent runs these
+    // steps:
+    // AD-HOC: These steps are from the overhaul proposed in https://github.com/w3c/picture-in-picture/pull/260.
+    if (is_fullscreen && is_picture_in_picture_element()) {
+        // 1. Let doc be the Picture-in-Picture element's node document.
+        auto& document = this->document();
+
+        // 2. Enqueue the following steps to doc's picture-in-picture parallel queue:
+        //    1. Run the exit Picture-in-Picture algorithm given doc and null.
+        document.page().picture_in_picture_controller().enqueue_exit(document, nullptr);
+    }
+}
+
+bool Element::is_picture_in_picture_element() const
+{
+    return document().picture_in_picture_element().ptr() == this;
 }
 
 void Element::set_fullscreen_request_type(Fullscreen::RequestType request_type)

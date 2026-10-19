@@ -230,7 +230,7 @@ void CompositorState::commit_placeholder_canvas(Compositing::CanvasId canvas_id,
         if (!placeholder.surface || placeholder.surface->size() != source_surface->size())
             placeholder.surface = Gfx::PaintingSurface::create_with_size(source_surface->size(), Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, m_skia_backend_context);
         placeholder.surface->copy_from_surface(*source_surface);
-        m_canvas_surface_registry.set_canvas_surface(canvas_id, *placeholder.surface);
+        m_canvas_surface_registry.set_canvas_surface(placeholder.owner->canvas_surface_owner_id(), canvas_id, *placeholder.surface);
     } else {
         placeholder.surface = nullptr;
         m_canvas_surface_registry.remove_canvas_surface(canvas_id);
@@ -262,7 +262,7 @@ void CompositorState::create_context(Web::CompositorContextId context_id, Option
         VERIFY(context_id == Web::compositor_context_id_for_page(*page_id));
 
     auto& context = *m_contexts.ensure(context_id, [&] {
-        return make<ContextState>(context_id, page_id, web_content_client, m_canvas_surface_registry, [this, context_id](Gfx::IntRect damage_rect) {
+        return make<ContextState>(context_id, page_id, web_content_client, Compositing::OwnedCanvasSurfaces { m_canvas_surface_registry, web_content_client.canvas_surface_owner_id() }, [this, context_id](Gfx::IntRect damage_rect) {
             schedule_caret_repaint(context_id, damage_rect);
         });
     });
@@ -297,7 +297,13 @@ void CompositorState::set_parent_context(Web::CompositorContextId context_id, Op
     if (parent_context_id.has_value()) {
         VERIFY(!context->presents_to_client());
         VERIFY(*parent_context_id != context_id);
-        VERIFY(context_if_present(*parent_context_id));
+        // The parent's context belongs to the process hosting the parent, which can destroy it before this context's
+        // process hears that the parent is gone. The context is left without a parent then, as destroying the parent
+        // would have left it.
+        // NB: The UI process creates a context here before it hands the context's ID out, so a parent this doesn't know
+        //     has been destroyed.
+        if (!context_if_present(*parent_context_id))
+            parent_context_id = {};
     }
 
     auto current_parent_context_id = context->parent_context_id();
@@ -825,15 +831,20 @@ void CompositorState::publish_pending_async_scroll_updates(Web::CompositorContex
     context.web_content_client().async_scroll_updates(context_id, context.take_pending_async_scroll_updates());
 }
 
-void CompositorState::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void CompositorState::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     auto* context = context_if_present(context_id);
     if (!context)
         return;
 
-    context->viewport_size_updated(viewport_size, window_resize_in_progress);
+    auto only_the_pixel_ratio_changed = viewport_size == context->presenter().viewport_size() && device_pixel_ratio != context->presenter().device_pixel_ratio();
+    context->viewport_size_updated(viewport_size, device_pixel_ratio, window_resize_in_progress);
     resize_backing_stores_if_needed(context_id, *context);
-    if (context->presenter().paused_debugger_overlay_visible()) {
+
+    // The paused debugger's page will not paint again. Any other page's next frame damages the whole viewport when its
+    // size changes, but a new pixel ratio alone need not damage the overlays.
+    auto const& overlays = context->presenter().ui_overlays();
+    if (overlays.paused_debugger.has_value() || (only_the_pixel_ratio_changed && overlays.picture_in_picture_controls.has_value())) {
         if (auto viewport_rect = context->presenter().viewport_rect_for_ui_overlay(); viewport_rect.has_value())
             schedule_present_frame(context_id, *context, *viewport_rect);
     }
@@ -841,12 +852,12 @@ void CompositorState::viewport_size_updated(Web::CompositorContextId context_id,
         schedule_backing_store_shrink(context_id, *context);
 }
 
-void CompositorState::set_paused_debugger_overlay(Web::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<Compositing::PausedDebuggerOverlayAction> hovered_action)
+void CompositorState::set_ui_overlays(Web::CompositorContextId context_id, Compositing::UIOverlays overlays)
 {
     auto* context = context_if_present(context_id);
     if (!context)
         return;
-    if (!context->set_paused_debugger_overlay(visible, device_pixel_ratio, move(font_family), hovered_action))
+    if (!context->set_ui_overlays(move(overlays)))
         return;
 
     if (auto viewport_rect = context->presenter().viewport_rect_for_ui_overlay(); viewport_rect.has_value())
@@ -984,7 +995,7 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
             presentation_signal_value = metal_context.next_presentation_signal_value();
     }
 #endif
-    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, presentation_signal_value, frame_paint_started_at, frame_paint_duration_microseconds, 0);
+    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, prepared_frame->device_pixel_ratio, presentation_signal_value, frame_paint_started_at, frame_paint_duration_microseconds, 0);
     auto* pending_present = &m_pending_async_presents.last();
     bool publish_before_gpu_completion = context.presents_to_client()
         && presentation_signal_value != 0
@@ -1041,7 +1052,7 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
         VERIFY(m_client);
         if (photon_frame_trace_enabled())
             dbgln("[Compositor] frame_submitted_to_client context={} bitmap={} signal={} at_ns={}", context_id, prepared_frame->bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds());
-        m_client->did_present_frame(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, presentation_signal_value);
+        m_client->did_present_frame(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, prepared_frame->device_pixel_ratio, presentation_signal_value);
     }
 }
 
@@ -1181,6 +1192,8 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id, 
                 context.presenter().queue_present_frame(PendingFrame::repainting_changes(*animation_frame));
             if (auto rebound_frame = context.advance_elastic_overscroll_rebounds(frame_time); rebound_frame.has_value())
                 context.presenter().queue_present_frame(PendingFrame::repainting_changes(*rebound_frame));
+            if (auto fade_frame = context.presenter().advance_ui_overlay_fades(frame_time); fade_frame.has_value())
+                context.presenter().queue_present_frame(*fade_frame);
         }
 
         // A render clock tick goes to the process's render clock thread, beside what its main thread is doing, with
@@ -1274,6 +1287,7 @@ void CompositorState::did_finish_async_present(PendingAsyncPresent& pending_pres
     if (photon_frame_trace_enabled())
         dbgln("[Compositor] gpu_present_complete context={} bitmap={} signal={} at_ns={} gpu_us={}", context_id, bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds(), pending_present.gpu_completion_microseconds);
     auto was_published_before_gpu_completion = pending_present.published_before_gpu_completion;
+    auto device_pixel_ratio = pending_present.device_pixel_ratio;
     auto was_cancelled = pending_present.was_cancelled;
     (void)m_pending_async_presents.remove(pending_present_iterator);
     if (m_pending_async_presents.is_empty() && m_gpu_completion_timer)
@@ -1292,7 +1306,7 @@ void CompositorState::did_finish_async_present(PendingAsyncPresent& pending_pres
         VERIFY(m_client);
         if (photon_frame_trace_enabled())
             dbgln("[Compositor] frame_submitted_to_client context={} bitmap={} signal={} at_ns={} after_gpu=true", context_id, bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds());
-        m_client->did_present_frame(context_id, viewport_rect, damage_rect, bitmap_id, presentation_signal_value);
+        m_client->did_present_frame(context_id, viewport_rect, damage_rect, bitmap_id, device_pixel_ratio, presentation_signal_value);
     }
     resize_backing_stores_if_needed(context_id, *context);
     if (auto parent_context_id = context->parent_context_id(); parent_context_id.has_value()) {

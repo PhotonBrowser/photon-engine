@@ -22,7 +22,12 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static NonnullOwnPtr<HeadlessWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate = IsPrivate::No);
-    static NonnullOwnPtr<HeadlessWebView> create_child(HeadlessWebView&, CanonicalTraversable&);
+    enum class IsOwnedByParent : bool {
+        No,
+        Yes,
+    };
+    static NonnullOwnPtr<HeadlessWebView> create_child(HeadlessWebView&, CanonicalTraversable&, IsOwnedByParent = IsOwnedByParent::No);
+    static NonnullOwnPtr<PictureInPictureWindow> create_picture_in_picture_window(HeadlessWebView& requesting_view, CanonicalTraversable&, Gfx::IntSize video_size);
 
     void reset_viewport_size(Web::DevicePixelSize);
 
@@ -56,7 +61,7 @@ protected:
     HeadlessWebView& adopt_child_web_view(NonnullOwnPtr<HeadlessWebView>);
     void discard_child_web_view(HeadlessWebView&);
     void schedule_forced_close();
-    void prepare_page_for_tab(WebContentPage&) override;
+    void prepare_page_for_navigable(WebContentPage&) override;
     void send_system_theme_to_page(WebContentPage&) override;
     void update_zoom() override;
     ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) override;

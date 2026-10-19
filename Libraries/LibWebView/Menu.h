@@ -58,6 +58,7 @@ enum class ActionID {
     ToggleBookmark,
     ToggleBookmarkViaToolbar,
     ToggleBookmarksBar,
+    ShowBookmarksBar,
     BookmarkItem,
 
     OpenAllBookmarksInTabs,
@@ -97,6 +98,8 @@ enum class ActionID {
     ToggleMediaLoopState,
     EnterFullscreen,
     ExitFullscreen,
+    EnterPictureInPicture,
+    ExitPictureInPicture,
 
     ZoomIn,
     ZoomOut,
@@ -260,7 +263,7 @@ public:
             item.visit(
                 [&](NonnullRefPtr<Action>& action) { callback(*action); },
                 [&](NonnullRefPtr<Menu>& submenu) { submenu->for_each_action(callback); },
-                [&](Separator) {});
+                [&](Separator) { });
         }
     }
 

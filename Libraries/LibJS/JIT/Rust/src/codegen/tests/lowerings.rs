@@ -13,6 +13,7 @@ use crate::builder::OperationInput;
 use crate::bytecode::EnvironmentCoordinate;
 use crate::ir::BinaryOp;
 use crate::ir::Comparison;
+use crate::ir::Float64Function;
 use crate::snapshot::KeyedFeedbackSnapshot;
 use crate::snapshot::keyed_feedback_bits;
 
@@ -265,9 +266,16 @@ fn marker_runtime() -> RuntimeInfo {
         O::CallBuiltinMathCeil,
         O::CallBuiltinMathRound,
         O::CallBuiltinMathSqrt,
+        O::CallBuiltinMathExp,
+        O::CallBuiltinMathLog,
+        O::CallBuiltinMathSin,
+        O::CallBuiltinMathCos,
+        O::CallBuiltinMathTan,
+        O::CallBuiltinMathPow,
     ] {
         set(opcode, marker_scalar as *const () as u64);
     }
+    runtime.float64_functions = crate::snapshot::Float64FunctionAddresses(fake_float64_function);
     for opcode in [O::ObjectPropertyIteratorNext, O::ResolveThisBinding, O::CreateVariable] {
         set(opcode, marker_put as *const () as u64);
     }
@@ -1216,11 +1224,22 @@ fn fake_object_layout() -> RuntimeLayout {
         builtin_math_ceil: 11,
         builtin_math_round: 12,
         builtin_math_sqrt: 13,
+        builtin_math_exp: 14,
+        builtin_math_log: 15,
+        builtin_math_sin: 16,
+        builtin_math_cos: 17,
+        builtin_math_tan: 18,
+        builtin_math_pow: 19,
         typeof_strings: crate::snapshot::TypeofStrings::default(),
         fly_string_cache: 0,
         fly_string_cache_mask: 0,
         numeric_string_cache: 0,
         numeric_string_cache_size: 0,
+        large_numeric_string_cache: 0,
+        large_numeric_string_cache_mask: 0,
+        large_numeric_string_cache_entry_size: 0,
+        large_numeric_string_cache_number: 0,
+        large_numeric_string_cache_string: 0,
         environment_outer: 16,
         environment_declarative: 13,
         module_environment_class: MODULE_ENVIRONMENT_CLASS,
@@ -1229,6 +1248,9 @@ fn fake_object_layout() -> RuntimeLayout {
         array_iterator_index: 0,
         array_iterator_kind: 0,
         array_iterator_kind_value: 0,
+        generator_object_class: 0,
+        generator_object_pending_completion_value: 0,
+        generator_object_pending_completion_type: 0,
         declarative_environment_binding_values_size: 32,
         declarative_environment_binding_values_capacity: 40,
         environment_shape_binding_names: 48,
@@ -3395,6 +3417,191 @@ fn math_builtin_calls() {
     }
 }
 
+extern "C" fn fake_exp(number: f64) -> f64 {
+    number.exp()
+}
+
+extern "C" fn fake_log(number: f64) -> f64 {
+    number.ln()
+}
+
+extern "C" fn fake_sin(number: f64) -> f64 {
+    number.sin()
+}
+
+extern "C" fn fake_cos(number: f64) -> f64 {
+    number.cos()
+}
+
+extern "C" fn fake_tan(number: f64) -> f64 {
+    number.tan()
+}
+
+extern "C" fn fake_pow(base: f64, exponent: f64) -> f64 {
+    base.powf(exponent)
+}
+
+fn fake_float64_function(function: Float64Function) -> u64 {
+    let function: *const () = match function {
+        Float64Function::Exp => fake_exp as *const (),
+        Float64Function::Log => fake_log as *const (),
+        Float64Function::Sin => fake_sin as *const (),
+        Float64Function::Cos => fake_cos as *const (),
+        Float64Function::Tan => fake_tan as *const (),
+        Float64Function::Pow => fake_pow as *const (),
+    };
+    function as u64
+}
+
+#[test]
+fn math_function_calls() {
+    type Reference = fn(f64, f64) -> f64;
+    let functions: [(u8, Reference); 6] = [
+        (14, |number, _| number.exp()),
+        (15, |number, _| number.ln()),
+        (16, |number, _| number.sin()),
+        (17, |number, _| number.cos()),
+        (18, |number, _| number.tan()),
+        (19, f64::powf),
+    ];
+    // NB: Where the code exited before, it calls the slow path instead.
+    let call_with = |builtin: u8, callee: u64, argument0: u64, argument1: u64, exited: bool| {
+        let instruction = match builtin {
+            14 => Instruction::CallBuiltinMathExp {
+                call_feedback: 0,
+                dst: r(5),
+                callee: argument(0),
+                this_value: argument(0),
+                argument: argument(1),
+                expression_string: None,
+            },
+            15 => Instruction::CallBuiltinMathLog {
+                call_feedback: 0,
+                dst: r(5),
+                callee: argument(0),
+                this_value: argument(0),
+                argument: argument(1),
+                expression_string: None,
+            },
+            16 => Instruction::CallBuiltinMathSin {
+                call_feedback: 0,
+                dst: r(5),
+                callee: argument(0),
+                this_value: argument(0),
+                argument: argument(1),
+                expression_string: None,
+            },
+            17 => Instruction::CallBuiltinMathCos {
+                call_feedback: 0,
+                dst: r(5),
+                callee: argument(0),
+                this_value: argument(0),
+                argument: argument(1),
+                expression_string: None,
+            },
+            18 => Instruction::CallBuiltinMathTan {
+                call_feedback: 0,
+                dst: r(5),
+                callee: argument(0),
+                this_value: argument(0),
+                argument: argument(1),
+                expression_string: None,
+            },
+            _ => Instruction::CallBuiltinMathPow {
+                call_feedback: 0,
+                dst: r(5),
+                callee: argument(0),
+                this_value: argument(0),
+                argument0: argument(1),
+                argument1: argument(2),
+                expression_string: None,
+            },
+        };
+        let program = assemble(|_| {
+            vec![
+                Instruction::Enter,
+                instruction.clone(),
+                Instruction::Return { value: r(5) },
+            ]
+        });
+        let pc = program.offsets[1];
+        let (result, _) = run_program_with_snapshot(
+            &program,
+            &[callee, argument0, argument1],
+            |snapshot| {
+                if exited {
+                    snapshot.executables[0].exit_sites = vec![(pc, ExitKind::SlowPath)];
+                }
+            },
+            |_| {},
+        );
+        if result.status == crate::code::JitStatus::Resume as u64 {
+            return EXITED;
+        }
+        assert_eq!(result.status, RETURNED);
+        result.value
+    };
+    let numbers = [
+        0.0,
+        -0.0,
+        0.5,
+        -0.5,
+        2.0,
+        10.0,
+        -3.25,
+        1e300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    for (builtin, reference) in functions {
+        let callee = fake_function(Some(builtin));
+        // NB: Before any exit at the site, the cases the slow path handles
+        //     exit instead.
+        for exited in [true, false] {
+            let slow = if exited { MARKER } else { EXITED };
+            for number in numbers {
+                for exponent in [3.0, -0.5] {
+                    let expected = box_number(reference(number, exponent));
+                    assert_eq!(
+                        call_with(builtin, callee, number.to_bits(), exponent.to_bits(), exited),
+                        expected,
+                        "builtin {builtin} of {number:?} and {exponent:?}"
+                    );
+                }
+            }
+            for integer in [0, 1, -1, 7, i32::MAX, i32::MIN] {
+                let expected = box_number(reference(f64::from(integer), 2.0));
+                assert_eq!(
+                    call_with(builtin, callee, value::int32(integer), value::int32(2), exited),
+                    expected,
+                    "builtin {builtin} of {integer}"
+                );
+            }
+            // Other callees and arguments take the slow path.
+            let one = value::int32(1);
+            assert_eq!(
+                call_with(builtin, fake_function(Some(builtin - 1)), one, one, exited),
+                slow
+            );
+            assert_eq!(call_with(builtin, fake_function(None), one, one, exited), slow);
+            assert_eq!(call_with(builtin, value::UNDEFINED, one, one, exited), slow);
+            assert_eq!(call_with(builtin, callee, value::UNDEFINED, one, exited), slow);
+            assert_eq!(call_with(builtin, callee, value::TRUE, one, exited), slow);
+        }
+    }
+    // So does an exponent that is no number.
+    let one = value::int32(1);
+    assert_eq!(
+        call_with(19, fake_function(Some(19)), one, value::UNDEFINED, false),
+        EXITED
+    );
+    assert_eq!(
+        call_with(19, fake_function(Some(19)), one, value::UNDEFINED, true),
+        MARKER
+    );
+}
+
 /// The fake string `string`, with its length set to `length`.
 fn with_length(string: u64, length: u32) -> u64 {
     let address = (string & 0xFFFF_FFFF_FFFF) as *mut u64;
@@ -3473,6 +3680,17 @@ fn short_string_concatenations_through_the_fly_string_cache() {
     let numbers: &'static mut [u64; 10] = Box::leak(Box::new([0; 10]));
     numbers[7] = fake_string_of_length(1, short_string_word(b"7")) & ((1 << 48) - 1);
     let numbers_address = numbers.as_ptr() as u64;
+    // The VM's cache of the strings of larger integers, entries of the
+    // integer and its string: only 1000 has one, in the entry of 1004 too.
+    let a1000 = short_string_word(b"a1000");
+    let cached_a1000 = fake_string_of_length(5, a1000);
+    cache[(murmur3_finalizer(a1000) & 1023) as usize] = cached_a1000 & ((1 << 48) - 1);
+    let large_numbers: &'static mut [[u64; 2]; 4] = Box::leak(Box::new([[0; 2]; 4]));
+    large_numbers[0] = [
+        1000,
+        fake_string_of_length(4, short_string_word(b"1000")) & ((1 << 48) - 1),
+    ];
+    let large_numbers_address = large_numbers.as_ptr() as u64;
     let concatenate = |lhs: u64, rhs: u64| {
         let program = assemble(|_| {
             vec![
@@ -3498,11 +3716,17 @@ fn short_string_concatenations_through_the_fly_string_cache() {
                     rhs_offset: 40,
                     length_offset: 16,
                     min_length: 8,
+                    slow_path: 0,
                 };
                 snapshot.runtime.layout.fly_string_cache = cache_address;
                 snapshot.runtime.layout.fly_string_cache_mask = 1023;
                 snapshot.runtime.layout.numeric_string_cache = numbers_address;
                 snapshot.runtime.layout.numeric_string_cache_size = 10;
+                snapshot.runtime.layout.large_numeric_string_cache = large_numbers_address;
+                snapshot.runtime.layout.large_numeric_string_cache_mask = 3;
+                snapshot.runtime.layout.large_numeric_string_cache_entry_size = 16;
+                snapshot.runtime.layout.large_numeric_string_cache_number = 0;
+                snapshot.runtime.layout.large_numeric_string_cache_string = 8;
                 // ArithFeedback::String and ArithFeedback::Int32.
                 snapshot.executables[0].feedback.arith = vec![1 << 3 | 1];
             },
@@ -3525,6 +3749,9 @@ fn short_string_concatenations_through_the_fly_string_cache() {
     assert_eq!(concatenate(short(b"a"), value::int32(6)), MARKER);
     assert_eq!(concatenate(short(b"a"), value::int32(-7)), MARKER);
     assert_eq!(concatenate(short(b"a"), value::int32(10)), MARKER);
+    assert_eq!(concatenate(short(b"a"), value::int32(1000)), cached_a1000);
+    assert_eq!(concatenate(short(b"a"), value::int32(1004)), MARKER);
+    assert_eq!(concatenate(short(b"a"), value::int32(1001)), MARKER);
 }
 
 #[test]
@@ -3995,4 +4222,100 @@ fn in_of_array_elements() {
     assert_eq!(has(value::int32(-1), holey.value()), MARKER);
     assert_eq!(has(value::UNDEFINED, holey.value()), MARKER);
     assert_eq!(has(value::int32(0), value::int32(0)), MARKER);
+}
+
+/// The words of the fake VM that the fake rope string slow path records
+/// its strings in.
+const VM_ROPE_STRINGS_WORDS: [usize; 2] = [10, 11];
+
+/// The fake `RopeAllocationInfo::slow_path`: records its strings, and
+/// returns `ROPE_FROM_RUNTIME`.
+extern "C" fn fake_create_rope_string(vm: *mut u64, lhs: u64, rhs: u64) -> u64 {
+    // SAFETY: The fake VM has room for the words the fakes here use.
+    unsafe {
+        vm.add(VM_ROPE_STRINGS_WORDS[0]).write(lhs);
+        vm.add(VM_ROPE_STRINGS_WORDS[1]).write(rhs);
+    }
+    ROPE_FROM_RUNTIME
+}
+
+/// The cell pointer the fake rope string slow path returns.
+const ROPE_FROM_RUNTIME: u64 = 0x7654_3210;
+
+#[test]
+fn rope_strings_come_from_the_runtime_without_a_local_free_cell() {
+    // A fake heap (allocated, threshold and total bytes), and a block whose
+    // one cell is the only never-allocated cell, if `free`.
+    let concatenate = |lhs: u64, rhs: u64, threshold: u64, free: bool| {
+        let mut heap = vec![100u64, threshold, 1000];
+        let block = FakeBlock::new(8, 0);
+        let address = block.cell().as_ptr() as u64;
+        // NB: The head of the free list, then the cursor, the end and the cell size of the never-allocated cells.
+        let mut free_list = if free {
+            vec![0, address, address + 64, 64]
+        } else {
+            vec![0, 0, 0, 64]
+        };
+        let program = assemble(|_| {
+            vec![
+                Instruction::Enter,
+                Instruction::Add {
+                    arith_feedback: 0,
+                    dst: r(5),
+                    lhs: argument(0),
+                    rhs: argument(1),
+                },
+                Instruction::Return { value: r(5) },
+            ]
+        });
+        let (result, machine) = run_program_with_snapshot(
+            &program,
+            &[lhs, rhs],
+            |snapshot| {
+                snapshot.runtime.rope_allocation = crate::snapshot::RopeAllocationInfo {
+                    allocator: free_list.as_mut_ptr() as u64,
+                    cell_size: 64,
+                    template: vec![0x1234; 8],
+                    lhs_offset: 32,
+                    rhs_offset: 40,
+                    length_offset: 16,
+                    min_length: 8,
+                    slow_path: fake_create_rope_string as *const () as u64,
+                };
+                let allocation = &mut snapshot.runtime.object_allocation;
+                allocation.heap = heap.as_mut_ptr() as u64;
+                allocation.heap_allocated_bytes_offset = 0;
+                allocation.heap_threshold_offset = 8;
+                allocation.heap_total_allocated_bytes_offset = 16;
+                allocation.local_free_list_offset = 0;
+                allocation.freelist_next_offset = 0;
+                allocation.freelist_link_mask = FakeBlock::LINK_MASK;
+                allocation.local_cursor_offset = 8;
+                allocation.local_end_offset = 16;
+                allocation.local_cell_size_offset = 24;
+                // ArithFeedback::String.
+                snapshot.executables[0].feedback.arith = vec![1 << 3];
+            },
+            |_| {},
+        );
+        assert_eq!(result.status, RETURNED);
+        let strings = VM_ROPE_STRINGS_WORDS.map(|word| machine.vm[word]);
+        (result.value, strings, block.cell()[..6].to_vec(), address)
+    };
+    let pointer = |string: u64| string & ((1 << 48) - 1);
+    let string = |pointer: u64| u64::from(STRING_TAG) << 48 | pointer;
+    let (lhs, rhs) = (fake_string_of_length(5, 0), fake_string_of_length(4, 0));
+
+    // A local free cell becomes the rope string.
+    let (result, strings, cell, address) = concatenate(lhs, rhs, 10_000, true);
+    assert_eq!((result, strings), (string(address), [0, 0]));
+    assert_eq!(cell, [0x1234, 0x1234, 9, 0x1234, pointer(lhs), pointer(rhs)]);
+
+    // Without one, or without room before the next collection, the runtime
+    // makes it.
+    for (threshold, free) in [(10_000, false), (150, true)] {
+        let (result, strings, _, _) = concatenate(lhs, rhs, threshold, free);
+        assert_eq!(result, string(ROPE_FROM_RUNTIME));
+        assert_eq!(strings, [pointer(lhs), pointer(rhs)]);
+    }
 }

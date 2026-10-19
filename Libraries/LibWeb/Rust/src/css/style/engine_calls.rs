@@ -145,6 +145,11 @@ pub(crate) struct StagedInput {
 }
 
 impl StagedInput {
+    /// How many tree deltas the batch holds, each of which may deepen the tree by a level.
+    pub(crate) fn tree_delta_count(&self) -> usize {
+        self.tree.len()
+    }
+
     fn is_empty(&self) -> bool {
         self.tree.is_empty()
             && self.arrivals.is_empty()
@@ -822,6 +827,23 @@ pub(crate) struct EngineMemo {
 }
 
 impl EngineMemo {
+    pub(crate) fn forget_released_animation_overlay_records(&self, released: &super::ReleasedAnimationOverlayRecords) {
+        if released.overflowed() {
+            let is_animation_overlay = |key: u64| {
+                super::computed::FinalStyleRecordID::from_raw(key).is_some_and(|record| record.is_animation_overlay())
+            };
+            self.views.forget_where(is_animation_overlay);
+            self.record_environments.forget_where(is_animation_overlay);
+            self.dependency_flags.forget_where(is_animation_overlay);
+            return;
+        }
+        for record in released.records() {
+            self.views.forget(record);
+            self.record_environments.forget(record);
+            self.dependency_flags.forget(record);
+        }
+    }
+
     /// Follows `change`, a write the host queued for the engine, as the host makes it.
     pub(crate) fn follow(&self, change: &super::boundary::StyleChange) {
         self.baselines.borrow_mut().follow(change);
@@ -1174,6 +1196,44 @@ pub extern "C" fn style_engine_has_pending_transaction(host: &DocumentHost, read
     }
 }
 
+/// What an element's arrival has to carry to reach the anchor of a `:has()` argument, and where that is: the raw
+/// identities of the tags, IDs, classes and attribute names, and the states, any of which reaches one. The spans hold
+/// until the host next asks.
+#[repr(C)]
+pub struct FfiRelationalArrivalKeys {
+    pub version: u64,
+    pub reached_by_any_arrival: bool,
+    pub names: *const usize,
+    pub name_count: usize,
+    pub states: *const u8,
+    pub state_count: usize,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_relational_arrival_keys(
+    host: &DocumentHost,
+    read: &BegunRead,
+) -> FfiRelationalArrivalKeys {
+    let (version, keys) = host.known_relational_arrival_keys().unwrap_or_else(|| {
+        with_engine(read, host, |engine| {
+            engine.resolve_relational_arrival_keys();
+            (
+                engine.relational_arrival_keys_version(),
+                Arc::clone(engine.relational_arrival_keys()),
+            )
+        })
+    });
+    let keys = host.lend_relational_arrival_keys(keys);
+    FfiRelationalArrivalKeys {
+        version,
+        reached_by_any_arrival: keys.reached_by_any_arrival,
+        names: keys.names.as_ptr(),
+        name_count: keys.names.len(),
+        states: keys.states.as_ptr(),
+        state_count: keys.states.len(),
+    }
+}
+
 /// Whether the engine defers any element style input, which the host knows without asking where it wrote nothing since
 /// its last job.
 #[unsafe(no_mangle)]
@@ -1307,6 +1367,23 @@ impl<T: Copy> Memo<T> {
 
     pub(crate) fn set(&self, key: u64, answer: T) {
         self.slot(key).set((key, answer));
+    }
+
+    fn forget(&self, key: u64) {
+        let slot = self.slot(key);
+        let (held, answer) = slot.get();
+        if held == key {
+            slot.set((Self::NO_KEY, answer));
+        }
+    }
+
+    fn forget_where(&self, forgets: impl Fn(u64) -> bool) {
+        for slot in &self.slots {
+            let (held, answer) = slot.get();
+            if held != Self::NO_KEY && forgets(held) {
+                slot.set((Self::NO_KEY, answer));
+            }
+        }
     }
 }
 

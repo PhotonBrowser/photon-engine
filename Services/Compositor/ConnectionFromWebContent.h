@@ -52,7 +52,8 @@ private:
     virtual void update_visual_context_tree(Web::CompositorContextId, Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction) override;
     virtual void update_scroll_state(Web::CompositorContextId, Compositing::ScrollStateSnapshot, Compositing::KeyboardScrollState) override;
     virtual void update_display_list_resources(Web::CompositorContextId, Compositing::DisplayListResourceTransaction) override;
-    virtual Messages::CompositorWebContentServer::CreateCanvas2dContextResponse create_canvas_2d_context(Gfx::IntSize, bool) override;
+    virtual Messages::CompositorWebContentServer::ReserveCanvasIdsResponse reserve_canvas_ids() override;
+    virtual void create_canvas_2d_context(Compositing::CanvasId, Gfx::IntSize, bool) override;
     virtual void update_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment>, Vector<Compositing::DisplayListFontResource>) override;
     virtual void destroy_canvas_context(Compositing::CanvasId) override;
     virtual Messages::CompositorWebContentServer::GetCanvasPixelsResponse get_canvas_pixels(Compositing::CanvasId, Gfx::IntRect, Gfx::AlphaType) override;
@@ -83,7 +84,7 @@ private:
     virtual Messages::CompositorWebContentServer::TakeInputTraceForTestingResponse take_input_trace_for_testing(Web::CompositorContextId) override;
     virtual void cancel_smooth_scroll(Web::CompositorContextId, Web::AsyncScrollNodeStableID) override;
     virtual Messages::CompositorWebContentServer::TakePendingAsyncScrollUpdatesResponse take_pending_async_scroll_updates(Web::CompositorContextId) override;
-    virtual void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress) override;
+    virtual void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress) override;
     virtual void request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second) override;
     virtual void hurry_rendering_opportunity(Web::CompositorContextId) override;
     virtual void present_frame(Web::CompositorContextId, Gfx::IntRect viewport_rect) override;
@@ -100,10 +101,20 @@ private:
     virtual void create_video_edge(Media::VideoSinkHandle) override;
     virtual void release_video_edge(Media::VideoSinkHandle) override;
     virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) override;
+    virtual Compositing::CanvasSurfaceOwnerId canvas_surface_owner_id() const override { return m_canvas_host.canvas_surface_owner_id(); }
     bool context_is_owned_by_this_connection(Web::CompositorContextId);
 
     NonnullRefPtr<CompositorState> m_compositor_state;
     CanvasHost m_canvas_host;
+
+    // The canvas IDs this WebContent has reserved and not yet named a 2D context with.
+    struct ReservedCanvasIds {
+        u64 next { 0 };
+        u64 end { 0 };
+
+        bool is_used_up() const { return next == end; }
+    };
+    ReservedCanvasIds m_reserved_canvas_ids;
     Function<void(ConnectionFromWebContent&)> m_on_death;
 
     // The presentation client end of this WebContent's video presentation channel (connect-only for now).

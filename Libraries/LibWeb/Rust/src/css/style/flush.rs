@@ -256,6 +256,29 @@ impl RetainedState {
         false
     }
 
+    fn is_referenceable_in_display_none_subtree(&self, node: StyleNodeID) -> bool {
+        use bridge::element_adjustment_fact::IS_SVG_ELEMENT;
+        use bridge::element_construction_fact::{IS_SVG_GEOMETRY_ELEMENT, IS_SVG_RESOURCE_ELEMENT};
+        if self.computed_group_sets.construction_facts(node) & IS_SVG_GEOMETRY_ELEMENT != 0
+            && !self.facts.id_of_node(node).is_none()
+        {
+            return true;
+        }
+        let mut current = Some(node);
+        while let Some(element) = current
+            && self.computed_group_sets.adjustment_facts(element) & IS_SVG_ELEMENT != 0
+        {
+            if self.computed_group_sets.construction_facts(element) & IS_SVG_RESOURCE_ELEMENT != 0 {
+                return true;
+            }
+            current = self
+                .tree
+                .parent(element)
+                .map(|parent| self.tree.host_of(parent).unwrap_or(parent));
+        }
+        false
+    }
+
     /// Note what the record loop reads of the answer a transaction publishes for the node before that
     /// answer is installed: its pseudo-element inventory, kept with the node's record columns for as
     /// long as that answer stands, the answer's completeness and the matches its custom-property
@@ -626,20 +649,21 @@ impl StyleEngine {
             return false;
         }
 
-        // A normalized transaction this wide will ask enough tree-shaped questions to amortize one
-        // preorder pass. Keep the coordinates in Tier-4 scratch and let smaller updates continue to
-        // walk the mandatory relation columns directly.
-        const TRANSACTION_TOPOLOGY_MINIMUM_INPUTS: usize = 32;
-        let mut regions = if transaction.inputs.len() >= TRANSACTION_TOPOLOGY_MINIMUM_INPUTS {
-            let regions = ImpactRegions::with_topology(&self.retained.tree, root);
-            let bytes = regions.topology_capacity_bytes();
-            self.retained
-                .memory
-                .reserve_required(MemoryCategory::BatchScratch, bytes);
-            regions
-        } else {
-            ImpactRegions::new()
-        };
+        // A preorder pass takes a step per element of the document, where a tree-shaped question
+        // walks the mandatory relation columns along a node's ancestors, and a transaction asks a
+        // few of them per input. A transaction this wide against its document amortizes the pass.
+        // Keep the coordinates in Tier-4 scratch and let narrower updates walk the columns.
+        let mut regions =
+            if transaction.inputs.len().saturating_mul(16) >= self.retained.tree.connected_element_count() as usize {
+                let regions = ImpactRegions::with_topology(&self.retained.tree, root);
+                let bytes = regions.topology_capacity_bytes();
+                self.retained
+                    .memory
+                    .reserve_required(MemoryCategory::BatchScratch, bytes);
+                regions
+            } else {
+                ImpactRegions::new()
+            };
         let topology_bytes = regions.topology_capacity_bytes();
         let mut arriving_nodes: Vec<StyleNodeID> = if !transaction.has_coarsened_markers() {
             transaction
@@ -1713,6 +1737,9 @@ impl StyleEngine {
                     self.begin_published_match_answer_completion_batch(root, prefer_complete_batch);
                     completion_begin_timer.stop(Counter::CompletionBatchBeginMicroseconds, &self.retained.counters);
                 } else if let Some(mut traversal) = self.retained.batch_matching_traversal.take() {
+                    // Rows matched outside the batch may belong to nodes this transaction removed.
+                    traversal.unbatched_facts = StyleNodeFacts::new();
+                    traversal.unbatched_facts_memory.release();
                     if let Some(batch) = traversal.batch.as_ref() {
                         self.prepare_prefix_rows_for_batch(batch, &mut traversal.prefix_contexts);
                     }
@@ -2138,13 +2165,14 @@ impl StyleEngine {
             for &node in &published_nodes {
                 self.retained.note_batch_answer_facts(node, &published_match_answers);
             }
-            // The rows that read style while hidden, an SVG element (which an SVG resource reference
-            // paints) and an element with animations, and every element they inherit from: none of
-            // them is answered as hidden.
+            // The rows that read style while hidden, an SVG element that can be referenced (which
+            // an SVG resource reference paints) and an element with animations, and every element
+            // they inherit from: none of them is answered as hidden.
             let mut hidden_style_readers = HashSet::<StyleNodeID>::default();
             for &node in &published_nodes {
                 use bridge::element_adjustment_fact as fact;
-                if self.computed_group_sets.adjustment_facts(node) & (fact::IS_SVG_ELEMENT | fact::HAS_ANIMATIONS) == 0
+                if self.computed_group_sets.adjustment_facts(node) & fact::HAS_ANIMATIONS == 0
+                    && !self.is_referenceable_in_display_none_subtree(node)
                 {
                     continue;
                 }

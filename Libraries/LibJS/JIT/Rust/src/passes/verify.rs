@@ -31,7 +31,8 @@
 //! - `StoreSlot` writes only the reserved registers, written constants, the
 //!   arguments the compiled function's legacy `arguments` shows, and slots
 //!   that the next call reading the frame (a `Generic` node, or a call that
-//!   reads its operands from the frame) reads (see `verify_frame_writes()`).
+//!   reads its operands from the frame) or `Suspend` reads (see
+//!   `verify_frame_writes()`).
 
 use super::dominators::Dominators;
 use crate::bytecode::FrameLayout;
@@ -84,17 +85,19 @@ pub fn verify_frame_writes(graph: &Graph, layout: &FrameLayout) -> Result<(), St
             let reader = nodes[position + 1..].iter().find(|next| {
                 let op = &graph.node(**next).op;
                 let properties = op.properties();
-                let initializes_frame =
-                    matches!(op, Op::InitializeFrame | Op::EnsureFrameInitialized | Op::PublishFrame);
+                let initializes_frame = matches!(
+                    op,
+                    Op::InitializeFrame { .. } | Op::EnsureFrameInitialized { .. } | Op::PublishFrame
+                );
                 !matches!(op, Op::StoreSlot { .. })
                     && !(is_argument && initializes_frame)
-                    && (properties.is_call
-                        || properties.reads != Locations::NONE
-                        || properties.writes != Locations::NONE)
+                    && (properties.reads != Locations::NONE || properties.writes != Locations::NONE)
             });
             let reads_frame = reader.is_some_and(|reader| {
-                let properties = graph.node(*reader).op.properties();
-                properties.is_call && properties.reads.intersects(Locations::FRAME)
+                let op = &graph.node(*reader).op;
+                let properties = op.properties();
+                (properties.is_call && properties.reads.intersects(Locations::FRAME))
+                    || matches!(op, Op::Suspend { .. })
             });
             if !reads_frame {
                 errors.push(format!(
@@ -474,6 +477,7 @@ fn branch_input_reprs(condition: crate::ir::BranchCondition) -> Vec<Repr> {
         | crate::ir::BranchCondition::Object
         | crate::ir::BranchCondition::NonNegativeInt32
         | crate::ir::BranchCondition::Int32Value
+        | crate::ir::BranchCondition::Int32OrBoolean
         | crate::ir::BranchCondition::Double
         | crate::ir::BranchCondition::String
         | crate::ir::BranchCondition::ElementsKind(_)
@@ -483,6 +487,7 @@ fn branch_input_reprs(condition: crate::ir::BranchCondition) -> Vec<Repr> {
         | crate::ir::BranchCondition::Extensible
         | crate::ir::BranchCondition::HoleFillableArray
         | crate::ir::BranchCondition::ArrayIterator
+        | crate::ir::BranchCondition::GeneratorObject
         | crate::ir::BranchCondition::PlainArrayPrototypeChain => vec![Repr::Pointer],
         crate::ir::BranchCondition::Shape(_) => vec![Repr::Tagged, Repr::Pointer],
         crate::ir::BranchCondition::PropertyIteratorCacheValid => tagged(2),
@@ -508,6 +513,7 @@ fn expected_input_reprs(graph: &Graph, node: NodeId) -> Option<Vec<Repr>> {
         Op::Float64Binary { .. } | Op::Float64Min | Op::Float64Max | Op::Float64Compare { .. } => {
             Some(vec![Repr::Float64, Repr::Float64])
         }
+        Op::CallFloat64Function { function } => Some(vec![Repr::Float64; function.argument_count()]),
         Op::Int32Min | Op::Int32Max | Op::Uint32Min => Some(vec![Repr::Int32, Repr::Int32]),
         Op::Uint32ShiftRight => Some(vec![Repr::Int32, Repr::Int32]),
         Op::Uint32ToFloat64 | Op::IntegerToString => Some(vec![Repr::Int32]),
@@ -526,7 +532,11 @@ fn expected_input_reprs(graph: &Graph, node: NodeId) -> Option<Vec<Repr>> {
         Op::LoadElementsLength | Op::LoadElementsCapacity => Some(vec![Repr::Pointer]),
         Op::LoadPropertyIteratorKey => Some(vec![Repr::Tagged, Repr::Int32]),
         Op::OpenArrayIteration => Some(tagged(1)),
-        Op::LoadArrayIteratorArray | Op::LoadArrayIteratorIndex | Op::FinishArrayIterator => Some(vec![Repr::Pointer]),
+        Op::LoadArrayIteratorArray
+        | Op::LoadArrayIteratorIndex
+        | Op::FinishArrayIterator
+        | Op::LoadGeneratorCompletionType
+        | Op::LoadGeneratorCompletionValue => Some(vec![Repr::Pointer]),
         Op::StoreArrayIteratorIndex => Some(vec![Repr::Pointer, Repr::Int32]),
         Op::BranchOnPc { .. } => Some(vec![Repr::Int32]),
         Op::BoxInt32 | Op::CheckNonNegativeInt32 => Some(vec![Repr::Int32]),

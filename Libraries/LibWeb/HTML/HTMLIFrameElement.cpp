@@ -212,6 +212,19 @@ void HTMLIFrameElement::removed_from(IsSubtreeRoot is_subtree_root, DOM::Node* o
 
     // When an iframe element is removed from a document, the user agent must destroy the nested navigable of the element.
     destroy_the_child_navigable();
+
+    // AD-HOC: A lazy loading iframe's resumption steps navigate its content navigable, which is gone now. Inserting
+    //         the iframe again processes its attributes, and lazy loads it anew.
+    stop_lazy_loading();
+}
+
+// Stops intersection-observing the iframe as a lazy loading element, and sets its lazy load resumption steps to null.
+// NB: Only an iframe that has lazy load resumption steps is intersection-observed. One without a src never started lazy
+//     loading, and its document can have no lazy load intersection observer to stop.
+void HTMLIFrameElement::stop_lazy_loading()
+{
+    if (take_lazy_load_resumption_steps_internal())
+        document().stop_intersection_observing_a_lazy_loading_element(*this);
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-load-event-steps
@@ -241,8 +254,15 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         }
     }
 
-    // FIXME: 2. Let childDocument be element's content navigable's active document.
-    // FIXME: 3. If childDocument has its mute iframe load flag set, then return.
+    // 2. Let childDocument be element's content navigable's active document.
+    // NB: A document hosted by another process can't be opened from this one, so it is never muted.
+    GC::Ptr<DOM::Document> child_document;
+    if (auto* local_navigable = as_if<LocalNavigable>(*element.content_navigable()))
+        child_document = local_navigable->active_document();
+
+    // 3. If childDocument has its mute iframe load flag set, then return.
+    if (child_document && child_document->mute_iframe_load())
+        return;
 
     // 4. If element's pending resource-timing start time is not null:
     if (element.pending_resource_start_time().has_value()) {
@@ -278,12 +298,18 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         element.set_pending_resource_timing_url({});
     }
 
-    // 5. Fire an event named load at element.
+    // 5. Set childDocument's iframe load in progress flag.
+    if (child_document)
+        child_document->set_iframe_load_in_progress(true);
+
+    // 6. Fire an event named load at element.
     element.dispatch_event(DOM::Event::create(
         HTML::EventNames::load,
         HighResolutionTime::current_high_resolution_time(relevant_global_object(element))));
 
-    // FIXME: 7. Unset childDocument's iframe load in progress flag.
+    // 7. Unset childDocument's iframe load in progress flag.
+    if (child_document)
+        child_document->set_iframe_load_in_progress(false);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex

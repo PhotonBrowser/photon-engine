@@ -101,3 +101,44 @@ jit.compile(absAndSqrt);
 // CHECK: Float64Round
 
 console.log(absAndSqrt(-9), absAndSqrt(16));
+
+// Math.exp, log, sin, cos, tan and pow of numbers call the runtime's functions
+// of doubles, which only compute: the code after them keeps what it knew, and
+// a call of loop invariant numbers moves out of the loop.
+
+function bias(base, values) {
+    let sum = 0;
+    for (let i = 0; i < values.length; ++i) sum += Math.pow(values[i], Math.log(1 - base * 0.5) / Math.LN2);
+    return sum;
+}
+jit.prepare(bias);
+for (let i = 0; i < 10; ++i) bias(0.25, [0.5, 0.75]);
+jit.compile(bias);
+
+// CHECK-FUNCTION: bias
+// CHECK-PASS: graph building
+// CHECK: CallFloat64Log
+// CHECK: CallFloat64Pow
+// CHECK-NOT: CallSlowPath CallBuiltinMath
+// CHECK-PASS: loop invariant code motion
+// CHECK: CallFloat64Log
+// CHECK: loop:
+// CHECK-NOT: CallFloat64Log
+// CHECK: CallFloat64Pow
+
+function trigonometry(x) {
+    return Math.sin(x) + Math.cos(x) + Math.tan(x) + Math.exp(x);
+}
+jit.prepare(trigonometry);
+for (let i = 0; i < 10; ++i) trigonometry(i * 0.5);
+jit.compile(trigonometry);
+
+// CHECK-FUNCTION: trigonometry
+// CHECK-PASS: dead code elimination
+// CHECK: CallFloat64Sin
+// CHECK: CallFloat64Cos
+// CHECK: CallFloat64Tan
+// CHECK: CallFloat64Exp
+// CHECK-NOT: CallSlowPath
+
+console.log(bias(0.25, [0.5, 0.75]), trigonometry(0.5), trigonometry(2));

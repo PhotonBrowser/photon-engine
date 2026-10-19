@@ -15,6 +15,7 @@ set(TEST_SOURCES
     TestHSTSStore.cpp
     TestNavigationLoader.cpp
     TestOmnibox.cpp
+    TestPictureInPictureWindow.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
     TestSessionHistorySnapshotStorage.cpp
@@ -175,6 +176,27 @@ if (NOT WIN32)
         target_compile_definitions(TestUserActivation PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
+    add_executable(TestPictureInPictureUserActivation TestPictureInPictureUserActivation.cpp)
+    add_dependencies(TestPictureInPictureUserActivation ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestPictureInPictureUserActivation PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestPictureInPictureUserActivation PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
+    add_executable(TestPictureInPictureWindowControls TestPictureInPictureWindowControls.cpp)
+    add_dependencies(TestPictureInPictureWindowControls ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestPictureInPictureWindowControls PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestPictureInPictureWindowControls PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
+    add_executable(TestPictureInPictureWindowLifetime TestPictureInPictureWindowLifetime.cpp)
+    add_dependencies(TestPictureInPictureWindowLifetime ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestPictureInPictureWindowLifetime PRIVATE AK LibCore LibFileSystem LibGfx LibIPC LibMain LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestPictureInPictureWindowLifetime PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     add_executable(TestShadowTreeTooltipsAndLinks TestShadowTreeTooltipsAndLinks.cpp)
     add_dependencies(TestShadowTreeTooltipsAndLinks ladybird_build_resource_files ${ladybird_helper_processes})
     target_link_libraries(TestShadowTreeTooltipsAndLinks PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
@@ -278,6 +300,16 @@ if (BUILD_TESTING AND NOT WIN32)
         )
         set_tests_properties(TestDevToolsCatchUpLayout PROPERTIES TIMEOUT 120)
         add_test(
+            NAME TestWindowSizeReachesEveryPage
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-window-size-reaches-every-page.py $<TARGET_FILE:ladybird>
+        )
+        set_tests_properties(TestWindowSizeReachesEveryPage PROPERTIES TIMEOUT 120)
+        add_test(
+            NAME TestUserAgentPresetReachesChildFrames
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-user-agent-preset-reaches-child-frames.py $<TARGET_FILE:ladybird>
+        )
+        set_tests_properties(TestUserAgentPresetReachesChildFrames PROPERTIES TIMEOUT 120)
+        add_test(
             NAME TestMessagePortCollection
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-message-port-collection.py $<TARGET_FILE:WebDriver>
         )
@@ -362,6 +394,15 @@ if (BUILD_TESTING AND NOT WIN32)
 
     add_test(NAME TestUserActivation COMMAND $<TARGET_FILE:TestUserActivation>)
     set_tests_properties(TestUserActivation PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+
+    add_test(NAME TestPictureInPictureUserActivation COMMAND $<TARGET_FILE:TestPictureInPictureUserActivation>)
+    set_tests_properties(TestPictureInPictureUserActivation PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+
+    add_test(NAME TestPictureInPictureWindowControls COMMAND $<TARGET_FILE:TestPictureInPictureWindowControls>)
+    set_tests_properties(TestPictureInPictureWindowControls PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+
+    add_test(NAME TestPictureInPictureWindowLifetime COMMAND $<TARGET_FILE:TestPictureInPictureWindowLifetime>)
+    set_tests_properties(TestPictureInPictureWindowLifetime PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
     add_test(NAME TestShadowTreeTooltipsAndLinks COMMAND $<TARGET_FILE:TestShadowTreeTooltipsAndLinks>)
     set_tests_properties(TestShadowTreeTooltipsAndLinks PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})

@@ -26,6 +26,7 @@ use crate::code::ExitKind;
 use crate::code::Repr;
 use crate::ir::BlockId;
 use crate::ir::BranchCondition;
+use crate::ir::Float64Function;
 use crate::ir::Float64UnaryOp;
 use crate::ir::FrameStateId;
 use crate::ir::NodeId;
@@ -104,6 +105,55 @@ impl GraphBuilder<'_> {
                 call_feedback,
                 ..
             } => self.build_math_function(Float64UnaryOp::Sqrt, dst, callee, argument, call_feedback),
+            Instruction::CallBuiltinMathExp {
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_call(Float64Function::Exp, dst, callee, &[argument], call_feedback),
+            Instruction::CallBuiltinMathLog {
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_call(Float64Function::Log, dst, callee, &[argument], call_feedback),
+            Instruction::CallBuiltinMathSin {
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_call(Float64Function::Sin, dst, callee, &[argument], call_feedback),
+            Instruction::CallBuiltinMathCos {
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_call(Float64Function::Cos, dst, callee, &[argument], call_feedback),
+            Instruction::CallBuiltinMathTan {
+                dst,
+                callee,
+                argument,
+                call_feedback,
+                ..
+            } => self.build_math_call(Float64Function::Tan, dst, callee, &[argument], call_feedback),
+            Instruction::CallBuiltinMathPow {
+                dst,
+                callee,
+                argument0,
+                argument1,
+                call_feedback,
+                ..
+            } => self.build_math_call(
+                Float64Function::Pow,
+                dst,
+                callee,
+                &[argument0, argument1],
+                call_feedback,
+            ),
             Instruction::GetIterator {
                 dst_iterator_object,
                 dst_iterator_next,
@@ -163,9 +213,15 @@ impl GraphBuilder<'_> {
             Instruction::GetByValue { .. } => self.build_get_by_value(instruction, info),
             Instruction::PutByValue { .. } => self.build_put_by_value(instruction, info),
             Instruction::GetLength { .. } => self.build_get_length(instruction),
+            Instruction::ConcatString { dst, src } => self.build_concat_string(instruction, info, dst, src),
             Instruction::GetById { .. } => self.build_get_by_id(instruction),
             Instruction::PutById { .. } => self.build_put_by_id(instruction),
             Instruction::IteratorClose { .. } => self.build_iterator_close(instruction),
+            Instruction::GetCompletionFields {
+                type_dst,
+                value_dst,
+                completion,
+            } => self.build_get_completion_fields(type_dst, value_dst, completion),
             Instruction::GetGlobal { .. } => self.build_get_global(instruction),
             Instruction::SetGlobal { .. } => self.build_set_global(instruction),
             _ => match super::speculation::Operation::of(instruction) {

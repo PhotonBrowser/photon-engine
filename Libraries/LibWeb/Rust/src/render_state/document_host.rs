@@ -109,6 +109,10 @@ pub struct DocumentHost {
     selector_value_text_names: RefCell<crate::css::style::SelectorAttributeNames>,
     /// The attribute names the engine's selectors test in any way, as its last job left them.
     selector_tested_attribute_names: RefCell<crate::css::style::SelectorAttributeNames>,
+    /// What an arrival has to carry to reach a `:has()` anchor, as its last job left it.
+    relational_arrival_keys: RefCell<std::sync::Arc<crate::css::style::RelationalArrivalKeys>>,
+    /// The keys the host was last told of, kept alive for as long as it reads them.
+    lent_relational_arrival_keys: RefCell<std::sync::Arc<crate::css::style::RelationalArrivalKeys>>,
     /// The ticks the render clock hands the lanes of the document's presented frames.
     ticks: Arc<ClockTicks>,
     /// The steps the hover of the lanes decided that the last rendering update took in, which the host runs as the lanes
@@ -202,6 +206,8 @@ impl DocumentHost {
             facts: Cell::new(None),
             selector_value_text_names: RefCell::default(),
             selector_tested_attribute_names: RefCell::default(),
+            relational_arrival_keys: RefCell::default(),
+            lent_relational_arrival_keys: RefCell::default(),
             ticks: ClockTicks::new(document),
             lane_transitions: RefCell::default(),
             frame_held_for_testing: Cell::default(),
@@ -332,7 +338,7 @@ impl DocumentHost {
         let seed = self.seed.take();
         let made = seed.is_none();
         self.seed.set(seed);
-        made && (cfg!(test) || !crate::stage_thread::style_layout_thread().is_current())
+        made && (cfg!(test) || !owner::is_held_here())
     }
 
     /// Notes that the document's render state is written, which leaves the paint and hit testing properties prepared
@@ -359,14 +365,19 @@ impl DocumentHost {
         Owed {
             work,
             deferred_inputs,
+            released_animation_overlay_records,
             facts,
             selector_value_text_names,
             selector_tested_attribute_names,
+            relational_arrival_keys,
         }: Owed,
     ) {
+        self.engine_memo
+            .forget_released_animation_overlay_records(&released_animation_overlay_records);
         self.facts.set(Some(facts));
         *self.selector_value_text_names.borrow_mut() = selector_value_text_names;
         *self.selector_tested_attribute_names.borrow_mut() = selector_tested_attribute_names;
+        *self.relational_arrival_keys.borrow_mut() = relational_arrival_keys;
         self.engine_memo
             .deferred
             .borrow_mut()
@@ -673,6 +684,26 @@ impl DocumentHost {
             .map(|facts| facts.selector_attribute_value_text_requirements_version)
     }
 
+    /// What an arrival has to carry to reach a `:has()` anchor, with where it is, where the host knows: none runs, and it
+    /// queued no rule since its last job or frame, which is all that compiles a selector.
+    pub(crate) fn known_relational_arrival_keys(
+        &self,
+    ) -> Option<(u64, std::sync::Arc<crate::css::style::RelationalArrivalKeys>)> {
+        let version = self
+            .facts_where(|moves| !moves.selectors)?
+            .relational_arrival_keys_version;
+        Some((version, std::sync::Arc::clone(&self.relational_arrival_keys.borrow())))
+    }
+
+    /// Keeps `keys` alive until the host next asks, and answers them.
+    pub(crate) fn lend_relational_arrival_keys(
+        &self,
+        keys: std::sync::Arc<crate::css::style::RelationalArrivalKeys>,
+    ) -> std::cell::Ref<'_, crate::css::style::RelationalArrivalKeys> {
+        *self.lent_relational_arrival_keys.borrow_mut() = keys;
+        std::cell::Ref::map(self.lent_relational_arrival_keys.borrow(), |keys| &**keys)
+    }
+
     /// Whether the engine's selectors read the value text of an attribute that answers to any of `keys`, where the host
     /// knows: as it knows where their requirements are.
     pub(crate) fn known_selectors_read_value_text_of(
@@ -728,7 +759,7 @@ impl DocumentHost {
                 });
                 None
             }
-            None => Some(on_render_side(move || super::clock::take_lanes_in(&ticks, update))),
+            None => Some(on_render_side(0, move || super::clock::take_lanes_in(&ticks, update))),
         };
         // A same-process iframe's lanes hear of the pointer from the lanes of the document around it, which handed them
         // nothing of a newer move the compositor told that document of: the pointer may have gone elsewhere, and the
@@ -960,7 +991,8 @@ impl DocumentHost {
                     .as_slice()
                     .iter()
                     .any(|change| !change.keeps_the_presented_frame());
-            let answer = on_render_side(move || {
+            let tree_depth = self.tree_depth_bound(changes.as_slice());
+            let answer = on_render_side(tree_depth, move || {
                 if moves_state {
                     super::clock::note_host_write(document);
                 }
@@ -984,6 +1016,26 @@ impl DocumentHost {
         // learn from the queue.
         self.pay(owed);
         answer
+    }
+
+    /// How deep the document's style tree may be once a job applies `changes`: as deep as its deepest element ever was,
+    /// and a level deeper for each relation row the engine staged and has not settled, and for each tree delta of
+    /// `changes`.
+    fn tree_depth_bound(&self, changes: &[ArenaChange]) -> u32 {
+        let queued_tree_deltas = changes
+            .iter()
+            .map(|change| match change {
+                ArenaChange::Engine(crate::css::style::engine_calls::EngineWrite::ApplyTransaction(input)) => {
+                    input.tree_delta_count()
+                }
+                _ => 0,
+            })
+            .sum::<usize>();
+        self.shared
+            .deepest_element
+            .load(Ordering::Relaxed)
+            .saturating_add(self.shared.staged_tree_rows.load(Ordering::Relaxed))
+            .saturating_add(u32::try_from(queued_tree_deltas).unwrap_or(u32::MAX))
     }
 
     /// Answers `read` of the document's render state, spending `wait`, as of every write the host queued. A read leaves
