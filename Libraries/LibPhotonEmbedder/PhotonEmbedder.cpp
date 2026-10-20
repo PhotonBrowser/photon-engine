@@ -560,7 +560,7 @@ public:
             // Give a background page time to become active again before discarding its rebuildable layout tree and
             // collecting unreachable DOM and JavaScript objects.
             if (!m_hidden_gc_timer) {
-                m_hidden_gc_timer = Core::Timer::create_single_shot(hidden_page_gc_delay_ms, [weak_this = make_weak_ptr<PhotonHeadlessWebView>()] {
+                m_hidden_gc_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(hidden_page_gc_delay_ms), [weak_this = make_weak_ptr<PhotonHeadlessWebView>()] {
                     if (!weak_this || !weak_this->page().is_open() || weak_this->traversable().system_visibility_state() != Web::HTML::VisibilityState::Hidden)
                         return;
                     if (weak_this->is_loading()) {

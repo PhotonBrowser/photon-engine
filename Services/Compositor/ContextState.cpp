@@ -760,7 +760,8 @@ ContextState::NodeScrollByWheelDelta ContextState::scroll_node_by_wheel_delta(Co
         return { outcome, delta };
     }
 
-    auto const* scrolled_node = m_async_scroll_tree.scroll_node_for_stable_id(scroll_offset->stable_node_id);
+    auto scrolled_node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(scroll_offset->stable_node_id);
+    auto const* scrolled_node = scrolled_node_id.has_value() ? m_async_scroll_tree.scroll_node_for_id(*scrolled_node_id) : nullptr;
     auto const* latched_node = m_async_scroll_tree.scroll_node_for_id(node_id);
     bool an_ancestor_scrolled = latched_node && scroll_offset->stable_node_id != latched_node->stable_node_id;
     auto unconsumed_delta = delta - scroll_offset->unadopted_scroll_delta;
@@ -1245,7 +1246,8 @@ ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_in_this_c
         auto simulated_scroll_state = m_scroll_state_snapshot;
         auto scroll_offset = m_async_scroll_tree.apply_scroll_delta(*node_id, delta, visual_context_tree, simulated_scroll_state, Compositing::ScrollChaining::ToScrollableAncestors);
         if (scroll_offset.has_value()) {
-            auto const* scrolled_node = m_async_scroll_tree.scroll_node_for_stable_id(scroll_offset->stable_node_id);
+            auto scrolled_node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(scroll_offset->stable_node_id);
+            auto const* scrolled_node = scrolled_node_id.has_value() ? m_async_scroll_tree.scroll_node_for_id(*scrolled_node_id) : nullptr;
             auto unconsumed_delta = delta - scroll_offset->unadopted_scroll_delta;
             if (!scrolled_node || !scrolled_node->is_viewport || !scrolled_node->chains_scroll_to_ancestors_horizontally || unconsumed_delta.x() == 0)
                 return {};

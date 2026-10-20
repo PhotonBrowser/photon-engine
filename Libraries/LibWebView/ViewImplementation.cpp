@@ -1184,7 +1184,7 @@ void ViewImplementation::update_input_response_watchdog()
         m_input_response_timer->stop();
     m_input_response_deadline_ms = deadline_ms;
     auto remaining_ms = max(1, static_cast<int>(deadline_ms - MonotonicTime::now().milliseconds()));
-    m_input_response_timer = Core::Timer::create_single_shot(remaining_ms, [this, deadline_ms] {
+    m_input_response_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(remaining_ms), [this, deadline_ms] {
         if (m_input_response_deadline_ms != deadline_ms)
             return;
         m_input_response_deadline_ms = 0;
@@ -1219,7 +1219,7 @@ void ViewImplementation::start_page_responsiveness_check()
     m_pending_page_responsiveness_request_id = request_id;
     page().async_check_page_responsiveness(request_id);
 
-    m_page_responsiveness_timer = Core::Timer::create_single_shot(page_response_timeout_ms, [this, request_id] {
+    m_page_responsiveness_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(page_response_timeout_ms), [this, request_id] {
         if (m_pending_page_responsiveness_request_id != request_id)
             return;
         m_pending_page_responsiveness_request_id = 0;

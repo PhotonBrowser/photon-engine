@@ -786,17 +786,17 @@ intptr_t EventLoopManagerUnix::register_timer(EventReceiver& object, AK::Duratio
 #ifdef AK_OS_MACOS
     CFRunLoopTimerContext context {};
     context.info = timer;
-    auto interval = static_cast<CFTimeInterval>(milliseconds) / 1000.0;
+    auto interval_seconds = static_cast<CFTimeInterval>(interval.to_seconds_f64());
     auto* run_loop_timer = CFRunLoopTimerCreate(kCFAllocatorDefault,
-        CFAbsoluteTimeGetCurrent() + interval,
-        should_reload ? interval : 0,
+        CFAbsoluteTimeGetCurrent() + interval_seconds,
+        should_reload ? interval_seconds : 0,
         0, 0, timer_callback, &context);
     if (run_loop_timer) {
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), run_loop_timer, kCFRunLoopCommonModes);
         thread_data.run_loop_timers.set(timer, run_loop_timer);
         if (run_loop_trace_enabled()) dbgln("[CoreTimer] register id={} deadline_ns={} interval_ms={} repeating={} cf_first_fire={} cf_repeat_interval={}",
-            reinterpret_cast<FlatPtr>(timer), timer->fire_time().nanoseconds(), milliseconds, should_reload,
-            CFAbsoluteTimeGetCurrent() + interval, should_reload ? interval : 0.0);
+            reinterpret_cast<FlatPtr>(timer), timer->fire_time().nanoseconds(), interval.to_milliseconds(), should_reload,
+            CFAbsoluteTimeGetCurrent() + interval_seconds, should_reload ? interval_seconds : 0.0);
     }
 #endif
     return bit_cast<intptr_t>(timer);

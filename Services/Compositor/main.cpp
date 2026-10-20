@@ -89,7 +89,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     // frame waits for one compile at most rather than for every program its first paint uses.
     RefPtr<Core::Timer> precompile_timer;
     if (skia_backend_context) {
-        precompile_timer = Core::Timer::create_repeating(0, [context = skia_backend_context, &precompile_timer] {
+        precompile_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(0), [context = skia_backend_context, &precompile_timer] {
             if (!context->precompile_next_shader())
                 precompile_timer->stop();
         });

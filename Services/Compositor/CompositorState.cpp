@@ -150,12 +150,13 @@ void CompositorState::schedule_idle_gpu_cache_purge()
     if (!m_skia_backend_context)
         return;
     if (!m_idle_gpu_cache_purge_timer) {
-        m_idle_gpu_cache_purge_timer = Core::Timer::create_single_shot(idle_gpu_cache_purge_delay_ms, [this] {
+        auto purge_delay = AK::Duration::from_milliseconds(idle_gpu_cache_purge_delay_ms);
+        m_idle_gpu_cache_purge_timer = Core::Timer::create_single_shot(purge_delay, [this, purge_delay] {
             if (m_skia_backend_context)
-                m_skia_backend_context->purge_resources_unused_for(AK::Duration::from_milliseconds(idle_gpu_cache_purge_delay_ms));
+                m_skia_backend_context->purge_resources_unused_for(purge_delay);
         });
     }
-    m_idle_gpu_cache_purge_timer->restart(idle_gpu_cache_purge_delay_ms);
+    m_idle_gpu_cache_purge_timer->restart(AK::Duration::from_milliseconds(idle_gpu_cache_purge_delay_ms));
 }
 
 void CompositorState::set_client(CompositorStateClient& client)
