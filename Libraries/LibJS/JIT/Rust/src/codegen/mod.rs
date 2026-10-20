@@ -1381,6 +1381,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_unbox_cell(output, input);
             }
             Op::CheckInt32 => self.emit_check_int32(node_id),
+            Op::CheckFloat64Int32 => self.emit_check_float64_int32(node_id),
             Op::CheckNumber => self.emit_check_number(node_id),
             Op::CheckIdentityComparable => self.emit_check_identity_comparable(node_id),
             Op::BoxInt32 => {
@@ -1747,6 +1748,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::LoadElementsCapacity => self.emit_load_elements_capacity(node_id),
             Op::AppendElement => self.emit_append_element_node(node_id),
             Op::CallArrayPush => self.emit_call_array_push(node_id),
+            Op::CallStoreHoleyElement => self.emit_call_store_holey_element(node_id),
             Op::OpenArrayIteration => self.emit_open_array_iteration(node_id),
             Op::LoadArrayIteratorArray => self.emit_load_array_iterator_array(node_id),
             Op::LoadArrayIteratorIndex => self.emit_load_array_iterator_index(node_id),
@@ -2246,6 +2248,22 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             BranchCondition::PlainArrayPrototypeChain => {
                 self.emit_branch_on_plain_array_prototype_chain(node, input, target, invert);
+            }
+            BranchCondition::ArrayWithRealmArrayPrototypeAndNoNamedProperties => {
+                self.emit_branch_on_array_with_realm_array_prototype_and_no_named_properties(
+                    node, input, target, invert,
+                );
+            }
+            BranchCondition::HoldsValidWatchpointSet => {
+                let other = self.masm.new_label();
+                let fail = if invert { target } else { other };
+                self.masm.load64(scratch, &Address::new(input, 0));
+                self.masm.branch_test64(Condition::Zero, scratch, u64::MAX, fail);
+                self.branch_unless_prototype_chain_valid(scratch, fail);
+                if !invert {
+                    self.masm.jump(target);
+                }
+                self.masm.bind(other);
             }
             BranchCondition::MagicalLength | BranchCondition::Extensible => {
                 let flag = match condition {

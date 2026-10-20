@@ -123,7 +123,6 @@ public:
     static ErrorOr<NonnullRefPtr<Requests::RequestClient>> request_server_client(IsPrivate = IsPrivate::No);
     // The control connection of the default session's RequestServer with no site.
     static Requests::RequestControlClient& request_server_control_client();
-    static bool has_request_server_control_client() { return the().m_request_server_manager; }
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     static WasmCompilerClient::Client& wasm_compiler_client() { return *the().m_wasm_compiler_client; }
 #endif
@@ -158,7 +157,6 @@ public:
     static BookmarkStore& bookmark_store() { return *the().m_bookmark_store; }
     void update_bookmark_action_for_current_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
-    void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
 
     void background_networking_settings_changed(Badge<ApplicationSettingsObserver>);
 
@@ -278,7 +276,7 @@ public:
 
     virtual Optional<ViewImplementation&> active_web_view() const { return {}; }
     virtual Vector<ViewImplementation&> active_window_web_views() const { return {}; }
-    virtual bool activate_tab_with_url(URL::URL const&) const { return false; }
+    virtual Optional<ViewImplementation&> activate_tab_with_url(URL::URL const&, URL::ExcludeFragment) const { return {}; }
 
     virtual Optional<ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const { return {}; }
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const;
@@ -291,6 +289,7 @@ public:
 
     virtual void resolve_external_url_handler(URL::URL const&, ExternalURLHandlerCallback callback) const { callback(nullptr); }
 
+    void activate_or_open_tab_with_url(URL::URL const&) const;
     void open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab) const;
     void open_bookmark_folder_in_new_tabs(String const& folder_id) const;
     void open_bookmark_in_new_window(String const& bookmark_id, IsPrivate);

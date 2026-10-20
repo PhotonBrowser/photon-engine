@@ -190,6 +190,7 @@ enum class InvalidateLayoutTreeReason {
     X(ScrollCursorIntoView, false)                  \
     X(ProcessScreenshot, false)                     \
     X(SVGGraphicsElementGetBBox, true)              \
+    X(SVGGraphicsElementGetCTM, false)              \
     X(SVGGraphicsElementGetScreenCTM, false)        \
     X(SVGLengthValue, false)                        \
     X(SVGPathLength, false)                         \
@@ -976,6 +977,9 @@ public:
     void mark_style_attribute_dirty(Element&);
     void synchronize_dirty_style_attributes();
     void flush_deferred_style_change_event();
+    // Once the registrations changed, name again to the style engine what every environment an
+    // element holds hands down, before the transaction that derives records under them.
+    void republish_custom_property_environments_for_style_update(Layout::BegunRead const&);
     // The style engine resolves substitutions against the Rust registry, whose parse context is
     // set up by the first sync; a document without registrations syncs once for it.
     void build_registered_properties_cache_for_style_update()
@@ -1210,6 +1214,8 @@ public:
 
     WebIDL::ExceptionOr<Vector<GC::Ref<Animations::Animation>>> get_animations();
     HashTable<GC::Ref<Animations::AnimationTimeline>> const& associated_animation_timelines() const { return m_associated_animation_timelines; }
+    void begin_smil_time_container_once_loaded(SVG::SMILTimeContainer&);
+    void schedule_svg_referenced_motion_path_update(SVG::SVGAnimateMotionElement&);
 
     bool ready_to_run_scripts() const { return m_ready_to_run_scripts; }
     void set_ready_to_run_scripts();
@@ -1325,7 +1331,6 @@ public:
         u64 style_update_remainder_microseconds { 0 };
         u64 relayouts_performed { 0 };
         u64 style_update_microseconds { 0 };
-        u64 style_recompute_microseconds { 0 };
         u64 custom_property_resolutions { 0 };
         u64 custom_property_elements { 0 };
         // What resolving those declared values actually walked: every entry into computing one
@@ -1379,6 +1384,9 @@ public:
     // state has to be derived when they move.
     void set_may_have_blocking_wheel_event_listener() { m_may_have_blocking_wheel_event_listener = true; }
     [[nodiscard]] bool may_have_blocking_wheel_event_listener() const { return m_may_have_blocking_wheel_event_listener; }
+    // The page's wheel event listener state generation at the newest change to this document's blocking listeners.
+    u64 wheel_event_listener_state_generation() const { return m_wheel_event_listener_state_generation; }
+    void set_wheel_event_listener_state_generation(u64 generation) { m_wheel_event_listener_state_generation = generation; }
 
     // Whether a node in this document has ever published a paint fact. It never goes back to false:
     // a node that lost its last fact still has to publish that it did.
@@ -2178,6 +2186,8 @@ private:
 
     // https://www.w3.org/TR/web-animations-1/#timeline-associated-with-a-document
     HashTable<GC::Ref<Animations::AnimationTimeline>> m_associated_animation_timelines;
+    Vector<GC::Ref<SVG::SMILTimeContainer>> m_smil_time_containers_to_begin;
+    Vector<GC::Ref<SVG::SVGAnimateMotionElement>> m_animate_motion_elements_to_update;
 
     // NB: Weak so the document does not unnecessarily keep animations alive. Note that this also includes animations
     //     associated with elements in shadow trees so differs from getAnimations()
@@ -2233,6 +2243,7 @@ private:
     bool m_requested_wanted_font_faces { false };
     bool m_may_have_scroll_snap_areas { false };
     bool m_may_have_blocking_wheel_event_listener { false };
+    u64 m_wheel_event_listener_state_generation { 0 };
     bool m_may_have_dom_paint_facts { false };
 
     HashTable<GC::Ref<Element>> m_list_owners_pending_item_renumber;
@@ -2373,6 +2384,7 @@ private:
     size_t m_custom_property_registration_generation { 0 };
     void const* m_rust_custom_property_registry { nullptr };
     bool m_rust_custom_property_registry_synced { false };
+    bool m_custom_property_environments_need_republishing { false };
 
     CSS::StyleScope m_style_scope;
 

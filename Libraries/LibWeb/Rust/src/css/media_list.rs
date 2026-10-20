@@ -126,16 +126,16 @@ pub extern "C" fn rust_media_list_length(list: &MediaList) -> usize {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_set_text(list: &MediaList, source: FfiUtf16View) {
-    list.set_text(unsafe { source.units() }.unwrap());
+pub extern "C" fn rust_media_list_set_text(list: &MediaList, source: FfiUtf16View) {
+    list.set_text(source.units().unwrap());
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_append(list: &MediaList, source: FfiUtf16View) -> bool {
+pub extern "C" fn rust_media_list_append(list: &MediaList, source: FfiUtf16View) -> bool {
     // https://drafts.csswg.org/cssom/#dom-medialist-appendmedium
     // 1. Let m be the result of parsing the given value.
     // 2. If m is null, then return.
-    let Some(query) = parse_medium(unsafe { source.units() }.unwrap()) else {
+    let Some(query) = parse_medium(source.units().unwrap()) else {
         return false;
     };
     // 3. If comparing m with any of the media queries in the collection of media queries returns true, then return.
@@ -158,11 +158,11 @@ pub enum MediaListDeleteResult {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_delete(list: &MediaList, source: FfiUtf16View) -> MediaListDeleteResult {
+pub extern "C" fn rust_media_list_delete(list: &MediaList, source: FfiUtf16View) -> MediaListDeleteResult {
     // https://drafts.csswg.org/cssom/#dom-medialist-deletemedium
     // 1. Let m be the result of parsing the given value.
     // 2. If m is null, then return.
-    let Some(query) = parse_medium(unsafe { source.units() }.unwrap()) else {
+    let Some(query) = parse_medium(source.units().unwrap()) else {
         return MediaListDeleteResult::Invalid;
     };
     // 3. Remove any media query from the collection of media queries for which comparing the media query with m

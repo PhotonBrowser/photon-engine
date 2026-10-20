@@ -113,7 +113,6 @@ public:
     void color_picker_update(Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state);
     void select_dropdown_closed(Optional<u32> const& selected_item_id);
 
-    void set_user_style(String source);
     void set_has_devtools_client(bool);
     bool has_devtools_client() const { return m_has_devtools_client; }
     virtual bool has_active_devtools_client() const override { return has_devtools_client(); }
@@ -123,7 +122,6 @@ public:
     void did_execute_js_console_input(JsonValue const&);
     void run_javascript(StringView js_source);
     void did_output_js_console_message(WebView::ConsoleOutput);
-    void console_peer_did_misbehave(char const* reason);
 
     Vector<Web::CSS::StyleSheetIdentifier> list_style_sheets() const;
     Vector<Web::HTML::ScriptRegistry::Description> list_devtools_sources() const;

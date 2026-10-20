@@ -387,6 +387,81 @@ fn substituted_tokens(value: &StyleValueData) -> &StyleValueData {
 /// Custom property names, sorted and without duplicates.
 pub(crate) type CustomPropertyNames = Arc<[Arc<[u16]>]>;
 
+/// What an element's custom declarations resolve over, where its match answer decides them all.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct EnvironmentByAnswerKey {
+    answer: MatchAnswerID,
+    tree_scope: TreeScopeID,
+    parent_environment: u64,
+    registration_generation: u64,
+}
+
+/// The environment such declarations resolved to, and what they read beyond it.
+#[derive(Clone)]
+pub(super) struct EnvironmentByAnswer {
+    environment: u64,
+    reads: u8,
+    custom_property_reads: Option<Option<CustomPropertyNames>>,
+}
+
+/// The custom properties cascaded custom declarations declare or read, by the declarations: the operator, written
+/// value and name of each, the last two of which an entry holds so that neither is handed out again while it does.
+#[derive(Default)]
+pub(super) struct CustomPropertyReadsByDeclarations(HashMap<u64, MemoizedCustomPropertyReads>);
+
+/// A cascaded custom declaration as the memo holds it: its operator, written value and declared name.
+type HeldCustomDeclaration = (CascadeOperator, RetainedStyleValueData, Arc<[u16]>);
+
+struct MemoizedCustomPropertyReads {
+    declarations: Box<[HeldCustomDeclaration]>,
+    reads: Option<CustomPropertyNames>,
+}
+
+// A copy of the engine state starts over, as the memo only saves work.
+impl Clone for CustomPropertyReadsByDeclarations {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl CustomPropertyReadsByDeclarations {
+    /// The most declaration lists remembered at once.
+    const LIMIT: usize = 4096;
+
+    fn get(
+        &self,
+        hash: u64,
+        declarations: &[(CascadeOperator, &RetainedStyleValueData, Arc<[u16]>)],
+    ) -> Option<Option<CustomPropertyNames>> {
+        let memoized = self.0.get(&hash)?;
+        let same = memoized.declarations.len() == declarations.len()
+            && memoized.declarations.iter().zip(declarations).all(
+                |((operator, value, name), (other_operator, other_value, other_name))| {
+                    operator == other_operator
+                        && value.pointer() == other_value.pointer()
+                        && Arc::ptr_eq(name, other_name)
+                },
+            );
+        same.then(|| memoized.reads.clone())
+    }
+
+    fn remember(
+        &mut self,
+        hash: u64,
+        declarations: &[(CascadeOperator, &RetainedStyleValueData, Arc<[u16]>)],
+        reads: Option<CustomPropertyNames>,
+    ) {
+        if self.0.len() >= Self::LIMIT {
+            self.0.clear();
+        }
+        let declarations = declarations
+            .iter()
+            .map(|(operator, value, name)| (*operator, (*value).clone(), Arc::clone(name)))
+            .collect();
+        self.0.insert(hash, MemoizedCustomPropertyReads { declarations, reads });
+    }
+}
+
 pub(super) fn append_custom_property_reads(value: &StyleValueData, names: &mut Vec<Arc<[u16]>>) -> bool {
     let Some((references, all_references_visible)) = custom_property_references(substituted_tokens(value)) else {
         return true;
@@ -403,6 +478,26 @@ pub(super) fn value_reads_any_of_custom_properties(value: &StyleValueData, names
         || references
             .into_iter()
             .any(|reference| names.binary_search_by(|name| name.as_ref().cmp(reference)).is_ok())
+}
+
+/// The custom properties a written value reads by name, or `None` when it may read others: an
+/// `if()` condition, a custom function or an attribute's value can read any.
+fn named_custom_property_reads(value: &StyleValueData) -> Option<Vec<&[u16]>> {
+    let value = substituted_tokens(value);
+    if let StyleValueData::Unresolved {
+        presence_attr,
+        presence_dashed_function,
+        presence_if,
+        ..
+    } = value
+        && (*presence_attr || *presence_dashed_function || *presence_if)
+    {
+        return None;
+    }
+    let Some((references, all_references_visible)) = custom_property_references(value) else {
+        return Some(Vec::new());
+    };
+    all_references_visible.then_some(references)
 }
 
 pub(super) fn sorted_custom_property_names(mut names: Vec<Arc<[u16]>>) -> CustomPropertyNames {
@@ -1323,21 +1418,42 @@ impl RetainedState {
     }
 
     fn cascaded_custom_property_reads(
-        &self,
+        &mut self,
         cascaded: &[(CustomDeclaration, RetainedStyleValueData)],
     ) -> Option<CustomPropertyNames> {
-        let mut names = Vec::new();
+        let mut declarations = Vec::with_capacity(cascaded.len());
         for (declared, value) in cascaded {
-            if !matches!(declared.operator, CascadeOperator::Declared | CascadeOperator::Initial)
-                || !append_custom_property_reads(value.data(), &mut names)
-            {
+            if !matches!(declared.operator, CascadeOperator::Declared | CascadeOperator::Initial) {
                 return None;
+            }
+            let name = Arc::clone(&self.declared_custom_property_name(declared.name)?.text);
+            declarations.push((declared.operator, value, name));
+        }
+        // OPTIMIZATION: Elements alike in their rules cascade the same declarations, which read the same names.
+        let hash = intern_table::content_hash(
+            declarations
+                .iter()
+                .map(|(operator, value, name)| (*operator, value.pointer(), Arc::as_ptr(name).cast::<u16>()))
+                .collect::<SmallVec<[_; 16]>>(),
+        );
+        if let Some(memoized) = self.custom_property_reads_by_declarations.get(hash, &declarations) {
+            return memoized;
+        }
+        let mut names = Vec::new();
+        let mut reads_are_listed = true;
+        for (_, value, name) in &declarations {
+            if !append_custom_property_reads(value.data(), &mut names) {
+                reads_are_listed = false;
+                break;
             }
             // A declared name counts as a read. An environment leaves out a declared value equal to the
             // one it inherits.
-            names.push(self.declared_custom_property_name(declared.name)?.text.clone());
+            names.push(Arc::clone(name));
         }
-        Some(sorted_custom_property_names(names))
+        let reads = reads_are_listed.then(|| sorted_custom_property_names(names));
+        self.custom_property_reads_by_declarations
+            .remember(hash, &declarations, reads.clone());
+        reads
     }
 
     /// The name a cascaded custom declaration names, as its store entry keys it. A block's
@@ -1381,6 +1497,92 @@ impl RetainedState {
         self.engine_custom_property_environment_of(node, None, parent_environment, inputs, registered)
     }
 
+    /// `engine_custom_property_environment` for an element whose cascade declares no registered custom property: the
+    /// environment an element alike in its match answer, its tree and the environment it inherits resolved to.
+    pub(super) fn engine_custom_property_environment_by_answer(
+        &mut self,
+        node: StyleNodeID,
+        parent_environment: u64,
+        inputs: &bridge::FfiDocumentStyleComputationInputs,
+    ) -> Drive<u64> {
+        let key = self.environment_by_answer_key(node, parent_environment, inputs);
+        if let Some(key) = key
+            && let Some(memoized) = self.custom_property_environments_by_answer.get(&key).cloned()
+        {
+            self.counters.bump(Counter::EngineCustomPropertyEnvironmentAnswerHits);
+            match memoized.reads {
+                0 => self.custom_declaration_reads.remove(&node),
+                reads => self.custom_declaration_reads.insert(node, reads),
+            };
+            match memoized.custom_property_reads {
+                None => self.custom_declaration_custom_property_reads.remove(&node),
+                Some(reads) => self.custom_declaration_custom_property_reads.insert(node, reads),
+            };
+            return Ok(memoized.environment);
+        }
+        self.last_custom_property_environment_memoizable = false;
+        let environment = self.engine_custom_property_environment(node, parent_environment, inputs, None)?;
+        if let Some(key) = key
+            && self.last_custom_property_environment_memoizable
+        {
+            let memoized = EnvironmentByAnswer {
+                environment,
+                reads: self.custom_declaration_reads.get(&node).copied().unwrap_or(0),
+                custom_property_reads: self.custom_declaration_custom_property_reads.get(&node).cloned(),
+            };
+            self.custom_property_environments_by_answer.insert(key, memoized);
+        }
+        Ok(environment)
+    }
+
+    /// What decides an element's custom declarations, where its published match answer does: no batch of matches
+    /// stands in for the answer, the element's inline style declares no custom property, and no container condition
+    /// gates a rule of the answer declaring one.
+    fn environment_by_answer_key(
+        &self,
+        node: StyleNodeID,
+        parent_environment: u64,
+        inputs: &bridge::FfiDocumentStyleComputationInputs,
+    ) -> Option<EnvironmentByAnswerKey> {
+        if self.facts.element_custom_declarations_written(node).is_some() {
+            return None;
+        }
+        let gated = |rule: RuleID| {
+            self.program.rule_is_gated_by_container_query(rule) && !self.program.custom_declarations_of(rule).is_empty()
+        };
+        let answer_id = if let Some(matches) = self.batch_custom_property_matches.get(&node) {
+            if matches.iter().any(|entry| entry.pseudo.is_none() && gated(entry.rule)) {
+                return None;
+            }
+            *self.batch_custom_property_answers.get(&node)?
+        } else {
+            let (published, answer) = Self::published_answer_lookup(
+                &self.published_match_answers,
+                self.batch_matching_traversal.as_deref(),
+                node,
+            )?;
+            let matches = published.matches_for(answer)?;
+            if matches
+                .iter()
+                .any(|entry| entry.pseudo_element.is_none() && gated(entry.rule))
+            {
+                return None;
+            }
+            answer.cascade_input?
+        };
+        Some(EnvironmentByAnswerKey {
+            answer: answer_id,
+            tree_scope: self.tree.tree_scope(node),
+            parent_environment,
+            registration_generation: inputs.custom_property_registration_generation,
+        })
+    }
+
+    /// Forget the environments taken by match answer, whose identities may be handed out again.
+    pub(super) fn forget_custom_property_environments_by_answer(&mut self) {
+        self.custom_property_environments_by_answer.clear();
+    }
+
     /// What `engine_custom_property_environment` says of the element, for one of its
     /// pseudo-elements over the element's own environment.
     pub(super) fn engine_custom_property_environment_of(
@@ -1396,6 +1598,7 @@ impl RetainedState {
                 self.custom_declaration_reads.remove(&node);
                 self.custom_declaration_custom_property_reads.remove(&node);
             }
+            self.last_custom_property_environment_memoizable = true;
             return Ok(self.custom_property_environments.inheritable(parent_environment));
         }
         // A node the engine drives has the match answer its winners came from, and a published
@@ -1470,6 +1673,7 @@ impl RetainedState {
     ) -> Drive<u64> {
         let inherited_environment = self.custom_property_environments.inheritable(parent_environment);
         if cascaded.is_empty() {
+            self.last_custom_property_environment_memoizable = true;
             return Ok(inherited_environment);
         }
         let registry_ref = inputs.custom_property_registry();
@@ -1511,6 +1715,7 @@ impl RetainedState {
         let reads_conditions =
             functions.is_some() || cascaded.iter().any(|(_, value)| value_reads_conditions(value.data()));
         let memoizes = !reads_attributes && !reads_conditions && registered.is_none();
+        self.last_custom_property_environment_memoizable = memoizes;
         let key = Self::environment_inputs(
             parent_environment,
             inputs.custom_property_registration_generation,
@@ -1662,6 +1867,12 @@ impl RetainedState {
         }
         let identity = if rust_store.is_null() {
             inherited_environment
+        } else if let Some(previous) =
+            self.environment_resolving_to_the_same_values(node, pseudo, rust_store, registry_ref)
+        {
+            // SAFETY: The resolution handed over one strong reference to the store, which nothing else holds.
+            drop(unsafe { Arc::from_raw(rust_store.cast::<CustomPropertyStore>()) });
+            previous
         } else {
             unsafe {
                 self.custom_property_environments.adopt_engine_environment(
@@ -1683,6 +1894,40 @@ impl RetainedState {
                 .remember(key, identity, written_values);
         }
         Ok(identity)
+    }
+
+    /// The environment the element's declarations resolved to last, beneath any animation overlay, where they resolve to
+    /// its values again in `resolved`: an environment resolved anew, as one holding a registered value is, would move
+    /// what the element's descendants inherit without moving any value they see. What an environment hands down was
+    /// decided under the registrations it was resolved under, so only one handing down every value, then and now, is
+    /// kept.
+    fn environment_resolving_to_the_same_values(
+        &self,
+        node: StyleNodeID,
+        pseudo: Option<u8>,
+        resolved: *const c_void,
+        registry: &crate::css::custom_properties::CustomPropertyRegistry,
+    ) -> Option<u64> {
+        if pseudo.is_some() {
+            return None;
+        }
+        let held = self.element_custom_property_data.get(&node)?;
+        let previous = held.sampled_over.unwrap_or(held.identity);
+        if previous & custom_property_environments::ENGINE_ENVIRONMENT_IDENTITY_BIT == 0
+            || self.custom_property_environments.inheritable(previous) != previous
+        {
+            return None;
+        }
+        let previous_store = self.custom_property_environments.store(previous)?;
+        // SAFETY: Both stores are live: the previous one while the environment naming it is, the resolved one for
+        // the call.
+        let (previous_store, resolved) = unsafe {
+            (
+                &*previous_store.cast::<CustomPropertyStore>(),
+                &*resolved.cast::<CustomPropertyStore>(),
+            )
+        };
+        (resolved.hands_down_every_value(registry) && resolved.holds_same_values_as(previous_store)).then_some(previous)
     }
 
     /// What a node's records read beyond their cascade, as `FfiNodeRecordReads` bits, for the row
@@ -1720,6 +1965,169 @@ impl RetainedState {
             reads |= bridge::FfiNodeRecordReads::SiblingPosition as u8;
         }
         reads
+    }
+
+    /// What the custom properties an element declares resolve to once its animations sampled
+    /// `animated` into its custom properties. An animated value wins the cascade over a declared
+    /// one, so a declaration reading an animated name, or reading a declaration that does, resolves
+    /// against the animated values. Answers each such declaration whose value moved from the one
+    /// it holds in `base`, the element's environment beneath its animations. `inheritance` is the
+    /// environment the element inherits, and `finalization` computes registered values against the
+    /// element's lengths.
+    pub(crate) fn resolve_custom_properties_reading_animated_values(
+        &mut self,
+        node: StyleNodeID,
+        pseudo: Option<u8>,
+        base: *const c_void,
+        inheritance: *const c_void,
+        animated: &[(
+            crate::css::retained_fly_string::RetainedUtf16FlyString,
+            RetainedStyleValueData,
+        )],
+        finalization: CustomPropertyFinalization<'_>,
+    ) -> Vec<(
+        crate::css::retained_fly_string::RetainedUtf16FlyString,
+        RetainedStyleValueData,
+    )> {
+        if animated.is_empty() || !self.any_custom_property_is_declared() {
+            return Vec::new();
+        }
+        let Some(cascaded) = self.cascaded_custom_declarations_of(node, pseudo) else {
+            return Vec::new();
+        };
+        let mut moved: Vec<Arc<[u16]>> = animated
+            .iter()
+            .map(|(name, _)| Arc::from(name.to_utf16().as_ref()))
+            .collect();
+        let mut candidates: Vec<_> = cascaded
+            .iter()
+            .filter(|(declared, _)| declared.operator == CascadeOperator::Declared)
+            .filter_map(|(declared, value)| {
+                let name = self.declared_custom_property_name(declared.name)?;
+                Some((name, declared, value, named_custom_property_reads(value.data())))
+            })
+            .filter(|(name, _, _, _)| !moved.contains(&name.text))
+            .collect();
+        // What a declaration reads moves where any name it reads moved, and a read the scan
+        // cannot name may read any.
+        let mut readers = Vec::new();
+        loop {
+            let reads_moved = |reads: &Option<Vec<&[u16]>>| {
+                reads
+                    .as_ref()
+                    .is_none_or(|reads| reads.iter().any(|read| moved.iter().any(|name| name[..] == **read)))
+            };
+            let Some(index) = candidates.iter().position(|(_, _, _, reads)| reads_moved(reads)) else {
+                break;
+            };
+            let (name, declared, value, _) = candidates.swap_remove(index);
+            moved.push(name.text.clone());
+            readers.push((name.clone(), declared, value));
+        }
+        if readers.is_empty() {
+            return Vec::new();
+        }
+
+        let functions = if readers
+            .iter()
+            .any(|(_, _, value)| value_calls_custom_functions(value.data()))
+        {
+            // A container condition the engine cannot decide leaves the declarations as they resolved.
+            let Some(functions) = self.prepare_custom_functions(node, pseudo) else {
+                return Vec::new();
+            };
+            Some(functions)
+        } else {
+            None
+        };
+        let reads_attributes = functions.as_ref().is_some_and(|functions| functions.reads_attributes)
+            || readers.iter().any(|(_, _, value)| value_reads_attributes(value.data()));
+        let attribute_element = self.substitution_attribute_element(node, pseudo);
+        let attributes = reads_attributes
+            .then(|| SubstitutionAttributes::of(&self.facts, attribute_element, self.html_element_namespace));
+        let reads_conditions =
+            functions.is_some() || readers.iter().any(|(_, _, value)| value_reads_conditions(value.data()));
+        let style_query = reads_conditions
+            .then(|| self.style_query_inputs(computed::ComputedStyleTarget::new(node, pseudo.unwrap_or(u8::MAX))))
+            .flatten();
+
+        // The readers resolve as declared, over the element's environment, beside the animated values.
+        let values = readers
+            .iter()
+            .map(|(name, declared, value)| {
+                (
+                    name.raw.raw(),
+                    name.text.clone(),
+                    declared.important,
+                    value.pointer().cast(),
+                )
+            })
+            .chain(animated.iter().map(|(name, value)| {
+                (
+                    name.raw(),
+                    Arc::from(name.to_utf16().as_ref()),
+                    false,
+                    value.pointer().cast(),
+                )
+            }))
+            .collect();
+        // SAFETY: The base store is live for the sample, and the values are live for the call.
+        let cascaded_store = unsafe { Arc::from_raw(CustomPropertyStore::cascaded_child(base, values).cast()) };
+        let registry = self.document_style_computation_inputs.custom_property_registry();
+        let mut random_function_index = 0_usize;
+        let mut parse_context = registry.parse_context(&mut random_function_index);
+        parse_context.in_quirks_mode = self.document_style_computation_inputs.in_quirks_mode;
+        let media_environment = self.document_media.environment();
+        // The `style()` queries the declarations read were noted as they resolved beneath the animations.
+        let mut style_query_references = None;
+        // SAFETY: The store the element inherits from is live for the sample.
+        let inheritance_store = unsafe { inheritance.cast::<CustomPropertyStore>().as_ref() };
+        let mut resolution_context = engine_resolution_context(
+            &parse_context,
+            Some(&cascaded_store),
+            inheritance_store,
+            registry,
+            attributes.as_ref(),
+            &media_environment,
+            style_query.as_ref(),
+            Some(&mut style_query_references),
+            functions.as_ref(),
+        );
+        // A registered reader's random() takes the base value drawn for the element as its
+        // declarations resolved, not one the keyframes share.
+        let random_base_values = std::cell::RefCell::new(&mut self.random_base_values);
+        let draw_random_base_value = |name: &[u16], element_shared: bool| {
+            random_base_values.borrow_mut().ensure(Some(node), name, element_shared)
+        };
+        let finalization = CustomPropertyFinalization {
+            random_base_values: &[],
+            draw_random_base_value: Some(&draw_random_base_value),
+            ..finalization
+        };
+        // SAFETY: As above.
+        let (resolved, _) = unsafe {
+            resolve_declared_custom_properties(&cascaded_store, base, true, &mut resolution_context, finalization)
+        };
+        if resolved.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: The resolution hands over one strong reference to the store.
+        let resolved = unsafe { Arc::from_raw(resolved.cast::<CustomPropertyStore>()) };
+        readers
+            .iter()
+            .filter_map(|(name, _, _)| {
+                let name_raw = name.raw.raw();
+                if !resolved.declared_names.contains(&name_raw) {
+                    return None;
+                }
+                let value = resolved.own_values.get(&name_raw)?.value.clone();
+                // SAFETY: The name is live while the engine notes it.
+                Some((
+                    unsafe { crate::css::retained_fly_string::RetainedUtf16FlyString::from_borrowed_raw(name_raw) },
+                    value,
+                ))
+            })
+            .collect()
     }
 
     /// What a keyframe's written value substitutes to on the element being sampled, against the

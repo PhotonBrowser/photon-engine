@@ -52,7 +52,7 @@ extern "C" void ladybird_utf16_fly_string_unref(size_t);
 // The time since `started_at`, for the timing counters of style updates.
 static u64 microseconds_since(MonotonicTime started_at)
 {
-    return (MonotonicTime::now() - started_at).to_truncated_microseconds();
+    return (MonotonicTime::now() - started_at).to_microseconds();
 }
 
 // One style update of a document: its style computation, the style record views it reads, and the strings the engine
@@ -221,10 +221,12 @@ static void note_style_reaction_applied(Layout::BegunRead const& read, DOM::Elem
 // One element's computed style answers for another only while the inputs it was keyed on still mean what they meant. A
 // transaction boundary is exactly where they stop doing so: a declaration keyed on by identity may have been edited,
 // and a sheet may have come or gone. The engine resolves custom properties against the registrations in force, and an
-// @property rule registers through this cache.
-static void prepare_for_style_engine_transaction(DOM::Document& document)
+// @property rule registers through this cache. A registration change moves what every environment an element holds
+// hands down, which the engine is told again before the transaction derives records under them.
+static void prepare_for_style_engine_transaction(Layout::BegunRead const& read, DOM::Document& document)
 {
     document.build_registered_properties_cache_for_style_update();
+    document.republish_custom_property_environments_for_style_update(read);
     document.style_computer().prepare_for_style_engine_transaction();
 }
 
@@ -246,7 +248,7 @@ StyleEngineFFI::FfiTakenStyleTransaction StyleEngineFFI::web_css_take_style_tran
     } else {
         auto transaction_setup_started_at = MonotonicTime::now();
         ++counters.style_engine_transaction_setups;
-        prepare_for_style_engine_transaction(document);
+        prepare_for_style_engine_transaction(read, document);
         auto setup_microseconds = microseconds_since(transaction_setup_started_at);
         counters.style_engine_transaction_setup_microseconds += setup_microseconds;
         counters.style_update_submission_microseconds += setup_microseconds;
@@ -469,6 +471,12 @@ static void propagate_custom_property_environment_move(StyleReactionApplication&
     if (!origin.first_element_child() && !origin.shadow_root() && !is<HTML::HTMLSlotElement>(origin))
         return;
     move_custom_property_environment_below(application, origin, old_origin_data, origin.custom_property_data({}));
+}
+
+void move_custom_property_environment_below_animated_element(Layout::BegunRead const& read, DOM::Element& element, RefPtr<CustomPropertyData const> old_data)
+{
+    StyleReactionApplication application { read, element.document() };
+    propagate_custom_property_environment_move(application, element, move(old_data));
 }
 
 // Install the record the engine settled for a row, and the pseudo-element records beside it. A C++ computation applied
@@ -814,7 +822,7 @@ static Optional<StyleUpdateInputs> let_style_update_fly(Layout::BegunRead const&
     document.sample_animation_effects_needing_style_update();
     if (!style_computer.style_engine().has_pending_transaction(read))
         return {};
-    prepare_for_style_engine_transaction(document);
+    prepare_for_style_engine_transaction(read, document);
     if (!style_computer.style_engine().let_style_transaction_fly(read, *inputs, root->style_node_id(), blocker))
         return {};
     return inputs;

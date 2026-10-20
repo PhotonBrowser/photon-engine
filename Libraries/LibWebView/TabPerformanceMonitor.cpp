@@ -157,15 +157,15 @@ void TabPerformanceMonitor::update_monitoring()
         m_tabs.clear();
         return;
     }
-    auto interval = diagnostics ? 500 : m_memory_pressure ? pressure_sampling_interval_ms : residency_sampling_interval_ms;
-    if (m_enabled && m_sampling_interval_ms == interval)
+    auto interval_ms = diagnostics ? 500 : m_memory_pressure ? pressure_sampling_interval_ms : residency_sampling_interval_ms;
+    if (m_enabled && m_sampling_interval_ms == interval_ms)
         return;
     auto was_enabled = m_enabled;
     if (m_timer)
         m_timer = nullptr;
     m_enabled = true;
-    m_sampling_interval_ms = interval;
-    m_timer = Core::Timer::create_repeating(interval, [this] { sample(); });
+    m_sampling_interval_ms = interval_ms;
+    m_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(interval_ms), [this] { sample(); });
     m_timer->start();
     if (!was_enabled || diagnostics || m_memory_pressure)
         sample();

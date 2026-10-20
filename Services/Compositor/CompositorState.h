@@ -192,7 +192,6 @@ private:
 
 public:
     void present_pending_frames_for_testing() { present_pending_frames_on_vsync({}, MonotonicTime::now()); }
-    void retire_idle_surplus_backing_stores_for_testing(Web::CompositorContextId context_id) { retire_idle_surplus_backing_stores(context_id); }
     size_t pending_async_present_count_for_testing() const { return m_pending_async_presents.size(); }
 
     // What was not published yet, for a caller that needs the compositor's state as of now.
@@ -234,7 +233,30 @@ private:
         ContextState&,
         ContextState::ContextUpdateResult const&);
     void schedule_animation_frames_if_needed(ContextState&);
-    void dispatch_scroll_fling_step(Web::CompositorContextId, ContextState&, Optional<ContextState::ScrollFlingStep>);
+    enum class WheelStepOrigin : u8 {
+        UI,
+        Fling,
+    };
+    // A fling step is scrolled at the frame time the fling synthesized it for.
+    ContextState::ContextUpdateResult scroll_for_wheel_step(Web::CompositorContextId, ContextState&, Web::MouseEvent const&, WheelStepOrigin, Optional<MonotonicTime> fling_step_time = {});
+    struct WheelStepHandedToNestedContext {
+        // What is left for the context the step was handed from to present and report.
+        ContextState::ContextUpdateResult result;
+        bool nested_context_presents_frame { false };
+    };
+    WheelStepHandedToNestedContext hand_wheel_step_to_nested_context(Web::CompositorContextId, ContextState&, Web::MouseEvent const&, ContextState::NestedContextWheelStep const&, MonotonicTime now);
+    struct NestedContextTakingWheelStep {
+        Web::CompositorContextId context_id;
+        // Null when the step cannot be handed to the context.
+        ContextState* context { nullptr };
+        Gfx::FloatPoint position {};
+        ContextState::FirstWheelStepRoute route;
+    };
+    // The context that takes the first step of a gesture over the content of a context nested in the context
+    // `context_id`, among that context and the contexts nested in it. Empty when each of them passes the step on.
+    Optional<NestedContextTakingWheelStep> nested_context_taking_first_wheel_step(Web::CompositorContextId, Compositing::NestedContextWheelHit, Gfx::FloatPoint delta_in_css_pixels, Web::WheelDeltaPrecision);
+    bool is_nested_in(Web::CompositorContextId containing_context_id, ContextState const&) const;
+    void dispatch_scroll_fling_step(Web::CompositorContextId, ContextState&, Optional<Web::MouseEvent>, MonotonicTime now);
     void present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
     void schedule_present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
     void schedule_present_frame(Web::CompositorContextId, ContextState&, Gfx::IntRect viewport_rect);

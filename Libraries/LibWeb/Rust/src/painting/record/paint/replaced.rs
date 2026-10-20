@@ -12,27 +12,29 @@ use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelRect, CssPixelSize};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::builder::PendingInlineClip;
-use crate::painting::display_list::commands::{CanvasId, CompositorContextId};
+use crate::painting::display_list::commands::{CanvasId, CompositorContextId, CompositorNestedContextWheelRegion};
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::paintable_geometry::absolute_rect;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::background::{paint_image_content, to_gfx_scaling_mode};
 use crate::painting::replaced_paint_facts::VideoPaintFacts;
 use crate::painting::visual_context::node_values::padding_edge_border_radii;
-use libgfx_rust::{Color, FloatRect, IntRect, ScalingMode};
+use libgfx_rust::{Color, CornerRadii, FloatRect, IntRect, ScalingMode};
 
 fn replaced_content_clip_geometry<O: Observer>(
     recorder: &PaintRecorder<'_, O>,
     paintable: NodeSlotId,
-) -> (FloatRect, Vec<PendingInlineClip>) {
+) -> (FloatRect, Vec<PendingInlineClip>, Option<CornerRadii>) {
     let device_rect = recorder
         .converter
         .rounded_device_rect(absolute_rect(recorder.source, paintable));
     let content_rect = device_rect.to_float();
     let Some(style) = recorder.source.node_style_if_live(paintable) else {
-        return (content_rect, Vec::new());
+        return (content_rect, Vec::new(), None);
     };
     let radii = padding_edge_border_radii(style, recorder.source, paintable);
+    let corner_radii = radii.corners_unconditionally(&recorder.converter);
+    let corner_radii = corner_radii.has_any_radius().then_some(corner_radii);
     if let Some(path) = radii.shaped_path(device_rect, &recorder.converter) {
         return (
             content_rect,
@@ -40,16 +42,14 @@ fn replaced_content_clip_geometry<O: Observer>(
                 &path,
                 libgfx_rust::WindingRule::Nonzero,
             )],
+            corner_radii,
         );
     }
-    let corner_radii = radii.corners_unconditionally(&recorder.converter);
-    if !corner_radii.has_any_radius() {
-        return (content_rect, Vec::new());
-    }
-    (
-        content_rect,
-        vec![PendingInlineClip::intersecting_rounded_rect(content_rect, corner_radii)],
-    )
+    let clips = corner_radii
+        .map(|corner_radii| PendingInlineClip::intersecting_rounded_rect(content_rect, corner_radii))
+        .into_iter()
+        .collect();
+    (content_rect, clips, corner_radii)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -310,7 +310,7 @@ pub(crate) fn paint_image_foreground<O: Observer>(recorder: &mut PaintRecorder<'
 
         let draw_rect = get_replaced_box_painting_area(recorder, paintable, object_fit, concrete_object_size);
         if !draw_rect.is_empty() {
-            let (content_rect, mut inline_clips) = replaced_content_clip_geometry(recorder, paintable);
+            let (content_rect, mut inline_clips, _) = replaced_content_clip_geometry(recorder, paintable);
             if !image_rect_device_pixels.contains_rect(draw_rect) {
                 inline_clips.push(PendingInlineClip::intersecting_float_rect(content_rect));
             }
@@ -350,7 +350,7 @@ pub(crate) fn paint_canvas_foreground<O: Observer>(recorder: &mut PaintRecorder<
     if !facts.has_content {
         return;
     }
-    let (_, corner_clips) = replaced_content_clip_geometry(recorder, paintable);
+    let (_, corner_clips, _) = replaced_content_clip_geometry(recorder, paintable);
     recorder.record_with_inline_clips(&corner_clips, |recorder| {
         let scaling_mode = to_gfx_scaling_mode(
             image_rendering,
@@ -376,7 +376,7 @@ pub(crate) fn paint_video_foreground<O: Observer>(recorder: &mut PaintRecorder<'
     let video_rect = recorder
         .converter
         .rounded_device_rect(absolute_rect(recorder.source, paintable));
-    let (content_rect, mut inline_clips) = replaced_content_clip_geometry(recorder, paintable);
+    let (content_rect, mut inline_clips, _) = replaced_content_clip_geometry(recorder, paintable);
     inline_clips.push(PendingInlineClip::intersecting_float_rect(content_rect));
     recorder.record_with_inline_clips(&inline_clips, |recorder| match &facts {
         VideoPaintFacts::VideoFrame(Some(video_frame)) => {
@@ -440,22 +440,37 @@ pub(crate) fn paint_navigable_container_foreground<O: Observer>(
         return;
     }
     let absolute_rect = absolute_rect(recorder.source, paintable);
-    let (content_rect, mut inline_clips) = replaced_content_clip_geometry(recorder, paintable);
+    let (content_rect, mut inline_clips, corner_radii) = replaced_content_clip_geometry(recorder, paintable);
     inline_clips.push(PendingInlineClip::intersecting_float_rect(content_rect));
+    // Preserve fractional placement so the child raster uses the same pixel phase as content
+    // painted directly under the embedding transform.
+    let scale = recorder.converter.device_pixels_per_css_pixel();
+    let destination_rect = FloatRect::new(
+        (absolute_rect.x.to_double() * scale) as f32,
+        (absolute_rect.y.to_double() * scale) as f32,
+        (absolute_rect.width.to_double() * scale) as f32,
+        (absolute_rect.height.to_double() * scale) as f32,
+    );
+    let child_context_id = CompositorContextId(facts.composited_context_id);
     recorder.record_with_inline_clips(&inline_clips, |recorder| {
-        // Preserve fractional placement so the child raster uses the same pixel phase as content
-        // painted directly under the embedding transform.
-        let scale = recorder.converter.device_pixels_per_css_pixel();
-        let destination_rect = FloatRect::new(
-            (absolute_rect.x.to_double() * scale) as f32,
-            (absolute_rect.y.to_double() * scale) as f32,
-            (absolute_rect.width.to_double() * scale) as f32,
-            (absolute_rect.height.to_double() * scale) as f32,
-        );
-        recorder.recorder.draw_composited_context(
-            destination_rect,
-            CompositorContextId(facts.composited_context_id),
-            ScalingMode::NearestNeighbor,
-        );
+        recorder
+            .recorder
+            .draw_composited_context(destination_rect, child_context_id, ScalingMode::NearestNeighbor);
     });
+
+    // The compositor only reads the metadata outside groups, and a record under ambient clips would count as drawn.
+    if destination_rect.is_empty()
+        || !recorder.visible_for_hit_testing(paintable)
+        || recorder.recorder.is_recording_inside_group()
+        || recorder.is_recording_svg_resource_content()
+    {
+        return;
+    }
+    recorder
+        .recorder
+        .compositor_nested_context_wheel_region(CompositorNestedContextWheelRegion {
+            rect: destination_rect,
+            corner_radii: corner_radii.unwrap_or_default(),
+            child_context_id,
+        });
 }

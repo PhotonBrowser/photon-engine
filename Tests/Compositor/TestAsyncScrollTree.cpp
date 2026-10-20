@@ -197,8 +197,8 @@ TEST_CASE(async_scrolling_resolves_sticky_offsets_from_the_visual_context_tree)
     auto scroll_tree = make_scroll_tree_with_viewport_scroll_node(2000);
     Compositing::ScrollStateSnapshot snapshot;
 
-    auto scroll_application = scroll_tree.apply_scroll_delta(viewport_node_id, { 0, 300 }, visual_context_tree, snapshot, Compositing::ScrollChaining::ToScrollableAncestors);
-    EXPECT(!scroll_application.scroll_offsets.is_empty());
+    auto scroll_offset = scroll_tree.apply_scroll_delta(viewport_node_id, { 0, 300 }, visual_context_tree, snapshot, Compositing::ScrollChaining::ToScrollableAncestors);
+    EXPECT(scroll_offset.has_value());
     EXPECT_EQ(snapshot.device_offset_for_index(viewport_scroll_node), (Gfx::FloatPoint { 0, -300 }));
     // The scrollport top passed the header by 200px, so the header follows it by that much.
     EXPECT_EQ(snapshot.device_offset_for_index(header_node), (Gfx::FloatPoint { 0, 200 }));

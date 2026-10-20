@@ -85,9 +85,9 @@ impl Utf16SliceExt for [u16] {
 }
 
 #[repr(C)]
-pub struct FfiCustomPropertyStoreEntry {
+pub struct FfiCustomPropertyStoreEntry<'a> {
     pub name_raw: usize,
-    pub name: FfiUtf16View,
+    pub name: FfiUtf16View<'a>,
     pub important: bool,
     pub data: *const c_void,
 }
@@ -182,12 +182,12 @@ struct FunctionLocalScope {
 }
 
 #[repr(C)]
-pub struct FfiCustomPropertyRegistration {
-    pub name: FfiUtf16View,
+pub struct FfiCustomPropertyRegistration<'a> {
+    pub name: FfiUtf16View<'a>,
     pub syntax: *const c_void,
     pub inherits: bool,
     pub has_initial_value: bool,
-    pub initial_value: FfiUtf16View,
+    pub initial_value: FfiUtf16View<'a>,
     /// The initial value as the host computed it against the document, borrowed for the call.
     pub computed_initial_value: *const c_void,
 }
@@ -606,6 +606,11 @@ impl CustomPropertyStore {
         self.parent.as_ref()
     }
 
+    /// The store this one was built over, whichever of its values it took in.
+    pub(crate) fn inheritance_parent(&self) -> Option<&Arc<CustomPropertyStore>> {
+        self.inheritance_parent.as_ref()
+    }
+
     pub(crate) fn get(&self, name_raw: usize) -> Option<&CustomPropertyEntry> {
         self.own_values
             .get(&name_raw)
@@ -629,10 +634,10 @@ impl CustomPropertyStore {
     /// What a child inherits of this store: the store without the entries a registration keeps
     /// from inheriting, over the same chain; `None` when every entry inherits.
     pub(crate) fn inheritable(&self, registry: &CustomPropertyRegistry) -> Option<Arc<CustomPropertyStore>> {
-        let inherits = |entry: &CustomPropertyEntry| registry.name_inherits(&entry.name);
-        if self.own_values.values().all(inherits) {
+        if self.hands_down_every_value(registry) {
             return None;
         }
+        let inherits = |entry: &CustomPropertyEntry| registry.name_inherits(&entry.name);
         let own_values: HashMap<usize, CustomPropertyEntry> = self
             .own_values
             .iter()
@@ -655,6 +660,33 @@ impl CustomPropertyStore {
             inheritance_parent: self.inheritance_parent.clone(),
             ancestor_count: self.ancestor_count,
         }))
+    }
+
+    /// Whether the store holds the same values as `other`, built over the same store and chained to
+    /// the same parent.
+    pub(crate) fn holds_same_values_as(&self, other: &Self) -> bool {
+        let same = |first: &Option<Arc<Self>>, second: &Option<Arc<Self>>| match (first, second) {
+            (None, None) => true,
+            (Some(first), Some(second)) => Arc::ptr_eq(first, second),
+            _ => false,
+        };
+        same(&self.parent, &other.parent)
+            && same(&self.inheritance_parent, &other.inheritance_parent)
+            && self.declared_names == other.declared_names
+            && self.own_values.len() == other.own_values.len()
+            && self.own_values.iter().all(|(name_raw, entry)| {
+                other.own_values.get(name_raw).is_some_and(|other_entry| {
+                    other_entry.important == entry.important
+                        && crate::css::style_value::retained_style_values_equal(&other_entry.value, &entry.value)
+                })
+            })
+    }
+
+    /// Whether a child inherits every entry of this store.
+    pub(crate) fn hands_down_every_value(&self, registry: &CustomPropertyRegistry) -> bool {
+        self.own_values
+            .values()
+            .all(|entry| registry.name_inherits(&entry.name))
     }
 
     pub(crate) fn value_matches(&self, name_raw: usize, value: &StyleValueData) -> bool {
@@ -961,14 +993,7 @@ pub unsafe extern "C" fn rust_style_query_dependencies_take(
     let dependencies = unsafe { Box::from_raw(dependencies.cast::<StyleQueryDependencies>()) };
     for name in dependencies.names() {
         unsafe {
-            visit(
-                context,
-                FfiUtf16View {
-                    ascii: std::ptr::null(),
-                    utf16: name.as_ptr(),
-                    length: name.len(),
-                },
-            );
+            visit(context, FfiUtf16View::from_utf16(name));
         }
     }
 }
@@ -3811,10 +3836,15 @@ pub unsafe extern "C" fn rust_custom_property_registry_update(
             .to_vec();
     registry.registrations.reserve(registrations.len());
     for registration in registrations {
-        let name = unsafe { registration.name.to_utf16() }.expect("invalid registered custom property name");
+        let name = registration
+            .name
+            .to_utf16()
+            .expect("invalid registered custom property name");
         let initial_source = if registration.has_initial_value {
             Some(
-                unsafe { registration.initial_value.to_utf16() }
+                registration
+                    .initial_value
+                    .to_utf16()
                     .expect("invalid registered custom property initial value"),
             )
         } else {
@@ -3908,9 +3938,7 @@ pub unsafe extern "C" fn rust_custom_property_store_create(
     let own_values = entries
         .iter()
         .map(|entry| {
-            let name: Arc<[u16]> = unsafe { entry.name.to_utf16() }
-                .expect("invalid custom property name")
-                .into();
+            let name: Arc<[u16]> = entry.name.to_utf16().expect("invalid custom property name").into();
             own_names.insert(name.clone(), entry.name_raw);
             (
                 entry.name_raw,
@@ -3954,9 +3982,7 @@ pub unsafe extern "C" fn rust_custom_property_store_create_animation_overlay(
     };
     let base = unsafe { base.cast::<CustomPropertyStore>().as_ref() };
     let animated = entries.iter().map(|entry| {
-        let name: Arc<[u16]> = unsafe { entry.name.to_utf16() }
-            .expect("invalid custom property name")
-            .into();
+        let name: Arc<[u16]> = entry.name.to_utf16().expect("invalid custom property name").into();
         (
             entry.name_raw,
             CustomPropertyEntry {

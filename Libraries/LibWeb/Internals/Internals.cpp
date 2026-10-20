@@ -1448,7 +1448,7 @@ static Optional<RecordedScrollTree> recorded_scroll_tree_of(DOM::Document& docum
         .admission = {},
     };
     auto async_scrolling_state = Compositing::async_scrolling_state_from_display_list(*display_list);
-    recorded.admission = Compositing::wheel_routing_admission_for(async_scrolling_state, document.page().wheel_event_listener_state_generation());
+    recorded.admission = Compositing::wheel_routing_admission_for(async_scrolling_state, document.wheel_event_listener_state_generation());
     recorded.scroll_tree.set_state(move(async_scrolling_state));
     recorded.scroll_tree.rebuild_wheel_hit_test_targets(display_list, &recorded.visual_context_tree, document.scroll_state_snapshot());
     return recorded;
@@ -2754,6 +2754,8 @@ GC::Ptr<JS::Object> Internals::take_context_menu_request()
     object->define_direct_property("kind"_utf16_fly_string, JS::PrimitiveString::create(vm(), context_menu_kind_to_string(request->kind)), JS::default_attributes);
     auto target = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, request->target);
     object->define_direct_property("target"_utf16_fly_string, target, JS::default_attributes);
+    object->define_direct_property("x"_utf16_fly_string, JS::Value(request->position.x().to_double()), JS::default_attributes);
+    object->define_direct_property("y"_utf16_fly_string, JS::Value(request->position.y().to_double()), JS::default_attributes);
     if (request->media.has_value()) {
         object->define_direct_property("isPictureInPicture"_utf16_fly_string, JS::Value(request->media->is_picture_in_picture), JS::default_attributes);
         object->define_direct_property("canEnterPictureInPicture"_utf16_fly_string, JS::Value(request->media->can_enter_picture_in_picture), JS::default_attributes);
@@ -2952,7 +2954,6 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
     object->define_direct_property("styleUpdateBridgeMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_bridge_microseconds), JS::default_attributes);
     object->define_direct_property("styleUpdateApplyMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_apply_microseconds), JS::default_attributes);
     object->define_direct_property("styleUpdateRemainderMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_remainder_microseconds), JS::default_attributes);
-    object->define_direct_property("styleRecomputeMicroseconds"_utf16_fly_string, JS::Value(counters.style_recompute_microseconds), JS::default_attributes);
     object->define_direct_property("customPropertyResolutions"_utf16_fly_string, JS::Value(counters.custom_property_resolutions), JS::default_attributes);
     object->define_direct_property("customPropertyElements"_utf16_fly_string, JS::Value(counters.custom_property_elements), JS::default_attributes);
     object->define_direct_property("customPropertyValueComputations"_utf16_fly_string, JS::Value(counters.custom_property_value_computations), JS::default_attributes);

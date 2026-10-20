@@ -479,7 +479,7 @@ void EventLoopManagerUnix::wait_for_events(EventLoopImplementation::PumpMode mod
             auto computed_timeout = next_timer_expiration.value() - time_at_iteration_start;
             if (computed_timeout.is_negative())
                 computed_timeout = AK::Duration::zero();
-            i64 true_timeout = computed_timeout.to_milliseconds();
+            i64 true_timeout = computed_timeout.to_ceiled_milliseconds();
             timeout = static_cast<i32>(min<i64>(AK::NumericLimits<i32>::max(), true_timeout));
         } else {
             should_wait_forever = true;
@@ -768,15 +768,15 @@ void EventLoopManagerUnix::unregister_signal(int handler_id)
         info.signal_handlers.remove(remove_signal_number);
 }
 
-intptr_t EventLoopManagerUnix::register_timer(EventReceiver& object, int milliseconds, bool should_reload)
+intptr_t EventLoopManagerUnix::register_timer(EventReceiver& object, AK::Duration interval, bool should_reload)
 {
-    VERIFY(milliseconds >= 0);
+    VERIFY(!interval.is_negative());
     auto& thread_data = ThreadData::the();
     MutexLocker locker(thread_data.mutex);
     auto timer = new EventLoopTimer;
     timer->owner_thread = thread_data.thread_id;
     timer->owner = object;
-    timer->interval = AK::Duration::from_milliseconds(milliseconds);
+    timer->interval = interval;
     // NB: The timer is armed and expired on the precise clock. CLOCK_MONOTONIC_COARSE lags it by up to a scheduler
     //     tick on Linux, so a timer armed against the coarse clock could fire that much before its deadline on the
     //     clock everything else measures with, performance.now() included.

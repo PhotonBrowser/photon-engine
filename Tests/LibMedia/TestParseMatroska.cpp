@@ -879,7 +879,7 @@ Media::TimeRanges wait_for_buffered_ranges(Core::EventLoop& loop, Media::Demuxer
     ScopeGuard remove_handler = [&] { demuxer.set_scan_state_change_handler(nullptr); };
 
     bool deadline_expired = false;
-    auto deadline_timer = Core::Timer::create_single_shot(1'000, [&] { deadline_expired = true; });
+    auto deadline_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1'000), [&] { deadline_expired = true; });
     deadline_timer->start();
 
     loop.spin_until([&] { return condition(source_buffered_ranges(demuxer)) || deadline_expired; });
@@ -933,7 +933,8 @@ TEST_CASE(buffered_time_ranges_incremental_thirds)
     // Stage 3: complete the file.
     stream->add_chunk_at(two_thirds, file_data.bytes().slice(two_thirds, CUES_START - two_thirds));
     stream->close();
-    auto ranges_3 = wait_for_buffered_ranges(loop, *demuxer, [&](auto const& ranges) { return ranges != ranges_2; });
+    auto ranges_3 = wait_for_buffered_ranges(loop, *demuxer, [&](auto const&) { return demuxer->scan_state().reached_end_of_stream; });
+    EXPECT(demuxer->scan_state().reached_end_of_stream);
     EXPECT_EQ(ranges_3.size(), 1u);
     EXPECT_EQ(ranges_3[0].start, start);
     EXPECT(ranges_3[0].end > ranges_2[0].end);

@@ -12,6 +12,7 @@ namespace Web::SVG::TagNames {
 
 #define ENUMERATE_SVG_TAGS                                          \
     __ENUMERATE_SVG_TAG(a, "a")                                     \
+    __ENUMERATE_SVG_TAG(animateMotion, "animateMotion")             \
     __ENUMERATE_SVG_TAG(circle, "circle")                           \
     __ENUMERATE_SVG_TAG(clipPath, "clipPath")                       \
     __ENUMERATE_SVG_TAG(defs, "defs")                               \
@@ -43,6 +44,7 @@ namespace Web::SVG::TagNames {
     __ENUMERATE_SVG_TAG(linearGradient, "linearGradient")           \
     __ENUMERATE_SVG_TAG(mask, "mask")                               \
     __ENUMERATE_SVG_TAG(metadata, "metadata")                       \
+    __ENUMERATE_SVG_TAG(mpath, "mpath")                             \
     __ENUMERATE_SVG_TAG(path, "path")                               \
     __ENUMERATE_SVG_TAG(pattern, "pattern")                         \
     __ENUMERATE_SVG_TAG(polygon, "polygon")                         \
@@ -50,6 +52,7 @@ namespace Web::SVG::TagNames {
     __ENUMERATE_SVG_TAG(radialGradient, "radialGradient")           \
     __ENUMERATE_SVG_TAG(rect, "rect")                               \
     __ENUMERATE_SVG_TAG(script, "script")                           \
+    __ENUMERATE_SVG_TAG(set, "set")                                 \
     __ENUMERATE_SVG_TAG(stop, "stop")                               \
     __ENUMERATE_SVG_TAG(style, "style")                             \
     __ENUMERATE_SVG_TAG(svg, "svg")                                 \

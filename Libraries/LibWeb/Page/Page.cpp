@@ -661,14 +661,15 @@ Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor
     return state;
 }
 
-void Page::invalidate_compositor_wheel_event_listener_state()
+// A document's listeners only see the wheel events over that document, so they only hold back the wheel steps of its own
+// navigable's context.
+void Page::invalidate_compositor_wheel_event_listener_state(DOM::Document& document)
 {
     ++m_wheel_event_listener_state_generation;
+    document.set_wheel_event_listener_state_generation(m_wheel_event_listener_state_generation);
 
-    for (auto const& navigable : hosted_navigables()) {
-        if (navigable->has_compositor_context())
-            navigable->compositor_context().invalidate_wheel_event_listener_state(m_wheel_event_listener_state_generation);
-    }
+    if (auto navigable = document.navigable(); navigable && navigable->has_compositor_context())
+        navigable->compositor_context().invalidate_wheel_event_listener_state(m_wheel_event_listener_state_generation);
 }
 
 void Page::update_needs_beforeunload_check()
@@ -1840,6 +1841,7 @@ void Page::invalidate_style_for_preference_change()
         if (auto document = navigable->active_document())
             invalidate_document(*document);
     }
+    m_client->request_frame();
 }
 
 bool Page::content_blocking_enabled_for_url(Optional<URL::URL> const& url) const

@@ -181,6 +181,7 @@ private:
     RefPtr<Gfx::PaintingSurface> m_latest_rendered_surface;
     RefPtr<Gfx::PaintingSurface> m_damage_surface;
     Optional<RasterizedFrame> m_last_rasterized_frame;
+    Gfx::FloatSize m_unbounded_raster_scale_of_embedding { 1, 1 };
     Gfx::FloatSize m_raster_scale { 1, 1 };
     Gfx::FloatPoint m_raster_translation;
     bool m_has_completed_first_present { false };

@@ -477,6 +477,18 @@ void BrowserWindow::duplicate_tab(Tab& source_tab)
         duplicate.navigate(source_url);
 }
 
+void BrowserWindow::open_history_entry_in_new_tab(Tab& source_tab, int delta)
+{
+    auto& view = source_tab.view();
+    auto history = view.session_history_snapshot();
+    history.current_used_step_index = view.traversable().effective_current_session_history_step_index() + delta;
+    if (history.current_used_step_index >= history.used_steps.size())
+        return;
+
+    auto& tab = create_new_tab(Web::HTML::ActivateTab::No, TabLocation::after_tab(source_tab));
+    (void)tab.view().restore_session_history_from_snapshot(AK::move(history));
+}
+
 Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, Optional<WebView::CanonicalTraversable&> traversable)
 {
     cancel_window_close_preflight();
@@ -739,16 +751,16 @@ void BrowserWindow::activate_tab(int index)
     m_tabs_container->set_current_index(index);
 }
 
-bool BrowserWindow::activate_tab_with_url(URL::URL const& url)
+Tab* BrowserWindow::activate_tab_with_url(URL::URL const& url, URL::ExcludeFragment exclude_fragment)
 {
     for (int index = 0; index < m_tabs_container->count(); ++index) {
         auto* tab = m_tabs_container->tab(index);
-        if (tab && tab->view().url() == url) {
+        if (tab && tab->view().url().equals(url, exclude_fragment)) {
             m_tabs_container->set_current_index(index);
-            return true;
+            return tab;
         }
     }
-    return false;
+    return nullptr;
 }
 
 bool BrowserWindow::definitely_close_tab(int index)
@@ -1550,28 +1562,28 @@ void BrowserWindow::closeEvent(QCloseEvent* event)
     }
 }
 
-void BrowserWindow::request_close_preflight_for_quit(Function<void(bool approved)> on_complete)
+void BrowserWindow::request_close_preflight(Function<void(bool approved)> on_complete)
 {
     if (m_window_close_approved) {
         on_complete(true);
         return;
     }
 
-    // A close the user already started on this window gives way to the quit's check, which asks every page again.
+    // A close the user already started on this window gives way to the caller's check, which asks every page again.
     if (m_window_close_coordinator.is_running())
         cancel_window_close_preflight();
 
     begin_window_close_preflight(AK::move(on_complete));
 }
 
-void BrowserWindow::raise_for_quit_prompt()
+void BrowserWindow::raise_for_close_prompt()
 {
-    // Only a quit's check carries a completion; a close the user started on this window is already in front.
+    // Only an application-wide check carries a completion; a close the user started on this window is already in front.
     if (!m_window_close_coordinator.is_running() || !m_window_close_preflight_on_complete)
         return;
 
     // A page's beforeunload prompt shows inside this window, which may sit behind other windows or in the Dock while a
-    // quit asks it, so the window comes to the front first, where the user can see the prompt.
+    // close check asks it, so the window comes to the front first, where the user can see the prompt.
     if (isMinimized())
         setWindowState(windowState() & ~Qt::WindowMinimized);
     raise();

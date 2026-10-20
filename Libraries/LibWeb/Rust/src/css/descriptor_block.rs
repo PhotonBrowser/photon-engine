@@ -52,21 +52,17 @@ pub struct FfiDescriptorBlock {
 }
 
 #[repr(C)]
-pub struct FfiDescriptor {
-    pub name: FfiUtf16View,
+pub struct FfiDescriptor<'a> {
+    pub name: FfiUtf16View<'a>,
     pub id: u8,
     pub value: *const c_void,
 }
 
 impl DescriptorData {
     #[cfg(test)]
-    pub(crate) fn view(&self) -> FfiDescriptor {
+    pub(crate) fn view(&self) -> FfiDescriptor<'_> {
         FfiDescriptor {
-            name: FfiUtf16View {
-                utf16: self.name.units().as_ptr(),
-                length: self.name.units().len(),
-                ..Default::default()
-            },
+            name: FfiUtf16View::from_utf16(self.name.units()),
             id: self.id,
             value: Arc::as_ptr(&self.value).cast(),
         }
@@ -108,7 +104,7 @@ impl FfiDescriptorBlock {
 }
 
 unsafe fn descriptor_from_view(view: &FfiDescriptor) -> DescriptorData {
-    let name = CssString::from_utf16(&unsafe { view.name.to_utf16() }.unwrap());
+    let name = CssString::from_utf16(&view.name.to_utf16().unwrap());
     assert!(!view.value.is_null());
     let value = view.value.cast::<StyleValueData>();
     let value = unsafe {
@@ -169,12 +165,8 @@ pub extern "C" fn rust_descriptor_block_length(block: &FfiDescriptorBlock) -> us
 
 // The block owns the returned value until its next mutation.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_descriptor_block_get(
-    block: &FfiDescriptorBlock,
-    id: u8,
-    name: FfiUtf16View,
-) -> *const c_void {
-    let name = unsafe { name.units() }.unwrap();
+pub extern "C" fn rust_descriptor_block_get(block: &FfiDescriptorBlock, id: u8, name: FfiUtf16View) -> *const c_void {
+    let name = name.units().unwrap();
     block
         .data()
         .descriptors
@@ -248,12 +240,8 @@ pub unsafe extern "C" fn rust_descriptor_block_set(block: &mut FfiDescriptorBloc
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_descriptor_block_remove(
-    block: &mut FfiDescriptorBlock,
-    id: u8,
-    name: FfiUtf16View,
-) -> bool {
-    let name = unsafe { name.to_utf16() }.unwrap();
+pub extern "C" fn rust_descriptor_block_remove(block: &mut FfiDescriptorBlock, id: u8, name: FfiUtf16View) -> bool {
+    let name = name.to_utf16().unwrap();
     let Some(index) =
         block.data().descriptors.iter().position(|descriptor| {
             descriptor.id == id && (id != CUSTOM_DESCRIPTOR_ID || descriptor.name.units() == name)
@@ -305,7 +293,7 @@ mod tests {
             first.value = Arc::as_ptr(&data.descriptors[1].value).cast();
             assert!(unsafe { rust_descriptor_block_set(&mut block, &first) });
             let second = data.descriptors[1].view();
-            assert!(unsafe { rust_descriptor_block_remove(&mut block, second.id, second.name) });
+            assert!(rust_descriptor_block_remove(&mut block, second.id, second.name));
             assert_eq!(block.data().descriptors.len(), 1);
             assert!(Arc::ptr_eq(
                 &block.data().descriptors[0].value,
@@ -340,7 +328,7 @@ mod tests {
         assert_eq!(rust_descriptor_block_length(block), 2);
         let allocations = DESCRIPTOR_OWNER_ALLOCATIONS.get();
         let descriptor = snapshot.descriptors[0].view();
-        let value = unsafe { rust_descriptor_block_get(block, descriptor.id, descriptor.name) };
+        let value = rust_descriptor_block_get(block, descriptor.id, descriptor.name);
         assert_eq!(value, descriptor.value);
         assert_eq!(
             serialize_descriptors(&block.data()).into_utf16(),
@@ -352,7 +340,11 @@ mod tests {
         assert!(matches!(*block.state.borrow(), DescriptorBlockState::Immutable(_)));
         assert!(rust_descriptor_block_external_memory_size(block) > 0);
         let mut fork = unsafe { Box::from_raw(rust_descriptor_block_share(block)) };
-        assert!(!unsafe { rust_descriptor_block_remove(&mut fork, CUSTOM_DESCRIPTOR_ID, FfiUtf16View::default()) });
+        assert!(!rust_descriptor_block_remove(
+            &mut fork,
+            CUSTOM_DESCRIPTOR_ID,
+            FfiUtf16View::default()
+        ));
         assert!(matches!(*block.state.borrow(), DescriptorBlockState::Immutable(_)));
         assert!(matches!(*fork.state.borrow(), DescriptorBlockState::Immutable(_)));
         assert!(Arc::ptr_eq(&snapshot, &fork.data()));
@@ -360,11 +352,15 @@ mod tests {
         let mut retained = unsafe { Box::from_raw(rust_descriptor_block_retain(block)) };
         assert!(Rc::ptr_eq(&block.owner(), &retained.owner()));
         let descriptor = snapshot.descriptors[0].view();
-        assert!(unsafe { rust_descriptor_block_remove(&mut retained, descriptor.id, descriptor.name) });
+        assert!(rust_descriptor_block_remove(
+            &mut retained,
+            descriptor.id,
+            descriptor.name
+        ));
         assert_eq!(rust_descriptor_block_length(block), 1);
         // The pinned snapshot still owns the removed descriptor.
         assert_eq!(
-            unsafe { descriptor.name.to_utf16().unwrap() },
+            descriptor.name.to_utf16().unwrap(),
             "font-family".encode_utf16().collect::<Vec<_>>()
         );
         assert_eq!(fork.data().descriptors.len(), 2);
@@ -373,7 +369,11 @@ mod tests {
         assert!(matches!(*fork.state.borrow(), DescriptorBlockState::Immutable(_)));
         drop((rule, rules));
         let first = &snapshot.descriptors[0];
-        assert!(unsafe { rust_descriptor_block_remove(&mut fork, first.id, FfiUtf16View::default()) });
+        assert!(rust_descriptor_block_remove(
+            &mut fork,
+            first.id,
+            FfiUtf16View::default()
+        ));
         assert!(matches!(*fork.state.borrow(), DescriptorBlockState::Mutable(_)));
         assert_eq!(fork.data().descriptors.len(), 1);
         assert_eq!(retained.data().descriptors.len(), 2);

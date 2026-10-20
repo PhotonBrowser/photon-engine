@@ -128,6 +128,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | StoreSlot | Writes input 0 to a frame slot: a reserved register (the this value, the saved lexical environment), a written constant, an argument the legacy `arguments` shows, or a slot the next call reading the frame or `Suspend` reads. The verifier enforces this. | | | Frame | |
 | BoxInt32, BoxBool | The tagged value of an unboxed input. | | | | cse |
 | CheckInt32 | Input 0 as an int32; exits unless it is one. | E | | | cse |
+| CheckFloat64Int32 | The float64 input 0 as an int32; exits unless it is one (-0 is none). What an int32 check of a boxed double becomes once checks of doubles no longer go. | E | | | cse |
 | CheckNumber | Input 0 as a float64; exits unless it is a number. | E | | | cse |
 | EmptyToUndefined | Input 0 with the empty value replaced by `undefined`. | | | | cse |
 | CellAddress | The cell pointer of a tagged value, shared by the nodes accessing the object. | | | | cse |
@@ -183,7 +184,8 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | ProbeGlobalCache, ProbeGlobalStore | The global variable a global variable cache is for (a data property of the global object of the cached shape, or an initialized binding of the global declarative environment), like `GetGlobal` and `SetGlobal`; the empty value, or false, where the cache does not apply. Inputs: the realm and the executable (and for stores, the value first). | | Any | (Store) Any | |
 | ProbeHasProperty | Whether the object has the property the key names, as its own (`hasOwnProperty`) or at all (`in`), where the VM can tell without running code: from the VM's keyed cache and, for `in`, the elements inline, and from the runtime's lookup out of line; the empty value otherwise. | | Any | | saves GPRs |
 | AppendElement | Appends an element below the capacity. | | Elements | Elements | |
-| CallArrayPush | Appends an element, growing the elements, preserving every register. Pushes of several values that do not fit call it for each. | | Elements | Elements | allocates |
+| CallArrayPush | Appends an element, growing the elements, preserving every register. Pushes of several values that do not fit call it for each, and so do stores at the length that do not fit. | | Elements | Elements | allocates |
+| CallStoreHoleyElement | Stores an element below the length of the holey elements of an array that `BranchCondition::HoleFillableArray` established runs no code, growing the elements where they have no room for it (or making them a dictionary, where the store is sparse), and making them packed where it filled their last hole, preserving every register. | | Elements | Elements | allocates |
 | **Strings and for-in** | | | | | |
 | StringLength, LoadStringCodeUnit | The length of a string, and a code unit of a readable string at an index in bounds, which the refinements of their branches establish. Strings never change. | | | | cse |
 | SingleCharacterString | The VM's string of an ASCII code unit (refined below 128). | | | | cse |
@@ -346,6 +348,13 @@ after the `Catch`, so a frame never enters and exits at the same pc. A catch whe
 entry counts like an exit, so that code compiled before the handler first caught is discarded and
 compiled again with the entry once catches keep happening there.
 
+Callees with handlers are inlined only if none of their handlers caught an exception before the
+compile, and their handlers get no blocks at all. An exception that one of them catches unwinds into
+the callee's materialized frame, the leave writes the frames, and the interpreter runs the handler.
+Inlined frames do not list their exception register in frame states, so the leave keeps the
+exception the unwinder put there. The leave counts such a catch like an exit, so that the code is
+compiled again once catches keep happening there, and the recompile calls the callee instead.
+
 ## 5. Dependencies and invalidation
 
 Compiled code may assume facts that hold until a rare runtime event (`code::Dependency`): a
@@ -385,6 +394,7 @@ unreachable. Each one keeps the graph valid (`passes/verify.rs`), and IR tests i
 
 | Pass | Contract |
 |---|---|
+| Loop rotation | A loop that an on-stack replacement entry enters at another block than the code before it does (the entry at a test at the bottom that does more than branch, like `i < this.length`, enters the body) has no header that dominates it. The blocks that the block entered from before the loop dominates (the test) are copied for the way in from before the loop, so that the loop has one entry, unless that would merge it with an inner loop. |
 | Trivial phi removal | Phis whose inputs are all one value (or the phi itself) become that value. |
 | Truncation | Int32 additions, subtractions and unsigned right shifts whose users only read the low 32 bits of their results (bitwise operations, shifts, wrapping arithmetic, integer typed array stores) and no frame state holds become `Int32WrappingBinary`, which never exits. Comparisons of uint32 values (`x >>> 0`) first become unsigned comparisons of the shifted values. |
 | Simplification | Constant folding and strength reduction; branches on constants become jumps; unboxing a box is the boxed value, and so is an int32 check of the boxed double of an int32; int32 operations that leave their left-hand side as it is, like `x \| 0`, become it. |
@@ -392,7 +402,7 @@ unreachable. Each one keeps the graph valid (`passes/verify.rs`), and IR tests i
 | Simplification | Again, for what unboxing made foldable. |
 | Global value numbering | A CSE-able node computing what a dominating node computed is replaced by it, so that check elimination sees one value where the builder computed it twice (like the index of `k[Math.abs(j)]` in two expressions). Memory reads are left to check elimination. |
 | Check elimination | A forward dataflow of facts removes checks that passed already, decides branches that a branch on the same values decided before, and reuses loads whose value is known; may turn shape checks into `AssumeValid` plus a stable shape dependency. |
-| Simplification | Again, for what the branches that check elimination decided left foldable (like the double path of `Math.abs` of an int32). |
+| Simplification | Again, for what the branches that check elimination decided left foldable (like the double path of `Math.abs` of an int32). Int32 checks of boxed doubles become `CheckFloat64Int32` of the doubles. |
 | Global value numbering | Again, for the nodes that check elimination and simplification made the same. |
 | Loop invariant code motion | Gives loops entered from several blocks a merged preheader, then moves effect-free nodes with inputs from outside the loop to it (but calls in cold blocks); nodes that may exit too, exiting to the loop header, and not where that kind of exit was taken there before. Those from blocks that not every iteration runs, but for cold ones, move speculatively: they exit with `Hoisted`, and stay in the loop where such an exit was taken there before. |
 | Bounds check elimination | Bounds checks against constant counts go away where the index is known to be in range: induction variables of loops whose back edge compares the grown counter with a constant bound, merges of values from outside a loop, and int32 arithmetic on them that cannot overflow. The counter an on-stack replacement entry brings is checked against the bound once where it enters, unless such a check exited there before. With the same ranges, `((x << k) + c) >> k` becomes `x + (c >> k)` where nothing overflows and `c` is a multiple of 2^k. Int32 additions, subtractions and multiplications become `Int32WrappingBinary` where the ranges of their operands keep the result an int32 (and not -0), with operands also bounded by the masks and shifts of any int32, and by the dominating bounds checks and in-bounds branches of indices. |

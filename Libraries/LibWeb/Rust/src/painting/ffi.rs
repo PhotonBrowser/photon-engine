@@ -1278,12 +1278,12 @@ pub unsafe extern "C" fn compositor_animation_effect_build(
     state: *mut c_void,
     document_host: &DocumentHost,
     request: *const crate::painting::host::FfiCompositorAnimationRequest,
-    host: *const crate::painting::host::FfiCompositorAnimationHost,
+    host: &crate::painting::host::FfiCompositorAnimationHost,
 ) -> crate::painting::host::FfiCompositorAnimationBuildOutcome {
     use crate::painting::visual_animation_builder::{Host, Request, effect_state_from_handle};
     let state = unsafe { effect_state_from_handle(state) };
     let request = unsafe { Request::new(&*request) };
-    let host = Host::new(unsafe { &*host });
+    let host = Host::new(host);
     let layout_node = request.layout_node();
     state.build(&request, &host, |kind| {
         read_arena(
@@ -1397,7 +1397,7 @@ pub unsafe extern "C" fn layout_arena_paint_push_bytes(sink: *mut c_void, bytes:
 /// view must satisfy [`FfiUtf16View::units`], and each non-null component transfer table must
 /// hold 256 bytes.
 unsafe fn svg_filter_primitive_from_ffi(primitive: &FfiSvgFilterPrimitive) -> SvgFilterPrimitive {
-    let name = |view: FfiUtf16View| unsafe { view.to_utf16() }.unwrap_or_default();
+    let name = |view: FfiUtf16View| view.to_utf16().unwrap_or_default();
     SvgFilterPrimitive {
         values: primitive.values,
         in1: name(primitive.in1),

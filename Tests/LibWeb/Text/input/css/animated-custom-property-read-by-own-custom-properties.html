@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    @property --turn {
+        syntax: "<angle>";
+        inherits: true;
+        initial-value: 0deg;
+    }
+    @property --double-turn {
+        syntax: "<angle>";
+        inherits: true;
+        initial-value: 0deg;
+    }
+    @keyframes turn {
+        from { --turn: 0deg; }
+        to { --turn: 360deg; }
+    }
+    #target {
+        animation: turn 1s linear infinite paused;
+        --gradient: linear-gradient(var(--turn), red, blue);
+        --rotation: rotate(var(--turn));
+        --rotations: var(--rotation) var(--rotation);
+        --double-turn: calc(var(--turn) * 2);
+        --unrelated: 1px;
+        background-image: var(--gradient);
+    }
+    #target::before {
+        content: "";
+        rotate: var(--turn);
+        background-image: var(--gradient);
+    }
+    #child {
+        background-image: var(--gradient);
+    }
+    @function --double() returns <angle> {
+        result: calc(var(--turn) * 2);
+    }
+    #conditional {
+        animation: turn 1s linear infinite paused;
+        --color: if(style(--turn >= 90deg): red; else: blue);
+        --doubled: --double();
+        color: var(--color);
+    }
+    #sharing-parent, #sharing {
+        --shared-rotation: rotate(var(--turn));
+    }
+    #sharing {
+        animation: turn 1s linear infinite paused;
+        transform: var(--shared-rotation);
+    }
+</style>
+<div id="target"><div id="child"></div></div>
+<div id="conditional"></div>
+<div id="sharing-parent"><div id="sharing"></div></div>
+<script>
+    test(() => {
+        const target = document.getElementById("target");
+        const child = document.getElementById("child");
+        const animation = target.getAnimations()[0];
+        const print = label => {
+            const style = getComputedStyle(target);
+            println(`${label}:`);
+            println(`  --gradient: ${style.getPropertyValue("--gradient")}`);
+            println(`  --rotations: ${style.getPropertyValue("--rotations")}`);
+            println(`  --double-turn: ${style.getPropertyValue("--double-turn")}`);
+            println(`  --unrelated: ${style.getPropertyValue("--unrelated")}`);
+            println(`  background-image: ${style.backgroundImage}`);
+            const before = getComputedStyle(target, "::before");
+            println(`  ::before rotate: ${before.rotate}`);
+            println(`  ::before background-image: ${before.backgroundImage}`);
+            println(`  child background-image: ${getComputedStyle(child).backgroundImage}`);
+            println(`  child --rotations: ${getComputedStyle(child).getPropertyValue("--rotations")}`);
+        };
+
+        animation.currentTime = 125;
+        print("an eighth of a turn");
+        animation.currentTime = 375;
+        print("three eighths of a turn");
+        animation.cancel();
+        print("cancelled");
+
+        // Names an if() condition or a custom function reads are not written as var().
+        const conditional = document.getElementById("conditional");
+        for (const currentTime of [125, 375]) {
+            conditional.getAnimations()[0].currentTime = currentTime;
+            const style = getComputedStyle(conditional);
+            println(`if() and custom function at ${currentTime}ms: ${style.color}, ${style.getPropertyValue("--doubled")}`);
+        }
+
+        // An element whose declarations resolve to what it inherits shares its parent's environment.
+        const sharing = document.getElementById("sharing");
+        for (const currentTime of [125, 375]) {
+            sharing.getAnimations()[0].currentTime = currentTime;
+            const style = getComputedStyle(sharing);
+            println(`declaration its parent shares at ${currentTime}ms: ${style.getPropertyValue("--shared-rotation")}, ${style.transform}`);
+        }
+    });
+</script>

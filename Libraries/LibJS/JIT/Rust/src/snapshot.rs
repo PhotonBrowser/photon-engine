@@ -1020,6 +1020,13 @@ pub struct RuntimeInfo {
     /// observable step, growing its packed elements, and returns the new
     /// length as a value.
     pub array_push: u64,
+    /// `void libjs_jit_store_holey_element(Object*, u32 index, u64 value)`:
+    /// stores `value` at `index`, below the length of the holey elements of
+    /// an array whose prototype chain has no indexed properties, growing the
+    /// elements where they have no room for it (or making them a dictionary,
+    /// where the store is sparse), and makes them packed if it filled their
+    /// last hole.
+    pub store_holey_element: u64,
     /// `u64 libjs_jit_slice_arguments(VM*, ExecutionContext* frame, i32 start)`:
     /// `Array.prototype.slice.call(arguments, start)` with the arguments
     /// object of `frame`, which the code never created, as an array value.
@@ -1038,6 +1045,17 @@ pub struct RuntimeInfo {
     /// Code that depends on it must list it in
     /// `CompiledCode::embedded_cells`.
     pub array_iterator_return_watchpoint_set: Option<CellId>,
+    /// The address of the cell of the realm of the compiled code that holds
+    /// the watchpoint set that stays valid while `%ArrayIteratorPrototype%`
+    /// has its builtin `next` method, if it held a valid one. Once the set
+    /// fired, the realm watches the method anew with a new set the next
+    /// time it asks, as long as it is the builtin one, and holds none from
+    /// when it is not. Code that reads the cell must list the realm in
+    /// `CompiledCode::embedded_cells`.
+    pub array_iterator_next_watchpoint_set_address: Option<u64>,
+    /// Likewise for the watchpoint set that stays valid while
+    /// `%Array.prototype%[@@iterator]` is its `%Array.prototype.values%`.
+    pub array_iterator_method_watchpoint_set_address: Option<u64>,
     /// The realm of the compiled code.
     pub realm: CellId,
     /// `%Array.prototype%` and `%Object.prototype%` of the realm of the
@@ -1570,6 +1588,10 @@ pub struct RuntimeLayout {
     pub object_flag_is_extensible: u16,
     /// `Object::Flag::HasMagicalLengthProperty`, which only arrays have.
     pub object_flag_has_magical_length: u16,
+    /// The classes (pointers) of `StringObject`s and of `%String.prototype%`,
+    /// which start their cells.
+    pub string_object_class: u64,
+    pub string_prototype_class: u64,
     /// `Object::Flag::MayInterfereWithIndexedPropertyAccess`.
     pub object_flag_may_interfere: u16,
     /// `Array::length_writable` and `Array::is_proxy_target` (bools).

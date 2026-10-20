@@ -1439,6 +1439,10 @@ void DisplayListPlayerSkia::play_command(CompositorScrollChainingBarrier const&)
 {
 }
 
+void DisplayListPlayerSkia::play_command(CompositorNestedContextWheelRegion const&)
+{
+}
+
 void DisplayListPlayerSkia::play_command(PaintScrollBar const& command)
 {
     paint_scrollbar_into_surface(surface(), command);

@@ -488,7 +488,9 @@ fn branch_input_reprs(condition: crate::ir::BranchCondition) -> Vec<Repr> {
         | crate::ir::BranchCondition::HoleFillableArray
         | crate::ir::BranchCondition::ArrayIterator
         | crate::ir::BranchCondition::GeneratorObject
-        | crate::ir::BranchCondition::PlainArrayPrototypeChain => vec![Repr::Pointer],
+        | crate::ir::BranchCondition::PlainArrayPrototypeChain
+        | crate::ir::BranchCondition::ArrayWithRealmArrayPrototypeAndNoNamedProperties
+        | crate::ir::BranchCondition::HoldsValidWatchpointSet => vec![Repr::Pointer],
         crate::ir::BranchCondition::Shape(_) => vec![Repr::Tagged, Repr::Pointer],
         crate::ir::BranchCondition::PropertyIteratorCacheValid => tagged(2),
         crate::ir::BranchCondition::BindingMutable { .. } | crate::ir::BranchCondition::NextBindingOfShape { .. } => {
@@ -507,9 +509,11 @@ fn expected_input_reprs(graph: &Graph, node: NodeId) -> Option<Vec<Repr>> {
         Op::Branch { condition, .. } | Op::Refine { condition, .. } => Some(branch_input_reprs(condition)),
         Op::UnboxInt32 | Op::UnboxDouble | Op::CheckNumber | Op::StringAddress => Some(tagged(1)),
         Op::StringLength => Some(vec![Repr::Pointer]),
-        Op::BoxFloat64 | Op::Float64Unary { .. } | Op::Float64ToInt32 | Op::Float64ToUint8Clamped => {
-            Some(vec![Repr::Float64])
-        }
+        Op::BoxFloat64
+        | Op::Float64Unary { .. }
+        | Op::Float64ToInt32
+        | Op::Float64ToUint8Clamped
+        | Op::CheckFloat64Int32 => Some(vec![Repr::Float64]),
         Op::Float64Binary { .. } | Op::Float64Min | Op::Float64Max | Op::Float64Compare { .. } => {
             Some(vec![Repr::Float64, Repr::Float64])
         }
@@ -528,7 +532,7 @@ fn expected_input_reprs(graph: &Graph, node: NodeId) -> Option<Vec<Repr>> {
         Op::ArrayCreate => Some(vec![Repr::Int32, Repr::Tagged]),
         Op::LoadStringCodeUnit => Some(vec![Repr::Pointer, Repr::Int32]),
         Op::SingleCharacterString | Op::Int32Abs | Op::Int32ToFloat64 => Some(vec![Repr::Int32]),
-        Op::AppendElement => Some(vec![Repr::Pointer, Repr::Int32, Repr::Tagged]),
+        Op::AppendElement | Op::CallStoreHoleyElement => Some(vec![Repr::Pointer, Repr::Int32, Repr::Tagged]),
         Op::LoadElementsLength | Op::LoadElementsCapacity => Some(vec![Repr::Pointer]),
         Op::LoadPropertyIteratorKey => Some(vec![Repr::Tagged, Repr::Int32]),
         Op::OpenArrayIteration => Some(tagged(1)),

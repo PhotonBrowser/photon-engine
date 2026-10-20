@@ -154,7 +154,7 @@ static Optional<CSS::PropertyID> property_id_for_presentational_attribute(Utf16F
     // https://svgwg.org/svg2-draft/styling.html#PresentationAttributes
     // The pattern and gradient elements take patternTransform and gradientTransform instead of the
     // plain transform presentation attribute.
-    if (name == "transform"_utf16_fly_string
+    if (name == SVG::AttributeNames::transform
         && (tag_name == TagNames::pattern || tag_name == TagNames::linearGradient || tag_name == TagNames::radialGradient))
         return {};
 
@@ -610,6 +610,16 @@ GC::Ptr<SVGSVGElement> SVGElement::owner_svg_element()
     }
 
     return nullptr;
+}
+
+// https://svgwg.org/svg2-draft/struct.html#TermOutermostSVGElement
+GC::Ptr<SVGSVGElement> SVGElement::outermost_svg_element()
+{
+    // The furthest ‘svg’ ancestor element that remains in the current SVG document fragment.
+    GC::Ptr<SVGSVGElement> outermost_svg_element = as_if<SVGSVGElement>(*this);
+    for (auto ancestor = owner_svg_element(); ancestor; ancestor = ancestor->owner_svg_element())
+        outermost_svg_element = ancestor;
+    return outermost_svg_element;
 }
 
 // https://svgwg.org/svg2-draft/types.html#__svg__SVGElement__viewportElement

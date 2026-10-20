@@ -2019,7 +2019,10 @@ impl StyleEngine {
                 custom_property_environments: Default::default(),
                 nodes_with_substituted_records: HashSet::default(),
                 custom_declaration_reads: HashMap::default(),
+                custom_property_environments_by_answer: HashMap::default(),
+                last_custom_property_environment_memoizable: false,
                 custom_declaration_custom_property_reads: HashMap::default(),
+                custom_property_reads_by_declarations: Default::default(),
                 nodes_with_tree_counting_records: HashMap::default(),
                 nodes_with_rolled_back_records: HashMap::default(),
                 nodes_with_element_relative_substitutions: HashMap::default(),
@@ -2054,6 +2057,7 @@ impl StyleEngine {
                 engine_pseudo_record_cache: HashMap::default(),
                 batch_answers_complete_but_for_custom_properties: HashMap::default(),
                 batch_custom_property_matches: HashMap::default(),
+                batch_custom_property_answers: HashMap::default(),
                 batch_backing_pseudo_matches: HashMap::default(),
                 engine_cold_record_cache: Default::default(),
                 engine_cold_record_donors: Default::default(),
@@ -3170,21 +3174,26 @@ impl StyleEngine {
     ///
     /// State invalidators may conservatively republish a related group of pseudo-classes when one
     /// member changes. The settled fact is therefore the old side; assuming every publication is
-    /// a Boolean toggle would invent transitions for the unchanged members of that group.
+    /// a Boolean toggle would invent transitions for the unchanged members of that group. Such a
+    /// member is no input at all, and the answer says whether the state moved.
     pub(crate) fn record_batched_state(
         &mut self,
         node: StyleNodeID,
         fact: StateFact,
         new_value: bool,
         arriving_node: bool,
-    ) {
+    ) -> bool {
         let old_value = self.retained.facts.states_of_node(node).contains(fact);
+        if old_value == new_value && !arriving_node {
+            return false;
+        }
         self.record_batched_input(
             InputKey::State(node, fact),
             InputValue::State(old_value),
             InputValue::State(new_value),
             arriving_node,
         );
+        true
     }
 
     /// Install the fixed facts carried by one element arrival. The tree row already routes the
@@ -3418,7 +3427,12 @@ impl RetainedState {
             custom_property_environments: _,
             nodes_with_substituted_records,
             custom_declaration_reads,
+            // Keyed by match answer, and cleared with the answers whose identities it names.
+            custom_property_environments_by_answer: _,
+            last_custom_property_environment_memoizable: _,
             custom_declaration_custom_property_reads,
+            // Keyed by the values and names it holds.
+            custom_property_reads_by_declarations: _,
             nodes_with_tree_counting_records,
             nodes_with_rolled_back_records,
             nodes_with_element_relative_substitutions,
@@ -3458,6 +3472,7 @@ impl RetainedState {
             // Filled and cleared within one transaction's record loop.
             batch_answers_complete_but_for_custom_properties: _,
             batch_custom_property_matches: _,
+            batch_custom_property_answers: _,
             batch_backing_pseudo_matches: _,
             engine_cold_record_cache: _,
             engine_cold_record_donors: _,

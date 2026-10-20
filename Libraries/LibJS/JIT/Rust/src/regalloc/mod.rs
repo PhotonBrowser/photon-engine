@@ -105,6 +105,7 @@ pub fn saves_only_gprs(op: &Op) -> bool {
         } | Op::InitializeFrame { clobbers_floats: true }
             | Op::EnsureFrameInitialized { clobbers_floats: true }
             | Op::CallArrayPush
+            | Op::CallStoreHoleyElement
             | Op::OpenArrayIteration
             | Op::AddNamed { .. }
             | Op::ProbeKeyedStore { .. }
@@ -269,7 +270,7 @@ pub struct Allocation {
     pub block_end_moves: Vec<Vec<Move>>,
     pub spill_slot_count: u32,
     /// The values live into each block, indexed by `BlockId`.
-    pub live_in: Vec<crate::bitset::BitSet>,
+    pub live_in: Vec<crate::sparse_bitset::SparseBitSet>,
 }
 
 impl Allocation {
@@ -438,6 +439,11 @@ fn constraints(node: &Node, registers: &RegisterSet) -> Constraints {
         // The object's prototypes.
         Op::Branch {
             condition: BranchCondition::PlainArrayPrototypeChain,
+            ..
+        } => constraints.temps = 1,
+        // The object's shape.
+        Op::Branch {
+            condition: BranchCondition::ArrayWithRealmArrayPrototypeAndNoNamedProperties,
             ..
         } => constraints.temps = 1,
         // The object's elements.

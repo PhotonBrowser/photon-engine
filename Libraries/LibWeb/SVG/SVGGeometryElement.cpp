@@ -6,6 +6,7 @@
 
 #include <AK/ScopeGuard.h>
 #include <LibGC/Heap.h>
+#include <LibWeb/Bindings/DOMPointReadOnly.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
@@ -15,6 +16,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/SVG/SVGGeometryElement.h>
+#include <LibWeb/WebIDL/DOMException.h>
 
 namespace Web::SVG {
 
@@ -61,12 +63,10 @@ static CSS::StyleRecordID declared_only_style_record(Layout::BegunRead const& re
         inline_style ? inline_style->declaration_block().handle() : nullptr) };
 }
 
-// https://w3c.github.io/svgwg/svg2-draft/types.html#__svg__SVGGeometryElement__getTotalLength
-WebIDL::ExceptionOr<float> SVGGeometryElement::get_total_length()
+// The geometry of the element in user units, which the geometry queries such as getTotalLength() measure. It is empty
+// for an element without style.
+bool SVGGeometryElement::with_computed_values(Function<void(CSSPixelSize viewport_size, CSS::ComputedValues const&)> const& callback)
 {
-    // When getTotalLength() is called, the user agent's computed value for the total length of the path, in user units,
-    // is returned.
-
     // NB: Update layout so that the viewport size is resolved correctly
     Layout::ForcedReadScope read { document() };
     document().update_layout(DOM::UpdateLayoutReason::SVGPathLength);
@@ -80,8 +80,10 @@ WebIDL::ExceptionOr<float> SVGGeometryElement::get_total_length()
     // FIXME: Layout builds each shape's geometry in Rust (svg_geometry_path_of() in svg_formatting_context.rs), while
     //        this reads the get_path() implementations, which duplicate it. Answer from the Rust builders instead, so
     //        a fix to one copy cannot miss the other.
-    if (auto computed_values = computed_style())
-        return get_path({ viewport_size.width(), viewport_size.height() }, *computed_values).length();
+    if (auto computed_values = computed_style()) {
+        callback({ viewport_size.width(), viewport_size.height() }, *computed_values);
+        return true;
+    }
 
     // NB: An element with no style is either in a subtree that is not rendered, which the style engine answers
     //     without installing anything, or outside the document, where no rule reaches it. The engine of the window's
@@ -101,14 +103,75 @@ WebIDL::ExceptionOr<float> SVGGeometryElement::get_total_length()
     };
     auto view = style_computer.computed_style_record_view(style_read, record);
     if (!view)
-        return 0;
-    return get_path({ viewport_size.width(), viewport_size.height() }, *view).length();
+        return false;
+    callback({ viewport_size.width(), viewport_size.height() }, *view);
+    return true;
 }
 
-GC::Ref<Geometry::DOMPoint> SVGGeometryElement::get_point_at_length(float distance)
+Gfx::Path SVGGeometryElement::computed_path()
 {
-    (void)distance;
-    return Geometry::DOMPoint::create(0, 0, 0, 0);
+    Gfx::Path path;
+    with_computed_values([&](CSSPixelSize viewport_size, CSS::ComputedValues const& computed_values) {
+        path = get_path(viewport_size, computed_values);
+    });
+    return path;
+}
+
+// https://svgwg.org/svg2-draft/types.html#__svg__SVGGeometryElement__isPointInFill
+WebIDL::ExceptionOr<bool> SVGGeometryElement::is_point_in_fill(Bindings::DOMPointInit const& point)
+{
+    // The isPointInFill method, when invoked, must return true if the point given by point passed to the method, in
+    // the coordinate space of an element, is inside the intended path as determined by the winding rule indicated by
+    // the fill-rule property of an element; and must return false otherwise. Open subpaths must be implicitly closed
+    // when computing the area inside the path, without affecting the actual subpaths. Points on the path itself must be
+    // considered to be inside the path.
+    // NB: Gfx::Path::contains() closes open subpaths and counts points on the path as inside.
+
+    // The returned value is independent of any visual CSS property but fill-rule
+    // If either of the x or y properties on point are infinite or NaN, then the method must return false.
+    if (!isfinite(point.x) || !isfinite(point.y))
+        return false;
+
+    // If current element is a non-rendered element, and the UA is not able to compute the geometry of the element,
+    // then throw an InvalidStateError.
+    bool is_point_in_fill = false;
+    auto has_geometry = with_computed_values([&](CSSPixelSize viewport_size, CSS::ComputedValues const& computed_values) {
+        auto winding_rule = computed_values.fill_rule() == CSS::FillRule::Evenodd ? Gfx::WindingRule::EvenOdd : Gfx::WindingRule::Nonzero;
+        is_point_in_fill = get_path(viewport_size, computed_values).contains({ point.x, point.y }, winding_rule);
+    });
+    if (!has_geometry)
+        return WebIDL::InvalidStateError::create(HTML::relevant_realm(*this), "The element's geometry cannot be computed"_utf16);
+    return is_point_in_fill;
+}
+
+// https://w3c.github.io/svgwg/svg2-draft/types.html#__svg__SVGGeometryElement__getTotalLength
+WebIDL::ExceptionOr<float> SVGGeometryElement::get_total_length()
+{
+    // When getTotalLength() is called, the user agent's computed value for the total length of the path, in user units,
+    // is returned.
+    return computed_path().length();
+}
+
+// https://w3c.github.io/svgwg/svg2-draft/types.html#__svg__SVGGeometryElement__getPointAtLength
+WebIDL::ExceptionOr<GC::Ref<Geometry::DOMPoint>> SVGGeometryElement::get_point_at_length(float distance)
+{
+    // When getPointAtLength(distance) is called, the following steps are run:
+    auto path = computed_path();
+
+    // 1. If current element is a non-rendered element, and the UA is not able to compute the total length of the path,
+    //    then throw an InvalidStateError.
+    // NB: Like other engines, throw for an empty path whether or not the element is rendered.
+    auto point_along_path = path.point_at_length(distance);
+    if (!point_along_path.has_value())
+        return WebIDL::InvalidStateError::create(HTML::relevant_realm(*this), "The element's path is empty"_utf16);
+
+    // 2. Let length be the user agent's computed value for the total length of the path, in user units.
+    // 3. Clamp distance to [0, length].
+    // 4. Let (x, y) be the point on the path at distance distance.
+    // NB: Gfx::Path::point_at_length() clamps the distance to the ends of the path.
+
+    // 5. Return a newly created, detached DOMPoint object representing the point (x, y).
+    return Geometry::DOMPoint::create(point_along_path->point.x(), point_along_path->point.y(), 0, 1);
 }
 
 GC::Ref<SVGAnimatedNumber> SVGGeometryElement::path_length()

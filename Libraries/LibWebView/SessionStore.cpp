@@ -262,7 +262,7 @@ ErrorOr<NonnullOwnPtr<SessionStore>> SessionStore::create(Database::Database& da
     auto store = adopt_own(*new SessionStore(move(persisted_storage)));
     TRY(store->run_startup_recovery(UnixDateTime::now()));
 
-    store->m_flush_timer = Core::Timer::create_repeating(FLUSH_TIMER_INTERVAL_MILLISECONDS, [store = store.ptr()]() {
+    store->m_flush_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(FLUSH_TIMER_INTERVAL_MILLISECONDS), [store = store.ptr()]() {
         store->flush_dirty_state();
     });
     store->m_flush_timer->start();
@@ -992,7 +992,7 @@ ErrorOr<Vector<ClosedSessionTab>> SessionStore::PersistedStorage::take_closed_un
 static UnixDateTime canonicalized_to_milliseconds(UnixDateTime time)
 {
     // Match persisted millisecond precision when ordering closes.
-    return UnixDateTime::from_milliseconds_since_epoch(time.offset_to_epoch().to_milliseconds());
+    return UnixDateTime::from_milliseconds_since_epoch(time.milliseconds_since_epoch());
 }
 
 static bool is_storable(Optional<SessionHistorySnapshot> const& history)

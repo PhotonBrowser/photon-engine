@@ -881,6 +881,8 @@ set(SOURCES
     SVG/AttributeNames.cpp
     SVG/AttributeParsing.cpp
     SVG/Path.cpp
+    SVG/SMILAnimation.cpp
+    SVG/SMILTimeContainer.cpp
     SVG/SVGAElement.cpp
     SVG/SVGAnimatedEnumeration.cpp
     SVG/SVGAnimatedInteger.cpp
@@ -891,6 +893,7 @@ set(SOURCES
     SVG/SVGAnimatedRect.cpp
     SVG/SVGAnimatedString.cpp
     SVG/SVGAnimatedTransformList.cpp
+    SVG/SVGAnimateMotionElement.cpp
     SVG/SVGAnimationElement.cpp
     SVG/SVGCircleElement.cpp
     SVG/SVGClipPathElement.cpp
@@ -935,6 +938,7 @@ set(SOURCES
     SVG/SVGList.cpp
     SVG/SVGMaskElement.cpp
     SVG/SVGMetadataElement.cpp
+    SVG/SVGMPathElement.cpp
     SVG/SVGNumber.cpp
     SVG/SVGNumberList.cpp
     SVG/SVGPathElement.cpp
@@ -944,6 +948,7 @@ set(SOURCES
     SVG/SVGRadialGradientElement.cpp
     SVG/SVGRectElement.cpp
     SVG/SVGScriptElement.cpp
+    SVG/SVGSetElement.cpp
     SVG/SVGStopElement.cpp
     SVG/SVGStyleElement.cpp
     SVG/SVGSVGElement.cpp
@@ -1190,6 +1195,9 @@ sync_rust_crate_ffi_headers(
 )
 add_dependencies(LibWeb libweb_rust-ffi-headers)
 target_link_libraries(libweb_bindings_rust INTERFACE LibGfx LibGC LibUnicode)
+# The JavaScript tools link the LibJS runtime from this archive. It calls into LibGC and LibUnicode, so those must come
+# after the archive on the link line.
+target_link_libraries(libweb_bindings_rust_archive INTERFACE LibGC LibUnicode)
 test_rust_crate(MANIFEST_PATH Bindings/Rust/Cargo.toml CRATE_NAME libweb_bindings_rust)
 test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)
 

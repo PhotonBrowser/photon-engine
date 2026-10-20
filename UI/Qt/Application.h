@@ -110,6 +110,10 @@ public:
 private:
     explicit Application();
 
+    void ask_next_window_to_close_for_private_session_restart();
+    void finish_private_session_restart();
+    void cancel_private_session_restart();
+
     void ask_next_window_to_close_for_quit();
     bool ask_windows_yet_to_agree_to_quit();
     void finish_quit();
@@ -128,7 +132,7 @@ private:
 
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
     virtual Vector<WebView::ViewImplementation&> active_window_web_views() const override;
-    virtual bool activate_tab_with_url(URL::URL const&) const override;
+    virtual Optional<WebView::ViewImplementation&> activate_tab_with_url(URL::URL const&, URL::ExcludeFragment) const override;
 
     virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override;
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
@@ -190,6 +194,7 @@ private:
     OwnPtr<ProcessManagerWindow> m_process_manager_window;
     CrashReportNotifier m_crash_report_notifier;
 
+    bool m_private_session_restart_in_progress { false };
     bool m_quit_in_progress { false };
     bool m_quit_is_finishing { false };
     Vector<QPointer<BrowserWindow>> m_windows_awaiting_quit_preflight;

@@ -151,7 +151,7 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
         client.async_did_request_cursor_change(id, cursor);
     });
 
-    m_frame_timer = Core::Timer::create_single_shot(0, [this] {
+    m_frame_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this] {
         if (m_is_closed)
             return;
         frame_timer_fired();
@@ -697,7 +697,7 @@ void PageClient::schedule_local_rendering_opportunity()
     }
 
     m_frame_timer_purpose = FrameTimerPurpose::LocalFallback;
-    m_frame_timer->restart(static_cast<int>(AK::ceil(delay)));
+    m_frame_timer->restart(AK::Duration::from_seconds_f64(delay / 1000));
 }
 
 void PageClient::schedule_compositor_watchdog()
@@ -706,7 +706,7 @@ void PageClient::schedule_compositor_watchdog()
     auto delay = 4.0 * m_last_rendering_opportunity_frame_interval;
     m_compositor_watchdog_deadline = Web::HighResolutionTime::unsafe_shared_current_time() + delay;
     m_frame_timer_purpose = FrameTimerPurpose::CompositorWatchdog;
-    m_frame_timer->restart(static_cast<int>(AK::ceil(delay)));
+    m_frame_timer->restart(AK::Duration::from_seconds_f64(delay / 1000));
 }
 
 void PageClient::frame_timer_fired()
@@ -732,7 +732,7 @@ void PageClient::frame_timer_fired()
         // an earlier request satisfy the current request before its own watchdog deadline.
         if (now < m_compositor_watchdog_deadline) {
             m_frame_timer_purpose = FrameTimerPurpose::CompositorWatchdog;
-            m_frame_timer->restart(static_cast<int>(AK::ceil(m_compositor_watchdog_deadline - now)));
+            m_frame_timer->restart(AK::Duration::from_seconds_f64((m_compositor_watchdog_deadline - now) / 1000));
             return;
         }
         // An opportunity IPC may already be waiting behind a long main-thread task when this timer becomes runnable.
@@ -1086,7 +1086,7 @@ void PageClient::page_did_change_accessibility_focus(Web::UniqueNodeID node_id)
     // (Document::setFocusedElement hands AXObjectCache::onFocusChange the old and the new element together).
     m_pending_accessibility_focus = static_cast<i64>(node_id.value());
     if (!m_accessibility_focus_timer) {
-        m_accessibility_focus_timer = Core::Timer::create_single_shot(0, [this] {
+        m_accessibility_focus_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this] {
             if (m_is_closed)
                 return;
             if (auto pending = exchange(m_pending_accessibility_focus, {}); pending.has_value())
@@ -1108,7 +1108,7 @@ void PageClient::schedule_accessibility_tree_update()
         return;
 
     if (!m_accessibility_update_timer) {
-        m_accessibility_update_timer = Core::Timer::create_single_shot(200, [this] {
+        m_accessibility_update_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(200), [this] {
             if (m_is_closed)
                 return;
             if (auto doc = page().local_traversable()->active_document()) {
@@ -1362,11 +1362,6 @@ void PageClient::toggle_media_loop_state()
 void PageClient::toggle_media_controls_state()
 {
     page().toggle_media_controls_state();
-}
-
-void PageClient::set_user_style(String source)
-{
-    page().set_user_style(Utf16String::from_utf8(source));
 }
 
 void PageClient::page_did_request_accept_dialog()
@@ -2283,11 +2278,6 @@ void PageClient::run_javascript(StringView js_source)
 void PageClient::did_output_js_console_message(WebView::ConsoleOutput console_output)
 {
     client().async_did_output_js_console_message(m_id, move(console_output));
-}
-
-void PageClient::console_peer_did_misbehave(char const* reason)
-{
-    client().did_misbehave(reason);
 }
 
 static void gather_style_sheets(Vector<Web::CSS::StyleSheetIdentifier>& results, Web::CSS::StyleSheetState& sheet)

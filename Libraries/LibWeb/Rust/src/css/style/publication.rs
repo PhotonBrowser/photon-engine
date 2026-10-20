@@ -664,7 +664,7 @@ impl RetainedState {
             };
             // A function's container condition the engine cannot decide yet waits, as the row does.
             let environment = self
-                .engine_custom_property_environment(node, parent_environment, &inputs, None)
+                .engine_custom_property_environment_by_answer(node, parent_environment, &inputs)
                 .inspect_err(|&unanswered| {
                     if unanswered == Unanswered::Refused {
                         self.counters.bump(Counter::EngineComputedRecordBailCustomProperties);
@@ -1501,7 +1501,7 @@ impl RetainedState {
         let has_registered_declarations = self.declares_registered_custom_property(node, None, &inputs);
         // A function's container condition the engine cannot decide yet waits, as the row does.
         let mut environment = self
-            .engine_custom_property_environment(node, parent_environment, &inputs, None)
+            .engine_custom_property_environment_by_answer(node, parent_environment, &inputs)
             .inspect_err(|&unanswered| {
                 if unanswered == Unanswered::Refused {
                     self.counters.bump(Counter::EngineComputedRecordBailCustomProperties);
@@ -4062,18 +4062,23 @@ impl RetainedState {
             .and_then(|(previous_generation, previous_state)| {
                 (previous_generation == current_generation).then_some(previous_state)
             });
-        let delta = self
-            .winner_groups
-            .semantic_delta(previous_cascade_state, current_cascade_state);
-        if delta.is_empty() {
+        // A first binding moves every winner of the state, which needs no merge to count.
+        let changed_properties = match previous_cascade_state {
+            None => self.winner_groups.winner_count_in_state(current_cascade_state),
+            previous => self
+                .winner_groups
+                .semantic_delta_properties(previous, current_cascade_state)
+                .count(),
+        };
+        if changed_properties == 0 {
             self.counters.bump(Counter::CascadeWinnerDeltaStops);
             return;
         }
         self.counters
-            .add(Counter::CascadeWinnerDeltaProperties, delta.properties().len() as u64);
+            .add(Counter::CascadeWinnerDeltaProperties, changed_properties as u64);
         self.counters.add(
             Counter::ComputedWinnerDeltaPropertiesConsumed,
-            delta.properties().len() as u64,
+            changed_properties as u64,
         );
         if !node_handle_changed {
             self.counters.bump(Counter::ComputedWinnerPropagationStops);
@@ -4273,6 +4278,7 @@ impl StyleEngine {
         self.retained
             .custom_property_environments
             .retain_only(|identity| live.contains(&identity));
+        self.retained.forget_custom_property_environments_by_answer();
         true
     }
 

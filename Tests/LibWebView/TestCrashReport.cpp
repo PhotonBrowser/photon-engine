@@ -16,11 +16,62 @@
 #include <LibWebCommon/WebView/ProcessHandle.h>
 #include <LibWebView/CrashReport.h>
 #include <LibWebView/ProcessManager.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(TEST_CRASH_REPORT_LATE_LIBRARY)
+#    include <dlfcn.h>
+#endif
+
+#if defined(AK_OS_LINUX)
+TEST_CASE(crash_scratch_has_fixed_size_and_allows_report_writes)
+{
+    auto report = MUST(WebView::CrashReport::create(WebView::ProcessType::WebContent));
+    auto fd = report->fd();
+    // NB: Depending on vm.memfd_noexec, the kernel can also add F_SEAL_EXEC.
+    auto seals = MUST(Core::System::fcntl(fd, F_GET_SEALS, static_cast<uintptr_t>(0)));
+    auto required_seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
+    EXPECT_EQ(seals & required_seals, required_seals);
+    EXPECT_EQ(seals & F_SEAL_WRITE, 0);
+    EXPECT(MUST(Core::System::fcntl(fd, F_GETFD, static_cast<uintptr_t>(0))) & FD_CLOEXEC);
+
+    auto metadata = MUST(Core::System::fstat(fd));
+    EXPECT_EQ(metadata.st_nlink, 0u);
+    EXPECT_EQ(metadata.st_mode & 0777, 0600u);
+    auto size = metadata.st_size;
+    // NB: The record holds the header, the frames, and a build description of at most 16 KiB after its length.
+    auto description_offset = sizeof(Core::CrashReportData::ReportHeader) + Core::CrashReportData::maximum_frames * sizeof(Core::CrashReportData::ReportFrame);
+    EXPECT_EQ(size, static_cast<off_t>(description_offset + sizeof(u32) + 16 * KiB));
+
+    auto shrink_result = ftruncate(fd, 0);
+    auto shrink_error = errno;
+    EXPECT_EQ(shrink_result, -1);
+    EXPECT_EQ(shrink_error, EPERM);
+    auto grow_result = ftruncate(fd, size + 1);
+    auto grow_error = errno;
+    EXPECT_EQ(grow_result, -1);
+    EXPECT_EQ(grow_error, EPERM);
+
+    Core::CrashReportData::ReportHeader header;
+    EXPECT_EQ(pwrite(fd, &header, sizeof(header), 0), static_cast<ssize_t>(sizeof(header)));
+    Core::CrashReportData::ReportHeader recorded;
+    EXPECT_EQ(pread(fd, &recorded, sizeof(recorded), 0), static_cast<ssize_t>(sizeof(recorded)));
+    EXPECT_EQ(recorded.magic, header.magic);
+
+    auto description = WebView::CrashReport::describe_current_build(WebView::ProcessType::WebContent);
+    MUST(report->record_build_description(description));
+    u32 recorded_length = 0;
+    EXPECT_EQ(pread(fd, &recorded_length, sizeof(recorded_length), description_offset), static_cast<ssize_t>(sizeof(recorded_length)));
+    EXPECT_EQ(recorded_length, description.length());
+    auto recorded_description = MUST(ByteBuffer::create_uninitialized(recorded_length));
+    EXPECT_EQ(pread(fd, recorded_description.data(), recorded_length, description_offset + sizeof(recorded_length)), static_cast<ssize_t>(recorded_length));
+    EXPECT_EQ(StringView { recorded_description.bytes() }, description.view());
+}
+#endif
 
 static ByteString test_directory()
 {
@@ -54,7 +105,8 @@ enum class CrashThread {
     Worker,
 };
 
-static int crash_child(WebView::CrashReport& report, int signal, CrashThread thread = CrashThread::Main)
+template<typename Crash>
+static int crash_child_running(WebView::CrashReport& report, Crash crash)
 {
     auto pid = fork();
     VERIFY(pid >= 0);
@@ -62,6 +114,17 @@ static int crash_child(WebView::CrashReport& report, int signal, CrashThread thr
         struct rlimit limit { 0, 0 };
         setrlimit(RLIMIT_CORE, &limit);
         MUST(Core::CrashHandler::initialize(report.fd()));
+        crash();
+        _exit(0);
+    }
+    int status;
+    VERIFY(waitpid(pid, &status, 0) == pid);
+    return status;
+}
+
+static int crash_child(WebView::CrashReport& report, int signal, CrashThread thread = CrashThread::Main)
+{
+    return crash_child_running(report, [&] {
         if (thread == CrashThread::Worker) {
             auto crash_worker = [](void* argument) -> void* {
                 raise(*static_cast<int*>(argument));
@@ -73,12 +136,39 @@ static int crash_child(WebView::CrashReport& report, int signal, CrashThread thr
         } else {
             raise(signal);
         }
-        _exit(0);
-    }
-    int status;
-    VERIFY(waitpid(pid, &status, 0) == pid);
-    return status;
+    });
 }
+
+#if defined(TEST_CRASH_REPORT_LATE_LIBRARY)
+TEST_CASE(unresolved_frames_do_not_skip_stack_search)
+{
+    for (size_t frame_count : { 3uz, Core::CrashReportData::maximum_frames }) {
+        auto report = MUST(WebView::CrashReport::create(WebView::ProcessType::Compositor));
+        auto status = crash_child_running(*report, [&] {
+            auto* library = dlopen(TEST_CRASH_REPORT_LATE_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+            VERIFY(library);
+            auto crash = reinterpret_cast<void (*)(size_t)>(dlsym(library, "crash_with_unresolved_frames"));
+            VERIFY(crash);
+            crash(frame_count);
+        });
+        EXPECT(WIFSIGNALED(status));
+        EXPECT_EQ(WTERMSIG(status), SIGILL);
+        Core::CrashReportData::ReportHeader header;
+        EXPECT_EQ(pread(report->fd(), &header, sizeof(header), 0), static_cast<ssize_t>(sizeof(header)));
+        EXPECT(header.frame_count >= frame_count);
+        EXPECT(header.frame_count <= Core::CrashReportData::maximum_frames);
+        bool has_binary_identity = false;
+        for (size_t i = 0; i < header.frame_count; ++i) {
+            Core::CrashReportData::ReportFrame frame;
+            EXPECT_EQ(pread(report->fd(), &frame, sizeof(frame), sizeof(header) + i * sizeof(frame)), static_cast<ssize_t>(sizeof(frame)));
+            if (i < min(frame_count, Core::CrashReportData::maximum_frames - 1))
+                EXPECT_EQ(frame.binary.size, 0u);
+            has_binary_identity |= frame.binary.size != 0;
+        }
+        EXPECT(has_binary_identity);
+    }
+}
+#endif
 
 TEST_CASE(capture_native_crash_without_personal_data)
 {

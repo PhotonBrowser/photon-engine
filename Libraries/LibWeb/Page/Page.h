@@ -243,7 +243,7 @@ public:
 
     u64 wheel_event_listener_state_generation() const { return m_wheel_event_listener_state_generation; }
     u64 keyboard_scroll_state_generation() const { return m_keyboard_scroll_state_generation; }
-    void invalidate_compositor_wheel_event_listener_state();
+    void invalidate_compositor_wheel_event_listener_state(DOM::Document&);
     void invalidate_compositor_keyboard_scroll_state();
     void invalidate_compositor_keyboard_scroll_state_for_document(DOM::Document const&);
     void keyboard_scroll_event_path_changed(DOM::EventTarget const&);
@@ -376,6 +376,7 @@ public:
         };
         Kind kind { Kind::Page };
         GC::Ref<DOM::Node> target;
+        CSSPixelPoint position;
         Optional<Web::MediaContextMenu> media {};
     };
     void record_context_menu_request(Badge<EventHandler>, ContextMenuRequest);

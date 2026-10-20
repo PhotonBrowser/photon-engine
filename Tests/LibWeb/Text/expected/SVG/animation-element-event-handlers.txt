@@ -1,0 +1,6 @@
+onbegin returns its handler: true
+onend returns its handler: true
+onrepeat returns its handler: true
+onbegin called for beginEvent
+onend called for endEvent
+onrepeat called for repeatEvent

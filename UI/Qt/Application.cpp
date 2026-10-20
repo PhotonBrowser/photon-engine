@@ -733,15 +733,83 @@ void Application::open_new_window(WebView::IsPrivate is_private)
 
 void Application::restart_private_browsing_session()
 {
+    if (m_private_session_restart_in_progress || m_quit_in_progress)
+        return;
+
+    m_private_session_restart_in_progress = true;
+    ask_next_window_to_close_for_private_session_restart();
+}
+
+void Application::ask_next_window_to_close_for_private_session_restart()
+{
+    if (!m_private_session_restart_in_progress)
+        return;
+
     for (auto* widget : QApplication::topLevelWidgets()) {
-        if (auto* window = as_if<BrowserWindow>(widget); window && window->is_private() == WebView::IsPrivate::Yes) {
-            if (!window->close())
+        auto* window = as_if<BrowserWindow>(widget);
+        if (!window || window->is_private() == WebView::IsPrivate::No || window->is_window_close_approved())
+            continue;
+
+        window->request_close_preflight([this](bool approved) {
+            if (!approved) {
+                cancel_private_session_restart();
                 return;
+            }
+            QTimer::singleShot(0, m_application.ptr(), [this]() {
+                ask_next_window_to_close_for_private_session_restart();
+            });
+        });
+
+        return;
+    }
+
+    // Finish outside a page's reply, after checking again for windows opened or navigated during the preflight.
+    QTimer::singleShot(0, m_application.ptr(), [this]() {
+        finish_private_session_restart();
+    });
+}
+
+void Application::finish_private_session_restart()
+{
+    if (!m_private_session_restart_in_progress)
+        return;
+
+    Vector<QPointer<BrowserWindow>> windows;
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        auto* window = as_if<BrowserWindow>(widget);
+        if (!window || window->is_private() == WebView::IsPrivate::No)
+            continue;
+
+        if (!window->is_window_close_approved()) {
+            ask_next_window_to_close_for_private_session_restart();
+            return;
         }
+
+        windows.append(window);
     }
 
     WebView::Application::the().reset_private_browsing_session();
     open_new_window(WebView::IsPrivate::Yes);
+
+    for (auto const& window : windows) {
+        if (window)
+            window->close();
+    }
+
+    m_private_session_restart_in_progress = false;
+}
+
+void Application::cancel_private_session_restart()
+{
+    if (!m_private_session_restart_in_progress)
+        return;
+
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget); window && window->is_private() == WebView::IsPrivate::Yes)
+            window->cancel_window_close_preflight();
+    }
+
+    m_private_session_restart_in_progress = false;
 }
 
 void Application::focus_location_editor()
@@ -858,6 +926,9 @@ void Application::quit()
     if (m_quit_in_progress)
         return;
 
+    if (m_private_session_restart_in_progress)
+        cancel_private_session_restart();
+
     m_quit_in_progress = true;
     m_windows_awaiting_quit_preflight.clear();
 
@@ -874,7 +945,7 @@ void Application::ask_next_window_to_close_for_quit()
         if (!window)
             continue;
 
-        window->request_close_preflight_for_quit([this](bool approved) {
+        window->request_close_preflight([this](bool approved) {
             if (approved)
                 ask_next_window_to_close_for_quit();
             else
@@ -995,11 +1066,24 @@ Vector<WebView::ViewImplementation&> Application::active_window_web_views() cons
     return web_views;
 }
 
-bool Application::activate_tab_with_url(URL::URL const& url) const
+Optional<WebView::ViewImplementation&> Application::activate_tab_with_url(URL::URL const& url, URL::ExcludeFragment exclude_fragment) const
 {
-    if (!m_active_window)
-        return false;
-    return m_active_window->activate_tab_with_url(url);
+    auto is_private = m_active_window ? m_active_window->is_private() : WebView::IsPrivate::No;
+    for (auto* window : visible_browser_windows_active_first(m_active_window)) {
+        if (window->is_private() != is_private)
+            continue;
+
+        auto* tab = window->activate_tab_with_url(url, exclude_fragment);
+        if (!tab)
+            continue;
+
+        if (window->isMinimized())
+            window->setWindowState(window->windowState() & ~Qt::WindowMinimized);
+        window->raise();
+        window->activateWindow();
+        return tab->view();
+    }
+    return {};
 }
 
 Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML::ActivateTab activate_tab) const

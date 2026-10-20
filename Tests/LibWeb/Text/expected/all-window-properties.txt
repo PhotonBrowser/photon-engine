@@ -398,6 +398,7 @@ ResizeObserverEntry
 ResizeObserverSize
 Response
 SVGAElement
+SVGAnimateMotionElement
 SVGAnimatedEnumeration
 SVGAnimatedInteger
 SVGAnimatedLength
@@ -444,6 +445,7 @@ SVGLength
 SVGLengthList
 SVGLineElement
 SVGLinearGradientElement
+SVGMPathElement
 SVGMaskElement
 SVGMatrix
 SVGMetadataElement
@@ -459,6 +461,7 @@ SVGRect
 SVGRectElement
 SVGSVGElement
 SVGScriptElement
+SVGSetElement
 SVGStopElement
 SVGStyleElement
 SVGSwitchElement

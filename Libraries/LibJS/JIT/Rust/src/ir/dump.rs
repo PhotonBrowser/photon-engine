@@ -79,6 +79,10 @@ fn condition_text(condition: BranchCondition) -> String {
         BranchCondition::ArrayIterator => "ArrayIterator".to_string(),
         BranchCondition::GeneratorObject => "GeneratorObject".to_string(),
         BranchCondition::PlainArrayPrototypeChain => "PlainArrayPrototypeChain".to_string(),
+        BranchCondition::ArrayWithRealmArrayPrototypeAndNoNamedProperties => {
+            "ArrayWithRealmArrayPrototypeAndNoNamedProperties".to_string()
+        }
+        BranchCondition::HoldsValidWatchpointSet => "HoldsValidWatchpointSet".to_string(),
         BranchCondition::Shape(shape) => format!("Shape {}", shapes_text(std::iter::once(&shape))),
         BranchCondition::NonNegativeInt32 => "NonNegativeInt32".to_string(),
         BranchCondition::Int32(comparison) => format!("Int32{comparison:?}"),
@@ -295,6 +299,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::SingleCharacterString
         | Op::Float64ToInt32
         | Op::Float64ToUint8Clamped
+        | Op::CheckFloat64Int32
         | Op::Uint32ShiftRight
         | Op::Uint32ToFloat64
         | Op::StringsEqual
@@ -305,6 +310,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::LoadElementsCapacity
         | Op::AppendElement
         | Op::CallArrayPush
+        | Op::CallStoreHoleyElement
         | Op::OpenArrayIteration
         | Op::LoadArrayIteratorArray
         | Op::LoadArrayIteratorIndex

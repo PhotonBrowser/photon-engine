@@ -95,6 +95,7 @@
 #include <LibWeb/MathML/TagNames.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/SVG/SVGAElement.h>
+#include <LibWeb/SVG/SVGAnimateMotionElement.h>
 #include <LibWeb/SVG/SVGCircleElement.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGDefsElement.h>
@@ -124,6 +125,7 @@
 #include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/SVG/SVGLineElement.h>
 #include <LibWeb/SVG/SVGLinearGradientElement.h>
+#include <LibWeb/SVG/SVGMPathElement.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGMetadataElement.h>
 #include <LibWeb/SVG/SVGPathElement.h>
@@ -134,6 +136,7 @@
 #include <LibWeb/SVG/SVGRectElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
+#include <LibWeb/SVG/SVGSetElement.h>
 #include <LibWeb/SVG/SVGStopElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
 #include <LibWeb/SVG/SVGSwitchElement.h>
@@ -511,6 +514,8 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
 
     if (local_name == SVG::TagNames::svg)
         return create_element_on_heap<SVG::SVGSVGElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::animateMotion)
+        return create_element_on_heap<SVG::SVGAnimateMotionElement>(document, move(qualified_name));
     // FIXME: Support SVG's mixedCase tag names properly.
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::clipPath))
         return create_element_on_heap<SVG::SVGClipPathElement>(document, move(qualified_name));
@@ -570,6 +575,8 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
         return create_element_on_heap<SVG::SVGMaskElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::metadata)
         return create_element_on_heap<SVG::SVGMetadataElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::mpath)
+        return create_element_on_heap<SVG::SVGMPathElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::path)
         return create_element_on_heap<SVG::SVGPathElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::pattern)
@@ -584,6 +591,8 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
         return create_element_on_heap<SVG::SVGRectElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::g)
         return create_element_on_heap<SVG::SVGGElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::set)
+        return create_element_on_heap<SVG::SVGSetElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::stop)
         return create_element_on_heap<SVG::SVGStopElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::style)

@@ -27,6 +27,7 @@ namespace Web::SVG::AttributeNames {
     __ENUMERATE_SVG_ATTRIBUTE(cy, "cy")                                                 \
     __ENUMERATE_SVG_ATTRIBUTE(d, "d")                                                   \
     __ENUMERATE_SVG_ATTRIBUTE(diffuseConstant, "diffuseConstant")                       \
+    __ENUMERATE_SVG_ATTRIBUTE(dur, "dur")                                               \
     __ENUMERATE_SVG_ATTRIBUTE(dx, "dx")                                                 \
     __ENUMERATE_SVG_ATTRIBUTE(dy, "dy")                                                 \
     __ENUMERATE_SVG_ATTRIBUTE(edgeMode, "edgeMode")                                     \
@@ -34,6 +35,7 @@ namespace Web::SVG::AttributeNames {
     __ENUMERATE_SVG_ATTRIBUTE(exponent, "exponent")                                     \
     __ENUMERATE_SVG_ATTRIBUTE(filterUnits, "filterUnits")                               \
     __ENUMERATE_SVG_ATTRIBUTE(fr, "fr")                                                 \
+    __ENUMERATE_SVG_ATTRIBUTE(from, "from")                                             \
     __ENUMERATE_SVG_ATTRIBUTE(fx, "fx")                                                 \
     __ENUMERATE_SVG_ATTRIBUTE(fy, "fy")                                                 \
     __ENUMERATE_SVG_ATTRIBUTE(glyphRef, "glyphRef")                                     \
@@ -65,6 +67,7 @@ namespace Web::SVG::AttributeNames {
     __ENUMERATE_SVG_ATTRIBUTE(offset, "offset")                                         \
     __ENUMERATE_SVG_ATTRIBUTE(opacity, "opacity")                                       \
     __ENUMERATE_SVG_ATTRIBUTE(operator_, "operator")                                    \
+    __ENUMERATE_SVG_ATTRIBUTE(path, "path")                                             \
     __ENUMERATE_SVG_ATTRIBUTE(pathLength, "pathLength")                                 \
     __ENUMERATE_SVG_ATTRIBUTE(patternContentUnits, "patternContentUnits")               \
     __ENUMERATE_SVG_ATTRIBUTE(patternTransform, "patternTransform")                     \
@@ -105,6 +108,7 @@ namespace Web::SVG::AttributeNames {
     __ENUMERATE_SVG_ATTRIBUTE(targetX, "targetX")                                       \
     __ENUMERATE_SVG_ATTRIBUTE(targetY, "targetY")                                       \
     __ENUMERATE_SVG_ATTRIBUTE(textLength, "textLength")                                 \
+    __ENUMERATE_SVG_ATTRIBUTE(to, "to")                                                 \
     __ENUMERATE_SVG_ATTRIBUTE(transform, "transform")                                   \
     __ENUMERATE_SVG_ATTRIBUTE(type, "type")                                             \
     __ENUMERATE_SVG_ATTRIBUTE(values, "values")                                         \

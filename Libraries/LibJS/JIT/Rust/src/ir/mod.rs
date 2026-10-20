@@ -149,6 +149,13 @@ pub enum BranchCondition {
     /// interfere with indexed property access, so that indices it has no
     /// element at read undefined?
     PlainArrayPrototypeChain,
+    /// The input is the `Repr::Pointer` of an object: is it an array whose
+    /// shape has the realm's `%Array.prototype%` as its prototype and no
+    /// named properties, so that it has no own `@@iterator`?
+    ArrayWithRealmArrayPrototypeAndNoNamedProperties,
+    /// The input is the `Repr::Pointer` address of a cell that holds an
+    /// optional watchpoint set: does it hold one that is still valid?
+    HoldsValidWatchpointSet,
     /// Input 0 is an object and input 1 its address: does it have the
     /// shape, like `Op::ShapeSwitch` cases test it? Only the refinements of
     /// those cases have this condition; no branch does.
@@ -1020,6 +1027,10 @@ pub enum Op {
     Float64ToInt32,
     /// ToUint8Clamp of the numeric `Repr::Float64` input 0, as a `Repr::Int32`.
     Float64ToUint8Clamped,
+    /// The `Repr::Float64` input 0 as a `Repr::Int32`. Exits with
+    /// `ExitKind::NotInt32` unless it is an int32 (and not -0): what a
+    /// `CheckInt32` of its `BoxFloat64` does, without the boxing.
+    CheckFloat64Int32,
     /// `input 0 >>> input 1` of two `Repr::Int32` inputs, as the
     /// `Repr::Int32` of the bits of the unsigned result.
     Uint32ShiftRight,
@@ -1085,6 +1096,14 @@ pub enum Op {
     /// registers the call clobbers and restores them afterwards, so it is no
     /// call for the register allocator. The node's value is the new length.
     CallArrayPush,
+    /// Stores the tagged input 2 at the `Repr::Int32` index input 1, below the
+    /// length of the holey elements of the array at the `Repr::Pointer` input
+    /// 0, through `RuntimeInfo::store_holey_element`, which grows the elements
+    /// where they have no room for it (or makes them a dictionary, where the
+    /// store is sparse), and makes them packed if it filled their last hole. A branch on `BranchCondition::HoleFillableArray`
+    /// established that this runs no code. It saves the registers the call
+    /// clobbers, like `CallArrayPush`.
+    CallStoreHoleyElement,
 
     // For-of loops over arrays.
     /// `RuntimeInfo::open_array_iteration` of the tagged iterable input 0:
@@ -1348,7 +1367,11 @@ impl Op {
                 allocates: true,
                 ..P::PURE
             },
-            Op::CheckInt32 | Op::CheckNumber | Op::CheckIdentityComparable | Op::CheckNonNegativeInt32 => P::PURE,
+            Op::CheckInt32
+            | Op::CheckFloat64Int32
+            | Op::CheckNumber
+            | Op::CheckIdentityComparable
+            | Op::CheckNonNegativeInt32 => P::PURE,
             Op::BoxInt32
             | Op::BoxBool
             | Op::Int32Binary { .. }
@@ -1586,7 +1609,7 @@ impl Op {
             },
             // NB: The keys of a cache never change.
             Op::LoadPropertyIteratorKeyCount | Op::LoadPropertyIteratorKey => P::PURE,
-            Op::CallArrayPush => P {
+            Op::CallArrayPush | Op::CallStoreHoleyElement => P {
                 reads: Locations::ELEMENTS_AND_COUNTS,
                 writes: Locations::ELEMENTS_AND_COUNTS,
                 allocates: true,
@@ -1643,6 +1666,7 @@ impl Op {
             Op::LoadArgument { .. } => "LoadArgument",
             Op::CallForwardingArguments { .. } => "CallForwardingArguments",
             Op::CheckInt32 => "CheckInt32",
+            Op::CheckFloat64Int32 => "CheckFloat64Int32",
             Op::CheckNumber => "CheckNumber",
             Op::BoxInt32 => "BoxInt32",
             Op::BoxBool => "BoxBool",
@@ -1732,6 +1756,7 @@ impl Op {
             Op::LoadElementsCapacity => "LoadElementsCapacity",
             Op::AppendElement => "AppendElement",
             Op::CallArrayPush => "CallArrayPush",
+            Op::CallStoreHoleyElement => "CallStoreHoleyElement",
             Op::OpenArrayIteration => "OpenArrayIteration",
             Op::LoadArrayIteratorArray => "LoadArrayIteratorArray",
             Op::LoadArrayIteratorIndex => "LoadArrayIteratorIndex",
@@ -1802,7 +1827,7 @@ impl Op {
             Op::CheckObject => Some(ExitKind::NotObject),
             Op::CheckElements { .. } | Op::CheckTypedArray => Some(ExitKind::BadElements),
             Op::CheckBounds | Op::CheckNotHole | Op::CheckTypedArrayStorage => Some(ExitKind::OutOfBounds),
-            Op::CheckInt32 => Some(ExitKind::NotInt32),
+            Op::CheckInt32 | Op::CheckFloat64Int32 => Some(ExitKind::NotInt32),
             Op::CheckArray => Some(ExitKind::BadType),
             Op::CheckNonNegativeInt32 => Some(ExitKind::Overflow),
             Op::CheckNumber | Op::CheckIdentityComparable | Op::HasInPrototypeChain => Some(ExitKind::BadType),

@@ -68,7 +68,7 @@ bool ContextPresenter::should_shrink_backing_stores_after_resize() const
 void ContextPresenter::schedule_backing_store_shrink(Function<void()> on_timeout)
 {
     if (!m_backing_store_shrink_timer)
-        m_backing_store_shrink_timer = Core::Timer::create_single_shot(3000, move(on_timeout));
+        m_backing_store_shrink_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(3000), move(on_timeout));
     m_backing_store_shrink_timer->restart();
 }
 
@@ -119,8 +119,9 @@ Optional<BackingStoreManager::Publication> ContextPresenter::resize_backing_stor
         return {};
     if (!presents_to_client()) {
         // A resize can arrive before the parent's next replay supplies the new embedding transform.
-        // Bound the existing scale before allocating backing stores for the new viewport.
-        auto scale = bounded_composited_raster_scale(m_raster_scale, m_viewport_size);
+        // Bound the existing embedding's scale for the new viewport before allocating backing stores. Bounding the
+        // already bounded scale instead can round it differently, which would discard the raster on every replay.
+        auto scale = bounded_composited_raster_scale(m_unbounded_raster_scale_of_embedding, m_viewport_size);
         if (m_raster_scale != scale) {
             m_raster_scale = scale;
             m_latest_rendered_surface = nullptr;
@@ -150,7 +151,7 @@ Optional<BackingStoreManager::Publication> ContextPresenter::add_backing_store_f
 void ContextPresenter::schedule_surplus_backing_store_retirement(Function<void()> on_timeout)
 {
     if (!m_surplus_backing_store_retirement_timer)
-        m_surplus_backing_store_retirement_timer = Core::Timer::create_single_shot(3000, move(on_timeout));
+        m_surplus_backing_store_retirement_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(3000), move(on_timeout));
     if (!m_surplus_backing_store_retirement_timer->is_active())
         m_surplus_backing_store_retirement_timer->start();
 }
@@ -183,9 +184,10 @@ bool ContextPresenter::update_composited_raster_transform(Gfx::FloatRect destina
     }
     if (!isfinite(scale_x) || !isfinite(scale_y))
         return false;
+    m_unbounded_raster_scale_of_embedding = { scale_x, scale_y };
 
     // Perspective keeps the native resolution until we can choose a scale from the visible projected region.
-    auto scale = bounded_composited_raster_scale({ scale_x, scale_y }, m_viewport_size);
+    auto scale = bounded_composited_raster_scale(m_unbounded_raster_scale_of_embedding, m_viewport_size);
 
     Gfx::FloatPoint translation;
     if (!has_perspective && transform[0, 1] == 0 && transform[1, 0] == 0 && scale.width() == scale_x && scale.height() == scale_y) {

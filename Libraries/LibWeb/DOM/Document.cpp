@@ -237,6 +237,8 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
+#include <LibWeb/SVG/SMILTimeContainer.h>
+#include <LibWeb/SVG/SVGAnimateMotionElement.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
@@ -995,6 +997,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
         resource.value->visit_edges(visitor);
 
     visitor.visit(m_associated_animation_timelines);
+    visitor.visit(m_smil_time_containers_to_begin);
+    visitor.visit(m_animate_motion_elements_to_update);
     visitor.visit(m_list_of_available_images);
     for (auto& it : m_map_of_preloaded_resources)
         visitor.visit(it.value);
@@ -2796,7 +2800,7 @@ void Document::arm_compositor_animation_timers_for_testing(Badge<Internals::Inte
 {
     stop_compositor_animation_timers();
     schedule_compositor_animation_wakeup(NumericLimits<int>::max());
-    m_compositor_animation_observation_timer = Core::Timer::create_single_shot(NumericLimits<int>::max(), GC::weak_callback(*this, [](auto&) { }));
+    m_compositor_animation_observation_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(NumericLimits<int>::max()), GC::weak_callback(*this, [](auto&) { }));
     m_compositor_animation_observation_timer->start();
 }
 
@@ -5149,6 +5153,27 @@ void Document::queue_navigation_timing_entry()
     HTML::relevant_window_or_worker_global_scope(*this).queue_performance_entry(*m_navigation_timing_entry);
 }
 
+void Document::begin_smil_time_container_once_loaded(SVG::SMILTimeContainer& time_container)
+{
+    // The timeline of an SVG document fragment should begin when the load event for its outermost svg element is
+    // triggered, but that event is not fired. Like Blink, begin the timeline once the document has completely loaded
+    // instead, or right away for a fragment that is inserted after that.
+    if (is_completely_loaded()) {
+        time_container.begin();
+        return;
+    }
+    m_smil_time_containers_to_begin.append(time_container);
+}
+
+void Document::schedule_svg_referenced_motion_path_update(SVG::SVGAnimateMotionElement& element)
+{
+    // The motion path that an animateMotion element takes from the element its mpath child references is the geometry
+    // of that element, which depends on its style. Instead of updating style and layout when the reference changes,
+    // take the motion path the next time the animations are updated.
+    if (!m_animate_motion_elements_to_update.contains_slow(GC::Ref { element }))
+        m_animate_motion_elements_to_update.append(element);
+}
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#completely-finish-loading
 void Document::completely_finish_loading()
 {
@@ -5162,6 +5187,9 @@ void Document::completely_finish_loading()
     //         notification steps.
     if (!m_completely_loaded_time.has_value())
         m_completely_loaded_time = AK::UnixDateTime::now();
+
+    for (auto& time_container : exchange(m_smil_time_containers_to_begin, {}))
+        time_container->begin();
 
     auto navigable = this->navigable();
     if (!navigable) {
@@ -6433,7 +6461,7 @@ struct DocumentLifecycleState : public GC::Cell {
         : remaining_children(remaining)
         , document(document)
         , finish_callback(finish_callback)
-        , timeout(Platform::Timer::create_single_shot(GC::Heap::the(), TIMEOUT_MS, GC::create_function(GC::Heap::the(), [this] {
+        , timeout(Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(TIMEOUT_MS), GC::create_function(GC::Heap::the(), [this] {
             if (remaining_children > 0)
                 dbgln("FIXME: Document unload/destruction timed out with {} remaining children", remaining_children);
         })))
@@ -7588,7 +7616,7 @@ void Document::shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::H
     //   given, document's active sandboxing flag set does not have the sandboxed automatic features browsing context
     //   flag set, then navigate document's node navigable to urlRecord using document, with historyHandling set to
     //   "replace".
-    m_active_refresh_timer = Core::Timer::create_single_shot(time * 1000, [this, has_meta_element = !!meta_element, url_record = move(url_record)]() {
+    m_active_refresh_timer = Core::Timer::create_single_shot(AK::Duration::from_seconds(time), [this, has_meta_element = !!meta_element, url_record = move(url_record)]() {
         if (has_meta_element && has_flag(active_sandboxing_flag_set(), HTML::SandboxingFlagSet::SandboxedAutomaticFeatures))
             return;
 
@@ -8179,7 +8207,7 @@ void Document::schedule_compositor_animation_wakeup(double delay_ms)
 
     m_compositor_animation_wakeup_deadline = deadline;
     if (!m_compositor_animation_wakeup_timer) {
-        m_compositor_animation_wakeup_timer = Core::Timer::create_single_shot(static_cast<int>(timer_delay_ms), GC::weak_callback(*this, [](auto& document) {
+        m_compositor_animation_wakeup_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(static_cast<int>(timer_delay_ms)), GC::weak_callback(*this, [](auto& document) {
             // Cancelling a finite effect can leave this deadline armed. The single wake-up is harmless: it finds
             // nothing due and leaves the timer idle unless another effect supplies a deadline.
             document.m_compositor_animation_wakeup_deadline.clear();
@@ -8188,7 +8216,7 @@ void Document::schedule_compositor_animation_wakeup(double delay_ms)
             document.service_compositor_animation_wakeup(timestamp);
         }));
     }
-    m_compositor_animation_wakeup_timer->restart(static_cast<int>(timer_delay_ms));
+    m_compositor_animation_wakeup_timer->restart(AK::Duration::from_milliseconds(static_cast<int>(timer_delay_ms)));
 }
 
 void Document::service_compositor_animation_wakeup(double timestamp)
@@ -8979,7 +9007,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
             m_compositor_animation_observation_timer->stop();
     } else {
         if (!m_compositor_animation_observation_timer) {
-            m_compositor_animation_observation_timer = Core::Timer::create_single_shot(100, GC::weak_callback(*this, [](auto& document) {
+            m_compositor_animation_observation_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(100), GC::weak_callback(*this, [](auto& document) {
                 ++document.m_style_invalidation_counters.animation_frame_pump_requests;
                 document.page().client().request_frame();
                 document.m_compositor_animation_observation_timer->start();
@@ -9039,7 +9067,14 @@ void Document::prepare_to_observe_css_animation_events()
 void Document::update_animations_and_send_events(double timestamp)
 {
     m_last_animation_frame_timestamp = timestamp;
-    auto timelines_to_update = GC::RootVector { m_associated_animation_timelines.values() };
+
+    // AD-HOC: Take the motion paths of animateMotion elements from the elements their mpath children refer to. See
+    //         schedule_svg_referenced_motion_path_update().
+    GC::RootVector animate_motion_elements_to_update = { exchange(m_animate_motion_elements_to_update, {}) };
+    for (auto& element : animate_motion_elements_to_update)
+        element->update_referenced_motion_path();
+
+    GC::RootVector timelines_to_update = { m_associated_animation_timelines.values() };
 
     {
         HTML::TemporaryExecutionContext temporary_execution_context { relevant_settings_object() };
@@ -11700,6 +11735,11 @@ void Document::did_change_custom_property_registrations(Optional<Utf16FlyString>
 {
     ++m_custom_property_registration_generation;
     sync_custom_property_registrations_to_rust();
+    // What every environment an element holds hands down follows the registrations. The engine has to be told
+    // again, or a child it styles under one registration resolves over an environment the host can't install.
+    // That waits for the next style update, which reaches the engine under a read of its own. A change beside
+    // a frame in flight leaves the flight alone.
+    m_custom_property_environments_need_republishing = true;
 
     // An @property rule's program input already reaches the elements declaring or referencing its
     // name. CSS.registerProperty() has no rule, so publish the equivalent named input explicitly.
@@ -11707,6 +11747,14 @@ void Document::did_change_custom_property_registrations(Optional<Utf16FlyString>
         auto& style_engine = style_computer().style_engine();
         CSS::StyleEngineFFI::style_engine_record_custom_property_registration_change(style_engine.host(), style_engine.intern_atom(*registered_property_set_change));
     }
+}
+
+void Document::republish_custom_property_environments_for_style_update(Layout::BegunRead const& read)
+{
+    if (!m_custom_property_environments_need_republishing)
+        return;
+    m_custom_property_environments_need_republishing = false;
+    style_computer().style_engine().republish_element_custom_property_environments(read, *this);
 }
 
 void Document::sync_custom_property_registrations_to_rust()

@@ -9,6 +9,7 @@
 
 #include <AK/Optional.h>
 #include <AK/kmalloc.h>
+#include <LibURL/URL.h>
 #include <LibWebCommon/HTML/ActivateTab.h>
 #include <LibWebCommon/HTML/AudioPlayState.h>
 #include <LibWebCommon/Page/PageId.h>
@@ -150,13 +151,14 @@ public:
 
     Tab& create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocation);
     void duplicate_tab(Tab&);
+    void open_history_entry_in_new_tab(Tab&, int delta);
     Tab* current_tab() const { return m_current_tab; }
-    bool activate_tab_with_url(URL::URL const&);
+    Tab* activate_tab_with_url(URL::URL const&, URL::ExcludeFragment);
     // Asks every tab's page if the window may close, without closing it, and reports the answer. Once the pages agree,
     // a close() goes straight through.
-    void request_close_preflight_for_quit(Function<void(bool approved)> on_complete);
-    // Brings the window forward for a page's beforeunload prompt, when the prompt is part of a quit's check.
-    void raise_for_quit_prompt();
+    void request_close_preflight(Function<void(bool approved)> on_complete);
+    // Brings the window forward for a page's beforeunload prompt during an application-wide close check.
+    void raise_for_close_prompt();
     bool is_window_close_approved() const { return m_window_close_approved; }
     void cancel_window_close_preflight();
     void on_tab_load_start(Tab&);

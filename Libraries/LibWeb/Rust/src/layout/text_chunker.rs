@@ -211,22 +211,62 @@ impl Drop for IcuSegmenterHandle {
 }
 
 pub(crate) enum GraphemeSegmenter {
-    Ascii { length_in_code_units: usize },
-    Icu(IcuSegmenterHandle),
+    Ascii {
+        length_in_code_units: usize,
+    },
+    /// Text of code points below U+0300 only, where every code unit is a grapheme cluster except for CR LF.
+    Latin {
+        length_in_code_units: usize,
+        /// Where each LF that follows a CR is, in increasing order.
+        line_feeds_after_carriage_returns: Box<[usize]>,
+    },
+    Icu {
+        handle: IcuSegmenterHandle,
+        length_in_code_units: usize,
+        /// One bit per code unit: whether it is a code point below U+0300 other than CR.
+        latin_code_units: Box<[u64]>,
+    },
+}
+
+// No code point below U+0300 extends or joins a grapheme cluster, and only CR joins the code point after it (CR LF).
+fn is_latin_code_unit_outside_clusters(code_unit: u16) -> bool {
+    code_unit < 0x300 && code_unit != 0x0d
 }
 
 impl GraphemeSegmenter {
     pub(crate) fn new(text: &[u16]) -> Self {
-        if text.iter().all(|unit| *unit <= 0x7f) {
+        let Some(first_non_ascii) = text.iter().position(|unit| *unit > 0x7f) else {
             return Self::Ascii {
                 length_in_code_units: text.len(),
             };
+        };
+        if text[first_non_ascii..].iter().all(|unit| *unit < 0x300) {
+            let line_feeds_after_carriage_returns = text
+                .windows(2)
+                .enumerate()
+                .filter(|(_, pair)| *pair == [0x0d, 0x0a])
+                .map(|(index, _)| index + 1)
+                .collect();
+            return Self::Latin {
+                length_in_code_units: text.len(),
+                line_feeds_after_carriage_returns,
+            };
+        }
+        let mut latin_code_units = vec![0u64; text.len().div_ceil(64)].into_boxed_slice();
+        for (index, code_unit) in text.iter().enumerate() {
+            if is_latin_code_unit_outside_clusters(*code_unit) {
+                latin_code_units[index / 64] |= 1 << (index % 64);
+            }
         }
         // SAFETY: The chunker borrows the text for its whole lifetime and the
         // segmenter handle is dropped with the chunker, so the ICU segmenter
         // never outlives the buffer it references.
         let raw = unsafe { unicode_layout_grapheme_segmenter_create(text.as_ptr(), text.len()) };
-        Self::Icu(IcuSegmenterHandle { raw })
+        Self::Icu {
+            handle: IcuSegmenterHandle { raw },
+            length_in_code_units: text.len(),
+            latin_code_units,
+        }
     }
 
     /// Mirrors Unicode::AsciiGraphemeSegmenter for the ASCII case: every code
@@ -242,27 +282,85 @@ impl GraphemeSegmenter {
                 }
                 Some(index + 1)
             }
-            Self::Icu(handle) => handle.next_boundary(index, inclusive),
+            Self::Latin {
+                length_in_code_units,
+                line_feeds_after_carriage_returns,
+            } => {
+                let is_boundary = |index: usize| line_feeds_after_carriage_returns.binary_search(&index).is_err();
+                if inclusive && index <= *length_in_code_units && is_boundary(index) {
+                    return Some(index);
+                }
+                if index >= *length_in_code_units {
+                    return None;
+                }
+                (index + 1..=*length_in_code_units).find(|&boundary| is_boundary(boundary))
+            }
+            Self::Icu {
+                handle,
+                length_in_code_units,
+                latin_code_units,
+            } => {
+                // OPTIMIZATION: Two code points below U+0300 have a grapheme cluster boundary between them, unless the
+                //               first one is CR. So do such a code point and the end of the text.
+                let is_latin = |index: usize| latin_code_units[index / 64] & (1 << (index % 64)) != 0;
+                let length = *length_in_code_units;
+                let boundary = if inclusive {
+                    (index > 0 && index < length && is_latin(index - 1) && is_latin(index)).then_some(index)
+                } else {
+                    (index < length && is_latin(index) && (index + 1 == length || is_latin(index + 1)))
+                        .then_some(index + 1)
+                };
+                if boundary.is_some() {
+                    debug_assert_eq!(boundary, handle.next_boundary(index, inclusive));
+                    return boundary;
+                }
+                handle.next_boundary(index, inclusive)
+            }
         }
     }
 }
 
-struct LineSegmenter {
+struct LineSegmenter<'text> {
     handle: IcuSegmenterHandle,
+    text: &'text [u16],
+    /// Where the last search for a boundary started, and the boundary it found, so that no boundary lies before it.
+    last_search: std::cell::Cell<Option<(usize, usize)>>,
 }
 
-impl LineSegmenter {
-    fn new(text: &[u16]) -> Self {
+impl<'text> LineSegmenter<'text> {
+    fn new(text: &'text [u16]) -> Self {
         // SAFETY: See GraphemeSegmenter::new; the same lifetime contract holds,
         // and the C++ side picks the ASCII line-breaking fast path internally.
         let raw = unsafe { unicode_layout_line_segmenter_create(text.as_ptr(), text.len()) };
         Self {
             handle: IcuSegmenterHandle { raw },
+            text,
+            last_search: std::cell::Cell::new(None),
         }
     }
 
     fn next_boundary(&self, index: usize, inclusive: bool) -> Option<usize> {
-        self.handle.next_boundary(index, inclusive)
+        // NB: The segmenter moves a search that starts inside a surrogate pair to the start of the pair, which can
+        //     find a boundary before where the search started.
+        let starts_inside_surrogate_pair = index > 0
+            && index < self.text.len()
+            && is_utf16_low_surrogate(self.text[index])
+            && is_utf16_high_surrogate(self.text[index - 1]);
+        if starts_inside_surrogate_pair {
+            return self.handle.next_boundary(index, inclusive);
+        }
+        // OPTIMIZATION: The chunker asks about every position from the start of the text to its end. A search finds
+        //               the first boundary at or after where it starts, so the boundary the last search found answers
+        //               every search that starts between the two.
+        let search_start = if inclusive { index } else { index + 1 };
+        if let Some((last_search_start, boundary)) = self.last_search.get()
+            && (last_search_start..=boundary).contains(&search_start)
+        {
+            return Some(boundary);
+        }
+        let boundary = self.handle.next_boundary(index, inclusive)?;
+        self.last_search.set(Some((search_start, boundary)));
+        Some(boundary)
     }
 }
 
@@ -371,7 +469,7 @@ struct TextChunker<'text> {
     text: &'text [u16],
     frozen_font_list: &'text FrozenFontList,
     grapheme_segmenter: GraphemeSegmenter,
-    line_segmenter: LineSegmenter,
+    line_segmenter: LineSegmenter<'text>,
     word_break: u8,
     font_variant_emoji: u8,
     should_collapse_whitespace: bool,
@@ -497,10 +595,34 @@ impl<'text> TextChunker<'text> {
     fn emoji_presentation_at(&self, code_unit_offset: usize, code_point: u32) -> EmojiPresentation {
         let next_offset = code_unit_offset + code_unit_length_for_code_point(code_point);
         let next_code_point = (next_offset < self.text.len()).then(|| code_point_at(self.text, next_offset));
-        let default_presentation = emoji_presentation_for_code_point(code_point, next_code_point);
-
-        // SAFETY: Pure Unicode table lookup.
-        if default_presentation.forced || !unsafe { unicode_layout_code_point_has_emoji_property(code_point) } {
+        // OPTIMIZATION: No code point below U+0300 has the Emoji_Presentation property, so only a variation selector
+        //               can give one of them anything but the default text presentation.
+        let default_presentation = if code_point < 0x300 && !matches!(next_code_point, Some(0xfe0e | 0xfe0f)) {
+            EmojiPresentation {
+                is_emoji: false,
+                forced: false,
+            }
+        } else {
+            emoji_presentation_for_code_point(code_point, next_code_point)
+        };
+        // OPTIMIZATION: Below U+0300, only '#', '*', the ASCII digits, U+00A9 and U+00AE have the Emoji property.
+        let has_emoji_property = if code_point < 0x300 {
+            matches!(code_point, 0x23 | 0x2a | 0x30..=0x39 | 0xa9 | 0xae)
+        } else {
+            // SAFETY: Pure Unicode table lookup.
+            unsafe { unicode_layout_code_point_has_emoji_property(code_point) }
+        };
+        debug_assert!(
+            code_point >= 0x300 || {
+                let presentation = emoji_presentation_for_code_point(code_point, next_code_point);
+                // SAFETY: Pure Unicode table lookup.
+                let has_property = unsafe { unicode_layout_code_point_has_emoji_property(code_point) };
+                presentation.is_emoji == default_presentation.is_emoji
+                    && presentation.forced == default_presentation.forced
+                    && has_property == has_emoji_property
+            }
+        );
+        if default_presentation.forced || !has_emoji_property {
             return default_presentation;
         }
 

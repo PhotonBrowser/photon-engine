@@ -28,7 +28,7 @@ public:
 
     explicit TimerVSyncScheduler(Function<void(MonotonicTime)>&& tick_callback)
         : m_tick_callback(move(tick_callback))
-        , m_timer(Core::Timer::create_single_shot(0, [this] {
+        , m_timer(Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this] {
             fire();
         }))
     {
@@ -100,11 +100,9 @@ private:
         advance_next_tick_time_past(now);
         VERIFY(*m_next_tick_time > now);
 
-        // NB: The timer is armed against a fixed display grid. Rounding the delay up avoids firing before the grid
-        //     point, and advancing by whole intervals keeps request and update latency from shifting later ticks.
-        auto delay_nanoseconds = (*m_next_tick_time - now).to_nanoseconds();
-        auto delay_milliseconds = (delay_nanoseconds + 999'999) / 1'000'000;
-        m_timer->restart(static_cast<int>(max<i64>(delay_milliseconds, 1)));
+        // NB: The timer is armed against a fixed display grid. Advancing by whole intervals keeps request and update
+        //     latency from shifting later ticks.
+        m_timer->restart(*m_next_tick_time - now);
     }
 
     Function<void(MonotonicTime)> m_tick_callback;
@@ -172,7 +170,7 @@ private:
     DisplayLinkState(Core::EventLoop& event_loop, CVDisplayLinkRef display_link)
         : event_loop(event_loop)
         , display_link(display_link)
-        , idle_stop_timer(Core::Timer::create_single_shot(display_link_idle_stop_delay_ms, [this] {
+        , idle_stop_timer(Core::Timer::create_single_shot(AK::Duration::from_milliseconds(display_link_idle_stop_delay_ms), [this] {
             stop_display_link_if_idle();
         }))
     {
@@ -230,7 +228,7 @@ void DisplayLinkState::schedule_display_link_stop_if_idle()
     if (invalidated.load() || tick_requested.load() || !display_link)
         return;
 
-    idle_stop_timer->restart(display_link_idle_stop_delay_ms);
+    idle_stop_timer->restart(AK::Duration::from_milliseconds(display_link_idle_stop_delay_ms));
 }
 
 void DisplayLinkState::stop_display_link_if_idle()

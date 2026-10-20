@@ -6,13 +6,14 @@
 
 #pragma once
 
+#include <AK/AtomicRefCounted.h>
 #include <AK/ByteBuffer.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullRefPtr.h>
-#include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/StdLibExtras.h>
 #include <AK/Variant.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Export.h>
 #include <LibCore/MappedFile.h>
 
@@ -26,6 +27,7 @@ public:
     static ErrorOr<ImmutableBytes> copy_to_readonly_mapping(ReadonlyBytes);
     static ImmutableBytes adopt(ByteBuffer);
     static ImmutableBytes adopt_mapped_file(NonnullOwnPtr<MappedFile>);
+    static ImmutableBytes adopt_anonymous_buffer(AnonymousBuffer);
     static ErrorOr<ImmutableBytes> map_from_fd_range_and_close(int fd, StringView path, off_t offset, size_t size);
 
     ImmutableBytes() = default;
@@ -35,12 +37,15 @@ public:
     [[nodiscard]] bool is_file_backed() const;
     [[nodiscard]] bool is_readonly_mapped() const;
 
-    [[nodiscard]] size_t size() const { return bytes().size(); }
+    [[nodiscard]] size_t size() const { return m_length; }
     [[nodiscard]] ReadonlyBytes bytes() const LIFETIME_BOUND;
     [[nodiscard]] ErrorOr<ByteBuffer> copy_to_byte_buffer() const;
 
+    // A view of part of the same storage, which it keeps alive.
+    [[nodiscard]] ImmutableBytes slice(size_t offset, size_t length) const;
+
 private:
-    class Impl final : public RefCounted<Impl> {
+    class Impl final : public AtomicRefCounted<Impl> {
     public:
         struct ReadonlyMapping {
             AK_MAKE_NONCOPYABLE(ReadonlyMapping);
@@ -65,18 +70,21 @@ private:
         explicit Impl(ByteBuffer);
         explicit Impl(NonnullOwnPtr<MappedFile>);
         explicit Impl(ReadonlyMapping);
+        explicit Impl(AnonymousBuffer);
 
         [[nodiscard]] bool is_file_backed() const;
         [[nodiscard]] bool is_readonly_mapped() const;
         [[nodiscard]] ReadonlyBytes bytes() const LIFETIME_BOUND;
 
     private:
-        Variant<ByteBuffer, NonnullOwnPtr<MappedFile>, ReadonlyMapping> m_storage;
+        Variant<ByteBuffer, NonnullOwnPtr<MappedFile>, ReadonlyMapping, AnonymousBuffer> m_storage;
     };
 
     explicit ImmutableBytes(NonnullRefPtr<Impl>);
 
     RefPtr<Impl> m_impl;
+    size_t m_offset { 0 };
+    size_t m_length { 0 };
 };
 
 }

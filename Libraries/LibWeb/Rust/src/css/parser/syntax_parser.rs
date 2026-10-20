@@ -3613,7 +3613,7 @@ pub unsafe extern "C" fn rust_parse_css_stylesheet_syntax(
     source: FfiUtf16View,
     parse_context: *const ParseContext,
 ) -> *const ParsedStyleSheet {
-    let Some(source) = (unsafe { source.units() }) else {
+    let Some(source) = source.units() else {
         return std::ptr::null();
     };
     Arc::into_raw(unsafe { parse_shared_stylesheet(source, parse_context) })
@@ -3631,7 +3631,7 @@ pub unsafe extern "C" fn rust_parse_css_rule_syntax(
     nested: bool,
     parse_context: *const ParseContext,
 ) -> *const ParsedStyleSheet {
-    let Some(source) = (unsafe { source.units() }) else {
+    let Some(source) = source.units() else {
         return std::ptr::null_mut();
     };
     let Some(contexts) = (unsafe { crate::bytes_from_raw(contexts, context_count) }) else {
@@ -3673,12 +3673,9 @@ pub(crate) fn parse_keyframe_selector_list(source: TokenizerInput<'_>) -> Option
 }
 
 /// Parses an immutable CSS page selector list.
-///
-/// # Safety
-/// `source` must remain readable for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_page_selector_list(source: FfiUtf16View) -> *const PageSelectorList {
-    let Some(source) = (unsafe { source.units() }) else {
+pub extern "C" fn rust_parse_page_selector_list(source: FfiUtf16View) -> *const PageSelectorList {
+    let Some(source) = source.units() else {
         return std::ptr::null();
     };
     let Some(selectors) = parse_page_selector_list(source) else {
@@ -3748,15 +3745,11 @@ pub extern "C" fn rust_css_syntax_parse_declaration_block(
 }
 
 /// Retains parsed descriptor lists from block contents, ignoring rules.
-///
-/// # Safety
-/// `parse` must be a live result of `rust_parse_css_block_syntax`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_css_syntax_parse_descriptor_block(
-    parse: *const ParsedStyleSheet,
+pub extern "C" fn rust_css_syntax_parse_descriptor_block(
+    parsed: &ParsedStyleSheet,
 ) -> *mut crate::css::descriptor_block::FfiDescriptorBlock {
     use crate::css::descriptor_block::FfiDescriptorBlock;
-    let parsed = unsafe { &*parse };
     // https://drafts.csswg.org/cssom/#parse-a-css-declaration-block
     // 2. Let parsed declarations be a new empty list.
     let mut descriptors: Option<Arc<DescriptorBlockData>> = None;
@@ -3797,7 +3790,7 @@ pub unsafe extern "C" fn rust_parse_css_block_syntax(
     parse_context: *const ParseContext,
     preserve_property_source_text: bool,
 ) -> *const ParsedStyleSheet {
-    let Some(source) = (unsafe { source.units() }) else {
+    let Some(source) = source.units() else {
         return std::ptr::null_mut();
     };
     let Some(contexts) = (unsafe { crate::bytes_from_raw(contexts, context_count) }) else {
@@ -3949,11 +3942,7 @@ mod tests {
             let source = utf16("@未来 {} @media all { .目 { height: 13px; & {} 未知: 雪; width: 赤; } }");
             let parse = unsafe {
                 std::sync::Arc::from_raw(super::rust_parse_css_stylesheet_syntax(
-                    FfiUtf16View {
-                        utf16: source.as_ptr(),
-                        length: source.len(),
-                        ..Default::default()
-                    },
+                    FfiUtf16View::from_utf16(&source),
                     &parse_context(),
                 ))
             };
@@ -4007,11 +3996,7 @@ mod tests {
         let contexts = [RuleContext::Style as u8];
         let parse = unsafe {
             std::sync::Arc::from_raw(super::rust_parse_css_block_syntax(
-                FfiUtf16View {
-                    utf16: source.as_ptr(),
-                    length: source.len(),
-                    ..Default::default()
-                },
+                FfiUtf16View::from_utf16(&source),
                 contexts.as_ptr(),
                 contexts.len(),
                 &parse_context(),

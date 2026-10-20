@@ -92,7 +92,7 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
 
     initialize_context_menus();
 
-    m_repeated_crash_timer = Core::Timer::create_single_shot(1000, [this] {
+    m_repeated_crash_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1000), [this] {
         // Reset the "crashing a lot" counter after 1 second in case we just
         // happen to be visiting crashy websites a lot.
         this->m_crash_count = 0;
@@ -1354,8 +1354,6 @@ void ViewImplementation::send_preferences_to_page(WebContentPage& page)
     page.async_set_preferred_motion(m_preferred_motion);
     page.async_set_preferred_languages(Application::settings().languages());
     page.async_set_zoom_level(m_zoom_level);
-    if (m_user_style_sheet.has_value())
-        page.async_set_user_style(*m_user_style_sheet);
     send_browsing_behavior(page);
     send_autoplay_settings(page);
     send_global_privacy_control(page);
@@ -2036,7 +2034,7 @@ void ViewImplementation::enable_picture_in_picture_controls()
 
     // The same delay as the page's media controls.
     static constexpr int hide_delay_ms = 1000;
-    m_picture_in_picture_controls_hide_timer = Core::Timer::create_single_shot(hide_delay_ms, [this] {
+    m_picture_in_picture_controls_hide_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(hide_delay_ms), [this] {
         if (!m_picture_in_picture_controls_pointer_state.hovered_action().has_value())
             set_picture_in_picture_controls_shown(false);
     });
@@ -3419,7 +3417,7 @@ void ViewImplementation::wait_for_webdriver_navigation_completion(Optional<u64> 
 
     if (page_load_timeout.has_value()) {
         auto timer_interval = *page_load_timeout > NumericLimits<int>::max() ? NumericLimits<int>::max() : static_cast<int>(*page_load_timeout);
-        auto timer = Core::Timer::create_single_shot(timer_interval, [this, request_id] {
+        auto timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(timer_interval), [this, request_id] {
             complete_webdriver_navigation_completion(request_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::Timeout, "Navigation timed out"sv));
         });
         timer->start();
@@ -4122,14 +4120,6 @@ ErrorOr<LexicalPath> ViewImplementation::dump_gc_graph()
     TRY(dump_file->write_until_depleted(";\n"sv.bytes()));
 
     return path;
-}
-
-void ViewImplementation::set_user_style_sheet(String const& source)
-{
-    m_user_style_sheet = source;
-    traversable().for_each_hosting_page([&](WebContentPage& page) {
-        page.async_set_user_style(source);
-    });
 }
 
 void ViewImplementation::initialize_context_menus()

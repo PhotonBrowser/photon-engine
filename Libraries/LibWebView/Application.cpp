@@ -730,7 +730,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     TRY(launch_services());
 
     if (m_web_content_options.is_test_mode == IsTestMode::No && m_browser_options.enable_content_blocker == EnableContentBlocker::Yes) {
-        m_content_blocker_list_update_timer = Core::Timer::create_repeating(24 * 60 * 60 * 1000, [this] {
+        m_content_blocker_list_update_timer = Core::Timer::create_repeating(AK::Duration::from_seconds(24 * 60 * 60), [this] {
             start_content_blocker_list_update(ContentBlockerListUpdateTrigger::Automatic);
         });
         m_content_blocker_list_update_timer->start();
@@ -880,7 +880,7 @@ void Application::start_next_content_blocker_list_update()
         return 30 * 1000;
     }();
 
-    auto timeout = Core::Timer::create_single_shot(timeout_ms, [this] {
+    auto timeout = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(timeout_ms), [this] {
         warnln("Content blocker list download timed out");
         stop_current_content_blocker_list_update_and_continue();
     });
@@ -1013,6 +1013,14 @@ void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTa
 {
     if (auto view = open_blank_new_tab(activate_tab); view.has_value())
         view->load(url);
+}
+
+void Application::activate_or_open_tab_with_url(URL::URL const& url) const
+{
+    if (auto view = activate_tab_with_url(url, URL::ExcludeFragment::Yes); view.has_value())
+        view->load(url);
+    else
+        open_url_in_new_tab(url, Web::HTML::ActivateTab::Yes);
 }
 
 void Application::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab) const
@@ -2049,7 +2057,7 @@ static NonnullRefPtr<Core::Timer> load_page_for_screenshot_and_exit(Core::EventL
     outln("Taking screenshot after {} seconds", screenshot_timeout);
 
     auto timer = Core::Timer::create_single_shot(
-        screenshot_timeout * 1000,
+        AK::Duration::from_seconds(screenshot_timeout),
         [&]() {
             view.take_screenshot(ViewImplementation::ScreenshotType::Full)
                 ->when_resolved([&event_loop](auto const& path) {
@@ -2542,14 +2550,13 @@ void Application::initialize_actions()
     });
 
     m_open_about_page_action = Action::create("About Ladybird"sv, ActionID::OpenAboutPage, [this]() {
-        open_url_in_new_tab(URL::about_version(), Web::HTML::ActivateTab::Yes);
+        activate_or_open_tab_with_url(URL::about_version());
     });
     m_open_downloads_page_action = Action::create("Downloads"sv, ActionID::ViewDownloads, [this]() {
-        if (!activate_tab_with_url(URL::about_downloads()))
-            open_url_in_new_tab(URL::about_downloads(), Web::HTML::ActivateTab::Yes);
+        activate_or_open_tab_with_url(URL::about_downloads());
     });
     m_open_settings_page_action = Action::create("Settings"sv, ActionID::OpenSettingsPage, [this]() {
-        open_url_in_new_tab(URL::about_settings(), Web::HTML::ActivateTab::Yes);
+        activate_or_open_tab_with_url(URL::about_settings());
     });
 
     m_zoom_in_action = Action::create("Zoom In"sv, ActionID::ZoomIn, [this]() {
@@ -2641,7 +2648,7 @@ void Application::initialize_actions()
 
     m_bookmarks_menu = Menu::create("Bookmarks"sv);
     m_bookmarks_menu->add_action(Action::create("Manage Bookmarks"sv, ActionID::ManageBookmarks, [this]() {
-        open_url_in_new_tab(URL::about_bookmarks(), Web::HTML::ActivateTab::Yes);
+        activate_or_open_tab_with_url(URL::about_bookmarks());
     }));
 
     auto add_show_bookmarks_bar_option = [&](auto name, auto value) {
@@ -2703,16 +2710,13 @@ void Application::initialize_actions()
 
     m_history_menu = Menu::create("History"sv);
     m_history_menu->add_action(Action::create("View History"sv, ActionID::ViewHistory, [this]() {
-        if (!activate_tab_with_url(URL::about_history()))
-            open_url_in_new_tab(URL::about_history(), Web::HTML::ActivateTab::Yes);
+        activate_or_open_tab_with_url(URL::about_history());
     }));
     m_history_menu->add_separator();
     m_history_menu->add_action(Action::create("Clear Browsing Data"sv, ActionID::ClearBrowsingData, [this]() {
         auto url = URL::about_settings();
         url.set_fragment("clearBrowsingData"sv);
-
-        if (!activate_tab_with_url(url))
-            open_url_in_new_tab(url, Web::HTML::ActivateTab::Yes);
+        activate_or_open_tab_with_url(url);
     }));
 
     m_inspect_menu = Menu::create("Inspect"sv);

@@ -1686,6 +1686,7 @@ impl Executable {
         let executable = Self::create_from_parts(vm, executable);
         if let Some(replaced_executable) = replaced_executable {
             Self::copy_runtime_caches_from(executable, &replaced_executable);
+            Self::take_over_warm_up_from(executable, &replaced_executable);
         }
         drop(rooted_template_object_caches);
         drop(rooted_constants);
@@ -1819,6 +1820,22 @@ impl Executable {
     /// Whether the bytecode runs in place in the bytecode cache blob it was materialized from.
     pub fn runs_in_place_in_bytecode_cache_blob(&self) -> bool {
         matches!(self.bytecode, ExecutableBytecode::InBytecodeCacheBlob(_))
+    }
+
+    /// Takes over the feedback, the tier and the tier-up budget of `other`, an executable with the same bytecode that
+    /// this one replaces, so that a function that warmed up goes on from where it was rather than start over, and
+    /// whether the JIT refused it.
+    fn take_over_warm_up_from(executable: Gc<Executable>, other: &Executable) {
+        executable.take_over_jit_refusal_from(other);
+        let Some(other_feedback) = other.feedback() else {
+            return;
+        };
+        if executable.feedback_slot_counts != other.feedback_slot_counts {
+            return;
+        }
+        executable.ensure_feedback().copy_from(other_feedback);
+        executable.set_interpreter_tier(other.interpreter_tier());
+        executable.head.tier_up_budget.set(other.head.tier_up_budget.get());
     }
 
     /// Executable::copy_runtime_caches_from(): makes `executable` take over what the inline caches of `other`, an

@@ -404,7 +404,6 @@ public:
     void did_change_audio_play_state(Badge<WebContentPage>, Web::HTML::AudioPlayState);
     Web::HTML::AudioPlayState audio_play_state() const { return m_audio_play_state; }
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
-    Web::ScreenWakeLockState screen_wake_lock_state() const { return m_screen_wake_lock_state; }
 
     void did_reset_session_history_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
     bool capture_session_history_snapshot_for_testing(Badge<WebContentPage>);
@@ -449,8 +448,6 @@ public:
     void did_receive_internal_page_info(Badge<WebContentPage>, PageInfoType, Optional<Core::AnonymousBuffer> const&);
 
     ErrorOr<LexicalPath> dump_gc_graph();
-
-    void set_user_style_sheet(String const& source);
 
     void request_close();
     void request_close_preflight(Function<void(bool)> on_complete);
@@ -616,7 +613,6 @@ protected:
     virtual Web::Clipboard::SystemClipboardItem clipboard_item() const;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
 
-    virtual bool defer_backing_store_release(i32) { return false; }
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
     void release_backing_store(i32 bitmap_id);
     static Gfx::IntRect rect_fitting_frame(Gfx::IntSize frame_size, Gfx::IntSize target_size);
@@ -920,7 +916,6 @@ protected:
     Optional<Gfx::IntSize> m_window_size;
     Web::CSS::PreferredContrast m_preferred_contrast { Web::CSS::PreferredContrast::Auto };
     Web::CSS::PreferredMotion m_preferred_motion { Web::CSS::PreferredMotion::Auto };
-    Optional<String> m_user_style_sheet;
 
     HistoryVisitTransition m_history_visit_transition_for_current_load { HistoryVisitTransition::Link };
     HistoryVisitTransition m_history_visit_transition_for_next_load { HistoryVisitTransition::Link };

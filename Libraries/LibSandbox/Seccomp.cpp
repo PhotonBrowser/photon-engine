@@ -84,8 +84,6 @@ static constexpr unsigned read_only_open_flags = [] {
 #define SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(policy, name) \
     IF_DEFINED_##name(SECCOMP_APPEND_ALLOW_SYSCALL(policy, name), (policy).append(SECCOMP_ALLOW_NOTHING))
 
-#define IF_DEFINED_accept(if_defined, if_not_defined) if_defined
-#define IF_DEFINED_accept4(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_access(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_bind(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_brk(if_defined, if_not_defined) if_defined
@@ -141,7 +139,6 @@ static constexpr unsigned read_only_open_flags = [] {
 #define IF_DEFINED_ioctl(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_link(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_linkat(if_defined, if_not_defined) if_defined
-#define IF_DEFINED_listen(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_lseek(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_madvise(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_membarrier(if_defined, if_not_defined) if_defined
@@ -208,14 +205,6 @@ static constexpr unsigned read_only_open_flags = [] {
 #define IF_DEFINED_write(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_writev(if_defined, if_not_defined) if_defined
 
-#ifndef __NR_accept
-#    undef IF_DEFINED_accept
-#    define IF_DEFINED_accept(if_defined, if_not_defined) if_not_defined
-#endif
-#ifndef __NR_accept4
-#    undef IF_DEFINED_accept4
-#    define IF_DEFINED_accept4(if_defined, if_not_defined) if_not_defined
-#endif
 #ifndef __NR_access
 #    undef IF_DEFINED_access
 #    define IF_DEFINED_access(if_defined, if_not_defined) if_not_defined
@@ -327,10 +316,6 @@ static constexpr unsigned read_only_open_flags = [] {
 #ifndef __NR_linkat
 #    undef IF_DEFINED_linkat
 #    define IF_DEFINED_linkat(if_defined, if_not_defined) if_not_defined
-#endif
-#ifndef __NR_listen
-#    undef IF_DEFINED_listen
-#    define IF_DEFINED_listen(if_defined, if_not_defined) if_not_defined
 #endif
 #ifndef __NR_getcpu
 #    undef IF_DEFINED_getcpu
@@ -1436,35 +1421,6 @@ void SeccompPolicy::allow_process_creation()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, waitid);
 }
 
-// NB: Seccomp cannot follow the sockaddr pointer that connect() is given, and Landlock does not
-//     mediate UNIX socket connections, so neither mechanism can restrict which endpoint a process
-//     reaches. The domain argument of socket() is the only part of this the kernel lets us filter,
-//     and connect() fails with EAFNOSUPPORT when the address family does not match the socket.
-//     Being able to create a socket in a domain is therefore the same thing as being able to
-//     address every endpoint in it.
-void SeccompPolicy::append_allow_socket_with_domains([[maybe_unused]] ReadonlySpan<u32> domains)
-{
-#ifdef __NR_socket
-    // Every jump offset below is a byte, so the group has to stay well short of 255 domains.
-    VERIFY(!domains.is_empty());
-    VERIFY(domains.size() < 32);
-
-    // Jump past the whole group when this is not socket(). The group is one argument load, one
-    // comparison per domain, and the allow.
-    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, static_cast<u8>(domains.size() + 2)));
-    append(SECCOMP_LOAD_ARGUMENT(0));
-    for (size_t i = 0; i < domains.size(); ++i) {
-        // A matching domain jumps to the allow. The last comparison is the one that has to step
-        // over the allow when it does not match.
-        auto instructions_to_allow = static_cast<u8>(domains.size() - i - 1);
-        auto instructions_past_allow = static_cast<u8>(i + 1 == domains.size() ? 1 : 0);
-        append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, domains[i], instructions_to_allow, instructions_past_allow));
-    }
-    append(SECCOMP_ALLOW);
-    append(SECCOMP_LOAD_SYSCALL_NR);
-#endif
-}
-
 // NB: Socket options reach deep into the kernel. SO_ATTACH_FILTER, for one, loads a classic BPF program into it. So we
 //     allow only the options that we know to be used, and install() refuses every other one with EPERM.
 void SeccompPolicy::append_allow_socket_options(u32 syscall_number, u32 level, ReadonlySpan<u32> options)
@@ -1608,6 +1564,12 @@ void SeccompPolicy::allow_pulseaudio_client_file_operations()
     append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
 }
 
+// NB: Seccomp cannot follow the sockaddr pointer that connect() is given, and Landlock does not
+//     mediate UNIX socket connections, so neither mechanism can restrict which endpoint a process
+//     reaches. The domain argument of socket() is the only part of this the kernel lets us filter,
+//     and connect() fails with EAFNOSUPPORT when the address family does not match the socket.
+//     Being able to create a socket in a domain is therefore the same thing as being able to
+//     address every endpoint in it.
 void SeccompPolicy::allow_network()
 {
 #ifdef __NR_socket
@@ -1624,16 +1586,32 @@ void SeccompPolicy::allow_network()
     append(SECCOMP_ALLOW);
     append(SECCOMP_ERRNO(EPERM));
     append(SECCOMP_LOAD_SYSCALL_NR);
+
+    // Internet sockets serve TCP streams and UDP datagrams, including the default protocol. Other domains fall
+    // through to the groups after this one.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 16));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, 13));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~static_cast<u32>(SOCK_CLOEXEC | SOCK_NONBLOCK)));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 0, 4));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_TCP, 0, 6));
+    append(SECCOMP_ALLOW);
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_DGRAM, 0, 4));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_UDP, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_ERRNO(EPERM));
+    append(SECCOMP_LOAD_SYSCALL_NR);
 #endif
-    static constexpr Array<u32, 2> domains { AF_INET, AF_INET6 };
-    append_allow_socket_with_domains(domains);
 
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendto);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, connect);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, bind);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, listen);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept);
-    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept4);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, shutdown);
 
 #ifdef __NR_setsockopt

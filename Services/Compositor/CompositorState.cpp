@@ -531,7 +531,7 @@ int CompositorState::unpainted_video_update_interval_ms() const
 void CompositorState::schedule_unpainted_video_updates()
 {
     if (!m_unpainted_video_update_timer) {
-        m_unpainted_video_update_timer = Core::Timer::create_repeating(unpainted_video_update_interval_ms(), [this] {
+        m_unpainted_video_update_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(unpainted_video_update_interval_ms()), [this] {
             update_unpainted_video_sinks();
         });
     }
@@ -649,7 +649,7 @@ bool CompositorState::handle_key_event(Web::CompositorContextId context_id, Web:
     if (!context)
         return false;
     if (event.type == Web::KeyEvent::Type::KeyDown && Web::is_keyboard_scroll_key(event.key, Web::UIEvents::Mod_None))
-        dispatch_scroll_fling_step(context_id, *context, context->end_scroll_fling(MonotonicTime::now()));
+        dispatch_scroll_fling_step(context_id, *context, context->end_scroll_fling(), MonotonicTime::now());
     return apply_context_update_result(context_id, *context, context->handle_key_event(event));
 }
 
@@ -678,7 +678,7 @@ void CompositorState::handle_and_dispatch_mouse_event(Web::CompositorContextId c
     }
 
     if (event.type == Web::MouseEvent::Type::MouseDown)
-        dispatch_scroll_fling_step(context_id, *context, context->end_scroll_fling(MonotonicTime::now()));
+        dispatch_scroll_fling_step(context_id, *context, context->end_scroll_fling(), MonotonicTime::now());
 
     auto is_wheel_event = event.type == Web::MouseEvent::Type::MouseWheel;
     if (is_wheel_event) {
@@ -693,7 +693,7 @@ void CompositorState::handle_and_dispatch_mouse_event(Web::CompositorContextId c
         }
 
         // A new gesture must not continue the gesture of the fling, so the fling ends first.
-        dispatch_scroll_fling_step(context_id, *context, context->interrupt_scroll_fling(event));
+        dispatch_scroll_fling_step(context_id, *context, context->interrupt_scroll_fling(event), MonotonicTime::now());
 
         // If the gesture continues as a fling, the end of the fling is the end of the gesture.
         if (m_synthesizes_scroll_momentum && event.scroll_gesture_phase == Web::ScrollGesturePhase::Ended && context->start_scroll_fling_if_flicked(event)) {
@@ -706,9 +706,11 @@ void CompositorState::handle_and_dispatch_mouse_event(Web::CompositorContextId c
 
     ContextState::ContextUpdateResult result;
     if (is_wheel_event)
-        result = context->handle_wheel_event(event);
+        result = scroll_for_wheel_step(context_id, *context, event, WheelStepOrigin::UI);
     else
         result = context->handle_mouse_event(event);
+    if (result.nested_context_hand_off.has_value())
+        record_routing(*result.nested_context_hand_off);
     if (result.routing_decision.has_value()) {
         dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Context {} routed input event {}: {}", context_id, event.id, Web::input_routing_decision_name(*result.routing_decision));
         record_routing(*result.routing_decision, result.routed_scroller);
@@ -741,31 +743,156 @@ void CompositorState::handle_and_dispatch_mouse_event(Web::CompositorContextId c
 bool CompositorState::nested_context_scrolled_since_last_frame(Web::CompositorContextId context_id) const
 {
     for (auto const& entry : m_contexts) {
-        auto const& context = *entry.value;
-        if (!context.scrolled_since_last_frame())
-            continue;
-        for (auto parent_context_id = context.parent_context_id(); parent_context_id.has_value();) {
-            if (*parent_context_id == context_id)
-                return true;
-            auto const* parent_context = context_if_present(*parent_context_id);
-            if (!parent_context)
-                break;
-            parent_context_id = parent_context->parent_context_id();
-        }
+        if (entry.value->scrolled_since_last_frame() && is_nested_in(context_id, *entry.value))
+            return true;
     }
     return false;
 }
 
-void CompositorState::dispatch_scroll_fling_step(Web::CompositorContextId context_id, ContextState& context, Optional<ContextState::ScrollFlingStep> step)
+bool CompositorState::is_nested_in(Web::CompositorContextId containing_context_id, ContextState const& context) const
+{
+    // A walk up the parents that outlasts the number of contexts went around a loop.
+    auto const* ancestor = &context;
+    for (size_t remaining_ancestors = m_contexts.size(); ancestor && remaining_ancestors > 0; --remaining_ancestors) {
+        auto parent_context_id = ancestor->parent_context_id();
+        if (!parent_context_id.has_value())
+            return false;
+        if (*parent_context_id == containing_context_id)
+            return true;
+        ancestor = context_if_present(*parent_context_id);
+    }
+    return false;
+}
+
+ContextState::ContextUpdateResult CompositorState::scroll_for_wheel_step(Web::CompositorContextId context_id, ContextState& context, Web::MouseEvent const& event, WheelStepOrigin origin, Optional<MonotonicTime> fling_step_time)
+{
+    auto now = fling_step_time.value_or(MonotonicTime::now());
+    auto result = origin == WheelStepOrigin::UI ? context.handle_wheel_event(event) : context.scroll_for_fling_step(event, now);
+    bool presents_frame = result.frame_to_present.has_value();
+    if (result.nested_context_wheel_step.has_value()) {
+        auto handed_step = hand_wheel_step_to_nested_context(context_id, context, event, *result.nested_context_wheel_step, now);
+        result = move(handed_step.result);
+        presents_frame = handed_step.nested_context_presents_frame;
+    }
+
+    // If the compositor accepts a momentum step of the fling but does not scroll, the scroller is at its edge.
+    // Alternatively, a snap scroll uses the step. The next display tick ends the fling.
+    if (origin == WheelStepOrigin::Fling && event.scroll_gesture_phase == Web::ScrollGesturePhase::Momentum && result.accepted && !presents_frame)
+        context.end_scroll_fling_on_next_step();
+    return result;
+}
+
+CompositorState::WheelStepHandedToNestedContext CompositorState::hand_wheel_step_to_nested_context(Web::CompositorContextId context_id, ContextState& context, Web::MouseEvent const& event, ContextState::NestedContextWheelStep const& nested_step, MonotonicTime now)
+{
+    auto step = ContextState::WheelStepFromContainingContext::for_wheel_event(event);
+    // The nested context presents and publishes what its step changed, and this context reports how the step went.
+    auto apply_result_of_nested_context = [&](Web::CompositorContextId nested_context_id, ContextState& nested_context, ContextState::ContextUpdateResult const& nested_result) {
+        apply_context_update_result(nested_context_id, nested_context, nested_result);
+        schedule_animation_frames_if_needed(nested_context);
+        // Node ids are only unique within the process that made them.
+        bool ids_are_of_this_process = nested_context.is_owned_by(context.web_content_client());
+        return WheelStepHandedToNestedContext {
+            .result = {
+                .accepted = nested_result.accepted,
+                .routing_decision = nested_result.routing_decision,
+                .routed_scroller = ids_are_of_this_process ? nested_result.routed_scroller : Optional<Web::AsyncScrollNodeStableID> {},
+            },
+            .nested_context_presents_frame = nested_result.frame_to_present.has_value(),
+        };
+    };
+
+    if (!nested_step.hit.has_value()) {
+        auto* nested_context = context_if_present(nested_step.context_id);
+        if (!nested_context || !is_nested_in(context_id, *nested_context)) {
+            context.forget_wheel_gesture_latch();
+            return { ContextState::ContextUpdateResult::declined(Web::InputRoutingDecision::NestedContextUnavailable) };
+        }
+        auto nested_result = nested_context->take_latched_wheel_step_from_containing_context(step, now);
+        // A step that the nested context leaves to the main thread for now, as a new blocking listener may cancel it,
+        // does not end the gesture there.
+        if (nested_result.routing_decision == Web::InputRoutingDecision::NestedContextUnavailable)
+            context.forget_wheel_gesture_latch();
+        return apply_result_of_nested_context(nested_step.context_id, *nested_context, nested_result);
+    }
+
+    auto taking_context = nested_context_taking_first_wheel_step(context_id, *nested_step.hit, step.delta_in_css_pixels, step.wheel_delta_precision);
+    if (!taking_context.has_value()) {
+        auto result = context.scroll_for_wheel_event_passed_on_by_nested_context(event, now);
+        result.nested_context_hand_off = Web::InputRoutingDecision::NestedContextPassedStepOn;
+        return { .result = result, .nested_context_presents_frame = result.frame_to_present.has_value() };
+    }
+
+    WheelStepHandedToNestedContext handed_step;
+    if (taking_context->context && taking_context->route.kind != ContextState::FirstWheelStepRoute::Kind::Declined) {
+        step.position = taking_context->position;
+        auto nested_result = taking_context->context->take_first_wheel_step_from_containing_context(taking_context->route, step, now);
+        handed_step = apply_result_of_nested_context(taking_context->context_id, *taking_context->context, nested_result);
+        context.latch_wheel_gesture_to_nested_context(taking_context->context_id, handed_step.result.routed_scroller, event, now);
+    } else {
+        handed_step.result = ContextState::ContextUpdateResult::declined(taking_context->route.decision);
+    }
+    handed_step.result.nested_context_hand_off = Web::InputRoutingDecision::HandedToNestedContext;
+    return handed_step;
+}
+
+// The content box of a nested context is drawn scaled to the size of its viewport.
+static Optional<Gfx::FloatPoint> position_in_nested_context(Compositing::NestedContextWheelHit const& hit, ContextState const& nested_context)
+{
+    auto viewport_size = nested_context.presenter().viewport_size().to_type<float>();
+    if (hit.content_box_size.is_empty() || viewport_size.is_empty())
+        return {};
+    return Gfx::FloatPoint {
+        hit.position_in_content_box.x() * viewport_size.width() / hit.content_box_size.width(),
+        hit.position_in_content_box.y() * viewport_size.height() / hit.content_box_size.height(),
+    };
+}
+
+Optional<CompositorState::NestedContextTakingWheelStep> CompositorState::nested_context_taking_first_wheel_step(Web::CompositorContextId context_id, Compositing::NestedContextWheelHit hit, Gfx::FloatPoint delta_in_css_pixels, Web::WheelDeltaPrecision wheel_delta_precision)
+{
+    using Kind = ContextState::FirstWheelStepRoute::Kind;
+    // The contexts the step went into, outermost first, each nested in the one before.
+    Vector<NestedContextTakingWheelStep, 4> contexts;
+    auto containing_context_id = context_id;
+    while (true) {
+        // WebContent names the contexts its display lists draw, so a context only reaches those nested in it.
+        auto* nested_context = context_if_present(hit.child_context_id);
+        if (!nested_context || nested_context->parent_context_id() != containing_context_id)
+            return NestedContextTakingWheelStep { .context_id = hit.child_context_id, .route = { Kind::Declined, Web::InputRoutingDecision::NestedContextUnavailable } };
+        auto position = position_in_nested_context(hit, *nested_context);
+        if (!position.has_value())
+            return NestedContextTakingWheelStep { .context_id = hit.child_context_id, .route = { Kind::Declined, Web::InputRoutingDecision::NestedContextUnavailable } };
+        auto route = nested_context->route_first_wheel_step_from_containing_context(*position, delta_in_css_pixels, wheel_delta_precision, Compositing::NestedContextRegions::HandToNestedContext);
+        contexts.append({ .context_id = hit.child_context_id, .context = nested_context, .position = *position, .route = route });
+        if (route.kind != Kind::NestedContext)
+            break;
+        containing_context_id = hit.child_context_id;
+        hit = *route.nested_context_hit;
+    }
+
+    // What a nested context passes on goes to whatever is painted under it in the context it is nested in.
+    while (contexts.last().route.kind == Kind::PassedOn) {
+        contexts.take_last();
+        if (contexts.is_empty())
+            return {};
+        auto& containing_context = contexts.last();
+        containing_context.route = containing_context.context->route_first_wheel_step_from_containing_context(containing_context.position, delta_in_css_pixels, wheel_delta_precision, Compositing::NestedContextRegions::Ignore);
+    }
+    return contexts.take_last();
+}
+
+void CompositorState::dispatch_scroll_fling_step(Web::CompositorContextId context_id, ContextState& context, Optional<Web::MouseEvent> event, MonotonicTime now)
 {
     // Send each fling step on the same route as a wheel event from the UI.
-    if (!step.has_value())
+    if (!event.has_value())
         return;
-    if (step->result.routing_decision.has_value())
-        context.input_trace().record({ .input_event_id = step->event.id, .stage = Web::InputTraceStage::Compositor, .decision = *step->result.routing_decision, .scroller = step->result.routed_scroller });
-    step->event.async_scroll_performed_default_action = apply_context_update_result(context_id, context, step->result);
+    auto result = scroll_for_wheel_step(context_id, context, *event, WheelStepOrigin::Fling, now);
+    if (result.nested_context_hand_off.has_value())
+        context.input_trace().record({ .input_event_id = event->id, .stage = Web::InputTraceStage::Compositor, .decision = *result.nested_context_hand_off });
+    if (result.routing_decision.has_value())
+        context.input_trace().record({ .input_event_id = event->id, .stage = Web::InputTraceStage::Compositor, .decision = *result.routing_decision, .scroller = result.routed_scroller });
+    event->async_scroll_performed_default_action = apply_context_update_result(context_id, context, result);
     schedule_animation_frames_if_needed(context);
-    context.dispatch_mouse_event_to_web_content(step->event);
+    context.dispatch_mouse_event_to_web_content(*event);
 }
 
 void CompositorState::handle_pinch_event(Web::CompositorContextId context_id, Web::PinchEvent const& event)
@@ -877,7 +1004,7 @@ void CompositorState::set_display_metadata(Web::CompositorContextId context_id, 
     if (context->set_display_metadata(display_id, refresh_rate)) {
         schedule_pending_present_frame(context_id, *context);
         if (m_unpainted_video_update_timer)
-            m_unpainted_video_update_timer->set_interval(unpainted_video_update_interval_ms());
+            m_unpainted_video_update_timer->set_interval(AK::Duration::from_milliseconds(unpainted_video_update_interval_ms()));
     }
 
     if (context->display_tick_requested() && context_is_effectively_visible(*context))
@@ -890,7 +1017,7 @@ void CompositorState::set_context_visibility(Web::CompositorContextId context_id
     if (!context)
         return;
     if (visibility == Compositing::ContextVisibility::Hidden)
-        dispatch_scroll_fling_step(context_id, *context, context->end_scroll_fling(MonotonicTime::now()));
+        dispatch_scroll_fling_step(context_id, *context, context->end_scroll_fling(), MonotonicTime::now());
     if (!context->set_visibility(visibility))
         return;
 
@@ -1187,7 +1314,7 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id, 
         auto presents_on_display = context.has_pending_present_frame_scheduled_on(display_id) || has_active_animation_on_display;
         if (presents_on_display) {
             if (display_id_for_context(context) == display_id)
-                dispatch_scroll_fling_step(context_id, context, context.take_scroll_fling_step(frame_time));
+                dispatch_scroll_fling_step(context_id, context, context.take_scroll_fling_step(frame_time), frame_time);
             if (auto animation_frame = context.advance_smooth_scroll_animations(frame_time); animation_frame.has_value())
                 context.presenter().queue_present_frame(PendingFrame::repainting_changes(*animation_frame));
             if (auto rebound_frame = context.advance_elastic_overscroll_rebounds(frame_time); rebound_frame.has_value())
@@ -1333,7 +1460,7 @@ void CompositorState::schedule_gpu_completion_check()
     VERIFY(!m_pending_async_presents.is_empty());
 
     if (!m_gpu_completion_timer) {
-        m_gpu_completion_timer = Core::Timer::create_repeating(gpu_completion_check_interval_ms, [this] {
+        m_gpu_completion_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(gpu_completion_check_interval_ms), [this] {
             check_gpu_completions();
         });
     }
@@ -1467,7 +1594,22 @@ Optional<Compositing::FirstWheelStepRouteForTesting> CompositorState::route_firs
     auto* context = context_if_present(context_id);
     if (!context)
         return {};
-    return context->route_first_wheel_step_for_testing(position, delta_in_css_pixels);
+    if (!context->presents_to_client() || !context->may_hand_first_wheel_steps_to_nested_contexts())
+        return context->route_first_wheel_step_for_testing(position, delta_in_css_pixels, Compositing::NestedContextRegions::LeaveToMainThread);
+    auto hit = context->nested_context_for_wheel_at(position);
+    if (!hit.has_value())
+        return context->route_first_wheel_step_for_testing(position, delta_in_css_pixels, Compositing::NestedContextRegions::HandToNestedContext);
+    auto taking_context = nested_context_taking_first_wheel_step(context_id, *hit, delta_in_css_pixels, Web::WheelDeltaPrecision::Precise);
+    if (!taking_context.has_value())
+        return context->route_first_wheel_step_for_testing(position, delta_in_css_pixels, Compositing::NestedContextRegions::Ignore);
+    // Node ids are only unique within the process that made them.
+    bool ids_are_of_this_process = taking_context->context && taking_context->context->is_owned_by(context->web_content_client());
+    Compositing::FirstWheelStepRouteForTesting route { .route = { taking_context->route.decision }, .document_id = {} };
+    if (ids_are_of_this_process) {
+        route.route.scroller = taking_context->route.scroller;
+        route.document_id = taking_context->context->document_id();
+    }
+    return route;
 }
 
 void CompositorState::begin_input_trace_for_testing(Web::CompositorContextId context_id)
