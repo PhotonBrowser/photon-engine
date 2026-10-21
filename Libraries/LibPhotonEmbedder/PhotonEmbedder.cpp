@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "PhotonEmbedderInternal.h"
 #include <LibCore/EventLoop.h>
 #include <LibCore/MachPort.h>
 #include <LibCore/Timer.h>
@@ -12,7 +13,6 @@
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
 #include <LibPhotonEmbedder/PhotonEmbedder.h>
-#include "PhotonEmbedderInternal.h"
 #include <LibURL/Parser.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Page/InputEvent.h>
@@ -287,7 +287,7 @@ public:
                 output.output.visit(
                     [](WebView::ConsoleError const& error) { dbgln("[HTMLScript] error name={} message={}", error.name, error.message); },
                     [](WebView::ConsoleLog const&) { dbgln("[HTMLScript] console_message at_ns={}", MonotonicTime::now().nanoseconds()); },
-                    [](WebView::ConsoleTrace const&) {});
+                    [](WebView::ConsoleTrace const&) { });
             };
         }
         reset_viewport_size({ physical_width, physical_height });
@@ -653,7 +653,7 @@ private:
                     m_context_menu_actions.append(action);
                 },
                 // Page context menus have no submenus.
-                [](NonnullRefPtr<Menu>&) {},
+                [](NonnullRefPtr<Menu>&) { },
                 [&](Separator) { separator_pending = true; });
         }
         if (!request.items.empty())

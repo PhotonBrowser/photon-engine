@@ -10,7 +10,9 @@
 #include <LibPhotonEmbedder/PhotonEmbedder.h>
 
 namespace WebView {
+
 class PhotonHeadlessWebView;
+
 }
 
 namespace Photon {

@@ -378,7 +378,9 @@ enum class PreferredColorScheme : uint8_t { Auto,
 
 class View;
 namespace Automation {
+
 class View;
+
 }
 
 struct RegisteredEngineProcess {

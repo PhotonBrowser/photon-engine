@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "PhotonEmbedderInternal.h"
 #include <AK/StringBuilder.h>
 #include <LibPhotonEmbedder/PhotonAutomation.h>
-#include "PhotonEmbedderInternal.h"
 
 namespace Photon {
 
@@ -370,4 +370,5 @@ bool Automation::View::request_jetstream_start(uint64_t expected_document_genera
     m_view.m_impl->run_javascript(move(script));
     return true;
 }
+
 }
