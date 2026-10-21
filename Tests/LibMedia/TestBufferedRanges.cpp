@@ -192,13 +192,14 @@ static Array fixtures {
     },
     Fixture {
         "buffered-ranges/tone.flac"sv,
-        { 32 * KiB, 87552, 0, 48000 },
-        { 68 * KiB, 221184, 0, 48000 },
+        { 32 * KiB, 82944, 4608, 48000 },
+        { 68 * KiB, 216576, 4608, 48000 },
     },
+    // Opus times count from after the stream's pre-skip of 312 samples.
     Fixture {
         "buffered-ranges/tone_opus.ogg"sv,
-        { 96 * KiB, 432000, 48000, 48000 },
-        { 160 * KiB, 768000, 48000, 48000 },
+        { 96 * KiB, 432000 - 312, 48000, 48000 },
+        { 160 * KiB, 768000 - 312, 48000, 48000 },
     },
     Fixture {
         "buffered-ranges/tone_flac.ogg"sv,

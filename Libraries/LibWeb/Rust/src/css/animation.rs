@@ -9,10 +9,12 @@
 // Animation values use the same thread-confined shared graph as the rest of the style core.
 #![allow(clippy::arc_with_non_send_sync)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::css::easing::{Easing, FfiEasingDescriptor, FfiLinearEasingPoint, evaluate_easing_descriptor};
 use crate::css::property_metadata::{property_animation_type, property_numeric_ranges};
+use crate::css::style::effect_descriptions::{PublishedEffect, PublishedValue};
 use crate::css::style_value::{
     BasicShapeData, ColorBase, CssString, CssStringList, FILTER_KIND_BLUR, FILTER_KIND_COLOR, FILTER_KIND_DROP_SHADOW,
     FILTER_KIND_HUE_ROTATE, GridTrackEntryKind, OwnedBasicShapeData, RetainedGridTrackEntry,
@@ -135,7 +137,7 @@ pub(crate) unsafe fn style_value_from_easing(descriptor: &FfiEasingDescriptor) -
     match descriptor.kind {
         FfiEasingKind::Linear => {
             assert!(descriptor.linear_point_count > 0);
-            let points = unsafe { std::slice::from_raw_parts(descriptor.linear_points, descriptor.linear_point_count) };
+            let points = unsafe { ak::slice_from_raw_parts(descriptor.linear_points, descriptor.linear_point_count) };
             stops = points
                 .iter()
                 .map(|point| {
@@ -748,7 +750,7 @@ struct AnimationKeyframePlan {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiCompositeOperation {
     Replace,
@@ -920,6 +922,11 @@ unsafe fn handled_borrowed_value(value: &StyleValueData) -> AnimationValueResult
     })
 }
 
+/// A handled result holding a copy of `value`, a keyword or display value, which is cheap to copy.
+fn handled_copied_value(value: &StyleValueData) -> AnimationValueResult {
+    handled_retained_value(RetainedStyleValueData::from_owned(value.clone()))
+}
+
 fn discrete_value(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
@@ -946,7 +953,7 @@ fn interpolate_visibility(
     };
 
     if from_keyword == to_keyword {
-        return unsafe { handled_borrowed_value(from) };
+        return handled_copied_value(from);
     }
 
     // https://drafts.csswg.org/web-animations-1/#animating-visibility
@@ -963,7 +970,7 @@ fn interpolate_visibility(
         } else {
             to
         };
-        return unsafe { handled_borrowed_value(value) };
+        return handled_copied_value(value);
     }
 
     discrete_value(context, from, to, delta)
@@ -982,7 +989,7 @@ fn interpolate_content_visibility(
     };
 
     if from_keyword == to_keyword {
-        return unsafe { handled_borrowed_value(from) };
+        return handled_copied_value(from);
     }
 
     // https://drafts.csswg.org/css-contain/#content-visibility-animation
@@ -1001,7 +1008,7 @@ fn interpolate_content_visibility(
         } else {
             from
         };
-        return unsafe { handled_borrowed_value(value) };
+        return handled_copied_value(value);
     }
 
     discrete_value(context, from, to, delta)
@@ -1018,7 +1025,7 @@ fn interpolate_display(
     };
 
     if from_raw == to_raw {
-        return unsafe { handled_borrowed_value(from) };
+        return handled_copied_value(from);
     }
 
     // https://drafts.csswg.org/css-display-4/#display-animation
@@ -1041,7 +1048,7 @@ fn interpolate_display(
         } else {
             from
         };
-        return unsafe { handled_borrowed_value(value) };
+        return handled_copied_value(value);
     }
 
     discrete_value(context, from, to, delta)
@@ -1079,7 +1086,7 @@ fn interpolate_scale(from: &StyleValueData, to: &StyleValueData, delta: f32) -> 
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == none)
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
-        return unsafe { handled_borrowed_value(from) };
+        return handled_copied_value(from);
     }
 
     // https://drafts.csswg.org/css-transforms-2/#propdef-scale
@@ -1301,7 +1308,7 @@ fn interpolate_translate(from: &StyleValueData, to: &StyleValueData, delta: f32)
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == none)
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
-        return unsafe { handled_borrowed_value(from) };
+        return handled_copied_value(from);
     }
 
     // https://drafts.csswg.org/css-transforms-2/#propdef-translate
@@ -1362,7 +1369,7 @@ fn interpolate_individual_rotate(
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == none)
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
-        return unsafe { handled_borrowed_value(from) };
+        return handled_copied_value(from);
     }
 
     // https://drafts.csswg.org/css-transforms-2/#propdef-rotate
@@ -6615,28 +6622,23 @@ fn composite_batch_value<'a>(
     BatchAnimationValue::Owned(value.into_arc())
 }
 
-fn evaluate_animation_value(
-    context: &FfiAnimationContext,
-    input: &AnimationValueInput,
-    underlying_override: Option<&StyleValueData>,
-) -> AnimatedProperty {
-    let keyframes = input.keyframes;
-    assert!(keyframes.len() >= 2);
-    let plan = |index: usize| &input.keyframe_plans[keyframes[index].keyframe];
-
+/// The endpoint indices in a property's keyframe sequence for the current sample.
+fn keyframe_interval(keyframe_count: usize, current_key: f64, key_at: impl Fn(usize) -> i64) -> (usize, usize) {
+    assert!(keyframe_count >= 2);
     // https://drafts.csswg.org/web-animations-1/#the-effect-value-of-a-keyframe-animation-effect
-    // 10. Let interval endpoints be an empty sequence of keyframes.
-    // 11. Populate interval endpoints by following the steps from the first matching condition from below:
+    // 1. Let interval endpoints be an empty sequence of keyframes.
+    // 2. Populate interval endpoints by following the steps from the first matching condition from below:
     // NB: The first and the last property-specific keyframes are at the computed keyframe offsets 0 and 1.
-    let last_index = keyframes.len() - 1;
+    let last_index = keyframe_count - 1;
+
     let mut start_index = 0;
     let mut end_index = 1;
-    if input.current_key < plan(0).key as f64 && plan(1).key == plan(0).key {
+    if current_key < key_at(0) as f64 && key_at(1) == key_at(0) {
         // If iteration progress < 0 and there is more than one keyframe in property-specific keyframes with a computed
         // keyframe offset of 0,
         //     Add the first keyframe in property-specific keyframes to interval endpoints.
         end_index = start_index;
-    } else if input.current_key >= plan(last_index).key as f64 && plan(last_index - 1).key == plan(last_index).key {
+    } else if current_key >= key_at(last_index) as f64 && key_at(last_index - 1) == key_at(last_index) {
         // If iteration progress ≥ 1 and there is more than one keyframe in property-specific keyframes with a computed
         // keyframe offset of 1,
         //     Add the last keyframe in property-specific keyframes to interval endpoints.
@@ -6648,14 +6650,26 @@ fn evaluate_animation_value(
         //    to iteration progress and less than 1. If there is no such keyframe (because, for example, the iteration progress is negative),
         //    add the last keyframe whose computed keyframe offset is 0.
         // 2. Append to interval endpoints the next keyframe in property-specific keyframes after the one added in the previous step.
-        for next_index in 2..keyframes.len() {
-            if input.current_key < plan(end_index).key as f64 {
+        for next_index in 2..keyframe_count {
+            if current_key < key_at(end_index) as f64 {
                 break;
             }
             start_index = end_index;
             end_index = next_index;
         }
     }
+
+    (start_index, end_index)
+}
+
+fn evaluate_animation_value(
+    context: &FfiAnimationContext,
+    input: &AnimationValueInput,
+    underlying_override: Option<&StyleValueData>,
+) -> AnimatedProperty {
+    let keyframes = input.keyframes;
+    let plan = |index: usize| &input.keyframe_plans[keyframes[index].keyframe];
+    let (start_index, end_index) = keyframe_interval(keyframes.len(), input.current_key, |index| plan(index).key);
     let start_keyframe = &keyframes[start_index];
     let end_keyframe = &keyframes[end_index];
     let (start_plan, end_plan) = (plan(start_index), plan(end_index));
@@ -6921,6 +6935,66 @@ pub unsafe extern "C" fn rust_substitute_compositor_keyframe_value(
     })
 }
 
+#[derive(Clone, Copy)]
+struct CustomPropertyKeyframeLookup {
+    keyframe_index: usize,
+    declaration_index: usize,
+}
+
+/// Build a sequence of lookups for each custom property, in keyframe order.
+fn build_custom_property_keyframe_lookups(
+    effect: &PublishedEffect,
+    custom_properties: &mut AnimatedCustomProperties,
+) -> BTreeMap<u32, Vec<CustomPropertyKeyframeLookup>> {
+    let mut property_lookups = BTreeMap::<_, Vec<_>>::new();
+    let mut declaration_index = 0;
+    for (keyframe_index, keyframe) in effect.keyframes.iter().enumerate() {
+        for declaration in effect.custom_declarations_of(keyframe) {
+            let name_id = custom_properties.mint(&declaration.name);
+
+            property_lookups
+                .entry(name_id)
+                .or_default()
+                .push(CustomPropertyKeyframeLookup {
+                    keyframe_index,
+                    declaration_index,
+                });
+
+            declaration_index += 1;
+        }
+    }
+    property_lookups
+}
+
+fn select_custom_property_interval_span(
+    effect: &PublishedEffect,
+    keyframe_lookups: &[CustomPropertyKeyframeLookup],
+    current_key: f64,
+) -> [CustomPropertyKeyframeLookup; 2] {
+    let first_lookup = keyframe_lookups[0];
+    let first_composite = effect.keyframes[first_lookup.keyframe_index].composite;
+    let first_value = &effect.custom_declaration_at(first_lookup.declaration_index).value;
+
+    let can_use_constant_interpolation = !matches!(first_value, PublishedValue::ElementValue)
+        && keyframe_lookups.iter().all(|lookup| {
+            let composite = effect.keyframes[lookup.keyframe_index].composite;
+            let value = &effect.custom_declaration_at(lookup.declaration_index).value;
+            composite == first_composite && value == first_value
+        });
+
+    // When declared values and composite operations are equal, use the same endpoints
+    // across all intervals so discrete properties reuse their retained values.
+    let (start, end) = if can_use_constant_interpolation {
+        (0, keyframe_lookups.len() - 1)
+    } else {
+        keyframe_interval(keyframe_lookups.len(), current_key, |index| {
+            effect.keyframes[keyframe_lookups[index].keyframe_index].key
+        })
+    };
+
+    [keyframe_lookups[start], keyframe_lookups[end]]
+}
+
 /// Resolve the declarations of the effects an element samples from their descriptions: each
 /// keyframe's easing and each value written as a token stream substituted against the element, a
 /// keyframe holding the element's own value given it, and every custom property minted into a
@@ -7039,31 +7113,43 @@ pub(crate) fn resolve_published_animation_declarations(
                     is_transition,
                 });
             }
-            for declaration in effect.custom_declarations_of(keyframe) {
-                let name_id = custom_properties.mint(&declaration.name);
-                let (value, use_initial) = match &declaration.value {
-                    PublishedValue::ElementValue => (custom_properties.underlying_value(registry, name_id), true),
-                    // A custom property's value is a token stream; only the substitution functions
-                    // in it resolve against the element.
-                    PublishedValue::Declared(value) if holds_arbitrary_substitution(value.data()) => (
-                        substitute(
-                            crate::css::property_metadata::property_id::CUSTOM,
-                            custom_properties.units(name_id),
-                            value,
-                        ),
-                        false,
-                    ),
-                    PublishedValue::Declared(value) => (value.clone_retained(), false),
-                };
+        }
+        for (name_id, keyframe_lookups) in build_custom_property_keyframe_lookups(effect, &mut custom_properties) {
+            let important = custom_properties.is_important(name_id);
+            if keyframe_lookups.len() < 2 || important && !is_transition {
+                continue;
+            }
+            let name = custom_properties.units(name_id);
+            let interval_span = select_custom_property_interval_span(effect, &keyframe_lookups, selection.current_key);
+            let interval_values = effect.resolve_custom_property_interval_values(
+                interval_span.map(|lookup| lookup.declaration_index),
+                registry.name_has_interpolable_syntax(name),
+                || {
+                    interval_span.map(|lookup| {
+                        let declaration = effect.custom_declaration_at(lookup.declaration_index);
+                        match &declaration.value {
+                            PublishedValue::ElementValue => custom_properties.underlying_value(registry, name_id),
+                            // A custom property's value is a token stream; only the substitution functions
+                            // in it resolve against the element.
+                            PublishedValue::Declared(value) if holds_arbitrary_substitution(value.data()) => {
+                                substitute(crate::css::property_metadata::property_id::CUSTOM, name, value)
+                            }
+                            PublishedValue::Declared(value) => value.clone_retained(),
+                        }
+                    })
+                },
+            );
+            for (lookup, value) in interval_span.into_iter().zip(interval_values) {
+                let declaration = effect.custom_declaration_at(lookup.declaration_index);
                 declarations.push(AnimationDeclaration {
-                    keyframe_index,
+                    keyframe_index: first_keyframe_index + lookup.keyframe_index,
                     property_id: crate::css::property_metadata::property_id::CUSTOM,
                     custom_name_id: name_id,
-                    custom_is_inherited: registry.name_inherits(custom_properties.units(name_id)),
-                    custom_is_important: custom_properties.is_important(name_id),
+                    custom_is_inherited: registry.name_inherits(name),
+                    custom_is_important: important,
                     value,
                     style_sheet_resource_context,
-                    use_initial,
+                    use_initial: matches!(declaration.value, PublishedValue::ElementValue),
                     is_transition,
                 });
             }

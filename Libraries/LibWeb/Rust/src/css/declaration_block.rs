@@ -156,6 +156,17 @@ impl DeclarationBlockData {
         );
     }
 
+    /// Drops the growth slack of a block that is done growing. Shrinking in place may keep the whole allocation: the
+    /// allocator reuses a block for any size above half of it.
+    pub(crate) fn compact(&mut self) {
+        if self.properties.capacity() > self.properties.len() {
+            self.properties = self.properties.to_vec();
+        }
+        if self.custom_properties.capacity() > self.custom_properties.len() {
+            self.custom_properties = self.custom_properties.to_vec();
+        }
+    }
+
     fn append_normalized_property(&mut self, declaration: DeclaredProperty) {
         if let Some(index) = self
             .properties
@@ -486,17 +497,11 @@ pub extern "C" fn rust_declaration_block_snapshot(block: &DeclarationBlock) -> *
 }
 
 /// Retain an immutable declaration snapshot without creating a live declaration owner.
-///
-/// # Safety
-/// `data` must be a live, Arc-owned declaration snapshot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_data_retain(
-    data: *const DeclarationBlockData,
+pub extern "C" fn rust_declaration_data_retain(
+    data: crate::css::ffi_support::ArcRef<'_, DeclarationBlockData>,
 ) -> *const DeclarationBlockData {
-    unsafe {
-        Arc::increment_strong_count(data);
-    }
-    data
+    Arc::into_raw(data.to_arc())
 }
 
 /// Release an immutable declaration snapshot returned by the style engine or retained from a view.
@@ -637,7 +642,7 @@ mod tests {
         let input = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
         // All context fields are booleans, integers, or nullable pointers.
         let context = ParseContext::default();
-        let parse = unsafe { parse_shared_stylesheet(input, &context) };
+        let parse = parse_shared_stylesheet(input, Some(&context));
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
         let rule = &rules.rule_at(0);
         rule.cascade_declarations().unwrap()
@@ -705,7 +710,7 @@ mod tests {
         let input = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
         // All context fields are booleans, integers, or nullable pointers.
         let context = ParseContext::default();
-        let parse = unsafe { parse_shared_stylesheet(input, &context) };
+        let parse = parse_shared_stylesheet(input, Some(&context));
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
         let rule = rules.rule_at(0);
         let nested = rule.child_rules().unwrap().rule_at(1);

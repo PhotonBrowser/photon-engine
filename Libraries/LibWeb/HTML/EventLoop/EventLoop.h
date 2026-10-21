@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Forward.h>
 #include <AK/Function.h>
 #include <AK/Noncopyable.h>
 #include <AK/OwnPtr.h>
@@ -113,6 +114,7 @@ public:
     };
     bool rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp frame_time, RenderingOpportunitySource);
     bool rendering_task_queued_or_running() const { return m_rendering_task_queued || m_running_rendering_task; }
+    void queue_task_to_process_input_events();
     bool running_synchronous_rendering_update() const { return m_running_synchronous_rendering_update; }
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#termination-nesting-level
@@ -133,6 +135,7 @@ public:
     void document_navigable_did_change(Badge<DOM::Document>);
 
     [[nodiscard]] Vector<GC::Root<DOM::Document>> documents_in_this_event_loop_matching(Function<bool(DOM::Document&)> callback) const;
+    void add_stats(JsonObject&) const;
 
     Vector<GC::Root<HTML::Window>> same_loop_windows() const;
 
@@ -198,6 +201,7 @@ private:
     virtual void visit_edges(Visitor&) override;
 
     void process_input_events() const;
+    Vector<GC::Root<DOM::Document>> take_clock_lanes_and_input_events_in(u64 update_serial);
     void update_the_rendering();
     // How the steps after style and layout take the layout of the docs: up to date, or as the update's layout that flew
     // left it, whatever was written since.
@@ -258,6 +262,7 @@ private:
     bool m_running_rendering_task { false };
     bool m_running_synchronous_rendering_update { false };
     bool m_rendering_task_queued { false };
+    bool m_input_events_task_queued { false };
     bool m_rendering_update_requested { false };
 
     RenderingSchedulerCounters m_rendering_scheduler_counters;

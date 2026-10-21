@@ -17,6 +17,8 @@
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/CrashReportSubmission.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/ReportDetail.h>
+#include <LibWebView/ReportSubmission.h>
 
 namespace WebView {
 
@@ -28,17 +30,10 @@ public:
     static constexpr size_t maximum_description_bytes = 16384;
     static constexpr size_t maximum_url_bytes = 4096;
 
-    struct Field {
-        String label;
-        String value;
-        // Values such as a commit hash or a source location, which read best in a fixed-width font.
-        bool is_code { false };
-    };
-
     struct Report {
         ByteString name;
-        // The fields that tell crashes apart. The rest is in the report itself, which show_report() opens.
-        Vector<Field> fields;
+        // The fields that tell crashes apart. The rest is in the report itself, which report_text() reads.
+        Vector<ReportDetail> fields;
     };
 
     explicit CrashReportReview(CrashReportStore& = CrashReportStore::the());
@@ -49,8 +44,8 @@ public:
     ErrorOr<Report> open(Optional<ByteString> const& name = {});
     bool has_next_report() const;
 
-    // Opens the open report's text, exactly as it would be attached, in the system's application for text files.
-    ErrorOr<void> show_report() const;
+    // The open report's text, exactly as it would be attached.
+    ErrorOr<ByteString> report_text() const;
 
     // A message for the user when these choices cannot be sent.
     static Optional<String> validate(StringView description, Optional<StringView> url);
@@ -59,17 +54,20 @@ public:
     // the review is destroyed, which then only stops hearing about it.
     Optional<String> send(String const& description, Optional<String> const& url);
     bool is_sending() const { return m_submission; }
+    void cancel_sending();
 
-    Function<void(CrashReportSubmission::Stage)> on_progress;
+    Function<void(ReportSubmission::Stage)> on_progress;
     Function<void(String reason, u32 retry_number, u32 maximum_retries, u32 delay_seconds)> on_retry;
     Function<void()> on_sent;
-    Function<void(CrashReportSubmission::Failure, String reason)> on_failed;
+    Function<void(ReportSubmission::Failure, String reason)> on_failed;
 
 private:
     CrashReportStore& m_store;
     ByteString m_report_name;
     ByteString m_text_digest;
     ByteString m_prepared_manifest;
+    String m_prepared_description;
+    Optional<String> m_prepared_url;
     RefPtr<CrashReportSubmission> m_submission;
 };
 

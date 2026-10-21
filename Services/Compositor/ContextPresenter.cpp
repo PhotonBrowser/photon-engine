@@ -15,6 +15,8 @@
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/SkiaUtils.h>
+#include <LibMedia/Sinks/VideoSink.h>
+#include <LibMediaCodecs/VideoFrame.h>
 #include <core/SkCanvas.h>
 #include <core/SkImage.h>
 #include <math.h>
@@ -470,15 +472,31 @@ Gfx::IntRect ContextPresenter::damage_since_last_raster(Gfx::IntSize viewport_si
         }
     }
 
-    auto const& visual_context_tree = m_scene.visual_context_tree_for_compositing();
+    Vector<Compositing::CanvasId> canvases_with_new_content;
+    for (auto const& [canvas_id, content_generation] : last_frame.canvas_content_generations) {
+        if (m_canvas_surfaces.canvas_content_generation(canvas_id) != content_generation)
+            canvases_with_new_content.append(canvas_id);
+    }
+    Vector<Compositing::VideoSinkResourceId> video_sinks_with_new_frames;
+    auto video_sinks_drawn_by_list = m_scene.display_list()->referenced_resource_ids().video_sinks;
+    for (auto const& [video_sink_id, frame_slot] : last_frame.video_frame_slots) {
+        if (current_video_frame_slot(video_sink_id) == frame_slot)
+            continue;
+        // A video drawn only by a nested display list, such as an SVG image's, has no command in
+        // this list to damage.
+        if (!video_sinks_drawn_by_list.contains_slow(video_sink_id.value()))
+            return viewport_rect;
+        video_sinks_with_new_frames.append(video_sink_id);
+    }
     auto display_list_damage = Compositing::compute_display_list_damage(
         *last_frame.display_list,
         last_frame.visual_context_tree,
         last_frame.scroll_state_snapshot,
         *m_scene.display_list(),
-        visual_context_tree,
+        m_scene.visual_context_tree_for_compositing(),
         presented_scroll_state_snapshot,
-        viewport_rect);
+        viewport_rect,
+        { .canvases = canvases_with_new_content, .video_sinks = video_sinks_with_new_frames });
     if (!display_list_damage.has_value())
         return viewport_rect;
 
@@ -490,20 +508,6 @@ Gfx::IntRect ContextPresenter::damage_since_last_raster(Gfx::IntSize viewport_si
             continue;
         damage_rect.unite(scrollbar.gutter_rect.united(scrollbar.expanded_gutter_rect));
     }
-    m_scene.display_list()->for_each_drawn_canvas([&](auto context, auto bounding_rect, auto const& draw_canvas) {
-        auto last_content_generation = last_frame.canvas_content_generations.get(draw_canvas.canvas_id);
-        if (last_content_generation.has_value() && *last_content_generation == m_canvas_surfaces.canvas_content_generation(draw_canvas.canvas_id))
-            return;
-        auto canvas_rect = visual_context_tree.transform_rect_to_viewport(context.spatial, bounding_rect.template to_type<float>(), presented_scroll_state_snapshot);
-        if (!isfinite(canvas_rect.x()) || !isfinite(canvas_rect.y()) || !isfinite(canvas_rect.width()) || !isfinite(canvas_rect.height())) {
-            damage_rect = viewport_rect;
-            return;
-        }
-        canvas_rect.intersect(viewport_rect.to_type<float>());
-        if (canvas_rect.is_empty())
-            return;
-        damage_rect.unite(Gfx::enclosing_int_rect(canvas_rect).inflated(1, 1, 1, 1));
-    });
     damage_rect.intersect(viewport_rect);
     return damage_rect;
 }
@@ -603,9 +607,16 @@ void ContextPresenter::shift_surface_for_scroll(Gfx::PaintingSurface& destinatio
 void ContextPresenter::remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot)
 {
     HashMap<Compositing::CanvasId, u64> canvas_content_generations;
-    m_scene.display_list()->for_each_drawn_canvas([&](auto, auto, auto const& draw_canvas) {
-        canvas_content_generations.set(draw_canvas.canvas_id, m_canvas_surfaces.canvas_content_generation(draw_canvas.canvas_id));
-    });
+    for (auto id : m_scene.display_list()->referenced_resource_ids().canvases) {
+        Compositing::CanvasId canvas_id { id };
+        canvas_content_generations.set(canvas_id, m_canvas_surfaces.canvas_content_generation(canvas_id));
+    }
+    // Every video the context holds is drawn by the list or by a display list it nests.
+    HashMap<Compositing::VideoSinkResourceId, Optional<VideoFrameSlot>> video_frame_slots;
+    for (auto const& [id, handle] : m_scene.video_sink_handles()) {
+        Compositing::VideoSinkResourceId video_sink_id { id };
+        video_frame_slots.set(video_sink_id, current_video_frame_slot(video_sink_id));
+    }
     m_last_rasterized_frame = RasterizedFrame {
         .display_list = NonnullRefPtr { *m_scene.display_list() },
         .visual_context_tree = m_scene.visual_context_tree_for_compositing(),
@@ -613,6 +624,23 @@ void ContextPresenter::remember_rasterized_frame(Gfx::IntSize viewport_size, Com
         .viewport_size = viewport_size,
         .canvas_content_generations = move(canvas_content_generations),
         .raster_content_epoch = m_raster_content_epoch,
+        .video_frame_slots = move(video_frame_slots),
+    };
+}
+
+Optional<ContextPresenter::VideoFrameSlot> ContextPresenter::current_video_frame_slot(Compositing::VideoSinkResourceId video_sink_id)
+{
+    auto sink = m_scene.resource_storage().video_sink(video_sink_id);
+    if (!sink)
+        return {};
+    auto frame = sink->current_frame();
+    if (!frame)
+        return {};
+    auto handle = Media::VideoFrameHandle::for_frame(*frame);
+    return VideoFrameSlot {
+        .pool_id = handle.pool_id,
+        .slot_index = handle.slot_index,
+        .slot_acquisition_id = handle.slot_acquisition_id,
     };
 }
 

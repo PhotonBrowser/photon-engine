@@ -59,7 +59,6 @@ public:
 
     Optional<Painting::VideoPaintFactsSnapshot> const& pushed_paint_facts() const { return m_pushed_paint_facts; }
     void set_pushed_paint_facts(Painting::VideoPaintFactsSnapshot snapshot) const { m_pushed_paint_facts = snapshot; }
-
     GC::Ref<WebIDL::Promise> request_picture_in_picture();
     // Whether requestPictureInPicture() would enter Picture-in-Picture if it were given a user activation.
     bool can_enter_picture_in_picture() const;

@@ -8,6 +8,7 @@
 
 #include <AK/AnyOf.h>
 #include <AK/Random.h>
+#include <LibCore/StatsLog.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
 #include <LibWebCommon/HTML/HistoryOperation.h>
 #include <LibWebCommon/HTML/SerializationRecords.h>
@@ -43,6 +44,12 @@ CanonicalDocument& CanonicalNavigable::active_document() const
     // A navigable's active document is its active session history entry's document.
     VERIFY(m_active_session_history_entry && m_active_session_history_entry->document_state->document);
     return *m_active_session_history_entry->document_state->document;
+}
+
+URL::URL const& CanonicalNavigable::active_document_url() const
+{
+    VERIFY(m_active_session_history_entry);
+    return m_active_session_history_entry->url;
 }
 
 CanonicalBrowsingContext& CanonicalNavigable::active_browsing_context() const
@@ -195,7 +202,7 @@ void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescripto
         // 1. If url equals navigable's active document's URL, and either userInvolvement is "browser UI" or
         //    initiatorOriginSnapshot is same origin with navigable's active document's origin, then set historyHandling
         //    to "replace".
-        if (m_hosted_state.has_value() && url == m_hosted_state->active_document_url
+        if (url == active_document_url()
             && (user_involvement == Web::HTML::UserNavigationInvolvement::BrowserUI || navigation.initiator_origin_snapshot.is_same_origin(active_document().origin()))) {
             history_handling = Web::Bindings::NavigationHistoryBehavior::Replace;
         }
@@ -953,6 +960,34 @@ void CanonicalNavigable::discard_pending_host(WebContentPage const& page)
         abandon_populated_document(move(document_state));
 }
 
+void CanonicalNavigable::set_stats_displayed(bool displayed)
+{
+    if (exchange(m_stats_displayed, displayed) != displayed)
+        send_stats_displayed_to_hosts();
+}
+
+void CanonicalNavigable::send_stats_displayed_to_hosts() const
+{
+    // An embedding change also changes the eligibility of hosted descendants.
+    RefPtr<WebContentPage> host = has_remote_host() ? &remote_host() : nullptr;
+    if (host)
+        send_stats_displayed_to(*host);
+    for_each_pending_host([&](WebContentPage& pending_host) {
+        if (&pending_host != host.ptr())
+            send_stats_displayed_to(pending_host);
+    });
+    for (auto const& child : children())
+        child->send_stats_displayed_to_hosts();
+}
+
+void CanonicalNavigable::send_stats_displayed_to(WebContentPage& host) const
+{
+    bool displayed = true;
+    for (auto const* ancestor = this; ancestor->parent(); ancestor = ancestor->parent())
+        displayed &= ancestor->m_stats_displayed;
+    host.async_set_rendering_stats_displayed(id(), displayed);
+}
+
 void CanonicalNavigable::set_viewport(Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio)
 {
     m_viewport_rect = viewport_rect;
@@ -977,11 +1012,13 @@ void CanonicalNavigable::send_viewport_to_host() const
 void CanonicalNavigable::send_viewport_to(WebContentPage& host) const
 {
     host.async_set_hosted_root_viewport(id(), m_viewport_rect->size(), m_viewport_intersection, m_device_pixel_ratio);
+    if (Core::StatsLog::the())
+        send_stats_displayed_to(host);
 }
 
 void CanonicalNavigable::set_hosted_state(Web::HTML::HostedNavigableState state)
 {
-    m_document_blob_url = BlobURLHandle::for_url(blob_url_store(), state.active_document_url);
+    m_document_blob_url = BlobURLHandle::for_url(blob_url_store(), active_document_url());
     m_hosted_state = move(state);
 }
 
@@ -1041,7 +1078,7 @@ Optional<Web::HTML::ReplicatedNavigableState> CanonicalNavigable::replicated_sta
 
     return Web::HTML::ReplicatedNavigableState {
         .target_name = target_name(),
-        .active_document_url = hosted_state.active_document_url,
+        .active_document_url = active_document_url(),
         .active_document_origin = active_document().origin(),
         .active_document_is_fully_active = hosted_state.active_document_is_fully_active,
         .top_level_creation_url = traversable.active_document().creation_url(),
@@ -1303,6 +1340,7 @@ void CanonicalNavigable::set_the_ongoing_navigation(OngoingNavigation value)
 
     // 3. Set navigable's ongoing navigation to newValue.
     m_ongoing_navigation = move(value);
+    notify_view_of_ongoing_navigation();
 
     if (superseded_navigation && superseded_navigation->ends_when_superseded())
         end_navigation(*superseded_navigation);
@@ -1310,6 +1348,14 @@ void CanonicalNavigable::set_the_ongoing_navigation(OngoingNavigation value)
 
 void CanonicalNavigable::set_ongoing_navigation(CanonicalNavigation::Start navigation)
 {
+    if (auto* log = Core::StatsLog::the(); log && is_top_level_traversable()) {
+        JsonObject data;
+        data.set("navigable_id"sv, MUST(String::formatted("{}", id())));
+        data.set("navigation_id"sv, navigation.navigation_id.to_utf8());
+        data.set("url"sv, navigation.url.serialize());
+        log->event("navigation_start"sv, move(data));
+    }
+
     // NB: Taken before the handle covering this navigation's start is dropped below, so that a revoked entry is not
     //     let go of in between.
     auto blob_url = BlobURLHandle::for_url(blob_url_store(), navigation.url);
@@ -1342,8 +1388,18 @@ void CanonicalNavigable::set_ongoing_navigation_to_traversal(Web::HTML::CrossPro
 
 void CanonicalNavigable::clear_ongoing_navigation_traversal(Web::HTML::CrossProcessId operation_id)
 {
-    if (auto const* traversal = m_ongoing_navigation.get_pointer<Traversal>(); traversal && traversal->operation_id == operation_id)
+    if (auto const* traversal = m_ongoing_navigation.get_pointer<Traversal>(); traversal && traversal->operation_id == operation_id) {
         m_ongoing_navigation = Empty {};
+        notify_view_of_ongoing_navigation();
+    }
+}
+
+void CanonicalNavigable::notify_view_of_ongoing_navigation() const
+{
+    if (!is_top_level_traversable())
+        return;
+    if (auto view = top_level_traversable().view(); view.has_value())
+        view->did_change_ongoing_navigation({});
 }
 
 void CanonicalNavigable::clear_ongoing_navigation()
@@ -1353,8 +1409,10 @@ void CanonicalNavigable::clear_ongoing_navigation()
 
 void CanonicalNavigable::end_navigation(CanonicalNavigation& navigation)
 {
-    if (auto navigation_id = ongoing_navigation_id(); navigation_id.has_value() && *navigation_id == navigation.navigation_id)
+    if (auto navigation_id = ongoing_navigation_id(); navigation_id.has_value() && *navigation_id == navigation.navigation_id) {
         m_ongoing_navigation = Empty {};
+        notify_view_of_ongoing_navigation();
+    }
     auto index = m_navigations.find_first_index_if([&](auto const& candidate) { return candidate.ptr() == &navigation; });
     VERIFY(index.has_value());
     auto ended_navigation = m_navigations.take(*index);

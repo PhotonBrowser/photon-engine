@@ -19,7 +19,7 @@ use super::bridge::{
 use super::font_resolution::{FontResolverHost, PublishedFontFaces};
 use super::inputs::RetainedCustomPropertyData;
 use super::instrumentation::Counter;
-use super::publication::RecordDemand;
+use super::publication::{RecordDemand, RecordDemandAnswer, Unanswered};
 use super::random_bases::ParkedBaseValues;
 use super::tree::{StyleNodeID, TreeScopeID};
 use super::{HashMap, StyleAtomID};
@@ -302,19 +302,17 @@ impl EngineWrite {
                 inheritable,
                 inheritable_store,
             } => {
-                let pointer = |store: &Option<super::custom_property_environments::RetainedCustomPropertyStore>| {
-                    store.as_ref().map_or(std::ptr::null(), |store| store.pointer())
-                };
-                // SAFETY: The write retains both stores.
-                unsafe {
-                    super::bridge::note_custom_property_environment(
-                        engine,
-                        identity,
-                        pointer(&store),
-                        inheritable,
-                        pointer(&inheritable_store),
-                    );
-                }
+                super::bridge::note_custom_property_environment(
+                    engine,
+                    identity,
+                    store
+                        .as_ref()
+                        .map(super::custom_property_environments::RetainedCustomPropertyStore::store),
+                    inheritable,
+                    inheritable_store
+                        .as_ref()
+                        .map(super::custom_property_environments::RetainedCustomPropertyStore::store),
+                );
             }
             Self::AbsorbElementStyleInput {
                 node,
@@ -824,6 +822,9 @@ pub(crate) struct EngineMemo {
     /// Whether the transaction the host takes is one a style update applies, whose reactions close over the elements
     /// they inherit through as the engine computes them.
     takes_transaction_to_apply: std::cell::Cell<bool>,
+    /// The trace of the targeted style update the panic of a layout update that ran out of passes makes of the
+    /// element it kept reaching without a style, while the update is traced.
+    bound_failure_trace: std::cell::RefCell<Option<String>>,
 }
 
 impl EngineMemo {
@@ -919,6 +920,7 @@ impl Default for EngineMemo {
             declarations_changed_during_apply: Default::default(),
             applying_reactions: Default::default(),
             takes_transaction_to_apply: Default::default(),
+            bound_failure_trace: Default::default(),
         }
     }
 }
@@ -1213,6 +1215,161 @@ pub extern "C" fn style_engine_for_each_element_custom_property_environment(
     }
 }
 
+/// What the engine knows of a node a layout update kept reaching without a style, for the panic that reports the
+/// update running out of passes.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiBoundFailureNodeFacts {
+    pub is_live: bool,
+    pub has_published_record: bool,
+    /// The display the node's published record holds: 0 for no record, 1 for none, 2 for contents, 3 for any other.
+    pub published_display: u8,
+    /// The style nodes the engine inherits the node's style from and places it under in the flat tree, or 0.
+    pub inheritance_parent: u32,
+    pub flat_tree_parent: u32,
+    pub owes_style_input: bool,
+    pub ancestor_owes_style_input: bool,
+    /// How a read-only demand of the node's record answers: 0 for a record, 1 for absent, 2 for refused, 3 for
+    /// suspended, 4 for a parent that holds no record yet.
+    pub read_demand_answer: u8,
+    /// The records the engine derived for the element that the host has not taken: how many, and the records the
+    /// last of the element's own moves between, or 0.
+    pub pending_records: u8,
+    pub pending_old_record: u64,
+    pub pending_new_record: u64,
+    /// The record the engine holds the node on and the custom-property environment it holds, or 0, and whether a
+    /// cascade state is bound to the node's record.
+    pub assigned_record: u64,
+    pub environment: u64,
+    pub has_cascade_state: bool,
+}
+
+/// Answers what the engine knows of `node` for the panic of a layout update that ran out of passes reaching it without
+/// a style. The demand it makes is read-only, so the engine is left as it was.
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_bound_failure_node_facts(
+    host: &DocumentHost,
+    read: &BegunRead,
+    node: u32,
+) -> FfiBoundFailureNodeFacts {
+    with_engine(read, host, |engine| {
+        let Some(node) = StyleNodeID::from_raw(node) else {
+            return FfiBoundFailureNodeFacts {
+                is_live: false,
+                has_published_record: false,
+                published_display: 0,
+                inheritance_parent: 0,
+                flat_tree_parent: 0,
+                owes_style_input: false,
+                ancestor_owes_style_input: false,
+                read_demand_answer: 2,
+                pending_records: 0,
+                pending_old_record: 0,
+                pending_new_record: 0,
+                assigned_record: 0,
+                environment: 0,
+                has_cascade_state: false,
+            };
+        };
+        let published_display = engine.element_published_box_facts(node).map_or(0, |facts| {
+            if facts.display.is_none() {
+                1
+            } else if facts.display.is_contents() {
+                2
+            } else {
+                3
+            }
+        });
+        let inheritance_parent = engine.retained.tree.inheritance_parent(node);
+        let ancestor_owes_style_input = std::iter::successors(inheritance_parent, |&ancestor| {
+            engine.retained.tree.inheritance_parent(ancestor)
+        })
+        .any(|ancestor| engine.host.owes_element_style_input(ancestor));
+        let (pending_records, pending_old_record, pending_new_record) =
+            engine.retained.bound_failure_pending_records(node);
+        let read_demand_answer =
+            match engine.answer_record_demand(node, RecordDemand::Element(FfiRecordDemand::ElementRead)) {
+                Ok(RecordDemandAnswer::Record { .. }) => 0,
+                Ok(RecordDemandAnswer::Absent { .. }) => 1,
+                Err(Unanswered::Refused) => 2,
+                Err(Unanswered::Suspended(_)) => 3,
+                Err(Unanswered::AwaitsParent) => 4,
+            };
+        FfiBoundFailureNodeFacts {
+            is_live: engine.retained.tree.is_live(node),
+            has_published_record: engine.published_element_record(node).is_some(),
+            published_display,
+            inheritance_parent: inheritance_parent.map_or(0, StyleNodeID::raw),
+            flat_tree_parent: engine.retained.tree.flat_tree_parent(node).map_or(0, StyleNodeID::raw),
+            owes_style_input: engine.host.owes_element_style_input(node),
+            ancestor_owes_style_input,
+            read_demand_answer,
+            pending_records,
+            pending_old_record,
+            pending_new_record,
+            assigned_record: engine
+                .retained
+                .computed_group_sets
+                .assigned_style_record(node)
+                .map_or(0, |record| record.raw()),
+            environment: engine
+                .retained
+                .computed_group_sets
+                .custom_property_environment_identity(node)
+                .unwrap_or(0),
+            has_cascade_state: engine
+                .retained
+                .computed_group_sets
+                .cascade_state(super::computed::ComputedStyleTarget::new(node, u8::MAX))
+                .is_some(),
+        }
+    })
+}
+
+/// Appends what `line` says to the trace of a targeted style update of `host`'s document, where one is being
+/// traced.
+pub(crate) fn note_bound_failure_trace(host: &DocumentHost, line: impl FnOnce() -> String) {
+    if let Some(trace) = host.engine_memo().bound_failure_trace.borrow_mut().as_mut() {
+        if !trace.is_empty() {
+            trace.push(' ');
+        }
+        trace.push_str(&line());
+    }
+}
+
+/// Starts tracing the targeted style updates of `host`'s document, for the panic of a layout update that ran out of
+/// passes.
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_begin_bound_failure_trace(host: &DocumentHost) {
+    *host.engine_memo().bound_failure_trace.borrow_mut() = Some(String::new());
+}
+
+/// Ends the trace and writes it to `buffer`, NUL-terminated and cut to fit `capacity`, answering its length.
+///
+/// # Safety
+///
+/// `buffer` must be writable for `capacity` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_end_bound_failure_trace(
+    host: &DocumentHost,
+    buffer: *mut u8,
+    capacity: usize,
+) -> usize {
+    let trace = host
+        .engine_memo()
+        .bound_failure_trace
+        .borrow_mut()
+        .take()
+        .unwrap_or_default();
+    let length = trace.len().min(capacity.saturating_sub(1));
+    // SAFETY: Guaranteed by the caller.
+    unsafe {
+        std::ptr::copy_nonoverlapping(trace.as_ptr(), buffer, length);
+        buffer.add(length).write(0);
+    }
+    length
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn style_engine_has_pending_transaction(host: &DocumentHost, read: &BegunRead) -> bool {
     match host.known_engine_facts() {
@@ -1477,9 +1634,7 @@ pub unsafe extern "C" fn style_engine_decide_transitions(
 ) {
     crate::css::ffi_stats::note_transition_decision();
     // SAFETY: Guaranteed by the caller.
-    let existing = unsafe {
-        crate::css::custom_properties::ffi_slice(input.existing_transitions, input.existing_transition_count)
-    };
+    let existing = unsafe { ak::slice_from_raw_parts(input.existing_transitions, input.existing_transition_count) };
     // SAFETY: As above.
     let hand_over = |actions: &[FfiTransitionAction]| unsafe { on_actions(context, actions.as_ptr(), actions.len()) };
     let decision = TransitionDecision {

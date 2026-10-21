@@ -15,6 +15,7 @@
 #include <LibCore/System.h>
 #include <LibGfx/YUVData.h>
 #include <LibIPC/Transport.h>
+#include <LibMedia/DecoderRegistrations.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
@@ -25,15 +26,20 @@
 #include <LibMedia/Sinks/RemoteVideoSink.h>
 #include <LibMedia/Track.h>
 #include <LibMedia/VideoEdgeQueue.h>
-#include <LibMedia/VideoFrame.h>
-#include <LibMedia/VideoFramePool.h>
-#include <LibMedia/VideoPresentation/PresentedFramePage.h>
 #include <LibMedia/VideoPresentation/VideoPresentationClientConnection.h>
 #include <LibMedia/VideoPresentation/VideoPresentationServerConnection.h>
+#include <LibMediaCodecs/VideoFrame.h>
+#include <LibMediaCodecs/VideoFramePool.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 
 #include "TestMediaCommon.h"
+
+TEST_SETUP
+{
+    Media::install_video_decoders({ Media::hardware_video_decoders(), Media::ffmpeg_video_decoders() });
+    Media::install_audio_decoders({ Media::audio_decoders() });
+}
 
 using namespace Media;
 
@@ -388,6 +394,48 @@ TEST_CASE(consumer_sends_backward_seeks_upstream)
     EXPECT_EQ(upstream_seeks, 1u);
 }
 
+// The seek must reach upstream before the stale frames' slots are released, and a frame of the new seek that arrives
+// in between must stay in the ring.
+TEST_CASE(consumer_requests_seeks_before_releasing_stale_frames)
+{
+    auto producer_edge = MUST(VideoEdgeQueue::create());
+    auto ring_fd = MUST(Core::System::dup(producer_edge.ring_fd()));
+    auto consumer_edge = MUST(VideoEdgeQueue::create(ring_fd, producer_edge.header_buffer()));
+
+    Vector<StringView> events;
+    Vector<u32> released_slot_indices;
+    RemoteVideoProducer::Delegates delegates;
+    delegates.request_start = [] { };
+    delegates.request_seek = [&](AK::Duration, InvalidateHeldData) {
+        events.append("seek"sv);
+        VideoFrameHandle handle;
+        handle.timestamp = AK::Duration::from_milliseconds(500);
+        handle.duration = AK::Duration::from_milliseconds(100);
+        handle.slot_index = 4;
+        MUST(producer_edge.enqueue(handle, 1));
+    };
+    delegates.release_slot = [&](VideoFramePoolID, u32 slot_index) {
+        events.append("release"sv);
+        released_slot_indices.append(slot_index);
+    };
+    delegates.notify_space_available = [] { };
+    auto consumer = RemoteVideoProducer::create(move(consumer_edge), VideoFrameSlotDirectory::create(), move(delegates));
+
+    for (u32 i = 0; i < 4; i++) {
+        VideoFrameHandle handle;
+        handle.timestamp = AK::Duration::from_milliseconds(1000 + (i * 100));
+        handle.duration = AK::Duration::from_milliseconds(100);
+        handle.slot_index = i;
+        MUST(producer_edge.enqueue(handle, 0));
+    }
+
+    consumer->seek(AK::Duration::from_milliseconds(500));
+
+    EXPECT_EQ(events.size(), 5u);
+    EXPECT_EQ(events.first(), "seek"sv);
+    EXPECT_EQ(released_slot_indices, (Vector<u32> { 0, 1, 2, 3 }));
+}
+
 // With the end of stream published, no frames exist beyond the lookahead for the producer to
 // re-emit, so a seek past the end must resolve locally instead of discarding the queued tail.
 TEST_CASE(consumer_resolves_seeks_past_the_end_of_stream_locally)
@@ -534,18 +582,17 @@ TEST_CASE(pump_resumes_after_a_withdrawn_seek_request)
     EXPECT_EQ(consumer_edge.peek()->seek_id, 0u);
 }
 
-// A presented-frame handle can outlive its lend when a newer frame's release is processed before the
-// page rewrite is read. Resolving such a handle must fall back to the superseding one, never crash.
-TEST_CASE(current_frame_ignores_handles_whose_lend_was_released)
+TEST_CASE(stopped_pump_reclaims_only_the_frames_left_in_the_ring)
 {
     auto& loop = never_destroyed_event_loop();
 
+    auto retired_pool_count = 0;
     RemoteVideoSink::Delegates delegates;
     delegates.ring_data_available = [] { };
     delegates.transmit_seek = [](InvalidateHeldData) { };
     delegates.transmit_time_reader = [](MediaTimeReader const&) { };
     delegates.announce_slot = [](VideoFramePoolID, u32, Core::AnonymousBuffer, RefPtr<VideoSurface>) { };
-    delegates.retire_pool = [](VideoFramePoolID) { };
+    delegates.retire_pool = [&](VideoFramePoolID) { retired_pool_count++; };
     auto sink = MUST(RemoteVideoSink::create(move(delegates)));
 
     auto pool = MUST(VideoFramePool::create());
@@ -559,29 +606,20 @@ TEST_CASE(current_frame_ignores_handles_whose_lend_was_released)
     MUST(sink->connect_input(producer));
     sink->start_input();
 
-    Vector<VideoFrameHandle> handles;
     EXPECT(spin_until(loop, [&] {
-        while (handles.size() < 2) {
-            auto item = consumer_edge.peek();
-            if (!item.has_value())
-                break;
-            handles.append(item->handle);
-            consumer_edge.consume();
-        }
-        return handles.size() == 2;
+        auto newest = consumer_edge.peek_newest();
+        return newest.has_value() && newest->handle.timestamp == AK::Duration::from_milliseconds(33);
     }));
+    auto taken_handle = consumer_edge.peek()->handle;
+    consumer_edge.consume();
 
-    PresentedFramePage page = sink->presented_frame_page();
+    sink->stop_and_reclaim_unconsumed_frames();
+    EXPECT(sink->has_lent_slots());
+    EXPECT_EQ(retired_pool_count, 0);
 
-    // While its lend is live, the presented handle resolves.
-    page.store(handles[0]);
-    EXPECT(sink->current_frame() != nullptr);
-
-    // Present the second frame and release its lend, as a newer present racing the page read would;
-    // the page now holds a stale handle while the pool keeps the first frame's lend.
-    page.store(handles[1]);
-    sink->release_slot(handles[1].pool_id, handles[1].slot_index);
-    EXPECT(sink->current_frame() == nullptr);
+    sink->release_slot(taken_handle.pool_id, taken_handle.slot_index);
+    EXPECT(!sink->has_lent_slots());
+    EXPECT_EQ(retired_pool_count, 1);
 }
 
 TEST_CASE(consumer_forgets_announced_slots_on_suspension)

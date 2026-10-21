@@ -1318,6 +1318,9 @@ std::vector<RegisteredEngineProcess> Runtime::registered_engine_processes() cons
         case WebView::ProcessType::MediaServer:
             role = "media_server";
             break;
+        case WebView::ProcessType::VideoDecoderServer:
+            role = "video_decoder_server";
+            break;
         case WebView::ProcessType::AudioServer:
             role = "audio_server";
             break;

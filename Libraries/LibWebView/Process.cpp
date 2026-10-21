@@ -11,6 +11,7 @@
 #include <LibCore/Process.h>
 #include <LibCore/Socket.h>
 #include <LibCore/StandardPaths.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibWebView/Process.h>
@@ -139,7 +140,7 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
         }
         if (type == ProcessType::AudioServer)
             is_allowed |= audio_names.contains_slow(entry.name);
-        if (type == ProcessType::Compositor)
+        if (type == ProcessType::Compositor || type == ProcessType::VideoDecoderServer)
             is_allowed |= any_of(gpu_prefixes, [&](auto prefix) { return entry.name.starts_with(prefix); });
         if (type == ProcessType::Compositor && entry.name == "PHOTON_VERBOSE"sv)
             is_allowed = true;
@@ -197,8 +198,14 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
     Array<int, 2> stdout_pipe {};
     Array<int, 2> stderr_pipe {};
 
-    Core::ProcessSpawnOptions spawn_options = options;
+    auto spawn_options = options;
     spawn_options.die_with_parent = true;
+    Vector<ByteString> arguments_with_stats;
+    if (auto* stats_log = Core::StatsLog::the()) {
+        arguments_with_stats = Vector<ByteString> { options.arguments };
+        arguments_with_stats.append(ByteString::formatted("--stats-log-dir={}", stats_log->directory()));
+        spawn_options.arguments = arguments_with_stats;
+    }
 #if defined(AK_OS_MACOS) || defined(AK_OS_LINUX)
     spawn_options.environment = helper_process_environment(type);
 #endif

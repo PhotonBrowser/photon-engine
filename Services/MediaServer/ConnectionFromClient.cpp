@@ -9,13 +9,14 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/NumericLimits.h>
 #include <LibCore/Process.h>
-#include <LibMedia/CodecParameters.h>
 #include <LibMedia/DecodeAudioStream.h>
-#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMedia/MediaSourceExtensions/ByteStreamParser.h>
 #include <LibMedia/MediaSupport.h>
 #include <LibMedia/PlaybackManager.h>
+#include <LibMediaCodecs/CodecParameters.h>
+#include <LibMediaCodecs/DecoderCapabilities.h>
+#include <LibThreading/Thread.h>
 #include <LibThreading/ThreadPool.h>
 #include <MediaServer/ConnectionFromClient.h>
 #include <MediaServer/PlaybackSession.h>
@@ -55,6 +56,32 @@ ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_audio_serve
     if (!response || !response->handle().has_value())
         return Error::from_string_literal("The Browser did not connect an audio server");
     return response->take_handle()->create_transport();
+}
+
+void ConnectionFromClient::request_video_decoder_server_transport(VideoDecoderServerTransportCallback callback)
+{
+    VERIFY(m_role == Role::Controller);
+    auto request_id = m_next_video_decoder_server_transport_request_id++;
+    m_video_decoder_server_transport_requests.set(request_id, move(callback));
+    async_request_video_decoder_server_connection(request_id);
+}
+
+void ConnectionFromClient::video_decoder_server_connection_ready(u64 request_id, Optional<IPC::TransportHandle> handle)
+{
+    if (m_role != Role::Controller) {
+        did_misbehave("Only the controller may connect a video decoder server");
+        return;
+    }
+    auto callback = m_video_decoder_server_transport_requests.take(request_id);
+    if (!callback.has_value()) {
+        did_misbehave("A video decoder server connection answered no request");
+        return;
+    }
+    if (!handle.has_value()) {
+        (*callback)(Error::from_string_literal("The Browser did not connect a video decoder server"));
+        return;
+    }
+    (*callback)(handle->create_transport());
 }
 
 ErrorOr<ConnectionFromClient::RendererConnection> ConnectionFromClient::create_renderer_connection()
@@ -147,24 +174,34 @@ static Optional<Media::DecoderCapabilities> decoder_capabilities_for_codecs(Stri
     return combined_capabilities;
 }
 
-Messages::MediaServer::QueryFileMediaSupportResponse ConnectionFromClient::query_file_media_support(String type, String subtype, Optional<String> codecs_parameter)
-{
-    return file_media_support_for(move(type), move(subtype), move(codecs_parameter));
-}
-
-Messages::MediaServer::QueryDecoderCapabilitiesResponse ConnectionFromClient::query_decoder_capabilities(String codecs_parameter)
-{
-    return decoder_capabilities_for_codecs(codecs_parameter);
-}
-
 void ConnectionFromClient::request_file_media_support(u64 request_id, String type, String subtype, Optional<String> codecs_parameter)
 {
-    async_file_media_support_reported(request_id, file_media_support_for(move(type), move(subtype), move(codecs_parameter)));
+    auto& main_thread_event_loop = Core::EventLoop::current();
+    auto thread = Threading::Thread::construct("MediaSupport"sv, [strong_this = NonnullRefPtr(*this), &main_thread_event_loop, request_id, type = move(type), subtype = move(subtype), codecs_parameter = move(codecs_parameter)] mutable -> intptr_t {
+        auto info = file_media_support_for(move(type), move(subtype), move(codecs_parameter));
+        main_thread_event_loop.deferred_invoke([strong_this = move(strong_this), request_id, info = move(info)] {
+            if (strong_this->is_open())
+                strong_this->async_file_media_support_reported(request_id, info);
+        });
+        return 0;
+    });
+    thread->start();
+    thread->detach();
 }
 
 void ConnectionFromClient::request_decoder_capabilities(u64 request_id, String codecs_parameter)
 {
-    async_decoder_capabilities_reported(request_id, decoder_capabilities_for_codecs(codecs_parameter));
+    auto& main_thread_event_loop = Core::EventLoop::current();
+    auto thread = Threading::Thread::construct("Capabilities"sv, [strong_this = NonnullRefPtr(*this), &main_thread_event_loop, request_id, codecs_parameter = move(codecs_parameter)] mutable -> intptr_t {
+        auto capabilities = decoder_capabilities_for_codecs(codecs_parameter);
+        main_thread_event_loop.deferred_invoke([strong_this = move(strong_this), request_id, capabilities] {
+            if (strong_this->is_open())
+                strong_this->async_decoder_capabilities_reported(request_id, capabilities);
+        });
+        return 0;
+    });
+    thread->start();
+    thread->detach();
 }
 
 struct DecodedAudioSamples {
@@ -393,16 +430,6 @@ void ConnectionFromClient::set_video_sink_ticking(u64 session_id, Media::VideoSi
 {
     if (find_playback_session(session_id))
         Media::PlaybackManager::set_video_sink_ticking(handle, ticking);
-}
-
-Messages::MediaServer::MapPresentedFrameSlotResponse ConnectionFromClient::map_presented_frame_slot(u64 session_id, Media::VideoSinkHandle handle, Media::VideoFramePoolID pool_id, u32 slot_index)
-{
-    if (!find_playback_session(session_id))
-        return { OptionalNone {}, nullptr };
-    auto storage = Media::PlaybackManager::presented_frame_slot_storage(handle, pool_id, slot_index);
-    if (!storage.has_value())
-        return { OptionalNone {}, nullptr };
-    return { move(storage->buffer), move(storage->surface) };
 }
 
 void ConnectionFromClient::create_source_buffer(u64 session_id, u64 source_buffer_id)

@@ -6,6 +6,7 @@
 
 #include <AK/BitCast.h>
 #include <AK/ByteBuffer.h>
+#include <AK/ScopeGuard.h>
 #include <Compositor/DisplayListRasterCache.h>
 #include <Compositor/VideoFrameSkia.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
@@ -15,11 +16,10 @@
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/SkiaBackendContext.h>
 #include <LibGfx/SkiaUtils.h>
-#include <LibGfx/VideoSurfaceImage.h>
 #include <LibGfx/YUVData.h>
-#include <LibMedia/VideoFrame.h>
-#include <LibMedia/VideoFrameHandle.h>
-#include <LibMedia/VideoSurface.h>
+#include <LibMediaCodecs/VideoFrame.h>
+#include <LibMediaCodecs/VideoFrameHandle.h>
+#include <LibMediaCodecs/VideoSurface.h>
 
 #include <core/SkFont.h>
 #include <core/SkImage.h>
@@ -54,14 +54,12 @@ struct DisplayListRasterCache::VideoSinkImage {
     Media::VideoFramePoolID pool_id { 0 };
     u32 slot_index { 0 };
     u64 slot_acquisition_id { 0 };
-    // A surface-backed image samples the surface where it lies, so it stays valid for every frame decoded into
-    // that surface rather than only for the one acquisition.
-    u32 surface_id { 0 };
-    // Drawing is recorded here but read by the GPU afterwards, so the surface stays in use until a different one
-    // is drawn in its place.
-    Media::VideoSurfaceUse surface_use;
+    // Drawing is recorded here but read by the GPU afterwards, so the frame stays held, and its surface's pixels
+    // with it, until a different frame is drawn in its place.
+    RefPtr<Media::VideoFrame const> drawn_frame;
     RefPtr<Gfx::SkiaBackendContext> skia_backend_context;
     sk_sp<SkImage> image;
+    Gfx::IntSize visible_size;
 };
 
 struct DisplayListRasterCache::RepeatedTileRaster {
@@ -106,7 +104,6 @@ struct DisplayListRasterCache::NestedDisplayListRasters {
     }
 
     RefPtr<Gfx::SkiaBackendContext> skia_backend_context;
-    bool was_painted { false };
 
     // The same display list can be painted at several places in one frame (repeated SVG images, atlas-style
     // lists painted in many small slices), each with its own visible sub-rectangle, so a single list keeps a
@@ -182,7 +179,7 @@ sk_sp<SkImage> DisplayListRasterCache::image_for_image_frame(DisplayListResource
     return image;
 }
 
-sk_sp<SkImage> DisplayListRasterCache::image_for_video_sink(DisplayListResourceStorage const& resource_storage, VideoSinkResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+sk_sp<SkImage> DisplayListRasterCache::image_for_video_sink(DisplayListResourceStorage const& resource_storage, VideoSinkResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, Gfx::IntSize& visible_size)
 {
     auto sink = resource_storage.video_sink(id);
     if (!sink)
@@ -193,15 +190,12 @@ sk_sp<SkImage> DisplayListRasterCache::image_for_video_sink(DisplayListResourceS
 
     auto handle = Media::VideoFrameHandle::for_frame(*frame);
     auto surface = frame->surface();
-    auto surface_id = surface ? surface->id() : 0;
     auto& cached_image = *m_video_sink_images.ensure(id.value(), [] { return make<VideoSinkImage>(); });
     auto cached_image_matches = [&] {
         if (!cached_image.image)
             return false;
         if (cached_image.skia_backend_context != skia_backend_context)
             return false;
-        if (surface_id != 0)
-            return cached_image.surface_id == surface_id;
         if (cached_image.pool_id != handle.pool_id)
             return false;
         if (cached_image.slot_index != handle.slot_index)
@@ -210,53 +204,13 @@ sk_sp<SkImage> DisplayListRasterCache::image_for_video_sink(DisplayListResourceS
             return false;
         return true;
     }();
-    if (cached_image_matches)
+    if (cached_image_matches) {
+        cached_image.drawn_frame = frame;
+        visible_size = cached_image.visible_size;
         return cached_image.image;
-
-    sk_sp<SkImage> image;
-    auto* gr_context = skia_backend_context ? skia_backend_context->sk_context() : nullptr;
-
-#ifdef AK_OS_MACOS
-    if (surface != nullptr && skia_backend_context)
-        image = sk_image_from_video_surface(surface->io_surface(), frame->cicp(), *skia_backend_context);
-#endif
-
-    auto yuv_data = image ? Optional<Gfx::YUVData> {} : frame->yuv_data();
-    if (!image && !yuv_data.has_value() && surface == nullptr)
-        return nullptr;
-
-    auto color_space = Gfx::ColorSpace {};
-    if (auto color_space_result = Gfx::ColorSpace::from_cicp(frame->cicp()); !color_space_result.is_error())
-        color_space = color_space_result.release_value();
-
-    if (!image && gr_context && yuv_data.has_value()) {
-        image = SkImages::TextureFromYUVAPixmaps(
-            gr_context,
-            make_yuva_pixmaps(*yuv_data),
-            skgpu::Mipmapped::kNo,
-            false,
-            Gfx::to_skia_color_space(color_space));
     }
 
-    if (!image) {
-        auto bitmap_or_error = [&] -> ErrorOr<NonnullRefPtr<Gfx::Bitmap>> {
-#ifdef AK_OS_MACOS
-            // Without a GPU to sample the surface on, its pixels have to be read back into memory to be drawn.
-            if (surface != nullptr)
-                return Gfx::bitmap_from_video_surface(surface->io_surface(), frame->cicp());
-#endif
-            return yuv_data->to_bitmap();
-        }();
-        if (bitmap_or_error.is_error()) {
-            dbgln("Could not convert video frame to bitmap: {}", bitmap_or_error.release_error());
-            return nullptr;
-        }
-        auto raster_image = Gfx::sk_image_adopting_bitmap(bitmap_or_error.release_value(), color_space);
-        if (gr_context)
-            image = SkImages::TextureFromImage(gr_context, raster_image.get(), skgpu::Mipmapped::kNo, skgpu::Budgeted::kYes);
-        if (!image)
-            image = move(raster_image);
-    }
+    auto image = sk_image_from_video_frame(*frame, skia_backend_context);
 
     if (!frame->revalidate_backing())
         return nullptr;
@@ -267,10 +221,11 @@ sk_sp<SkImage> DisplayListRasterCache::image_for_video_sink(DisplayListResourceS
     cached_image.pool_id = handle.pool_id;
     cached_image.slot_index = handle.slot_index;
     cached_image.slot_acquisition_id = handle.slot_acquisition_id;
-    cached_image.surface_id = surface_id;
-    cached_image.surface_use = surface ? surface->begin_use() : Media::VideoSurfaceUse {};
+    cached_image.drawn_frame = frame;
     cached_image.skia_backend_context = skia_backend_context;
     cached_image.image = image;
+    cached_image.visible_size = frame->size().to_type<int>();
+    visible_size = cached_image.visible_size;
     return image;
 }
 
@@ -328,9 +283,13 @@ sk_sp<SkImage> DisplayListRasterCache::nested_display_list_raster(DisplayListRes
     return {};
 }
 
-void DisplayListRasterCache::add_nested_display_list_raster(DisplayListResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, Gfx::IntRect rect_in_list_space, sk_sp<SkImage> image)
+bool DisplayListRasterCache::has_rasterized_nested_display_list(DisplayListResourceId id) const
 {
-    VERIFY(image);
+    return m_nested_display_list_rasters.contains(id.value());
+}
+
+sk_sp<SkImage> DisplayListRasterCache::create_nested_display_list_raster(DisplayListResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, Gfx::IntRect rect_in_list_space, Function<sk_sp<SkImage>()> const& rasterize)
+{
     auto& rasters = *m_nested_display_list_rasters.ensure(id.value(), [&] {
         return make<NestedDisplayListRasters>(skia_backend_context);
     });
@@ -346,7 +305,8 @@ void DisplayListRasterCache::add_nested_display_list_raster(DisplayListResourceI
     // the overflow instead of thrashing the whole cache. Additions are rare by design, so the total is simply
     // recomputed here instead of being tracked incrementally.
     constexpr size_t max_nested_raster_cache_bytes = 512 * MiB;
-    auto total_bytes = static_cast<size_t>(rect_in_list_space.width()) * rect_in_list_space.height() * 4;
+    auto raster_bytes = static_cast<size_t>(rect_in_list_space.width()) * rect_in_list_space.height() * 4;
+    auto total_bytes = raster_bytes + m_nested_raster_cache_reserved_bytes;
     for (auto const& it : m_nested_display_list_rasters)
         total_bytes += it.value->total_byte_size();
     if (total_bytes > max_nested_raster_cache_bytes) {
@@ -360,25 +320,20 @@ void DisplayListRasterCache::add_nested_display_list_raster(DisplayListResourceI
             });
         }
         if (total_bytes > max_nested_raster_cache_bytes)
-            return;
+            return {};
     }
+
+    // Reserve before rasterizing: a nested list can create other cached rasters while it is painted.
+    m_nested_raster_cache_reserved_bytes += raster_bytes;
+    ScopeGuard release_reservation = [&] { m_nested_raster_cache_reserved_bytes -= raster_bytes; };
+    auto image = rasterize();
+    if (!image)
+        return {};
 
     if (rasters.rasters.size() == NestedDisplayListRasters::max_rasters)
         rasters.rasters.take_last();
-    rasters.rasters.prepend({ rect_in_list_space, move(image) });
-}
-
-bool DisplayListRasterCache::should_cache_nested_display_list_raster(DisplayListResourceStorage const& resource_storage, DisplayListResourceId id)
-{
-    // Only rasterize a list that has been painted before: content that is re-recorded for every update gets a
-    // fresh id each time and would waste a full rasterization per recording, while anything replayed more than
-    // once converges to cache hits after its second paint.
-    auto& rasters = *m_nested_display_list_rasters.ensure(id.value(), [&] {
-        return make<NestedDisplayListRasters>(nullptr);
-    });
-    if (!exchange(rasters.was_painted, true))
-        return false;
-    return !resource_storage.display_list_requires_direct_replay(id);
+    rasters.rasters.prepend({ rect_in_list_space, image });
+    return image;
 }
 
 static u64 text_blob_glyph_hash(ReadonlySpan<DisplayListGlyph> glyphs)
@@ -393,7 +348,7 @@ static u64 text_blob_glyph_hash(ReadonlySpan<DisplayListGlyph> glyphs)
     return hash;
 }
 
-static sk_sp<SkTextBlob> make_text_blob(Gfx::Font const& font, float scale, ReadonlySpan<DisplayListGlyph> glyphs, [[maybe_unused]] u8 font_smoothing, TextRasterizationMode rasterization_mode)
+static sk_sp<SkTextBlob> make_text_blob(Gfx::Font const& font, float scale, ReadonlySpan<DisplayListGlyph> glyphs, [[maybe_unused]] u8 font_smoothing)
 {
     if (font.is_invisible())
         return nullptr;
@@ -416,12 +371,6 @@ static sk_sp<SkTextBlob> make_text_blob(Gfx::Font const& font, float scale, Read
         break;
     }
 #endif
-    if (rasterization_mode == TextRasterizationMode::Unhinted) {
-        // NB: Preserve canvas text's fractional baseline and unhinted outline geometry.
-        sk_font.setHinting(SkFontHinting::kNone);
-        sk_font.setForceAutoHinting(false);
-        sk_font.setBaselineSnap(false);
-    }
     SkTextBlobBuilder builder;
     auto const& run = builder.allocRunPos(sk_font, glyphs.size());
 
@@ -434,13 +383,13 @@ static sk_sp<SkTextBlob> make_text_blob(Gfx::Font const& font, float scale, Read
     return builder.make();
 }
 
-sk_sp<SkTextBlob> DisplayListRasterCache::text_blob(DisplayListResourceStorage const& resource_storage, FontResourceId font_id, float scale, ReadonlySpan<DisplayListGlyph> glyphs, u8 font_smoothing, TextRasterizationMode rasterization_mode)
+sk_sp<SkTextBlob> DisplayListRasterCache::text_blob(DisplayListResourceStorage const& resource_storage, FontResourceId font_id, float scale, ReadonlySpan<DisplayListGlyph> glyphs, u8 font_smoothing)
 {
     constexpr size_t max_text_blob_cache_bytes = 16 * MiB;
     constexpr auto text_blob_idle_duration = AK::Duration::from_milliseconds(250);
 
     ReadonlyBytes glyph_bytes { reinterpret_cast<u8 const*>(glyphs.data()), glyphs.size() * sizeof(DisplayListGlyph) };
-    TextBlobCacheKey key { font_id.value(), bit_cast<u32>(scale), font_smoothing, text_blob_glyph_hash(glyphs), rasterization_mode };
+    TextBlobCacheKey key { font_id.value(), bit_cast<u32>(scale), font_smoothing, text_blob_glyph_hash(glyphs) };
     auto now = MonotonicTime::now();
 
     if (auto cached = m_text_blobs.find(key); cached != m_text_blobs.end()) {
@@ -453,7 +402,7 @@ sk_sp<SkTextBlob> DisplayListRasterCache::text_blob(DisplayListResourceStorage c
         m_text_blobs.remove(cached);
     }
 
-    auto blob = make_text_blob(resource_storage.font(font_id), scale, glyphs, font_smoothing, rasterization_mode);
+    auto blob = make_text_blob(resource_storage.font(font_id), scale, glyphs, font_smoothing);
     if (!blob)
         return nullptr;
 

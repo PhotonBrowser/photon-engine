@@ -20,9 +20,8 @@ fn declarations(source: &str) -> crate::css::declaration_block::DeclarationBlock
     unsafe {
         let parse = std::sync::Arc::from_raw(super::rust_parse_css_block_syntax(
             view(&source),
-            contexts.as_ptr(),
-            contexts.len(),
-            &super::tests::parse_context(),
+            ak::Span::new(&contexts),
+            Some(&super::tests::parse_context()),
             false,
         ));
         *Box::from_raw(super::rust_css_syntax_parse_declaration_block(&*parse))
@@ -46,14 +45,14 @@ fn view(source: &[u16]) -> FfiUtf16View<'_> {
 }
 
 fn parse(source: &[u16], context: &crate::css::parser::value_parser::ParseContext) -> Arc<ParsedStyleSheet> {
-    unsafe { parse_shared_stylesheet(TokenizerInput::Utf16(source), context) }
+    parse_shared_stylesheet(TokenizerInput::Utf16(source), Some(context))
 }
 
 fn parse_shared_on_worker(source: &'static str) -> Arc<ParsedStyleSheet> {
     std::thread::spawn(move || {
         let source = utf16(source);
         let context = super::tests::parse_context();
-        let parse = || unsafe { parse_shared_stylesheet(TokenizerInput::Utf16(&source), &context) };
+        let parse = || parse_shared_stylesheet(TokenizerInput::Utf16(&source), Some(&context));
         let first = parse();
         let second = parse();
         assert!(Arc::ptr_eq(&first, &second));
@@ -81,7 +80,7 @@ fn builder_constructs_one_rule_tree_with_dense_unique_identities() {
         b"@media all { .parent { & {} color: red; @supports (display: grid) { width: 13px; } } } @font-face { font-family: Test; src: url(font.woff); }",
     );
     let context = super::tests::parse_context();
-    let mut builder = super::SyntaxParseBuilder::new(&context, false);
+    let mut builder = super::SyntaxParseBuilder::new(Some(&context), false);
     builder.append_roots(&rules);
     assert_eq!(builder.rules.len(), 2);
     let mut identities = std::collections::BTreeSet::new();
@@ -212,7 +211,7 @@ fn font_feature_mutation_preserves_live_owners_and_shared_maps() {
                 return None;
             }
             let entry = rust_font_feature_values_at(owner, kind, index);
-            Some(std::slice::from_raw_parts(entry.values, entry.count).to_vec())
+            Some(ak::slice_from_raw_parts(entry.values, entry.count).to_vec())
         }
     }
     let kind = FontFeatureValuesRuleKind::Styleset;
@@ -221,7 +220,7 @@ fn font_feature_mutation_preserves_live_owners_and_shared_maps() {
         assert_eq!(rust_font_feature_values_count(values, kind), 3);
         let entry = rust_font_feature_values_at(values, kind, 1);
         assert_eq!(entry.name.to_utf16().unwrap(), utf16("色"));
-        assert_eq!(std::slice::from_raw_parts(entry.values, entry.count), [6, 7]);
+        assert_eq!(ak::slice_from_raw_parts(entry.values, entry.count), [6, 7]);
         assert_eq!(entry.values, rust_font_feature_values_at(&shared, kind, 1).values);
         rust_font_feature_values_set(values, kind, entry.name, [29].as_ptr(), 1);
         assert_eq!(get(&shared, kind, "色").unwrap(), [6, 7]);
@@ -483,11 +482,10 @@ fn worker_selector_normalization_survives_publication() {
     use crate::css::selector_parser::*;
     use crate::css::selector_serialization::serialize_selector_without_namespaces;
     fn text(parsed: &RustParsedSelectorList) -> Vec<u16> {
-        unsafe {
-            assert_eq!(rust_parsed_selector_list_length(parsed), 1);
-            let selector = Box::from_raw(rust_parsed_selector_list_selector(parsed, 0));
-            serialize_selector_without_namespaces(&selector)
-        }
+        assert_eq!(rust_parsed_selector_list_length(parsed), 1);
+        // SAFETY: The selector is a new one, which the test owns.
+        let selector = unsafe { Box::from_raw(rust_parsed_selector_list_selector(parsed, 0)) };
+        serialize_selector_without_namespaces(&selector)
     }
     fn visit(rule: &super::ParsedRule, selectors: &mut Vec<Vec<u16>>, scopes: &mut Vec<Vec<u16>>) {
         for child in &rule.children {
@@ -553,7 +551,7 @@ fn import_preludes_outlive_the_worker_and_shared_sheet() {
 
 unsafe extern "C" fn collect_text(context: *mut std::ffi::c_void, text: *const u16, length: usize) {
     let result = unsafe { &mut *context.cast::<Vec<u16>>() };
-    result.extend_from_slice(unsafe { std::slice::from_raw_parts(text, length) });
+    result.extend_from_slice(unsafe { ak::slice_from_raw_parts(text, length) });
 }
 
 fn page_text(selectors: &PageSelectorList) -> Vec<u16> {
@@ -654,16 +652,12 @@ fn namespace_rules_own_native_names_after_the_sheet_is_dropped() {
 fn cached_sheets_share_across_urls_without_capturing_image_resource_contexts() {
     let mut first_context = super::tests::parse_context();
     let first_url = b"https://first.example/path/";
-    first_context.document_url = first_url.as_ptr();
-    first_context.document_url_length = first_url.len();
-    first_context.document_base_url = first_url.as_ptr();
-    first_context.document_base_url_length = first_url.len();
+    first_context.document_url = ak::Span::new(first_url);
+    first_context.document_base_url = ak::Span::new(first_url);
     let mut second_context = first_context;
     let second_url = b"https://second.example/other/";
-    second_context.document_url = second_url.as_ptr();
-    second_context.document_url_length = second_url.len();
-    second_context.document_base_url = second_url.as_ptr();
-    second_context.document_base_url_length = second_url.len();
+    second_context.document_url = ak::Span::new(second_url);
+    second_context.document_base_url = ak::Span::new(second_url);
 
     let source = utf16(".shared-without-images { display: none !important; --image: url(later.png) }");
     let first = parse(&source, &first_context);
@@ -688,11 +682,12 @@ fn cached_calculated_descriptors_keep_their_length_resolution_context() {
     let source =
         utf16("@counter-style contextual { system: numeric; symbols: 'a' 'b'; pad: calc(sign(1em - 1px) + 1) '0'; }");
     let mut context = super::tests::parse_context();
-    let mut lengths = crate::css::style_compute::FfiLengthResolutionContext::default();
-    context.length_resolution_context = (&raw const lengths).cast();
+    let lengths = crate::css::style_compute::FfiLengthResolutionContext::default();
+    context.length_resolution_context = Some(&lengths);
     let first = parse(&source, &context);
-    lengths.font_metrics.font_size = 16.0;
-    context.length_resolution_context = (&raw const lengths).cast();
+    let mut larger_lengths = lengths;
+    larger_lengths.font_metrics.font_size = 16.0;
+    context.length_resolution_context = Some(&larger_lengths);
     let second = parse(&source, &context);
     assert!(!Arc::ptr_eq(&first, &second));
     let repeated = parse(&source, &context);
@@ -711,36 +706,36 @@ fn cache_keys_include_parsing_context_and_replay_side_effects() {
     assert!(!Arc::ptr_eq(&first, &quirks));
     context.in_quirks_mode = false;
     let base_url = b"https://example.com/directory/";
-    context.document_base_url = base_url.as_ptr();
-    context.document_base_url_length = base_url.len();
+    context.document_base_url = ak::Span::new(base_url);
     let with_base_url = parse(&source, &context);
     assert!(Arc::ptr_eq(&first, &with_base_url));
-    context.document_base_url = std::ptr::null();
-    context.document_base_url_length = 0;
+    context.document_base_url = ak::Span::default();
 
-    let mut lengths = crate::css::style_compute::FfiLengthResolutionContext::default();
-    context.length_resolution_context = (&raw const lengths).cast();
+    let lengths = crate::css::style_compute::FfiLengthResolutionContext::default();
+    context.length_resolution_context = Some(&lengths);
     let with_lengths = parse(&source, &context);
-    lengths.viewport_width = 800.0;
-    context.length_resolution_context = (&raw const lengths).cast();
+    let mut resized_lengths = lengths;
+    resized_lengths.viewport_width = 800.0;
+    context.length_resolution_context = Some(&resized_lengths);
     let resized = parse(&source, &context);
     assert!(Arc::ptr_eq(&first, &with_lengths));
     assert!(Arc::ptr_eq(&with_lengths, &resized));
     let mut resolved_viewport_length = false;
-    lengths.resolved_viewport_relative_length = &raw mut resolved_viewport_length;
-    context.length_resolution_context = (&raw const lengths).cast();
+    let mut tracking_lengths = resized_lengths;
+    tracking_lengths.resolved_viewport_relative_length = &raw mut resolved_viewport_length;
+    context.length_resolution_context = Some(&tracking_lengths);
     let tracked = parse(&source, &context);
     let tracked_again = parse(&source, &context);
     assert!(!Arc::ptr_eq(&tracked, &tracked_again));
-    context.length_resolution_context = std::ptr::null();
+    context.length_resolution_context = None;
 
-    let mut random_index = 7;
-    context.random_function_index = &raw mut random_index;
+    let random_index = crate::css::parser::value_parser::RandomFunctionIndex::new(7);
+    context.random_function_index = Some(&random_index);
     let with_counter = parse(&source, &context);
-    let final_index = random_index;
-    random_index = 7;
+    let final_index = random_index.get();
+    random_index.set(7);
     let with_counter_again = parse(&source, &context);
-    assert_eq!(random_index, final_index);
+    assert_eq!(random_index.get(), final_index);
     assert!(Arc::ptr_eq(&with_counter, &with_counter_again));
 }
 
@@ -748,7 +743,7 @@ fn cache_keys_include_parsing_context_and_replay_side_effects() {
 fn cache_shares_ascii_and_utf16_sources() {
     let source = b".cached { width: 13px }";
     let context = super::tests::parse_context();
-    let ascii = unsafe { parse_shared_stylesheet(TokenizerInput::Ascii(source), &context) };
+    let ascii = parse_shared_stylesheet(TokenizerInput::Ascii(source), Some(&context));
     let wide = parse(&utf16(".cached { width: 13px }"), &context);
     assert!(Arc::ptr_eq(&ascii, &wide));
 }
@@ -806,25 +801,21 @@ fn independent_workers_read_the_same_immutable_graph() {
             ));
             assert_eq!(serialize_style_value_to_utf16(&expected_value), utf16("13px"));
             assert_eq!(sheet.rules.len(), 4);
-            unsafe {
-                assert_eq!(
-                    rust_parsed_selector_list_length(Arc::as_ptr(sheet.rules[0].selector_list.as_ref().unwrap())),
-                    1
-                );
-                assert_eq!(
-                    css_query_evaluate_supports(sheet.rules[1].supports_condition.as_deref()),
-                    1
-                );
-            }
+            assert_eq!(
+                rust_parsed_selector_list_length(sheet.rules[0].selector_list.as_ref().unwrap()),
+                1
+            );
+            assert_eq!(
+                css_query_evaluate_supports(sheet.rules[1].supports_condition.as_deref()),
+                1
+            );
             let ParsedRuleChild::Rule(nested) = &sheet.rules[1].children[0] else {
                 panic!()
             };
-            unsafe {
-                assert_eq!(
-                    rust_parsed_selector_list_length(Arc::as_ptr(nested.selector_list.as_ref().unwrap())),
-                    1
-                )
-            };
+            assert_eq!(
+                rust_parsed_selector_list_length(nested.selector_list.as_ref().unwrap()),
+                1
+            );
             assert_eq!(
                 *sheet.rules[2].property_rule.as_ref().unwrap().syntax,
                 SyntaxNode::Type(SyntaxType::Length)
@@ -862,17 +853,15 @@ fn scope_presence_and_native_selector_names_survive_worker_exit() {
                 (scope.start.as_ref().unwrap(), "親"),
                 (scope.end.as_ref().unwrap(), "限界"),
             ] {
-                unsafe {
-                    assert_eq!(rust_parsed_selector_list_length(Arc::as_ptr(selectors)), 1);
-                    let selector = &selectors.selectors()[0].compound_selectors[0].simple_selectors[0];
-                    let crate::css::selector::SimpleSelector::Class(name) = selector else {
-                        panic!("expected class selector")
-                    };
-                    assert_eq!(
-                        name.name,
-                        crate::css::retained_fly_string::RetainedUtf16FlyString::from_utf16(&utf16(expected))
-                    );
-                }
+                assert_eq!(rust_parsed_selector_list_length(selectors), 1);
+                let selector = &selectors.selectors()[0].compound_selectors[0].simple_selectors[0];
+                let crate::css::selector::SimpleSelector::Class(name) = selector else {
+                    panic!("expected class selector")
+                };
+                assert_eq!(
+                    name.name,
+                    crate::css::retained_fly_string::RetainedUtf16FlyString::from_utf16(&utf16(expected))
+                );
             }
         }
     }
@@ -928,7 +917,7 @@ fn container_conditions_own_names_and_queries_after_the_sheet_is_dropped() {
     assert!(entries[2].name.is_none());
     assert!(entries[0].query.is_some());
     unsafe {
-        let query = Arc::as_ptr(entries[2].query.as_ref().unwrap());
+        let query = entries[2].query.as_deref();
         let mut text = Vec::<u16>::new();
         assert!(css_query_serialize_condition(
             query,
@@ -1127,7 +1116,10 @@ fn media_mutation_preserves_live_owners_and_shared_snapshots() {
     let retained = media.clone();
     unsafe {
         let shared = Box::from_raw(rust_media_list_share(&media));
-        assert!(rust_media_list_evaluate(&media, std::mem::zeroed()));
+        assert!(rust_media_list_evaluate(
+            &media,
+            crate::css::parser::query_parser::FfiMediaEnvironment::new(&[], None)
+        ));
         assert!(rust_media_list_matches(&retained));
         assert!(!rust_media_list_matches(&shared));
         assert!(matches!(
@@ -1175,14 +1167,12 @@ fn function_descriptor_blocks_retain_worker_parsed_values() {
     use crate::css::descriptor_block::FfiDescriptorBlock;
     let (data, parsed_values) = std::thread::spawn(|| {
         let source = utf16("--色: 13px; result: var(--色)");
-        let parse = unsafe {
-            super::parse_shared_block(
-                TokenizerInput::Utf16(&source),
-                vec![super::RuleContext::AtFunction],
-                &super::tests::parse_context(),
-                false,
-            )
-        };
+        let parse = super::parse_shared_block(
+            TokenizerInput::Utf16(&source),
+            vec![super::RuleContext::AtFunction],
+            Some(&super::tests::parse_context()),
+            false,
+        );
         assert_eq!(parse.items.len(), 1);
         let ParsedRuleChild::Declarations(list) = &parse.items[0] else {
             panic!()

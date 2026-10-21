@@ -605,6 +605,16 @@ void BrowserWindow::initialize_tab(Tab* tab)
         }
     });
 
+    tab->view().on_new_webdriver_window = [this](WebView::ViewImplementation::NewWindowType type) {
+        using NewWindowType = WebView::ViewImplementation::NewWindowType;
+        if (type == NewWindowType::Window) {
+            auto& window = Application::the().new_window({ URL::about_blank() }, Application::the().configuration_for_new_window(), IsPopupWindow::No, m_is_private, nullptr, {}, ShowWindow::WithoutActivating);
+            return WebView::ViewImplementation::NewWebDriverWindow { window.current_tab()->view(), type };
+        }
+        auto& new_tab = create_new_tab(Web::HTML::ActivateTab::No, TabLocation::end());
+        return WebView::ViewImplementation::NewWebDriverWindow { new_tab.view(), type };
+    };
+
     tab->view().on_new_web_view = [this, tab](auto activate_tab, Web::HTML::WebViewHints hints, WebView::CanonicalTraversable& traversable) {
         if (hints.popup) {
             auto cascaded_configuration = Application::the().configuration_for_new_window();
@@ -742,8 +752,7 @@ void BrowserWindow::set_current_tab(Tab* tab)
             m_session->session_store->active_tab_changed(*session_tab_id);
     }
 
-    WebView::Application::the().update_bookmark_action_for_current_web_view();
-    WebView::Application::the().update_editing_history_actions();
+    WebView::Application::the().update_actions_for_active_web_view();
 }
 
 void BrowserWindow::activate_tab(int index)
@@ -1167,6 +1176,7 @@ bool BrowserWindow::event(QEvent* event)
 
     if (event->type() == QEvent::WindowActivate) {
         Application::the().set_active_window(*this);
+        WebView::Application::the().update_actions_for_active_web_view();
         QTimer::singleShot(0, this, [this] {
             refresh_resize_cursor_at_current_position(true);
             Application::the().crash_report_notifier().show_pending();

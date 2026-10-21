@@ -39,14 +39,17 @@ public:
 
     // Controller only: asks the Browser for this server's connection to the AudioServer.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_audio_server_transport();
+    // Controller only: asks the Browser for this server's connection to its VideoDecoderServer. The Browser answers
+    // once it has one, and the callback runs on this thread when the answer arrives.
+    using VideoDecoderServerTransportCallback = Function<void(ErrorOr<NonnullOwnPtr<IPC::Transport>>)>;
+    void request_video_decoder_server_transport(VideoDecoderServerTransportCallback);
 
 private:
     virtual Messages::MediaServer::ConnectNewClientResponse connect_new_client() override;
+    virtual void video_decoder_server_connection_ready(u64 request_id, Optional<IPC::TransportHandle> handle) override;
 
     virtual void connect_video_presentation_channel(int client_id, IPC::TransportHandle handle) override;
 
-    virtual Messages::MediaServer::QueryFileMediaSupportResponse query_file_media_support(String type, String subtype, Optional<String> codecs_parameter) override;
-    virtual Messages::MediaServer::QueryDecoderCapabilitiesResponse query_decoder_capabilities(String codecs_parameter) override;
     virtual void request_file_media_support(u64 request_id, String type, String subtype, Optional<String> codecs_parameter) override;
     virtual void request_decoder_capabilities(u64 request_id, String codecs_parameter) override;
     virtual void decode_audio_data(u64 request_id, Core::AnonymousBuffer data, u32 output_sample_rate) override;
@@ -72,7 +75,6 @@ private:
     virtual void reserve_video_sink(u64 session_id, u64 seek_request_id, Media::Track track, Media::VideoSinkHandle handle, bool resume_ended_playback) override;
     virtual void disable_video_sink(u64 session_id, u64 seek_request_id, Media::VideoSinkHandle handle) override;
     virtual void set_video_sink_ticking(u64 session_id, Media::VideoSinkHandle handle, bool ticking) override;
-    virtual Messages::MediaServer::MapPresentedFrameSlotResponse map_presented_frame_slot(u64 session_id, Media::VideoSinkHandle handle, Media::VideoFramePoolID pool_id, u32 slot_index) override;
 
     virtual void create_source_buffer(u64 session_id, u64 source_buffer_id) override;
     virtual void destroy_source_buffer(u64 session_id, u64 source_buffer_id) override;
@@ -101,6 +103,9 @@ private:
     Media::IncrementallyPopulatedStream* find_media_stream(u64 stream_id);
 
     Role m_role { Role::Renderer };
+
+    HashMap<u64, VideoDecoderServerTransportCallback> m_video_decoder_server_transport_requests;
+    u64 m_next_video_decoder_server_transport_request_id { 1 };
 
     HashMap<u64, NonnullOwnPtr<PlaybackSession>> m_playback_sessions;
     HashMap<u64, NonnullRefPtr<Media::IncrementallyPopulatedStream>> m_media_streams;

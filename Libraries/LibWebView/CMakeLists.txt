@@ -52,6 +52,7 @@ set(SOURCES
     TabPerformanceMonitor.cpp
     ProcessMonitor.cpp
     Profile.cpp
+    ReportSubmission.cpp
     RequestServerManager.cpp
     RequestServerSiteBindings.cpp
     SearchEngine.cpp
@@ -66,7 +67,9 @@ set(SOURCES
     URL.cpp
     UserAgent.cpp
     Utilities.cpp
+    VideoDecoderServerControlClient.cpp
     ViewImplementation.cpp
+    WebCompatReport.cpp
     WebContentClient.cpp
     WebContentPage.cpp
     WebContentTestClient.cpp
@@ -103,6 +106,8 @@ set(GENERATED_SOURCES
     ../../Services/AudioServer/AudioServerControlEndpoint.h
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
+    ../../Services/VideoDecoderServer/VideoDecoderServerControlClientEndpoint.h
+    ../../Services/VideoDecoderServer/VideoDecoderServerControlEndpoint.h
     UIProcessClientEndpoint.h
     UIProcessServerEndpoint.h
 )

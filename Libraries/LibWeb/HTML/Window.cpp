@@ -89,6 +89,7 @@
 #include <LibWeb/Internals/Internals.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/RequestIdleCallback/IdleDeadline.h>
@@ -304,10 +305,14 @@ void run_animation_frame_callbacks(DOM::Document& document, double now)
 {
     // FIXME: Bring this closer to the spec.
     auto window = document.window();
+    auto& driver = window->animation_frame_callback_driver();
     if (photon_frame_trace_enabled())
         dbgln("[FrameTrace] raf_document_state window={} at_ms={:.3f} hidden={} fully_active={} page_visible={} rendering_opportunity={} animated_style_pending={}", reinterpret_cast<FlatPtr>(window.ptr()), HighResolutionTime::unsafe_shared_current_time(), document.hidden(), document.is_fully_active(), document.page().system_visibility_state() == VisibilityState::Visible, document.page().client().has_rendering_opportunity(), document.needs_animated_style_update());
     if (photon_frame_trace_enabled()) dbgln("[FrameTrace] run_animation_frame_callbacks window={} at_ms={:.3f} frame_time_ms={:.3f} has_callbacks={}", reinterpret_cast<FlatPtr>(window.ptr()), HighResolutionTime::unsafe_shared_current_time(), now, window->has_animation_frame_callbacks());
-    window->animation_frame_callback_driver().run(now);
+    set_rendering_pending(document, RenderingPendingReason::ScheduledAnimationFrameCallbacks, 0);
+    driver.run(now);
+    if (Core::StatsLog::the())
+        set_rendering_pending(document, RenderingPendingReason::ScheduledAnimationFrameCallbacks, driver.callback_count());
 }
 
 // NB: A GC cell, so that the window's two idle callback lists trace the handler, and with it the WebIDL callback the
@@ -2144,6 +2149,8 @@ WebIDL::UnsignedLong Window::request_animation_frame(AnimationFrameCallbackHandl
     // FIXME: Make this fully spec compliant. Currently implements a mix of 'requestAnimationFrame()' and 'run the animation frame callbacks'.
     auto handle = animation_frame_callback_driver().add(GC::create_function(GC::Heap::the(), move(callback)));
     if (photon_frame_trace_enabled()) dbgln("[FrameTrace] requestAnimationFrame window={} handle={} at_ms={:.3f}", reinterpret_cast<FlatPtr>(this), handle, HighResolutionTime::unsafe_shared_current_time());
+    if (Core::StatsLog::the())
+        set_rendering_pending(associated_document(), RenderingPendingReason::ScheduledAnimationFrameCallbacks, animation_frame_callback_driver().callback_count());
     page().client().request_frame();
     return handle;
 }
@@ -2156,8 +2163,11 @@ void Window::cancel_animation_frame(WebIDL::UnsignedLong handle)
 
     // 2. Let callbacks be this's target object's map of animation frame callbacks.
     // 3. Remove callbacks[handle].
-    if (m_animation_frame_callback_driver)
+    if (m_animation_frame_callback_driver) {
         (void)m_animation_frame_callback_driver->remove(handle);
+        if (Core::StatsLog::the())
+            set_rendering_pending(associated_document(), RenderingPendingReason::ScheduledAnimationFrameCallbacks, m_animation_frame_callback_driver->callback_count());
+    }
 }
 
 AnimationFrameCallbackDriver& Window::animation_frame_callback_driver()

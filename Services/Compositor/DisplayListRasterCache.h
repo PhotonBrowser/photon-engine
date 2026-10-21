@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullOwnPtr.h>
@@ -26,17 +27,11 @@ class sk_sp;
 
 namespace Compositor {
 
-enum class TextRasterizationMode : u8 {
-    Normal,
-    Unhinted,
-};
-
 struct TextBlobCacheKey {
     u64 font_id { 0 };
     u32 scale_bits { 0 };
     u8 font_smoothing { 0 };
     u64 glyph_hash { 0 };
-    TextRasterizationMode rasterization_mode { TextRasterizationMode::Normal };
 
     bool operator==(TextBlobCacheKey const&) const = default;
 };
@@ -49,7 +44,7 @@ template<>
 struct Traits<Compositor::TextBlobCacheKey> : public DefaultTraits<Compositor::TextBlobCacheKey> {
     static unsigned hash(Compositor::TextBlobCacheKey const& key)
     {
-        return pair_int_hash(pair_int_hash(u64_hash(key.font_id ^ key.glyph_hash), key.scale_bits), pair_int_hash(key.font_smoothing, static_cast<u8>(key.rasterization_mode)));
+        return pair_int_hash(pair_int_hash(u64_hash(key.font_id ^ key.glyph_hash), key.scale_bits), key.font_smoothing);
     }
 };
 
@@ -71,13 +66,14 @@ public:
     void evict(Compositing::DisplayListResourceSet const& removed_resources);
 
     sk_sp<SkImage> image_for_image_frame(Compositing::DisplayListResourceStorage const&, Compositing::ImageFrameResourceId, RefPtr<Gfx::SkiaBackendContext> const&);
-    sk_sp<SkImage> image_for_video_sink(Compositing::DisplayListResourceStorage const&, Compositing::VideoSinkResourceId, RefPtr<Gfx::SkiaBackendContext> const&);
+    // The image can be larger than the frame, whose visible size is the part of it to draw.
+    sk_sp<SkImage> image_for_video_sink(Compositing::DisplayListResourceStorage const&, Compositing::VideoSinkResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntSize& visible_size);
     sk_sp<SkImage> repeated_tile_raster(u64 tile_key, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&) const;
     void add_repeated_tile_raster(u64 tile_key, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&, sk_sp<SkImage>);
     sk_sp<SkImage> nested_display_list_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect visible_rect_in_list_space, Gfx::IntRect& raster_rect_in_list_space);
-    void add_nested_display_list_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_list_space, sk_sp<SkImage>);
-    bool should_cache_nested_display_list_raster(Compositing::DisplayListResourceStorage const&, Compositing::DisplayListResourceId);
-    sk_sp<SkTextBlob> text_blob(Compositing::DisplayListResourceStorage const&, Compositing::FontResourceId, float scale, ReadonlySpan<Compositing::DisplayListGlyph>, u8 font_smoothing, TextRasterizationMode = TextRasterizationMode::Normal);
+    bool has_rasterized_nested_display_list(Compositing::DisplayListResourceId) const;
+    sk_sp<SkImage> create_nested_display_list_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_list_space, Function<sk_sp<SkImage>()> const& rasterize);
+    sk_sp<SkTextBlob> text_blob(Compositing::DisplayListResourceStorage const&, Compositing::FontResourceId, float scale, ReadonlySpan<Compositing::DisplayListGlyph>, u8 font_smoothing);
 
 private:
     struct ImageFrameImage;
@@ -91,6 +87,7 @@ private:
     HashMap<u64, NonnullOwnPtr<RepeatedTileRaster>> m_repeated_tile_rasters;
     size_t m_repeated_tile_raster_bytes { 0 };
     HashMap<u64, NonnullOwnPtr<NestedDisplayListRasters>> m_nested_display_list_rasters;
+    size_t m_nested_raster_cache_reserved_bytes { 0 };
     HashMap<TextBlobCacheKey, NonnullOwnPtr<TextBlob>> m_text_blobs;
     size_t m_text_blob_cache_bytes { 0 };
     MonotonicTime m_text_blob_cache_sweep_time { MonotonicTime::now() };

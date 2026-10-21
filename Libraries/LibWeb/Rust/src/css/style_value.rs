@@ -55,7 +55,7 @@ impl RetainedComponentValueList {
             return &[];
         }
         // SAFETY: The allocation is owned by this handle and has `length` initialized elements.
-        unsafe { std::slice::from_raw_parts(self.pointer.cast(), self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer.cast(), self.length) }
     }
 }
 
@@ -421,7 +421,7 @@ impl RetainedStyleValueData {
         // SAFETY: This repr(C) type has exactly one field, a *const c_void, so its
         //         size, alignment and layout match that pointer. The shared slice
         //         borrows the handles and cannot outlive or modify their storage.
-        unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), values.len()) }
+        unsafe { ak::slice_from_raw_parts(values.as_ptr().cast(), values.len()) }
     }
 
     pub(crate) fn pointer(&self) -> *const StyleValueData {
@@ -503,7 +503,7 @@ impl RetainedStyleValueDataList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 
     pub(crate) fn from_retained_values(values: Vec<RetainedStyleValueData>) -> Self {
@@ -599,7 +599,7 @@ macro_rules! retained_list {
                         length: 0,
                     };
                 }
-                let elements = unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+                let elements = unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
                     .to_vec()
                     .into_boxed_slice();
                 let length = elements.len();
@@ -631,7 +631,7 @@ impl RetainedPropertyIdList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -876,7 +876,7 @@ impl RetainedByteList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -1060,7 +1060,7 @@ macro_rules! retained_list_as_slice {
                 if self.pointer.is_null() {
                     return &[];
                 }
-                unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+                unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
             }
         }
     };
@@ -1155,7 +1155,7 @@ impl RetainedColorStopList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -1305,7 +1305,7 @@ impl RetainedGridTrackEntryList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer.cast(), self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer.cast(), self.length) }
     }
 
     pub(crate) fn from_retained_entries(entries: Vec<RetainedGridTrackEntry>) -> Self {
@@ -1473,7 +1473,7 @@ impl RetainedNumericRangeList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 
     pub(crate) fn clone_owned(&self) -> Self {
@@ -1501,7 +1501,7 @@ macro_rules! retained_list_partial_eq {
                     if list.pointer.is_null() {
                         &[]
                     } else {
-                        unsafe { std::slice::from_raw_parts(list.pointer.cast::<$element>(), list.length) }
+                        unsafe { ak::slice_from_raw_parts(list.pointer.cast::<$element>(), list.length) }
                     }
                 };
                 as_slice(self) == as_slice(other)
@@ -2167,36 +2167,27 @@ pub unsafe extern "C" fn rust_style_value_copy_computed_font_families(
 }
 
 /// Reads the primitive payload of a computed absolute length.
-///
-/// # Safety
-/// `value` must point at live Length StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_length_value(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_length_value(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Length { value, .. } => *value,
         _ => unreachable!("computed value must be a length"),
     }
 }
 
 /// Reads the primitive payload of a computed number.
-///
-/// # Safety
-/// `value` must point at live Number StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_number(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_number(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Number { value } => *value,
         _ => unreachable!("computed value must be a number"),
     }
 }
 
 /// Reads the primitive payload of a computed percentage.
-///
-/// # Safety
-/// `value` must point at live Percentage StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_percentage(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_percentage(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Percentage { value } => *value,
         _ => unreachable!("computed value must be a percentage"),
     }
@@ -3289,7 +3280,7 @@ pub(crate) fn retained_style_values_equal(first: &RetainedStyleValueData, second
 }
 
 /// Two absent values are equal, and an absent value equals no present one.
-fn optional_style_values_equal(first: Option<&StyleValueData>, second: Option<&StyleValueData>) -> bool {
+pub(crate) fn optional_style_values_equal(first: Option<&StyleValueData>, second: Option<&StyleValueData>) -> bool {
     match (first, second) {
         (None, None) => true,
         (Some(first), Some(second)) => style_values_equal(first, second),
@@ -3549,28 +3540,25 @@ pub(crate) fn value_may_depend_on_font_metrics(value: &StyleValueData) -> bool {
         .expect("font dependency requested for an unsupported value")
 }
 
-pub(crate) fn style_value_dependency_flags(value: *const StyleValueData) -> u8 {
-    let value = unsafe { &*value };
+pub(crate) fn style_value_dependency_flags(value: &StyleValueData) -> u8 {
     u8::from(value_depends_on_current_color(value))
         | (u8::from(value_depends_on_color_scheme(value)) << 1)
         | (u8::from(value_may_depend_on_font_metrics(value)) << 2)
 }
 
 pub(crate) fn retained_value_depends_on_current_color(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 1 != 0
+    style_value_dependency_flags(value.data()) & 1 != 0
 }
 
 pub(crate) fn retained_value_depends_on_color_scheme(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 2 != 0
+    style_value_dependency_flags(value.data()) & 2 != 0
 }
 
 pub(crate) fn retained_value_may_depend_on_font_metrics(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 4 != 0
+    style_value_dependency_flags(value.data()) & 4 != 0
 }
 
-/// # Safety
-/// `data` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_depends_on_current_color(data: *const c_void) -> bool {
-    value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) })
+pub extern "C" fn rust_style_value_depends_on_current_color(data: &StyleValueData) -> bool {
+    value_depends_on_current_color(data)
 }

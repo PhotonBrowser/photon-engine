@@ -13,6 +13,7 @@
 #include <AK/FFIHelpers.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/UnicodeUtils.h>
+#include <LibCore/StatsLog.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
 #include <LibTextCodec/Decoder.h>
@@ -47,12 +48,15 @@
 #include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/HTMLToken.h>
 #include <LibWeb/HTML/Parser/ParserScriptingMode.h>
 #include <LibWeb/HTML/Parser/SpeculativeHTMLParser.h>
 #include <LibWeb/HTML/PolicyContainers.h>
+#include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
@@ -60,6 +64,7 @@
 #include <LibWeb/HTMLTokenizerRustFFI.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
@@ -657,6 +662,9 @@ void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> pa
     if (parser)
         parser->m_tokenizer.undefine_insertion_point();
 
+    // NB: The normal parser fetches nothing more.
+    discard_speculative_preloads(*document);
+
     // 3. Update the current document readiness to "interactive".
     document->update_readiness(HTML::DocumentReadyState::Interactive);
 
@@ -747,6 +755,15 @@ void HTMLParserEndState::schedule_progress_check()
     }));
 }
 
+static bool navigable_container_is_rendered(DOM::Document& document)
+{
+    auto navigable = document.navigable();
+    if (!navigable || !navigable->container())
+        return true;
+    auto& container = *navigable->container();
+    return container.document().update_style_for_element(DOM::AbstractElement { container }, DOM::Document::StyleUpdateMode::StopAtDisplayNone);
+}
+
 void HTMLParserEndState::check_progress()
 {
     if (m_phase == Phase::Cancelled)
@@ -802,7 +819,8 @@ void HTMLParserEndState::check_progress()
         // 8. Spin the event loop until there is nothing that delays the load event in the Document.
         // AD-HOC: Update layout first so font loads selected by text shaping can delay the load event.
         // INTEROP: Gecko also flushes layout before firing the load event — so lazily-started font loads hold it back.
-        m_document->update_layout_for_document_readiness_complete();
+        if (navigable_container_is_rendered(*m_document))
+            m_document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
         if (m_document->anything_is_delaying_the_load_event())
             return;
 
@@ -815,6 +833,22 @@ void HTMLParserEndState::check_progress()
     case Phase::Cancelled:
         return;
     }
+}
+
+static void log_document_stats_event(DOM::Document const& document, StringView name)
+{
+    auto* log = Core::StatsLog::the();
+    if (!log || document.is_decoded_svg() || !document.is_active())
+        return;
+    auto navigable = document.navigable();
+    if (!navigable || !navigable->is_top_level_traversable())
+        return;
+    JsonObject data;
+    data.set("page_id"sv, document.page().client().id().value());
+    data.set("navigable_id"sv, MUST(String::formatted("{}", navigable->id())));
+    data.set("document_id"sv, MUST(String::formatted("{}", document.id())));
+    data.set("url"sv, document.url().serialize());
+    log->event(name, move(data));
 }
 
 void HTMLParserEndState::advance_to_dom_content_loaded_phase()
@@ -843,6 +877,9 @@ void HTMLParserEndState::advance_to_dom_content_loaded_phase()
             return;
         // 1. Set the Document's load timing info's DOM content loaded event start time to the current high resolution time given the Document's relevant global object.
         document->load_timing_info().dom_content_loaded_event_start_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(*document));
+
+        if (Core::StatsLog::the())
+            log_document_stats_event(*document, "DOMContentLoaded"sv);
 
         // 2. Fire an event named DOMContentLoaded at the Document object, with its bubbles attribute initialized to true.
         auto content_loaded_event = DOM::Event::create(
@@ -939,13 +976,17 @@ void HTMLParserEndState::complete()
         //         layout otherwise wait for the next rendering update, and a load handler that
         //         changes style would fold its change into the document's very first style pass,
         //         where a transition it expects to start has no before-change style to start from.
-        document->update_layout_for_document_readiness_complete();
+        if (navigable_container_is_rendered(*document))
+            document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
 
         // 3. Let window be the Document's relevant global object.
         auto& window = relevant_window(*document);
 
         // 4. Set the Document's load timing info's load event start time to the current high resolution time given window.
         document->load_timing_info().load_event_start_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(window));
+
+        if (Core::StatsLog::the())
+            log_document_stats_event(*document, "load"sv);
 
         // 5. Fire an event named load at window, with legacy target override flag set.
         // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
@@ -2579,6 +2620,7 @@ void HTMLParser::abort()
 
     // 2. Stop the speculative HTML parser for this HTML parser.
     stop_the_speculative_html_parser();
+    discard_speculative_preloads(*m_document);
 
     // 3. Update the current document readiness to "interactive".
     m_document->update_readiness(DocumentReadyState::Interactive);

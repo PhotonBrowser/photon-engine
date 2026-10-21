@@ -15,6 +15,7 @@
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
 #include <LibCompositing/DisplayList/DisplayListResourceIds.h>
+#include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibCore/Forward.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Rect.h>
@@ -159,6 +160,15 @@ public:
     GC::Ref<AudioTrackList> audio_tracks() const { return *m_audio_tracks; }
     GC::Ref<VideoTrackList> video_tracks() const { return *m_video_tracks; }
     GC::Ref<TextTrackList> text_tracks() const { return *m_text_tracks; }
+    enum class TimeMarchesOnReason : u8 {
+        NormalPlayback,
+        Other,
+    };
+    void time_marches_on(TimeMarchesOnReason = TimeMarchesOnReason::NormalPlayback);
+
+    void add_newly_introduced_cues(ReadonlySpan<GC::Ref<TextTrackCue>>);
+    void text_track_cue_or_text_track_removed();
+    void text_track_mode_changed();
 
     void set_audio_track_enabled(Badge<AudioTrack>, GC::Ptr<HTML::AudioTrack> audio_track, bool);
 
@@ -190,7 +200,7 @@ public:
     CORSSettingAttribute crossorigin() const { return m_crossorigin; }
 
     Optional<Media::VideoSinkHandle> video_sink_handle() const;
-    RefPtr<Media::VideoFrame> current_presented_frame() const;
+    Optional<Compositing::CapturedVideoFrame> capture_current_video_frame() const;
 
     Optional<Compositing::VideoSinkResourceId> video_sink_resource_id() const;
 
@@ -230,6 +240,11 @@ private:
     void load_remote_resource(ByteRange const&);
     void load_local_resource(MediaProvider const&, ESCAPING Function<void(Utf16String)> failure_callback);
     bool preload_attribute_is_in_none_state() const;
+    bool preload_attribute_is_in_automatic_state() const;
+    bool should_suspend_the_download() const;
+    void update_download_suspension();
+    void stop_suspending_the_download_after_first_frame();
+    void stop_suspending_the_download_after_a_track_change();
     bool should_wait_for_an_implementation_defined_event_before_fetching_the_resource() const;
     void wait_for_an_implementation_defined_event_before_fetching_the_resource(u32 fetch_generation);
     void continue_fetching_the_resource_after_an_implementation_defined_event();
@@ -315,12 +330,6 @@ private:
     void reached_end_of_media_playback();
 
     void dispatch_time_update_event();
-
-    enum class TimeMarchesOnReason : u8 {
-        NormalPlayback,
-        Other,
-    };
-    void time_marches_on(TimeMarchesOnReason = TimeMarchesOnReason::NormalPlayback);
 
     GC::RootVector<GC::Ref<WebIDL::Promise>> take_pending_play_promises();
     void resolve_pending_play_promises(ReadonlySpan<GC::Ref<WebIDL::Promise>> promises);
@@ -419,6 +428,14 @@ private:
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-texttracks
     GC::Ptr<TextTrackList> m_text_tracks;
+
+    // https://html.spec.whatwg.org/multipage/media.html#list-of-newly-introduced-cues
+    Vector<GC::Ref<TextTrackCue>> m_list_of_newly_introduced_cues;
+
+    Optional<double> m_time_marches_on_last_time;
+
+    // https://html.spec.whatwg.org/multipage/media.html#pending-text-track-change-notification-flag
+    bool m_pending_text_track_change_notification_flag { false };
 
     // https://html.spec.whatwg.org/multipage/media.html#can-autoplay-flag
     bool m_can_autoplay { true };

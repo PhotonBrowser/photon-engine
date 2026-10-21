@@ -19,6 +19,7 @@
 #include <LibCore/Environment.h>
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/System.h>
 #include <LibCore/TimeZoneWatcher.h>
 #include <LibCore/Timer.h>
@@ -210,15 +211,12 @@ Application::Application(Optional<ByteString> ladybird_binary_path)
 Application::~Application()
 {
 #if defined(AK_OS_MACOS)
-    // NB: Stop bootstrap callbacks before destroying the state they use.
+    // Stop bootstrap callbacks before destroying the state they use.
     m_mach_port_server.clear();
 #endif
 
     m_autocomplete_service.clear();
 
-    // Explicitly delete the observers first, as the observer destructors will refer to Application::the().
-    m_settings_observer.clear();
-    m_bookmark_store_observer.clear();
     if (m_compositor_client)
         m_compositor_client->on_death = nullptr;
 
@@ -244,7 +242,7 @@ Application::~Application()
 
     m_spare_web_content_process = nullptr;
 
-    // NB: Connection die() handlers use the process manager, so destroy the processes while it is still reachable.
+    // Connection die() handlers use the process manager, so destroy the processes while it is still reachable.
     if (m_process_manager)
         m_process_manager->remove_all_processes();
     m_process_manager = nullptr;
@@ -304,6 +302,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<StringView> screenshot_path;
     bool new_window = false;
     bool force_new_process = false;
+    StringView stats_log_directory;
     Optional<StringView> profile_name;
     Optional<StringView> profile_path;
     bool temporary_profile = false;
@@ -331,6 +330,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool disable_http_disk_cache = false;
     bool disable_content_blocker = false;
     bool disable_sandbox = false;
+    bool force_video_decoder_server = false;
     Vector<ByteString> content_blocker_list_paths;
     Optional<StringView> resource_substitution_map_path;
     bool enable_autoplay = false;
@@ -389,6 +389,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(new_window, "Force opening in a new window", "new-window", 'n');
 #if !defined(AK_OS_ANDROID)
     args_parser.add_option(force_new_process, "Force creation of a new browser process", "force-new-process");
+    args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(profile_name, "Select or create a named profile", "profile", 0, "name");
     args_parser.add_option(profile_path, "Use a self-contained profile at an absolute path", "profile-path", 0, "path");
     args_parser.add_option(temporary_profile, "Use a temporary profile that is removed on clean shutdown", "temporary-profile");
@@ -438,6 +439,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(maximum_site_request_servers, "How many RequestServers a session may have for the sites it visits, 0 to share one", "max-site-request-servers", 0, "count");
     args_parser.add_option(disable_content_blocker, "Disable content blocker", "disable-content-blocker");
     args_parser.add_option(disable_sandbox, "Disable helper process sandboxing", "disable-sandbox");
+    args_parser.add_option(force_video_decoder_server, "Also decode video that has no hardware decoder in the VideoDecoderServer", "force-video-decoder-server");
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
         .help_string = "Path to a content blocker list. May be specified multiple times.",
@@ -493,6 +495,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     create_platform_arguments(args_parser);
     args_parser.parse(m_arguments);
 
+    m_stats_log = TRY(Core::StatsLog::create(stats_log_directory, "Ladybird"sv));
+
 #if !defined(AK_OS_ANDROID)
     ProfileSelection profile_selection;
     if (force_new_process) {
@@ -530,8 +534,9 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     m_profile = TRY(Profile::create(profile_selection, profile_roots));
 #endif
 
-    // Browsers launched by WebDriver are driven directly and must never join an existing browser process.
-    bool coordinate_browser_process = !headless_mode.has_value() && !webdriver_browser_endpoint.has_value() && should_coordinate_browser_process();
+    // Browsers launched by WebDriver are driven directly and must never join an existing browser process. A browser
+    // that logs process statistics must not join one either, since that browser would not sample them.
+    bool coordinate_browser_process = !headless_mode.has_value() && !webdriver_browser_endpoint.has_value() && !m_stats_log && should_coordinate_browser_process();
 
     // Synchronous IPC used to forward URLs to an existing browser process requires an event loop.
     if (coordinate_browser_process) {
@@ -641,6 +646,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .devtools_port = devtools_port,
         .enable_content_blocker = disable_content_blocker ? EnableContentBlocker::No : EnableContentBlocker::Yes,
         .disable_sandbox = disable_sandbox ? DisableSandbox::Yes : DisableSandbox::No,
+        .force_video_decoder_server = force_video_decoder_server ? ForceVideoDecoderServer::Yes : ForceVideoDecoderServer::No,
     };
     rebuild_content_blocker_list_paths();
 
@@ -727,6 +733,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     // NB: The host's thread makes an event loop, which would install the default event loop manager if the platform
     //     one were not installed yet.
     m_font_service_host = FontServiceHost::create(*m_font_service);
+    if (m_stats_log)
+        m_stats_log->start_sampling();
     TRY(launch_services());
 
     if (m_web_content_options.is_test_mode == IsTestMode::No && m_browser_options.enable_content_blocker == EnableContentBlocker::Yes) {
@@ -1796,6 +1804,9 @@ ErrorOr<void> Application::launch_compositor_process()
     m_compositor_client->on_death = [this]() {
         handle_compositor_process_death();
     };
+    m_compositor_client->on_gpu_device_identity_reported = [this](Optional<Gfx::GpuDeviceIdentity> identity) {
+        compositor_reported_gpu_device_identity(move(identity));
+    };
 
     if (!platform_reports_scroll_momentum())
         m_compositor_client->async_set_synthesizes_scroll_momentum(true);
@@ -1811,6 +1822,29 @@ ErrorOr<void> Application::launch_compositor_process()
 #endif
 
     return {};
+}
+
+void Application::compositor_reported_gpu_device_identity(Optional<Gfx::GpuDeviceIdentity> identity)
+{
+    auto previous_identity = exchange(m_compositor_gpu_device_identity, identity);
+
+    // Frames decoded on another GPU cannot be displayed by this Compositor, so decoding starts over on its own. Each
+    // MediaServer relaunches its server when it next asks for one.
+    if (previous_identity.has_value() && *previous_identity != identity)
+        shut_down_video_decoder_servers();
+
+    auto callbacks = move(m_callbacks_awaiting_compositor_gpu_device_identity);
+    for (auto& callback : callbacks)
+        callback(identity);
+}
+
+void Application::when_compositor_gpu_device_identity_is_known(CompositorGpuDeviceIdentityCallback callback)
+{
+    if (m_compositor_gpu_device_identity.has_value()) {
+        callback(*m_compositor_gpu_device_identity);
+        return;
+    }
+    m_callbacks_awaiting_compositor_gpu_device_identity.append(move(callback));
 }
 
 void Application::set_scrolls_elastically(bool enabled)
@@ -2198,6 +2232,9 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     case ProcessType::AudioServer:
         // The connection's holder launches a new AudioServer when it next connects a client; the streams of the old
         // one report their loss and reopen.
+        break;
+    case ProcessType::VideoDecoderServer:
+        // The MediaServer it served asks for a new one once its decoders notice the loss.
         break;
     case ProcessType::RequestServer:
         if (auto client = process.client<Requests::RequestControlClient>()) {
@@ -2733,6 +2770,12 @@ void Application::initialize_actions()
     });
     m_inspect_menu->add_action(*m_toggle_devtools_action);
 
+    m_report_website_issue_action = Action::create("Report Website Issue..."sv, ActionID::ReportWebsiteIssue, [this]() {
+        if (auto view = active_web_view(); view.has_value())
+            view->report_website_issue();
+    });
+    m_report_website_issue_action->set_enabled(false);
+
     m_debug_menu = Menu::create("Debug"sv);
     m_debug_menu->set_visible(m_settings->config_variable_as_bool(ConfigVariableID::ShowAdvancedDebugMenu));
     m_debug_menu->add_action(Action::create("Dump Session History Tree"sv, ActionID::DumpSessionHistoryTree, debug_request("dump-session-history"sv)));
@@ -2996,6 +3039,14 @@ void Application::update_bookmark_action_for_current_web_view()
 
     m_toggle_bookmark_action->set_text(is_bookmarked ? "Remove Bookmark"sv : "Add Bookmark"sv);
     m_toggle_bookmark_action->set_engaged(is_bookmarked);
+}
+
+// The shared actions that depend on the page follow the active view, whichever tab or window made it the active one.
+void Application::update_actions_for_active_web_view()
+{
+    update_bookmark_action_for_current_web_view();
+    update_editing_history_actions();
+    update_report_website_issue_action();
 }
 
 void Application::bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>)
@@ -3436,6 +3487,12 @@ void Application::inspect_indexed_database_objects(DevTools::TabDescription cons
     }
 
     view->inspect_indexed_database_objects(host, move(names), move(options), move(on_complete));
+}
+
+void Application::update_report_website_issue_action()
+{
+    auto view = active_web_view();
+    m_report_website_issue_action->set_enabled(view.has_value() && view->can_report_website_issue());
 }
 
 void Application::update_editing_history_actions()

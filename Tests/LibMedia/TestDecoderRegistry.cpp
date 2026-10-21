@@ -4,14 +4,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibMedia/DecoderRegistry.h>
+#include <LibMedia/DecoderRegistrations.h>
 #include <LibMedia/FFmpeg/FFmpegAudioDecoder.h>
-#include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
+#include <LibMediaCodecs/FFmpeg/FFmpegVideoDecoder.h>
 #include <LibTest/TestCase.h>
 
 #ifdef AK_OS_MACOS
 #    include <LibMedia/AudioToolbox/AudioToolboxAudioDecoder.h>
 #endif
+
+TEST_SETUP
+{
+    Media::install_video_decoders({ Media::hardware_video_decoders(), Media::ffmpeg_video_decoders() });
+    Media::install_audio_decoders({ Media::audio_decoders() });
+}
 
 TEST_CASE(ffmpeg_decoder_capabilities)
 {

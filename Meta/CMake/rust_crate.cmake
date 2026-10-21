@@ -307,12 +307,13 @@ function(build_rust_binary)
 endfunction()
 
 function(test_rust_crate)
-    cmake_parse_arguments(PARSE_ARGV 0 ARG "" "MANIFEST_PATH;CRATE_NAME" "")
+    cmake_parse_arguments(PARSE_ARGV 0 ARG "" "MANIFEST_PATH;CRATE_NAME" "ENVIRONMENT")
     _rust_crate_common_setup(
         MANIFEST_PATH "${ARG_MANIFEST_PATH}"
         CRATE_NAME ${ARG_CRATE_NAME}
         TARGET_DIR "${CMAKE_BINARY_DIR}/cargo/tests/${ARG_CRATE_NAME}"
     )
+    list(APPEND cargo_env ${ARG_ENVIRONMENT})
     # cargo test accepts harness arguments after --, not rustc arguments.
     list(FIND cargo_common_flags "--" rustc_flags_start)
     list(SUBLIST cargo_common_flags 0 ${rustc_flags_start} cargo_test_flags)
@@ -387,6 +388,12 @@ function(_rust_crate_common_setup)
     )
 
     list(APPEND cargo_env "CARGO_TARGET_${target_upper}_RUSTFLAGS=${RUSTC_TARGET_FLAGS}")
+
+    # The optimized builds otherwise leave out every debug assertion, which then runs only in unit tests. A sanitizer
+    # build is one that is run to find bugs, so it checks them too.
+    if (ENABLE_ADDRESS_SANITIZER OR ENABLE_UNDEFINED_SANITIZER)
+        list(APPEND cargo_env "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true")
+    endif()
 
     if (RUSTC_WRAPPER)
         list(APPEND cargo_env

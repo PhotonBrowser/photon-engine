@@ -10,6 +10,7 @@
 #include <AK/Time.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/StatsLog.h>
 #include <LibDevTools/StorageHelpers.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
@@ -454,9 +455,6 @@ void WebContentPage::begin_top_level_load(URL::URL const& url)
     view.m_history_visit_transition_for_next_load = HistoryVisitTransition::Link;
     view.did_start_navigation();
 
-    view.set_url({}, url);
-    view.set_title({}, Utf16String::from_utf8(url.serialize()));
-    view.set_favicon({}, {});
     view.set_editing_history_state(false, false);
 
     if (view.on_load_start)
@@ -2173,6 +2171,16 @@ void WebContentPage::did_change_navigable_container_state(Web::HTML::CrossProces
     if (!navigable.has_value() || !holds_container_of(*navigable, "did_change_navigable_container_state"sv))
         return;
     navigable->update_container_state(move(state));
+}
+
+void WebContentPage::did_update_frame_stats_displayed(Web::HTML::CrossProcessId frame_id, bool displayed)
+{
+    if (!Core::StatsLog::the())
+        return;
+    auto child_frame = traversable().find(frame_id);
+    if (!child_frame.has_value() || !holds_container_of(*child_frame, "did_update_frame_stats_displayed"sv))
+        return;
+    child_frame->set_stats_displayed(displayed);
 }
 
 void WebContentPage::did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio)

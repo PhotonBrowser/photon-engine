@@ -5,14 +5,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibMedia/DecoderRegistrations.h>
 #include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/FFmpeg/FFmpegAudioDecoder.h>
 #include <Tests/LibMedia/TestMediaCommon.h>
 
+TEST_SETUP
+{
+    Media::install_video_decoders({ Media::hardware_video_decoders(), Media::ffmpeg_video_decoders() });
+    Media::install_audio_decoders({ Media::audio_decoders() });
+}
+
 TEST_CASE(44_1Khz_stereo)
 {
-    // FIXME: 96 samples are marked to be discarded, but DecodedAudioProducer currently is not aware of this.
-    decode_audio("vorbis/44_1Khz_stereo.ogg"sv, 44100, 2, 352800 + 96);
+    decode_audio("vorbis/44_1Khz_stereo.ogg"sv, 44100, 2, 352800);
 }
 
 TEST_CASE(input_after_the_end_of_stream_is_rejected_until_flushed)

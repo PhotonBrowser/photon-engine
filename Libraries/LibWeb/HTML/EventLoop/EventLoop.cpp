@@ -7,6 +7,7 @@
 
 #include <AK/AnyOf.h>
 #include <AK/Debug.h>
+#include <AK/JsonObject.h>
 #include <AK/TemporaryChange.h>
 #include <cstdlib>
 #include <LibCore/EventLoop.h>
@@ -18,13 +19,16 @@
 #include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/HTML/AnimationFrameCallbackDriver.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/ClockPlan.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventLoop/FrameCompletion.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
+#include <LibWeb/HTML/ListOfAvailableImages.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
@@ -39,6 +43,7 @@
 #include <LibWeb/Layout/TreeBuilderRustFFI.h>
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -168,6 +173,13 @@ void EventLoop::process()
 {
     if (execution_paused())
         return;
+
+    if (Core::StatsLog::the())
+        begin_rendering_pending_task();
+    ScopeGuard pending_task = [] {
+        if (Core::StatsLog::the())
+            end_rendering_pending_task();
+    };
 
     // 1. Let oldestTask and taskStartTime be null.
     GC::Ptr<Task> oldest_task;
@@ -710,8 +722,9 @@ static bool is_renderable(DOM::Document const& document)
     return true;
 }
 
-// https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
-void EventLoop::update_the_rendering()
+// Takes in what the render clock's lanes did, then the queued input events. The lanes wait for the plan of the rendering
+// update with the serial number `update_serial`. Answers the documents whose lanes were taken in.
+Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(u64 update_serial)
 {
     VERIFY(!m_running_rendering_task);
     m_running_rendering_task = true;
@@ -727,7 +740,6 @@ void EventLoop::update_the_rendering()
     if (m_rendering_update_in_flight && !m_rendering_update_in_flight->held_for_testing && !m_rendering_update_in_flight->layout_flew
         && !let_layout_of_rendering_update_fly())
         finish_rendering_update_in_flight();
-
     // AD-HOC: The render clock's lanes present frames of a document's animations and hover beside the tasks since the
     //         last update, at display ticks later than the opportunity this update renders for, which reached the event
     //         loop only after those tasks. An update after a lane's tick presented a frame renders at the time it runs,
@@ -760,7 +772,7 @@ void EventLoop::update_the_rendering()
             if (auto* root_arena = root_document ? root_document->layout_node_arena_if_created() : nullptr)
                 outer_input_event = Layout::RustFFI::document_host_newest_pointer_input_event(root_arena->host());
         }
-        if (Layout::RustFFI::document_host_take_clock_lanes_in(arena->host(), m_rendering_update_serial, outer_input_event)) {
+        if (Layout::RustFFI::document_host_take_clock_lanes_in(arena->host(), update_serial, outer_input_event)) {
             tick_presented = true;
             navigable->set_needs_to_record_display_list();
             navigable->set_needs_repaint();
@@ -831,6 +843,43 @@ void EventLoop::update_the_rendering()
         if (lanes_taken_in || !arena || !Layout::RustFFI::document_host_may_have_lanes(arena->host()))
             style_computer->forget_style_nodes_retired_beside_lanes();
     }
+    return documents_with_lanes;
+}
+
+// NB: Pointer moves and wheel steps wait for a rendering update, which coalesces those that come at the display's rate.
+//     A button or key press goes ahead of the next display tick, with the events queued before it, unless an update in
+//     flight holds what it would read.
+void EventLoop::queue_task_to_process_input_events()
+{
+    if (m_input_events_task_queued)
+        return;
+    m_input_events_task_queued = true;
+    queue_a_task(Task::Source::UserInteraction, this, nullptr, GC::create_function(GC::Heap::the(), [this] {
+        m_input_events_task_queued = false;
+        if (m_running_rendering_task || m_rendering_update_in_flight)
+            return;
+        take_clock_lanes_and_input_events_in(m_rendering_update_serial + 1);
+    }));
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
+void EventLoop::update_the_rendering()
+{
+    VERIFY(!m_running_rendering_task);
+    m_running_rendering_task = true;
+    for (auto const& page : pages_of_local_roots())
+        page->client().will_begin_rendering_update();
+    auto update_start_time = HighResolutionTime::unsafe_shared_current_time();
+    ++m_rendering_scheduler_counters.updates_run;
+    ++m_rendering_update_serial;
+
+    // AD-HOC: The last rendering update may have ended as its style transaction flew. Its layout runs beside this
+    //         update's steps up to step 16, which takes the rest of it in, or the rest of it runs now.
+    if (m_rendering_update_in_flight && !m_rendering_update_in_flight->held_for_testing && !m_rendering_update_in_flight->layout_flew
+        && !let_layout_of_rendering_update_fly())
+        finish_rendering_update_in_flight();
+
+    auto documents_with_lanes = take_clock_lanes_and_input_events_in(m_rendering_update_serial);
 
     // 1. Let frameTimestamp be eventLoop's last render opportunity time.
     auto frame_timestamp = m_last_render_opportunity_time;
@@ -854,7 +903,22 @@ void EventLoop::update_the_rendering()
         return is_renderable(document);
     });
 
-    // FIXME: 4. Unnecessary rendering: Remove from docs any Document object doc for which all of the following are true:
+    // 4. Unnecessary rendering: Remove from docs any Document object doc for which all of the following are true:
+    //    - the user agent believes that updating the rendering of doc's node navigable would have no visible effect; and
+    //    - doc's map of animation frame callbacks is empty.
+    docs.remove_all_matching([](auto const& document) {
+        // NB: Nothing of a document whose navigable container isn't being rendered (e.g. a display: none iframe) can be
+        //     seen. Its animations, observers and media query lists still report through the steps below, so keep a
+        //     document that has any of them to report.
+        auto container = document->navigable()->container();
+        if (!container || container->has_layout_box())
+            return false;
+        return !document->window()->animation_frame_callback_driver().has_callbacks()
+            && !document->has_associated_animations()
+            && !document->has_intersection_observers()
+            && !document->has_resize_observers()
+            && !document->needs_media_query_list_evaluation();
+    });
 
     // FIXME: 5. Remove from docs all Document objects for which the user agent believes that it's preferable to skip updating the rendering for other reasons.
 
@@ -1180,6 +1244,8 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         // AD-HOC: Script that ran earlier in this rendering update may have spun the event loop and run tasks that
         //         detached doc from its navigable (e.g. after its iframe was removed).
         auto lay_out_first = taken_layout == TakenLayout::UpToDate ? LocalNavigable::LayOutFirst::Yes : LocalNavigable::LayOutFirst::No;
+        if (Core::StatsLog::the() && navigable && !navigable->needs_repaint())
+            did_update_rendering(*doc);
         if (!navigable || !navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate, lay_out_first))
             continue;
         ++m_rendering_scheduler_counters.paints;
@@ -1551,6 +1617,9 @@ void EventLoop::perform_a_microtask_checkpoint()
     // 7. Set the event loop's performing a microtask checkpoint to false.
     m_performing_a_microtask_checkpoint = false;
 
+    if (Core::StatsLog::the())
+        flush_rendering_pending();
+
     // FIXME: 8. Record timing info for microtask checkpoint.
 }
 
@@ -1575,8 +1644,34 @@ void EventLoop::register_document(Badge<DOM::Document>, DOM::Document& document)
     m_documents_sort_dirty = true;
 }
 
+void EventLoop::add_stats(JsonObject& values) const
+{
+    // NB: Read container sizes from the existing document registry, without sorting it or walking any trees.
+    size_t available_images = 0;
+    size_t shared_image_requests = 0;
+    size_t style_sheets = 0;
+    size_t font_faces = 0;
+    for (auto const& document : m_documents) {
+        if (!document)
+            continue;
+        available_images += document->list_of_available_images().size();
+        shared_image_requests += document->shared_resource_requests().size();
+        style_sheets += document->style_scope().style_sheets().size();
+        font_faces += document->fonts()->set_size();
+    }
+    values.set("dom.documents"sv, m_documents.size());
+    values.set("images.available_entries"sv, available_images);
+    values.set("images.shared_requests"sv, shared_image_requests);
+    values.set("css.document_style_sheet_entries"sv, style_sheets);
+    values.set("fonts.face_entries"sv, font_faces);
+    values.set("rendering.updates"sv, m_rendering_scheduler_counters.updates_run);
+    values.set("rendering.paints"sv, m_rendering_scheduler_counters.paints);
+    values.set("rendering.update_duration_us"sv, m_rendering_scheduler_counters.update_microseconds);
+}
+
 void EventLoop::unregister_document(Badge<DOM::Document>, DOM::Document& document)
 {
+    forget_rendering_stats(document);
     bool did_remove = m_documents.remove_first_matching([&](auto& entry) { return entry.ptr().ptr() == &document; });
     VERIFY(did_remove);
 }

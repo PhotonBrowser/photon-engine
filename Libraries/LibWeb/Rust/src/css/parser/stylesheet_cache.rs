@@ -5,7 +5,7 @@
  */
 
 use super::syntax_parser::ParsedStyleSheet;
-use super::value_parser::{FfiValueParsingContext, ParseContext};
+use super::value_parser::{FfiValueParsingContext, ParseContext, RandomFunctionIndex};
 use crate::css::css_tokenizer::TokenizerInput;
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::style_compute::{FfiFontMetrics, FfiLengthResolutionContext};
@@ -165,21 +165,20 @@ fn own_text(source: TokenizerInput<'_>) -> Box<[u16]> {
     text.into_boxed_slice()
 }
 
-unsafe fn own_view(view: FfiUtf16View) -> Option<Box<[u16]>> {
+fn own_view(view: FfiUtf16View) -> Option<Box<[u16]>> {
     Some(own_text(view.units()?))
 }
 
-unsafe fn own_url(pointer: *const u8, length: usize) -> Option<Box<[u16]>> {
-    if length == 0 {
+fn own_url(bytes: &[u8]) -> Option<Box<[u16]>> {
+    if bytes.is_empty() {
         return Some(Box::default());
     }
     // The legacy URL context is UTF-8. Keep the cache's owned strings in native UTF-16.
-    let bytes = unsafe { std::slice::from_raw_parts(pointer, length) };
     Some(std::str::from_utf8(bytes).ok()?.encode_utf16().collect())
 }
 
 impl ContextKey {
-    unsafe fn new(context: &ParseContext) -> Option<Self> {
+    fn new(context: &ParseContext) -> Option<Self> {
         // Keep this exhaustive so new parsing inputs cannot silently bypass the cache key.
         let ParseContext {
             in_quirks_mode,
@@ -188,38 +187,34 @@ impl ContextKey {
             contains_attr_tainted_values,
             is_ua_style_sheet,
             value_contexts: borrowed_value_contexts,
-            value_context_count,
-            declared_namespaces: borrowed_declared_namespaces,
+            declared_namespaces,
             // Parsed values do not use the document URL. Image values capture the base URL.
             document_url: _,
-            document_url_length: _,
             document_base_url,
-            document_base_url_length,
             length_resolution_context,
             random_function_index,
         } = *context;
-        let mut value_contexts = Vec::with_capacity(value_context_count);
-        for index in 0..value_context_count {
-            let FfiValueParsingContext {
-                kind,
-                value,
-                secondary_value,
-                name,
-            } = unsafe { *borrowed_value_contexts.add(index) };
+        let mut value_contexts = Vec::with_capacity(borrowed_value_contexts.as_slice().len());
+        for &FfiValueParsingContext {
+            kind,
+            value,
+            secondary_value,
+            name,
+        } in borrowed_value_contexts.as_slice()
+        {
             value_contexts.push(ValueContextKey {
                 kind: kind as u8,
                 value,
                 secondary_value,
-                name: unsafe { own_view(name) }?,
+                name: own_view(name)?,
             });
         }
-        let declared_namespaces = unsafe { borrowed_declared_namespaces.as_ref() }
+        let declared_namespaces = declared_namespaces
             .into_iter()
             .flat_map(|namespaces| namespaces.prefixes.iter())
             .map(|namespace| namespace.units().into())
             .collect();
-        let length_resolution = match unsafe { length_resolution_context.cast::<FfiLengthResolutionContext>().as_ref() }
-        {
+        let length_resolution = match length_resolution_context {
             Some(context) => Some(LengthResolutionKey::new(context)?),
             None => None,
         };
@@ -234,16 +229,67 @@ impl ContextKey {
                 ],
                 value_contexts,
                 declared_namespaces,
-                random_function_index: unsafe { random_function_index.as_ref() }.copied(),
+                random_function_index: random_function_index.map(RandomFunctionIndex::get),
             },
-            document_base_url: unsafe { own_url(document_base_url, document_base_url_length) }?,
+            document_base_url: own_url(document_base_url.as_slice())?,
             length_resolution,
         })
     }
 }
 
+/// Identifies a sheet's text without keeping a copy of it: its length and two keyed hashes of its code units. The
+/// keys are random for each process, so a page cannot make two different texts collide.
+#[derive(PartialEq, Eq, Hash)]
+struct TextDigest {
+    length: usize,
+    hashes: [u64; 2],
+}
+
+impl TextDigest {
+    fn new(source: TokenizerInput<'_>) -> Self {
+        const CHUNK_BYTES: usize = 4096;
+        static KEYS: OnceLock<[RandomState; 2]> = OnceLock::new();
+        let mut hashers = KEYS
+            .get_or_init(|| [RandomState::new(), RandomState::new()])
+            .each_ref()
+            .map(RandomState::build_hasher);
+        let mut write = |bytes: &[u8]| hashers.iter_mut().for_each(|hasher| hasher.write(bytes));
+        // NB: Equal texts hash equally whether they arrive as ASCII or as UTF-16, so UTF-16 text that is all ASCII is
+        //     hashed as ASCII. The first byte keeps the two forms apart otherwise.
+        let mut chunk = [0u8; CHUNK_BYTES];
+        match source {
+            TokenizerInput::Ascii(units) => {
+                write(&[0]);
+                write(units);
+            }
+            TokenizerInput::Utf16(units) if units.iter().all(|&unit| unit < 0x80) => {
+                write(&[0]);
+                for part in units.chunks(CHUNK_BYTES) {
+                    for (byte, &unit) in chunk.iter_mut().zip(part) {
+                        *byte = unit as u8;
+                    }
+                    write(&chunk[..part.len()]);
+                }
+            }
+            TokenizerInput::Utf16(units) => {
+                write(&[1]);
+                for part in units.chunks(CHUNK_BYTES / 2) {
+                    for (bytes, &unit) in chunk.as_chunks_mut::<2>().0.iter_mut().zip(part) {
+                        bytes.copy_from_slice(&unit.to_ne_bytes());
+                    }
+                    write(&chunk[..part.len() * 2]);
+                }
+            }
+        }
+        Self {
+            length: source.len(),
+            hashes: hashers.map(|hasher| hasher.finish()),
+        }
+    }
+}
+
 struct StyleSheetKey {
-    text: Box<[u16]>,
+    text: TextDigest,
     context: Option<ContextKey>,
 }
 
@@ -328,22 +374,20 @@ fn find(entries: &Entries, hash: u64, key: &StyleSheetKey) -> Option<Arc<ParsedS
     })
 }
 
-/// # Safety
-/// All pointers in `context` must remain valid for this call, just as for parsing.
-pub(super) unsafe fn parse_with_cache(
+pub(super) fn parse_with_cache(
     source: TokenizerInput<'_>,
     context: Option<&ParseContext>,
     parse: impl FnOnce() -> ParsedStyleSheet,
 ) -> Arc<ParsedStyleSheet> {
     let context_key = match context {
-        Some(context) => match unsafe { ContextKey::new(context) } {
+        Some(context) => match ContextKey::new(context) {
             Some(key) => Some(key),
             None => return Arc::new(parse()),
         },
         None => None,
     };
     let key = StyleSheetKey {
-        text: own_text(source),
+        text: TextDigest::new(source),
         context: context_key,
     };
     static HASHER: OnceLock<RandomState> = OnceLock::new();
@@ -376,13 +420,15 @@ pub(super) unsafe fn parse_with_cache(
     };
     if let Some(sheet) = cached {
         sheet.cache_metadata.as_ref().unwrap().dependencies.record();
-        if let Some(counter) = context.and_then(|context| unsafe { context.random_function_index.as_mut() }) {
-            *counter = sheet
-                .cache_metadata
-                .as_ref()
-                .unwrap()
-                .final_random_function_index
-                .unwrap();
+        if let Some(counter) = context.and_then(|context| context.random_function_index) {
+            counter.set(
+                sheet
+                    .cache_metadata
+                    .as_ref()
+                    .unwrap()
+                    .final_random_function_index
+                    .unwrap(),
+            );
         }
         return sheet;
     }
@@ -410,12 +456,32 @@ pub(super) unsafe fn parse_with_cache(
         key,
         dependencies,
         final_random_function_index: context
-            .and_then(|context| unsafe { context.random_function_index.as_ref() })
-            .copied(),
+            .and_then(|context| context.random_function_index)
+            .map(RandomFunctionIndex::get),
     });
     let sheet = Arc::new(sheet);
     entries.entry(hash).or_default().push(Arc::downgrade(&sheet));
     drop(cache);
     drop(in_flight);
     sheet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_digests_agree_for_ascii_and_utf16_forms_of_one_text() {
+        let utf16 = |text: &str| text.encode_utf16().collect::<Vec<_>>();
+        let long = "a { color: red }\n".repeat(1000);
+        for text in ["", "a{}", long.as_str()] {
+            let ascii = TextDigest::new(TokenizerInput::Ascii(text.as_bytes()));
+            assert!(ascii == TextDigest::new(TokenizerInput::Utf16(&utf16(text))));
+        }
+        let ascii = TextDigest::new(TokenizerInput::Ascii(b"a{}"));
+        assert!(ascii != TextDigest::new(TokenizerInput::Ascii(b"b{}")));
+        let wide = TextDigest::new(TokenizerInput::Utf16(&utf16("\u{e9}{}")));
+        assert!(wide == TextDigest::new(TokenizerInput::Utf16(&utf16("\u{e9}{}"))));
+        assert!(wide != TextDigest::new(TokenizerInput::Utf16(&utf16("\u{e8}{}"))));
+    }
 }

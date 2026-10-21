@@ -10,7 +10,7 @@
 #include <LibAudio/SampleSpecification.h>
 #include <LibMedia/Audio/AudioConverter.h>
 #include <LibMedia/Export.h>
-#include <LibMedia/FFmpeg/FFmpegForward.h>
+#include <LibMediaCodecs/FFmpeg/FFmpegForward.h>
 
 namespace Media::FFmpeg {
 
@@ -52,6 +52,7 @@ private:
     size_t m_buffered_frame_count { 0 };
     size_t m_buffered_frame_offset { 0 };
     AK::Duration m_converted_media_time_end;
+    AK::Duration m_input_media_time_end;
     bool m_end_of_stream { false };
 };
 

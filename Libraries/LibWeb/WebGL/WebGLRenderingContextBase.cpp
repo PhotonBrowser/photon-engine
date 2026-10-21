@@ -61,11 +61,6 @@ struct RustContextAttributes {
     bool xr_compatible { false };
 };
 
-struct ByteSpan {
-    u8 const* data { nullptr };
-    size_t size { 0 };
-};
-
 // `ContextCreationArguments` of Bindings/Rust/src/web_gl/exports.rs.
 struct ContextCreationArguments {
     void* transport { nullptr };
@@ -75,8 +70,7 @@ struct ContextCreationArguments {
     void* canvas_host { nullptr };
     bool canvas_is_offscreen { false };
     RustContextAttributes context_attributes;
-    ByteSpan const* supported_extensions { nullptr };
-    size_t supported_extension_count { 0 };
+    ReadonlySpan<ReadonlyBytes> supported_extensions;
 };
 
 // `TexImageSourceKind` and `TexImageSourceResult` of Bindings/Rust/src/web_gl/canvas.rs.
@@ -125,7 +119,7 @@ bool web_webgl_context_mark_lost(void* context);
 void web_webgl_context_set_restore_requested(void* context, bool requested);
 bool web_webgl_context_wants_restoring(void* context);
 void web_webgl_context_actual_context_parameters(void* context, RustContextAttributes* out_context_attributes);
-void web_webgl_context_restore(void* context, void* transport, ByteSpan const* supported_extensions, size_t supported_extension_count);
+void web_webgl_context_restore(void* context, void* transport, ReadonlySpan<ReadonlyBytes> supported_extensions);
 bool web_webgl_context_xr_compatible(void* context);
 void web_webgl_context_set_xr_compatible(void* context, bool xr_compatible);
 
@@ -216,12 +210,12 @@ struct RemoteWebGLContext {
     NonnullRefPtr<RemoteWebGLTransport> transport;
     Vector<String> supported_extensions;
 
-    Vector<ByteSpan> supported_extension_spans() const
+    Vector<ReadonlyBytes> supported_extension_spans() const
     {
-        Vector<ByteSpan> spans;
+        Vector<ReadonlyBytes> spans;
         spans.ensure_capacity(supported_extensions.size());
         for (auto const& extension : supported_extensions)
-            spans.unchecked_append({ extension.bytes().data(), extension.bytes().size() });
+            spans.unchecked_append(extension.bytes());
         return spans;
     }
 };
@@ -269,8 +263,7 @@ JS::ThrowCompletionOr<WebGLRenderingContextBase*> WebGLRenderingContextBase::cre
         .canvas_host = &canvas_host,
         .canvas_is_offscreen = canvas.has<GC::Ref<HTML::OffscreenCanvas>>(),
         .context_attributes = to_rust_context_attributes(context_attributes),
-        .supported_extensions = supported_extensions.data(),
-        .supported_extension_count = supported_extensions.size(),
+        .supported_extensions = supported_extensions.span(),
     };
     return static_cast<WebGLRenderingContextBase*>(web_webgl_context_create(JS::HostABI::vm_to_abi(realm.vm()), &arguments));
 }
@@ -353,7 +346,7 @@ void WebGLRenderingContextBase::restore_context_after_compositor_reconnect()
         return;
 
     auto supported_extensions = remote->supported_extension_spans();
-    web_webgl_context_restore(this, &remote->transport.leak_ref(), supported_extensions.data(), supported_extensions.size());
+    web_webgl_context_restore(this, &remote->transport.leak_ref(), supported_extensions.span());
 
     HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(GC::Heap::the(), [this] {
         fire_webgl_context_event(canvas_host(), EventNames::webglcontextrestored);
@@ -501,10 +494,11 @@ TexImageSourceResult web_webgl_read_tex_image_source(void* source_wrapper, TexIm
     //        a SECURITY_ERR exception must be thrown. See Origin Restrictions.
     // FIXME: If source is null then an INVALID_VALUE error is generated.
     auto& wrapper = *static_cast<JS::Object*>(source_wrapper);
-    Optional<Gfx::DecodedImageFrame> frame;
+    Optional<Compositing::WebGL::ImageSourceFrame> frame;
     switch (source_kind) {
     case TexImageSourceKind::HTMLImageElement:
-        frame = Bindings::impl_from<HTML::HTMLImageElement>(wrapper).current_image_frame();
+        if (auto image_frame = Bindings::impl_from<HTML::HTMLImageElement>(wrapper).current_image_frame(); image_frame.has_value())
+            frame = image_frame.release_value();
         break;
     case TexImageSourceKind::HTMLCanvasElement:
         if (auto bitmap = Bindings::impl_from<HTML::HTMLCanvasElement>(wrapper).get_bitmap_from_surface())
@@ -515,7 +509,8 @@ TexImageSourceResult web_webgl_read_tex_image_source(void* source_wrapper, TexIm
             frame = Gfx::DecodedImageFrame { *bitmap };
         break;
     case TexImageSourceKind::HTMLVideoElement:
-        frame = Bindings::impl_from<HTML::HTMLVideoElement>(wrapper).current_decoded_image_frame();
+        if (auto captured_frame = Bindings::impl_from<HTML::HTMLVideoElement>(wrapper).capture_current_video_frame(); captured_frame.has_value())
+            frame = captured_frame.release_value();
         break;
     case TexImageSourceKind::ImageBitmap:
         frame = Gfx::DecodedImageFrame { *Bindings::impl_from<HTML::ImageBitmap>(wrapper).bitmap() };
@@ -548,7 +543,7 @@ TexImageSourceResult web_webgl_read_tex_image_source(void* source_wrapper, TexIm
         return TexImageSourceResult::NoFrame;
 
     // FIXME: Respect unpackColorSpace
-    *out_frame = new Gfx::DecodedImageFrame(frame.release_value());
+    *out_frame = new ImageSourceFrameOwnedByRecorder { frame.release_value() };
     return TexImageSourceResult::Frame;
 }
 

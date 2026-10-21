@@ -441,12 +441,9 @@ pub extern "C" fn rust_parse_syntax(source: FfiUtf16View, limit_ident_to_custom_
     Arc::into_raw(Arc::new(syntax)).cast()
 }
 
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_retain(syntax: *const c_void) -> *const c_void {
-    unsafe { Arc::increment_strong_count(syntax.cast::<SyntaxNode>()) };
-    syntax
+pub extern "C" fn rust_syntax_retain(syntax: crate::css::ffi_support::ArcRef<'_, SyntaxNode>) -> *const SyntaxNode {
+    Arc::into_raw(syntax.to_arc())
 }
 
 /// # Safety
@@ -462,89 +459,73 @@ pub(crate) unsafe fn clone_syntax_handle(syntax: *const c_void) -> Option<Syntax
     unsafe { syntax.cast::<SyntaxNode>().as_ref() }.cloned()
 }
 
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_is_universal(syntax: *const c_void) -> bool {
-    matches!(unsafe { &*syntax.cast::<SyntaxNode>() }, SyntaxNode::Universal)
+pub extern "C" fn rust_syntax_is_universal(syntax: &SyntaxNode) -> bool {
+    matches!(syntax, SyntaxNode::Universal)
 }
 
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_is_single_component(syntax: *const c_void) -> bool {
-    is_single_syntax_component(unsafe { &*syntax.cast::<SyntaxNode>() })
+pub extern "C" fn rust_syntax_is_single_component(syntax: &SyntaxNode) -> bool {
+    is_single_syntax_component(syntax)
 }
 
-/// # Safety
-/// `left` and `right` must be live parsed-syntax handles.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_equals(left: *const c_void, right: *const c_void) -> bool {
-    let left = unsafe { &*left.cast::<SyntaxNode>() };
-    let right = unsafe { &*right.cast::<SyntaxNode>() };
+pub extern "C" fn rust_syntax_equals(left: &SyntaxNode, right: &SyntaxNode) -> bool {
     left == right
 }
 
-/// Serializes a syntax handle into an owned native `AK::Utf16String`.
-///
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle. The returned raw string must be adopted by C++.
+/// Serializes a syntax handle into an owned native `AK::Utf16String`, which C++ must adopt.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_serialize(syntax: *const c_void) -> usize {
+pub extern "C" fn rust_syntax_serialize(syntax: &SyntaxNode) -> usize {
     let mut sink = TextSink::new();
-    serialize_syntax(unsafe { &*syntax.cast::<SyntaxNode>() }, &mut sink);
+    serialize_syntax(syntax, &mut sink);
     crate::css::serialize::sink_into_raw(sink)
 }
 
 /// Parses a CSS value against a registered syntax and returns one strong style-value handle.
 ///
 /// # Safety
-/// All non-null pointers must remain readable for their accompanying lengths during this call.
+/// The pointers `context` holds must remain readable for their accompanying lengths during this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_parse_with_syntax(
     context: Option<&ParseContext>,
     source: FfiUtf16View,
-    syntax: *const c_void,
-    out_status: *mut FfiParseStatus,
+    syntax: Option<&SyntaxNode>,
+    out_status: Option<&mut FfiParseStatus>,
 ) -> *const c_void {
-    let Some(context) = context else {
+    let (Some(context), Some(syntax), Some(out_status)) = (context, syntax, out_status) else {
         return std::ptr::null();
     };
-    if syntax.is_null() || out_status.is_null() {
-        return std::ptr::null();
-    }
     let Some(source) = source.to_utf16() else {
-        unsafe { *out_status = FfiParseStatus::Invalid };
+        *out_status = FfiParseStatus::Invalid;
         return std::ptr::null();
     };
-    let Some(parsed) = parse_with_syntax(context, &source, unsafe { &*syntax.cast::<SyntaxNode>() }) else {
-        unsafe { *out_status = FfiParseStatus::Invalid };
+    let Some(parsed) = parse_with_syntax(context, &source, syntax) else {
+        *out_status = FfiParseStatus::Invalid;
         return std::ptr::null();
     };
-    unsafe { *out_status = FfiParseStatus::Parsed };
+    *out_status = FfiParseStatus::Parsed;
     Arc::into_raw(Arc::new(parsed)).cast()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::parser::value_parser::RandomFunctionIndex;
 
-    fn context(random_function_index: &mut usize) -> ParseContext {
+    fn context(random_function_index: &RandomFunctionIndex) -> ParseContext<'_> {
         ParseContext {
             in_quirks_mode: false,
             is_svg_presentation_attribute: false,
             is_substituted_value: false,
             contains_attr_tainted_values: false,
             is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index,
+            value_contexts: ak::Span::default(),
+            declared_namespaces: None,
+            document_url: ak::Span::default(),
+            document_base_url: ak::Span::default(),
+            length_resolution_context: None,
+            random_function_index: Some(random_function_index),
         }
     }
 
@@ -611,8 +592,8 @@ mod tests {
 
     #[test]
     fn parses_values_against_syntax() {
-        let mut random_function_index = 0;
-        let context = context(&mut random_function_index);
+        let random_function_index = RandomFunctionIndex::default();
+        let context = context(&random_function_index);
         let syntax = parse_syntax(&utf16("<length> | <number>#"), true).unwrap();
         assert!(parse_with_syntax(&context, &utf16("12px"), &syntax).is_some());
         assert!(parse_with_syntax(&context, &utf16("1, 2, calc(1 + 2)"), &syntax).is_some());

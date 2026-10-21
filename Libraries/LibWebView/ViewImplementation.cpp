@@ -105,6 +105,8 @@ ViewImplementation::~ViewImplementation()
         m_input_response_timer->stop();
     if (m_page_responsiveness_timer)
         m_page_responsiveness_timer->stop();
+    // The frontend may be torn down already, so clearing the ongoing navigation must not report a URL change to it.
+    on_url_change = nullptr;
     TabPerformanceMonitor::forget_view(view_id());
     if (m_top_level_traversable)
         m_top_level_traversable->clear_ongoing_navigation();
@@ -159,25 +161,49 @@ WebContentPage& ViewImplementation::page() const
     return *page;
 }
 
-void ViewImplementation::set_url(URL::URL url)
+URL::URL ViewImplementation::url() const
 {
-    if (url.fragment().has_value() && url.fragment()->contains(":~:"sv))
-        m_text_fragment_indication_is_visible = true;
+    if (!m_top_level_traversable)
+        return URL::about_blank();
+    return m_top_level_traversable->active_document_url();
+}
 
-    if (m_url != url) {
-        clear_page_response_watchdog();
-        m_url = move(url);
-        update_bookmark_action();
-        if (auto page = traversable().display_page(); page && page->routed_connection())
-            page->routed_connection()->update_audio_capture_permission();
-    }
-
+void ViewImplementation::did_update_url()
+{
+    update_bookmark_action();
+    update_report_website_issue_action();
+    if (auto page = traversable().display_page(); page && page->routed_connection())
+        page->routed_connection()->update_audio_capture_permission();
     update_displayed_url();
+}
+
+Optional<URL::URL const&> ViewImplementation::browser_ui_load_url() const
+{
+    if (!m_browser_ui_load.has_value() || !m_top_level_traversable)
+        return {};
+    auto ongoing_navigation_id = m_top_level_traversable->ongoing_navigation_id();
+    if (!ongoing_navigation_id.has_value() || *ongoing_navigation_id != m_browser_ui_load->navigation_id)
+        return {};
+    return m_browser_ui_load->url;
+}
+
+void ViewImplementation::did_change_ongoing_navigation(Badge<CanonicalNavigable>)
+{
+    update_displayed_url();
+}
+
+void ViewImplementation::did_change_active_document(Badge<CanonicalTraversable>)
+{
+    set_title(Utf16String::from_utf8(url().serialize()));
+    set_favicon({});
+    did_update_url();
 }
 
 void ViewImplementation::update_displayed_url()
 {
-    auto displayed_url = m_url;
+    auto displayed_url = url();
+    if (auto browser_ui_load_url = this->browser_ui_load_url(); browser_ui_load_url.has_value())
+        displayed_url = *browser_ui_load_url;
     auto displayed_url_without_fragment_directive = displayed_url;
     if (auto const& raw_fragment = displayed_url_without_fragment_directive.fragment(); raw_fragment.has_value()) {
         if (auto position = raw_fragment->find(":~:"sv); position.has_value())
@@ -207,7 +233,7 @@ void ViewImplementation::set_text_fragment_indication_visibility(Badge<WebConten
     update_displayed_url();
 }
 
-void ViewImplementation::set_title(Badge<WebContentPage>, Utf16String title)
+void ViewImplementation::set_title(Utf16String title)
 {
     if (m_title == title)
         return;
@@ -218,7 +244,7 @@ void ViewImplementation::set_title(Badge<WebContentPage>, Utf16String title)
         on_title_change(m_title);
 }
 
-void ViewImplementation::set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap const&> favicon)
+void ViewImplementation::set_favicon(Optional<Gfx::Bitmap const&> favicon)
 {
     m_favicon_hash.clear();
 
@@ -228,8 +254,8 @@ void ViewImplementation::set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap
 
         if (m_favicon_hash.has_value()) {
             if (m_is_private == IsPrivate::No)
-                Application::bookmark_store().update_favicon(m_url, *m_favicon_hash);
-            m_session->history_store->update_favicon(m_url, *m_favicon_hash);
+                Application::bookmark_store().update_favicon(url(), *m_favicon_hash);
+            m_session->history_store->update_favicon(url(), *m_favicon_hash);
         }
     }
 
@@ -337,8 +363,11 @@ void ViewImplementation::load(Web::HTML::PreparedNavigationDescriptor navigation
 
     prepare_for_navigation_after_crash(NavigationToRetry { navigation.url, prepare_navigation_to_retry(navigation) });
     m_last_stopped_navigation.clear();
-    if (navigation.url.scheme() != "javascript"sv)
-        set_url(navigation.url);
+    if (navigation.url.scheme() != "javascript"sv) {
+        if (navigation.url.fragment().has_value() && navigation.url.fragment()->contains(":~:"sv))
+            m_text_fragment_indication_is_visible = true;
+        m_browser_ui_load = BrowserUILoad { navigation.navigation_id, navigation.url };
+    }
     traversable().begin_navigation(move(navigation));
     if (traversable().has_uncommitted_navigation())
         set_loading_state(true);
@@ -539,10 +568,10 @@ void ViewImplementation::did_stop_loading(Badge<CanonicalTraversable>, bool stop
     did_end_uncommitted_navigation("stop-loading"sv);
 }
 
-// The address shown is the current entry's again, and a navigation WebDriver waits on is over.
+// The address shown is the active entry's again, and a navigation WebDriver waits on is over.
 void ViewImplementation::did_end_uncommitted_navigation(StringView reason)
 {
-    set_url(traversable().session_history().current_entry().url);
+    update_displayed_url();
     if (m_webdriver_navigation_observation.has_value())
         complete_webdriver_navigation();
     dump_session_history(reason);
@@ -602,7 +631,7 @@ void ViewImplementation::did_not_apply_reload()
 
 void ViewImplementation::did_commit_history_step()
 {
-    set_url(traversable().session_history().current_entry().url);
+    did_update_url();
     update_navigation_action_state();
 }
 
@@ -843,7 +872,7 @@ void ViewImplementation::handle_external_url_from_user_input(URL::URL const& url
 {
     // Browser UI actions can submit several URLs at once, for example when opening a bookmark folder. Keep those
     // requests ordered while a handler lookup or confirmation is in progress.
-    m_pending_external_url_requests.enqueue({ url, m_url.origin(), move(on_handler_unavailable) });
+    m_pending_external_url_requests.enqueue({ url, this->url().origin(), move(on_handler_unavailable) });
     process_next_external_url_request();
 }
 
@@ -1427,7 +1456,7 @@ ErrorOr<Core::SharedVersionIndex> ViewImplementation::ensure_document_cookie_ver
         Core::SharedVersionIndex document_index = m_document_cookie_version_indices.size();
 
         if (!Core::initialize_shared_version(m_document_cookie_version_buffer, document_index)) {
-            dbgln("Reached maximum document cookie version count for {}, cannot create new version for {}", m_url, domain);
+            dbgln("Reached maximum document cookie version count for {}, cannot create new version for {}", url(), domain);
             return Error::from_string_literal("Reached maximum document cookie version count");
         }
 
@@ -1625,6 +1654,25 @@ void ViewImplementation::find_in_page_end()
 void ViewImplementation::get_source()
 {
     page().async_get_source();
+}
+
+// Only a website the page is showing can be reported, so not a browser page or a page that crashed.
+bool ViewImplementation::can_report_website_issue() const
+{
+    auto url = this->url();
+    return (url.scheme() == "http"sv || url.scheme() == "https"sv) && !crash_overlay_active();
+}
+
+void ViewImplementation::report_website_issue()
+{
+    if (can_report_website_issue() && on_request_website_issue_report)
+        on_request_website_issue_report();
+}
+
+void ViewImplementation::update_report_website_issue_action()
+{
+    m_report_website_issue_action->set_enabled(can_report_website_issue());
+    Application::the().update_report_website_issue_action();
 }
 
 void ViewImplementation::inspect_dom_tree()
@@ -3492,7 +3540,9 @@ void ViewImplementation::complete_webdriver_history_traversal(Web::HTML::CrossPr
 JsonValue ViewImplementation::webdriver_session_history() const
 {
     JsonObject serialized;
-    serialized.set("currentURL"sv, m_url.serialize());
+    serialized.set("currentURL"sv, url().serialize());
+    serialized.set("displayedURL"sv, m_displayed_url.serialize());
+    serialized.set("title"sv, m_title.to_utf8());
     serialized.set("webContentProcessID"sv, page().client().pid());
     serialized.set("backButtonEnabled"sv, m_navigate_back_action->enabled());
     serialized.set("forwardButtonEnabled"sv, m_navigate_forward_action->enabled());
@@ -3532,7 +3582,6 @@ void ViewImplementation::update_navigation_action_state()
 void ViewImplementation::recover_current_session_history_entry_with_history_operation()
 {
     m_history_visit_transition_for_next_load = HistoryVisitTransition::Restore;
-    set_url(traversable().session_history().current_entry().url);
     begin_webdriver_navigation(WebDriverNavigationCompletionSource::CrashRecovery);
     traversable().recover_from_web_content_process_crash();
 }
@@ -3540,7 +3589,6 @@ void ViewImplementation::recover_current_session_history_entry_with_history_oper
 void ViewImplementation::reconstruct_current_session_history_entry_with_history_operation(StringView reason)
 {
     m_history_visit_transition_for_next_load = HistoryVisitTransition::Restore;
-    set_url(traversable().session_history().current_entry().url);
     begin_webdriver_navigation(WebDriverNavigationCompletionSource::HistoryTraversal);
     traversable().reconstruct_the_history_to_step(traversable().session_history().current_step());
     dump_session_history(reason);
@@ -3585,7 +3633,7 @@ bool ViewImplementation::register_session_store_tab_for_testing(Badge<WebContent
     if (m_session_tab_id.has_value())
         return true;
 
-    auto tab_id = m_session->session_store->tab_opened({ .window_id = {}, .initial_url = m_url, .insertion_index = {}, .is_active = SessionStore::IsActive::No });
+    auto tab_id = m_session->session_store->tab_opened({ .window_id = {}, .initial_url = url(), .insertion_index = {}, .is_active = SessionStore::IsActive::No });
     if (tab_id.is_error())
         return false;
     set_session_tab_id(tab_id.value());
@@ -3688,7 +3736,7 @@ void ViewImplementation::dump_session_history(StringView reason, SessionHistoryD
         page().id(),
         connection ? connection->pid() : -1,
         reason,
-        m_url,
+        url(),
         traversable().has_uncommitted_navigation(),
         loading_url,
         traversal.has_value() ? Optional<i32> { traversal->target_step } : Optional<i32> {},
@@ -3701,7 +3749,9 @@ void ViewImplementation::dump_session_history(StringView reason, SessionHistoryD
 
 void ViewImplementation::handle_web_content_process_crash()
 {
-    auto failed_url = m_url;
+    auto failed_url = url();
+    if (auto browser_ui_load_url = this->browser_ui_load_url(); browser_ui_load_url.has_value())
+        failed_url = *browser_ui_load_url;
     Optional<NavigationToRetry> navigation_to_retry;
     if (traversable().session_history().current_entry().url != failed_url) {
         navigation_to_retry = NavigationToRetry { failed_url, {} };
@@ -3839,6 +3889,7 @@ void ViewImplementation::set_crash_state(Optional<CrashState> state)
     auto active = state.has_value();
     m_crash_state = move(state);
     notify_content_blocking_changed();
+    update_report_website_issue_action();
     if (on_crash_overlay_state_change)
         on_crash_overlay_state_change(active);
 }
@@ -3855,7 +3906,7 @@ void ViewImplementation::did_save_crash_report(ByteString report_name)
 
 String ViewImplementation::crash_overlay_failed_url() const
 {
-    return m_crash_state.has_value() ? m_crash_state->failed_url.serialize() : m_url.serialize();
+    return m_crash_state.has_value() ? m_crash_state->failed_url.serialize() : url().serialize();
 }
 
 Optional<ByteString> ViewImplementation::crash_report_name() const
@@ -3881,13 +3932,11 @@ Optional<String> ViewImplementation::crash_report_website() const
 
 String ViewImplementation::current_host_for_settings() const
 {
-    if (auto const& state = traversable().replicated_state(); state.has_value()) {
-        if (state->active_document_url.host().has_value())
-            return MUST(String::from_utf8(state->active_document_url.serialized_host()));
-        if (state->active_document_url.scheme() == "about"sv)
-            return MUST(String::from_utf8(state->active_document_url.serialize_path()));
-    }
-
+    auto url = this->url();
+    if (url.host().has_value())
+        return MUST(String::from_utf8(url.serialized_host()));
+    if (url.scheme() == "about"sv)
+        return MUST(String::from_utf8(url.serialize_path()));
     return {};
 }
 
@@ -4196,6 +4245,11 @@ void ViewImplementation::initialize_context_menus()
         take_and_save_screenshot(ScreenshotType::Full);
     });
 
+    m_report_website_issue_action = Action::create("Report Website Issue..."sv, ActionID::ReportWebsiteIssue, [this]() {
+        report_website_issue();
+    });
+    m_report_website_issue_action->set_enabled(false);
+
     // A URL from the context menu is the page's — a link's or an image's — so it's navigated to from the page, unless
     // the user selected it as text. Blink also starts a selected URL with no initiator (IDC_CONTENT_CONTEXT_GOTOURL).
     m_open_in_new_tab_action = Action::create("Open in New Tab"sv, ActionID::OpenInNewTab, [this]() {
@@ -4350,6 +4404,7 @@ void ViewImplementation::initialize_context_menus()
     m_page_context_menu->add_action(*m_take_full_screenshot_action);
     m_page_context_menu->add_separator();
     m_page_context_menu->add_action(application.view_source_action());
+    m_page_context_menu->add_action(*m_report_website_issue_action);
 
     m_link_context_menu = Menu::create("Link Context Menu"sv);
     m_link_context_menu->add_action(*m_look_up_selected_text_action);

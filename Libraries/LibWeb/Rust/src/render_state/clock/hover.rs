@@ -50,8 +50,8 @@ unsafe extern "C" {
     /// Hands the render clock a pointer move over the compositor context of a same-process iframe's document, as the
     /// compositor hands it those over the page's: the context, the position in the context's device pixels, or none
     /// where the pointer left it, the buttons held, whether the compositor scrolled since the frame, and the input
-    /// event id. Any thread may call it.
-    fn web_render_clock_hand_pointer_move(
+    /// event id. Any thread may call it, and it ignores a context it has no lane for.
+    safe fn web_render_clock_hand_pointer_move(
         context: u64,
         has_position: bool,
         x: f32,
@@ -155,7 +155,7 @@ impl HoverPlan {
             Vec::new()
         } else {
             // SAFETY: Guaranteed by the caller.
-            unsafe { std::slice::from_raw_parts(inputs.scroll_offsets, inputs.scroll_offset_count) }.to_vec()
+            unsafe { ak::slice_from_raw_parts(inputs.scroll_offsets, inputs.scroll_offset_count) }.to_vec()
         };
         let effect_timings = if inputs.effect_timing_count == 0 {
             Vec::new()
@@ -163,9 +163,9 @@ impl HoverPlan {
             // SAFETY: Guaranteed by the caller.
             let (nodes, identities, timings) = unsafe {
                 (
-                    std::slice::from_raw_parts(inputs.effect_timing_nodes, inputs.effect_timing_count),
-                    std::slice::from_raw_parts(inputs.effect_timing_identities, inputs.effect_timing_count),
-                    std::slice::from_raw_parts(
+                    ak::slice_from_raw_parts(inputs.effect_timing_nodes, inputs.effect_timing_count),
+                    ak::slice_from_raw_parts(inputs.effect_timing_identities, inputs.effect_timing_count),
+                    ak::slice_from_raw_parts(
                         inputs.effect_timings.cast::<FfiEffectTiming>(),
                         inputs.effect_timing_count,
                     ),
@@ -203,13 +203,16 @@ impl HoverPlan {
         // NB: Keep the frame's geometry and dispatch identities even when the host moves its boxes in the next task.
         //     Published rows share immutable columns instead of copying the mutable arena and style engine. The lease
         //     pins only these rows' records, leaving unrelated records reclaimable. Frames with animation overlays
-        //     use the regular lane above.
+        //     use the regular lane above, and so do frames with a row that still names an overlay record no element
+        //     is assigned, which the lease declines.
         let visual_context = state.arena.arena().paint_state().borrow().visual_context.clone();
         if visual_context.tree.is_none() {
             return;
         }
         let records = state.arena.arena().hover_frame_style_records();
-        let style_records = state.engine_ref().lease_selected_style_records(records);
+        let Some(style_records) = state.engine_ref().lease_selected_style_records(records) else {
+            return;
+        };
         self.read_only_frame = Some(ReadOnlyHoverFrame {
             rows: state.arena.arena_mut().publish_rows(),
             bound_rows: state.arena.arena_mut().bound_rows_mut().publish(),
@@ -235,18 +238,15 @@ impl HoverPlan {
 /// pixels, or out of it.
 fn hand_pointer_to_context(context: u64, position: Option<FloatPoint>, pointer: PendingPointer) {
     let position_or_origin = position.unwrap_or(FloatPoint { x: 0.0, y: 0.0 });
-    // SAFETY: The render clock takes these arguments from any thread.
-    unsafe {
-        web_render_clock_hand_pointer_move(
-            context,
-            position.is_some(),
-            position_or_origin.x,
-            position_or_origin.y,
-            pointer.buttons,
-            pointer.scrolled_since_frame,
-            pointer.input_event_id,
-        );
-    }
+    web_render_clock_hand_pointer_move(
+        context,
+        position.is_some(),
+        position_or_origin.x,
+        position_or_origin.y,
+        pointer.buttons,
+        pointer.scrolled_since_frame,
+        pointer.input_event_id,
+    );
 }
 
 /// Where the render clock heard the pointer went.
@@ -489,7 +489,7 @@ fn monotonic_milliseconds() -> f64 {
         nanoseconds: i64,
     }
     unsafe extern "C" {
-        fn clock_gettime(clock: i32, time: *mut Timespec) -> i32;
+        safe fn clock_gettime(clock: i32, time: &mut Timespec) -> i32;
     }
     #[cfg(target_os = "macos")]
     const CLOCK_MONOTONIC: i32 = 6;
@@ -499,8 +499,7 @@ fn monotonic_milliseconds() -> f64 {
         seconds: 0,
         nanoseconds: 0,
     };
-    // SAFETY: `time` is valid for writes.
-    unsafe { clock_gettime(CLOCK_MONOTONIC, &raw mut time) };
+    clock_gettime(CLOCK_MONOTONIC, &mut time);
     time.seconds as f64 * 1000.0 + time.nanoseconds as f64 / 1_000_000.0
 }
 
@@ -1418,12 +1417,9 @@ fn cursor_for_hit(state: &mut RenderState, hit: CursorHit) -> Option<u8> {
 /// or out of the context, beside the mouse event with the input event id `input_event_id`, and answers what the lane
 /// wants next, as a `PointerAnswer`.
 ///
-/// # Safety
-///
-/// `ticks` must come from `document_host_lease_clock` and not be released yet.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clock_ticks_pointer_moved(
-    ticks: *const super::ClockTicks,
+pub extern "C" fn clock_ticks_pointer_moved(
+    ticks: &super::ClockTicks,
     has_position: bool,
     x: f32,
     y: f32,
@@ -1431,8 +1427,6 @@ pub unsafe extern "C" fn clock_ticks_pointer_moved(
     scrolled_since_frame: bool,
     input_event_id: u64,
 ) -> u8 {
-    // SAFETY: Guaranteed by the caller, whose reference this borrows.
-    let ticks = std::mem::ManuallyDrop::new(unsafe { std::sync::Arc::from_raw(ticks) });
     ticks.pointer_moved(PendingPointer {
         position: has_position.then_some(FloatPoint { x, y }),
         buttons,

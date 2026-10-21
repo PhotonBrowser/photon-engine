@@ -6,12 +6,13 @@
 
 #include <AK/ConditionVariable.h>
 #include <AK/Mutex.h>
+#include <AK/Queue.h>
 #include <AK/Time.h>
 #include <LibCore/System.h>
-#include <LibMedia/VideoFrame.h>
-#include <LibMedia/VideoFrameHandle.h>
-#include <LibMedia/VideoFramePool.h>
-#include <LibMedia/VideoSurface.h>
+#include <LibMediaCodecs/VideoFrame.h>
+#include <LibMediaCodecs/VideoFrameHandle.h>
+#include <LibMediaCodecs/VideoFramePool.h>
+#include <LibMediaCodecs/VideoSurface.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 
@@ -568,11 +569,69 @@ TEST_CASE(recycle_versus_hold_stress)
     (void)consumer_thread->join();
 }
 
-#ifdef AK_OS_MACOS
+// A frame shown a second time arrives as a second hold on the acquisition its slot is already held for, which must
+// not be mistaken for a slot given away while held.
+TEST_CASE(relay_pool_holds_a_slot_again_for_the_acquisition_it_already_holds)
+{
+    auto source_pool = MUST(Media::VideoFramePool::create());
+    auto acquired = source_pool->try_acquire(resolved_frame_byte_count()).release_value();
+
+    auto release_count = 0u;
+    auto relay_pool = MUST(Media::VideoFrameRelayPool::create([&](u32) { release_count++; }));
+    MUST(relay_pool->set_slot_storage(acquired.index, source_pool->slot_buffer(acquired.index), nullptr));
+
+    RefPtr<Media::PooledVideoFrameSlot> first_hold = MUST(relay_pool->try_adopt_published_slot(acquired.index, acquired.slot_acquisition_id));
+    RefPtr<Media::PooledVideoFrameSlot> second_hold = MUST(relay_pool->try_adopt_published_slot(acquired.index, acquired.slot_acquisition_id));
+    EXPECT(relay_pool->try_adopt_published_slot(acquired.index, acquired.slot_acquisition_id + 1).is_error());
+    // A frame lent onward holds the slot as well, which the other process never hears of.
+    relay_pool->add_hold(acquired.index);
+
+    first_hold = nullptr;
+    EXPECT_EQ(release_count, 0u);
+    second_hold = nullptr;
+    EXPECT_EQ(release_count, 0u);
+    // The other process holds the slot once per frame, so each of those holds is released to it once the slot is free.
+    relay_pool->release_hold(acquired.index);
+    EXPECT_EQ(release_count, 2u);
+}
+
+#if defined(AK_OS_MACOS) || defined(AK_OS_LINUX)
+
+// Stands in for what a decoder gives with a surface to keep its pixels in place, counting how many are alive.
+class TestSurfaceContents final : public Media::VideoSurfaceContents {
+public:
+    explicit TestSurfaceContents(Atomic<u32>& live_count)
+        : m_live_count(live_count)
+    {
+        m_live_count++;
+    }
+    virtual ~TestSurfaceContents() override { m_live_count--; }
+
+private:
+    Atomic<u32>& m_live_count;
+};
 
 static NonnullRefPtr<Media::VideoSurface> make_surface()
 {
+#    ifdef AK_OS_MACOS
     return MUST(Media::VideoSurface::create(Core::IOSurfaceHandle::create(16, 16)));
+#    else
+    static u32 s_next_surface_id = 1;
+    Gfx::LinuxDmaBufHandle dma_buf;
+    dma_buf.size = { 16, 16 };
+    return MUST(Media::VideoSurface::create_from_dma_buf(s_next_surface_id++, move(dma_buf)));
+#    endif
+}
+
+static NonnullRefPtr<Media::VideoSurfaceContents> make_contents(Atomic<u32>& live_count)
+{
+    return make_ref_counted<TestSurfaceContents>(live_count);
+}
+
+static NonnullRefPtr<Media::VideoSurfaceContents> make_contents()
+{
+    static Atomic<u32> s_unwatched_live_count { 0 };
+    return make_contents(s_unwatched_live_count);
 }
 
 TEST_CASE(surface_pool_keeps_a_recycled_surface_on_its_slot)
@@ -580,9 +639,9 @@ TEST_CASE(surface_pool_keeps_a_recycled_surface_on_its_slot)
     auto pool = MUST(Media::VideoFrameSurfacePool::create());
     auto surface = make_surface();
 
-    auto first = pool->try_acquire(surface).value();
+    auto first = pool->try_acquire(surface, make_contents()).value();
     pool->release_hold(first.index);
-    auto second = pool->try_acquire(surface).value();
+    auto second = pool->try_acquire(surface, make_contents()).value();
 
     // Announcement is keyed on the slot's buffer generation, so a recycled surface must not appear to be a new one.
     EXPECT_EQ(second.index, first.index);
@@ -590,79 +649,73 @@ TEST_CASE(surface_pool_keeps_a_recycled_surface_on_its_slot)
     EXPECT_NE(second.slot_acquisition_id, first.slot_acquisition_id);
 }
 
-TEST_CASE(surface_pool_stops_using_a_surface_once_its_holds_run_out)
+TEST_CASE(surface_pool_drops_the_contents_with_the_last_hold)
 {
+    Atomic<u32> live_contents { 0 };
     auto pool = MUST(Media::VideoFrameSurfacePool::create());
     auto surface = make_surface();
 
-    auto first = pool->try_acquire(surface).value();
-    EXPECT(surface->is_in_use());
+    auto first = pool->try_acquire(surface, make_contents(live_contents)).value();
+    EXPECT_EQ(live_contents.load(), 1u);
 
+    pool->add_hold(first.index);
     pool->release_hold(first.index);
+    EXPECT_EQ(live_contents.load(), 1u);
 
-    // The decoder is free to decode into it again, which it can only be recognized for having done because the
-    // slot kept hold of the surface through it.
-    EXPECT(!surface->is_in_use());
+    // The decoder is free to decode into the surface again, which the slot recognizes it for having done because
+    // it kept the surface through the release.
+    pool->release_hold(first.index);
+    EXPECT_EQ(live_contents.load(), 0u);
 
-    auto second = pool->try_acquire(surface).value();
-    EXPECT(surface->is_in_use());
+    auto second = pool->try_acquire(surface, make_contents(live_contents)).value();
+    EXPECT_EQ(live_contents.load(), 1u);
     EXPECT_EQ(second.index, first.index);
     EXPECT_EQ(second.allocated_buffer_id, first.allocated_buffer_id);
 }
 
-TEST_CASE(a_resolved_frame_keeps_using_a_surface_its_slot_has_released)
+// A decoder can hand a surface back while it is held, as when a frame is shown a second time. The pixels are the
+// ones the slot already keeps, so the frame joins the acquisition instead of starting one.
+TEST_CASE(surface_pool_holds_a_held_surface_again_when_it_is_handed_back)
 {
+    Atomic<u32> live_contents { 0 };
     auto pool = MUST(Media::VideoFrameSurfacePool::create());
     auto surface = make_surface();
-    auto acquired = pool->try_acquire(surface).value();
 
-    auto directory = Media::VideoFrameSlotDirectory::create();
-    directory->notify_slot_announced(pool->id(), acquired.index, pool->slot_buffer(acquired.index), pool->slot_surface(acquired.index));
+    auto first = pool->try_acquire(surface, make_contents(live_contents)).value();
+    auto again = pool->try_acquire(surface, make_contents(live_contents)).value();
+    EXPECT_EQ(again.index, first.index);
+    EXPECT_EQ(again.slot_acquisition_id, first.slot_acquisition_id);
+    EXPECT_EQ(live_contents.load(), 1u);
 
-    auto handle = Media::VideoFrameHandle {
-        .pool_id = pool->id(),
-        .slot_index = acquired.index,
-        .slot_acquisition_id = acquired.slot_acquisition_id,
-        .timestamp = AK::Duration::from_milliseconds(40),
-        .duration = AK::Duration::from_milliseconds(20),
-        .size = { 16, 16 },
-        .bit_depth = 8,
-        .subsampling = Media::Subsampling(true, true),
-        .cicp = {},
-    };
-    auto frame = directory->resolve_frame(handle, [] { });
-    EXPECT(frame != nullptr);
-
-    // A lend can be released from under a frame, so the frame is what has to say it is still reading the pixels.
-    pool->release_hold(acquired.index);
-    EXPECT(surface->is_in_use());
-
-    frame = nullptr;
-    EXPECT(!surface->is_in_use());
+    pool->release_hold(first.index);
+    EXPECT_EQ(live_contents.load(), 1u);
+    pool->release_hold(first.index);
+    EXPECT_EQ(live_contents.load(), 0u);
 }
 
 TEST_CASE(shed_storage_releases_surfaces_as_their_holds_run_out)
 {
+    Atomic<u32> live_contents { 0 };
     auto pool = MUST(Media::VideoFrameSurfacePool::create());
     auto held_surface = make_surface();
     auto free_surface = make_surface();
 
-    auto held = pool->try_acquire(held_surface).value();
-    auto freed = pool->try_acquire(free_surface).value();
+    auto held = pool->try_acquire(held_surface, make_contents(live_contents)).value();
+    auto freed = pool->try_acquire(free_surface, make_contents(live_contents)).value();
     pool->release_hold(freed.index);
 
     pool->shed_storage();
 
-    // Nothing but this test refers to a surface the pool has let go of, while the held one is still being read.
+    // Nothing but this test refers to a surface the pool has let go of, while the held one's pixels are still kept.
     EXPECT_EQ(free_surface->ref_count(), 1u);
-    EXPECT(held_surface->is_in_use());
+    EXPECT_EQ(live_contents.load(), 1u);
 
     pool->release_hold(held.index);
     EXPECT_EQ(held_surface->ref_count(), 1u);
-    EXPECT(!held_surface->is_in_use());
+    EXPECT_EQ(live_contents.load(), 0u);
 
     // The identities went with them, so a surface the pool held through the shed is a stranger to it again.
-    auto reacquired = pool->try_acquire(held_surface).value();
+    auto reacquired = pool->try_acquire(held_surface, make_contents(live_contents)).value();
     EXPECT_NE(reacquired.allocated_buffer_id, held.allocated_buffer_id);
 }
 
@@ -674,28 +727,61 @@ TEST_CASE(surface_pool_gives_distinct_surfaces_distinct_slots)
     auto second_surface = make_surface();
     EXPECT_NE(first_surface->id(), second_surface->id());
 
-    auto first = pool->try_acquire(first_surface).value();
-    auto second = pool->try_acquire(second_surface).value();
+    auto first = pool->try_acquire(first_surface, make_contents()).value();
+    auto second = pool->try_acquire(second_surface, make_contents()).value();
     EXPECT_NE(second.index, first.index);
 }
 
-TEST_CASE(surface_pool_refuses_to_exceed_its_slot_count)
+TEST_CASE(surface_pool_refuses_to_exceed_its_held_slot_count)
 {
     auto pool = MUST(Media::VideoFrameSurfacePool::create());
 
-    // The platform allocator hands out surfaces without limit, so this pool's slot count is what stops a decoder
+    // The platform allocator hands out surfaces without limit, so this pool's held slot count is what stops a decoder
     // from running arbitrarily far ahead of whoever is displaying its frames.
     Vector<NonnullRefPtr<Media::VideoSurface>> surfaces;
-    for (u32 index = 0; index < Media::VideoFrameSurfacePool::MAX_SLOT_COUNT; index++) {
+    for (u32 index = 0; index < Media::VideoFrameSurfacePool::MAX_HELD_SLOT_COUNT; index++) {
         surfaces.append(make_surface());
-        EXPECT(pool->try_acquire(surfaces.last()).has_value());
+        EXPECT(pool->try_acquire(surfaces.last(), make_contents()).has_value());
     }
 
     auto surface_too_many = make_surface();
-    EXPECT(!pool->try_acquire(surface_too_many).has_value());
+    EXPECT(!pool->try_acquire(surface_too_many, make_contents()).has_value());
+
+    // A held surface handed back again takes no further slot.
+    EXPECT(pool->try_acquire(surfaces.first(), make_contents()).has_value());
+    pool->release_hold(0);
 
     pool->release_hold(0);
-    EXPECT(pool->try_acquire(surface_too_many).has_value());
+    EXPECT(pool->try_acquire(surface_too_many, make_contents()).has_value());
+}
+
+TEST_CASE(surface_pool_remembers_more_surfaces_than_it_lets_be_held)
+{
+    auto pool = MUST(Media::VideoFrameSurfacePool::create());
+
+    // Decoders cycle through more surfaces than may be held at once, and each one should be announced only once.
+    static constexpr u32 decoder_surface_count = Media::VideoFrameSurfacePool::MAX_HELD_SLOT_COUNT * 2 + 1;
+    static_assert(decoder_surface_count <= Media::VideoFrameSurfacePool::MAX_SLOT_COUNT);
+    Vector<NonnullRefPtr<Media::VideoSurface>> surfaces;
+    for (u32 index = 0; index < decoder_surface_count; index++)
+        surfaces.append(make_surface());
+
+    Vector<Media::VideoFrameSurfacePool::AcquiredSlot> first_cycle_acquisitions;
+    Queue<u32> held_slot_indices;
+    for (u32 cycle = 0; cycle < 3; cycle++) {
+        for (u32 index = 0; index < decoder_surface_count; index++) {
+            if (held_slot_indices.size() == Media::VideoFrameSurfacePool::MAX_HELD_SLOT_COUNT)
+                pool->release_hold(held_slot_indices.dequeue());
+            auto acquired = pool->try_acquire(surfaces[index], make_contents()).value();
+            held_slot_indices.enqueue(acquired.index);
+            if (cycle == 0) {
+                first_cycle_acquisitions.append(acquired);
+                continue;
+            }
+            EXPECT_EQ(acquired.index, first_cycle_acquisitions[index].index);
+            EXPECT_EQ(acquired.allocated_buffer_id, first_cycle_acquisitions[index].allocated_buffer_id);
+        }
+    }
 }
 
 TEST_CASE(surface_pool_evicts_the_least_recently_acquired_identity_when_full)
@@ -706,33 +792,33 @@ TEST_CASE(surface_pool_evicts_the_least_recently_acquired_identity_when_full)
     Vector<Media::VideoFrameSurfacePool::AcquiredSlot> acquisitions;
     for (u32 index = 0; index < Media::VideoFrameSurfacePool::MAX_SLOT_COUNT; index++) {
         surfaces.append(make_surface());
-        acquisitions.append(pool->try_acquire(surfaces.last()).value());
+        acquisitions.append(pool->try_acquire(surfaces.last(), make_contents()).value());
+        pool->release_hold(acquisitions.last().index);
     }
-    for (auto const& acquisition : acquisitions)
-        pool->release_hold(acquisition.index);
 
     // Every slot remembers a surface, so a surface the pool has never seen has to displace one of them.
     auto new_surface = make_surface();
-    auto acquired = pool->try_acquire(new_surface).value();
+    auto acquired = pool->try_acquire(new_surface, make_contents()).value();
     EXPECT_EQ(acquired.index, acquisitions.first().index);
     EXPECT_NE(acquired.allocated_buffer_id, acquisitions.first().allocated_buffer_id);
     pool->release_hold(acquired.index);
 
     // The surface that was displaced is a stranger again, while the ones still on their slots are not.
-    auto reacquired_evicted = pool->try_acquire(surfaces.first()).value();
+    auto reacquired_evicted = pool->try_acquire(surfaces.first(), make_contents()).value();
     EXPECT_NE(reacquired_evicted.allocated_buffer_id, acquisitions.first().allocated_buffer_id);
     pool->release_hold(reacquired_evicted.index);
 
-    auto reacquired_kept = pool->try_acquire(surfaces.last()).value();
+    auto reacquired_kept = pool->try_acquire(surfaces.last(), make_contents()).value();
     EXPECT_EQ(reacquired_kept.index, acquisitions.last().index);
     EXPECT_EQ(reacquired_kept.allocated_buffer_id, acquisitions.last().allocated_buffer_id);
 }
 
+#    ifdef AK_OS_MACOS
 TEST_CASE(surface_slots_survive_a_mach_port_round_trip)
 {
     auto pool = MUST(Media::VideoFrameSurfacePool::create());
     auto surface = make_surface();
-    auto acquired = pool->try_acquire(surface).value();
+    auto acquired = pool->try_acquire(surface, make_contents()).value();
 
     auto lent_surface = pool->slot_surface(acquired.index);
     EXPECT_NE(lent_surface, nullptr);
@@ -742,12 +828,13 @@ TEST_CASE(surface_slots_survive_a_mach_port_round_trip)
     EXPECT_EQ(reimported.width(), 16u);
     EXPECT_EQ(reimported.height(), 16u);
 }
+#    endif
 
 TEST_CASE(directory_resolves_an_announced_surface_slot)
 {
     auto pool = MUST(Media::VideoFrameSurfacePool::create());
     auto surface = make_surface();
-    auto acquired = pool->try_acquire(surface).value();
+    auto acquired = pool->try_acquire(surface, make_contents()).value();
 
     auto directory = Media::VideoFrameSlotDirectory::create();
     directory->notify_slot_announced(pool->id(), acquired.index, pool->slot_buffer(acquired.index), pool->slot_surface(acquired.index));
@@ -773,12 +860,50 @@ TEST_CASE(directory_resolves_an_announced_surface_slot)
     EXPECT(!frame->yuv_data().has_value());
 }
 
+TEST_CASE(directory_waits_for_a_slot_to_be_announced_with_its_new_surface)
+{
+    auto pool = MUST(Media::VideoFrameSurfacePool::create());
+    auto directory = Media::VideoFrameSlotDirectory::create();
+
+    Vector<NonnullRefPtr<Media::VideoSurface>> surfaces;
+    Vector<Media::VideoFrameSurfacePool::AcquiredSlot> acquisitions;
+    for (u32 index = 0; index < Media::VideoFrameSurfacePool::MAX_SLOT_COUNT; index++) {
+        surfaces.append(make_surface());
+        acquisitions.append(pool->try_acquire(surfaces.last(), make_contents()).value());
+        directory->notify_slot_announced(pool->id(), acquisitions.last().index, pool->slot_buffer(acquisitions.last().index), pool->slot_surface(acquisitions.last().index));
+        pool->release_hold(acquisitions.last().index);
+    }
+
+    // The new surface displaces the first one from its slot, but the directory has yet to hear of that.
+    auto new_surface = make_surface();
+    auto acquired = pool->try_acquire(new_surface, make_contents()).value();
+    EXPECT_EQ(acquired.index, acquisitions.first().index);
+
+    Media::VideoFrameHandle handle {
+        .pool_id = pool->id(),
+        .slot_index = acquired.index,
+        .slot_acquisition_id = acquired.slot_acquisition_id,
+        .timestamp = {},
+        .duration = {},
+        .size = { 16, 16 },
+        .bit_depth = 8,
+        .subsampling = Media::Subsampling(true, true),
+        .cicp = {},
+    };
+    EXPECT_EQ(directory->resolve_frame(handle, [] { }), nullptr);
+
+    directory->notify_slot_announced(pool->id(), acquired.index, pool->slot_buffer(acquired.index), pool->slot_surface(acquired.index));
+    auto frame = directory->resolve_frame(handle, [] { });
+    EXPECT_NE(frame, nullptr);
+    EXPECT_EQ(frame->surface()->id(), new_surface->id());
+}
+
 TEST_CASE(surface_slots_hold_and_free_through_the_shared_ledger)
 {
     auto freed_count = 0u;
     auto pool = MUST(Media::VideoFrameSurfacePool::create());
     pool->set_slot_freed_callback([&] { freed_count++; });
-    auto acquired = pool->try_acquire(make_surface()).value();
+    auto acquired = pool->try_acquire(make_surface(), make_contents()).value();
 
     pool->add_hold(acquired.index);
     pool->release_hold(acquired.index);

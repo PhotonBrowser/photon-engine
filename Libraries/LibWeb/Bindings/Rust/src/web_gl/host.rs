@@ -68,8 +68,8 @@ unsafe extern "C" {
         width: i32,
         height: i32,
     ) -> *mut c_void;
-    fn web_webgl_max_frames_per_message() -> usize;
-    fn web_webgl_anonymous_buffer_create(size: usize, out_data: *mut *mut u8) -> *mut c_void;
+    safe fn web_webgl_max_frames_per_message() -> usize;
+    safe fn web_webgl_anonymous_buffer_create(size: usize, out_data: &mut *mut u8) -> *mut c_void;
     fn web_webgl_anonymous_buffer_destroy(anonymous_buffer: *mut c_void);
     fn web_webgl_frame_destroy(frame: *mut c_void);
     fn web_webgl_bitmap_unref(bitmap: *mut c_void);
@@ -84,8 +84,7 @@ pub(crate) struct AnonymousBuffer {
 impl AnonymousBuffer {
     fn create(size: usize) -> Option<Self> {
         let mut data = ptr::null_mut();
-        // SAFETY: The function has no preconditions, and stores where the memory is mapped when it returns a buffer.
-        let buffer = NonNull::new(unsafe { web_webgl_anonymous_buffer_create(size, &raw mut data) })?;
+        let buffer = NonNull::new(web_webgl_anonymous_buffer_create(size, &mut data))?;
         Some(Self { buffer, data, size })
     }
 }
@@ -113,7 +112,7 @@ pub(crate) struct Frame(NonNull<c_void>);
 impl Frame {
     /// # Safety
     ///
-    /// `frame` is a Gfx::DecodedImageFrame allocated with `new`, which the value takes over.
+    /// `frame` is a Compositing::WebGL::ImageSourceFrame allocated with `new`, which the value takes over.
     pub(crate) unsafe fn from_raw(frame: NonNull<c_void>) -> Self {
         Self(frame)
     }
@@ -172,7 +171,7 @@ unsafe extern "C" fn append_reply(reply_sink: *mut c_void, reply: *const u8, rep
     // SAFETY: sync_call() passes its vector as the sink, and the transport passes the bytes of its reply.
     unsafe {
         let reply_sink = &mut *reply_sink.cast::<Vec<u8>>();
-        reply_sink.extend_from_slice(core::slice::from_raw_parts(reply, reply_size));
+        reply_sink.extend_from_slice(ak::slice_from_raw_parts(reply, reply_size));
     }
 }
 
@@ -184,7 +183,7 @@ impl Transport for CppTransport {
     type Bitmap = Bitmap;
 
     fn max_frames_per_message(&self) -> usize {
-        unsafe { web_webgl_max_frames_per_message() }
+        web_webgl_max_frames_per_message()
     }
 
     fn create_shared_memory(&self, size: usize) -> Option<AnonymousBuffer> {

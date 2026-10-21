@@ -112,14 +112,11 @@ pub unsafe extern "C" fn rust_compiled_function_release(function: *const Compile
     }
 }
 
-/// # Safety
-/// The function must be live and Arc-owned.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_compiled_function_retain(function: *const CompiledFunction) -> *const CompiledFunction {
-    unsafe {
-        Arc::increment_strong_count(function);
-    }
-    function
+pub extern "C" fn rust_compiled_function_retain(
+    function: crate::css::ffi_support::ArcRef<'_, CompiledFunction>,
+) -> *const CompiledFunction {
+    Arc::into_raw(function.to_arc())
 }
 
 /// The functions a style sheet's top-level `@function` rules compile to, in order, with no rule
@@ -128,12 +125,10 @@ pub unsafe extern "C" fn rust_compiled_function_retain(function: *const Compiled
 pub(crate) fn compile_functions_for_testing(source: &str) -> Vec<CompiledFunction> {
     let units: Vec<_> = source.encode_utf16().collect();
     let context = crate::css::parser::value_parser::ParseContext::default();
-    let parsed = unsafe {
-        crate::css::parser::syntax_parser::parse_shared_stylesheet(
-            crate::css::css_tokenizer::TokenizerInput::Utf16(&units),
-            &raw const context,
-        )
-    };
+    let parsed = crate::css::parser::syntax_parser::parse_shared_stylesheet(
+        crate::css::css_tokenizer::TokenizerInput::Utf16(&units),
+        Some(&context),
+    );
     let rules = super::NativeRuleList::from_parsed(parsed);
     let mut compiled = Vec::new();
     let _ = rules.visit_rules(&mut |rule| {

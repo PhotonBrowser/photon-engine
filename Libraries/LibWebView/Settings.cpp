@@ -1010,6 +1010,9 @@ void Settings::add_custom_search_engine(SearchEngine search_engine)
 
     m_custom_search_engines.append(move(search_engine));
     persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.search_engine_settings_changed();
 }
 
 void Settings::remove_custom_search_engine(SearchEngine const& search_engine)
@@ -1024,10 +1027,8 @@ void Settings::remove_custom_search_engine(SearchEngine const& search_engine)
 
     persist_settings();
 
-    if (reset_default_search_engine) {
-        for (auto& observer : m_observers)
-            observer.search_engine_settings_changed();
-    }
+    for (auto& observer : m_observers)
+        observer.search_engine_settings_changed();
 }
 
 Optional<SearchEngine> Settings::find_search_engine_by_name(StringView name) const
@@ -1354,25 +1355,27 @@ void Settings::persist_settings()
 
 void Settings::add_observer(Badge<SettingsObserver>, SettingsObserver& observer)
 {
-    Application::settings().m_observers.append(observer);
+    m_observers.append(observer);
 }
 
 void Settings::remove_observer(Badge<SettingsObserver>, SettingsObserver& observer)
 {
-    auto was_removed = Application::settings().m_observers.remove_first_matching([&](auto const& candidate) {
+    auto was_removed = m_observers.remove_first_matching([&](auto const& candidate) {
         return &candidate == &observer;
     });
     VERIFY(was_removed);
 }
 
 SettingsObserver::SettingsObserver()
+    : m_settings(Application::settings())
 {
-    Settings::add_observer({}, *this);
+    m_settings->add_observer({}, *this);
 }
 
 SettingsObserver::~SettingsObserver()
 {
-    Settings::remove_observer({}, *this);
+    if (m_settings)
+        m_settings->remove_observer({}, *this);
 }
 
 }

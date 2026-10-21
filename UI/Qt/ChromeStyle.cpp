@@ -1075,7 +1075,7 @@ QDialog#LadybirdBookmarkDialog QPushButton:focus {{
         surface, recessed, hover, pressed, control_border, accent, text, selection, selection_text);
 }
 
-QString crash_report_review_style_sheet(QPalette const& palette)
+QString report_review_style_sheet(QPalette const& palette)
 {
     auto recessed = style_sheet_color(chrome_surface_recessed(palette));
     auto control_border = style_sheet_color(chrome_control_border(palette));
@@ -1086,8 +1086,8 @@ QString crash_report_review_style_sheet(QPalette const& palette)
     auto muted = style_sheet_color(chrome_muted_text(palette));
 
     return qformatted(R"(
-QWidget#LadybirdCrashReportReview QLineEdit,
-QWidget#LadybirdCrashReportReview QPlainTextEdit {{
+QWidget#LadybirdReportReview QLineEdit,
+QWidget#LadybirdReportReview QPlainTextEdit {{
     color: {3};
     background: {0};
     border: 1px solid {1};
@@ -1096,25 +1096,25 @@ QWidget#LadybirdCrashReportReview QPlainTextEdit {{
     selection-color: {6};
 }}
 
-QWidget#LadybirdCrashReportReview QLineEdit {{
+QWidget#LadybirdReportReview QLineEdit {{
     min-height: 26px;
     padding: 2px 9px;
 }}
 
-QWidget#LadybirdCrashReportReview QPlainTextEdit {{
+QWidget#LadybirdReportReview QPlainTextEdit {{
     padding: 4px 5px;
 }}
 
-QWidget#LadybirdCrashReportReview QLineEdit:focus,
-QWidget#LadybirdCrashReportReview QPlainTextEdit:focus {{
+QWidget#LadybirdReportReview QLineEdit:focus,
+QWidget#LadybirdReportReview QPlainTextEdit:focus {{
     border-color: {2};
 }}
 
-QWidget#LadybirdCrashReportReview QLineEdit:disabled {{
+QWidget#LadybirdReportReview QLineEdit:disabled {{
     color: {4};
 }}
 
-QWidget#LadybirdCrashReportReview QFrame#CrashReportDetails {{
+QWidget#LadybirdReportReview QFrame#ReportDetails {{
     background: {0};
     border: 1px solid {1};
     border-radius: 8px;
@@ -1124,7 +1124,7 @@ QWidget#LadybirdCrashReportReview QFrame#CrashReportDetails {{
 }
 
 // Placeholders hint at what to write, so they stay readable rather than taking the platform's faintest text color.
-QColor crash_report_review_placeholder_text(QPalette const& palette)
+QColor report_review_placeholder_text(QPalette const& palette)
 {
     return mix(chrome_text(palette), chrome_surface_recessed(palette), 0.45);
 }
@@ -1490,6 +1490,85 @@ QPushButton#LadybirdMessagePopoverAcceptButton:pressed {{
 }}
 )",
         text, surface, border, muted_text, control_border, hover_surface, pressed_surface, accent_color, accent_hover, accent_pressed);
+}
+
+// The instructions over a screenshot selection look like a message popover, with every action a secondary one.
+QString screenshot_selection_style_sheet(QPalette const& palette)
+{
+    auto text = style_sheet_color(chrome_text(palette));
+    auto surface = style_sheet_color(chrome_surface(palette));
+    auto border = style_sheet_color(chrome_border(palette));
+    auto control_border = style_sheet_color(chrome_control_border(palette));
+    auto hover_surface = style_sheet_color(chrome_surface_hover(palette));
+    auto pressed_surface = style_sheet_color(chrome_surface_pressed(palette));
+    auto accent = style_sheet_color(chrome_accent());
+
+    return qformatted(R"(
+QFrame#ScreenshotSelectionInstructions {{
+    color: {0};
+    background: {1};
+    border: 1px solid {2};
+    border-radius: 8px;
+}}
+
+QFrame#ScreenshotSelectionInstructions QLabel {{
+    color: {0};
+    background: transparent;
+    border: none;
+}}
+
+QFrame#ScreenshotSelectionInstructions QPushButton {{
+    color: {0};
+    background: {1};
+    border: 1px solid {3};
+    border-radius: 6px;
+    padding: 5px 12px;
+}}
+
+QFrame#ScreenshotSelectionInstructions QPushButton:hover {{
+    background: {4};
+}}
+
+QFrame#ScreenshotSelectionInstructions QPushButton:pressed {{
+    background: {5};
+}}
+
+QFrame#ScreenshotSelectionInstructions QPushButton:focus {{
+    border: 2px solid {6};
+    padding: 4px 11px;
+}}
+)",
+        text, surface, border, control_border, hover_surface, pressed_surface, accent);
+}
+
+// The viewer darkens the whole tab whatever the theme, so its controls are light on dark like a photo viewer's.
+QString screenshot_viewer_style_sheet()
+{
+    return QStringLiteral(R"(
+QLabel#ScreenshotViewerCaption {
+    color: #ffffff;
+    background: rgba(0, 0, 0, 180);
+    border: 1px solid rgba(255, 255, 255, 40);
+    border-radius: 12px;
+    padding: 4px 12px;
+}
+
+QPushButton#ScreenshotViewerCloseButton {
+    color: #ffffff;
+    background: rgba(0, 0, 0, 180);
+    border: 1px solid rgba(255, 255, 255, 64);
+    border-radius: 6px;
+    padding: 5px 12px;
+}
+
+QPushButton#ScreenshotViewerCloseButton:hover {
+    background: rgba(48, 48, 48, 200);
+}
+
+QPushButton#ScreenshotViewerCloseButton:pressed {
+    background: rgba(0, 0, 0, 220);
+}
+)");
 }
 
 QString content_blocking_popover_style_sheet(QPalette const& palette)

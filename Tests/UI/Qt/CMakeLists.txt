@@ -69,10 +69,47 @@ if (APPLE OR LINUX)
     target_sources(TestCrashReportReviewWidget PRIVATE
         "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
         "${LADYBIRD_SOURCE_DIR}/UI/Qt/CrashReportReviewWidget.cpp"
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/ReportReview.cpp"
         "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
     )
     deploy_qt_offscreen_platform_plugin(TestCrashReportReviewWidget)
 endif()
+
+ladybird_test("TestScreenshotSelectionOverlay.cpp" UI/Qt
+    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
+    LIBS LibURL Qt::Core Qt::Gui Qt::Widgets
+)
+target_sources(TestScreenshotSelectionOverlay PRIVATE
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/Popover.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ScreenshotSelectionOverlay.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
+)
+deploy_qt_offscreen_platform_plugin(TestScreenshotSelectionOverlay)
+
+ladybird_test("TestScreenshotViewer.cpp" UI/Qt
+    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
+    LIBS LibURL Qt::Core Qt::Gui Qt::Widgets
+)
+target_sources(TestScreenshotViewer PRIVATE
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ScreenshotViewer.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
+)
+deploy_qt_offscreen_platform_plugin(TestScreenshotViewer)
+
+ladybird_test("TestWebCompatReportReview.cpp" UI/Qt
+    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
+    LIBS LibURL LibWebView Qt::Core Qt::Gui Qt::Widgets
+)
+target_sources(TestWebCompatReportReview PRIVATE
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/Icon.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ReportReview.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/WebCompatReportReview.cpp"
+)
+deploy_qt_offscreen_platform_plugin(TestWebCompatReportReview)
 
 ladybird_test("TestHiddenPageSizing.cpp" UI/Qt
     CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"

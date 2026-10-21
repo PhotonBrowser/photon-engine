@@ -116,20 +116,19 @@ fn custom_property_value_moved(
     let new = new.and_then(|store| store.get(name));
     let (old, new) = match (old, new) {
         (None, None) => return false,
-        (Some(old), Some(new)) => (old.value.pointer(), new.value.pointer()),
+        (Some(old), Some(new)) => (&old.value, &new.value),
         _ => return true,
     };
-    if std::ptr::eq(old, new) {
+    if std::ptr::eq(old.pointer(), new.pointer()) {
         return false;
     }
-    // SAFETY: Both values are kept alive by the stores that hold them.
-    matches!(unsafe { &*old }, StyleValueData::PendingSubstitution { .. })
-        || !unsafe { crate::css::style_value::rust_style_value_equals(old, new) }
+    matches!(old.optional_data(), Some(StyleValueData::PendingSubstitution { .. }))
+        || !crate::css::style_value::retained_style_values_equal(old, new)
 }
 
 /// # Safety
 /// `store` must be null or a live raw `Arc` pointer to a `CustomPropertyStore`.
-unsafe fn retained_store(store: *const c_void) -> Option<Arc<CustomPropertyStore>> {
+pub(super) unsafe fn retained_store(store: *const c_void) -> Option<Arc<CustomPropertyStore>> {
     if store.is_null() {
         return None;
     }
@@ -161,7 +160,7 @@ impl StyleEngine {
         unsafe {
             self.retained
                 .custom_property_environments
-                .retain(moved.new_inheritable.identity, moved.new_inheritable.store);
+                .retain_raw(moved.new_inheritable.identity, moved.new_inheritable.store);
         }
         let mut changed_names = None;
         let mut pending = Vec::new();
@@ -229,8 +228,13 @@ impl StyleEngine {
                 (held.identity, held.sampled_over.is_some(), held.declares)
             });
         // An animation overlay samples over what the element's style resolves to, which a
-        // computation moves.
-        if is_animation_overlay {
+        // computation moves. So does a record composing animated values: only a base record moves
+        // to another environment by itself, and the host would otherwise hold an environment its
+        // record does not name.
+        if is_animation_overlay
+            || computed::FinalStyleRecordID::from_raw(held_style_record)
+                .is_some_and(computed::FinalStyleRecordID::is_animation_overlay)
+        {
             act(EnvironmentMoveAction::Recompute(element));
             return None;
         }
@@ -326,11 +330,8 @@ impl StyleEngine {
         let Some(store) = environments.store(identity) else {
             return false;
         };
-        // SAFETY: The store is live while the identity naming it is.
-        let built_over = unsafe { &*store.cast::<CustomPropertyStore>() }
-            .inheritance_parent()
-            .map_or(std::ptr::null(), |parent| Arc::as_ptr(parent).cast());
-        built_over == environments.store(parent).unwrap_or(std::ptr::null())
+        let built_over = store.inheritance_parent().map_or(std::ptr::null(), Arc::as_ptr);
+        built_over == environments.store(parent).map_or(std::ptr::null(), Arc::as_ptr)
     }
 
     /// Whether a moved environment computes the element again rather than handing it the moved
@@ -499,13 +500,10 @@ mod tests {
     /// Give `identity` a store of no values built over the one `parent` names, or over none.
     fn note_store_built_over(engine: &mut StyleEngine, identity: u64, parent: u64) {
         let environments = &mut engine.retained.custom_property_environments;
-        let parent = environments.store(parent).unwrap_or(std::ptr::null());
-        // SAFETY: The parent is null or a live store, and the environments retain the new one.
-        unsafe {
-            let store = CustomPropertyStore::cascaded_child(parent, Vec::new());
-            environments.retain(identity, store);
-            drop(Arc::from_raw(store.cast::<CustomPropertyStore>()));
-        }
+        let parent = environments.store(parent).cloned();
+        // SAFETY: The store holds no values.
+        let store = unsafe { CustomPropertyStore::cascaded_child(parent, Vec::new()) };
+        environments.retain(identity, Some(&store));
     }
 
     #[test]

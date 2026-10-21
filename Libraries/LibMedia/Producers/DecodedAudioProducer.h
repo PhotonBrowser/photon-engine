@@ -16,11 +16,6 @@
 #include <AK/Time.h>
 #include <LibCore/Forward.h>
 #include <LibMedia/Audio/AudioConverter.h>
-#include <LibMedia/AudioBlock.h>
-#include <LibMedia/CodecID.h>
-#include <LibMedia/CodedFrame.h>
-#include <LibMedia/DecoderError.h>
-#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
@@ -28,6 +23,11 @@
 #include <LibMedia/SynchronizedWakeHandler.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
+#include <LibMediaCodecs/AudioBlock.h>
+#include <LibMediaCodecs/AudioDecoderRegistry.h>
+#include <LibMediaCodecs/CodecID.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/DecoderError.h>
 #include <LibThreading/Forward.h>
 
 namespace Media {
@@ -81,6 +81,7 @@ private:
         DecoderErrorOr<void> receive_into_decoder(CodedFrame const&);
         DecoderErrorOr<void> receive_coded_frame(CodedFrame const&);
         DecoderErrorOr<bool> replace_drained_decoder();
+        bool check_if_seek_is_needed_or_allow_demuxer_reads(u32 seek_id);
         void release_decoder();
         void exit();
 
@@ -97,6 +98,9 @@ private:
         DecoderErrorOr<void> retrieve_next_block(AudioBlock&);
         bool handle_seek();
         void resolve_seek(u32 seek_id);
+        bool seek_to_resubmit_if_decoder_lost_its_state(DecoderError const&);
+        bool seek_to_replace_decoder_if_it_cannot_decode_the_stream(DecoderError const&);
+        void seek_to_resubmit_while_locked();
         void push_data_and_decode_a_block();
 
         AudioProducerOutput peek();
@@ -146,6 +150,7 @@ private:
 
         size_t m_queue_max_size { 8 };
         AudioQueue m_queue;
+        AK::Duration m_earliest_available_timestamp;
         ErrorHandler m_error_handler;
         ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };

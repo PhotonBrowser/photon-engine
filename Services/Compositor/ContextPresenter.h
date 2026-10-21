@@ -31,6 +31,7 @@
 #include <LibGfx/Rect.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibGfx/Size.h>
+#include <LibMediaCodecs/VideoFrameHandle.h>
 
 namespace Gfx {
 
@@ -136,6 +137,16 @@ public:
     void paint_screenshot(DisplayListPlayerSkia&, Gfx::ShareableBitmap&, FrameContent const&);
 
 private:
+    // A video frame named by the pool slot acquisition it was decoded into, which is new for every
+    // frame even when frames share a surface.
+    struct VideoFrameSlot {
+        Media::VideoFramePoolID pool_id;
+        u32 slot_index { 0 };
+        u64 slot_acquisition_id { 0 };
+
+        bool operator==(VideoFrameSlot const&) const = default;
+    };
+
     struct RasterizedFrame {
         NonnullRefPtr<Compositing::DisplayList const> display_list;
         Compositing::AccumulatedVisualContextTree visual_context_tree;
@@ -143,6 +154,7 @@ private:
         Gfx::IntSize viewport_size;
         HashMap<Compositing::CanvasId, u64> canvas_content_generations;
         u64 raster_content_epoch { 0 };
+        HashMap<Compositing::VideoSinkResourceId, Optional<VideoFrameSlot>> video_frame_slots;
     };
 
     struct ScrollBlit {
@@ -164,6 +176,7 @@ private:
     Optional<ScrollBlit> scroll_blit_for(Gfx::IntSize viewport_size, FrameContent const&);
     void shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::IntPoint translation);
     void remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot);
+    Optional<VideoFrameSlot> current_video_frame_slot(Compositing::VideoSinkResourceId);
     void stop_backing_store_shrink_timer();
     void stop_surplus_backing_store_retirement_timer();
 

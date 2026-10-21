@@ -4,26 +4,17 @@ set(SOURCES
     Audio/WSOLAInternals.cpp
     Audio/WSOLATimeStretcher.cpp
     AudioDiscardIntervals.cpp
-    CodecParameters.cpp
-    Color/CodingIndependentCodePoints.cpp
-    Codecs/AAC.cpp
-    Codecs/AV1.cpp
     Codecs/FLAC.cpp
-    Codecs/H264.cpp
-    Codecs/H265.cpp
-    Codecs/MPEG4Audio.cpp
     Codecs/Opus.cpp
     Codecs/Vorbis.cpp
-    Codecs/VP9.cpp
     ContainerID.cpp
     Containers/ADTS/ADTSDemuxer.cpp
     Containers/ADTS/FrameHeader.cpp
     Containers/ADTS/Reader.cpp
-    Containers/ConstantBitrateContainerNavigator.cpp
-    Containers/FLACNavigator.cpp
+    Containers/FLAC/FLACDemuxer.cpp
+    Containers/FLAC/Reader.cpp
     Containers/FrameScanTimeline.cpp
     Containers/ID3.cpp
-    Containers/IndexedContainerNavigator.cpp
     Containers/ISOBMFF/FragmentSampleIterator.cpp
     Containers/ISOBMFF/ISOBMFFDemuxer.cpp
     Containers/ISOBMFF/SampleIterator.cpp
@@ -38,10 +29,12 @@ set(SOURCES
     Containers/MP3/MP3Demuxer.cpp
     Containers/MP3/Reader.cpp
     Containers/MP3/StreamInfo.cpp
-    Containers/OggNavigator.cpp
+    Containers/Ogg/OggDemuxer.cpp
+    Containers/Ogg/Reader.cpp
+    Containers/WAV/Reader.cpp
+    Containers/WAV/WAVDemuxer.cpp
     DecodeAudioStream.cpp
-    DecoderError.cpp
-    DecoderRegistry.cpp
+    DecoderRegistrations.cpp
     DemuxerRegistry.cpp
     DemuxerScanState.cpp
     IncrementallyPopulatedStream.cpp
@@ -67,17 +60,13 @@ set(SOURCES
     Producers/DecodedAudioProducer.cpp
     Producers/DecodedVideoProducer.cpp
     Producers/RemoteVideoProducer.cpp
+    RemoteVideoDecoder.cpp
     Sinks/AudioPlaybackSink.cpp
     Sinks/DisplayingVideoSink.cpp
     Sinks/RemoteVideoSink.cpp
     TimeRanges.cpp
     Track.cpp
     VideoEdgeQueue.cpp
-    VideoFrame.cpp
-    VideoFrameHandle.cpp
-    VideoFramePool.cpp
-    VideoSurface.cpp
-    VideoPresentation/PresentedFramePage.cpp
     VideoPresentation/VideoPresentationClientConnection.cpp
     VideoPresentation/VideoPresentationServerConnection.cpp
 )
@@ -90,7 +79,6 @@ set(GENERATED_SOURCES
 if (APPLE)
     list(APPEND SOURCES
         AudioToolbox/AudioToolboxAudioDecoder.cpp
-        VideoToolbox/VideoToolboxVideoDecoder.mm
     )
 endif()
 
@@ -99,24 +87,20 @@ compile_ipc(VideoPresentation/VideoPresentationServer.ipc VideoPresentation/Vide
 
 ladybird_lib(LibMedia media EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibMedia PRIVATE LibCore LibCrypto LibIPC LibGfx LibThreading LibUnicode)
-target_link_libraries(LibMedia PUBLIC LibAudio)
+target_link_libraries(LibMedia PUBLIC LibAudio LibMediaCodecs)
 
 if (APPLE)
-    target_link_libraries(LibMedia PRIVATE "-framework AudioToolbox" "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo")
+    target_link_libraries(LibMedia PRIVATE "-framework AudioToolbox")
 endif()
 
 target_sources(LibMedia PRIVATE
         FFmpeg/FFmpegAudioConverter.cpp
         FFmpeg/FFmpegAudioDecoder.cpp
-        FFmpeg/FFmpegDemuxer.cpp
-        FFmpeg/FFmpegFunctions.cpp
-        FFmpeg/FFmpegHelpers.cpp
-        FFmpeg/FFmpegIOContext.cpp
-        FFmpeg/FFmpegVideoDecoder.cpp
+        FFmpeg/FFmpegChannelLayout.cpp
 )
 
 if (NOT ANDROID)
-    target_link_libraries(LibMedia PRIVATE PkgConfig::AVCODEC PkgConfig::AVFORMAT PkgConfig::AVUTIL PkgConfig::LIBSWRESAMPLE)
+    target_link_libraries(LibMedia PRIVATE PkgConfig::AVCODEC PkgConfig::AVUTIL PkgConfig::LIBSWRESAMPLE)
 else()
     target_include_directories(LibMedia PRIVATE ${FFMPEG_INCLUDE_DIRS})
     target_link_directories(LibMedia PRIVATE ${FFMPEG_LIBRARY_DIRS})
@@ -125,7 +109,6 @@ endif()
 
 if (LINUX)
     target_sources(LibMedia PRIVATE
-        FFmpeg/SystemFFmpeg.cpp
         FFmpeg/SystemFFmpegDecoders.cpp
     )
     target_link_libraries(LibMedia PRIVATE ${CMAKE_DL_LIBS})

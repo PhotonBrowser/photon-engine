@@ -14,6 +14,7 @@
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
 #include <LibWebView/CrashReportReview.h>
+#include <LibWebView/ReportSubmission.h>
 
 #include <QWidget>
 
@@ -32,26 +33,21 @@ class CrashReportReviewWidget final : public QWidget {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    // The spacing of items within a group and of the groups themselves, which the screen around the review shares.
-    static constexpr int item_spacing = 8;
-    static constexpr int group_spacing = 28;
-
-    static QLabel* create_title(QString const& text, QWidget* parent);
-
     // The exit button leaves the review, for example by reloading the crashed page.
     CrashReportReviewWidget(QString exit_text, QWidget* parent, WebView::CrashReportStore& = WebView::CrashReportStore::the());
 
     ErrorOr<void> open_report(Optional<ByteString> const& name = {}, Optional<String> const& website = {});
 
-    void show_progress(WebView::CrashReportSubmission::Stage);
+    void show_progress(WebView::ReportSubmission::Stage);
     void show_retry(String const& reason, u32 retry_number, u32 maximum_retries, u32 delay_seconds);
     void show_sent();
     void show_declined();
-    void show_failure(WebView::CrashReportSubmission::Failure, String const& reason);
+    void show_failure(WebView::ReportSubmission::Failure, String const& reason);
 
     Function<void()> on_exit;
-    // The user chose to send the report or not, so the screen around the review no longer needs to ask.
+    // The report was sent, declined or cannot be sent, so the screen around the review no longer needs to ask.
     Function<void()> on_answered;
+    Function<void(bool)> on_report_text_visibility_change;
 
 protected:
     virtual bool event(QEvent*) override;
@@ -61,6 +57,7 @@ private:
     void send();
     void update_chrome_style();
     void show_page(QWidget&);
+    void show_report_text();
     // Shows the given actions of the status page, with the primary one as the default and focused action.
     void show_status(QString const& title, QString const& message, Vector<QPushButton*> const& actions = {},
         QPushButton* primary = nullptr);
@@ -73,6 +70,7 @@ private:
 
     QWidget* m_review_page { nullptr };
     QWidget* m_status_page { nullptr };
+    QWidget* m_report_text_page { nullptr };
 
     QPlainTextEdit* m_description_edit { nullptr };
     QWidget* m_website_option { nullptr };
@@ -80,12 +78,15 @@ private:
     QLineEdit* m_website { nullptr };
     QFrame* m_details { nullptr };
     QFormLayout* m_fields { nullptr };
+    QPushButton* m_show_report_button { nullptr };
+    QPlainTextEdit* m_report_text { nullptr };
     QLabel* m_validation { nullptr };
 
     QLabel* m_status_title { nullptr };
     QProgressBar* m_progress { nullptr };
     QLabel* m_status_message { nullptr };
     QPushButton* m_retry_button { nullptr };
+    QPushButton* m_cancel_button { nullptr };
     QPushButton* m_next_button { nullptr };
     QPushButton* m_exit_button { nullptr };
 

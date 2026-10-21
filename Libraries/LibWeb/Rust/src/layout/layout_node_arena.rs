@@ -3321,15 +3321,14 @@ impl LayoutNodeArena {
         if !self.has_style_engine() {
             return;
         }
-        // SAFETY: As with `with_style_store`, the engine outlives the arena's live nodes, and no
-        // reader keeps a borrow of the engine across the host call this publication arrives in.
-        let engine = unsafe { self.style_engine().get_mut() };
-        for atom in retained {
-            engine.retain_published_atom(crate::css::style::index::StyleAtomID(atom));
-        }
-        for atom in released {
-            engine.release_published_atom(crate::css::style::index::StyleAtomID(atom));
-        }
+        self.with_style_engine(|engine| {
+            for atom in retained {
+                engine.retain_published_atom(crate::css::style::index::StyleAtomID(atom));
+            }
+            for atom in released {
+                engine.release_published_atom(crate::css::style::index::StyleAtomID(atom));
+            }
+        });
     }
 
     pub(crate) fn with_counter_style_registry<T>(
@@ -5149,12 +5148,20 @@ impl LayoutNodeArena {
 
     pub(crate) fn text_source_range(&self, id: NodeSlotId, source_length: usize) -> FfiTextSourceRange {
         self.data(id);
-        self.text_node_state(id)
-            .and_then(|state| state.source_range)
-            .unwrap_or(FfiTextSourceRange {
+        let Some(range) = self.text_node_state(id).and_then(|state| state.source_range) else {
+            return FfiTextSourceRange {
                 start: 0,
                 length: source_length,
-            })
+            };
+        };
+        // NB: A slice's range was taken from the text when its ::first-letter split was built. The text can change
+        //     or leave the document before the next tree build replaces the split, and a layout in the meantime
+        //     renders the part of the range that the current text still has.
+        let start = range.start.min(source_length);
+        FfiTextSourceRange {
+            start,
+            length: range.length.min(source_length - start),
+        }
     }
 
     pub(crate) fn text_has_source_range(&self, id: NodeSlotId) -> bool {
@@ -5691,7 +5698,7 @@ fn counter_owner(style_node: u32, generated_for: u8) -> Option<super::counters::
 pub unsafe extern "C" fn style_resets_forward_list_item_counter(payloads: *const *const c_void, count: usize) -> bool {
     assert!(!payloads.is_null(), "style group payload array is null");
     // SAFETY: Guaranteed by the caller.
-    let groups = unsafe { std::slice::from_raw_parts(payloads, count) };
+    let groups = unsafe { ak::slice_from_raw_parts(payloads, count) };
     super::counters::style_resets_forward_list_item_counter(ComputedValuesView::new(groups))
 }
 

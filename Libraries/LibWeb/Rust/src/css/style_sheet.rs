@@ -100,6 +100,11 @@ impl NativeStyleSheet {
         &self.rules
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_rules(&self) -> &Rc<NativeRuleList> {
+        &self.rules
+    }
+
     pub(super) fn imported_sheet(&self, identity: u64) -> Option<Rc<Self>> {
         self.imports.borrow().get(&identity).cloned()
     }
@@ -453,12 +458,11 @@ impl Drop for NativeStyleSheet {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_sheet_create(
-    rules: *const NativeRuleList,
+pub extern "C" fn rust_style_sheet_create(
+    rules: crate::css::ffi_support::RcRef<'_, NativeRuleList>,
     media: &MediaList,
 ) -> *const NativeStyleSheet {
-    unsafe { Rc::increment_strong_count(rules) };
-    Rc::into_raw(NativeStyleSheet::new(unsafe { Rc::from_raw(rules) }, media.clone()))
+    Rc::into_raw(NativeStyleSheet::new(rules.to_rc(), media.clone()))
 }
 
 #[unsafe(no_mangle)]
@@ -519,19 +523,15 @@ pub extern "C" fn rust_style_sheet_reset_media_state(sheet: &NativeStyleSheet) {
 
 /// Evaluate media queries throughout the sheet graph from one document environment snapshot, and queue whether the
 /// conditions of the rules whose conditions changed hold.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, and the environment must contain
-/// valid media feature data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_sheet_evaluate_media_queries(
+pub extern "C" fn rust_style_sheet_evaluate_media_queries(
     sheet: &NativeStyleSheet,
-    environment: FfiMediaEnvironment,
+    environment: FfiMediaEnvironment<'_>,
     state: &mut NativeMediaEvaluationState,
     host: &crate::render_state::DocumentHost,
 ) -> NativeStyleSheetMediaEvaluation {
     let mut conditions = Vec::new();
-    let result = sheet.evaluate_media_queries(unsafe { environment.borrow() }, state, &mut |identity, holds| {
+    let result = sheet.evaluate_media_queries(environment.borrow(), state, &mut |identity, holds| {
         conditions.push((identity, holds));
     });
     write_rule_conditions(host, conditions);
@@ -539,18 +539,14 @@ pub unsafe extern "C" fn rust_style_sheet_evaluate_media_queries(
 }
 
 /// Queue inherited condition gates for the document engine.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, and the environment live for this
-/// call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_sheet_publish_conditions(
+pub extern "C" fn rust_style_sheet_publish_conditions(
     sheet: &NativeStyleSheet,
     host: &crate::render_state::DocumentHost,
-    environment: FfiMediaEnvironment,
+    environment: FfiMediaEnvironment<'_>,
 ) {
     let mut conditions = Vec::new();
-    sheet.visit_conditions(unsafe { environment.borrow() }, true, &mut |identity, holds| {
+    sheet.visit_conditions(environment.borrow(), true, &mut |identity, holds| {
         conditions.push((identity, holds));
     });
     write_rule_conditions(host, conditions);
@@ -630,7 +626,7 @@ pub unsafe extern "C" fn rust_style_sheet_publish_layer_order(
     let sheets = if count == 0 {
         &[][..]
     } else {
-        unsafe { std::slice::from_raw_parts(sheets, count) }
+        unsafe { ak::slice_from_raw_parts(sheets, count) }
     };
     let names = cascade_layer_order(sheets.iter().map(|&sheet| unsafe { &*sheet }));
     let has_layers = names.len() > 1;
@@ -670,7 +666,7 @@ mod tests {
         let units: Vec<_> = source.encode_utf16().collect();
         // All fields are booleans, integers, or nullable pointers; zero is an empty parser context.
         let context = ParseContext::default();
-        unsafe { parse_shared_stylesheet(crate::css::css_tokenizer::TokenizerInput::Utf16(&units), &context) }
+        parse_shared_stylesheet(crate::css::css_tokenizer::TokenizerInput::Utf16(&units), Some(&context))
     }
 
     fn sheet(parsed: &std::sync::Arc<ParsedStyleSheet>) -> Rc<NativeStyleSheet> {
@@ -689,11 +685,7 @@ mod tests {
 
     #[test]
     fn media_cache_invalidation_reads_shared_rules_without_owners() {
-        let environment = FfiMediaEnvironment {
-            values: std::ptr::null(),
-            value_count: 0,
-            length_resolution_context: std::ptr::null(),
-        };
+        let environment = FfiMediaEnvironment::new(&[], None);
         for (text, reaches_cache) in [
             ("@media all { .target { color: red; } }", false),
             ("@media all { @keyframes motion { from { opacity: 0; } } }", true),
@@ -702,11 +694,11 @@ mod tests {
             let sheet = sheet(&parse(text));
             let owners = crate::css::rule::RULE_OWNER_ALLOCATIONS.get();
             let mut state = NativeMediaEvaluationState::default();
-            let initial = sheet.evaluate_media_queries(unsafe { environment.borrow() }, &mut state, &mut |_, _| {});
+            let initial = sheet.evaluate_media_queries(environment.borrow(), &mut state, &mut |_, _| {});
             assert!(!initial.any_changed);
             assert!(!initial.style_cache_inputs_changed);
             set_media(&sheet, "not all");
-            let changed = sheet.evaluate_media_queries(unsafe { environment.borrow() }, &mut state, &mut |_, _| {});
+            let changed = sheet.evaluate_media_queries(environment.borrow(), &mut state, &mut |_, _| {});
             assert!(changed.sheet_changed);
             assert_eq!(changed.style_cache_inputs_changed, reaches_cache);
             assert_eq!(crate::css::rule::RULE_OWNER_ALLOCATIONS.get(), owners);

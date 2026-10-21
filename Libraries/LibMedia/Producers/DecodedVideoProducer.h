@@ -16,9 +16,6 @@
 #include <AK/ThreadID.h>
 #include <AK/Time.h>
 #include <LibCore/Forward.h>
-#include <LibMedia/CodedFrame.h>
-#include <LibMedia/DecoderError.h>
-#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
@@ -28,7 +25,11 @@
 #include <LibMedia/SynchronizedWakeHandler.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
-#include <LibMedia/VideoDecoder.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/DecoderError.h>
+#include <LibMediaCodecs/NonReferenceFrameDetector.h>
+#include <LibMediaCodecs/VideoDecoder.h>
+#include <LibMediaCodecs/VideoDecoderRegistry.h>
 
 namespace Media {
 
@@ -79,7 +80,8 @@ private:
         DecoderErrorOr<void> receive_into_decoder(CodedFrame const&, DecodeIntent);
         DecoderErrorOr<void> create_decoder_for_frame(CodedFrame const&);
         DecoderErrorOr<void> receive_coded_frame(CodedFrame const&, DecodeIntent);
-        DecoderErrorOr<bool> replace_drained_decoder();
+        DecoderErrorOr<bool> replace_drained_decoder(u32 seek_id);
+        bool check_if_seek_is_needed_or_allow_demuxer_reads(u32 seek_id);
         void release_decoder();
         void exit();
 
@@ -103,6 +105,9 @@ private:
         void dispatch_error(DecoderError&&);
         bool handle_seek();
         void resolve_seek(u32 seek_id);
+        bool seek_to_resubmit_if_decoder_lost_its_state(DecoderError const&);
+        bool seek_to_replace_decoder_if_it_cannot_decode_the_stream(DecoderError const&);
+        void seek_to_resubmit_while_locked();
         bool is_within_available_range_while_locked(AK::Duration) const;
         void re_emit_last_frame_if_at_end_of_stream_while_locked();
         void push_data_and_decode_some_frames();
@@ -134,6 +139,7 @@ private:
             Mutex mutex;
             ConditionVariable condition { mutex };
             bool frame_storage_was_freed { false };
+            Atomic<bool> output_should_interrupt_demuxer_reads { false };
         };
         NonnullRefPtr<WaitState> m_wait_state { make_ref_counted<WaitState>() };
         RequestedState m_requested_state { RequestedState::None };
@@ -147,6 +153,7 @@ private:
         Optional<CodedFrame> m_frame_awaiting_decoder_replacement;
         DecodeIntent m_intent_awaiting_decoder_replacement { DecodeIntent::Output };
         OwnPtr<VideoDecoder> m_decoder;
+        NonReferenceFrameDetector m_non_reference_frame_detector;
         bool m_decoder_needs_keyframe_next_seek { false };
         bool m_decoder_needs_codec_configuration_next_seek { true };
 

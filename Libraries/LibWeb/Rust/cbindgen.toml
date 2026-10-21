@@ -10,6 +10,7 @@ line_length  = 120
 tab_width = 4
 no_includes = true
 sys_includes = ["stdint.h", "stddef.h"]
+includes = ["AK/Span.h"]
 usize_is_size_t = true
 
 [parse]
@@ -18,9 +19,18 @@ parse_deps = false
 [parse.expand]
 all_features = false
 
+[export]
+# Opaque to C++, which names each by a void pointer (see below).
+exclude = ["SyntaxNode"]
+
 [export.mangle]
 rename_types = "PascalCase"
 
 [export.rename]
+# An ak::Span is laid out as an AK ReadonlySpan, which C++ passes it as.
+"Span" = "AK::ReadonlySpan"
+"SpanMut" = "AK::Span"
 # A style engine handle is opaque to C++.
 "StyleEngineHandle" = "const void*"
+# So is a parsed syntax, which C++ holds by pointer.
+"SyntaxNode" = "void"

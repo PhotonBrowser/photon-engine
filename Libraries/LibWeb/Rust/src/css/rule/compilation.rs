@@ -312,13 +312,13 @@ pub(crate) unsafe fn style_sheet_visit_compilation(
     rule_identity: u64,
     purpose: NativeCompilationPurpose,
     source: *const c_void,
-    environment: FfiMediaEnvironment,
+    environment: FfiMediaEnvironment<'_>,
     callbacks: &NativeCompilationCallbacks,
 ) {
     // SAFETY: Guaranteed by the caller.
     let (host, source) = unsafe { CompilationHost::new(callbacks, source) };
     // SAFETY: Guaranteed by the caller.
-    let environment = unsafe { environment.borrow() };
+    let environment = environment.borrow();
     visit_compilation(sheet, rule_identity, purpose, source, environment, host, None);
 }
 
@@ -334,7 +334,7 @@ pub unsafe extern "C" fn rust_style_sheet_compile(
     sheet: &NativeStyleSheet,
     rule_identity: u64,
     source: *const c_void,
-    environment: FfiMediaEnvironment,
+    environment: FfiMediaEnvironment<'_>,
     callbacks: &NativeCompilationCallbacks,
     publication: &NativeStylePublication,
 ) {
@@ -343,7 +343,7 @@ pub unsafe extern "C" fn rust_style_sheet_compile(
     // SAFETY: Guaranteed by the caller.
     let (host, source) = unsafe { CompilationHost::new(callbacks, source) };
     // SAFETY: Guaranteed by the caller.
-    let environment = unsafe { environment.borrow() };
+    let environment = environment.borrow();
     visit_compilation(
         sheet,
         rule_identity,
@@ -365,11 +365,11 @@ pub unsafe extern "C" fn rust_style_sheet_replace_selectors(
     sheet: &NativeStyleSheet,
     rule_identity: u64,
     source: *const c_void,
-    environment: FfiMediaEnvironment,
+    environment: FfiMediaEnvironment<'_>,
     callbacks: &NativeCompilationCallbacks,
     publication: &NativeStylePublication,
 ) {
-    let environment = unsafe { environment.borrow() };
+    let environment = environment.borrow();
     // SAFETY: Guaranteed by the caller.
     let publisher = unsafe { Publisher::new(publication) };
     // SAFETY: Guaranteed by the caller.
@@ -544,7 +544,7 @@ mod tests {
         let view = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
         // All context fields are booleans, integers, or nullable pointers.
         let context = ParseContext::default();
-        let parsed = unsafe { parse_shared_stylesheet(view, &context) };
+        let parsed = parse_shared_stylesheet(view, Some(&context));
         let rules = crate::css::rule::NativeRuleList::from_parsed(parsed);
         let media = MediaList::new(Default::default());
         NativeStyleSheet::new(rules, media)
@@ -623,12 +623,8 @@ mod tests {
         ];
         values[id].kind = FfiMediaFeatureValueKind::Length;
         values[id].value = width;
-        let environment = FfiMediaEnvironment {
-            values: values.as_ptr(),
-            value_count: values.len(),
-            length_resolution_context: std::ptr::null(),
-        };
-        visit(unsafe { environment.borrow() })
+        let environment = FfiMediaEnvironment::new(&values, None);
+        visit(environment.borrow())
     }
 
     fn media_at(sheet: &NativeStyleSheet, path: &[usize]) -> MediaList {
@@ -1149,15 +1145,11 @@ mod tests {
         let mut images = 0_usize;
         unsafe { rust_rule_list_visit_images(rules, (&raw mut images).cast(), image) };
         assert_eq!(images, 1);
-        let environment = FfiMediaEnvironment {
-            values: std::ptr::null(),
-            value_count: 0,
-            length_resolution_context: std::ptr::null(),
-        };
+        let environment = FfiMediaEnvironment::new(&[], None);
         let mut media_state = crate::css::style_sheet::NativeMediaEvaluationState::default();
         assert!(
             !source
-                .evaluate_media_queries(unsafe { environment.borrow() }, &mut media_state, &mut |_, _| {})
+                .evaluate_media_queries(environment.borrow(), &mut media_state, &mut |_, _| {})
                 .any_changed
         );
         assert!(rules.rules.borrow().is_none());
@@ -1181,7 +1173,7 @@ mod tests {
         });
         assert!(
             !source
-                .evaluate_media_queries(unsafe { environment.borrow() }, &mut media_state, &mut |_, _| {})
+                .evaluate_media_queries(environment.borrow(), &mut media_state, &mut |_, _| {})
                 .any_changed
         );
     }
@@ -1194,9 +1186,8 @@ mod tests {
             let units: Vec<_> = source.encode_utf16().collect();
             let parsed = std::thread::spawn(move || {
                 let context = ParseContext::default();
-                let parsed = unsafe {
-                    parse_shared_stylesheet(crate::css::css_tokenizer::TokenizerInput::Utf16(&units), &context)
-                };
+                let parsed =
+                    parse_shared_stylesheet(crate::css::css_tokenizer::TokenizerInput::Utf16(&units), Some(&context));
                 assert_eq!(RULE_OWNER_ALLOCATIONS.get(), 0);
                 assert_eq!(DECLARATION_OWNER_ALLOCATIONS.get(), 0);
                 assert_eq!(crate::css::descriptor_block::DESCRIPTOR_OWNER_ALLOCATIONS.get(), 0);
@@ -1259,7 +1250,7 @@ mod tests {
             };
             let child = unsafe {
                 Rc::from_raw(rust_style_sheet_create(
-                    std::ptr::from_ref(parsed_child.rules()),
+                    crate::css::ffi_support::RcRef::new(parsed_child.shared_rules()),
                     &media,
                 ))
             };
@@ -1290,12 +1281,8 @@ mod tests {
             sheet: compiled_sheet,
             before: 0,
         };
-        let environment = FfiMediaEnvironment {
-            values: std::ptr::null(),
-            value_count: 0,
-            length_resolution_context: std::ptr::null(),
-        };
-        let borrowed_environment = unsafe { environment.borrow() };
+        let environment = FfiMediaEnvironment::new(&[], None);
+        let borrowed_environment = environment.borrow();
         let mut media_state = crate::css::style_sheet::NativeMediaEvaluationState::default();
         assert!(
             !source
@@ -1333,7 +1320,7 @@ mod tests {
             );
         }
         assert_eq!(compiled.get(), 9);
-        unsafe { crate::css::style_sheet::rust_style_sheet_publish_conditions(&source, host.host(), environment) };
+        crate::css::style_sheet::rust_style_sheet_publish_conditions(&source, host.host(), environment);
         unsafe extern "C" fn prepare(_: *mut c_void) {}
         let sheets = [Rc::as_ptr(&source)];
         assert!(unsafe {
@@ -1577,13 +1564,13 @@ mod tests {
         drop(sheet);
         std::thread::spawn(move || {
             let context = ParseContext {
-                declared_namespaces: Arc::as_ptr(&namespaces),
+                declared_namespaces: Some(&namespaces),
                 ..ParseContext::default()
             };
             for (source, expected) in [("色|item { color: red; }", 1), ("未知|item { color: red; }", 0)] {
                 let units: Vec<_> = source.encode_utf16().collect();
                 let view = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
-                let parsed = unsafe { parse_shared_stylesheet(view, &context) };
+                let parsed = parse_shared_stylesheet(view, Some(&context));
                 let rules = crate::css::rule::NativeRuleList::from_parsed(parsed);
                 assert_eq!(rules.materialized_rules().len(), expected);
             }
@@ -1601,8 +1588,8 @@ mod tests {
         let import = &rules[0];
         let namespace = &rules[1];
         let style = &rules[2];
-        let insert = |rule: &Rc<NativeRule>, index, nested| unsafe {
-            rust_rule_list_insert_css_rule(target.rules(), index, Rc::as_ptr(rule), nested)
+        let insert = |rule: &Rc<NativeRule>, index, nested| {
+            rust_rule_list_insert_css_rule(target.rules(), index, crate::css::ffi_support::RcRef::new(rule), nested)
         };
         assert_eq!(insert(style, 2, false), RuleInsertionResult::IndexSizeError);
         assert_eq!(insert(style, 0, false), RuleInsertionResult::HierarchyRequestError);
@@ -1688,7 +1675,7 @@ mod tests {
             let collection = unsafe { &*data.cast::<Collection>() };
             if rule_type == NativeRuleType::Style {
                 let layer = context.layer_name.to_utf16().unwrap();
-                let scopes = unsafe { std::slice::from_raw_parts(context.scopes, context.scope_count) };
+                let scopes = unsafe { ak::slice_from_raw_parts(context.scopes, context.scope_count) };
                 collection.rules.borrow_mut().push(CompiledRule {
                     identity,
                     source,
@@ -1714,11 +1701,7 @@ mod tests {
             implicit_scope_root: root,
             visit_rule: visit,
         };
-        let environment = FfiMediaEnvironment {
-            values: std::ptr::null(),
-            value_count: 0,
-            length_resolution_context: std::ptr::null(),
-        };
+        let environment = FfiMediaEnvironment::new(&[], None);
         unsafe {
             style_sheet_visit_compilation(
                 sheet,

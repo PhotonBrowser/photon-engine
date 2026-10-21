@@ -16,10 +16,10 @@
 #include <LibCore/Promise.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibMedia/DecoderCapabilities.h>
-#include <LibMedia/DecoderError.h>
 #include <LibMedia/MediaSupport.h>
 #include <LibMediaClient/Forward.h>
+#include <LibMediaCodecs/DecoderCapabilities.h>
+#include <LibMediaCodecs/DecoderError.h>
 #include <MediaServer/MediaClientEndpoint.h>
 #include <MediaServer/MediaServerEndpoint.h>
 
@@ -49,6 +49,9 @@ public:
 
     // Set by the Browser on the controller connection; a server's request for an AudioServer connection goes here.
     Function<ErrorOr<IPC::TransportHandle>()> on_request_audio_server_connection;
+    // The answer may be given later, once the Browser can launch a server.
+    using VideoDecoderServerConnectionAnswer = Function<void(ErrorOr<IPC::TransportHandle>)>;
+    Function<void(VideoDecoderServerConnectionAnswer)> on_request_video_decoder_server_connection;
 
     // The synchronous queries serve APIs that must answer on the spot; everything else asks through a promise.
     Media::MediaSupportInfo query_file_media_support(StringView type, StringView subtype, Optional<String> codecs_parameter);
@@ -82,6 +85,7 @@ private:
     virtual void die() override;
 
     virtual Messages::MediaClient::RequestAudioServerConnectionResponse request_audio_server_connection() override;
+    virtual void request_video_decoder_server_connection(u64 request_id) override;
     virtual void file_media_support_reported(u64 request_id, Media::MediaSupportInfo info) override;
     virtual void decoder_capabilities_reported(u64 request_id, Optional<Media::DecoderCapabilities> capabilities) override;
     virtual void audio_data_decoded(u64 request_id, u32 sample_rate, u32 channel_count, u64 frame_count, Core::AnonymousBuffer planar_samples) override;
@@ -97,8 +101,6 @@ private:
     virtual void playback_session_media_stream_scan_state_changed(u64 session_id, u64 stream_id, Media::DemuxerScanState scan_state) override;
     virtual void playback_session_error(u64 session_id, Media::DecoderError error) override;
     virtual void playback_session_video_resized(u64 session_id, Media::VideoSinkHandle handle, u32 width, u32 height) override;
-    virtual void playback_session_video_edge_attached(u64 session_id, Media::VideoSinkHandle handle, Media::PresentedFramePage presented_frame_page) override;
-    virtual void playback_session_video_frame_pool_retired(u64 session_id, Media::VideoSinkHandle handle, Media::VideoFramePoolID pool_id) override;
 
     virtual void source_buffer_duration_received(u64 session_id, u64 source_buffer_id, double duration) override;
     virtual void source_buffer_first_initialization_segment_received(u64 session_id, u64 source_buffer_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Vector<Media::Track> text_tracks) override;
@@ -106,6 +108,9 @@ private:
     virtual void source_buffer_append_completed(u64 session_id, u64 source_buffer_id, u64 append_generation, Media::MediaSourceExtensions::PublishedState state) override;
     virtual void source_buffer_append_failed(u64 session_id, u64 source_buffer_id, u64 append_generation, Media::MediaSourceExtensions::PublishedState state) override;
     virtual void source_buffer_removal_completed(u64 session_id, u64 source_buffer_id, Media::MediaSourceExtensions::PublishedState state) override;
+
+    template<typename Reply, typename OtherReplyHandler>
+    OwnPtr<Reply> wait_for_reply_to(u64 request_id, OtherReplyHandler);
 
     RemotePlaybackManager* find_playback_manager(u64 session_id);
     void update_idle_timer();

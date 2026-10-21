@@ -85,6 +85,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-document
     CanonicalDocument& active_document() const;
+    URL::URL const& active_document_url() const;
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-target-name
     Utf16String const& target_name() const;
@@ -175,6 +176,9 @@ public:
     void set_viewport(Web::DevicePixelRect, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio);
     void send_viewport_to_host() const;
     void send_viewport_to(WebContentPage&) const;
+    void set_stats_displayed(bool);
+    void send_stats_displayed_to_hosts() const;
+    void send_stats_displayed_to(WebContentPage&) const;
 
     // The navigable's replicated state: what its host reports, and what the UI process knows of it.
     Optional<Web::HTML::ReplicatedNavigableState> replicated_state() const;
@@ -254,6 +258,7 @@ private:
     RefPtr<CanonicalSessionHistoryEntry> m_current_session_history_entry;
     RefPtr<CanonicalSessionHistoryEntry> m_active_session_history_entry;
     void set_the_ongoing_navigation(OngoingNavigation);
+    void notify_view_of_ongoing_navigation() const;
     void end_navigation(CanonicalNavigation&);
     OngoingNavigation m_ongoing_navigation;
     Vector<NonnullRefPtr<CanonicalNavigation>> m_navigations;
@@ -265,6 +270,7 @@ private:
     BlobURLHandle m_pending_navigation_blob_url;
     BlobURLHandle m_document_blob_url;
     ActiveDocumentLoad m_active_document_load;
+    bool m_stats_displayed { false };
     Optional<Web::DevicePixelRect> m_viewport_rect;
     Web::DevicePixelRect m_viewport_intersection;
     double m_device_pixel_ratio { 1 };

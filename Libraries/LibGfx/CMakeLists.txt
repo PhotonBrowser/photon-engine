@@ -26,8 +26,10 @@ set(SOURCES
     Font/WOFF/Loader.cpp
     Font/WOFF2/Loader.cpp
     FontCascadeList.cpp
+    GpuDeviceIdentity.cpp
     GradientPainting.cpp
     Gradients.cpp
+    LinuxDmaBufHandle.cpp
     Matrix4x4.cpp
     DecodedImageFrame.cpp
     RustProcessState.cpp
@@ -68,7 +70,7 @@ if (HAS_DIRECTX)
 endif()
 
 if (HAS_VULKAN)
-    list(APPEND SOURCES SkiaVulkanMemoryAllocator.cpp VulkanContext.cpp VulkanImage.cpp)
+    list(APPEND SOURCES ImportedYCbCrVulkanImage.cpp SkiaVulkanMemoryAllocator.cpp VulkanContext.cpp VulkanImage.cpp)
 endif()
 
 if (HAS_FONTCONFIG)

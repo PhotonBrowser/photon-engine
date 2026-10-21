@@ -30,7 +30,9 @@ use crate::css::parser::query_parser::{
     parse_and_evaluate_media_if_condition, parse_and_evaluate_supports_if_condition, parse_style_range_from_source,
 };
 use crate::css::parser::syntax::{SyntaxNode, SyntaxType, clone_syntax_handle, parse_syntax, parse_with_syntax};
-use crate::css::parser::value_parser::{FfiValueParsingContext, FfiValueParsingContextKind, ParseContext};
+use crate::css::parser::value_parser::{
+    FfiValueParsingContext, FfiValueParsingContextKind, ParseContext, RandomFunctionIndex,
+};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
 use crate::css::serialize::serialize_component_values_to_utf16;
 use crate::css::style_value::RetainedStyleValueData;
@@ -132,6 +134,7 @@ type RegisteredValueParse = (RetainedStyleValueData, Option<RetainedStyleValueDa
 /// How many parses the registry keeps before it starts over.
 const MAX_REGISTERED_VALUE_PARSES: usize = 4096;
 
+#[derive(PartialEq)]
 struct RegisteredCustomProperty {
     syntax: SyntaxNode,
     inherits: bool,
@@ -263,6 +266,11 @@ impl CustomPropertyRegistry {
         self.registrations.contains_key(name)
     }
 
+    /// Whether a name has the same effective registration in two document registries.
+    pub(crate) fn registration_matches(&self, other: &Self, name: &[u16]) -> bool {
+        self.registrations.get(name) == other.registrations.get(name)
+    }
+
     /// Whether a custom property of this name inherits: only a registration can say it does not.
     pub(crate) fn name_inherits(&self, name: &[u16]) -> bool {
         self.registrations
@@ -278,6 +286,25 @@ impl CustomPropertyRegistry {
             .is_some_and(|registration| !matches!(registration.syntax, SyntaxNode::Universal))
     }
 
+    /// Whether a registration's syntax permits smooth interpolation.
+    pub(crate) fn name_has_interpolable_syntax(&self, name: &[u16]) -> bool {
+        fn is_interpolable(syntax: &SyntaxNode) -> bool {
+            match syntax {
+                SyntaxNode::Universal
+                | SyntaxNode::Ident { .. }
+                | SyntaxNode::Type(
+                    SyntaxType::CustomIdent | SyntaxType::Image | SyntaxType::String | SyntaxType::Url,
+                ) => false,
+                SyntaxNode::Type(_) => true,
+                SyntaxNode::Multiplier { child, .. } => is_interpolable(child),
+                SyntaxNode::Alternatives(alternatives) => alternatives.iter().any(is_interpolable),
+            }
+        }
+        self.registrations
+            .get(name)
+            .is_some_and(|registration| is_interpolable(&registration.syntax))
+    }
+
     /// A custom property's initial value: what its registration's initial value computes to, and
     /// the guaranteed-invalid value for an unregistered name or a registration without one.
     pub(crate) fn initial_value(&self, name: &[u16]) -> RetainedStyleValueData {
@@ -287,22 +314,19 @@ impl CustomPropertyRegistry {
         )
     }
 
-    pub(crate) fn parse_context(&self, random_function_index: &mut usize) -> ParseContext {
+    pub(crate) fn parse_context<'a>(&'a self, random_function_index: &'a RandomFunctionIndex) -> ParseContext<'a> {
         ParseContext {
             in_quirks_mode: false,
             is_svg_presentation_attribute: false,
             is_substituted_value: false,
             contains_attr_tainted_values: false,
             is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: self.document_url.as_ptr(),
-            document_url_length: self.document_url.len(),
-            document_base_url: self.document_base_url.as_ptr(),
-            document_base_url_length: self.document_base_url.len(),
-            length_resolution_context: std::ptr::null(),
-            random_function_index,
+            value_contexts: ak::Span::default(),
+            declared_namespaces: None,
+            document_url: ak::Span::new(&self.document_url),
+            document_base_url: ak::Span::new(&self.document_base_url),
+            length_resolution_context: None,
+            random_function_index: Some(random_function_index),
         }
     }
 }
@@ -352,16 +376,15 @@ impl CustomPropertyRegistry {
         registration: &RegisteredCustomProperty,
         source: &[u16],
     ) -> Option<StyleValueData> {
-        let mut random_function_index = 0;
+        let random_function_index = RandomFunctionIndex::default();
         let value_context = FfiValueParsingContext {
             kind: FfiValueParsingContextKind::Property,
             value: crate::css::property_metadata::property_id::CUSTOM,
             secondary_value: 0,
             name: Default::default(),
         };
-        let mut context = self.parse_context(&mut random_function_index);
-        context.value_contexts = &raw const value_context;
-        context.value_context_count = 1;
+        let mut context = self.parse_context(&random_function_index);
+        context.value_contexts = ak::Span::new(std::slice::from_ref(&value_context));
         parse_with_syntax(&context, source, &registration.syntax)
     }
 
@@ -698,19 +721,10 @@ impl CustomPropertyStore {
             .is_some_and(|entry| entry.value.pointer().cast() == value)
     }
 
-    unsafe fn retained_parent(parent: *const c_void) -> Option<Arc<CustomPropertyStore>> {
-        if parent.is_null() {
-            return None;
-        }
-        let parent = parent.cast::<CustomPropertyStore>();
-        unsafe { Arc::increment_strong_count(parent) };
-        Some(unsafe { Arc::from_raw(parent) })
-    }
-
     fn child(
         mut parent: Option<Arc<CustomPropertyStore>>,
         entries: Vec<(usize, CustomPropertyEntry)>,
-    ) -> *const c_void {
+    ) -> Arc<CustomPropertyStore> {
         let mut own_names = HashMap::with_capacity(entries.len());
         let mut own_values = HashMap::with_capacity(entries.len());
         let mut declared_names = Vec::with_capacity(entries.len());
@@ -751,24 +765,21 @@ impl CustomPropertyStore {
             0
         };
 
-        Arc::into_raw(Arc::new(CustomPropertyStore {
+        Arc::new(CustomPropertyStore {
             own_values,
             declared_names,
             own_names,
             inheritance_parent,
             parent,
             ancestor_count,
-        }))
-        .cast()
+        })
     }
 
-    /// # Safety
-    /// `parent` must be null or a live raw `Arc` pointer to a `CustomPropertyStore`.
-    pub(crate) unsafe fn resolved_child(
+    pub(crate) fn resolved_child(
         &self,
-        parent: *const c_void,
+        parent: Option<Arc<CustomPropertyStore>>,
         values: Vec<(usize, RetainedStyleValueData)>,
-    ) -> *const c_void {
+    ) -> Arc<CustomPropertyStore> {
         let entries = values
             .into_iter()
             .map(|(name_raw, value)| {
@@ -787,16 +798,15 @@ impl CustomPropertyStore {
                 )
             })
             .collect();
-        Self::child(unsafe { Self::retained_parent(parent) }, entries)
+        Self::child(parent, entries)
     }
 
     /// # Safety
-    /// `parent` must be null or a live raw `Arc` pointer, and every value pointer must remain live
-    /// for this call.
+    /// Every name and value pointer must remain live for this call.
     pub(crate) unsafe fn cascaded_child(
-        parent: *const c_void,
+        parent: Option<Arc<CustomPropertyStore>>,
         values: Vec<(usize, Arc<[u16]>, bool, *const c_void)>,
-    ) -> *const c_void {
+    ) -> Arc<CustomPropertyStore> {
         let entries = values
             .into_iter()
             .map(|(name_raw, name, important, value)| {
@@ -815,7 +825,7 @@ impl CustomPropertyStore {
                 )
             })
             .collect();
-        Self::child(unsafe { Self::retained_parent(parent) }, entries)
+        Self::child(parent, entries)
     }
 }
 
@@ -916,8 +926,8 @@ struct ASFResolutionContext<'a> {
     /// Whether an attr-tainted value was substituted into a URL, or substituted one.
     uses_attr_tainted_url: bool,
     custom_functions: Option<&'a CustomFunctionRegistry>,
-    parse_context: Option<&'a ParseContext>,
-    media_environment: Option<&'a FfiMediaEnvironment>,
+    parse_context: Option<&'a ParseContext<'a>>,
+    media_environment: Option<&'a FfiMediaEnvironment<'a>>,
     /// What lengths in a style query resolve against: the element's last computed style.
     style_query_length_resolution_context: Option<&'a crate::css::style_compute::FfiLengthResolutionContext>,
     /// What colors in a style query resolve against, where the queried element's are known.
@@ -1191,18 +1201,6 @@ fn tokens_for_function_value(data: &StyleValueData) -> (Vec<OwnedToken>, bool) {
     (tokenize_owned(&source), false)
 }
 
-/// An array the host lends, empty when it has no entries.
-///
-/// # Safety
-/// A non-empty array must be live for `'a`.
-pub(crate) unsafe fn ffi_slice<'a, T>(items: *const T, count: usize) -> &'a [T] {
-    if count == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(items, count) }
-    }
-}
-
 fn custom_function_registry(
     definitions: &[SubstitutionFunctionDefinition],
     caller_scope_identity: usize,
@@ -1452,8 +1450,8 @@ fn normalize_function_tokens(
         return TokenResolution::NotHandled;
     };
     let source = serialize_tokens(tokens);
-    let mut random_function_index = 0;
-    let context = registry.parse_context(&mut random_function_index);
+    let random_function_index = RandomFunctionIndex::default();
+    let context = registry.parse_context(&random_function_index);
     let Some(parsed) = parse_with_syntax(&context, &source, syntax) else {
         return TokenResolution::Invalid;
     };
@@ -2003,8 +2001,8 @@ fn registered_style_query_values_are_equal(
     query_tokens: &[OwnedToken],
     resolution_context: &mut ASFResolutionContext,
 ) -> bool {
-    let mut random_function_index = 0;
-    let context = registry.parse_context(&mut random_function_index);
+    let random_function_index = RandomFunctionIndex::default();
+    let context = registry.parse_context(&random_function_index);
     let Some(computed) = parse_with_syntax(&context, &serialize_tokens(computed_tokens), syntax) else {
         return false;
     };
@@ -2164,12 +2162,12 @@ fn evaluate_style_range_value(
         TokenResolution::NotHandled => return Err(ConditionEvaluation::NotHandled),
     };
     let source = serialize_tokens(&resolved);
-    let mut random_function_index = 0;
+    let random_function_index = RandomFunctionIndex::default();
     let registry_parse_context;
     let parse_context = match (context.parse_context, registry) {
         (Some(parse_context), _) => parse_context,
         (None, Some(registry)) => {
-            registry_parse_context = registry.parse_context(&mut random_function_index);
+            registry_parse_context = registry.parse_context(&random_function_index);
             &registry_parse_context
         }
         (None, None) => return Ok(None),
@@ -2503,7 +2501,7 @@ fn evaluate_if_condition(
                 return ConditionEvaluation::NotHandled;
             };
             let source = serialize_tokens(&test[1..close]);
-            return match unsafe { parse_and_evaluate_media_if_condition(&source, environment) } {
+            return match parse_and_evaluate_media_if_condition(&source, environment) {
                 Some(MatchResult::True) => ConditionEvaluation::Match(true),
                 Some(MatchResult::False | MatchResult::Unknown) => ConditionEvaluation::Match(false),
                 None => ConditionEvaluation::Invalid,
@@ -2514,7 +2512,7 @@ fn evaluate_if_condition(
                 return ConditionEvaluation::NotHandled;
             };
             let source = serialize_tokens(&test[1..close]);
-            return match unsafe { parse_and_evaluate_supports_if_condition(&source, parse_context) } {
+            return match parse_and_evaluate_supports_if_condition(&source, parse_context) {
                 Some(MatchResult::True) => ConditionEvaluation::Match(true),
                 Some(MatchResult::False | MatchResult::Unknown) => ConditionEvaluation::Match(false),
                 None => ConditionEvaluation::Invalid,
@@ -2991,8 +2989,8 @@ fn parse_attr_value_with_syntax(
     syntax: &SyntaxNode,
 ) -> Option<Vec<OwnedToken>> {
     let registry = registry?;
-    let mut random_function_index = 0;
-    let parsed = parse_with_syntax(&registry.parse_context(&mut random_function_index), source, syntax)?;
+    let random_function_index = RandomFunctionIndex::default();
+    let parsed = parse_with_syntax(&registry.parse_context(&random_function_index), source, syntax)?;
     let serialized = crate::css::serialize::serialize_style_value_to_utf16(&parsed);
     Some(tokenize_owned(&serialized))
 }
@@ -3355,8 +3353,8 @@ pub(crate) struct VarResolutionInputs<'a> {
     pub(crate) store: Option<&'a CustomPropertyStore>,
     pub(crate) inheritance_store: Option<&'a CustomPropertyStore>,
     pub(crate) registry: Option<&'a CustomPropertyRegistry>,
-    pub(crate) parse_context: Option<&'a ParseContext>,
-    pub(crate) media_environment: Option<&'a FfiMediaEnvironment>,
+    pub(crate) parse_context: Option<&'a ParseContext<'a>>,
+    pub(crate) media_environment: Option<&'a FfiMediaEnvironment<'a>>,
     pub(crate) attribute_names_are_ascii_case_insensitive: bool,
     pub(crate) style_query_inputs: Option<&'a crate::css::cascaded_properties::FfiStyleQueryInputs>,
 }
@@ -3451,8 +3449,8 @@ mod tests {
     #[test]
     fn style_queries_only_report_sibling_dependencies_for_tree_counting() {
         let registry = CustomPropertyRegistry::empty();
-        let mut random_index = 0;
-        let parse_context = registry.parse_context(&mut random_index);
+        let random_index = RandomFunctionIndex::default();
+        let parse_context = registry.parse_context(&random_index);
         let length = crate::css::style_compute::FfiLengthResolutionContext::default();
         for (source, expected, reads_sibling_position) in [
             ("10px", 10.0, false),
@@ -3498,8 +3496,6 @@ mod tests {
                 },
             )],
         );
-        // SAFETY: child returns one owned Arc reference.
-        let store = unsafe { Arc::from_raw(store.cast::<CustomPropertyStore>()) };
         let value = store.get(0).unwrap().value.clone();
         drop(store);
         assert!(matches!(value.data(), StyleValueData::Number { value } if *value == 1.0));
@@ -3822,7 +3818,7 @@ pub unsafe extern "C" fn rust_custom_property_registry_update(
     let registrations = if registration_count == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(registrations, registration_count) }
+        unsafe { ak::slice_from_raw_parts(registrations, registration_count) }
     };
     // SAFETY: Guaranteed by the caller.
     drop(unsafe { Arc::from_raw(registry.cast::<CustomPropertyRegistry>()) });
@@ -3917,7 +3913,7 @@ pub unsafe extern "C" fn rust_custom_property_store_create(
     let entries = if entry_count == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(entries, entry_count) }
+        unsafe { ak::slice_from_raw_parts(entries, entry_count) }
     };
     assert!(declared_count <= entries.len());
     let parent = if parent.is_null() {
@@ -3978,7 +3974,7 @@ pub unsafe extern "C" fn rust_custom_property_store_create_animation_overlay(
     let entries = if entry_count == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(entries, entry_count) }
+        unsafe { ak::slice_from_raw_parts(entries, entry_count) }
     };
     let base = unsafe { base.cast::<CustomPropertyStore>().as_ref() };
     let animated = entries.iter().map(|entry| {

@@ -2391,7 +2391,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut svg_config = base_config.clone();
     svg_config.namespaces = Some(vec!["Web".to_string(), "SVG".to_string(), "RustFFI".to_string()]);
     svg_config.export.include = vec![
-        "FfiSvgInput".to_string(),
+        "FfiUtf16View".to_string(),
         "FfiSvgPoint".to_string(),
         "FfiSvgTransform".to_string(),
         "TRANSFORM_MATRIX".to_string(),
@@ -2401,10 +2401,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         "TRANSFORM_SKEW_Y".to_string(),
         "TRANSFORM_TRANSLATE".to_string(),
     ];
+    // A parsed path is opaque to C++, which holds it by pointer.
+    svg_config
+        .export
+        .rename
+        .insert("ParsedPath".to_string(), "void".to_string());
+    svg_config.export.exclude.push("ParsedPath".to_string());
 
     generate_ffi_header_strict(
         svg_config,
         &[
+            manifest_dir.join("src/css/ffi_support.rs"),
             manifest_dir.join("src/svg/attribute_parser.rs"),
             manifest_dir.join("src/svg/path_parser.rs"),
         ],
@@ -2515,6 +2522,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     ];
     // A tree scope's counter styles are queued on the document host, which the layout header declares.
     declare_document_host_of_layout_header(&mut value_parser_config);
+    // A parse context's random function counter is the `size_t` C++ lends.
+    value_parser_config
+        .export
+        .rename
+        .insert("RandomFunctionIndex".to_string(), "size_t".to_string());
+    value_parser_config
+        .export
+        .exclude
+        .push("RandomFunctionIndex".to_string());
+    // A parse context names the lengths it resolves against as the computed values header declares them.
+    value_parser_config.export.rename.insert(
+        "FfiLengthResolutionContext".to_string(),
+        "Web::CSS::ComputedValuesFFI::FfiLengthResolutionContext".to_string(),
+    );
+    value_parser_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::ComputedValuesFFI { struct FfiLengthResolutionContext; }");
 
     generate_ffi_header(
         value_parser_config,
@@ -2718,6 +2743,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .after_includes
         .get_or_insert_with(String::new)
         .push_str("\nnamespace Web::CSS::Parser::ValueParserFFI { struct DeclarationBlockData; }");
+    // The computations C++ hands a style value take the value as the style value header declares it.
+    computed_values_config.export.rename.insert(
+        "StyleValueData".to_string(),
+        "Web::CSS::StyleValueFFI::StyleValueData".to_string(),
+    );
+    computed_values_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::StyleValueFFI { union StyleValueData; }");
     // An animation sample and plan read the document's style engine, which the document host reaches.
     declare_document_host_of_layout_header(&mut computed_values_config);
 
@@ -2826,6 +2860,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     layout_config
         .includes
         .push("LibWeb/Layout/TreeBuilderRustFFI.h".to_string());
+    // A compositor animation effect state is opaque to C++, which holds it by pointer, and so is the paint server an
+    // SVG paint resource callback fills.
+    for name in ["CompositorAnimationEffectState", "PublishedSvgPaintServer"] {
+        layout_config.export.rename.insert(name.to_string(), "void".to_string());
+        layout_config.export.exclude.push(name.to_string());
+    }
     generate_ffi_header(
         layout_config,
         &[

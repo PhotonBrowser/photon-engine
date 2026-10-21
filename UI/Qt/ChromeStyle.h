@@ -46,14 +46,16 @@ QString bookmarks_bar_style_sheet(QPalette const&, int corner_radius);
 QString find_in_page_style_sheet(QPalette const&);
 QString javascript_dialog_style_sheet(QPalette const&);
 QString bookmark_dialog_style_sheet(QPalette const&);
-QString crash_report_review_style_sheet(QPalette const&);
-QColor crash_report_review_placeholder_text(QPalette const&);
+QString report_review_style_sheet(QPalette const&);
+QColor report_review_placeholder_text(QPalette const&);
 QString devtools_banner_style_sheet(QPalette const&);
 QString tab_widget_style_sheet(QPalette const&);
 QString autocomplete_popup_style_sheet(QPalette const&);
 QString downloads_popover_style_sheet(QPalette const&);
 QString message_popover_style_sheet(QPalette const&);
 QString content_blocking_popover_style_sheet(QPalette const&);
+QString screenshot_selection_style_sheet(QPalette const&);
+QString screenshot_viewer_style_sheet();
 
 enum class CircularControlFrameStyle {
     InteractionOnly,

@@ -8,8 +8,7 @@
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Producers/VideoProducer.h>
-#include <LibMedia/VideoFrame.h>
-#include <LibMedia/VideoFrameHandle.h>
+#include <LibMediaCodecs/VideoFrame.h>
 
 #include "DisplayingVideoSink.h"
 
@@ -74,6 +73,7 @@ void DisplayingVideoSink::seek(AK::Duration timestamp, InvalidateHeldData invali
 {
     m_seek_id++;
     m_last_dispatched_status = PipelineStatus::Pending;
+    m_seek_resolution_is_pending_frame_at_target = true;
 
     auto can_resolve_seek_within_cached_frames = [&] {
         if (invalidate_held_data == InvalidateHeldData::Yes)
@@ -193,17 +193,18 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
     auto status_to_dispatch = last_status;
 
     if (m_current_frame != nullptr && m_seek_status == SeekStatus::None) {
-        AK::Duration current_frame_end;
-        if (is_terminal(last_status))
-            current_frame_end = m_current_frame->timestamp() + m_current_frame->duration();
-        else
-            current_frame_end = m_current_frame->conservative_end();
-        if (current_time <= current_frame_end)
+        auto current_frame_end = m_current_frame->conservative_end();
+        if (is_terminal(last_status) || m_seek_resolution_is_pending_frame_at_target)
+            current_frame_end = m_current_frame->end();
+        if (current_time < current_frame_end)
             status_to_dispatch = PipelineStatus::HaveData;
     }
 
     if (m_next_frame != nullptr && m_next_frame->timestamp() > current_time)
         status_to_dispatch = PipelineStatus::HaveData;
+
+    if (resolves_seek(status_to_dispatch))
+        m_seek_resolution_is_pending_frame_at_target = false;
 
     if (last_status == PipelineStatus::Suspended) {
         auto time_is_changing = time_state.is_advancing || m_seek_status != SeekStatus::None;
@@ -217,12 +218,8 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
         }
     }
 
-    if (new_frame_available) {
-        if (m_presented_frame_page.has_value())
-            m_presented_frame_page->store(m_current_frame ? VideoFrameHandle::for_frame(*m_current_frame) : VideoFrameHandle {});
-        if (m_on_present_needed)
-            m_on_present_needed();
-    }
+    if (new_frame_available && m_on_present_needed)
+        m_on_present_needed();
 
     if (status_to_dispatch != m_last_dispatched_status) {
         // Dispatch the new state with a deferred invoke to avoid reentrancy. This prevents a seek from resolving while

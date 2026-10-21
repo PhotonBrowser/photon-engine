@@ -256,8 +256,10 @@ impl RetainedState {
         );
         // The element's own color resolves first, since every other group resolves `currentcolor`
         // against it.
-        let color_value = table.effective_value(Some(overlay), prop::COLOR, true).value;
-        let color_data = unsafe { color_value.cast::<StyleValueData>().as_ref() };
+        let color_data = table
+            .effective_value_handle(Some(overlay), prop::COLOR, true)
+            .0
+            .optional_data();
         let color = color_data
             .and_then(|color| {
                 to_color(
@@ -622,7 +624,7 @@ impl super::StyleEngine {
         let [store, inheritance_store] = custom_property_environments.map(|identity| {
             self.custom_property_environments
                 .store(identity)
-                .unwrap_or(std::ptr::null())
+                .map_or(std::ptr::null(), |store| std::sync::Arc::as_ptr(store).cast())
         });
         let inheritance_parent_style_record = inheritance_parent
             .and_then(|parent| self.held_style_records.get(&parent).copied())
@@ -1339,13 +1341,7 @@ pub(super) fn effective_data<'a>(
     overlay: Option<&'a AnimatedOverlay>,
     property: u16,
 ) -> Option<&'a StyleValueData> {
-    unsafe {
-        table
-            .effective_value(overlay, property, true)
-            .value
-            .cast::<StyleValueData>()
-            .as_ref()
-    }
+    table.effective_value_handle(overlay, property, true).0.optional_data()
 }
 
 /// What resolving an element's font asks the document's resolver, as the C++ font computer would

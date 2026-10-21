@@ -911,6 +911,8 @@ pub struct KeyedPropertyLookupCacheLayout {
     pub shape_dictionary_generation: u32,
     pub shape: u32,
     pub property_name: u32,
+    pub prototype_chain_validity: u32,
+    pub new_shape: u32,
 }
 
 /// The VM-wide cache of string-keyed GetByValue lookups. Lookups are copied out, so that no entry is borrowed while
@@ -951,6 +953,8 @@ impl KeyedPropertyLookupCache {
             shape_dictionary_generation: (lookup + offset_of!(KeyedPropertyLookup, shape_dictionary_generation)) as u32,
             shape: (lookup + offset_of!(KeyedPropertyLookup, shape)) as u32,
             property_name: offset_of!(KeyedPropertyLookupCacheEntry, property_name) as u32,
+            prototype_chain_validity: (lookup + offset_of!(KeyedPropertyLookup, prototype_chain_validity)) as u32,
+            new_shape: (lookup + offset_of!(KeyedPropertyLookup, new_shape)) as u32,
         }
     }
 

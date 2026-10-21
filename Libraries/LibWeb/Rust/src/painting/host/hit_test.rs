@@ -19,7 +19,7 @@ pub struct FfiHitTestQueryCallbacks {
     pub has_chrome_metrics: bool,
     pub chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
     /// Private: reached only through the method below, which takes the main thread token.
-    contains: unsafe extern "C" fn(*mut c_void, FfiNodeIdentity, FfiNodeIdentity) -> bool,
+    contains: extern "C" fn(*mut c_void, FfiNodeIdentity, FfiNodeIdentity) -> bool,
 }
 
 impl FfiHitTestQueryCallbacks {
@@ -31,7 +31,7 @@ impl FfiHitTestQueryCallbacks {
         scroll_offsets: &[libgfx_rust::FloatPoint],
         chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
     ) -> Self {
-        unsafe extern "C" fn no_contains(_: *mut c_void, _: FfiNodeIdentity, _: FfiNodeIdentity) -> bool {
+        extern "C" fn no_contains(_: *mut c_void, _: FfiNodeIdentity, _: FfiNodeIdentity) -> bool {
             panic!("a point query on the render owner asks the host nothing of the DOM");
         }
         Self {
@@ -52,15 +52,14 @@ impl FfiHitTestQueryCallbacks {
         ancestor: FfiNodeIdentity,
         node: FfiNodeIdentity,
     ) -> bool {
-        // SAFETY: The C++ host answers synchronously.
-        unsafe { (self.contains)(self.context, ancestor, node) }
+        (self.contains)(self.context, ancestor, node)
     }
     pub(crate) fn scroll_offsets(&self) -> &[libgfx_rust::FloatPoint] {
         if self.scroll_offsets.is_null() {
             return &[];
         }
         // SAFETY: QueryContext keeps the document and its resolved scroll snapshot alive for the synchronous query.
-        unsafe { std::slice::from_raw_parts(self.scroll_offsets, self.scroll_offsets_len) }
+        unsafe { ak::slice_from_raw_parts(self.scroll_offsets, self.scroll_offsets_len) }
     }
 }
 
@@ -96,7 +95,7 @@ impl FfiCaretPositionQuery {
             return &[];
         }
         // SAFETY: The host keeps the descent alive for the synchronous query.
-        unsafe { std::slice::from_raw_parts(self.boundary_descent, self.boundary_descent_len) }
+        unsafe { ak::slice_from_raw_parts(self.boundary_descent, self.boundary_descent_len) }
     }
 
     pub(crate) fn is_query_node(&self, node: u32) -> bool {

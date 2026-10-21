@@ -229,6 +229,14 @@ void SkiaBackendContext::perform_post_flush_cleanup()
         dbgln("Photon Skia cleanup detail: total={:.2f}ms deferred={:.2f}ms aggressive={:.2f}ms purge={:.2f}ms resources={}/{}/{}/{} cache_bytes={}/{}/{}/{}", cleanup_duration.to_seconds_f64() * 1000.0, deferred_cleanup_duration.to_seconds_f64() * 1000.0, aggressive_cleanup_duration.to_seconds_f64() * 1000.0, purge_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_count_after_aggressive_cleanup, resource_count_after_purge, resource_bytes_before, resource_bytes_after_deferred_cleanup, resource_bytes, resource_bytes_after_purge);
 }
 
+size_t SkiaBackendContext::resource_cache_bytes() const
+{
+    size_t bytes = 0;
+    if (auto* context = sk_context())
+        context->getResourceCacheUsage(nullptr, &bytes);
+    return bytes;
+}
+
 void SkiaBackendContext::initialize_gpu_backend()
 {
     VERIFY(!main_thread_context());
@@ -399,20 +407,17 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
     };
 
     auto extensions = make<skgpu::VulkanExtensions>();
-#    ifdef USE_VULKAN_DMABUF_IMAGES
-    static constexpr Array<char const*, 4> enabled_device_extensions {
-        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
-        VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
-        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-    };
-    extensions->init(backend_context.fGetProc, vulkan_context.instance, vulkan_context.physical_device,
-        0, nullptr, enabled_device_extensions.size(), enabled_device_extensions.data());
-#    else
-    extensions->init(backend_context.fGetProc, vulkan_context.instance, vulkan_context.physical_device,
-        0, nullptr, 0, nullptr);
-#    endif
+    extensions->init(backend_context.fGetProc, vulkan_context.instance, vulkan_context.physical_device, 0, nullptr, vulkan_context.enabled_device_extensions.size(), vulkan_context.enabled_device_extensions.data());
     backend_context.fVkExtensions = extensions.ptr();
+
+    // Skia samples through a YCbCr conversion only once it knows the device has that enabled.
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_conversion_features {};
+    ycbcr_conversion_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+    ycbcr_conversion_features.samplerYcbcrConversion = vulkan_context.can_sample_through_ycbcr_conversion ? VK_TRUE : VK_FALSE;
+    VkPhysicalDeviceFeatures2 features {};
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &ycbcr_conversion_features;
+    backend_context.fDeviceFeatures2 = &features;
 
     backend_context.fMemoryAllocator = create_skia_vulkan_memory_allocator(vulkan_context);
     VERIFY(backend_context.fMemoryAllocator);

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/Debug.h>
 #include <AK/Format.h>
 #include <AK/Vector.h>
@@ -124,7 +125,29 @@ static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
     return Error::from_string_literal("No usable Vulkan physical device found");
 }
 
-static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device, uint32_t* graphics_queue_family)
+#ifdef USE_VULKAN_DMABUF_IMAGES
+static constexpr Array<char const*, 4> s_enabled_device_extensions = {
+    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+    VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+    VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
+    VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+};
+#else
+static constexpr Array<char const*, 0> s_enabled_device_extensions;
+#endif
+
+static bool device_can_sample_through_ycbcr_conversion(VkPhysicalDevice physical_device)
+{
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_conversion_features {};
+    ycbcr_conversion_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+    VkPhysicalDeviceFeatures2 features {};
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &ycbcr_conversion_features;
+    vkGetPhysicalDeviceFeatures2(physical_device, &features);
+    return ycbcr_conversion_features.samplerYcbcrConversion == VK_TRUE;
+}
+
+static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device, uint32_t* graphics_queue_family, bool enable_sampling_through_ycbcr_conversion)
 {
     VkDevice device;
 
@@ -163,20 +186,20 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device,
     float const queue_priority = 1.0f;
     queue_create_info.pQueuePriorities = &queue_priority;
 
-    VkPhysicalDeviceFeatures deviceFeatures {};
+    // Decoded video is sampled in place, converting from YCbCr as it is read.
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_conversion_features {};
+    ycbcr_conversion_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+    ycbcr_conversion_features.samplerYcbcrConversion = enable_sampling_through_ycbcr_conversion ? VK_TRUE : VK_FALSE;
+    VkPhysicalDeviceFeatures2 features {};
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &ycbcr_conversion_features;
 #ifdef USE_VULKAN_DMABUF_IMAGES
-    Array<char const*, 4> device_extensions = {
-        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
-        VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
-        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-    };
     uint32_t extension_count = 0;
     vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, nullptr);
     Vector<VkExtensionProperties> available_extensions;
     available_extensions.resize(extension_count);
     vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, available_extensions.data());
-    for (auto* required_extension : device_extensions) {
+    for (auto* required_extension : s_enabled_device_extensions) {
         bool const available = available_extensions.contains([&](auto const& extension) {
             return std::strcmp(extension.extensionName, required_extension) == 0;
         });
@@ -185,16 +208,14 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device,
         if (!available)
             return Error::from_string_literal("required Vulkan external-memory extension unavailable");
     }
-#else
-    Array<char const*, 0> device_extensions;
 #endif
     VkDeviceCreateInfo create_device_info {};
     create_device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    create_device_info.pNext = &features;
     create_device_info.pQueueCreateInfos = &queue_create_info;
     create_device_info.queueCreateInfoCount = 1;
-    create_device_info.pEnabledFeatures = &deviceFeatures;
-    create_device_info.enabledExtensionCount = device_extensions.size();
-    create_device_info.ppEnabledExtensionNames = device_extensions.data();
+    create_device_info.enabledExtensionCount = s_enabled_device_extensions.size();
+    create_device_info.ppEnabledExtensionNames = s_enabled_device_extensions.data();
 
     if (vkCreateDevice(physical_device, &create_device_info, nullptr, &device) != VK_SUCCESS) {
         return Error::from_string_literal("Logical device creation failed");
@@ -240,6 +261,22 @@ static ErrorOr<VkCommandBuffer> allocate_command_buffer(VkDevice logical_device,
 }
 #endif
 
+GpuDeviceIdentity gpu_device_identity_of(VkPhysicalDevice physical_device)
+{
+    VkPhysicalDeviceIDProperties id_properties {};
+    id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceProperties2 properties {};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &id_properties;
+    vkGetPhysicalDeviceProperties2(physical_device, &properties);
+
+    // Memory exported from one device imports only where both the device and the driver match.
+    GpuDeviceIdentity identity;
+    identity.bytes.append(id_properties.deviceUUID, VK_UUID_SIZE);
+    identity.bytes.append(id_properties.driverUUID, VK_UUID_SIZE);
+    return identity;
+}
+
 ErrorOr<VulkanContext> create_vulkan_context()
 {
     uint32_t const api_version = VK_API_VERSION_1_1; // v1.1 needed for vkGetPhysicalDeviceFormatProperties2
@@ -266,7 +303,8 @@ ErrorOr<VulkanContext> create_vulkan_context()
     }
 
     uint32_t graphics_queue_family = 0;
-    auto* logical_device = TRY(create_logical_device(physical_device, &graphics_queue_family));
+    auto can_sample_through_ycbcr_conversion = device_can_sample_through_ycbcr_conversion(physical_device);
+    auto* logical_device = TRY(create_logical_device(physical_device, &graphics_queue_family, can_sample_through_ycbcr_conversion));
     VkQueue graphics_queue;
     vkGetDeviceQueue(logical_device, graphics_queue_family, 0, &graphics_queue);
 
@@ -278,6 +316,10 @@ ErrorOr<VulkanContext> create_vulkan_context()
     if (pfn_vk_get_memory_fd_khr == nullptr) {
         return Error::from_string_literal("vkGetMemoryFdKHR unavailable");
     }
+    auto pfn_vk_get_memory_fd_properties_khr = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(vkGetDeviceProcAddr(logical_device, "vkGetMemoryFdPropertiesKHR"));
+    if (pfn_vk_get_memory_fd_properties_khr == nullptr) {
+        return Error::from_string_literal("vkGetMemoryFdPropertiesKHR unavailable");
+    }
     auto pfn_vk_get_image_drm_format_modifier_properties_khr = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(vkGetDeviceProcAddr(logical_device, "vkGetImageDrmFormatModifierPropertiesEXT"));
     if (pfn_vk_get_image_drm_format_modifier_properties_khr == nullptr) {
         return Error::from_string_literal("vkGetImageDrmFormatModifierPropertiesEXT unavailable");
@@ -288,14 +330,18 @@ ErrorOr<VulkanContext> create_vulkan_context()
         .api_version = api_version,
         .instance = instance,
         .physical_device = physical_device,
+        .device_identity = gpu_device_identity_of(physical_device),
         .logical_device = logical_device,
         .graphics_queue = graphics_queue,
         .graphics_queue_family = graphics_queue_family,
+        .enabled_device_extensions = s_enabled_device_extensions,
+        .can_sample_through_ycbcr_conversion = can_sample_through_ycbcr_conversion,
 #ifdef USE_VULKAN_DMABUF_IMAGES
         .command_pool = command_pool,
         .command_buffer = command_buffer,
         .ext_procs = {
             .get_memory_fd = pfn_vk_get_memory_fd_khr,
+            .get_memory_fd_properties = pfn_vk_get_memory_fd_properties_khr,
             .get_image_drm_format_modifier_properties = pfn_vk_get_image_drm_format_modifier_properties_khr,
         },
 #endif

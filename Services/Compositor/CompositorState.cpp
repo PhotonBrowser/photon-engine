@@ -10,6 +10,7 @@
 #include <Compositor/CanvasHost.h>
 #include <Compositor/CompositorState.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/Timer.h>
 #include <LibMedia/Sinks/DisplayingVideoSink.h>
 
@@ -441,6 +442,8 @@ void CompositorState::on_video_sink_ready(CompositorStateWebContentClient& clien
         return;
     sink_state->sink = sink;
     sink->set_on_present_needed([this, &client, handle] {
+        if (auto* sink_state = video_sink_state(client, handle); sink_state && sink_state->sink)
+            client.video_sink_presented_frame(handle, sink_state->sink->current_frame());
         present_contexts_drawing_video_sink(client, handle);
         update_unpainted_video_update_scheduling();
     });
@@ -478,7 +481,7 @@ void CompositorState::present_contexts_drawing_video_sink(CompositorStateWebCont
         for (auto const& resource_entry : context.video_sink_handles()) {
             if (resource_entry.value == handle) {
                 if (auto rect = context.presenter().self_present_rect(); rect.has_value())
-                    schedule_present_frame(context_entry.key, context, *rect);
+                    schedule_present_frame(context_entry.key, context, PendingFrame::repainting_changes(*rect));
                 break;
             }
         }
@@ -494,7 +497,7 @@ void CompositorState::present_contexts_drawing_canvas(CompositorStateWebContentC
         if (!context_is_effectively_visible(context) || !context.presenter().draws_canvas(canvas_id))
             continue;
         if (auto rect = context.presenter().self_present_rect(); rect.has_value())
-            schedule_present_frame(context_entry.key, context, *rect);
+            schedule_present_frame(context_entry.key, context, PendingFrame::repainting_changes(*rect));
     }
 }
 
@@ -1175,6 +1178,22 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
     pending_present->submit_duration_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(submit_returned_at - submit_started_at).count();
     pending_present->submit_completed_at = submit_returned_at;
     context.presenter().did_submit_prepared_frame(pending_frame.viewport_rect);
+#ifdef AK_OS_MACOS
+    // The window server's reads of an IOSurface wait for GPU work that is already scheduled to write it. Handing the
+    // frame to the client before that work finishes keeps it ahead of the window server's deadline for the next refresh.
+    if (context.presents_to_client() && m_skia_backend_context) {
+        m_skia_backend_context->metal_context().when_committed_work_is_scheduled([self = NonnullRefPtr { *this }, &event_loop, pending_present]() mutable {
+            event_loop.deferred_invoke([self = move(self), pending_present] {
+                for (auto& entry : self->m_pending_async_presents) {
+                    if (&entry == pending_present) {
+                        self->deliver_rendered_frame(entry);
+                        return;
+                    }
+                }
+            });
+        });
+    }
+#endif
     schedule_gpu_completion_check();
     if (publish_before_gpu_completion) {
         VERIFY(m_client);
@@ -1407,34 +1426,45 @@ void CompositorState::did_finish_async_present(PendingAsyncPresent& pending_pres
     }
     VERIFY(pending_present_iterator != m_pending_async_presents.end());
 
-    auto context_id = pending_present.context_id;
-    auto viewport_rect = pending_present.viewport_rect;
-    auto damage_rect = pending_present.damage_rect;
-    auto bitmap_id = pending_present.bitmap_id;
-    auto presentation_signal_value = pending_present.presentation_signal_value;
     if (photon_frame_trace_enabled())
-        dbgln("[Compositor] gpu_present_complete context={} bitmap={} signal={} at_ns={} gpu_us={}", context_id, bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds(), pending_present.gpu_completion_microseconds);
-    auto was_published_before_gpu_completion = pending_present.published_before_gpu_completion;
-    auto device_pixel_ratio = pending_present.device_pixel_ratio;
-    auto was_cancelled = pending_present.was_cancelled;
+        dbgln("[Compositor] gpu_present_complete context={} bitmap={} signal={} at_ns={} gpu_us={}", pending_present.context_id, pending_present.bitmap_id, pending_present.presentation_signal_value, MonotonicTime::now().nanoseconds(), pending_present.gpu_completion_microseconds);
+    auto finished_present = pending_present;
     (void)m_pending_async_presents.remove(pending_present_iterator);
     if (m_pending_async_presents.is_empty() && m_gpu_completion_timer)
         m_gpu_completion_timer->stop();
 
     schedule_idle_gpu_cache_purge();
+    deliver_rendered_frame(finished_present);
+}
 
-    if (was_cancelled)
+void CompositorState::deliver_rendered_frame(PendingAsyncPresent& pending_present)
+{
+    if (pending_present.was_cancelled || exchange(pending_present.was_delivered, true))
         return;
 
+    auto context_id = pending_present.context_id;
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
-    context->presenter().did_finish_gpu_present(bitmap_id);
-    if (context->presents_to_client() && !was_published_before_gpu_completion) {
+    context->presenter().did_finish_gpu_present(pending_present.bitmap_id);
+    if (context->presents_to_client()) {
         VERIFY(m_client);
-        if (photon_frame_trace_enabled())
-            dbgln("[Compositor] frame_submitted_to_client context={} bitmap={} signal={} at_ns={} after_gpu=true", context_id, bitmap_id, presentation_signal_value, MonotonicTime::now().nanoseconds());
-        m_client->did_present_frame(context_id, viewport_rect, damage_rect, bitmap_id, device_pixel_ratio, presentation_signal_value);
+        if (auto* log = Core::StatsLog::the(); log && context->page_id().has_value()) {
+            auto const& damage = pending_present.damage_rect;
+            JsonObject data;
+            data.set("page_id"sv, *context->page_id());
+            data.set("changed"sv, !damage.is_empty());
+            data.set("damage_x"sv, damage.x());
+            data.set("damage_y"sv, damage.y());
+            data.set("damage_width"sv, damage.width());
+            data.set("damage_height"sv, damage.height());
+            log->event("frame"sv, move(data));
+        }
+        if (!pending_present.published_before_gpu_completion) {
+            if (photon_frame_trace_enabled())
+                dbgln("[Compositor] frame_submitted_to_client context={} bitmap={} signal={} at_ns={} after_gpu=true", context_id, pending_present.bitmap_id, pending_present.presentation_signal_value, MonotonicTime::now().nanoseconds());
+            m_client->did_present_frame(context_id, pending_present.viewport_rect, pending_present.damage_rect, pending_present.bitmap_id, pending_present.device_pixel_ratio, pending_present.presentation_signal_value);
+        }
     }
     resize_backing_stores_if_needed(context_id, *context);
     if (auto parent_context_id = context->parent_context_id(); parent_context_id.has_value()) {

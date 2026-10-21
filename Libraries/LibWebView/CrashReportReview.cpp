@@ -40,6 +40,8 @@ ErrorOr<CrashReportReview::Report> CrashReportReview::open(Optional<ByteString> 
     m_report_name = {};
     m_text_digest = {};
     m_prepared_manifest = {};
+    m_prepared_description = {};
+    m_prepared_url = {};
 
     auto report_name = name.value_or({});
     if (report_name.is_empty()) {
@@ -108,10 +110,10 @@ bool CrashReportReview::has_next_report() const
     return any_of(pending.value(), [&](auto const& name) { return name != m_report_name; });
 }
 
-ErrorOr<void> CrashReportReview::show_report() const
+ErrorOr<ByteString> CrashReportReview::report_text() const
 {
     VERIFY(!m_report_name.is_empty());
-    return m_store.show_report(m_report_name);
+    return TRY(m_store.saved_report(m_report_name)).text;
 }
 
 Optional<String> CrashReportReview::validate(StringView description, Optional<StringView> url)
@@ -141,6 +143,14 @@ Optional<String> CrashReportReview::send(String const& description, Optional<Str
     if (auto error = validate(description, url_view); error.has_value())
         return error;
 
+    // Sending the same choices again, after a failed or canceled attempt, sends the same submission, which the server
+    // recognizes if the earlier attempt reached it. Other choices make a new submission, carrying only those.
+    if (description != m_prepared_description || url != m_prepared_url) {
+        m_prepared_manifest = {};
+        m_prepared_description = description;
+        m_prepared_url = url;
+    }
+
     auto submission = CrashReportSubmission::create(m_store,
         {
             .report_name = m_report_name,
@@ -158,9 +168,9 @@ Optional<String> CrashReportReview::send(String const& description, Optional<Str
         if (auto* self = weak_this.ptr())
             self->m_prepared_manifest = manifest;
     };
-    submission->on_retry = [weak_this = make_weak_ptr()](String reason, u32 retry_number, u32 delay_seconds) {
+    submission->on_retry = [weak_this = make_weak_ptr()](String reason, u32 retry_number, u32 maximum_retries, u32 delay_seconds) {
         if (auto* self = weak_this.ptr(); self && self->on_retry)
-            self->on_retry(move(reason), retry_number, CrashReportSubmission::maximum_attempts - 1, delay_seconds);
+            self->on_retry(move(reason), retry_number, maximum_retries, delay_seconds);
     };
     submission->on_sent = [weak_this = make_weak_ptr()] {
         if (auto* self = weak_this.ptr()) {
@@ -180,6 +190,14 @@ Optional<String> CrashReportReview::send(String const& description, Optional<Str
     m_submission = submission;
     submission->start();
     return {};
+}
+
+// The report stays on the device, and sending it again sends the same submission, which the server recognizes if the
+// canceled one reached it after all.
+void CrashReportReview::cancel_sending()
+{
+    if (auto submission = move(m_submission))
+        submission->cancel();
 }
 
 }

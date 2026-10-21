@@ -788,6 +788,7 @@ set(SOURCES
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
     Page/PageCursor.cpp
+    Page/RenderingStats.cpp
     Page/ScreenWakeLockHandle.cpp
     Painting/Blending.cpp
     Painting/BoxModelMetrics.cpp
@@ -1076,6 +1077,7 @@ set(SOURCES
     WebIDL/Promise.cpp
     WebIDL/QuotaExceededError.cpp
     WebSockets/WebSocket.cpp
+    WebVTT/Parser.cpp
     WebVTT/VTTCue.cpp
     WebVTT/VTTRegion.cpp
     WebXR/XRLayer.cpp

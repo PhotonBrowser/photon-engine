@@ -9,13 +9,20 @@
 #include <AK/StringView.h>
 #include <AK/Time.h>
 #include <LibCore/EventLoop.h>
-#include <LibMedia/FFmpeg/FFmpegDemuxer.h>
+#include <LibMedia/Containers/WAV/WAVDemuxer.h>
+#include <LibMedia/DecoderRegistrations.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Producers/DecodedAudioProducer.h>
 #include <LibTest/TestCase.h>
 
 #include "TestMediaCommon.h"
+
+TEST_SETUP
+{
+    Media::install_video_decoders({ Media::hardware_video_decoders(), Media::ffmpeg_video_decoders() });
+    Media::install_audio_decoders({ Media::audio_decoders() });
+}
 
 template<typename Integer>
 requires(IsIntegral<Integer>)
@@ -77,7 +84,7 @@ static void decode_and_expect()
     constexpr size_t sample_count = 2048;
     auto wav_data = make_square_wav<Sample>(sample_count);
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(wav_data);
-    auto demuxer = MUST(Media::FFmpeg::FFmpegDemuxer::from_stream(stream));
+    auto demuxer = MUST(Media::WAV::WAVDemuxer::from_stream(stream));
 
     auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Audio));
     VERIFY(!tracks.is_empty());

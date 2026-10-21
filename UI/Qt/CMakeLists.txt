@@ -49,10 +49,14 @@ target_sources(ladybird PRIVATE
     PerformanceMonitorWidget.cpp
     PictureInPictureWindow.cpp
     Popover.cpp
+    ReportReview.cpp
+    ScreenshotSelectionOverlay.cpp
+    ScreenshotViewer.cpp
     SelectDropdown.cpp
     StringUtils.cpp
     Tab.cpp
     TabBar.cpp
+    WebCompatReportReview.cpp
     WebContentView.cpp
     WindowCloseCoordinator.cpp
     WindowControlButton.cpp

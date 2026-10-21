@@ -1948,12 +1948,11 @@ pub(crate) fn supports_declaration_matches(context: &ParseContext, source: &[u16
     };
     let mut value_context = *context;
     value_context.is_ua_style_sheet = false;
-    value_context.value_contexts = &raw const property_context;
-    value_context.value_context_count = 1;
-    value_context.length_resolution_context = std::ptr::null();
+    value_context.value_contexts = ak::Span::new(std::slice::from_ref(&property_context));
+    value_context.length_resolution_context = None;
     let outcome = parse_css_value_with_utf16_source(&value_context, property_id, &declaration.value, source.as_ref());
-    if let Some(random_function_index) = unsafe { context.random_function_index.as_mut() } {
-        *random_function_index = 0;
+    if let Some(random_function_index) = context.random_function_index {
+        random_function_index.set(0);
     }
     matches!(outcome, ParseOutcome::Parsed(_))
 }
@@ -2127,7 +2126,7 @@ struct ParsedRule {
 }
 
 // Parser state is discarded before publishing the owned result.
-struct SyntaxParseBuilder {
+struct SyntaxParseBuilder<'a> {
     declarations_kind: NestedDeclarationsKind,
     values: Vec<u16>,
     declarations: Vec<ParsedDeclaration>,
@@ -2142,8 +2141,66 @@ struct SyntaxParseBuilder {
     // Whether a top-level @import or @namespace rule appended next is still in its ordering window.
     import_rules_valid: bool,
     namespace_rules_valid: bool,
-    parse_context: *const ParseContext,
+    parse_context: Option<&'a ParseContext<'a>>,
     preserve_property_source_text: bool,
+    dedup: DeclarationDedup,
+}
+
+/// What was parsed for each key, by the key's hash.
+type DedupBuckets<T> = std::collections::HashMap<u64, Vec<(std::ops::Range<usize>, T)>>;
+
+/// Lets the declarations and declaration blocks a sheet repeats share one parse, for the length of the sheet's parse.
+/// Most of a large sheet's declarations repeat earlier ones: of YouTube's 83k declarations, 11k are distinct, and so
+/// are 13k of its 24k blocks. Within one sheet, the same text parses the same way.
+#[derive(Default)]
+struct DeclarationDedup {
+    /// Each declaration's name and value, each after its length, then whether it is important. The lengths keep the
+    /// keys of two different declarations, or runs of declarations, from being equal.
+    keys: Vec<u16>,
+    /// The range of `keys` for each declaration, by index; `None` for one that is never shared.
+    declaration_keys: Vec<Option<std::ops::Range<usize>>>,
+    values: DedupBuckets<ParsedDeclarationValue>,
+    blocks: DedupBuckets<Arc<DeclarationBlockData>>,
+    /// Keyed at random, so that a page cannot make many keys fall into one bucket.
+    hasher: std::collections::hash_map::RandomState,
+}
+
+impl DeclarationDedup {
+    fn hash(&self, key: &std::ops::Range<usize>) -> u64 {
+        use std::hash::BuildHasher;
+        self.hasher.hash_one(&self.keys[key.clone()])
+    }
+
+    fn push_with_length(&mut self, units: &[u16]) {
+        let length = u32::try_from(units.len()).expect("declaration text length exceeds u32");
+        self.keys.push((length >> 16) as u16);
+        self.keys.push(length as u16);
+        self.keys.extend_from_slice(units);
+    }
+
+    fn find<'a, T>(&self, candidates: &'a DedupBuckets<T>, hash: u64, key: &std::ops::Range<usize>) -> Option<&'a T> {
+        candidates
+            .get(&hash)?
+            .iter()
+            .find(|(candidate, _)| self.keys[candidate.clone()] == self.keys[key.clone()])
+            .map(|(_, value)| value)
+    }
+}
+
+type ParsedDeclarationValue = (u16, u8, FfiDeclarationRejection, Option<Arc<StyleValueData>>);
+
+/// Whether parsing `values` may do more than produce a value, which sharing the result would skip: `attr()` records
+/// the attribute names it reads, and `random()` values have an identity of their own.
+fn value_may_not_be_shared(values: &[ComponentValue]) -> bool {
+    values.iter().any(|value| match &value.kind {
+        ComponentKind::Function { name, values } => {
+            equals_ascii_case_insensitive(name, b"attr")
+                || equals_ascii_case_insensitive(name, b"random")
+                || value_may_not_be_shared(values)
+        }
+        ComponentKind::SimpleBlock { values, .. } => value_may_not_be_shared(values),
+        ComponentKind::Token(_) => false,
+    })
 }
 
 // The shared graph owns typed Rust payloads, independently of any FFI views.
@@ -2666,9 +2723,9 @@ fn invalid_location_inner_name(rule: &Rule, rule_kind: ParsedRuleKind, outer_nam
     }
 }
 
-impl SyntaxParseBuilder {
+impl<'a> SyntaxParseBuilder<'a> {
     fn collect_declaration_errors(&self) -> Box<[usize]> {
-        fn visit_item(sheet: &SyntaxParseBuilder, item: &ParsedRuleChild, errors: &mut Vec<usize>) {
+        fn visit_item(sheet: &SyntaxParseBuilder<'_>, item: &ParsedRuleChild, errors: &mut Vec<usize>) {
             match item {
                 ParsedRuleChild::Declarations(list) => {
                     for index in sheet.declaration_ranges[list.local_identity as usize].clone() {
@@ -2690,7 +2747,7 @@ impl SyntaxParseBuilder {
                 }
             }
         }
-        fn visit_rule(sheet: &SyntaxParseBuilder, rule: &ParsedRule, errors: &mut Vec<usize>) {
+        fn visit_rule(sheet: &SyntaxParseBuilder<'_>, rule: &ParsedRule, errors: &mut Vec<usize>) {
             match rule.rule_kind {
                 ParsedRuleKind::Qualified if rule.selector_list.is_some() => {}
                 ParsedRuleKind::Container
@@ -2779,9 +2836,9 @@ impl SyntaxParseBuilder {
         parsed
     }
 
-    pub(crate) fn new(parse_context: *const ParseContext, preserve_property_source_text: bool) -> Self {
-        let declared_namespaces = (unsafe { parse_context.as_ref() })
-            .map(|context| unsafe { declared_namespaces_from_context(context) })
+    pub(crate) fn new(parse_context: Option<&'a ParseContext<'a>>, preserve_property_source_text: bool) -> Self {
+        let declared_namespaces = parse_context
+            .map(declared_namespaces_from_context)
             .unwrap_or_default()
             .into_iter()
             .map(|namespace| {
@@ -2805,6 +2862,7 @@ impl SyntaxParseBuilder {
             namespace_rules_valid: true,
             parse_context,
             preserve_property_source_text,
+            dedup: DeclarationDedup::default(),
         }
     }
 
@@ -2873,8 +2931,40 @@ impl SyntaxParseBuilder {
     ) -> usize {
         let (name_offset, name_length) = self.append_value(declaration.name.as_ref());
         let value_source = component_list_source(&declaration.value);
-        let (property_id, descriptor_id, rejection, parsed_value) =
-            self.parse_declaration_value(declaration, value_source.as_ref());
+        let shareable = declaration.is_property && !value_may_not_be_shared(&declaration.value);
+        let value_key = shareable.then(|| {
+            let start = self.dedup.keys.len();
+            self.dedup.push_with_length(declaration.name.as_ref());
+            self.dedup.push_with_length(value_source.as_ref());
+            let key = start..self.dedup.keys.len();
+            (self.dedup.hash(&key), key)
+        });
+        let shared_value = value_key
+            .as_ref()
+            .and_then(|(hash, key)| self.dedup.find(&self.dedup.values, *hash, key).cloned());
+        let (property_id, descriptor_id, rejection, parsed_value) = match shared_value {
+            Some(value) => value,
+            None => {
+                let value = self.parse_declaration_value(declaration, value_source.as_ref());
+                if let Some((hash, key)) = &value_key {
+                    self.dedup
+                        .values
+                        .entry(*hash)
+                        .or_default()
+                        .push((key.clone(), value.clone()));
+                }
+                value
+            }
+        };
+        let declaration_key = value_key.map(|(_, key)| {
+            self.dedup.keys.push(u16::from(declaration.important));
+            key.start..self.dedup.keys.len()
+        });
+        let declaration_index = self.declarations.len();
+        if self.dedup.declaration_keys.len() < declaration_index {
+            self.dedup.declaration_keys.resize(declaration_index, None);
+        }
+        self.dedup.declaration_keys.push(declaration_key);
         let font_feature_values = font_feature_maximum_value_count
             .and_then(|maximum_value_count| parse_font_feature_values(declaration, maximum_value_count));
         let (font_feature_values_start, font_feature_value_count) = if let Some(values) = font_feature_values {
@@ -2917,14 +3007,13 @@ impl SyntaxParseBuilder {
         declaration: &Declaration,
         source_utf16: &[u16],
     ) -> (u16, u8, FfiDeclarationRejection, Option<Arc<StyleValueData>>) {
-        if self.parse_context.is_null() {
+        let Some(parse_context) = self.parse_context else {
             return (u16::MAX, u8::MAX, FfiDeclarationRejection::None, None);
-        }
+        };
         if !declaration.is_property {
             let Some(at_rule) = descriptor_at_rule(declaration.rule_context) else {
                 return (u16::MAX, u8::MAX, FfiDeclarationRejection::None, None);
             };
-            let parse_context = unsafe { &*self.parse_context };
             return match parse_descriptor(
                 parse_context,
                 at_rule,
@@ -2952,14 +3041,7 @@ impl SyntaxParseBuilder {
             return (u16::MAX, u8::MAX, rejection, None);
         };
 
-        let parse_context = unsafe { &*self.parse_context };
-        let mut value_contexts = if parse_context.value_context_count == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: C++ keeps the context storage live for the complete syntax parse call.
-            unsafe { std::slice::from_raw_parts(parse_context.value_contexts, parse_context.value_context_count) }
-                .to_vec()
-        };
+        let mut value_contexts = parse_context.value_contexts.as_slice().to_vec();
         value_contexts.push(FfiValueParsingContext {
             kind: FfiValueParsingContextKind::Property,
             value: property_id,
@@ -2967,12 +3049,11 @@ impl SyntaxParseBuilder {
             name: Default::default(),
         });
         let mut context = *parse_context;
-        context.value_contexts = value_contexts.as_ptr();
-        context.value_context_count = value_contexts.len();
+        context.value_contexts = ak::Span::new(&value_contexts);
 
         let outcome = parse_css_value_with_utf16_source(&context, property_id, &declaration.value, source_utf16);
-        if let Some(random_function_index) = unsafe { parse_context.random_function_index.as_mut() } {
-            *random_function_index = 0;
+        if let Some(random_function_index) = parse_context.random_function_index {
+            random_function_index.set(0);
         }
         match outcome {
             ParseOutcome::Parsed(value) => (property_id, u8::MAX, FfiDeclarationRejection::None, Some(value)),
@@ -3009,12 +3090,11 @@ impl SyntaxParseBuilder {
         font_feature_maximum_value_count: Option<usize>,
     ) -> (usize, usize, Option<Arc<DescriptorBlockData>>) {
         let start = self.declarations.len();
-        if !self.parse_context.is_null()
+        if let Some(context) = self.parse_context
             && declarations
                 .first()
                 .is_some_and(|declaration| descriptor_at_rule(declaration.rule_context).is_some())
         {
-            let context = unsafe { &*self.parse_context };
             let descriptors = collect_descriptors(declarations, context);
             for descriptor in &descriptors {
                 self.append_collected_declaration(descriptor);
@@ -3074,6 +3154,25 @@ impl SyntaxParseBuilder {
                 block.append_in_specified_order(property);
             }
         }
+    }
+
+    /// The range of dedup keys spanning `count` declarations from `start`, when all of them may be shared.
+    fn declaration_block_key(&self, start: usize, count: usize) -> Option<std::ops::Range<usize>> {
+        if count == 0 {
+            return None;
+        }
+        let keys = self.dedup.declaration_keys.get(start..start + count)?;
+        let first = keys.first()?.as_ref()?.start;
+        let mut end = first;
+        for key in keys {
+            let key = key.as_ref()?;
+            // The keys of one block are appended one after the other.
+            if key.start != end {
+                return None;
+            }
+            end = key.end;
+        }
+        Some(first..end)
     }
 
     fn next_identity(&mut self) -> u64 {
@@ -3204,7 +3303,7 @@ impl SyntaxParseBuilder {
             ),
             _ => None,
         };
-        let parse_context = unsafe { self.parse_context.as_ref() };
+        let parse_context = self.parse_context;
         let declared_namespaces = self
             .declared_namespaces
             .iter()
@@ -3395,22 +3494,44 @@ impl SyntaxParseBuilder {
             ParsedRulePrelude::FontFeatureValuesRule(_) => {}
         }
         let declaration_block = if let Rule::Qualified(qualified_rule) = rule {
-            let mut block = DeclarationBlockData::default();
-            self.append_declaration_block(
-                &mut block,
-                declarations_start,
-                declaration_count,
-                !qualified_rule.prelude_is_selector,
-            );
-            if !qualified_rule.prelude_is_selector {
-                for item in &children {
-                    if let ParsedRuleChild::Declarations(item) = item {
-                        let range = &self.declaration_ranges[item.local_identity as usize];
-                        self.append_declaration_block(&mut block, range.start, range.len(), true);
+            // NB: A style rule's block is its own declarations, so the same text gives the same block.
+            let block_key = qualified_rule
+                .prelude_is_selector
+                .then(|| self.declaration_block_key(declarations_start, declaration_count))
+                .flatten()
+                .map(|key| (self.dedup.hash(&key), key));
+            if let Some(shared) = block_key
+                .as_ref()
+                .and_then(|(hash, key)| self.dedup.find(&self.dedup.blocks, *hash, key))
+            {
+                Some(Arc::clone(shared))
+            } else {
+                let mut block = DeclarationBlockData::default();
+                self.append_declaration_block(
+                    &mut block,
+                    declarations_start,
+                    declaration_count,
+                    !qualified_rule.prelude_is_selector,
+                );
+                if !qualified_rule.prelude_is_selector {
+                    for item in &children {
+                        if let ParsedRuleChild::Declarations(item) = item {
+                            let range = &self.declaration_ranges[item.local_identity as usize];
+                            self.append_declaration_block(&mut block, range.start, range.len(), true);
+                        }
                     }
                 }
+                block.compact();
+                let block = Arc::new(block);
+                if let Some((hash, key)) = block_key {
+                    self.dedup
+                        .blocks
+                        .entry(hash)
+                        .or_default()
+                        .push((key, Arc::clone(&block)));
+                }
+                Some(block)
             }
-            Some(Arc::new(block))
         } else if rule_kind == ParsedRuleKind::Margin {
             Some(declaration_block_from_blocks(children.iter().filter_map(
                 |item| match item {
@@ -3573,83 +3694,93 @@ fn token_diagnostics(tokens: &[ParserToken]) -> Vec<FfiSyntaxDiagnostic> {
         .collect()
 }
 
-/// # Safety
-/// The parse context and its referenced data must remain valid during parsing.
-pub(crate) unsafe fn parse_shared_stylesheet(
+pub(crate) fn parse_shared_stylesheet(
     source: TokenizerInput<'_>,
-    parse_context: *const ParseContext,
+    parse_context: Option<&ParseContext<'_>>,
 ) -> Arc<ParsedStyleSheet> {
-    unsafe {
-        parse_with_cache(source, parse_context.as_ref(), || {
-            let mut parser = Parser::streaming(source);
-            let mut parse = SyntaxParseBuilder::new(parse_context, false);
-            while let Some(rule) = parser.consume_next_stylesheet_rule() {
-                parse.append_root(&rule);
-            }
-            // As in every other parse, the tokens' own diagnostics come ahead of the rules'.
-            parse.diagnostics.splice(0..0, parser.tokens.diagnostics);
-            parse.finish()
-        })
-    }
+    parse_with_cache(source, parse_context, || {
+        let mut parser = Parser::streaming(source);
+        let mut parse = SyntaxParseBuilder::new(parse_context, false);
+        while let Some(rule) = parser.consume_next_stylesheet_rule() {
+            parse.append_root(&rule);
+        }
+        // As in every other parse, the tokens' own diagnostics come ahead of the rules'.
+        parse.diagnostics.splice(0..0, parser.tokens.diagnostics);
+        parse.finish()
+    })
 }
+
+/// Every rule context, at the index of its discriminant.
+const RULE_CONTEXTS: [RuleContext; RuleContext::Margin as usize + 1] = {
+    use RuleContext::*;
+    let contexts = [
+        Unknown,
+        Style,
+        AtContainer,
+        AtCounterStyle,
+        AtMedia,
+        AtFontFace,
+        AtFontFeatureValues,
+        FontFeatureValue,
+        AtFunction,
+        AtKeyframes,
+        Keyframe,
+        AtSupports,
+        AtScope,
+        SupportsCondition,
+        AtLayer,
+        AtProperty,
+        AtPage,
+        Margin,
+    ];
+    let mut index = 0;
+    while index < contexts.len() {
+        assert!(contexts[index] as usize == index);
+        index += 1;
+    }
+    contexts
+};
 
 fn rule_contexts(contexts: &[u8]) -> Option<Vec<RuleContext>> {
     contexts
         .iter()
-        .map(|&context| {
-            if context > RuleContext::Margin as u8 {
-                return None;
-            }
-            // SAFETY: RuleContext has contiguous repr(u8) discriminants and the value was range-checked.
-            Some(unsafe { std::mem::transmute::<u8, RuleContext>(context) })
-        })
+        .map(|&context| RULE_CONTEXTS.get(usize::from(context)).copied())
         .collect()
 }
 
-/// # Safety
-/// The source and parse context must remain readable during this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_css_stylesheet_syntax(
+pub extern "C" fn rust_parse_css_stylesheet_syntax(
     source: FfiUtf16View,
-    parse_context: *const ParseContext,
+    parse_context: Option<&ParseContext<'_>>,
 ) -> *const ParsedStyleSheet {
     let Some(source) = source.units() else {
         return std::ptr::null();
     };
-    Arc::into_raw(unsafe { parse_shared_stylesheet(source, parse_context) })
+    Arc::into_raw(parse_shared_stylesheet(source, parse_context))
 }
 
 /// Parses exactly one CSS rule into a Rust-owned arena.
-///
-/// # Safety
-/// The source, context array, and parse context must remain readable during this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_css_rule_syntax(
+pub extern "C" fn rust_parse_css_rule_syntax(
     source: FfiUtf16View,
-    contexts: *const u8,
-    context_count: usize,
+    contexts: ak::Span<'_, u8>,
     nested: bool,
-    parse_context: *const ParseContext,
+    parse_context: Option<&ParseContext<'_>>,
 ) -> *const ParsedStyleSheet {
     let Some(source) = source.units() else {
         return std::ptr::null_mut();
     };
-    let Some(contexts) = (unsafe { crate::bytes_from_raw(contexts, context_count) }) else {
+    let Some(contexts) = rule_contexts(contexts.as_slice()) else {
         return std::ptr::null_mut();
     };
-    let Some(contexts) = rule_contexts(contexts) else {
-        return std::ptr::null_mut();
-    };
-    Arc::into_raw(unsafe { parse_shared_rule(source, contexts, nested, parse_context) })
+    Arc::into_raw(parse_shared_rule(source, contexts, nested, parse_context))
 }
 
-/// # Safety
-/// The parse context and its referenced data must remain valid during parsing.
-pub(crate) unsafe fn parse_shared_rule(
+pub(crate) fn parse_shared_rule(
     source: TokenizerInput<'_>,
     contexts: Vec<RuleContext>,
     nested: bool,
-    parse_context: *const ParseContext,
+    parse_context: Option<&ParseContext<'_>>,
 ) -> Arc<ParsedStyleSheet> {
     let (parser, diagnostics) = Parser::from_source(source, contexts);
     let mut parse = SyntaxParseBuilder::new(parse_context, false);
@@ -3779,35 +3910,31 @@ pub extern "C" fn rust_css_syntax_parse_descriptor_block(
 }
 
 /// Parses block contents into a Rust-owned arena.
-///
-/// # Safety
-/// All pointers must remain readable for their accompanying lengths during this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_css_block_syntax(
+pub extern "C" fn rust_parse_css_block_syntax(
     source: FfiUtf16View,
-    contexts: *const u8,
-    context_count: usize,
-    parse_context: *const ParseContext,
+    contexts: ak::Span<'_, u8>,
+    parse_context: Option<&ParseContext<'_>>,
     preserve_property_source_text: bool,
 ) -> *const ParsedStyleSheet {
     let Some(source) = source.units() else {
         return std::ptr::null_mut();
     };
-    let Some(contexts) = (unsafe { crate::bytes_from_raw(contexts, context_count) }) else {
+    let Some(contexts) = rule_contexts(contexts.as_slice()) else {
         return std::ptr::null_mut();
     };
-    let Some(contexts) = rule_contexts(contexts) else {
-        return std::ptr::null_mut();
-    };
-    Arc::into_raw(unsafe { parse_shared_block(source, contexts, parse_context, preserve_property_source_text) })
+    Arc::into_raw(parse_shared_block(
+        source,
+        contexts,
+        parse_context,
+        preserve_property_source_text,
+    ))
 }
 
-/// # Safety
-/// The parse context and its referenced data must remain valid during parsing.
-pub(crate) unsafe fn parse_shared_block(
+pub(crate) fn parse_shared_block(
     source: TokenizerInput<'_>,
     contexts: Vec<RuleContext>,
-    parse_context: *const ParseContext,
+    parse_context: Option<&ParseContext<'_>>,
     preserve_property_source_text: bool,
 ) -> Arc<ParsedStyleSheet> {
     let (mut parser, diagnostics) = Parser::from_source(source, contexts);
@@ -3851,23 +3978,8 @@ mod tests {
         parse_rule_prelude(rule, rule_kind(rule), None, &[], &|_, _| None)
     }
 
-    pub(super) fn parse_context() -> ParseContext {
-        ParseContext {
-            in_quirks_mode: false,
-            is_svg_presentation_attribute: false,
-            is_substituted_value: false,
-            contains_attr_tainted_values: false,
-            is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index: std::ptr::null_mut(),
-        }
+    pub(super) fn parse_context() -> ParseContext<'static> {
+        ParseContext::default()
     }
 
     fn parse_test_rule_prelude_with_context(rule: &Rule) -> ParsedRulePrelude {
@@ -3877,7 +3989,7 @@ mod tests {
     fn parse_test_stylesheet(source: &[u8]) -> ParsedStyleSheet {
         let rules = parse_stylesheet(source);
         let context = parse_context();
-        let mut parse = SyntaxParseBuilder::new(&raw const context, false);
+        let mut parse = SyntaxParseBuilder::new(Some(&context), false);
         parse.append_roots(&rules);
         parse.finish()
     }
@@ -3905,16 +4017,14 @@ mod tests {
             move || {
                 let context = parse_context();
                 let input = crate::css::css_tokenizer::TokenizerInput::Utf16(&source);
-                unsafe {
-                    super::super::stylesheet_cache::parse_with_cache(input, Some(&context), || {
-                        parses.fetch_add(1, Ordering::SeqCst);
-                        if let Some((started, may_finish)) = &held {
-                            started.wait();
-                            may_finish.wait();
-                        }
-                        parse_test_stylesheet(b"a { color: red } b { color: blue }")
-                    })
-                }
+                super::super::stylesheet_cache::parse_with_cache(input, Some(&context), || {
+                    parses.fetch_add(1, Ordering::SeqCst);
+                    if let Some((started, may_finish)) = &held {
+                        started.wait();
+                        may_finish.wait();
+                    }
+                    parse_test_stylesheet(b"a { color: red } b { color: blue }")
+                })
             }
         };
         let first = std::thread::spawn(parse(
@@ -3940,10 +4050,11 @@ mod tests {
         use crate::css::ffi_support::FfiUtf16View;
         let parsed = std::thread::spawn(|| {
             let source = utf16("@未来 {} @media all { .目 { height: 13px; & {} 未知: 雪; width: 赤; } }");
+            // SAFETY: The parse hands over one strong reference.
             let parse = unsafe {
                 std::sync::Arc::from_raw(super::rust_parse_css_stylesheet_syntax(
                     FfiUtf16View::from_utf16(&source),
-                    &parse_context(),
+                    Some(&parse_context()),
                 ))
             };
             assert_eq!(crate::css::ffi_stats::THREAD_UNSAFE_CPP_CALLBACK_COUNT.get(), 0);
@@ -3963,7 +4074,7 @@ mod tests {
         assert_eq!(names, [utf16("未知"), utf16("width")]);
         let parse = parsed;
         extern "C" fn diagnostic(values: *const u16, count: usize, diagnostic: &FfiSyntaxDiagnostic) {
-            let values = unsafe { std::slice::from_raw_parts(values, count) };
+            let values = unsafe { ak::slice_from_raw_parts(values, count) };
             assert_eq!(diagnostic.code, FfiSyntaxDiagnosticCode::UnknownRule);
             assert_eq!(
                 &values[diagnostic.primary_offset..diagnostic.primary_offset + diagnostic.primary_length],
@@ -3971,7 +4082,7 @@ mod tests {
             );
         }
         extern "C" fn declaration(values: *const u16, count: usize, declaration: &FfiSyntaxDeclaration) {
-            let values = unsafe { std::slice::from_raw_parts(values, count) };
+            let values = unsafe { ak::slice_from_raw_parts(values, count) };
             let value = &values
                 [declaration.value_source_offset..declaration.value_source_offset + declaration.value_source_length];
             match declaration.rejection {
@@ -3997,9 +4108,8 @@ mod tests {
         let parse = unsafe {
             std::sync::Arc::from_raw(super::rust_parse_css_block_syntax(
                 FfiUtf16View::from_utf16(&source),
-                contexts.as_ptr(),
-                contexts.len(),
-                &parse_context(),
+                ak::Span::new(&contexts),
+                Some(&parse_context()),
                 true,
             ))
         };
@@ -4010,7 +4120,7 @@ mod tests {
             declaration: &FfiSyntaxDeclaration,
         ) {
             let names = unsafe { &mut *context.cast::<Vec<Vec<u16>>>() };
-            let values = unsafe { std::slice::from_raw_parts(values, count) };
+            let values = unsafe { ak::slice_from_raw_parts(values, count) };
             assert!(declaration.preserve_source_text);
             names.push(values[declaration.name_offset..declaration.name_offset + declaration.name_length].to_vec());
         }
@@ -4081,7 +4191,7 @@ mod tests {
 
     #[test]
     fn exposes_token_diagnostics_with_source_spans() {
-        let mut parse = SyntaxParseBuilder::new(std::ptr::null(), false);
+        let mut parse = SyntaxParseBuilder::new(None, false);
         let tokens =
             crate::css::css_tokenizer::tokenize_for_parser(&utf16("a { color: \"bad\n; background: url(foo\"bar) }"));
         parse.diagnostics = token_diagnostics(&tokens);
@@ -4371,7 +4481,7 @@ mod tests {
     #[test]
     fn parses_selector_preludes_from_component_values() {
         let rules = parse_stylesheet(b"a {} :heading(1.0) {} a { > b {} @scope (> .start) to (> .end) {} }");
-        let mut parse = SyntaxParseBuilder::new(std::ptr::null(), false);
+        let mut parse = SyntaxParseBuilder::new(None, false);
         parse.append_roots(&rules);
 
         assert!(parse.rules[0].selector_list.is_some());
@@ -4387,7 +4497,7 @@ mod tests {
         assert!(selectors.end.is_some());
 
         let rules = parse_stylesheet(b"@media all { > b {} @scope (> .start) {} }");
-        let mut parse = SyntaxParseBuilder::new(std::ptr::null(), false);
+        let mut parse = SyntaxParseBuilder::new(None, false);
         parse.append_roots(&rules);
         let [ParsedRuleChild::Rule(group_child), ParsedRuleChild::Rule(scope_rule)] = &*parse.rules[0].children else {
             panic!("expected nested style and scope rules")
@@ -4442,7 +4552,7 @@ mod tests {
         let rules = parse_stylesheet(
             b"@media screen and (width > 1px) {} @supports (display: grid) {} @container card (width > 1px), style(--theme: dark) {} @supports {}",
         );
-        let mut parse = SyntaxParseBuilder::new(std::ptr::null(), false);
+        let mut parse = SyntaxParseBuilder::new(None, false);
         parse.append_roots(&rules);
 
         let media = &parse.rules[0];

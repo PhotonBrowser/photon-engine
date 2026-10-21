@@ -18,6 +18,7 @@
 #include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibCompositing/Scrolling/SmoothScrollAnimation.h>
 #include <LibCore/Forward.h>
+#include <LibCore/StatsLog.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/Navigation.h>
@@ -318,8 +319,16 @@ public:
     // which gives it back.
     Compositor::NavigablePresenter& presenter();
 
+    bool stats_ancestors_displayed() const { return m_stats_ancestors_displayed; }
+    bool update_stats_ancestors_displayed(bool displayed) { return exchange(m_stats_ancestors_displayed, displayed) != displayed; }
+
     bool needs_repaint() const { return m_needs_repaint; }
-    void set_needs_repaint() { m_needs_repaint = true; }
+    void set_needs_repaint()
+    {
+        m_needs_repaint = true;
+        if (Core::StatsLog::the())
+            record_rendering_invalidation();
+    }
     bool needs_to_record_display_list() const { return m_needs_to_record_display_list; }
     void set_needs_to_record_display_list() { m_needs_to_record_display_list = true; }
     void repaint_after_compositor_process_reconnect();
@@ -402,6 +411,7 @@ public:
     void note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type);
     RefPtr<Painting::Scrollbar> scrollbar_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const&);
     void note_user_scroll_gesture_phase(Web::ScrollGesturePhase);
+    void did_handle_wheel_event();
     void defer_user_scroll_settlement();
     void snap_user_scroll_gestures_that_awaited_layout();
     void begin_user_scroll_gesture_hold(Badge<UserScrollGestureHold>);
@@ -423,6 +433,8 @@ protected:
     Variant<Empty, Traversal, Utf16String> m_ongoing_navigation;
 
 private:
+    void record_rendering_invalidation();
+
     // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
     struct RecordingInFlight;
 
@@ -503,6 +515,7 @@ private:
     void abandon_snapping_of_user_scroll_gesture(Web::AsyncScrollNodeStableID);
     void settle_user_scroll_gesture();
     void settle_user_scroll_gesture_if_input_deadline_passed();
+    void release_wheel_user_scroll_gesture_hold();
     void reset_momentum_fling_state();
     // Which of the latched gestures a settlement is for: every gesture that ran out of input, or only those left
     // waiting for layout by an earlier settlement.
@@ -580,6 +593,7 @@ private:
     Vector<Utf16String> m_queued_javascript_url_navigations;
 
     bool m_is_svg_page { false };
+    bool m_stats_ancestors_displayed { false };
     bool m_needs_repaint { true };
     bool m_needs_to_record_display_list { true };
 
@@ -600,6 +614,7 @@ private:
     RefPtr<Core::Timer> m_user_scroll_settle_timer;
     OwnPtr<UserScrollGestureHold> m_compositor_user_scroll_gesture_hold;
     OwnPtr<UserScrollGestureHold> m_wheel_user_scroll_gesture_hold;
+    RefPtr<Core::Timer> m_wheel_user_scroll_gesture_hold_expiry_timer;
     size_t m_user_scroll_gesture_hold_count { 0 };
     Compositing::SnapSelectionStrategy::Type m_user_scroll_input_intent { Compositing::SnapSelectionStrategy::Type::EndPosition };
     bool m_user_scroll_gesture_travels_under_momentum { false };

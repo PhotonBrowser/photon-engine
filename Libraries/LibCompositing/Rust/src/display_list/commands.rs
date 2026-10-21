@@ -211,6 +211,8 @@ pub struct ReplayLayer {
     pub backdrop_region: IntRect,
     pub backdrop_corner_radii: CornerRadii,
     pub effect: EffectNodeIndex,
+    /// Bounds of everything replay draws into the layer, in the effect's space, when known.
+    pub content_bounds: OptionalFloatRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1158,8 +1160,22 @@ ffi_bytes_fields!(StrokePath {
 
 impl DisplayListCommand for StrokePath {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::StrokePath;
+    // The path bounding rect reaches half the thickness past the path, as far as round and bevel
+    // joins and butt and round caps paint. Miter joins reach out to the miter limit times that, and
+    // the corners of square caps reach out diagonally.
     fn bounding_rect(&self) -> Option<IntRect> {
-        Some(enclosing_int_rect(self.path_bounding_rect))
+        let mut reach_multiplier: f32 = 1.0;
+        if self.join_style == JoinStyle::Miter {
+            reach_multiplier = reach_multiplier.max(self.miter_limit);
+        }
+        if self.cap_style == CapStyle::Square {
+            reach_multiplier = reach_multiplier.max(std::f32::consts::SQRT_2);
+        }
+        let reach_past_path_bounding_rect = self.thickness / 2.0 * (reach_multiplier - 1.0);
+        Some(enclosing_int_rect(self.path_bounding_rect.inflated(
+            2.0 * reach_past_path_bounding_rect,
+            2.0 * reach_past_path_bounding_rect,
+        )))
     }
 }
 

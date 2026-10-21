@@ -82,6 +82,7 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/ChromeWidget.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
@@ -1526,7 +1527,6 @@ HostedNavigableState LocalNavigable::hosted_state() const
 {
     VERIFY(m_active_document);
     return {
-        .active_document_url = m_active_document->url(),
         .active_document_is_fully_active = m_active_document->is_fully_active(),
         .is_closing = m_closing,
         .container = container_state(),
@@ -4654,6 +4654,7 @@ void LocalNavigable::set_viewport_intersection(CSSPixelRect intersection)
     if (m_viewport_intersection == intersection)
         return;
     m_viewport_intersection = intersection;
+    set_rendering_pending_displayed(*this, !intersection.is_empty());
 
     // Intersection observations only run when the document renders, so ask for one.
     if (auto document = active_document()) {
@@ -5132,7 +5133,7 @@ void LocalNavigable::note_user_scroll_gesture_phase(Web::ScrollGesturePhase phas
     case Web::ScrollGesturePhase::None:
         m_user_scroll_gesture_travels_under_momentum = false;
         reset_momentum_fling_state();
-        m_wheel_user_scroll_gesture_hold = nullptr;
+        release_wheel_user_scroll_gesture_hold();
         break;
     case Web::ScrollGesturePhase::Ongoing:
     case Web::ScrollGesturePhase::Momentum: {
@@ -5142,7 +5143,7 @@ void LocalNavigable::note_user_scroll_gesture_phase(Web::ScrollGesturePhase phas
             reset_momentum_fling_state();
 
         if (m_wheel_user_scroll_gesture_hold && m_user_scroll_gesture_travels_under_momentum != travels_under_momentum)
-            m_wheel_user_scroll_gesture_hold = nullptr;
+            release_wheel_user_scroll_gesture_hold();
         m_user_scroll_gesture_travels_under_momentum = travels_under_momentum;
 
         if (!m_wheel_user_scroll_gesture_hold)
@@ -5153,12 +5154,31 @@ void LocalNavigable::note_user_scroll_gesture_phase(Web::ScrollGesturePhase phas
         m_user_scroll_gesture_travels_under_momentum = false;
         reset_momentum_fling_state();
         if (m_wheel_user_scroll_gesture_hold) {
-            m_wheel_user_scroll_gesture_hold = nullptr;
+            release_wheel_user_scroll_gesture_hold();
             break;
         }
         settle_user_scroll_gesture();
         break;
     }
+}
+
+void LocalNavigable::did_handle_wheel_event()
+{
+    if (!m_wheel_user_scroll_gesture_hold)
+        return;
+    if (!m_wheel_user_scroll_gesture_hold_expiry_timer) {
+        m_wheel_user_scroll_gesture_hold_expiry_timer = Core::Timer::create_single_shot(Compositing::user_scroll_settle_delay, [this] {
+            m_wheel_user_scroll_gesture_hold = nullptr;
+        });
+    }
+    m_wheel_user_scroll_gesture_hold_expiry_timer->restart();
+}
+
+void LocalNavigable::release_wheel_user_scroll_gesture_hold()
+{
+    if (m_wheel_user_scroll_gesture_hold_expiry_timer)
+        m_wheel_user_scroll_gesture_hold_expiry_timer->stop();
+    m_wheel_user_scroll_gesture_hold = nullptr;
 }
 
 void LocalNavigable::reset_momentum_fling_state()
@@ -5290,7 +5310,7 @@ void LocalNavigable::cancel_user_scroll_settlement()
         m_user_scroll_settle_timer->stop();
     m_pending_user_scrollend_targets.clear();
     m_compositor_user_scroll_gesture_hold = nullptr;
-    m_wheel_user_scroll_gesture_hold = nullptr;
+    release_wheel_user_scroll_gesture_hold();
 }
 
 void LocalNavigable::begin_user_scroll_gesture_hold(Badge<UserScrollGestureHold>)
@@ -6452,7 +6472,7 @@ void LocalNavigable::repaint_after_compositor_process_reconnect()
             page().client().device_pixel_ratio(),
             Compositing::WindowResizingInProgress::No);
 
-        m_needs_repaint = true;
+        set_needs_repaint();
         m_needs_to_record_display_list = true;
         presenter().forget_compositor_display_list();
     }
@@ -6595,6 +6615,7 @@ bool LocalNavigable::commit_frame(PaintConfig paint_config)
         || !compositor_display_list_paint_config.has_value()
         || !(compositor_display_list_paint_config.value() == paint_config);
     auto sealed = seal_presentation(*document, paint_config, should_record_display_list);
+    set_rendering_pending(*document, RenderingPendingReason::NeedsRenderingUpdate, 0);
     if (!should_record_display_list) {
         commit_unrecorded_frame(read, *document, move(sealed));
         return true;
@@ -6793,6 +6814,12 @@ void LocalNavigable::finish_recording_in_flight(RecordingInFlight& in_flight, La
     auto const hit_test_list_stands = landing == Layout::RustFFI::FfiRecordingLanding::LandedBehindRows ? Painting::HitTestListStands::No : Painting::HitTestListStands::Yes;
     Painting::take_recording_trace_if_pending(read, *document);
     document->adopt_published_recording(Painting::hit_test_list_read(read, hit_test_list_stands), *in_flight.recording, sealed->published->display_list, [&] { return sealed->published->referenced_resources; });
+}
+
+void LocalNavigable::record_rendering_invalidation()
+{
+    if (auto document = active_document())
+        set_rendering_pending(*document, RenderingPendingReason::NeedsRenderingUpdate, 1);
 }
 
 void LocalNavigable::paint_next_frame()

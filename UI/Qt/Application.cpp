@@ -394,6 +394,8 @@ public:
         m_debug_menu = create_application_menu(*m_application_widget, application.debug_menu());
 
         m_help_menu = new QMenu("Help", m_application_widget);
+        m_help_menu->addAction(create_application_action(*m_application_widget, application.report_website_issue_action(), IncludeActionIcon::No));
+        m_help_menu->addSeparator();
         m_help_menu->addAction(create_application_action(*m_application_widget, application.open_about_page_action(), IncludeActionIcon::No));
     }
 
@@ -633,7 +635,8 @@ Optional<String> Application::system_font_family() const
 BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Tab* parent_tab, Optional<WebView::CanonicalTraversable&> traversable, ShowWindow show_window, Optional<Web::HTML::PreparedNavigationDescriptor> initial_navigation)
 {
     auto* window = new BrowserWindow(initial_urls, is_popup_window, is_private, parent_tab, traversable);
-    set_active_window(*window);
+    if (show_window != ShowWindow::WithoutActivating)
+        set_active_window(*window);
     QObject::connect(window, &QObject::destroyed, m_application.ptr(), [this, window] {
         if (m_active_window == window)
             m_active_window = nullptr;
@@ -646,14 +649,18 @@ BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, Win
     }
 
     window->set_window_rect(configuration.x, configuration.y, configuration.width, configuration.height);
-    if (show_window == ShowWindow::Yes) {
+    if (show_window != ShowWindow::No) {
+        if (show_window == ShowWindow::WithoutActivating)
+            window->setAttribute(Qt::WA_ShowWithoutActivating);
         if (configuration.maximized == true)
             window->showMaximized();
         else
             window->show();
 
-        window->activateWindow();
-        window->raise();
+        if (show_window == ShowWindow::Yes) {
+            window->activateWindow();
+            window->raise();
+        }
     }
 
     size_t initial_url_index = 0;
@@ -891,9 +898,8 @@ void Application::review_crash_report(ByteString const& report_name)
     // The tab is blank, so no web content runs behind the review, and it closes once the review is left.
     auto* current_tab = m_active_window->current_tab();
     auto& tab = m_active_window->new_tab_from_url(URL::about_blank(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
-    if (current_tab)
-        tab.set_tab_to_activate_on_close(*current_tab);
     tab.view().review_hidden_crash_report(report_name);
+    tab.enter_report_review(current_tab);
 }
 
 void Application::open_file()

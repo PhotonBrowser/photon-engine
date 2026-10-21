@@ -1,23 +1,20 @@
 #include <AK/Time.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibMedia/DecoderCapabilities.h>
+#include <LibMediaCodecs/DecoderCapabilities.h>
 #include <LibMedia/MediaSourceExtensions/SourceBufferProcessor.h>
 #include <LibMedia/MediaSupport.h>
 #include <LibMedia/SeekMode.h>
 #include <LibMedia/Track.h>
-#include <LibMedia/VideoFrameHandle.h>
 #include <LibMedia/VideoSinkHandle.h>
-#include <LibMedia/VideoSurface.h>
 
 endpoint MediaServer
 {
 
     connect_new_client() => (Optional<IPC::TransportHandle> handle, int client_id)
+    video_decoder_server_connection_ready(u64 request_id, Optional<IPC::TransportHandle> handle) =|
     connect_video_presentation_channel(int client_id, IPC::TransportHandle handle) =|
 
-    query_file_media_support(String type, String subtype, Optional<String> codecs_parameter) => (Media::MediaSupportInfo info)
-    query_decoder_capabilities(String codecs_parameter) => (Optional<Media::DecoderCapabilities> capabilities)
     request_file_media_support(u64 request_id, String type, String subtype, Optional<String> codecs_parameter) =|
     request_decoder_capabilities(u64 request_id, String codecs_parameter) =|
 
@@ -44,7 +41,6 @@ endpoint MediaServer
     reserve_video_sink(u64 session_id, u64 seek_request_id, Media::Track track, Media::VideoSinkHandle handle, bool resume_ended_playback) =|
     disable_video_sink(u64 session_id, u64 seek_request_id, Media::VideoSinkHandle handle) =|
     set_video_sink_ticking(u64 session_id, Media::VideoSinkHandle handle, bool ticking) =|
-    map_presented_frame_slot(u64 session_id, Media::VideoSinkHandle handle, Media::VideoFramePoolID pool_id, u32 slot_index) => (Optional<Core::AnonymousBuffer> slot_buffer, RefPtr<Media::VideoSurface> surface)
 
     create_source_buffer(u64 session_id, u64 source_buffer_id) =|
     destroy_source_buffer(u64 session_id, u64 source_buffer_id) =|

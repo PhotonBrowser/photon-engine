@@ -6,21 +6,35 @@
 
 #include <Compositor/CanvasHost.h>
 #include <Compositor/HostWebGLContext.h>
+#include <Compositor/VideoFrameHolds.h>
+#include <Compositor/VideoFrameSkia.h>
 #include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
 #include <LibCompositing/DisplayList/CanvasSurfaceRegistry.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/CanvasCommandPlayer.h>
+#include <LibGfx/ColorSpace.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibGfx/SkiaBackendContext.h>
-#include <core/SkTextBlob.h>
+#include <LibMediaCodecs/VideoFrame.h>
+#include <core/SkImage.h>
 
 namespace Compositor {
 
-CanvasHost::CanvasHost(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Compositing::CanvasSurfaceRegistry& canvas_surface_registry)
+struct CanvasHost::VideoFrameImage {
+    AK_ALLOC_WITH_KMALLOC;
+
+    u64 generation { 0 };
+    // Kept until replaced, since the GPU samples the image after the commands are played.
+    RefPtr<Media::VideoFrame> frame;
+    sk_sp<SkImage> image;
+};
+
+CanvasHost::CanvasHost(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Compositing::CanvasSurfaceRegistry& canvas_surface_registry, VideoFrameHolds const& video_frame_holds)
     : m_skia_backend_context(move(skia_backend_context))
     , m_canvas_surface_registry(canvas_surface_registry)
     , m_canvas_surface_owner_id(canvas_surface_registry.allocate_owner_id())
+    , m_video_frame_holds(video_frame_holds)
 {
 }
 
@@ -48,16 +62,15 @@ OwnPtr<Gfx::CanvasCommandPlayer> CanvasHost::create_2d_command_player(Gfx::IntSi
         // WebGL sources are presented separately and resolve via the registry.
         return m_canvas_surface_registry.canvas_surface(m_canvas_surface_owner_id, Compositing::CanvasId { canvas_id });
     };
-    auto text_blob_resolver = [this](u64 font_id, ReadonlySpan<Gfx::CanvasGlyph> glyphs) {
+    auto font_resolver = [this](u64 font_id) -> Gfx::Font const* {
         if (!m_text_resources.has_font(Compositing::FontResourceId { font_id }))
-            return sk_sp<SkTextBlob> {};
-        Vector<Compositing::DisplayListGlyph> display_list_glyphs;
-        display_list_glyphs.ensure_capacity(glyphs.size());
-        for (auto const& glyph : glyphs)
-            display_list_glyphs.unchecked_append({ .position = glyph.position, .glyph_id = glyph.glyph_id });
-        return m_text_blobs.text_blob(m_text_resources, Compositing::FontResourceId { font_id }, 1, display_list_glyphs, 0, TextRasterizationMode::Unhinted);
+            return nullptr;
+        return &m_text_resources.font(Compositing::FontResourceId { font_id });
     };
-    auto player = make<Gfx::CanvasCommandPlayer>(m_skia_backend_context, size, format, Gfx::AlphaType::Premultiplied, move(canvas_surface_resolver), move(text_blob_resolver));
+    auto player = make<Gfx::CanvasCommandPlayer>(m_skia_backend_context, size, format, Gfx::AlphaType::Premultiplied, move(canvas_surface_resolver), move(font_resolver));
+    player->set_video_frame_image_resolver([this](u64 video_sink_handle, u64 generation) {
+        return held_video_frame_image(Media::VideoSinkHandle { video_sink_handle }, generation);
+    });
 
     // https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-settings:concept-canvas-alpha
     // "Thus, the bitmap of such a context starts off as opaque black instead of transparent black"
@@ -145,16 +158,19 @@ void CanvasHost::present_canvas_2d_context(Compositing::CanvasId canvas_id, Canv
     context.has_uncommitted_commands = false;
 }
 
-void CanvasHost::execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> const& segments, Vector<Compositing::DisplayListFontResource> const& fonts)
+void CanvasHost::execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> const& segments, Vector<Compositing::FontResourceId> const& kept_font_ids, Vector<Compositing::DisplayListFontResource> const& added_fonts)
 {
     Compositing::DisplayListResourceSet resources;
-    for (auto const& font : fonts) {
-        // NB: Font IDs are immutable. Preserve the backing storage used by cached text blobs.
+    for (auto font_id : kept_font_ids)
+        resources.fonts.set(font_id);
+    for (auto const& font : added_fonts) {
+        // NB: Font IDs are immutable. Keep the typeface that Skia's glyph caches were built for.
         if (!m_text_resources.has_font(font.id))
             m_text_resources.set_font(font.id, font.font);
         resources.fonts.set(font.id);
     }
-    m_text_blobs.evict(m_text_resources.retain_only(resources));
+    m_text_resources.retain_only(resources);
+    Vector<NonnullRefPtr<Gfx::PaintingSurface>> surfaces_that_sample_video_frames;
     for (auto const& segment : segments) {
         // The canvas may have been destroyed while this segment was pending in
         // WebContent, so a missing context is not a protocol violation.
@@ -164,20 +180,71 @@ void CanvasHost::execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStr
             continue;
 
         if (!segment.commands.is_empty()) {
+            m_drew_video_frame_in_segment = false;
             canvas_context->command_player->play(segment.commands);
             canvas_context->has_uncommitted_commands = true;
+            if (m_drew_video_frame_in_segment && !surfaces_that_sample_video_frames.contains_slow(canvas_context->command_player->surface()))
+                surfaces_that_sample_video_frames.append(canvas_context->command_player->surface());
         }
 
         if (segment.present && canvas_context->has_uncommitted_commands)
             present_canvas_2d_context(segment.canvas_id, *canvas_context);
     }
+
+    // The frames stay held only until WebContent releases them, which follows this stream, so the GPU has to have
+    // finished sampling them by then.
+    if (m_skia_backend_context) {
+        for (auto& surface : surfaces_that_sample_video_frames)
+            m_skia_backend_context->flush_and_submit(surface);
+    }
 }
 
-void CanvasHost::execute_webgl_commands(Compositing::CanvasId canvas_id, ReadonlyBytes commands, Vector<Gfx::DecodedImageFrame> const& bitmaps)
+sk_sp<SkImage> CanvasHost::held_video_frame_image(Media::VideoSinkHandle handle, u64 generation)
+{
+    if (auto cached = m_video_frame_images.get(handle); cached.has_value() && (*cached)->generation == generation)
+        return (*cached)->image;
+
+    m_drew_video_frame_in_segment = true;
+    auto frame = m_video_frame_holds.held_frame(handle, generation);
+    if (!frame)
+        return nullptr;
+    auto image = sk_image_from_video_frame(*frame, m_skia_backend_context);
+    if (!image)
+        return nullptr;
+    m_video_frame_images.set(handle, make<VideoFrameImage>(generation, move(frame), image));
+    return image;
+}
+
+void CanvasHost::forget_video_sink(Media::VideoSinkHandle handle)
+{
+    m_video_frame_images.remove(handle);
+}
+
+Vector<HostWebGLContext::UploadSource> CanvasHost::resolve_webgl_upload_sources(Vector<Compositing::WebGL::ImageSourceFrame> const& frames) const
+{
+    Vector<HostWebGLContext::UploadSource> sources;
+    sources.ensure_capacity(frames.size());
+    for (auto const& frame : frames) {
+        frame.visit(
+            [&](Gfx::DecodedImageFrame const& decoded_frame) {
+                sources.unchecked_append(decoded_frame);
+            },
+            [&](Compositing::CapturedVideoFrame const& captured_frame) {
+                if (auto video_frame = m_video_frame_holds.held_frame(captured_frame.sink_handle, captured_frame.generation)) {
+                    sources.unchecked_append(video_frame.release_nonnull());
+                    return;
+                }
+                sources.unchecked_append(Gfx::DecodedImageFrame { NonnullRefPtr<Gfx::Bitmap const> { MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, { 1, 1 })) } });
+            });
+    }
+    return sources;
+}
+
+void CanvasHost::execute_webgl_commands(Compositing::CanvasId canvas_id, ReadonlyBytes commands, Vector<Compositing::WebGL::ImageSourceFrame> const& frames)
 {
     auto* context = this->context(canvas_id);
     VERIFY(context);
-    MUST(as_webgl(*context).execute_commands(commands, bitmaps));
+    MUST(as_webgl(*context).execute_commands(commands, resolve_webgl_upload_sources(frames)));
 }
 
 void CanvasHost::set_webgl_shared_command_buffer(Compositing::CanvasId canvas_id, Compositing::WebGL::WebGLSharedCommandBuffer shared_command_buffer)
@@ -187,7 +254,7 @@ void CanvasHost::set_webgl_shared_command_buffer(Compositing::CanvasId canvas_id
     as_webgl(*context).set_shared_command_buffer(move(shared_command_buffer));
 }
 
-bool CanvasHost::execute_webgl_commands_from_shared_buffer(Compositing::CanvasId canvas_id, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Gfx::DecodedImageFrame> const& bitmaps)
+bool CanvasHost::execute_webgl_commands_from_shared_buffer(Compositing::CanvasId canvas_id, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Compositing::WebGL::ImageSourceFrame> const& frames)
 {
     auto* context = this->context(canvas_id);
     VERIFY(context);
@@ -199,7 +266,7 @@ bool CanvasHost::execute_webgl_commands_from_shared_buffer(Compositing::CanvasId
 
     // WebContent can rewrite shared bytes while they execute, so a malformed stream is
     // a misbehaving peer rather than a Compositor bug; report instead of crashing.
-    if (webgl_context.execute_commands(*commands, bitmaps).is_error())
+    if (webgl_context.execute_commands(*commands, resolve_webgl_upload_sources(frames)).is_error())
         return false;
     webgl_context.store_executed_flush_sequence_number(flush_sequence_number);
     return true;

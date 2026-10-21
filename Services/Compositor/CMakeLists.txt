@@ -24,6 +24,7 @@ set(SOURCES
     ScrollFlingController.cpp
     ScrollSnapController.cpp
     ScrollbarController.cpp
+    VideoFrameHolds.cpp
     VideoFrameSkia.cpp
     VSyncScheduler.cpp
     WebGLObjectMap.cpp
@@ -72,14 +73,16 @@ target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSa
 # OpenGL framework pulled in by Skia.
 target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibCompositing ${ANGLE_TARGETS} skia)
 
+if (USE_VULKAN_DMABUF_IMAGES)
+    target_sources(compositorservice PRIVATE VideoFrameSkiaVulkan.cpp)
+endif()
+
 if (APPLE)
     target_sources(compositorservice PRIVATE VideoFrameSkia.mm)
     target_link_libraries(compositorservice PUBLIC "-framework CoreGraphics" "-framework CoreVideo")
 endif()
 
 if (WIN32)
-    target_include_directories(Compositor PRIVATE $<BUILD_INTERFACE:${PTHREAD_INCLUDE_DIR}>)
-    target_include_directories(compositorservice PRIVATE $<BUILD_INTERFACE:${PTHREAD_INCLUDE_DIR}>)
     ladybird_windows_bin(Compositor CONSOLE)
 endif()
 

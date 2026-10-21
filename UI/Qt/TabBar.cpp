@@ -38,6 +38,7 @@
 #include <QGraphicsDropShadowEffect>
 #include <QHBoxLayout>
 #include <QHelpEvent>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLayoutItem>
 #include <QLinearGradient>
@@ -235,12 +236,14 @@ static void paint_load_sheen(QPainter& painter, QPalette const& palette, QPainte
     painter.restore();
 }
 
-// NB: The macOS style gives tab bars a small font when it polishes them, so tab titles are drawn a point larger than
-//     the tab bar's font rather than by setting the tab bar's font.
 static QFont tab_title_font(QFont font)
 {
+#if defined(AK_OS_MACOS)
+    // The macOS style gives tab bars a small font when it polishes them, so tab titles are drawn a point larger than
+    // the tab bar's font rather than by setting the tab bar's font.
     if (font.pointSizeF() > 0)
         font.setPointSizeF(font.pointSizeF() + 1);
+#endif
     return font;
 }
 
@@ -538,6 +541,21 @@ QLabel#LadybirdTabPreviewURL {{
     TabPreviewThumbnail* m_thumbnail { nullptr };
     QLabel* m_title_label { nullptr };
     QLabel* m_url_label { nullptr };
+};
+
+class TabDragCancellationFilter final : public QObject {
+public:
+    bool was_canceled() const { return m_was_canceled; }
+
+private:
+    virtual bool eventFilter(QObject*, QEvent* event) override
+    {
+        if (event->type() == QEvent::KeyPress && static_cast<QKeyEvent*>(event)->key() == Qt::Key_Escape)
+            m_was_canceled = true;
+        return false;
+    }
+
+    bool m_was_canceled { false };
 };
 
 TabBar::TabBar(TabWidget* tab_widget)
@@ -1311,7 +1329,6 @@ void TabBar::start_tab_drag(int index)
     auto* drag = new QDrag(this);
     auto* mime_data = new QMimeData;
     mime_data->setData(LADYBIRD_TAB_MIME_TYPE, QByteArray {});
-    mime_data->setText(tab->title());
     drag->setMimeData(mime_data);
     drag->setPixmap(render_tab_drag_pixmap(index));
     drag->setHotSpot(m_position_in_selected_tab_while_dragging);
@@ -1323,19 +1340,32 @@ void TabBar::start_tab_drag(int index)
     update_tab_button_geometry();
     update();
 
+    TabDragCancellationFilter cancellation_filter;
+
+    // Qt installs its own drag event filter in exec(). Install ours afterward so Escape is observed before Qt consumes it.
+    QTimer::singleShot(0, &cancellation_filter, [&cancellation_filter]() {
+        QApplication::instance()->installEventFilter(&cancellation_filter);
+    });
+
+#if defined(AK_OS_MACOS)
+    auto action = execute_appkit_tab_drag(*this, *drag);
+#else
     auto action = drag->exec(Qt::MoveAction, Qt::MoveAction);
+#endif
+    QApplication::instance()->removeEventFilter(&cancellation_filter);
+
+    static auto const is_wayland = QGuiApplication::platformName().startsWith("wayland");
+    auto was_canceled = cancellation_filter.was_canceled() || (is_wayland && action == Qt::IgnoreAction);
+
     auto drop_target = s_pending_tab_drop_target;
 
-    auto* source_window = qobject_cast<BrowserWindow*>(window());
-    if (source_window && dragged_tab) {
-        auto current_index = source_window->tab_index(dragged_tab);
-        if (current_index >= 0) {
-            if (action == Qt::MoveAction && s_pending_tab_drop_target) {
-                if (auto* target_window = qobject_cast<BrowserWindow*>(s_pending_tab_drop_target->window()))
+    if (auto* source_window = qobject_cast<BrowserWindow*>(window()); source_window && dragged_tab) {
+        if (auto current_index = source_window->tab_index(dragged_tab); current_index >= 0) {
+            if (action == Qt::MoveAction && drop_target) {
+                if (auto* target_window = qobject_cast<BrowserWindow*>(drop_target->window()))
                     source_window->move_tab_to_window(current_index, *target_window, s_pending_tab_drop_index);
-            } else if (action == Qt::IgnoreAction) {
-                if (!m_tab_widget->tab_strip_global_rect().contains(QCursor::pos()) && m_tab_widget->count() > 1)
-                    source_window->detach_tab_to_new_window(current_index, QCursor::pos());
+            } else if (!drop_target && !was_canceled && m_tab_widget->count() > 1) {
+                source_window->detach_tab_to_new_window(current_index, QCursor::pos());
             }
         }
     }
@@ -1868,6 +1898,7 @@ TabWidget::TabWidget(QWidget* parent)
 
     m_tab_bar_row = new QWidget(this);
     m_tab_bar_row->setObjectName("LadybirdTabStrip");
+    m_tab_bar_row->setAcceptDrops(true);
     m_tab_bar_row_layout = new QHBoxLayout(m_tab_bar_row);
     m_tab_bar_row->installEventFilter(this);
 
@@ -1879,6 +1910,7 @@ TabWidget::TabWidget(QWidget* parent)
 
     m_vertical_tab_bar_column = new QWidget(this);
     m_vertical_tab_bar_column->setObjectName("LadybirdVerticalTabBar");
+    m_vertical_tab_bar_column->setAcceptDrops(true);
 #if defined(AK_OS_MACOS)
     m_vertical_tab_bar_column->setAttribute(Qt::WA_DontCreateNativeAncestors);
     m_vertical_tab_bar_column->setAttribute(Qt::WA_NativeWindow);
@@ -2158,7 +2190,7 @@ bool TabWidget::event(QEvent* event)
 
 void TabWidget::dragEnterEvent(QDragEnterEvent* event)
 {
-    accept_tab_drag(event);
+    accept_tab_drag(event, this);
 }
 
 void TabWidget::dragLeaveEvent(QDragLeaveEvent* event)
@@ -2169,7 +2201,7 @@ void TabWidget::dragLeaveEvent(QDragLeaveEvent* event)
 
 void TabWidget::dragMoveEvent(QDragMoveEvent* event)
 {
-    accept_tab_drag(event);
+    accept_tab_drag(event, this);
 }
 
 // A tab dropped elsewhere in the tab strip's area, such as past the new tab button, lands at the nearest end of the
@@ -2181,6 +2213,27 @@ void TabWidget::dropEvent(QDropEvent* event)
 
 bool TabWidget::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == m_tab_bar_row || watched == m_vertical_tab_bar_column) {
+        auto* tab_strip = static_cast<QWidget*>(watched);
+
+        switch (event->type()) {
+        case QEvent::DragEnter:
+        case QEvent::DragMove:
+            accept_tab_drag(static_cast<QDragMoveEvent*>(event), tab_strip);
+            return true;
+        case QEvent::DragLeave:
+            m_tab_bar->hide_drop_preview();
+            return true;
+        case QEvent::Drop: {
+            auto* drop_event = static_cast<QDropEvent*>(event);
+            accept_tab_drop(drop_event, m_tab_bar->drop_index_at(m_tab_bar->mapFrom(tab_strip, drop_event->position().toPoint())));
+            return true;
+        }
+        default:
+            break;
+        }
+    }
+
     if (is<BookmarksBar>(watched) && (event->type() == QEvent::Show || event->type() == QEvent::Hide))
         update_vertical_tabs_content_separator();
 
@@ -2321,7 +2374,7 @@ void TabWidget::size_hidden_pages_like_the_current_one()
     }
 }
 
-void TabWidget::accept_tab_drag(QDragMoveEvent* event)
+void TabWidget::accept_tab_drag(QDragMoveEvent* event, QWidget* target)
 {
     if (!target_can_accept_tab_drop(*this, *event)) {
         m_tab_bar->hide_drop_preview();
@@ -2330,14 +2383,14 @@ void TabWidget::accept_tab_drag(QDragMoveEvent* event)
     }
 
     auto* drag_area = tab_drag_area_widget();
-    auto position_in_drag_area = drag_area->mapFrom(this, event->position().toPoint());
+    auto position_in_drag_area = drag_area->mapFrom(target, event->position().toPoint());
     if (!drag_area->rect().contains(position_in_drag_area)) {
         m_tab_bar->hide_drop_preview();
         event->ignore();
         return;
     }
 
-    m_tab_bar->update_drop_preview(m_tab_bar->mapFrom(this, event->position().toPoint()));
+    m_tab_bar->update_drop_preview(m_tab_bar->mapFrom(target, event->position().toPoint()));
     event->setDropAction(Qt::MoveAction);
     event->accept();
 }

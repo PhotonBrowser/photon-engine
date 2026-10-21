@@ -6,14 +6,14 @@
 
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
-#include <LibMedia/CodecParameters.h>
-#include <LibMedia/Codecs/AV1.h>
-#include <LibMedia/Codecs/H264.h>
 #include <LibMedia/DemuxerRegistry.h>
-#include <LibMedia/VideoFrame.h>
-#include <LibMedia/VideoFramePool.h>
-#include <LibMedia/VideoSurface.h>
-#include <LibMedia/VideoToolbox/VideoToolboxVideoDecoder.h>
+#include <LibMediaCodecs/CodecParameters.h>
+#include <LibMediaCodecs/Codecs/AV1.h>
+#include <LibMediaCodecs/Codecs/H264.h>
+#include <LibMediaCodecs/VideoFrame.h>
+#include <LibMediaCodecs/VideoFramePool.h>
+#include <LibMediaCodecs/VideoSurface.h>
+#include <LibMediaCodecs/VideoToolbox/VideoToolboxVideoDecoder.h>
 
 #include "TestMediaCommon.h"
 
@@ -126,7 +126,7 @@ TEST_CASE(surfaces_are_not_reused_while_their_frames_are_held)
     // one in use. Were that claim missing, these frames would be a handful of surfaces overwriting one another.
     Vector<NonnullRefPtr<Media::VideoFrame>> held_frames;
     HashTable<u32> held_surface_ids;
-    while (held_frames.size() < Media::VideoFrameSurfacePool::MAX_SLOT_COUNT) {
+    while (held_frames.size() < Media::VideoFrameSurfacePool::MAX_HELD_SLOT_COUNT) {
         auto frame_result = decoding.next_frame();
         if (frame_result.is_error() && decoding_is_unavailable(frame_result.error()))
             return;
@@ -177,7 +177,7 @@ TEST_CASE(storage_runs_out_while_every_frame_is_held)
     auto decoding = open_decoding("./vp9_in_webm.webm"sv, Media::CodecID::VP9);
 
     Vector<NonnullRefPtr<Media::VideoFrame>> held_frames;
-    while (held_frames.size() < Media::VideoFrameSurfacePool::MAX_SLOT_COUNT) {
+    while (held_frames.size() < Media::VideoFrameSurfacePool::MAX_HELD_SLOT_COUNT) {
         auto frame_result = decoding.next_frame();
         if (frame_result.is_error() && decoding_is_unavailable(frame_result.error()))
             return;
@@ -483,6 +483,28 @@ TEST_CASE(h264_parameter_sets_can_arrive_separately_and_outlive_their_frames)
         }
         EXPECT_EQ(frame_count, 50u);
     }
+}
+
+TEST_CASE(a_vp9_stream_starting_without_a_keyframe_is_corrupted)
+{
+    auto decoding = open_decoding("./vp9_in_webm.webm"sv, Media::CodecID::VP9);
+    MUST(decoding.demuxer->get_next_sample_for_track(decoding.track));
+    auto inter_frame = MUST(decoding.demuxer->get_next_sample_for_track(decoding.track));
+
+    auto result = decoding.decoder->receive_coded_data(inter_frame, Media::DecodeIntent::Output);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::Corrupted);
+}
+
+TEST_CASE(an_h264_stream_without_parameter_sets_is_corrupted)
+{
+    auto decoding = open_decoding("./avc.mp4"sv, Media::CodecID::H264);
+    auto sample = MUST(decoding.demuxer->get_next_sample_for_track(decoding.track));
+    Media::CodedFrame frame_without_configuration { sample.codec_id(), sample.presentation_timestamp(), sample.decode_timestamp(), sample.duration(), sample.flags(), MUST(FixedArray<u8>::create(sample.data())) };
+
+    auto result = decoding.decoder->receive_coded_data(frame_without_configuration, Media::DecodeIntent::Output);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::Corrupted);
 }
 
 TEST_CASE(input_after_the_end_of_stream_is_rejected_until_flushed)

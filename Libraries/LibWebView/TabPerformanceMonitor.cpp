@@ -14,6 +14,7 @@
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebContentPage.h>
 #include <LibWebView/WebWorkerClient.h>
 #include <LibWebView/WorkerProcessManager.h>
 
@@ -233,7 +234,10 @@ void TabPerformanceMonitor::sample()
     ViewImplementation::for_each_view([&](ViewImplementation& view) {
         if (view.owner_view_id().has_value())
             return IterationDecision::Continue;
-        auto stats = m_tabs.ensure(view.view_id()).sample(now, processes.ensure(view.view_id()));
+        Optional<pid_t> top_level_process;
+        if (auto page = view.traversable().display_page())
+            top_level_process = page->client().pid();
+        auto stats = m_tabs.ensure(view.view_id()).sample(now, processes.ensure(view.view_id()), top_level_process);
         Checked<u64> process_memory_bytes = 0;
         bool has_process_memory = false;
         if (auto memory = process_memory.get(view.view_id()); memory.has_value()) {

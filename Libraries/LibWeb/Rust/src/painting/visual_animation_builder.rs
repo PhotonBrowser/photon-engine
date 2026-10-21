@@ -9,8 +9,6 @@
 //! values, the animations an effect has built and published, and the document-wide list the visual
 //! context tree receives.
 
-use std::ffi::c_void;
-
 use crate::css::absolutize::number_from_value;
 use crate::css::color_resolution::{ColorResolutionInput, FfiColorResolutionStyle, to_color};
 use crate::css::css_enums::keyword;
@@ -38,7 +36,6 @@ use crate::painting::host::{
 use crate::painting::visual_animation::{
     VisualAnimation, VisualAnimationKeyframe, VisualAnimationTransformOperation, VisualAnimationValue,
 };
-use libcompositing_rust::ffi::ffi_slice;
 use libgfx_rust::{Color, ColorFilterType};
 
 const TARGET_KIND_COUNT: usize = 4;
@@ -142,8 +139,15 @@ impl<'a> Request<'a> {
         Self {
             ffi,
             // SAFETY: The caller guarantees the keyframe range is live.
-            keyframes: unsafe { ffi_slice(ffi.keyframes, ffi.keyframe_count) },
+            keyframes: unsafe { ak::slice_from_raw_parts(ffi.keyframes, ffi.keyframe_count) },
         }
+    }
+
+    /// A request whose keyframe range is `keyframes`, for a unit test.
+    #[cfg(test)]
+    fn with_keyframes(ffi: &'a FfiCompositorAnimationRequest, keyframes: &'a [FfiCompositorAnimationKeyframe]) -> Self {
+        assert!(std::ptr::eq(ffi.keyframes, keyframes.as_ptr()) && ffi.keyframe_count == keyframes.len());
+        Self { ffi, keyframes }
     }
 
     pub fn target_kind(&self) -> FfiVisualAnimationTargetKind {
@@ -857,14 +861,6 @@ impl CompositorAnimationEffectState {
     }
 }
 
-/// # Safety
-///
-/// `state` must be a live handle from `compositor_animation_effect_state_create`.
-pub(crate) unsafe fn effect_state_from_handle<'a>(state: *mut c_void) -> &'a mut CompositorAnimationEffectState {
-    // SAFETY: The caller guarantees a live, exclusively used handle.
-    unsafe { &mut *state.cast::<CompositorAnimationEffectState>() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,11 +999,11 @@ mod tests {
     }
 
     unsafe extern "C" fn test_resolved_keyframe_value(
-        context: *mut c_void,
+        context: *mut std::ffi::c_void,
         keyframe_index: usize,
         property_id: u16,
         uses_underlying_style: bool,
-    ) -> *const c_void {
+    ) -> *const std::ffi::c_void {
         let host = unsafe { &*context.cast::<TestHost>() };
         *host.resolutions.borrow_mut() += 1;
         host.values
@@ -1137,7 +1133,7 @@ mod tests {
             present(1.0, AnimatedProperty::Opacity),
         ];
         let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &keyframes, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &keyframes);
         let mut state = CompositorAnimationEffectState::default();
 
         let outcome = state.build(&request, &Host::new(&ffi_host), |_| vec![3]);
@@ -1160,7 +1156,7 @@ mod tests {
 
         let mut changed_style = ffi_request;
         changed_style.target_style_generation += 1;
-        let request = unsafe { Request::new(&changed_style) };
+        let request = Request::with_keyframes(&changed_style, &keyframes);
         assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![3]).built);
         assert_eq!(*host.resolutions.borrow(), 4, "a style change lowers the values again");
     }
@@ -1176,7 +1172,7 @@ mod tests {
             present(1.0, AnimatedProperty::Opacity),
         ];
         let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &keyframes, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &keyframes);
         let mut state = CompositorAnimationEffectState::default();
 
         let outcome = state.build(&request, &Host::new(&ffi_host), |_| Vec::new());
@@ -1187,13 +1183,13 @@ mod tests {
         let mut additive = keyframes;
         additive[1].composite_is_replace = false;
         let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &additive, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &additive);
         assert!(!state.build(&request, &Host::new(&ffi_host), |_| vec![3]).built);
 
         let mut unsupported_easing = keyframes;
         unsupported_easing[0].easing_is_supported = false;
         let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &unsupported_easing, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &unsupported_easing);
         assert!(!state.build(&request, &Host::new(&ffi_host), |_| vec![3]).built);
 
         // A keyframe without the property is left out; too few remain for an animation. Another
@@ -1204,7 +1200,7 @@ mod tests {
         ];
         let mut ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &sparse, 0);
         ffi_request.key_frame_set_identity += 1;
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &sparse);
         assert!(!state.build(&request, &Host::new(&ffi_host), |_| vec![3]).built);
     }
 
@@ -1237,7 +1233,7 @@ mod tests {
             &keyframes,
             TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
         );
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &keyframes);
         let mut state = CompositorAnimationEffectState::default();
 
         let outcome = state.build(&request, &Host::new(&ffi_host), |_| vec![1]);
@@ -1325,7 +1321,7 @@ mod tests {
                 &keyframes,
                 TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
             );
-            let request = unsafe { Request::new(&ffi_request) };
+            let request = Request::with_keyframes(&ffi_request, &keyframes);
             let mut state = CompositorAnimationEffectState::default();
             state.build(&request, &Host::new(&ffi_host), |_| vec![1]).built
         };
@@ -1383,7 +1379,7 @@ mod tests {
             &keyframes,
             TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
         );
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &keyframes);
         let mut state = CompositorAnimationEffectState::default();
         assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![1]).built);
         let animation = pending_animation(&state, FfiVisualAnimationTargetKind::Transform);
@@ -1412,7 +1408,7 @@ mod tests {
             &keyframes,
             TARGETED_TRANSFORM_PROPERTY_SCALE,
         );
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &keyframes);
         let mut state = CompositorAnimationEffectState::default();
         assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![1]).built);
         let animation = pending_animation(&state, FfiVisualAnimationTargetKind::Transform);
@@ -1455,7 +1451,7 @@ mod tests {
             &keyframes,
             TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
         );
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &keyframes);
         assert!(effect_only_translates_horizontally(&request, &Host::new(&ffi_host)));
         assert!(effect_transform_preserves_axes(&request, &Host::new(&ffi_host)));
 
@@ -1467,7 +1463,7 @@ mod tests {
         let mut with_rotate = ffi_request;
         with_rotate.targeted_transform_properties |= TARGETED_TRANSFORM_PROPERTY_ROTATE;
         with_rotate.targets_only_transform = false;
-        let request = unsafe { Request::new(&with_rotate) };
+        let request = Request::with_keyframes(&with_rotate, &keyframes);
         assert!(!effect_only_translates_horizontally(&request, &Host::new(&ffi_host)));
         assert!(!effect_transform_preserves_axes(&request, &Host::new(&ffi_host)));
 
@@ -1489,7 +1485,7 @@ mod tests {
                 )]),
             );
         let vertical_host = vertical.ffi();
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &keyframes);
         assert!(!effect_only_translates_horizontally(
             &request,
             &Host::new(&vertical_host)
@@ -1521,7 +1517,7 @@ mod tests {
             present(1.0, AnimatedProperty::Filter),
         ];
         let ffi_request = build_request(FfiVisualAnimationTargetKind::Filter, &keyframes, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframes(&ffi_request, &keyframes);
         let mut state = CompositorAnimationEffectState::default();
         assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![2]).built);
         let animation = pending_animation(&state, FfiVisualAnimationTargetKind::Filter);
@@ -1578,7 +1574,7 @@ mod tests {
                 present(1.0, AnimatedProperty::BackgroundColor),
             ];
             let ffi_request = build_request(FfiVisualAnimationTargetKind::BackgroundColor, &keyframes, 0);
-            let request = unsafe { Request::new(&ffi_request) };
+            let request = Request::with_keyframes(&ffi_request, &keyframes);
             let mut state = CompositorAnimationEffectState::default();
             let built = state.build(&request, &Host::new(&ffi_host), |_| vec![2]).built;
             built.then(|| pending_animation(&state, FfiVisualAnimationTargetKind::BackgroundColor).clone())

@@ -90,6 +90,7 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Loader/SourceHighlighter.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
@@ -224,6 +225,17 @@ void ConnectionFromClient::stop_hosting_navigable(Web::PageId page_id, Web::HTML
     if (auto page = this->page(page_id); page.has_value()) {
         page->page().stop_hosting(navigable_id, move(replicated_state));
         page->page().client().request_frame();
+    }
+}
+
+void ConnectionFromClient::set_rendering_stats_displayed(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, bool displayed)
+{
+    if (!Core::StatsLog::the())
+        return;
+    if (auto page = this->page(page_id); page.has_value()) {
+        auto* navigable = as_if<Web::HTML::LocalNavigable>(page->page().navigable_with_id(navigable_id).ptr());
+        if (navigable && navigable->is_local_root())
+            Web::set_rendering_pending_ancestors_displayed(*navigable, displayed);
     }
 }
 
@@ -1131,6 +1143,15 @@ void ConnectionFromClient::pinch_event(Web::PageId page_id, Web::PinchEvent even
     enqueue_input_event({ page_id, move(event), {}, {} });
 }
 
+static bool is_discrete_input_event(Web::InputEvent const& event)
+{
+    if (event.has<Web::KeyEvent>())
+        return true;
+    if (auto const* mouse_event = event.get_pointer<Web::MouseEvent>())
+        return first_is_one_of(mouse_event->type, Web::MouseEvent::Type::MouseDown, Web::MouseEvent::Type::MouseUp);
+    return false;
+}
+
 void ConnectionFromClient::enqueue_input_event(Web::QueuedInputEvent event)
 {
     auto page_id = event.page_id;
@@ -1140,8 +1161,11 @@ void ConnectionFromClient::enqueue_input_event(Web::QueuedInputEvent event)
         return;
     }
 
+    auto is_discrete = is_discrete_input_event(event.event);
     m_input_event_queue.enqueue(move(event));
     page->page().client().request_frame();
+    if (is_discrete)
+        Web::HTML::main_thread_event_loop().queue_task_to_process_input_events();
 }
 
 void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request, ByteString argument)
@@ -2769,6 +2793,17 @@ static void append_stacking_context_tree(Web::Page& page, StringBuilder& builder
     Web::Painting::dump_stacking_context_tree(read, builder, *document);
 }
 
+static void append_display_list(Web::Page& page, StringBuilder& builder)
+{
+    auto document = page.local_traversable()->active_document();
+    if (!document) {
+        builder.append("(no DOM tree)"sv);
+        return;
+    }
+
+    builder.append(document->dump_display_list().to_utf8());
+}
+
 static void append_gc_graph(StringBuilder& builder)
 {
     auto gc_graph = Web::Bindings::main_thread_vm().heap().dump_graph();
@@ -2799,6 +2834,12 @@ void ConnectionFromClient::request_internal_page_info(Web::PageId page_id, WebVi
         if (!builder.is_empty())
             builder.append("\n"sv);
         append_stacking_context_tree(page->page(), builder);
+    }
+
+    if (has_flag(type, WebView::PageInfoType::DisplayList)) {
+        if (!builder.is_empty())
+            builder.append("\n"sv);
+        append_display_list(page->page(), builder);
     }
 
     if (has_flag(type, WebView::PageInfoType::AccessibilityTree)) {

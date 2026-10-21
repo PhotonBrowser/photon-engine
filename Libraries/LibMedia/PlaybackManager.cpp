@@ -20,9 +20,8 @@
 #include <LibMedia/Sinks/DisplayingVideoSink.h>
 #include <LibMedia/Sinks/VideoSink.h>
 #include <LibMedia/Track.h>
-#include <LibMedia/VideoFrame.h>
+#include <LibMediaCodecs/VideoFrame.h>
 #include <LibThreading/Thread.h>
-#include <LibThreading/ThreadPool.h>
 
 #include "PlaybackManager.h"
 
@@ -209,18 +208,21 @@ NonnullRefPtr<PlaybackManager::AddMediaSourcePromise> PlaybackManager::add_media
     auto& main_thread_event_loop = Core::EventLoop::current();
     auto promise = AddMediaSourcePromise::construct();
 
-    // The promise's reference count is not atomic, so the thread pool task must only ever move it.
-    Threading::ThreadPool::the().submit([self = move(self), stream, &main_thread_event_loop, promise = promise] mutable {
+    // The promise's reference count is not atomic, so it must only be moved to and from the thread.
+    auto thread = Threading::Thread::construct("InitMediaSource"sv, [self = move(self), stream, &main_thread_event_loop, promise = promise] mutable -> intptr_t {
         auto demuxer_or_error = create_demuxer(stream);
         if (demuxer_or_error.is_error()) {
             reject_media_source(move(self), move(promise), main_thread_event_loop, demuxer_or_error.release_error());
-            return;
+            return 0;
         }
 
         auto maybe_error = prepare_playback_from_demuxer(self, demuxer_or_error.release_value(), main_thread_event_loop, promise);
         if (maybe_error.is_error())
             reject_media_source(move(self), move(promise), main_thread_event_loop, maybe_error.release_error());
+        return 0;
     });
+    thread->start();
+    thread->detach();
     return promise;
 }
 
@@ -230,12 +232,15 @@ NonnullRefPtr<PlaybackManager::AddMediaSourcePromise> PlaybackManager::add_media
     auto& main_thread_event_loop = Core::EventLoop::current();
     auto promise = AddMediaSourcePromise::construct();
 
-    // The promise's reference count is not atomic, so the thread pool task must only ever move it.
-    Threading::ThreadPool::the().submit([self = move(self), demuxer, &main_thread_event_loop, promise = promise] mutable {
+    // The promise's reference count is not atomic, so it must only be moved to and from the thread.
+    auto thread = Threading::Thread::construct("InitMediaSource"sv, [self = move(self), demuxer, &main_thread_event_loop, promise = promise] mutable -> intptr_t {
         auto maybe_error = prepare_playback_from_demuxer(self, demuxer, main_thread_event_loop, promise);
         if (maybe_error.is_error())
             reject_media_source(move(self), move(promise), main_thread_event_loop, maybe_error.release_error());
+        return 0;
     });
+    thread->start();
+    thread->detach();
     return promise;
 }
 
@@ -580,38 +585,8 @@ void PlaybackManager::attach_video_edge(Badge<VideoPresentationServerConnection>
     // The replaced sink's last status stands until the new one reports, so replacing does not interrupt buffering.
     if (track_data.video_sink != nullptr)
         disconnect_video_sink(track_data);
-    pump->set_pool_retired_observer([self = manager->weak(), handle](VideoFramePoolID pool_id) {
-        if (!self)
-            return;
-        if (self->m_host_hooks.on_video_frame_pool_retired)
-            self->m_host_hooks.on_video_frame_pool_retired(handle, pool_id);
-    });
     manager->attach_video_sink(track_data, pump);
     track_data.video_edge_sink = pump;
-    if (manager->m_host_hooks.on_video_edge_attached)
-        manager->m_host_hooks.on_video_edge_attached(handle, pump->presented_frame_page());
-}
-
-Optional<RemoteVideoSink::SlotStorage> PlaybackManager::presented_frame_slot_storage(VideoSinkHandle handle, VideoFramePoolID pool_id, u32 slot_index)
-{
-    auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
-    if (!manager)
-        return {};
-    auto* track_data = manager->find_video_data_for_handle(handle);
-    if (!track_data || !track_data->video_edge_sink)
-        return {};
-    return track_data->video_edge_sink->lent_slot_storage(pool_id, slot_index);
-}
-
-RefPtr<VideoFrame> PlaybackManager::current_presented_frame(VideoSinkHandle handle)
-{
-    auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
-    if (!manager)
-        return nullptr;
-    auto& track_data = manager->get_video_data_for_handle(handle);
-    if (!track_data.video_sink)
-        return nullptr;
-    return track_data.video_sink->current_frame();
 }
 
 void PlaybackManager::release_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle handle, VideoSink const& released_sink)

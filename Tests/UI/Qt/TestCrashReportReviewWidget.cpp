@@ -6,6 +6,7 @@
 
 #include <AK/LexicalPath.h>
 #include <AK/ScopeGuard.h>
+#include <AK/Vector.h>
 #include <LibCore/Directory.h>
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
@@ -26,7 +27,7 @@
 #include <unistd.h>
 
 using Ladybird::CrashReportReviewWidget;
-using WebView::CrashReportSubmission;
+using WebView::ReportSubmission;
 
 static constexpr auto report_text = "Ladybird crash report, format 1\n"
                                     "Process: WebContent\n"
@@ -122,11 +123,42 @@ TEST_CASE(the_review_offers_to_exit_before_and_after_answering)
     exit_button.click();
     EXPECT_EQ(exits, 2);
 
-    // A report that may still be sent offers both.
-    widget.show_failure(CrashReportSubmission::Failure::Sending, "Network error while contacting the report server."_string);
+    // A report that may still be sent offers to try again, or to go back to the review.
+    widget.show_failure(ReportSubmission::Failure::Sending, "Network error while contacting the report server."_string);
     EXPECT(child<QPushButton>(widget, "CrashReportRetryButton").isVisible());
-    EXPECT(exit_button.isVisible());
-    EXPECT(!exit_button.isDefault());
+    EXPECT(child<QPushButton>(widget, "CrashReportCancelButton").isVisible());
+    EXPECT(!exit_button.isVisible());
+}
+
+TEST_CASE(sending_can_be_canceled_until_the_report_is_sent)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
+    WebView::CrashReportStore store { test_directory() };
+    CrashReportReviewWidget widget { QStringLiteral("Reload page"), nullptr, store };
+    auto answers = 0;
+    widget.on_answered = [&] { ++answers; };
+    MUST(widget.open_report(name));
+    widget.show();
+
+    auto& description = child<QPlainTextEdit>(widget, "CrashReportDescription");
+    description.setPlainText("Opening a menu");
+    widget.show_progress(ReportSubmission::Stage::SolvingProof);
+    auto& cancel = child<QPushButton>(widget, "CrashReportCancelButton");
+    EXPECT(cancel.isVisible());
+    EXPECT(!cancel.isDefault());
+    EXPECT(!child<QPushButton>(widget, "CrashReportExitButton").isVisible());
+
+    cancel.click();
+    EXPECT(child<QPushButton>(widget, "CrashReportSendButton").isVisible());
+    EXPECT_EQ(description.toPlainText(), "Opening a menu");
+    EXPECT_EQ(answers, 0);
+
+    widget.show_sent();
+    EXPECT_EQ(answers, 1);
+    EXPECT(!cancel.isVisible());
 }
 
 TEST_CASE(a_choice_that_cannot_be_sent_is_explained_in_place)
@@ -198,7 +230,7 @@ TEST_CASE(sending_shows_its_progress_and_outcome)
     auto& message = child<QLabel>(widget, "CrashReportStatusMessage");
     auto& retry = child<QPushButton>(widget, "CrashReportRetryButton");
 
-    widget.show_progress(CrashReportSubmission::Stage::SolvingProof);
+    widget.show_progress(ReportSubmission::Stage::SolvingProof);
     EXPECT_EQ(status_title(widget), "Sending crash report");
     EXPECT_EQ(message.text(), "Preparing report…");
 
@@ -206,17 +238,44 @@ TEST_CASE(sending_shows_its_progress_and_outcome)
     EXPECT_EQ(message.text(), "Report server returned 503 while sending the report. Trying again in 3 seconds (2 of 5)…");
 
     // Only a report that failed to reach the server can be sent again.
-    widget.show_failure(CrashReportSubmission::Failure::Sending, "Network error while contacting the report server."_string);
+    widget.show_failure(ReportSubmission::Failure::Sending, "Network error while contacting the report server."_string);
     EXPECT_EQ(status_title(widget), "Couldn’t send report");
     EXPECT(retry.isVisible());
 
-    widget.show_failure(CrashReportSubmission::Failure::Preparation, "Could not prepare this report."_string);
+    widget.show_failure(ReportSubmission::Failure::Preparation, "Could not prepare this report."_string);
     EXPECT(!retry.isVisible());
     EXPECT(child<QPushButton>(widget, "CrashReportExitButton").isVisible());
 
     widget.show_sent();
     EXPECT_EQ(status_title(widget), "Report sent");
     EXPECT_EQ(message.text(), "Thank you for helping Ladybird.");
+}
+
+TEST_CASE(the_full_report_is_shown_in_place_of_the_review)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
+    WebView::CrashReportStore store { test_directory() };
+    CrashReportReviewWidget widget { QStringLiteral("Reload page"), nullptr, store };
+    MUST(widget.open_report(name));
+    Vector<bool> text_visibility;
+    widget.on_report_text_visibility_change = [&](bool visible) { text_visibility.append(visible); };
+    widget.show();
+
+    auto& send = child<QPushButton>(widget, "CrashReportSendButton");
+    child<QPushButton>(widget, "CrashReportShowReportButton").click();
+    EXPECT_EQ(text_visibility, (Vector<bool> { true }));
+    auto& text = child<QPlainTextEdit>(widget, "ReportText");
+    EXPECT(text.isVisible());
+    EXPECT(!send.isVisible());
+    EXPECT_EQ(text.toPlainText(), QString::fromUtf8(report_text.characters_without_null_termination(), report_text.length()));
+
+    child<QPushButton>(widget, "ReportTextBackButton").click();
+    EXPECT(!text.isVisible());
+    EXPECT(send.isVisible());
+    EXPECT_EQ(text_visibility, (Vector<bool> { true, false }));
 }
 
 TEST_CASE(the_details_toggle_is_written_like_the_text_around_it)

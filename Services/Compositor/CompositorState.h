@@ -30,9 +30,9 @@
 #include <LibGfx/Size.h>
 #include <LibGfx/SkiaBackendContext.h>
 #include <LibMedia/Forward.h>
-#include <LibMedia/VideoFramePool.h>
 #include <LibMedia/VideoSinkHandle.h>
 #include <chrono>
+#include <LibMediaCodecs/VideoFramePool.h>
 
 namespace Compositor {
 
@@ -66,6 +66,7 @@ public:
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) = 0;
     virtual void create_video_edge(Media::VideoSinkHandle) = 0;
     virtual void release_video_edge(Media::VideoSinkHandle) = 0;
+    virtual void video_sink_presented_frame(Media::VideoSinkHandle, RefPtr<Media::VideoFrame>) { }
     virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) = 0;
     // The owner of this client's canvases, which are the only ones its contexts may draw.
     virtual Compositing::CanvasSurfaceOwnerId canvas_surface_owner_id() const = 0;
@@ -183,6 +184,7 @@ private:
         u64 readback_microseconds { 0 };
         bool published_before_gpu_completion { false };
         bool was_cancelled { false };
+        bool was_delivered { false };
     };
 
     ContextState* context_if_present(Web::CompositorContextId);
@@ -271,6 +273,7 @@ private:
     void publish_backing_stores(Web::CompositorContextId, ContextState&, BackingStoreManager::Publication&&);
     BackingStoreManager::GpuSharing gpu_sharing_for_client() const;
     void did_finish_async_present(PendingAsyncPresent&);
+    void deliver_rendered_frame(PendingAsyncPresent&);
     void cancel_pending_async_presents_for_context(Web::CompositorContextId);
     void schedule_gpu_completion_check();
     void check_gpu_completions();

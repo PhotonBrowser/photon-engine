@@ -21,8 +21,9 @@ use crate::painting::paintable_data::*;
 use crate::painting::paintable_rows::{PaintableRowsRead, with_inline_pieces};
 use crate::painting::rect_to_viewport_transform::RectToViewportTransform;
 use crate::painting::svg_filter::SvgFilterPrimitive;
+use crate::painting::visual_animation_builder::CompositorAnimationEffectState;
 use crate::render_state::{DocumentHost, RenderWait};
-use libcompositing_rust::ffi::{ffi_slice, tree_from_handle};
+use libcompositing_rust::ffi::tree_from_handle;
 use libgfx_rust::filter::Filter;
 use std::ffi::c_void;
 
@@ -536,16 +537,13 @@ pub struct FfiImageMapArea {
     pub coords_count: u32,
 }
 
-/// # Safety
-///
-/// `sink` must be the pointer handed to the callback, used synchronously.
+/// Adds a color stop to `sink`, the paint server handed to the callback.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paint_push_color_stop(
-    sink: *mut c_void,
+pub extern "C" fn layout_arena_paint_push_color_stop(
+    sink: &mut crate::painting::svg_paint_resources::PublishedSvgPaintServer,
     color: libgfx_rust::Color,
     position: f32,
 ) {
-    let sink = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgPaintServer>() };
     if let crate::painting::svg_paint_resources::PublishedSvgPaintServer::Gradient(gradient) = sink {
         gradient
             .stops
@@ -553,19 +551,15 @@ pub unsafe extern "C" fn layout_arena_paint_push_color_stop(
     }
 }
 
-/// # Safety
-///
-/// `sink` must be the pointer handed to the callback, used synchronously, and `description`
-/// must be readable.
+/// Makes `sink`, the paint server handed to the callback, the gradient `description` describes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_svg_paint_resources_push_gradient(
-    sink: *mut c_void,
-    description: *const crate::painting::host::FfiSvgGradientDescription,
+pub extern "C" fn layout_arena_svg_paint_resources_push_gradient(
+    sink: &mut crate::painting::svg_paint_resources::PublishedSvgPaintServer,
+    description: &crate::painting::host::FfiSvgGradientDescription,
 ) {
-    let sink = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgPaintServer>() };
     *sink = crate::painting::svg_paint_resources::PublishedSvgPaintServer::Gradient(
         crate::painting::svg_paint_resources::PublishedSvgGradient {
-            description: unsafe { *description },
+            description: *description,
             stops: Vec::new(),
         },
     );
@@ -573,22 +567,20 @@ pub unsafe extern "C" fn layout_arena_svg_paint_resources_push_gradient(
 
 /// # Safety
 ///
-/// `sink` must be the pointer handed to the callback, used synchronously, `description` must be
-/// readable, and `css_transform_entries` must point at `css_transform_count` readable
-/// `ComputedResolvedTransform` values of a live computed style.
+/// `css_transform_entries` must point at `css_transform_count` readable `ComputedResolvedTransform` values of a live
+/// computed style.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_svg_paint_resources_push_pattern(
-    sink: *mut c_void,
-    description: *const crate::painting::host::FfiSvgPatternDescription,
+    sink: &mut crate::painting::svg_paint_resources::PublishedSvgPaintServer,
+    description: &crate::painting::host::FfiSvgPatternDescription,
     css_transform_entries: *const c_void,
     css_transform_count: usize,
 ) {
-    let sink = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgPaintServer>() };
     *sink = crate::painting::svg_paint_resources::PublishedSvgPaintServer::Pattern(
         crate::painting::svg_paint_resources::PublishedSvgPattern {
-            description: unsafe { *description },
+            description: *description,
             css_transform: unsafe {
-                ffi_slice(
+                ak::slice_from_raw_parts(
                     css_transform_entries.cast::<crate::css::computed_value_types::ComputedResolvedTransform>(),
                     css_transform_count,
                 )
@@ -767,27 +759,32 @@ pub struct FfiEmptyLineCaretRect {
     pub style_source: NodeSlotId,
 }
 
+/// What maps a rect to the viewport, as C++ lends it for `'a`: a non-null `visual_context_tree` is a live retained tree
+/// handle, and `scroll_offsets` addresses `scroll_offsets_len` points. Rust never makes one.
 #[repr(C)]
-pub struct FfiRectToViewportTransform {
-    pub visual_context_tree: *const c_void,
-    pub scroll_offsets: *const libgfx_rust::FloatPoint,
-    pub scroll_offsets_len: usize,
-    pub device_pixels_per_css_pixel: f32,
+pub struct FfiRectToViewportTransform<'a> {
+    visual_context_tree: *const c_void,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+    device_pixels_per_css_pixel: f32,
+    lent: std::marker::PhantomData<&'a [libgfx_rust::FloatPoint]>,
 }
 
-/// SAFETY: A non-null `visual_context_tree` must be a live retained tree handle and `scroll_offsets`
-/// must address `scroll_offsets_len` points for as long as the returned borrow lives.
-pub(crate) unsafe fn rect_to_viewport_transform_from_ffi(
-    transform: &FfiRectToViewportTransform,
-) -> Option<RectToViewportTransform<'_>> {
-    if transform.visual_context_tree.is_null() {
-        return None;
+impl<'a> FfiRectToViewportTransform<'a> {
+    /// The transform, or none where C++ lends no visual context tree.
+    pub(crate) fn transform(&self) -> Option<RectToViewportTransform<'a>> {
+        if self.visual_context_tree.is_null() {
+            return None;
+        }
+        // SAFETY: C++ lends a live tree and the scroll offsets for 'a.
+        unsafe {
+            Some(RectToViewportTransform {
+                visual_context_tree: tree_from_handle(self.visual_context_tree),
+                scroll_offsets: ak::slice_from_raw_parts(self.scroll_offsets, self.scroll_offsets_len),
+                device_pixels_per_css_pixel: self.device_pixels_per_css_pixel,
+            })
+        }
     }
-    Some(RectToViewportTransform {
-        visual_context_tree: unsafe { tree_from_handle(transform.visual_context_tree) },
-        scroll_offsets: unsafe { ffi_slice(transform.scroll_offsets, transform.scroll_offsets_len) },
-        device_pixels_per_css_pixel: transform.device_pixels_per_css_pixel,
-    })
 }
 
 /// Whether a row has ever been given a style with `content-visibility: auto`, which is when a
@@ -1245,25 +1242,20 @@ pub unsafe extern "C" fn render_state_background_color_animation_keyframe_colors
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_state_create() -> *mut c_void {
-    Box::into_raw(Box::new(
-        crate::painting::visual_animation_builder::CompositorAnimationEffectState::default(),
-    ))
-    .cast()
+pub extern "C" fn compositor_animation_effect_state_create() -> *mut CompositorAnimationEffectState {
+    Box::into_raw(Box::new(CompositorAnimationEffectState::default()))
 }
 
 /// # Safety
 ///
 /// `state` must be a handle from `compositor_animation_effect_state_create` that is given up here.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_state_destroy(state: *mut c_void) {
+pub unsafe extern "C" fn compositor_animation_effect_state_destroy(state: *mut CompositorAnimationEffectState) {
     if state.is_null() {
         return;
     }
     // SAFETY: The caller gives up the handle it created.
-    drop(unsafe {
-        Box::from_raw(state.cast::<crate::painting::visual_animation_builder::CompositorAnimationEffectState>())
-    });
+    drop(unsafe { Box::from_raw(state) });
 }
 
 /// Builds the animation of the request's target kind for the effect and keeps it pending with the
@@ -1271,17 +1263,17 @@ pub unsafe extern "C" fn compositor_animation_effect_state_destroy(state: *mut c
 ///
 /// # Safety
 ///
-/// `state` must be a live effect state handle, `document_host` a live document host on its document's thread, and the request and host, with every range they address, live
-/// for the call. The host's callbacks run synchronously and may not touch the arena.
+/// `document_host` must be a live document host on its document's thread, and the request and host, with every range
+/// they address, live for the call. The host's callbacks run synchronously and may not touch the arena.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn compositor_animation_effect_build(
-    state: *mut c_void,
+    state: &mut CompositorAnimationEffectState,
     document_host: &DocumentHost,
     request: *const crate::painting::host::FfiCompositorAnimationRequest,
     host: &crate::painting::host::FfiCompositorAnimationHost,
 ) -> crate::painting::host::FfiCompositorAnimationBuildOutcome {
-    use crate::painting::visual_animation_builder::{Host, Request, effect_state_from_handle};
-    let state = unsafe { effect_state_from_handle(state) };
+    use crate::painting::visual_animation_builder::{Host, Request};
+    // SAFETY: Guaranteed by the caller.
     let request = unsafe { Request::new(&*request) };
     let host = Host::new(host);
     let layout_node = request.layout_node();
@@ -1298,55 +1290,37 @@ pub unsafe extern "C" fn compositor_animation_effect_build(
     })
 }
 
-/// # Safety
-///
-/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_discard_pending(
-    state: *mut c_void,
+pub extern "C" fn compositor_animation_effect_discard_pending(
+    state: &mut CompositorAnimationEffectState,
     kind: crate::painting::host::FfiVisualAnimationTargetKind,
 ) {
-    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.discard_pending(kind);
+    state.discard_pending(kind);
 }
 
-/// # Safety
-///
-/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_has_pending(state: *mut c_void) -> bool {
-    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.has_pending()
+pub extern "C" fn compositor_animation_effect_has_pending(state: &CompositorAnimationEffectState) -> bool {
+    state.has_pending()
 }
 
-/// # Safety
-///
-/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_clear_pending(state: *mut c_void) {
-    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.clear_pending();
+pub extern "C" fn compositor_animation_effect_clear_pending(state: &mut CompositorAnimationEffectState) {
+    state.clear_pending();
 }
 
-/// # Safety
-///
-/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_has_retained(state: *mut c_void) -> bool {
-    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.has_retained()
+pub extern "C" fn compositor_animation_effect_has_retained(state: &CompositorAnimationEffectState) -> bool {
+    state.has_retained()
 }
 
-/// # Safety
-///
-/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_clear_retained(state: *mut c_void) {
-    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.clear_retained();
+pub extern "C" fn compositor_animation_effect_clear_retained(state: &mut CompositorAnimationEffectState) {
+    state.clear_retained();
 }
 
-/// # Safety
-///
-/// `state` must be a live effect state handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_reset(state: *mut c_void) {
-    unsafe { crate::painting::visual_animation_builder::effect_state_from_handle(state) }.reset();
+pub extern "C" fn compositor_animation_effect_reset(state: &mut CompositorAnimationEffectState) {
+    state.reset();
 }
 
 /// # Safety
@@ -1387,7 +1361,7 @@ pub unsafe extern "C" fn layout_arena_paint_push_bytes(sink: *mut c_void, bytes:
     // guarantees the byte range.
     let vec = unsafe { &mut *sink.cast::<Vec<u8>>() };
     if length > 0 {
-        vec.extend_from_slice(unsafe { std::slice::from_raw_parts(bytes, length) });
+        vec.extend_from_slice(unsafe { ak::slice_from_raw_parts(bytes, length) });
     }
 }
 
@@ -1403,15 +1377,17 @@ unsafe fn svg_filter_primitive_from_ffi(primitive: &FfiSvgFilterPrimitive) -> Sv
         in1: name(primitive.in1),
         in2: name(primitive.in2),
         result: name(primitive.result),
-        merge_inputs: unsafe { ffi_slice(primitive.merge_inputs, primitive.merge_input_count) }
+        merge_inputs: unsafe { ak::slice_from_raw_parts(primitive.merge_inputs, primitive.merge_input_count) }
             .iter()
             .map(|view| name(*view))
             .collect(),
-        color_matrix_values: unsafe { ffi_slice(primitive.color_matrix_values, primitive.color_matrix_value_count) }
-            .to_vec(),
+        color_matrix_values: unsafe {
+            ak::slice_from_raw_parts(primitive.color_matrix_values, primitive.color_matrix_value_count)
+        }
+        .to_vec(),
         component_transfer_tables: primitive.component_transfer_tables.map(|table| {
             (!table.is_null()).then(|| {
-                let table = unsafe { ffi_slice(table, 256) };
+                let table = unsafe { ak::slice_from_raw_parts(table, 256) };
                 Box::new(<[u8; 256]>::try_from(table).expect("a component transfer table holds 256 entries"))
             })
         }),
@@ -1460,7 +1436,7 @@ pub unsafe extern "C" fn layout_arena_filter_functions_serialize(
     append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
     context: *mut c_void,
 ) -> bool {
-    let functions = unsafe { ffi_slice(functions, count) };
+    let functions = unsafe { ak::slice_from_raw_parts(functions, count) };
     let Some(graph) = filter_functions_graph(functions.iter().copied().map(Filter::from)) else {
         return false;
     };

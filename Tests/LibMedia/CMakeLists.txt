@@ -16,7 +16,7 @@ set(TEST_SOURCES
     TestDemuxerRegistry.cpp
     TestDisplayingVideoSink.cpp
     TestFFmpegAudioNormalization.cpp
-    TestFFmpegDemuxer.cpp
+    TestFLACDemuxer.cpp
     TestID3.cpp
     TestIncrementallyPopulatedStream.cpp
     TestISOBMFF.cpp
@@ -26,10 +26,14 @@ set(TEST_SOURCES
     TestMP3FrameHeader.cpp
     TestMP3Reader.cpp
     TestMP3StreamInfo.cpp
+    TestNonReferenceFrameDetector.cpp
     TestMediaSupport.cpp
     TestMediaTime.cpp
+    TestOggDemuxer.cpp
     TestParseMatroska.cpp
     TestPipelineNodes.cpp
+    TestPlaybackManager.cpp
+    TestRemoteVideoDecoder.cpp
     TestRemoteVideoNode.cpp
     TestSourceBufferDemuxer.cpp
     TestTimeRanges.cpp
@@ -38,6 +42,7 @@ set(TEST_SOURCES
     TestVorbisDecode.cpp
     TestVP9Decode.cpp
     TestWav.cpp
+    TestWAVDemuxer.cpp
 )
 
 if (APPLE)
@@ -59,13 +64,19 @@ endforeach()
 
 target_link_libraries(TestAudioBlockTimingRing PRIVATE LibThreading)
 target_link_libraries(TestDecodedAudioProducer PRIVATE LibGfx)
+target_link_libraries(TestDecodedVideoProducer PRIVATE LibThreading)
 target_link_libraries(TestDisplayingVideoSink PRIVATE LibGfx)
 target_link_libraries(TestVP9Decode PRIVATE LibGfx)
-target_link_libraries(TestFFmpegDemuxer PRIVATE LibThreading)
+target_link_libraries(TestADTSDemuxer PRIVATE LibThreading)
+target_link_libraries(TestFLACDemuxer PRIVATE LibThreading)
+target_link_libraries(TestMP3Demuxer PRIVATE LibThreading)
+target_link_libraries(TestOggDemuxer PRIVATE LibThreading LibGfx)
+target_link_libraries(TestWAVDemuxer PRIVATE LibThreading)
 target_link_libraries(TestISOBMFF PRIVATE LibThreading)
 target_link_libraries(TestMediaTime PRIVATE LibThreading)
-target_link_libraries(TestVideoFramePool PRIVATE LibThreading)
+target_link_libraries(TestVideoFramePool PRIVATE LibThreading LibIPC)
 target_link_libraries(TestIncrementallyPopulatedStream PRIVATE LibThreading)
+target_link_libraries(TestRemoteVideoDecoder PRIVATE LibThreading LibIPC LibMediaCodecs)
 target_link_libraries(TestRemoteVideoNode PRIVATE LibThreading LibGfx LibIPC)
 
 if (LINUX)

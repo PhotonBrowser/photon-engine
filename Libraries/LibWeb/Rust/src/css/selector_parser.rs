@@ -1297,7 +1297,7 @@ pub(crate) unsafe fn parse_selector_list_from_ffi(
             &[]
         } else {
             assert!(!namespaces.is_null());
-            std::slice::from_raw_parts(namespaces, namespace_count)
+            ak::slice_from_raw_parts(namespaces, namespace_count)
         };
         let namespace_storage = namespace_views
             .iter()
@@ -1306,7 +1306,7 @@ pub(crate) unsafe fn parse_selector_list_from_ffi(
                     TokenizerInput::Utf16(&[])
                 } else {
                     assert!(!namespace.data.is_null());
-                    TokenizerInput::Utf16(std::slice::from_raw_parts(namespace.data, namespace.length))
+                    TokenizerInput::Utf16(ak::slice_from_raw_parts(namespace.data, namespace.length))
                 }
             })
             .collect::<Vec<_>>();
@@ -1368,25 +1368,17 @@ pub unsafe extern "C" fn rust_parsed_selector_list_destroy(list: *mut RustParsed
     }
 }
 
-/// # Safety
-/// `list` must point to a live parsed selector list.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_length(list: *const RustParsedSelectorList) -> usize {
-    unsafe { (&*list).selectors.len() }
+pub extern "C" fn rust_parsed_selector_list_length(list: &RustParsedSelectorList) -> usize {
+    list.selectors.len()
 }
 
-/// # Safety
-/// `list` must point to a live selector list and `index` must be in bounds.
+/// The selector at `index`, which must be in bounds, as a new selector that C++ owns.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_selector(
-    list: *const RustParsedSelectorList,
-    index: usize,
-) -> *mut RustSelector {
-    unsafe {
-        Box::into_raw(Box::new(RustSelector {
-            selector: (&(*list).selectors)[index].clone(),
-        }))
-    }
+pub extern "C" fn rust_parsed_selector_list_selector(list: &RustParsedSelectorList, index: usize) -> *mut RustSelector {
+    Box::into_raw(Box::new(RustSelector {
+        selector: list.selectors[index].clone(),
+    }))
 }
 
 #[cfg(test)]

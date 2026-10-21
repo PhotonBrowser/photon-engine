@@ -63,6 +63,20 @@ pub(in crate::codegen) struct CacheRegisters {
     pub(in crate::codegen) entry: Gpr,
 }
 
+/// The offsets in a cache entry of the parts of an addition (see
+/// `Codegen::emit_add_own_property()`). Entries that the shape they add to
+/// and its dictionary generation were already matched for have no
+/// `from_shape` or `dictionary_generation` to check.
+#[derive(Clone, Copy)]
+pub(super) struct AdditionEntryFields {
+    pub entry_type: i32,
+    pub from_shape: Option<i32>,
+    pub dictionary_generation: Option<i32>,
+    pub prototype_chain_validity: i32,
+    pub new_shape: i32,
+    pub property_offset: i32,
+}
+
 impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn cache_registers(&self, node: NodeId) -> CacheRegisters {
         CacheRegisters {
@@ -208,15 +222,23 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         Address::indexed(registers.shape, scratch, Scale::Eight, 0)
     }
 
-    /// Branches to `miss` unless the `GetMissingProperty` entry in `entry`
-    /// for the shape of `object` applies to it, like
-    /// `get_with_property_lookup_cache()`: only plain objects, ECMAScript
-    /// functions, arrays and String objects (for the names their entries can
-    /// be for) have no other properties than those of their shape (see
-    /// `Object::is_cacheable_for_property_absence()`), and the property
-    /// must also be missing from an unchanged prototype chain. Clobbers
+    /// Branches to `miss` unless a `GetMissingProperty` entry for the shape
+    /// of `object`, whose prototype chain validity is at `validity`, applies
+    /// to it, like `get_with_property_lookup_cache()`: only objects whose
+    /// class keeps the default
+    /// `ObjectMethods::is_cacheable_for_property_absence` have no other
+    /// properties than those of their shape (for the names their entries can
+    /// be for), and the property must also be missing from an unchanged
+    /// prototype chain. Plain objects, ECMAScript functions, arrays and
+    /// String objects are told apart without loading the hook. Clobbers
     /// `shape`.
-    pub(super) fn branch_unless_property_absence_applies(&mut self, object: Gpr, shape: Gpr, entry: Gpr, miss: Label) {
+    pub(super) fn branch_unless_property_absence_applies(
+        &mut self,
+        object: Gpr,
+        shape: Gpr,
+        validity: &Address,
+        miss: Label,
+    ) {
         let scratch = self.pinned.scratch;
         let layout = self.runtime.layout;
         let offsets = self.runtime.offsets;
@@ -237,23 +259,31 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         }
         let flags =
             self.runtime.dynamic_calls.object_flag_is_ecmascript_function | layout.object_flag_has_magical_length;
-        if flags == 0 {
-            self.masm.jump(miss);
-        } else {
+        if flags != 0 {
             self.masm
                 .load16(scratch, &Address::new(object, offsets.object_flags as i32));
             self.masm
-                .branch_test32(Condition::Zero, scratch, u32::from(flags), miss);
+                .branch_test32(Condition::NonZero, scratch, u32::from(flags), cacheable);
+        }
+        if layout.default_is_cacheable_for_property_absence == 0 || layout.class_object_methods == 0 {
+            self.masm.jump(miss);
+        } else {
+            // NB: Objects start with their class.
+            self.masm.load64(shape, &Address::new(object, 0));
+            self.masm
+                .load64(shape, &Address::new(shape, layout.class_object_methods as i32));
+            self.masm
+                .move_imm64(scratch, layout.default_is_cacheable_for_property_absence);
+            self.masm.branch64_memory(
+                Condition::NotEqual,
+                &Address::new(shape, layout.object_methods_is_cacheable_for_property_absence as i32),
+                scratch,
+                miss,
+            );
         }
         self.masm.bind(cacheable);
         let (has_chain, done) = (self.masm.new_label(), self.masm.new_label());
-        self.masm.load64(
-            shape,
-            &Address::new(
-                entry,
-                layout.property_lookup_cache_entry_prototype_chain_validity as i32,
-            ),
-        );
+        self.masm.load64(shape, validity);
         self.masm.branch_test64(Condition::NonZero, shape, u64::MAX, has_chain);
         // Entries without a prototype chain validity are for shapes without
         // a prototype.
@@ -340,7 +370,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             layout.property_lookup_cache_entry_type_get_missing_property as i32,
             present,
         );
-        self.branch_unless_property_absence_applies(object, shape, entry, probe);
+        let validity = Address::new(
+            entry,
+            layout.property_lookup_cache_entry_prototype_chain_validity as i32,
+        );
+        self.branch_unless_property_absence_applies(object, shape, &validity, probe);
         self.masm.move_imm64(output, value::UNDEFINED);
         self.masm.jump(done);
 
@@ -465,24 +499,26 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         );
         self.masm.bind(transition);
         let storage = self.temp(node, 3);
-        self.emit_add_own_property(node, &registers, source, storage, probe);
+        let fields = self.site_addition_entry_fields();
+        self.emit_add_own_property(node, &registers, fields, source, storage, probe);
         self.masm.bind(stored);
         self.masm.move_imm32(output, 1);
         self.bind_probe_failure(output, 0, failure, done);
         Ok(())
     }
 
-    /// Adds the property of the `AddOwnProperty` entry in `registers.entry`
-    /// to the object in `registers.object`, whose shape is in
-    /// `registers.shape`, like `asm_try_put_by_id_cache()` does: the object
-    /// takes the entry's new shape, and `source` goes in the new property's
-    /// slot. Storage that must grow grows out of line (see
+    /// Adds the property of the `AddOwnProperty` entry in `registers.entry`,
+    /// laid out like `fields` says, to the object in `registers.object`,
+    /// whose shape is in `registers.shape`, like `asm_try_put_by_id_cache()`
+    /// does: the object takes the entry's new shape, and `source` goes in the
+    /// new property's slot. Storage that must grow grows out of line (see
     /// `named_storage`), or the addition is left to `miss`. Uses `storage`
     /// and clobbers the shape register.
     pub(super) fn emit_add_own_property(
         &mut self,
         node: NodeId,
         registers: &CacheRegisters,
+        fields: AdditionEntryFields,
         source: Gpr,
         storage: Gpr,
         miss: Label,
@@ -494,16 +530,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
         self.masm.branch32_memory_imm(
             Condition::NotEqual,
-            &Address::new(entry, layout.property_lookup_cache_entry_type as i32),
+            &Address::new(entry, fields.entry_type),
             layout.property_lookup_cache_entry_type_add_own_property as i32,
             miss,
         );
-        self.masm.branch64_memory(
-            Condition::NotEqual,
-            &Address::new(entry, layout.property_lookup_cache_entry_from_shape as i32),
-            shape,
-            miss,
-        );
+        if let Some(from_shape) = fields.from_shape {
+            self.masm
+                .branch64_memory(Condition::NotEqual, &Address::new(entry, from_shape), shape, miss);
+        }
         // Extensible objects that may cache property additions, without a
         // magical length (whose additions depend on the key).
         let flags = layout.object_flag_is_extensible
@@ -521,22 +555,17 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         );
         // NB: Only additions that make dictionary shapes need the dictionary
         //     generations to match, but requiring it of all of them is safe.
-        self.branch_unless_dictionary_generation_matches(shape, entry, miss);
+        if let Some(dictionary_generation) = fields.dictionary_generation {
+            let expected = Address::new(entry, dictionary_generation);
+            self.branch_unless_dictionary_generation_is(shape, expected, [shape, scratch], miss);
+        }
         let valid_chain = self.masm.new_label();
-        self.masm.load64(
-            shape,
-            &Address::new(
-                entry,
-                layout.property_lookup_cache_entry_prototype_chain_validity as i32,
-            ),
-        );
+        self.masm
+            .load64(shape, &Address::new(entry, fields.prototype_chain_validity));
         self.masm.branch_test64(Condition::Zero, shape, u64::MAX, valid_chain);
         self.branch_unless_prototype_chain_valid(shape, miss);
         self.masm.bind(valid_chain);
-        self.masm.load64(
-            shape,
-            &Address::new(entry, layout.property_lookup_cache_entry_shape as i32),
-        );
+        self.masm.load64(shape, &Address::new(entry, fields.new_shape));
         self.masm.branch_test64(Condition::Zero, shape, u64::MAX, miss);
 
         // The capacity of the inline or heap storage must hold every
@@ -562,20 +591,31 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .load32(storage, &Address::new(shape, layout.shape_property_count as i32));
         let has_room = self.masm.new_label();
-        let grow = self.storage_growth(node, registers, storage, has_room, miss);
+        let grow = self.storage_growth(node, registers, fields.new_shape, storage, has_room, miss);
         self.masm.branch32(Condition::Above, storage, scratch, grow);
 
         self.masm.bind(has_room);
         self.masm
             .store64(&Address::new(object, offsets.object_shape as i32), shape);
-        self.masm.load32(
-            scratch,
-            &Address::new(entry, layout.property_lookup_cache_entry_property_offset as i32),
-        );
+        self.masm.load32(scratch, &Address::new(entry, fields.property_offset));
         self.masm
             .load64(storage, &Address::new(object, offsets.object_named_properties as i32));
         self.masm
             .store64(&Address::indexed(storage, scratch, Scale::Eight, 0), source);
+    }
+
+    /// Where an entry of a property lookup cache keeps the parts of an
+    /// addition.
+    pub(super) fn site_addition_entry_fields(&self) -> AdditionEntryFields {
+        let layout = self.runtime.layout;
+        AdditionEntryFields {
+            entry_type: layout.property_lookup_cache_entry_type as i32,
+            from_shape: Some(layout.property_lookup_cache_entry_from_shape as i32),
+            dictionary_generation: Some(layout.property_lookup_cache_entry_dictionary_generation as i32),
+            prototype_chain_validity: layout.property_lookup_cache_entry_prototype_chain_validity as i32,
+            new_shape: layout.property_lookup_cache_entry_shape as i32,
+            property_offset: layout.property_lookup_cache_entry_property_offset as i32,
+        }
     }
 
     /// The runtime probes of the cache probe nodes, out of line.

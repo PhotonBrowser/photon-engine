@@ -123,16 +123,18 @@ public:
     void did_change_display_page(Badge<CanonicalNavigable>, RefPtr<WebContentPage> previous_page);
     void did_cancel_loading(Badge<CanonicalNavigable>, bool canceled_navigation);
     void did_stop_loading(Badge<CanonicalTraversable>, bool stopped_navigation);
+    void did_change_ongoing_navigation(Badge<CanonicalNavigable>);
+    void did_change_active_document(Badge<CanonicalTraversable>);
 
-    void set_url(Badge<WebContentPage>, URL::URL url) { set_url(move(url)); }
     void set_text_fragment_indication_visibility(Badge<WebContentPage>, bool);
-    URL::URL const& url() const { return m_url; }
+    // The URL of the tab's active document.
+    URL::URL url() const;
     URL::URL const& displayed_url() const { return m_displayed_url; }
 
-    void set_title(Badge<WebContentPage>, Utf16String title);
+    void set_title(Badge<WebContentPage>, Utf16String title) { set_title(move(title)); }
     Utf16String const& title() const { return m_title; }
 
-    void set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap const&>);
+    void set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap const&> favicon) { set_favicon(favicon); }
     Optional<String> const& favicon_hash() const { return m_favicon_hash; }
 
     String const& handle() const { return m_window_handle; }
@@ -287,6 +289,9 @@ public:
     void find_in_page_end();
 
     void get_source();
+
+    bool can_report_website_issue() const;
+    void report_website_issue();
 
     void inspect_dom_tree();
     void inspect_storage(Web::StorageAPI::StorageEndpointType, u64 request_id);
@@ -467,6 +472,15 @@ public:
     Function<void()> on_ready_to_paint;
     Function<void()> on_backing_store_pool_changed;
     Function<void(TabPerformanceStats const&)> on_performance_stats;
+    enum class NewWindowType {
+        Tab,
+        Window,
+    };
+    struct NewWebDriverWindow {
+        ViewImplementation& view;
+        NewWindowType type;
+    };
+    Function<NewWebDriverWindow(NewWindowType)> on_new_webdriver_window;
     Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, CanonicalTraversable&)> on_new_web_view;
     Function<void()> on_activate_tab;
     Function<void()> on_close;
@@ -496,6 +510,7 @@ public:
     Function<void()> on_before_browser_initiated_navigation;
     Function<void(URL::URL const&, URL::Origin const&, ExternalURLHandler const&, Function<void(bool)>)> on_request_external_url_confirmation;
     Function<void()> on_request_accept_dialog;
+    Function<void()> on_request_website_issue_report;
     Function<void()> on_request_dismiss_dialog;
     Function<void(JsonObject)> on_received_dom_tree;
     Function<void(DOMNodeProperties)> on_received_dom_node_properties;
@@ -624,7 +639,10 @@ protected:
 
     void set_owner_view(ViewImplementation const& owner_view) { m_owner_view_id = owner_view.view_id(); }
 
-    void set_url(URL::URL);
+    void did_update_url();
+    void set_title(Utf16String);
+    void set_favicon(Optional<Gfx::Bitmap const&>);
+    Optional<URL::URL const&> browser_ui_load_url() const;
     void update_displayed_url();
     void did_start_navigation();
     void did_finish_navigation();
@@ -722,6 +740,7 @@ protected:
     void update_bookmark_action();
 
     void initialize_context_menus();
+    void update_report_website_issue_action();
     void handle_external_url(URL::URL, URL::Origin, bool has_transient_activation, Function<void()> on_handler_unavailable = {});
     void handle_external_url_from_user_input(URL::URL const&, Function<void()> on_handler_unavailable = {});
     void complete_external_url_request();
@@ -758,7 +777,12 @@ protected:
     IsPrivate m_is_private { IsPrivate::No };
     NonnullRefPtr<BrowsingSession> m_session;
 
-    URL::URL m_url { URL::about_blank() };
+    // A load the browser's UI started, whose URL the address bar shows while it is the ongoing navigation.
+    struct BrowserUILoad {
+        Utf16String navigation_id;
+        URL::URL url;
+    };
+    Optional<BrowserUILoad> m_browser_ui_load;
     URL::URL m_displayed_url { URL::about_blank() };
     bool m_text_fragment_indication_is_visible { false };
     Utf16String m_title;
@@ -818,6 +842,7 @@ protected:
 
     RefPtr<Action> m_take_visible_screenshot_action;
     RefPtr<Action> m_take_full_screenshot_action;
+    RefPtr<Action> m_report_website_issue_action;
 
     RefPtr<Action> m_open_in_new_tab_action;
     RefPtr<Action> m_open_in_new_window_action;

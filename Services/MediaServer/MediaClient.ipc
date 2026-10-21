@@ -1,8 +1,8 @@
 #include <AK/Time.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibMedia/DecoderCapabilities.h>
-#include <LibMedia/DecoderError.h>
+#include <LibMediaCodecs/DecoderCapabilities.h>
+#include <LibMediaCodecs/DecoderError.h>
 #include <LibMedia/DemuxerScanState.h>
 #include <LibMedia/MediaSourceExtensions/SourceBufferProcessor.h>
 #include <LibMedia/MediaSupport.h>
@@ -11,14 +11,16 @@
 #include <LibMedia/PlaybackStates/PlaybackState.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
-#include <LibMedia/VideoFrameHandle.h>
-#include <LibMedia/VideoPresentation/PresentedFramePage.h>
+#include <LibMediaCodecs/VideoFrameHandle.h>
 #include <LibMedia/VideoSinkHandle.h>
 
 endpoint MediaClient
 {
     // Only the controller answers this: the Browser connects the server to the AudioServer as a member of its tab's mix.
     request_audio_server_connection() => (Optional<IPC::TransportHandle> handle)
+    // Likewise, the Browser launches the server's VideoDecoderServer, or a new one if the last one was lost, and
+    // answers with video_decoder_server_connection_ready() once it has.
+    request_video_decoder_server_connection(u64 request_id) =|
 
     file_media_support_reported(u64 request_id, Media::MediaSupportInfo info) =|
     decoder_capabilities_reported(u64 request_id, Optional<Media::DecoderCapabilities> capabilities) =|
@@ -35,8 +37,6 @@ endpoint MediaClient
     playback_session_media_stream_scan_state_changed(u64 session_id, u64 stream_id, Media::DemuxerScanState scan_state) =|
     playback_session_error(u64 session_id, Media::DecoderError error) =|
     playback_session_video_resized(u64 session_id, Media::VideoSinkHandle handle, u32 width, u32 height) =|
-    playback_session_video_edge_attached(u64 session_id, Media::VideoSinkHandle handle, Media::PresentedFramePage presented_frame_page) =|
-    playback_session_video_frame_pool_retired(u64 session_id, Media::VideoSinkHandle handle, Media::VideoFramePoolID pool_id) =|
 
     source_buffer_duration_received(u64 session_id, u64 source_buffer_id, double duration) =|
     source_buffer_first_initialization_segment_received(u64 session_id, u64 source_buffer_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Vector<Media::Track> text_tracks) =|

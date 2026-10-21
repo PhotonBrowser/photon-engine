@@ -6,16 +6,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
+#include <AK/AnyOf.h>
+#include <AK/QuickSort.h>
 #include <LibCore/Timer.h>
+#include <LibGC/ConservativeVector.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/Promise.h>
 #include <LibMedia/MediaSupport.h>
 #include <LibMedia/Track.h>
-#include <LibMedia/VideoFrame.h>
 #include <LibMediaClient/Client.h>
 #include <LibMediaClient/RemoteMediaStream.h>
 #include <LibMediaClient/RemotePlaybackManager.h>
+#include <LibMediaCodecs/VideoFrame.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/Bindings/HTMLMediaElement.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
@@ -38,6 +42,7 @@
 #include <LibWeb/HTML/HTMLAudioElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/HTMLSourceElement.h>
+#include <LibWeb/HTML/HTMLTrackElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/MediaError.h>
@@ -45,6 +50,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/TextTrack.h>
+#include <LibWeb/HTML/TextTrackCue.h>
 #include <LibWeb/HTML/TextTrackList.h>
 #include <LibWeb/HTML/TimeRanges.h>
 #include <LibWeb/HTML/TrackEvent.h>
@@ -91,7 +97,8 @@ public:
             return;
         unregister();
         m_compositor_host = &compositor_host;
-        m_compositor_host->add_video_sink(m_handle);
+        m_presentation_page = MUST(Compositing::VideoFramePresentationPage::create());
+        m_compositor_host->add_video_sink(m_handle, *m_presentation_page);
     }
 
     void unregister()
@@ -100,12 +107,30 @@ public:
             return;
         m_compositor_host->remove_video_sink(m_handle);
         m_compositor_host = nullptr;
+        m_presentation_page = nullptr;
+        m_latest_hold = nullptr;
+    }
+
+    Optional<Compositing::CapturedVideoFrame> capture_current_frame()
+    {
+        if (!m_compositor_host || !m_presentation_page)
+            return {};
+        auto hold = m_latest_hold.strong_ref();
+        if (!hold || hold->generation() != m_presentation_page->current_generation()) {
+            hold = Compositing::VideoFrameHold::hold_current_frame(*m_presentation_page, m_handle, m_compositor_host->video_frame_hold_releaser_for_current_connection());
+            if (!hold)
+                return {};
+            m_latest_hold = *hold;
+        }
+        return Compositing::CapturedVideoFrame { .sink_handle = m_handle, .generation = hold->generation(), .hold = hold };
     }
 
 private:
     Media::VideoSinkHandle m_handle;
     Compositing::VideoSinkResourceId m_resource_id;
     Compositor::CompositorHost* m_compositor_host { nullptr };
+    RefPtr<Compositing::VideoFramePresentationPage> m_presentation_page;
+    WeakPtr<Compositing::VideoFrameHold> m_latest_hold;
 };
 
 static u64 s_next_remote_fetch_data_id = 0;
@@ -122,6 +147,8 @@ struct HTMLMediaElement::RemoteFetchData {
     bool accepts_byte_ranges { false };
     u64 offset { 0 };
     bool resource_was_complete { false };
+    bool download_is_suspended { false };
+    bool may_suspend_after_first_frame { true };
 
     ~RemoteFetchData()
     {
@@ -183,9 +210,10 @@ void HTMLMediaElement::initialize_element()
     });
 
     m_document_observer->set_document_became_active([this]() {
-        // AD-HOC: Now that the document is active again, let the stream notify us when to start fetching again.
+        // AD-HOC: Now that the document is active again, let the stream notify us when to start fetching again, unless
+        //         the download is suspended.
         if (m_remote_fetch_data)
-            m_remote_fetch_data->stream->set_may_idle(false);
+            m_remote_fetch_data->stream->set_may_idle(m_remote_fetch_data->download_is_suspended);
 
         add_current_video_sink();
     });
@@ -249,6 +277,7 @@ void HTMLMediaElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_audio_tracks);
     visitor.visit(m_video_tracks);
     visitor.visit(m_text_tracks);
+    visitor.visit(m_list_of_newly_introduced_cues);
     visitor.visit(m_document_observer);
     visitor.visit(m_source_element_selector);
     visitor.visit(m_pending_play_promises);
@@ -288,6 +317,7 @@ void HTMLMediaElement::attribute_changed(Utf16FlyString const& name, Optional<Ut
             //     wait_for_an_implementation_defined_event_before_fetching_the_resource().
             continue_fetching_the_resource_after_an_implementation_defined_event();
         }
+        update_download_suspension();
     }
 }
 
@@ -491,6 +521,7 @@ void HTMLMediaElement::set_seeking(bool seeking)
         return;
     m_seeking = seeking;
     CSS::Invalidation::invalidate_style_after_media_seeking_state_change(*this, seeking);
+    update_download_suspension();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#dom-media-load
@@ -772,12 +803,13 @@ GC::Ref<TextTrack> HTMLMediaElement::add_text_track(Bindings::TextTrackKind kind
     text_track->set_language(language);
     text_track->set_readiness_state(TextTrack::ReadinessState::Loaded);
     text_track->set_mode(TextTrackMode::Hidden);
-    // FIXME: set text track list of cues to an empty list
 
     // FIXME: 3. Initially, the text track list of cues is not associated with any rules for updating the text track rendering.
     //    When a text track cue is added to it, the text track list of cues has its rules permanently set accordingly.
 
-    // FIXME: 4. Add the new text track to the media element's list of text tracks.
+    // 4. Add the new text track to the media element's list of text tracks.
+    m_text_tracks->add_track(text_track);
+    text_track->set_media_element(this);
 
     // 5. Queue a media element task given the media element to fire an event named addtrack at the media element's
     //    textTracks attribute's TextTrackList object, using TrackEvent, with the track attribute initialized to the new
@@ -1328,6 +1360,9 @@ void HTMLMediaElement::load_url_resource(URL::URL const& url_record, Function<vo
     }));
     m_remote_fetch_data->failure_callback = move(failure_callback);
 
+    // AD-HOC: If the poster is cleared, that means we've started playing or seeked, so continue the download.
+    m_remote_fetch_data->may_suspend_after_first_frame = m_show_poster;
+
     load_remote_resource(EntireResource {});
 }
 
@@ -1336,6 +1371,89 @@ bool HTMLMediaElement::preload_attribute_is_in_none_state() const
 {
     auto preload = attribute(HTML::AttributeNames::preload);
     return preload.has_value() && preload->equals_ignoring_ascii_case(u"none"sv);
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#attr-media-preload
+bool HTMLMediaElement::preload_attribute_is_in_automatic_state() const
+{
+    // The attribute's empty value default is the Automatic state.
+    // NB: The missing value default and invalid value default are the Metadata state, as the spec suggests.
+    auto preload = attribute(HTML::AttributeNames::preload);
+    return preload.has_value() && (preload->is_empty() || preload->equals_ignoring_ascii_case(u"auto"sv));
+}
+
+bool HTMLMediaElement::should_suspend_the_download() const
+{
+    if (!m_remote_fetch_data || m_remote_fetch_data->resource_was_complete || m_error)
+        return false;
+
+    // NB: Once the media has been played, seeked or had its tracks changed, it is likely to be played again, so we
+    //     keep fetching for the rest of the load. Gecko and Blink do the same.
+    if (!m_remote_fetch_data->may_suspend_after_first_frame)
+        return false;
+
+    // NB: The Metadata state hints that fetching the resource metadata, and maybe even the first few frames, is
+    //     reasonable. Once something made us fetch in the None state anyway, the same amount is enough there too.
+    if (preload_attribute_is_in_automatic_state())
+        return false;
+
+    // NB: A media element that is playing, seeking or about to autoplay needs data regardless of the hint. As with the
+    //     None state, autoplay that isn't allowed to play doesn't keep the download going.
+    if (!paused() || seeking())
+        return false;
+    if (is_eligible_for_autoplay() && is_allowed_to_play())
+        return false;
+
+    return m_ready_state >= ReadyState::HaveCurrentData;
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#concept-media-load-resource
+void HTMLMediaElement::update_download_suspension()
+{
+    if (!m_remote_fetch_data)
+        return;
+
+    auto should_suspend = should_suspend_the_download();
+    if (m_remote_fetch_data->download_is_suspended == should_suspend)
+        return;
+    m_remote_fetch_data->download_is_suspended = should_suspend;
+
+    // NB: The stream lets any reads that are waiting finish before it stops the fetch, and when the download resumes,
+    //     it fetches what reads are waiting on. An inactive document's stream stays idle until it becomes active.
+    if (document().is_fully_active())
+        m_remote_fetch_data->stream->set_may_idle(should_suspend);
+
+    // NB: When the download resumes, processing the next media data sets the networkState back to NETWORK_LOADING.
+    if (!should_suspend)
+        return;
+
+    // When a media element's download has been suspended, the user agent must queue a media element task given the
+    // media element to set the networkState to NETWORK_IDLE and fire an event named suspend at the element.
+    queue_a_media_element_task([fetch_data_id = m_remote_fetch_data->id](HTMLMediaElement& self) {
+        if (!self.m_remote_fetch_data || self.m_remote_fetch_data->id != fetch_data_id || !self.m_remote_fetch_data->download_is_suspended)
+            return;
+        self.m_network_state = NetworkState::Idle;
+        self.dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::suspend));
+    });
+
+    // NB: The spec also stops delaying the load event when a download is suspended, but we only suspend at
+    //     HAVE_CURRENT_DATA, and reaching that state already stopped delaying it.
+}
+
+void HTMLMediaElement::stop_suspending_the_download_after_first_frame()
+{
+    if (!m_remote_fetch_data)
+        return;
+    m_remote_fetch_data->may_suspend_after_first_frame = false;
+    update_download_suspension();
+}
+
+void HTMLMediaElement::stop_suspending_the_download_after_a_track_change()
+{
+    // NB: The initial track selection happens before the first frame is available, and doesn't count as a change.
+    if (m_ready_state < ReadyState::HaveCurrentData)
+        return;
+    stop_suspending_the_download_after_first_frame();
 }
 
 bool HTMLMediaElement::should_wait_for_an_implementation_defined_event_before_fetching_the_resource() const
@@ -1818,6 +1936,7 @@ void HTMLMediaElement::set_audio_track_enabled(Badge<AudioTrack>, GC::Ptr<HTML::
             m_playback_manager->enable_an_audio_track(audio_track->track_in_playback_manager());
         else
             m_playback_manager->disable_an_audio_track(audio_track->track_in_playback_manager());
+        stop_suspending_the_download_after_a_track_change();
     }
 
     update_audio_play_state();
@@ -1838,13 +1957,12 @@ Optional<Compositing::VideoSinkResourceId> HTMLMediaElement::video_sink_resource
     return m_active_video_sink->resource_id();
 }
 
-RefPtr<Media::VideoFrame> HTMLMediaElement::current_presented_frame() const
+Optional<Compositing::CapturedVideoFrame> HTMLMediaElement::capture_current_video_frame() const
 {
-    auto handle = video_sink_handle();
-    if (!m_playback_manager || !handle.has_value())
-        return nullptr;
+    if (!m_active_video_sink)
+        return {};
     note_frame_captured();
-    return m_playback_manager->current_presented_frame(*handle);
+    return m_active_video_sink->capture_current_frame();
 }
 
 void HTMLMediaElement::attach_selected_video_track_sink(Media::Track const& track)
@@ -1883,8 +2001,6 @@ void HTMLMediaElement::detach_video_sink_edge()
     if (!m_active_video_sink)
         return;
     m_active_video_sink->unregister();
-    if (m_playback_manager)
-        m_playback_manager->forget_presented_frame_page(m_active_video_sink->handle());
 }
 
 void HTMLMediaElement::release_active_video_sink()
@@ -1906,6 +2022,7 @@ void HTMLMediaElement::set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML:
         return;
 
     m_selected_video_track = video_track;
+    stop_suspending_the_download_after_a_track_change();
     if (video_track) {
         attach_selected_video_track_sink(video_track->track_in_playback_manager());
         if (auto* video_element = as_if<HTMLVideoElement>(this)) {
@@ -2304,6 +2421,7 @@ void HTMLMediaElement::maybe_complete_remote_fetch()
         return;
     // NB: Record the transition before dispatching events, which can synchronously start another load.
     fetch_data.resource_was_complete = resource_is_complete;
+    update_download_suspension();
     if (resource_is_complete)
         process_media_data(FetchingStatus::Complete);
 }
@@ -2333,6 +2451,10 @@ void HTMLMediaElement::process_media_data(FetchingStatus fetching_status)
             // NB: Once an error has been set in the meantime, the network state stays where that error left it.
             if (self.m_error)
                 return;
+            // NB: Data that arrives after we suspended the download only satisfies reads that were already waiting for
+            //     it, so the download stays suspended.
+            if (self.m_remote_fetch_data && self.m_remote_fetch_data->download_is_suspended)
+                return;
             self.m_network_state = NetworkState::Loading;
         });
 
@@ -2340,12 +2462,14 @@ void HTMLMediaElement::process_media_data(FetchingStatus fetching_status)
         // least frequent, queue a media element task given the media element to:
         auto now = MonotonicTime::now();
         if (!m_last_progress_event_time.has_value() || now - m_last_progress_event_time.value() > AK::Duration::from_milliseconds(350)) {
-            m_last_progress_event_time = now;
-            queue_a_media_element_task([](HTMLMediaElement& self) {
-                // FIXME: 1. Set the element's is currently stalled to false.
-                // 2. Fire an event named progress at the element.
-                self.dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::progress));
-            });
+            if (!m_remote_fetch_data || !m_remote_fetch_data->download_is_suspended) {
+                m_last_progress_event_time = now;
+                queue_a_media_element_task([](HTMLMediaElement& self) {
+                    // FIXME: 1. Set the element's is currently stalled to false.
+                    // 2. Fire an event named progress at the element.
+                    self.dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::progress));
+                });
+            }
 
             update_ready_state();
         }
@@ -2474,10 +2598,17 @@ void HTMLMediaElement::set_ready_state(ReadyState ready_state)
     m_ready_state = ready_state;
     CSS::Invalidation::invalidate_style_after_media_ready_state_change(*this, was_buffering);
 
+    // https://html.spec.whatwg.org/multipage/media.html#text-track-cue-active-flag
+    if (m_ready_state == ReadyState::HaveNothing) {
+        for (size_t i = 0; i < m_text_tracks->length(); ++i)
+            m_text_tracks->item(i)->unset_active_flag_of_cues();
+    }
+
     ScopeGuard guard { [&] {
         upon_has_ended_playback_possibly_changed();
         update_screen_wake_lock();
         update_representation();
+        update_download_suspension();
     } };
 
     // When the ready state of a media element whose networkState is not NETWORK_EMPTY changes, the user agent must
@@ -2589,6 +2720,9 @@ void HTMLMediaElement::set_ready_state(ReadyState ready_state)
             if (m_show_poster) {
                 set_show_poster(false);
                 time_marches_on();
+
+                // AD-HOC: Playing indicates user interaction that should allow loading data ahead.
+                stop_suspending_the_download_after_first_frame();
             }
 
             // Queue a media element task given the element to fire an event named play at the element.
@@ -2799,6 +2933,9 @@ void HTMLMediaElement::play_element()
         if (m_show_poster) {
             set_show_poster(false);
             time_marches_on();
+
+            // AD-HOC: Playing indicates user interaction that should allow loading data ahead.
+            stop_suspending_the_download_after_first_frame();
         }
 
         // 3. Queue a media element task given the media element to fire an event named play at the element.
@@ -2873,6 +3010,9 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
 
     // 1. Set the media element's show poster flag to false.
     set_show_poster(false);
+
+    // AD-HOC: A seek that clears the poster indicates user interaction that should allow loading data ahead.
+    stop_suspending_the_download_after_first_frame();
 
     // 2. If the media element's readyState is HAVE_NOTHING, return.
     if (m_ready_state == ReadyState::HaveNothing)
@@ -3354,19 +3494,53 @@ void HTMLMediaElement::dispatch_time_update_event()
 // https://html.spec.whatwg.org/multipage/media.html#time-marches-on
 void HTMLMediaElement::time_marches_on(TimeMarchesOnReason reason)
 {
-    // FIXME: 1. Let current cues be a list of cues, initialized to contain all the cues of all the hidden or showing text tracks
-    //           of the media element (not the disabled ones) whose start times are less than or equal to the current playback
-    //           position and whose end times are greater than the current playback position.
-    // FIXME: 2. Let other cues be a list of cues, initialized to contain all the cues of hidden and showing text tracks of the
-    //           media element that are not present in current cues.
-    // FIXME: 3. Let last time be the current playback position at the time this algorithm was last run for this media element,
-    //           if this is not the first time it has run.
-    // FIXME: 4. If the current playback position has, since the last time this algorithm was run, only changed through its usual
-    //           monotonic increase during normal playback, then let missed cues be the list of cues in other cues whose start times
-    //           are greater than or equal to last time and whose end times are less than or equal to the current playback position.
-    //           Otherwise, let missed cues be an empty list.
-    // FIXME: 5. Remove all the cues in missed cues that are also in the media element's list of newly introduced cues, and then
-    //           empty the element's list of newly introduced cues.
+    auto current_position = current_playback_position();
+
+    auto for_each_cue_of_hidden_or_showing_text_tracks = [&](auto callback) {
+        for (size_t i = 0; i < m_text_tracks->length(); ++i) {
+            auto text_track = m_text_tracks->item(i);
+            if (text_track->mode() == TextTrackMode::Disabled)
+                continue;
+            for (auto const& cue : text_track->text_track_list_of_cues())
+                callback(cue);
+        }
+    };
+
+    // 1. Let current cues be a list of cues, initialized to contain all the cues of all the hidden or showing text tracks
+    //    of the media element (not the disabled ones) whose start times are less than or equal to the current playback
+    //    position and whose end times are greater than the current playback position.
+    // 2. Let other cues be a list of cues, initialized to contain all the cues of hidden and showing text tracks of the
+    //    media element that are not present in current cues.
+    GC::RootVector<GC::Ref<TextTrackCue>> current_cues;
+    GC::RootVector<GC::Ref<TextTrackCue>> other_cues;
+    for_each_cue_of_hidden_or_showing_text_tracks([&](GC::Ref<TextTrackCue> cue) {
+        if (cue->start_time() <= current_position && cue->end_time() > current_position)
+            current_cues.append(cue);
+        else
+            other_cues.append(cue);
+    });
+
+    // 3. Let last time be the current playback position at the time this algorithm was last run for this media element,
+    //    if this is not the first time it has run.
+    auto last_time = m_time_marches_on_last_time;
+    m_time_marches_on_last_time = current_position;
+
+    // 4. If the current playback position has, since the last time this algorithm was run, only changed through its usual
+    //    monotonic increase during normal playback, then let missed cues be the list of cues in other cues whose start times
+    //    are greater than or equal to last time and whose end times are less than or equal to the current playback position.
+    //    Otherwise, let missed cues be an empty list.
+    GC::RootVector<GC::Ref<TextTrackCue>> missed_cues;
+    if (reason == TimeMarchesOnReason::NormalPlayback && last_time.has_value()) {
+        for (auto const& cue : other_cues) {
+            if (cue->start_time() >= *last_time && cue->end_time() <= current_position)
+                missed_cues.append(cue);
+        }
+    }
+
+    // 5. Remove all the cues in missed cues that are also in the media element's list of newly introduced cues, and then
+    //    empty the element's list of newly introduced cues.
+    missed_cues.remove_all_matching([&](auto const& cue) { return m_list_of_newly_introduced_cues.contains_slow(cue); });
+    m_list_of_newly_introduced_cues.clear();
 
     // 6. If the time was reached through the usual monotonic increase of the current playback position during normal
     //    playback, and if the user agent has not fired a timeupdate event at the element in the past 15 to 250ms and is
@@ -3391,48 +3565,200 @@ void HTMLMediaElement::time_marches_on(TimeMarchesOnReason reason)
         }
     }
 
-    // FIXME: 7. If all of the cues in current cues have their text track cue active flag set, none of the cues in other cues have
-    //           their text track cue active flag set, and missed cues is empty, then return.
-    // FIXME: 8. If the time was reached through the usual monotonic increase of the current playback position during normal playback,
-    //           and there are cues in other cues that have their text track cue pause-on-exit flag set and that either have their
-    //           text track cue active flag set or are also in missed cues, then immediately pause the media element.
-    // FIXME: 9. Let events be a list of tasks, initially empty. Each task in this list will be associated with a text track, a
-    //           text track cue, and a time, which are used to sort the list before the tasks are queued.
+    // 7. If all of the cues in current cues have their text track cue active flag set, none of the cues in other cues have
+    //    their text track cue active flag set, and missed cues is empty, then return.
+    if (all_of(current_cues, [](auto const& cue) { return cue->is_active(); })
+        && !any_of(other_cues, [](auto const& cue) { return cue->is_active(); })
+        && missed_cues.is_empty()) {
+        return;
+    }
+
+    // 8. If the time was reached through the usual monotonic increase of the current playback position during normal playback,
+    //    and there are cues in other cues that have their text track cue pause-on-exit flag set and that either have their
+    //    text track cue active flag set or are also in missed cues, then immediately pause the media element.
+    if (reason == TimeMarchesOnReason::NormalPlayback) {
+        auto should_pause = any_of(other_cues, [&](auto const& cue) {
+            return cue->pause_on_exit() && (cue->is_active() || missed_cues.contains_slow(cue));
+        });
+        if (should_pause)
+            pause_element();
+    }
+
+    // 9. Let events be a list of tasks, initially empty. Each task in this list will be associated with a text track, a
+    //    text track cue, and a time, which are used to sort the list before the tasks are queued.
     //
-    //           Let affected tracks be a list of text tracks, initially empty.
+    //    Let affected tracks be a list of text tracks, initially empty.
+    struct CueEvent {
+        Utf16FlyString name;
+        GC::Ref<TextTrackCue> target;
+        double time { 0 };
+    };
+    GC::ConservativeVector<CueEvent> events;
+    GC::RootVector<GC::Ref<TextTrack>> affected_tracks;
+
+    //    When the steps below say to prepare an event named event for a text track cue target with a time time, the user
+    //    agent must run these steps:
+    auto prepare_an_event = [&](Utf16FlyString const& event, GC::Ref<TextTrackCue> target, double time) {
+        // 1. Let track be the text track with which the text track cue target is associated.
+        auto track = target->track();
+        VERIFY(track);
+
+        // 2. Create a task to fire an event named event at target.
+        // 3. Add the newly created task to events, associated with the time time, the text track track, and the text
+        //    track cue target.
+        events.append({ event, target, time });
+
+        // 4. Add track to affected tracks.
+        if (!affected_tracks.contains_slow(GC::Ref { *track }))
+            affected_tracks.append(*track);
+    };
+
+    // 10. For each text track cue in missed cues, prepare an event named enter for the TextTrackCue object with the text
+    //     track cue start time.
+    for (auto const& cue : missed_cues)
+        prepare_an_event(HTML::EventNames::enter, cue, cue->start_time());
+
+    // 11. For each text track cue in other cues that either has its text track cue active flag set or is in missed cues,
+    //     prepare an event named exit for the TextTrackCue object with the later of the text track cue end time and the
+    //     text track cue start time.
+    for (auto const& cue : other_cues) {
+        if (cue->is_active() || missed_cues.contains_slow(cue))
+            prepare_an_event(HTML::EventNames::exit, cue, max(cue->end_time(), cue->start_time()));
+    }
+
+    // 12. For each text track cue in current cues that does not have its text track cue active flag set, prepare an event
+    //     named enter for the TextTrackCue object with the text track cue start time.
+    for (auto const& cue : current_cues) {
+        if (!cue->is_active())
+            prepare_an_event(HTML::EventNames::enter, cue, cue->start_time());
+    }
+
+    // 13. Sort the tasks in events in ascending time order (tasks with earlier times first).
     //
-    //           When the steps below say to prepare an event named event for a text track cue target with a time time, the user
-    //           agent must run these steps:
-    //               1. Let track be the text track with which the text track cue target is associated.
-    //               2. Create a task to fire an event named event at target.
-    //               3. Add the newly created task to events, associated with the time time, the text track track, and the text
-    //                  track cue target.
-    //               4. Add track to affected tracks.
-    // FIXME: 10. For each text track cue in missed cues, prepare an event named enter for the TextTrackCue object with the text
-    //            track cue start time.
-    // FIXME: 11. For each text track cue in other cues that either has its text track cue active flag set or is in missed cues,
-    //            prepare an event named exit for the TextTrackCue object with the later of the text track cue end time and the
-    ///           text track cue start time.
-    // FIXME: 12. For each text track cue in current cues that does not have its text track cue active flag set, prepare an event
-    //            named enter for the TextTrackCue object with the text track cue start time.
-    // FIXME: 13. Sort the tasks in events in ascending time order (tasks with earlier times first).
+    //     Further sort tasks in events that have the same time by the relative text track cue order of the text track cues
+    //     associated with these tasks.
     //
-    //            Further sort tasks in events that have the same time by the relative text track cue order of the text track cues
-    //            associated with these tasks.
-    //
-    //            Finally, sort tasks in events that have the same time and same text track cue order by placing tasks that fire
-    //            enter events before those that fire exit events.
-    // FIXME: 14. Queue a media element task given the media element for each task in events, in list order.
-    // FIXME: 15. Sort affected tracks in the same order as the text tracks appear in the media element's list of text tracks, and
-    //            remove duplicates.
-    // FIXME: 16. For each text track in affected tracks, in the list order, queue a media element task given the media element to
-    //            fire an event named cuechange at the TextTrack object, and, if the text track has a corresponding track element,
-    //            to then fire an event named cuechange at the track element as well.
-    // FIXME: 17. Set the text track cue active flag of all the cues in the current cues, and unset the text track cue active flag
-    //            of all the cues in the other cues.
+    //     Finally, sort tasks in events that have the same time and same text track cue order by placing tasks that fire
+    //     enter events before those that fire exit events.
+    auto text_track_index = [&](TextTrack const& text_track) {
+        for (size_t i = 0; i < m_text_tracks->length(); ++i) {
+            if (m_text_tracks->item(i).ptr() == &text_track)
+                return i;
+        }
+        VERIFY_NOT_REACHED();
+    };
+    auto index_in_text_track_list_of_cues = [&](TextTrackCue const& cue) {
+        auto cues = cue.track()->text_track_list_of_cues();
+        for (size_t i = 0; i < cues.size(); ++i) {
+            if (cues[i].ptr() == &cue)
+                return i;
+        }
+        VERIFY_NOT_REACHED();
+    };
+    quick_sort(events, [&](auto const& a, auto const& b) {
+        if (a.time != b.time)
+            return a.time < b.time;
+        auto a_track_index = text_track_index(*a.target->track());
+        auto b_track_index = text_track_index(*b.target->track());
+        if (a_track_index != b_track_index)
+            return a_track_index < b_track_index;
+        auto a_cue_index = index_in_text_track_list_of_cues(a.target);
+        auto b_cue_index = index_in_text_track_list_of_cues(b.target);
+        if (a_cue_index != b_cue_index)
+            return a_cue_index < b_cue_index;
+        return a.name == HTML::EventNames::enter && b.name == HTML::EventNames::exit;
+    });
+
+    // 14. Queue a media element task given the media element for each task in events, in list order.
+    for (auto& event : events) {
+        queue_a_media_element_task([name = move(event.name), target = event.target](HTMLMediaElement& self) {
+            target->dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), name));
+        });
+    }
+
+    // 15. Sort affected tracks in the same order as the text tracks appear in the media element's list of text tracks, and
+    //     remove duplicates.
+    quick_sort(affected_tracks, [&](auto const& a, auto const& b) {
+        return text_track_index(a) < text_track_index(b);
+    });
+
+    // 16. For each text track in affected tracks, in the list order, queue a media element task given the media element to
+    //     fire an event named cuechange at the TextTrack object, and, if the text track has a corresponding track element,
+    //     to then fire an event named cuechange at the track element as well.
+    for (auto const& text_track : affected_tracks) {
+        queue_a_media_element_task([text_track](HTMLMediaElement& self) {
+            text_track->dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::cuechange));
+            if (auto track_element = text_track->track_element())
+                track_element->dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::cuechange));
+        });
+    }
+
+    // 17. Set the text track cue active flag of all the cues in the current cues, and unset the text track cue active flag
+    //     of all the cues in the other cues.
+    for (auto const& cue : current_cues)
+        cue->set_active(true);
+    for (auto const& cue : other_cues)
+        cue->set_active(false);
+
     // FIXME: 18. Run the rules for updating the text track rendering of each of the text tracks in affected tracks that are showing,
     //            providing the text track's text track language as the fallback language if it is not the empty string. For example,
     //            for text tracks based on WebVTT, the rules for updating the display of WebVTT text tracks.
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#list-of-newly-introduced-cues
+void HTMLMediaElement::add_newly_introduced_cues(ReadonlySpan<GC::Ref<TextTrackCue>> cues)
+{
+    if (cues.is_empty())
+        return;
+
+    // Whenever a text track cue is added to the list of cues of a text track that is in the list of text tracks for a
+    // media element, that cue must be added to the media element's list of newly introduced cues. Whenever a text track
+    // is added to the list of text tracks for a media element, all of the cues in that text track's list of cues must
+    // be added to the media element's list of newly introduced cues.
+    for (auto const& cue : cues)
+        m_list_of_newly_introduced_cues.append(cue);
+
+    // When a media element's list of newly introduced cues has new cues added while the media element's show poster flag
+    // is not set, then the user agent must run the time marches on steps.
+    if (!m_show_poster)
+        time_marches_on(TimeMarchesOnReason::Other);
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#list-of-newly-introduced-cues
+void HTMLMediaElement::text_track_cue_or_text_track_removed()
+{
+    // When a text track cue is removed from the list of cues of a text track that is in the list of text tracks for a
+    // media element, and whenever a text track is removed from the list of text tracks of a media element, if the
+    // media element's show poster flag is not set, then the user agent must run the time marches on steps.
+    if (!m_show_poster)
+        time_marches_on(TimeMarchesOnReason::Other);
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#pending-text-track-change-notification-flag
+void HTMLMediaElement::text_track_mode_changed()
+{
+    // Whenever a text track that is in a media element's list of text tracks has its text track mode change value, the
+    // user agent must run the following steps for the media element:
+
+    // 1. If the media element's pending text track change notification flag is set, return.
+    if (m_pending_text_track_change_notification_flag)
+        return;
+
+    // 2. Set the media element's pending text track change notification flag.
+    m_pending_text_track_change_notification_flag = true;
+
+    // 3. Queue a media element task given the media element to run these steps:
+    queue_a_media_element_task([](HTMLMediaElement& self) {
+        // 1. Unset the media element's pending text track change notification flag.
+        self.m_pending_text_track_change_notification_flag = false;
+
+        // 2. Fire an event named change at the media element's textTracks attribute's TextTrackList object.
+        self.m_text_tracks->dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::change));
+    });
+
+    // 4. If the media element's show poster flag is not set, run the time marches on steps.
+    if (!m_show_poster)
+        time_marches_on(TimeMarchesOnReason::Other);
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#take-pending-play-promises

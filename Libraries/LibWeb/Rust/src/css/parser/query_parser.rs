@@ -6,7 +6,7 @@
 
 use crate::css::css_enums::keyword_from_ascii_case_insensitive;
 use crate::css::css_pixels::CssPixels;
-use crate::css::css_tokenizer::{ParserString, ParserTokenKind, TokenizerInput, tokenize_for_parser};
+use crate::css::css_tokenizer::{ParserString, ParserTokenKind, TextDetacher, TokenizerInput, tokenize_for_parser};
 use crate::css::custom_properties::environment_variable_is_known;
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::parser::component_value::{
@@ -27,6 +27,7 @@ use crate::css::serialize::{StringUnits, TextSink, serialize_an_identifier, seri
 use crate::css::style_compute::{FfiLengthResolutionContext, LENGTH_UNIT_NAMES, px_length_unit};
 use crate::css::style_value::StyleValueData;
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 include!(concat!(env!("OUT_DIR"), "/media_features_generated.rs"));
@@ -185,12 +186,17 @@ pub struct FfiMediaFeatureValue {
     pub second_value: f64,
 }
 
+/// The media feature values and length resolution context media queries evaluate against, borrowed for `'a`.
+///
+/// Rust builds one only from borrowed values, and C++ hands one over under the same contract: `values` identifies
+/// `value_count` values, and a non-null `length_resolution_context` a context, which stay readable for `'a`.
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct FfiMediaEnvironment {
-    pub values: *const FfiMediaFeatureValue,
-    pub value_count: usize,
-    pub length_resolution_context: *const c_void,
+pub struct FfiMediaEnvironment<'a> {
+    values: *const FfiMediaFeatureValue,
+    value_count: usize,
+    length_resolution_context: *const c_void,
+    lent: PhantomData<(&'a [FfiMediaFeatureValue], Option<&'a FfiLengthResolutionContext>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -199,14 +205,37 @@ pub(crate) struct MediaEnvironment<'a> {
     length_context: Option<&'a FfiLengthResolutionContext>,
 }
 
-impl FfiMediaEnvironment {
-    /// # Safety
-    /// The feature values and optional length context must remain readable while borrowed.
-    pub(crate) unsafe fn borrow(&self) -> MediaEnvironment<'_> {
-        let data = unsafe { ffi_media_environment(self) };
+impl<'a> FfiMediaEnvironment<'a> {
+    pub(crate) fn new(values: &'a [FfiMediaFeatureValue], length: Option<&'a FfiLengthResolutionContext>) -> Self {
+        Self {
+            values: values.as_ptr(),
+            value_count: values.len(),
+            length_resolution_context: length.map_or(std::ptr::null(), |length| std::ptr::from_ref(length).cast()),
+            lent: PhantomData,
+        }
+    }
+
+    pub(crate) fn borrow(&self) -> MediaEnvironment<'a> {
+        let data = self.parts();
         MediaEnvironment {
             values: data.map(|(values, _)| values),
             length_context: data.and_then(|(_, context)| context),
+        }
+    }
+
+    /// The feature values and the length context, or none for an environment that names values it has no storage for.
+    fn parts(&self) -> Option<(&'a [FfiMediaFeatureValue], Option<&'a FfiLengthResolutionContext>)> {
+        if self.value_count != 0 && self.values.is_null() {
+            return None;
+        }
+        // SAFETY: The environment is readable for 'a, as the type says.
+        unsafe {
+            Some((
+                ak::slice_from_raw_parts(self.values, self.value_count),
+                self.length_resolution_context
+                    .cast::<FfiLengthResolutionContext>()
+                    .as_ref(),
+            ))
         }
     }
 }
@@ -1524,13 +1553,117 @@ impl FfiQueryHandle {
     }
 }
 
-pub(crate) fn media_query_handle(query: MediaQuery) -> Arc<FfiQueryHandle> {
+impl MediaQuery {
+    fn detach(&mut self, detacher: &mut TextDetacher) {
+        if let Some(media_type) = &mut self.media_type {
+            media_type.detach(detacher);
+        }
+        if let Some(condition) = &mut self.condition {
+            condition.detach(detacher);
+        }
+    }
+}
+
+impl Expression {
+    /// Detaches every component value and string the expression keeps (see `ComponentValue::detach`).
+    fn detach(&mut self, detacher: &mut TextDetacher) {
+        match self {
+            Self::Not(expression)
+            | Self::InParens(expression)
+            | Self::StyleFunction(expression)
+            | Self::ScrollStateFunction(expression) => expression.detach(detacher),
+            Self::And(expressions) | Self::Or(expressions) => expressions
+                .iter_mut()
+                .for_each(|expression| expression.detach(detacher)),
+            Self::GeneralEnclosed { component, .. } => component.detach(detacher),
+            Self::GeneralEnclosedValues { components, .. } => {
+                components.iter_mut().for_each(|value| value.detach(detacher));
+            }
+            Self::QueryFeature(feature) => feature.detach(detacher),
+            Self::SupportsFeature(feature) => feature.detach(detacher),
+            Self::StyleFeature(feature) => feature.detach(detacher),
+        }
+    }
+}
+
+impl QueryFeature {
+    fn detach(&mut self, detacher: &mut TextDetacher) {
+        match self {
+            Self::Boolean { .. } => {}
+            Self::Plain { value, .. } => value.components.iter_mut().for_each(|value| value.detach(detacher)),
+            Self::Range { left, right, .. } => {
+                if let Some((value, _)) = left {
+                    value.components.iter_mut().for_each(|value| value.detach(detacher));
+                }
+                if let Some((_, value)) = right {
+                    value.components.iter_mut().for_each(|value| value.detach(detacher));
+                }
+            }
+        }
+    }
+}
+
+impl SupportsFeature {
+    fn detach(&mut self, detacher: &mut TextDetacher) {
+        match self {
+            Self::Declaration { components, .. } | Self::Selector { components, .. } => {
+                components.iter_mut().for_each(|value| value.detach(detacher));
+            }
+            Self::FontTech { name, .. }
+            | Self::FontFormat { name, .. }
+            | Self::AtRule { name, .. }
+            | Self::Env { name, .. } => name.detach(detacher),
+        }
+    }
+}
+
+impl StyleRangeValue {
+    fn detach(&mut self, detacher: &mut TextDetacher) {
+        match self {
+            Self::Property(name) => name.detach(detacher),
+            Self::Components(components) => components.iter_mut().for_each(|value| value.detach(detacher)),
+        }
+    }
+}
+
+impl StyleFeature {
+    fn detach(&mut self, detacher: &mut TextDetacher) {
+        match self {
+            Self::Boolean(name) => name.detach(detacher),
+            Self::Plain {
+                name,
+                value,
+                original_source,
+                original_value_source,
+            } => {
+                name.detach(detacher);
+                value.iter_mut().for_each(|value| value.detach(detacher));
+                original_source.detach(detacher);
+                original_value_source.detach(detacher);
+            }
+            Self::Range {
+                left, middle, right, ..
+            } => {
+                left.detach(detacher);
+                middle.detach(detacher);
+                if let Some((_, right)) = right {
+                    right.detach(detacher);
+                }
+            }
+        }
+    }
+}
+
+// NB: A query outlives the parse of its sheet, so its handle detaches it from the sheet's text.
+pub(crate) fn media_query_handle(mut query: MediaQuery) -> Arc<FfiQueryHandle> {
+    TextDetacher::detach(|detacher| query.detach(detacher));
     Arc::new(FfiQueryHandle {
         tree: QueryTree::MediaQuery(query),
     })
 }
 
-pub(crate) fn expression_query_handle(expression: Expression, kind: QueryKind) -> Arc<FfiQueryHandle> {
+pub(crate) fn expression_query_handle(mut expression: Expression, kind: QueryKind) -> Arc<FfiQueryHandle> {
+    TextDetacher::detach(|detacher| expression.detach(detacher));
     Arc::new(FfiQueryHandle {
         tree: QueryTree::Expression { expression, kind },
     })
@@ -1859,22 +1992,19 @@ enum ResolvedFeatureValue {
     Unknown,
 }
 
-fn media_value_parse_context(value_context: &FfiValueParsingContext<'static>) -> ParseContext {
+fn media_value_parse_context<'a>(value_context: &'a FfiValueParsingContext<'a>) -> ParseContext<'a> {
     ParseContext {
         in_quirks_mode: false,
         is_svg_presentation_attribute: false,
         is_substituted_value: false,
         contains_attr_tainted_values: false,
         is_ua_style_sheet: false,
-        value_contexts: value_context,
-        value_context_count: 1,
-        declared_namespaces: std::ptr::null(),
-        document_url: std::ptr::null(),
-        document_url_length: 0,
-        document_base_url: std::ptr::null(),
-        document_base_url_length: 0,
-        length_resolution_context: std::ptr::null(),
-        random_function_index: std::ptr::null_mut(),
+        value_contexts: ak::Span::new(std::slice::from_ref(value_context)),
+        declared_namespaces: None,
+        document_url: ak::Span::default(),
+        document_base_url: ak::Span::default(),
+        length_resolution_context: None,
+        random_function_index: None,
     }
 }
 
@@ -2310,29 +2440,9 @@ fn evaluate_supports_expression(expression: &Expression) -> MatchResult {
     }
 }
 
-unsafe fn ffi_media_environment(
-    environment: &FfiMediaEnvironment,
-) -> Option<(&[FfiMediaFeatureValue], Option<&FfiLengthResolutionContext>)> {
-    let values = if environment.value_count == 0 {
-        &[]
-    } else {
-        if environment.values.is_null() {
-            return None;
-        }
-        unsafe { std::slice::from_raw_parts(environment.values, environment.value_count) }
-    };
-    let length_context = unsafe {
-        environment
-            .length_resolution_context
-            .cast::<FfiLengthResolutionContext>()
-            .as_ref()
-    };
-    Some((values, length_context))
-}
-
-pub(crate) unsafe fn parse_and_evaluate_media_if_condition(
+pub(crate) fn parse_and_evaluate_media_if_condition(
     source: &[u16],
-    environment: &FfiMediaEnvironment,
+    environment: &FfiMediaEnvironment<'_>,
 ) -> Option<MatchResult> {
     // NB: Mirrors the media arm of evaluate_condition_for_substitution, which this series removed
     //     from Libraries/LibWeb/CSS/StyleComputer.cpp. Try a standalone media feature first, then
@@ -2341,15 +2451,15 @@ pub(crate) unsafe fn parse_and_evaluate_media_if_condition(
         let values = components_from_source(source)?;
         parse_media_condition(&values, &resolve_query_feature)
     })?;
-    let (values, length_context) = unsafe { ffi_media_environment(environment) }?;
+    let (values, length_context) = environment.parts()?;
     Some(evaluate_media_expression(&expression, values, length_context))
 }
 
-pub(crate) unsafe fn parse_and_evaluate_supports_if_condition(
+pub(crate) fn parse_and_evaluate_supports_if_condition(
     source: &[u16],
-    context: &ParseContext,
+    context: &ParseContext<'_>,
 ) -> Option<MatchResult> {
-    let declared_namespaces = unsafe { declared_namespaces_from_context(context) };
+    let declared_namespaces = declared_namespaces_from_context(context);
     let evaluate_feature =
         |kind: SupportsFeatureKind, value: &[u16]| supports_feature_matches(context, &declared_namespaces, kind, value);
     // NB: Mirrors the supports arm of evaluate_condition_for_substitution, which this series
@@ -2807,20 +2917,19 @@ fn parse_sizes_attribute(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_parse_sizes_attribute(
     source: FfiUtf16View,
-    context: *const ParseContext,
-    media_environment: *const FfiMediaEnvironment,
-    img_auto_width: *const f64,
+    context: Option<&ParseContext>,
+    media_environment: Option<&FfiMediaEnvironment<'_>>,
+    img_auto_width: Option<&f64>,
 ) -> *const c_void {
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SizesAttributeParseEntry);
     let Some(source) = source.units() else {
         return std::ptr::null();
     };
-    let Some(context) = (unsafe { context.as_ref() }) else {
+    let Some(context) = context else {
         return std::ptr::null();
     };
-    let media_environment =
-        unsafe { media_environment.as_ref() }.and_then(|environment| unsafe { ffi_media_environment(environment) });
-    let img_auto_width = unsafe { img_auto_width.as_ref() }.copied();
+    let media_environment = media_environment.and_then(FfiMediaEnvironment::parts);
+    let img_auto_width = img_auto_width.copied();
     Arc::into_raw(Arc::new(parse_sizes_attribute(
         context,
         source,
@@ -2830,9 +2939,9 @@ pub unsafe extern "C" fn rust_parse_sizes_attribute(
     .cast()
 }
 
-pub(crate) unsafe fn declared_namespaces_from_context(context: &ParseContext) -> Vec<TokenizerInput<'_>> {
-    let namespaces = unsafe { context.declared_namespaces.as_ref() };
-    namespaces
+pub(crate) fn declared_namespaces_from_context<'a>(context: &ParseContext<'a>) -> Vec<TokenizerInput<'a>> {
+    context
+        .declared_namespaces
         .into_iter()
         .flat_map(|namespaces| namespaces.prefixes.iter())
         .map(|namespace| TokenizerInput::Utf16(namespace.units()))
@@ -2850,15 +2959,15 @@ fn create_expression_handle(expression: Expression, kind: QueryKind) -> *const F
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_parse_supports_condition(
     source: FfiUtf16View,
-    context: *const ParseContext,
+    context: Option<&ParseContext>,
 ) -> *const FfiQueryHandle {
     let Some(source) = source.units() else {
         return std::ptr::null();
     };
-    let Some(context) = (unsafe { context.as_ref() }) else {
+    let Some(context) = context else {
         return std::ptr::null();
     };
-    let declared_namespaces = unsafe { declared_namespaces_from_context(context) };
+    let declared_namespaces = declared_namespaces_from_context(context);
     let Some(expression) = parse_supports_condition(source, &|kind, value| {
         supports_feature_matches(context, &declared_namespaces, kind, value)
     }) else {
@@ -2934,11 +3043,11 @@ pub(crate) unsafe fn evaluate_container_query(
 /// retain a copy of the borrowed UTF-16 slice.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn css_query_serialize_condition(
-    handle: *const FfiQueryHandle,
+    handle: Option<&FfiQueryHandle>,
     context: *mut c_void,
     visit: VisitQuerySerialization,
 ) -> bool {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
+    let Some(handle) = handle else {
         return false;
     };
     let QueryTree::Expression { expression, kind } = &handle.tree else {

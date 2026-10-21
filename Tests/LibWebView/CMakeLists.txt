@@ -204,6 +204,13 @@ if (NOT WIN32)
         target_compile_definitions(TestPictureInPictureWindowLifetime PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
+    add_executable(TestWebCompatReportPage TestWebCompatReportPage.cpp)
+    add_dependencies(TestWebCompatReportPage ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestWebCompatReportPage PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestWebCompatReportPage PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     add_executable(TestShadowTreeTooltipsAndLinks TestShadowTreeTooltipsAndLinks.cpp)
     add_dependencies(TestShadowTreeTooltipsAndLinks ladybird_build_resource_files ${ladybird_helper_processes})
     target_link_libraries(TestShadowTreeTooltipsAndLinks PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
@@ -243,6 +250,13 @@ if (NOT WIN32)
     target_link_libraries(TestCrashReportSubmission PRIVATE AK LibCore LibCrypto LibFileSystem LibIPC LibMain LibWebView)
     if (APPLE)
         target_compile_definitions(TestCrashReportSubmission PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
+    add_executable(TestWebCompatReport TestWebCompatReport.cpp)
+    add_dependencies(TestWebCompatReport ${ladybird_helper_processes})
+    target_link_libraries(TestWebCompatReport PRIVATE AK LibCore LibCrypto LibFileSystem LibIPC LibMain LibURL LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestWebCompatReport PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
     add_executable(TestRequestServerClientSessions TestRequestServerClientSessions.cpp)
@@ -352,6 +366,12 @@ if (BUILD_TESTING AND NOT WIN32)
     set_tests_properties(TestWebDriverSearchEngineSettings PROPERTIES TIMEOUT 120)
 
     add_test(
+        NAME TestWebDriverSettingsChanges
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-settings-changes.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverSettingsChanges PROPERTIES TIMEOUT 120)
+
+    add_test(
         NAME TestWebDriverSessionHistory
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-session-history.py $<TARGET_FILE:WebDriver>
     )
@@ -411,6 +431,8 @@ if (BUILD_TESTING AND NOT WIN32)
     add_test(NAME TestPictureInPictureWindowLifetime COMMAND $<TARGET_FILE:TestPictureInPictureWindowLifetime>)
     set_tests_properties(TestPictureInPictureWindowLifetime PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
+    add_test(NAME TestWebCompatReportPage COMMAND $<TARGET_FILE:TestWebCompatReportPage>)
+    set_tests_properties(TestWebCompatReportPage PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestShadowTreeTooltipsAndLinks COMMAND $<TARGET_FILE:TestShadowTreeTooltipsAndLinks>)
     set_tests_properties(TestShadowTreeTooltipsAndLinks PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
@@ -424,6 +446,8 @@ if (BUILD_TESTING AND NOT WIN32)
     set_tests_properties(TestImageDecoderIsolation PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestCrashReportSubmission COMMAND $<TARGET_FILE:TestCrashReportSubmission>)
     set_tests_properties(TestCrashReportSubmission PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+    add_test(NAME TestWebCompatReport COMMAND $<TARGET_FILE:TestWebCompatReport>)
+    set_tests_properties(TestWebCompatReport PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestRequestServerClientSessions COMMAND $<TARGET_FILE:TestRequestServerClientSessions>)
     set_tests_properties(TestRequestServerClientSessions PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestTabPerformanceMonitor COMMAND $<TARGET_FILE:TestTabPerformanceMonitor>)

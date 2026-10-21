@@ -584,13 +584,9 @@ fn compute_font_width(value: &StyleValueData) -> FfiComputedNumber {
 }
 
 /// Computes the font-width property from its absolutized value.
-///
-/// # Safety
-/// `absolutized_value` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_compute_font_width(absolutized_value: *const c_void) -> FfiComputedNumber {
-    let value = unsafe { &*(absolutized_value as *const StyleValueData) };
-    compute_font_width(value)
+pub extern "C" fn rust_compute_font_width(absolutized_value: &StyleValueData) -> FfiComputedNumber {
+    compute_font_width(absolutized_value)
 }
 
 /// An <absolute-size> keyword refers to an entry in a table of font sizes computed and kept by
@@ -727,20 +723,16 @@ fn compute_font_size(
 
 /// Computes the font-size property from its absolutized value. The font size
 /// inputs are raw CSSPixels values.
-///
-/// # Safety
-/// `absolutized_value` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_compute_font_size(
-    absolutized_value: *const c_void,
+pub extern "C" fn rust_compute_font_size(
+    absolutized_value: &StyleValueData,
     computed_math_depth: i32,
     inherited_font_size_raw: i32,
     inherited_math_depth: i32,
     default_font_size_raw: i32,
 ) -> FfiComputedNumber {
-    let value = unsafe { &*(absolutized_value as *const StyleValueData) };
     compute_font_size(
-        value,
+        absolutized_value,
         computed_math_depth,
         CssPixels::from_raw(inherited_font_size_raw),
         inherited_math_depth,
@@ -799,27 +791,26 @@ impl FfiFontSizeRecascadeDocumentInputs {
 /// and viewport-relative lengths resolve from the size reached so far and the
 /// document's inputs.
 ///
-/// A non-null `length_resolution_context` applies only to the value at
+/// A `length_resolution_context` applies only to the value at
 /// `start_index`.
 /// Building it involves font work, so the caller does so lazily after a batch
 /// reports `NeedsLengthResolution` and resumes at the reported index.
 ///
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recascade_font_size_batch(
+pub(crate) fn recascade_font_size_batch<'a>(
     value_count: usize,
-    mut value_at: impl FnMut(usize) -> *const c_void,
+    mut value_at: impl FnMut(usize) -> Option<&'a StyleValueData>,
     start_index: usize,
     current_size_raw: i32,
     current_depends_on_viewport_metrics: bool,
     default_size_raw: i32,
     document_inputs: FfiFontSizeRecascadeDocumentInputs,
-    length_resolution_context: *const FfiLengthResolutionContext,
+    supplied_length_resolution_context: Option<&FfiLengthResolutionContext>,
 ) -> FfiFontSizeRecascadeBatch {
     assert!(start_index <= value_count);
     let mut current_size = CssPixels::from_raw(current_size_raw);
     let mut depends_on_viewport_metrics = current_depends_on_viewport_metrics;
     let default_size = CssPixels::from_raw(default_size_raw);
-    let supplied_length_resolution_context = unsafe { length_resolution_context.as_ref() };
     let mut skipped_calculated_value = false;
     let stopped =
         |status, next_index, current_size: CssPixels, depends_on_viewport_metrics, skipped_calculated_value| {
@@ -833,11 +824,9 @@ pub(crate) fn recascade_font_size_batch(
         };
 
     for index in start_index..value_count {
-        let value = value_at(index);
-        if value.is_null() {
+        let Some(value) = value_at(index) else {
             continue;
-        }
-        let value = unsafe { &*value.cast::<StyleValueData>() };
+        };
         match value {
             StyleValueData::Keyword { keyword } => {
                 if *keyword == keyword::INITIAL || *keyword == keyword::UNSET {
@@ -972,11 +961,9 @@ pub(crate) fn content_reads_counter_style_environment(value: &StyleValueData) ->
     }
 }
 
-/// # Safety
-/// `value` must point to a live style value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_content_reads_counter_style_environment(value: *const c_void) -> bool {
-    content_reads_counter_style_environment(unsafe { &*value.cast::<StyleValueData>() })
+pub extern "C" fn rust_content_reads_counter_style_environment(value: &StyleValueData) -> bool {
+    content_reads_counter_style_environment(value)
 }
 
 /// The counter-style names no @counter-style rule overrides: decimal, disc, square, circle,
@@ -1019,22 +1006,13 @@ pub(crate) fn style_reads_counter_style_environment(
         }
 }
 
-/// # Safety
-/// `content` and `list_style_type` must point to live style values.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_reads_counter_style_environment(
-    content: *const c_void,
-    list_style_type: *const c_void,
+pub extern "C" fn rust_style_reads_counter_style_environment(
+    content: Option<&StyleValueData>,
+    list_style_type: Option<&StyleValueData>,
     is_pseudo: bool,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        style_reads_counter_style_environment(
-            content.cast::<StyleValueData>().as_ref(),
-            list_style_type.cast::<StyleValueData>().as_ref(),
-            is_pseudo,
-        )
-    }
+    style_reads_counter_style_environment(content, list_style_type, is_pseudo)
 }
 
 /// https://drafts.css-houdini.org/css-properties-values-api/#computationally-independent
@@ -1991,12 +1969,9 @@ pub(crate) fn collect_unfixed_random_sharings_in_value(
     }
 }
 
-/// # Safety
-/// `data` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_is_computationally_independent(data: *const c_void) -> bool {
-    value_is_computationally_independent(unsafe { &*(data as *const StyleValueData) })
-        .expect("computational independence requested for an unsupported value")
+pub extern "C" fn rust_style_value_is_computationally_independent(data: &StyleValueData) -> bool {
+    value_is_computationally_independent(data).expect("computational independence requested for an unsupported value")
 }
 
 // The computed value of the math-depth value is determined as follows:
@@ -2311,11 +2286,9 @@ pub struct FfiFontStyleComputation {
 /// this keyword arm is reached when StylePropertyMap sets a keyword directly.
 /// https://drafts.csswg.org/css-fonts-4/#font-style-prop
 ///
-/// # Safety
-/// `absolutized_value` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_compute_font_style(absolutized_value: *const c_void) -> FfiFontStyleComputation {
-    if let StyleValueData::Keyword { keyword } = (unsafe { &*(absolutized_value as *const StyleValueData) })
+pub extern "C" fn rust_compute_font_style(absolutized_value: &StyleValueData) -> FfiFontStyleComputation {
+    if let StyleValueData::Keyword { keyword } = absolutized_value
         && let Some(font_style_keyword) = keyword_to_font_style_keyword(*keyword)
     {
         return FfiFontStyleComputation {
@@ -2796,7 +2769,7 @@ impl FfiEffectiveColorSchemeInput {
                 &[][..]
             } else {
                 unsafe {
-                    std::slice::from_raw_parts(
+                    ak::slice_from_raw_parts(
                         self.document_supported_scheme_codes,
                         self.document_supported_scheme_count,
                     )
@@ -3060,9 +3033,7 @@ impl<'a> ParentSnapshot<'a> {
             return Some(entry.value_handle());
         }
         for (property, value) in self.table.retained_inheritance_dependent_values() {
-            if property == property_id
-                && crate::css::style_value::style_value_dependency_flags(value.pointer()) & 1 != 0
-            {
+            if property == property_id && crate::css::style_value::style_value_dependency_flags(value.data()) & 1 != 0 {
                 return Some(value);
             }
         }
@@ -3346,18 +3317,18 @@ pub(crate) unsafe fn drive_property_computation(
     let random_base_values = if environment.random_base_value_count == 0 {
         &[][..]
     } else {
-        unsafe { std::slice::from_raw_parts(environment.random_base_values, environment.random_base_value_count) }
+        unsafe { ak::slice_from_raw_parts(environment.random_base_values, environment.random_base_value_count) }
     };
     let document_base_url = if environment.document_base_url_length == 0 {
         &[][..]
     } else {
-        unsafe { std::slice::from_raw_parts(environment.document_base_url, environment.document_base_url_length) }
+        unsafe { ak::slice_from_raw_parts(environment.document_base_url, environment.document_base_url_length) }
     };
     let style_sheet_resource_contexts = if environment.style_sheet_resource_context_count == 0 {
         &[][..]
     } else {
         unsafe {
-            std::slice::from_raw_parts(
+            ak::slice_from_raw_parts(
                 environment.style_sheet_resource_contexts,
                 environment.style_sheet_resource_context_count,
             )
@@ -3594,7 +3565,7 @@ pub(crate) unsafe fn drive_property_computation(
                     let base_url = if context.base_url_length == 0 {
                         &[][..]
                     } else {
-                        unsafe { std::slice::from_raw_parts(context.base_url, context.base_url_length) }
+                        unsafe { ak::slice_from_raw_parts(context.base_url, context.base_url_length) }
                     };
                     crate::css::absolutize::StyleSheetResourceContext {
                         base_url,
@@ -4945,8 +4916,7 @@ fn effective_longhand_data<'a>(
     overlay: Option<&'a AnimatedOverlay>,
     property_id: u16,
 ) -> &'a StyleValueData {
-    let effective = table.effective_value(overlay, property_id, true);
-    unsafe { &*effective.value.cast::<StyleValueData>() }
+    table.effective_value_handle(overlay, property_id, true).0.data()
 }
 
 fn effective_keyword(table: &ComputedLonghandTable, overlay: Option<&AnimatedOverlay>, property_id: u16) -> u16 {
@@ -5652,10 +5622,7 @@ impl FfiHostAnimationSample {
             (
                 &*self.longhand_table.cast::<ComputedLonghandTable>(),
                 self.animated_overlay.cast::<AnimatedOverlay>().as_ref(),
-                HostSampledEffects::new(crate::css::custom_properties::ffi_slice(
-                    self.effects,
-                    self.effect_count,
-                )),
+                HostSampledEffects::new(ak::slice_from_raw_parts(self.effects, self.effect_count)),
                 &*self.environment,
             )
         };
@@ -5733,7 +5700,7 @@ pub unsafe extern "C" fn rust_sample_animation_effects_each(
     use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
 
     // SAFETY: Guaranteed by the caller.
-    let inputs = unsafe { crate::css::custom_properties::ffi_slice(inputs, count) };
+    let inputs = unsafe { ak::slice_from_raw_parts(inputs, count) };
     let Some(first) = inputs.first() else {
         return;
     };
@@ -6949,14 +6916,13 @@ fn resolve_effective_color_scheme(
 /// Resolves the used color scheme for a value that required C++ computation.
 ///
 /// # Safety
-/// `value` must point at valid ColorScheme StyleValueData and `input` at valid
-/// document inputs for the duration of the call.
+/// `input` must point at valid document inputs for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_resolve_effective_color_scheme(
-    value: *const c_void,
+    value: &StyleValueData,
     input: &FfiEffectiveColorSchemeInput,
 ) -> u8 {
-    let StyleValueData::ColorScheme { scheme_codes, .. } = (unsafe { &*(value as *const StyleValueData) }) else {
+    let StyleValueData::ColorScheme { scheme_codes, .. } = value else {
         unreachable!("computed color-scheme must have color-scheme data");
     };
     resolve_effective_color_scheme(scheme_codes.as_slice(), input.preferred_color_scheme, unsafe {
@@ -7063,8 +7029,8 @@ fn finalize_animated_box_type(
     // A value the overlay animates keeps its animation's place; one it does not is adjusted over the base value.
     let mut adjust = |property_id: u16, keyword_or_display: StyleValueData| {
         let value = retained_new(keyword_or_display);
-        let effective = longhand_table.effective_value(Some(&*overlay), property_id, true);
-        if unsafe { &*effective.value.cast::<StyleValueData>() } == value.data() {
+        let (effective, _) = longhand_table.effective_value_handle(Some(&*overlay), property_id, true);
+        if effective.data() == value.data() {
             return;
         }
         match overlay
@@ -7127,16 +7093,12 @@ pub extern "C" fn rust_finalize_animated_box_type(
 }
 
 /// Computes the font-weight property from its absolutized value.
-///
-/// # Safety
-/// `absolutized_value` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_compute_font_weight(
-    absolutized_value: *const c_void,
+pub extern "C" fn rust_compute_font_weight(
+    absolutized_value: &StyleValueData,
     inherited_font_weight: f64,
 ) -> FfiComputedNumber {
-    let value = unsafe { &*(absolutized_value as *const StyleValueData) };
-    compute_font_weight(value, inherited_font_weight)
+    compute_font_weight(absolutized_value, inherited_font_weight)
 }
 
 // The standalone cargo test binary has no C++ side, so release callbacks are
@@ -7300,7 +7262,7 @@ pub(crate) mod ffi_test_stubs {
             reserved: u32,
         }
         const _: () = assert!(size_of::<Header>() == 24);
-        let units = unsafe { std::slice::from_raw_parts(data, length) };
+        let units = unsafe { ak::slice_from_raw_parts(data, length) };
         static FLY_STRINGS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Vec<u16>, Box<[u64]>>>> =
             std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         {
@@ -7389,7 +7351,7 @@ pub(crate) mod ffi_test_stubs {
     ) {
         // The style tests only need ASCII URL hosts. The production build uses LibUnicode's C++
         // implementation for the full IDNA algorithm.
-        let domain = unsafe { std::slice::from_raw_parts(domain, domain_length) };
+        let domain = unsafe { ak::slice_from_raw_parts(domain, domain_length) };
         if domain.is_ascii() {
             unsafe { on_success(context, domain.as_ptr(), domain.len()) };
         }
@@ -7699,12 +7661,7 @@ mod tests {
             unit: unit_code("em") as u8,
         };
         let final_percentage = StyleValueData::Percentage { value: 50.0 };
-        let values: [*const std::ffi::c_void; 4] = [
-            std::ptr::null(),
-            (&percentage as *const StyleValueData).cast(),
-            (&em as *const StyleValueData).cast(),
-            (&final_percentage as *const StyleValueData).cast(),
-        ];
+        let values = [None, Some(&percentage), Some(&em), Some(&final_percentage)];
         let default_size = CssPixels::from_integer(13);
         let batch = recascade_font_size_batch(
             values.len(),
@@ -7719,7 +7676,7 @@ mod tests {
                 viewport_width: 800.0,
                 viewport_height: 600.0,
             },
-            std::ptr::null(),
+            None,
         );
         assert!(batch.status == FontSizeRecascadeStatus::Complete);
         assert_eq!(batch.next_index, values.len());
@@ -7736,10 +7693,7 @@ mod tests {
             value: 10.0,
             unit: unit_code("vw") as u8,
         };
-        let values: [*const std::ffi::c_void; 2] = [
-            (&rem as *const StyleValueData).cast(),
-            (&vw as *const StyleValueData).cast(),
-        ];
+        let values = [Some(&rem), Some(&vw)];
         let batch = recascade_font_size_batch(
             values.len(),
             |index| values[index],
@@ -7753,7 +7707,7 @@ mod tests {
                 viewport_width: 800.0,
                 viewport_height: 600.0,
             },
-            std::ptr::null(),
+            None,
         );
         assert!(batch.status == FontSizeRecascadeStatus::Complete);
         assert_eq!(batch.current_size_raw, CssPixels::from_integer(80).raw_value());
@@ -7766,7 +7720,7 @@ mod tests {
             value: 2.0,
             unit: unit_code("ex") as u8,
         };
-        let values: [*const std::ffi::c_void; 1] = [(&ex as *const StyleValueData).cast()];
+        let values = [Some(&ex)];
         let batch = recascade_font_size_batch(
             values.len(),
             |index| values[index],
@@ -7780,7 +7734,7 @@ mod tests {
                 viewport_width: 800.0,
                 viewport_height: 600.0,
             },
-            std::ptr::null(),
+            None,
         );
         assert!(batch.status == FontSizeRecascadeStatus::NeedsLengthResolution);
         assert_eq!(batch.next_index, 0);

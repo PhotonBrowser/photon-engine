@@ -73,6 +73,7 @@ public:
     void flush_and_submit(SkSurface*, SurfaceAccess);
     void flush_and_submit_async(SkSurface*, SurfaceAccess, Function<void()>&&, uint64_t presentation_signal_value = 0);
     void check_async_work_completion();
+    size_t resource_cache_bytes() const;
     virtual GrDirectContext* sk_context() const = 0;
 
     // Compiles the next GPU program recent sessions used, ahead of its first use, so that a first paint does not wait

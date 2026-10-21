@@ -24,6 +24,7 @@
 #include <LibDatabase/Forward.h>
 #include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/Forward.h>
+#include <LibGfx/GpuDeviceIdentity.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/Size.h>
 #include <LibIPC/Forward.h>
@@ -156,6 +157,7 @@ public:
 
     static BookmarkStore& bookmark_store() { return *the().m_bookmark_store; }
     void update_bookmark_action_for_current_web_view();
+    void update_actions_for_active_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
 
     void background_networking_settings_changed(Badge<ApplicationSettingsObserver>);
@@ -392,6 +394,9 @@ public:
     Menu& inspect_menu() { return *m_inspect_menu; }
     Action& view_source_action() { return *m_view_source_action; }
 
+    Action& report_website_issue_action() { return *m_report_website_issue_action; }
+    void update_report_website_issue_action();
+
     Menu& debug_menu() { return *m_debug_menu; }
 
     FileDownloader& file_downloader() { return m_file_downloader; }
@@ -410,6 +415,11 @@ public:
     // CPU-shared backing stores.
     void notify_compositor_gpu_presentation_unavailable();
     void notify_compositor_gpu_presentation_available();
+
+    // Runs the callback with the GPU that hardware decoders must output to for the Compositor to display their frames,
+    // if there is one, as soon as the Compositor has reported it.
+    using CompositorGpuDeviceIdentityCallback = Function<void(Optional<Gfx::GpuDeviceIdentity> const&)>;
+    void when_compositor_gpu_device_identity_is_known(CompositorGpuDeviceIdentityCallback);
 
 protected:
     explicit Application(Optional<ByteString> ladybird_binary_path = {});
@@ -450,6 +460,7 @@ private:
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
     ErrorOr<void> launch_compositor_process();
+    void compositor_reported_gpu_device_identity(Optional<Gfx::GpuDeviceIdentity>);
     void handle_compositor_process_death();
     void recover_compositor_process();
     void crash_compositor_process();
@@ -590,6 +601,7 @@ private:
     OwnPtr<AutocompleteService> m_autocomplete_service;
 
     Main::Arguments m_arguments;
+    OwnPtr<Core::StatsLog> m_stats_log;
     BrowserOptions m_browser_options;
     Optional<Core::Process> m_cpu_profiler_process;
     OwnPtr<Core::File> m_cpu_profiler_control_socket;
@@ -633,6 +645,9 @@ private:
     Optional<bool> m_scrolls_elastically_override;
     bool m_reported_compositor_gpu_presentation_unavailable { false };
     bool m_compositor_metal_presentation_enabled { false };
+    // The last identity a Compositor reported, which outlives that Compositor until its replacement reports.
+    Optional<Optional<Gfx::GpuDeviceIdentity>> m_compositor_gpu_device_identity;
+    Vector<CompositorGpuDeviceIdentityCallback> m_callbacks_awaiting_compositor_gpu_device_identity;
     size_t m_compositor_restart_count { 0 };
     enum class CompositorRecoveryState {
         Idle,
@@ -716,6 +731,8 @@ private:
     RefPtr<Menu> m_inspect_menu;
     RefPtr<Action> m_view_source_action;
     RefPtr<Action> m_toggle_devtools_action;
+
+    RefPtr<Action> m_report_website_issue_action;
 
     RefPtr<Menu> m_debug_menu;
     RefPtr<Action> m_show_line_box_borders_action;

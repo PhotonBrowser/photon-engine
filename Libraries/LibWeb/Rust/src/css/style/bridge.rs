@@ -32,7 +32,7 @@ use std::ffi::c_void;
 use crate::abort_on_panic;
 use crate::css::animated_overlay::AnimatedOverlay;
 use crate::css::computed_longhand_table::ComputedLonghandTable;
-use crate::css::custom_properties::{CustomPropertyRegistry, ffi_slice};
+use crate::css::custom_properties::CustomPropertyRegistry;
 use crate::css::host_shared::{HostShared, SharedPayload};
 use crate::css::selector::CompiledSelector;
 use crate::css::style_value::RetainedStyleValueData;
@@ -1227,9 +1227,9 @@ pub unsafe extern "C" fn style_engine_set_tree_scope_animation_keyframes(
     // SAFETY: Guaranteed by the caller.
     let row = unsafe {
         super::animations::AnimationKeyframes::row(
-            ffi_slice(name_lengths, count),
-            ffi_slice(name_units, name_unit_count),
-            ffi_slice(keyframe_sets, count),
+            ak::slice_from_raw_parts(name_lengths, count),
+            ak::slice_from_raw_parts(name_units, name_unit_count),
+            ak::slice_from_raw_parts(keyframe_sets, count),
         )
     };
     let write = super::engine_calls::EngineWrite::AnimationKeyframes {
@@ -1269,22 +1269,17 @@ pub unsafe extern "C" fn style_engine_note_custom_property_environment(
 }
 
 /// [`style_engine_note_custom_property_environment`] on `engine`.
-///
-/// # Safety
-/// As for [`style_engine_note_custom_property_environment`], for the arguments after `engine`.
-pub unsafe fn note_custom_property_environment(
+pub fn note_custom_property_environment(
     engine: &mut StyleEngine,
     identity: u64,
-    store: *const c_void,
+    store: Option<&std::sync::Arc<crate::css::custom_properties::CustomPropertyStore>>,
     inheritable: u64,
-    inheritable_store: *const c_void,
+    inheritable_store: Option<&std::sync::Arc<crate::css::custom_properties::CustomPropertyStore>>,
 ) {
-    unsafe {
-        engine.custom_property_environments.retain(identity, store);
-        engine
-            .custom_property_environments
-            .note_inheritable(identity, inheritable, inheritable_store);
-    }
+    engine.custom_property_environments.retain(identity, store);
+    engine
+        .custom_property_environments
+        .note_inheritable(identity, inheritable, inheritable_store);
 }
 
 /// The environment a child inherits from one the engine resolved: itself, unless a registration
@@ -1421,12 +1416,12 @@ pub unsafe extern "C" fn style_engine_set_element_animation_effect_descriptions(
     // SAFETY: Guaranteed by the caller.
     let effects = unsafe {
         super::effect_descriptions::PublishedEffectBuffers {
-            effects: ffi_slice(effects, effect_count),
-            keyframes: ffi_slice(keyframes, keyframe_count),
-            declarations: ffi_slice(declarations, declaration_count),
-            custom_declarations: ffi_slice(custom_declarations, custom_declaration_count),
-            linear_points: ffi_slice(linear_points, linear_point_count),
-            base_url_bytes: ffi_slice(base_url_bytes, base_url_byte_count),
+            effects: ak::slice_from_raw_parts(effects, effect_count),
+            keyframes: ak::slice_from_raw_parts(keyframes, keyframe_count),
+            declarations: ak::slice_from_raw_parts(declarations, declaration_count),
+            custom_declarations: ak::slice_from_raw_parts(custom_declarations, custom_declaration_count),
+            linear_points: ak::slice_from_raw_parts(linear_points, linear_point_count),
+            base_url_bytes: ak::slice_from_raw_parts(base_url_bytes, base_url_byte_count),
         }
         .effects()
     };
@@ -1456,7 +1451,7 @@ pub unsafe extern "C" fn style_engine_describes_animation_effects(
         host.engine_memo()
             .described
             .borrow()
-            .describe(node, slot, unsafe { ffi_slice(versions, count) })
+            .describe(node, slot, unsafe { ak::slice_from_raw_parts(versions, count) })
     })
 }
 
@@ -1690,7 +1685,7 @@ fn collect_native_custom_declarations(
             let declaration = &property.declaration;
             // Custom properties retain their authored values, without normal-property
             // canonicalization. Their token spelling is observable after substitution.
-            let value = unsafe { engine.intern_specified_value(std::sync::Arc::as_ptr(&declaration.value)) };
+            let value = engine.intern_specified_value(&declaration.value);
             let written = RetainedStyleValueData::from_arc(declaration.value.clone());
             let declared = CustomDeclaration {
                 name: atom,
@@ -1769,7 +1764,7 @@ pub unsafe extern "C" fn style_engine_set_element_presentational_hint_properties
         &[]
     } else {
         // SAFETY: Guaranteed by the caller.
-        unsafe { std::slice::from_raw_parts(properties.cast::<FfiDeclaredProperty>(), count) }
+        unsafe { ak::slice_from_raw_parts(properties.cast::<FfiDeclaredProperty>(), count) }
     };
     // A hint may name a shorthand. Expanded as any declaration block is, it declares every longhand it decides, and so
     // do all declarations the engine is given.
@@ -1868,7 +1863,7 @@ pub unsafe fn publish_computed_groups(
     }
     let payloads = match count {
         0 => &[],
-        _ => SharedPayload::from_pointer_slice(unsafe { std::slice::from_raw_parts(payloads, count) }),
+        _ => SharedPayload::from_pointer_slice(unsafe { ak::slice_from_raw_parts(payloads, count) }),
     };
     if animation_overlay_payload_count != 0 && animation_overlay_payloads.is_null() {
         return FfiStyleRecordDelta::default();
@@ -1876,7 +1871,7 @@ pub unsafe fn publish_computed_groups(
     let animation_overlay_payloads = match animation_overlay_payload_count {
         0 => &[],
         _ => SharedPayload::from_pointer_slice(unsafe {
-            std::slice::from_raw_parts(animation_overlay_payloads, animation_overlay_payload_count)
+            ak::slice_from_raw_parts(animation_overlay_payloads, animation_overlay_payload_count)
         }),
     };
     let longhand_table = unsafe {
@@ -2014,7 +2009,7 @@ pub(crate) fn publish_computed_groups_from_inputs(
     unsafe {
         engine
             .custom_property_environments
-            .retain(custom_property_environment, custom_property_store);
+            .retain_raw(custom_property_environment, custom_property_store);
     }
     if pseudo_kind == u8::MAX
         && let Some(node) = StyleNodeID::from_raw(node)
@@ -2196,8 +2191,8 @@ pub unsafe extern "C" fn style_engine_publish_sampled_animation_overlays(
     // SAFETY: Guaranteed by the caller.
     let (inputs, out) = unsafe {
         (
-            std::slice::from_raw_parts(inputs, count),
-            std::slice::from_raw_parts_mut(out, count),
+            ak::slice_from_raw_parts(inputs, count),
+            ak::slice_from_raw_parts_mut(out, count),
         )
     };
     with_engine(read, host, |engine| {
@@ -2345,8 +2340,8 @@ pub unsafe extern "C" fn style_engine_changed_style_groups(
         // SAFETY: Guaranteed by the caller: a live record's view holds `payload_count` payloads of each kind.
         Some(unsafe {
             [
-                SharedPayload::from_pointer_slice(std::slice::from_raw_parts(view.base_payloads, view.payload_count)),
-                SharedPayload::from_pointer_slice(std::slice::from_raw_parts(view.payloads, view.payload_count)),
+                SharedPayload::from_pointer_slice(ak::slice_from_raw_parts(view.base_payloads, view.payload_count)),
+                SharedPayload::from_pointer_slice(ak::slice_from_raw_parts(view.payloads, view.payload_count)),
             ]
         })
     };
@@ -2456,7 +2451,8 @@ pub(crate) fn publish_rule_declarations(
 
 /// Moves a node's record to the custom-property environment C++ refreshed it to, keeping the
 /// store behind the environment, and returns the new record's identity; zero when the node holds
-/// no base record to move.
+/// no record to move. Only a base record moves: an environment move computes an element holding a
+/// record that composes animated values again instead of having C++ refresh it.
 ///
 /// # Safety
 /// `host` must be a live document host, on its document's thread, and `store` must be null or a
@@ -2474,7 +2470,7 @@ pub unsafe extern "C" fn style_engine_republish_record_environment(
         let Some(node) = StyleNodeID::from_raw(node) else {
             return (0, None);
         };
-        unsafe { engine.custom_property_environments.retain(environment, store) };
+        unsafe { engine.custom_property_environments.retain_raw(environment, store) };
         let Some(style_record) = engine.republish_record_environment(node, environment) else {
             return (0, None);
         };
@@ -2592,8 +2588,18 @@ pub(crate) fn answer_record_demand(
     style_node: StyleNodeID,
     demand: super::publication::RecordDemand,
 ) -> FfiRecordDemandAnswer {
-    let read_only = demand.is_read_only();
-    match engine.answer_record_demand(style_node, demand) {
+    let answer = engine.answer_record_demand(style_node, demand);
+    ffi_record_demand_answer(engine, style_node, demand.is_read_only(), answer)
+}
+
+/// The FFI form of `answer`, what a demand of `style_node`'s record answered.
+pub(in crate::css::style) fn ffi_record_demand_answer(
+    engine: &mut StyleEngine,
+    style_node: StyleNodeID,
+    read_only: bool,
+    answer: Result<super::publication::RecordDemandAnswer, super::publication::Unanswered>,
+) -> FfiRecordDemandAnswer {
+    match answer {
         Ok(super::publication::RecordDemandAnswer::Record {
             record,
             uses_substitution,
@@ -2659,7 +2665,7 @@ pub unsafe extern "C" fn style_engine_declared_only_record(
             let hints = if hint_count == 0 {
                 &[]
             } else {
-                unsafe { std::slice::from_raw_parts(hints.cast::<FfiDeclaredProperty>(), hint_count) }
+                unsafe { ak::slice_from_raw_parts(hints.cast::<FfiDeclaredProperty>(), hint_count) }
             };
             let hints = hints
                 .iter()
@@ -2737,11 +2743,8 @@ pub unsafe extern "C" fn style_engine_borrow_engine_custom_property_environment(
         let Some((store, parent_identity)) = engine.custom_property_environments.engine_environment(identity) else {
             return std::ptr::null();
         };
-        unsafe {
-            std::sync::Arc::increment_strong_count(store.cast::<crate::css::custom_properties::CustomPropertyStore>());
-            *parent = parent_identity;
-        }
-        store
+        unsafe { *parent = parent_identity };
+        std::sync::Arc::into_raw(std::sync::Arc::clone(store)).cast()
     })
 }
 
@@ -3012,6 +3015,13 @@ pub(crate) unsafe fn take_style_transaction(
         != computation_inputs.custom_property_registration_generation;
     if engine.custom_property_registrations_changed {
         engine.custom_property_environments.registrations_changed();
+        let previous_registry = engine.custom_property_registry.clone();
+        engine.animation_effect_descriptions.registrations_changed(
+            previous_registry
+                .as_deref()
+                .unwrap_or_else(|| CustomPropertyRegistry::shared_empty()),
+            computation_inputs.custom_property_registry(),
+        );
     }
     if engine.document_style_computation_inputs != computation_inputs {
         // Persistent records are derived from every document computation input, not only the
@@ -3223,7 +3233,7 @@ pub(crate) unsafe fn borrow<'a, T>(pointer: *const T, count: usize) -> &'a [T] {
         return &[];
     }
     assert!(!pointer.is_null(), "a non-empty delta array must not be null");
-    unsafe { std::slice::from_raw_parts(pointer, count) }
+    unsafe { ak::slice_from_raw_parts(pointer, count) }
 }
 
 #[cfg(test)]

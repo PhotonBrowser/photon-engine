@@ -141,6 +141,7 @@ public:
     // Whether the scroll offsets here moved past those of the last frame WebContent presented.
     bool scrolled_since_last_frame() const;
     bool can_dispatch_input_to_web_content() const { return m_page_id.has_value(); }
+    Optional<u64> page_id() const { return m_page_id; }
 
     bool presents_to_client() const { return m_presenter.presents_to_client(); }
     void stop_presenting_to_client();
@@ -157,7 +158,7 @@ public:
         Compositing::ScrollStateSnapshot&&);
     void update_visual_context_tree(Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction&&);
     void update_scroll_state(Compositing::ScrollStateSnapshot&&, Compositing::KeyboardScrollState);
-    void set_video_sink(Compositing::VideoSinkResourceId, RefPtr<Media::VideoSink>);
+    void set_video_sink(Compositing::VideoSinkResourceId, RefPtr<Media::DisplayingVideoSink>);
     HashMap<u64, Media::VideoSinkHandle> const& video_sink_handles() const { return m_scene.video_sink_handles(); }
 
     void invalidate_wheel_event_listener_state(u64 generation);
