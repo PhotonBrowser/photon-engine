@@ -377,6 +377,9 @@ enum class PreferredColorScheme : uint8_t { Auto,
     Light };
 
 class View;
+namespace Automation {
+class View;
+}
 
 struct RegisteredEngineProcess {
     int32_t pid { 0 };
@@ -442,20 +445,6 @@ public:
     View& operator=(View const&) = delete;
 
     void navigate(std::string const&);
-    // Reports the real WebView load-finish callback state without accessing
-    // the page object. A page may not yet exist during provisional navigation.
-    bool has_completed_document_load() const;
-    // Monotonically identifies the top-level document lifecycle for this view.
-    uint64_t document_generation() const;
-    // Installs a fixed, read-only observer for the official Speedometer 3.1
-    // result object. This is used only by authenticated automation sessions.
-    bool install_speedometer_result_observer(uint64_t expected_document_generation);
-    // Installs a fixed, read-only observer for the official JetStream 3.0
-    // result UI. This is used only by authenticated automation sessions.
-    bool install_jetstream_result_observer(uint64_t expected_document_generation);
-    // Activates only JetStream's built-in Start Test control on the expected
-    // document. This is used only by authenticated automation sessions.
-    bool request_jetstream_start(uint64_t expected_document_generation);
     void reload();
     void stop_loading();
     void go_back();
@@ -515,6 +504,7 @@ public:
 
 private:
     friend class Runtime;
+    friend class Automation::View;
     struct Impl;
     explicit View(std::unique_ptr<Impl>);
     std::unique_ptr<Impl> m_impl;

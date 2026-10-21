@@ -1,4 +1,4 @@
-set(SOURCES PhotonEmbedder.cpp)
+set(SOURCES PhotonEmbedder.cpp PhotonAutomation.cpp)
 ladybird_lib(LibPhotonEmbedder photonembedder EXPLICIT_SYMBOL_EXPORT)
 add_library(Photon::Embedder ALIAS LibPhotonEmbedder)
 target_include_directories(LibPhotonEmbedder PUBLIC
