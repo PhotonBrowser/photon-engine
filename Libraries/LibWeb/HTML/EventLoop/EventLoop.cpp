@@ -726,20 +726,6 @@ static bool is_renderable(DOM::Document const& document)
 // update with the serial number `update_serial`. Answers the documents whose lanes were taken in.
 Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(u64 update_serial)
 {
-    VERIFY(!m_running_rendering_task);
-    m_running_rendering_task = true;
-    for (auto const& page : pages_of_local_roots())
-        page->client().will_begin_rendering_update();
-    auto update_start_time = HighResolutionTime::unsafe_shared_current_time();
-    if (photon_frame_trace_enabled()) dbgln("[FrameTrace] update_rendering_begin loop={} at_ms={:.3f} last_opportunity_ms={:.3f}", reinterpret_cast<FlatPtr>(this), update_start_time, m_last_render_opportunity_time);
-    ++m_rendering_scheduler_counters.updates_run;
-    ++m_rendering_update_serial;
-
-    // AD-HOC: The last rendering update may have ended as its style transaction flew. Its layout runs beside this
-    //         update's steps up to step 16, which takes the rest of it in, or the rest of it runs now.
-    if (m_rendering_update_in_flight && !m_rendering_update_in_flight->held_for_testing && !m_rendering_update_in_flight->layout_flew
-        && !let_layout_of_rendering_update_fly())
-        finish_rendering_update_in_flight();
     // AD-HOC: The render clock's lanes present frames of a document's animations and hover beside the tasks since the
     //         last update, at display ticks later than the opportunity this update renders for, which reached the event
     //         loop only after those tasks. An update after a lane's tick presented a frame renders at the time it runs,
@@ -854,12 +840,18 @@ void EventLoop::queue_task_to_process_input_events()
     if (m_input_events_task_queued)
         return;
     m_input_events_task_queued = true;
-    queue_a_task(Task::Source::UserInteraction, this, nullptr, GC::create_function(GC::Heap::the(), [this] {
-        m_input_events_task_queued = false;
-        if (m_running_rendering_task || m_rendering_update_in_flight)
-            return;
-        take_clock_lanes_and_input_events_in(m_rendering_update_serial + 1);
-    }));
+    queue_a_task(Task::Source::UserInteraction, this, nullptr, GC::create_function(GC::Heap::the(), [this] { process_input_events_task(); }));
+}
+
+void EventLoop::process_input_events_task()
+{
+    m_input_events_task_queued = false;
+    if (m_running_rendering_task || m_rendering_update_in_flight)
+        return;
+    // Input dispatch can run script and request another frame. Keep that work
+    // behind the reentrancy guard without starting a rendering-update lifecycle.
+    TemporaryChange running { m_running_rendering_task, true };
+    take_clock_lanes_and_input_events_in(m_rendering_update_serial + 1);
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering

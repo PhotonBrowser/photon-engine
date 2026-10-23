@@ -27,6 +27,8 @@ enum class FfiFlightBlocker : uint8_t;
 
 namespace Web::HTML {
 
+class EventLoopTestAccess;
+
 // What the render clock's lanes do with a document's running animations.
 enum class ClockAnimations : u8 {
     // Leaves them alone: the event loop is idle, and its rendering updates run them.
@@ -195,12 +197,15 @@ public:
     void reset_rendering_scheduler_counters();
 
 private:
+    friend class EventLoopTestAccess;
+
     bool rendering_update_in_flight_holds_tasks_of(DOM::Document const*) const;
     explicit EventLoop(Type);
 
     virtual void visit_edges(Visitor&) override;
 
     void process_input_events() const;
+    void process_input_events_task();
     Vector<GC::Root<DOM::Document>> take_clock_lanes_and_input_events_in(u64 update_serial);
     void update_the_rendering();
     // How the steps after style and layout take the layout of the docs: up to date, or as the update's layout that flew

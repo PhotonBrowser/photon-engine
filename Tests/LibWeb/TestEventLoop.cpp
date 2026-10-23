@@ -13,6 +13,31 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Platform/FontPlugin.h>
 
+namespace Web::HTML {
+
+class EventLoopTestAccess {
+public:
+    static void mark_rendering_task_queued(EventLoop& event_loop)
+    {
+        VERIFY(!event_loop.m_rendering_task_queued);
+        event_loop.m_rendering_task_queued = true;
+    }
+
+    static void run_rendering_task(EventLoop& event_loop)
+    {
+        event_loop.m_rendering_task_function->function()();
+    }
+
+    static void dispatch_input_events_task(EventLoop& event_loop)
+    {
+        VERIFY(!event_loop.m_input_events_task_queued);
+        event_loop.m_input_events_task_queued = true;
+        event_loop.process_input_events_task();
+    }
+};
+
+}
+
 TEST_CASE(nested_pause_handles_keep_the_event_loop_paused)
 {
     static Web::Platform::FontPlugin font_plugin { false };
@@ -40,4 +65,28 @@ TEST_CASE(nested_pause_handles_keep_the_event_loop_paused)
     }
 
     EXPECT(!event_loop.execution_paused());
+}
+
+TEST_CASE(successive_rendering_tasks_keep_the_running_state_balanced)
+{
+    auto& event_loop = Web::HTML::main_thread_event_loop();
+
+    for (size_t opportunity = 0; opportunity < 2; ++opportunity) {
+        EXPECT(!event_loop.rendering_task_queued_or_running());
+        Web::HTML::EventLoopTestAccess::mark_rendering_task_queued(event_loop);
+        EXPECT(event_loop.rendering_task_queued_or_running());
+        Web::HTML::EventLoopTestAccess::run_rendering_task(event_loop);
+
+        EXPECT(!event_loop.rendering_task_queued_or_running());
+    }
+}
+
+TEST_CASE(input_event_lane_takes_do_not_leave_a_rendering_task_active)
+{
+    auto& event_loop = Web::HTML::main_thread_event_loop();
+
+    for (size_t input_dispatch = 0; input_dispatch < 2; ++input_dispatch) {
+        Web::HTML::EventLoopTestAccess::dispatch_input_events_task(event_loop);
+        EXPECT(!event_loop.running_rendering_task());
+    }
 }
