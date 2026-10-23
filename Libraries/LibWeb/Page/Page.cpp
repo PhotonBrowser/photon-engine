@@ -1452,15 +1452,20 @@ void Page::unregister_emulated_position_data_observer(u64 observer_id)
     m_emulated_position_data_observers.remove(observer_id);
 }
 
-void Page::request_permission(Utf16String const& name, PermissionPromptCallback callback)
+void Page::request_permission(Utf16String const& name, URL::Origin const& requesting_origin, URL::Origin const& top_level_origin, HTML::EnvironmentId const& document_id, PermissionPromptCallback callback)
 {
     auto request_id = m_next_permission_request_id++;
     m_pending_permission_requests.set(request_id, callback);
-    client().page_did_request_permission(request_id, name);
+    m_permission_request_documents.set(request_id, document_id);
+    client().page_did_request_permission(request_id, name, requesting_origin, top_level_origin, document_id);
 }
 
-void Page::permission_request_completed(u64 request_id, bool granted)
+void Page::permission_request_completed(u64 request_id, HTML::EnvironmentId const& document_id, bool granted)
 {
+    auto expected_document = m_permission_request_documents.get(request_id);
+    if (!expected_document.has_value() || expected_document.value() != document_id)
+        return;
+    m_permission_request_documents.remove(request_id);
     if (auto callback = m_pending_permission_requests.take(request_id); callback.has_value())
         callback.value()->function()(granted);
 }

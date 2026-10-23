@@ -114,11 +114,11 @@ void request_permission_with_user_prompt(PermissionDescriptor const& descriptor,
     // 3. Ask the user for express permission for the calling algorithm to use the powerful feature described by descriptor.
     // Only windows have a page to ask through; a worker's request is denied.
     auto* window = HTML::window_from_global_object(settings.global_object());
-    if (!window) {
+    if (!window || !settings.top_level_origin.has_value()) {
         settle->function()(false);
         return;
     }
-    window->page().request_permission(descriptor.name, settle);
+    window->page().request_permission(descriptor.name, settings.origin(), settings.top_level_origin.value(), settings.id, settle);
 }
 
 // https://w3c.github.io/permissions/#dfn-permission-state

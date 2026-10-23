@@ -1262,14 +1262,14 @@ void PageClient::page_did_request_geolocation_position(u64 request_id)
     client().async_did_request_geolocation_position(m_id, request_id);
 }
 
-void PageClient::page_did_request_permission(u64 request_id, Utf16String const& name)
+void PageClient::page_did_request_permission(u64 request_id, Utf16String const& name, URL::Origin const& requesting_origin, URL::Origin const& top_level_origin, Web::HTML::EnvironmentId const& document_id)
 {
-    client().async_did_request_permission(m_id, request_id, name);
+    client().async_did_request_permission(m_id, request_id, name, requesting_origin, top_level_origin, document_id);
 }
 
-void PageClient::permission_request_completed(u64 request_id, bool granted)
+void PageClient::permission_request_completed(u64 request_id, Web::HTML::EnvironmentId const& document_id, bool granted)
 {
-    page().permission_request_completed(request_id, granted);
+    page().permission_request_completed(request_id, document_id, granted);
 }
 
 void PageClient::page_did_cancel_geolocation_position_request(u64 request_id)

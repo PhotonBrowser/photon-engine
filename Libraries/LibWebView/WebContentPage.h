@@ -19,6 +19,7 @@
 #include <LibGfx/Rect.h>
 #include <LibGfx/SharedImage.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/StorageAPI/StorageEndpoint.h>
@@ -87,6 +88,7 @@ public:
     String dump_process_tree() const;
     Optional<CanonicalNavigable&> hosted_navigable(Web::HTML::CrossProcessId) const;
     Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
+    void cancel_permission_requests_for_document(Web::HTML::EnvironmentId const& document_id);
 
     // Whether the document of an environment the page hosts has a cross-site ancestor, or nothing if the page hosts no
     // such environment.
@@ -254,7 +256,7 @@ private:
     virtual void did_cancel_geolocation_position_request(u64 request_id) override;
     virtual void did_start_geolocation_position_watch(u64 request_id) override;
     virtual void did_stop_geolocation_position_watch(u64 request_id) override;
-    virtual void did_request_permission(u64 request_id, Utf16String name) override;
+    virtual void did_request_permission(u64 request_id, Utf16String name, URL::Origin requesting_origin, URL::Origin top_level_origin, Web::HTML::EnvironmentId document_id) override;
     virtual void did_request_file_picker(Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) override;
     virtual void did_finish_handling_input_event(u64 event_id, Web::EventResult event_result) override;
     virtual void did_update_input_method_state(Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) override;
@@ -378,6 +380,7 @@ private:
     bool m_detached_close_pending { false };
     Optional<String> m_history_recorded_url_for_current_load;
     HashTable<u64> m_renderer_owned_downloads;
+    HashMap<u64, Web::HTML::EnvironmentId> m_pending_permission_requests;
     HashTable<OwedReply> m_owed_replies;
     Optional<MonotonicTime> m_last_user_activation;
 };

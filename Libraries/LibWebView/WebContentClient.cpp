@@ -853,6 +853,18 @@ ErrorOr<void> WebContentClient::grant_audio_capture(URL::URL const& url)
     return tell_audio_server_of_capture_permission();
 }
 
+ErrorOr<void> WebContentClient::grant_audio_capture(URL::Origin const& origin)
+{
+    if (origin.is_opaque())
+        return Error::from_string_literal("Cannot grant audio capture to an opaque origin");
+    m_audio_capture_grants.set(origin.serialize());
+    // The permission is tied to an active requesting environment, which can
+    // be a cross-origin frame rather than the view's top-level URL.
+    m_audio_capture_permitted = true;
+    TRY(ensure_audio_server_controller());
+    return tell_audio_server_of_capture_permission();
+}
+
 void WebContentClient::update_audio_capture_permission()
 {
     auto permitted = audio_capture_permitted();

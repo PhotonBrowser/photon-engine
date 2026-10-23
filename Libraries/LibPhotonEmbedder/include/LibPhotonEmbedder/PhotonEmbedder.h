@@ -175,6 +175,16 @@ struct SelectDropdownRequest {
     std::vector<SelectDropdownItem> items;
 };
 
+// A permission request from one specific environment. Origins and the opaque
+// document identity are supplied by Engine state, never by page script.
+struct PermissionRequest {
+    uint64_t request_id { 0 };
+    std::string document_id;
+    std::string requesting_origin;
+    std::string top_level_origin;
+    std::string capability;
+};
+
 // One representation of the clipboard's contents, such as "text/plain" or
 // "image/png" data.
 struct ClipboardEntry {
@@ -263,6 +273,9 @@ struct ViewCallbacks {
     // A file input asked for files. The embedder answers with
     // View::file_picker_closed, also when cancelled.
     std::function<void(bool allow_multiple)> file_picker_requested;
+    std::function<void(PermissionRequest const&)> permission_requested;
+    // The request was denied by Engine because its document was replaced.
+    std::function<void(uint64_t request_id, std::string const& document_id)> permission_cancelled;
     // A context menu action opened a link in a new tab.
     std::function<void(std::string const& url, bool activate)> open_in_new_tab_requested;
     // A link was shift-clicked, to be shown in a preview over the page.
@@ -498,6 +511,9 @@ public:
     // Answer the open file picker with the chosen files' paths, empty when
     // cancelled.
     void file_picker_closed(std::vector<std::string> const& paths);
+    // Resolves a pending permission request. The document identity must match
+    // the request, and the Engine rejects replies after that document changes.
+    void permission_request_completed(uint64_t request_id, std::string const& document_id, bool granted);
     // Answer the open dialog. A prompt's response is empty when cancelled.
     void alert_closed();
     void confirm_closed(bool accepted);

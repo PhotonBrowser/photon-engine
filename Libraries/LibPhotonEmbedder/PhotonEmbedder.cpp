@@ -709,6 +709,55 @@ private:
         on_audio_play_state_changed = [this](Web::HTML::AudioPlayState play_state) {
             notify_audio_state(play_state);
         };
+        on_request_permission = [this](u64 request_id, Utf16String const& name, URL::Origin const& requesting_origin, URL::Origin const& top_level_origin, Web::HTML::EnvironmentId const& document_id, Function<void(bool)> on_decided) {
+            if (!m_callbacks.permission_requested) {
+                on_decided(false);
+                return;
+            }
+            auto requesting_origin_string = requesting_origin.serialize();
+            auto top_level_origin_string = top_level_origin.serialize();
+            auto capability = name.to_utf8();
+            auto document = document_id.to_string();
+            auto bytes = [](auto const& value) {
+                auto view = value.bytes_as_string_view();
+                return std::string(view.characters_without_null_termination(), view.length());
+            };
+            auto doc_id = bytes(document);
+            auto embedder_request_id = m_next_permission_request_id++;
+            if (embedder_request_id == 0)
+                embedder_request_id = m_next_permission_request_id++;
+            m_pending_permission_requests.set(embedder_request_id, PendingPermission {
+                                                                       .renderer_request_id = request_id,
+                                                                       .document_id = doc_id,
+                                                                       .document_generation = m_document_generation,
+                                                                       .on_decided = move(on_decided),
+                                                                   });
+            m_callbacks.permission_requested(Photon::PermissionRequest {
+                .request_id = embedder_request_id,
+                .document_id = move(doc_id),
+                .requesting_origin = bytes(requesting_origin_string),
+                .top_level_origin = bytes(top_level_origin_string),
+                .capability = bytes(capability),
+            });
+        };
+        on_cancel_permission_request = [this](u64 request_id, Web::HTML::EnvironmentId const& document_id) {
+            auto document = document_id.to_string();
+            auto document_bytes = document.bytes_as_string_view();
+            auto document_string = std::string(document_bytes.characters_without_null_termination(), document_bytes.length());
+            Optional<uint64_t> embedder_request_id;
+            for (auto const& entry : m_pending_permission_requests) {
+                if (entry.value.renderer_request_id == request_id && entry.value.document_id == document_string) {
+                    embedder_request_id = entry.key;
+                    break;
+                }
+            }
+            if (!embedder_request_id.has_value())
+                return;
+            auto pending = m_pending_permission_requests.take(*embedder_request_id).release_value();
+            if (m_callbacks.permission_cancelled)
+                m_callbacks.permission_cancelled(*embedder_request_id, pending.document_id);
+            pending.on_decided(false);
+        };
         on_page_unresponsive_changed = [this](bool unresponsive) {
             if (m_callbacks.page_unresponsive_changed)
                 m_callbacks.page_unresponsive_changed(unresponsive);
@@ -732,6 +781,7 @@ private:
         };
         on_load_start = [this] {
             m_document_load_finished = false;
+            invalidate_pending_permission_requests();
             ++m_document_generation;
             if (m_document_generation == 0)
                 ++m_document_generation;
@@ -1047,10 +1097,46 @@ private:
         };
     }
 
+public:
+    ~PhotonHeadlessWebView() override
+    {
+        invalidate_pending_permission_requests();
+    }
+
+    void permission_request_completed(uint64_t request_id, std::string const& document_id, bool granted)
+    {
+        auto pending = m_pending_permission_requests.get(request_id);
+        if (!pending.has_value() || pending->document_id != document_id
+            || pending->document_generation != m_document_generation)
+            return;
+        auto request = m_pending_permission_requests.take(request_id).release_value();
+        request.on_decided(granted);
+    }
+
+private:
+    void invalidate_pending_permission_requests()
+    {
+        auto pending = move(m_pending_permission_requests);
+        m_pending_permission_requests.clear();
+        for (auto& entry : pending) {
+            if (m_callbacks.permission_cancelled)
+                m_callbacks.permission_cancelled(entry.key, entry.value.document_id);
+            entry.value.on_decided(false);
+        }
+    }
+
     // Open links in a Photon tab rather than a hidden headless view.
     virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) override { return nullptr; }
 
     Photon::ViewCallbacks m_callbacks;
+    struct PendingPermission {
+        uint64_t renderer_request_id { 0 };
+        std::string document_id;
+        uint64_t document_generation { 0 };
+        Function<void(bool)> on_decided;
+    };
+    HashMap<uint64_t, PendingPermission> m_pending_permission_requests;
+    uint64_t m_next_permission_request_id { 1 };
     RefPtr<Core::Timer> m_hidden_gc_timer;
     bool m_navigation_timing_waiting_for_first_frame { false };
     std::shared_ptr<CpuFallbackFramePool> m_cpu_fallback_frame_pool;
@@ -1198,6 +1284,12 @@ bool View::Impl::has_completed_document_load() const
 uint64_t View::Impl::document_generation() const
 {
     return view ? view->document_generation() : 0;
+}
+
+void View::Impl::permission_request_completed(uint64_t request_id, std::string const& document_id, bool granted)
+{
+    if (view)
+        view->permission_request_completed(request_id, document_id, granted);
 }
 
 void View::Impl::run_javascript(String script)
@@ -1727,6 +1819,12 @@ void View::file_picker_closed(std::vector<std::string> const& paths)
 {
     VERIFY(m_impl && m_impl->view);
     m_impl->view->choose_files(paths);
+}
+
+void View::permission_request_completed(uint64_t request_id, std::string const& document_id, bool granted)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->permission_request_completed(request_id, document_id, granted);
 }
 
 void View::find_in_page_end()

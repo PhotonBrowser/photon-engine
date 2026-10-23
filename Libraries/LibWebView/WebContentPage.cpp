@@ -38,6 +38,8 @@
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
 #include <cstdlib>
+#include <atomic>
+#include <memory>
 #include <LibWebView/WebContentTestClient.h>
 #include <LibWebView/WebUI.h>
 #include <LibWebView/WorkerProcessManager.h>
@@ -642,6 +644,13 @@ void WebContentPage::fail_renderer_owned_downloads()
 
 void WebContentPage::close()
 {
+    Vector<Web::HTML::EnvironmentId> pending_documents;
+    for (auto const& entry : m_pending_permission_requests) {
+        if (!pending_documents.contains_slow(entry.value))
+            pending_documents.append(entry.value);
+    }
+    for (auto const& document_id : pending_documents)
+        cancel_permission_requests_for_document(document_id);
     PictureInPictureManager::the().close_window(*this);
     m_is_open = false;
     m_needs_beforeunload_check = true;
@@ -782,8 +791,15 @@ void WebContentPage::did_completely_finish_loading(Web::HTML::CrossProcessId nav
 
 void WebContentPage::did_create_populated_document_with_an_origin_of_its_own(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id, Web::HTML::PopulatedDocumentOrigin origin, Web::HTML::EnvironmentId environment_id)
 {
-    if (auto navigable = traversable().find(navigable_id); navigable.has_value())
+    if (auto navigable = traversable().find(navigable_id); navigable.has_value()) {
+        auto const& old_document = navigable->active_document();
+        auto const& old_environment = old_document.relevant_global_object().relevant_settings_object().id();
+        if (old_environment != environment_id) {
+            if (auto host = old_document.host())
+                host->cancel_permission_requests_for_document(old_environment);
+        }
         navigable->did_create_populated_document_with_an_origin_of_its_own(*this, document_id, origin, environment_id);
+    }
 }
 
 void WebContentPage::did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId container_document_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState hosted_state, Web::HTML::PendingSessionHistoryEntryDescriptor initial_history_entry, URL::Origin origin, Web::HTML::EnvironmentId environment_id, Web::HTML::CrossProcessId document_id)
@@ -1507,30 +1523,52 @@ void WebContentPage::did_request_geolocation_position(u64 request_id)
         view().on_request_geolocation_position(*this, request_id);
 }
 
-void WebContentPage::did_request_permission(u64 request_id, Utf16String name)
+void WebContentPage::did_request_permission(u64 request_id, Utf16String name, URL::Origin requesting_origin, URL::Origin top_level_origin, Web::HTML::EnvironmentId document_id)
 {
     if (name != "microphone"_utf16) {
-        client().did_misbehave("did_request_permission"sv, "unknown permission name"sv);
+        async_permission_request_completed(request_id, document_id, false);
         return;
     }
 
-    if (!view().on_request_permission) {
-        async_permission_request_completed(request_id, false);
+    auto hosted_settings = hosted_environment(document_id);
+    auto hosted_document = document_with_hosted_environment(document_id);
+    if (!hosted_settings.has_value() || !hosted_document.has_value()
+        || hosted_document->unload_counter() != 0
+        || hosted_document->relevant_global_object().associated_document().id() != hosted_document->id()
+        || !hosted_settings->origin().is_same_origin(requesting_origin)
+        || !hosted_settings->top_level_origin().has_value()
+        || !hosted_settings->top_level_origin()->is_same_origin(top_level_origin)
+        || !view().on_request_permission) {
+        async_permission_request_completed(request_id, document_id, false);
         return;
     }
 
-    auto url = view().url();
-    view().on_request_permission(name, url.origin(), [page = NonnullRefPtr(*this), request_id, name, url](bool granted) {
+    m_pending_permission_requests.set(request_id, document_id);
+    auto decision_consumed = std::make_shared<std::atomic_bool>(false);
+    view().on_request_permission(request_id, name, requesting_origin, top_level_origin, document_id, [page = NonnullRefPtr(*this), decision_consumed, request_id, name, requesting_origin, top_level_origin, document_id](bool granted) {
+        if (decision_consumed->exchange(true, std::memory_order_acq_rel))
+            return;
+        if (!page->m_pending_permission_requests.take(request_id).has_value())
+            return;
         if (!page->is_open())
             return;
+        auto current_settings = page->hosted_environment(document_id);
+        auto current_document = page->document_with_hosted_environment(document_id);
+        if (!current_settings.has_value() || !current_document.has_value()
+            || current_document->unload_counter() != 0
+            || current_document->relevant_global_object().associated_document().id() != current_document->id()
+            || !current_settings->origin().is_same_origin(requesting_origin)
+            || !current_settings->top_level_origin().has_value()
+            || !current_settings->top_level_origin()->is_same_origin(top_level_origin))
+            granted = false;
         // The AudioServer hears of the permission before the page does, so the page's first request finds it in place.
         if (granted && name == "microphone"_utf16) {
-            if (auto result = page->client().grant_audio_capture(url); result.is_error()) {
+            if (auto result = page->client().grant_audio_capture(requesting_origin); result.is_error()) {
                 warnln("Unable to grant audio capture: {}", result.error());
                 granted = false;
             }
         }
-        page->async_permission_request_completed(request_id, granted);
+        page->async_permission_request_completed(request_id, document_id, granted);
     });
 }
 
@@ -2211,7 +2249,31 @@ void WebContentPage::did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)
     auto child_frame = traversable().find(frame_id);
     if (!child_frame.has_value() || !holds_container_of(*child_frame, "did_destroy_child_frame"sv))
         return;
+    auto cancel_document_tree = [&](auto&& self, CanonicalNavigable& navigable) -> void {
+        auto const& document = navigable.active_document();
+        auto const& environment_id = document.relevant_global_object().relevant_settings_object().id();
+        if (auto host = document.host())
+            host->cancel_permission_requests_for_document(environment_id);
+        for (auto& descendant : navigable.children())
+            self(self, *descendant);
+    };
+    cancel_document_tree(cancel_document_tree, *child_frame);
     traversable().remove(*child_frame);
+}
+
+void WebContentPage::cancel_permission_requests_for_document(Web::HTML::EnvironmentId const& document_id)
+{
+    Vector<u64> request_ids;
+    for (auto const& entry : m_pending_permission_requests) {
+        if (entry.value == document_id)
+            request_ids.append(entry.key);
+    }
+    for (auto request_id : request_ids) {
+        if (view().on_cancel_permission_request)
+            view().on_cancel_permission_request(request_id, document_id);
+        if (m_pending_permission_requests.take(request_id).has_value())
+            async_permission_request_completed(request_id, document_id, false);
+    }
 }
 
 Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentPage::did_start_download_without_request(URL::URL url, ByteString suggested_filename, Optional<u64> total_size)

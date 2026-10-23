@@ -158,6 +158,7 @@ public:
     // The user let the page at the URL capture audio. The process's AudioServer hears of the permission before this
     // returns, so a page told afterwards finds it in place.
     ErrorOr<void> grant_audio_capture(URL::URL const&);
+    ErrorOr<void> grant_audio_capture(URL::Origin const&);
     // The permission follows the origins the process's open pages show, so it goes with a navigation away.
     void update_audio_capture_permission();
     void replay_compositor_view_state_after_reconnect(Badge<Application>);

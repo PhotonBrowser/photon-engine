@@ -23,6 +23,7 @@ struct View::Impl {
     bool has_completed_document_load() const;
     uint64_t document_generation() const;
     void run_javascript(String);
+    void permission_request_completed(uint64_t, std::string const&, bool);
 
     OwnPtr<WebView::PhotonHeadlessWebView> view;
     int last_viewport_width { 0 };

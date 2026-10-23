@@ -48,6 +48,7 @@
 #include <LibWebCommon/HTML/ColorPickerUpdateState.h>
 #include <LibWebCommon/HTML/FileFilter.h>
 #include <LibWebCommon/HTML/HistoryOperation.h>
+#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
 #include <LibWebCommon/HTML/SelectItem.h>
@@ -552,7 +553,8 @@ public:
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_cancel_geolocation_position_request;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_start_geolocation_position_watch;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_stop_geolocation_position_watch;
-    Function<void(Utf16String const& name, URL::Origin const&, Function<void(bool granted)> on_decided)> on_request_permission;
+    Function<void(u64 request_id, Utf16String const& name, URL::Origin const& requesting_origin, URL::Origin const& top_level_origin, Web::HTML::EnvironmentId const& document_id, Function<void(bool granted)> on_decided)> on_request_permission;
+    Function<void(u64 request_id, Web::HTML::EnvironmentId const& document_id)> on_cancel_permission_request;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;
     Function<void(Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)> on_request_select_dropdown;
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
