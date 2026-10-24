@@ -11,17 +11,9 @@
 #include <AK/TypeCasts.h>
 #include <AK/Utf16String.h>
 #include <LibGfx/Font/Font.h>
-#include <LibGfx/Font/TypefaceSkia.h>
+#include <LibGfx/Font/FontTable.h>
 #include <LibGfx/TextLayout.h>
 #include <RustFFI.h>
-
-#if defined(USE_FONTCONFIG)
-#    include <LibGfx/Font/GlobalFontConfig.h>
-#endif
-
-#include <core/SkFont.h>
-#include <core/SkFontMetrics.h>
-#include <core/SkFontTypes.h>
 
 #include <harfbuzz/hb-ot.h>
 #include <harfbuzz/hb.h>
@@ -31,6 +23,7 @@ void ladybird_gfx_font_snapshot(void const*, Gfx::FFI::FfiFontSnapshot*);
 u32 ladybird_gfx_font_glyph_id(void const*, u32);
 bool ladybird_gfx_font_contains_glyph(void const*, u32);
 bool ladybird_gfx_font_is_emoji_font(void const*);
+bool ladybird_gfx_font_is_invisible(void const*);
 void ladybird_gfx_font_ref(void const*);
 void ladybird_gfx_font_unref(void const*);
 }
@@ -48,38 +41,80 @@ Font::Font(NonnullRefPtr<Typeface const> typeface, float point_width, float poin
     , m_shape_features(features)
 {
     m_pixel_size = m_point_height * (DEFAULT_DPI / POINTS_PER_INCH);
+    m_style = m_typeface->style_for_variations(m_font_variation_settings.to_sorted_list());
+    m_harfbuzz_font = create_harfbuzz_font();
+    m_pixel_metrics = compute_pixel_metrics();
+}
 
-    auto const* sk_typeface = as<TypefaceSkia>(*m_typeface).sk_typeface();
-    SkFont const font { sk_ref_sp(sk_typeface), m_pixel_size };
-
-    SkFontMetrics skMetrics;
-    font.getMetrics(&skMetrics);
+FontPixelMetrics Font::compute_pixel_metrics() const
+{
+    auto const& vertical_metrics = m_typeface->description().vertical_metrics();
+    auto units_per_em = static_cast<float>(m_typeface->units_per_em());
+    auto font_units_to_pixels = [&](float units) {
+        return units / units_per_em * m_pixel_size;
+    };
 
     FontPixelMetrics metrics;
-    metrics.x_height = skMetrics.fXHeight;
-    metrics.advance_of_ascii_zero = font.measureText("0", 1, SkTextEncoding::kUTF8);
-    metrics.ascent = -skMetrics.fAscent;
-    metrics.descent = skMetrics.fDescent;
+    metrics.ascent = font_units_to_pixels(vertical_metrics.ascender + hb_ot_metrics_get_variation(m_harfbuzz_font, HB_OT_METRICS_TAG_HORIZONTAL_ASCENDER));
+    metrics.descent = -font_units_to_pixels(vertical_metrics.descender + hb_ot_metrics_get_variation(m_harfbuzz_font, HB_OT_METRICS_TAG_HORIZONTAL_DESCENDER));
 
-    m_pixel_metrics = metrics;
+    // https://drafts.csswg.org/css-values-4/#ex
+    // In the cases where it is impossible or impractical to determine the x-height, a value of 0.5em must be assumed.
+    metrics.x_height = m_pixel_size / 2;
+    int x_scale = 0;
+    int y_scale = 0;
+    hb_font_get_scale(m_harfbuzz_font, &x_scale, &y_scale);
+    hb_codepoint_t glyph_id = 0;
+    hb_glyph_extents_t extents {};
+    if (vertical_metrics.x_height != 0) {
+        metrics.x_height = font_units_to_pixels(vertical_metrics.x_height + hb_ot_metrics_get_variation(m_harfbuzz_font, HB_OT_METRICS_TAG_X_HEIGHT));
+    } else if (y_scale > 0 && hb_font_get_nominal_glyph(m_harfbuzz_font, 'x', &glyph_id) && hb_font_get_glyph_extents(m_harfbuzz_font, glyph_id, &extents) && extents.y_bearing > 0) {
+        metrics.x_height = static_cast<float>(extents.y_bearing) * m_pixel_size / static_cast<float>(y_scale);
+    }
+
+    // https://drafts.csswg.org/css-values-4/#ch
+    // The advance of the glyph that shaping uses for "0". In the cases where it is impossible or impractical to
+    // determine the measure of the "0" glyph, it must be assumed to be 0.5em wide.
+    metrics.advance_of_ascii_zero = m_pixel_size / 2;
+    if (hb_font_get_nominal_glyph(m_harfbuzz_font, '0', &glyph_id))
+        metrics.advance_of_ascii_zero = static_cast<float>(hb_font_get_glyph_h_advance(m_harfbuzz_font, glyph_id)) / text_shaping_resolution;
+
+    return metrics;
+}
+
+float Font::cap_height() const
+{
+    // https://drafts.csswg.org/css-values-4/#cap
+    // In the cases where it is impossible or impractical to determine the cap-height, the font’s ascent must be used.
+    hb_position_t cap_height = 0;
+    if (hb_ot_metrics_get_position(m_harfbuzz_font, HB_OT_METRICS_TAG_CAP_HEIGHT, &cap_height) && cap_height > 0)
+        return static_cast<float>(cap_height) / text_shaping_resolution;
+    return m_pixel_metrics.ascent;
+}
+
+Optional<float> Font::horizontal_advance_of_code_point(u32 code_point) const
+{
+    hb_codepoint_t glyph_id = 0;
+    if (!hb_font_get_nominal_glyph(m_harfbuzz_font, code_point, &glyph_id))
+        return {};
+    return static_cast<float>(hb_font_get_glyph_h_advance(m_harfbuzz_font, glyph_id)) / text_shaping_resolution;
+}
+
+Optional<float> Font::vertical_advance_of_code_point(u32 code_point) const
+{
+    hb_codepoint_t glyph_id = 0;
+    if (!hb_font_get_nominal_glyph(m_harfbuzz_font, code_point, &glyph_id))
+        return {};
+    // NB: HarfBuzz measures vertical advances downwards as negative.
+    auto advance = hb_font_get_glyph_v_advance(m_harfbuzz_font, glyph_id);
+    return static_cast<float>(advance < 0 ? -advance : advance) / text_shaping_resolution;
 }
 
 float Font::width(Utf16View const& view) const { return measure_text_width(view, *this); }
 
 NonnullRefPtr<Font> Font::invisible_variant() const
 {
-    auto font = adopt_ref(*new Font(m_typeface, m_point_width, m_point_height, m_font_variation_settings, m_shape_features));
-    font->m_is_invisible = true;
-    return font;
-}
-
-NonnullRefPtr<Font> Font::with_size(float point_size) const
-{
-    if (point_size == m_point_height && point_size == m_point_width)
-        return *const_cast<Font*>(this);
-
-    // FIXME: Should we be discarding m_font_variation_settings and m_shape_features here?
-    return m_typeface->font(point_size);
+    return m_typeface->invisible_font(m_point_height, m_font_variation_settings, m_shape_features);
 }
 
 float Font::pixel_size() const
@@ -90,6 +125,11 @@ float Font::pixel_size() const
 float Font::point_size() const
 {
     return m_point_height;
+}
+
+void Font::will_be_destroyed() const
+{
+    m_typeface->forget_font(*this);
 }
 
 Font::~Font()
@@ -110,111 +150,27 @@ static int scale_for_harfbuzz(float pixel_size)
     return static_cast<int>(scaled_pixel_size);
 }
 
-hb_font_t* Font::harfbuzz_font() const
+hb_font_t* Font::create_harfbuzz_font() const
 {
-    call_once(m_harfbuzz_font_once, [&] {
-        m_harfbuzz_font = hb_font_create(typeface().harfbuzz_typeface());
-        auto harfbuzz_scale = scale_for_harfbuzz(pixel_size());
-        hb_font_set_scale(m_harfbuzz_font, harfbuzz_scale, harfbuzz_scale);
-        // HarfBuzz uses ptem for AAT 'trak' table lookup; use CSS pixels instead of physical points here.
-        hb_font_set_ptem(m_harfbuzz_font, pixel_size());
+    auto* font = hb_font_create(typeface().harfbuzz_typeface());
+    auto harfbuzz_scale = scale_for_harfbuzz(pixel_size());
+    hb_font_set_scale(font, harfbuzz_scale, harfbuzz_scale);
+    // HarfBuzz uses ptem for AAT 'trak' table lookup; use CSS pixels instead of physical points here.
+    hb_font_set_ptem(font, pixel_size());
 
-        auto variations = m_font_variation_settings.axes;
-        if (!variations.is_empty()) {
-            Vector<hb_variation_t> hb_list;
-            hb_list.ensure_capacity(variations.size());
+    auto variations = m_font_variation_settings.axes;
+    if (!variations.is_empty()) {
+        Vector<hb_variation_t> hb_list;
+        hb_list.ensure_capacity(variations.size());
 
-            for (auto const& axis : variations) {
-                hb_list.unchecked_append(hb_variation_t { axis.key.to_u32(), axis.value });
-            }
-
-            hb_font_set_variations(m_harfbuzz_font, hb_list.data(), hb_list.size());
+        for (auto const& axis : variations) {
+            hb_list.unchecked_append(hb_variation_t { axis.key.to_u32(), axis.value });
         }
-        hb_font_make_immutable(m_harfbuzz_font);
-    });
-    return m_harfbuzz_font;
-}
 
-#if defined(USE_FONTCONFIG)
-static Optional<FontHintingStyle> s_hinting_override_for_testing;
-
-static SkFontHinting to_skia_hinting(FontHintingStyle style)
-{
-    switch (style) {
-    case FontHintingStyle::None:
-        return SkFontHinting::kNone;
-    case FontHintingStyle::Slight:
-        return SkFontHinting::kSlight;
-    case FontHintingStyle::Normal:
-        return SkFontHinting::kNormal;
-    case FontHintingStyle::Full:
-        return SkFontHinting::kFull;
+        hb_font_set_variations(font, hb_list.data(), hb_list.size());
     }
-    VERIFY_NOT_REACHED();
-}
-#endif
-
-void force_hinting_for_testing([[maybe_unused]] Optional<FontHintingStyle> style)
-{
-#if defined(USE_FONTCONFIG)
-    s_hinting_override_for_testing = style;
-#endif
-}
-
-#if defined(USE_FONTCONFIG)
-// The scale's bits sit above, bit 0 says the word holds an answer, bits 1 and 2 carry the style
-// and bit 3 the autohinting flag.
-static constexpr u64 hinting_memo_holds_answer = 1;
-
-static u64 encode_hinting_memo(float scale, FontHintingOptions options)
-{
-    return (static_cast<u64>(bit_cast<u32>(scale)) << 32)
-        | hinting_memo_holds_answer
-        | (static_cast<u64>(to_underlying(options.style)) << 1)
-        | (static_cast<u64>(options.force_autohinting) << 3);
-}
-
-FontHintingOptions Font::hinting_options(float scale) const
-{
-    auto memo = m_hinting_memo.load(AK::MemoryOrder::memory_order_relaxed);
-    if ((memo & hinting_memo_holds_answer) != 0 && bit_cast<float>(static_cast<u32>(memo >> 32)) == scale) {
-        return FontHintingOptions {
-            .style = static_cast<FontHintingStyle>((memo >> 1) & 3),
-            .force_autohinting = ((memo >> 3) & 1) != 0,
-        };
-    }
-
-    auto options = GlobalFontConfig::the().hinting_for_font(family(), pixel_size() * scale, weight(), slope());
-    m_hinting_memo.store(encode_hinting_memo(scale, options), AK::MemoryOrder::memory_order_relaxed);
-    return options;
-}
-#endif
-
-SkFont Font::skia_font(float scale) const
-{
-    auto const& sk_typeface = as<TypefaceSkia>(*m_typeface).sk_typeface();
-    auto sk_font = SkFont { sk_ref_sp(sk_typeface), pixel_size() * scale };
-    sk_font.setSubpixel(true);
-
-#if defined(USE_FONTCONFIG)
-    if (s_hinting_override_for_testing.has_value()) {
-        sk_font.setHinting(to_skia_hinting(*s_hinting_override_for_testing));
-    } else {
-        auto options = hinting_options(scale);
-        sk_font.setHinting(to_skia_hinting(options.style));
-        sk_font.setForceAutoHinting(options.force_autohinting);
-    }
-#endif
-
-    return sk_font;
-}
-
-static bool hb_face_has_table(hb_face_t* face, hb_tag_t tag)
-{
-    hb_blob_t* blob = hb_face_reference_table(face, tag);
-    unsigned len = hb_blob_get_length(blob);
-    hb_blob_destroy(blob);
-    return len > 0;
+    hb_font_make_immutable(font);
+    return font;
 }
 
 bool Font::is_emoji_font() const
@@ -235,9 +191,9 @@ bool Font::is_emoji_font() const
         bool has_colr = hb_ot_color_has_layers(face) || hb_ot_color_has_paint(face);
         bool has_svg = hb_ot_color_has_svg(face);
 
-        bool has_sbix = hb_face_has_table(face, HB_TAG('s', 'b', 'i', 'x'));
-        bool has_cbdt = hb_face_has_table(face, HB_TAG('C', 'B', 'D', 'T'));
-        bool has_cblc = hb_face_has_table(face, HB_TAG('C', 'B', 'L', 'C'));
+        bool has_sbix = face_has_table(face, FourCC { "sbix" });
+        bool has_cbdt = face_has_table(face, FourCC { "CBDT" });
+        bool has_cblc = face_has_table(face, FourCC { "CBLC" });
         bool has_any_color = has_colr || has_svg || has_sbix || (has_cbdt && has_cblc);
 
         auto looks_like_text = [&]() {
@@ -291,6 +247,12 @@ extern "C" bool ladybird_gfx_font_is_emoji_font(void const* font)
 {
     VERIFY(font);
     return static_cast<Gfx::Font const*>(font)->is_emoji_font();
+}
+
+extern "C" bool ladybird_gfx_font_is_invisible(void const* font)
+{
+    VERIFY(font);
+    return static_cast<Gfx::Font const*>(font)->is_invisible();
 }
 
 extern "C" void ladybird_gfx_font_ref(void const* font)

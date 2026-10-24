@@ -28,6 +28,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
+#include <LibWeb/Forward.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestPriority.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestReferrer.h>
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
@@ -308,8 +309,8 @@ public:
     [[nodiscard]] bool destination_is_script_like() const;
 
     [[nodiscard]] bool is_subresource_request() const;
-    [[nodiscard]] bool is_non_subresource_request() const;
     [[nodiscard]] bool is_navigation_request() const;
+    [[nodiscard]] GC::Ptr<HTML::BrowsingContext> target_browsing_context() const;
 
     [[nodiscard]] RedirectTaint redirect_taint() const;
 

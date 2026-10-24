@@ -28,8 +28,12 @@ namespace Web::UIEvents {
 
 class PointerEvent;
 
+// https://w3c.github.io/pointerevents/#dom-pointerevent-pointerid
+// The mouse is the one pointer there is, and this is its id in every pointer event of it.
+constexpr WebIDL::Long mouse_pointer_id = 0;
+
 struct PointerEventOptions : public MouseEventOptions {
-    WebIDL::Long pointer_id { 0 };
+    WebIDL::Long pointer_id { mouse_pointer_id };
     double width { 1 };
     double height { 1 };
     float pressure { 0 };
@@ -42,8 +46,8 @@ struct PointerEventOptions : public MouseEventOptions {
     Utf16FlyString pointer_type {};
     bool is_primary { false };
     WebIDL::Long persistent_device_id { 0 };
-    Vector<GC::Ref<PointerEvent>> coalesced_events;
-    Vector<GC::Ref<PointerEvent>> predicted_events;
+    GC::RootVector<GC::Ref<PointerEvent>> coalesced_events;
+    GC::RootVector<GC::Ref<PointerEvent>> predicted_events;
 };
 
 // https://w3c.github.io/pointerevents/#pointerevent-interface

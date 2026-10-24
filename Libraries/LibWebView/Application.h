@@ -65,10 +65,6 @@
 #    include <LibIPC/TransportBootstrapMach.h>
 #endif
 
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-#    include <LibWasmCompilerClient/Client.h>
-#endif
-
 namespace Compositing {
 
 struct KeyEvent;
@@ -124,9 +120,6 @@ public:
     static ErrorOr<NonnullRefPtr<Requests::RequestClient>> request_server_client(IsPrivate = IsPrivate::No);
     // The control connection of the default session's RequestServer with no site.
     static Requests::RequestControlClient& request_server_control_client();
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    static WasmCompilerClient::Client& wasm_compiler_client() { return *the().m_wasm_compiler_client; }
-#endif
 
     virtual bool supports_system_menu_bar() const { return false; }
     virtual bool supports_vertical_tabs() const { return false; }
@@ -134,6 +127,11 @@ public:
     virtual bool supports_private_browsing_windows() const { return false; }
     virtual bool supports_client_side_window_decorations() const { return false; }
     virtual bool supports_picture_in_picture() const;
+
+    // What startup recovery does with the windows the last run left open. Only a frontend that shows the launch plan
+    // asks for more than None.
+    virtual SessionLaunchPolicy launch_restore_policy() const;
+
     // Returns true if the platform sends momentum scroll events after a touchpad flick.
     // If it does not, the compositor makes the fling.
     virtual bool platform_reports_scroll_momentum() const { return true; }
@@ -142,6 +140,10 @@ public:
     virtual bool platform_scrolls_elastically() const { return false; }
     void set_scrolls_elastically(bool);
 
+    // Returns true if a press on a scrollbar track beside the thumb jumps to that spot, rather than paging toward it.
+    virtual bool platform_scrollbar_track_press_jumps() const { return false; }
+    // Tells the compositor of a change to what platform_scrollbar_track_press_jumps() returns.
+    void platform_scrollbar_track_press_behavior_changed();
     // The languages the user prefers, as the platform lists them (BCP 47 tags, most preferred first).
     virtual Vector<String> platform_preferred_languages() const { return {}; }
 
@@ -217,8 +219,8 @@ public:
     static IPC::HandleBrokerServer& handle_broker_server() { return *the().m_handle_broker_server; }
 #endif
 
-    // Runs the handler when the ImageDecoder with the given pid exits.
-    void set_image_decoder_exit_handler(pid_t, Function<void()>);
+    // Runs the handler when the ImageDecoder with the given child ID exits.
+    void set_image_decoder_exit_handler(u64 child_id, Function<void()>);
 #if defined(AK_OS_MACOS)
     static IPC::TransportBootstrapMachServer& transport_bootstrap_server() { return the().m_transport_bootstrap_server; }
     void set_browser_process_transport_handler(Function<void(NonnullOwnPtr<IPC::Transport>)> handler);
@@ -265,8 +267,7 @@ public:
     void update_compositor_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays const&);
     void update_compositor_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void update_compositor_context_visibility(Web::CompositorContextId, Web::HTML::VisibilityState);
-    bool handle_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&);
-    bool dispatch_key_event_to_web_content(Web::CompositorContextId, Web::KeyEvent const&);
+    bool handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&, bool allow_keyboard_scroll);
     void handle_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
     bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
     void notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
@@ -298,7 +299,7 @@ public:
 
     Main::Arguments const& command_line_arguments() const { return m_arguments; }
 
-    void add_child_process(Process&&);
+    ChildIdentity add_child_process(Process&&);
 
     // FIXME: Should these methods be part of Application, instead of deferring to ProcessManager?
 #if defined(AK_OS_MACH)
@@ -466,9 +467,6 @@ private:
     void crash_compositor_process();
     void offer_crash_report(ByteString const& report_name);
     ErrorOr<void> launch_request_server();
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    ErrorOr<void> launch_wasm_compiler_server();
-#endif
     ErrorOr<void> launch_devtools_server();
     // Returns whether the combined rules changed.
     ErrorOr<bool> load_content_blocker_lists();
@@ -499,7 +497,7 @@ private:
     };
     void create_bookmark_menu_items(Optional<MenuData> = {});
 
-    Vector<BookmarkItem::Bookmark> bookmarks_for_all_tabs_in_current_window() const;
+    virtual Vector<BookmarkItem::Bookmark> bookmarks_for_all_tabs_in_current_window() const;
 
     virtual Vector<DevTools::TabDescription> tab_list() const override;
     virtual Vector<DevTools::CSSProperty> css_property_list() const override;
@@ -607,6 +605,7 @@ private:
     OwnPtr<Core::File> m_cpu_profiler_control_socket;
     bool m_cpu_profiler_claimed { false };
     Vector<int> m_cpu_profiler_signal_handlers;
+    Vector<int> m_session_signal_handlers;
     RequestServerOptions m_request_server_options;
     WebContentOptions m_web_content_options;
     RefPtr<FontService> m_font_service;
@@ -637,12 +636,11 @@ private:
     WebDriverSessionConfig m_webdriver_session_config;
 
     OwnPtr<RequestServerManager> m_request_server_manager;
-    HashMap<pid_t, Function<void()>> m_image_decoder_exit_handlers;
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    RefPtr<WasmCompilerClient::Client> m_wasm_compiler_client;
-#endif
+    HashMap<u64, Function<void()>> m_image_decoder_exit_handlers;
     RefPtr<CompositorClient> m_compositor_client;
     Optional<bool> m_scrolls_elastically_override;
+    RefPtr<CompositorPresentationClient> m_compositor_presentation_client;
+    u64 m_compositor_presentation_id { 0 };
     bool m_reported_compositor_gpu_presentation_unavailable { false };
     bool m_compositor_metal_presentation_enabled { false };
     // The last identity a Compositor reported, which outlives that Compositor until its replacement reports.

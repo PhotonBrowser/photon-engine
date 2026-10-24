@@ -9,13 +9,15 @@ set(SOURCES
     Animations/TimeValue.cpp
     Animations/DocumentTimeline.cpp
     Animations/KeyframeEffect.cpp
+    Animations/NamedTimelines.cpp
     Animations/PseudoElementParsing.cpp
     Animations/ScrollTimeline.cpp
+    Animations/TimelineRange.cpp
+    Animations/ViewTimeline.cpp
     ARIA/AriaData.cpp
     ARIA/ARIAMixin.cpp
     ARIA/AttributeNames.cpp
     ARIA/Roles.cpp
-    ARIA/RoleType.cpp
     ARIA/StateAndProperties.cpp
     Bindings/AudioConstructor.cpp
     Bindings/HostDefined.cpp
@@ -36,8 +38,6 @@ set(SOURCES
     Compositor/CompositorHost.cpp
     Compositor/NavigablePresenter.cpp
     Compositor/RenderClock.cpp
-    Compression/CompressionStream.cpp
-    Compression/DecompressionStream.cpp
     ContentSecurityPolicy/BlockingAlgorithms.cpp
     ContentSecurityPolicy/Directives/BaseUriDirective.cpp
     ContentSecurityPolicy/Directives/ChildSourceDirective.cpp
@@ -135,6 +135,8 @@ set(SOURCES
     CSS/CSSPageRule.cpp
     CSS/CSSPageDescriptors.cpp
     CSS/CSSPerspective.cpp
+    CSS/CSSPositionTryDescriptors.cpp
+    CSS/CSSPositionTryRule.cpp
     CSS/CSSPropertyRule.cpp
     CSS/CSSRotate.cpp
     CSS/CSSRule.cpp
@@ -325,9 +327,7 @@ set(SOURCES
     DOM/Utils.cpp
     DOM/XMLDocument.cpp
     DOMURL/DOMURL.cpp
-    DOMURL/Origin.cpp
     DOMURL/URLSearchParams.cpp
-    DOMURL/URLSearchParamsIterator.cpp
     Dump.cpp
     Editing/CommandNames.cpp
     Editing/Commands.cpp
@@ -357,16 +357,14 @@ set(SOURCES
     Editing/StyledMarkupSerializer.cpp
     Editing/VisiblePosition.cpp
     Editing/ReplaceSelection.cpp
-    Encoding/TextDecoderCommon.cpp
-    Encoding/TextDecoderStream.cpp
-    Encoding/TextEncoderCommon.cpp
-    Encoding/TextEncoderStream.cpp
     EncryptedMediaExtensions/Algorithms.cpp
     EncryptedMediaExtensions/MediaKeySystemAccess.cpp
     EntriesAPI/FileSystemEntry.cpp
     EventTiming/PerformanceEventTiming.cpp
     Fetch/Body.cpp
     Fetch/BodyInit.cpp
+    Fetch/Engine/FetchExecutor.cpp
+    Fetch/Engine/InlineFetchExecutor.cpp
     Fetch/Fetching/Checks.cpp
     Fetch/Fetching/FetchedDataReceiver.cpp
     Fetch/Fetching/Fetching.cpp
@@ -393,7 +391,6 @@ set(SOURCES
     Fetch/Infrastructure/PortBlocking.cpp
     Fetch/Infrastructure/PreflightCache.cpp
     Fetch/Infrastructure/Task.cpp
-    Fetch/Infrastructure/URL.cpp
     Fetch/Request.cpp
     Fetch/Response.cpp
     FileAPI/Blob.cpp
@@ -419,7 +416,6 @@ set(SOURCES
     Geometry/DOMMatrixReadOnly.cpp
     Geometry/DOMPoint.cpp
     Geometry/DOMPointReadOnly.cpp
-    Geometry/DOMQuad.cpp
     Geometry/DOMRect.cpp
     Geometry/DOMRectList.cpp
     Geometry/DOMRectReadOnly.cpp
@@ -439,18 +435,11 @@ set(SOURCES
     HTML/BeforeUnloadEvent.cpp
     HTML/BroadcastChannel.cpp
     HTML/BrowsingContext.cpp
-    HTML/Canvas/AbstractCanvasMixin.cpp
     HTML/Canvas/Canvas2DContextBase.cpp
     HTML/Canvas/CanvasHost.cpp
     HTML/Canvas/CanvasDrawImage.cpp
-    HTML/Canvas/CanvasFillStrokeStyles.cpp
-    HTML/Canvas/CanvasPath.cpp
-    HTML/Canvas/CanvasState.cpp
-    HTML/Canvas/CanvasTextDrawingStyles.cpp
-    HTML/Canvas/DrawingState.cpp
+    HTML/Canvas/RemoteCanvas2DTransportFFI.cpp
     HTML/Canvas/SerializeBitmap.cpp
-    HTML/CanvasGradient.cpp
-    HTML/CanvasPattern.cpp
     HTML/CanvasRenderingContext2D.cpp
     HTML/CheckUnloadingCanceledState.cpp
     HTML/CloseEvent.cpp
@@ -625,7 +614,6 @@ set(SOURCES
     HTML/Parser/HTMLTokenizer.cpp
     HTML/Parser/IncrementalDocumentParser.cpp
     HTML/Parser/SpeculativeHTMLParser.cpp
-    HTML/Path2D.cpp
     HTML/Plugin.cpp
     HTML/PluginArray.cpp
     HTML/PolicyContainers.cpp
@@ -676,7 +664,6 @@ set(SOURCES
     HTML/TagNames.cpp
     HTML/TextDirective.cpp
     HTML/TextDirectiveGenerator.cpp
-    HTML/TextMetrics.cpp
     HTML/TextTrack.cpp
     HTML/TextTrackCue.cpp
     HTML/TextTrackCueList.cpp
@@ -691,6 +678,7 @@ set(SOURCES
     HTML/UserNavigationInvolvement.cpp
     HTML/UniversalGlobalScope.cpp
     HTML/ValidityState.cpp
+    HTML/VideoPlaybackQuality.cpp
     HTML/VideoTrack.cpp
     HTML/VideoTrackList.cpp
     HTML/WebViewHints.cpp
@@ -773,7 +761,6 @@ set(SOURCES
     MediaSourceExtensions/MediaSourceHandle.cpp
     MediaSourceExtensions/SourceBuffer.cpp
     MediaSourceExtensions/SourceBufferList.cpp
-    MimeSniff/Resource.cpp
     MixedContent/AbstractOperations.cpp
     Namespace.cpp
     NavigationTiming/EntryNames.cpp
@@ -828,10 +815,10 @@ set(SOURCES
     ResizeObserver/ResizeObserverEntry.cpp
     ResizeObserver/ResizeObserverSize.cpp
     ResourceTiming/PerformanceResourceTiming.cpp
-    SecureContexts/AbstractOperations.cpp
     Selection/Selection.cpp
     Selection/CaretNavigation.cpp
     Selection/SelectionModifier.cpp
+    ServerTiming/PerformanceServerTiming.cpp
     ServiceWorker/Cache.cpp
     ServiceWorker/CacheStorage.cpp
     ServiceWorker/EventNames.cpp
@@ -994,11 +981,13 @@ set(SOURCES
     WebLocks/LockManager.cpp
     WebLocks/LockRequest.cpp
     WebLocks/NavigatorLocks.cpp
+    WebAssembly/Exception.cpp
     WebAssembly/Global.cpp
     WebAssembly/Instance.cpp
     WebAssembly/Memory.cpp
     WebAssembly/Module.cpp
     WebAssembly/Table.cpp
+    WebAssembly/Tag.cpp
     WebAssembly/WebAssembly.cpp
     WebAssembly/WebAssemblyModule.cpp
     WebAudio/AnalyserNode.cpp
@@ -1104,15 +1093,6 @@ set(SOURCES
 )
 
 
-invoke_py_generator(
-    "AriaRoles.cpp"
-    generate_libweb_aria_roles.py
-    "${CMAKE_CURRENT_SOURCE_DIR}/ARIA/AriaRoles.json"
-    "ARIA/AriaRoles.h"
-    "ARIA/AriaRoles.cpp"
-    arguments -j "${CMAKE_CURRENT_SOURCE_DIR}/ARIA/AriaRoles.json"
-)
-
 generate_css_implementation()
 
 generate_html_implementation()
@@ -1120,7 +1100,6 @@ generate_html_implementation()
 generate_picture_in_picture_implementation()
 
 set(GENERATED_SOURCES
-    ARIA/AriaRoles.cpp
     CSS/DefaultStyleSheetSource.cpp
     CSS/DescriptorID.cpp
     CSS/Enums.cpp
@@ -1151,7 +1130,7 @@ target_sources(LibWeb PRIVATE $<TARGET_OBJECTS:LibJSObjects>)
 target_compile_definitions(LibWeb PRIVATE LibJS_EXPORTS)
 target_link_libraries(LibWeb PUBLIC LibCompositing LibWebCommon LibJSHeaders)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibWasm LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibWasm LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibXml2::LibXml2)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile

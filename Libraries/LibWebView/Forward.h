@@ -35,6 +35,7 @@ class CanonicalSimilarOriginWindowAgent;
 class CanonicalTraversable;
 class CanonicalWindow;
 class CompositorClient;
+class CompositorPresentationClient;
 class CookieJar;
 class DownloadStore;
 class ExternalURLHandler;
@@ -76,6 +77,8 @@ struct HistoryOperation;
 struct SearchEngine;
 struct WebContentOptions;
 class WebContentPage;
+
+enum class SessionLaunchPolicy : u8;
 
 }
 

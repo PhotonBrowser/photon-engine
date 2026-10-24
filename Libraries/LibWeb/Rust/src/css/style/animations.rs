@@ -50,30 +50,47 @@ impl FfiAppliedAnimationDefinition {
                 timeline_kind: animation.timeline_kind as u8,
                 scroll_scroller: animation.scroll_scroller,
                 scroll_axis: animation.scroll_axis,
+                range_start_name: animation.range_start_name,
+                range_start_px: animation.range_start_px,
+                range_start_percentage: animation.range_start_percentage,
+                range_end_name: animation.range_end_name,
+                range_end_px: animation.range_end_px,
+                range_end_percentage: animation.range_end_percentage,
             },
             keyframe_set: animation.keyframe_set,
             timing_function: animation.timing_function,
+            range_start_calculated: animation.range_start_calculated,
+            range_end_calculated: animation.range_end_calculated,
         }
     }
 
     /// Whether applying `self` to an animation that last had `published` applied would leave it
-    /// exactly as it is. A scroll timeline is rebuilt from the element's surroundings every time it
-    /// is applied, so a definition that names one is never called unchanged, and an animation no
+    /// exactly as it is. A scroll, view or named timeline is found from the element's surroundings
+    /// every time it is applied, so a definition that names one is never called unchanged, and an animation no
     /// plan has described yet publishes a null timing function, which no computed definition has.
-    /// The timing function is compared by value: a recomputed style builds a fresh allocation for
+    /// The timing function and range calculations are compared by value: a recomputed style builds a fresh allocation for
     /// a declaration that has not changed.
     #[must_use]
     fn would_change_nothing(&self, published: &Self) -> bool {
-        self.values.timeline_kind != crate::css::style_compute::FfiAnimationTimelineKind::Scroll as u8
+        use crate::css::style_compute::FfiAnimationTimelineKind;
+        ![
+            FfiAnimationTimelineKind::Scroll as u8,
+            FfiAnimationTimelineKind::View as u8,
+            FfiAnimationTimelineKind::Named as u8,
+        ]
+        .contains(&self.values.timeline_kind)
             && !published.timing_function.is_null()
             && self.values == published.values
             && self.keyframe_set == published.keyframe_set
-            && unsafe {
-                crate::css::style_value::rust_style_value_equals(
-                    self.timing_function.cast(),
-                    published.timing_function.cast(),
-                )
-            }
+            && [
+                (self.timing_function, published.timing_function),
+                (self.range_start_calculated, published.range_start_calculated),
+                (self.range_end_calculated, published.range_end_calculated),
+            ]
+            .into_iter()
+            .all(|(value, published_value)| unsafe {
+                crate::css::style_value::rust_style_value_equals(value.cast(), published_value.cast())
+            })
     }
 }
 
@@ -393,6 +410,14 @@ fn smallest(a: f64, b: f64) -> f64 {
     if b < a { b } else { a }
 }
 
+/// Whether two progress-based timeline times, in percent, are the same but for floating point error.
+fn is_within_progress_tolerance(a: f64, b: f64) -> bool {
+    (a - b).abs() < PROGRESS_TOLERANCE
+}
+
+/// Must match `Animations::progress_timeline_tolerance` in the host.
+const PROGRESS_TOLERANCE: f64 = 1e-6;
+
 /// The timing the host sampled each of an element's effects with, by the effect's identity.
 pub(crate) type SampledEffectTimings = Box<[(u64, EffectTiming)]>;
 
@@ -460,18 +485,26 @@ impl EffectTiming {
             false => unconstrained_time,
         };
 
-        // https://www.w3.org/TR/web-animations-1/#animation-effect-phases-and-states
+        // https://drafts.csswg.org/web-animations-2/#at-timeline-boundary
+        let at_timeline_boundary = timing.has_timeline_boundaries
+            && timeline_time.is_some_and(|time| {
+                is_within_progress_tolerance(time, timing.minimum_timeline_time)
+                    || is_within_progress_tolerance(time, timing.maximum_timeline_time)
+            });
+
+        // https://drafts.csswg.org/web-animations-2/#animation-effect-phases-and-states
         let backwards = timing.playback_rate < 0.0;
         let phase = match local_time {
             None => Phase::Idle,
             Some(local_time) => {
                 let before_active_boundary_time = largest(smallest(timing.start_delay, end_time), 0.0);
                 let after_active_boundary_time = largest(smallest(timing.start_delay + active_duration, end_time), 0.0);
-                if local_time < before_active_boundary_time || (backwards && local_time == before_active_boundary_time)
+                if local_time < before_active_boundary_time
+                    || (backwards && local_time == before_active_boundary_time && !at_timeline_boundary)
                 {
                     Phase::Before
                 } else if local_time > after_active_boundary_time
-                    || (!backwards && local_time == after_active_boundary_time)
+                    || (!backwards && local_time == after_active_boundary_time && !at_timeline_boundary)
                 {
                     Phase::After
                 } else {
@@ -618,9 +651,17 @@ mod tests {
                 timeline_kind: 0,
                 scroll_scroller: 0,
                 scroll_axis: 0,
+                range_start_name: 0,
+                range_start_px: 0.0,
+                range_start_percentage: 0.0,
+                range_end_name: 0,
+                range_end_px: 0.0,
+                range_end_percentage: 0.0,
             },
             keyframe_set: std::ptr::null(),
             timing_function: std::ptr::null(),
+            range_start_calculated: std::ptr::null(),
+            range_end_calculated: std::ptr::null(),
         };
         animations.set(node, slot, self::names(names), &vec![undescribed; names.len()]);
     }
@@ -761,6 +802,9 @@ mod tests {
                 has_timeline_scroller: true,
                 timeline_scroller_is_vertical: true,
                 timeline_scroller: 7,
+                has_timeline_boundaries: false,
+                minimum_timeline_time: 0.0,
+                maximum_timeline_time: 0.0,
                 iteration_duration: 100.0,
                 ..timing_at(25.0).timing
             },

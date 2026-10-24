@@ -56,7 +56,7 @@ private:
     virtual void update_display_list_resources(Web::CompositorContextId, Compositing::DisplayListResourceTransaction) override;
     virtual Messages::CompositorWebContentServer::ReserveCanvasIdsResponse reserve_canvas_ids() override;
     virtual void create_canvas_2d_context(Compositing::CanvasId, Gfx::IntSize, bool) override;
-    virtual void update_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment>, Vector<Compositing::FontResourceId>, Vector<Compositing::DisplayListFontResource>) override;
+    virtual void update_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment>, Vector<Compositing::FontResourceId>, Vector<Compositing::DisplayListFontResource>, Vector<Compositing::DisplayListImageFrameResource>) override;
     virtual void destroy_canvas_context(Compositing::CanvasId) override;
     virtual Messages::CompositorWebContentServer::GetCanvasPixelsResponse get_canvas_pixels(Compositing::CanvasId, Gfx::IntRect, Gfx::AlphaType) override;
     virtual Messages::CompositorWebContentServer::AllocatePlaceholderCanvasResponse allocate_placeholder_canvas() override;
@@ -100,9 +100,11 @@ private:
     virtual void pointer_moved(Web::CompositorContextId, Web::DevicePixelPoint, u32 buttons, bool scrolled_since_frame, u64 input_event_id) override;
     virtual void pointer_left(Web::CompositorContextId, u64 input_event_id) override;
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) override;
+    virtual void overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> const&) override;
     virtual void create_video_edge(Media::VideoSinkHandle) override;
     virtual void release_video_edge(Media::VideoSinkHandle) override;
-    virtual void video_sink_presented_frame(Media::VideoSinkHandle, RefPtr<Media::VideoFrame>) override;
+    virtual void video_sink_presented_frame(Media::VideoSinkHandle, RefPtr<Media::VideoFrame>, Media::DisplayingVideoSinkFrameCounts) override;
+    virtual void video_sink_counted_frames(Media::VideoSinkHandle, Media::DisplayingVideoSinkFrameCounts) override;
     virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) override;
     virtual Compositing::CanvasSurfaceOwnerId canvas_surface_owner_id() const override { return m_canvas_host.canvas_surface_owner_id(); }
     bool context_is_owned_by_this_connection(Web::CompositorContextId);

@@ -35,16 +35,28 @@ enum class ErrorMode {
     Fatal,
 };
 
+class Decoder;
+
+TEXTCODEC_API Optional<Decoder> decoder_for(StringView encoding);
+TEXTCODEC_API Optional<Decoder> decoder_for(Utf16View encoding);
+
+// NB: A decoder never removes a BOM. The decode algorithms below do that.
 class TEXTCODEC_API Decoder {
 public:
-    virtual ErrorOr<String> to_utf8(StringView, IgnoreBOM, ErrorMode);
-    virtual ErrorOr<Utf16String> to_utf16(StringView);
-    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView);
-    ErrorOr<void> process_code_points(StringView, Function<ErrorOr<void>(u32)>);
+    ErrorOr<String> to_utf8(ReadonlyBytes, ErrorMode = ErrorMode::Replacement) const;
+    ErrorOr<Utf16String> to_utf16(ReadonlyBytes) const;
+    ErrorOr<size_t> length_in_utf16_code_units(ReadonlyBytes) const;
 
-protected:
-    virtual ~Decoder() = default;
-    virtual ErrorOr<void> process(StringView, Function<ErrorOr<void>(u32)> on_code_point) = 0;
+private:
+    friend TEXTCODEC_API Optional<Decoder> decoder_for(StringView);
+    friend TEXTCODEC_API Optional<Decoder> decoder_for(Utf16View);
+
+    explicit Decoder(StringView encoding)
+        : m_encoding(encoding)
+    {
+    }
+
+    StringView m_encoding;
 };
 
 class TEXTCODEC_API StreamingDecoder final {
@@ -56,33 +68,22 @@ public:
     StreamingDecoder(StringView encoding, IgnoreBOM, ErrorMode);
     ~StreamingDecoder();
 
-    ErrorOr<String> to_utf8(ReadonlyBytes);
-    ErrorOr<Utf16String> to_utf16(ReadonlyBytes, Flush = Flush::No);
-    ErrorOr<String> finish();
-    ErrorOr<Utf16String> finish_to_utf16();
+    ErrorOr<Utf16String> decode(ReadonlyBytes, Flush = Flush::No);
 
 private:
-    ErrorMode m_error_mode { ErrorMode::Replacement };
     void* m_decoder { nullptr };
 };
 
-// This will return a decoder for the exact name specified, skipping get_standardized_encoding.
-// Use this when you want ISO-8859-1 instead of windows-1252.
-TEXTCODEC_API Optional<Decoder&> decoder_for_exact_name(StringView encoding);
-
-TEXTCODEC_API Optional<Decoder&> decoder_for(StringView encoding);
-TEXTCODEC_API Optional<Decoder&> decoder_for(Utf16View encoding);
 TEXTCODEC_API Optional<StringView> get_standardized_encoding(StringView encoding);
 TEXTCODEC_API Optional<StringView> get_standardized_encoding(Utf16View encoding);
 
-// This returns the appropriate Unicode decoder for the sniffed BOM or nothing if there is no appropriate decoder.
-TEXTCODEC_API Optional<Decoder&> bom_sniff_to_decoder(StringView);
+// https://encoding.spec.whatwg.org/#decode
+TEXTCODEC_API ErrorOr<String> decode_to_utf8(ReadonlyBytes, Decoder fallback_decoder, ErrorMode = ErrorMode::Replacement);
+TEXTCODEC_API ErrorOr<Utf16String> decode_to_utf16(ReadonlyBytes, Decoder fallback_decoder);
+TEXTCODEC_API ErrorOr<size_t> decoded_length_in_utf16_code_units(ReadonlyBytes, Decoder fallback_decoder);
 
-// NOTE: This has an obnoxious name to discourage usage. Only use this if you absolutely must! For example, XHR in LibWeb uses this.
-// This will use the given decoder unless there is a byte order mark in the input, in which we will instead use the appropriate Unicode decoder.
-TEXTCODEC_API ErrorOr<String> convert_input_to_utf8_using_given_decoder_unless_there_is_a_byte_order_mark(Decoder&, StringView);
-TEXTCODEC_API ErrorOr<Utf16String> convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(Decoder&, StringView);
-TEXTCODEC_API ErrorOr<size_t> convert_input_to_utf16_length_using_given_decoder_unless_there_is_a_byte_order_mark(Decoder&, StringView);
+// https://encoding.spec.whatwg.org/#utf-8-decode
+TEXTCODEC_API ErrorOr<Utf16String> utf8_decode_to_utf16(ReadonlyBytes);
 
 TEXTCODEC_API StringView get_output_encoding(StringView encoding);
 

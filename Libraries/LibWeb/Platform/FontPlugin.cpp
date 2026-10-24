@@ -35,9 +35,6 @@ void FontPlugin::install(FontPlugin& plugin)
 FontPlugin::FontPlugin(bool is_layout_test_mode, Gfx::SystemFontProvider* font_provider)
     : m_is_layout_test_mode(is_layout_test_mode)
 {
-    if (is_layout_test_mode)
-        Gfx::force_hinting_for_testing(Gfx::FontHintingStyle::Normal);
-
     if (!font_provider)
         font_provider = &static_cast<Gfx::PathFontProvider&>(Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>()));
     if (is<Gfx::PathFontProvider>(*font_provider)) {
@@ -63,11 +60,6 @@ RefPtr<Gfx::Font> FontPlugin::default_font(float point_size, Optional<Gfx::FontV
 {
     auto font_name = generic_font_name(GenericFont::UiSansSerif);
     return Gfx::FontDatabase::the().get(font_name, point_size, 400, Gfx::FontWidth::Normal, 0, font_variation_settings, shape_features);
-}
-
-Gfx::Font& FontPlugin::default_fixed_width_font()
-{
-    return *m_default_fixed_width_font;
 }
 
 Vector<FlyString> FontPlugin::symbol_font_names()

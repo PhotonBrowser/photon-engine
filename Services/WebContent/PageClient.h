@@ -84,6 +84,8 @@ public:
     }
     void set_zoom_level(double zoom_level);
     void set_maximum_frames_per_second(double maximum_frames_per_second);
+    void set_viewport_corner_radius(double radius);
+    virtual double viewport_corner_radius() const override { return m_viewport_corner_radius; }
     virtual double maximum_frames_per_second() const override { return m_maximum_frames_per_second; }
     void set_preferred_color_scheme(Web::CSS::PreferredColorScheme);
     void set_preferred_contrast(Web::CSS::PreferredContrast);
@@ -188,7 +190,7 @@ private:
     virtual void request_navigation_start(Web::HTML::LocalNavigable&, Web::NavigationTarget, URL::URL const& url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest>) override;
     virtual void request_navigation_of_navigable(Web::HTML::Navigable&, Web::HTML::Navigable& source_navigable, Web::DOM::Document const& source_document, Web::HTML::PreparedNavigationDescriptor) override;
     virtual void request_post_message_to_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::PostedMessageDescriptor) override;
-    virtual void request_close_of_remote_traversable(Web::HTML::RemoteNavigable&, Web::HTML::LocalNavigable const& source) override;
+    virtual void request_close_of_remote_traversable(Web::HTML::RemoteNavigable&, Web::HTML::LocalNavigable const& source, Web::HTML::NavigationSourceSnapshot) override;
     virtual void request_focusing_steps_for_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::FocusTrigger) override;
     virtual void request_window_focus_of_remote_navigable(Web::HTML::RemoteNavigable&) override;
     virtual void request_set_opener_of_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::Navigable const& opener) override;
@@ -226,6 +228,7 @@ private:
     virtual Web::CSS::PreferredMotion preferred_motion() const override { return m_preferred_motion; }
     virtual void request_frame() override;
     virtual void rendering_opportunity(i64 frame_time_nanoseconds, double frame_interval_milliseconds) override;
+    virtual double rendering_frame_interval_in_milliseconds() const override { return m_last_rendering_opportunity_frame_interval; }
     virtual void will_begin_rendering_update() override;
     virtual bool has_rendering_opportunity() const override;
     virtual void did_finish_rendering_update() override;
@@ -403,6 +406,7 @@ private:
     Optional<double> m_pending_browser_zoom;
     double m_zoom_level { 1.0 };
     double m_maximum_frames_per_second { 60.0 };
+    double m_viewport_corner_radius { 0 };
     Web::PageId m_id { 0 };
     u64 m_next_delete_all_cookies_request_id { 1 };
     u64 m_next_text_fragment_generation_id { 1 };

@@ -19,7 +19,7 @@ use crate::painting::visual_context::build::{
 };
 use crate::painting::visual_context::node_values::{MaskLayerPresenceEntry, mask_layer_presence};
 use crate::painting::visual_context::{
-    ClipData, ClipNodeData, EffectNodeData, EffectNodeIndex, MaskData, MaskLayerOrigin,
+    ClipData, EffectNodeData, EffectNodeIndex, MaskData, MaskLayerOrigin,
 };
 use libgfx_rust::path::PathBuilder;
 use libgfx_rust::{AffineTransform, CompositingAndBlendingOperator, FloatPoint, FloatRect, MaskKind, multiply_affine};
@@ -251,6 +251,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             border_radii: crate::painting::border_radii::BorderRadii::default(),
             image_rendering: crate::css::css_enums::image_rendering::AUTO,
             is_root_element,
+            visible_device_rect: None,
         };
         crate::painting::record::paint::background::paint_resolved_background(self, paintable, &inputs);
         self.recorder.restore_force_dark(suspended_force_dark);
@@ -341,18 +342,12 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if facts.may_have_clip
             && let Some(clip) = facts.overflow_clip
         {
-            match clip {
-                ClipNodeData::Rect(clip) => self.recorder.push_ambient_inline_clips(&[transformed_rect_clip(
-                    to_enclosing_space,
-                    clip.rect,
-                    &clip,
-                )]),
-                ClipNodeData::Path(clip) => {
-                    let path = clip.path.copy_transformed(to_enclosing_space.values);
-                    self.recorder
-                        .push_ambient_inline_clips(&[PendingInlineClip::intersecting_path(&path, clip.fill_rule)]);
-                }
-                ClipNodeData::Dead => unreachable!("a newly computed overflow clip cannot be dead"),
+            self.recorder
+                .push_ambient_inline_clips(&[transformed_rect_clip(to_enclosing_space, clip.rect, &clip)]);
+            if let Some(contour) = facts.overflow_clip_contour {
+                let path = contour.path.copy_transformed(to_enclosing_space.values);
+                self.recorder
+                    .push_ambient_inline_clips(&[PendingInlineClip::intersecting_path(&path, contour.fill_rule)]);
             }
         }
         let mut descendants_to_enclosing_space = to_enclosing_space;

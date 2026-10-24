@@ -244,6 +244,7 @@ pub(crate) struct UsedValuesRareData {
     pub(crate) svg: CommittedSvgFacts,
     pub(crate) grid_layout_data: Option<std::sync::Arc<grid_formatting_context::GridLayoutData>>,
     pub(crate) flex_layout_data: Option<std::sync::Arc<formatting_context::FlexLayoutData>>,
+    pub(crate) multicol_layout_data: Option<std::sync::Arc<fragmentation::MulticolLayoutData>>,
     pub(crate) used_grid_tracks: Option<std::sync::Arc<grid_formatting_context::OwnedUsedGridTracks>>,
     pub(crate) collapsed_table_borders: Option<std::sync::Arc<table_formatting_context::OwnedCollapsedTableBorders>>,
     pub(crate) abspos_layout_inputs: Option<abspos_inputs::AbsposLayoutInputs>,
@@ -257,6 +258,7 @@ impl UsedValuesRareData {
             svg,
             grid_layout_data,
             flex_layout_data,
+            multicol_layout_data,
             used_grid_tracks,
             collapsed_table_borders,
             abspos_layout_inputs,
@@ -270,6 +272,7 @@ impl UsedValuesRareData {
             && svg == CommittedSvgFacts::default()
             && grid_layout_data.is_none()
             && flex_layout_data.is_none()
+            && multicol_layout_data.is_none()
             && used_grid_tracks.is_none()
             && collapsed_table_borders.is_none()
         {
@@ -288,6 +291,9 @@ impl UsedValuesRareData {
         }
         if let Some(data) = flex_layout_data {
             rare.flex_layout_data = Some(data);
+        }
+        if let Some(data) = multicol_layout_data {
+            rare.multicol_layout_data = Some(data);
         }
         if let Some(tracks) = used_grid_tracks {
             rare.used_grid_tracks = Some(tracks);
@@ -338,6 +344,8 @@ pub(crate) struct UsedValues {
     pub has_line_clamp_point: Cell<bool>,
     pub is_invisible_for_line_clamp: Cell<bool>,
     pub clamped_content_is_scrollable_overflow: Cell<bool>,
+    pub continues_from_previous_fragment: Cell<bool>,
+    pub continues_in_next_fragment: Cell<bool>,
 
     // For table cells and table-column(-group) boxes: the first grid column the box occupies and the number of grid
     // columns it spans, so painting can find the cells that originate in a column (CSS 2.2 §17.5.1).
@@ -401,6 +409,8 @@ impl Default for UsedValues {
             is_collapsed_borders_table_box: Cell::new(false),
             has_line_clamp_point: Cell::new(false),
             is_invisible_for_line_clamp: Cell::new(false),
+            continues_from_previous_fragment: Cell::new(false),
+            continues_in_next_fragment: Cell::new(false),
             clamped_content_is_scrollable_overflow: Cell::new(false),
             table_column_index: Cell::new(0),
             table_column_span: Cell::new(0),
@@ -425,7 +435,7 @@ impl Default for UsedValues {
 
 impl UsedValues {
     /// Resolves the left and right margins, borders and padding of `style`, with percentages against `basis`.
-    pub(crate) fn resolve_horizontal_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+    pub(crate) fn resolve_horizontal_box_model(&self, style: &StyleValues<'_>, basis: CssPixels) {
         self.margin_left.set(style.margin_left().to_px(basis));
         self.margin_right.set(style.margin_right().to_px(basis));
         self.border_left.set(style.border_left_width());
@@ -435,7 +445,7 @@ impl UsedValues {
     }
 
     /// Resolves the top and bottom margins, borders and padding of `style`, with percentages against `basis`.
-    pub(crate) fn resolve_vertical_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+    pub(crate) fn resolve_vertical_box_model(&self, style: &StyleValues<'_>, basis: CssPixels) {
         self.margin_top.set(style.margin_top().to_px(basis));
         self.margin_bottom.set(style.margin_bottom().to_px(basis));
         self.border_top.set(style.border_top_width());
@@ -445,7 +455,7 @@ impl UsedValues {
     }
 
     /// Resolves every margin, border and padding of `style`, with percentages against `basis`.
-    pub(crate) fn resolve_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+    pub(crate) fn resolve_box_model(&self, style: &StyleValues<'_>, basis: CssPixels) {
         self.resolve_horizontal_box_model(style, basis);
         self.resolve_vertical_box_model(style, basis);
     }
@@ -603,6 +613,8 @@ used_values_cell_state! {
     has_line_clamp_point: bool,
     is_invisible_for_line_clamp: bool,
     clamped_content_is_scrollable_overflow: bool,
+    continues_from_previous_fragment: bool,
+    continues_in_next_fragment: bool,
     table_column_index: u32,
     table_column_span: u32,
     hidden_by_collapsed_columns: bool,
@@ -965,6 +977,39 @@ pub(crate) fn create_used_values(
             return None;
         }
 
+        // https://drafts.csswg.org/css-sizing-3/#stretch-fit-sizing
+        // NB: A stretch size is definite where percentages resolve to a definite value, and sizes the margin box to
+        //     fill the containing block exactly, treating auto margins as zero.
+        if size.is_stretch() && size.calc_size().is_none() {
+            if !containing_block_has_definite_size(axis) {
+                return None;
+            }
+            let inline_basis = percentage_basis_inline_size.unwrap_or_default();
+            let margins_borders_and_padding = match axis {
+                Axis::Inline => {
+                    style.margin_left().to_px(inline_basis)
+                        + style.border_left_width()
+                        + style.padding_left().to_px(inline_basis)
+                        + style.padding_right().to_px(inline_basis)
+                        + style.border_right_width()
+                        + style.margin_right().to_px(inline_basis)
+                }
+                Axis::Block => {
+                    let (margin_top, margin_bottom) =
+                        crate::layout::sizing_context::stretch_fit_block_margins(callbacks, node, inline_basis);
+                    margin_top
+                        + style.border_top_width()
+                        + style.padding_top().to_px(inline_basis)
+                        + style.padding_bottom().to_px(inline_basis)
+                        + style.border_bottom_width()
+                        + margin_bottom
+                }
+            };
+            return Some(clamp_to_max_dimension_value(
+                (containing_block_size_for_axis(axis) - margins_borders_and_padding)
+                    .max(crate::layout::CssPixels::default()),
+            ));
+        }
         if !size.is_length_percentage() {
             return None;
         }

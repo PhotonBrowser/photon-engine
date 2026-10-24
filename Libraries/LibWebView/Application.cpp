@@ -49,6 +49,7 @@
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CompositorClient.h>
+#include <LibWebView/CompositorPresentationClient.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/FaviconStore.h>
@@ -210,6 +211,12 @@ Application::Application(Optional<ByteString> ladybird_binary_path)
 
 Application::~Application()
 {
+#if !defined(AK_OS_WINDOWS)
+    // No event loop runs the handlers during teardown, so a signal from here on takes its default action again.
+    for (auto handler : m_session_signal_handlers)
+        Core::EventLoop::unregister_signal(handler);
+#endif
+
 #if defined(AK_OS_MACOS)
     // Stop bootstrap callbacks before destroying the state they use.
     m_mach_port_server.clear();
@@ -219,6 +226,8 @@ Application::~Application()
 
     if (m_compositor_client)
         m_compositor_client->on_death = nullptr;
+    if (m_compositor_presentation_client)
+        m_compositor_presentation_client->on_death = nullptr;
 
     if (m_cpu_profiler_process.has_value()) {
 #if !defined(AK_OS_WINDOWS)
@@ -248,7 +257,18 @@ Application::~Application()
     m_process_manager = nullptr;
     m_browser_process = nullptr;
 
+    // Only a normal exit gets this far, and only after every teardown step above, so a crash never records a clean one.
+    if (m_default_session && m_default_session->session_store) {
+        m_default_session->session_store->flush_dirty_state();
+        m_default_session->session_store->mark_clean_exit();
+    }
+
     s_the = nullptr;
+}
+
+SessionLaunchPolicy Application::launch_restore_policy() const
+{
+    return SessionLaunchPolicy::None;
 }
 
 bool Application::claim_cpu_profiler(ProcessType process_type)
@@ -1106,9 +1126,6 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
     // The client's WebContentClient picks up this same session when it is created.
     auto request_server_connection = TRY(connect_new_request_server_client(session_for_new_view(is_private), RequestServer::SiteBinding::Bound));
     auto image_decoder = TRY(launch_image_decoder_process());
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    auto wasm_compiler_handle = TRY(connect_new_wasm_compiler_client());
-#endif
 
     auto cross_process_id_allocator = allocate_cross_process_id_allocator();
     auto root_navigable_id = navigable_to_adopt.has_value() ? *navigable_to_adopt : cross_process_id_allocator.allocate();
@@ -1139,9 +1156,6 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
     client->async_connect_to_request_server(move(request_server_connection.handle), request_server_connection.client_id);
     client->async_set_site_compatibility_data(m_site_compatibility_data);
     connect_to_image_decoder(*client, move(image_decoder));
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    client->async_connect_to_wasm_compiler(wasm_compiler_handle);
-#endif
 
     if (m_content_blocker_list_buffer.has_value())
         client->async_set_content_blockers(*m_content_blocker_list_buffer);
@@ -1353,7 +1367,8 @@ Web::CompositorContextId Application::allocate_compositor_context_id()
     return Web::CompositorContextId { m_next_page_or_compositor_context_id++ };
 }
 
-static bool can_send_compositor_process_ipc(RefPtr<CompositorClient> const& compositor_client)
+template<typename Client>
+static bool can_send_compositor_process_ipc(RefPtr<Client> const& compositor_client)
 {
     if (!compositor_client)
         return false;
@@ -1433,6 +1448,12 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     if (result.is_error())
         return Error::from_string_literal("Compositor process disconnected while creating context");
 
+    // A page's context presents its frames to us, and takes its input from us, through our presentation connection.
+    if (page_id.has_value() && m_compositor_presentation_client) {
+        if (m_compositor_client->try_bind_presentation(context_id, m_compositor_presentation_id).is_error())
+            return Error::from_string_literal("Compositor process disconnected while binding context");
+    }
+
     return {};
 }
 
@@ -1475,47 +1496,41 @@ void Application::update_compositor_context_visibility(Web::CompositorContextId 
     m_compositor_client->async_set_context_visibility(context_id, context_visibility);
 }
 
-bool Application::handle_key_event_in_compositor(Web::CompositorContextId context_id, Web::KeyEvent const& event)
+bool Application::handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId context_id, Web::KeyEvent const& event, bool allow_keyboard_scroll)
 {
-    if (!can_send_compositor_process_ipc(m_compositor_client))
+    if (!can_send_compositor_process_ipc(m_compositor_presentation_client))
         return false;
-    auto result = m_compositor_client->try_handle_key_event(context_id, event.clone_without_browser_data());
-    return !result.is_error() && result.release_value();
-}
+    VERIFY(m_compositor_presentation_client);
 
-bool Application::dispatch_key_event_to_web_content(Web::CompositorContextId context_id, Web::KeyEvent const& event)
-{
-    if (!can_send_compositor_process_ipc(m_compositor_client))
-        return false;
-    auto result = m_compositor_client->try_dispatch_key_event_to_web_content(context_id, event.clone_without_browser_data());
-    return !result.is_error() && result.release_value();
+    m_compositor_presentation_client->async_handle_and_dispatch_key_event(context_id, event.clone_without_browser_data(), allow_keyboard_scroll);
+    return true;
 }
 
 void Application::handle_pinch_event_in_compositor(Web::CompositorContextId context_id, Web::PinchEvent const& event)
 {
-    if (!can_send_compositor_process_ipc(m_compositor_client))
+    if (!can_send_compositor_process_ipc(m_compositor_presentation_client))
         return;
 
-    m_compositor_client->async_handle_pinch_event(context_id, event);
+    m_compositor_presentation_client->async_handle_pinch_event(context_id, event);
 }
 
 bool Application::handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId context_id, Web::MouseEvent const& event)
 {
-    if (!can_send_compositor_process_ipc(m_compositor_client))
+    if (!can_send_compositor_process_ipc(m_compositor_presentation_client))
         return false;
-    VERIFY(m_compositor_client);
+    VERIFY(m_compositor_presentation_client);
 
-    m_compositor_client->async_handle_and_dispatch_mouse_event(context_id, event.clone_without_browser_data());
+    m_compositor_presentation_client->async_handle_and_dispatch_mouse_event(context_id, event.clone_without_browser_data());
     return true;
 }
 
 void Application::notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id)
 {
-    if (!can_send_compositor_process_ipc(m_compositor_client))
+    if (!can_send_compositor_process_ipc(m_compositor_presentation_client))
         return;
-    VERIFY(m_compositor_client);
+    VERIFY(m_compositor_presentation_client);
 
-    m_compositor_client->async_presented_bitmap_ready_to_paint(context_id, bitmap_id);
+    m_compositor_presentation_client->async_presented_bitmap_ready_to_paint(context_id, bitmap_id);
 }
 
 void Application::crash_compositor_process()
@@ -1609,7 +1624,7 @@ void Application::launch_spare_web_content_process()
         }
 
         m_spare_web_content_process = web_content_client.release_value();
-        if (auto process = find_process(m_spare_web_content_process->pid()); process.has_value())
+        if (auto process = m_process_manager->find_child(m_spare_web_content_process->child_id()); process.has_value())
             process->set_title("(spare)"_utf16);
     });
 }
@@ -1722,10 +1737,17 @@ ErrorOr<void> Application::launch_services()
 
         // Fall back without modifying the existing Sessions database.
         auto session_store = [&]() -> ErrorOr<NonnullOwnPtr<SessionStore>> {
+            // A headless run, a browser that WebDriver drives, and one that logs process statistics never join a browser
+            // already running on their profile. Yet startup recovery would still rewrite the saved session, reset the
+            // unclean-exit count, and demote the open windows of a browser running on this profile. So each gets a
+            // transient store instead, leaving the Sessions database as the last run left it.
+            if (m_browser_options.headless_mode.has_value() || m_browser_options.webdriver_browser_endpoint.has_value() || m_stats_log)
+                return SessionStore::create();
+
             auto session_database = TRY(Database::Database::create(database_path, "Sessions"sv, { .foreign_keys = Database::Database::ForeignKeys::Yes }));
             if (TRY(SessionStore::migrate_schema(session_database)) != Database::MigrationOutcome::Success)
                 return Error::from_string_literal("Sessions database was created by a newer Ladybird version");
-            return SessionStore::create(session_database);
+            return SessionStore::create(session_database, launch_restore_policy());
         }();
         if (session_store.is_error()) {
             dbgln("Sessions will not be persisted this session: {}", session_store.error());
@@ -1760,6 +1782,19 @@ ErrorOr<void> Application::launch_services()
         on_recently_closed_entries_changed();
     };
 
+#if !defined(AK_OS_WINDOWS)
+    // A run stopped by SIGINT or SIGTERM ends like a quit, rather than like a crash: It saves the session, leaves its
+    // windows for the next launch to recover, and records a clean exit.
+    if (m_default_session->session_store->is_persistent()) {
+        for (auto signal_number : { SIGINT, SIGTERM }) {
+            m_session_signal_handlers.append(Core::EventLoop::register_signal(signal_number, [this](int) {
+                m_default_session->session_store->application_quitting();
+                m_event_loop->quit(0);
+            }));
+        }
+    }
+#endif
+
     VERIFY(m_event_loop);
     m_autocomplete_service = make<AutocompleteService>(*m_event_loop, move(history_database_directory));
     m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(*m_bookmark_store));
@@ -1781,9 +1816,6 @@ ErrorOr<void> Application::launch_services()
     }
 
     TRY(launch_request_server());
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    TRY(launch_wasm_compiler_server());
-#endif
     TRY(launch_compositor_process());
 
     if (m_browser_options.devtools_port.has_value()) {
@@ -1808,18 +1840,35 @@ ErrorOr<void> Application::launch_compositor_process()
         compositor_reported_gpu_device_identity(move(identity));
     };
 
-    if (!platform_reports_scroll_momentum())
-        m_compositor_client->async_set_synthesizes_scroll_momentum(true);
-    m_compositor_client->async_set_scrolls_elastically(
-        m_scrolls_elastically_override.value_or(platform_scrolls_elastically()));
     if (m_memory_pressure)
         m_compositor_client->async_purge_unused_gpu_resources();
 
+    Optional<u64> gpu_presentation_adapter_luid;
 #ifdef USE_DIRECTX
     m_reported_compositor_gpu_presentation_unavailable = false;
-    if (auto adapter_luid = Gfx::default_dxgi_adapter_luid(); adapter_luid.has_value())
-        m_compositor_client->async_set_client_gpu_presentation_capability(true, *adapter_luid);
+    gpu_presentation_adapter_luid = Gfx::default_dxgi_adapter_luid();
 #endif
+    auto presentation_or_error = m_compositor_client->try_create_presentation_connection(
+        !platform_reports_scroll_momentum(),
+        m_scrolls_elastically_override.value_or(platform_scrolls_elastically()),
+        gpu_presentation_adapter_luid);
+    if (presentation_or_error.is_error())
+        return Error::from_string_literal("Compositor process disconnected while creating presentation connection");
+    auto presentation = presentation_or_error.release_value();
+    auto transport = TRY(presentation.take_handle().create_transport());
+    m_compositor_presentation_client = adopt_ref(*new CompositorPresentationClient(move(transport)));
+    m_compositor_presentation_id = presentation.presentation_id();
+    m_compositor_presentation_client->async_set_scrollbar_track_press_jumps(platform_scrollbar_track_press_jumps());
+    m_compositor_presentation_client->on_death = [this, presentation_client = m_compositor_presentation_client->make_weak_ptr<CompositorPresentationClient>()] {
+        // NB: This runs on a later turn, by which time a new Compositor can have replaced the one this belonged to.
+        if (!presentation_client || presentation_client.ptr() != m_compositor_presentation_client.ptr())
+            return;
+        // NB: Our pages can neither show frames nor take input through the Compositor without this connection, so
+        //     losing it is a Compositor failure. Closing the management connection ends the Compositor, and we
+        //     restart it and rebind our pages as after a crash.
+        if (m_compositor_client)
+            m_compositor_client->shutdown();
+    };
 
     return {};
 }
@@ -1850,8 +1899,14 @@ void Application::when_compositor_gpu_device_identity_is_known(CompositorGpuDevi
 void Application::set_scrolls_elastically(bool enabled)
 {
     m_scrolls_elastically_override = enabled;
-    if (m_compositor_client)
-        m_compositor_client->async_set_scrolls_elastically(enabled);
+    if (m_compositor_presentation_client)
+        m_compositor_presentation_client->async_set_scrolls_elastically(enabled);
+}
+
+void Application::platform_scrollbar_track_press_behavior_changed()
+{
+    if (m_compositor_presentation_client)
+        m_compositor_presentation_client->async_set_scrollbar_track_press_jumps(platform_scrollbar_track_press_jumps());
 }
 
 void Application::notify_compositor_gpu_presentation_unavailable()
@@ -1860,8 +1915,8 @@ void Application::notify_compositor_gpu_presentation_unavailable()
     if (m_reported_compositor_gpu_presentation_unavailable)
         return;
     m_reported_compositor_gpu_presentation_unavailable = true;
-    if (m_compositor_client)
-        m_compositor_client->async_set_client_gpu_presentation_capability(false, 0);
+    if (m_compositor_presentation_client)
+        m_compositor_presentation_client->async_set_client_gpu_presentation_capability(false, 0);
 }
 
 void Application::notify_compositor_gpu_presentation_available()
@@ -1870,13 +1925,16 @@ void Application::notify_compositor_gpu_presentation_available()
         return;
     m_compositor_metal_presentation_enabled = true;
     m_reported_compositor_gpu_presentation_unavailable = false;
-    if (m_compositor_client)
-        m_compositor_client->async_set_client_gpu_presentation_capability(true, 0);
+    if (m_compositor_presentation_client)
+        m_compositor_presentation_client->async_set_client_gpu_presentation_capability(true, 0);
 }
 
 void Application::handle_compositor_process_death()
 {
     m_compositor_client = nullptr;
+    if (m_compositor_presentation_client)
+        m_compositor_presentation_client->on_death = nullptr;
+    m_compositor_presentation_client = nullptr;
 
     // Nothing will forward or hand back the input events the dead compositor still held.
     WebContentClient::for_each_client([](WebContentClient& client) {
@@ -2010,50 +2068,10 @@ void Application::configure_request_server_control_client(Requests::RequestContr
     TabPerformanceMonitor::configure(control_client);
 }
 
-void Application::set_image_decoder_exit_handler(pid_t pid, Function<void()> handler)
+void Application::set_image_decoder_exit_handler(u64 child_id, Function<void()> handler)
 {
-    m_image_decoder_exit_handlers.set(pid, move(handler));
+    m_image_decoder_exit_handlers.set(child_id, move(handler));
 }
-
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-ErrorOr<void> Application::launch_wasm_compiler_server()
-{
-    m_wasm_compiler_client = TRY(launch_wasm_compiler_process());
-
-    m_wasm_compiler_client->on_death = [this]() {
-        m_wasm_compiler_client = nullptr;
-
-        if (Core::EventLoop::current().was_exit_requested())
-            return;
-
-        if (auto result = launch_wasm_compiler_server(); result.is_error()) {
-            dbgln("Failed to restart WebAssembly compiler: {}", result.error());
-            VERIFY_NOT_REACHED();
-        }
-
-        auto client_count = WebContentClient::client_count() + WorkerProcessManager::the().client_count();
-
-        auto response = m_wasm_compiler_client->send_sync_but_allow_failure<Messages::WasmCompilerServer::ConnectNewClients>(client_count);
-        if (!response || response->handles().size() != client_count) {
-            dbgln("Failed to connect {} new clients to WasmCompiler", client_count);
-            VERIFY_NOT_REACHED();
-        }
-
-        auto handles = response->take_handles();
-
-        WebContentClient::for_each_client([&](WebContentClient& client) {
-            client.async_connect_to_wasm_compiler(handles.take_last());
-            return IterationDecision::Continue;
-        });
-        WorkerProcessManager::the().for_each_client([&](WebWorkerClient& client) {
-            client.async_connect_to_wasm_compiler(handles.take_last());
-            return IterationDecision::Continue;
-        });
-    };
-
-    return {};
-}
-#endif
 
 ErrorOr<void> Application::launch_devtools_server()
 {
@@ -2181,9 +2199,9 @@ Core::EventLoop& Application::create_platform_event_loop()
     return Core::EventLoop::initialize_for_current_thread();
 }
 
-void Application::add_child_process(WebView::Process&& process)
+ChildIdentity Application::add_child_process(WebView::Process&& process)
 {
-    m_process_manager->add_process(move(process));
+    return m_process_manager->add_process(move(process));
 }
 
 #if defined(AK_OS_MACH)
@@ -2223,7 +2241,7 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         }
         break;
     case ProcessType::ImageDecoder:
-        if (auto handler = m_image_decoder_exit_handlers.take(process.pid()); handler.has_value())
+        if (auto handler = m_image_decoder_exit_handlers.take(process.child_id()); handler.has_value())
             (*handler)();
         break;
     case ProcessType::MediaServer:
@@ -2242,15 +2260,6 @@ void Application::process_did_exit(Process&& process, Optional<int>)
             if (auto on_request_server_died = move(client->on_request_server_died))
                 on_request_server_died();
         }
-        break;
-    case ProcessType::WasmCompiler:
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-        if (auto client = process.client<WasmCompilerClient::Client>()) {
-            dbgln_if(WEBVIEW_PROCESS_DEBUG, "Restart WebAssembly compiler");
-            if (auto on_death = move(client->on_death))
-                on_death();
-        }
-#endif
         break;
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>()) {
@@ -2531,10 +2540,9 @@ void Application::initialize_actions()
         };
     };
 
-    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto persist, auto notify_workers) {
-        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, persist, notify_workers]() {
+    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto notify_workers) {
+        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, notify_workers]() {
             cached_value = value;
-            persist();
             // Workers take no debug requests; the worker process manager hands the new value to every live worker.
             notify_workers();
 
@@ -2790,7 +2798,6 @@ void Application::initialize_actions()
     m_debug_menu->add_action(Action::create("Dump Cookies"sv, ActionID::DumpCookies, [this]() { m_default_session->cookie_jar->dump_cookies(); }));
     m_debug_menu->add_action(Action::create("Dump Local Storage"sv, ActionID::DumpLocalStorage, debug_request("dump-local-storage"sv)));
     m_debug_menu->add_action(Action::create("Dump Session Storage"sv, ActionID::DumpSessionStorage, debug_request("dump-session-storage"sv)));
-    m_debug_menu->add_action(Action::create("Dump WASM Stats"sv, ActionID::DumpWasmStats, debug_request("dump-wasm-stats"sv)));
     m_debug_menu->add_action(Action::create("Dump GC graph"sv, ActionID::DumpGCGraph, [this]() {
         if (auto view = active_web_view(); view.has_value()) {
             auto gc_graph_path = view->dump_gc_graph();
@@ -2817,32 +2824,23 @@ void Application::initialize_actions()
     m_debug_menu->add_action(Action::create("Crash Compositor Process"sv, ActionID::CrashCompositorProcess, [this]() { crash_compositor_process(); }));
     m_debug_menu->add_separator();
 
-    // Both spoofing choices persist in the profile's settings. The --user-agent-preset flag overrides the saved preset for
-    // this session only, and test mode ignores the saved choices so test results can't depend on the developer's profile.
-    auto use_saved_spoofing_choices = m_web_content_options.is_test_mode == IsTestMode::No;
-
     auto spoof_user_agent_menu = Menu::create_group("Spoof User Agent"sv);
-    auto user_agent_preset = m_web_content_options.user_agent_preset;
-    if (!user_agent_preset.has_value() && use_saved_spoofing_choices)
-        user_agent_preset = m_settings->user_agent_preset();
-    m_user_agent_string = user_agent_preset.has_value()
-        ? *WebView::user_agents.get(*user_agent_preset)
+    m_user_agent_string = m_web_content_options.user_agent_preset.has_value()
+        ? *WebView::user_agents.get(*m_web_content_options.user_agent_preset)
         : Web::default_user_agent;
 
     auto notify_workers_of_user_agent = [this] { WorkerProcessManager::the().update_user_agent(user_agent_string()); };
-    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv, [this] { m_settings->set_user_agent_preset({}); }, notify_workers_of_user_agent);
+    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv, notify_workers_of_user_agent);
     for (auto const& user_agent : WebView::user_agents) {
-        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv, [this, name = user_agent.key] { m_settings->set_user_agent_preset(name); }, notify_workers_of_user_agent);
+        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv, notify_workers_of_user_agent);
     }
 
     auto navigator_compatibility_mode_menu = Menu::create_group("Navigator Compatibility Mode"sv);
-    m_navigator_compatibility_mode = navigator_compatibility_mode_to_string(use_saved_spoofing_choices
-            ? m_settings->navigator_compatibility_mode()
-            : Web::default_navigator_compatibility_mode);
+    m_navigator_compatibility_mode = navigator_compatibility_mode_to_string(Web::default_navigator_compatibility_mode);
 
     auto notify_workers_of_navigator_compatibility_mode = [this] { WorkerProcessManager::the().update_navigator_compatibility_mode(navigator_compatibility_mode()); };
     auto add_navigator_compatibility_mode = [&](StringView name, Web::NavigatorCompatibilityMode mode) {
-        add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv, [this, mode] { m_settings->set_navigator_compatibility_mode(mode); }, notify_workers_of_navigator_compatibility_mode);
+        add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv, notify_workers_of_navigator_compatibility_mode);
     };
     add_navigator_compatibility_mode("Chrome"sv, Web::NavigatorCompatibilityMode::Chrome);
     add_navigator_compatibility_mode("Gecko"sv, Web::NavigatorCompatibilityMode::Gecko);

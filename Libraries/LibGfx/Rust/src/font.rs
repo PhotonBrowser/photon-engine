@@ -13,6 +13,7 @@ unsafe extern "C" {
     fn ladybird_gfx_font_glyph_id(font: *const c_void, code_point: u32) -> u32;
     fn ladybird_gfx_font_contains_glyph(font: *const c_void, code_point: u32) -> bool;
     fn ladybird_gfx_font_is_emoji_font(font: *const c_void) -> bool;
+    fn ladybird_gfx_font_is_invisible(font: *const c_void) -> bool;
     fn ladybird_gfx_font_measure_text_width(
         font: *const c_void,
         text_utf16: *const u16,
@@ -24,6 +25,7 @@ unsafe extern "C" {
         emoji_presentation: bool,
         forced_presentation: bool,
     ) -> *const c_void;
+    fn ladybird_gfx_font_cascade_list_first(list: *const c_void) -> *const c_void;
     fn ladybird_gfx_font_ref(font: *const c_void);
     fn ladybird_gfx_font_unref(font: *const c_void);
     fn ladybird_gfx_font_cascade_list_ref(list: *const c_void);
@@ -65,6 +67,33 @@ struct FontEntry {
     id: FontId,
     raw: NonNull<c_void>,
     facts: FontFacts,
+    // What the font answers about itself that text chunking asks for every character: whether it is an emoji font,
+    // and whether it has a glyph for U+0020 SPACE. Each is unknown until first asked.
+    is_emoji_font: LazyVerdict,
+    contains_space_glyph: LazyVerdict,
+}
+
+/// A yes or no answer that never changes, asked for once: zero until then.
+#[derive(Default)]
+struct LazyVerdict(std::sync::atomic::AtomicU8);
+
+impl LazyVerdict {
+    const NO: u8 = 1;
+    const YES: u8 = 2;
+
+    fn get(&self, ask: impl FnOnce() -> bool) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.0.load(Ordering::Relaxed) {
+            Self::NO => false,
+            Self::YES => true,
+            _ => {
+                let answer = ask();
+                self.0
+                    .store(if answer { Self::YES } else { Self::NO }, Ordering::Relaxed);
+                answer
+            }
+        }
+    }
 }
 
 // SAFETY: Gfx::Font is atomically reference counted, and the retained reference this entry owns
@@ -112,6 +141,8 @@ impl FontHandle {
                 pixel_size: snapshot.pixel_size,
                 point_size: snapshot.point_size,
             },
+            is_emoji_font: LazyVerdict::default(),
+            contains_space_glyph: LazyVerdict::default(),
         }))
     }
 
@@ -143,8 +174,16 @@ impl FontHandle {
     }
 
     pub fn is_emoji_font(&self) -> bool {
+        self.0.is_emoji_font.get(|| {
+            // SAFETY: The entry's retained reference keeps the font live.
+            unsafe { ladybird_gfx_font_is_emoji_font(self.as_raw()) }
+        })
+    }
+
+    /// Whether the font stands in for one that is still loading, whose glyphs draw nothing.
+    pub fn is_invisible(&self) -> bool {
         // SAFETY: The entry's retained reference keeps the font live.
-        unsafe { ladybird_gfx_font_is_emoji_font(self.as_raw()) }
+        unsafe { ladybird_gfx_font_is_invisible(self.as_raw()) }
     }
 
     pub fn glyph_width(&self, code_point: u32) -> f32 {
@@ -161,8 +200,14 @@ impl FontHandle {
     }
 
     pub fn contains_glyph(&self, code_point: u32) -> bool {
-        // SAFETY: The entry's retained reference keeps the font live.
-        unsafe { ladybird_gfx_font_contains_glyph(self.as_raw(), code_point) }
+        let ask = || {
+            // SAFETY: The entry's retained reference keeps the font live.
+            unsafe { ladybird_gfx_font_contains_glyph(self.as_raw(), code_point) }
+        };
+        if code_point == u32::from(' ') {
+            return self.0.contains_space_glyph.get(ask);
+        }
+        ask()
     }
 
     pub fn measure_text_width(&self, text: &[u16]) -> f32 {
@@ -267,6 +312,13 @@ impl FontCascadeListHandle {
         );
         // SAFETY: Both handles keep their lists live.
         unsafe { ladybird_gfx_font_cascade_list_equals(self.pointer, other.pointer) }
+    }
+
+    /// The first font of the cascade, or its last resort font if it has none, as Gfx::FontCascadeList::first().
+    pub fn first(&self) -> FontHandle {
+        assert!(!self.pointer.is_null(), "Gfx::FontCascadeList pointer must not be null");
+        // SAFETY: This handle keeps the list live, and the list keeps its fonts live for the call.
+        unsafe { FontHandle::intern(ladybird_gfx_font_cascade_list_first(self.pointer)) }
     }
 
     pub fn font_for_code_point(

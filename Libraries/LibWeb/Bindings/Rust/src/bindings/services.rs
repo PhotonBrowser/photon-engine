@@ -18,6 +18,9 @@ unsafe extern "C" {
     /// The interface object of the interface in the realm, likewise.
     pub(crate) fn web_bindings_ensure_web_constructor(realm: *mut c_void, interface_name: u16) -> *mut c_void;
 
+    /// The iterator prototype object of the interface in the realm, likewise, for an interface with a pair iterator.
+    pub(crate) fn web_bindings_ensure_web_iterator_prototype(realm: *mut c_void, interface_name: u16) -> *mut c_void;
+
     /// The wrapper world of the realm, a cell that the realm keeps alive, and whether it is the main world of its
     /// agent.
     pub(crate) fn web_bindings_wrapper_world(realm: *mut c_void, is_main_world: *mut bool) -> *mut c_void;
@@ -29,9 +32,37 @@ unsafe extern "C" {
     /// Makes `wrapper` the wrapper that the world of its realm, which is not a main world, holds for the cell.
     pub(crate) fn web_bindings_set_rust_wrapper(realm: *mut c_void, cell: *mut c_void, wrapper: *mut c_void);
 
+    /// Whether the global object of the realm is a Window.
+    pub(crate) fn web_bindings_realm_is_window(realm: *mut c_void) -> bool;
+
+    /// Runs the steps with the context while an execution context of the realm is on the stack, as an
+    /// HTML::TemporaryExecutionContext puts it there.
+    pub(crate) fn web_bindings_with_temporary_execution_context(
+        realm: *mut c_void,
+        context: *mut c_void,
+        steps: unsafe extern "C" fn(*mut c_void),
+    );
+
     /// Whether the object is a wrapper of an object that implements the interface, a Web::Bindings::InterfaceName of
     /// an interface that LibWeb implements in C++.
     pub(crate) fn web_bindings_object_implements_interface(object: *mut c_void, interface_name: u16) -> bool;
+
+    /// Runs the extract an origin operation of the object, https://html.spec.whatwg.org/multipage/browsers.html#extract-an-origin,
+    /// if it is a platform object of an interface implemented in C++ or a WindowProxy, and calls `on_origin` with the
+    /// origin, which it lends for the call, if that is not null. Returns whether it called `on_origin`.
+    pub(crate) fn web_bindings_extract_an_origin(
+        object: *mut c_void,
+        ctx: *mut c_void,
+        on_origin: unsafe extern "C" fn(*mut c_void, *const liburl_rust::FfiOrigin),
+    ) -> bool;
+
+    /// The wrapper in the realm of a new DOMException with the name, which is ASCII, and the message, a borrowed
+    /// AK::Utf16String.
+    pub(crate) fn web_bindings_create_dom_exception(
+        realm: *mut c_void,
+        name: ak::Span<'_, u8>,
+        message: usize,
+    ) -> *mut c_void;
 
     /// A promise rejected with the reason, in the realm of the this value of an operation that ran in the current
     /// realm: the realm of the object, or the current realm for a value that is not an object.

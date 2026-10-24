@@ -214,11 +214,8 @@ void BodyMixin::text(GC::Ref<WebIDL::Promise> promise) const
     auto& realm = WebIDL::promise_realm(*promise);
     // The text() method steps are to return the result of running consume body with this and UTF-8 decode.
     consume_body(*this, promise, GC::create_function(GC::Heap::the(), [&realm](ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
-        auto decoder = TextCodec::decoder_for("UTF-8"sv);
-        VERIFY(decoder.has_value());
-
-        auto utf8_text = MUST(decoder->to_utf8(bytes, TextCodec::IgnoreBOM::No, TextCodec::ErrorMode::Replacement));
-        return JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(utf8_text));
+        auto text = MUST(TextCodec::utf8_decode_to_utf16(bytes));
+        return JS::PrimitiveString::create(realm.vm(), move(text));
     }));
 }
 
@@ -433,10 +430,7 @@ MultipartParsingErrorOr<GC::ConservativeVector<XHR::FormDataEntry>> parse_multip
 
             // 3. Let value be a new File object with name filename, type contentType, and body body.
             auto content_type = header.content_type.release_value();
-            auto blob = FileAPI::Blob::create(MUST(ByteBuffer::copy(body.bytes())), content_type);
-            FileAPI::FilePropertyBag options {};
-            options.type = Utf16String::from_utf8(content_type);
-            value = MUST(FileAPI::File::create({ { blob } }, header.filename.release_value(), move(options)));
+            value = FileAPI::File::create(body.bytes(), Utf16String::from_utf8(header.filename.release_value()), Utf16String::from_utf8(content_type));
         }
         // 11. Otherwise:
         else {

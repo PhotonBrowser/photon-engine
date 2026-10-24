@@ -5,23 +5,25 @@
  */
 
 use crate::css::computed_value_views::LengthPercentageRef;
+use crate::css::css_enums::keyword;
 use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixelSize};
 use crate::css::style_value::{BasicShapeData, RetainedStyleValueData, StyleValueData};
 use crate::layout::node_data::NodeSlotId;
-use crate::painting::border_radii::normalize_border_radii_data;
+use crate::painting::border_radii::{BorderRadii, normalize_border_radii_data};
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::paint_read::PaintRead;
 use crate::painting::{paintable_geometry, style_queries};
 use libgfx_rust::WindingRule;
 use libgfx_rust::path::{OwnedPath, PathBuilder};
 
-mod basic_shape_kind {
+pub(super) mod basic_shape_kind {
     pub const INSET: u8 = 0;
     pub const CIRCLE: u8 = 3;
     pub const ELLIPSE: u8 = 4;
     pub const POLYGON: u8 = 5;
     pub const PATH: u8 = 6;
+    pub const SHAPE: u8 = 7;
 }
 
 mod radial_extent {
@@ -311,6 +313,16 @@ fn inset_to_path(
         crate::painting::border_radii::ROUND_CORNER_SHAPES,
     );
 
+    rounded_rect_path(top_edge, right_edge, bottom_edge, left_edge, radii)
+}
+
+fn rounded_rect_path(
+    top_edge: f32,
+    right_edge: f32,
+    bottom_edge: f32,
+    left_edge: f32,
+    radii: BorderRadii,
+) -> OwnedPath {
     if !radii.has_any_radius() {
         return path_from_resolved_rect(top_edge, right_edge, bottom_edge, left_edge);
     }
@@ -357,10 +369,14 @@ fn circle_to_path(
     let radius_px = resolve_circle_size(radius.data(), center, translated_reference_box).to_float();
     let center_x = center.x.to_float();
     let center_y = center.y.to_float();
+    // NB: The circle is traced in quarter arcs from its rightmost point, as SVG traces a <circle>, so that both
+    //     rasterize alike.
     let mut path = PathBuilder::new();
-    path.move_to(center_x, center_y + radius_px);
-    path.arc_to(center_x, center_y - radius_px, radius_px, true, true);
-    path.arc_to(center_x, center_y + radius_px, radius_px, true, true);
+    path.move_to(center_x + radius_px, center_y);
+    path.arc_to(center_x, center_y + radius_px, radius_px, false, true);
+    path.arc_to(center_x - radius_px, center_y, radius_px, false, true);
+    path.arc_to(center_x, center_y - radius_px, radius_px, false, true);
+    path.arc_to(center_x + radius_px, center_y, radius_px, false, true);
     path.build()
 }
 
@@ -384,10 +400,14 @@ fn ellipse_to_path(
     let center_y = center.y.to_float();
     let radius_x = size.width.to_float();
     let radius_y = size.height.to_float();
+    // NB: The ellipse is traced in quarter arcs from its rightmost point, as SVG traces an <ellipse>, so that both
+    //     rasterize alike.
     let mut path = PathBuilder::new();
-    path.move_to(center_x, center_y + radius_y);
-    path.elliptical_arc_to(center_x, center_y - radius_y, radius_x, radius_y, 0.0, true, true);
-    path.elliptical_arc_to(center_x, center_y + radius_y, radius_x, radius_y, 0.0, true, true);
+    path.move_to(center_x + radius_x, center_y);
+    path.elliptical_arc_to(center_x, center_y + radius_y, radius_x, radius_y, 0.0, false, true);
+    path.elliptical_arc_to(center_x - radius_x, center_y, radius_x, radius_y, 0.0, false, true);
+    path.elliptical_arc_to(center_x, center_y - radius_y, radius_x, radius_y, 0.0, false, true);
+    path.elliptical_arc_to(center_x + radius_x, center_y, radius_x, radius_y, 0.0, false, true);
     path.build()
 }
 
@@ -413,14 +433,144 @@ fn polygon_to_path(points: &crate::css::style_value::RetainedShapePointList, ref
     path.build()
 }
 
-pub(crate) fn compute_basic_shape_clip_path_data(
-    layout_arena: &impl PaintRead,
-    slot: NodeSlotId,
+/// One coordinate of a shape() point: a length-percentage, or a position edge holding one.
+fn shape_coordinate(value: &RetainedStyleValueData, basis: CssPixels) -> f32 {
+    let value = match value.data() {
+        StyleValueData::Edge { offset, .. } => offset.data(),
+        value => value,
+    };
+    LengthPercentageRef::over(value).to_px(basis).to_float()
+}
+
+// https://drafts.csswg.org/css-shapes-1/#shape-function
+// The commands used by shape() are dynamically turned into path segments when it is used for rendering.
+pub(crate) fn shape_to_path(
+    points: &[crate::css::style_value::RetainedShapePoint],
+    commands: &[crate::css::style_value::ShapeCommand],
+    reference_box: CssPixelRect,
+) -> OwnedPath {
+    use crate::css::style_value::{ShapeCommandKind, ShapeControlPointAnchor};
+    let (width, height) = (reference_box.width, reference_box.height);
+    let resolve = |point: &crate::css::style_value::RetainedShapePoint| {
+        let [x, y] = point.values();
+        (shape_coordinate(x, width), shape_coordinate(y, height))
+    };
+    let mut path = PathBuilder::new();
+    let mut points = points.iter();
+    let mut current = (0.0f32, 0.0f32);
+    let mut subpath_start = current;
+    // The second control point of the previous command, if it was a curve, for smooth commands to reflect.
+    let mut previous_control_point: Option<(f32, f32)> = None;
+    for command in commands {
+        let mut control_point = None;
+        let start = current;
+        let end_point = |offset: (f32, f32)| {
+            if command.relative {
+                (start.0 + offset.0, start.1 + offset.1)
+            } else {
+                offset
+            }
+        };
+        match command.kind {
+            ShapeCommandKind::From | ShapeCommandKind::Move => {
+                current = end_point(resolve(points.next().unwrap()));
+                subpath_start = current;
+                path.move_to(current.0, current.1);
+            }
+            ShapeCommandKind::Line => {
+                current = end_point(resolve(points.next().unwrap()));
+                path.line_to(current.0, current.1);
+            }
+            ShapeCommandKind::HorizontalLine => {
+                let (x, _) = resolve(points.next().unwrap());
+                current = if command.relative {
+                    (start.0 + x, start.1)
+                } else {
+                    (x, start.1)
+                };
+                path.line_to(current.0, current.1);
+            }
+            ShapeCommandKind::VerticalLine => {
+                let (_, y) = resolve(points.next().unwrap());
+                current = if command.relative {
+                    (start.0, start.1 + y)
+                } else {
+                    (start.0, y)
+                };
+                path.line_to(current.0, current.1);
+            }
+            ShapeCommandKind::Curve | ShapeCommandKind::Smooth => {
+                let end = end_point(resolve(points.next().unwrap()));
+                let mut control_points = Vec::with_capacity(2);
+                for anchor in &command.control_points[..usize::from(command.control_point_count)] {
+                    let offset = resolve(points.next().unwrap());
+                    control_points.push(match anchor {
+                        ShapeControlPointAnchor::Start => (start.0 + offset.0, start.1 + offset.1),
+                        ShapeControlPointAnchor::End => (end.0 + offset.0, end.1 + offset.1),
+                        ShapeControlPointAnchor::Origin => offset,
+                    });
+                }
+                if command.kind == ShapeCommandKind::Smooth {
+                    // A smooth command's first control point is the reflection of the previous curve's second
+                    // control point around the starting point, or the starting point itself.
+                    let reflected = previous_control_point.map_or(start, |previous| {
+                        (2.0 * start.0 - previous.0, 2.0 * start.1 - previous.1)
+                    });
+                    control_points.insert(0, reflected);
+                }
+                match control_points[..] {
+                    [only] => path.quadratic_bezier_curve_to(only.0, only.1, end.0, end.1),
+                    [first, second] => path.cubic_bezier_curve_to(first.0, first.1, second.0, second.1, end.0, end.1),
+                    _ => unreachable!("a curve has one or two control points"),
+                }
+                control_point = control_points.last().copied();
+                current = end;
+            }
+            ShapeCommandKind::Arc => {
+                let end = end_point(resolve(points.next().unwrap()));
+                let radii = points.next().unwrap();
+                let (radius_x, radius_y) = if command.arc_has_one_radius {
+                    // A single radius resolves percentages against the direction-agnostic size of the reference
+                    // box.
+                    let [radius, _] = radii.values();
+                    let agnostic_size = CssPixels::nearest_value_for(
+                        (width.to_double().powi(2) + height.to_double().powi(2)).sqrt() / std::f64::consts::SQRT_2,
+                    );
+                    let radius = shape_coordinate(radius, agnostic_size);
+                    (radius, radius)
+                } else {
+                    resolve(radii)
+                };
+                let rotation_degrees =
+                    crate::css::table_group_builder::angle_degrees(points.next().unwrap().values()[0].data())
+                        .unwrap_or(0.0);
+                path.elliptical_arc_to(
+                    end.0,
+                    end.1,
+                    radius_x.abs(),
+                    radius_y.abs(),
+                    rotation_degrees.to_radians() as f32,
+                    command.arc_large,
+                    command.arc_clockwise,
+                );
+                current = end;
+            }
+            ShapeCommandKind::Close => {
+                path.close();
+                current = subpath_start;
+            }
+        }
+        previous_control_point = control_point;
+    }
+    path.build()
+}
+
+/// The device-space path of a computed basic shape whose reference box is `reference_box`, and its fill rule.
+pub(crate) fn basic_shape_device_path(
+    shape: &BasicShapeData,
+    reference_box: CssPixelRect,
     pixel_ratio: f64,
-) -> Option<(OwnedPath, libgfx_rust::IntRect, WindingRule)> {
-    let node = slot;
-    let style = layout_arena.node_style_if_live(node)?;
-    let clip_path = style_queries::handle_value(&style.mask().clip_path)?;
+) -> (OwnedPath, WindingRule) {
     let BasicShapeData {
         kind,
         v0,
@@ -431,33 +581,210 @@ pub(crate) fn compute_basic_shape_clip_path_data(
         fill_rule,
         points,
         path,
-    } = clip_path.basic_shape()?;
-
-    // FIXME: Support other geometry boxes. See: https://drafts.fxtf.org/css-masking/#typedef-geometry-box
-    let masking_area = paintable_geometry::absolute_border_box_rect(layout_arena, slot);
-    let reference_box = CssPixelRect::new(
+        commands,
+    } = shape;
+    let local_reference_box = CssPixelRect::new(
         CssPixels::from_raw(0),
         CssPixels::from_raw(0),
-        masking_area.width,
-        masking_area.height,
+        reference_box.width,
+        reference_box.height,
     );
     let shape_path = match *kind {
-        basic_shape_kind::INSET => inset_to_path(v0, v1, v2, v3, v4, reference_box),
-        basic_shape_kind::CIRCLE => circle_to_path(v0, v1, reference_box),
-        basic_shape_kind::ELLIPSE => ellipse_to_path(v0, v1, reference_box),
-        basic_shape_kind::POLYGON => polygon_to_path(points, reference_box),
+        basic_shape_kind::INSET => inset_to_path(v0, v1, v2, v3, v4, local_reference_box),
+        basic_shape_kind::CIRCLE => circle_to_path(v0, v1, local_reference_box),
+        basic_shape_kind::ELLIPSE => ellipse_to_path(v0, v1, local_reference_box),
+        basic_shape_kind::POLYGON => polygon_to_path(points, local_reference_box),
         basic_shape_kind::PATH => path.to_gfx_path(),
-        _ => unreachable!("computed clip-path basic shape holds an unlowered kind"),
+        basic_shape_kind::SHAPE => shape_to_path(points.as_slice(), commands.as_slice(), local_reference_box),
+        _ => unreachable!("a computed basic shape holds a lowered kind"),
     };
     let resolved_fill_rule = match *kind {
-        basic_shape_kind::POLYGON | basic_shape_kind::PATH => WindingRule::from_raw(i32::from(*fill_rule)),
+        basic_shape_kind::POLYGON | basic_shape_kind::PATH | basic_shape_kind::SHAPE => {
+            WindingRule::from_raw(i32::from(*fill_rule))
+        }
         _ => WindingRule::Nonzero,
     };
+    (
+        device_path_from_local_path(shape_path, reference_box, pixel_ratio),
+        resolved_fill_rule,
+    )
+}
 
-    let translated_path =
-        shape_path.copy_transformed([1.0, 0.0, 0.0, 1.0, masking_area.x.to_float(), masking_area.y.to_float()]);
+/// The device-space path of a path whose coordinates are relative to the origin of `reference_box`.
+fn device_path_from_local_path(path: OwnedPath, reference_box: CssPixelRect, pixel_ratio: f64) -> OwnedPath {
+    let translated_path = path.copy_transformed([
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        reference_box.x.to_float(),
+        reference_box.y.to_float(),
+    ]);
     let scale = pixel_ratio as f32;
-    let device_path = translated_path.copy_transformed([scale, 0.0, 0.0, scale, 0.0, 0.0]);
+    translated_path.copy_transformed([scale, 0.0, 0.0, scale, 0.0, 0.0])
+}
+
+// https://drafts.fxtf.org/css-masking-1/#typedef-geometry-box
+// For elements with associated CSS layout box, the used value for fill-box is content-box and for stroke-box and
+// view-box is border-box.
+// FIXME: For SVG elements without associated CSS layout box, the used value for content-box and padding-box is
+//        fill-box and for border-box and margin-box is stroke-box.
+fn used_geometry_box(geometry_box: u16) -> u16 {
+    match geometry_box {
+        keyword::FILL_BOX => keyword::CONTENT_BOX,
+        keyword::STROKE_BOX | keyword::VIEW_BOX => keyword::BORDER_BOX,
+        other => other,
+    }
+}
+
+// https://drafts.csswg.org/css-shapes-1/#valdef-shape-box-margin-box
+// The corner radii of this shape are determined by the corresponding border-radius and margin values. If the ratio of
+// border-radius/margin is 1 or more, or margin is negative or zero, then the margin box corner radius is
+// max(border-radius + margin, 0). The margin box's corners are outset-adjusted given the element's border box,
+// border-radius, and the margin.
+fn margin_box_border_radii(
+    border_box: CssPixelRect,
+    radii: BorderRadii,
+    [top, right, bottom, left]: [CssPixels; 4],
+) -> BorderRadii {
+    // https://drafts.csswg.org/css-borders-4/#adjusted-radius-dimension
+    // To compute the adjusted radius dimension given numbers coverage, radius, and outset:
+    let adjusted_radius_dimension = |coverage: f32, radius: f32, outset: f32| {
+        // NB: This is the margin box rule for a margin that is negative or zero.
+        if outset <= 0.0 {
+            return (radius + outset).max(0.0);
+        }
+        // 1. If radius is greater than outset, or if coverage is greater than 1, then return radius + outset.
+        if radius > outset || coverage > 1.0 {
+            return radius + outset;
+        }
+        // 2. Let ratio be radius / outset.
+        let ratio = radius / outset;
+        // 3. Return radius + outset * (1 - (1 - ratio)^3 * (1 - coverage^3)).
+        radius + outset * (1.0 - (1.0 - ratio).powi(3) * (1.0 - coverage.powi(3)))
+    };
+    // https://drafts.csswg.org/css-borders-4/#outset-adjusted-border-radius
+    // To compute the outset-adjusted border radius given the 2-dimensional size's edge, radius, and outset:
+    let (edge_width, edge_height) = (border_box.width.to_float(), border_box.height.to_float());
+    let outset_adjusted_border_radius =
+        |radius_width: CssPixels, radius_height: CssPixels, outset_width: CssPixels, outset_height: CssPixels| {
+            let (radius_width, radius_height) = (radius_width.to_float(), radius_height.to_float());
+            // 1. Let coverage be 2 * min(radius's width / edge's width, radius's height / edge's height).
+            let coverage = 2.0 * (radius_width / edge_width).min(radius_height / edge_height);
+            // NB: An empty border box has no corner to cover.
+            let coverage = if coverage.is_nan() { 0.0 } else { coverage };
+            // 2. Let adjustedRadiusWidth be the adjusted radius dimension given coverage, radius's width, and outset's
+            //    width.
+            let adjusted_radius_width = adjusted_radius_dimension(coverage, radius_width, outset_width.to_float());
+            // 3. Let adjustedRadiusHeight be the adjusted radius dimension given coverage, radius's height, and outset's
+            //    height.
+            let adjusted_radius_height = adjusted_radius_dimension(coverage, radius_height, outset_height.to_float());
+            // 4. Return (adjustedRadiusWidth, adjustedRadiusHeight).
+            [
+                CssPixels::nearest_value_for_f32(adjusted_radius_width),
+                CssPixels::nearest_value_for_f32(adjusted_radius_height),
+            ]
+        };
+    let [tl_h, tl_v, tr_h, tr_v, br_h, br_v, bl_h, bl_v] = radii.values;
+    let [tl_h, tl_v] = outset_adjusted_border_radius(tl_h, tl_v, left, top);
+    let [tr_h, tr_v] = outset_adjusted_border_radius(tr_h, tr_v, right, top);
+    let [br_h, br_v] = outset_adjusted_border_radius(br_h, br_v, right, bottom);
+    let [bl_h, bl_v] = outset_adjusted_border_radius(bl_h, bl_v, left, bottom);
+    BorderRadii {
+        values: [tl_h, tl_v, tr_h, tr_v, br_h, br_v, bl_h, bl_v],
+        shapes: radii.shapes,
+    }
+}
+
+// https://drafts.fxtf.org/css-masking-1/#the-clip-path
+// If specified by itself, uses the edges of the specified box, including any corner shaping (e.g. defined by
+// border-radius), as clipping path.
+fn geometry_box_path(
+    layout_arena: &impl PaintRead,
+    slot: NodeSlotId,
+    style: crate::css::computed_value_views::ComputedValuesView<'_>,
+    geometry_box: u16,
+    reference_box: CssPixelRect,
+) -> OwnedPath {
+    let border = [
+        style.border_top_width(),
+        style.border_right_width(),
+        style.border_bottom_width(),
+        style.border_left_width(),
+    ];
+    let radii = super::node_values::border_radii_data(style, layout_arena, slot);
+    let radii = match geometry_box {
+        keyword::PADDING_BOX => radii.shrunken(border[0], border[1], border[2], border[3]),
+        keyword::CONTENT_BOX => {
+            let padding = paintable_geometry::committed_padding(layout_arena, slot);
+            radii.shrunken(
+                border[0] + padding.top,
+                border[1] + padding.right,
+                border[2] + padding.bottom,
+                border[3] + padding.left,
+            )
+        }
+        keyword::MARGIN_BOX => {
+            let margin = paintable_geometry::committed_margin(layout_arena, slot);
+            let border_box = paintable_geometry::absolute_border_box_rect(layout_arena, slot);
+            margin_box_border_radii(
+                border_box,
+                radii,
+                [margin.top, margin.right, margin.bottom, margin.left],
+            )
+        }
+        _ => radii,
+    };
+    rounded_rect_path(
+        0.0,
+        reference_box.width.to_float(),
+        reference_box.height.to_float(),
+        0.0,
+        radii,
+    )
+}
+
+pub(crate) fn compute_basic_shape_clip_path_data(
+    layout_arena: &impl PaintRead,
+    slot: NodeSlotId,
+    pixel_ratio: f64,
+) -> Option<(OwnedPath, libgfx_rust::IntRect, WindingRule)> {
+    let node = slot;
+    let style = layout_arena.node_style_if_live(node)?;
+    let clip_path = style_queries::handle_value(&style.mask().clip_path)?;
+    // [ <basic-shape> || <geometry-box> ], as a lone shape, a lone box, or a shape followed by its box.
+    let (shape, geometry_box) = match clip_path {
+        StyleValueData::BasicShape { shape } => (Some(shape.as_ref()), None),
+        StyleValueData::Keyword { keyword } if *keyword != keyword::NONE => (None, Some(*keyword)),
+        StyleValueData::ValueList { values, .. } => match values.as_slice() {
+            [shape, geometry_box] => match geometry_box.data() {
+                StyleValueData::Keyword { keyword } => (Some(shape.data().basic_shape()?), Some(*keyword)),
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // If no reference box is specified, the border-box will be used as reference box.
+    let geometry_box = used_geometry_box(geometry_box.unwrap_or(keyword::BORDER_BOX));
+    let masking_area = crate::painting::border_shape::reference_box(
+        layout_arena,
+        slot,
+        style,
+        Some(geometry_box),
+        keyword::BORDER_BOX,
+    );
+    let (device_path, resolved_fill_rule) = match shape {
+        Some(shape) => basic_shape_device_path(shape, masking_area, pixel_ratio),
+        None => (
+            device_path_from_local_path(
+                geometry_box_path(layout_arena, slot, style, geometry_box, masking_area),
+                masking_area,
+                pixel_ratio,
+            ),
+            WindingRule::Nonzero,
+        ),
+    };
     let converter = DevicePixelConverter::new(pixel_ratio);
     let device_bounding_rect = converter.rounded_device_rect(masking_area);
     Some((device_path, device_bounding_rect, resolved_fill_rule))

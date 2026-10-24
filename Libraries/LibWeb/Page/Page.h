@@ -137,7 +137,7 @@ public:
     GC::Ref<HTML::LocalNavigable> local_traversable() const;
     bool has_local_traversable() const;
     bool set_viewport_size_from_device_pixels_if_local(DevicePixelSize, InvalidateDisplayList);
-    Vector<GC::Ref<HTML::LocalNavigable>> local_roots() const;
+    GC::RootVector<GC::Ref<HTML::LocalNavigable>> local_roots() const;
     Vector<GC::Root<HTML::LocalNavigable>> hosted_navigables() const;
     GC::Ptr<HTML::Navigable> navigable_with_id(HTML::CrossProcessId) const;
 
@@ -188,7 +188,7 @@ public:
     CSSPixelSize device_to_css_size(DevicePixelSize) const;
     DevicePixelRect enclosing_device_rect(CSSPixelRect) const;
     DevicePixelRect rounded_device_rect(CSSPixelRect) const;
-    ChromeMetrics chrome_metrics() const;
+    ChromeMetrics chrome_metrics(DOM::Document const&) const;
 
     EventResult handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target);
     EventResult handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const&, Optional<RemoteInputEventTarget>* remote_target);
@@ -354,6 +354,7 @@ public:
     void register_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
     void unregister_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
     bool has_media_element_playing_audio(DOM::Document const&) const;
+    Vector<GC::Root<HTML::HTMLVideoElement>> video_elements_of(DOM::Document const&);
 
     void sync_media_element_video_sink_ticking();
     void restore_all_media_element_video_sinks();
@@ -655,7 +656,7 @@ public:
     virtual void request_navigation_start(HTML::LocalNavigable&, NavigationTarget, URL::URL const& url, Utf16String navigation_id, Optional<HTML::NavigationStartRequest>);
     virtual void request_navigation_of_navigable(HTML::Navigable&, HTML::Navigable&, DOM::Document const&, HTML::PreparedNavigationDescriptor) { VERIFY_NOT_REACHED(); }
     virtual void request_post_message_to_remote_navigable(HTML::RemoteNavigable&, HTML::PostedMessageDescriptor) { VERIFY_NOT_REACHED(); }
-    virtual void request_close_of_remote_traversable(HTML::RemoteNavigable&, HTML::LocalNavigable const&) { VERIFY_NOT_REACHED(); }
+    virtual void request_close_of_remote_traversable(HTML::RemoteNavigable&, HTML::LocalNavigable const&, HTML::NavigationSourceSnapshot) { VERIFY_NOT_REACHED(); }
     virtual void request_focusing_steps_for_remote_navigable(HTML::RemoteNavigable&, HTML::FocusTrigger) { VERIFY_NOT_REACHED(); }
     virtual void request_window_focus_of_remote_navigable(HTML::RemoteNavigable&) { VERIFY_NOT_REACHED(); }
     virtual void request_set_opener_of_remote_navigable(HTML::RemoteNavigable&, HTML::Navigable const&) { VERIFY_NOT_REACHED(); }
@@ -684,6 +685,7 @@ public:
     // a menu bar or a dock. A client that doesn't know it reports the whole screen.
     virtual DevicePixelRect available_screen_rect() const { return screen_rect(); }
     virtual double zoom_level() const = 0;
+    virtual double viewport_corner_radius() const { return 0; }
     virtual double device_pixel_ratio() const = 0;
     virtual double device_pixels_per_css_pixel() const = 0;
     virtual double maximum_frames_per_second() const { return 60.0; }
@@ -708,6 +710,7 @@ public:
     }
     virtual HTML::CrossProcessId allocate_navigable_id() { return allocate_cross_process_id(); }
     virtual void request_frame() = 0;
+    virtual double rendering_frame_interval_in_milliseconds() const { return 1000.0 / 60.0; }
     virtual void rendering_opportunity([[maybe_unused]] i64 frame_time_nanoseconds, [[maybe_unused]] double frame_interval_milliseconds) { }
     virtual void will_begin_rendering_update() { }
     virtual bool has_rendering_opportunity() const { return true; }

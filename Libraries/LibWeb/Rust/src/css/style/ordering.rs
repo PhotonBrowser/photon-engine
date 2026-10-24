@@ -66,11 +66,6 @@ impl ElementCascadeCompactionTop1 {
         self.winners.sort_unstable_by_key(|winner| winner.key);
         &self.winners
     }
-
-    fn capacity_bytes(&self) -> u64 {
-        (self.winners.capacity() * size_of::<Top1Winner<u16, CascadePriority, CascadeCompactionCandidate>>()
-            + self.winner_by_property.capacity() * size_of::<u32>()) as u64
-    }
 }
 
 /// The winner state a compaction publishes for one of a node's targets.
@@ -125,7 +120,6 @@ struct RememberedCompactions {
     /// The hashes of the lists compacted once since the table was last cleared.
     seen: HashSet<u64>,
     by_matches: hashbrown::HashTable<RememberedCompaction>,
-    nested_bytes: usize,
 }
 
 impl RememberedCompactions {
@@ -148,7 +142,6 @@ impl RememberedCompactions {
 
     fn clear(&mut self) {
         self.by_matches.clear();
-        self.nested_bytes = 0;
     }
 
     fn get(&self, hash: u64, matches: &[CompactionKeyPart]) -> Option<&RememberedCompaction> {
@@ -181,21 +174,8 @@ impl RememberedCompactions {
             states: states.into(),
             keep: keep.map(Into::into),
         };
-        self.nested_bytes += size_of_val(remembered.matches.as_ref())
-            + keep.map_or(0, size_of_val)
-            + if remembered.states.spilled() {
-                size_of_val(states)
-            } else {
-                0
-            };
         self.by_matches
             .insert_unique(hash, remembered, |remembered| remembered.hash);
-    }
-
-    fn capacity_bytes(&self) -> u64 {
-        (self.seen.capacity() * size_of::<u64>()
-            + self.by_matches.capacity() * size_of::<RememberedCompaction>()
-            + self.nested_bytes) as u64
     }
 }
 
@@ -233,23 +213,7 @@ impl Default for CascadeCompactionWorkspace {
     }
 }
 
-impl CascadeCompactionWorkspace {
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        self.top_1.capacity_bytes() as u64
-            + self.element_top_1.capacity_bytes()
-            + (self.keep.capacity() * size_of::<bool>()) as u64
-            + (self.published_winners.capacity() * size_of::<PropertyWinner>()) as u64
-            + (self.published_targets.capacity()
-                * size_of::<(Option<tree::PseudoElementTarget>, std::ops::Range<usize>)>()) as u64
-            + if self.published_states.spilled() {
-                (self.published_states.capacity() * size_of::<PublishedWinnerState>()) as u64
-            } else {
-                0
-            }
-            + (self.remembered_key.capacity() * size_of::<CompactionKeyPart>()) as u64
-            + self.remembered.capacity_bytes()
-    }
-}
+impl CascadeCompactionWorkspace {}
 
 /// Whether a declared property names a longhand column; a shorthand declared whole does not.
 fn property_is_longhand(property: u16) -> bool {
@@ -656,8 +620,7 @@ impl RetainedState {
             publish_winners_for,
             &mut workspace,
         );
-        self.cascade_compaction_scratch_memory
-            .resize_required_to(&mut self.memory, workspace.capacity_bytes());
+
         self.cascade_compaction_scratch = workspace;
     }
 
@@ -666,21 +629,9 @@ impl RetainedState {
         effects: &mut AnswerEffects,
         all: &mut Vec<RuleMatch>,
         can_have_scope_duplicates: bool,
-        mut publish_winners_for: Option<StyleNodeID>,
+        publish_winners_for: Option<StyleNodeID>,
         workspace: &mut CascadeCompactionWorkspace,
     ) {
-        if publish_winners_for.is_some_and(|node| {
-            !self.winner_groups.admits_new_rows()
-                && matches!(
-                    effects
-                        .winners
-                        .view(&self.winner_groups)
-                        .lookup(WinnerGroupKey::current(node, self.program.version())),
-                    Lookup::Missing(_)
-                )
-        }) {
-            publish_winners_for = None;
-        }
         self.order_matches_in_cascade(all, can_have_scope_duplicates);
         self.counters
             .add(Counter::CascadeMatchesBeforeCompaction, all.len() as u64);
@@ -865,8 +816,6 @@ impl RetainedState {
                 }
             }
         }
-        let mut scratch_bytes = 0;
-
         let published_winners = &mut workspace.published_winners;
         published_winners.clear();
         let published_targets = &mut workspace.published_targets;
@@ -929,10 +878,6 @@ impl RetainedState {
         }
 
         if let Some(node) = publish_winners_for {
-            let winner_count = published_winners.len();
-            let winner_scratch_bytes = (winner_count * size_of::<PropertyWinner>()) as u64;
-            self.memory
-                .reserve_required(MemoryCategory::BatchScratch, winner_scratch_bytes);
             let published_states = &mut workspace.published_states;
             published_states.clear();
             for (target, range) in published_targets.iter() {
@@ -974,7 +919,6 @@ impl RetainedState {
                 });
             }
             self.publish_winner_states(effects, node, published_states);
-            self.memory.release(MemoryCategory::BatchScratch, winner_scratch_bytes);
         }
 
         if compaction_blocked {
@@ -983,7 +927,7 @@ impl RetainedState {
                     .remembered
                     .remember(hash, &workspace.remembered_key, &workspace.published_states, None);
             }
-            self.memory.release(MemoryCategory::BatchScratch, scratch_bytes);
+
             return;
         }
 
@@ -1031,9 +975,10 @@ impl RetainedState {
         // from the answer again (`winner_below_substitution`), so a match declaring such a
         // property is kept whatever else it loses.
         if keep.iter().any(|kept| !kept) {
-            let may_substitute_revert = |value| match self.specified_values.value(value) {
-                Lookup::Known(value) => custom_property_cascade::value_may_substitute_revert(value),
-                _ => false,
+            let may_substitute_revert = |value| {
+                self.specified_values
+                    .value(value)
+                    .is_some_and(custom_property_cascade::value_may_substitute_revert)
             };
             let mut substituted: SmallVec<[(Option<tree::PseudoElementTarget>, u16); 4]> = SmallVec::new();
             let top_1_winners = top_1.unordered_winners().map(|winner| (winner.key, winner.payload));
@@ -1089,21 +1034,6 @@ impl RetainedState {
             }
         }
 
-        let pseudo_target_scratch_bytes = if retained_pseudo_targets.spilled() {
-            retained_pseudo_targets.capacity() * size_of::<tree::PseudoElementTarget>()
-        } else {
-            0
-        };
-        let actual_scratch_bytes = pseudo_target_scratch_bytes as u64;
-        if actual_scratch_bytes > scratch_bytes {
-            self.memory
-                .reserve_required(MemoryCategory::BatchScratch, actual_scratch_bytes - scratch_bytes);
-        } else {
-            self.memory
-                .release(MemoryCategory::BatchScratch, scratch_bytes - actual_scratch_bytes);
-        }
-        scratch_bytes = actual_scratch_bytes;
-
         if let Some(hash) = remember_as {
             workspace
                 .remembered
@@ -1115,7 +1045,6 @@ impl RetainedState {
             index += 1;
             retained
         });
-        self.memory.release(MemoryCategory::BatchScratch, scratch_bytes);
     }
 
     /// Whether compacting `all` for `node` decides what it would for any other node with the same
@@ -1155,14 +1084,10 @@ impl RetainedState {
         } in states
         {
             if let Some(target) = target {
-                let published = effects.winners.set_pseudo(
-                    &mut self.winner_groups,
-                    node,
-                    target,
-                    state,
-                    self.program.version(),
-                    &mut self.memory,
-                );
+                let published =
+                    effects
+                        .winners
+                        .set_pseudo(&mut self.winner_groups, node, target, state, self.program.version());
                 if published && !inventory_is_complete {
                     effects.winners.mark_pseudo_inventory_incomplete(node, target);
                 }
@@ -1173,11 +1098,10 @@ impl RetainedState {
                     node,
                     state,
                     self.program.version(),
-                    &mut self.memory,
                 ));
             }
         }
-        self.winner_groups.settle_memory(&mut self.memory);
+
         self.counters
             .add(Counter::CascadeNodeHandlesPublished, published_row_count as u64);
     }
@@ -1187,10 +1111,9 @@ impl RetainedState {
     /// name.
     fn state_may_substitute_revert(&self, state: CascadeStateID) -> bool {
         self.winner_groups.winners_in_state(state).any(|winner| {
-            matches!(
-                self.specified_values.value(winner.key.value),
-                Lookup::Known(value) if custom_property_cascade::value_may_substitute_revert(value)
-            )
+            self.specified_values
+                .value(winner.key.value)
+                .is_some_and(custom_property_cascade::value_may_substitute_revert)
         })
     }
 
@@ -1312,13 +1235,7 @@ impl RetainedState {
             };
             pseudo_rules.push((pseudo, rules, marker));
         }
-        let scratch_bytes = if pseudo_rules.spilled() {
-            (pseudo_rules.capacity() * size_of::<PseudoCompactionEntry<'_>>()) as u64
-        } else {
-            0
-        };
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, scratch_bytes);
+
         self.counters
             .add(Counter::CascadeMatchesBeforeCompaction, all.len() as u64);
         let mut index = 0;
@@ -1337,7 +1254,7 @@ impl RetainedState {
             index += 1;
             retained
         });
-        self.memory.release(MemoryCategory::BatchScratch, scratch_bytes);
+
         drop(pseudo_rules);
         verify_style_answer_patch(self, |verifier| {
             verifier.verify_cascade_answer(all, node, "pseudo compaction from updated winners");
@@ -1577,24 +1494,15 @@ impl RetainedState {
         let (state, _) =
             self.with_cascade_interning_counters(|groups| groups.apply_property_updates(previous, &updates));
         let published = if let Some(pseudo) = pseudo {
-            effects.winners.set_pseudo(
-                &mut self.winner_groups,
-                node,
-                pseudo,
-                state,
-                self.program.version(),
-                &mut self.memory,
-            )
+            effects
+                .winners
+                .set_pseudo(&mut self.winner_groups, node, pseudo, state, self.program.version())
         } else {
-            effects.winners.set(
-                &mut self.winner_groups,
-                node,
-                state,
-                self.program.version(),
-                &mut self.memory,
-            )
+            effects
+                .winners
+                .set(&mut self.winner_groups, node, state, self.program.version())
         };
-        self.winner_groups.settle_memory(&mut self.memory);
+
         if published {
             self.counters.bump(Counter::CascadeNodeHandlesPublished);
         }
@@ -1741,8 +1649,7 @@ impl RetainedState {
             }
             let scope = TreeScopeID(u32::try_from(index).expect("tree scope identity space exhausted"));
             let (_, dispatch) = self.prepare_scope_program(scope);
-            let ancestor_requirements =
-                ancestor_requirements_cache.prepare(&self.tree, &batch, &dispatch, None, &mut self.memory);
+            let ancestor_requirements = ancestor_requirements_cache.prepare(&self.tree, &batch, &dispatch, None);
             // `:host` names the host of this tree, which stands outside it, so the tree's own rules
             // are asked of it as well.
             let host = self.scope_root(scope).and_then(|root| self.tree.host_of(root));
@@ -1776,10 +1683,7 @@ impl RetainedState {
             }
         }
         self.install_witness_effects();
-        ancestor_requirements_cache.release(&mut self.memory);
-        let dispatch_workspace_bytes = dispatch_workspace.capacity_bytes();
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, dispatch_workspace_bytes);
+        ancestor_requirements_cache.release();
 
         // Within one style node the matches come out in the order the cascade applies them, so a
         // consumer reads them rather than sorting them again.
@@ -1787,10 +1691,8 @@ impl RetainedState {
             self.order_matches_in_cascade(matches.as_mut_vec(), can_have_scope_duplicates);
             matches.len()
         });
-        matches.settle_memory(&mut self.memory);
-        matches.release(&mut self.memory);
-        self.memory
-            .release(MemoryCategory::BatchScratch, dispatch_workspace_bytes);
+
+        matches.release();
 
         match_count
     }
@@ -1985,9 +1887,9 @@ impl RetainedState {
     /// Advance staged local facts to the transaction's final snapshot.
     pub(super) fn apply_staged_facts(&mut self, transaction: &mut StyleTransaction) {
         if self.facts.has_staged_input() {
-            transaction.install_before_facts(self.facts.staged_before_facts(), &mut self.memory);
+            transaction.install_before_facts(self.facts.staged_before_facts());
         }
-        self.facts.apply_staged(&mut self.memory);
+        self.facts.apply_staged();
     }
 
     /// Drop routing entry points for rules whose sheet is attached nowhere and not kept for reattachment.
@@ -2028,14 +1930,7 @@ impl RetainedState {
             }
         }
         rebuilt_routing.prepare_route_liveness(&self.program, &self.programs);
-        let mut previous_routing = std::mem::replace(&mut self.routing, Arc::new(rebuilt_routing));
-        // NB: A fork of the render state may still share the previous routing program, which it releases itself.
-        if let Some(previous_routing) = Arc::get_mut(&mut previous_routing) {
-            previous_routing.release_memory();
-        }
-        Arc::get_mut(&mut self.routing)
-            .expect("new routing program cannot be shared")
-            .settle_memory(&mut self.memory);
+        self.routing = Arc::new(rebuilt_routing);
         self.sheets_excluded_from_routing = excluded_sheets;
     }
 
@@ -2085,17 +1980,10 @@ impl RetainedState {
         }
         self.sheets_excluded_from_routing = excluded_sheets;
         rebuilt_routing.prepare_route_liveness(&self.program, &self.programs);
-        let mut previous_routing = std::mem::replace(&mut self.routing, Arc::new(rebuilt_routing));
-        // NB: A fork of the render state may still share the previous routing program, which it releases itself.
-        if let Some(previous_routing) = Arc::get_mut(&mut previous_routing) {
-            previous_routing.release_memory();
-        }
-        Arc::get_mut(&mut self.routing)
-            .expect("new routing program cannot be shared")
-            .settle_memory(&mut self.memory);
+        self.routing = Arc::new(rebuilt_routing);
 
         self.relational_witnesses.clear_all();
-        self.relational_witness_residency.release();
+
         self.scope_dispatch_templates.retain(|shape, _| {
             shape
                 .0
@@ -2125,7 +2013,7 @@ impl RetainedState {
         // NB: The retired shapes may name swept selector programs, whose identities are recycled.
         self.retired_scope_templates.clear();
         self.programs.sweep_unreferenced(&referenced);
-        self.programs.settle_memory(&mut self.memory);
+
         self.selector_programs_need_sweep = false;
     }
 }
@@ -2140,12 +2028,8 @@ impl StyleEngine {
         // program. It remains queryable in builder form; compact it at the next unshared boundary.
         if let Some(routing) = Arc::get_mut(&mut self.retained.routing)
             && routing.finish_directories()
-        {
-            routing.settle_memory(&mut self.retained.memory);
-        }
-        self.host
-            .journal
-            .take_transaction(&mut self.retained.memory, &self.retained.counters)
+        {}
+        self.host.journal.take_transaction(&self.retained.counters)
     }
 
     /// Advance staged program and tree state to the transaction's final snapshot.
@@ -2162,7 +2046,7 @@ impl StyleEngine {
         for input in &transaction.inputs {
             self.append_program_join_deltas(input, &mut program_joins);
         }
-        transaction.install_program_joins(program_joins, &mut self.retained.memory);
+        transaction.install_program_joins(program_joins);
         let mut declaration_changes = std::mem::take(&mut self.host.program_staging.rule_declaration_changes);
         declaration_changes.retain(|change| {
             transaction
@@ -2182,7 +2066,6 @@ impl StyleEngine {
                     custom_declarations_changed: change.custom_declarations_changed,
                 })
                 .collect(),
-            &mut self.retained.memory,
         );
     }
 
@@ -2246,22 +2129,15 @@ impl StyleEngine {
                 },
             ),
         }
-        let deferred_style_input_bytes =
-            (self.host.deferred_element_style_inputs.capacity() * size_of::<NormalizedInput>()) as u64;
-        self.host
-            .deferred_element_style_input_memory
-            .resize_required_to(&mut self.retained.memory, deferred_style_input_bytes);
     }
 
     /// Release a drained transaction's scratch charge.
     pub fn release_transaction(&mut self, transaction: StyleTransaction) {
-        transaction.release(&mut self.retained.memory);
+        transaction.release();
         self.forget_departed_elements();
         self.host.tree_staging.clear();
-        self.host
-            .tree_staging_memory
-            .resize_required_to(&mut self.retained.memory, 0);
-        self.retained.facts.release_staging(&mut self.retained.memory);
+
+        self.retained.facts.release_staging();
         self.host.program_staging.clear();
         self.host.environment_move_changed_names.clear();
         self.sweep_selector_programs();
@@ -2387,16 +2263,12 @@ impl StyleEngine {
         }
     }
 
-    /// The document budget is written in connected elements, so it has to follow the live element
-    /// count rather than a high-water mark.
-    pub(super) fn publish_budget_inputs(&mut self) {
-        let inputs = BudgetInputs {
-            connected_element_count: self.retained.tree.connected_element_count(),
-        };
-        self.retained.memory.set_budget_inputs(inputs);
+    /// The journal's entry limit is written in connected elements, so it has to follow the live
+    /// element count rather than a high-water mark.
+    pub(super) fn update_journal_entry_limit(&mut self) {
         self.host
             .journal
-            .set_document_capacity_limit(self.retained.tree.connected_element_count());
+            .set_document_entry_limit(self.retained.tree.connected_element_count());
     }
 }
 

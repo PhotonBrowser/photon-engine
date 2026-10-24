@@ -34,6 +34,7 @@
 #include <LibWebView/WebCompatReport.h>
 #include <LibWebView/WebContentClient.h>
 #include <UI/Qt/Application.h>
+#include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/CrashReportReviewWidget.h>
 #include <UI/Qt/ReportReview.h>
 #include <UI/Qt/ScreenshotSelectionOverlay.h>
@@ -111,7 +112,7 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     setParent(window);
     setApi(QRhiWidget::Api::Direct3D11);
 #elif defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
-    // The page is shown by a layer of this widget's own native view; Qt neither erases nor paints the area under it.
+    // The page is shown by a layer of this widget's own native view; Qt only paints the chrome behind its corners.
     setAttribute(Qt::WA_DontCreateNativeAncestors);
     setAttribute(Qt::WA_NativeWindow);
     setAttribute(Qt::WA_OpaquePaintEvent);
@@ -923,11 +924,6 @@ void WebContentView::mouseReleaseEvent(QMouseEvent* event)
     }
 
     enqueue_native_event(Web::MouseEvent::Type::MouseUp, *event);
-
-    if (event->button() == Qt::MouseButton::BackButton)
-        traverse_the_history_by_delta(-1);
-    else if (event->button() == Qt::MouseButton::ForwardButton)
-        traverse_the_history_by_delta(1);
 }
 
 void WebContentView::wheelEvent(QWheelEvent* event)
@@ -1143,6 +1139,15 @@ void WebContentView::paintEvent(QPaintEvent*)
 
     auto background_color = page_background_color();
     painter.fillRect(QRect(0, 0, m_viewport_size.width(), m_viewport_size.height()), QColor(background_color.red(), background_color.green(), background_color.blue()));
+}
+#endif
+
+#ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
+void WebContentView::paintEvent(QPaintEvent*)
+{
+    // The page layer has rounded corners, so the area outside them should match the chrome around this view.
+    QPainter painter(this);
+    painter.fillRect(rect(), ChromeStyle::chrome_background(window()->palette()));
 }
 #endif
 
@@ -1760,30 +1765,6 @@ void WebContentView::set_zoom_level(double zoom_level)
     update_zoom();
 }
 
-void WebContentView::set_maximum_frames_per_second(double maximum_frames_per_second)
-{
-    set_display_metadata(m_display_id, maximum_frames_per_second);
-}
-
-void WebContentView::set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second)
-{
-    m_display_id = display_id;
-    m_maximum_frames_per_second = maximum_frames_per_second;
-    page().async_set_maximum_frames_per_second(m_maximum_frames_per_second);
-    update_compositor_display_metadata();
-}
-
-void WebContentView::update_compositor_display_metadata()
-{
-    update_compositor_display_metadata(page());
-}
-
-void WebContentView::update_compositor_display_metadata(WebView::WebContentPage& page)
-{
-    auto compositor_context_id = page.compositor_context_id();
-    WebView::Application::the().update_compositor_display_metadata(compositor_context_id, m_display_id, m_maximum_frames_per_second);
-}
-
 void WebContentView::update_viewport_size()
 {
     auto scaled_width = int(width() * m_device_pixel_ratio);
@@ -1892,15 +1873,15 @@ void WebContentView::update_palette(PaletteMode mode)
 
     // NB: Every page hosting documents of this tab takes the palette, including the pages of out-of-process iframes.
     //     Their prefers-color-scheme and system colors resolve against it.
-    auto theme = make_system_theme_from_qt_palette(*this, mode);
-    traversable().for_each_hosting_page([&](WebView::WebContentPage& page) {
-        page.async_update_system_theme(theme);
-    });
+    update_system_theme(make_system_theme_from_qt_palette(*this, mode));
+#ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
+    update_iosurface_layer_border();
+#endif
 }
 
-void WebContentView::send_system_theme_to_page(WebView::WebContentPage& page)
+Core::AnonymousBuffer WebContentView::system_theme()
 {
-    page.async_update_system_theme(make_system_theme_from_qt_palette(*this, PaletteMode::Default));
+    return make_system_theme_from_qt_palette(*this, PaletteMode::Default);
 }
 
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
@@ -1981,20 +1962,12 @@ void WebContentView::watch_screen_geometry(QScreen& screen)
     });
 }
 
-void WebContentView::update_screen_rects()
-{
-    traversable().for_each_hosting_page([&](WebView::WebContentPage& page) {
-        update_screen_rects(page);
-    });
-}
-
-void WebContentView::update_screen_rects(WebView::WebContentPage& page)
+Optional<WebView::ViewImplementation::ScreenRects> WebContentView::screen_rects() const
 {
     auto screens = QGuiApplication::screens();
 
     if (!screens.empty()) {
-        Vector<Web::DevicePixelRect> screen_rects;
-        Vector<Web::DevicePixelRect> available_screen_rects;
+        ScreenRects result;
         for (auto const& screen : screens) {
             // NOTE: QScreen::geometry() returns the 'device-independent pixels', we multiply
             //       by the device pixel ratio to get the 'physical pixels' of the display.
@@ -2002,16 +1975,16 @@ void WebContentView::update_screen_rects(WebView::WebContentPage& page)
             auto to_device_pixels = [&](QRect const& geometry) {
                 return Web::DevicePixelRect(geometry.x() * device_pixel_ratio, geometry.y() * device_pixel_ratio, geometry.width() * device_pixel_ratio, geometry.height() * device_pixel_ratio);
             };
-            screen_rects.append(to_device_pixels(screen->geometry()));
-            // The available geometry leaves out what the system keeps for itself, such as a menu bar or a dock.
-            available_screen_rects.append(to_device_pixels(screen->availableGeometry()));
+            result.rects.append(to_device_pixels(screen->geometry()));
+            result.available_rects.append(to_device_pixels(screen->availableGeometry()));
         }
 
         // NOTE: The first item in QGuiApplication::screens is always the primary screen.
         //       This is not specified in the documentation but QGuiApplication::primaryScreen
-        //       always returns the first item in the list if it isn't empty.
-        page.async_update_screen_rects(screen_rects, available_screen_rects, 0);
+        //       always returns the first item in the list if it isn't empty, so main_screen_index stays 0.
+        return result;
     }
+    return {};
 }
 
 void WebContentView::prepare_page_for_navigable(WebView::WebContentPage& page)
@@ -2019,7 +1992,6 @@ void WebContentView::prepare_page_for_navigable(WebView::WebContentPage& page)
     ViewImplementation::prepare_page_for_navigable(page);
 
     update_compositor_display_metadata(page);
-    update_screen_rects(page);
 }
 
 void WebContentView::update_cursor(Gfx::Cursor cursor)

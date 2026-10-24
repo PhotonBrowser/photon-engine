@@ -23,12 +23,14 @@ use super::web_gl_uniform_location::WebGLUniformLocation;
 use crate::bindings::conversions::{ArrayBufferView, BufferSource, CppInterface};
 use crate::bindings::interface::Ref;
 use crate::bindings::{CallContext, WebIdlResult};
+use crate::html::image_bitmap::ImageBitmap;
+use crate::html::image_data::ImageData;
 
 /// https://registry.khronos.org/webgl/specs/latest/1.0/#5.14.8
 // FIXME: VideoFrame
 pub(crate) enum TexImageSource {
-    ImageBitmap(CppInterface),
-    ImageData(CppInterface),
+    ImageBitmap(Ref<ImageBitmap>),
+    ImageData(Ref<ImageData>),
     HTMLImageElement(CppInterface),
     HTMLCanvasElement(CppInterface),
     HTMLVideoElement(CppInterface),
@@ -299,7 +301,7 @@ impl RenderingContext<WebGL1> {
         r#type: u32,
         source: TexImageSource,
     ) -> WebIdlResult<()> {
-        let Some((frame, upload)) = self.read_texture_image_source(&source, format, r#type) else {
+        let Some((frame, upload)) = self.read_texture_image_source(&source, format, r#type)? else {
             return Ok(());
         };
         self.proxy
@@ -360,7 +362,7 @@ impl RenderingContext<WebGL1> {
         r#type: u32,
         source: TexImageSource,
     ) -> WebIdlResult<()> {
-        let Some((frame, upload)) = self.read_texture_image_source(&source, format, r#type) else {
+        let Some((frame, upload)) = self.read_texture_image_source(&source, format, r#type)? else {
             return Ok(());
         };
         self.proxy

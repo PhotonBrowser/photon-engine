@@ -11,6 +11,7 @@ pub mod background;
 pub mod background_resolution;
 pub mod border;
 pub mod border_image;
+pub mod column_rule;
 pub mod fieldset;
 pub mod form_controls;
 pub mod gradient_resolution;
@@ -27,6 +28,7 @@ pub mod text;
 pub mod text_decoration;
 
 use crate::css::computed_value_views::ComputedValuesView;
+use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::node_painting;
 use crate::painting::record::{BasePaintFacts, PaintPhase, PaintRecorder};
@@ -61,7 +63,12 @@ pub(crate) fn paint_phase_mask<O: Observer>(
         {
             phases |= PaintPhase::Background.bit();
         }
-        if facts.paints_border_image || style_queries::has_css_borders(style) {
+        // A border shape fills the area between its two shapes even without border widths.
+        if facts.paints_border_image
+            || style_queries::has_css_borders(style)
+            || crate::painting::border_shape::has_border_shape(style)
+            || facts.paints_column_rules
+        {
             phases |= PaintPhase::Border.bit();
         }
     }
@@ -127,7 +134,14 @@ pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable:
             if !recorder.is_visible(paintable) {
                 return;
             }
-            paint_base(recorder, paintable, phase);
+            if crate::layout::node_facts::kind_is_non_devolvable_widget(kind) {
+                // A non-devolvable widget keeps its native appearance whatever background it has. Layout already gave
+                // it zero border widths, so only its background is left to skip.
+                // https://drafts.csswg.org/css-ui/#non-devolvable
+                paint_base_with(recorder, paintable, phase, |_, _| {});
+            } else {
+                paint_base(recorder, paintable, phase);
+            }
             if phase == PaintPhase::Foreground {
                 match kind {
                     NodeKind::ImageBox => replaced::paint_image_foreground(recorder, paintable),
@@ -197,24 +211,55 @@ pub(crate) fn paint_base_with<O: Observer>(
     if !facts.is_visible {
         return;
     }
+    let fragment_count = crate::painting::paintable_geometry::fragment_count(recorder.source, paintable);
     if phase == PaintPhase::Background && !facts.empty_cells_property_applies {
         paint_backdrop_filter(recorder, paintable, &facts);
-        paint_background(recorder, paintable);
-        if facts.has_box_shadow {
-            let border_box_rect =
-                crate::painting::paintable_geometry::absolute_border_box_rect(recorder.source, paintable);
-            let padding_box_rect =
-                crate::painting::paintable_geometry::absolute_padding_box_rect(recorder.source, paintable);
-            let border_radii = recorder.border_radii(paintable);
-            shadow::paint_box_shadow(recorder, paintable, border_box_rect, padding_box_rect, border_radii);
+        if fragment_count > 1 {
+            paint_background_of_fragments(recorder, paintable, &facts, fragment_count);
+        } else {
+            paint_background(recorder, paintable);
+            if facts.has_box_shadow {
+                let border_box_rect =
+                    crate::painting::paintable_geometry::absolute_border_box_rect(recorder.source, paintable);
+                let padding_box_rect =
+                    crate::painting::paintable_geometry::absolute_padding_box_rect(recorder.source, paintable);
+                let border_radii = recorder.border_radii(paintable);
+                shadow::paint_box_shadow(recorder, paintable, border_box_rect, padding_box_rect, border_radii);
+            }
         }
     }
-    if phase == PaintPhase::Border
-        && !crate::painting::paintable_geometry::committed_uses_collapsing_borders_model(recorder.source, paintable)
-        && !facts.empty_cells_property_applies
-    {
+    if phase == PaintPhase::Border && !facts.empty_cells_property_applies {
         let previous = set_own_background_as_contrast_backdrop(recorder, paintable);
-        border::paint_box_borders_from_style(recorder, paintable, &facts);
+        if !crate::painting::paintable_geometry::committed_uses_collapsing_borders_model(recorder.source, paintable) {
+            if fragment_count > 1 {
+                for index in 0..fragment_count {
+                    let (border_box_rect, border_radii) = recorder.fragment_border_box(paintable, index);
+                    border::paint_borders_from_style(
+                        recorder,
+                        paintable,
+                        &facts,
+                        crate::painting::paintable_geometry::committed_fragment_border(
+                            recorder.source,
+                            paintable,
+                            index,
+                        ),
+                        border_box_rect,
+                        border_radii,
+                        crate::painting::paintable_geometry::committed_fragment_present_edges(
+                            recorder.source,
+                            paintable,
+                            index,
+                        ),
+                    );
+                }
+            } else {
+                border::paint_box_borders_from_style(recorder, paintable, &facts);
+            }
+        }
+        if facts.paints_column_rules {
+            let context = recorder.for_descendants_context(paintable);
+            recorder.with_context(context, |recorder| column_rule::paint_column_rules(recorder, paintable));
+        }
         recorder.recorder.set_contrast_backdrop(previous);
     }
     if phase == PaintPhase::TableCollapsedBorder {
@@ -229,6 +274,67 @@ pub(crate) fn paint_base_with<O: Observer>(
     }
     if phase == PaintPhase::Overlay {
         overlay::paint_overlay(recorder, paintable);
+    }
+}
+
+fn paint_background_of_fragments<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    facts: &BasePaintFacts,
+    fragment_count: usize,
+) {
+    use crate::painting::paintable_geometry;
+    let source = recorder.source;
+    let Some(style) = source.node_style_if_live(paintable) else {
+        return;
+    };
+    let paints_background = background_resolution::has_background_to_paint(
+        source,
+        paintable,
+        recorder.inputs.uncaptured.root_background_source,
+    );
+    let unbroken_edges = {
+        let (_, padding, border) = paintable_geometry::unbroken_box_model(source, paintable);
+        (padding, border)
+    };
+    let unbroken_block_size = style_queries::background_layers_have_image(style)
+        .then(|| paintable_geometry::unbroken_border_box_size(source, paintable).height);
+    let mut block_offset_in_unbroken_box = CssPixels::default();
+    for index in 0..fragment_count {
+        let (border_box_rect, border_radii) = recorder.fragment_border_box(paintable, index);
+        if paints_background && let Some(unbroken_block_size) = unbroken_block_size {
+            let unbroken_border_box_rect = CssPixelRect::new(
+                border_box_rect.x,
+                border_box_rect.y - block_offset_in_unbroken_box,
+                border_box_rect.width,
+                unbroken_block_size,
+            );
+            block_offset_in_unbroken_box += border_box_rect.height;
+            let fragment_clip = crate::painting::display_list::builder::PendingInlineClip::intersecting_rounded_rect(
+                recorder.converter.rounded_device_rect(border_box_rect).to_float(),
+                border_radii.as_corners(&recorder.converter),
+            );
+            recorder.record_with_inline_clips(&[fragment_clip], |recorder| {
+                background::paint_background_within(
+                    recorder,
+                    paintable,
+                    unbroken_border_box_rect,
+                    crate::painting::border_radii::BorderRadii::default(),
+                    Some(unbroken_edges),
+                    Some(border_box_rect),
+                );
+            });
+        } else if paints_background {
+            let edges = (
+                paintable_geometry::committed_fragment_padding(source, paintable, index),
+                paintable_geometry::committed_fragment_border(source, paintable, index),
+            );
+            background::paint_background_within(recorder, paintable, border_box_rect, border_radii, Some(edges), None);
+        }
+        if facts.has_box_shadow {
+            let padding_box_rect = paintable_geometry::absolute_fragment_padding_box_rect(source, paintable, index);
+            shadow::paint_box_shadow(recorder, paintable, border_box_rect, padding_box_rect, border_radii);
+        }
     }
 }
 

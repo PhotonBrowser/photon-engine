@@ -128,8 +128,8 @@ public:
     void discard();
 
     Web::CompositorContextId compositor_context_id();
-    bool handle_key_event_in_compositor(Web::KeyEvent const&);
-    void dispatch_key_event_to_web_content(Web::KeyEvent const&);
+    // Returns whether the event was posted; a page without a compositor sends it to WebContent itself.
+    bool handle_and_dispatch_key_event_in_compositor(Web::KeyEvent const&, bool allow_keyboard_scroll);
     void handle_pinch_event_in_compositor(Web::PinchEvent const&);
     // Returns whether the event was posted; a page without a compositor sends it to WebContent itself.
     bool handle_and_dispatch_mouse_event_in_compositor(Web::MouseEvent const&);
@@ -137,6 +137,7 @@ public:
     void did_not_dispatch_input_event_through_compositor(u64 event_id);
     void did_detect_history_swipe_candidate(u64 gesture_id, bool back, float unconsumed_delta);
     void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio, u64 presentation_signal_value = 0);
+    void did_dispatch_input_event_through_compositor(u64 event_id, bool async_scroll_performed_default_action);
     void did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_add_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids);
@@ -286,7 +287,7 @@ private:
     virtual void request_child_navigable_unload(Web::HTML::CrossProcessId navigable_id) override;
     virtual void changing_navigable_continuation_applied(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) override;
     virtual void nonchanging_navigable_history_state_updated(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void did_request_close_of_traversable(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id) override;
+    virtual void did_request_close_of_traversable(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id, Web::HTML::NavigationSourceSnapshot source_snapshot) override;
     virtual void did_inspect_dom_tree(String dom_tree) override;
     virtual void did_inspect_dom_node(DOMNodeProperties properties) override;
     virtual void did_finish_editing_dom_node(Optional<Web::UniqueNodeID> node_id) override;

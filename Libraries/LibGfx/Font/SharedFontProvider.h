@@ -16,6 +16,7 @@
 #include <LibGfx/Font/FontCatalog.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/PathFontProvider.h>
+#include <LibGfx/Font/SystemFontMatcher.h>
 #include <LibIPC/File.h>
 
 namespace Gfx {
@@ -26,17 +27,9 @@ struct BrokeredFontFile {
     IPC::File file;
 };
 
-// A system font the client re-matches in its own process, for typefaces whose data does not survive a round trip.
-struct SystemFontReference {
-    String family;
-    u16 weight { 0 };
-    u16 width { 0 };
-    u8 slope { 0 };
-};
-
 struct BrokeredFont {
     u64 face_id { 0 };
-    Variant<Empty, BrokeredFontFile, SystemFontReference> source;
+    Variant<Empty, BrokeredFontFile, PlatformFontName> source;
 };
 
 // Any thread may ask these. The provider asks one question at a time.
@@ -92,7 +85,7 @@ private:
     RefPtr<Typeface> load_catalog_face(FontCatalogFace const&);
     RefPtr<Typeface> load_brokered_font(BrokeredFont);
     RefPtr<Typeface> load_font_file(u64 face_id, u32 ttc_index, FontFileFormat, IPC::File);
-    RefPtr<Typeface> load_font_reference(u64 face_id, SystemFontReference const&);
+    RefPtr<Typeface> load_platform_font(u64 face_id, PlatformFontName const&);
 
     NonnullOwnPtr<Core::MappedFile> const m_catalog_mapping;
     NonnullOwnPtr<FontCatalog> const m_catalog;
@@ -119,10 +112,10 @@ template<>
 ErrorOr<Gfx::BrokeredFontFile> decode(Decoder&);
 
 template<>
-ErrorOr<void> encode(Encoder&, Gfx::SystemFontReference const&);
+ErrorOr<void> encode(Encoder&, Gfx::PlatformFontName const&);
 
 template<>
-ErrorOr<Gfx::SystemFontReference> decode(Decoder&);
+ErrorOr<Gfx::PlatformFontName> decode(Decoder&);
 
 template<>
 ErrorOr<void> encode(Encoder&, Gfx::BrokeredFont const&);

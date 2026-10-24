@@ -10,10 +10,11 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
+#include <Compositor/CompositedContext.h>
 #include <Compositor/DisplayListPlayer.h>
 #include <Compositor/Forward.h>
 #include <cstdint>
-#include <LibCompositing/DisplayList/CompositedContext.h>
+#include <Compositor/ScrollbarController.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibGfx/Forward.h>
@@ -23,6 +24,7 @@ class SkColorFilter;
 class SkImage;
 class SkImageFilter;
 class SkPaint;
+class SkPath;
 template<typename T>
 class sk_sp;
 
@@ -47,12 +49,14 @@ public:
         DisplayListRasterCache&,
         Compositing::ScrollStateSnapshot const&,
         RefPtr<Gfx::PaintingSurface>,
-        Compositing::OwnedCanvasSurfaces const*,
-        Compositing::CompositedContextResolver const*);
+        OwnedCanvasSurfaces const*,
+        CompositedContextResolver const*,
+        ScrollbarController const* = nullptr);
 
     void flush(Gfx::PaintingSurface&) override;
     void flush_async(Gfx::PaintingSurface&, Function<void()>&&, uint64_t presentation_signal_value = 0);
-    void paint_scrollbar(Gfx::PaintingSurface&, Compositing::PaintScrollBar const&);
+    // A corner clip radius that is not zero shapes the thumb to the corner clip rect with that radius.
+    void paint_scrollbar(Gfx::PaintingSurface&, ScrollbarController::PresentedScrollbar const&, Gfx::IntRect const& corner_clip_rect = {}, int corner_clip_radius = 0);
 
 private:
 #define DECLARE_PLAY_COMMAND(command_type) \
@@ -64,15 +68,16 @@ private:
     bool would_be_fully_clipped_by_painter(Gfx::IntRect) const override;
 
     void push_clip(Compositing::ReplayClip const&) override;
-    void push_clip_path(Gfx::Path const&, Gfx::WindingRule) override;
+    void push_clip_path(Gfx::Path const&, u64 path_identity, Gfx::WindingRule) override;
+    void push_clip_path_bytes(ReadonlyBytes, Gfx::WindingRule) override;
     void push_transform(Gfx::AffineTransform const&) override;
     void push_layer(Compositing::ReplayLayer const&) override;
-    void push_mask(Compositing::ReplayMask const&) override;
+    void push_mask(Compositing::ReplayMask const&, Compositing::ReplayLayer const* backdrop) override;
     void pop_mask(Compositing::ReplayMask const&, Compositing::EffectNodeIndex) override;
     void pop() override;
     void push_device_space_plane_clip(Gfx::Path const&) override;
 
-    void clip_path(Gfx::Path const&, Gfx::WindingRule, bool anti_aliased);
+    void clip_path(SkPath, Gfx::WindingRule, bool anti_aliased);
 
     SkPaint paint_style_to_skia_paint(Compositing::DisplayListPaintStyle const&, Gfx::FloatRect const& bounding_rect);
     sk_sp<SkImageFilter> layer_image_filter(Compositing::ReplayLayer const&);
@@ -84,7 +89,9 @@ private:
     ReadonlySpan<float> gradient_positions(Compositing::DisplayListGradientColorStops) const;
 
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
-    Compositing::CompositedContextResolver const* m_composited_context_resolver { nullptr };
+    CompositedContextResolver const* m_composited_context_resolver { nullptr };
+    // Says how opaque the scrollbars that the display list paints are.
+    ScrollbarController const* m_scrollbar_controller { nullptr };
     DisplayListRasterCache* m_raster_cache { nullptr };
     DisplayListRasterCache& raster_cache() const { return *m_raster_cache; }
 

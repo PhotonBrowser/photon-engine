@@ -14,6 +14,7 @@
 #include <LibGC/Heap.h>
 #include <LibGC/HeapAccess.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibWeb/Animations/NamedTimelines.h>
 #include <LibWeb/Animations/ScrollTimeline.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/CSSTransition.h>
@@ -193,7 +194,7 @@ void EventLoop::process()
 
     // Some algorithms request that steps or states only occur once the event loop has reached step 1.
     // Invoke a set of tasks that these algorithms request us to in order to achieve this.
-    auto reached_step_1_tasks = move(m_reached_step_1_tasks);
+    GC::RootVector reached_step_1_tasks { move(m_reached_step_1_tasks) };
     for (auto& reached_step_1_task : reached_step_1_tasks)
         reached_step_1_task->function()();
 
@@ -541,7 +542,7 @@ void EventLoop::process_input_events() const
     };
 
     // Every page hosting a document takes the input events queued for it, once.
-    Vector<GC::Ref<Page>> pages;
+    GC::RootVector<GC::Ref<Page>> pages;
     for (auto& navigable : all_local_navigables()) {
         if (!navigable->is_local_root() || navigable->has_been_destroyed())
             continue;
@@ -954,11 +955,22 @@ void EventLoop::update_the_rendering()
 
     // FIXME: 13. For each doc of docs, if the user agent detects that the backing storage associated with a CanvasRenderingContext2D or an OffscreenCanvasRenderingContext2D, context, has been lost, then it must run the context lost steps for each such context:
 
+    // https://wicg.github.io/video-rvfc/#video-rvfc-rendering-step
+    // For each fully active Document in docs, for each associated video element for that Document, run the video
+    // frame request callbacks passing now as the timestamp.
+    for (auto& document : docs)
+        document->run_the_video_frame_request_callbacks(relative_frame_timestamp_for(*document));
+
     // 14. For each doc of docs, run the animation frame callbacks for doc, passing in the relative high resolution time given frameTimestamp and doc's relevant global object as the timestamp.
     for (auto& document : docs) {
         auto now = relative_frame_timestamp_for(*document);
         run_animation_frame_callbacks(*document, now);
     }
+
+    // AD-HOC: Captures in this update's video frame and animation frame callbacks draw the frame that the video frame
+    //         callbacks' metadata described. Later captures draw whatever frame is presented then.
+    for (auto& document : docs)
+        document->release_video_frames_held_for_callbacks();
 
     // FIXME: 15. Let unsafeStyleAndLayoutStartTime be the unsafe shared current time.
 
@@ -1134,13 +1146,22 @@ static void update_style_and_layout_for_rendering(DOM::Document& document)
 
     TemporaryExecutionContext context { document.relevant_settings_object() };
 
+    // NB: The animations that name their timeline find the timelines that style update and layout declared. An
+    //     animation that moved to another timeline takes its time from it in this frame, so the timelines update their
+    //     current time and style and layout run again.
+    bool animations_changed_timeline = false;
+    if (document.has_named_timelines())
+        animations_changed_timeline = document.named_timelines().update_tracked_animations();
+    if (animations_changed_timeline)
+        requires_style_and_layout_update = true;
+
     for (auto const& timeline : document.associated_animation_timelines()) {
         auto* scroll_timeline = as_if<Animations::ScrollTimeline>(*timeline);
 
         if (!scroll_timeline)
             continue;
 
-        if (!scroll_timeline->is_stale())
+        if (!animations_changed_timeline && !scroll_timeline->is_stale())
             continue;
 
         // NB: The passed timestamp is ignored for ScrollTimelines so we can just use 0.
@@ -1168,7 +1189,7 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         // NB: A play task resolves the animation's ready promise.
         TemporaryExecutionContext execution_context { document->relevant_settings_object() };
         for (auto const& timeline : document->associated_animation_timelines()) {
-            Vector<GC::Ref<Animations::Animation>> pending_css_animations;
+            GC::RootVector<GC::Ref<Animations::Animation>> pending_css_animations;
             for (auto& animation : timeline->associated_animations()) {
                 if (rendering_update_makes_ready(animation))
                     pending_css_animations.append(animation);
@@ -1211,7 +1232,7 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
     //         layout is settled, so it is decided here rather than at the points that invalidate it. A page's media
     //         elements live in any of its documents, so this waits until step 19 has laid out every one of them: a task
     //         that ran beside a later document's frame in flight may have left an earlier document's layout stale.
-    Vector<GC::Ref<Page>, 1> synced_pages;
+    GC::RootVector<GC::Ref<Page>, 1> synced_pages;
     for (auto& document : docs) {
         if (!document->navigable() || document->navigable()->active_document().ptr() != document.ptr())
             continue;
@@ -1291,8 +1312,6 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
     }
 }
 
-// Whether the style transaction of `document` in a rendering update may fly beside the event loop, or what keeps it in
-// step.
 Layout::RustFFI::FfiFlightBlocker EventLoop::style_flight_blocker(DOM::Document& document) const
 {
     using Blocker = Layout::RustFFI::FfiFlightBlocker;
@@ -1309,6 +1328,9 @@ Layout::RustFFI::FfiFlightBlocker EventLoop::style_flight_blocker(DOM::Document&
         if (is<Animations::ScrollTimeline>(*timeline))
             return Blocker::ScrollTimeline;
     }
+    // The animations that name their timeline look it up again after style and layout.
+    if (document.has_named_timelines())
+        return Blocker::ScrollTimeline;
     return Blocker::None;
 }
 
@@ -1664,8 +1686,9 @@ void EventLoop::add_stats(JsonObject& values) const
 void EventLoop::unregister_document(Badge<DOM::Document>, DOM::Document& document)
 {
     forget_rendering_stats(document);
-    bool did_remove = m_documents.remove_first_matching([&](auto& entry) { return entry.ptr().ptr() == &document; });
-    VERIFY(did_remove);
+    // This runs from the document's finalizer, so the GC may already have cleared our weak pointer to it, as well as to
+    // any other document dying in the same collection.
+    m_documents.remove_all_matching([&](auto const& entry) { return !entry || entry.ptr().ptr() == &document; });
 }
 
 void EventLoop::document_navigable_did_change(Badge<DOM::Document>)
@@ -1685,7 +1708,7 @@ void EventLoop::ensure_documents_sorted() const
         return;
     m_documents_sort_dirty = false;
 
-    HashMap<DOM::Document*, size_t> doc_to_index;
+    GC::RootHashMap<DOM::Document*, size_t> doc_to_index;
     doc_to_index.ensure_capacity(m_documents.size());
     for (size_t i = 0; i < m_documents.size(); ++i)
         doc_to_index.set(m_documents[i].ptr().ptr(), i);

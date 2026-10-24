@@ -11,6 +11,8 @@ set(TEST_SOURCES
     TestDump.cpp
     TestEventLoop.cpp
     TestFaviconDecoding.cpp
+    TestFetchEngineMessages.cpp
+    TestFetchExecutor.cpp
     TestFetchResponse.cpp
     TestFetchURL.cpp
     TestHTMLTokenizer.cpp
@@ -61,6 +63,8 @@ endforeach()
 target_link_libraries(BenchmarkDisplayListRecording PRIVATE LibGC LibGfx LibIPC LibJS LibURL LibWebView)
 target_link_libraries(TestAudioWorkletPipe PRIVATE LibCore LibThreading)
 target_link_libraries(TestContentBlocker PRIVATE LibURL)
+target_link_libraries(TestFetchEngineMessages PRIVATE LibCore LibIPC LibRequests)
+target_link_libraries(TestFetchExecutor PRIVATE LibCore LibIPC LibThreading)
 if (NOT WIN32)
     target_link_libraries(TestCSSSyntaxParser PRIVATE LibThreading)
 endif()
@@ -71,7 +75,7 @@ target_link_libraries(TestFetchURL PRIVATE LibURL)
 target_link_libraries(TestImageData PRIVATE LibGC LibJS)
 target_link_libraries(TestWebIDLBuffers PRIVATE LibGC LibJS)
 target_link_libraries(TestStructuredSerializeCorpus PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
-target_link_libraries(TestStructuredSerializeDurability PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
+target_link_libraries(TestStructuredSerializeDurability PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC LibWasm)
 target_link_libraries(TestStructuredSerializeFormat PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
 target_link_libraries(TestStructuredSerializeHardening PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
 target_link_libraries(TestStructuredSerializeSharedArrayBuffer PRIVATE LibGC LibJS LibIPC)

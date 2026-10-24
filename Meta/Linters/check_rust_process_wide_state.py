@@ -51,6 +51,11 @@ IN_ONE_LIBRARY = {
         {"libweb_bindings_rust"},
         "a dependency of libweb_bindings_rust alone, whose archive LibWeb's library links",
     ),
+    "libwasm_engine": (
+        {"libwasm_jit"},
+        "a dev-dependency of libwasm_jit alone, whose tests run compiled code against it; the engine is the one Rust "
+        "archive of LibWasm's library (Libraries/LibWasm/CMakeLists.txt)",
+    ),
 }
 
 # libweb_rust: `file:name` -> why the state is fine on a thread other than the document's.
@@ -76,7 +81,6 @@ RENDER_STATE_ALLOWED = {
         [
             "css/style/matching.rs:DISPATCH_POOLS",
             "css/style/native_rules/targets.rs:TARGET_PAGES",
-            "css/style/prefix/relation.rs:RELATION_PROGRAM_MEMORY",
             "css/style/program.rs:RULE_DECLARATIONS",
             "css/style/program/rule_records.rs:RULE_RECORD_PAGES",
             "css/style/program/rule_versions.rs:RULE_VERSION_PAGES",
@@ -153,6 +157,7 @@ RENDER_STATE_ALLOWED = {
             "css/custom_properties.rs:EMPTY",
             "css/parser/stylesheet_cache.rs:HASHER",
             "css/parser/stylesheet_cache.rs:KEYS",
+            "css/property_metadata.rs:SHORTHAND_LEAVES",
             "css/style/publication.rs:REMAINING",
             "css/style_compute.rs:KINDS",
             "css/style_compute.rs:LONGHANDS",
@@ -175,6 +180,7 @@ RENDER_STATE_ALLOWED = {
     **render_state_entries(
         TEST_ONLY,
         [
+            "css/custom_properties.rs:CUSTOM_PROPERTY_COMPUTATIONS",
             "css/declaration_block.rs:DECLARATION_OWNER_ALLOCATIONS",
             "css/descriptor_block.rs:DESCRIPTOR_OWNER_ALLOCATIONS",
             "css/rule.rs:RULE_OWNER_ALLOCATIONS",
@@ -188,6 +194,7 @@ RENDER_STATE_ALLOWED = {
     ),
     f"{RENDER_STATE_CRATE}/src/css/parser/stylesheet_cache.rs:PARSE_DEPENDENCIES": "per-thread record of the parse running on this thread; scoped to that parse",
     f"{RENDER_STATE_CRATE}/src/css/style_value.rs:VALUES": "built-once keyword values, and a replay-only table of the same name",
+    f"{RENDER_STATE_CRATE}/src/css/parser/value_parser.rs:LISTS": "built-once immutable lists of initial background values",
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD": "a test's hold on the next recording that flies, behind a mutex; only internals arms it",
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD_RELEASED": "wakes the recording a test held once it lets it go",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD_SETUP": "set once before the first stage thread starts, which runs it; read-only after",

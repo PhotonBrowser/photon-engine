@@ -7,7 +7,7 @@
 #include <LibWeb/Bindings/HostDefined.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
-#include <LibWeb/WebAssembly/WebAssembly.h>
+#include <LibWeb/WebAssembly/Tag.h>
 
 namespace Web::Bindings {
 
@@ -32,8 +32,7 @@ void HostDefined::visit_edges(Cell::Visitor& visitor)
     visitor.visit(intrinsics);
     visitor.visit(wrapper_world);
     visitor.visit(principal_realm);
-    if (wasm_cache)
-        wasm_cache->visit_edges(visitor);
+    visitor.visit(wasm_js_tag);
 }
 
 }

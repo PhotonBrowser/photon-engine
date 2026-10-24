@@ -8,7 +8,9 @@
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/SharedFontProvider.h>
-#include <LibGfx/Font/TypefaceSkia.h>
+#ifdef AK_OS_MACOS
+#    include <LibGfx/Font/TypefaceCoreText.h>
+#endif
 #include <LibGfx/Font/WOFF/Loader.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
@@ -69,11 +71,7 @@ SharedFontProvider::SharedFontProvider(NonnullOwnPtr<Core::MappedFile> mapping, 
     m_resource_fonts.load_all_fonts_from_uri("resource://fonts"sv);
 }
 
-SharedFontProvider::~SharedFontProvider()
-{
-    for (auto const& entry : m_typeface_cache)
-        entry.value->clear_font_cache();
-}
+SharedFontProvider::~SharedFontProvider() = default;
 
 static FontVariationSettings default_variations(float point_size, unsigned weight, unsigned width)
 {
@@ -232,24 +230,27 @@ RefPtr<Typeface> SharedFontProvider::load_brokered_font(BrokeredFont brokered_fo
     return brokered_font.source.visit(
         [](Empty) -> RefPtr<Typeface> { return nullptr; },
         [&](BrokeredFontFile& font_file) { return load_font_file(brokered_font.face_id, font_file.ttc_index, font_file.format, move(font_file.file)); },
-        [&](SystemFontReference const& reference) { return load_font_reference(brokered_font.face_id, reference); });
+        [&](PlatformFontName const& name) { return load_platform_font(brokered_font.face_id, name); });
 }
 
-RefPtr<Typeface> SharedFontProvider::load_font_reference(u64 face_id, SystemFontReference const& reference)
+RefPtr<Typeface> SharedFontProvider::load_platform_font(u64 face_id, [[maybe_unused]] PlatformFontName const& name)
 {
     if (m_failed_face_ids.contains(face_id))
         return nullptr;
 
-    auto typeface_or_error = TypefaceSkia::match_family_style(reference.family, reference.weight, reference.width, reference.slope);
-    if (typeface_or_error.is_error() || !typeface_or_error.value()) {
-        m_failed_face_ids.set(face_id);
-        return nullptr;
+#ifdef AK_OS_MACOS
+    auto typeface_or_error = TypefaceCoreText::try_load_postscript_name(name.postscript_name);
+    if (!typeface_or_error.is_error()) {
+        auto typeface = typeface_or_error.release_value();
+        typeface->set_system_font_identifier({ m_catalog->generation(), face_id });
+        m_typeface_cache.set(face_id, typeface);
+        return typeface;
     }
+#endif
 
-    auto typeface = typeface_or_error.release_value().release_nonnull();
-    typeface->set_system_font_identifier({ m_catalog->generation(), face_id });
-    m_typeface_cache.set(face_id, typeface);
-    return typeface;
+    // Only CoreText gives fonts by name.
+    m_failed_face_ids.set(face_id);
+    return nullptr;
 }
 
 RefPtr<Typeface> SharedFontProvider::load_font_file(u64 face_id, u32 ttc_index, FontFileFormat format, IPC::File file)
@@ -305,23 +306,17 @@ ErrorOr<Gfx::BrokeredFontFile> decode(Decoder& decoder)
 }
 
 template<>
-ErrorOr<void> encode(Encoder& encoder, Gfx::SystemFontReference const& reference)
+ErrorOr<void> encode(Encoder& encoder, Gfx::PlatformFontName const& name)
 {
-    TRY(encoder.encode(reference.family));
-    TRY(encoder.encode(reference.weight));
-    TRY(encoder.encode(reference.width));
-    TRY(encoder.encode(reference.slope));
+    TRY(encoder.encode(name.postscript_name));
     return {};
 }
 
 template<>
-ErrorOr<Gfx::SystemFontReference> decode(Decoder& decoder)
+ErrorOr<Gfx::PlatformFontName> decode(Decoder& decoder)
 {
-    auto family = TRY(decoder.decode<String>());
-    auto weight = TRY(decoder.decode<u16>());
-    auto width = TRY(decoder.decode<u16>());
-    auto slope = TRY(decoder.decode<u8>());
-    return Gfx::SystemFontReference { move(family), weight, width, slope };
+    auto postscript_name = TRY(decoder.decode<String>());
+    return Gfx::PlatformFontName { move(postscript_name) };
 }
 
 template<>
@@ -336,7 +331,7 @@ template<>
 ErrorOr<Gfx::BrokeredFont> decode(Decoder& decoder)
 {
     auto face_id = TRY(decoder.decode<u64>());
-    auto source = TRY((decoder.decode<Variant<Empty, Gfx::BrokeredFontFile, Gfx::SystemFontReference>>()));
+    auto source = TRY((decoder.decode<Variant<Empty, Gfx::BrokeredFontFile, Gfx::PlatformFontName>>()));
     return Gfx::BrokeredFont { face_id, move(source) };
 }
 

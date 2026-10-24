@@ -1,0 +1,222 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/kmalloc.h>
+#include <Compositor/PhotonGaneshPersistentCache.h>
+#include <LibTest/TestCase.h>
+
+#include <core/SkData.h>
+#include <core/SkString.h>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
+
+namespace {
+
+ByteString test_cache_root(StringView name)
+{
+    return ByteString::formatted("/tmp/photon-ganesh-cache-test-{}-{}", getpid(), name);
+}
+
+sk_sp<SkData> data(StringView bytes)
+{
+    return SkData::MakeWithCopy(bytes.characters_without_null_termination(), bytes.length());
+}
+
+bool data_equals(SkData const& actual, SkData const& expected)
+{
+    return actual.size() == expected.size() && memcmp(actual.data(), expected.data(), actual.size()) == 0;
+}
+
+}
+
+TEST_CASE(persistent_cache_stores_and_retrieves_exact_bytes)
+{
+    auto root = test_cache_root("roundtrip"sv);
+    std::filesystem::remove_all(root.characters());
+    Gfx::PhotonGaneshPersistentCache cache(root, ByteString("namespace-a"), 1024);
+    auto key = data("program-key"sv);
+    auto value = data("compiled-program-bytes"sv);
+
+    cache.store(*key, *value, SkString("roundtrip"));
+    auto loaded = cache.load(*key);
+    EXPECT(loaded);
+    EXPECT(data_equals(*loaded, *value));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_load_does_not_mutate_entry_metadata)
+{
+    auto root = test_cache_root("read-only-load"sv);
+    std::filesystem::remove_all(root.characters());
+    Gfx::PhotonGaneshPersistentCache cache(root, ByteString("namespace-a"), 1024);
+    auto key = data("program-key"sv);
+    auto value = data("compiled-program-bytes"sv);
+    cache.store(*key, *value, SkString("read-only-load"));
+
+    auto path = cache.file_path_for_key(*key);
+    auto stored_time = std::filesystem::file_time_type::clock::now() - std::chrono::hours(2);
+    std::error_code error;
+    std::filesystem::last_write_time(path.characters(), stored_time, error);
+    EXPECT(!error);
+
+    EXPECT(cache.load(*key));
+    EXPECT(std::filesystem::last_write_time(path.characters(), error) == stored_time);
+    EXPECT(!error);
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_namespaces_are_isolated)
+{
+    auto root = test_cache_root("namespace"sv);
+    std::filesystem::remove_all(root.characters());
+    Gfx::PhotonGaneshPersistentCache old_namespace(root, ByteString("skia-148/cache-v1/gpu-a"), 1024);
+    Gfx::PhotonGaneshPersistentCache new_namespace(root, ByteString("skia-148/cache-v2/gpu-a"), 1024);
+    auto key = data("program-key"sv);
+    auto value = data("compiled-program-bytes"sv);
+
+    old_namespace.store(*key, *value, SkString("namespace"));
+    EXPECT(old_namespace.load(*key));
+    EXPECT(!new_namespace.load(*key));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_ignores_corrupt_entries)
+{
+    auto root = test_cache_root("corrupt"sv);
+    std::filesystem::remove_all(root.characters());
+    Gfx::PhotonGaneshPersistentCache cache(root, ByteString("namespace-a"), 1024);
+    auto key = data("program-key"sv);
+    auto value = data("compiled-program-bytes"sv);
+
+    cache.store(*key, *value, SkString("corrupt"));
+    {
+        std::ofstream file(cache.file_path_for_key(*key).characters(), std::ios::binary | std::ios::trunc);
+        file.write("broken", 6);
+    }
+    EXPECT(!cache.load(*key));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_atomically_replaces_existing_entry)
+{
+    auto root = test_cache_root("replace"sv);
+    std::filesystem::remove_all(root.characters());
+    Gfx::PhotonGaneshPersistentCache cache(root, ByteString("namespace-a"), 1024);
+    auto key = data("program-key"sv);
+    auto old_value = data("old-program"sv);
+    auto new_value = data("new-program"sv);
+
+    cache.store(*key, *old_value, SkString("replace"));
+    cache.store(*key, *new_value, SkString("replace"));
+    auto loaded = cache.load(*key);
+    EXPECT(loaded);
+    EXPECT(data_equals(*loaded, *new_value));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_evicts_oldest_entries_across_namespaces)
+{
+    auto root = test_cache_root("eviction"sv);
+    std::filesystem::remove_all(root.characters());
+    Gfx::PhotonGaneshPersistentCache old_namespace(root, ByteString("old-namespace"), 96);
+    Gfx::PhotonGaneshPersistentCache current_namespace(root, ByteString("current-namespace"), 96);
+    auto old_key = data("old-key"sv);
+    auto new_key = data("new-key"sv);
+    auto value = data("1234567890123456789012345678901234567890"sv);
+
+    old_namespace.store(*old_key, *value, SkString("old"));
+    auto old_path = old_namespace.file_path_for_key(*old_key);
+    std::error_code error;
+    std::filesystem::last_write_time(old_path.characters(), std::filesystem::file_time_type::clock::now() - std::chrono::hours(2), error);
+    EXPECT(!error);
+
+    current_namespace.store(*new_key, *value, SkString("new"));
+    EXPECT(!std::filesystem::exists(old_path.characters()));
+    EXPECT(std::filesystem::exists(current_namespace.file_path_for_key(*new_key).characters()));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_warms_programs_in_first_use_order)
+{
+    auto root = test_cache_root("warm-order"sv);
+    std::filesystem::remove_all(root.characters());
+    auto first = data("first-key"sv);
+    auto second = data("second-key"sv);
+    {
+        Gfx::PhotonGaneshPersistentCache session(root, ByteString("namespace-a"), 1024);
+        EXPECT(!session.load(*second));
+        session.store(*second, *data("second-program"sv), SkString("second"));
+        EXPECT(!session.load(*first));
+        session.store(*first, *data("first-program"sv), SkString("first"));
+        // Asked for again, a program keeps its first place.
+        EXPECT(session.load(*second));
+    }
+
+    Gfx::PhotonGaneshPersistentCache next_session(root, ByteString("namespace-a"), 1024);
+    auto entries = next_session.load_warm_entries();
+    EXPECT_EQ(entries.size(), 2u);
+    EXPECT(data_equals(*entries[0].key, *second));
+    EXPECT(data_equals(*entries[0].data, *data("second-program"sv)));
+    EXPECT(data_equals(*entries[1].key, *first));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_keeps_warmed_programs_ahead_of_new_ones)
+{
+    auto root = test_cache_root("warm-keep"sv);
+    std::filesystem::remove_all(root.characters());
+    auto warmed = data("warmed-key"sv);
+    auto added = data("added-key"sv);
+    {
+        Gfx::PhotonGaneshPersistentCache session(root, ByteString("namespace-a"), 1024);
+        EXPECT(!session.load(*warmed));
+        session.store(*warmed, *data("warmed-program"sv), SkString("warmed"));
+    }
+    {
+        // This session compiles the warmed program up front, so never asks for it, and asks for a new one.
+        Gfx::PhotonGaneshPersistentCache session(root, ByteString("namespace-a"), 1024);
+        EXPECT_EQ(session.load_warm_entries().size(), 1u);
+        EXPECT(!session.load(*added));
+        session.store(*added, *data("added-program"sv), SkString("added"));
+    }
+
+    Gfx::PhotonGaneshPersistentCache next_session(root, ByteString("namespace-a"), 1024);
+    auto entries = next_session.load_warm_entries();
+    EXPECT_EQ(entries.size(), 2u);
+    EXPECT(data_equals(*entries[0].key, *warmed));
+    EXPECT(data_equals(*entries[1].key, *added));
+    std::filesystem::remove_all(root.characters());
+}
+
+TEST_CASE(persistent_cache_batches_synchronous_disk_work)
+{
+    auto root = test_cache_root("batched-disk-work"sv);
+    std::filesystem::remove_all(root.characters());
+    auto diagnostics_before = Gfx::PhotonGaneshPersistentCache::diagnostics_snapshot();
+
+    {
+        Gfx::PhotonGaneshPersistentCache cache(root, ByteString("namespace-a"), 1024 * 1024);
+        SkString description("batch");
+        char payload[8 * 1024] {};
+
+        for (uint64_t index = 0; index < 32; ++index) {
+            auto key = SkData::MakeWithCopy(&index, sizeof(index));
+            auto value = SkData::MakeWithCopy(payload, sizeof(payload));
+            EXPECT(key);
+            EXPECT(value);
+            if (!key || !value)
+                return;
+            EXPECT(!cache.load(*key));
+            cache.store(*key, *value, description);
+        }
+    }
+
+    auto diagnostics_after = Gfx::PhotonGaneshPersistentCache::diagnostics_snapshot();
+    EXPECT_EQ(diagnostics_after.warm_list_writes - diagnostics_before.warm_list_writes, 2u);
+    EXPECT_EQ(diagnostics_after.eviction_scans - diagnostics_before.eviction_scans, 4u);
+    std::filesystem::remove_all(root.characters());
+}

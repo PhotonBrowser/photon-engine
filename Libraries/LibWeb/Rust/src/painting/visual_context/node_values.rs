@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::{ClipData, ClipNodeData, ClipPathData, EffectsData, PerspectiveData, TransformData, TransformDataRole};
+use super::{ClipData, EffectsData, PerspectiveData, TransformData, TransformDataRole};
 use crate::css::computed_value_types::{ComputedClipEdge, ComputedStyleValueHandle};
 use crate::css::computed_value_views::{ComputedValuesView, LengthPercentageRef};
 use crate::css::css_enums;
@@ -22,8 +22,8 @@ use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::style_queries;
 use libgfx_rust::{
-    AffineTransform, CompositingAndBlendingOperator, CornerRadii, FloatPoint, FloatRect, affine_to_matrix,
-    enclosing_int_rect, perspective_matrix, scale_matrix_for_device_pixels, translation_matrix,
+    AffineTransform, CompositingAndBlendingOperator, CornerRadii, FloatPoint, affine_to_matrix, perspective_matrix,
+    scale_matrix_for_device_pixels, translation_matrix,
 };
 
 pub(crate) fn visual_viewport_transform_data(inputs: &FfiVisualContextTreeInputs) -> TransformData {
@@ -150,7 +150,7 @@ pub(crate) fn compute_transform(
     };
 
     let transform_values = style.transform();
-    let style_has_transform = transform_values.resolved_transforms.length != 0;
+    let style_has_transform = transform_values.resolved_transforms.length != 0 || transform_values.has_offset_path;
     let has_transform_node_input = style_has_transform
         || additional_element_transform.is_some()
         || style_queries::will_change_promotes_transform_node(style);
@@ -177,15 +177,36 @@ pub(crate) fn compute_transform(
     // 3. Translate by the computed X, Y, and Z values of translate.
     // 4. Rotate by the computed <angle> about the specified axis of rotate.
     // 5. Scale by the computed X, Y, and Z values of scale.
-    // FIXME: 6. Translate and rotate by the transform specified by offset.
+    // 6. Translate and rotate by the transform specified by offset.
     // 7. Multiply by each of the transform functions in transform from left to right.
     // NB: The resolved transform list carries translate, rotate, scale, and the
     //     transform functions pre-lowered in exactly that order.
-    let mut matrix = multiply_transform_functions(
-        translation_matrix(0.0, 0.0, origin_z),
-        transform_values.resolved_transforms.as_slice(),
-        reference_box,
-    );
+    let resolved_transforms = transform_values.resolved_transforms.as_slice();
+    let mut matrix = translation_matrix(0.0, 0.0, origin_z);
+    if transform_values.has_offset_path {
+        let individual_transform_count = [
+            &transform_values.translate,
+            &transform_values.rotate,
+            &transform_values.scale,
+        ]
+        .into_iter()
+        .filter(|handle| !handle.pointer.is_null())
+        .count();
+        let (individual_transforms, transform_functions) = resolved_transforms.split_at(individual_transform_count);
+        matrix = multiply_transform_functions(matrix, individual_transforms, reference_box);
+        if let Some(offset_transform) = super::offset_transform::compute_offset_transform(
+            style,
+            layout_arena,
+            node,
+            reference_box,
+            (origin_x.to_double(), origin_y.to_double()),
+        ) {
+            matrix = matrix.multiplied(offset_transform);
+        }
+        matrix = multiply_transform_functions(matrix, transform_functions, reference_box);
+    } else {
+        matrix = multiply_transform_functions(matrix, resolved_transforms, reference_box);
+    }
 
     // The x and y properties of <use> define an additional translation applied after any
     // transformations specified with other properties.
@@ -366,6 +387,12 @@ pub(crate) fn border_radii_data(
     slot: NodeSlotId,
 ) -> BorderRadii {
     let border = style.border();
+    // https://drafts.csswg.org/css-borders-4/#border-shape-radius-interaction
+    // When an element's computed value of 'border-shape' is not none, its 'border-radius' is ignored, as if it was set
+    // to 0.
+    if crate::painting::border_shape::has_border_shape(style) {
+        return BorderRadii::default();
+    }
     let has_noninitial_radii = !border_radius_is_initial(&border.border_bottom_left_radius)
         || !border_radius_is_initial(&border.border_bottom_right_radius)
         || !border_radius_is_initial(&border.border_top_left_radius)
@@ -413,6 +440,12 @@ pub(crate) fn piece_border_radii_data(
     present_edges: u8,
 ) -> BorderRadii {
     let border = style.border();
+    // https://drafts.csswg.org/css-borders-4/#border-shape-radius-interaction
+    // When an element's computed value of 'border-shape' is not none, its 'border-radius' is ignored, as if it was set
+    // to 0.
+    if crate::painting::border_shape::has_border_shape(style) {
+        return BorderRadii::default();
+    }
     let has_noninitial_radii = !border_radius_is_initial(&border.border_bottom_left_radius)
         || !border_radius_is_initial(&border.border_bottom_right_radius)
         || !border_radius_is_initial(&border.border_top_left_radius)
@@ -845,14 +878,23 @@ pub(crate) fn may_have_clip(layout_arena: &impl PaintRead, node: NodeSlotId) -> 
         || style.content_visibility() == content_visibility::AUTO
 }
 
-pub(crate) fn compute_clip_data(
+/// Whether a box's overflow clips in both axes, which is when its clipping region follows its corners.
+pub(crate) fn overflow_clips_both_axes(layout_arena: &impl PaintRead, slot: NodeSlotId) -> bool {
+    use crate::css::css_enums::overflow;
+    layout_arena.node_style_if_live(slot).is_some_and(|style| {
+        let (overflow_x, overflow_y) = used_overflow(layout_arena, slot, style);
+        overflow_x != overflow::VISIBLE && overflow_y != overflow::VISIBLE
+    })
+}
+
+/// The overflow-x and overflow-y values a box clips its content with, after paint containment.
+fn used_overflow(
     layout_arena: &impl PaintRead,
     slot: NodeSlotId,
-    pixel_ratio: f64,
-) -> Option<ClipNodeData> {
+    style: crate::css::computed_value_views::ComputedValuesView<'_>,
+) -> (u8, u8) {
     use crate::css::css_enums::{content_visibility, overflow};
     let node = slot;
-    let style = layout_arena.node_style_if_live(node)?;
     let box_values = style.box_values();
     let mut overflow_x = box_values.overflow_x;
     let mut overflow_y = box_values.overflow_y;
@@ -873,6 +915,14 @@ pub(crate) fn compute_clip_data(
         overflow_x = overflow::CLIP;
         overflow_y = overflow::CLIP;
     }
+    (overflow_x, overflow_y)
+}
+
+pub(crate) fn compute_clip_data(layout_arena: &impl PaintRead, slot: NodeSlotId, pixel_ratio: f64) -> Option<ClipData> {
+    use crate::css::css_enums::overflow;
+    let node = slot;
+    let style = layout_arena.node_style_if_live(node)?;
+    let (overflow_x, overflow_y) = used_overflow(layout_arena, node, style);
 
     // https://drafts.csswg.org/css-overflow-3/#propdef-overflow
     // 'clip'
@@ -918,18 +968,9 @@ pub(crate) fn compute_clip_data(
         BorderRadii::default()
     };
     let converter = DevicePixelConverter::new(pixel_ratio);
-    let device_rect = converter.rounded_device_rect(clip_rect);
-    if let Some(path) = radii.shaped_path(device_rect, &converter) {
-        let bounding_rect = enclosing_int_rect(FloatRect::from_array(path.bounding_box()));
-        return Some(ClipNodeData::Path(ClipPathData {
-            path: std::sync::Arc::new(path),
-            bounding_rect,
-            fill_rule: libgfx_rust::WindingRule::Nonzero,
-        }));
-    }
-    Some(ClipNodeData::Rect(ClipData {
-        rect: device_rect.to_float(),
+    Some(ClipData {
+        rect: converter.rounded_device_rect(clip_rect).to_float(),
         corner_radii: radii.as_corners(&converter),
         mode: super::ClipMode::Intersect,
-    }))
+    })
 }

@@ -239,7 +239,6 @@ public:
         i64 seconds = sane_mod(milliseconds, 1'000);
         return Duration(seconds, milliseconds * 1'000'000);
     }
-    [[nodiscard]] static Duration from_ticks(clock_t, time_t);
     [[nodiscard]] static Duration from_timespec(const struct timespec&);
     [[nodiscard]] static Duration from_timeval(const struct timeval&);
     [[nodiscard]] static Duration from_time_units(i64 units, u32 numerator, u32 denominator);
@@ -473,6 +472,7 @@ public:
     [[nodiscard]] i64 seconds_since_epoch() const { return m_offset.to_floored_seconds(); }
     [[nodiscard]] i64 milliseconds_since_epoch() const { return m_offset.to_floored_milliseconds(); }
     [[nodiscard]] i64 nanoseconds_since_epoch() const { return m_offset.to_nanoseconds(); }
+    [[nodiscard]] f64 to_seconds_f64() const { return m_offset.to_seconds_f64(); }
 
     enum class LocalTime {
         Yes,
@@ -552,9 +552,10 @@ private:
 // Monotonic time represents time returned from the CLOCK_MONOTONIC clock, which has an arbitrary fixed reference point.
 class MonotonicTime : private Detail::UnawareTime {
 public:
-    // Monotonic time does not have a defined reference point.
-    // A MonotonicTime at the reference point is therefore meaningless.
-    MonotonicTime() = delete;
+    constexpr MonotonicTime()
+        : Detail::UnawareTime(Duration::zero())
+    {
+    }
     constexpr MonotonicTime(MonotonicTime const&) = default;
     constexpr MonotonicTime(MonotonicTime&&) = default;
     constexpr MonotonicTime& operator=(MonotonicTime const&) = default;
@@ -568,6 +569,7 @@ public:
     [[nodiscard]] i64 milliseconds() const { return m_offset.to_floored_milliseconds(); }
     [[nodiscard]] i64 nanoseconds() const { return m_offset.to_nanoseconds(); }
     [[nodiscard]] i64 nanoseconds_within_second() const { return to_timespec().tv_nsec; }
+    [[nodiscard]] f64 to_seconds_f64() const { return m_offset.to_seconds_f64(); }
 
     constexpr bool operator==(MonotonicTime const& other) const { return this->m_offset == other.m_offset; }
     constexpr int operator<=>(MonotonicTime const& other) const { return this->m_offset <=> other.m_offset; }

@@ -19,6 +19,7 @@
 #include <AK/String.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
+#include <Compositor/Forward.h>
 #include <Compositor/HostWebGLContext.h>
 #include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCompositing/Forward.h>
@@ -45,6 +46,7 @@ class CanvasSurfaceRegistry;
 
 namespace Compositor {
 
+class Canvas2DCommandPlayer;
 class VideoFrameHolds;
 
 class CanvasHost {
@@ -55,15 +57,14 @@ public:
         Vector<String> supported_extensions;
     };
 
-    CanvasHost(RefPtr<Gfx::SkiaBackendContext>, Compositing::CanvasSurfaceRegistry&, VideoFrameHolds const&);
+    CanvasHost(RefPtr<Gfx::SkiaBackendContext>, CanvasSurfaceRegistry&, VideoFrameHolds const&);
     ~CanvasHost();
 
     bool create_2d_context(Compositing::CanvasId, Gfx::IntSize, bool alpha);
     CreateWebGLContextResult create_webgl_context(Compositing::WebGL::WebGLVersion, Gfx::IntSize, bool depth, bool stencil, bool antialias);
     void destroy_context(Compositing::CanvasId);
-    bool has_context(Compositing::CanvasId) const;
 
-    void execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> const&, Vector<Compositing::FontResourceId> const& kept_font_ids, Vector<Compositing::DisplayListFontResource> const& added_fonts);
+    void execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> const&, Vector<Compositing::FontResourceId> const& kept_font_ids, Vector<Compositing::DisplayListFontResource> const& added_fonts, Vector<Compositing::DisplayListImageFrameResource> const& image_frames);
     void execute_webgl_commands(Compositing::CanvasId, ReadonlyBytes, Vector<Compositing::WebGL::ImageSourceFrame> const&);
     void set_webgl_shared_command_buffer(Compositing::CanvasId, Compositing::WebGL::WebGLSharedCommandBuffer);
     [[nodiscard]] bool execute_webgl_commands_from_shared_buffer(Compositing::CanvasId, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Compositing::WebGL::ImageSourceFrame> const&);
@@ -84,7 +85,7 @@ public:
 
 private:
     struct Canvas2DContext {
-        NonnullOwnPtr<Gfx::CanvasCommandPlayer> command_player;
+        NonnullOwnPtr<Canvas2DCommandPlayer> command_player;
         NonnullRefPtr<Gfx::PaintingSurface> presented_surface;
         bool has_uncommitted_commands { false };
     };
@@ -92,17 +93,19 @@ private:
     using Context = Variant<Canvas2DContext, WebGLContext>;
 
     Context* context(Compositing::CanvasId);
-    OwnPtr<Gfx::CanvasCommandPlayer> create_2d_command_player(Gfx::IntSize, bool alpha);
+    OwnPtr<Canvas2DCommandPlayer> create_2d_command_player(Gfx::IntSize, bool alpha);
     static HostWebGLContext& as_webgl(Context&);
     void present_canvas_2d_context(Compositing::CanvasId, Canvas2DContext&);
     sk_sp<SkImage> held_video_frame_image(Media::VideoSinkHandle, u64 generation);
     Vector<HostWebGLContext::UploadSource> resolve_webgl_upload_sources(Vector<Compositing::WebGL::ImageSourceFrame> const&) const;
 
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
-    Compositing::CanvasSurfaceRegistry& m_canvas_surface_registry;
+    CanvasSurfaceRegistry& m_canvas_surface_registry;
     Compositing::CanvasSurfaceOwnerId m_canvas_surface_owner_id;
     HashMap<Compositing::CanvasId, Context> m_contexts;
     Compositing::DisplayListResourceStorage m_text_resources;
+    // The image frames of the stream batch that plays.
+    HashMap<u64, Gfx::DecodedImageFrame> m_image_frames_of_batch;
 
     VideoFrameHolds const& m_video_frame_holds;
     struct VideoFrameImage;

@@ -437,7 +437,7 @@ impl GraphBuilder<'_> {
     /// Makes compiled code check at entry that the interpreter stack has room
     /// for a frame of `bytes` that a call pushes on top of the frames of the
     /// inlined calls it is in, so the call need not check.
-    fn reserve_call_frame(&mut self, bytes: u64) {
+    pub(super) fn reserve_call_frame(&mut self, bytes: u64) {
         let frame_bytes = self.function.inline.as_ref().map_or(0, |call| call.frame_bytes) + bytes;
         self.graph.materialized_frame_bytes = self.graph.materialized_frame_bytes.max(frame_bytes);
     }
@@ -777,7 +777,16 @@ impl GraphBuilder<'_> {
                 let Some(bound_function) = feedback.target else {
                     return Ok(None);
                 };
-                let bound_arguments = &forwarded.bound_arguments[..usize::from(forwarded.bound_argument_count)];
+                let start = forwarded.bound_arguments_start as usize;
+                let Some(bound_arguments) = self
+                    .function
+                    .executable
+                    .feedback
+                    .bound_arguments
+                    .get(start..start + forwarded.bound_argument_count as usize)
+                else {
+                    return Ok(None);
+                };
                 InlinedCallSite {
                     callee: Some(*callee),
                     expected_callee: Some(bound_function),
@@ -791,7 +800,7 @@ impl GraphBuilder<'_> {
                             .map(InlineValue::Constant)
                             .chain(arguments.iter().copied().map(InlineValue::Operand))
                             .collect(),
-                        u32::from(forwarded.bound_argument_count) + argument_count,
+                        forwarded.bound_argument_count + argument_count,
                         *dst,
                     )
                 }

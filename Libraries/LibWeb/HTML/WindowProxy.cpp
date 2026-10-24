@@ -386,8 +386,11 @@ void WindowProxy::set_window(GC::Ref<Window> window)
     // still exposes Window's public prototype, while ordinary property caches
     // can guard and load through this hidden link. Retargeting the proxy after
     // navigation changes its shape and invalidates those caches naturally.
-    auto& window_wrapper = Bindings::platform_object_for_window(*m_window, realm());
-    m_object->set_prototype(&window_wrapper);
+
+    // The proxy's shape keeps its realm alive, so it follows the Window instead of pinning the realm it was created in.
+    auto& window_realm = m_window->principal_realm();
+    auto& window_wrapper = Bindings::platform_object_for_window(*m_window, window_realm);
+    m_object->set_realm_and_prototype(window_realm, &window_wrapper);
 }
 
 void WindowProxy::set_window(GC::Ref<RemoteWindow> window)
@@ -417,7 +420,7 @@ Vector<GC::Root<Navigable>> WindowProxy::document_tree_child_navigables() const
     return m_window->associated_document().document_tree_child_navigables();
 }
 
-OrderedHashMap<Utf16FlyString, GC::Ref<Navigable>> WindowProxy::document_tree_child_navigable_target_name_property_set() const
+GC::OrderedRootHashMap<Utf16FlyString, GC::Ref<Navigable>> WindowProxy::document_tree_child_navigable_target_name_property_set() const
 {
     if (m_remote_window)
         return m_remote_window->document_tree_child_navigable_target_name_property_set();

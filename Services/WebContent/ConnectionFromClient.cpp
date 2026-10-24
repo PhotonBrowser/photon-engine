@@ -34,8 +34,6 @@
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibJS/Runtime/Date.h>
 #include <LibUnicode/TimeZone.h>
-#include <LibWasm/Types.h>
-#include <LibWeb/ARIA/RoleType.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/PerformanceDiagnostics.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
@@ -62,7 +60,6 @@
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/Gamepad/GamepadRegistry.h>
-#include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/HTML/AutoplaySettings.h>
 #include <LibWeb/HTML/BroadcastChannel.h>
 #include <LibWeb/HTML/BrowsingContext.h>
@@ -308,17 +305,13 @@ void ConnectionFromClient::deliver_posted_message(Web::PageId page_id, Web::HTML
         page->deliver_posted_message(navigable_id, move(message));
 }
 
-void ConnectionFromClient::close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id)
+void ConnectionFromClient::close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id)
 {
     auto page = this->page(page_id);
     if (!page.has_value())
         return;
-    // The source is in another page of this process when it is in another tab.
-    auto source = Web::HTML::navigable_with_id_in_any_page(page->page(), source_navigable_id);
-    if (!source)
-        return;
     if (auto* traversable = as_if<Web::HTML::LocalTraversableNavigable>(page->page().navigable_with_id(navigable_id).ptr()))
-        traversable->close_top_level_traversable_from_script(*source);
+        traversable->close_top_level_traversable_from_script();
 }
 
 void ConnectionFromClient::run_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger focus_trigger)
@@ -615,14 +608,6 @@ void ConnectionFromClient::connect_to_image_decoder(IPC::TransportHandle handle)
 {
     if (on_image_decoder_connection)
         on_image_decoder_connection(handle);
-}
-
-void ConnectionFromClient::connect_to_wasm_compiler([[maybe_unused]] IPC::TransportHandle handle)
-{
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    if (on_wasm_compiler_connection)
-        on_wasm_compiler_connection(move(handle));
-#endif
 }
 
 void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle)
@@ -1250,12 +1235,12 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
         };
 
         if (auto doc = page->page().local_traversable()->active_document()) {
-            Queue<Web::DOM::Node*> nodes_to_visit;
-            nodes_to_visit.enqueue(doc->document_element());
-            while (!nodes_to_visit.is_empty()) {
-                auto node = nodes_to_visit.dequeue();
+            GC::RootVector<Web::DOM::Node*> nodes_to_visit;
+            nodes_to_visit.append(doc->document_element());
+            for (size_t i = 0; i < nodes_to_visit.size(); ++i) {
+                auto node = nodes_to_visit[i];
                 for (auto& child : node->children_as_vector())
-                    nodes_to_visit.enqueue(child.ptr());
+                    nodes_to_visit.append(child.ptr());
                 if (auto* element = as_if<Web::DOM::Element>(node)) {
                     doc->update_style_for_element(Web::DOM::AbstractElement { *element });
                     if (auto styles = element->computed_style())
@@ -1276,11 +1261,6 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "dump-all-css-errors") {
         Web::CSS::Parser::ErrorReporter::the().dump();
-        return;
-    }
-
-    if (request == "dump-wasm-stats") {
-        Wasm::dump_module_stats();
         return;
     }
 
@@ -1344,6 +1324,11 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "clear-cache") {
         Web::Fetch::Fetching::clear_http_memory_cache();
+        return;
+    }
+
+    if (request == "clear-user-style") {
+        page->page().set_user_style({});
         return;
     }
 
@@ -3081,14 +3066,14 @@ static Optional<Gfx::IntPoint> dictionary_lookup_baseline_origin_for_range(Web::
     if (!navigable)
         return {};
 
-    auto rect = range.get_bounding_client_rect();
-    if (rect->width() <= 0 || rect->height() <= 0)
+    auto rect = range.bounding_client_rect();
+    if (rect.width() <= 0 || rect.height() <= 0)
         return {};
 
     auto const& font = layout_node.first_available_font();
     Web::CSSPixelPoint baseline_origin {
-        Web::CSSPixels::nearest_value_for(rect->x()),
-        Web::CSSPixels::nearest_value_for(rect->y() + font.pixel_metrics().ascent),
+        Web::CSSPixels::nearest_value_for(rect.x()),
+        Web::CSSPixels::nearest_value_for(rect.y() + font.pixel_metrics().ascent),
     };
     return page.css_to_device_point(navigable->to_page_position(baseline_origin)).to_type<int>();
 }
@@ -3458,6 +3443,12 @@ void ConnectionFromClient::set_maximum_frames_per_second(Web::PageId page_id, do
 {
     if (auto page = this->page(page_id); page.has_value())
         page->set_maximum_frames_per_second(maximum_frames_per_second);
+}
+
+void ConnectionFromClient::set_viewport_corner_radius(Web::PageId page_id, double radius)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->set_viewport_corner_radius(radius);
 }
 
 void ConnectionFromClient::set_window_position(Web::PageId page_id, Web::DevicePixelPoint position)

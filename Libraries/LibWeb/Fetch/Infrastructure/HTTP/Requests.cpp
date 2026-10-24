@@ -17,6 +17,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 
 namespace Web::Fetch::Infrastructure {
 
@@ -118,26 +119,6 @@ bool Request::is_subresource_request() const
     }) || !m_destination.has_value();
 }
 
-// https://fetch.spec.whatwg.org/#non-subresource-request
-bool Request::is_non_subresource_request() const
-{
-    // A non-subresource request is a request whose destination is "document", "embed", "frame", "iframe", "object", "report", "serviceworker", "sharedworker", or "worker".
-    static constexpr Array non_subresource_request_destinations = {
-        Destination::Document,
-        Destination::Embed,
-        Destination::Frame,
-        Destination::IFrame,
-        Destination::Object,
-        Destination::Report,
-        Destination::ServiceWorker,
-        Destination::SharedWorker,
-        Destination::Worker,
-    };
-    return any_of(non_subresource_request_destinations, [this](auto destination) {
-        return m_destination == destination;
-    });
-}
-
 // https://fetch.spec.whatwg.org/#navigation-request
 bool Request::is_navigation_request() const
 {
@@ -152,6 +133,15 @@ bool Request::is_navigation_request() const
     return any_of(navigation_request_destinations, [this](auto destination) {
         return m_destination == destination;
     });
+}
+
+// Mixed Content refers to a request's target browsing context, which Fetch does not define. A navigation request targets
+// its reserved client's target browsing context: the navigable's active browsing context when the client was reserved.
+GC::Ptr<HTML::BrowsingContext> Request::target_browsing_context() const
+{
+    if (!m_reserved_client)
+        return {};
+    return m_reserved_client->target_browsing_context.ptr();
 }
 
 // https://fetch.spec.whatwg.org/#concept-request-tainted-origin

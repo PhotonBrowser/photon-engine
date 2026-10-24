@@ -6,10 +6,10 @@
 
 #include <AK/AnyOf.h>
 #include <Compositor/BackingStoreManager.h>
+#include <Compositor/PaintingSurface.h>
+#include <Compositor/SkiaBackendContext.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/PaintingSurface.h>
 #include <LibGfx/SharedImageBuffer.h>
-#include <LibGfx/SkiaBackendContext.h>
 #include <AK/Time.h>
 #include <cstdlib>
 
@@ -119,21 +119,18 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
         return {};
 
     auto allocation_size = viewport_size;
-    bool force_reallocate = false;
+    bool needs_allocation = m_allocated_size.is_empty();
     if (window_resize_in_progress == Compositing::WindowResizingInProgress::Yes) {
-        // Pad a new allocation so that it can cover nearby viewport sizes
-        // without reallocating backing stores during every step of a resize.
+        // Pad the backing stores we allocate so that we don't have to keep reallocating them while the window is being
+        // resized. Ones that still hold the viewport are kept.
         allocation_size = { viewport_size.width() + 256, viewport_size.height() + 256 };
+        needs_allocation |= !m_allocated_size.contains(viewport_size);
     } else {
         // If we're not in the middle of a resize, we can shrink the backing store size to match the viewport size.
-        force_reallocate = m_allocated_size != viewport_size;
+        needs_allocation |= m_allocated_size != viewport_size;
     }
 
-    // During resize, test the actual viewport against the padded allocation.
-    // Testing `allocation_size` here would require another 256 px of headroom
-    // after every viewport change and cause the pool to be recreated on each
-    // resize event.
-    if (force_reallocate || m_allocated_size.is_empty() || !m_allocated_size.contains(viewport_size)) {
+    if (needs_allocation) {
         m_allocated_size = allocation_size;
         ++m_pool_epoch;
         Vector<i32> bitmap_ids;
@@ -429,6 +426,17 @@ void BackingStoreManager::log_pool_state(StringView event) const
     for (auto const& store : m_backing_stores) {
         auto state = store.state == BufferState::Available ? "AVAILABLE"sv : store.state == BufferState::Rendering ? "RENDERING"sv : "PRESENTED"sv;
         dbgln("[ExternalImageLease][Pool] at_ns={} event={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state={} presented_to_client={} consumer_release_gpu_complete={} iosurface_in_use={} iosurface_gate_bypassed={} available_for_rendering={}", MonotonicTime::now().nanoseconds(), event, static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch, state, store.was_presented_to_client, store.consumer_gpu_work_complete, published_surface_is_in_use(store), !store.was_presented_to_client, store_can_be_rendered_into(store));
+    }
+}
+
+void BackingStoreManager::release_all_presented_buffers()
+{
+    for (auto& store : m_backing_stores) {
+        if (store.state != BufferState::Presented)
+            continue;
+        store.state = BufferState::Available;
+        store.was_presented_to_client = false;
+        store.consumer_gpu_work_complete = true;
     }
 }
 

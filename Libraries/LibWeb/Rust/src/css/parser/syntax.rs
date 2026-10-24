@@ -17,7 +17,7 @@ use crate::css::parser::token_stream::TokenStream;
 use crate::css::parser::transforms_effects_parser::{parse_transform, parse_transform_function};
 use crate::css::parser::value_parser::{
     FfiParseStatus, ParseContext, is_valid_custom_ident, parse_custom_ident_value, parse_string_value,
-    parse_syntax_numeric_value, parse_url_value, unresolved_value, value_list,
+    parse_syntax_numeric_value, parse_url_value, unresolved_value, unresolved_value_from_component_values, value_list,
 };
 use crate::css::property_metadata::property_id;
 use crate::css::serialize::{StringUnits, TextSink, serialize_an_identifier};
@@ -243,7 +243,7 @@ pub(crate) fn parse_syntax(source: &[u16], limit_ident_to_custom_ident: bool) ->
     parse_syntax_values(&values, limit_ident_to_custom_ident)
 }
 
-fn parse_syntax_values(values: &[ComponentValue], limit_ident_to_custom_ident: bool) -> Option<SyntaxNode> {
+pub(crate) fn parse_syntax_values(values: &[ComponentValue], limit_ident_to_custom_ident: bool) -> Option<SyntaxNode> {
     let mut position = 0;
     discard_whitespace(values, &mut position);
 
@@ -303,23 +303,13 @@ fn identifier_matches(value: &[u16], expected: &[u16], case_sensitive: bool) -> 
 
 fn parse_type(context: &ParseContext, syntax_type: SyntaxType, tokens: &mut TokenStream<'_>) -> Option<StyleValueData> {
     tokens.discard_whitespace();
-    let parsed = match syntax_type {
+    match syntax_type {
         SyntaxType::Color => parse_color_value(context, property_id::CUSTOM, tokens, false),
-        SyntaxType::CustomIdent => {
-            let value = parse_custom_ident_value(context, tokens.next_token(), &[])?;
-            tokens.discard_a_token();
-            Some(value)
-        }
+        SyntaxType::CustomIdent => parse_custom_ident_value(context, tokens.consume_a_token(), &[]),
         SyntaxType::Image => parse_image_value(context, property_id::CUSTOM, tokens, false),
-        SyntaxType::String => {
-            let value = parse_string_value(context, tokens.next_token())?;
-            tokens.discard_a_token();
-            Some(value)
-        }
+        SyntaxType::String => parse_string_value(context, tokens.consume_a_token()),
         SyntaxType::TransformFunction => {
-            let value = parse_transform_function(context, property_id::CUSTOM, tokens.next_token())?;
-            tokens.discard_a_token();
-            Some(value)
+            parse_transform_function(context, property_id::CUSTOM, tokens.consume_a_token())
         }
         SyntaxType::TransformList => {
             let start = tokens.current_index();
@@ -328,85 +318,68 @@ fn parse_type(context: &ParseContext, syntax_type: SyntaxType, tokens: &mut Toke
             }
             parse_transform(context, property_id::CUSTOM, tokens.tokens_since(start))
         }
-        SyntaxType::Url => {
-            let value = parse_url_value(context, tokens.next_token())?;
-            tokens.discard_a_token();
-            Some(value)
-        }
-        _ => {
-            let value = parse_syntax_numeric_value(context, syntax_type, tokens.next_token())?;
-            tokens.discard_a_token();
-            Some(value)
-        }
-    }?;
-    Some(parsed)
+        SyntaxType::Url => parse_url_value(context, tokens.consume_a_token()),
+        _ => parse_syntax_numeric_value(context, syntax_type, tokens.consume_a_token()),
+    }
 }
 
+/// May consume tokens on failure. Callers that retry must use a transaction.
 fn parse_node(context: &ParseContext, syntax: &SyntaxNode, tokens: &mut TokenStream<'_>) -> Option<StyleValueData> {
-    let mut transaction = tokens.begin_transaction();
-    let parsed = match syntax {
-        SyntaxNode::Universal => return None,
+    match syntax {
+        SyntaxNode::Universal => None,
         SyntaxNode::Ident { value, case_sensitive } => {
-            transaction.discard_whitespace();
-            let identifier = transaction.consume_a_token().ident()?;
+            tokens.discard_whitespace();
+            let identifier = tokens.consume_a_token().ident()?;
             if !identifier_matches(identifier, value, *case_sensitive) {
                 return None;
             }
             if let Some(keyword) = keyword_from_ascii_case_insensitive(value) {
-                StyleValueData::Keyword { keyword }
+                Some(StyleValueData::Keyword { keyword })
             } else {
-                StyleValueData::CustomIdent {
+                Some(StyleValueData::CustomIdent {
                     custom_ident: CssString::from_utf16(value),
-                }
+                })
             }
         }
-        SyntaxNode::Type(syntax_type) => parse_type(context, *syntax_type, &mut transaction)?,
+        SyntaxNode::Type(syntax_type) => parse_type(context, *syntax_type, tokens),
         SyntaxNode::Multiplier { child, multiplier } => {
             let mut values = Vec::new();
-            transaction.discard_whitespace();
+            tokens.discard_whitespace();
             loop {
-                values.push(parse_node(context, child, &mut transaction)?);
-                transaction.discard_whitespace();
+                values.push(parse_node(context, child, tokens)?);
+                tokens.discard_whitespace();
                 match multiplier {
-                    SyntaxMultiplier::CommaSeparated if transaction.next_token().is_comma() => {
-                        transaction.discard_a_token();
-                        transaction.discard_whitespace();
-                        if !transaction.has_next_token() {
+                    SyntaxMultiplier::CommaSeparated if tokens.next_token().is_comma() => {
+                        tokens.discard_a_token();
+                        tokens.discard_whitespace();
+                        if !tokens.has_next_token() {
                             return None;
                         }
                     }
-                    SyntaxMultiplier::SpaceSeparated if transaction.has_next_token() => {}
+                    SyntaxMultiplier::SpaceSeparated if tokens.has_next_token() => {}
                     _ => break,
                 }
             }
-            value_list(values, u8::from(*multiplier == SyntaxMultiplier::CommaSeparated), true)
+            Some(value_list(
+                values,
+                u8::from(*multiplier == SyntaxMultiplier::CommaSeparated),
+                true,
+            ))
         }
         SyntaxNode::Alternatives(alternatives) => {
             for alternative in alternatives {
-                let parsed = {
-                    let mut alternative_transaction = transaction.begin_transaction();
-                    if let Some(parsed) = parse_node(context, alternative, &mut alternative_transaction) {
-                        alternative_transaction.discard_whitespace();
-                        if !alternative_transaction.has_next_token() {
-                            alternative_transaction.commit();
-                            Some(parsed)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                let mut transaction = tokens.begin_transaction();
+                if let Some(parsed) = parse_node(context, alternative, &mut transaction) {
+                    transaction.discard_whitespace();
+                    if !transaction.has_next_token() {
+                        transaction.commit();
+                        return Some(parsed);
                     }
-                };
-                if let Some(parsed) = parsed {
-                    transaction.commit();
-                    return Some(parsed);
                 }
             }
-            return None;
+            None
         }
-    };
-    transaction.commit();
-    Some(parsed)
+    }
 }
 
 // https://drafts.csswg.org/css-values-5/#parse-with-a-syntax
@@ -415,15 +388,33 @@ pub(crate) fn parse_with_syntax(context: &ParseContext, source: &[u16], syntax: 
         crate::css::css_tokenizer::TokenizerInput::Utf16(source),
     ))
     .ok()?;
+    parse_with_syntax_component_values(context, &values, syntax, Some(source))
+}
+
+/// Parses component values against a syntax. Original source text is only used
+/// when constructing an unresolved value for the universal syntax; when absent,
+/// the component values are serialized instead.
+pub(crate) fn parse_with_syntax_component_values(
+    context: &ParseContext,
+    values: &[ComponentValue],
+    syntax: &SyntaxNode,
+    original_source: Option<&[u16]>,
+) -> Option<StyleValueData> {
     if matches!(syntax, SyntaxNode::Universal) {
-        if !declaration_value_is_valid(&values) {
+        if !declaration_value_is_valid(values) {
             return None;
         }
+
         let mut presence = SubstitutionFunctionsPresence::default();
-        collect_arbitrary_substitution_function_presence(&values, &mut presence).ok()?;
-        return Some(unresolved_value(source, &[], presence));
+        collect_arbitrary_substitution_function_presence(values, &mut presence).ok()?;
+
+        return Some(match original_source {
+            Some(source) => unresolved_value(source, &[], values.to_vec(), presence),
+            None => unresolved_value_from_component_values(values.to_vec(), presence),
+        });
     }
-    let mut tokens = TokenStream::new(&values);
+
+    let mut tokens = TokenStream::new(values);
     let parsed = parse_node(context, syntax, &mut tokens)?;
     tokens.discard_whitespace();
     (!tokens.has_next_token()).then_some(parsed)
@@ -599,6 +590,41 @@ mod tests {
         assert!(parse_with_syntax(&context, &utf16("1, 2, calc(1 + 2)"), &syntax).is_some());
         assert!(parse_with_syntax(&context, &utf16("red"), &syntax).is_none());
         assert!(parse_with_syntax(&context, &utf16("1,"), &syntax).is_none());
+    }
+
+    #[test]
+    fn universal_syntax_uses_provided_source_text() {
+        let random_function_index = RandomFunctionIndex::default();
+        let context = context(&random_function_index);
+        let source = utf16("1.00px");
+        let values = consume_a_list_of_component_values(
+            crate::css::css_tokenizer::tokenize_for_parser_without_source(b"1.00px").into_vec(),
+        )
+        .unwrap();
+        let Some(StyleValueData::Unresolved { source_text, .. }) =
+            parse_with_syntax_component_values(&context, &values, &SyntaxNode::Universal, Some(&source))
+        else {
+            panic!("expected an unresolved value");
+        };
+        assert_eq!(source_text.units(), source);
+    }
+
+    #[test]
+    fn universal_syntax_serializes_component_values_without_original_source() {
+        let random_function_index = RandomFunctionIndex::default();
+        let context = context(&random_function_index);
+        let mut values = consume_a_list_of_component_values(tokenize_for_parser(b"a b".as_slice())).unwrap();
+        values.remove(1);
+        let Some(StyleValueData::Unresolved {
+            source_text,
+            components,
+            ..
+        }) = parse_with_syntax_component_values(&context, &values, &SyntaxNode::Universal, None)
+        else {
+            panic!("expected an unresolved value");
+        };
+        assert_eq!(source_text.units(), utf16("a/**/b"));
+        assert_eq!(components.as_slice(), values.as_slice());
     }
 
     #[test]

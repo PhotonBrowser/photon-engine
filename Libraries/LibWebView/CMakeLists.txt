@@ -20,6 +20,7 @@ set(SOURCES
     CanonicalWindow.cpp
     BrowserProcess.cpp
     CompositorClient.cpp
+    CompositorPresentationClient.cpp
     CookieJar.cpp
     CrashReport.cpp
     CrashReportDiagnostics.cpp
@@ -48,6 +49,7 @@ set(SOURCES
     PictureInPictureWindow.cpp
     Process.cpp
     ProcessManager.cpp
+    ProcessSnapshot.cpp
     TabPerformanceStats.cpp
     TabPerformanceMonitor.cpp
     ProcessMonitor.cpp
@@ -151,11 +153,6 @@ if (LINUX)
         target_compile_definitions(LibWebView PRIVATE HAVE_PULSEAUDIO=1)
         target_link_libraries(LibWebView PRIVATE PkgConfig::PULSEAUDIO)
     endif()
-endif()
-
-if (ENABLE_CRANELIFT_JIT)
-    target_link_libraries(LibWebView PRIVATE LibWasmCompilerClient)
-    target_compile_definitions(LibWebView PUBLIC HAVE_WASM_COMPILER_SERVICE=1)
 endif()
 
 if (APPLE)

@@ -12,9 +12,12 @@ use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ops::Deref;
 
+use ak::Utf16String;
 use libjs_rust::api::{ForeignCellSlot, Gc, Realm, Trace, Visitor, Vm};
 
-use super::canvas::{Canvas, TexImageSourceFrame, TexImageSourceKind, read_tex_image_source};
+use super::canvas::{
+    Canvas, TexImageSourceFrame, TexImageSourceKind, read_tex_image_frame, read_tex_image_pixels, read_tex_image_source,
+};
 use super::constants::{
     GL_BROWSER_DEFAULT_WEBGL, GL_CONTEXT_LOST_WEBGL, GL_INVALID_OPERATION, GL_INVALID_VALUE, GL_NO_ERROR,
 };
@@ -37,6 +40,8 @@ use super::web_gl_uniform_location::WebGLUniformLocation;
 use super::web_gl_vertex_array_object::WebGLVertexArrayObject;
 use super::web_gl_vertex_array_object_oes::WebGLVertexArrayObjectOES;
 use crate::bindings::interface::{Inherits, Interface, Ref, Wrappable, cell_into_abi};
+use crate::bindings::{Exception, WebIdlResult};
+use crate::canvas_2d::canvas::CanvasImageSourceKind;
 
 pub(crate) const MAX_WEBGL_DRAWING_BUFFER_DIMENSION: i32 = 16384;
 
@@ -352,33 +357,66 @@ impl ContextState {
         source: &TexImageSource,
         format: u32,
         r#type: u32,
-    ) -> Option<(Frame, FrameUpload)> {
-        let (source_kind, source_object) = match *source {
-            TexImageSource::ImageBitmap(object) => (TexImageSourceKind::ImageBitmap, object),
-            TexImageSource::ImageData(object) => (TexImageSourceKind::ImageData, object),
-            TexImageSource::HTMLImageElement(object) => (TexImageSourceKind::HTMLImageElement, object),
-            TexImageSource::HTMLCanvasElement(object) => (TexImageSourceKind::HTMLCanvasElement, object),
-            TexImageSource::HTMLVideoElement(object) => (TexImageSourceKind::HTMLVideoElement, object),
-            TexImageSource::OffscreenCanvas(object) => (TexImageSourceKind::OffscreenCanvas, object),
+    ) -> WebIdlResult<Option<(Frame, FrameUpload)>> {
+        // If this function is called with an HTMLImageElement or HTMLVideoElement whose origin differs from the origin
+        // of the containing Document, or with an HTMLCanvasElement, ImageBitmap or OffscreenCanvas whose bitmap's
+        // origin-clean flag is set to false, a SECURITY_ERR exception must be thrown. See Origin Restrictions.
+        // https://registry.khronos.org/webgl/specs/latest/1.0/#ORIGIN_RESTRICTIONS
+        if tex_image_source_is_not_origin_clean(source) {
+            return Err(Exception::Dom(
+                "SecurityError",
+                Utf16String::from_ascii(b"Cannot upload a texture source that is not origin-clean"),
+            ));
+        }
+
+        let source_frame = match *source {
+            TexImageSource::ImageBitmap(image_bitmap) => match image_bitmap.frame() {
+                Some(image_frame) => read_tex_image_frame(&image_frame, format, r#type),
+                // If this function is called with an ImageBitmap that has been neutered, an INVALID_VALUE error is
+                // generated.
+                None => TexImageSourceFrame::InvalidValue,
+            },
+            TexImageSource::ImageData(image_data) => match image_data.pixels() {
+                Some(pixels) => {
+                    let (width, height) = image_data.size();
+                    // SAFETY: Nothing runs script while the pixels are copied.
+                    unsafe { read_tex_image_pixels(pixels, width, height, format, r#type) }
+                }
+                // If this function is called with an ImageData whose data attribute has been neutered, an
+                // INVALID_VALUE error is generated.
+                None => TexImageSourceFrame::InvalidValue,
+            },
+            TexImageSource::HTMLImageElement(object) => {
+                read_tex_image_source(object, TexImageSourceKind::HTMLImageElement, format, r#type)
+            }
+            TexImageSource::HTMLCanvasElement(object) => {
+                read_tex_image_source(object, TexImageSourceKind::HTMLCanvasElement, format, r#type)
+            }
+            TexImageSource::HTMLVideoElement(object) => {
+                read_tex_image_source(object, TexImageSourceKind::HTMLVideoElement, format, r#type)
+            }
+            TexImageSource::OffscreenCanvas(object) => {
+                read_tex_image_source(object, TexImageSourceKind::OffscreenCanvas, format, r#type)
+            }
         };
-        let frame = match read_tex_image_source(source_object, source_kind, format, r#type) {
+        let frame = match source_frame {
             TexImageSourceFrame::Frame(frame) => frame,
-            TexImageSourceFrame::NoFrame => return None,
+            TexImageSourceFrame::NoFrame => return Ok(None),
             TexImageSourceFrame::InvalidValue => {
                 self.set_error(GL_INVALID_VALUE);
-                return None;
+                return Ok(None);
             }
         };
         // The first pixel transferred from the source to the WebGL implementation corresponds to the upper left
         // corner of the source. This behavior is modified by the UNPACK_FLIP_Y_WEBGL pixel storage parameter,
         // except for ImageBitmap arguments, as described in the abovementioned section.
-        let flip_y = self.unpack_flip_y.get() && source_kind != TexImageSourceKind::ImageBitmap;
+        let flip_y = self.unpack_flip_y.get() && !matches!(source, TexImageSource::ImageBitmap(_));
         let upload = FrameUpload {
             destination_size: None,
             flip_y,
             premultiply_alpha: self.unpack_premultiply_alpha.get(),
         };
-        Some((frame, upload))
+        Ok(Some((frame, upload)))
     }
 
     /// https://registry.khronos.org/webgl/specs/latest/2.0/#PIXEL_STORE_PARAM_CONSTRAINTS
@@ -462,5 +500,19 @@ impl ContextState {
         self.any_samples_passed.set(None);
         self.any_samples_passed_conservative.set(None);
         self.transform_feedback_primitives_written.set(None);
+    }
+}
+
+/// https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument-is-not-origin-clean
+fn tex_image_source_is_not_origin_clean(source: &TexImageSource) -> bool {
+    match *source {
+        TexImageSource::ImageBitmap(image_bitmap) => !image_bitmap.origin_clean(),
+        TexImageSource::ImageData(_) => false,
+        TexImageSource::HTMLImageElement(object) => CanvasImageSourceKind::HTMLImageElement.is_not_origin_clean(object),
+        TexImageSource::HTMLCanvasElement(object) => {
+            CanvasImageSourceKind::HTMLCanvasElement.is_not_origin_clean(object)
+        }
+        TexImageSource::HTMLVideoElement(object) => CanvasImageSourceKind::HTMLVideoElement.is_not_origin_clean(object),
+        TexImageSource::OffscreenCanvas(object) => CanvasImageSourceKind::OffscreenCanvas.is_not_origin_clean(object),
     }
 }

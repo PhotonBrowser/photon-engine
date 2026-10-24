@@ -627,7 +627,7 @@ fn generate_selector_pseudo_types(manifest_dir: &Path, out_dir: &Path) -> Result
             None => "None",
             Some("<compound-selector>") => "CompoundSelector",
             Some("<ident>+") => "IdentList",
-            Some("<pt-name-selector>") => "PTNameSelector",
+            Some("<pt-name-and-class-selector>") => "PTNameAndClassSelector",
             Some(argument) => return Err(format!("unsupported pseudo-element parameter type {argument}").into()),
         };
         writeln!(
@@ -877,6 +877,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "font-kerning",
         "font-optical-sizing",
         "font-size",
+        "font-size-adjust",
         "font-style",
         "font-variant-alternates",
         "font-variant-caps",
@@ -1001,11 +1002,16 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         };
         // Animation controls can select or retime an animation of any property, so their own
         // direct layout metadata cannot bound the geometry they expose. Likewise, container-name
-        // can change which descendant container queries apply without changing its own box, and
-        // color can change SVG bounds when stroke resolves currentColor.
+        // can change which descendant container queries apply without changing its own box,
+        // color can change SVG bounds when stroke resolves currentColor, and the scroll-snap
+        // properties can re-snap a scroll container, which moves every box inside it. A test in
+        // property_metadata.rs checks this against property_may_resnap_scroll_container().
         let may_affect_layout_geometry_indirectly = property_field(name, "style-group")
             .is_some_and(|value| value.as_str() == Some("AnimationValues"))
-            || matches!(name.as_str(), "color" | "container-name");
+            || matches!(
+                name.as_str(),
+                "color" | "container-name" | "scroll-snap-align" | "scroll-snap-stop" | "scroll-snap-type"
+            );
         layout_geometry_effects[index] = metadata_flag("affects-layout", true)
             || metadata_flag("affects-accumulated-visual-contexts", false)
             || metadata_flag("affects-scrollable-overflow", false)
@@ -1473,8 +1479,8 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         .collect();
     let expanded_longhand_counts: Vec<usize> = expanded_shorthand_longhands.iter().map(Vec::len).collect();
 
-    // Accepted property keywords mirror property_accepts_keyword() in
-    // generate_libweb_css_property_id.py.
+    // Accepted property keywords are a property's valid identifiers and the
+    // keywords of the enums in its valid types.
     let mut accepted_keyword_rows = Vec::new();
     let mut accepted_value_type_rows = Vec::new();
     let mut custom_ident_blacklist_rows = Vec::new();
@@ -2275,9 +2281,9 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "AK/Optional.h",
             "LibGfx/AffineTransform.h",
             "LibGfx/Color.h",
+            "LibGfx/ColorFilterType.h",
             "LibGfx/CompositingAndBlendingOperator.h",
             "LibGfx/CornerRadii.h",
-            "LibGfx/Filter.h",
             "LibGfx/GradientInterpolation.h",
             "LibGfx/InterpolationColorSpace.h",
             "LibGfx/Matrix4x4.h",
@@ -2509,7 +2515,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     value_parser_config.export.include = vec![
         "NativeCompilationPurpose".to_string(),
         "FfiParseStatus".to_string(),
-        "FfiSimpleColor".to_string(),
         "FontFeatureValuesRuleKind".to_string(),
         "FfiValueParsingContext".to_string(),
         "FfiValueParsingContextKind".to_string(),
@@ -2884,6 +2889,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/layout/flex_formatting_context.rs"),
             manifest_dir.join("src/layout/grid_formatting_context.rs"),
             manifest_dir.join("src/layout/svg_formatting_context.rs"),
+            manifest_dir.join("src/layout/math_formatting_context.rs"),
             manifest_dir.join("src/layout/table_formatting_context.rs"),
             manifest_dir.join("src/layout/inline_formatting_context.rs"),
             manifest_dir.join("src/layout/inline_level_iterator.rs"),

@@ -149,8 +149,8 @@ enum class InvalidateLayoutTreeReason {
     X(ElementScroll, false)                         \
     X(ElementScrollHeight, false)                   \
     X(ElementScrollIntoView, false)                 \
-    X(ElementScrollLeft, false)                     \
-    X(ElementScrollTop, false)                      \
+    X(ElementScrollLeft, true)                      \
+    X(ElementScrollTop, true)                       \
     X(ElementScrollWidth, false)                    \
     X(ElementSetScrollLeft, false)                  \
     X(ElementSetScrollTop, false)                   \
@@ -162,6 +162,7 @@ enum class InvalidateLayoutTreeReason {
     X(EventHandlerHandleMouseMove, false)           \
     X(EventHandlerHandleMouseUp, false)             \
     X(EventHandlerHandleMouseWheel, false)          \
+    X(EventHandlerPointerCaptureEvents, false)      \
     X(EventHandlerRunActivationBehavior, false)     \
     X(EventHandlerShowContextMenu, false)           \
     X(FontFaceSetReady, false)                      \
@@ -269,6 +270,7 @@ struct DocumentUnloadTimingInfo {
 enum class PolicyControlledFeature : u8 {
     Autoplay,
     Camera,
+    CrossOriginIsolated,
     EncryptedMedia,
     FocusWithoutUserActivation,
     Fullscreen,
@@ -845,7 +847,6 @@ public:
     // https://wicg.github.io/scroll-to-text-fragment/#feature-detectability
     GC::Ref<FragmentDirective> fragment_directive();
     Optional<Vector<HTML::TextDirective>> const& pending_text_directives() const { return m_pending_text_directives; }
-    void set_pending_text_directives(Optional<Vector<HTML::TextDirective>> directives);
     void clear_pending_text_directives();
     ReadonlySpan<GC::Ref<Range>> text_fragment_ranges() const { return m_text_fragment_ranges; }
     void dismiss_text_fragment_indication();
@@ -921,6 +922,10 @@ public:
 
     void run_the_resize_steps();
     void run_the_scroll_steps();
+
+    u32 increment_video_frame_request_callback_identifier() { return ++m_video_frame_request_callback_identifier; }
+    void run_the_video_frame_request_callbacks(double now);
+    void release_video_frames_held_for_callbacks();
 
     void evaluate_media_queries_and_report_changes();
     bool needs_media_query_list_evaluation() const { return m_needs_media_query_list_evaluation; }
@@ -1013,8 +1018,6 @@ public:
     // Records that a pending update cannot be attributed to any boundary in the partial relayout
     // root set; the layout node arena keeps the escape bit next to those roots.
     void record_partial_relayout_escape(PartialRelayoutEscapeReason);
-
-    void invalidate_scroll_state();
 
     bool has_active_favicon() const { return !!m_active_favicon; }
     void check_favicon_after_loading_link_resource();
@@ -1160,7 +1163,6 @@ public:
     void add_speculative_fetch_url(URL::URL url) { m_list_of_speculative_fetch_urls.set(move(url)); }
 
     void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserver&);
-    void unregister_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserver&);
     bool has_intersection_observation_targets() const;
 
     void register_resize_observer(Badge<ResizeObserver::ResizeObserver>, ResizeObserver::ResizeObserver&);
@@ -1199,6 +1201,13 @@ public:
     void restore_the_history_object_state(NonnullRefPtr<HTML::SessionHistoryEntry> entry);
 
     GC::Ref<Animations::DocumentTimeline> timeline();
+
+    // The scroll progress timelines and view progress timelines the elements of the document declare by name.
+    Animations::NamedTimelines& named_timelines();
+    bool has_named_timelines() const { return m_named_timelines != nullptr; }
+    // Moves on whenever the timelines an element declares by name, or the timeline names it scopes, may have changed.
+    u64 timeline_declarations_generation() const { return m_timeline_declarations_generation; }
+    void did_change_timeline_declarations() { ++m_timeline_declarations_generation; }
     auto const& last_animation_frame_timestamp() const { return m_last_animation_frame_timestamp; }
 
     void associate_with_timeline(GC::Ref<Animations::AnimationTimeline>);
@@ -1221,7 +1230,7 @@ public:
     void dispatch_events_for_animation_if_necessary(GC::Ref<Animations::Animation>);
     void remove_replaced_animations();
 
-    WebIDL::ExceptionOr<Vector<GC::Ref<Animations::Animation>>> get_animations();
+    WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animations::Animation>>> get_animations();
     HashTable<GC::Ref<Animations::AnimationTimeline>> const& associated_animation_timelines() const { return m_associated_animation_timelines; }
     void begin_smil_time_container_once_loaded(SVG::SMILTimeContainer&);
     void schedule_svg_referenced_motion_path_update(SVG::SVGAnimateMotionElement&);
@@ -1385,6 +1394,8 @@ public:
     void schedule_scroll_container_resnap() { m_needs_scroll_container_resnap = true; }
     void cancel_scheduled_scroll_container_resnap() { m_needs_scroll_container_resnap = false; }
     [[nodiscard]] bool needs_scroll_container_resnap() const { return m_needs_scroll_container_resnap; }
+    // A re-snap is scheduled after every layout change, but only one with snap areas to re-snap can move a scroll offset.
+    [[nodiscard]] bool has_pending_scroll_container_resnap() const { return m_needs_scroll_container_resnap && m_may_have_scroll_snap_areas; }
     void set_may_have_scroll_snap_areas() { m_may_have_scroll_snap_areas = true; }
     [[nodiscard]] bool may_have_scroll_snap_areas() const { return m_may_have_scroll_snap_areas; }
 
@@ -1407,7 +1418,7 @@ public:
 
     virtual Vector<Utf16FlyString> supported_property_names() const override;
     Vector<GC::Ref<DOM::Element>> const& potentially_named_elements() const { return m_potentially_named_elements; }
-    Vector<GC::Ref<DOM::Element>> named_elements_with_name(Utf16FlyString const&) const;
+    GC::RootVector<GC::Ref<DOM::Element>> named_elements_with_name(Utf16FlyString const&) const;
     static bool is_named_element_with_name(Element const&, Utf16FlyString const&);
 
     void gather_active_observations_at_depth(size_t depth);
@@ -1874,6 +1885,9 @@ private:
 
     GC::Ptr<HTML::HTMLParser> m_parser;
     u64 m_parser_generation { 0 };
+
+    // https://wicg.github.io/video-rvfc/#video-frame-request-callback-identifier
+    u32 m_video_frame_request_callback_identifier { 0 };
     bool m_active_parser_was_aborted { false };
 
     bool m_has_been_destroyed { false };
@@ -2208,6 +2222,8 @@ private:
 
     // https://www.w3.org/TR/web-animations-1/#document-default-document-timeline
     GC::Ptr<Animations::DocumentTimeline> m_default_timeline;
+    GC::Ptr<Animations::NamedTimelines> m_named_timelines;
+    u64 m_timeline_declarations_generation { 0 };
     Optional<double> m_last_animation_frame_timestamp;
 
     // https://www.w3.org/TR/web-animations-1/#pending-animation-event-queue

@@ -11,6 +11,7 @@
 #include <AK/Mutex.h>
 #include <AK/Time.h>
 #include <cstdlib>
+#include <LibCompositing/CanvasSize.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/Environment.h>
@@ -319,7 +320,7 @@ Optional<Compositing::CanvasId> CompositorConnection::create_canvas_2d_context(G
         return {};
 
     // NB: The Compositor refuses the same sizes, so a context it is asked to create always exists afterwards.
-    if (!Gfx::is_valid_canvas_2d_size(size))
+    if (!Compositing::is_valid_canvas_2d_size(size))
         return {};
 
     // OPTIMIZATION: Creating a context is asynchronous, under an ID from a range reserved up front. A synchronous
@@ -361,7 +362,19 @@ void CompositorConnection::update_canvas_2d_stream(Compositing::Canvas2DCommandS
             added_fonts.append(move(font));
     }
 
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateCanvas2dStream::static_encode(stream.take_segments(), move(kept_font_ids), move(added_fonts)));
+    // A frame travels in a shared bitmap. One that cannot be placed in one is left out, and the Compositor skips the
+    // draws that name it.
+    Vector<Compositing::DisplayListImageFrameResource> image_frames;
+    for (auto& frame : stream.take_image_frames()) {
+        auto bitmap = frame.frame.bitmap().to_shareable_bitmap();
+        if (!bitmap.is_valid()) {
+            dbgln("WebContent: Could not place a {} canvas image frame in shared memory", frame.frame.bitmap().size());
+            continue;
+        }
+        image_frames.append({ .id = frame.id, .frame = Gfx::DecodedImageFrame { *bitmap.bitmap(), frame.frame.color_space() } });
+    }
+
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateCanvas2dStream::static_encode(stream.take_segments(), move(kept_font_ids), move(added_fonts), move(image_frames)));
     auto video_frame_holds = stream.take_video_frame_holds();
     if (post_message(encoded_message).is_error()) {
         did_lose_compositor();
@@ -384,7 +397,11 @@ Gfx::ShareableBitmap CompositorConnection::get_canvas_pixels(Compositing::Canvas
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::GetCanvasPixels>(canvas_id, rect, alpha_type);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::GetCanvasPixels>(canvas_id, rect, alpha_type);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
     return response->take_pixels();
 }
 
@@ -393,7 +410,11 @@ Optional<Web::Compositor::PlaceholderCanvasLink> CompositorConnection::allocate_
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::AllocatePlaceholderCanvas>();
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AllocatePlaceholderCanvas>();
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
     return Web::Compositor::PlaceholderCanvasLink { response->canvas_id(), response->secret() };
 }
 
@@ -416,7 +437,11 @@ Web::Compositor::PlaceholderCanvasPixels CompositorConnection::get_placeholder_c
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::GetPlaceholderCanvasPixels>(canvas_id, rect);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::GetPlaceholderCanvasPixels>(canvas_id, rect);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
     auto pixels = response->take_pixels();
     return { pixels.is_valid() ? pixels.bitmap() : nullptr, response->origin_clean() };
 }
@@ -657,7 +682,11 @@ Optional<Compositing::CanvasId> CompositorConnection::create_webgl_context(Compo
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::CreateWebglContext>(webgl_version, size, depth, stencil, antialias);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::CreateWebglContext>(webgl_version, size, depth, stencil, antialias);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
     out_supported_extensions = response->take_supported_extensions();
     if (!response->success())
         return {};
@@ -737,7 +766,11 @@ ByteBuffer CompositorConnection::webgl_sync_call(Compositing::CanvasId canvas_id
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::WebglSyncCall>(canvas_id, move(request));
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::WebglSyncCall>(canvas_id, move(request));
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
     return response->take_reply();
 }
 
@@ -746,7 +779,11 @@ Compositing::WebGL::ReadPixelsResult CompositorConnection::read_webgl_pixels(Com
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::WebglReadPixels>(canvas_id, x, y, width, height, format, type, buf_size, pixels);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::WebglReadPixels>(canvas_id, x, y, width, height, format, type, buf_size, pixels);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
     return {
         .length = response->length(),
         .columns = response->columns(),
@@ -759,7 +796,11 @@ bool CompositorConnection::read_webgl_buffer_sub_data(Compositing::CanvasId canv
     if (!can_send_message_to_compositor())
         return false;
 
-    auto response = send_sync<Messages::CompositorWebContentServer::WebglReadBufferSubData>(canvas_id, target, offset, size, data);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::WebglReadBufferSubData>(canvas_id, target, offset, size, data);
+    if (!response) {
+        did_lose_compositor();
+        return false;
+    }
     return response->success();
 }
 
@@ -810,6 +851,17 @@ void CompositorConnection::rendering_opportunity(Web::CompositorContextId contex
             continue;
         navigable->page().client().rendering_opportunity(frame_time_nanoseconds, frame_interval_milliseconds);
         return;
+    }
+}
+
+void CompositorConnection::overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> visibilities)
+{
+    // Each scroller belongs to the active document of one of our navigables, which takes its scrollbar's visibility.
+    for (auto const& visibility : visibilities) {
+        for (auto& navigable : Web::HTML::all_local_navigables()) {
+            if (navigable->set_overlay_scrollbar_hidden(visibility.scroller_stable_node_id, visibility.vertical, visibility.hidden))
+                break;
+        }
     }
 }
 

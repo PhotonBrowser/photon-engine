@@ -69,7 +69,7 @@ SearchableText SearchableText::collect(Viewport& viewport)
     //
     // Collect the rendered pieces first so that the specification-ordered DOM walk below can use
     // rendered text while retaining the corresponding DOM offsets.
-    HashMap<DOM::Text const*, Vector<Layout::TextNode const*>> rendered_text_nodes;
+    GC::RootHashMap<DOM::Text const*, Vector<Layout::TextNode const*>> rendered_text_nodes;
     viewport.for_each_in_inclusive_subtree([&](auto const& layout_node) {
         auto const* text_node = as_if<Layout::TextNode>(layout_node);
         if (!text_node)
@@ -172,7 +172,7 @@ SearchableText SearchableText::collect(Viewport& viewport)
     };
 
     auto& document = const_cast<DOM::Document&>(viewport.dom_node());
-    Vector<DOM::Node*> nodes_in_shadow_including_tree_order;
+    GC::RootVector<DOM::Node*> nodes_in_shadow_including_tree_order;
     document.for_each_shadow_including_descendant([&](DOM::Node& node) {
         nodes_in_shadow_including_tree_order.append(&node);
         return TraversalDecision::Continue;
@@ -482,44 +482,6 @@ Optional<DOM::BoundaryPoint> SearchableText::boundary_point_at_offset(Block cons
     if (!node->is_connected() || dom_offset > node->length())
         return {};
     return DOM::BoundaryPoint { *node, static_cast<WebIDL::UnsignedLong>(dom_offset) };
-}
-
-Optional<GC::Ref<DOM::Range>> SearchableText::range_from_offsets(Block const& block, size_t start_offset, size_t end_offset) const
-{
-    if (block.segments.is_empty() || block.offset_mapping.is_empty() || start_offset > end_offset || end_offset > block.offset_mapping.size())
-        return {};
-
-    auto segment_for_code_unit = [&](size_t code_unit_offset) -> Segment const& {
-        auto const* segment = &block.segments.first();
-        for (size_t i = 1; i < block.segments.size() && block.segments[i].start_offset <= code_unit_offset; ++i)
-            segment = &block.segments[i];
-        return *segment;
-    };
-
-    auto const start_mapping_index = start_offset < block.offset_mapping.size() ? start_offset : block.offset_mapping.size() - 1;
-    auto const end_mapping_index = end_offset > 0 ? end_offset - 1 : 0;
-    auto const& start_mapping = block.offset_mapping[start_mapping_index];
-    auto const& end_mapping = block.offset_mapping[end_mapping_index];
-    auto start_node = segment_for_code_unit(start_mapping_index).dom_node.ptr();
-    auto end_node = segment_for_code_unit(end_mapping_index).dom_node.ptr();
-    if (!start_node || !end_node)
-        return {};
-
-    auto const start_dom_offset = start_offset < block.offset_mapping.size()
-        ? start_mapping.dom_start_offset
-        : start_mapping.dom_end_offset;
-    auto const end_dom_offset = end_offset > 0
-        ? end_mapping.dom_end_offset
-        : end_mapping.dom_start_offset;
-
-    if (&start_node->root() != &end_node->root()
-        || !start_node->is_connected()
-        || !end_node->is_connected()
-        || start_dom_offset > start_node->length()
-        || end_dom_offset > end_node->length())
-        return {};
-
-    return DOM::Range::create(*start_node, start_dom_offset, *end_node, end_dom_offset);
 }
 
 SearchableText const& SearchableTextCache::get()

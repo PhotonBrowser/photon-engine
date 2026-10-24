@@ -1283,6 +1283,10 @@ fn build_transform_group(
         };
         ComputedStyleValueHandle::from_retained(offset)
     };
+    let has_offset_path = values
+        .value(property_id::OFFSET_PATH)
+        .is_some_and(|value| !crate::css::style_value::is_none_keyword(value));
+
     let perspective_origin_x = position_offset(edge_x);
     let perspective_origin_y = position_offset(edge_y);
 
@@ -1302,6 +1306,12 @@ fn build_transform_group(
             payload.perspective_px = perspective_px;
             payload.perspective_origin_x = perspective_origin_x;
             payload.perspective_origin_y = perspective_origin_y;
+            payload.has_offset_path = has_offset_path;
+            payload.offset_path = retained(property_id::OFFSET_PATH);
+            payload.offset_distance = retained(property_id::OFFSET_DISTANCE);
+            payload.offset_position = retained(property_id::OFFSET_POSITION);
+            payload.offset_anchor = retained(property_id::OFFSET_ANCHOR);
+            payload.offset_rotate = retained(property_id::OFFSET_ROTATE);
         },
         parent,
     )
@@ -1822,6 +1832,7 @@ fn build_border_group(
             payload.border_top_right_radius = retained(property_id::BORDER_TOP_RIGHT_RADIUS);
             payload.has_noninitial_border_radii = has_noninitial_border_radii;
             payload.border_image_source = retained(property_id::BORDER_IMAGE_SOURCE);
+            payload.border_shape = retained(property_id::BORDER_SHAPE);
             payload.border_image_slice = retained(property_id::BORDER_IMAGE_SLICE);
             payload.border_image_width = retained(property_id::BORDER_IMAGE_WIDTH);
             payload.border_image_outset = retained(property_id::BORDER_IMAGE_OUTSET);
@@ -2652,7 +2663,7 @@ fn build_anchor_group(
     let mut append_fallback = |data: &StyleValueData| {
         let mut fallback = ComputedPositionTryFallback {
             name: RetainedUtf16FlyString::none(),
-            tactics: [0; 3],
+            tactics: [0; 5],
             tactic_count: 0,
             has_position_area: false,
             position_area: RetainedPositionAreaList::from_vec(Vec::new()),
@@ -2662,8 +2673,8 @@ fn build_anchor_group(
                 fallback.name = custom_ident.to_fly_string();
             } else if let Some(tactic) = keyword_of(data).and_then(crate::css::css_enums::keyword_to_try_tactic) {
                 assert!(
-                    fallback.tactic_count < 3,
-                    "a try tactic list holds at most three tactics"
+                    fallback.tactic_count < 5,
+                    "a try tactic list holds at most five tactics"
                 );
                 fallback.tactics[fallback.tactic_count] = tactic;
                 fallback.tactic_count += 1;
@@ -2805,8 +2816,8 @@ fn build_box_group(
         BoxValues, ComputedAspectRatio, ComputedContainIntrinsicSize, ComputedVerticalAlign,
     };
     use crate::css::css_enums::{
-        keyword_to_box_sizing, keyword_to_clear, keyword_to_continue_value, keyword_to_float, keyword_to_overflow,
-        keyword_to_overscroll_behavior, keyword_to_positioning, keyword_to_resize, keyword_to_table_layout,
+        keyword_to_box_sizing, keyword_to_clear, keyword_to_continue_value, keyword_to_field_sizing, keyword_to_float,
+        keyword_to_overflow, keyword_to_overscroll_behavior, keyword_to_positioning, keyword_to_resize, keyword_to_table_layout,
         keyword_to_text_overflow, keyword_to_unicode_bidi, keyword_to_vertical_align,
     };
 
@@ -3039,6 +3050,7 @@ fn build_box_group(
             keyword_to_overscroll_behavior,
         ),
         box_sizing: required_keyword_code(values, property_id::BOX_SIZING, keyword_to_box_sizing),
+        field_sizing: required_keyword_code(values, property_id::FIELD_SIZING, keyword_to_field_sizing),
         resize: required_keyword_code(values, property_id::RESIZE, keyword_to_resize),
         text_overflow: required_keyword_code(values, property_id::TEXT_OVERFLOW, keyword_to_text_overflow),
         unicode_bidi: required_keyword_code(values, property_id::UNICODE_BIDI, keyword_to_unicode_bidi),
@@ -3167,6 +3179,8 @@ fn build_animation_group(
             payload.animation_iteration_count = retained(property_id::ANIMATION_ITERATION_COUNT);
             payload.animation_play_state = retained(property_id::ANIMATION_PLAY_STATE);
             payload.animation_timeline = retained(property_id::ANIMATION_TIMELINE);
+            payload.animation_range_start = retained(property_id::ANIMATION_RANGE_START);
+            payload.animation_range_end = retained(property_id::ANIMATION_RANGE_END);
             payload.animation_timing_function = retained(property_id::ANIMATION_TIMING_FUNCTION);
             payload.scroll_timeline_name = retained(property_id::SCROLL_TIMELINE_NAME);
             payload.scroll_timeline_axis = retained(property_id::SCROLL_TIMELINE_AXIS);

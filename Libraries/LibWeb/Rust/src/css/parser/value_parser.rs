@@ -25,7 +25,7 @@ use crate::css::parser::arbitrary_substitution::{
     substitution_function_presence_bits,
 };
 use crate::css::parser::calc_parser::{CalcParseError, parse_a_calc_function_node};
-use crate::css::parser::color_parser::{is_color_function_name, parse_color_value, parse_simple_color};
+use crate::css::parser::color_parser::{is_color_function_name, parse_color_value};
 use crate::css::parser::component_value::{
     ComponentKind, ComponentValue, consume_a_list_of_component_values, consume_a_small_list_of_component_values,
 };
@@ -49,9 +49,9 @@ use crate::css::property_metadata::{
 };
 use crate::css::style_compute::{LENGTH_UNIT_NAMES, px_length_unit};
 use crate::css::style_value::{
-    RetainedByteList, RetainedCounterDefinition, RetainedCounterDefinitionList, RetainedNumericRangeList,
-    RetainedPropertyIdList, RetainedRequestUrlModifier, RetainedRequestUrlModifierList, RetainedString,
-    RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData, shared_style_value,
+    RetainedByteList, RetainedComponentValueList, RetainedCounterDefinition, RetainedCounterDefinitionList,
+    RetainedNumericRangeList, RetainedPropertyIdList, RetainedRequestUrlModifier, RetainedRequestUrlModifierList,
+    RetainedString, RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData, shared_style_value,
 };
 use crate::css::value_codes::*;
 use std::ffi::c_void;
@@ -281,6 +281,7 @@ fn property_uses_special_keyword_parser(property: u16) -> bool {
             | property_id::TRANSFORM_ORIGIN
             | property_id::TRANSITION_PROPERTY
             | property_id::TRANSLATE
+            | property_id::VIEW_TRANSITION_CLASS
             | property_id::WHITE_SPACE
             | property_id::WHITE_SPACE_TRIM
             | property_id::WILL_CHANGE
@@ -1200,6 +1201,31 @@ pub(crate) fn parse_calculated_numeric_value_with_ranges(
     name: &[u16],
     values: &[ComponentValue],
 ) -> Option<StyleValueData> {
+    parse_calculated_numeric_value_allowing_size_keyword(
+        context,
+        property,
+        value_type,
+        percentages_resolve_as,
+        range,
+        name,
+        values,
+        false,
+    )
+}
+
+/// Parses a math function like parse_calculated_numeric_value_with_ranges(), where `allow_size_keyword` lets the
+/// calculation read the size keyword of a calc-size() calculation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_calculated_numeric_value_allowing_size_keyword(
+    context: &ParseContext,
+    property: u16,
+    value_type: u8,
+    percentages_resolve_as: Option<u8>,
+    range: NumericRange,
+    name: &[u16],
+    values: &[ComponentValue],
+    allow_size_keyword: bool,
+) -> Option<StyleValueData> {
     if equals_ascii_case_insensitive(name, b"calc")
         && let Some(tree_value) = single_non_whitespace_value(values)
         && let Some((tree_name, tree_arguments)) = tree_value.function()
@@ -1228,6 +1254,7 @@ pub(crate) fn parse_calculated_numeric_value_with_ranges(
             property,
             random_function_index: context.random_function_index,
             allowed_color_channels: 0,
+            allow_size_keyword,
             allow_random_functions: context_allows_random_functions(context),
             parse_context: Some(context),
         },
@@ -2557,7 +2584,11 @@ fn parse_position_try_fallbacks_property(context: &ParseContext, values: &[Compo
                 if let Some(keyword) = value.ident().and_then(keyword_from_ascii_case_insensitive)
                     && matches!(
                         keyword,
-                        keyword::FLIP_BLOCK | keyword::FLIP_INLINE | keyword::FLIP_START
+                        keyword::FLIP_BLOCK
+                            | keyword::FLIP_INLINE
+                            | keyword::FLIP_START
+                            | keyword::FLIP_X
+                            | keyword::FLIP_Y
                     )
                 {
                     if dashed_ident.is_some() {
@@ -2736,6 +2767,23 @@ fn parse_comma_separated_dashed_ident_list(
     Some(value_list(values, 1, true))
 }
 
+fn parse_custom_ident_list(
+    context: &ParseContext,
+    values: &[ComponentValue],
+    blacklist: &[&str],
+) -> Option<StyleValueData> {
+    let names = values
+        .iter()
+        .filter(|value| !value.is_whitespace())
+        .map(|value| parse_custom_ident_value(context, value, blacklist))
+        .collect::<Option<Vec<_>>>()?;
+    match names.as_slice() {
+        [] => None,
+        [_] => names.into_iter().next(),
+        _ => Some(value_list(names, 0, false)),
+    }
+}
+
 fn parse_special_text_property(context: &ParseContext, property: u16, values: &[ComponentValue]) -> ParseOutcome {
     if !matches!(
         property,
@@ -2746,6 +2794,7 @@ fn parse_special_text_property(context: &ParseContext, property: u16, values: &[
             | property_id::POSITION_ANCHOR
             | property_id::TIMELINE_SCOPE
             | property_id::TRANSITION_PROPERTY
+            | property_id::VIEW_TRANSITION_CLASS
             | property_id::WILL_CHANGE
     ) {
         return ParseOutcome::NotHandled;
@@ -2768,18 +2817,13 @@ fn parse_special_text_property(context: &ParseContext, property: u16, values: &[
         }),
         property_id::CONTAINER_NAME => single_value
             .and_then(|value| parse_specific_keyword(value, &[keyword::NONE]))
-            .or_else(|| {
-                let names = values
-                    .iter()
-                    .filter(|value| !value.is_whitespace())
-                    .map(|value| parse_custom_ident_value(context, value, &["none", "and", "not", "or"]))
-                    .collect::<Option<Vec<_>>>()?;
-                match names.as_slice() {
-                    [] => None,
-                    [_] => names.into_iter().next(),
-                    _ => Some(value_list(names, 0, false)),
-                }
-            }),
+            .or_else(|| parse_custom_ident_list(context, values, &["none", "and", "not", "or"])),
+        // https://drafts.csswg.org/css-view-transitions-2/#view-transition-class-prop
+        // none | <custom-ident>+
+        // none is an invalid <custom-ident> for view-transition-class, even when combined with another <custom-ident>.
+        property_id::VIEW_TRANSITION_CLASS => single_value
+            .and_then(|value| parse_specific_keyword(value, &[keyword::NONE]))
+            .or_else(|| parse_custom_ident_list(context, values, &["none"])),
         property_id::FONT_LANGUAGE_OVERRIDE => single_value.and_then(|value| {
             if let Some(normal) = parse_specific_keyword(value, &[keyword::NORMAL]) {
                 return Some(normal);
@@ -3408,9 +3452,151 @@ fn parse_view_timeline_inset_property(
     })
 }
 
+// https://drafts.csswg.org/scroll-animations-1/#typedef-timeline-range-name
+fn parse_timeline_range_name(value: &ComponentValue) -> Option<u16> {
+    let keyword = keyword_from_ascii_case_insensitive(value.ident()?)?;
+    matches!(
+        keyword,
+        keyword::COVER
+            | keyword::CONTAIN
+            | keyword::ENTRY
+            | keyword::EXIT
+            | keyword::ENTRY_CROSSING
+            | keyword::EXIT_CROSSING
+            | keyword::SCROLL
+    )
+    .then_some(keyword)
+}
+
+/// One edge of an animation attachment range: `normal | <length-percentage> | <timeline-range-name>
+/// <length-percentage>?`, consumed from `tokens`. A range name's offset is left out when it is the default for the
+/// edge: 0% for a start, 100% for an end.
+fn parse_animation_range_edge(
+    context: &ParseContext,
+    property: u16,
+    tokens: &mut TokenStream<'_>,
+    default_offset: f64,
+) -> Option<StyleValueData> {
+    tokens.discard_whitespace();
+    if !tokens.has_next_token() {
+        return None;
+    }
+    if let Some(normal) = parse_specific_keyword(tokens.next_token(), &[keyword::NORMAL]) {
+        tokens.discard_a_token();
+        return Some(normal);
+    }
+    let Some(name) = parse_timeline_range_name(tokens.next_token()) else {
+        return parse_length_percentage_from_stream(
+            context,
+            property,
+            tokens,
+            NumericRange::INFINITE,
+            NumericRange::INFINITE,
+        );
+    };
+    tokens.discard_a_token();
+    let mut after_name = tokens.clone();
+    let offset = parse_length_percentage_from_stream(
+        context,
+        property,
+        &mut after_name,
+        NumericRange::INFINITE,
+        NumericRange::INFINITE,
+    );
+    let name = StyleValueData::Keyword { keyword: name };
+    let Some(offset) = offset else {
+        return Some(name);
+    };
+    *tokens = after_name;
+    if matches!(offset, StyleValueData::Percentage { value } if value == default_offset) {
+        return Some(name);
+    }
+    Some(value_list(vec![name, offset], 0, false))
+}
+
+// https://drafts.csswg.org/scroll-animations-1/#animation-range-start
+// https://drafts.csswg.org/scroll-animations-1/#animation-range-end
+fn parse_animation_range_longhand(context: &ParseContext, property: u16, values: &[ComponentValue]) -> ParseOutcome {
+    let default_offset = if property == property_id::ANIMATION_RANGE_START {
+        0.0
+    } else {
+        100.0
+    };
+    let edges = values
+        .split(ComponentValue::is_comma)
+        .map(|item| {
+            let mut tokens = TokenStream::new(item);
+            let edge = parse_animation_range_edge(context, property, &mut tokens, default_offset)?;
+            tokens.discard_whitespace();
+            (!tokens.has_next_token()).then_some(edge)
+        })
+        .collect::<Option<Vec<_>>>();
+    edges.map_or(ParseOutcome::Invalid, |edges| {
+        ParseOutcome::Parsed(shared_style_value(value_list(edges, 1, true)))
+    })
+}
+
+// https://drafts.csswg.org/scroll-animations-1/#animation-range
+// [ <'animation-range-start'> <'animation-range-end'>? ]#
+// If <'animation-range-end'> is omitted and <'animation-range-start'> includes a <timeline-range-name> component, then
+// animation-range-end is set to that same <timeline-range-name> and 100%. Otherwise, any omitted longhand is set to
+// its initial value.
+fn parse_animation_range_shorthand(context: &ParseContext, values: &[ComponentValue]) -> ParseOutcome {
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    for item in values.split(ComponentValue::is_comma) {
+        let mut tokens = TokenStream::new(item);
+        let Some(start) = parse_animation_range_edge(context, property_id::ANIMATION_RANGE_START, &mut tokens, 0.0)
+        else {
+            return ParseOutcome::Invalid;
+        };
+        tokens.discard_whitespace();
+        let end = if tokens.has_next_token() {
+            let Some(end) = parse_animation_range_edge(context, property_id::ANIMATION_RANGE_END, &mut tokens, 100.0)
+            else {
+                return ParseOutcome::Invalid;
+            };
+            tokens.discard_whitespace();
+            if tokens.has_next_token() {
+                return ParseOutcome::Invalid;
+            }
+            end
+        } else {
+            match animation_range_edge_name(&start) {
+                Some(name) => StyleValueData::Keyword { keyword: name },
+                None => StyleValueData::Keyword {
+                    keyword: keyword::NORMAL,
+                },
+            }
+        };
+        starts.push(start);
+        ends.push(end);
+    }
+    ParseOutcome::Parsed(shared_style_value(shorthand_value(
+        property_id::ANIMATION_RANGE,
+        vec![property_id::ANIMATION_RANGE_START, property_id::ANIMATION_RANGE_END],
+        vec![value_list(starts, 1, true), value_list(ends, 1, true)],
+    )))
+}
+
+/// The <timeline-range-name> of an animation range edge, if it has one.
+pub(crate) fn animation_range_edge_name(edge: &StyleValueData) -> Option<u16> {
+    match edge {
+        StyleValueData::Keyword { keyword } if *keyword != keyword::NORMAL => Some(*keyword),
+        StyleValueData::ValueList { values, .. } => match values.as_slice().first()?.data() {
+            StyleValueData::Keyword { keyword } => Some(*keyword),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn parse_long_tail_property(context: &ParseContext, property: u16, values: &[ComponentValue]) -> ParseOutcome {
     match property {
         property_id::ANIMATION_TIMELINE => parse_animation_timeline_property(context, values),
+        property_id::ANIMATION_RANGE_START | property_id::ANIMATION_RANGE_END => {
+            parse_animation_range_longhand(context, property, values)
+        }
         property_id::COLOR_SCHEME => parse_color_scheme_property(context, values),
         property_id::CONTENT => parse_content_property(context, values),
         property_id::CURSOR => parse_cursor_property(context, values),
@@ -3807,7 +3993,7 @@ pub(crate) fn parse_initial_value(property: u16) -> Option<Arc<StyleValueData>> 
     }
 }
 
-fn parse_initial_longhand(context: &ParseContext, property: u16) -> Option<StyleValueData> {
+pub(crate) fn parse_initial_longhand(context: &ParseContext, property: u16) -> Option<StyleValueData> {
     let initial = property_initial_value(property);
     let values = consume_a_list_of_component_values(tokenize_for_parser(initial.as_bytes())).ok()?;
     match parse_css_value(context, property, &values) {
@@ -3816,13 +4002,23 @@ fn parse_initial_longhand(context: &ParseContext, property: u16) -> Option<Style
     }
 }
 
-fn shorthand_value(property: u16, sub_properties: Vec<u16>, values: Vec<StyleValueData>) -> StyleValueData {
+pub(crate) fn shorthand_value(property: u16, sub_properties: Vec<u16>, values: Vec<StyleValueData>) -> StyleValueData {
+    retained_shorthand_value(
+        property,
+        sub_properties,
+        values.into_iter().map(RetainedStyleValueData::from_owned).collect(),
+    )
+}
+
+fn retained_shorthand_value(
+    property: u16,
+    sub_properties: Vec<u16>,
+    values: Vec<RetainedStyleValueData>,
+) -> StyleValueData {
     StyleValueData::Shorthand {
         shorthand_property: property,
         sub_properties: RetainedPropertyIdList::from_property_ids(sub_properties),
-        values: RetainedStyleValueDataList::from_retained_values(
-            values.into_iter().map(RetainedStyleValueData::from_owned).collect(),
-        ),
+        values: RetainedStyleValueDataList::from_retained_values(values),
     }
 }
 
@@ -4336,6 +4532,38 @@ fn parse_container_shorthand(context: &ParseContext, values: &[ComponentValue]) 
         property_id::CONTAINER,
         longhands_for_shorthand(property_id::CONTAINER).to_vec(),
         vec![(*name).clone(), container_type],
+    )))
+}
+
+// https://drafts.csswg.org/css-anchor-position-1/#position-try-prop
+// <'position-try-order'>? <'position-try-fallbacks'>
+fn parse_position_try_shorthand(context: &ParseContext, values: &[ComponentValue]) -> ParseOutcome {
+    let first = values.iter().position(|value| !value.is_whitespace());
+    let order_and_fallbacks = first.and_then(|first| {
+        let ParseOutcome::Parsed(order) =
+            parse_css_value(context, property_id::POSITION_TRY_ORDER, &values[first..=first])
+        else {
+            return None;
+        };
+        Some(((*order).clone(), &values[first + 1..]))
+    });
+    // If <'position-try-order'> is omitted, it's set to the property's initial value.
+    let (order, fallback_values) = match order_and_fallbacks {
+        Some(parsed) => parsed,
+        None => match parse_initial_longhand(context, property_id::POSITION_TRY_ORDER) {
+            Some(order) => (order, values),
+            None => return ParseOutcome::Invalid,
+        },
+    };
+    let ParseOutcome::Parsed(fallbacks) =
+        parse_css_value(context, property_id::POSITION_TRY_FALLBACKS, fallback_values)
+    else {
+        return ParseOutcome::Invalid;
+    };
+    ParseOutcome::Parsed(shared_style_value(shorthand_value(
+        property_id::POSITION_TRY,
+        longhands_for_shorthand(property_id::POSITION_TRY).to_vec(),
+        vec![order, (*fallbacks).clone()],
     )))
 }
 
@@ -5087,6 +5315,14 @@ fn parse_background_shorthand(context: &ParseContext, values: &[ComponentValue])
         property_id::BACKGROUND_POSITION,
         property_id::BACKGROUND_REPEAT,
     ];
+    // NB: A single layer that omits a longhand takes the longhand's shared initial list, so the items
+    //     of omitted longhands are only made when there are several layers.
+    let single_layer = layers.len() == 1;
+    let item_or_initial = |item: Option<StyleValueData>, property: u16| match item {
+        Some(item) => Some(Some(item)),
+        None if single_layer => Some(None),
+        None => coordinating_initial_item(context, property).map(Some),
+    };
     let mut images = Vec::new();
     let mut position_xs = Vec::new();
     let mut position_ys = Vec::new();
@@ -5125,46 +5361,37 @@ fn parse_background_shorthand(context: &ParseContext, values: &[ComponentValue])
             let Some(y) = y.optional_data().cloned().and_then(single_coordinating_value) else {
                 return ParseOutcome::Invalid;
             };
-            (x, y)
+            (Some(x), Some(y))
         } else {
-            let Some(x) = coordinating_initial_item(context, property_id::BACKGROUND_POSITION_X) else {
+            let Some(x) = item_or_initial(None, property_id::BACKGROUND_POSITION_X) else {
                 return ParseOutcome::Invalid;
             };
-            let Some(y) = coordinating_initial_item(context, property_id::BACKGROUND_POSITION_Y) else {
+            let Some(y) = item_or_initial(None, property_id::BACKGROUND_POSITION_Y) else {
                 return ParseOutcome::Invalid;
             };
             (x, y)
         };
-        let Some(image) = parsed[3]
-            .take()
-            .or_else(|| coordinating_initial_item(context, property_id::BACKGROUND_IMAGE))
-        else {
+        let Some(image) = item_or_initial(parsed[3].take(), property_id::BACKGROUND_IMAGE) else {
             return ParseOutcome::Invalid;
         };
-        let Some(size) = size.or_else(|| coordinating_initial_item(context, property_id::BACKGROUND_SIZE)) else {
+        let Some(size) = item_or_initial(size, property_id::BACKGROUND_SIZE) else {
             return ParseOutcome::Invalid;
         };
-        let Some(repeat) = parsed[6]
-            .take()
-            .or_else(|| coordinating_initial_item(context, property_id::BACKGROUND_REPEAT))
-        else {
+        let Some(repeat) = item_or_initial(parsed[6].take(), property_id::BACKGROUND_REPEAT) else {
             return ParseOutcome::Invalid;
         };
-        let Some(attachment) = parsed[0]
-            .take()
-            .or_else(|| coordinating_initial_item(context, property_id::BACKGROUND_ATTACHMENT))
-        else {
+        let Some(attachment) = item_or_initial(parsed[0].take(), property_id::BACKGROUND_ATTACHMENT) else {
             return ParseOutcome::Invalid;
         };
         let (origin, clip) = match (parsed[1].take(), parsed[4].take()) {
-            (Some(first), Some(second)) => (first, second),
-            (Some(first), None) => (first.clone(), first),
-            (None, Some(first)) => (first.clone(), first),
+            (Some(first), Some(second)) => (Some(first), Some(second)),
+            (Some(first), None) => (Some(first.clone()), Some(first)),
+            (None, Some(first)) => (Some(first.clone()), Some(first)),
             (None, None) => {
-                let Some(origin) = coordinating_initial_item(context, property_id::BACKGROUND_ORIGIN) else {
+                let Some(origin) = item_or_initial(None, property_id::BACKGROUND_ORIGIN) else {
                     return ParseOutcome::Invalid;
                 };
-                let Some(clip) = coordinating_initial_item(context, property_id::BACKGROUND_CLIP) else {
+                let Some(clip) = item_or_initial(None, property_id::BACKGROUND_CLIP) else {
                     return ParseOutcome::Invalid;
                 };
                 (origin, clip)
@@ -5182,10 +5409,44 @@ fn parse_background_shorthand(context: &ParseContext, values: &[ComponentValue])
     let Some(color) = color.or_else(|| parse_initial_longhand(context, property_id::BACKGROUND_COLOR)) else {
         return ParseOutcome::Invalid;
     };
-    let position = shorthand_value(
+    let list = |property: u16, items: Vec<Option<StyleValueData>>| match items.as_slice() {
+        [None] => shared_single_layer_initial_list(property),
+        _ => Some(RetainedStyleValueData::from_owned(value_list(
+            items
+                .into_iter()
+                .map(|item| item.expect("a layer of several holds every item"))
+                .collect(),
+            1,
+            true,
+        ))),
+    };
+    let lists = [
+        list(property_id::BACKGROUND_IMAGE, images),
+        list(property_id::BACKGROUND_POSITION_X, position_xs),
+        list(property_id::BACKGROUND_POSITION_Y, position_ys),
+        list(property_id::BACKGROUND_SIZE, sizes),
+        list(property_id::BACKGROUND_REPEAT, repeats),
+        list(property_id::BACKGROUND_ATTACHMENT, attachments),
+        list(property_id::BACKGROUND_ORIGIN, origins),
+        list(property_id::BACKGROUND_CLIP, clips),
+    ];
+    let [
+        Some(image),
+        Some(position_x),
+        Some(position_y),
+        Some(size),
+        Some(repeat),
+        Some(attachment),
+        Some(origin),
+        Some(clip),
+    ] = lists
+    else {
+        return ParseOutcome::Invalid;
+    };
+    let position = retained_shorthand_value(
         property_id::BACKGROUND_POSITION,
         vec![property_id::BACKGROUND_POSITION_X, property_id::BACKGROUND_POSITION_Y],
-        vec![value_list(position_xs, 1, true), value_list(position_ys, 1, true)],
+        vec![position_x, position_y],
     );
     let output_order = [
         property_id::BACKGROUND_COLOR,
@@ -5197,20 +5458,51 @@ fn parse_background_shorthand(context: &ParseContext, values: &[ComponentValue])
         property_id::BACKGROUND_ORIGIN,
         property_id::BACKGROUND_CLIP,
     ];
-    ParseOutcome::Parsed(shared_style_value(shorthand_value(
+    ParseOutcome::Parsed(shared_style_value(retained_shorthand_value(
         property_id::BACKGROUND,
         output_order.to_vec(),
         vec![
-            color,
-            value_list(images, 1, true),
-            position,
-            value_list(sizes, 1, true),
-            value_list(repeats, 1, true),
-            value_list(attachments, 1, true),
-            value_list(origins, 1, true),
-            value_list(clips, 1, true),
+            RetainedStyleValueData::from_owned(color),
+            image,
+            RetainedStyleValueData::from_owned(position),
+            size,
+            repeat,
+            attachment,
+            origin,
+            clip,
         ],
     )))
+}
+
+/// The one-item list of a background layer longhand's initial value, which every single-layer
+/// `background` that omits the longhand shares instead of parsing and allocating its own.
+fn shared_single_layer_initial_list(property: u16) -> Option<RetainedStyleValueData> {
+    const PROPERTIES: [u16; 8] = [
+        property_id::BACKGROUND_IMAGE,
+        property_id::BACKGROUND_POSITION_X,
+        property_id::BACKGROUND_POSITION_Y,
+        property_id::BACKGROUND_SIZE,
+        property_id::BACKGROUND_REPEAT,
+        property_id::BACKGROUND_ATTACHMENT,
+        property_id::BACKGROUND_ORIGIN,
+        property_id::BACKGROUND_CLIP,
+    ];
+    static LISTS: [std::sync::OnceLock<Option<RetainedStyleValueData>>; PROPERTIES.len()] =
+        [const { std::sync::OnceLock::new() }; PROPERTIES.len()];
+    let index = PROPERTIES
+        .iter()
+        .position(|&candidate| candidate == property)
+        .expect("a background layer longhand has a shared initial list");
+    // NB: An initial value parses the same in every context, so the list is parsed in the empty one.
+    LISTS[index]
+        .get_or_init(|| {
+            Some(RetainedStyleValueData::from_owned(value_list(
+                vec![coordinating_initial_item(&ParseContext::default(), property)?],
+                1,
+                true,
+            )))
+        })
+        .clone()
 }
 
 fn parse_mask_shorthand(context: &ParseContext, values: &[ComponentValue]) -> ParseOutcome {
@@ -5409,7 +5701,11 @@ fn parse_animation_transition_shorthand(
                 property_id::ANIMATION_PLAY_STATE,
                 property_id::ANIMATION_NAME,
             ][..],
-            Some(property_id::ANIMATION_TIMELINE),
+            &[
+                property_id::ANIMATION_TIMELINE,
+                property_id::ANIMATION_RANGE_START,
+                property_id::ANIMATION_RANGE_END,
+            ][..],
         ),
         property_id::TRANSITION => (
             &[
@@ -5419,7 +5715,7 @@ fn parse_animation_transition_shorthand(
                 property_id::TRANSITION_DELAY,
                 property_id::TRANSITION_BEHAVIOR,
             ][..],
-            None,
+            &[][..],
         ),
         _ => return ParseOutcome::NotHandled,
     };
@@ -5461,7 +5757,7 @@ fn parse_animation_transition_shorthand(
         .into_iter()
         .map(|values| value_list(values, 1, true))
         .collect::<Vec<_>>();
-    if let Some(reset_only) = reset_only {
+    for &reset_only in reset_only {
         sub_properties.push(reset_only);
         let Some(initial) = parse_initial_longhand(context, reset_only) else {
             return ParseOutcome::Invalid;
@@ -5484,7 +5780,7 @@ fn trim_ascii_whitespace(code_units: &[u16]) -> &[u16] {
     &code_units[start..end]
 }
 
-pub(crate) fn unresolved_value(
+pub(crate) fn unresolved_value_from_string(
     unresolved_source: &[u16],
     comparison_source: &[u16],
     presence: SubstitutionFunctionsPresence,
@@ -5495,7 +5791,20 @@ pub(crate) fn unresolved_value(
     } else {
         comparison_source
     };
-    let components = crate::css::style_value::RetainedComponentValueList::from_source(component_source);
+    let values =
+        super::component_value::consume_a_counted_list_of_component_values(tokenize_for_parser(component_source))
+            .unwrap_or_default();
+    unresolved_value(source_text, comparison_source, values, presence)
+}
+
+pub(crate) fn unresolved_value(
+    unresolved_source: &[u16],
+    comparison_source: &[u16],
+    values: impl Into<super::component_value::ComponentValueList>,
+    presence: SubstitutionFunctionsPresence,
+) -> StyleValueData {
+    let source_text = trim_ascii_whitespace(unresolved_source);
+    let components = RetainedComponentValueList::from_values(values);
     if presence.attr {
         crate::css::parser::arbitrary_substitution::note_attr_names_read_by(components.as_slice());
     }
@@ -5512,6 +5821,17 @@ pub(crate) fn unresolved_value(
         contains_attr_tainted_values: false,
         parsed_value: RetainedStyleValueData::none(),
     }
+}
+
+pub(crate) fn unresolved_value_from_component_values(
+    values: Vec<ComponentValue>,
+    presence: SubstitutionFunctionsPresence,
+) -> StyleValueData {
+    let source = crate::css::serialize::serialize_component_values_to_utf16(
+        &values,
+        crate::css::parser::component_value::ComponentSerializationMode::Retokenize,
+    );
+    unresolved_value(&source, &[], values, presence)
 }
 
 pub(crate) fn parse_css_value_with_source(
@@ -5561,7 +5881,12 @@ fn parse_css_value_after_substitution_scan(
         if !declaration_values.is_empty() && !declaration_value_is_valid(declaration_values) {
             return ParseOutcome::Invalid;
         }
-        let mut unresolved = unresolved_value(unresolved_source, comparison_source, substitution_presence);
+        let mut unresolved = unresolved_value(
+            unresolved_source,
+            comparison_source,
+            values.to_vec(),
+            substitution_presence,
+        );
         if let StyleValueData::Unresolved {
             source_text,
             contains_attr_tainted_values,
@@ -5586,7 +5911,7 @@ fn parse_css_value_after_substitution_scan(
             nested_values = vec![ComponentValue {
                 kind: ComponentKind::Function {
                     name: function_name.into_boxed_slice().into(),
-                    values: nested_values.into_boxed_slice(),
+                    values: nested_values.into_boxed_slice().into(),
                 },
                 original_source_text: crate::css::css_tokenizer::ParserSource::empty(),
                 opening_source_length: 0,
@@ -5652,6 +5977,9 @@ fn parse_css_value_after_substitution_scan(
         if property_id == property_id::CONTAINER {
             return parse_container_shorthand(context, values);
         }
+        if property_id == property_id::POSITION_TRY {
+            return parse_position_try_shorthand(context, values);
+        }
         let outcome = parse_place_shorthand(context, property_id, values);
         if !matches!(outcome, ParseOutcome::NotHandled) {
             return outcome;
@@ -5687,6 +6015,9 @@ fn parse_css_value_after_substitution_scan(
         let outcome = parse_timeline_shorthand(context, property_id, values);
         if !matches!(outcome, ParseOutcome::NotHandled) {
             return outcome;
+        }
+        if property_id == property_id::ANIMATION_RANGE {
+            return parse_animation_range_shorthand(context, values);
         }
         let outcome = parse_animation_transition_shorthand(context, property_id, values);
         if !matches!(outcome, ParseOutcome::NotHandled) {
@@ -6237,34 +6568,6 @@ pub unsafe extern "C" fn rust_parse_entire_css_primitive_from_source(
     }
 }
 
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct FfiSimpleColor {
-    pub success: bool,
-    pub red: u8,
-    pub green: u8,
-    pub blue: u8,
-    pub alpha: u8,
-}
-
-/// Parses the allocation-free subset used by the canvas color cache.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_parse_simple_color(source: FfiUtf16View) -> FfiSimpleColor {
-    let Some(source) = source.units() else {
-        return FfiSimpleColor::default();
-    };
-    let Some([red, green, blue, alpha]) = parse_simple_color(source) else {
-        return FfiSimpleColor::default();
-    };
-    FfiSimpleColor {
-        success: true,
-        red,
-        green,
-        blue,
-        alpha,
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_is_valid_animation_name_custom_ident(source: FfiUtf16View) -> bool {
     let Some(source) = source.units() else {
@@ -6584,15 +6887,15 @@ mod tests {
             (property_id::FONT_VARIANT, "normal", 7),
             (property_id::FONT_VARIANT, "none", 7),
             (property_id::FONT_VARIANT, "small-caps oldstyle-nums ruby emoji", 7),
-            (property_id::FONT, "16px serif", 12),
+            (property_id::FONT, "16px serif", 13),
             (
                 property_id::FONT,
                 "italic small-caps 700 condensed 12px/1.5 'Example', serif",
-                12,
+                13,
             ),
-            (property_id::FONT, "normal normal 10pt sans-serif", 12),
-            (property_id::FONT, "oblique 45deg 24px Arial", 12),
-            (property_id::FONT, "16px initial simple", 12),
+            (property_id::FONT, "normal normal 10pt sans-serif", 13),
+            (property_id::FONT, "oblique 45deg 24px Arial", 13),
+            (property_id::FONT, "16px initial simple", 13),
         ] {
             let ParseOutcome::Parsed(value) = parse(property, source) else {
                 panic!("shorthand should parse: {source}");
@@ -7500,13 +7803,7 @@ mod tests {
         };
         assert_eq!(retained_utf16(source_text), utf16("10\\70 x"));
         assert_eq!(retained_utf16(value_comparison_text), comparison);
-        assert_eq!(
-            crate::css::serialize::serialize_component_values_to_utf16(
-                components.as_slice(),
-                crate::css::parser::component_value::ComponentSerializationMode::Normalized,
-            ),
-            comparison
-        );
+        assert_eq!(components.as_slice(), values.as_slice());
 
         let source = utf16("a/* comment */");
         let comparison = utf16("a");
@@ -7519,13 +7816,7 @@ mod tests {
         let StyleValueData::Unresolved { components, .. } = &*value else {
             panic!("custom property should produce an unresolved value");
         };
-        assert_eq!(
-            crate::css::serialize::serialize_component_values_to_utf16(
-                components.as_slice(),
-                crate::css::parser::component_value::ComponentSerializationMode::Normalized,
-            ),
-            comparison
-        );
+        assert_eq!(components.as_slice(), values.as_slice());
         assert!(matches!(
             parse(property_id::CUSTOM, "inherit"),
             ParseOutcome::Parsed(value) if matches!(&*value, StyleValueData::Keyword { keyword: keyword::INHERIT })

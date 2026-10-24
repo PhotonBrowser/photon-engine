@@ -106,6 +106,7 @@ fn record_display_list_impl<O: Observer>(
         source_recording,
         source_items,
         live_producer: false,
+        line_root_positions: None,
         moved_expansion: FastSet::default(),
         blocking_wheel_event_region_count: 0,
         records_per_box_wheel_hit_test_targets: frame_inputs.records_per_box_wheel_hit_test_targets(),
@@ -255,7 +256,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         }
     }
 
-    fn for_descendants_context(&self, paintable: NodeSlotId) -> ContextRef {
+    pub(crate) fn for_descendants_context(&self, paintable: NodeSlotId) -> ContextRef {
         if let Some(walk) = &self.svg_resource_walk {
             return walk.enclosing_context;
         }

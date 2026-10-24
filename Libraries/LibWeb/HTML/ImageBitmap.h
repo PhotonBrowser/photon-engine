@@ -6,16 +6,17 @@
 
 #pragma once
 
-#include <AK/OwnPtr.h>
+#include <AK/Optional.h>
+#include <AK/RefPtr.h>
 #include <AK/Types.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Forward.h>
 #include <LibWeb/Bindings/ImageBitmap.h>
-#include <LibWeb/Bindings/Serializable.h>
-#include <LibWeb/Bindings/Transferable.h>
-#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Bindings/RustInterface.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/Canvas/CanvasDrawImage.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
@@ -26,61 +27,44 @@ using ResizeQuality = Bindings::ResizeQuality;
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#imagebitmapoptions
 using ImageBitmapOptions = Bindings::ImageBitmapOptions;
 
-class WEB_API ImageBitmap final
-    : public Bindings::GCAllocatedWrappable
-    , public Web::Bindings::Serializable
-    , public Web::Bindings::Transferable {
-    WEB_WRAPPABLE(ImageBitmap, Bindings::GCAllocatedWrappable);
-    GC_DECLARE_ALLOCATOR(ImageBitmap);
+// AD-HOC: The pixels of every ImageBitmap that one message transfers share one buffer of shared memory, which the
+//         message carries alongside the memory of its SharedArrayBuffers. However many bitmaps a message transfers,
+//         their pixels then take one attachment, and the receiver uses them without copying.
+struct ImageBitmapSharedPixels {
+    Core::AnonymousBuffer buffer;
+    u32 buffer_index { 0 };
+    size_t used_size { 0 };
+};
+
+// https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#imagebitmap
+// The C++ side of an ImageBitmap, which is implemented in Rust (Libraries/LibWeb/Bindings/Rust/src/html): what
+// createImageBitmap(), OffscreenCanvas and WebDriver create, and createImageBitmap() and StructuredSerialize read.
+// ImageBitmap.cpp encodes and decodes the bitmap data for the serialization and transfer steps of the Rust
+// implementation.
+class WEB_API ImageBitmap final : public Bindings::RustInterfaceCell {
+    WEB_RUST_INTERFACE(ImageBitmap, image_bitmap)
 
 public:
-    static GC::Ref<ImageBitmap> create();
-    virtual ~ImageBitmap() override;
-
-    // ^Web::Bindings::Serializable
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(JS::Realm&, HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
-
-    // ^Web::Bindings::Transferable
-    virtual WebIDL::ExceptionOr<void> transfer_steps(JS::Realm&, HTML::TransferDataEncoder&) override;
-    virtual WebIDL::ExceptionOr<void> transfer_receiving_steps(JS::Realm&, HTML::TransferDataDecoder&) override;
-    virtual HTML::TransferType primary_interface() const override;
+    // A new ImageBitmap whose bitmap data is the bitmap, or that has none.
+    static GC::Ref<ImageBitmap> create(RefPtr<Gfx::Bitmap const>);
 
     WebIDL::UnsignedLong width() const;
     WebIDL::UnsignedLong height() const;
 
+    // https://html.spec.whatwg.org/multipage/structured-data.html#detached
+    bool is_detached() const;
+
+    // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-imagebitmap-close
     void close();
 
-    // Implementation specific:
+    // https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean
+    bool is_origin_clean() const;
+    void set_origin_clean(bool);
 
-    // AD-HOC: The pixels of every ImageBitmap that one message transfers share one buffer of shared memory, which the
-    //         message carries alongside the memory of its SharedArrayBuffers. However many bitmaps a message transfers,
-    //         their pixels then take one attachment, and the receiver uses them without copying.
-    struct SharedPixels {
-        Core::AnonymousBuffer buffer;
-        u32 buffer_index { 0 };
-        size_t used_size { 0 };
-    };
+    // The bitmap of the bitmap data, which the ImageBitmap keeps until it is closed or transferred.
+    Gfx::Bitmap const* bitmap() const;
+
     static size_t shared_pixels_size(Gfx::Bitmap const&);
-    WebIDL::ExceptionOr<void> transfer_steps(HTML::TransferDataEncoder&, SharedPixels*);
-
-    void set_bitmap(RefPtr<Gfx::Bitmap>);
-    Gfx::Bitmap* bitmap() const;
-
-private:
-    ImageBitmap();
-
-    // FIXME: We don't implement this flag yet:
-    // An ImageBitmap object's bitmap has an origin-clean flag, which indicates whether the bitmap is tainted by content
-    // from a different origin. The flag is initially set to true and may be changed to false by the steps of
-    // createImageBitmap().
-
-    virtual size_t external_memory_size() const override;
-
-    WebIDL::UnsignedLong m_width = 0;
-    WebIDL::UnsignedLong m_height = 0;
-
-    RefPtr<Gfx::Bitmap> m_bitmap;
 };
 
 }

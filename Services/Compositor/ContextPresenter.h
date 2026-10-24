@@ -16,10 +16,11 @@
 #include <AK/StringView.h>
 #include <AK/Vector.h>
 #include <Compositor/BackingStoreManager.h>
+#include <Compositor/CanvasSurfaceRegistry.h>
+#include <Compositor/CompositedContext.h>
 #include <Compositor/Forward.h>
+#include <Compositor/PaintingSurface.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
-#include <LibCompositing/DisplayList/CanvasSurfaceRegistry.h>
-#include <LibCompositing/DisplayList/CompositedContext.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/Forward.h>
 #include <LibCompositing/OverlayFade.h>
@@ -27,7 +28,6 @@
 #include <LibCompositing/Types.h>
 #include <LibCompositing/UIOverlays.h>
 #include <LibCore/Forward.h>
-#include <LibGfx/PaintingSurface.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibGfx/Size.h>
@@ -43,7 +43,6 @@ namespace Compositor {
 
 class ContextScene;
 class ScrollbarController;
-using Compositing::CompositedContextResolver;
 
 struct PendingFrame {
     Gfx::IntRect viewport_rect;
@@ -75,7 +74,7 @@ public:
         CompositedContextResolver const* composited_context_resolver { nullptr };
     };
 
-    ContextPresenter(ContextScene&, Compositing::OwnedCanvasSurfaces, bool presents_to_client);
+    ContextPresenter(ContextScene&, OwnedCanvasSurfaces, bool presents_to_client);
     ~ContextPresenter();
 
     bool presents_to_client() const { return m_presents_to_client; }
@@ -96,7 +95,7 @@ public:
     Optional<PendingFrame> advance_ui_overlay_fades(MonotonicTime frame_time);
 
     Optional<BackingStoreManager::Publication> resize_backing_stores_if_needed(
-        RefPtr<Gfx::SkiaBackendContext> const&, BackingStoreManager::GpuSharing,
+        RefPtr<Gfx::SkiaBackendContext> const&, BackingStoreManager::GpuSharing, BackingStoreManager::PublicationMode,
         BackingStoreManager::ClientSamplesOnGpu = BackingStoreManager::ClientSamplesOnGpu::No);
     void invalidate_backing_stores();
     void invalidate_raster_content() { ++m_raster_content_epoch; }
@@ -105,12 +104,13 @@ public:
     Vector<i32> retire_idle_surplus_backing_stores() { return m_backing_store_manager.retire_idle_surplus_backing_stores(); }
     void schedule_surplus_backing_store_retirement(Function<void()>);
     bool acknowledge_presented_bitmap(i32 bitmap_id, bool consumer_gpu_work_complete = false);
+    void acknowledge_all_presented_bitmaps() { m_backing_store_manager.release_all_presented_buffers(); }
     void did_finish_gpu_present(i32 bitmap_id);
     bool has_completed_first_present() const { return m_has_completed_first_present; }
     RefPtr<Gfx::PaintingSurface> latest_rendered_surface() const { return m_latest_rendered_surface; }
 
     bool update_composited_raster_transform(Gfx::FloatRect destination_rect, Gfx::FloatMatrix4x4 const& canvas_transform);
-    Compositing::CompositedContextSurface composited_surface() const;
+    CompositedContextSurface composited_surface() const;
 
     void queue_present_frame(PendingFrame);
     void mark_pending_present_frame_scheduled();
@@ -181,7 +181,7 @@ private:
     void stop_surplus_backing_store_retirement_timer();
 
     ContextScene& m_scene;
-    Compositing::OwnedCanvasSurfaces m_canvas_surfaces;
+    OwnedCanvasSurfaces m_canvas_surfaces;
     bool m_presents_to_client { false };
 
     Gfx::IntSize m_viewport_size;

@@ -18,7 +18,6 @@
 #include <LibHTTP/Cache/DiskCacheSettings.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/HTML/AutoplayPolicy.h>
-#include <LibWebCommon/Loader/UserAgent.h>
 #include <LibWebCommon/WebView/BrowsingBehavior.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/Options.h>
@@ -131,6 +130,7 @@ public:
     virtual ~SettingsObserver();
 
     virtual void new_tab_page_url_changed() { }
+    virtual void restore_previous_session_changed() { }
     virtual void languages_changed() { }
     virtual void appearance_changed() { }
     virtual void content_settings_changed() { }
@@ -169,6 +169,10 @@ public:
 
     URL::URL const& new_tab_page_url() const { return m_new_tab_page_url; }
     void set_new_tab_page_url(URL::URL);
+
+    // Read only at launch, so a change applies at the next launch.
+    bool restore_previous_session() const { return m_restore_previous_session; }
+    void set_restore_previous_session(bool);
 
     static Vector<String> parse_json_languages(JsonValue const&);
     Vector<String> const& languages() const { return m_languages; }
@@ -216,12 +220,6 @@ public:
 
     GlobalPrivacyControl global_privacy_control() const { return m_global_privacy_control; }
     void set_global_privacy_control(GlobalPrivacyControl);
-
-    Optional<StringView> user_agent_preset() const { return m_user_agent_preset; }
-    void set_user_agent_preset(Optional<StringView> user_agent_preset_name);
-
-    Web::NavigatorCompatibilityMode navigator_compatibility_mode() const { return m_navigator_compatibility_mode; }
-    void set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode);
 
     bool background_networking_enabled() const { return m_background_networking_enabled; }
     void set_background_networking_enabled(bool);
@@ -280,6 +278,7 @@ private:
     WindowSettings m_window_settings;
 
     URL::URL m_new_tab_page_url;
+    bool m_restore_previous_session { false };
     Vector<String> m_languages;
 
     Appearance m_appearance;
@@ -295,9 +294,6 @@ private:
 
     BrowsingDataSettings m_browsing_data_settings;
     GlobalPrivacyControl m_global_privacy_control { GlobalPrivacyControl::No };
-
-    Optional<StringView> m_user_agent_preset;
-    Web::NavigatorCompatibilityMode m_navigator_compatibility_mode { Web::default_navigator_compatibility_mode };
 
     bool m_background_networking_enabled { true };
     bool m_filter_list_updates_enabled { false };

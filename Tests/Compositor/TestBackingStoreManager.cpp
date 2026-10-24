@@ -5,7 +5,7 @@
  */
 
 #include <Compositor/BackingStoreManager.h>
-#include <LibGfx/PaintingSurface.h>
+#include <Compositor/PaintingSurface.h>
 #include <LibTest/TestCase.h>
 
 TEST_CASE(backing_store_padding_is_reused_during_live_resize)

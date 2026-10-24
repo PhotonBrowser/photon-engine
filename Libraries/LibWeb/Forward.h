@@ -74,7 +74,9 @@ class AnimationPlaybackEvent;
 class AnimationTimeline;
 class DocumentTimeline;
 class KeyframeEffect;
+class NamedTimelines;
 class ScrollTimeline;
+class ViewTimeline;
 
 }
 
@@ -151,13 +153,6 @@ namespace Web::Clipboard {
 
 class Clipboard;
 class ClipboardItem;
-
-}
-
-namespace Web::Compression {
-
-class CompressionStream;
-class DecompressionStream;
 
 }
 
@@ -285,6 +280,8 @@ class CSSNumericValue;
 class CSSPageRule;
 class CSSPageDescriptors;
 class CSSPerspective;
+class CSSPositionTryDescriptors;
+class CSSPositionTryRule;
 class CSSPropertyRule;
 class CSSRotate;
 class CSSRule;
@@ -361,7 +358,6 @@ class ScreenOrientation;
 class Selector;
 class ShadowStyleValue;
 class ShorthandStyleValue;
-class Size;
 class StringStyleValue;
 class StyleComputer;
 class StylePropertyMap;
@@ -555,12 +551,6 @@ enum class HistoryAction : u8;
 
 }
 
-namespace Web::Encoding {
-
-class TextEncoderStream;
-
-}
-
 namespace Web::EncryptedMediaExtensions {
 
 class MediaKeySystemAccess;
@@ -645,7 +635,6 @@ class DOMMatrix;
 class DOMMatrixReadOnly;
 class DOMPoint;
 class DOMPointReadOnly;
-class DOMQuad;
 class DOMRect;
 class DOMRectList;
 class DOMRectReadOnly;
@@ -805,7 +794,6 @@ class Navigator;
 class OffscreenCanvas;
 class OffscreenCanvasRenderingContext2D;
 class PageTransitionEvent;
-class Path2D;
 class Plugin;
 class PluginArray;
 class PopoverTargetAttributes;
@@ -825,7 +813,6 @@ class Storage;
 class StructuredSerializeReader;
 class StructuredSerializeWriter;
 class SubmitEvent;
-class TextMetrics;
 class TextTrack;
 class TextTrackCue;
 class TextTrackCueList;
@@ -839,6 +826,7 @@ class TransferDataDecoder;
 class UserActivation;
 class UserScrollGestureHold;
 class ValidityState;
+class VideoPlaybackQuality;
 class VideoTrack;
 class VideoTrackList;
 class Window;
@@ -1210,9 +1198,7 @@ class UIEvent;
 
 namespace Web::DOMURL {
 
-class DOMURL;
 class URLSearchParams;
-class URLSearchParamsIterator;
 
 }
 
@@ -1236,6 +1222,7 @@ class Instance;
 class Memory;
 class Module;
 class Table;
+class Tag;
 
 namespace Detail {
 

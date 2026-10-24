@@ -429,7 +429,12 @@ fn accumulated_visual_context_property_always_requires_repaint(property: u16) ->
 }
 
 fn clip_path_value_is_a_visual_context_frame(values: ComputedValuesView<'_>) -> bool {
-    matches!(values.mask().clip_path.data(), Some(StyleValueData::BasicShape { .. }))
+    // NB: A basic shape, a geometry box, or both clip with a path, which a visual context frame holds.
+    match values.mask().clip_path.data() {
+        Some(StyleValueData::BasicShape { .. } | StyleValueData::ValueList { .. }) => true,
+        Some(StyleValueData::Keyword { keyword }) => *keyword != crate::css::css_enums::keyword::NONE,
+        _ => false,
+    }
 }
 
 fn accumulated_visual_context_change_alters_hit_test_items(
@@ -572,20 +577,7 @@ fn property_invalidation(property: u16, old: ComputedValuesView<'_>, new: Comput
         result.ensure_level(INVALIDATION_RELAYOUT);
     }
     if property_metadata::property_affects_scrollable_overflow(property)
-        || matches!(
-            property,
-            property_id::SCROLL_SNAP_TYPE
-                | property_id::SCROLL_SNAP_ALIGN
-                | property_id::SCROLL_SNAP_STOP
-                | property_id::SCROLL_MARGIN_TOP
-                | property_id::SCROLL_MARGIN_RIGHT
-                | property_id::SCROLL_MARGIN_BOTTOM
-                | property_id::SCROLL_MARGIN_LEFT
-                | property_id::SCROLL_PADDING_TOP
-                | property_id::SCROLL_PADDING_RIGHT
-                | property_id::SCROLL_PADDING_BOTTOM
-                | property_id::SCROLL_PADDING_LEFT
-        )
+        || property_metadata::property_may_resnap_scroll_container(property)
     {
         result.resnap_scroll_container = true;
     }

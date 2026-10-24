@@ -116,6 +116,7 @@
 namespace Web::Internals {
 
 static u16 s_echo_server_port { 0 };
+static u16 s_https_echo_server_port { 0 };
 
 static Web::WheelDeltaPrecision wheel_delta_precision_from(bool precise)
 {
@@ -192,14 +193,6 @@ u64 Internals::accumulated_visual_context_incremental_update_count()
     if (!document.has_committed_viewport_box())
         return 0;
     return document.paint_state().accumulated_visual_context_tree_incremental_update_count();
-}
-
-u64 Internals::visual_context_pending_dirty_box_count()
-{
-    auto& document = window().associated_document();
-    if (!document.has_committed_viewport_box())
-        return 0;
-    return Layout::RustFFI::render_state_visual_context_pending_dirty_box_count(document.layout_node_arena().host());
 }
 
 u64 Internals::layout_tree_pre_order_label_violation_count()
@@ -807,7 +800,8 @@ void Internals::mouse_down(double x, double y, WebIDL::UnsignedShort click_count
 {
     auto& page = this->page();
     auto position = page.css_to_device_point({ x, y });
-    page.handle_mousedown(position, position, button_from_unsigned_short(button), 0, modifiers, click_count);
+    auto pressed_button = button_from_unsigned_short(button);
+    page.handle_mousedown(position, position, pressed_button, pressed_button, modifiers, click_count);
 }
 
 void Internals::mouse_up(double x, double y, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers)
@@ -865,7 +859,7 @@ void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, doub
         return;
     }
 
-    Vector<GC::Ref<WebIDL::Promise>> scroll_promises;
+    GC::RootVector<GC::Ref<WebIDL::Promise>> scroll_promises;
     for (auto& navigable : HTML::all_local_navigables()) {
         if (&navigable->page() == &page && !navigable->has_been_destroyed())
             navigable->wait_for_wheel_scrolls(scroll_promises);
@@ -1533,6 +1527,16 @@ u16 Internals::get_echo_server_port()
 void Internals::set_echo_server_port(u16 const port)
 {
     s_echo_server_port = port;
+}
+
+u16 Internals::get_https_echo_server_port()
+{
+    return s_https_echo_server_port;
+}
+
+void Internals::set_https_echo_server_port(u16 const port)
+{
+    s_https_echo_server_port = port;
 }
 
 WebIDL::ExceptionOr<void> Internals::set_hsts_policy(Utf16String const& domain, u64 max_age, bool include_sub_domains)

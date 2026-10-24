@@ -853,13 +853,13 @@ pub unsafe extern "C" fn visual_context_tree_has_unisolated_destination_reading_
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle; `visit` is called synchronously with `context` for every
-/// filter and backdrop filter an effect node carries.
+/// `tree` must be a live retained tree handle; `visit` is called synchronously with `context` for the id
+/// of every image frame that a filter or backdrop filter of an effect node draws.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_for_each_effects_filter_bytes(
+pub unsafe extern "C" fn visual_context_tree_for_each_effects_filter_image_frame_id(
     tree: *const c_void,
     context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+    visit: unsafe extern "C" fn(*mut c_void, u64),
 ) {
     let tree = unsafe { tree_from_handle(tree) };
     for node in &tree.effect_nodes {
@@ -868,8 +868,11 @@ pub unsafe extern "C" fn visual_context_tree_for_each_effects_filter_bytes(
         };
         let backdrop_filter_bytes = effects.backdrop_filter.as_ref().map(|backdrop| &backdrop.filter);
         for filter_bytes in effects.filter.iter().chain(backdrop_filter_bytes) {
-            // SAFETY: The C++ visitor reads the bytes synchronously.
-            unsafe { visit(context, filter_bytes.as_ptr(), filter_bytes.len()) };
+            let Some(filter) = libgfx_rust::filter::Filter::deserialize(filter_bytes) else {
+                continue;
+            };
+            // SAFETY: The caller guarantees `visit` accepts `context`.
+            filter.for_each_image_frame_id(&mut |id| unsafe { visit(context, id) });
         }
     }
 }
@@ -977,6 +980,7 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_sticky(
             scrollport_size: constraints.scrollport_size,
             containing_block_region: constraints.containing_block_region,
             needs_parent_offset_adjustment: constraints.needs_parent_offset_adjustment,
+            non_scrolling_scroll_container: NodeSlotId::INVALID,
             inset_top: inset(constraints.inset_top),
             inset_right: inset(constraints.inset_right),
             inset_bottom: inset(constraints.inset_bottom),

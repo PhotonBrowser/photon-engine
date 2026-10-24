@@ -18,6 +18,8 @@
 namespace GC {
 
 class GC_API RootVectorBase {
+    AK_MAKE_NONCOPYABLE(RootVectorBase);
+
 public:
     virtual void gather_roots(HashMap<Cell*, GC::HeapRoot>&) const = 0;
 
@@ -53,6 +55,12 @@ public:
     RootVector(ReadonlySpan<T> other)
         : RootVectorBase()
         , Vector<T, inline_capacity>(other)
+    {
+    }
+
+    RootVector(VectorBase&& other)
+        : RootVectorBase()
+        , VectorBase(move(other))
     {
     }
 

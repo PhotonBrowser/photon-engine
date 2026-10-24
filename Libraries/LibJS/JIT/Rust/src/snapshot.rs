@@ -391,6 +391,9 @@ pub struct FeedbackSnapshot {
     pub value: Vec<u16>,
     pub call: Vec<CallFeedbackSnapshot>,
     pub keyed: Vec<KeyedFeedbackSnapshot>,
+    /// The bound arguments of the bound functions that call sites forwarded
+    /// to, as NaN-boxed values (see `ForwardedCallSnapshot::bound_arguments_start`).
+    pub bound_arguments: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -463,11 +466,18 @@ pub struct ForwardedCallSnapshot {
     /// The index in `Snapshot::executables` of `target`'s executable, if it
     /// is an inlining candidate.
     pub inline_executable: Option<u32>,
-    /// For bound functions: the bound `this` and the first
-    /// `bound_argument_count` bound arguments, as NaN-boxed values.
+    /// For bound functions that are inlining candidates: the bound `this`, as
+    /// a NaN-boxed value, and where the bound arguments start in
+    /// `FeedbackSnapshot::bound_arguments`, and how many there are.
     pub bound_this: u64,
-    pub bound_arguments: [u64; 4],
-    pub bound_argument_count: u8,
+    pub bound_arguments_start: u32,
+    pub bound_argument_count: u32,
+}
+
+impl ForwardedCallSnapshot {
+    /// The most bound arguments a bound function can have for its calls to be
+    /// inlined, as each one becomes a constant of the inlined call.
+    pub const MAX_INLINED_BOUND_ARGUMENTS: usize = 64;
 }
 
 /// A call target JIT code can call directly, building its frame like the
@@ -580,6 +590,24 @@ pub struct NativeCallTarget {
     pub realm: CellId,
     /// `ThrowCompletionOr<Value> (*)(VM&)`: the native function.
     pub entry: u64,
+    /// Where the function, a getter of a platform object attribute backed by
+    /// a field, finds the wrapper it would return, if it is one and the
+    /// interpreter validated the cache entry for it (see
+    /// `PropertyLookupCacheEntry::direct_getter_validated`).
+    pub direct_getter: Option<DirectGetterFields>,
+}
+
+/// The byte offsets a `DirectGetterFunction` reads: the implementation of a
+/// wrapper, the field of the implementation the attribute returns, the weak
+/// reference of an implementation to its main world wrapper, and the cell of
+/// that weak reference. The getter returns the main world wrapper of the
+/// field's implementation, or null for a null field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectGetterFields {
+    pub wrapper_implementation: u32,
+    pub implementation_value: u32,
+    pub main_world_wrapper: u32,
+    pub weak_impl_value: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -689,6 +717,9 @@ pub struct AccessorFunctionSnapshot {
     /// The index in `Snapshot::executables` of the function's executable,
     /// if it is an inlining candidate.
     pub inline_executable: Option<u32>,
+    /// The function as a raw native function that JIT code may call
+    /// directly, if it is one.
+    pub native: Option<NativeCallTarget>,
 }
 
 /// Built-in functions the compiler recognizes.
@@ -1603,6 +1634,9 @@ pub struct RuntimeLayout {
     pub object_flag_is_typed_array: u16,
     /// `Object::Flag::IsHTMLDDA`.
     pub object_flag_is_htmldda: u16,
+    /// `Object::Flag::IsPlatformObject` and `Object::Flag::IsGlobalObject`.
+    pub object_flag_is_platform_object: u16,
+    pub object_flag_is_global_object: u16,
     /// `Object::Flag::RequiresSlowAddOwnProperty`.
     pub object_flag_requires_slow_add_own_property: u16,
     /// The capacity (u32) of heap named property storage, relative to the

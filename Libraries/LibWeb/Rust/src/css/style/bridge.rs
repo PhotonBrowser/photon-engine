@@ -445,6 +445,22 @@ pub enum FontResolutionFeatureInput {
     TextRendering,
 }
 
+/// What a resolution request's `font-size-adjust` asks of the resolver.
+/// https://drafts.csswg.org/css-fonts-5/#font-size-adjust-prop
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub enum FontSizeAdjustKind {
+    /// `none`: the resolver selects fonts at the computed font size.
+    #[default]
+    None,
+    /// A number: the resolver scales the size it selects fonts at so that the metric of the first
+    /// available font is that proportion of the computed font size.
+    Number,
+    /// `from-font`: the resolver measures the metric of the first available font, which is the
+    /// number the value computes to, and sizes the other fonts by that number.
+    FromFont,
+}
+
 /// How many values a resolution request names, one per `FontResolutionFeatureInput`.
 pub const FONT_RESOLUTION_FEATURE_INPUT_COUNT: usize = 11;
 const _: () = assert!(FontResolutionFeatureInput::TextRendering as usize + 1 == FONT_RESOLUTION_FEATURE_INPUT_COUNT);
@@ -462,6 +478,12 @@ pub struct FfiFontResolutionRequest {
     pub font_weight: f64,
     pub font_width: f64,
     pub font_optical_sizing: u8,
+    /// The computed `font-size-adjust`: its kind, the metric it normalizes (a
+    /// `font_size_adjust_metric` value), and the number for `FontSizeAdjustKind::Number`. The
+    /// metric and number are zero for `FontSizeAdjustKind::None`.
+    pub font_size_adjust: FontSizeAdjustKind,
+    pub font_size_adjust_metric: u8,
+    pub font_size_adjust_value: f64,
     /// The tree scope whose `@font-feature-values` `font-variant-alternates` names features
     /// through, or the document's where the request names no `font-variant-alternates`.
     pub font_feature_values_scope: u32,
@@ -488,6 +510,10 @@ pub struct FfiResolvedFont {
     pub descent: f32,
     pub x_height: f32,
     pub zero_advance: f32,
+    /// For a request naming `from-font`, the number it computes to: the request's metric of the
+    /// first available font, divided by that font's size. Zero for other requests, and where the
+    /// font has no size to divide by.
+    pub font_size_adjust_from_font: f64,
 }
 
 impl Default for FfiStyleTransactionView {
@@ -728,6 +754,9 @@ pub mod element_construction_fact {
     pub const IS_DOCUMENT_ELEMENT: u32 = 1 << 6;
     pub const IS_SVG_RESOURCE_ELEMENT: u32 = 1 << 7;
     pub const IS_SVG_GEOMETRY_ELEMENT: u32 = 1 << 8;
+    /// The layout algorithm a MathML element's tag name selects, as a `MathLayoutKind` in these bits.
+    pub const MATHML_LAYOUT_KIND_SHIFT: u32 = 16;
+    pub const MATHML_LAYOUT_KIND_MASK: u32 = 0x1f << MATHML_LAYOUT_KIND_SHIFT;
 }
 
 /// Which principal box an element asks for before its computed style has a say. The element's own
@@ -1176,6 +1205,9 @@ pub struct FfiAppliedAnimationDefinition {
     /// The computed `animation-timing-function`, which the animation retains, or null where no plan
     /// has described the animation yet.
     pub timing_function: *const c_void,
+    /// The calculations the edges of the attachment range resolve, which the animation retains, or null.
+    pub range_start_calculated: *const c_void,
+    pub range_end_calculated: *const c_void,
 }
 
 /// What an applied animation definition holds by value.
@@ -1194,6 +1226,12 @@ pub struct FfiAppliedAnimationValues {
     pub timeline_kind: u8,
     pub scroll_scroller: u8,
     pub scroll_axis: u8,
+    pub range_start_name: u8,
+    pub range_start_px: f64,
+    pub range_start_percentage: f64,
+    pub range_end_name: u8,
+    pub range_end_px: f64,
+    pub range_end_percentage: f64,
 }
 
 // SAFETY: the keyframe set is only compared by address, and the timing function is immutable style
@@ -3215,7 +3253,7 @@ pub(super) fn sort_style_deltas_for_direct_application(engine: &StyleEngine, del
         |delta: &FfiStyleDelta| StyleNodeID::from_raw(delta.style_node).expect("a style delta must name an element");
     // Small batches cost less to compare directly. A large batch names its dependency order once instead of walking
     // both ancestor chains in every sort comparison.
-    if deltas.len() > 32 {
+    if engine.tree.style_reaction_order_ranks_pay_off(deltas.len()) {
         let ranks = engine.tree.style_reaction_order_ranks(deltas.iter().map(node));
         deltas.sort_unstable_by_key(|delta| (ranks[&node(delta)], pseudo_rank(delta)));
         return;
@@ -3241,8 +3279,6 @@ mod tests {
     use super::*;
     use crate::css::style::Lookup;
     use crate::css::style::instrumentation::Counter;
-    use crate::css::style::memory::MemoryCategory;
-    use crate::css::style::memory::Tier;
     use crate::css::style::transaction::InputKind;
 
     fn no_relations() -> FfiTreeRelations {
@@ -3617,9 +3653,10 @@ mod tests {
             engine.retained_match_answer(StyleNodeID::from_raw(nodes[0]).unwrap()),
             Lookup::Known(_)
         ));
+        // An answer nothing consumed stays retained for the node's first read.
         assert!(matches!(
             engine.retained_match_answer(StyleNodeID::from_raw(nodes[2]).unwrap()),
-            Lookup::Missing(_)
+            Lookup::Known(_)
         ));
         assert_eq!(engine.counters().get(Counter::MatchAnswerUpqueries), upqueries);
         assert_eq!(
@@ -3721,22 +3758,11 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_of_no_deltas_costs_nothing() {
-        let mut engine = StyleEngine::new();
-        engine.apply_transaction_batch(&[], (&[], &[]), &[], &[], &[], &[]);
-        let transaction = engine.take_transaction();
-        assert!(transaction.is_empty());
-        engine.release_transaction(transaction);
-        assert_eq!(engine.memory().bytes_in_tier(Tier::Acceleration), 0);
-    }
-
-    #[test]
     fn identities_are_minted_in_one_call_per_batch() {
         let mut engine = StyleEngine::new();
         let mut nodes = [0_u32; 512];
         engine.allocate_style_nodes(&mut nodes);
         assert_eq!(engine.counters().get(Counter::StyleNodesAllocated), 512);
         assert!(nodes.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(engine.memory().bytes_in_category(MemoryCategory::RelationColumns) > 0);
     }
 }

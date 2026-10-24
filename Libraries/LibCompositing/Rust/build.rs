@@ -104,6 +104,8 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "FfiVisualViewportTransform",
             "CanvasId",
             "VideoSinkResourceId",
+            "Canvas2DPaintKind",
+            "Canvas2DPatternRepetition",
         ]
         .map(String::from),
     );
@@ -151,6 +153,10 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("FfiVisualViewportTransform", "Compositing::TransformWithOrigin"),
         ("CanvasId", "Compositing::CanvasId"),
         ("VideoSinkResourceId", "Compositing::VideoSinkResourceId"),
+        ("Canvas2DPaintKind", "Compositing::Canvas2DPaintKind"),
+        ("Canvas2DPatternRepetition", "Compositing::Canvas2DPatternRepetition"),
+        ("CapStyle", "Gfx::Path::CapStyle"),
+        ("JoinStyle", "Gfx::Path::JoinStyle"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
@@ -160,12 +166,13 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "AK/Optional.h",
             "LibGfx/AffineTransform.h",
             "LibGfx/Color.h",
+            "LibGfx/ColorFilterType.h",
             "LibGfx/CompositingAndBlendingOperator.h",
             "LibGfx/CornerRadii.h",
-            "LibGfx/Filter.h",
             "LibGfx/GradientInterpolation.h",
             "LibGfx/InterpolationColorSpace.h",
             "LibGfx/Matrix4x4.h",
+            "LibGfx/Path.h",
             "LibGfx/Point.h",
             "LibGfx/Rect.h",
             "LibGfx/ScalingMode.h",
@@ -262,6 +269,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     ffi_config.namespaces = Some(vec!["Compositing".to_string(), "RustFFI".to_string()]);
     expose_css_pixel_types_as_web_types(&mut ffi_config);
     expose_shared_abi_types_as_cpp_types(&mut ffi_config);
+    // An ak::Span is laid out as an AK ReadonlySpan, which C++ passes it as.
+    ffi_config
+        .export
+        .rename
+        .insert("Span".to_string(), "AK::ReadonlySpan".to_string());
+    ffi_config.includes.push("AK/Span.h".to_string());
     // The values WebContent's own entry points take and return, which its headers refer to here.
     ffi_config.export.include = [
         "NodeSlotId",
@@ -280,6 +293,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiEasingDescriptor",
         "FfiEasingKind",
         "FfiLinearEasingPoint",
+        "FfiCanvas2DPaint",
+        "FfiCanvas2DCompositing",
+        "FfiCanvas2DStroke",
     ]
     .map(String::from)
     .to_vec();
@@ -293,6 +309,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/visual_context/ffi_types.rs"),
             manifest_dir.join("src/host/replay.rs"),
             manifest_dir.join("src/display_list/storage.rs"),
+            manifest_dir.join("src/display_list/canvas_2d.rs"),
+            manifest_dir.join("src/display_list/canvas_2d_recorder.rs"),
             manifest_dir.join("src/ffi.rs"),
         ],
         &out_dir,
@@ -386,7 +404,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("FloatMatrix4x4", "Gfx::FloatMatrix4x4"),
         ("CornerRadius", "Gfx::CornerRadius"),
         ("CornerRadii", "Gfx::CornerRadii"),
-        ("CornerClip", "Gfx::CornerClip"),
         ("GradientInterpolationMethod", "Gfx::GradientInterpolationMethod"),
         ("GradientInterpolationType", "Gfx::GradientInterpolationMethod::Type"),
         ("RectangularColorSpace", "Gfx::RectangularColorSpace"),
@@ -449,12 +466,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     .into_iter()
     .map(String::from)
     .collect();
-    let mut after_includes = String::from("\n#define ENUMERATE_DISPLAY_LIST_COMMANDS(V)");
-    for name in display_list_command_type_variants(&commands_source)? {
-        after_includes.push_str(&format!(" \\\n    V({name})"));
+    // The commands of the canvas 2D stream go into a list of their own, as only the canvas player plays them.
+    let variants = display_list_command_type_variants(&commands_source)?;
+    let mut after_includes = String::new();
+    for (macro_name, canvas_2d) in [
+        ("ENUMERATE_DISPLAY_LIST_COMMANDS", false),
+        ("ENUMERATE_CANVAS_2D_COMMANDS", true),
+    ] {
+        after_includes.push_str(&format!("\n#define {macro_name}(V)"));
+        for name in variants.iter().filter(|name| name.starts_with("Canvas2D") == canvas_2d) {
+            after_includes.push_str(&format!(" \\\n    V({name})"));
+        }
+        after_includes.push('\n');
     }
     after_includes.push_str(&format!(
-        "\n\nnamespace Compositing {{\n\n// Every record and every payload starts at a multiple of this.\nconstexpr size_t display_list_payload_alignment = {};\n\n}}",
+        "\nnamespace Compositing {{\n\n// Every record and every payload starts at a multiple of this.\nconstexpr size_t display_list_payload_alignment = {};\n\n}}",
         display_list_payload_alignment(&manifest_dir.join("src/display_list/builder.rs"))?
     ));
     commands_config.after_includes = Some(after_includes);

@@ -13,7 +13,6 @@
 #include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibTest/TestCase.h>
-#include <LibWebCommon/WebView/ProcessHandle.h>
 #include <LibWebView/CrashReport.h>
 #include <LibWebView/ProcessManager.h>
 #include <fcntl.h>
@@ -91,13 +90,6 @@ static void cleanup()
 {
     if (FileSystem::exists(test_directory()))
         MUST(FileSystem::remove(test_directory(), FileSystem::RecursionMode::Allowed));
-}
-
-TEST_CASE(helper_termination_requires_a_specific_process_id)
-{
-    EXPECT(!WebView::should_terminate_pid(-1));
-    EXPECT(!WebView::should_terminate_pid(0));
-    EXPECT(WebView::should_terminate_pid(1));
 }
 
 enum class CrashThread {
@@ -331,12 +323,12 @@ TEST_CASE(helper_process_names)
 {
     cleanup();
     ScopeGuard guard = cleanup;
-    for (auto type : { WebView::ProcessType::WebContent, WebView::ProcessType::WebWorker, WebView::ProcessType::RequestServer, WebView::ProcessType::ImageDecoder, WebView::ProcessType::MediaServer, WebView::ProcessType::Compositor, WebView::ProcessType::WasmCompiler }) {
+    for (auto type : { WebView::ProcessType::WebContent, WebView::ProcessType::WebWorker, WebView::ProcessType::RequestServer, WebView::ProcessType::ImageDecoder, WebView::ProcessType::MediaServer, WebView::ProcessType::Compositor }) {
         auto report = MUST(WebView::CrashReport::create(type));
         MUST(report->save(SIGSEGV, test_directory()));
     }
     auto paths = report_paths();
-    EXPECT_EQ(paths.size(), 7u);
+    EXPECT_EQ(paths.size(), 6u);
     for (auto const& path : paths) {
         auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
         auto contents = MUST(file->read_until_eof());

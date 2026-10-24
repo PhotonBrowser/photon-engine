@@ -30,6 +30,7 @@
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/ScrollTimeline.h>
+#include <LibWeb/Animations/ViewTimeline.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/CSS/AnimationEvent.h>
 #include <LibWeb/CSS/CSSAnimation.h>
@@ -98,6 +99,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
@@ -262,6 +264,8 @@ void StyleComputer::register_style_node(StyleNodeID style_node_id, DOM::Node& no
     // had one published nothing.
     if (auto* svg_element = as_if<SVG::SVGElement>(node))
         Layout::publish_svg_attribute_facts(*svg_element);
+    else if (auto* mathml_element = as_if<MathML::MathMLElement>(node))
+        Layout::publish_math_attribute_facts(*mathml_element);
 }
 
 static void ensure_slot(auto& nodes, u32 index)
@@ -663,6 +667,11 @@ ComputedValuesFFI::FfiEffectTiming style_engine_effect_timing(Animations::Keyfra
             timing.timeline_scroller_is_vertical = scroller.vertical;
             timing.timeline_scroller = scroller.scroll_node.node_id.value();
         }
+        if (auto minimum = timeline->minimum_timeline_time(), maximum = timeline->maximum_timeline_time(); minimum.has_value() && maximum.has_value()) {
+            timing.has_timeline_boundaries = true;
+            timing.minimum_timeline_time = minimum->value;
+            timing.maximum_timeline_time = maximum->value;
+        }
     }
     optional_duration(animation.start_time(), timing.has_start_time, timing.start_time);
     optional_duration(animation.hold_time(), timing.has_hold_time, timing.hold_time);
@@ -930,6 +939,8 @@ static AnimationProperties animation_properties_from_ffi(ComputedValuesFFI::FfiC
     static_assert(to_underlying(AnimationTimelineSource::Kind::Document) == to_underlying(ComputedValuesFFI::FfiAnimationTimelineKind::Document));
     static_assert(to_underlying(AnimationTimelineSource::Kind::None) == to_underlying(ComputedValuesFFI::FfiAnimationTimelineKind::None));
     static_assert(to_underlying(AnimationTimelineSource::Kind::Scroll) == to_underlying(ComputedValuesFFI::FfiAnimationTimelineKind::Scroll));
+    static_assert(to_underlying(AnimationTimelineSource::Kind::View) == to_underlying(ComputedValuesFFI::FfiAnimationTimelineKind::View));
+    static_assert(to_underlying(AnimationTimelineSource::Kind::Named) == to_underlying(ComputedValuesFFI::FfiAnimationTimelineKind::Named));
     return {
         .duration = move(duration),
         .timing_function = EasingFunction::from_style_value(timing_function),
@@ -944,6 +955,12 @@ static AnimationProperties animation_properties_from_ffi(ComputedValuesFFI::FfiC
             .kind = static_cast<AnimationTimelineSource::Kind>(animation.timeline_kind),
             .scroller = static_cast<Scroller>(animation.scroll_scroller),
             .axis = static_cast<Axis>(animation.scroll_axis),
+            .view_inset = Animations::view_timeline_inset_from_ffi(animation.view_inset),
+            .name = animation.timeline_name ? css_string_from_rust(animation.timeline_name) : Utf16FlyString {},
+        },
+        .range = {
+            .start = { static_cast<Animations::TimelineRangeName>(animation.range_start_name), animation.range_start_px, animation.range_start_percentage, Animations::retain_calculated_offset(animation.range_start_calculated) },
+            .end = { static_cast<Animations::TimelineRangeName>(animation.range_end_name), animation.range_end_px, animation.range_end_percentage, Animations::retain_calculated_offset(animation.range_end_calculated) },
         },
         .timing_function_value = move(timing_function_value),
     };
@@ -974,10 +991,10 @@ void StyleComputer::apply_animation_definitions(DOM::AbstractElement& abstract_e
     //     the animations this element holds, which it publishes. See match_existing_animations(). So are the
     //     keyframes each definition runs, from the `@keyframes` every style scope publishes.
 
-    auto existing_animations = *element_animations;
+    GC::RootVector<GC::Ref<CSSAnimation>> existing_animations { element_animations->span() };
     Vector<bool> existing_animation_was_claimed;
     existing_animation_was_claimed.resize(existing_animations.size());
-    Vector<GC::Ref<CSSAnimation>> new_animations;
+    GC::RootVector<GC::Ref<CSSAnimation>> new_animations;
 
     for (size_t i = animation_definitions.size(); i-- > 0;) {
         auto const& definition = animation_definitions[i];
@@ -1026,8 +1043,10 @@ void StyleComputer::apply_animation_definitions(DOM::AbstractElement& abstract_e
     // Once an animation has started it continues until it ends or the animation-name is removed
     // NB: An animation no definition claimed is one whose animation-name entry has gone.
     for (size_t i = 0; i < existing_animations.size(); ++i) {
-        if (!existing_animation_was_claimed[i])
+        if (!existing_animation_was_claimed[i]) {
             existing_animations[i]->cancel(Animations::Animation::ShouldInvalidate::No);
+            existing_animations[i]->stop_following_named_timeline();
+        }
     }
 
     // NB: We create animations in reverse definition order so flip it back.
@@ -1223,8 +1242,8 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
         return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(value));
     };
 
-    Vector<GC::Ref<Animations::KeyframeEffect>> newly_started_transition_effects;
-    HashTable<Animations::KeyframeEffect*> replaced_transition_effects;
+    GC::RootVector<GC::Ref<Animations::KeyframeEffect>> newly_started_transition_effects;
+    GC::RootHashTable<Animations::KeyframeEffect*> replaced_transition_effects;
     auto on_actions = [&](ReadonlySpan<StyleValueFFI::FfiTransitionAction> actions) {
         for (auto const& action : actions) {
             auto property_id = static_cast<PropertyID>(action.property_id);
@@ -1917,6 +1936,7 @@ ComputationContext StyleComputer::make_computation_context_for_property(Layout::
     case PropertyID::FontKerning:
     case PropertyID::FontOpticalSizing:
     case PropertyID::FontSize:
+    case PropertyID::FontSizeAdjust:
     case PropertyID::FontStyle:
     case PropertyID::FontVariantAlternates:
     case PropertyID::FontVariantCaps:
@@ -2055,7 +2075,7 @@ void StyleComputer::publish_sampled_animation_overlays(Layout::BegunRead const& 
         GC::Ref<DOM::Document const> document;
         TreeScopeID tree_scope;
     };
-    Vector<OverlayFont, 1> fonts;
+    GC::ConservativeVector<OverlayFont, 1> fonts;
     Vector<StyleEngineFFI::FfiAnimationOverlayPublicationInput, 1> inputs;
     fonts.ensure_capacity(overlays.size());
     inputs.ensure_capacity(overlays.size());

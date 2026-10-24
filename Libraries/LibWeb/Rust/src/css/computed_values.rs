@@ -660,6 +660,8 @@ impl_computed_payload_clone_and_eq!(AnimationValues {
     animation_fill_mode,
     animation_iteration_count,
     animation_play_state,
+    animation_range_start,
+    animation_range_end,
     animation_timeline,
     animation_timing_function,
     scroll_timeline_name,
@@ -724,6 +726,7 @@ impl_computed_payload_clone_and_eq!(BorderValues {
     corner_top_left_shape,
     corner_top_right_shape,
     border_image_source,
+    border_shape,
     border_image_slice,
     border_image_width,
     border_image_outset,
@@ -903,6 +906,8 @@ impl_computed_payload_clone_and_eq!(InheritedUIValues {
     accent_color,
     cursor,
     pointer_events,
+    forced_color_adjust,
+    interpolate_size,
     scrollbar_color,
     color_scheme,
     color_schemes,
@@ -953,6 +958,12 @@ impl_computed_payload_clone_and_eq!(TransformValues {
     perspective_px,
     perspective_origin_x,
     perspective_origin_y,
+    has_offset_path,
+    offset_path,
+    offset_distance,
+    offset_position,
+    offset_anchor,
+    offset_rotate,
 });
 impl_computed_payload_clone_and_eq!(ComputedVerticalAlign {
     is_keyword,
@@ -970,6 +981,7 @@ impl_computed_payload_clone_and_eq!(BoxValues {
     overscroll_behavior_x,
     overscroll_behavior_y,
     box_sizing,
+    field_sizing,
     resize,
     text_overflow,
     unicode_bidi,
@@ -1639,15 +1651,6 @@ pub(crate) fn retain_group_payload(group_index: usize, payload: *const c_void) {
     refcount.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn retained_group_payload_bytes(group_index: usize, payload: *const c_void) -> usize {
-    let group = style_group(group_index);
-    let refcount = refcount_of(payload, payload_align(group));
-    if refcount.load(Ordering::Relaxed) == STYLE_GROUP_STATIC_REFCOUNT {
-        return 0;
-    }
-    allocation_layout(group).size()
-}
-
 fn header_size(align: usize) -> usize {
     align.max(size_of::<usize>())
 }
@@ -1953,6 +1956,49 @@ pub unsafe extern "C" fn rust_style_group_payloads_equal(
     unsafe { style_group_payloads_equal(group_index, a, b) }
 }
 
+/// Clamps a border box size by the min and max sizes of a sizing group that resolve against the given basis, as
+/// resizing an element by its resizer does.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_sizing_values_clamp_size(
+    values: &SizingValues,
+    basis_width: f64,
+    basis_height: f64,
+    width: &mut f64,
+    height: &mut f64,
+) {
+    use crate::css::css_pixels::CssPixels;
+    let clamp = |size: f64, basis: f64, minimum: &ComputedSize, maximum: &ComputedSize| {
+        let basis = CssPixels::nearest_value_for(basis);
+        let mut size = size;
+        if minimum.is_length_percentage() {
+            size = size.max(minimum.to_px(basis).to_double());
+        }
+        if maximum.is_length_percentage() {
+            size = size.min(maximum.to_px(basis).to_double());
+        }
+        size
+    };
+    *width = clamp(*width, basis_width, &values.min_width, &values.max_width);
+    *height = clamp(*height, basis_height, &values.min_height, &values.max_height);
+}
+
+/// The pixels of a computed size given as an absolute length, written to `pixels`. Returns false for any other size.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_computed_size_absolute_length_px(size: &ComputedSize, pixels: &mut f64) -> bool {
+    let Some(StyleValueData::Length { value, unit }) = size.value.style_value() else {
+        return false;
+    };
+    if size.kind != ComputedSizeKind::Length {
+        return false;
+    }
+    let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
+    if !ratio.is_finite() {
+        return false;
+    }
+    *pixels = value * ratio;
+    true
+}
+
 /// One field of a style group the generic builder can populate or check: a pokeable simple field
 /// at `offset` in the group's payload, or a constraint requiring the value to be one that leaves
 /// the payload's initial value standing.
@@ -2080,6 +2126,7 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             COLUMN_RULE_WIDTH @ column_rule_width => CssPixelsNonNegative,
             USER_SELECT @ user_select => EnumKeyword(enums::keyword_to_user_select),
             OBJECT_POSITION => RequireInitialValue,
+            VIEW_TRANSITION_CLASS => RequireKeyword(k::NONE),
             VIEW_TRANSITION_NAME => RequireKeyword(k::NONE),
             TOUCH_ACTION => RequireInitialValue,
             SCROLL_BEHAVIOR @ scroll_behavior => EnumKeyword(enums::keyword_to_scroll_behavior),
@@ -2130,6 +2177,8 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             ACCENT_COLOR => RequireKeyword(k::AUTO),
             CURSOR => RequireKeyword(k::AUTO),
             POINTER_EVENTS @ pointer_events => EnumKeyword(enums::keyword_to_pointer_events),
+            FORCED_COLOR_ADJUST @ forced_color_adjust => EnumKeyword(enums::keyword_to_forced_color_adjust),
+            INTERPOLATE_SIZE @ interpolate_size => EnumKeyword(enums::keyword_to_interpolate_size),
             SCROLLBAR_COLOR => RequireKeyword(k::AUTO),
             COLOR_SCHEME @ color_scheme => ResolvedU8,
             COLOR_SCHEME => RequireInitialValue,
@@ -2145,6 +2194,11 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             SCALE => RequireKeyword(k::NONE),
             PERSPECTIVE => RequireKeyword(k::NONE),
             PERSPECTIVE_ORIGIN => RequireInitialValue,
+            OFFSET_PATH => RequireKeyword(k::NONE),
+            OFFSET_DISTANCE => RequireZeroPx,
+            OFFSET_POSITION => RequireKeyword(k::NORMAL),
+            OFFSET_ANCHOR => RequireKeyword(k::AUTO),
+            OFFSET_ROTATE => RequireKeyword(k::AUTO),
         },
         group_index::MASK => fields! { MaskValues:
             MASK_IMAGE => RequireKeyword(k::NONE),
@@ -2169,6 +2223,8 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             ANIMATION_ITERATION_COUNT => RequireInitialValue,
             ANIMATION_PLAY_STATE => RequireInitialValue,
             ANIMATION_TIMELINE => RequireInitialValue,
+            ANIMATION_RANGE_START => RequireInitialValue,
+            ANIMATION_RANGE_END => RequireInitialValue,
             ANIMATION_TIMING_FUNCTION => RequireInitialValue,
             SCROLL_TIMELINE_NAME => RequireInitialValue,
             SCROLL_TIMELINE_AXIS => RequireInitialValue,
@@ -2251,6 +2307,7 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             CORNER_TOP_LEFT_SHAPE @ corner_top_left_shape => ResolvedF64,
             CORNER_TOP_RIGHT_SHAPE @ corner_top_right_shape => ResolvedF64,
             BORDER_IMAGE_SOURCE => RequireKeyword(k::NONE),
+            BORDER_SHAPE => RequireKeyword(k::NONE),
             BORDER_IMAGE_OUTSET => RequireInitialValue,
             BORDER_IMAGE_REPEAT => RequireInitialValue,
             BORDER_IMAGE_SLICE => RequireInitialValue,
@@ -2682,8 +2739,29 @@ impl ComputedSize {
             Some(StyleValueData::Keyword { keyword: value }) if *value == keyword::MAX_CONTENT => {
                 Self::keyword(ComputedSizeKind::MaxContent)
             }
+            Some(StyleValueData::Keyword { keyword: value }) if *value == keyword::STRETCH => {
+                Self::keyword(ComputedSizeKind::Stretch)
+            }
+            // NB: -webkit-fill-available behaves as stretch, and keeps its own keyword for serialization.
+            Some(StyleValueData::Keyword { keyword: value }) if *value == keyword::_WEBKIT_FILL_AVAILABLE => {
+                Self::retained(ComputedSizeKind::Stretch, data)
+            }
             Some(StyleValueData::Keyword { keyword: value }) if *value == keyword::NONE => {
                 Self::keyword(ComputedSizeKind::None)
+            }
+            Some(value @ StyleValueData::Function { .. })
+                if crate::css::calc_size::calc_size_arguments(value).is_some() =>
+            {
+                // NB: A calc-size() acts like its basis keyword, or like a calculation for any other basis.
+                let kind = match crate::css::calc_size::calc_size_basis_keyword(value) {
+                    Some(keyword::AUTO) => ComputedSizeKind::Auto,
+                    Some(keyword::MIN_CONTENT) => ComputedSizeKind::MinContent,
+                    Some(keyword::MAX_CONTENT) => ComputedSizeKind::MaxContent,
+                    Some(keyword::FIT_CONTENT) => ComputedSizeKind::FitContent,
+                    Some(keyword::STRETCH) => ComputedSizeKind::Stretch,
+                    _ => ComputedSizeKind::Calculated,
+                };
+                Self::retained(kind, data)
             }
             Some(StyleValueData::Function { value, .. }) => Self::retained(ComputedSizeKind::FitContent, value),
             Some(StyleValueData::Calculated { .. }) => Self::retained(ComputedSizeKind::Calculated, data),
@@ -2718,10 +2796,17 @@ impl ComputedFlexBasis {
             data.optional_data(),
             Some(StyleValueData::Keyword { keyword }) if *keyword == keyword::CONTENT
         );
+        // A calc-size() with a content basis acts as content, and keeps the function for resolving the size.
+        let is_calc_size_of_content = data
+            .optional_data()
+            .and_then(crate::css::calc_size::calc_size_basis_keyword)
+            == Some(keyword::CONTENT);
         Self {
-            is_content,
+            is_content: is_content || is_calc_size_of_content,
             size: if is_content {
                 ComputedSize::keyword(ComputedSizeKind::Auto)
+            } else if is_calc_size_of_content {
+                ComputedSize::retained(ComputedSizeKind::Auto, data)
             } else {
                 ComputedSize::from_data(data)
             },
@@ -2913,7 +2998,7 @@ impl ComputedAspectRatio {
 impl BoxValues {
     fn initial() -> Self {
         use crate::css::css_enums::{
-            box_sizing, clear, float, overflow, overscroll_behavior, positioning, resize, table_layout, text_overflow,
+            box_sizing, clear, field_sizing, float, overflow, overscroll_behavior, positioning, resize, table_layout, text_overflow,
             unicode_bidi, vertical_align,
         };
         use crate::css::display::FfiDisplay;
@@ -2929,6 +3014,7 @@ impl BoxValues {
             overscroll_behavior_x: overscroll_behavior::AUTO,
             overscroll_behavior_y: overscroll_behavior::AUTO,
             box_sizing: box_sizing::CONTENT_BOX,
+            field_sizing: field_sizing::FIXED,
             resize: resize::NONE,
             text_overflow: text_overflow::CLIP,
             unicode_bidi: unicode_bidi::NORMAL,
@@ -3014,6 +3100,11 @@ impl TextResetValues {
 
 impl TransformValues {
     fn initial() -> Self {
+        use crate::css::property_metadata::property_id;
+
+        let initial = |property| {
+            ComputedStyleValueHandle::from_retained(crate::css::style_compute::initial_value_handle(property))
+        };
         Self {
             transformations: ComputedStyleValueHandle::empty(),
             resolved_transforms: RetainedComputedResolvedTransformList::from_vec(Vec::new()),
@@ -3033,6 +3124,12 @@ impl TransformValues {
             perspective_px: 0,
             perspective_origin_x: ComputedStyleValueHandle::percentage(50.0),
             perspective_origin_y: ComputedStyleValueHandle::percentage(50.0),
+            has_offset_path: false,
+            offset_path: initial(property_id::OFFSET_PATH),
+            offset_distance: initial(property_id::OFFSET_DISTANCE),
+            offset_position: initial(property_id::OFFSET_POSITION),
+            offset_anchor: initial(property_id::OFFSET_ANCHOR),
+            offset_rotate: initial(property_id::OFFSET_ROTATE),
         }
     }
 }
@@ -3117,6 +3214,8 @@ impl InheritedUIValues {
                 predefined: crate::css::css_enums::cursor_predefined::AUTO,
             }]),
             pointer_events: crate::css::css_enums::pointer_events::AUTO,
+            forced_color_adjust: crate::css::css_enums::forced_color_adjust::AUTO,
+            interpolate_size: crate::css::css_enums::interpolate_size::NUMERIC_ONLY,
             scrollbar_color: crate::css::computed_value_types::ComputedScrollbarColor {
                 thumb_color: 0,
                 track_color: 0,
@@ -3246,6 +3345,8 @@ impl AnimationValues {
             animation_iteration_count: initial(property_id::ANIMATION_ITERATION_COUNT),
             animation_play_state: initial(property_id::ANIMATION_PLAY_STATE),
             animation_timeline: initial(property_id::ANIMATION_TIMELINE),
+            animation_range_start: initial(property_id::ANIMATION_RANGE_START),
+            animation_range_end: initial(property_id::ANIMATION_RANGE_END),
             animation_timing_function: initial(property_id::ANIMATION_TIMING_FUNCTION),
             scroll_timeline_name: initial(property_id::SCROLL_TIMELINE_NAME),
             scroll_timeline_axis: initial(property_id::SCROLL_TIMELINE_AXIS),
@@ -3347,6 +3448,7 @@ impl BorderValues {
             corner_top_left_shape: 1.0,
             corner_top_right_shape: 1.0,
             border_image_source: initial(property_id::BORDER_IMAGE_SOURCE),
+            border_shape: initial(property_id::BORDER_SHAPE),
             border_image_slice: initial(property_id::BORDER_IMAGE_SLICE),
             border_image_width: initial(property_id::BORDER_IMAGE_WIDTH),
             border_image_outset: initial(property_id::BORDER_IMAGE_OUTSET),

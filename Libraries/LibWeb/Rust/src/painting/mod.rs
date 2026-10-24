@@ -5,10 +5,12 @@
  */
 
 pub mod border_radii;
+pub(crate) mod border_shape;
 pub(crate) mod caret;
 pub(crate) mod chrome_geometry;
 pub(crate) mod client_rects;
 pub(crate) mod content_visibility;
+pub(crate) mod corner_shape;
 pub(crate) mod corner_shapes;
 pub(crate) mod css_filter;
 mod devtools_layout;

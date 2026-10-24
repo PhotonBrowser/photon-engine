@@ -9,6 +9,7 @@
 #include <AK/DistinctNumeric.h>
 #include <AK/Function.h>
 #include <AK/GenericShorthands.h>
+#include <AK/HashMap.h>
 #include <AK/RefPtr.h>
 #include <AK/TypeCasts.h>
 #include <AK/Utf16FlyString.h>
@@ -16,6 +17,7 @@
 #include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <AK/Vector.h>
+#include <LibGC/Weak.h>
 #include <LibWeb/Bindings/Node.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/DOM/FragmentSerializationMode.h>
@@ -95,6 +97,7 @@ enum class RootNodeComposed {
     X(HTMLVideoElementSetVideoTrack)                  \
     X(KeyframeEffect)                                 \
     X(LayoutTreeUpdate)                               \
+    X(MathMLAttributeChange)                          \
     X(NavigableSetViewportSize)                       \
     X(SVGImageElementFetchTheDocument)                \
     X(SVGResourceElementAttributeChange)              \
@@ -667,6 +670,16 @@ protected:
         GC::Ptr<NodeList> child_nodes;
         GC::Ptr<HTMLCollection> children;
         OwnPtr<HTMLCollectionCacheRegistration::List> html_collections_with_valid_caches;
+
+        // The collections getElementsByTagName() returned, which it may return again for the same argument while the
+        // type of the root's node document stays the same, so that type is kept with each.
+        struct CollectionByTagName {
+            GC::Weak<HTMLCollection> collection;
+            bool for_html_document { false };
+        };
+        OwnPtr<HashMap<Utf16FlyString, CollectionByTagName>> collections_by_tag_name;
+        // The size the map grows to before the entries of collected collections are swept from it.
+        size_t collections_by_tag_name_sweep_size { 0 };
     };
 
     void register_html_collection_with_valid_cache(HTMLCollection&);
@@ -733,7 +746,7 @@ private:
     bool schedule_list_item_renumber_for_removal();
     void report_removal_to_style_engine(Node& parent);
     void update_layout_tree_for_removal(Layout::BegunRead const& read, Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
-    Vector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
+    GC::RootVector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
     void assign_slottables_after_removal(Node& parent, Node& parent_root, ReadonlySpan<GC::Ref<HTML::HTMLSlotElement>> descendant_slots);
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);
     void add_transient_registered_observers(Node& parent);

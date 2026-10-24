@@ -55,8 +55,13 @@ ErrorOr<void> DisplayingVideoSink::connect_input(NonnullRefPtr<VideoProducer> co
             dispatch_state_if_changed(PipelineStatus::Suspended);
             return;
         }
+        // Update the sink to dispatch a status if we're still resolving a seek. If we're not, avoid the update so that
+        // we don't count dropped frames due to the decoder waiting for room while we're not consuming frames.
+        if (!m_is_ticking && m_seek_status == SeekStatus::None && !m_seek_resolution_is_pending_frame_at_target)
+            return;
         update(MonotonicTime::now());
     });
+    m_seek_resolution_is_pending_frame_at_target = true;
     input->seek(m_time_reader.current_time());
     input->start();
     return {};
@@ -131,6 +136,11 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
     auto time_state = m_time_reader.time_state(now);
     auto current_time = time_state.time;
     auto new_frame_available = false;
+    u64 passed_frame_count = 0;
+    auto last_passed_frame_was_late = false;
+    Optional<AK::Duration> last_passed_timestamp;
+    if (m_current_frame)
+        last_passed_timestamp = m_current_frame->timestamp();
 
     auto last_status = PipelineStatus::Pending;
     auto seek_resolved_during_this_update = false;
@@ -150,6 +160,7 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
         }
         if (m_seek_status != SeekStatus::None && resolves_seek(last_status)) {
             m_current_frame.clear();
+            last_passed_timestamp.clear();
             m_seek_status = SeekStatus::None;
             seek_resolved_during_this_update = true;
             new_frame_available = true;
@@ -159,7 +170,7 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
         if (m_next_frame->timestamp() > current_time)
             break;
 
-        if (m_current_frame && m_current_frame->timestamp() > m_next_frame->timestamp()) {
+        if (last_passed_timestamp.has_value() && last_passed_timestamp.value() > m_next_frame->timestamp()) {
             m_next_frame.clear();
             continue;
         }
@@ -177,6 +188,11 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
             last_status = next.status;
             if (!is_terminal(last_status)) {
                 if (last_status == PipelineStatus::HaveData) {
+                    if (!m_seek_resolution_is_pending_frame_at_target) {
+                        passed_frame_count++;
+                        last_passed_frame_was_late = true;
+                    }
+                    last_passed_timestamp = m_next_frame->timestamp();
                     m_next_frame = move(next.frame);
                     m_input->consume();
                     m_cached_frames_are_discontinuous = true;
@@ -188,7 +204,18 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
         m_current_frame = m_next_frame.release_nonnull();
         m_cached_frames_are_discontinuous = false;
         new_frame_available = true;
+        last_passed_timestamp = m_current_frame->timestamp();
+        if (m_seek_resolution_is_pending_frame_at_target)
+            passed_frame_count = 1;
+        else
+            passed_frame_count++;
+        last_passed_frame_was_late = false;
     }
+
+    if (last_passed_frame_was_late)
+        m_frame_counts.dropped += passed_frame_count;
+    else
+        m_frame_counts.presented += passed_frame_count;
 
     auto status_to_dispatch = last_status;
 
@@ -211,6 +238,7 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
         if (time_is_changing) {
             m_next_frame = nullptr;
             m_seek_status = SeekStatus::InProgress;
+            m_seek_resolution_is_pending_frame_at_target = true;
             m_input->seek(current_time);
             status_to_dispatch = PipelineStatus::Pending;
         } else {
@@ -251,6 +279,26 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update(MonotonicTime now)
 void DisplayingVideoSink::notify_clock_resumed()
 {
     update(MonotonicTime::now());
+}
+
+void DisplayingVideoSink::set_ticking(bool ticking)
+{
+    auto was_ticking = exchange(m_is_ticking, ticking);
+    if (ticking && !was_ticking)
+        seek_back_to_current_time();
+}
+
+void DisplayingVideoSink::seek_back_to_current_time()
+{
+    if (m_seek_status != SeekStatus::None)
+        return;
+    auto current_time = m_time_reader.current_time();
+
+    // Don't request a seek to the same frame, or we'll wake upstream while suspended for no reason.
+    if (m_current_frame != nullptr && m_current_frame->contains_timestamp(current_time))
+        return;
+
+    seek(current_time);
 }
 
 RefPtr<VideoFrame> DisplayingVideoSink::current_frame() const

@@ -471,7 +471,15 @@ QWidget#LadybirdNavigationToolbar QToolButton#LadybirdCloseWindowButton[pressedO
     color: {4};
     background: transparent;
 }}
-)",
+)"
+#if defined(AK_OS_MACOS)
+                      R"(
+QWidget#LadybirdToolbarContainer {{
+    border-bottom: 0;
+}}
+)"
+#endif
+        ,
         background, surface_hover, surface_pressed, separator, text, disabled_text, close_hover, close_text,
         window_controls_separator, badge_surface, badge_border, badge_surface_hover, badge_surface_pressed);
 }
@@ -611,6 +619,11 @@ static QColor chrome_control_soft_hover(QPalette const& palette)
     return is_dark(palette) ? QColor(255, 255, 255, 24) : QColor(0, 0, 0, 16);
 }
 
+QColor location_edit_border(QPalette const& palette)
+{
+    return is_dark(palette) ? mix(chrome_background(palette), chrome_border(palette), 0.36) : chrome_border(palette);
+}
+
 static QColor location_edit_focus_border(QPalette const& palette)
 {
     return mix(chrome_border(palette), chrome_accent(), is_dark(palette) ? 0.50 : 0.54);
@@ -627,7 +640,7 @@ QString location_edit_style_sheet(QPalette const& palette)
     auto hover_color = mix(surface_color, QColor(soft_hover.rgb()), soft_hover.alpha() / 255.0);
     auto focus_color = dark ? mix(surface_color, QColor(255, 255, 255), 0.035) : surface_color;
 
-    auto border_color = dark ? mix(chrome_background(palette), chrome_border(palette), 0.36) : chrome_border(palette);
+    auto border_color = location_edit_border(palette);
     auto hover_border_color = border_color;
     auto focus_border_color = location_edit_focus_border(palette);
 
@@ -1331,7 +1344,23 @@ QToolButton#LadybirdCloseWindowButton[pressedOutside="true"] {{
     color: {4};
     background: transparent;
 }}
-)",
+)"
+#if defined(AK_OS_MACOS)
+                      R"(
+QWidget#LadybirdVerticalTabBar {{
+    border-right-color: transparent;
+}}
+
+QWidget#LadybirdVerticalTabBar[verticalTabsPosition="right"] {{
+    border-left-color: transparent;
+}}
+
+QWidget#LadybirdVerticalTabsContentSeparator {{
+    background: transparent;
+}}
+)"
+#endif
+        ,
         background, hover, pressed, control_border, text, close_hover, close_text, sidebar_separator, sidebar_separator_hover);
 }
 

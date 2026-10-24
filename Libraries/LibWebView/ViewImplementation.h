@@ -110,12 +110,14 @@ public:
     BrowsingSession& session() const { return *m_session; }
 
     u64 view_id() const { return m_view_id; }
+    pid_t web_content_pid() const;
 
     // A view that shows a page on behalf of another view, such as a Picture-in-Picture window, is part of that view's
     // tab rather than a tab or window of its own.
     Optional<u64> owner_view_id() const { return m_owner_view_id; }
 
     CanonicalTraversable& traversable() const;
+    bool has_traversable() const { return m_top_level_traversable != nullptr; }
     // A page that comes to host any navigable of the tab gets the tab's settings: the spoofed User-Agent and
     // navigator compatibility mode, the preferred languages and color scheme, the window geometry, and the rest of
     // what the UI decides for the tab. A page that displays the tab gets its viewport and focus on top of that.
@@ -190,6 +192,7 @@ public:
         CheckForCancelation = CheckForCancelation::Yes,
         Function<void()> on_ready = nullptr);
     [[nodiscard]] Vector<SessionHistoryTraversalMenuItem> session_history_traversal_menu_items(int direction) const;
+    Vector<HistoryEntry> recent_history_entries(size_t limit) const;
 
     [[nodiscard]] SessionHistorySnapshot session_history_snapshot() const;
     [[nodiscard]] ErrorOr<void> restore_session_history_from_snapshot(SessionHistorySnapshot);
@@ -207,6 +210,19 @@ public:
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
+    // Sends the display metadata to every page hosting documents of the tab.
+    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second);
+    double viewport_corner_radius() const { return m_viewport_corner_radius; }
+    void set_viewport_corner_radius(double);
+
+    struct ScreenRects {
+        Vector<Web::DevicePixelRect> rects;
+        // The available rects leave out what the system keeps for itself, such as a menu bar or a dock.
+        Vector<Web::DevicePixelRect> available_rects;
+        u32 main_screen_index { 0 };
+    };
+    // Sends the screens that screen_rects() reports to every page hosting documents of the tab.
+    void update_screen_rects();
     void set_scales_frames_to_fit(bool scales_frames_to_fit) { m_scales_frames_to_fit = scales_frames_to_fit; }
     void enable_picture_in_picture_controls();
     void enqueue_input_event(Web::InputEvent);
@@ -223,9 +239,10 @@ public:
     void consume_user_activation_of_input_handled_by(Badge<WebContentPage>, WebContentPage const&);
     // Opening a link in a new tab takes one key or mouse press the view delivered.
     bool take_input_to_open_link_in_new_tab(Badge<WebContentPage>);
-    void did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage&);
+    void did_lose_input_event_endpoint(Badge<WebContentPage>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
+    void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action);
     void discard_input_events_routed_through_lost_compositor(Badge<Application>);
     void restart_unresponsive_page();
     size_t pending_input_event_count_for_testing() const { return m_pending_input_events.size(); }
@@ -248,7 +265,9 @@ public:
     void set_preferred_motion(Web::CSS::PreferredMotion);
     // A page created to host documents of the tab in another process takes the preferences the view's page has.
     void send_preferences_to_page(WebContentPage&);
-    virtual void send_system_theme_to_page(WebContentPage&) { }
+    void send_system_theme_to_page(WebContentPage&);
+    // Sends the theme to every page hosting documents of the tab, including the pages of out-of-process iframes.
+    void update_system_theme(Core::AnonymousBuffer const&);
 
     void notify_cookies_changed(HashTable<String> const& changed_domains, ReadonlySpan<HTTP::Cookie::Cookie> page_cookies, ReadonlySpan<HTTP::Cookie::Cookie> host_cookies);
     void listen_for_host_cookie_changes(DevTools::DevToolsDelegate::OnHostCookieChange);
@@ -433,6 +452,7 @@ public:
     void did_close_browsing_context(Badge<WebContentPage>);
     void run_webdriver_user_prompt_handling(Function<void(Web::WebDriver::Response)> on_complete);
     void did_complete_webdriver_user_prompt_handling(Badge<WebContentPage>, u64 request_id, Web::WebDriver::Response);
+    void did_open_user_prompt(Badge<WebContentPage>);
     static Optional<ViewImplementation&> find_view_by_handle(StringView);
     void did_change_background_color(Badge<WebContentPage>, Gfx::Color);
     Gfx::Color page_background_color() const { return m_page_background_color; }
@@ -473,15 +493,6 @@ public:
     Function<void()> on_ready_to_paint;
     Function<void()> on_backing_store_pool_changed;
     Function<void(TabPerformanceStats const&)> on_performance_stats;
-    enum class NewWindowType {
-        Tab,
-        Window,
-    };
-    struct NewWebDriverWindow {
-        ViewImplementation& view;
-        NewWindowType type;
-    };
-    Function<NewWebDriverWindow(NewWindowType)> on_new_webdriver_window;
     Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, CanonicalTraversable&)> on_new_web_view;
     Function<void()> on_activate_tab;
     Function<void()> on_close;
@@ -636,6 +647,10 @@ protected:
     static Gfx::IntRect rect_fitting_frame(Gfx::IntSize frame_size, Gfx::IntSize target_size);
 
     static constexpr auto ZOOM_STEP = 0.1;
+
+    virtual Core::AnonymousBuffer system_theme() { return {}; }
+    virtual Optional<ScreenRects> screen_rects() const { return {}; }
+    void update_compositor_display_metadata(WebContentPage&);
 
     explicit ViewImplementation(IsPrivate = IsPrivate::No);
 
@@ -802,6 +817,7 @@ protected:
     double m_device_pixel_ratio { 1.0 };
     Optional<u64> m_display_id;
     double m_maximum_frames_per_second { 60.0 };
+    double m_viewport_corner_radius { 0 };
     bool m_scales_frames_to_fit { false };
 
     RefPtr<Menu> m_page_context_menu;
@@ -881,11 +897,18 @@ protected:
         // navigable. A lost page never finishes the events it held.
         NonnullRefPtr<WebContentPage> endpoint;
 
+        // Unset while the event waits for the compositor to decide where an earlier key event goes.
+        bool sent { false };
+
         // Set while the compositor decides whether it consumes the event, forwards it or hands it back. A compositor
         // that dies forwards none of the events still marked this way.
         bool routed_through_compositor { false };
         i64 enqueued_at_ms { 0 };
         bool watches_page_response { false };
+
+        // A key event stays routed through the compositor until it forwards the event or hands it back. Later input
+        // waits until then.
+        bool awaits_compositor_dispatch() const { return routed_through_compositor && event.has<Web::KeyEvent>(); }
 
         // When the view delivered an event that gives user activation, until something consumes that activation.
         Optional<MonotonicTime> user_activation_time {};
@@ -900,6 +923,9 @@ protected:
     bool m_probe_page_unresponsive { false };
     int m_unresponsive_page_process_id { 0 };
     bool m_page_unresponsive { false };
+    void send_queued_input_events();
+    void send_input_event(size_t index);
+    bool may_scroll_for_key_event_in_compositor(size_t index) const;
     Optional<size_t> index_of_input_in_flight_giving_user_activation_to(WebContentPage const&) const;
 
     // The key and mouse presses the view delivered that have yet to open a link in a new tab.

@@ -510,6 +510,7 @@ public:
     void prepare_for_inline_style_change();
     bool can_defer_inline_style_attribute_update() const;
     void did_update_inline_style();
+    void clone_inline_style_from(Element const&);
 
     GC::Ref<CSS::CSSStyleProperties> style();
     GC::Ref<CSS::StylePropertyMap> attribute_style_map();
@@ -891,9 +892,9 @@ public:
     // https://drafts.csswg.org/css-view-transitions-1/#capture-the-image
     Optional<Gfx::DecodedImageFrame> capture_the_image();
 
-    void set_pointer_capture(WebIDL::Long pointer_id);
-    void release_pointer_capture(WebIDL::Long pointer_id);
-    bool has_pointer_capture(WebIDL::Long pointer_id);
+    WebIDL::ExceptionOr<void> set_pointer_capture(WebIDL::Long pointer_id);
+    WebIDL::ExceptionOr<void> release_pointer_capture(WebIDL::Long pointer_id);
+    bool has_pointer_capture(WebIDL::Long pointer_id) const;
 
     virtual bool contributes_a_script_blocking_style_sheet() const { return false; }
 

@@ -100,7 +100,7 @@ impl RetainedState {
         }
         let republication = republication.or_refused()?;
         // The element row may already be compared with the record derived from it in this flush:
-        // keep it and publish only the pseudo rows. An evicted answer is matched again.
+        // keep it and publish only the pseudo rows. A missing answer is matched again.
         let republished = self.current_winner_groups().row_stamp(node) == Some(self.flush_stamp)
             && self
                 .republish_pseudo_winners_from_retained_answer(node, republication)
@@ -419,7 +419,6 @@ impl RetainedState {
                         if substituted {
                             scratch.substituted_states.insert((state, environment));
                         }
-                        scratch.store_capacity_bytes += store.capacity_bytes();
                         if !element_alone && !self.records_are_the_elements_alone(node) {
                             scratch.pseudo_stores.insert((kind, state, environment), store.clone());
                         }
@@ -443,22 +442,23 @@ impl RetainedState {
             }
             // What the record is derived from: the element's inherited style, display and
             // environment, and the element's record itself only when the state inherits a
-            // non-inherited property from it, or when the element's animations sampled values
-            // into its inherited style. A record whose winners read beyond its environment is
-            // the originating element's alone, as is one declaring registered custom properties,
-            // which its own font decides.
+            // non-inherited property from it, written or substituted, or when the element's
+            // animations sampled values into its inherited style. A record whose winners read
+            // beyond its environment is the originating element's alone, as is one declaring
+            // registered custom properties, which its own font decides.
             let key = self
                 .computed_group_sets
                 .node_inherited_groups_identity(node)
-                // NB: The pseudo-elements of a display:none element are derived here like any others, so the
-                //     element's display keys them as well.
-                .zip(self.box_type_parent_display(node, UnderDisplayNone::Keyed))
+                // NB: The pseudo-elements of a display:none element are derived here like any others. The
+                //     element's dependency flags key that it is display:none.
+                .zip(self.box_type_parent_blockifies(node, UnderDisplayNone::Keyed))
                 .filter(|_| !element_alone && !has_registered_declarations)
-                .map(|(inherited_groups, parent_display)| PseudoCohortKey {
+                .map(|(inherited_groups, parent_blockifies)| PseudoCohortKey {
                     monospace_recascaded_font_size: state.map_or(0, |state| self.monospace_cohort_key(target, state)),
                     parent_record: if pseudo_kind::is_highlight(kind)
                         || kind == BACKDROP
                         || state.is_some_and(|state| self.state_explicitly_inherits_non_inherited_property(node, state))
+                        || store.substitutes_inherit_for_non_inherited_property(self)
                         || !self.computed_group_sets.record_inherits_as_its_base(new_element_record)
                     {
                         new_element_record.raw()
@@ -467,7 +467,7 @@ impl RetainedState {
                     },
                     highlight_parent_record: highlight_parent_record.map_or(0, computed::FinalStyleRecordID::raw),
                     inherited_groups,
-                    parent_display,
+                    parent_blockifies,
                     dependency_flags: new_view_dependency_flags,
                     environment,
                     kind,
@@ -748,8 +748,8 @@ impl RetainedState {
         }
     }
 
-    /// The kinds the node's match answer has rules for, matching the element again when that
-    /// answer was evicted. A match that cannot complete for want of a fact generates no
+    /// The kinds the node's match answer has rules for, matching the element again when there is
+    /// no answer. A match that cannot complete for want of a fact generates no
     /// pseudo-element.
     pub(super) fn pseudo_style_mask_or_rematch(&mut self, node: StyleNodeID) -> u64 {
         if let Some(mask) = self.pseudo_style_mask(node) {
@@ -1279,7 +1279,6 @@ impl RetainedState {
             self.engine_pseudo_record_cache.retain(|_, record| *record != derived);
         }
         scratch.pseudo_deltas.clear();
-        self.settle_computed_memory();
     }
 
     /// Whether the winners hold every match the node's answer has for a pseudo-element, as
@@ -1343,7 +1342,7 @@ impl StyleEngine {
             resolver.prepare(font_environment_generation);
         }
         let mut scratch = EngineComputedRecordScratch::default();
-        let mut suspended_memory = MemoryLease::new(MemoryCategory::BatchScratch);
+
         // The settle runs in the host's style update, which publishes winners as a flush does.
         let republication = WinnerRepublication::for_flush();
         let attempt = loop {
@@ -1355,7 +1354,7 @@ impl StyleEngine {
             ) {
                 Err(Unanswered::Suspended(Suspension::Font)) => {
                     let request = scratch.font_drive.take_suspended_request();
-                    suspended_memory.resize_required_to(&mut self.memory, scratch.font_drive.capacity_bytes());
+
                     self.refill_font_request(node, request);
                 }
                 attempt => break attempt,

@@ -122,6 +122,7 @@ pub struct PaintRecorder<'a, O: Observer> {
     list: HitTestList,
     pub(crate) scratch: &'a mut scratch::RecordingScratch,
     pub(crate) resources: resources::RecordingResourceManifest,
+    line_root_positions: Option<(NodeSlotId, crate::painting::paintable_geometry::LineRootPositions)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -133,12 +134,27 @@ pub(crate) struct BasePaintFacts {
     pub paints_border_image: bool,
     pub has_fixed_background: bool,
     pub has_scroll_offset_dependent_background: bool,
+    pub paints_column_rules: bool,
     pub paint_phase_mask: u8,
 }
 
 impl<O: Observer> PaintRecorder<'_, O> {
     pub(crate) fn mark_live_producer(&mut self) {
         self.live_producer = true;
+    }
+
+    pub(crate) fn line_root_positions(
+        &mut self,
+        root: NodeSlotId,
+    ) -> crate::painting::paintable_geometry::LineRootPositions {
+        if let Some((cached_root, positions)) = &self.line_root_positions
+            && *cached_root == root
+        {
+            return positions.clone();
+        }
+        let positions = crate::painting::paintable_geometry::LineRootPositions::new(self.source, root);
+        self.line_root_positions = Some((root, positions.clone()));
+        positions
     }
 
     pub(crate) fn data(&self, paintable: NodeSlotId) -> &PaintableData {
@@ -527,6 +543,41 @@ impl<O: Observer> PaintRecorder<'_, O> {
         )
     }
 
+    pub(crate) fn fragment_border_box(
+        &mut self,
+        paintable: NodeSlotId,
+        index: usize,
+    ) -> (crate::css::css_pixels::CssPixelRect, BorderRadii) {
+        let rect =
+            crate::painting::paintable_geometry::absolute_fragment_border_box_rect(self.source, paintable, index);
+        let Some(style) = self.source.node_style_if_live(paintable) else {
+            return (rect, BorderRadii::default());
+        };
+        let radii = crate::painting::visual_context::node_values::piece_border_radii_data(
+            style,
+            rect.width,
+            rect.height,
+            crate::painting::paintable_geometry::committed_fragment_present_edges(self.source, paintable, index),
+        );
+        (rect, radii)
+    }
+
+    pub(crate) fn border_boxes_of_fragments(
+        &mut self,
+        paintable: NodeSlotId,
+    ) -> smallvec::SmallVec<[(CssPixelRect, BorderRadii); 1]> {
+        let fragment_count = crate::painting::paintable_geometry::fragment_count(self.source, paintable);
+        if fragment_count > 1 && !crate::painting::node_painting::is_fragmented_inline(self.source, paintable) {
+            return (0..fragment_count)
+                .map(|index| self.fragment_border_box(paintable, index))
+                .collect();
+        }
+        smallvec::smallvec![(
+            crate::painting::paintable_geometry::absolute_border_box_rect(self.source, paintable),
+            self.border_radii(paintable),
+        )]
+    }
+
     pub(crate) fn base_paint_facts(&mut self, paintable: NodeSlotId) -> BasePaintFacts {
         if let Some(facts) = self.scratch.base_paint_facts(paintable) {
             return facts;
@@ -564,6 +615,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                     self.inputs.uncaptured.root_background_source,
                     paintable,
                 ),
+            paints_column_rules: paint::column_rule::has_visible_column_rule(style),
             paint_phase_mask: 0,
         };
         facts.paint_phase_mask = paint::paint_phase_mask(self, paintable, style, &facts);

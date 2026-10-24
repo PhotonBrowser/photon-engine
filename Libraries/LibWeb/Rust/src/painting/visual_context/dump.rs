@@ -85,13 +85,17 @@ impl VisualContextTreeDump for VisualContextTree {
                 }
                 let _ = write!(
                     text,
-                    " position_relative_to_scroller={} border_box_size={} scrollport_size={} containing_block_region={} needs_parent_offset_adjustment={} insets=[",
+                    " position_relative_to_scroller={} border_box_size={} scrollport_size={} containing_block_region={} needs_parent_offset_adjustment={}",
                     format_point(sticky.position_relative_to_scroller),
                     format_size(sticky.border_box_size),
                     format_size(sticky.scrollport_size),
                     format_rect(sticky.containing_block_region),
                     sticky.needs_parent_offset_adjustment
                 );
+                if !sticky.non_scrolling_scroll_container.is_invalid() {
+                    text.push_str(" non_scrolling_scroll_container");
+                }
+                text.push_str(" insets=[");
                 let mut is_first_inset = true;
                 let mut append_inset = |side: &str, inset: Option<f32>| {
                     let Some(inset) = inset else {
@@ -246,10 +250,11 @@ impl VisualContextTreeDump for VisualContextTree {
                 };
                 let _ = write!(
                     text,
-                    "mask=[{}] kind={} origin={}",
+                    "mask=[{}] kind={} origin={}{}",
                     format_int_rect_components(mask.rect),
                     kind,
-                    origin
+                    origin,
+                    if mask.masks_backdrop { " masks-backdrop" } else { "" }
                 );
             }
             EffectNodeData::BackgroundColorAnimation => text.push_str("background-color-animation"),
@@ -487,6 +492,7 @@ mod node_dump_tests {
                 },
                 containing_block_region: FloatRect::new(0.0, 0.0, 800.0, 16.0),
                 needs_parent_offset_adjustment: true,
+                non_scrolling_scroll_container: NodeSlotId::INVALID,
                 inset_top: Some(20.0),
                 inset_right: None,
                 inset_bottom: Some(1.5),
@@ -600,6 +606,7 @@ mod node_dump_tests {
                 rect: IntRect::new(1, 2, 30, 40),
                 kind: MaskKind::Luminance,
                 origin: MaskLayerOrigin::SvgMask,
+                masks_backdrop: false,
             }),
             EffectNodeIndex::NONE,
             VISUAL_VIEWPORT_NODE_INDEX,

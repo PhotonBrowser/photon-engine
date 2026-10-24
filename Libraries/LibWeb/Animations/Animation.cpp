@@ -6,6 +6,7 @@
  */
 
 #include <AK/TemporaryChange.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Animations/Animation.h>
@@ -17,9 +18,14 @@
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/CSSAnimation.h>
+#include <LibWeb/CSS/CSSKeywordValue.h>
+#include <LibWeb/CSS/CSSMathSum.h>
 #include <LibWeb/CSS/CSSNumericValue.h>
 #include <LibWeb/CSS/CSSTransition.h>
+#include <LibWeb/CSS/CSSUnitValue.h>
 #include <LibWeb/CSS/Length.h>
+#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -169,6 +175,7 @@ void Animation::set_timeline(GC::Ptr<AnimationTimeline> new_timeline)
 
     // AD-HOC: The normalization of the specified timing of the associated effect depends on the associated timeline.
     //         This must be done before calling set_current_time_for_bindings() to ensure consistent units
+    m_normalized_attachment_interval = attachment_interval();
     if (m_effect)
         m_effect->normalize_specified_timing();
 
@@ -203,13 +210,22 @@ void Animation::set_timeline(GC::Ptr<AnimationTimeline> new_timeline)
     // If from finite timeline and previous progress is resolved,
     else if (from_finite_timeline && previous_progress.has_value()) {
         // Run the procedure to set the current time to previous progress * end time.
-        // NB: We know that the time we are passing is valid so we can wrap this in a MUST() to avoid error handling
-        MUST(set_current_time_for_bindings(previous_progress_multiplied_by_end_time().as_css_numberish()));
+        // NB: We know that the time we are passing is valid so we can wrap this in a MUST() to avoid error handling.
+        //     This is the procedure itself, not script setting the current time of a CSS animation. Until it is done,
+        //     the start time is still in the units of the old timeline.
+        MUST(Animation::set_current_time_for_bindings(previous_progress_multiplied_by_end_time().as_css_numberish()));
     }
 
     // 10. If the start time of animation is resolved, make animation’s hold time unresolved.
-    if (m_start_time.has_value())
+    if (m_start_time.has_value()) {
+        // AD-HOC: A finished animation holds a time beside its start time, and setting its current time as it leaves a
+        //         finite timeline sets the hold time alone, which leaves the start time in the units of the old
+        //         timeline. See https://github.com/w3c/csswg-drafts/issues/11761. Like WebKit, the start time takes
+        //         the hold time.
+        if (m_hold_time.has_value() && m_hold_time->type != m_start_time->type)
+            m_start_time = m_hold_time;
         m_hold_time = {};
+    }
 
     // 11. Run the procedure to update an animation’s finished state for animation with the did seek flag set to false,
     //    and the synchronously notify flag set to false.
@@ -344,6 +360,19 @@ WebIDL::ExceptionOr<void> Animation::set_start_time_for_bindings(NullableCSSNumb
 }
 
 // https://drafts.csswg.org/web-animations-2/#auto-aligning-start-time
+// NB: The effect's timing is normalized against the attachment interval, which moves with the timeline's scroll
+//     container and subject. That holds whether or not the start time is auto-aligned, e.g. for a paused animation.
+void Animation::normalize_timing_against_attachment_interval()
+{
+    auto interval = attachment_interval();
+    if (!interval.has_value() || m_normalized_attachment_interval == *interval)
+        return;
+    m_normalized_attachment_interval = *interval;
+    if (m_effect)
+        m_effect->normalize_specified_timing();
+    invalidate_effect();
+}
+
 void Animation::calculate_auto_aligned_start_time()
 {
     VERIFY(m_timeline && m_timeline->is_progress_based());
@@ -364,15 +393,16 @@ void Animation::calculate_auto_aligned_start_time()
     if (play_state() == AnimationPlayState::Paused && m_hold_time.has_value())
         return;
 
-    // 5. FIXME: Let start offset be the resolved timeline time corresponding to the start of the animation attachment
-    //           range. In the case of view timelines, it requires a calculation based on the proportion of the cover
-    //           range.
-    auto start_offset = TimeValue { TimeValue::Type::Percentage, 0 };
+    normalize_timing_against_attachment_interval();
+    auto interval = attachment_interval().value();
 
-    // 6. FIXME: Let end offset be the resolved timeline time corresponding to the end of the animation attachment
-    //           range. In the case of view timelines, it requires a calculation based on the proportion of the cover
-    //           range.
-    auto end_offset = TimeValue { TimeValue::Type::Percentage, 100 };
+    // 5. Let start offset be the resolved timeline time corresponding to the start of the animation attachment range.
+    //    In the case of view timelines, it requires a calculation based on the proportion of the cover range.
+    auto start_offset = interval.start;
+
+    // 6. Let end offset be the resolved timeline time corresponding to the end of the animation attachment range. In
+    //    the case of view timelines, it requires a calculation based on the proportion of the cover range.
+    auto end_offset = interval.end;
 
     // 7. Set start time to start offset if effective playback rate ≥ 0, and end offset otherwise.
     if (effective_playback_rate() >= 0.0)
@@ -382,6 +412,120 @@ void Animation::calculate_auto_aligned_start_time()
 
     // 8. Clear hold time.
     m_hold_time = {};
+}
+
+// https://drafts.csswg.org/web-animations-2/#dom-keyframeanimationoptions-rangestart
+WebIDL::ExceptionOr<TimelineRangeEdge> parse_timeline_range_edge(DOM::Document& document, TimelineRangeBindingValue const& value, TimelineRangeEdgeSide side)
+{
+    auto property = side == TimelineRangeEdgeSide::Start ? CSS::PropertyID::AnimationRangeStart : CSS::PropertyID::AnimationRangeEnd;
+    // A DOMString value is parsed as an 'animation-range-start' (or 'animation-range-end') value to yield a
+    // TimelineRangeOffset rangeName and offset or alternatively a CSSKeywordValue with the value of "normal"; a
+    // CSSNumericValue is interpreted as a TimelineRangeOffset with that offset and a null rangeName.
+    auto parse = [&](Utf16String const& string) -> WebIDL::ExceptionOr<TimelineRangeEdge> {
+        auto parsed = parse_css_value(CSS::Parser::ParsingParams { document }, string, property);
+        // NB: Arbitrary substitution functions and CSS-wide keywords have nothing to substitute or inherit from here.
+        if (!parsed || parsed->is_css_wide_keyword() || parsed->is_unresolved() || parsed->is_pending_substitution())
+            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid timeline range"_utf16 };
+        auto computed = parsed->absolutized(CSS::ComputationContext { .length_resolution_context = CSS::Length::ResolutionContext::for_document(document) });
+        CSS::ComputedValuesFFI::FfiAnimationRangeEdge edge {};
+        if (!CSS::ComputedValuesFFI::rust_animation_range_edge(computed->rust_style_value_data(), side == TimelineRangeEdgeSide::End, &edge))
+            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid timeline range"_utf16 };
+        return TimelineRangeEdge { static_cast<TimelineRangeName>(edge.name), edge.offset_px, edge.offset_percentage, retain_calculated_offset(edge.offset_calculated) };
+    };
+    return value.visit(
+        [&](Bindings::TimelineRangeOffset const& offset) -> WebIDL::ExceptionOr<TimelineRangeEdge> {
+            Utf16StringBuilder builder;
+            if (offset.range_name.has_value() && offset.range_name->has_value())
+                builder.append(**offset.range_name);
+            if (offset.offset) {
+                builder.append_ascii(' ');
+                builder.append(offset.offset->to_string({}));
+            }
+            // NB: A TimelineRangeOffset that gives neither a range name nor an offset is the default edge.
+            if (builder.is_empty())
+                return parse("normal"_utf16);
+            return parse(builder.to_string());
+        },
+        [&](GC::Ref<CSS::CSSNumericValue> const& offset) { return parse(offset->to_string({})); },
+        // Passing a CSSKeywordValue with a value other than "normal" as the rangeStart or rangeEnd value to any API
+        // defined to accept KeyframeAnimationOptions throws a TypeError.
+        [&](GC::Ref<CSS::CSSKeywordValue> const& keyword) -> WebIDL::ExceptionOr<TimelineRangeEdge> {
+            if (!keyword->value().equals_ignoring_ascii_case("normal"sv))
+                return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid timeline range"_utf16 };
+            return parse("normal"_utf16);
+        },
+        [&](Utf16String const& string) { return parse(string); });
+}
+
+// When reading the attribute, the returned value is either a TimelineRangeOffset or the DOMString "normal".
+static TimelineRangeBindingValue timeline_range_edge_to_bindings(TimelineRangeEdge const& edge, TimelineRangeEdge const& normal)
+{
+    if (edge == normal)
+        return "normal"_utf16;
+
+    auto px = CSS::CSSUnitValue::create(edge.offset_px, "px"_utf16_fly_string);
+    auto percentage = CSS::CSSUnitValue::create(edge.offset_percentage, "percent"_utf16_fly_string);
+    GC::Ref<CSS::CSSNumericValue> offset = edge.offset_px == 0 ? GC::Ref<CSS::CSSNumericValue> { percentage } : GC::Ref<CSS::CSSNumericValue> { px };
+    if (edge.offset_px != 0 && edge.offset_percentage != 0)
+        offset = MUST(CSS::CSSMathSum::create_for_constructor(Vector<CSS::CSSNumberish> { GC::Ref<CSS::CSSNumericValue> { px }, GC::Ref<CSS::CSSNumericValue> { percentage } }));
+    if (edge.calculated_offset) {
+        auto calculated = CSS::StyleValue::adopt_rust_style_value_data(CSS::StyleValueFFI::rust_style_value_retain(edge.calculated_offset.data()));
+        offset = as<CSS::CSSNumericValue>(*calculated->as_calculated().reify({}));
+    }
+
+    Bindings::TimelineRangeOffset range_offset {};
+    range_offset.range_name = edge.name == TimelineRangeName::None ? Optional<Utf16String> {} : Utf16String::from_utf8_without_validation(timeline_range_name_to_string(edge.name).bytes());
+    range_offset.offset = offset;
+    return range_offset;
+}
+
+TimelineRangeBindingValue Animation::range_start_for_bindings() const
+{
+    update_style_if_needed();
+    return timeline_range_edge_to_bindings(m_range.start, AnimationAttachmentRange {}.start);
+}
+
+TimelineRangeBindingValue Animation::range_end_for_bindings() const
+{
+    update_style_if_needed();
+    return timeline_range_edge_to_bindings(m_range.end, AnimationAttachmentRange {}.end);
+}
+
+WebIDL::ExceptionOr<void> Animation::set_range_start_for_bindings(TimelineRangeBindingValue const& value)
+{
+    auto range = m_range;
+    range.start = TRY(parse_timeline_range_edge(HTML::relevant_window(relevant_global_object()).associated_document(), value, TimelineRangeEdgeSide::Start));
+    set_range(range);
+    return {};
+}
+
+WebIDL::ExceptionOr<void> Animation::set_range_end_for_bindings(TimelineRangeBindingValue const& value)
+{
+    auto range = m_range;
+    range.end = TRY(parse_timeline_range_edge(HTML::relevant_window(relevant_global_object()).associated_document(), value, TimelineRangeEdgeSide::End));
+    set_range(range);
+    return {};
+}
+
+void Animation::set_range(AnimationAttachmentRange const& range)
+{
+    if (m_range == range)
+        return;
+    m_range = range;
+    if (!m_timeline || !m_timeline->is_progress_based())
+        return;
+    m_normalized_attachment_interval = attachment_interval();
+    if (m_effect)
+        m_effect->normalize_specified_timing();
+    calculate_auto_aligned_start_time();
+    invalidate_effect();
+}
+
+Optional<AttachmentInterval> Animation::attachment_interval() const
+{
+    if (!m_timeline || !m_timeline->is_progress_based())
+        return {};
+    return m_timeline->interval_for_attachment_range(m_range);
 }
 
 // https://www.w3.org/TR/web-animations-1/#animation-current-time
@@ -1218,8 +1362,10 @@ void Animation::update()
     // https://drafts.csswg.org/scroll-animations-1/#event-loop
     // When updating timeline current time, the start time of any attached animation is conditionally updated. For each
     // attached animation, run the procedure for calculating an auto-aligned start time.
-    if (m_timeline && m_timeline->is_progress_based())
+    if (m_timeline && m_timeline->is_progress_based()) {
+        normalize_timing_against_attachment_interval();
         calculate_auto_aligned_start_time();
+    }
 
     // Prevent unnecessary work if the animation is already finished and can't exit the finished state due to timeline
     // changes

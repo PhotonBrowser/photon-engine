@@ -105,6 +105,25 @@ CSSPixelRect absolute_border_box_rect(Layout::Node const& node)
     return rect;
 }
 
+CSSPixelRect border_box_rect_of_fragments(Layout::Node const& node)
+{
+    CSSPixelRect rect;
+    Layout::RustFFI::layout_script_paintable_border_box_rect_of_fragments(node.document_host(), committed_row_slot(node), &rect);
+    return rect;
+}
+
+size_t box_fragment_count(Layout::Node const& node)
+{
+    return Layout::RustFFI::layout_script_paintable_box_fragment_count(node.document_host(), committed_row_slot(node));
+}
+
+CSSPixelSize unbroken_border_box_size(Layout::Node const& node)
+{
+    CSSPixelSize size;
+    Layout::RustFFI::layout_script_paintable_unbroken_border_box_size(node.document_host(), committed_row_slot(node), &size);
+    return size;
+}
+
 CSSPixelPoint absolute_position(Layout::Node const& node)
 {
     return absolute_rect(node).location();
@@ -435,6 +454,12 @@ CSSPixelRect caret_rect_for_child_offset(Layout::BegunRead const& read, Layout::
     auto* child = dom_node->child_at_index(offset);
     if (!child || !is<HTML::HTMLBRElement>(*child))
         return rect;
+
+    if (auto const* break_layout_node = child->unsafe_layout_node(read)) {
+        CSSPixelPoint line_position;
+        if (Layout::RustFFI::layout_script_empty_line_ended_by_forced_break_position(block.document_host(), committed_row_slot(block), Layout::Node::slot_id(break_layout_node), &line_position))
+            return caret_rect_for_empty_line(styled_block, line_position);
+    }
 
     // A caret parked before a <br> sits on the line below the content preceding the <br>. Layout produces no
     // fragments for <br>, so start below the fragments of any preceding content, and add one line height for each
@@ -791,14 +816,8 @@ void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidat
         set_needs_repaint(node, invalidation.invalidates_hit_test_display_list() ? InvalidateDisplayList::PaintCommandsAndHitTestList : InvalidateDisplayList::PaintCommands);
     if (invalidation.repaint_propagated_text_decorations)
         invalidate_propagated_text_decoration_caches(node);
-    if (invalidation.needs_stacking_context_tree_rebuild()) {
-        auto& document = const_cast<DOM::Document&>(node.document());
-        document.schedule_accumulated_visual_context_update(node, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
-        auto const* table_wrapper_carrying_the_moved_table_properties
-            = display(node).is_table_inside() && node.parent() && node.parent()->is_table_wrapper() ? node.parent() : nullptr;
-        if (table_wrapper_carrying_the_moved_table_properties)
-            document.schedule_accumulated_visual_context_update(*table_wrapper_carrying_the_moved_table_properties, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
-    }
+    if (invalidation.needs_stacking_context_tree_rebuild())
+        const_cast<DOM::Document&>(node.document()).schedule_accumulated_visual_context_update(node, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
 }
 
 Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform()

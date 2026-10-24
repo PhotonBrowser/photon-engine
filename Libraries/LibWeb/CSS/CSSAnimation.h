@@ -36,6 +36,13 @@ public:
     EasingFunction const& default_easing() const { return m_default_easing; }
 
     virtual void set_timeline_for_bindings(GC::Ptr<Animations::AnimationTimeline> timeline) override;
+    virtual WebIDL::ExceptionOr<void> set_range_start_for_bindings(Animations::TimelineRangeBindingValue const&) override;
+    virtual WebIDL::ExceptionOr<void> set_range_end_for_bindings(Animations::TimelineRangeBindingValue const&) override;
+
+    // Looks the named timeline the animation follows up again.
+    void update_named_timeline();
+    // A removed animation no longer follows its named timeline.
+    void stop_following_named_timeline() { m_named_timeline_source.clear(); }
 
     virtual WebIDL::ExceptionOr<void> set_start_time_for_bindings(Animations::NullableCSSNumberish const&) override;
     virtual WebIDL::ExceptionOr<void> set_current_time_for_bindings(Animations::NullableCSSNumberish const&) override;
@@ -65,6 +72,7 @@ private:
         double delay;
         AnimationFillMode fill_mode;
         AnimationComposition composition;
+        Animations::AnimationAttachmentRange range;
 
         bool operator==(AppliedCSSProperties const&) const = default;
     };
@@ -87,9 +95,10 @@ private:
 
     // What the style computation last computed for this animation, as computed values rather than
     // the easings and enums `m_applied_css_properties` holds, with the keyframe set and the timing
-    // function it names, which the animation retains for as long as it names them.
+    // function and range calculations it names, which the animation retains for as long as it names them.
     StyleEngineFFI::FfiAppliedAnimationDefinition m_applied_definition {};
     RefPtr<Animations::KeyframeEffect::KeyFrameSet const> m_applied_keyframe_set;
+    Animations::AnimationAttachmentRange m_applied_definition_range;
     RustStyleValueHandle m_applied_timing_function_value;
 
     bool m_script_overrode_play_state { false };
@@ -98,6 +107,14 @@ private:
     size_t m_animation_name_index { 0 };
 
     void mark_script_play_state_override();
+
+    virtual void visit_edges(Cell::Visitor&) override;
+
+    struct NamedTimelineSource {
+        Utf16FlyString name;
+        DOM::AbstractElement target;
+    };
+    Optional<NamedTimelineSource> m_named_timeline_source;
 };
 
 }

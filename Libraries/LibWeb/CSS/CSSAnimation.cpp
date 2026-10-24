@@ -7,7 +7,9 @@
 #include <LibGC/Heap.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
+#include <LibWeb/Animations/NamedTimelines.h>
 #include <LibWeb/Animations/ScrollTimeline.h>
+#include <LibWeb/Animations/ViewTimeline.h>
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/DOM/Document.h>
@@ -97,12 +99,21 @@ static bool should_update_timeline(GC::Ptr<Animations::AnimationTimeline> old_ti
         GC::Ptr<Animations::AnimationTimeline> const document_timeline = target.document().timeline();
         return old_timeline != document_timeline;
     }
+    case AnimationTimelineSource::Kind::Named:
+        return old_timeline != target.document().named_timelines().target_timeline(target, requested.name);
+    case AnimationTimelineSource::Kind::View: {
+        auto const* old_view_timeline = as_if<Animations::ViewTimeline>(old_timeline.ptr());
+        return !old_view_timeline
+            || old_view_timeline->subject_internal() != target
+            || old_view_timeline->axis() != Animations::scroll_axis_from_css_axis(requested.axis)
+            || old_view_timeline->inset() != requested.view_inset;
+    }
     case AnimationTimelineSource::Kind::Scroll:
         break;
     }
 
     auto const* old_scroll_timeline = as_if<Animations::ScrollTimeline>(old_timeline.ptr());
-    if (!old_scroll_timeline)
+    if (!old_scroll_timeline || is<Animations::ViewTimeline>(*old_scroll_timeline))
         return true;
 
     if (old_scroll_timeline->axis() != Animations::scroll_axis_from_css_axis(requested.axis))
@@ -127,6 +138,10 @@ static GC::Ptr<Animations::AnimationTimeline> materialize_timeline(AnimationTime
             target.document(),
             anonymous_scroll_source(requested, target),
             Animations::scroll_axis_from_css_axis(requested.axis));
+    case AnimationTimelineSource::Kind::View:
+        return Animations::ViewTimeline::create(target.document(), target, Animations::scroll_axis_from_css_axis(requested.axis), requested.view_inset);
+    case AnimationTimelineSource::Kind::Named:
+        return target.document().named_timelines().target_timeline(target, requested.name);
     }
     VERIFY_NOT_REACHED();
 }
@@ -143,6 +158,7 @@ void CSSAnimation::apply_css_properties(AnimationProperties const& animation_pro
     //     computation last computed.
     m_applied_keyframe_set = keyframe_set;
     m_applied_timing_function_value = animation_properties.timing_function_value;
+    m_applied_definition_range = animation_properties.range;
     m_applied_definition = {
         .values = {
             .duration_is_auto = animation_properties.duration.has<Utf16String>(),
@@ -158,9 +174,17 @@ void CSSAnimation::apply_css_properties(AnimationProperties const& animation_pro
             .timeline_kind = to_underlying(animation_properties.timeline.kind),
             .scroll_scroller = to_underlying(animation_properties.timeline.scroller),
             .scroll_axis = to_underlying(animation_properties.timeline.axis),
+            .range_start_name = to_underlying(animation_properties.range.start.name),
+            .range_start_px = animation_properties.range.start.offset_px,
+            .range_start_percentage = animation_properties.range.start.offset_percentage,
+            .range_end_name = to_underlying(animation_properties.range.end.name),
+            .range_end_px = animation_properties.range.end.offset_px,
+            .range_end_percentage = animation_properties.range.end.offset_percentage,
         },
         .keyframe_set = m_applied_keyframe_set.ptr(),
         .timing_function = m_applied_timing_function_value.data(),
+        .range_start_calculated = m_applied_definition_range.start.calculated_offset.data(),
+        .range_end_calculated = m_applied_definition_range.end.calculated_offset.data(),
     };
 
     auto const update_timeline = !m_ignored_css_properties.contains(PropertyID::AnimationTimeline)
@@ -174,7 +198,17 @@ void CSSAnimation::apply_css_properties(AnimationProperties const& animation_pro
         .delay = animation_properties.delay,
         .fill_mode = animation_properties.fill_mode,
         .composition = animation_properties.composition,
+        .range = animation_properties.range,
     };
+    // NB: An animation that names its timeline looks it up again as the timelines its document declares change, also
+    //     while the name finds no timeline.
+    if (animation_properties.timeline.kind == AnimationTimelineSource::Kind::Named) {
+        m_named_timeline_source = NamedTimelineSource { animation_properties.timeline.name, timeline_target };
+        timeline_target.document().named_timelines().track_animation(*this);
+    } else {
+        m_named_timeline_source.clear();
+    }
+
     // NB: Style feedback can recompute an animation's owning element. Reapplying unchanged
     //     properties would invalidate the effect and turn that feedback into an endless cycle.
     if (!update_timeline && m_applied_css_properties == applied_properties)
@@ -185,6 +219,13 @@ void CSSAnimation::apply_css_properties(AnimationProperties const& animation_pro
         HTML::TemporaryExecutionContext context(relevant_settings_object());
         set_timeline(materialize_timeline(animation_properties.timeline, timeline_target));
     }
+    // NB: An edge of the range that script set is no longer the style's to change.
+    auto range = animation_properties.range;
+    if (m_ignored_css_properties.contains(PropertyID::AnimationRangeStart))
+        range.start = this->range().start;
+    if (m_ignored_css_properties.contains(PropertyID::AnimationRangeEnd))
+        range.end = this->range().end;
+    set_range(range);
 
     effect.set_specified_iteration_duration(animation_properties.duration);
     effect.set_specified_start_delay(animation_properties.delay);
@@ -297,6 +338,41 @@ WebIDL::ExceptionOr<void> CSSAnimation::reverse()
     if (!result.is_error() && previous_play_state != play_state())
         mark_script_play_state_override();
     return result;
+}
+
+// AD-HOC: Like the timeline, a range edge script sets takes precedence over the animation-range-start or
+//         animation-range-end property from then on, as WPT expects (scroll-animations/css/animation-range-ignored.html).
+WebIDL::ExceptionOr<void> CSSAnimation::set_range_start_for_bindings(Animations::TimelineRangeBindingValue const& value)
+{
+    TRY(Animations::Animation::set_range_start_for_bindings(value));
+    m_ignored_css_properties.set(PropertyID::AnimationRangeStart);
+    return {};
+}
+
+WebIDL::ExceptionOr<void> CSSAnimation::set_range_end_for_bindings(Animations::TimelineRangeBindingValue const& value)
+{
+    TRY(Animations::Animation::set_range_end_for_bindings(value));
+    m_ignored_css_properties.set(PropertyID::AnimationRangeEnd);
+    return {};
+}
+
+void CSSAnimation::update_named_timeline()
+{
+    if (!m_named_timeline_source.has_value() || m_ignored_css_properties.contains(PropertyID::AnimationTimeline))
+        return;
+    auto const& [name, target] = *m_named_timeline_source;
+    GC::Ptr<Animations::AnimationTimeline> timeline = target.document().named_timelines().target_timeline(target, name);
+    if (timeline == this->timeline())
+        return;
+    HTML::TemporaryExecutionContext context(relevant_settings_object());
+    set_timeline(timeline);
+}
+
+void CSSAnimation::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    if (m_named_timeline_source.has_value())
+        m_named_timeline_source->target.visit(visitor);
 }
 
 void CSSAnimation::set_timeline_for_bindings(GC::Ptr<Animations::AnimationTimeline> timeline)

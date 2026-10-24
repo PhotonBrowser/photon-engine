@@ -81,10 +81,6 @@ HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSi
     // A headless window is exactly its viewport, so every page gets the viewport as its window size.
     m_window_size = viewport_size.to_type<int>();
 
-    on_new_webdriver_window = [this](auto) {
-        return NewWebDriverWindow { *create_view_for_new_tab_or_window(this->is_private()), NewWindowType::Tab };
-    };
-
     on_new_web_view = [this](auto, auto, CanonicalTraversable& traversable) {
         auto web_view = HeadlessWebView::create_child(*this, traversable);
 
@@ -271,16 +267,9 @@ void HeadlessWebView::schedule_forced_close()
         m_forced_close_timer->start();
 }
 
-void HeadlessWebView::send_system_theme_to_page(WebContentPage& page)
+Optional<ViewImplementation::ScreenRects> HeadlessWebView::screen_rects() const
 {
-    page.async_update_system_theme(m_theme);
-}
-
-void HeadlessWebView::prepare_page_for_navigable(WebContentPage& page)
-{
-    ViewImplementation::prepare_page_for_navigable(page);
-
-    page.async_update_screen_rects({ { screen_rect } }, { { screen_rect } }, 0);
+    return ScreenRects { .rects = { screen_rect }, .available_rects = { screen_rect }, .main_screen_index = 0 };
 }
 
 void HeadlessWebView::reset_viewport_size(Web::DevicePixelSize size)

@@ -16,11 +16,10 @@
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
-#include <LibGfx/Font/Font.h>
+#include <LibGfx/Font/RasterizerData.h>
 #include <LibGfx/Font/Typeface.h>
 #include <LibGfx/ShapeFeature.h>
 
-class SkFont;
 struct hb_font_t;
 struct hb_buffer_t;
 
@@ -52,20 +51,6 @@ enum FontWidth {
 
 constexpr float text_shaping_resolution = 64;
 
-enum class FontHintingStyle {
-    None,
-    Slight,
-    Normal,
-    Full,
-};
-
-struct FontHintingOptions {
-    FontHintingStyle style { FontHintingStyle::Normal };
-    bool force_autohinting { false };
-};
-
-void force_hinting_for_testing(Optional<FontHintingStyle>);
-
 class Font : public AtomicRefCounted<Font> {
 public:
     Font(NonnullRefPtr<Typeface const>, float point_width, float point_height, FontVariationSettings const variations, ShapeFeatures const& features);
@@ -75,44 +60,49 @@ public:
     float point_size() const;
     float pixel_size() const;
     FontPixelMetrics const& pixel_metrics() const { return m_pixel_metrics; }
-    u8 slope() const { return m_typeface->slope(); }
-    u16 weight() const { return m_typeface->weight(); }
+    // Metrics that only font-size-adjust reads, measured when asked for rather than with the pixel metrics.
+    float cap_height() const;
+    Optional<float> horizontal_advance_of_code_point(u32 code_point) const;
+    Optional<float> vertical_advance_of_code_point(u32 code_point) const;
+    u8 slope() const { return m_style.slope; }
+    u16 weight() const { return m_style.weight; }
+    u16 width() const { return m_style.width; }
     bool contains_glyph(u32 code_point) const { return m_typeface->glyph_id_for_code_point(code_point) > 0; }
     u32 glyph_id_for_code_point(u32 code_point) const { return m_typeface->glyph_id_for_code_point(code_point); }
     int x_height() const { return m_point_height; } // FIXME: Read from font
     float width(Utf16View const&) const;
     FlyString const& family() const { return m_typeface->family(); }
 
-    NonnullRefPtr<Font> with_size(float point_size) const;
     NonnullRefPtr<Font> invisible_variant() const;
     bool is_invisible() const { return m_is_invisible; }
 
     Typeface const& typeface() const { return m_typeface; }
 
-    SkFont skia_font(float scale) const;
-
-    hb_font_t* harfbuzz_font() const;
+    hb_font_t* harfbuzz_font() const { return m_harfbuzz_font; }
     FontVariationSettings const& variation_settings() const { return m_font_variation_settings; }
     ShapeFeatures const& features() const { return m_shape_features; }
 
     bool is_emoji_font() const;
 
+    // Called by AtomicRefCounted when the last reference goes away.
+    void will_be_destroyed() const;
+
+    // What a rasterizer keeps with this font. The first call makes it.
+    template<typename T, typename Callback>
+    T& rasterizer_data(Callback make) const { return m_rasterizer_data.get<T>(make); }
+
 private:
+    friend class Typeface;
+
     bool m_is_invisible { false };
     u64 m_id { 0 };
 
-#if defined(USE_FONTCONFIG)
-    FontHintingOptions hinting_options(float scale) const;
+    hb_font_t* create_harfbuzz_font() const;
+    FontPixelMetrics compute_pixel_metrics() const;
 
-    // The one-entry memo is a single atomic word because a stage that turns text into a path and
-    // the rasterizer that draws it ask the same font for hinting at different scales. Font.cpp
-    // owns the encoding. Either winner is correct: fontconfig's answer is a pure function of the
-    // family, the scaled pixel size, the weight and the slope.
-    mutable Atomic<u64> m_hinting_memo { 0 };
-#endif
+    hb_font_t* m_harfbuzz_font { nullptr };
 
-    mutable OnceFlag m_harfbuzz_font_once;
-    mutable hb_font_t* m_harfbuzz_font { nullptr };
+    RasterizerDataSlot m_rasterizer_data;
 
     // A layout pass classifies fonts while the document thread may be doing the same to the same
     // font, so the verdict is a single atomic byte. Either winner is correct: the classification
@@ -125,6 +115,7 @@ private:
     FontVariationSettings const m_font_variation_settings;
     ShapeFeatures m_shape_features;
     FontPixelMetrics m_pixel_metrics;
+    FaceStyle m_style;
 
     float m_pixel_size { 0.0f };
 };

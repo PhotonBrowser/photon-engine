@@ -41,6 +41,7 @@
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
+#include <math.h>
 
 #include <cstdlib>
 
@@ -133,6 +134,16 @@ ViewImplementation::~ViewImplementation()
 
     if (m_top_level_traversable)
         CanonicalTraversable::remove_from_user_agent_top_level_traversable_set(*m_top_level_traversable);
+}
+
+pid_t ViewImplementation::web_content_pid() const
+{
+    return page().client().pid();
+}
+
+Vector<HistoryEntry> ViewImplementation::recent_history_entries(size_t limit) const
+{
+    return m_session->history_store->list_entries({}, 0, limit);
 }
 
 CanonicalTraversable& ViewImplementation::traversable() const
@@ -708,6 +719,59 @@ void ViewImplementation::set_zoom(double zoom_level)
     update_zoom();
 }
 
+void ViewImplementation::set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second)
+{
+    m_display_id = display_id;
+    m_maximum_frames_per_second = maximum_frames_per_second;
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        page.async_set_maximum_frames_per_second(m_maximum_frames_per_second);
+        update_compositor_display_metadata(page);
+    });
+}
+
+void ViewImplementation::set_viewport_corner_radius(double radius)
+{
+    if (m_viewport_corner_radius == radius)
+        return;
+    m_viewport_corner_radius = radius;
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        page.async_set_viewport_corner_radius(m_viewport_corner_radius);
+    });
+}
+
+void ViewImplementation::update_compositor_display_metadata(WebContentPage& page)
+{
+    Application::the().update_compositor_display_metadata(page.compositor_context_id(), m_display_id, m_maximum_frames_per_second);
+}
+
+static void send_screen_rects_to_page(WebContentPage& page, ViewImplementation::ScreenRects const& screens)
+{
+    page.async_update_screen_rects(screens.rects, screens.available_rects, screens.main_screen_index);
+}
+
+void ViewImplementation::update_screen_rects()
+{
+    auto screens = screen_rects();
+    if (!screens.has_value())
+        return;
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        send_screen_rects_to_page(page, *screens);
+    });
+}
+
+void ViewImplementation::update_system_theme(Core::AnonymousBuffer const& theme)
+{
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        page.async_update_system_theme(theme);
+    });
+}
+
+void ViewImplementation::send_system_theme_to_page(WebContentPage& page)
+{
+    if (auto theme = system_theme(); theme.is_valid())
+        page.async_update_system_theme(theme);
+}
+
 void ViewImplementation::reset_zoom()
 {
     m_zoom_level = 1.0;
@@ -756,6 +820,11 @@ static constexpr auto longest_user_activation_delivery = AK::Duration::from_seco
 
 void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 {
+    // NB: A pinch event's scale delta must be finite to be sent over IPC. Drop a pinch event the platform gave us
+    //     with a scale delta that is not finite.
+    if (auto const* pinch_event = event.get_pointer<Web::PinchEvent>(); pinch_event && !isfinite(pinch_event->scale_delta))
+        return;
+
     auto* key_event = event.get_pointer<Web::KeyEvent>();
     auto* mouse_event = event.get_pointer<Web::MouseEvent>();
     auto watches_page_response = (key_event && key_event->type == Web::KeyEvent::Type::KeyDown)
@@ -798,23 +867,6 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         mouse_event->wheel_tick_120ths_y /= zoom_level();
     }
 
-    if (key_event && !key_event->native_editing_binding_resolved && Web::is_keyboard_scroll_key(key_event->key, Web::UIEvents::Mod_None)) {
-        bool preceding_input_may_change_target = false;
-        for (auto const& pending : m_pending_input_events) {
-            auto const* key = pending.event.get_pointer<Web::KeyEvent>();
-            if (!key || key->type != Web::KeyEvent::Type::KeyDown || !key->async_scroll_performed_default_action)
-                preceding_input_may_change_target = true;
-        }
-        // Always deliver key release to the compositor, even if it could no longer accept a new scroll. A focused
-        // navigable another page hosts scrolls there.
-        if (&focused_navigable_host() == &page()
-            && (key_event->type == Web::KeyEvent::Type::KeyUp
-                || (m_has_usable_bitmap && !preceding_input_may_change_target))) {
-            auto handled = page().handle_key_event_in_compositor(*key_event);
-            key_event->async_scroll_performed_default_action = handled && key_event->type == Web::KeyEvent::Type::KeyDown;
-        }
-    }
-
     // Send the next event over to the WebContent to be handled by JS. We'll later get a message to say whether JS
     // prevented the default event behavior, at which point we either discard or handle that event, and then try to
     // process the next one.
@@ -833,33 +885,73 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         });
         m_inputs_to_open_links_in_new_tabs.append({ Web::input_event_id(pending.event), now });
     }
+    // A focused navigable another page hosts takes key events directly.
+    if (pending.event.has<Web::KeyEvent>())
+        pending.endpoint = focused_navigable_host();
+    send_queued_input_events();
+}
+
+// Input waits while the compositor decides whether it forwards a key event, so a key it hands back is not overtaken.
+void ViewImplementation::send_queued_input_events()
+{
+    for (size_t index = 0; index < m_pending_input_events.size(); ++index) {
+        if (!m_pending_input_events[index].sent)
+            send_input_event(index);
+        if (m_pending_input_events[index].awaits_compositor_dispatch())
+            return;
+    }
+}
+
+// A key press may scroll in the compositor only while no earlier input the pages have yet to handle can change its
+// target. Key release always reaches the compositor's keyboard scrolling, even if it could no longer accept a new
+// scroll.
+bool ViewImplementation::may_scroll_for_key_event_in_compositor(size_t index) const
+{
+    auto const& key_event = m_pending_input_events[index].event.get<Web::KeyEvent>();
+    if (key_event.native_editing_binding_resolved || !Web::is_keyboard_scroll_key(key_event.key, Web::UIEvents::Mod_None))
+        return false;
+    if (key_event.type == Web::KeyEvent::Type::KeyUp)
+        return true;
+    if (!m_has_usable_bitmap)
+        return false;
+    for (size_t preceding = 0; preceding < index; ++preceding) {
+        auto const* key = m_pending_input_events[preceding].event.get_pointer<Web::KeyEvent>();
+        if (!key || key->type != Web::KeyEvent::Type::KeyDown || !key->async_scroll_performed_default_action)
+            return false;
+    }
+    return true;
+}
+
+void ViewImplementation::send_input_event(size_t index)
+{
+    auto& pending = m_pending_input_events[index];
+    pending.sent = true;
     pending.event.visit(
         [&](Web::KeyEvent const& event) {
-            auto& host = focused_navigable_host();
-            if (&host == &page()) {
-                page().dispatch_key_event_to_web_content(event);
-            } else {
-                pending.endpoint = host;
-                host.async_key_event(event.clone_without_browser_data());
-            }
+            // The compositor scrolls for the event when it may, then forwards the event to WebContent behind the scroll
+            // updates that produced, or hands it back for direct dispatch.
+            if (pending.endpoint == page() && page().handle_and_dispatch_key_event_in_compositor(event, may_scroll_for_key_event_in_compositor(index)))
+                pending.routed_through_compositor = true;
+            else
+                pending.endpoint->async_key_event(event.clone_without_browser_data());
         },
         [&](Web::MouseEvent const& event) {
             // The compositor scrolls or drags a scrollbar for the event when it can, then forwards the event to
             // WebContent behind the scroll updates that produced, consumes it, or hands it back for direct dispatch.
-            if (page().handle_and_dispatch_mouse_event_in_compositor(event))
+            if (pending.endpoint->handle_and_dispatch_mouse_event_in_compositor(event))
                 pending.routed_through_compositor = true;
             else
-                page().async_mouse_event(event.clone_without_browser_data());
+                pending.endpoint->async_mouse_event(event.clone_without_browser_data());
         },
-        [this](Web::DragEvent& event) {
+        [&](Web::DragEvent& event) {
             auto cloned_event = event.clone_without_browser_data();
             cloned_event.files = move(event.files);
 
-            page().async_drag_event(cloned_event);
+            pending.endpoint->async_drag_event(cloned_event);
         },
-        [this](Web::PinchEvent const& event) {
-            page().handle_pinch_event_in_compositor(event);
-            page().async_pinch_event(event);
+        [&](Web::PinchEvent const& event) {
+            pending.endpoint->handle_pinch_event_in_compositor(event);
+            pending.endpoint->async_pinch_event(event);
         });
 }
 
@@ -1037,6 +1129,7 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
     auto pending = m_pending_input_events.take(*index);
     auto event = move(pending.event);
     update_input_response_watchdog();
+    send_queued_input_events();
 
     // The renderer's activation counts from when it handled the event, so the activation the event gives does too. An
     // event the page dropped gives none, and opens no link.
@@ -1052,6 +1145,15 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
     if (auto const* mouse_event = event.get_pointer<Web::MouseEvent>()) {
         if (on_finish_handling_mouse_event)
             on_finish_handling_mouse_event(*mouse_event, event_result);
+
+        // The back and forward buttons traverse the session history once released, unless the page cancelled the
+        // mouseup.
+        if (mouse_event->type == Web::MouseEvent::Type::MouseUp && event_result != Web::EventResult::Cancelled) {
+            if (mouse_event->button == Web::UIEvents::MouseButton::Backward)
+                traverse_the_history_by_delta(-1);
+            else if (mouse_event->button == Web::UIEvents::MouseButton::Forward)
+                traverse_the_history_by_delta(1);
+        }
         return;
     }
 
@@ -1133,11 +1235,12 @@ bool ViewImplementation::take_input_to_open_link_in_new_tab(Badge<WebContentPage
     return true;
 }
 
-void ViewImplementation::did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage& page)
+void ViewImplementation::did_lose_input_event_endpoint(Badge<WebContentPage>, WebContentPage& page)
 {
-    // Nothing will finish the events the lost page held, and a pending event holds back compositor input.
+    // Nothing will finish the events the closed page held, and a pending event holds back compositor input.
     m_pending_input_events.remove_all_matching([&](auto const& pending) { return pending.endpoint == page; });
     update_input_response_watchdog();
+    send_queued_input_events();
 }
 
 void ViewImplementation::did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id)
@@ -1147,6 +1250,7 @@ void ViewImplementation::did_consume_input_event_in_compositor(Badge<WebContentP
     m_pending_input_events.remove_first_matching([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
     update_input_response_watchdog();
     m_inputs_to_open_links_in_new_tabs.remove_all_matching([&](auto const& input) { return input.event_id == event_id; });
+    send_queued_input_events();
 }
 
 void ViewImplementation::did_detect_history_swipe_candidate(Badge<WebContentPage>, u64 gesture_id, bool back, float unconsumed_delta)
@@ -1165,14 +1269,35 @@ void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<W
         return;
 
     auto& pending = m_pending_input_events[*index];
+    if (!pending.routed_through_compositor)
+        return;
     pending.routed_through_compositor = false;
     pending.event.visit(
+        [&](Web::KeyEvent const& event) {
+            pending.endpoint->async_key_event(event.clone_without_browser_data());
+        },
         [&](Web::MouseEvent const& event) {
             pending.endpoint->async_mouse_event(event.clone_without_browser_data());
         },
         [](auto const&) {
             VERIFY_NOT_REACHED();
         });
+    send_queued_input_events();
+}
+
+void ViewImplementation::did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action)
+{
+    auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
+    if (!index.has_value())
+        return;
+
+    auto& pending = m_pending_input_events[*index];
+    if (!pending.awaits_compositor_dispatch())
+        return;
+    // WebContent finishes the event from here on, as it does an event the view sends it directly.
+    pending.routed_through_compositor = false;
+    pending.event.get<Web::KeyEvent>().async_scroll_performed_default_action = async_scroll_performed_default_action;
+    send_queued_input_events();
 }
 
 void ViewImplementation::discard_input_events_routed_through_lost_compositor(Badge<Application>)
@@ -1181,6 +1306,7 @@ void ViewImplementation::discard_input_events_routed_through_lost_compositor(Bad
     // so sending them again could run an event twice. Acknowledgements that still arrive for them are ignored.
     m_pending_input_events.remove_all_matching([](auto const& pending) { return pending.routed_through_compositor; });
     update_input_response_watchdog();
+    send_queued_input_events();
 }
 
 void ViewImplementation::update_input_response_watchdog()
@@ -1312,6 +1438,7 @@ void ViewImplementation::restart_unresponsive_page()
         return;
     }
     Application::process_manager().force_exit_after_timeout(pid, 0);
+    send_queued_input_events();
 }
 
 void ViewImplementation::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)
@@ -3110,6 +3237,7 @@ void ViewImplementation::prepare_page_for_navigable(WebContentPage& page)
     if (m_window_size.has_value())
         page.async_set_window_size(m_window_size->to_type<Web::DevicePixels>());
     page.async_set_maximum_frames_per_second(m_maximum_frames_per_second);
+    page.async_set_viewport_corner_radius(m_viewport_corner_radius);
     page.async_set_has_focus(traversable().has_system_focus());
     if (auto focused_navigable_id = traversable().focused_navigable_id(); focused_navigable_id.has_value())
         page.async_set_focused_navigable(*focused_navigable_id);
@@ -3122,6 +3250,8 @@ void ViewImplementation::prepare_page_for_navigable(WebContentPage& page)
     Application::the().apply_view_options({}, *this, page);
     send_force_dark(page);
     send_preferences_to_page(page);
+    if (auto screens = screen_rects(); screens.has_value())
+        send_screen_rects_to_page(page, *screens);
 }
 
 void ViewImplementation::prepare_page_for_tab(WebContentPage& page)
@@ -3427,6 +3557,11 @@ void ViewImplementation::did_complete_webdriver_user_prompt_handling(Badge<WebCo
 {
     if (auto on_complete = m_pending_webdriver_user_prompt_requests.take(request_id); on_complete.has_value())
         on_complete.value()(move(response));
+}
+
+void ViewImplementation::did_open_user_prompt(Badge<WebContentPage>)
+{
+    complete_webdriver_navigation();
 }
 
 Optional<ViewImplementation&> ViewImplementation::find_view_by_handle(StringView handle)
@@ -4407,7 +4542,6 @@ void ViewImplementation::initialize_context_menus()
     m_page_context_menu->add_action(*m_report_website_issue_action);
 
     m_link_context_menu = Menu::create("Link Context Menu"sv);
-    m_link_context_menu->add_action(*m_look_up_selected_text_action);
     add_open_url_actions(*m_link_context_menu);
     m_link_context_menu->add_separator();
     m_link_context_menu->add_action(*m_download_linked_file_action);
@@ -4426,9 +4560,8 @@ void ViewImplementation::initialize_context_menus()
     m_selected_text_link_context_menu->add_action(*m_copy_link_to_highlight_action);
 
     m_image_context_menu = Menu::create("Image Context Menu"sv);
-    m_image_context_menu->add_action(*m_look_up_selected_text_action);
-    m_image_context_menu->add_action(*m_open_image_action);
     m_image_context_menu->add_action(*m_open_in_new_tab_action);
+    m_image_context_menu->add_action(*m_open_image_action);
     m_image_context_menu->add_separator();
     m_image_context_menu->add_action(*m_save_image_action);
     m_image_context_menu->add_separator();
@@ -4436,7 +4569,6 @@ void ViewImplementation::initialize_context_menus()
     m_image_context_menu->add_action(*m_copy_url_action);
 
     m_media_context_menu = Menu::create("Media Context Menu"sv);
-    m_media_context_menu->add_action(*m_look_up_selected_text_action);
     m_media_context_menu->add_action(*m_media_play_action);
     m_media_context_menu->add_action(*m_media_pause_action);
     m_media_context_menu->add_action(*m_media_mute_action);
@@ -4449,9 +4581,9 @@ void ViewImplementation::initialize_context_menus()
     m_media_context_menu->add_action(*m_media_enter_picture_in_picture_action);
     m_media_context_menu->add_action(*m_media_exit_picture_in_picture_action);
     m_media_context_menu->add_separator();
+    m_media_context_menu->add_action(*m_open_in_new_tab_action);
     m_media_context_menu->add_action(*m_open_audio_action);
     m_media_context_menu->add_action(*m_open_video_action);
-    m_media_context_menu->add_action(*m_open_in_new_tab_action);
     m_media_context_menu->add_separator();
     m_media_context_menu->add_action(*m_copy_url_action);
 
@@ -4852,34 +4984,28 @@ void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, We
 void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<u64> text_fragment_generation_id)
 {
     request_text_fragment_url(text_fragment_generation_id);
-    auto request_id = ++m_context_menu_request_id;
-    auto weak_this = make_weak_ptr();
-    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, navigation = move(navigation)](auto const& lookup) mutable {
-        if (!weak_this || request_id != weak_this->m_context_menu_request_id)
-            return;
+    ++m_context_menu_request_id;
 
-        weak_this->set_context_menu_url_actions_enabled(true);
-        weak_this->m_context_menu_url = navigation.url;
-        weak_this->m_context_menu_navigation = move(navigation);
-        weak_this->update_look_up_selected_text_action(lookup, content_position);
+    set_context_menu_url_actions_enabled(true);
+    m_context_menu_url = navigation.url;
+    m_context_menu_navigation = move(navigation);
 
-        weak_this->m_open_in_new_tab_action->set_text("Open in New Tab"sv);
+    m_open_in_new_tab_action->set_text("Open in New Tab"sv);
 
-        switch (url_type(weak_this->m_context_menu_url)) {
-        case URLType::Email:
-            weak_this->m_copy_url_action->set_text("Copy Email Address"sv);
-            break;
-        case URLType::Telephone:
-            weak_this->m_copy_url_action->set_text("Copy Phone Number"sv);
-            break;
-        case URLType::Other:
-            weak_this->m_copy_url_action->set_text("Copy Link Address"sv);
-            break;
-        }
+    switch (url_type(m_context_menu_url)) {
+    case URLType::Email:
+        m_copy_url_action->set_text("Copy Email Address"sv);
+        break;
+    case URLType::Telephone:
+        m_copy_url_action->set_text("Copy Phone Number"sv);
+        break;
+    case URLType::Other:
+        m_copy_url_action->set_text("Copy Link Address"sv);
+        break;
+    }
 
-        if (weak_this->m_link_context_menu->on_activation)
-            weak_this->m_link_context_menu->on_activation(weak_this->to_widget_position(content_position));
-    });
+    if (m_link_context_menu->on_activation)
+        m_link_context_menu->on_activation(to_widget_position(content_position));
 }
 
 void ViewImplementation::download_context_menu_url(PromptForPath prompt_for_path)
@@ -4902,26 +5028,20 @@ void ViewImplementation::download_context_menu_url(PromptForPath prompt_for_path
 
 void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap)
 {
-    auto request_id = ++m_context_menu_request_id;
-    auto weak_this = make_weak_ptr();
-    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, navigation = move(navigation), bitmap = move(bitmap)](auto const& lookup) mutable {
-        if (!weak_this || request_id != weak_this->m_context_menu_request_id)
-            return;
+    ++m_context_menu_request_id;
 
-        weak_this->set_context_menu_url_actions_enabled(true);
-        weak_this->m_context_menu_url = navigation.url;
-        weak_this->m_context_menu_navigation = move(navigation);
-        weak_this->m_image_context_menu_bitmap = move(bitmap);
-        weak_this->update_look_up_selected_text_action(lookup, content_position);
+    set_context_menu_url_actions_enabled(true);
+    m_context_menu_url = navigation.url;
+    m_context_menu_navigation = move(navigation);
+    m_image_context_menu_bitmap = move(bitmap);
 
-        weak_this->m_open_in_new_tab_action->set_text("Open Image in New Tab"sv);
-        weak_this->m_copy_url_action->set_text("Copy Image URL"sv);
+    m_open_in_new_tab_action->set_text("Open Image in New Tab"sv);
+    m_copy_url_action->set_text("Copy Image URL"sv);
 
-        weak_this->m_copy_image_action->set_enabled(weak_this->m_image_context_menu_bitmap.has_value());
+    m_copy_image_action->set_enabled(m_image_context_menu_bitmap.has_value());
 
-        if (weak_this->m_image_context_menu->on_activation)
-            weak_this->m_image_context_menu->on_activation(weak_this->to_widget_position(content_position));
-    });
+    if (m_image_context_menu->on_activation)
+        m_image_context_menu->on_activation(to_widget_position(content_position));
 }
 
 void ViewImplementation::send_to_media_context_menu_page(Function<void(WebContentPage&)> const& send)
@@ -4943,42 +5063,36 @@ void ViewImplementation::set_context_menu_url_actions_enabled(bool enabled)
 void ViewImplementation::did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)
 {
     m_media_context_menu_page = requesting_page;
-    auto request_id = ++m_context_menu_request_id;
-    auto weak_this = make_weak_ptr();
-    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, menu = move(menu), navigation = move(navigation)](auto const& lookup) mutable {
-        if (!weak_this || request_id != weak_this->m_context_menu_request_id)
-            return;
+    ++m_context_menu_request_id;
 
-        weak_this->set_context_menu_url_actions_enabled(menu.media_url.has_value());
-        weak_this->m_context_menu_url = move(menu.media_url).value_or({});
-        weak_this->m_context_menu_navigation = move(navigation);
-        weak_this->update_look_up_selected_text_action(lookup, content_position);
+    set_context_menu_url_actions_enabled(menu.media_url.has_value());
+    m_context_menu_url = move(menu.media_url).value_or({});
+    m_context_menu_navigation = move(navigation);
 
-        weak_this->m_open_in_new_tab_action->set_text(menu.is_video ? "Open Video in New Tab"sv : "Open Audio in new Tab"sv);
-        weak_this->m_copy_url_action->set_text(menu.is_video ? "Copy Video URL"sv : "Copy Audio URL"sv);
+    m_open_in_new_tab_action->set_text(menu.is_video ? "Open Video in New Tab"sv : "Open Audio in new Tab"sv);
+    m_copy_url_action->set_text(menu.is_video ? "Copy Video URL"sv : "Copy Audio URL"sv);
 
-        weak_this->m_open_audio_action->set_visible(!menu.is_video);
-        weak_this->m_open_video_action->set_visible(menu.is_video);
+    m_open_audio_action->set_visible(!menu.is_video);
+    m_open_video_action->set_visible(menu.is_video);
 
-        weak_this->m_media_play_action->set_visible(!menu.is_playing);
-        weak_this->m_media_pause_action->set_visible(menu.is_playing);
+    m_media_play_action->set_visible(!menu.is_playing);
+    m_media_pause_action->set_visible(menu.is_playing);
 
-        weak_this->m_media_mute_action->set_visible(!menu.is_muted);
-        weak_this->m_media_unmute_action->set_visible(menu.is_muted);
+    m_media_mute_action->set_visible(!menu.is_muted);
+    m_media_unmute_action->set_visible(menu.is_muted);
 
-        weak_this->m_media_show_controls_action->set_visible(!menu.has_user_agent_controls);
-        weak_this->m_media_hide_controls_action->set_visible(menu.has_user_agent_controls);
+    m_media_show_controls_action->set_visible(!menu.has_user_agent_controls);
+    m_media_hide_controls_action->set_visible(menu.has_user_agent_controls);
 
-        weak_this->m_media_loop_action->set_checked(menu.is_looping);
+    m_media_loop_action->set_checked(menu.is_looping);
 
-        weak_this->m_media_enter_fullscreen_action->set_visible(menu.is_video && !menu.is_fullscreen);
-        weak_this->m_media_exit_fullscreen_action->set_visible(menu.is_video && menu.is_fullscreen);
-        weak_this->m_media_enter_picture_in_picture_action->set_visible(menu.can_enter_picture_in_picture && !menu.is_picture_in_picture);
-        weak_this->m_media_exit_picture_in_picture_action->set_visible(menu.is_picture_in_picture);
+    m_media_enter_fullscreen_action->set_visible(menu.is_video && !menu.is_fullscreen);
+    m_media_exit_fullscreen_action->set_visible(menu.is_video && menu.is_fullscreen);
+    m_media_enter_picture_in_picture_action->set_visible(menu.can_enter_picture_in_picture && !menu.is_picture_in_picture);
+    m_media_exit_picture_in_picture_action->set_visible(menu.is_picture_in_picture);
 
-        if (weak_this->m_media_context_menu->on_activation)
-            weak_this->m_media_context_menu->on_activation(weak_this->to_widget_position(content_position));
-    });
+    if (m_media_context_menu->on_activation)
+        m_media_context_menu->on_activation(to_widget_position(content_position));
 }
 
 u64 ViewImplementation::add_navigation_listener(NavigationListener listener)

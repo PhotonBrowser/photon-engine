@@ -96,25 +96,41 @@ WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(Vector<BaseKeyframe>
 
 WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(JS::Realm& realm, GC::Ptr<JS::Object> keyframes, Variant<double, Bindings::KeyframeAnimationOptions> const& options)
 {
-    auto animation = TRY(animate(TRY(process_keyframes(realm, keyframes)), TRY(keyframe_animation_options_from_bindings(options))));
+    auto processed_keyframes = TRY(process_keyframes(realm, keyframes));
+
+    // https://drafts.csswg.org/web-animations-2/#dom-keyframeanimationoptions-rangestart
+    // https://drafts.csswg.org/web-animations-2/#dom-keyframeanimationoptions-rangeend
+    // INTEROP: Like Chrome, the keyframes are processed before the range is parsed, so the keyframes' getters run first.
+    Optional<AnimationAttachmentRange> range;
+    if (auto const* animation_options = options.get_pointer<Bindings::KeyframeAnimationOptions>()) {
+        auto& document = static_cast<DOM::Element*>(this)->document();
+        range = AnimationAttachmentRange {
+            .start = TRY(parse_timeline_range_edge(document, animation_options->range_start, TimelineRangeEdgeSide::Start)),
+            .end = TRY(parse_timeline_range_edge(document, animation_options->range_end, TimelineRangeEdgeSide::End)),
+        };
+    }
+
+    auto animation = TRY(animate(move(processed_keyframes), TRY(keyframe_animation_options_from_bindings(options))));
+    if (range.has_value())
+        animation->set_range(*range);
 
     return animation;
 }
 
 // https://drafts.csswg.org/web-animations-1/#dom-animatable-getanimations
-WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations(GetAnimationsOptions const& options)
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> Animatable::get_animations(GetAnimationsOptions const& options)
 {
     as<DOM::Element>(*this).document().update_style();
 
     return get_animations_internal(GetAnimationsSorted::Yes, options);
 }
 
-WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations(Bindings::GetAnimationsOptions const& options)
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> Animatable::get_animations(Bindings::GetAnimationsOptions const& options)
 {
     return get_animations(TRY(get_animations_options_from_bindings(options)));
 }
 
-WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options)
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> Animatable::get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options)
 {
     // 1. Let object be the object on which this method was called.
 
@@ -126,7 +142,7 @@ WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_inter
 
     // 4. If options is passed with subtree set to true, then return the set of relevant animations for a subtree of target.
     //    Otherwise, return the set of relevant animations for target.
-    Vector<GC::Ref<Animation>> relevant_animations;
+    GC::RootVector<GC::Ref<Animation>> relevant_animations;
     if (m_impl) {
         auto& associated_animations = m_impl->associated_animations;
         for (auto const& animation : associated_animations) {
@@ -198,19 +214,6 @@ bool Animatable::has_relevant_animations() const
 
     for (auto const& animation : m_impl->associated_animations) {
         if (animation->is_relevant())
-            return true;
-    }
-
-    return false;
-}
-
-bool Animatable::has_relevant_animations_other_than_transitions() const
-{
-    if (!m_impl)
-        return false;
-
-    for (auto const& animation : m_impl->associated_animations) {
-        if (!animation->is_css_transition() && animation->is_relevant())
             return true;
     }
 

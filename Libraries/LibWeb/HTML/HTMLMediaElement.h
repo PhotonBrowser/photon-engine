@@ -202,6 +202,28 @@ public:
     Optional<Media::VideoSinkHandle> video_sink_handle() const;
     Optional<Compositing::CapturedVideoFrame> capture_current_video_frame() const;
 
+    struct VideoFrameCounts {
+        u64 presented { 0 };
+        u64 dropped { 0 };
+
+        VideoFrameCounts operator+(VideoFrameCounts const& other) const { return { presented + other.presented, dropped + other.dropped }; }
+        VideoFrameCounts operator-(VideoFrameCounts const& other) const { return { presented - other.presented, dropped - other.dropped }; }
+        VideoFrameCounts& operator+=(VideoFrameCounts const& other) { return *this = *this + other; }
+    };
+    VideoFrameCounts video_frame_counts() const;
+    VideoFrameCounts video_frame_counts_since_last_load() const { return video_frame_counts() - m_video_frame_counts_at_last_load; }
+
+    struct PresentedVideoFrame {
+        u64 presented_frames { 0 };
+        AK::Duration media_time;
+        MonotonicTime presentation_time;
+        u32 width { 0 };
+        u32 height { 0 };
+    };
+    Optional<PresentedVideoFrame> hold_presented_video_frame_for_callbacks();
+    void release_presented_video_frame_held_for_callbacks();
+    virtual void request_rendering_update_for_video_frame_callbacks() { }
+
     Optional<Compositing::VideoSinkResourceId> video_sink_resource_id() const;
 
     virtual void update_representation() { }
@@ -463,6 +485,8 @@ private:
     RefPtr<Core::Timer> m_playback_position_update_timer;
     GC::Ptr<VideoTrack> m_selected_video_track;
     OwnPtr<ActiveVideoSink> m_active_video_sink;
+    VideoFrameCounts m_frame_counts_of_released_video_sinks;
+    VideoFrameCounts m_video_frame_counts_at_last_load;
     mutable bool m_video_frame_was_recently_captured { false };
     mutable RefPtr<Core::Timer> m_video_frame_capture_keepalive_timer;
     Optional<ScreenWakeLockHandle> m_screen_wake_lock;

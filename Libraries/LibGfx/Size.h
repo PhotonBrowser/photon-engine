@@ -9,7 +9,6 @@
 #include <AK/Format.h>
 #include <LibGfx/Orientation.h>
 #include <LibGfx/Point.h>
-#include <LibIPC/Forward.h>
 
 namespace Gfx {
 
@@ -81,25 +80,6 @@ public:
     {
         VERIFY(height() != 0);
         return static_cast<float>(width()) / static_cast<float>(height());
-    }
-
-    // Horizontal means preserve the width, Vertical means preserve the height.
-    [[nodiscard]] constexpr Size<T> match_aspect_ratio(float aspect_ratio, Orientation side_to_preserve) const
-    {
-        VERIFY(aspect_ratio != 0.0f);
-        auto matched = *this;
-        auto height_corresponding_to_width = static_cast<T>(static_cast<float>(width()) / aspect_ratio);
-        auto width_corresponding_to_height = static_cast<T>(static_cast<float>(height()) * aspect_ratio);
-
-        switch (side_to_preserve) {
-        case Orientation::Vertical:
-            matched.m_width = width_corresponding_to_height;
-            break;
-        case Orientation::Horizontal:
-            matched.m_height = height_corresponding_to_width;
-            break;
-        }
-        return matched;
     }
 
     template<typename U>
@@ -202,15 +182,7 @@ struct Formatter<Gfx::Size<T>> : Formatter<FormatString> {
 
 }
 
-namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder&, Gfx::IntSize const&);
-
-template<>
-ErrorOr<Gfx::IntSize> decode(Decoder&);
-
-}
+#include <LibGfx/SizeCodecs.h>
 
 template<typename T>
 struct AK::Traits<Gfx::Size<T>> : public AK::DefaultTraits<Gfx::Size<T>> {

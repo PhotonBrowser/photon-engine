@@ -61,6 +61,7 @@
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/ComputedValuesRustFFI.h>
+#include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/DOMTokenList.h>
@@ -156,6 +157,7 @@
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
+#include <LibWeb/UIEvents/PointerEvent.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -658,12 +660,11 @@ void Element::follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML:
 
     // 11. Navigate targetNavigable to urlString using subject's node document, with referrerPolicy set to subject's
     //     hyperlink referrer policy, userInvolvement set to userInvolvement, and sourceElement set to subject.
-    // FIXME: Set sourceElement.
     auto url = url_string_with_suffix.has_value()
         ? URL::Parser::basic_parse(url_string_with_suffix->utf16_view())
         : URL::Parser::basic_parse(url_string);
     VERIFY(url.has_value());
-    MUST(target_navigable->navigate({ .url = url.release_value(), .source_document = document(), .referrer_policy = hyperlink_referrer_policy(), .user_involvement = user_involvement }));
+    MUST(target_navigable->navigate({ .url = url.release_value(), .source_document = document(), .referrer_policy = hyperlink_referrer_policy(), .user_involvement = user_involvement, .source_element = this }));
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy
@@ -2339,10 +2340,11 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
         // with the pseudo-element styles it still computes.
         install_custom_property_environment();
         set_computed_style({}, new_style_record);
-        update_anchor_name_registry(nullptr, *computed_style());
-        update_animation_name_index(*this, nullptr, *computed_style());
+        auto new_computed_values = computed_style();
+        update_anchor_name_registry(nullptr, *new_computed_values);
+        update_animation_name_index(*this, nullptr, *new_computed_values);
         if (is_document_element())
-            style_computer.update_root_element_font_metrics(*computed_style());
+            style_computer.update_root_element_font_metrics(*new_computed_values);
         counters.element_computed_style_changes++;
         auto invalidation = CSS::RequiredInvalidationAfterStyleChange::full();
         invalidation |= recompute_pseudo_element_styles(read, did_change_custom_properties, false, nullptr, &pseudo_element_records, engine_record_damages);
@@ -3218,9 +3220,39 @@ double Element::current_css_zoom() const
     return 1.0;
 }
 
+static bool style_attribute_is_blocked_by_content_security_policy(Element& element, Utf16View value)
+{
+    if (auto shadow_root = element.containing_shadow_root(); shadow_root && shadow_root->is_user_agent_internal())
+        return false;
+    return ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(element, ContentSecurityPolicy::Directives::Directive::InlineType::StyleAttribute, value) == ContentSecurityPolicy::Directives::Directive::Result::Blocked;
+}
+
+static void prefetch_inline_style_image_resources(CSS::CSSStyleProperties const&, Document&);
+
+void Element::clone_inline_style_from(Element const& source)
+{
+    // NB: A source whose style attribute still awaits its check leaves the copy to make that check once connected.
+    auto const* source_rare_data = source.element_rare_data();
+    if (!m_inline_style || !source.m_inline_style || (source_rare_data && source_rare_data->style_attribute_awaits_content_security_policy_check))
+        return;
+    m_inline_style->set_declarations_from(*source.m_inline_style);
+    if (auto* rare_data = element_rare_data())
+        rare_data->style_attribute_awaits_content_security_policy_check = false;
+}
+
 void Element::inserted()
 {
     Base::inserted();
+
+    if (auto* rare_data = element_rare_data(); rare_data && rare_data->style_attribute_awaits_content_security_policy_check && is_connected()) {
+        rare_data->style_attribute_awaits_content_security_policy_check = false;
+        if (auto value = attribute(HTML::AttributeNames::style); value.has_value() && m_inline_style) {
+            if (style_attribute_is_blocked_by_content_security_policy(*this, value->utf16_view()))
+                m_inline_style->set_declarations_from_text({});
+            else
+                prefetch_inline_style_image_resources(*m_inline_style, document());
+        }
+    }
 
     if (is_connected()) {
         if (m_style_attribute_is_dirty)
@@ -3705,7 +3737,7 @@ double Element::scroll_top() const
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
     Layout::ForcedReadScope read { document };
-    const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementScrollTop);
+    const_cast<Document&>(document).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementScrollTop);
 
     // 6. If the element is the root element return the value of scrollY on window.
     if (document.document_element() == this)
@@ -3751,7 +3783,7 @@ double Element::scroll_left() const
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
     Layout::ForcedReadScope read { document };
-    const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementScrollLeft);
+    const_cast<Document&>(document).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementScrollLeft);
 
     // 6. If the element is the root element return the value of scrollX on window.
     if (document.document_element() == this)
@@ -4602,15 +4634,15 @@ void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarg
             [](Range* range) {
                 // AD-HOC: Text-fragment scrolling centers the beginning of a match. Using the union
                 //         of every client rect can put the beginning of a long passage outside the viewport.
-                auto rects = range->get_client_rects();
-                auto const* rect = rects->length() > 0 ? rects->item(0) : nullptr;
-                if (!rect)
+                auto rects = range->client_rects();
+                if (rects.is_empty())
                     return CSSPixelRect {};
+                auto const& rect = rects.first();
                 return CSSPixelRect {
-                    CSSPixels::nearest_value_for(rect->x()),
-                    CSSPixels::nearest_value_for(rect->y()),
-                    CSSPixels::nearest_value_for(rect->width()),
-                    CSSPixels::nearest_value_for(rect->height()),
+                    CSSPixels::nearest_value_for(rect.x()),
+                    CSSPixels::nearest_value_for(rect.y()),
+                    CSSPixels::nearest_value_for(rect.width()),
+                    CSSPixels::nearest_value_for(rect.height()),
                 };
             });
     };
@@ -5366,6 +5398,29 @@ void Element::update_animated_properties_for_abstract_element(Badge<Web::Animati
     effect.update_computed_properties_for_style(context, abstract_element);
 }
 
+// The animation style group of an installed style, which holds the timelines it declares by name.
+static CSS::ComputedValues::AnimationValues const* installed_animation_values(CSS::InstalledStyle const& style)
+{
+    auto const* payloads = static_cast<void const* const*>(style.payloads());
+    if (!payloads)
+        return nullptr;
+    return static_cast<CSS::ComputedValues::AnimationValues const*>(payloads[CSS::ComputedValues::AnimationValues::style_group_index]);
+}
+
+// Whether two installed styles differ in the timelines they declare by name, or the timeline names they scope.
+static bool timeline_declarations_differ(CSS::InstalledStyle const& old_style, CSS::InstalledStyle const& new_style)
+{
+    auto const* old_values = installed_animation_values(old_style);
+    auto const* new_values = installed_animation_values(new_style);
+    bool const old_declares = old_values && CSS::ComputedValuesFFI::rust_animation_values_declare_timelines(old_values);
+    bool const new_declares = new_values && CSS::ComputedValuesFFI::rust_animation_values_declare_timelines(new_values);
+    if (!old_declares && !new_declares)
+        return false;
+    if (old_declares != new_declares)
+        return true;
+    return old_values != new_values && !CSS::ComputedValuesFFI::rust_animation_values_timeline_declarations_equal(old_values, new_values);
+}
+
 void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
 {
     VERIFY(!style_record_identity || style_node_id() != 0);
@@ -5374,20 +5429,26 @@ void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
     Layout::ForcedReadScope read { document() };
     auto held_before = exchange(m_installed_style, document().style_computer().install_style(read, style_record_identity));
     // The element holds the record it installed before until the engine takes the new one in, so the layout node reads
-    // what it moves from before the element lets go of it.
+    // what it moves from, and everything below that compares against the old record is read from it, before the
+    // element lets go of it. The engine may free the old record's payloads as soon as it is no longer held.
     if (auto* layout_node = unsafe_layout_node(read))
         layout_node->set_style_record_identity(m_installed_style, held_before);
+    bool const was_display_none = !held_before || held_before.display_is_none();
+    // https://drafts.csswg.org/scroll-animations-1/#timeline-scoping
+    bool const timeline_declarations_changed = timeline_declarations_differ(held_before, m_installed_style);
     if (style_node_id() != 0)
         CSS::StyleEngineFFI::style_engine_set_held_style_record(document().style_computer().style_engine().host(), style_node_id(), style_record_identity.value());
     // Children that wait to arrive in a display:none subtree may be revealed as the subtree's root, or an element
     // between it and them, stops being display:none.
     if ((child_style_arrivals_wait() || descendant_style_arrival_pending()) && m_installed_style && !m_installed_style.display_is_none()
-        && (!held_before || held_before.display_is_none()))
+        && was_display_none)
         CSS::record_waiting_children_may_be_revealed(*this);
     // The resources an SVG graphics element's `mask`, `clip-path`, `fill` and `stroke` name are published beside its
     // attributes for the layout tree build to resolve, so they follow every record the element takes.
     if (is<SVG::SVGGraphicsElement>(*this) && !!style_record_identity)
         Layout::publish_svg_style_references(*this);
+    if (timeline_declarations_changed)
+        document().did_change_timeline_declarations();
 }
 
 // What C++ installs beside a pseudo-element it computes: its element's inheritable environment, or the one its own
@@ -6056,20 +6117,14 @@ void Element::set_last_relative_scroll_direction(u8 direction)
 // That is why the unchecked layout node accessor is the right one here.
 void Element::set_scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type, CSSPixelPoint offset)
 {
-    // The document's scroll state mirrors these offsets, so it is invalidated here, next to the
-    // store, rather than by each caller.
     if (pseudo_element_type.has_value()) {
         auto pseudo_element = get_synthetic_pseudo_element(*pseudo_element_type);
         if (!pseudo_element.has_value())
             return;
-        if (pseudo_element->scroll_offset() != offset)
-            document().invalidate_scroll_state();
         pseudo_element->set_scroll_offset(offset);
         return;
     }
 
-    if (scroll_offset({}) != offset)
-        document().invalidate_scroll_state();
     if (!offset.is_zero())
         ensure_element_rare_data().scroll_offset = offset;
     else if (auto* rare_data = element_rare_data())
@@ -6454,7 +6509,25 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         document().flush_deferred_style_change_event();
         if (!m_inline_style)
             m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this });
-        m_inline_style->set_declarations_from_text(value_or_empty);
+        // https://html.spec.whatwg.org/multipage/dom.html#the-style-attribute
+        // However, if the Should element's inline behavior be blocked by Content Security Policy? algorithm returns
+        // "Blocked" when executed upon the attribute's element, "style attribute", and the attribute's value, then
+        // the style rules defined in the attribute's value must not be applied to the element.
+        // NB: The internal elements of a user agent shadow tree get their style attribute before they are inserted
+        //     into it, and are styled by the user agent rather than the document. So the check is made when an
+        //     element that is not connected becomes connected, and the resources its declarations use are fetched then.
+        if (value.has_value() && !is_connected()) {
+            ensure_element_rare_data().style_attribute_awaits_content_security_policy_check = true;
+            m_inline_style->set_declarations_from_text(*value);
+            return;
+        }
+        if (auto* rare_data = element_rare_data())
+            rare_data->style_attribute_awaits_content_security_policy_check = false;
+        if (!value.has_value()) {
+            m_inline_style->set_declarations_from_text({});
+            return;
+        }
+        m_inline_style->set_declarations_from_text(style_attribute_is_blocked_by_content_security_policy(*this, *value) ? Utf16View {} : *value);
         prefetch_inline_style_image_resources(*m_inline_style, document());
     } else if (local_name == HTML::AttributeNames::dir || local_name == HTML::AttributeNames::lang) {
         bool const is_dir = local_name == HTML::AttributeNames::dir;
@@ -6788,23 +6861,74 @@ Optional<Gfx::DecodedImageFrame> Element::capture_the_image()
     return Gfx::DecodedImageFrame { *bitmap };
 }
 
-void Element::set_pointer_capture(WebIDL::Long pointer_id)
+// https://w3c.github.io/pointerevents/#dfn-active-pointer
+// A mouse connected to the device is always active, and it is the one pointer there is.
+static bool pointer_id_names_an_active_pointer(WebIDL::Long pointer_id)
 {
-    (void)pointer_id;
-    dbgln("FIXME: Implement Element::setPointerCapture()");
+    return pointer_id == UIEvents::mouse_pointer_id;
 }
 
-void Element::release_pointer_capture(WebIDL::Long pointer_id)
+// https://w3c.github.io/pointerevents/#setting-pointer-capture
+WebIDL::ExceptionOr<void> Element::set_pointer_capture(WebIDL::Long pointer_id)
 {
-    (void)pointer_id;
-    dbgln("FIXME: Implement Element::releasePointerCapture()");
+    // 1. If the pointerId provided as the method's argument does not match any of the active pointers, then throw a
+    //    "NotFoundError" DOMException.
+    if (!pointer_id_names_an_active_pointer(pointer_id))
+        return WebIDL::NotFoundError::create("No active pointer has the given pointerId"_utf16);
+
+    // 2. Let the pointer be the active pointer specified by the given pointerId.
+    // 3. If the element is not connected, throw an "InvalidStateError" DOMException.
+    if (!is_connected())
+        return WebIDL::InvalidStateError::create("Cannot set pointer capture on an element that is not connected"_utf16);
+
+    // FIXME: 4. If this method is invoked while the element's node document has a locked element, throw an
+    //           "InvalidStateError" DOMException.
+
+    // 5. If the pointer is not in the active buttons state or the element's node document is not the active document
+    //    of the pointer, then terminate these steps.
+    auto navigable = document().navigable();
+    if (!navigable)
+        return {};
+    auto& event_handler = navigable->event_handler();
+    if (!event_handler.is_mouse_pointer_in_active_buttons_state())
+        return {};
+
+    // 6. For the specified pointerId, set the pending pointer capture target override to the Element on which this
+    //    method was invoked.
+    event_handler.set_pending_pointer_capture_target_override({}, *this);
+    return {};
 }
 
-bool Element::has_pointer_capture(WebIDL::Long pointer_id)
+// https://w3c.github.io/pointerevents/#releasing-pointer-capture
+WebIDL::ExceptionOr<void> Element::release_pointer_capture(WebIDL::Long pointer_id)
 {
-    (void)pointer_id;
-    dbgln("FIXME: Implement Element::hasPointerCapture()");
-    return false;
+    // 1. If the pointerId provided as the method's argument does not match any of the active pointers and these steps
+    //    are not being invoked as a result of the implicit release of pointer capture, then throw a "NotFoundError"
+    //    DOMException.
+    if (!pointer_id_names_an_active_pointer(pointer_id))
+        return WebIDL::NotFoundError::create("No active pointer has the given pointerId"_utf16);
+
+    // 2. If hasPointerCapture is false for the Element with the specified pointerId, then terminate these steps.
+    if (!has_pointer_capture(pointer_id))
+        return {};
+
+    // 3. For the specified pointerId, clear the pending pointer capture target override, if set.
+    document().navigable()->event_handler().clear_pending_pointer_capture_target_override({});
+    return {};
+}
+
+// https://w3c.github.io/pointerevents/#dom-element-haspointercapture
+bool Element::has_pointer_capture(WebIDL::Long pointer_id) const
+{
+    // Indicates whether the element on which this method is invoked has pointer capture for the pointer identified by
+    // the argument pointerId. In particular, returns true if the pending pointer capture target override for pointerId
+    // is set to the element on which this method is invoked, and false otherwise.
+    if (!pointer_id_names_an_active_pointer(pointer_id))
+        return false;
+    auto navigable = document().navigable();
+    if (!navigable)
+        return false;
+    return navigable->event_handler().pending_pointer_capture_target_override().ptr() == this;
 }
 
 GC::Ptr<NamedNodeMap> Element::attributes()
@@ -7140,11 +7264,11 @@ GC::Ref<Geometry::DOMRect> get_bounding_client_rect(DOM::Element const& element)
 
 GC::Ref<Geometry::DOMRectList> get_client_rects(DOM::Element const& element)
 {
-    Vector<GC::Root<Geometry::DOMRect>> rects;
+    Vector<Gfx::DoubleRect> rects;
     for (auto const& rect : element.get_client_rects())
-        rects.append(create_dom_rect(rect));
+        rects.append(rect.to_type<double>());
 
-    return Geometry::DOMRectList::create(move(rects));
+    return Geometry::DOMRectList::create(rects);
 }
 
 GC::Ref<WebIDL::Promise> request_pointer_lock(DOM::Element& element, Optional<PointerLockOptions> const& options)

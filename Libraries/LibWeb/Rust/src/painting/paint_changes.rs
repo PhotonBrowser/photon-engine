@@ -32,8 +32,6 @@ use std::sync::Arc;
 pub(crate) enum PaintChange {
     /// What the navigable has scrolled the viewport to.
     SetViewportScrollOffset(CssPixelPoint),
-    /// The scroll containers' offsets moved: the scroll state is read again before it is published next.
-    InvalidateScrollState,
     /// The selection covers `entries`, between the offsets in its start and end text.
     ApplySelection {
         viewport: NodeSlotId,
@@ -71,6 +69,12 @@ pub(crate) enum PaintChange {
         node: NodeSlotId,
         direction: ScrollDirection,
         enlarged: bool,
+    },
+    /// Whether the overlay scrollbar of the row in `direction` has faded out, so that it takes no pointer input.
+    SetScrollbarHidden {
+        node: NodeSlotId,
+        direction: ScrollDirection,
+        hidden: bool,
     },
     /// The images the row's background, mask and border image layers paint.
     SetLayerImagePaintFacts {
@@ -127,13 +131,6 @@ impl PaintChange {
     pub(crate) fn apply(self, arena: &mut LayoutNodeArena) {
         match self {
             Self::SetViewportScrollOffset(offset) => arena.set_viewport_scroll_offset(offset),
-            Self::InvalidateScrollState => {
-                arena
-                    .paint_state()
-                    .borrow_mut()
-                    .visual_context
-                    .needs_to_refresh_scroll_state = true;
-            }
             Self::ApplySelection {
                 viewport,
                 entries,
@@ -190,6 +187,25 @@ impl PaintChange {
                 rows.paintable_data_mut(node).set_flag(flag, enlarged);
                 rows.push_paint_damage(node, PaintDamage::DRAW_OVERLAY | PaintDamage::HIT_OVERLAY);
             }
+            Self::SetScrollbarHidden {
+                node,
+                direction,
+                hidden,
+            } => {
+                let mut rows = arena.paintable_rows_mut();
+                if !rows.paintable_row_is_populated(node) {
+                    return;
+                }
+                let flag = match direction {
+                    ScrollDirection::Horizontal => PaintableFlag::HorizontalScrollbarHidden,
+                    ScrollDirection::Vertical => PaintableFlag::VerticalScrollbarHidden,
+                };
+                if rows.paintable_data(node).has_flag(flag) == hidden {
+                    return;
+                }
+                rows.paintable_data_mut(node).set_flag(flag, hidden);
+                rows.push_paint_damage(node, PaintDamage::HIT_OVERLAY);
+            }
             Self::SetLayerImagePaintFacts { node, entries } => {
                 arena.set_layer_image_paint_facts(node, entries);
             }
@@ -226,11 +242,6 @@ pub(crate) fn queue(host: &DocumentHost, change: PaintChange) {
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_set_viewport_scroll_offset(host: &DocumentHost, offset: FfiCssPixelPoint) {
     queue(host, PaintChange::SetViewportScrollOffset(offset.into()));
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_invalidate_scroll_state(host: &DocumentHost) {
-    queue(host, PaintChange::InvalidateScrollState);
 }
 
 /// # Safety
@@ -375,6 +386,21 @@ pub extern "C" fn render_state_set_scrollbar_enlarged(
         node,
         direction,
         enlarged,
+    };
+    queue(host, change);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_set_scrollbar_hidden(
+    host: &DocumentHost,
+    node: NodeSlotId,
+    direction: ScrollDirection,
+    hidden: bool,
+) {
+    let change = PaintChange::SetScrollbarHidden {
+        node,
+        direction,
+        hidden,
     };
     queue(host, change);
 }

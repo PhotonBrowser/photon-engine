@@ -60,7 +60,9 @@ pub(crate) struct BoxFacts {
     pub transform_is_invertible: bool,
     pub perspective: Option<PerspectiveData>,
     pub effects: Option<std::rc::Rc<EffectsData>>,
-    pub overflow_clip: Option<ClipNodeData>,
+    pub overflow_clip: Option<ClipData>,
+    /// The overflow clip's shape, when shaped corners make it a path rather than a rounded rectangle.
+    pub overflow_clip_contour: Option<ClipPathData>,
     pub css_clip: Option<ClipData>,
     pub line_clamp_float_clip: Option<ClipData>,
     pub clip_path: Option<(std::sync::Arc<libgfx_rust::path::OwnedPath>, IntRect, WindingRule)>,
@@ -149,6 +151,7 @@ impl BoxFacts {
             line_clamp_float_clip: None,
             clip_path: None,
             mask_layers: Vec::new(),
+            overflow_clip_contour: None,
             establishes_absolute_containing_block: false,
             establishes_fixed_containing_block: false,
             backface_hidden: false,
@@ -175,12 +178,14 @@ impl BoxFacts {
         facts.clip_path = super::basic_shapes::compute_basic_shape_clip_path_data(layout_arena, slot, pixel_ratio)
             .map(|(path, bounding_rect, fill_rule)| (std::sync::Arc::new(path), bounding_rect, fill_rule));
         let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(pixel_ratio);
+        let masks_backdrop = facts.effects_layer_is_inside_transform_and_clips();
         facts.mask_layers = super::node_values::mask_layer_presence(layout_arena, slot, true)
             .into_iter()
             .map(|layer| MaskData {
                 rect: converter.enclosing_device_rect(layer.area),
                 kind: layer.kind,
                 origin: layer.origin,
+                masks_backdrop,
             })
             .collect();
         facts.css_clip = super::node_values::compute_css_clip_data(layout_arena, slot, pixel_ratio);
@@ -202,6 +207,47 @@ impl BoxFacts {
         } else {
             None
         };
+        // https://drafts.csswg.org/css-borders-4/#corner-shape-rendering
+        // An element's overflow area is shaped by its inner contour.
+        // NB: As with rounded corners, a clip in one axis only is not shaped.
+        // FIXME: Shape an overflow clip edge that overflow-clip-margin moves off the padding box.
+        if let Some(overflow_clip) = &mut facts.overflow_clip
+            && super::node_values::overflow_clips_both_axes(layout_arena, slot)
+            && let Some(border_shape) =
+                crate::painting::border_shape::BorderShape::for_paintable(layout_arena, slot, &converter)
+        {
+            let (path, fill_rule) = border_shape.into_overflow_clip_path();
+            facts.overflow_clip_contour = Some(ClipPathData {
+                path: std::sync::Arc::new(path),
+                bounding_rect: libgfx_rust::enclosing_int_rect(overflow_clip.rect),
+                fill_rule,
+            });
+            overflow_clip.corner_radii = CornerRadii::default();
+        } else if let Some(overflow_clip) = &mut facts.overflow_clip
+            && overflow_clip.corner_radii.has_any_radius()
+            && let Some(style) = layout_arena.node_style_if_live(slot)
+        {
+            let border_box = crate::painting::paintable_geometry::absolute_border_box_rect(layout_arena, slot);
+            let border_box_rect = converter.rounded_device_rect(border_box).to_float();
+            let border_radii = super::node_values::border_radii_data(style, layout_arena, slot).as_corners(&converter);
+            let shapes = crate::painting::corner_shape::CornerShapes::of(style);
+            if shapes.needs_contour(border_radii) {
+                let insets = crate::painting::corner_shape::Insets {
+                    top: f64::from(converter.rounded_device_pixels(style.border_top_width())),
+                    right: f64::from(converter.rounded_device_pixels(style.border_right_width())),
+                    bottom: f64::from(converter.rounded_device_pixels(style.border_bottom_width())),
+                    left: f64::from(converter.rounded_device_pixels(style.border_left_width())),
+                };
+                let contour =
+                    crate::painting::corner_shape::border_contour_path(border_box_rect, border_radii, shapes, insets);
+                facts.overflow_clip_contour = Some(ClipPathData {
+                    path: std::sync::Arc::new(contour),
+                    bounding_rect: libgfx_rust::enclosing_int_rect(overflow_clip.rect),
+                    fill_rule: WindingRule::Nonzero,
+                });
+                overflow_clip.corner_radii = CornerRadii::default();
+            }
+        }
         facts
     }
 

@@ -518,6 +518,11 @@ impl TransitionDecision {
         let after_overlay = after_overlay.or(record_after_overlay);
         let mut context = crate::css::animation::FfiAnimationContext {
             allow_discrete: false,
+            // The value that matters is the one in the after-change style.
+            allow_keyword_size_interpolation: crate::css::animation::allows_keyword_size_interpolation(
+                after_table,
+                after_overlay,
+            ),
             current_color: Some(
                 after_table
                     .effective_value_handle(after_overlay, crate::css::property_metadata::property_id::COLOR, true)
@@ -1202,6 +1207,9 @@ fn started_transition_timing(
             has_timeline_scroller: false,
             timeline_scroller_is_vertical: false,
             timeline_scroller: 0,
+            has_timeline_boundaries: false,
+            minimum_timeline_time: 0.0,
+            maximum_timeline_time: 0.0,
             has_start_time: false,
             has_hold_time: true,
             paused: false,
@@ -1587,6 +1595,7 @@ mod tests {
         };
         crate::css::animation::FfiAnimationContext {
             allow_discrete: false,
+            allow_keyword_size_interpolation: false,
             current_color: None,
             has_length_resolution_context: false,
             length_resolution_context: crate::css::animation::FfiAnimationLengthResolutionContext {

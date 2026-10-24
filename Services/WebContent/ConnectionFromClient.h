@@ -75,9 +75,6 @@ public:
     // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_audio_server_transport();
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    Function<void(IPC::TransportHandle)> on_wasm_compiler_connection;
-#endif
 
     // Null outside test mode: the UI process connects the test endpoint only when it runs tests.
     TestConnection* test_connection();
@@ -145,7 +142,6 @@ private:
     virtual void connect_to_request_server(IPC::TransportHandle handle, int client_id) override;
     virtual void connect_to_test_endpoint(IPC::TransportHandle handle) override;
     virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
-    virtual void connect_to_wasm_compiler(IPC::TransportHandle handle) override;
     virtual void connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle) override;
     virtual void set_site_compatibility_data(JsonValue data) override;
     virtual void compositor_process_reconnected() override;
@@ -161,7 +157,7 @@ private:
     virtual void create_navigation_params(Web::PageId page_id, Web::HTML::NavigationPopulationRequest) override;
     virtual void cancel_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) override;
     virtual void deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor) override;
-    virtual void close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id) override;
+    virtual void close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void run_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger) override;
     virtual void focus_window_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void set_opener_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId opener_navigable_id) override;
@@ -282,6 +278,7 @@ private:
     virtual void set_is_scripting_enabled(Web::PageId page_id, bool) override;
     virtual void set_zoom_level(Web::PageId page_id, double zoom_level) override;
     virtual void set_maximum_frames_per_second(Web::PageId page_id, double) override;
+    virtual void set_viewport_corner_radius(Web::PageId page_id, double) override;
     virtual void set_window_position(Web::PageId page_id, Web::DevicePixelPoint) override;
     virtual void set_window_size(Web::PageId page_id, Web::DevicePixelSize) override;
     virtual void did_complete_window_rect_request(Web::PageId page_id, u64 completion_id) override;

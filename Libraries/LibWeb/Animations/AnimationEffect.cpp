@@ -123,8 +123,11 @@ Bindings::ComputedEffectTiming AnimationEffect::get_computed_timing() const
     update_style_if_needed();
 
     if (m_associated_animation) {
+        // NB: Observing the current time can ask for the phase of this effect, which must not read the time it observed
+        //     last.
+        auto observed_local_time = m_associated_animation->current_time_for_observation();
         m_has_local_time_override_for_observation = true;
-        m_local_time_override_for_observation = m_associated_animation->current_time_for_observation();
+        m_local_time_override_for_observation = observed_local_time;
     }
     ScopeGuard clear_local_time_override = [&] {
         m_has_local_time_override_for_observation = false;
@@ -195,9 +198,9 @@ TimeValue AnimationEffect::intrinsic_iteration_duration() const
     else {
         // Return(100% - start delay - end delay) / iteration count
         // Note : Presently start and end delays are zero until such time as percentage based delays are supported.
-        auto one_hundred_percent = TimeValue { TimeValue::Type::Percentage, 100.0 };
-
-        return (one_hundred_percent - m_start_delay - m_end_delay) / m_iteration_count;
+        // AD-HOC: An effect fills its animation's attachment range rather than the whole timeline, which is what the
+        //         timeline duration is here. This matches WebKit.
+        return (timeline_duration().value() - m_start_delay - m_end_delay) / m_iteration_count;
     }
 }
 
@@ -214,6 +217,12 @@ Optional<TimeValue> AnimationEffect::timeline_duration() const
     auto timeline = associated_timeline();
     if (!timeline)
         return {};
+
+    // AD-HOC: The duration of a progress-based timeline, as an animation attached to a range of it sees it, is the
+    //         length of its attachment range. This matches WebKit.
+    //         An attachment range whose end comes before its start is empty.
+    if (auto interval = m_associated_animation->attachment_interval(); interval.has_value())
+        return max(interval->end - interval->start, TimeValue { TimeValue::Type::Percentage, 0 });
 
     return timeline->duration();
 }
@@ -581,6 +590,26 @@ TimeValue AnimationEffect::after_active_boundary_time() const
     return max(min(m_start_delay + active_duration(), end_time()), TimeValue::create_zero(associated_timeline()));
 }
 
+// https://drafts.csswg.org/web-animations-2/#at-timeline-boundary
+bool AnimationEffect::is_at_timeline_boundary() const
+{
+    auto timeline = associated_timeline();
+    if (!timeline)
+        return false;
+    auto timeline_time = timeline->current_time();
+    if (!timeline_time.has_value())
+        return false;
+    auto matches = [&](Optional<TimeValue> const& time) {
+        return time.has_value() && fabs(timeline_time->value - time->value) < progress_timeline_tolerance;
+    };
+
+    // Determined based on the first matching condition:
+    // If the minimum timeline time matches the timeline current time: Return true
+    // If the maximum timeline time matches the timeline current time: Return true
+    // Otherwise: Return false
+    return matches(timeline->minimum_timeline_time()) || matches(timeline->maximum_timeline_time());
+}
+
 AnimationEffect::Phase AnimationEffect::phase() const
 {
     return phase(local_time());
@@ -593,22 +622,25 @@ AnimationEffect::Phase AnimationEffect::phase(Optional<TimeValue> const& local_t
     if (!local_time.has_value())
         return Phase::Idle;
 
+    auto at_timeline_boundary = this->is_at_timeline_boundary();
+
     auto before_active_boundary_time = this->before_active_boundary_time();
-    // https://www.w3.org/TR/web-animations-1/#animation-effect-before-phase
+    // https://drafts.csswg.org/web-animations-2/#animation-effect-phases-and-states
     // An animation effect is in the before phase if the animation effect’s local time is not unresolved and either of
     // the following conditions are met:
-    // - the local time is less than the before-active boundary time, or
-    // - the animation direction is "backwards" and the local time is equal to the before-active boundary time.
-    if (local_time.value() < before_active_boundary_time || (animation_direction() == AnimationDirection::Backwards && local_time.value() == before_active_boundary_time))
+    // 1. the local time is less than the before-active boundary time, or
+    // 2. the animation direction is "backwards" and the local time is equal to the before-active boundary time and
+    //    not at timeline boundary.
+    if (local_time.value() < before_active_boundary_time || (animation_direction() == AnimationDirection::Backwards && local_time.value() == before_active_boundary_time && !at_timeline_boundary))
         return Phase::Before;
 
     auto after_active_boundary_time = this->after_active_boundary_time();
-    // https://www.w3.org/TR/web-animations-1/#animation-effect-after-phase
     // An animation effect is in the after phase if the animation effect’s local time is not unresolved and either of
     // the following conditions are met:
-    // - the local time is greater than the active-after boundary time, or
-    // - the animation direction is "forwards" and the local time is equal to the active-after boundary time.
-    if (local_time.value() > after_active_boundary_time || (animation_direction() == AnimationDirection::Forwards && local_time.value() == after_active_boundary_time))
+    // 1. the local time is greater than the active-after boundary time, or
+    // 2. the animation direction is "forwards" and the local time is equal to the active-after boundary time and not
+    //    at timeline boundary.
+    if (local_time.value() > after_active_boundary_time || (animation_direction() == AnimationDirection::Forwards && local_time.value() == after_active_boundary_time && !at_timeline_boundary))
         return Phase::After;
 
     // https://www.w3.org/TR/web-animations-1/#animation-effect-active-phase
@@ -826,7 +858,7 @@ void AnimationUpdateContext::publish()
         ElementData const& data;
         GC::ConservativeVector<GC::Ref<KeyframeEffect>> effects;
     };
-    Vector<Sample> samples;
+    GC::ConservativeVector<Sample> samples;
     for (auto& it : elements) {
         if (!it.value.target_style)
             continue;
@@ -868,7 +900,7 @@ void AnimationUpdateContext::publish()
         bool may_record_baseline { false };
     };
     Vector<Publication> publications;
-    Vector<CSS::StyleComputer::SampledAnimationOverlay> overlays;
+    GC::ConservativeVector<CSS::StyleComputer::SampledAnimationOverlay> overlays;
     Vector<CSS::StyleEngineFFI::FfiAnimationOverlayPublication> published;
 
     // The render owner samples every element of a document in one call, and publishes what it sampled in another,
@@ -877,7 +909,7 @@ void AnimationUpdateContext::publish()
         auto& document = samples[first].element.document();
         auto& style_computer = document.style_computer();
         Layout::ForcedReadScope read { document };
-        Vector<CSS::StyleComputer::AnimationRefreshRequest> requests;
+        GC::ConservativeVector<CSS::StyleComputer::AnimationRefreshRequest> requests;
         size_t end = first;
         for (; end < samples.size() && &samples[end].element.document() == &document; ++end) {
             auto& sample = samples[end];

@@ -5,8 +5,21 @@
  */
 
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
+
+use crate::geometry::{FloatPoint, FloatSize};
+
+mod arcs;
+mod curves;
+mod encoding;
+pub mod ffi;
+mod geometry;
+mod hit_test;
+mod measure;
+mod stroke;
+mod svg_text;
 
 unsafe extern "C" {
     fn ladybird_gfx_process_next_path_identity() -> u64;
@@ -25,8 +38,24 @@ unsafe extern "C" {
         context: *mut c_void,
     );
     fn ladybird_gfx_path_contains(path: *const c_void, x: f32, y: f32, winding_rule: i32) -> bool;
+    fn ladybird_gfx_path_stroke_to_fill(
+        path: *const c_void,
+        thickness: f32,
+        cap_style: i32,
+        join_style: i32,
+        miter_limit: f32,
+        dash_array: *const f32,
+        dash_count: usize,
+        dash_offset: f32,
+    ) -> *mut c_void;
     fn ladybird_gfx_path_length(path: *const c_void) -> f32;
+    fn ladybird_gfx_path_point_at_length(path: *const c_void, distance: f32, out: *mut f32) -> bool;
     fn ladybird_gfx_path_create_from_ops(kinds: *const u8, values: *const f32, count: usize) -> *mut c_void;
+    fn ladybird_gfx_path_append_ops(path: *mut c_void, kinds: *const u8, values: *const f32, count: usize);
+    fn ladybird_gfx_path_append_path(path: *mut c_void, other: *const c_void);
+    fn ladybird_gfx_path_is_empty(path: *const c_void) -> bool;
+    fn ladybird_gfx_path_last_point(path: *const c_void, out_x_y: *mut f32);
+    fn ladybird_gfx_path_clone(path: *const c_void) -> *mut c_void;
     fn ladybird_gfx_path_create_from_serialized_bytes(bytes: *const u8, count: usize) -> *mut c_void;
     fn ladybird_gfx_path_copy_transformed(path: *const c_void, affine_values: *const f32) -> *mut c_void;
     fn ladybird_gfx_path_create_from_glyph_runs(runs: *const FfiGlyphRun, run_count: usize) -> *mut c_void;
@@ -169,6 +198,119 @@ impl PathBuilder {
     }
 }
 
+/// A `Gfx::Path` that is built on where it is: one that an [`OwnedPath`] or C++ owns, borrowed mutably for `'a`.
+/// Each operation is that of the path, with its rules for a path that has no current point.
+pub struct PathMut<'a> {
+    raw: NonNull<c_void>,
+    path: PhantomData<&'a mut c_void>,
+}
+
+impl PathMut<'_> {
+    /// Borrows a `Gfx::Path` that C++ owns.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be a live `Gfx::Path`, which nothing else uses while the value lives.
+    pub unsafe fn from_raw(raw: *mut c_void) -> Self {
+        Self {
+            raw: NonNull::new(raw).expect("Gfx::Path pointer must not be null"),
+            path: PhantomData,
+        }
+    }
+
+    fn apply(&mut self, kind: PathBuilderOpKind, values: [f32; 7]) {
+        let kind = kind as u8;
+        // SAFETY: The path is live and borrowed mutably, and the op is live for the call.
+        unsafe { ladybird_gfx_path_append_ops(self.raw.as_ptr(), &raw const kind, values.as_ptr(), 1) };
+    }
+
+    /// Whether the path has no current point, which Gfx::Path::is_empty() calls empty.
+    pub fn is_empty(&self) -> bool {
+        // SAFETY: The path is live.
+        unsafe { ladybird_gfx_path_is_empty(self.raw.as_ptr()) }
+    }
+
+    pub fn last_point(&self) -> FloatPoint {
+        last_point_of(self.raw)
+    }
+
+    pub fn move_to(&mut self, point: FloatPoint) {
+        self.apply(PathBuilderOpKind::MoveTo, [point.x, point.y, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    pub fn line_to(&mut self, point: FloatPoint) {
+        self.apply(PathBuilderOpKind::LineTo, [point.x, point.y, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    pub fn quadratic_bezier_curve_to(&mut self, through: FloatPoint, point: FloatPoint) {
+        self.apply(
+            PathBuilderOpKind::QuadraticBezierCurveTo,
+            [through.x, through.y, point.x, point.y, 0.0, 0.0, 0.0],
+        );
+    }
+
+    pub fn cubic_bezier_curve_to(&mut self, c1: FloatPoint, c2: FloatPoint, point: FloatPoint) {
+        self.apply(
+            PathBuilderOpKind::CubicBezierCurveTo,
+            [c1.x, c1.y, c2.x, c2.y, point.x, point.y, 0.0],
+        );
+    }
+
+    pub fn elliptical_arc_to(
+        &mut self,
+        point: FloatPoint,
+        radii: FloatSize,
+        x_axis_rotation: f32,
+        large_arc: bool,
+        sweep: bool,
+    ) {
+        self.apply(
+            PathBuilderOpKind::EllipticalArcTo,
+            [
+                point.x,
+                point.y,
+                radii.width,
+                radii.height,
+                x_axis_rotation,
+                if large_arc { 1.0 } else { 0.0 },
+                if sweep { 1.0 } else { 0.0 },
+            ],
+        );
+    }
+
+    pub fn arc_to(&mut self, point: FloatPoint, radius: f32, large_arc: bool, sweep: bool) {
+        self.apply(
+            PathBuilderOpKind::ArcTo,
+            [
+                point.x,
+                point.y,
+                radius,
+                if large_arc { 1.0 } else { 0.0 },
+                if sweep { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
+        );
+    }
+
+    pub fn close(&mut self) {
+        self.apply(PathBuilderOpKind::Close, [0.0; 7]);
+    }
+
+    /// Adds all the subpaths of the other path to this one.
+    pub fn append_path(&mut self, other: &OwnedPath) {
+        // SAFETY: Both paths are live, and this one is borrowed mutably.
+        unsafe { ladybird_gfx_path_append_path(self.raw.as_ptr(), other.raw.as_ptr()) };
+    }
+}
+
+fn last_point_of(path: NonNull<c_void>) -> FloatPoint {
+    let mut x_y = [0.0f32; 2];
+    // SAFETY: The path is live for the call; the out-array holds two floats.
+    unsafe { ladybird_gfx_path_last_point(path.as_ptr(), x_y.as_mut_ptr()) };
+    FloatPoint { x: x_y[0], y: x_y[1] }
+}
+
 unsafe extern "C" fn append_to_vec(context: *mut c_void, bytes: *const u8, length: usize) {
     if length == 0 {
         return;
@@ -190,6 +332,17 @@ unsafe extern "C" fn append_to_string(context: *mut c_void, bytes: *const u8, le
     }
 }
 
+/// How a path is stroked, as `OwnedPath::stroke_to_fill()` takes it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StrokeStyle {
+    pub thickness: f32,
+    pub cap_style: crate::CapStyle,
+    pub join_style: crate::JoinStyle,
+    pub miter_limit: f32,
+    pub dash_array: Vec<f32>,
+    pub dash_offset: f32,
+}
+
 /// The sole owner of a heap-allocated `Gfx::Path`, destroying it on drop.
 pub struct OwnedPath {
     raw: NonNull<c_void>,
@@ -197,8 +350,7 @@ pub struct OwnedPath {
 }
 
 // SAFETY: OwnedPath uniquely owns its Gfx::Path. Every operation on a shared reference is a const
-// query, which PathImplSkia makes safe to run concurrently by publishing its lazily built SkPath
-// with a compare-and-swap.
+// query, which only reads the path.
 unsafe impl Send for OwnedPath {}
 // SAFETY: See the Send implementation above.
 unsafe impl Sync for OwnedPath {}
@@ -244,6 +396,27 @@ impl OwnedPath {
         this.raw.as_ptr()
     }
 
+    /// The path, borrowed to be built on. The path gets a new identity, as it may no longer be the
+    /// path that a snapshot holding the old identity copied.
+    pub fn as_path_mut(&mut self) -> PathMut<'_> {
+        // SAFETY: The counter is an atomic on the other side of the boundary.
+        self.identity = unsafe { ladybird_gfx_process_next_path_identity() };
+        PathMut {
+            raw: self.raw,
+            path: PhantomData,
+        }
+    }
+
+    /// Whether the path has no current point, which Gfx::Path::is_empty() calls empty.
+    pub fn is_empty(&self) -> bool {
+        // SAFETY: The path is live for the duration of the call.
+        unsafe { ladybird_gfx_path_is_empty(self.raw.as_ptr()) }
+    }
+
+    pub fn last_point(&self) -> FloatPoint {
+        last_point_of(self.raw)
+    }
+
     /// A process-unique, never-reused identity for this path allocation, so
     /// consumers holding a copied snapshot can recognize an unchanged path
     /// without comparing contents.
@@ -267,6 +440,13 @@ impl OwnedPath {
     pub fn length(&self) -> f32 {
         // SAFETY: The path is live for the duration of the call.
         unsafe { ladybird_gfx_path_length(self.raw.as_ptr()) }
+    }
+
+    /// The point at the given distance along the path, followed by the path's tangent there.
+    pub fn point_at_length(&self, distance: f32) -> Option<[f32; 4]> {
+        let mut out = [0.0f32; 4];
+        // SAFETY: The path is live for the duration of the call; the out-array holds four floats.
+        unsafe { ladybird_gfx_path_point_at_length(self.raw.as_ptr(), distance, out.as_mut_ptr()) }.then_some(out)
     }
 
     pub fn copy_transformed(&self, affine_values: [f32; 6]) -> OwnedPath {
@@ -328,12 +508,39 @@ impl OwnedPath {
         unsafe { ladybird_gfx_path_contains(self.raw.as_ptr(), x, y, winding_rule) }
     }
 
+    /// The outline of the area that stroking this path with the given style covers, as a path to fill with the
+    /// nonzero winding rule.
+    pub fn stroke_to_fill(&self, style: &StrokeStyle) -> OwnedPath {
+        // SAFETY: The path and the dash array are live for the synchronous call, which returns a fresh heap-allocated
+        //         Gfx::Path.
+        unsafe {
+            OwnedPath::adopt(ladybird_gfx_path_stroke_to_fill(
+                self.raw.as_ptr(),
+                style.thickness,
+                style.cap_style as i32,
+                style.join_style as i32,
+                style.miter_limit,
+                style.dash_array.as_ptr(),
+                style.dash_array.len(),
+                style.dash_offset,
+            ))
+        }
+    }
+
     pub fn to_svg_string(&self) -> String {
         let mut output = String::new();
         // SAFETY: The path is live for the duration of the call, and the callback only writes
         // into the String whose pointer it receives.
         unsafe { ladybird_gfx_path_append_svg_string(self.raw.as_ptr(), append_to_string, (&raw mut output).cast()) };
         output
+    }
+}
+
+/// A copy of the path, which has an identity of its own.
+impl Clone for OwnedPath {
+    fn clone(&self) -> Self {
+        // SAFETY: The path is live for the call; the result is a fresh heap-allocated Gfx::Path.
+        unsafe { OwnedPath::adopt(ladybird_gfx_path_clone(self.raw.as_ptr())) }
     }
 }
 

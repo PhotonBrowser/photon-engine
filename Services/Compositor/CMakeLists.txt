@@ -1,8 +1,11 @@
 set(SOURCES
     AsyncScrollUpdateOutbox.cpp
     BackingStoreManager.cpp
+    BitmapExport.cpp
+    Canvas2DCommandPlayer.cpp
     CanvasHost.cpp
     CaretBlinkTimer.cpp
+    ColorSpaceSkia.cpp
     CompositorState.cpp
     ContextPresenter.cpp
     ContextScene.cpp
@@ -10,13 +13,18 @@ set(SOURCES
     DisplayListPlayer.cpp
     DisplayListPlayerSkia.cpp
     DisplayListRasterCache.cpp
+    FontSkia.cpp
     ConnectionFromClient.cpp
+    ConnectionFromPresentation.cpp
     ConnectionFromWebContent.cpp
     ElasticOverscrollController.cpp
     FramePacer.cpp
     HostWebGLContext.cpp
     KeyboardScrollController.cpp
     OpenGLContext.cpp
+    PhotonGaneshPersistentCache.cpp
+    PainterSkia.cpp
+    PaintingSurface.cpp
     PausedDebuggerOverlay.cpp
     PictureInPictureControls.cpp
     RasterizeDisplayList.cpp
@@ -24,6 +32,8 @@ set(SOURCES
     ScrollFlingController.cpp
     ScrollSnapController.cpp
     ScrollbarController.cpp
+    SkiaBackendContext.cpp
+    SkiaUtils.cpp
     VideoFrameHolds.cpp
     VideoFrameSkia.cpp
     VSyncScheduler.cpp
@@ -44,6 +54,8 @@ invoke_py_generator(
 set(GENERATED_SOURCES
     CompositorControlClientEndpoint.h
     CompositorControlServerEndpoint.h
+    CompositorPresentationClientEndpoint.h
+    CompositorPresentationServerEndpoint.h
     CompositorWebContentClientEndpoint.h
     CompositorWebContentServerEndpoint.h
     RenderClockClientEndpoint.h
@@ -73,12 +85,17 @@ target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSa
 # OpenGL framework pulled in by Skia.
 target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibCompositing ${ANGLE_TARGETS} skia)
 
+if (HAS_VULKAN)
+    target_sources(compositorservice PRIVATE SkiaVulkanMemoryAllocator.cpp)
+    target_link_libraries(compositorservice PRIVATE Vulkan::Vulkan GPUOpen::VulkanMemoryAllocator)
+endif()
+
 if (USE_VULKAN_DMABUF_IMAGES)
     target_sources(compositorservice PRIVATE VideoFrameSkiaVulkan.cpp)
 endif()
 
 if (APPLE)
-    target_sources(compositorservice PRIVATE VideoFrameSkia.mm)
+    target_sources(compositorservice PRIVATE MetalContext.mm VideoFrameSkia.mm)
     target_link_libraries(compositorservice PUBLIC "-framework CoreGraphics" "-framework CoreVideo")
 endif()
 

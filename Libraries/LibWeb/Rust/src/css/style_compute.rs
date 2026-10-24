@@ -1212,6 +1212,13 @@ pub(crate) fn value_is_computationally_independent(value: &StyleValueData) -> Op
         }
         // Every filter kind's rule recurses into its single value.
         StyleValueData::Filter { value, .. } => all_data(&[value]),
+        StyleValueData::Ray { angle, position, .. } => {
+            let mut independent = value_is_computationally_independent(angle.data())?;
+            if let Some(position) = position.optional_data() {
+                independent = independent && value_is_computationally_independent(position)?;
+            }
+            Some(independent)
+        }
         StyleValueData::Counter { counter_style, .. } => all_data(&[counter_style]),
         StyleValueData::OpenTypeTagged { value, .. } => all_data(&[value]),
         StyleValueData::RandomValueSharing { fixed_value, .. } => match fixed_value.optional_data() {
@@ -1375,20 +1382,15 @@ pub(crate) fn value_is_computationally_independent(value: &StyleValueData) -> Op
         }
         StyleValueData::ColorMix {
             color_interpolation_method,
-            first_color,
-            first_percentage,
-            second_color,
-            second_percentage,
+            colors,
+            percentages,
             ..
         } => {
             let mut independent = true;
-            for value in [
-                color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
-            ] {
+            for value in std::iter::once(color_interpolation_method)
+                .chain(colors.as_slice())
+                .chain(percentages.as_slice())
+            {
                 if let Some(value) = value.optional_data() {
                     independent = independent && value_is_computationally_independent(value)?;
                 }
@@ -1529,6 +1531,10 @@ pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> Ext
                 collect_values(&[numerator, denominator], dependencies);
             }
             StyleValueData::Edge { offset, .. } => collect_optional(offset, dependencies),
+            StyleValueData::Ray { angle, position, .. } => {
+                collect_optional(angle, dependencies);
+                collect_optional(position, dependencies);
+            }
             StyleValueData::Function { value, .. }
             | StyleValueData::OpacityValue { value }
             | StyleValueData::Filter { value, .. }
@@ -1668,21 +1674,14 @@ pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> Ext
             }
             StyleValueData::ColorMix {
                 color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
+                colors,
+                percentages,
                 ..
-            } => collect_values(
-                &[
-                    color_interpolation_method,
-                    first_color,
-                    first_percentage,
-                    second_color,
-                    second_percentage,
-                ],
-                dependencies,
-            ),
+            } => {
+                collect_values(&[color_interpolation_method], dependencies);
+                collect_values(&colors.as_slice().iter().collect::<Vec<_>>(), dependencies);
+                collect_values(&percentages.as_slice().iter().collect::<Vec<_>>(), dependencies);
+            }
             StyleValueData::ContrastColor { color, .. } => collect(color.data(), dependencies),
             StyleValueData::LightDark { light, dark, .. } => collect_values(&[light, dark], dependencies),
             StyleValueData::Superellipse { parameter } => collect_optional(parameter, dependencies),
@@ -1809,6 +1808,7 @@ pub(crate) fn collect_unfixed_random_sharings_in_value(
         },
         StyleValueData::Ratio { numerator, denominator } => collect_values(&[numerator, denominator], sharings),
         StyleValueData::Edge { offset, .. } => collect_values(&[offset], sharings),
+        StyleValueData::Ray { angle, position, .. } => collect_values(&[angle, position], sharings),
         StyleValueData::Function { value, .. }
         | StyleValueData::OpacityValue { value }
         | StyleValueData::Filter { value, .. }
@@ -1915,21 +1915,14 @@ pub(crate) fn collect_unfixed_random_sharings_in_value(
         }
         StyleValueData::ColorMix {
             color_interpolation_method,
-            first_color,
-            first_percentage,
-            second_color,
-            second_percentage,
+            colors,
+            percentages,
             ..
-        } => collect_values(
-            &[
-                color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
-            ],
-            sharings,
-        ),
+        } => {
+            collect_values(&[color_interpolation_method], sharings);
+            collect_values(&colors.as_slice().iter().collect::<Vec<_>>(), sharings);
+            collect_values(&percentages.as_slice().iter().collect::<Vec<_>>(), sharings);
+        }
         StyleValueData::ContrastColor { color, .. } => collect_values(&[color], sharings),
         StyleValueData::LightDark { light, dark, .. } => collect_values(&[light, dark], sharings),
         StyleValueData::Superellipse { parameter } => collect_values(&[parameter], sharings),
@@ -2122,7 +2115,7 @@ fn compute_border_or_outline_width(
 }
 
 // https://drafts.csswg.org/css-backgrounds/#compute-a-border-width
-fn snap_a_length_as_a_border_width(device_pixels_per_css_pixel: f64, length: CssPixels) -> CssPixels {
+pub(crate) fn snap_a_length_as_a_border_width(device_pixels_per_css_pixel: f64, length: CssPixels) -> CssPixels {
     // 1. Assert: len is non-negative.
     // NB: The caller guarantees this; negative widths are invalid at parse time.
 
@@ -2456,6 +2449,154 @@ fn border_spacing_pair(single: StyleValueData) -> Arc<StyleValueData> {
     })
 }
 
+/// https://drafts.csswg.org/css-borders-4/#border-shape-geometry-box
+/// The computed value of a border-shape leaves out the reference boxes that are the defaults, and keeps one of two
+/// shapes that are the same against the same box. Returns `None` when the value is already canonical.
+#[allow(clippy::arc_with_non_send_sync)]
+fn canonicalize_border_shape(value: &StyleValueData) -> Option<Arc<StyleValueData>> {
+    let StyleValueData::ValueList { values, .. } = value else {
+        return None;
+    };
+    let mut entries: Vec<(&RetainedStyleValueData, Option<u16>)> = Vec::new();
+    for item in values.as_slice() {
+        match item.data() {
+            StyleValueData::Keyword { keyword } => entries.last_mut()?.1 = Some(*keyword),
+            _ => entries.push((item, None)),
+        }
+    }
+    // A single shape defaults to the half-border-box. Of two, the outer one defaults to the border box, and the inner
+    // one to the padding box.
+    let default_box = |count: usize, index: usize| match (count, index) {
+        (1, _) => keyword::HALF_BORDER_BOX,
+        (_, 0) => keyword::BORDER_BOX,
+        _ => keyword::PADDING_BOX,
+    };
+    if let [(outer, outer_box), (inner, inner_box)] = entries[..]
+        && outer.data() == inner.data()
+        && outer_box.unwrap_or(default_box(2, 0)) == inner_box.unwrap_or(default_box(2, 1))
+    {
+        // NB: An omitted box means something else for a single shape, so this keeps the box the outer shape used.
+        entries = vec![(outer, Some(outer_box.unwrap_or(default_box(2, 0))))];
+    }
+    let count = entries.len();
+    let mut canonical = Vec::with_capacity(count * 2);
+    for (index, (shape, geometry_box)) in entries.into_iter().enumerate() {
+        canonical.push(shape.clone_retained());
+        if let Some(geometry_box) = geometry_box.filter(|&geometry_box| geometry_box != default_box(count, index)) {
+            canonical.push(retained_new(StyleValueData::Keyword { keyword: geometry_box }));
+        }
+    }
+    if canonical.len() == values.as_slice().len() {
+        return None;
+    }
+    if let [only] = &canonical[..] {
+        return Some(Arc::new(only.data().clone()));
+    }
+    Some(Arc::new(StyleValueData::ValueList {
+        values: RetainedStyleValueDataList::from_retained_values(canonical),
+        separator: 0,
+        collapsible: false,
+    }))
+}
+
+/// https://drafts.csswg.org/scroll-animations-1/#animation-range-start
+/// A computed range edge leaves out the progress after a range name when it is the default for the edge: 0% for a
+/// start, 100% for an end. Returns `None` when the value is already canonical.
+#[allow(clippy::arc_with_non_send_sync)]
+fn canonicalize_animation_range(value: &StyleValueData, default_offset: f64) -> Option<Arc<StyleValueData>> {
+    // A calculation that resolves to the default percentage, with no length part, is left out too.
+    let is_percentage_of = |offset: &StyleValueData, percentage: f64| match offset {
+        StyleValueData::Percentage { value } => *value == percentage,
+        StyleValueData::Calculated { .. } => {
+            let offset = crate::css::computed_value_views::LengthPercentageRef::over(offset);
+            offset.to_px(CssPixels::default()) == CssPixels::default()
+                && offset.to_px(CssPixels::from_integer(100)).to_double() == percentage
+        }
+        _ => false,
+    };
+    let canonical_edge = |edge: &StyleValueData| match edge {
+        StyleValueData::ValueList { values, .. } => match values.as_slice() {
+            [name, offset] if is_percentage_of(offset.data(), default_offset) => Some(name.clone_retained()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let StyleValueData::ValueList {
+        values,
+        separator,
+        collapsible,
+    } = value
+    else {
+        return None;
+    };
+    // A list of edges is comma separated; a lone edge with a range name and an offset is a space separated pair.
+    if *separator == 0 {
+        return canonical_edge(value).map(|edge| Arc::new(edge.data().clone()));
+    }
+    let mut changed = false;
+    let edges = values
+        .as_slice()
+        .iter()
+        .map(|edge| match canonical_edge(edge.data()) {
+            Some(canonical) => {
+                changed = true;
+                canonical
+            }
+            None => edge.clone_retained(),
+        })
+        .collect();
+    changed.then(|| {
+        Arc::new(StyleValueData::ValueList {
+            values: RetainedStyleValueDataList::from_retained_values(edges),
+            separator: *separator,
+            collapsible: *collapsible,
+        })
+    })
+}
+
+/// https://drafts.csswg.org/motion-1/#offset-rotate-property
+/// Computed value: computed <angle> value, optionally preceded by auto
+/// Returns `None` when the value is already canonical.
+#[allow(clippy::arc_with_non_send_sync)]
+fn canonicalize_offset_rotate(value: &StyleValueData) -> Option<Arc<StyleValueData>> {
+    // NB: The C++ AngleUnit for degrees.
+    const DEGREES: u8 = 0;
+    let degrees = match value {
+        StyleValueData::Keyword {
+            keyword: keyword::REVERSE,
+        } => 0.0,
+        StyleValueData::ValueList { values, .. } => match values.as_slice() {
+            [first, angle]
+                if matches!(
+                    first.data(),
+                    StyleValueData::Keyword {
+                        keyword: keyword::REVERSE
+                    }
+                ) =>
+            {
+                let StyleValueData::Angle { value, unit: DEGREES } = angle.data() else {
+                    return None;
+                };
+                *value
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // reverse <angle>?: Identical to auto, but adds an additional 180deg to the rotation.
+    Some(Arc::new(StyleValueData::ValueList {
+        values: RetainedStyleValueDataList::from_retained_values(vec![
+            retained_new(StyleValueData::Keyword { keyword: keyword::AUTO }),
+            retained_new(StyleValueData::Angle {
+                value: degrees + 180.0,
+                unit: DEGREES,
+            }),
+        ]),
+        separator: 0,
+        collapsible: false,
+    }))
+}
+
 // https://drafts.csswg.org/css-contain-2/#contain-property
 #[allow(clippy::arc_with_non_send_sync)]
 fn collapse_containment_list(value: &StyleValueData) -> Option<Arc<StyleValueData>> {
@@ -2712,6 +2853,25 @@ pub enum FfiAnimationTimelineKind {
     Document,
     None,
     Scroll,
+    View,
+    Named,
+}
+
+/// The insets of a view progress timeline's visibility range, as the host takes them: each side either auto, which
+/// takes the scroll container's scroll padding, or a length plus a percentage of the scrollport.
+/// https://drafts.csswg.org/scroll-animations-1/#view-timeline-inset
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiViewTimelineInset {
+    pub start_is_auto: bool,
+    pub start_px: f64,
+    pub start_percentage: f64,
+    /// A calculation the start inset resolves against the scrollport size, or null. See `calculated_offset`.
+    pub start_calculated: *const c_void,
+    pub end_is_auto: bool,
+    pub end_px: f64,
+    pub end_percentage: f64,
+    pub end_calculated: *const c_void,
 }
 
 #[repr(C)]
@@ -2729,6 +2889,21 @@ pub struct FfiComputedAnimation {
     pub timeline_kind: FfiAnimationTimelineKind,
     pub scroll_scroller: u8,
     pub scroll_axis: u8,
+    /// The insets of a view() timeline.
+    pub view_inset: FfiViewTimelineInset,
+    /// The name of a named timeline, as a CSS string, or null.
+    pub timeline_name: *const c_void,
+    /// The edges of the animation attachment range, each a `TimelineRangeName` in the host's numbering and an offset
+    /// from the start of that range: a length plus a percentage of the range.
+    pub range_start_name: u8,
+    pub range_start_px: f64,
+    pub range_start_percentage: f64,
+    /// A calculation the start offset resolves against the size of its range, or null. See `calculated_offset`.
+    pub range_start_calculated: *const c_void,
+    pub range_end_name: u8,
+    pub range_end_px: f64,
+    pub range_end_percentage: f64,
+    pub range_end_calculated: *const c_void,
     /// The index, in the list of CSS animations the host already holds for this element or
     /// pseudo-element, of the animation this definition claims, or -1 where it asks for a new one.
     pub matched_existing_index: i32,
@@ -3032,9 +3207,16 @@ impl<'a> ParentSnapshot<'a> {
         {
             return Some(entry.value_handle());
         }
-        for (property, value) in self.table.retained_inheritance_dependent_values() {
-            if property == property_id && crate::css::style_value::style_value_dependency_flags(value.data()) & 1 != 0 {
-                return Some(value);
+        // NB: A value reading currentcolor is inherited as specified, to resolve against the inheriting element's own
+        //     color, except in the color property, whose currentcolor is the inherited value and so resolved where
+        //     it computes.
+        if property_id != crate::css::property_metadata::property_id::COLOR {
+            for (property, value) in self.table.retained_inheritance_dependent_values() {
+                if property == property_id
+                    && crate::css::style_value::style_value_dependency_flags(value.data()) & 1 != 0
+                {
+                    return Some(value);
+                }
             }
         }
         self.table.get(property_id)
@@ -3575,6 +3757,15 @@ pub(crate) unsafe fn drive_property_computation(
         } else {
             None
         };
+        // https://www.w3.org/TR/css-color-4/#resolving-other-colors
+        // In the color property, the used value of currentcolor is the resolved inherited value.
+        let current_color = (inherited_property_id == prop::COLOR).then(|| {
+            highlight_parent_snapshot
+                .or(snapshot)
+                .and_then(|snapshot| snapshot.value_handle(prop::COLOR))
+                .and_then(RetainedStyleValueData::optional_data)
+                .unwrap_or_else(|| initial_value_handle(prop::COLOR).data())
+        });
         // Absolutizes a value against this element's facts, noting in `results` when it resolved a viewport-relative
         // length.
         let absolutize_value = |value: &StyleValueData,
@@ -3589,6 +3780,7 @@ pub(crate) unsafe fn drive_property_computation(
                 random_base_values,
                 document_base_url,
                 style_sheet_resource_context,
+                current_color,
             };
             let outcome = crate::css::absolutize::absolutize(value, &context);
             if context.resolved_viewport_relative_length.get() {
@@ -4172,6 +4364,58 @@ pub(crate) unsafe fn drive_property_computation(
                     };
                     NativeValue::StyleValue(border_spacing_pair(single))
                 }
+                (None, prop::BORDER_SHAPE) => {
+                    let resolution_context =
+                        length_resolution_context.expect("border-shape must compute with a resolution context");
+                    match absolutize_value(value_data, resolution_context, current_effective_color_scheme, results) {
+                        Some(crate::css::absolutize::Absolutized::Unchanged) => canonicalize_border_shape(value_data)
+                            .map_or(NativeValue::Unchanged, NativeValue::StyleValue),
+                        Some(crate::css::absolutize::Absolutized::Changed(new_value)) => {
+                            match canonicalize_border_shape(new_value.data()) {
+                                Some(canonical) => NativeValue::StyleValue(canonical),
+                                None => NativeValue::StyleValue(new_value.into_arc()),
+                            }
+                        }
+                        None => NativeValue::Unsupported,
+                    }
+                }
+                (_, prop::OFFSET_ROTATE) => {
+                    let resolution_context =
+                        length_resolution_context.expect("offset-rotate must compute with a resolution context");
+                    match absolutize_value(value_data, resolution_context, current_effective_color_scheme, results) {
+                        Some(crate::css::absolutize::Absolutized::Unchanged) => canonicalize_offset_rotate(value_data)
+                            .map_or(NativeValue::Unchanged, NativeValue::StyleValue),
+                        Some(crate::css::absolutize::Absolutized::Changed(new_value)) => {
+                            match canonicalize_offset_rotate(new_value.data()) {
+                                Some(canonical) => NativeValue::StyleValue(canonical),
+                                None => NativeValue::StyleValue(new_value.into_arc()),
+                            }
+                        }
+                        None => NativeValue::Unsupported,
+                    }
+                }
+                (None, prop::ANIMATION_RANGE_START | prop::ANIMATION_RANGE_END) => {
+                    let resolution_context =
+                        length_resolution_context.expect("animation-range must compute with a resolution context");
+                    let default_offset = if inherited_property_id == prop::ANIMATION_RANGE_START {
+                        0.0
+                    } else {
+                        100.0
+                    };
+                    match absolutize_value(value_data, resolution_context, current_effective_color_scheme, results) {
+                        Some(crate::css::absolutize::Absolutized::Unchanged) => {
+                            canonicalize_animation_range(value_data, default_offset)
+                                .map_or(NativeValue::Unchanged, NativeValue::StyleValue)
+                        }
+                        Some(crate::css::absolutize::Absolutized::Changed(new_value)) => {
+                            match canonicalize_animation_range(new_value.data(), default_offset) {
+                                Some(canonical) => NativeValue::StyleValue(canonical),
+                                None => NativeValue::StyleValue(new_value.into_arc()),
+                            }
+                        }
+                        None => NativeValue::Unsupported,
+                    }
+                }
                 (_, prop::CONTAIN) => match collapse_containment_list(value_data) {
                     Some(value) => NativeValue::StyleValue(value),
                     None => NativeValue::Unchanged,
@@ -4658,12 +4902,297 @@ fn fly_string_is_ascii(string: &crate::css::css_string::CssString, expected: &[u
         .eq(expected.iter().copied().map(u16::from))
 }
 
-fn animation_timeline_descriptor(value: &StyleValueData) -> (FfiAnimationTimelineKind, u8, u8) {
-    let default = (FfiAnimationTimelineKind::Document, scroller::NEAREST, axis::BLOCK);
+/// The computed value of a length-percentage that only a calculation can describe, such as `min(50%, 10px)`, which the
+/// host retains and resolves once it knows the size the percentages are of, or null for any other value.
+fn calculated_offset(value: &StyleValueData) -> *const c_void {
     match value {
-        StyleValueData::Keyword { keyword } if *keyword == keyword::AUTO => default,
+        StyleValueData::Calculated { .. } => std::ptr::from_ref(value).cast(),
+        _ => std::ptr::null(),
+    }
+}
+
+/// The pixels of a computed length-percentage, resolving its percentages against `basis`.
+///
+/// # Safety
+/// `value` must point at live style value data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_length_percentage_px(value: *const c_void, basis: f64) -> f64 {
+    // SAFETY: The caller passes a live style value.
+    let value = unsafe { &*value.cast::<StyleValueData>() };
+    crate::css::computed_value_views::LengthPercentageRef::over(value)
+        .to_px(CssPixels::nearest_value_for(basis))
+        .to_double()
+}
+
+/// A length-percentage computed value as a length plus a percentage of what it resolves against.
+fn length_plus_percentage(value: &StyleValueData) -> (f64, f64) {
+    match value {
+        StyleValueData::Percentage { value } => (0.0, *value),
+        value => {
+            let value = crate::css::computed_value_views::LengthPercentageRef::over(value);
+            let px = value.to_px(CssPixels::default()).to_double();
+            (px, value.to_px(CssPixels::from_integer(100)).to_double() - px)
+        }
+    }
+}
+
+/// The insets a computed `[ auto | <length-percentage> ]{1,2}` describes, or both auto where there is none.
+fn view_timeline_inset(value: Option<&StyleValueData>) -> FfiViewTimelineInset {
+    let side = |value: &StyleValueData| match value {
+        StyleValueData::Keyword { keyword } if *keyword == keyword::AUTO => (true, 0.0, 0.0, std::ptr::null()),
+        value => {
+            let (px, percentage) = length_plus_percentage(value);
+            (false, px, percentage, calculated_offset(value))
+        }
+    };
+    let (start, end) = match value {
+        None => ((true, 0.0, 0.0, std::ptr::null()), (true, 0.0, 0.0, std::ptr::null())),
+        Some(StyleValueData::ValueList { values, .. }) => match values.as_slice() {
+            [start, end] => (side(start.data()), side(end.data())),
+            [both] => (side(both.data()), side(both.data())),
+            _ => unreachable!("computed view timeline inset must have one or two sides"),
+        },
+        Some(value) => (side(value), side(value)),
+    };
+    FfiViewTimelineInset {
+        start_is_auto: start.0,
+        start_px: start.1,
+        start_percentage: start.2,
+        start_calculated: start.3,
+        end_is_auto: end.0,
+        end_px: end.1,
+        end_percentage: end.2,
+        end_calculated: end.3,
+    }
+}
+
+/// The insets a computed `view-timeline-inset` item describes, for a timeline the host builds from script.
+///
+/// # Safety
+/// `value` must point at live style value data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_view_timeline_inset(value: *const c_void) -> FfiViewTimelineInset {
+    // SAFETY: Guaranteed by the caller.
+    let value = unsafe { &*value.cast::<StyleValueData>() };
+    let value = match value {
+        StyleValueData::ValueList { values, separator, .. } if *separator == 1 => values.as_slice()[0].data(),
+        value => value,
+    };
+    view_timeline_inset(Some(value))
+}
+
+/// One named timeline an element declares with `scroll-timeline` or `view-timeline`.
+/// https://drafts.csswg.org/scroll-animations-1/#timeline-scoping
+#[repr(C)]
+pub struct FfiTimelineDeclaration {
+    /// The name, as a CSS string.
+    pub name: *const c_void,
+    pub is_view: bool,
+    pub axis: u8,
+    pub view_inset: FfiViewTimelineInset,
+}
+
+/// Hands `declare` the named timelines `values` declares. Of the timelines that share a name, the one handed last is
+/// the one the element defines: names declared later in the naming property take precedence, and scroll progress
+/// timelines take precedence over view progress timelines.
+///
+/// # Safety
+/// `values` must point at a live animation style group, and `declare` must be safe to call with `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_animation_values_timeline_declarations(
+    values: &crate::css::computed_value_types::AnimationValues,
+    context: *mut c_void,
+    declare: unsafe extern "C" fn(*mut c_void, *const FfiTimelineDeclaration),
+) {
+    let items = |handle: &crate::css::computed_value_types::ComputedStyleValueHandle| -> Vec<&StyleValueData> {
+        // SAFETY: A computed style group's handles point at retained style values it owns.
+        match unsafe { handle.pointer.cast::<StyleValueData>().as_ref() } {
+            None => Vec::new(),
+            Some(StyleValueData::ValueList { values, separator, .. }) if *separator == 1 => {
+                values.as_slice().iter().map(|value| value.data()).collect()
+            }
+            Some(value) => vec![value],
+        }
+    };
+    let axis_of = |values: &[&StyleValueData], index: usize| match values.get(index % values.len().max(1)) {
+        Some(StyleValueData::Keyword { keyword }) => keyword_to_axis(*keyword).unwrap_or(axis::BLOCK),
+        _ => axis::BLOCK,
+    };
+    let declare_names =
+        |names: Vec<&StyleValueData>, is_view: bool, axes: Vec<&StyleValueData>, insets: Vec<&StyleValueData>| {
+            for (index, name) in names.iter().enumerate() {
+                let StyleValueData::CustomIdent { custom_ident } = name else {
+                    continue;
+                };
+                let declaration = FfiTimelineDeclaration {
+                    name: custom_ident.as_ptr(),
+                    is_view,
+                    axis: axis_of(&axes, index),
+                    view_inset: view_timeline_inset(insets.get(index % insets.len().max(1)).copied()),
+                };
+                // SAFETY: Guaranteed by the caller.
+                unsafe { declare(context, &raw const declaration) };
+            }
+        };
+    declare_names(
+        items(&values.view_timeline_name),
+        true,
+        items(&values.view_timeline_axis),
+        items(&values.view_timeline_inset),
+    );
+    declare_names(
+        items(&values.scroll_timeline_name),
+        false,
+        items(&values.scroll_timeline_axis),
+        Vec::new(),
+    );
+}
+
+/// The names `timeline-scope` in `values` scopes: none, all of them, or those handed to `scope`.
+/// https://drafts.csswg.org/scroll-animations-1/#timeline-scope
+///
+/// # Safety
+/// `values` must point at a live animation style group, and `scope` must be safe to call with `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_animation_values_timeline_scope(
+    values: &crate::css::computed_value_types::AnimationValues,
+    context: *mut c_void,
+    scope: unsafe extern "C" fn(*mut c_void, *const c_void),
+) -> FfiTimelineScope {
+    // SAFETY: A computed style group's handles point at retained style values it owns.
+    let Some(value) = (unsafe { values.timeline_scope.pointer.cast::<StyleValueData>().as_ref() }) else {
+        return FfiTimelineScope::None;
+    };
+    let names: Vec<&StyleValueData> = match value {
+        StyleValueData::Keyword { keyword } if *keyword == keyword::ALL => return FfiTimelineScope::All,
+        StyleValueData::Keyword { .. } => return FfiTimelineScope::None,
+        StyleValueData::ValueList { values, .. } => values.as_slice().iter().map(|value| value.data()).collect(),
+        value => vec![value],
+    };
+    for name in names {
+        if let StyleValueData::CustomIdent { custom_ident } = name {
+            // SAFETY: Guaranteed by the caller.
+            unsafe { scope(context, custom_ident.as_ptr()) };
+        }
+    }
+    FfiTimelineScope::Names
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq)]
+pub enum FfiTimelineScope {
+    None,
+    All,
+    Names,
+}
+
+/// Whether `a` and `b` declare the same named timelines, and scope the same timeline names.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_animation_values_timeline_declarations_equal(
+    a: &crate::css::computed_value_types::AnimationValues,
+    b: &crate::css::computed_value_types::AnimationValues,
+) -> bool {
+    let same = |a: &crate::css::computed_value_types::ComputedStyleValueHandle,
+                b: &crate::css::computed_value_types::ComputedStyleValueHandle| {
+        // SAFETY: A computed style group's handles point at retained style values it owns.
+        let (a, b) = unsafe {
+            (
+                a.pointer.cast::<StyleValueData>().as_ref(),
+                b.pointer.cast::<StyleValueData>().as_ref(),
+            )
+        };
+        a == b
+    };
+    same(&a.scroll_timeline_name, &b.scroll_timeline_name)
+        && same(&a.scroll_timeline_axis, &b.scroll_timeline_axis)
+        && same(&a.view_timeline_name, &b.view_timeline_name)
+        && same(&a.view_timeline_axis, &b.view_timeline_axis)
+        && same(&a.view_timeline_inset, &b.view_timeline_inset)
+        && same(&a.timeline_scope, &b.timeline_scope)
+}
+
+/// Whether `values` declares a named timeline, or scopes timeline names.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_animation_values_declare_timelines(
+    values: &crate::css::computed_value_types::AnimationValues,
+) -> bool {
+    fn declares_name(value: &StyleValueData) -> bool {
+        match value {
+            StyleValueData::Keyword { keyword } => *keyword != keyword::NONE,
+            StyleValueData::ValueList { values, .. } => values.as_slice().iter().any(|item| declares_name(item.data())),
+            _ => true,
+        }
+    }
+    let is_declared = |handle: &crate::css::computed_value_types::ComputedStyleValueHandle| {
+        // SAFETY: A computed style group's handles point at retained style values it owns.
+        unsafe { handle.pointer.cast::<StyleValueData>().as_ref() }.is_some_and(declares_name)
+    };
+    is_declared(&values.scroll_timeline_name)
+        || is_declared(&values.view_timeline_name)
+        || is_declared(&values.timeline_scope)
+}
+
+/// Whether a parsed `view-timeline-inset` value has a length in a unit that is not absolute.
+///
+/// # Safety
+/// `value` must point at live style value data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_view_timeline_inset_has_relative_length(value: *const c_void) -> bool {
+    let is_absolute = |unit: u8| {
+        matches!(
+            length_unit_kinds().get(unit as usize),
+            Some(LengthUnitKind::Px | LengthUnitKind::Absolute { .. })
+        )
+    };
+    fn has_relative_length(value: &StyleValueData, is_absolute: &dyn Fn(u8) -> bool) -> bool {
+        match value {
+            StyleValueData::Length { unit, .. } => !is_absolute(*unit),
+            StyleValueData::Calculated { rust_calculation, .. } => !rust_calculation
+                .node()
+                .is_computationally_independent(&|unit| is_absolute(unit), &|_| false),
+            StyleValueData::ValueList { values, .. } => values
+                .as_slice()
+                .iter()
+                .any(|value| has_relative_length(value.data(), is_absolute)),
+            _ => false,
+        }
+    }
+    // SAFETY: Guaranteed by the caller.
+    has_relative_length(unsafe { &*value.cast::<StyleValueData>() }, &is_absolute)
+}
+
+/// The timeline a computed `animation-timeline` item asks for.
+struct AnimationTimelineDescriptor {
+    kind: FfiAnimationTimelineKind,
+    scroller: u8,
+    axis: u8,
+    view_inset: FfiViewTimelineInset,
+    name: *const c_void,
+}
+
+fn animation_timeline_descriptor(value: &StyleValueData) -> AnimationTimelineDescriptor {
+    let descriptor = |kind, scroller, axis| AnimationTimelineDescriptor {
+        kind,
+        scroller,
+        axis,
+        view_inset: view_timeline_inset(None),
+        name: std::ptr::null(),
+    };
+    let optional_axis = |value: &RetainedStyleValueData| {
+        value
+            .optional_data()
+            .map(|value| match value {
+                StyleValueData::Keyword { keyword } => keyword_to_axis(*keyword).unwrap(),
+                _ => unreachable!("computed timeline axis must be a keyword"),
+            })
+            .unwrap_or(axis::BLOCK)
+    };
+    match value {
+        StyleValueData::Keyword { keyword } if *keyword == keyword::AUTO => {
+            descriptor(FfiAnimationTimelineKind::Document, scroller::NEAREST, axis::BLOCK)
+        }
         StyleValueData::Keyword { keyword } if *keyword == keyword::NONE => {
-            (FfiAnimationTimelineKind::None, scroller::NEAREST, axis::BLOCK)
+            descriptor(FfiAnimationTimelineKind::None, scroller::NEAREST, axis::BLOCK)
         }
         StyleValueData::Function { name, value } if fly_string_is_ascii(name, b"scroll") => {
             let StyleValueData::Tuple { values } = value.data() else {
@@ -4677,17 +5206,108 @@ fn animation_timeline_descriptor(value: &StyleValueData) -> (FfiAnimationTimelin
                     _ => unreachable!("computed scroll() scroller must be a keyword"),
                 })
                 .unwrap_or(scroller::NEAREST);
-            let axis = arguments[1]
-                .optional_data()
-                .map(|value| match value {
-                    StyleValueData::Keyword { keyword } => keyword_to_axis(*keyword).unwrap(),
-                    _ => unreachable!("computed scroll() axis must be a keyword"),
-                })
-                .unwrap_or(axis::BLOCK);
-            (FfiAnimationTimelineKind::Scroll, scroller, axis)
+            descriptor(FfiAnimationTimelineKind::Scroll, scroller, optional_axis(&arguments[1]))
         }
-        _ => default,
+        // https://drafts.csswg.org/scroll-animations-1/#view-notation
+        StyleValueData::Function { name, value } if fly_string_is_ascii(name, b"view") => {
+            let StyleValueData::Tuple { values } = value.data() else {
+                unreachable!("computed view() timeline must contain a tuple")
+            };
+            let arguments = values.as_slice();
+            AnimationTimelineDescriptor {
+                view_inset: view_timeline_inset(arguments[1].optional_data()),
+                ..descriptor(
+                    FfiAnimationTimelineKind::View,
+                    scroller::NEAREST,
+                    optional_axis(&arguments[0]),
+                )
+            }
+        }
+        StyleValueData::CustomIdent { custom_ident } => AnimationTimelineDescriptor {
+            name: custom_ident.as_ptr(),
+            ..descriptor(FfiAnimationTimelineKind::Named, scroller::NEAREST, axis::BLOCK)
+        },
+        _ => descriptor(FfiAnimationTimelineKind::Document, scroller::NEAREST, axis::BLOCK),
     }
+}
+
+/// One edge of a computed animation attachment range, as the host takes it: the `TimelineRangeName` it is measured in,
+/// and its offset from the start of that range as a length plus a percentage of the range. `normal` is the start or the
+/// end of the entire timeline.
+/// https://drafts.csswg.org/scroll-animations-1/#animation-range-start
+fn animation_range_edge(value: &StyleValueData, default_percentage: f64) -> (u8, f64, f64, *const c_void) {
+    let range_name = |keyword: u16| match keyword {
+        keyword::COVER => 1,
+        keyword::CONTAIN => 2,
+        keyword::ENTRY => 3,
+        keyword::EXIT => 4,
+        keyword::ENTRY_CROSSING => 5,
+        keyword::EXIT_CROSSING => 6,
+        keyword::SCROLL => 7,
+        _ => 0,
+    };
+    let offset = |value: &StyleValueData| {
+        let (px, percentage) = length_plus_percentage(value);
+        (px, percentage, calculated_offset(value))
+    };
+    match value {
+        StyleValueData::Keyword { keyword } => (range_name(*keyword), 0.0, default_percentage, std::ptr::null()),
+        StyleValueData::ValueList { values, .. } => {
+            let [name, length_percentage] = values.as_slice() else {
+                unreachable!("computed animation range edge must be a range name and an offset")
+            };
+            let StyleValueData::Keyword { keyword } = name.data() else {
+                unreachable!("computed animation range edge must start with a range name")
+            };
+            let (px, percentage, calculated) = offset(length_percentage.data());
+            (range_name(*keyword), px, percentage, calculated)
+        }
+        value => {
+            let (px, percentage, calculated) = offset(value);
+            (0, px, percentage, calculated)
+        }
+    }
+}
+
+/// One edge of an animation attachment range, as `animation_range_edge` describes it.
+#[repr(C)]
+pub struct FfiAnimationRangeEdge {
+    pub name: u8,
+    pub offset_px: f64,
+    pub offset_percentage: f64,
+    /// A calculation the offset resolves against the size of its range, or null. See `calculated_offset`.
+    pub offset_calculated: *const c_void,
+}
+
+/// The edge a computed `animation-range-start` or `animation-range-end` value with a single item describes, for a range
+/// script sets. Answers false where the value has more than one item.
+///
+/// # Safety
+/// `value` must point at live style value data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_animation_range_edge(
+    value: *const c_void,
+    is_end: bool,
+    out: &mut FfiAnimationRangeEdge,
+) -> bool {
+    // SAFETY: Guaranteed by the caller.
+    let value = unsafe { &*value.cast::<StyleValueData>() };
+    let item = match value {
+        StyleValueData::ValueList { values, separator, .. } if *separator == 1 => match values.as_slice() {
+            [item] => item.data(),
+            _ => return false,
+        },
+        value => value,
+    };
+    let (name, offset_px, offset_percentage, offset_calculated) =
+        animation_range_edge(item, if is_end { 100.0 } else { 0.0 });
+    *out = FfiAnimationRangeEdge {
+        name,
+        offset_px,
+        offset_percentage,
+        offset_calculated,
+    };
+    true
 }
 
 /// Which of an element's animation lists a computation belongs to, in the host's own numbering:
@@ -4848,6 +5468,8 @@ fn build_computed_animation_list(
     let fill_mode_values = computed_value_list(table, prop::ANIMATION_FILL_MODE);
     let composition_values = computed_value_list(table, prop::ANIMATION_COMPOSITION);
     let timeline_values = computed_value_list(table, prop::ANIMATION_TIMELINE);
+    let range_start_values = computed_value_list(table, prop::ANIMATION_RANGE_START);
+    let range_end_values = computed_value_list(table, prop::ANIMATION_RANGE_END);
 
     // The name of each definition, for matching against the animations the host holds.
     let mut definition_names = smallvec::SmallVec::<[&crate::css::css_string::CssString; 1]>::new();
@@ -4875,8 +5497,11 @@ fn build_computed_animation_list(
             StyleValueData::Keyword { keyword } => *keyword,
             _ => unreachable!("computed animation enum must be a keyword"),
         };
-        let (timeline_kind, scroll_scroller, scroll_axis) =
-            animation_timeline_descriptor(timeline_values[index % timeline_values.len()].data());
+        let timeline = animation_timeline_descriptor(timeline_values[index % timeline_values.len()].data());
+        let (range_start_name, range_start_px, range_start_percentage, range_start_calculated) =
+            animation_range_edge(range_start_values[index % range_start_values.len()].data(), 0.0);
+        let (range_end_name, range_end_px, range_end_percentage, range_end_calculated) =
+            animation_range_edge(range_end_values[index % range_end_values.len()].data(), 100.0);
         animations.push(FfiComputedAnimation {
             duration_is_auto,
             duration,
@@ -4890,9 +5515,19 @@ fn build_computed_animation_list(
             fill_mode: keyword_to_animation_fill_mode(keyword_value(fill_mode_values)).unwrap(),
             composition: keyword_to_animation_composition(keyword_value(composition_values)).unwrap(),
             name: name.as_ptr(),
-            timeline_kind,
-            scroll_scroller,
-            scroll_axis,
+            timeline_kind: timeline.kind,
+            scroll_scroller: timeline.scroller,
+            scroll_axis: timeline.axis,
+            view_inset: timeline.view_inset,
+            timeline_name: timeline.name,
+            range_start_name,
+            range_start_px,
+            range_start_percentage,
+            range_start_calculated,
+            range_end_name,
+            range_end_px,
+            range_end_percentage,
+            range_end_calculated,
             matched_existing_index: crate::css::style::animations::NO_MATCHED_ANIMATION,
             keyframe_set: resolve_keyframes(name.units()).map_or(std::ptr::null(), |set| set as *const c_void),
         });
@@ -5300,6 +5935,10 @@ pub struct FfiEffectTiming {
     pub has_timeline_scroller: bool,
     pub timeline_scroller_is_vertical: bool,
     pub timeline_scroller: i64,
+    /// The effect's animation runs on a progress-based timeline, whose minimum and maximum timeline times these are.
+    pub has_timeline_boundaries: bool,
+    pub minimum_timeline_time: f64,
+    pub maximum_timeline_time: f64,
     pub has_start_time: bool,
     pub has_hold_time: bool,
     /// The effect's animation is paused, which holds its time, as one whose play is pending does too.
@@ -5559,6 +6198,10 @@ impl AnimationSampleInput<'_> {
     ) -> crate::css::animation::FfiAnimationContext<'_> {
         let mut context = crate::css::animation::FfiAnimationContext {
             allow_discrete: length_resolution_context.is_some(),
+            allow_keyword_size_interpolation: crate::css::animation::allows_keyword_size_interpolation(
+                self.longhand_table,
+                None,
+            ),
             current_color: Some(&self.current_color),
             has_length_resolution_context: length_resolution_context.is_some(),
             length_resolution_context: length_resolution_context
@@ -5953,6 +6596,7 @@ fn begin_animation_sample(
     if anim::animation_preparation_matches(Some(mutated_overlay), &composed, input.custom_property_environments) {
         anim::evaluate_animations(anim::ComputedAnimationBatch {
             context: input.animation_context(None, reference_box),
+            device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
             sampled_effects: &composed,
             custom_property_environments: input.custom_property_environments,
             cache_preparation: true,
@@ -6120,6 +6764,7 @@ fn finish_animation_sample(
         && resolved.unfixed_random_sharings.is_empty();
     let custom_results = anim::evaluate_animations(anim::ComputedAnimationBatch {
         context: input.animation_context(Some(&length_contexts.remaining), reference_box),
+        device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
         sampled_effects: &composed,
         custom_property_environments: input.custom_property_environments,
         cache_preparation,

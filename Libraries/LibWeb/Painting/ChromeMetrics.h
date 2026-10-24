@@ -14,14 +14,14 @@ struct ChromeMetrics {
     // Chrome sizing constants independent of page zoom.
     static constexpr CSSPixels ZOOM_INVARIANT_SCROLL_THUMB_MIN_LENGTH { 24 };
     static constexpr CSSPixels ZOOM_INVARIANT_SCROLL_THUMB_PADDING_THIN { 2 };
-    static constexpr CSSPixels ZOOM_INVARIANT_SCROLL_THUMB_THICKNESS_THIN { 6 };
-    static constexpr CSSPixels ZOOM_INVARIANT_SCROLL_THUMB_THICKNESS { 8 };
-    static constexpr CSSPixels ZOOM_INVARIANT_SCROLL_GUTTER_THICKNESS { 12 };
+    static constexpr CSSPixels ZOOM_INVARIANT_SCROLL_THUMB_THICKNESS_THIN { 7 };
+    static constexpr CSSPixels ZOOM_INVARIANT_SCROLL_THUMB_THICKNESS { 11 };
+    static constexpr CSSPixels ZOOM_INVARIANT_SCROLL_GUTTER_THICKNESS { 15 };
     static constexpr CSSPixels ZOOM_INVARIANT_RESIZE_GRIPPER_SIZE { 12 };
     static constexpr CSSPixels ZOOM_INVARIANT_RESIZE_GRIPPER_PADDING { 2 };
 
     ChromeMetrics() = default;
-    explicit ChromeMetrics(double zoom_factor)
+    explicit ChromeMetrics(double zoom_factor, double viewport_corner_radius = 0)
     {
         VERIFY(zoom_factor > 0);
         // So we can still use device_pixels_per_css_pixel transforms at paint time.
@@ -33,6 +33,7 @@ struct ChromeMetrics {
         scroll_gutter_thickness = ZOOM_INVARIANT_SCROLL_GUTTER_THICKNESS * inverse_zoom;
         resize_gripper_size = ZOOM_INVARIANT_RESIZE_GRIPPER_SIZE * inverse_zoom;
         resize_gripper_padding = ZOOM_INVARIANT_RESIZE_GRIPPER_PADDING * inverse_zoom;
+        this->viewport_corner_radius = CSSPixels { viewport_corner_radius } * inverse_zoom;
     }
     CSSPixels scroll_thumb_min_length;
     CSSPixels scroll_thumb_padding_thin;
@@ -41,6 +42,8 @@ struct ChromeMetrics {
     CSSPixels scroll_gutter_thickness;
     CSSPixels resize_gripper_size;
     CSSPixels resize_gripper_padding;
+    // The UI may round the corners of the top-level viewport with circular arcs. Its scrollbars follow them.
+    CSSPixels viewport_corner_radius;
 };
 
 }

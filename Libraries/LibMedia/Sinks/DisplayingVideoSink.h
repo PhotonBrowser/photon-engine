@@ -26,6 +26,13 @@ struct DisplayingVideoSinkUpdateResult {
     bool may_require_updates { false };
 };
 
+struct DisplayingVideoSinkFrameCounts {
+    u64 presented { 0 };
+    u64 dropped { 0 };
+
+    bool is_zero() const { return presented == 0 && dropped == 0; }
+};
+
 class MEDIA_API DisplayingVideoSink final : public VideoSink
     , public ThreadSafeWeakable<DisplayingVideoSink> {
 public:
@@ -43,22 +50,28 @@ public:
 
     virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) override;
     virtual void notify_clock_resumed() override;
+    void set_ticking(bool);
+    bool is_ticking() const { return m_is_ticking; }
 
     DisplayingVideoSinkUpdateResult update(MonotonicTime now);
     RefPtr<VideoFrame> current_frame() const;
+    DisplayingVideoSinkFrameCounts take_frame_counts() { return exchange(m_frame_counts, {}); }
 
     void set_on_present_needed(Function<void()> handler) { m_on_present_needed = move(handler); }
 
 private:
     void dispatch_state_if_changed(PipelineStatus);
+    void seek_back_to_current_time();
 
     MediaTimeReader m_time_reader;
     RefPtr<VideoProducer> m_input;
 
+    bool m_is_ticking { true };
     RefPtr<VideoFrame> m_next_frame;
     RefPtr<VideoFrame> m_current_frame;
     bool m_cached_frames_are_discontinuous { false };
     bool m_seek_resolution_is_pending_frame_at_target { false };
+    DisplayingVideoSinkFrameCounts m_frame_counts;
 
     enum class SeekStatus : u8 {
         None,

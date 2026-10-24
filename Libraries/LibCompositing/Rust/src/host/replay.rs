@@ -18,9 +18,11 @@ pub struct FfiDisplayListReplayCallbacks {
     pub set_matrix: unsafe extern "C" fn(*mut c_void, *const FloatMatrix4x4),
     pub would_be_fully_clipped_by_painter: unsafe extern "C" fn(*mut c_void, IntRect) -> bool,
     pub push_clip: unsafe extern "C" fn(*mut c_void, *const ReplayClip),
-    pub push_clip_path: unsafe extern "C" fn(*mut c_void, *const c_void, WindingRule),
+    /// Takes the path, the identity of the path, and the fill rule.
+    pub push_clip_path: unsafe extern "C" fn(*mut c_void, *const c_void, u64, WindingRule),
     pub push_layer: unsafe extern "C" fn(*mut c_void, *const ReplayLayer),
-    pub push_mask: unsafe extern "C" fn(*mut c_void, *const ReplayMask),
+    // Arguments: the mask, and the layer whose backdrop filter the mask's layer starts with, or null.
+    pub push_mask: unsafe extern "C" fn(*mut c_void, *const ReplayMask, *const ReplayLayer),
     pub pop_mask: unsafe extern "C" fn(*mut c_void, *const ReplayMask, EffectNodeIndex),
     pub pop: unsafe extern "C" fn(*mut c_void),
     pub push_device_space_plane_clip: unsafe extern "C" fn(*mut c_void, *const FloatVector3, usize),
@@ -53,7 +55,7 @@ impl ReplayPainter for FfiDisplayListReplayCallbacks {
 
     fn push_clip_path(&mut self, path: &OwnedPath, winding_rule: WindingRule) {
         // SAFETY: The C++ painter reads the Gfx::Path synchronously; the tree keeps it alive.
-        unsafe { (self.push_clip_path)(self.context, path.as_raw(), winding_rule) };
+        unsafe { (self.push_clip_path)(self.context, path.as_raw(), path.identity(), winding_rule) };
     }
 
     fn push_layer(&mut self, layer: &ReplayLayer) {
@@ -61,9 +63,11 @@ impl ReplayPainter for FfiDisplayListReplayCallbacks {
         unsafe { (self.push_layer)(self.context, layer) };
     }
 
-    fn push_mask(&mut self, mask: &ReplayMask) {
-        // SAFETY: The C++ painter reads the mask synchronously.
-        unsafe { (self.push_mask)(self.context, mask) };
+    fn push_mask(&mut self, mask: &ReplayMask, backdrop: Option<&ReplayLayer>) {
+        let backdrop = backdrop.map_or(std::ptr::null(), |backdrop| backdrop as *const ReplayLayer);
+        // SAFETY: The C++ painter reads the mask, the layer and its filter bytes synchronously; the tree keeps
+        //         them alive.
+        unsafe { (self.push_mask)(self.context, mask, backdrop) };
     }
 
     fn pop_mask(&mut self, mask: &ReplayMask, effect: EffectNodeIndex) {

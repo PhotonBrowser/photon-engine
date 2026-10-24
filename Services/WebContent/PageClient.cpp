@@ -268,9 +268,9 @@ void PageClient::request_post_message_to_remote_navigable(Web::HTML::RemoteNavig
     client().async_did_post_message_to_navigable(m_id, navigable.id(), move(message));
 }
 
-void PageClient::request_close_of_remote_traversable(Web::HTML::RemoteNavigable& navigable, Web::HTML::LocalNavigable const& source)
+void PageClient::request_close_of_remote_traversable(Web::HTML::RemoteNavigable& navigable, Web::HTML::LocalNavigable const& source, Web::HTML::NavigationSourceSnapshot source_snapshot_params)
 {
-    client().async_did_request_close_of_traversable(m_id, navigable.id(), source.id());
+    client().async_did_request_close_of_traversable(m_id, navigable.id(), source.id(), move(source_snapshot_params));
 }
 
 void PageClient::request_focusing_steps_for_remote_navigable(Web::HTML::RemoteNavigable& navigable, Web::HTML::FocusTrigger focus_trigger)
@@ -853,6 +853,20 @@ void PageClient::inject_rendering_opportunity(double frame_time)
         return;
 
     grant_rendering_opportunity(frame_time, Web::HTML::EventLoop::RenderingOpportunitySource::Manual);
+}
+
+void PageClient::set_viewport_corner_radius(double radius)
+{
+    static constexpr double maximum_viewport_corner_radius = 64;
+    if (!isfinite(radius) || radius < 0)
+        return;
+    radius = min(radius, maximum_viewport_corner_radius);
+    if (m_viewport_corner_radius == radius)
+        return;
+    m_viewport_corner_radius = radius;
+
+    if (page().has_local_traversable())
+        page().local_traversable()->viewport_corner_radius_did_change();
 }
 
 void PageClient::set_maximum_frames_per_second(double maximum_frames_per_second)

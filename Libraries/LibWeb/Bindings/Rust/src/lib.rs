@@ -22,6 +22,8 @@ mod rust_demangle;
 #[path = "../../../../RustPanic.rs"]
 mod rust_panic;
 
+pub(crate) mod ak_format;
+
 #[cfg(not(test))]
 #[allow(
     dead_code,
@@ -32,7 +34,62 @@ pub(crate) mod bindings;
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod canvas_2d;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod compression;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod domurl;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
 pub(crate) mod encoding;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod file_api;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod geometry;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod html;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
@@ -73,7 +130,7 @@ mod webgl_proxy;
 #[path = "../generate/webgl_wire_model.rs"]
 mod webgl_wire_model;
 
-// NB: Only C++ calls into libweb_rust, so nothing in this crate names it. Linking it keeps its extern "C" functions in
-//     the static library.
+// NB: Little in this crate names libweb_rust, which C++ calls into. Linking it keeps its extern "C" functions in the
+//     static library.
 #[cfg(not(test))]
 extern crate libweb_rust;

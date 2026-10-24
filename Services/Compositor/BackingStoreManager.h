@@ -14,6 +14,7 @@
 #include <AK/Types.h>
 #include <AK/Time.h>
 #include <AK/Vector.h>
+#include <Compositor/Forward.h>
 #include <LibCompositing/Types.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/SharedImage.h>
@@ -39,6 +40,11 @@ public:
         Gfx::PaintingSurface& surface;
         i32 bitmap_id { -1 };
         Gfx::IntRect damage_rect;
+    };
+
+    enum class PublicationMode {
+        Unpublished,
+        Published,
     };
 
     enum class GpuSharing {
@@ -67,6 +73,7 @@ public:
     void complete_rendering(i32 bitmap_id, bool release_to_external);
     bool release_buffer(i32 bitmap_id, bool consumer_gpu_work_complete = false);
     void log_pool_state(StringView event) const;
+    void release_all_presented_buffers();
     RefPtr<Gfx::PaintingSurface> latest_rendered_surface() const;
 
     Optional<Publication> add_backing_store_if_window_server_still_reads_every_released_store(RefPtr<Gfx::SkiaBackendContext> const&);

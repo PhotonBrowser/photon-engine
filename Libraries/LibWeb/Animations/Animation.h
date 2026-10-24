@@ -9,6 +9,7 @@
 #include <LibJS/Forward.h>
 #include <LibJS/Runtime/PromiseCapability.h>
 #include <LibWeb/Animations/TimeValue.h>
+#include <LibWeb/Animations/TimelineRange.h>
 #include <LibWeb/Bindings/Animation.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/EventTarget.h>
@@ -30,6 +31,16 @@ using AnimationReplaceState = Bindings::AnimationReplaceState;
 using AnimationPlayState = Bindings::AnimationPlayState;
 
 // https://www.w3.org/TR/web-animations-1/#the-animation-interface
+// (TimelineRangeOffset or CSSNumericValue or CSSKeywordValue or DOMString)
+using TimelineRangeBindingValue = Variant<Bindings::TimelineRangeOffset, GC::Ref<CSS::CSSNumericValue>, GC::Ref<CSS::CSSKeywordValue>, Utf16String>;
+
+// Parses an attachment range edge script gives, as KeyframeAnimationOptions's rangeStart and rangeEnd take it.
+enum class TimelineRangeEdgeSide : u8 {
+    Start,
+    End,
+};
+WebIDL::ExceptionOr<TimelineRangeEdge> parse_timeline_range_edge(DOM::Document&, TimelineRangeBindingValue const&, TimelineRangeEdgeSide);
+
 class Animation : public DOM::EventTarget {
     WEB_WRAPPABLE(Animation, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(Animation);
@@ -66,6 +77,20 @@ public:
     virtual WebIDL::ExceptionOr<void> set_start_time_for_bindings(NullableCSSNumberish const&);
 
     void calculate_auto_aligned_start_time();
+    void normalize_timing_against_attachment_interval();
+
+    // https://drafts.csswg.org/scroll-animations-1/#animation-attachment-range
+    AnimationAttachmentRange const& range() const { return m_range; }
+    void set_range(AnimationAttachmentRange const&);
+
+    // https://drafts.csswg.org/web-animations-2/#dom-animation-rangestart
+    TimelineRangeBindingValue range_start_for_bindings() const;
+    virtual WebIDL::ExceptionOr<void> set_range_start_for_bindings(TimelineRangeBindingValue const&);
+    // https://drafts.csswg.org/web-animations-2/#dom-animation-rangeend
+    TimelineRangeBindingValue range_end_for_bindings() const;
+    virtual WebIDL::ExceptionOr<void> set_range_end_for_bindings(TimelineRangeBindingValue const&);
+    // The start and the end of the attachment range on a progress-based timeline, as timeline times.
+    Optional<AttachmentInterval> attachment_interval() const;
 
     // https://drafts.csswg.org/web-animations-2/#dom-animation-currenttime
     NullableCSSNumberish current_time_for_bindings() const;
@@ -235,6 +260,11 @@ private:
     Optional<TimeValue> m_start_time {};
 
     bool m_auto_align_start_time { false };
+
+    AnimationAttachmentRange m_range;
+
+    // The attachment interval the effect's timing was last normalized against.
+    Optional<AttachmentInterval> m_normalized_attachment_interval;
 
     // https://www.w3.org/TR/web-animations-1/#animation-hold-time
     Optional<TimeValue> m_hold_time {};

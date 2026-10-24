@@ -22,7 +22,7 @@ set(TEST_SOURCES
     TestSessionHistoryTraversalQueue.cpp
     TestSessionStore.cpp
     TestSiteCompatibilityDataLoading.cpp
-    TestSpoofingSettings.cpp
+    TestStartupSettings.cpp
     TestStorageJar.cpp
     TestTabPerformanceStats.cpp
     TestWebViewURL.cpp
@@ -57,7 +57,7 @@ foreach(source IN LISTS TEST_SOURCES)
         list(APPEND test_libraries LibHTTP)
     endif()
     if (source STREQUAL "TestFontService.cpp")
-        list(APPEND test_libraries LibIPC LibGfx)
+        list(APPEND test_libraries LibFileSystem LibIPC LibGfx)
     endif()
     if (source STREQUAL "TestRendererFontService.cpp")
         list(APPEND test_libraries LibCompositing LibGfx LibIPC LibThreading)
@@ -101,6 +101,12 @@ if (APPLE OR LINUX)
         add_custom_target(${ARG_CRATE_NAME}_build DEPENDS "${rust_test_library}")
         ladybird_test(TestRustCrashReport.cpp LibWebView NAME TestRustCrashReport_${panic_strategy}
             LIBS LibWebView "${rust_test_library}")
+        if (LINUX AND panic_strategy STREQUAL "unwind")
+            # Keep the fixture's Rust standard library private to the test executable. Exported, it would take the
+            # place of the copies in Ladybird's shared libraries, which then install their panic hooks into it.
+            get_filename_component(rust_test_library_name "${rust_test_library}" NAME)
+            target_link_options(TestRustCrashReport_${panic_strategy} PRIVATE "LINKER:--exclude-libs,${rust_test_library_name}")
+        endif()
         set_tests_properties(TestRustCrashReport_${panic_strategy} PROPERTIES TIMEOUT 60)
         add_dependencies(TestRustCrashReport_${panic_strategy} ${ARG_CRATE_NAME}_build)
         if (panic_strategy STREQUAL "unwind")
@@ -290,9 +296,6 @@ if (BUILD_TESTING AND NOT WIN32)
         )
         set_tests_properties(TestWebDriverBrowserCrashRecovery PROPERTIES TIMEOUT 120)
         set(crash_report_helpers WebWorker RequestServer ImageDecoder Compositor)
-        if (ENABLE_CRANELIFT_JIT)
-            list(APPEND crash_report_helpers WasmCompiler)
-        endif()
         foreach(helper IN LISTS crash_report_helpers)
             add_test(
                 NAME Test${helper}CrashReport

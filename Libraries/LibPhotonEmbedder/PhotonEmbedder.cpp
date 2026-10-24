@@ -1416,9 +1416,6 @@ std::vector<RegisteredEngineProcess> Runtime::registered_engine_processes() cons
         case WebView::ProcessType::AudioServer:
             role = "audio_server";
             break;
-        case WebView::ProcessType::WasmCompiler:
-            role = "wasm_compiler";
-            break;
         }
         processes.push_back({
             .pid = static_cast<int32_t>(process.pid()),

@@ -11,6 +11,7 @@
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/WebIDL/OverloadResolution.h>
 
 namespace Web::WebIDL {
@@ -26,7 +27,7 @@ static bool platform_object_implements_interface(JS::Value value, StringView int
 {
     auto const* wrappable = Bindings::wrappable_impl_from(&value.as_object());
     if (!wrappable)
-        return false;
+        return Bindings::rust_interface_object_implements_interface(value.as_object(), interface_name);
 
     return wrappable->implements_interface(MUST(String::from_utf8(interface_name)));
 }
@@ -103,7 +104,7 @@ JS::ThrowCompletionOr<ResolvedOverload> resolve_overload(JS::VM& vm, EffectiveOv
         distinguishing_argument_index = overloads.distinguishing_argument_index();
 
     // 9. Initialize values to be an empty list, where each entry will be either an IDL value or the special value “missing”.
-    Vector<ResolvedOverload::Argument> values;
+    GC::ConservativeVector<ResolvedOverload::Argument> values;
 
     // 10. Initialize i to 0.
     auto i = 0;

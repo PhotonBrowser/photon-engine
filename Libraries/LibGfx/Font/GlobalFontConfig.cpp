@@ -6,11 +6,21 @@
 
 #include <AK/Assertions.h>
 #include <AK/ByteString.h>
+#include <AK/LsanSuppressions.h>
 #include <AK/NeverDestroyed.h>
 #include <LibGfx/Font/GlobalFontConfig.h>
 #include <fontconfig/fontconfig.h>
 
 namespace Gfx {
+
+int fontconfig_slant(u8 slope)
+{
+    if (slope == 1)
+        return FC_SLANT_ITALIC;
+    if (slope == 2)
+        return FC_SLANT_OBLIQUE;
+    return FC_SLANT_ROMAN;
+}
 
 GlobalFontConfig::GlobalFontConfig()
 {
@@ -34,12 +44,7 @@ FontHintingOptions GlobalFontConfig::hinting_for_font(FlyString const& family, f
     FcPatternAddDouble(pattern, FC_PIXEL_SIZE, pixel_size);
     FcPatternAddInteger(pattern, FC_WEIGHT, FcWeightFromOpenType(weight));
 
-    int slant = FC_SLANT_ROMAN;
-    if (slope == 1)
-        slant = FC_SLANT_ITALIC;
-    else if (slope == 2)
-        slant = FC_SLANT_OBLIQUE;
-    FcPatternAddInteger(pattern, FC_SLANT, slant);
+    FcPatternAddInteger(pattern, FC_SLANT, fontconfig_slant(slope));
 
     FcConfigSubstitute(m_config, pattern, FcMatchPattern);
     FcDefaultSubstitute(pattern);

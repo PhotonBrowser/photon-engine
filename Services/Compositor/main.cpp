@@ -5,7 +5,10 @@
  */
 
 #include <Compositor/ConnectionFromClient.h>
+#include <Compositor/FontSkia.h>
 #include <Compositor/Sandbox.h>
+#include <Compositor/ScrollbarController.h>
+#include <Compositor/SkiaBackendContext.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/CrashHandler.h>
 #include <LibCore/EventLoop.h>
@@ -16,9 +19,7 @@
 #include <LibCore/Timer.h>
 #include <LibCore/StatsLog.h>
 #include <LibGfx/Font/Font.h>
-#include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/GpuDeviceIdentity.h>
-#include <LibGfx/SkiaBackendContext.h>
 #include <LibIPC/SingleServer.h>
 #include <LibMain/Main.h>
 
@@ -68,12 +69,14 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInteractive); result.is_error())
         warnln("Could not set main thread QoS: {}", result.error());
 
-    if (enable_test_mode)
-        Gfx::force_hinting_for_testing(Gfx::FontHintingStyle::Normal);
+    if (enable_test_mode) {
+        Compositor::force_font_hinting_for_testing();
+        Compositor::ScrollbarController::show_scrollbars_always_for_testing();
+    }
 
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(TRY(String::from_utf8(resource_root))));
     if (force_fontconfig)
-        Gfx::FontDatabase::the().set_force_freetype_rasterization(true);
+        Compositor::set_font_rasterizer(Compositor::FontRasterizer::FreeType);
 
 #if defined(AK_OS_LINUX)
     // NB: The GPU driver starts threads, and Landlock does not confine a thread that already runs. Seccomp covers every

@@ -97,6 +97,7 @@ public:
             return;
         unregister();
         m_compositor_host = &compositor_host;
+        m_frame_counts_of_earlier_pages += exchange(m_frame_counts_of_this_page, {});
         m_presentation_page = MUST(Compositing::VideoFramePresentationPage::create());
         m_compositor_host->add_video_sink(m_handle, *m_presentation_page);
     }
@@ -109,12 +110,15 @@ public:
         m_compositor_host = nullptr;
         m_presentation_page = nullptr;
         m_latest_hold = nullptr;
+        m_hold_for_video_frame_callbacks = nullptr;
     }
 
     Optional<Compositing::CapturedVideoFrame> capture_current_frame()
     {
         if (!m_compositor_host || !m_presentation_page)
             return {};
+        if (m_hold_for_video_frame_callbacks)
+            return Compositing::CapturedVideoFrame { .sink_handle = m_handle, .generation = m_hold_for_video_frame_callbacks->generation(), .hold = m_hold_for_video_frame_callbacks };
         auto hold = m_latest_hold.strong_ref();
         if (!hold || hold->generation() != m_presentation_page->current_generation()) {
             hold = Compositing::VideoFrameHold::hold_current_frame(*m_presentation_page, m_handle, m_compositor_host->video_frame_hold_releaser_for_current_connection());
@@ -125,12 +129,58 @@ public:
         return Compositing::CapturedVideoFrame { .sink_handle = m_handle, .generation = hold->generation(), .hold = hold };
     }
 
+    Optional<PresentedVideoFrame> hold_presented_frame_for_video_frame_callbacks()
+    {
+        static constexpr size_t max_attempts_while_frames_are_presented = 8;
+        if (!m_compositor_host || !m_presentation_page)
+            return {};
+        for (size_t attempt = 0; attempt < max_attempts_while_frames_are_presented; attempt++) {
+            auto presented_frame = m_presentation_page->presented_frame();
+            if (!presented_frame.has_value())
+                return {};
+            note_frame_counts(*presented_frame);
+            if (presented_frame->presented_frame_count == 0)
+                return {};
+            auto hold = Compositing::VideoFrameHold::hold_frame_of_generation(*m_presentation_page, m_handle, presented_frame->generation, m_compositor_host->video_frame_hold_releaser_for_current_connection());
+            if (!hold)
+                continue;
+            m_hold_for_video_frame_callbacks = move(hold);
+            return PresentedVideoFrame {
+                .presented_frames = frame_counts().presented,
+                .media_time = presented_frame->media_time,
+                .presentation_time = presented_frame->presentation_time,
+                .width = presented_frame->width,
+                .height = presented_frame->height,
+            };
+        }
+        return {};
+    }
+
+    void release_frame_held_for_video_frame_callbacks() { m_hold_for_video_frame_callbacks = nullptr; }
+
+    VideoFrameCounts frame_counts()
+    {
+        if (m_presentation_page) {
+            if (auto presented_frame = m_presentation_page->presented_frame(); presented_frame.has_value())
+                note_frame_counts(*presented_frame);
+        }
+        return m_frame_counts_of_earlier_pages + m_frame_counts_of_this_page;
+    }
+
 private:
     Media::VideoSinkHandle m_handle;
     Compositing::VideoSinkResourceId m_resource_id;
     Compositor::CompositorHost* m_compositor_host { nullptr };
     RefPtr<Compositing::VideoFramePresentationPage> m_presentation_page;
     WeakPtr<Compositing::VideoFrameHold> m_latest_hold;
+    RefPtr<Compositing::VideoFrameHold> m_hold_for_video_frame_callbacks;
+    void note_frame_counts(Compositing::VideoFramePresentationPage::PresentedFrame const& presented_frame)
+    {
+        m_frame_counts_of_this_page = { .presented = presented_frame.presented_frame_count, .dropped = presented_frame.dropped_frame_count };
+    }
+
+    VideoFrameCounts m_frame_counts_of_earlier_pages;
+    VideoFrameCounts m_frame_counts_of_this_page;
 };
 
 static u64 s_next_remote_fetch_data_id = 0;
@@ -830,6 +880,10 @@ GC::Ref<TextTrack> HTMLMediaElement::add_text_track(Bindings::TextTrackKind kind
 WebIDL::ExceptionOr<void> HTMLMediaElement::load_element()
 {
     m_has_fired_loadeddata = false;
+
+    // https://w3c.github.io/media-playback-quality/#concepts
+    // NB: The total and dropped video frame counts are "reset to 0 when the media element load algorithm is invoked".
+    m_video_frame_counts_at_last_load = video_frame_counts();
 
     // FIXME: 1. Set this element's is currently stalled to false.
 
@@ -1965,6 +2019,30 @@ Optional<Compositing::CapturedVideoFrame> HTMLMediaElement::capture_current_vide
     return m_active_video_sink->capture_current_frame();
 }
 
+HTMLMediaElement::VideoFrameCounts HTMLMediaElement::video_frame_counts() const
+{
+    auto frame_counts = m_frame_counts_of_released_video_sinks;
+    if (m_active_video_sink)
+        frame_counts += m_active_video_sink->frame_counts();
+    return frame_counts;
+}
+
+Optional<HTMLMediaElement::PresentedVideoFrame> HTMLMediaElement::hold_presented_video_frame_for_callbacks()
+{
+    if (!m_active_video_sink)
+        return {};
+    auto presented_frame = m_active_video_sink->hold_presented_frame_for_video_frame_callbacks();
+    if (presented_frame.has_value())
+        presented_frame->presented_frames += m_frame_counts_of_released_video_sinks.presented;
+    return presented_frame;
+}
+
+void HTMLMediaElement::release_presented_video_frame_held_for_callbacks()
+{
+    if (m_active_video_sink)
+        m_active_video_sink->release_frame_held_for_video_frame_callbacks();
+}
+
 void HTMLMediaElement::attach_selected_video_track_sink(Media::Track const& track)
 {
     if (video_sink_handle().has_value())
@@ -2006,6 +2084,8 @@ void HTMLMediaElement::detach_video_sink_edge()
 void HTMLMediaElement::release_active_video_sink()
 {
     auto handle = video_sink_handle();
+    if (m_active_video_sink)
+        m_frame_counts_of_released_video_sinks += m_active_video_sink->frame_counts();
     m_active_video_sink.clear();
     if (m_playback_manager && handle.has_value())
         m_playback_manager->disable_video_sink_by_handle(*handle);
@@ -2597,6 +2677,7 @@ void HTMLMediaElement::set_ready_state(ReadyState ready_state)
     auto old_ready_state = m_ready_state;
     m_ready_state = ready_state;
     CSS::Invalidation::invalidate_style_after_media_ready_state_change(*this, was_buffering);
+    request_rendering_update_for_video_frame_callbacks();
 
     // https://html.spec.whatwg.org/multipage/media.html#text-track-cue-active-flag
     if (m_ready_state == ReadyState::HaveNothing) {
@@ -2832,6 +2913,8 @@ bool HTMLMediaElement::video_sink_should_tick() const
     Layout::ForcedReadScope read { document() };
     if (m_video_frame_was_recently_captured)
         return true;
+    if (auto const* video_element = as_if<HTMLVideoElement>(*this); video_element && video_element->has_video_frame_request_callbacks())
+        return true;
     // Another element, such as one in a Picture-in-Picture window, shows the frames whatever happens to this one's box.
     if (is_shown_elsewhere())
         return true;
@@ -3026,6 +3109,8 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
     // 4. Set the seeking IDL attribute to true.
     set_seeking(true);
 
+    request_rendering_update_for_video_frame_callbacks();
+
     // 5. If the seek was in response to a DOM method call or setting of an IDL attribute, then continue the script. The
     //    remainder of these steps must be run in parallel. With the exception of the steps marked with ⌛, they could be
     //    aborted at any time by another instance of this algorithm being invoked.
@@ -3217,6 +3302,7 @@ void HTMLMediaElement::set_paused(bool paused)
         return;
 
     m_paused = paused;
+    request_rendering_update_for_video_frame_callbacks();
 
     if (m_paused) {
         m_has_started_playback = false;

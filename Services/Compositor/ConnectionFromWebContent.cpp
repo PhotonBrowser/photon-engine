@@ -8,6 +8,7 @@
 #include <AK/Math.h>
 #include <Compositor/ConnectionFromWebContent.h>
 #include <Compositor/RasterizeDisplayList.h>
+#include <LibCompositing/DisplayList/Canvas2DTape.h>
 #include <LibCompositing/WebGL/WebGLSharedCommandBuffer.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/Environment.h>
@@ -100,9 +101,14 @@ void ConnectionFromWebContent::release_video_frame_hold(Media::VideoSinkHandle v
         did_misbehave("WebContent released a video frame hold that it did not take");
 }
 
-void ConnectionFromWebContent::video_sink_presented_frame(Media::VideoSinkHandle video_sink_handle, RefPtr<Media::VideoFrame> frame)
+void ConnectionFromWebContent::video_sink_presented_frame(Media::VideoSinkHandle video_sink_handle, RefPtr<Media::VideoFrame> frame, Media::DisplayingVideoSinkFrameCounts new_frame_counts)
 {
-    m_video_frame_holds.present_frame(video_sink_handle, move(frame));
+    m_video_frame_holds.present_frame(video_sink_handle, move(frame), new_frame_counts);
+}
+
+void ConnectionFromWebContent::video_sink_counted_frames(Media::VideoSinkHandle video_sink_handle, Media::DisplayingVideoSinkFrameCounts new_frame_counts)
+{
+    m_video_frame_holds.add_frame_counts(video_sink_handle, new_frame_counts);
 }
 
 void ConnectionFromWebContent::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
@@ -143,6 +149,11 @@ void ConnectionFromWebContent::rendering_opportunity(Web::CompositorContextId co
 void ConnectionFromWebContent::async_scroll_updates(Web::CompositorContextId context_id, Compositing::PendingAsyncScrollUpdates const& updates)
 {
     async_async_scroll_updates(context_id, updates);
+}
+
+void ConnectionFromWebContent::overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> const& visibilities)
+{
+    async_overlay_scrollbar_visibilities_changed(visibilities);
 }
 
 void ConnectionFromWebContent::dispatch_mouse_event_to_web_content(u64 page_id, Web::MouseEvent const& event)
@@ -280,9 +291,15 @@ void ConnectionFromWebContent::create_canvas_2d_context(Compositing::CanvasId ca
     (void)m_canvas_host.create_2d_context(canvas_id, size, alpha);
 }
 
-void ConnectionFromWebContent::update_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> segments, Vector<Compositing::FontResourceId> kept_font_ids, Vector<Compositing::DisplayListFontResource> added_fonts)
+void ConnectionFromWebContent::update_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> segments, Vector<Compositing::FontResourceId> kept_font_ids, Vector<Compositing::DisplayListFontResource> added_fonts, Vector<Compositing::DisplayListImageFrameResource> image_frames)
 {
-    m_canvas_host.execute_canvas_2d_stream(segments, kept_font_ids, added_fonts);
+    for (auto const& segment : segments) {
+        if (Compositing::validate_canvas_2d_tape(segment.tape).is_error()) {
+            did_misbehave("WebContent sent a canvas 2D stream that does not validate");
+            return;
+        }
+    }
+    m_canvas_host.execute_canvas_2d_stream(segments, kept_font_ids, added_fonts, image_frames);
 }
 
 void ConnectionFromWebContent::destroy_canvas_context(Compositing::CanvasId canvas_id)

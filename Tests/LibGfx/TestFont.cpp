@@ -13,16 +13,15 @@
 #include <LibGfx/Font/PathFontProvider.h>
 #include <LibGfx/Font/SystemFallbackFonts.h>
 #include <LibGfx/Font/Typeface.h>
-#include <LibGfx/Font/TypefaceSkia.h>
+#ifdef AK_OS_MACOS
+#    include <LibGfx/Font/TypefaceCoreText.h>
+#endif
 #include <LibGfx/FontCascadeList.h>
 #include <LibGfx/TextLayout.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
-#include <core/SkFont.h>
-#include <core/SkStream.h>
-#include <core/SkTypeface.h>
 #include <harfbuzz/hb.h>
 
 #define TEST_INPUT(x) ("test-inputs/" x)
@@ -59,10 +58,7 @@ private:
 static bool font_is_emoji(StringView path)
 {
     auto typeface = MUST(Gfx::Typeface::try_load_from_mapped_file(MUST(Core::MappedFile::map(path)), 0));
-    // Construct the Font directly rather than via Typeface::font() — which would cache it on the
-    // Typeface and form a Typeface<->Font reference cycle that leaks once both leave this scope.
-    auto font = adopt_ref(*new Gfx::Font(typeface, 12, 12, {}, {}));
-    return font->is_emoji_font();
+    return typeface->font(12)->is_emoji_font();
 }
 
 // A COLRv1 color font is recognized.
@@ -81,56 +77,6 @@ TEST_CASE(monochrome_emoji_font_is_not_emoji_font)
 TEST_CASE(text_font_is_not_emoji_font)
 {
     EXPECT(!font_is_emoji(TEST_INPUT("fonts/text.ttf"sv)));
-}
-
-static void check_skia_font_data_lifetime(Function<NonnullRefPtr<Gfx::Typeface>()> load_typeface)
-{
-    sk_sp<SkTypeface const> skia_typeface;
-    ByteBuffer expected_table;
-    ByteBuffer expected_font_data;
-    constexpr auto cmap_tag = SkSetFourByteTag('c', 'm', 'a', 'p');
-    {
-        auto typeface = load_typeface();
-        skia_typeface = sk_ref_sp(static_cast<Gfx::TypefaceSkia const&>(*typeface).sk_typeface());
-        int collection_index = 0;
-        auto stream = skia_typeface->openStream(&collection_index);
-        EXPECT(stream);
-        if (stream) {
-            EXPECT_EQ(stream->getMemoryBase(), typeface->font_data().data());
-            EXPECT_EQ(stream->getLength(), typeface->font_data().size());
-        }
-        expected_font_data = MUST(ByteBuffer::copy(typeface->font_data()));
-        expected_table = MUST(ByteBuffer::create_uninitialized(skia_typeface->getTableSize(cmap_tag)));
-        EXPECT(!expected_table.is_empty());
-        EXPECT_EQ(skia_typeface->getTableData(cmap_tag, 0, expected_table.size(), expected_table.data()), expected_table.size());
-    }
-    auto actual_table = MUST(ByteBuffer::create_uninitialized(expected_table.size()));
-    EXPECT_EQ(skia_typeface->getTableData(cmap_tag, 0, actual_table.size(), actual_table.data()), actual_table.size());
-    EXPECT_EQ(actual_table, expected_table);
-    int collection_index = 0;
-    auto stream = skia_typeface->openStream(&collection_index);
-    EXPECT(stream);
-    if (stream) {
-        auto actual_font_data = MUST(ByteBuffer::create_uninitialized(expected_font_data.size()));
-        EXPECT_EQ(stream->read(actual_font_data.data(), actual_font_data.size()), actual_font_data.size());
-        EXPECT_EQ(actual_font_data, expected_font_data);
-    }
-}
-
-TEST_CASE(skia_typeface_retains_font_data_after_ladybird_typeface_is_destroyed)
-{
-    check_skia_font_data_lifetime([] {
-        auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/text.ttf"sv)));
-        return MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes()));
-    });
-}
-
-TEST_CASE(skia_typeface_retains_mapped_font_data_after_ladybird_typeface_is_destroyed)
-{
-    check_skia_font_data_lifetime([] {
-        auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/text.ttf"sv)));
-        return MUST(Gfx::Typeface::try_load_from_mapped_file(move(file)));
-    });
 }
 
 static NonnullRefPtr<Gfx::Font> load_text_font(float point_size)
@@ -381,12 +327,12 @@ static NonnullRefPtr<Gfx::Typeface const> round_trip_typeface_through_ipc(Gfx::T
     return MUST(IPC::decode<NonnullRefPtr<Gfx::Typeface const>>(decoder));
 }
 
-TEST_CASE(system_ui_italic_keeps_its_slope_when_the_variation_clone_collapses)
+TEST_CASE(system_ui_italic_keeps_its_slope_with_variations)
 {
-    // At 28px the system font's opsz axis sits at its maximum, so applying the default variation hands back the base
-    // CoreText UI font, which Skia reads as upright.
+    // A system UI font is one variable face for every style, so its typeface and its fonts answer with the style
+    // that they were asked for, also after the typeface crosses IPC.
     float const font_size = 28;
-    auto typeface = MUST(Gfx::TypefaceSkia::match_system_ui(Gfx::SystemUIFontKind::System, font_size, 400, Gfx::FontWidth::Normal, 1));
+    auto typeface = Gfx::TypefaceCoreText::system_ui({ Gfx::SystemUIFontKind::System, 400, Gfx::FontWidth::Normal, 1 });
     EXPECT(typeface);
 
     Gfx::FontVariationSettings variations;
@@ -394,11 +340,12 @@ TEST_CASE(system_ui_italic_keeps_its_slope_when_the_variation_clone_collapses)
     variations.set_width(100);
     variations.set_optical_sizing(font_size);
     auto font = typeface->font(font_size * 0.75f, variations);
+    EXPECT_EQ(font->slope(), 1u);
     EXPECT_EQ(font->typeface().slope(), 1u);
 
     auto decoded = round_trip_typeface_through_ipc(font->typeface());
     EXPECT_EQ(decoded->slope(), 1u);
-    EXPECT_EQ(decoded->glyph_id_for_code_point('m'), font->typeface().glyph_id_for_code_point('m'));
+    EXPECT_EQ(decoded.ptr(), &font->typeface());
 }
 #endif
 
@@ -486,42 +433,6 @@ TEST_CASE(typeface_bounding_box_can_be_read_on_several_threads)
     }
 }
 
-// Only ThreadSanitizer can catch a memo race here, since fontconfig answers each scale the same way.
-TEST_CASE(hinting_options_can_be_memoized_on_several_threads)
-{
-    IGNORE_USE_IN_ESCAPING_LAMBDA auto font = load_text_font(16);
-    IGNORE_USE_IN_ESCAPING_LAMBDA Array<float, 4> scales { 1, 1.5f, 2, 3 };
-
-    // The memo answers the way a fresh query does: ask, displace it with another scale, ask again.
-    auto fresh = font->skia_font(1);
-    (void)font->skia_font(2);
-    auto memoized = font->skia_font(1);
-    EXPECT_EQ(memoized.getHinting(), fresh.getHinting());
-    EXPECT_EQ(memoized.isForceAutoHinting(), fresh.isForceAutoHinting());
-
-    IGNORE_USE_IN_ESCAPING_LAMBDA Array<Array<SkFont, 4>, 8> fonts;
-    Vector<NonnullRefPtr<Threading::Thread>> threads;
-    for (size_t thread_index = 0; thread_index < fonts.size(); ++thread_index) {
-        auto thread = Threading::Thread::construct("HintingMemo"sv, [&font, &scales, &fonts, thread_index]() {
-            for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index)
-                fonts[thread_index][scale_index] = font->skia_font(scales[scale_index]);
-            return 0;
-        });
-        thread->start();
-        threads.append(move(thread));
-    }
-    for (auto& thread : threads)
-        (void)thread->join();
-
-    for (auto const& thread_fonts : fonts) {
-        for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index) {
-            EXPECT_EQ(thread_fonts[scale_index].getHinting(), fonts[0][scale_index].getHinting());
-            EXPECT_EQ(thread_fonts[scale_index].isForceAutoHinting(), fonts[0][scale_index].isForceAutoHinting());
-            EXPECT_EQ(thread_fonts[scale_index].getSize(), font->pixel_size() * scales[scale_index]);
-        }
-    }
-}
-
 // Only ThreadSanitizer can catch a cache race here, since every thread computes the same glyph IDs.
 TEST_CASE(glyph_pages_can_be_populated_on_several_threads)
 {
@@ -566,12 +477,12 @@ TEST_CASE(glyph_page_caches_keep_the_typefaces_in_use_once_full)
     auto thread = Threading::Thread::construct("GlyphPageCache"sv, [&typefaces, &pages_populated_in_turns]() {
         for (auto const& typeface : typefaces)
             (void)typeface->glyph_id_for_code_point('A');
-        auto populated_before_turns = Gfx::TypefaceSkia::glyph_pages_populated_on_this_thread();
+        auto populated_before_turns = Gfx::Typeface::glyph_pages_populated_on_this_thread();
         for (size_t turn = 0; turn < 50; ++turn) {
             for (size_t i = 0; i < 8; ++i)
                 (void)typefaces[i * 20]->glyph_id_for_code_point('A');
         }
-        pages_populated_in_turns = Gfx::TypefaceSkia::glyph_pages_populated_on_this_thread() - populated_before_turns;
+        pages_populated_in_turns = Gfx::Typeface::glyph_pages_populated_on_this_thread() - populated_before_turns;
         return 0;
     });
     thread->start();
@@ -583,7 +494,7 @@ TEST_CASE(font_collection_preserves_each_face_style)
 {
     auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/styles.ttc"sv)));
     for (u32 index = 0; index < 3; ++index) {
-        auto result = Gfx::TypefaceSkia::try_load_from_temporary_memory(file->bytes(), index);
+        auto result = Gfx::Typeface::try_load_from_temporary_memory(file->bytes(), index);
         EXPECT(!result.is_error());
         if (result.is_error())
             continue;
@@ -602,31 +513,7 @@ TEST_CASE(font_collection_preserves_each_face_style)
         EXPECT_EQ(font->slope(), expected_slope);
         EXPECT_NE(font->glyph_id_for_code_point('a'), 0u);
     }
-    EXPECT(Gfx::TypefaceSkia::try_load_from_temporary_memory(file->bytes(), 3).is_error());
-}
-
-TEST_CASE(font_collection_retains_shared_backing_for_skia)
-{
-    auto mapping = MUST(Core::MappedFile::map(TEST_INPUT("fonts/styles.ttc"sv)));
-    auto backing = make_ref_counted<Gfx::Typeface::FontDataBacking>(move(mapping));
-    sk_sp<SkTypeface const> skia_typeface;
-    ByteBuffer expected_table;
-    constexpr auto cmap_tag = SkSetFourByteTag('c', 'm', 'a', 'p');
-    {
-        auto const& mapping = backing->storage.get<NonnullOwnPtr<Core::MappedFile>>();
-
-        auto typeface = MUST(Gfx::TypefaceSkia::load_from_buffer(mapping->bytes(), 1, backing));
-        EXPECT_EQ(typeface->buffer().data(), mapping->bytes().data());
-        skia_typeface = sk_ref_sp(typeface->sk_typeface());
-        expected_table = MUST(ByteBuffer::create_uninitialized(skia_typeface->getTableSize(cmap_tag)));
-        EXPECT(!expected_table.is_empty());
-        EXPECT_EQ(skia_typeface->getTableData(cmap_tag, 0, expected_table.size(), expected_table.data()), expected_table.size());
-    }
-    // Skia still uses the original mapping after the Ladybird typeface has gone away.
-    EXPECT(backing->ref_count() > 1);
-    auto actual_table = MUST(ByteBuffer::create_uninitialized(expected_table.size()));
-    EXPECT_EQ(skia_typeface->getTableData(cmap_tag, 0, actual_table.size(), actual_table.data()), actual_table.size());
-    EXPECT_EQ(actual_table, expected_table);
+    EXPECT(Gfx::Typeface::try_load_from_temporary_memory(file->bytes(), 3).is_error());
 }
 
 // The answer depends on the installed font set alone, so every thread must reach the same one and
@@ -643,11 +530,11 @@ TEST_CASE(system_fallback_fonts_can_be_matched_on_several_threads)
     };
     // NB: A machine without a font covering this code point answers null, and null is an answer the
     //     memo keeps like any other, so this test does not depend on what is installed.
-    IGNORE_USE_IN_ESCAPING_LAMBDA Array<Gfx::Font const*, 8> matched {};
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<RefPtr<Gfx::Font const>, 8> matched {};
     Vector<NonnullRefPtr<Threading::Thread>> threads;
     for (size_t thread_index = 0; thread_index < matched.size(); ++thread_index) {
         auto thread = Threading::Thread::construct("SystemFallbackFont"sv, [&key, &matched, thread_index]() {
-            matched[thread_index] = Gfx::system_fallback_font(key, 12).ptr();
+            matched[thread_index] = Gfx::system_fallback_font(key, 12);
             return 0;
         });
         thread->start();
@@ -657,10 +544,10 @@ TEST_CASE(system_fallback_fonts_can_be_matched_on_several_threads)
         (void)thread->join();
 
     // One key is matched once, so every thread names the same font object, not eight equivalent ones.
-    for (auto const* font : matched)
-        EXPECT_EQ(font, matched[0]);
+    for (auto const& font : matched)
+        EXPECT_EQ(font.ptr(), matched[0].ptr());
     EXPECT_EQ(Gfx::system_fallback_font_cache_size(), 1u);
-    EXPECT_EQ(Gfx::system_fallback_font(key, 12).ptr(), matched[0]);
+    EXPECT_EQ(Gfx::system_fallback_font(key, 12).ptr(), matched[0].ptr());
 
     // Another size picks another font from the same typeface, so it does not grow the memo.
     (void)Gfx::system_fallback_font(key, 13);

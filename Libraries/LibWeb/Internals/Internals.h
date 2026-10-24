@@ -54,7 +54,6 @@ public:
     void set_show_line_box_borders(bool);
     void set_force_dark_thresholds(i32, i32);
     u64 visual_context_tree_node_count();
-    u64 visual_context_pending_dirty_box_count();
     u64 accumulated_visual_context_incremental_update_count();
     u64 visual_context_tree_node_capacity();
     u64 visual_context_tree_dead_node_count();
@@ -185,6 +184,8 @@ public:
 
     static u16 get_echo_server_port();
     static void set_echo_server_port(u16 port);
+    static u16 get_https_echo_server_port();
+    static void set_https_echo_server_port(u16 port);
 
     WebIDL::ExceptionOr<void> set_hsts_policy(Utf16String const& domain, u64 max_age, bool include_sub_domains);
     WebIDL::ExceptionOr<void> ingest_hsts_header(Utf16String const& url, Utf16String const& header_value);

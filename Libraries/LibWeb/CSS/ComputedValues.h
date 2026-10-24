@@ -30,7 +30,6 @@
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/Ratio.h>
 #include <LibWeb/CSS/ResolvedTransform.h>
-#include <LibWeb/CSS/Size.h>
 #include <LibWeb/CSS/StyleRecordID.h>
 #include <LibWeb/CSS/StyleStructRef.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
@@ -525,8 +524,8 @@ public:
     ComputedFilterView backdrop_filter() const { return m_noninherited.effects->backdrop_filter_value(); }
     ComputedFilterView filter() const { return m_noninherited.effects->filter_value(); }
     ReadonlySpan<ShadowData> box_shadow() const { return m_noninherited.effects->box_shadow_span(); }
-    Size const& width() const { return Size::view(m_noninherited.sizing->width); }
-    Size const& height() const { return Size::view(m_noninherited.sizing->height); }
+    ComputedValuesFFI::ComputedSize const& width() const { return m_noninherited.sizing->width; }
+    ComputedValuesFFI::ComputedSize const& height() const { return m_noninherited.sizing->height; }
     Variant<VerticalAlign, LengthPercentage> vertical_align() const
     {
         auto const& value = m_noninherited.box->vertical_align;
@@ -1093,27 +1092,7 @@ public:
 
         bool operator==(AlignmentValues const& other) const
         {
-            auto gaps_equal = [](auto const& first, auto const& second) {
-                if (first.is_normal || second.is_normal)
-                    return first.is_normal == second.is_normal;
-                return LengthPercentage::view(first.value) == LengthPercentage::view(second.value);
-            };
-            return webkit_box_orient == other.webkit_box_orient
-                && flex_direction == other.flex_direction
-                && flex_wrap == other.flex_wrap
-                && flex_basis.is_content == other.flex_basis.is_content
-                && Size::view(flex_basis.size) == Size::view(other.flex_basis.size)
-                && flex_grow == other.flex_grow
-                && flex_shrink == other.flex_shrink
-                && order == other.order
-                && align_content == other.align_content
-                && align_items == other.align_items
-                && align_self == other.align_self
-                && justify_content == other.justify_content
-                && justify_items == other.justify_items
-                && justify_self == other.justify_self
-                && gaps_equal(column_gap, other.column_gap)
-                && gaps_equal(row_gap, other.row_gap);
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
         }
     };
 
@@ -1134,12 +1113,7 @@ public:
 
         bool operator==(SizingValues const& other) const
         {
-            return Size::view(width) == Size::view(other.width)
-                && Size::view(min_width) == Size::view(other.min_width)
-                && Size::view(max_width) == Size::view(other.max_width)
-                && Size::view(height) == Size::view(other.height)
-                && Size::view(min_height) == Size::view(other.min_height)
-                && Size::view(max_height) == Size::view(other.max_height);
+            return ComputedValuesFFI::rust_style_group_payloads_equal(style_group_index, this, &other);
         }
     };
 
@@ -1264,26 +1238,22 @@ public:
     ComputedStyleRecordView(StyleEngineFFI::FfiStyleRecordView const&, StyleComputer const&, StyleRecordID, bool owns_style_record_pin);
     ~ComputedStyleRecordView();
 
-    explicit operator bool() const { return m_present; }
+    explicit operator bool() const { return m_values.has_value(); }
     ComputedValues const* operator->() const
     {
-        if (!m_present)
+        if (!m_values.has_value())
             return nullptr;
-        return &m_values;
+        return &*m_values;
     }
-    ComputedValues const& operator*() const
-    {
-        VERIFY(m_present);
-        return m_values;
-    }
+    ComputedValues const& operator*() const { return m_values.value(); }
 
 private:
     Optional<ComputedValues> m_base_values;
-    ComputedValues m_values { ComputedValues::BorrowedStyleRecord::Yes };
+    // NB: Only a present view builds its values, so a view of no record costs nothing to make.
+    Optional<ComputedValues> m_values;
     GC::Ptr<StyleComputer const> m_style_computer;
     StyleRecordID m_style_record_identity;
     bool m_owns_style_record_pin { false };
-    bool m_present { false };
 };
 
 class ComputedValues::Mutator final {
@@ -1322,7 +1292,6 @@ public:
             return;
         m_values.m_inherited.text.access().letter_spacing = value;
     }
-    void set_width(Size value) { set_size(&ComputedValuesFFI::SizingValues::width, move(value)); }
     void set_display(Display value)
     {
         if (m_values.display() == value)
@@ -1352,14 +1321,6 @@ public:
         if (m_values.translate() == value)
             return;
         TransformValues::set_transformation(m_values.m_noninherited.transform.access().translate, value.ptr());
-    }
-
-private:
-    void set_size(ComputedValuesFFI::ComputedSize ComputedValuesFFI::SizingValues::* member, Size value)
-    {
-        if (Size::view(m_values.m_noninherited.sizing.operator->()->*member) == value)
-            return;
-        Size::replace(m_values.m_noninherited.sizing.access().*member, move(value));
     }
 
     ComputedValues& m_values;

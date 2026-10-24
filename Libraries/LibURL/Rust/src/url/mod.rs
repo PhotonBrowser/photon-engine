@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+pub mod form_urlencoded;
 mod host;
 mod input;
 mod parser;
@@ -14,6 +15,7 @@ mod types;
 
 pub(crate) use self::host::parse_host_into;
 pub use self::input::UrlInput;
+pub use self::percent_encoding::percent_decode_bytes;
 pub use self::scheme::SchemeType;
 pub(crate) use self::scheme::default_port_for_scheme;
 pub(crate) use self::scheme::is_special_scheme;

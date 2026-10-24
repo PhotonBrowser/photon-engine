@@ -66,13 +66,6 @@
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/FileAPI/File.h>
 #include <LibWeb/FileAPI/FileList.h>
-#include <LibWeb/Geometry/DOMMatrix.h>
-#include <LibWeb/Geometry/DOMMatrixReadOnly.h>
-#include <LibWeb/Geometry/DOMPoint.h>
-#include <LibWeb/Geometry/DOMPointReadOnly.h>
-#include <LibWeb/Geometry/DOMQuad.h>
-#include <LibWeb/Geometry/DOMRect.h>
-#include <LibWeb/Geometry/DOMRectReadOnly.h>
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/MessagePort.h>
@@ -1194,17 +1187,6 @@ WebIDL::Exception data_clone_error_from_serialization_error(JS::Realm& realm, AK
     return WebIDL::Exception { WebIDL::DataCloneError::create(realm, "Unable to process structured serialized data"_utf16) };
 }
 
-WebIDL::ExceptionOr<String> decode_utf8_text_or_throw_data_clone_error(JS::Realm& realm, StructuredSerializeReader& reader)
-{
-    auto text = reader.decode<Utf16String>();
-    if (text.is_error())
-        return data_clone_error_from_serialization_error(realm, text.release_error());
-    auto utf8 = utf16_to_utf8_text(text.value());
-    if (utf8.is_error())
-        return data_clone_error_from_serialization_error(realm, utf8.release_error());
-    return utf8.release_value();
-}
-
 static GC::Ref<WebIDL::DOMException> data_clone_error(Utf16String message)
 {
     return WebIDL::DataCloneError::create(move(message));
@@ -1572,7 +1554,10 @@ public:
 
             // 19. Otherwise, if value is a platform object that is a serializable object:
             else if (auto serializable = Bindings::serializable_from_object(*object); serializable.has_value()) {
-                // FIXME: 1. If value has a [[Detached]] internal slot whose value is true, then throw a "DataCloneError" DOMException.
+                // 1. If value has a [[Detached]] internal slot whose value is true, then throw a "DataCloneError" DOMException.
+                // NB: The platform objects that have a [[Detached]] internal slot are the transferable objects.
+                if (auto transferable = Bindings::transferable_from_object(*object); transferable.has_value() && transferable->is_detached())
+                    return data_clone_error("Cannot serialize a detached platform object"_utf16);
 
                 // 2. Let typeString be the identifier of the primary interface of value.
                 // 3. Set serialized to { [[Type]]: typeString }.
@@ -1670,7 +1655,7 @@ public:
 
             // 3. Otherwise, if value is a platform object that is a serializable object, then perform the serialization steps for value's primary interface, given value, serialized, and forStorage.
             else if (auto serializable = Bindings::serializable_from_object(object); serializable.has_value()) {
-                TRY(serializable->serializable->serialization_steps(serialized, m_for_storage, m_memory));
+                TRY(serializable->serialization_steps(serialized, m_for_storage, m_memory));
             }
 
             // 4. Otherwise, for each key in ! EnumerableOwnProperties(value, key):
@@ -2127,6 +2112,18 @@ public:
             if (!Bindings::is_exposed(interface_name, realm))
                 return WebIDL::DataCloneError::create(realm, "Unsupported type"_utf16);
 
+            // NB: The deserialization steps of an interface implemented in Rust create the new instance from what they
+            //     read, so they run here, at the position in memory that the instance has.
+            if (Bindings::serializable_interface_is_implemented_in_rust(interface_name)) {
+                if (version.has_value() && *version != serializable_payload_version)
+                    return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("Unsupported serializable payload version"));
+                auto memory_index = m_memory.size();
+                m_memory.append(JS::js_undefined());
+                value = TRY(Bindings::deserialize_rust_platform_object(interface_name, realm, m_serialized, m_memory));
+                m_memory[memory_index] = value;
+                return value;
+            }
+
             // 3. Set value to a new instance of the interface identified by interfaceName, created in targetRealm.
             value = Bindings::create_serialized_platform_object(interface_name, realm);
 
@@ -2201,7 +2198,7 @@ public:
             else {
                 // 1. Perform the appropriate deserialization steps for the interface identified by serialized.[[Type]], given serialized, value, and targetRealm.
                 auto serializable = Bindings::serializable_from_object(value.as_object());
-                VERIFY(serializable.has_value());
+                VERIFY(serializable.has_value() && serializable->serializable);
                 TRY(serializable->serializable->deserialization_steps(realm, m_serialized, m_memory));
             }
         }
@@ -2237,7 +2234,7 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
 
         // 1. If transferable has neither an [[ArrayBufferData]] internal slot nor a [[Detached]] internal slot, then throw a "DataCloneError" DOMException.
         // FIXME: Handle transferring objects with [[Detached]] internal slot.
-        if (!as_array_buffer && !Bindings::transferable_from_object(*transferable))
+        if (!as_array_buffer && !Bindings::transferable_from_object(*transferable).has_value())
             return WebIDL::DataCloneError::create("Cannot transfer type"_utf16);
 
         // 2. If transferable has an [[ArrayBufferData]] internal slot and IsSharedArrayBuffer(transferable) is true, then throw a "DataCloneError" DOMException.
@@ -2262,7 +2259,7 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
 
     // AD-HOC: Gather the pixels of the transferred ImageBitmaps in one buffer of shared memory. Without it, as when there
     //         is not enough memory for it, the pixels travel inline.
-    Optional<ImageBitmap::SharedPixels> image_bitmap_pixels;
+    Optional<ImageBitmapSharedPixels> image_bitmap_pixels;
     Checked<size_t> image_bitmap_pixels_size = 0;
     for (auto const& transferable : transfer_list) {
         if (auto* image_bitmap = Bindings::impl_from<ImageBitmap>(transferable.ptr()); image_bitmap && image_bitmap->bitmap())
@@ -2270,7 +2267,7 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
     }
     if (!image_bitmap_pixels_size.has_overflow() && image_bitmap_pixels_size.value() > 0) {
         if (auto buffer = Core::AnonymousBuffer::create_with_size(image_bitmap_pixels_size.value(), Core::AnonymousBuffer::Sealability::Sealable); !buffer.is_error()) {
-            image_bitmap_pixels = ImageBitmap::SharedPixels { .buffer = buffer.release_value(), .buffer_index = static_cast<u32>(serialized_writer.shared_buffers().size()) };
+            image_bitmap_pixels = ImageBitmapSharedPixels { .buffer = buffer.release_value(), .buffer_index = static_cast<u32>(serialized_writer.shared_buffers().size()) };
             serialized_writer.shared_buffers().append(image_bitmap_pixels->buffer);
         }
     }
@@ -2289,7 +2286,7 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
             return WebIDL::DataCloneError::create("Cannot transfer detached buffer"_utf16);
 
         // 2. If transferable has a [[Detached]] internal slot and transferable.[[Detached]] is true, then throw a "DataCloneError" DOMException.
-        if (auto* transferable_object = Bindings::transferable_from_object(*transferable)) {
+        if (auto transferable_object = Bindings::transferable_from_object(*transferable); transferable_object.has_value()) {
             if (transferable_object->is_detached())
                 return WebIDL::DataCloneError::create("Value already transferred"_utf16);
         }
@@ -2331,23 +2328,20 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
         // 5. Otherwise:
         else {
             // 1. Assert: transferable is a platform object that is a transferable object.
-            auto& transferable_object = *Bindings::transferable_from_object(*transferable);
+            auto transferable_object = Bindings::transferable_from_object(*transferable).release_value();
             VERIFY(Bindings::is_platform_object(*transferable));
 
             // 2. Let interfaceName be the identifier of the primary interface of transferable.
-            auto interface_name = transferable_object.primary_interface();
+            auto interface_name = transferable_object.primary_interface;
 
             // 3. Set dataHolder.[[Type]] to interfaceName.
             MUST(data_holder.encode(interface_name));
 
             // 4. Perform the appropriate transfer steps for the interface identified by interfaceName, given transferable and dataHolder.
-            if (interface_name == TransferType::ImageBitmap)
-                TRY(Bindings::impl_from<ImageBitmap>(transferable.ptr())->transfer_steps(data_holder, image_bitmap_pixels.has_value() ? &image_bitmap_pixels.value() : nullptr));
-            else
-                TRY(transferable_object.transfer_steps(realm, data_holder));
+            TRY(transferable_object.transfer_steps(realm, data_holder, image_bitmap_pixels.has_value() ? &image_bitmap_pixels.value() : nullptr));
 
             // 5. Set transferable.[[Detached]] to true.
-            transferable_object.set_detached(true);
+            transferable_object.set_detached();
         }
 
         // 6. Append dataHolder to transferDataHolders.

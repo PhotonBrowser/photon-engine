@@ -1,6 +1,7 @@
 set(TEST_SOURCES
     TestAsyncScrollTree.cpp
     TestBackingStoreManager.cpp
+    TestBitmapExport.cpp
     TestCanvasSurfaceRegistry.cpp
     TestContextState.cpp
     TestScrollbarController.cpp
@@ -12,7 +13,7 @@ foreach(source IN LISTS TEST_SOURCES)
 endforeach()
 
 # These drive Skia directly, and the compositor keeps its Skia dependency private.
-foreach(source IN ITEMS BenchmarkForceDarkImageFilter.cpp TestForceDarkImageFilter.cpp TestYUVData.cpp)
+foreach(source IN ITEMS BenchmarkForceDarkImageFilter.cpp TestForceDarkImageFilter.cpp TestPaintingSurface.cpp TestPhotonGaneshPersistentCache.cpp TestYUVData.cpp)
     ladybird_test("${source}" Compositor LIBS compositorservice LibCompositing LibGfx skia)
 endforeach()
 

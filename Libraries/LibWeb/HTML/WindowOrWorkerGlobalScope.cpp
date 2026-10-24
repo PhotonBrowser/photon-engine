@@ -40,6 +40,7 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventSource.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
+#include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/PromiseRejectionEvent.h>
@@ -456,7 +457,8 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
         return;
 
     // 5. Let imageBitmap be a new ImageBitmap object.
-    auto image_bitmap = ImageBitmap::create();
+    // NB: Each case below creates imageBitmap once it has the bitmap data, which nothing can tell apart from setting the
+    //     bitmap data of an ImageBitmap that was created here.
 
     // 6. Switch on image:
     image.visit(
@@ -493,7 +495,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     }));
                 };
 
-                auto on_successful_decode = [image_bitmap = GC::Root(*image_bitmap), p = GC::Root(*p), sx, sy, sw, sh, options](Web::Platform::DecodedImage& result) -> ErrorOr<void> {
+                auto on_successful_decode = [p = GC::Root(*p), sx, sy, sw, sh, options](Web::Platform::DecodedImage& result) -> ErrorOr<void> {
                     if (Core::StatsLog::the())
                         end_rendering_pending_operation(GC::as_cell(p.ptr()));
                     // 4. Set imageBitmap's bitmap data to imageData, cropped to the source rectangle with formatting.
@@ -512,7 +514,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         }));
                         return {};
                     }
-                    image_bitmap->set_bitmap(cropped_bitmap_or_error.release_value());
+                    auto image_bitmap = ImageBitmap::create(cropped_bitmap_or_error.release_value());
 
                     auto& realm = WebIDL::promise_realm(*p);
 
@@ -531,17 +533,21 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
         // -> ImageData
         [&](GC::Ref<ImageData> image_data) -> void {
             // 1. Let buffer be image's data attribute value's [[ViewedArrayBuffer]] internal slot.
-            auto const buffer = image_data->data()->viewed_array_buffer();
-
             // 2. If IsDetachedBuffer(buffer) is true, then return a promise rejected with an "InvalidStateError" DOMException.
-            if (buffer->is_detached()) {
+            if (image_data->is_detached()) {
                 WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image data is detached"_utf16));
                 return;
             }
 
+            if (!image_data->pixels()) {
+                WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image data is detached or out-of-bounds"_utf16));
+                return;
+            }
+
+            // AD-HOC: Reject promise with an "InvalidStateError" DOMException if the image data is too large for a bitmap
             auto bitmap_or_error = image_data->bitmap();
             if (bitmap_or_error.is_error()) {
-                WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image data is detached or out-of-bounds"_utf16));
+                WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is too large"_utf16));
                 return;
             }
 
@@ -553,7 +559,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                 WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is invalid"_utf16));
                 return;
             }
-            image_bitmap->set_bitmap(cropped_bitmap_or_error.release_value());
+            auto image_bitmap = ImageBitmap::create(cropped_bitmap_or_error.release_value());
 
             // 4. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
             queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
@@ -582,9 +588,10 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is invalid"_utf16));
                         return;
                     }
-                    image_bitmap->set_bitmap(cropped_bitmap_or_error.release_value());
+                    auto image_bitmap = ImageBitmap::create(cropped_bitmap_or_error.release_value());
 
-                    // FIXME: 2. Set the origin-clean flag of the imageBitmap's bitmap to the same value as the origin-clean flag of image's bitmap.
+                    // 2. Set the origin-clean flag of the imageBitmap's bitmap to the same value as the origin-clean flag of image's bitmap.
+                    image_bitmap->set_origin_clean(canvas->is_origin_clean());
 
                     // 3. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
                     queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
@@ -595,6 +602,13 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                 },
                 // -> ImageBitmap
                 [&](GC::Ref<ImageBitmap> source_image_bitmap) {
+                    // AD-HOC: An ImageBitmap that is not detached has no bitmap data if the bitmap it was created from
+                    //         had none, as that of an OffscreenCanvas that has no size.
+                    if (!source_image_bitmap->bitmap()) {
+                        WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is invalid"_utf16));
+                        return;
+                    }
+
                     // 1. Set imageBitmap's bitmap data to a copy of image's bitmap data, cropped to the source rectangle with formatting.
                     auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), source_image_bitmap->bitmap(), sx, sy, sw, sh, options);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
@@ -603,9 +617,10 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is invalid"_utf16));
                         return;
                     }
-                    image_bitmap->set_bitmap(cropped_bitmap_or_error.release_value());
+                    auto image_bitmap = ImageBitmap::create(cropped_bitmap_or_error.release_value());
 
-                    // FIXME: 2. Set the origin-clean flag of imageBitmap's bitmap to the same value as the origin-clean flag of image's bitmap.
+                    // 2. Set the origin-clean flag of imageBitmap's bitmap to the same value as the origin-clean flag of image's bitmap.
+                    image_bitmap->set_origin_clean(source_image_bitmap->is_origin_clean());
 
                     // 3. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
                     queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
@@ -659,9 +674,11 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is invalid"_utf16));
                         return;
                     }
-                    image_bitmap->set_bitmap(cropped_bitmap_or_error.release_value());
+                    auto image_bitmap = ImageBitmap::create(cropped_bitmap_or_error.release_value());
 
-                    // FIXME: 4. If image is not origin-clean, then set the origin-clean flag of imageBitmap's bitmap to false.
+                    // 4. If image is not origin-clean, then set the origin-clean flag of imageBitmap's bitmap to false.
+                    if (image_is_not_origin_clean(image_element))
+                        image_bitmap->set_origin_clean(false);
 
                     // 5. Queue a global task, using the bitmap task source, to resolve promise with imageBitmap.
                     queue_global_task(Task::Source::BitmapTask, realm.global_object(), GC::create_function(GC::Heap::the(), [p, image_bitmap] {
@@ -1088,7 +1105,7 @@ void WindowOrWorkerGlobalScopeMixin::queue_the_performance_observer_task()
         m_performance_observer_task_queued = false;
 
         // 2. Let notifyList be a copy of relevantGlobal's list of registered performance observer objects.
-        auto notify_list = m_registered_performance_observer_objects;
+        GC::RootVector notify_list { m_registered_performance_observer_objects.values() };
 
         // 3. For each registered performance observer object registeredObserver in notifyList, run these steps:
         for (auto& registered_observer : notify_list) {
@@ -1102,7 +1119,7 @@ void WindowOrWorkerGlobalScopeMixin::queue_the_performance_observer_task()
             if (entries.is_empty())
                 continue;
 
-            Vector<GC::Ref<PerformanceTimeline::PerformanceEntry>> entries_as_gc_ptrs;
+            GC::RootVector<GC::Ref<PerformanceTimeline::PerformanceEntry>> entries_as_gc_ptrs;
             for (auto& entry : entries)
                 entries_as_gc_ptrs.append(*entry);
 
@@ -1199,7 +1216,7 @@ bool WindowOrWorkerGlobalScopeMixin::can_add_resource_timing_entry()
 size_t WindowOrWorkerGlobalScopeMixin::resource_timing_buffer_current_size()
 {
     // A resource timing buffer current size which is initially 0.
-    auto resource_timing_tuple = relevant_performance_entry_tuple(PerformanceTimeline::EntryTypes::resource);
+    auto const& resource_timing_tuple = relevant_performance_entry_tuple(PerformanceTimeline::EntryTypes::resource);
     return resource_timing_tuple.performance_entry_buffer.size();
 }
 

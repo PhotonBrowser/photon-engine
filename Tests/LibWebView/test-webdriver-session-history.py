@@ -162,6 +162,38 @@ class TestPageHandler(http.server.BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/webdriver-navigation-user-prompt":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"""<!doctype html>
+<script>alert("Navigation prompt");</script>
+<p>Loaded</p>"""
+            )
+            return
+
+        if self.path == "/webdriver-script-timeout-navigation-target":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"""<!doctype html>
+<p>Target</p>
+<script>
+let remainingRounds = 10;
+function allocate() {
+    const objects = [];
+    for (let i = 0; i < 500000; ++i)
+        objects.push({ i });
+    if (--remainingRounds > 0)
+        setTimeout(allocate, 0);
+}
+allocate();
+</script>"""
+            )
+            return
+
         if self.path == "/webdriver-intercepted-navigation-click":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -1548,6 +1580,32 @@ def expect_frame_url(webdriver_port, session_id, label, expected_url, log, expec
     raise AssertionError(f"Expected {label} to be {expected_url}, got {actual}\n" + "\n".join(log))
 
 
+def wait_for_frame_load(webdriver_port, session_id):
+    # A frame's document can become active before it has finished loading, so wait for the frame's load event before
+    # reading its document.
+    execute_async_script(
+        webdriver_port,
+        session_id,
+        """
+const done = arguments[0];
+const frame = document.getElementById('frame');
+const resolveIfComplete = () => {
+    if (frame.contentDocument?.readyState !== "complete")
+        return false;
+    done();
+    return true;
+};
+if (!resolveIfComplete()) {
+    // The frame's document may be replaced before it finishes loading, so it is checked again on each load event.
+    frame.addEventListener("load", function onLoad() {
+        if (resolveIfComplete())
+            frame.removeEventListener("load", onLoad);
+    });
+}
+""",
+    )
+
+
 def wait_for_frame_url(
     webdriver_port, session_id, label, expected_url, log, expected_title=None, timeout=EVENT_TIMEOUT_SECONDS
 ):
@@ -1987,6 +2045,40 @@ def run_webdriver_intercepted_navigation_click_test(webdriver_port, url):
         request(webdriver_port, "DELETE", f"/session/{session_id}")
 
 
+def run_webdriver_navigation_to_user_prompt_test(webdriver_port, url):
+    session_id = create_session(webdriver_port)
+    try:
+        log = [f"WebDriver navigation to user prompt initial: {current_url(webdriver_port, session_id)}"]
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url})
+        prompt_text = request(webdriver_port, "GET", f"/session/{session_id}/alert/text")["value"]
+        if prompt_text != "Navigation prompt":
+            raise AssertionError(f"Expected the navigated-to page's prompt to be open, got {prompt_text!r}")
+
+        request(webdriver_port, "POST", f"/session/{session_id}/alert/accept", {})
+        wait_for_body_text(webdriver_port, session_id, "after accepting the navigation prompt", "Loaded", log)
+    finally:
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_webdriver_script_timeout_after_navigation_test(webdriver_port, url_a, target_url):
+    session_id = create_session(webdriver_port)
+    try:
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"script": 2000})
+
+        status, payload, response_body = request_raw(
+            webdriver_port,
+            "POST",
+            f"/session/{session_id}/execute/async",
+            {"script": f"location.href = {json.dumps(target_url)};", "args": []},
+        )
+        value = payload.get("value")
+        if status != 500 or not isinstance(value, dict) or value.get("error") != "script timeout":
+            raise AssertionError(f"Expected the script to time out, got HTTP {status}: {response_body}")
+    finally:
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
 def run_failed_redirected_navigation_shows_failed_url_test(webdriver_port, page_port, url_a):
     url_redirect_to_tls_failure = f"http://localhost:{page_port}/redirect-to-tls-failure"
     url_tls_failure = f"https://127.0.0.1:{page_port}/tls-failure"
@@ -2023,6 +2115,15 @@ def run_self_contained_navigation_tests(webdriver_port, page_port, url_a):
     run_webdriver_intercepted_navigation_click_test(
         webdriver_port,
         f"http://localhost:{page_port}/webdriver-intercepted-navigation-click",
+    )
+    run_webdriver_navigation_to_user_prompt_test(
+        webdriver_port,
+        f"http://localhost:{page_port}/webdriver-navigation-user-prompt",
+    )
+    run_webdriver_script_timeout_after_navigation_test(
+        webdriver_port,
+        url_a,
+        f"http://localhost:{page_port}/webdriver-script-timeout-navigation-target",
     )
     run_failed_redirected_navigation_shows_failed_url_test(webdriver_port, page_port, url_a)
 
@@ -3530,6 +3631,7 @@ return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.heigh
         page_server.release_blocked_frame_b.set()
         wait_for_event(page_server.frame_b_blocked_document_ran, "nested frame restore document")
         expect_url(webdriver_port, session_id, "after nested restore crash recovery", url_nested, log)
+        wait_for_frame_load(webdriver_port, session_id)
         expect_frame_url(
             webdriver_port,
             session_id,
@@ -4652,6 +4754,7 @@ return [location.href, window.canceledTraverseCount];
         crash_current_page(webdriver_port, session_id)
         wait_for_event(page_server.frame_b_blocked_document_ran, "nested frame document after crash recovery")
         expect_url(webdriver_port, session_id, "after nested crash recovery", url_nested, log)
+        wait_for_frame_load(webdriver_port, session_id)
         expect_frame_url(
             webdriver_port,
             session_id,
@@ -4673,6 +4776,7 @@ return [location.href, window.canceledTraverseCount];
 
         request(webdriver_port, "POST", f"/session/{session_id}/back", {})
         expect_url(webdriver_port, session_id, "after nested crash recovery frame back", url_nested, log)
+        wait_for_frame_load(webdriver_port, session_id)
         expect_frame_url(
             webdriver_port,
             session_id,
@@ -4693,6 +4797,7 @@ return [location.href, window.canceledTraverseCount];
 
         request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
         expect_url(webdriver_port, session_id, "after nested crash recovery frame forward", url_nested, log)
+        wait_for_frame_load(webdriver_port, session_id)
         expect_frame_url(
             webdriver_port,
             session_id,
@@ -4749,6 +4854,7 @@ return location.href;
         expect_url(
             webdriver_port, session_id, "after same-document nested crash recovery", url_nested_same_document, log
         )
+        wait_for_frame_load(webdriver_port, session_id)
         expect_frame_url(
             webdriver_port,
             session_id,
@@ -4908,6 +5014,7 @@ return [Math.floor(rect.left + rect.width / 2), Math.floor(rect.top + rect.heigh
         request(webdriver_port, "POST", f"/session/{session_id}/back", {})
         expect_url(webdriver_port, session_id, "after nested frame back", url_nested, log)
         expect_navigation_buttons(webdriver_port, session_id, "after nested frame back", True, True, log)
+        wait_for_frame_load(webdriver_port, session_id)
         expect_frame_url(
             webdriver_port, session_id, "after nested frame back restores previous entry", url_frame_a, log, "Frame A"
         )

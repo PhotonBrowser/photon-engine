@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <LibGfx/Font/Font.h>
+#include <AK/FlyString.h>
 #include <fontconfig/fontconfig.h>
 
 namespace AK {
@@ -17,6 +17,21 @@ class NeverDestroyed;
 }
 
 namespace Gfx {
+
+enum class FontHintingStyle {
+    None,
+    Slight,
+    Normal,
+    Full,
+};
+
+struct FontHintingOptions {
+    FontHintingStyle style { FontHintingStyle::Normal };
+    bool force_autohinting { false };
+};
+
+// The FC_SLANT value for a slope of 0 for upright, 1 for italic or 2 for oblique.
+int fontconfig_slant(u8 slope);
 
 class GlobalFontConfig {
 public:

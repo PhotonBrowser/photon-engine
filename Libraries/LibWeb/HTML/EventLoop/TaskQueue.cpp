@@ -473,7 +473,7 @@ String TaskQueue::performance_diagnostics_json()
 void TaskQueue::run_discard_steps()
 {
     while (!m_discarded_tasks.is_empty()) {
-        auto discarded_tasks = move(m_discarded_tasks);
+        GC::RootVector discarded_tasks { move(m_discarded_tasks) };
         for (auto& task : discarded_tasks)
             task->discard();
     }
@@ -482,15 +482,6 @@ void TaskQueue::run_discard_steps()
 Task const* TaskQueue::last_added_task() const
 {
     return m_last_added_task.ptr();
-}
-
-bool TaskQueue::has_rendering_tasks() const
-{
-    for (auto const& task : m_tasks) {
-        if (task.source() == Task::Source::Rendering)
-            return true;
-    }
-    return false;
 }
 
 }

@@ -286,11 +286,6 @@ void ComputedStyleWorkingSet::set_font_metrics_depend_on_viewport_metrics()
     metadata().dependency_flags |= to_underlying(StyleRecordDependencyFlag::FontMetricsDependOnViewportMetrics);
 }
 
-static bool property_affects_computed_font_list(PropertyID id)
-{
-    return first_is_one_of(id, PropertyID::FontFamily, PropertyID::FontSize, PropertyID::FontStyle, PropertyID::FontWeight, PropertyID::FontWidth, PropertyID::FontVariationSettings);
-}
-
 Display ComputedStyleWorkingSet::display_before_box_type_transformation() const
 {
     return bit_cast<Display>(metadata().display_before_box_type_transformation);
@@ -299,21 +294,6 @@ Display ComputedStyleWorkingSet::display_before_box_type_transformation() const
 void ComputedStyleWorkingSet::set_display_before_box_type_transformation(Display value)
 {
     metadata().display_before_box_type_transformation = bit_cast<u32>(value);
-}
-
-void ComputedStyleWorkingSet::set_animated_property_internal(PropertyID id, NonnullRefPtr<StyleValue const> value, AnimatedPropertyResultOfTransition animated_property_result_of_transition, Inherited inherited)
-{
-    VERIFY(id >= first_longhand_property_id && id <= last_longhand_property_id);
-
-    mutable_animated_properties().set_property(id, move(value), animated_property_result_of_transition, inherited);
-
-    if (property_affects_computed_font_list(id))
-        clear_computed_font_list_cache();
-}
-
-void ComputedStyleWorkingSet::set_animated_property(Badge<StyleComputer>, PropertyID id, NonnullRefPtr<StyleValue const> value, AnimatedPropertyResultOfTransition animated_property_result_of_transition, Inherited inherited)
-{
-    set_animated_property_internal(id, move(value), animated_property_result_of_transition, inherited);
 }
 
 ComputedValuesFFI::AnimatedOverlay* ComputedStyleWorkingSet::prepare_animated_overlay_for_rust_mutation(Badge<StyleComputer>)
@@ -549,6 +529,7 @@ ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet:
                 .font_families = computed_font_families(),
                 .font_optical_sizing = font_optical_sizing(),
                 .font_size = font_size(),
+                .font_size_adjust = font_size_adjust(),
                 .font_slope = font_slope(),
                 .font_weight = font_weight(),
                 .font_width = font_width(),
@@ -574,6 +555,15 @@ ValueComparingNonnullRefPtr<Gfx::Font const> ComputedStyleWorkingSet::first_avai
 int ComputedStyleWorkingSet::math_depth() const
 {
     return property(PropertyID::MathDepth).as_integer().integer();
+}
+
+Optional<FontSizeAdjust> ComputedStyleWorkingSet::font_size_adjust() const
+{
+    u8 metric = 0;
+    double value = 0;
+    if (!StyleValueFFI::rust_style_value_computed_font_size_adjust_number(effective_property_data(PropertyID::FontSizeAdjust), &metric, &value))
+        return {};
+    return FontSizeAdjust { static_cast<FontSizeAdjustMetric>(metric), value };
 }
 
 CSSPixels ComputedStyleWorkingSet::font_size() const

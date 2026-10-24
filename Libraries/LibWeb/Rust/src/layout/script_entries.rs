@@ -349,7 +349,7 @@ pub extern "C" fn layout_script_paintable_absolute_padding_box_rect(
         if !paintable_rows.paintable_row_is_populated(slot) {
             return FfiCssPixelRect::default();
         }
-        crate::painting::paintable_geometry::absolute_padding_box_rect(paintable_rows, slot).into()
+        crate::painting::paintable_geometry::first_fragment_padding_box_rect(paintable_rows, slot).into()
     });
 }
 
@@ -364,8 +364,73 @@ pub extern "C" fn layout_script_paintable_absolute_border_box_rect(
         if !paintable_rows.paintable_row_is_populated(slot) {
             return FfiCssPixelRect::default();
         }
-        crate::painting::paintable_geometry::absolute_border_box_rect(paintable_rows, slot).into()
+        crate::painting::paintable_geometry::first_fragment_border_box_rect(paintable_rows, slot).into()
     });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_paintable_border_box_rect_of_fragments(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    out: &mut FfiCssPixelRect,
+) {
+    *out = read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(slot) {
+            return FfiCssPixelRect::default();
+        }
+        crate::painting::paintable_geometry::absolute_border_box_rect(arena, slot).into()
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_paintable_box_fragment_count(host: &DocumentHost, slot: NodeSlotId) -> usize {
+    read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(slot) {
+            return 0;
+        }
+        crate::painting::paintable_geometry::fragment_count(arena, slot)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_paintable_unbroken_border_box_size(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    out: &mut FfiCssPixelSize,
+) {
+    *out = read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(slot) {
+            return FfiCssPixelSize::default();
+        }
+        crate::painting::paintable_geometry::unbroken_border_box_size(arena, slot)
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_empty_line_ended_by_forced_break_position(
+    host: &DocumentHost,
+    block: NodeSlotId,
+    forced_break: NodeSlotId,
+    out: &mut super::used_values::FfiCssPixelPoint,
+) -> bool {
+    let position = read_rows(host, |arena| {
+        if !arena.paintable_row_is_populated(block) {
+            return None;
+        }
+        let side = arena.committed_side_data(block);
+        let line = side
+            .lines()
+            .iter()
+            .find(|line| line.forced_break_node == forced_break && line.fragment_count == 0)?;
+        let root_position =
+            crate::painting::paintable_geometry::LineRootPositions::new(arena, block).of_fragment(line.box_fragment);
+        Some(CssPixelRect::from(line.rect).translated_by(root_position).location())
+    });
+    let Some(position) = position else {
+        return false;
+    };
+    *out = position.into();
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -378,10 +443,11 @@ pub extern "C" fn layout_script_paintable_box_model(
         if !arena.paintable_row_is_populated(slot) {
             return FfiBoxModelMetrics::default();
         }
+        let (margin, padding, border) = crate::painting::paintable_geometry::unbroken_box_model(arena, slot);
         FfiBoxModelMetrics {
-            margin: crate::painting::paintable_geometry::committed_margin(arena, slot),
-            padding: crate::painting::paintable_geometry::committed_padding(arena, slot),
-            border: crate::painting::paintable_geometry::committed_border(arena, slot),
+            margin,
+            padding,
+            border,
             inset: crate::painting::paintable_geometry::committed_inset(arena, slot),
         }
     });
@@ -398,7 +464,7 @@ pub extern "C" fn layout_script_paintable_content_size(
         if !paintable_rows.paintable_row_is_populated(slot) {
             return FfiCssPixelSize::default();
         }
-        crate::painting::paintable_geometry::committed_content_size(paintable_rows, slot)
+        crate::painting::paintable_geometry::unbroken_content_size(paintable_rows, slot)
     });
 }
 
@@ -429,8 +495,7 @@ pub struct FfiRenderedTextWithOffsetsView {
     pub offset_mapping_length: usize,
 }
 
-/// The text the rows of the text node whose primary row is `primary` render, with whitespace collapsed where their
-/// style collapses it if `collapse_whitespace`, handed to `append`.
+/// The text the rows of the text node whose primary row is `primary` render, handed to `append`.
 ///
 /// # Safety
 ///
@@ -440,7 +505,6 @@ pub struct FfiRenderedTextWithOffsetsView {
 pub unsafe extern "C" fn layout_script_rendered_text(
     host: &DocumentHost,
     primary: NodeSlotId,
-    collapse_whitespace: bool,
     context: *mut c_void,
     append: unsafe extern "C" fn(*mut c_void, FfiRenderedTextView),
 ) {
@@ -448,15 +512,11 @@ pub unsafe extern "C" fn layout_script_rendered_text(
     // the render state does.
     let from_rows = host.read_rows_with_rendered_text(
         ScriptForcedRead::at_script_entry(&SCRIPT_ENTRY),
-        |rows, awaiting_render| {
-            crate::layout::text_queries::rendered_text_of_rows(rows, awaiting_render, primary, collapse_whitespace)
-        },
+        |rows, awaiting_render| crate::layout::text_queries::rendered_text_of_rows(rows, awaiting_render, primary),
     );
     let text = match from_rows {
         Some(text) => text,
-        None => read_arena(host, |arena| {
-            crate::layout::text_queries::rendered_text(arena, primary, collapse_whitespace)
-        }),
+        None => read_arena(host, |arena| crate::layout::text_queries::rendered_text(arena, primary)),
     };
     let view = FfiRenderedTextView {
         text: text.as_ptr(),

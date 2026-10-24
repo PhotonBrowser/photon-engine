@@ -15,7 +15,9 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::css::css_tokenizer::{ParserSource, ParserTokenKind, SourcePosition, TokenizerInput};
-use crate::css::parser::component_value::{ComponentKind, ComponentSerializationMode, ComponentValue};
+use crate::css::parser::component_value::{
+    ComponentKind, ComponentSerializationMode, ComponentValue, ComponentValueList, ComponentValueSlice,
+};
 
 pub(crate) use crate::css::css_string::{CssString, CssStringList};
 
@@ -25,6 +27,7 @@ pub(crate) use crate::css::css_string::{CssString, CssStringList};
 pub struct RetainedComponentValueList {
     pointer: *mut c_void,
     length: usize,
+    token_count: usize,
 }
 
 // SAFETY: This handle owns an immutable boxed slice. The bounds cover the erased element type.
@@ -32,22 +35,29 @@ unsafe impl Send for RetainedComponentValueList where ComponentValue: Send {}
 unsafe impl Sync for RetainedComponentValueList where ComponentValue: Sync {}
 
 impl RetainedComponentValueList {
-    pub(crate) fn from_values(values: Vec<ComponentValue>) -> Self {
-        let mut values = values.into_boxed_slice();
+    pub(crate) fn from_values(values: impl Into<ComponentValueList>) -> Self {
+        let values = values.into();
+        let token_count = values.token_count;
+        let mut values = values.into_vec().into_boxed_slice();
         let result = Self {
             pointer: values.as_mut_ptr().cast(),
             length: values.len(),
+            token_count,
         };
         std::mem::forget(values);
         result
     }
 
     pub(crate) fn from_source(source: &[u16]) -> Self {
-        let values = crate::css::parser::component_value::consume_a_list_of_component_values(
+        let values = crate::css::parser::component_value::consume_a_counted_list_of_component_values(
             crate::css::css_tokenizer::tokenize_for_parser(source),
         )
         .unwrap_or_default();
         Self::from_values(values)
+    }
+
+    pub(crate) fn as_counted_slice(&self) -> ComponentValueSlice<'_> {
+        ComponentValueSlice::with_token_count(self.as_slice(), self.token_count)
     }
 
     pub(crate) fn as_slice(&self) -> &[ComponentValue] {
@@ -308,7 +318,7 @@ mod unresolved_component_tests {
 
 impl Clone for RetainedComponentValueList {
     fn clone(&self) -> Self {
-        Self::from_values(self.as_slice().to_vec())
+        Self::from_values(self.as_counted_slice().to_owned())
     }
 }
 
@@ -1339,10 +1349,14 @@ impl RetainedGridTrackEntry {
     }
 
     pub(crate) fn size(value: StyleValueData) -> Self {
+        Self::retained_size(RetainedStyleValueData::from_owned(value))
+    }
+
+    fn retained_size(size_value: RetainedStyleValueData) -> Self {
         Self {
             kind: GridTrackEntryKind::Size,
             names: CssStringList::from_strings(Vec::new()),
-            size_value: RetainedStyleValueData::from_owned(value),
+            size_value,
             min_value: RetainedStyleValueData::none(),
             max_value: RetainedStyleValueData::none(),
             repeat_type: 0,
@@ -1587,6 +1601,99 @@ pub struct BasicShapeData {
     pub(crate) v4: RetainedStyleValueData,
     pub(crate) points: RetainedShapePointList,
     pub(crate) path: crate::css::css_path::CssPath,
+    /// The commands of a shape(), whose coordinates are `points` in order.
+    pub(crate) commands: ShapeCommands,
+}
+
+/// https://drafts.csswg.org/css-shapes-1/#shape-function
+/// One command of a shape(). Its points, in order, are its end point, then its control points, or its arc's
+/// radii and rotation. Each point holds two length-percentages, the two edges of a position, or a keyword.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeCommand {
+    pub(crate) kind: ShapeCommandKind,
+    /// Whether the end point is given with `by`, relative to the command's starting point.
+    pub(crate) relative: bool,
+    /// What each control point is relative to.
+    pub(crate) control_points: [ShapeControlPointAnchor; 2],
+    pub(crate) control_point_count: u8,
+    /// Whether an arc's single radius applies to both axes.
+    pub(crate) arc_has_one_radius: bool,
+    pub(crate) arc_clockwise: bool,
+    pub(crate) arc_large: bool,
+    /// Whether an arc's rotation was given. Arcs hold their rotation angle as a third point either way.
+    pub(crate) arc_has_rotation: bool,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeCommandKind {
+    From,
+    Move,
+    Line,
+    HorizontalLine,
+    VerticalLine,
+    Curve,
+    Smooth,
+    Arc,
+    Close,
+}
+
+/// What a shape() control point is relative to: the command's start or end point, or the reference box.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeControlPointAnchor {
+    Start,
+    End,
+    Origin,
+}
+
+impl ShapeCommand {
+    pub(crate) fn new(kind: ShapeCommandKind, relative: bool) -> Self {
+        Self {
+            kind,
+            relative,
+            control_points: [ShapeControlPointAnchor::Start; 2],
+            control_point_count: 0,
+            arc_has_one_radius: false,
+            arc_clockwise: false,
+            arc_large: false,
+            arc_has_rotation: false,
+        }
+    }
+}
+
+/// The commands of a shape().
+#[repr(C)]
+pub struct ShapeCommands {
+    pointer: *mut ShapeCommand,
+    length: usize,
+}
+
+retained_list!(ShapeCommands, ShapeCommand, native);
+retained_list_as_slice!(ShapeCommands, ShapeCommand);
+retained_list_from_vec!(ShapeCommands, ShapeCommand);
+retained_list_send_sync!(ShapeCommands, ShapeCommand);
+
+impl ShapeCommands {
+    pub(crate) fn new(commands: Vec<ShapeCommand>) -> Self {
+        Self::from_retained_elements(commands)
+    }
+}
+
+impl Default for ShapeCommands {
+    fn default() -> Self {
+        Self {
+            pointer: std::ptr::null_mut(),
+            length: 0,
+        }
+    }
+}
+
+impl PartialEq for ShapeCommands {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
 }
 
 /// A Rust-owned shape allocation with an explicit pointer layout for C++ bindings.
@@ -1855,15 +1962,14 @@ pub enum StyleValueData {
         name: CssString,
         origin_color: RetainedStyleValueData,
     },
-    /// color-mix() with its optional retained interpolation method value and two components,
-    /// each a retained color with an optional retained percentage.
+    /// color-mix() with its optional retained interpolation method value and its mix items:
+    /// one or more retained colors, each with an optional retained percentage. The two lists
+    /// have the same length, and an omitted percentage is a null entry.
     ColorMix {
         color_base: ColorBase,
         color_interpolation_method: RetainedStyleValueData,
-        first_color: RetainedStyleValueData,
-        first_percentage: RetainedStyleValueData,
-        second_color: RetainedStyleValueData,
-        second_percentage: RetainedStyleValueData,
+        colors: RetainedStyleValueDataList,
+        percentages: RetainedStyleValueDataList,
     },
     /// The shared data of every color style value: an optional color type and the color syntax
     /// (both C++ enums on ColorStyleValue, opaque to Rust).
@@ -2096,6 +2202,15 @@ pub enum StyleValueData {
         color_operation: u8,
         value: RetainedStyleValueData,
     },
+    /// https://drafts.csswg.org/motion-1/#ray-function
+    /// A ray() offset path: its angle, its <ray-size> keyword, whether it has `contain`, and its
+    /// optional `at <position>` (null when absent).
+    Ray {
+        size: u16,
+        contain: bool,
+        angle: RetainedStyleValueData,
+        position: RetainedStyleValueData,
+    },
 }
 
 // The kinds of a filter style value, which are C++ enum values.
@@ -2193,34 +2308,29 @@ pub extern "C" fn rust_style_value_computed_percentage(value: &StyleValueData) -
     }
 }
 
+/// Reads a computed `font-size-adjust` that scales the size fonts are selected at: true, with the
+/// metric (a `font_size_adjust_metric` value) and the number, for one naming a number, and false
+/// for `none` and `from-font`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_computed_font_size_adjust_number(
+    value: &StyleValueData,
+    metric: &mut u8,
+    number: &mut f64,
+) -> bool {
+    let (kind, value_metric, value_number) = crate::css::style::engine_sample::font_size_adjust_of(Some(value));
+    if kind != crate::css::style::bridge::FontSizeAdjustKind::Number {
+        return false;
+    }
+    *metric = value_metric;
+    *number = value_number;
+    true
+}
+
 impl StyleValueData {
     pub(crate) fn basic_shape(&self) -> Option<&BasicShapeData> {
         match self {
             Self::BasicShape { shape } => Some(shape.as_ref()),
             _ => None,
-        }
-    }
-
-    pub(crate) fn unresolved_authored_source(&self) -> Option<TokenizerInput<'_>> {
-        let Self::Unresolved { source_text, .. } = self else {
-            return None;
-        };
-        Some(TokenizerInput::from(source_text))
-    }
-
-    pub(crate) fn unresolved_token_source(&self) -> Option<TokenizerInput<'_>> {
-        let Self::Unresolved {
-            source_text,
-            value_comparison_text,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        if value_comparison_text.units().is_empty() {
-            Some(TokenizerInput::from(source_text))
-        } else {
-            Some(TokenizerInput::from(value_comparison_text))
         }
     }
 }
@@ -2244,8 +2354,8 @@ impl StyleValueData {
     ///
     /// Consistency holds by construction because the hash only ever omits fields, and derived
     /// equality requires every field to be equal, so any hashed subset agrees on equal values.
-    /// Opaque payloads (calc trees, geometry and stop lists) contribute nothing beyond the
-    /// variant discriminant; deep equality settles whatever shares a bucket. Floats hash by bit
+    /// Opaque payloads (calc trees and path geometry) contribute nothing beyond the variant
+    /// discriminant; deep equality settles whatever shares a bucket. Floats hash by bit
     /// pattern with negative zero normalized to zero; NaN never equals anything, so its hash is
     /// unconstrained.
     pub(crate) fn content_hash(&self) -> u64 {
@@ -2285,6 +2395,35 @@ impl StyleValueData {
             hasher.write_u8(base.color_type);
             hasher.write_u8(base.color_syntax);
         }
+        fn write_color_stops(hasher: &mut crate::css::style::fast_hash::FastHasher, stops: &RetainedColorStopList) {
+            hasher.write_usize(stops.as_slice().len());
+            for stop in stops.as_slice() {
+                for value in stop.values() {
+                    write_value(hasher, value);
+                }
+            }
+        }
+        fn write_grid_track_entries(
+            hasher: &mut crate::css::style::fast_hash::FastHasher,
+            entries: &[RetainedGridTrackEntry],
+        ) {
+            hasher.write_usize(entries.len());
+            for entry in entries {
+                hasher.write_u8(entry.kind as u8);
+                hasher.write_usize(entry.names.as_slice().len());
+                for name in entry.names.as_slice() {
+                    write_fly(hasher, name);
+                }
+                write_value(hasher, &entry.size_value);
+                write_value(hasher, &entry.min_value);
+                write_value(hasher, &entry.max_value);
+                hasher.write_u8(entry.repeat_type);
+                write_value(hasher, &entry.repeat_count);
+                write_bool(hasher, entry.repeat_is_subgrid);
+                write_bool(hasher, entry.repeat_preserve_line_name_sets);
+                write_grid_track_entries(hasher, entry.repeat_entries.as_slice());
+            }
+        }
 
         std::mem::discriminant(self).hash(hasher);
         match self {
@@ -2312,8 +2451,10 @@ impl StyleValueData {
                     fill_rule,
                     points: _,
                     path,
+                    commands,
                 } = shape.as_ref();
                 hasher.write_u8(*kind);
+                hasher.write_usize(commands.as_slice().len());
                 write_value(hasher, v0);
                 write_value(hasher, v1);
                 write_value(hasher, v2);
@@ -2542,35 +2683,37 @@ impl StyleValueData {
                 name,
                 origin_color,
             } => {
-                write_color_base(hasher, color_base);
+                // NB: Equality ignores the color syntax, and the color type and name when absent.
+                write_bool(hasher, color_base.has_color_type);
+                if color_base.has_color_type {
+                    hasher.write_u8(color_base.color_type);
+                }
                 write_value(hasher, channel_0);
                 write_value(hasher, channel_1);
                 write_value(hasher, channel_2);
                 write_value(hasher, alpha);
                 write_bool(hasher, *has_name);
-                write_fly(hasher, name);
+                if *has_name {
+                    write_fly(hasher, name);
+                }
                 write_value(hasher, origin_color);
             }
             Self::ColorMix {
                 color_base,
                 color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
+                colors,
+                percentages,
             } => {
                 write_color_base(hasher, color_base);
                 write_value(hasher, color_interpolation_method);
-                write_value(hasher, first_color);
-                write_value(hasher, first_percentage);
-                write_value(hasher, second_color);
-                write_value(hasher, second_percentage);
+                write_values(hasher, colors);
+                write_values(hasher, percentages);
             }
             Self::LinearGradient {
                 has_direction_value,
                 direction_value,
                 side_or_corner,
-                color_stop_list: _,
+                color_stop_list,
                 gradient_type,
                 repeating,
                 color_interpolation_method,
@@ -2579,6 +2722,7 @@ impl StyleValueData {
                 write_bool(hasher, *has_direction_value);
                 write_value(hasher, direction_value);
                 hasher.write_u8(*side_or_corner);
+                write_color_stops(hasher, color_stop_list);
                 hasher.write_u8(*gradient_type);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
@@ -2587,13 +2731,14 @@ impl StyleValueData {
             Self::ConicGradient {
                 from_angle,
                 position,
-                color_stop_list: _,
+                color_stop_list,
                 repeating,
                 color_interpolation_method,
                 color_syntax,
             } => {
                 write_value(hasher, from_angle);
                 write_value(hasher, position);
+                write_color_stops(hasher, color_stop_list);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
                 hasher.write_u8(*color_syntax);
@@ -2602,7 +2747,7 @@ impl StyleValueData {
                 ending_shape,
                 size,
                 position,
-                color_stop_list: _,
+                color_stop_list,
                 repeating,
                 color_interpolation_method,
                 color_syntax,
@@ -2610,6 +2755,7 @@ impl StyleValueData {
                 hasher.write_u8(*ending_shape);
                 write_value(hasher, size);
                 write_value(hasher, position);
+                write_color_stops(hasher, color_stop_list);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
                 hasher.write_u8(*color_syntax);
@@ -2618,10 +2764,18 @@ impl StyleValueData {
                 url.hash(hasher);
                 hasher.write_u8(*url_type);
             }
-            Self::ImageSet { options: _ } => {}
+            Self::ImageSet { options } => {
+                hasher.write_usize(options.as_slice().len());
+                for option in options.as_slice() {
+                    write_value(hasher, &option.image);
+                    write_value(hasher, &option.resolution);
+                    write_bool(hasher, option.has_type);
+                    write_fly(hasher, &option.type_string);
+                }
+            }
             Self::Easing {
                 kind,
-                linear_stops: _,
+                linear_stops,
                 x1,
                 y1,
                 x2,
@@ -2630,6 +2784,11 @@ impl StyleValueData {
                 step_position,
             } => {
                 hasher.write_u8(*kind);
+                hasher.write_usize(linear_stops.as_slice().len());
+                for stop in linear_stops.as_slice() {
+                    write_value(hasher, &stop.output);
+                    write_value(hasher, &stop.input);
+                }
                 write_value(hasher, x1);
                 write_value(hasher, y1);
                 write_value(hasher, x2);
@@ -2645,20 +2804,37 @@ impl StyleValueData {
             Self::GridTrackSizeList {
                 is_subgrid,
                 preserve_line_name_sets,
-                entries: _,
+                entries,
             } => {
                 write_bool(hasher, *is_subgrid);
                 write_bool(hasher, *preserve_line_name_sets);
+                write_grid_track_entries(hasher, entries.as_slice());
             }
             Self::GridTemplateArea {
-                grid_areas: _,
+                grid_areas,
                 row_count,
                 column_count,
             } => {
+                hasher.write_usize(grid_areas.as_slice().len());
+                for area in grid_areas.as_slice() {
+                    write_fly(hasher, &area.name);
+                    write_fly(hasher, &area.implicit_start_name);
+                    write_fly(hasher, &area.implicit_end_name);
+                    for line in area.grid_lines() {
+                        hasher.write_usize(line);
+                    }
+                }
                 hasher.write_usize(*row_count);
                 hasher.write_usize(*column_count);
             }
-            Self::CounterDefinitions { counter_definitions: _ } => {}
+            Self::CounterDefinitions { counter_definitions } => {
+                hasher.write_usize(counter_definitions.as_slice().len());
+                for definition in counter_definitions.as_slice() {
+                    write_fly(hasher, &definition.name);
+                    write_bool(hasher, definition.is_reversed);
+                    write_value(hasher, &definition.value);
+                }
+            }
             Self::GridTrackPlacement {
                 kind,
                 value,
@@ -2853,6 +3029,17 @@ impl StyleValueData {
                 hasher.write_u8(*color_operation);
                 write_value(hasher, value);
             }
+            Self::Ray {
+                size,
+                contain,
+                angle,
+                position,
+            } => {
+                hasher.write_u16(*size);
+                write_bool(hasher, *contain);
+                write_value(hasher, angle);
+                write_value(hasher, position);
+            }
         }
     }
 }
@@ -2917,6 +3104,65 @@ pub unsafe extern "C" fn rust_style_value_create_ratio(
         numerator: unsafe { RetainedStyleValueData::from_retained_pointer(numerator) },
         denominator: unsafe { RetainedStyleValueData::from_retained_pointer(denominator) },
     }))
+}
+
+/// Takes ownership of one strong reference to the number, percentage or calculated value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_value_create_opacity_value(value: *const StyleValueData) -> *const StyleValueData {
+    Arc::into_raw(Arc::new(StyleValueData::OpacityValue {
+        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
+    }))
+}
+
+/// Takes ownership of one strong reference to the length-percentage value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_value_create_text_indent(
+    length_percentage: *const StyleValueData,
+    hanging: bool,
+    each_line: bool,
+) -> *const StyleValueData {
+    Arc::into_raw(Arc::new(StyleValueData::TextIndent {
+        length_percentage: unsafe { RetainedStyleValueData::from_retained_pointer(length_percentage) },
+        hanging,
+        each_line,
+    }))
+}
+
+/// Takes ownership of one strong reference to each track size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_value_create_grid_track_size_list(
+    track_sizes: *const *const StyleValueData,
+    length: usize,
+) -> *const StyleValueData {
+    let entries = unsafe { ak::slice_from_raw_parts(track_sizes, length) }
+        .iter()
+        .map(|&track_size| {
+            RetainedGridTrackEntry::retained_size(unsafe { RetainedStyleValueData::from_retained_pointer(track_size) })
+        })
+        .collect();
+    Arc::into_raw(Arc::new(StyleValueData::GridTrackSizeList {
+        is_subgrid: false,
+        preserve_line_name_sets: false,
+        entries: RetainedGridTrackEntryList::from_retained_entries(entries),
+    }))
+}
+
+/// The track size of a grid track size list that holds just one track size, without line names, or null. The
+/// returned value is borrowed from `data`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_grid_track_size_list_single_size(data: &StyleValueData) -> *const StyleValueData {
+    let StyleValueData::GridTrackSizeList {
+        is_subgrid: false,
+        entries,
+        ..
+    } = data
+    else {
+        return std::ptr::null();
+    };
+    match entries.as_slice() {
+        [entry] if entry.kind == GridTrackEntryKind::Size => entry.size_value.pointer(),
+        _ => std::ptr::null(),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3493,11 +3739,7 @@ pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
     match value {
         StyleValueData::Keyword { keyword } => *keyword == crate::css::style_compute::keyword::CURRENTCOLOR,
         StyleValueData::ColorFunction { origin_color, .. } => retained_data_depends(origin_color),
-        StyleValueData::ColorMix {
-            first_color,
-            second_color,
-            ..
-        } => retained_data_depends(first_color) || retained_data_depends(second_color),
+        StyleValueData::ColorMix { colors, .. } => colors.as_slice().iter().any(retained_data_depends),
         StyleValueData::ContrastColor { color, .. } => retained_data_depends(color),
         StyleValueData::LightDark { light, dark, .. } => retained_data_depends(light) || retained_data_depends(dark),
         StyleValueData::Shadow { color, .. } => retained_data_depends(color),
@@ -3523,11 +3765,7 @@ pub(crate) fn value_depends_on_color_scheme(value: &StyleValueData) -> bool {
         StyleValueData::ColorFunction { origin_color, .. } => {
             origin_color.optional_data().is_some_and(value_depends_on_color_scheme)
         }
-        StyleValueData::ColorMix {
-            first_color,
-            second_color,
-            ..
-        } => retained_data_depends(first_color) || retained_data_depends(second_color),
+        StyleValueData::ColorMix { colors, .. } => colors.as_slice().iter().any(retained_data_depends),
         StyleValueData::ContrastColor { color, .. } => retained_data_depends(color),
         StyleValueData::LightDark { .. } => true,
         _ => false,
