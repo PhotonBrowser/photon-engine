@@ -39,6 +39,13 @@ struct ProcessSnapshot {
     Optional<u64> owner_child_id;
     float cpu_percent { 0 };
     u64 memory_usage_bytes { 0 };
+    bool has_cpu_statistics { false };
+    bool has_memory_statistics { false };
+    Optional<u64> disk_read_bytes;
+    Optional<u64> disk_write_bytes;
+    bool has_network_statistics { false };
+    u64 network_download_bytes_per_second { 0 };
+    u64 network_upload_bytes_per_second { 0 };
     Optional<ProcessPageSnapshot> page;
 };
 

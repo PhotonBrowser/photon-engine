@@ -215,6 +215,16 @@ public:
     static SessionStore* session_store(IsPrivate);
 
     static ProcessManager& process_manager() { return *the().m_process_manager; }
+    static Optional<ProcessManager&> process_manager_if_available()
+    {
+        if (!is_initialized())
+            return {};
+        auto& application = the();
+        // Profile coordination can finish initialization before browser services start.
+        if (!application.m_process_manager)
+            return {};
+        return *application.m_process_manager;
+    }
 #if defined(AK_OS_WINDOWS)
     static IPC::HandleBrokerServer& handle_broker_server() { return *the().m_handle_broker_server; }
 #endif

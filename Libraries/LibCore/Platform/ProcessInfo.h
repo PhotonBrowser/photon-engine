@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/Types.h>
 
 #if defined(AK_OS_MACH)
@@ -25,21 +26,23 @@ struct ProcessInfo {
     void reset_cpu_time()
     {
         cpu_percent = 0.0f;
-#if defined(AK_OS_MACH)
         has_cpu_time_baseline = false;
-#endif
     }
 
     pid_t pid { 0 };
 
     u64 memory_usage_bytes { 0 };
     float cpu_percent { 0.0f };
+    bool has_cpu_time_baseline { false };
+    bool has_cpu_statistics { false };
+    bool has_memory_statistics { false };
+    Optional<u64> disk_read_bytes;
+    Optional<u64> disk_write_bytes;
 
     u64 time_spent_in_process { 0 };
 
 #if defined(AK_OS_MACH)
     Core::MachPort task_name_port;
-    bool has_cpu_time_baseline { false };
 #endif
 };
 

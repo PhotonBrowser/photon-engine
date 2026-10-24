@@ -404,6 +404,22 @@ struct RegisteredEngineProcess {
     std::optional<uint64_t> parent_start_time_in_microseconds;
 };
 
+struct EngineProcessSnapshot {
+    uint64_t child_id { 0 };
+    int32_t pid { 0 };
+    std::string role;
+    std::optional<std::string> title;
+    std::optional<uint64_t> owner_child_id;
+    std::optional<double> cpu_percent;
+    std::optional<uint64_t> memory_bytes;
+    std::optional<uint64_t> disk_read_bytes;
+    std::optional<uint64_t> disk_write_bytes;
+    std::optional<uint64_t> network_download_bytes_per_second;
+    std::optional<uint64_t> network_upload_bytes_per_second;
+    std::optional<std::string> page_url;
+    bool page_is_frame { false };
+};
+
 class PHOTONEMBEDDER_API Runtime {
 public:
     // Keeps cookies, site storage and the cache in `profile_path`. An empty
@@ -438,6 +454,9 @@ public:
     // Returns a snapshot of active processes registered by WebView's process
     // manager. The scope is limited to that manager's process records.
     std::vector<RegisteredEngineProcess> registered_engine_processes() const;
+    // Returns resource metrics and the representative page for every process
+    // registered by WebView's process manager.
+    std::vector<EngineProcessSnapshot> process_snapshots() const;
     // Use the host's system clipboard for copying and pasting.
     void set_clipboard(Clipboard);
     // Deletes website data, then calls `done`.

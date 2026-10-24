@@ -70,8 +70,37 @@ ErrorOr<void> update_process_statistics(ProcessStatistics& statistics)
         process->time_spent_in_process = time_process;
 
         process->cpu_percent = 0.0;
-        if (total_time_scheduled_diff > 0) {
+        if (process->has_cpu_time_baseline && total_time_scheduled_diff > 0) {
             process->cpu_percent = time_scheduled_diff / (total_time_scheduled_diff / ncpu_online) * 100.0f;
+        }
+        process->has_cpu_time_baseline = true;
+        process->has_cpu_statistics = true;
+        process->has_memory_statistics = true;
+
+        process->disk_read_bytes.clear();
+        process->disk_write_bytes.clear();
+        auto io_file = Core::File::open(MUST(String::formatted("/proc/{}/io", process->pid)), Core::File::OpenMode::Read);
+        if (!io_file.is_error()) {
+            auto contents = io_file.value()->read_until_eof();
+            if (!contents.is_error()) {
+                Optional<u64> disk_read_bytes;
+                Optional<u64> disk_write_bytes;
+                for (auto io_line : StringView(contents.value()).split_view('\n')) {
+                    auto separator = io_line.find(':');
+                    if (!separator.has_value())
+                        continue;
+                    auto key = io_line.substring_view(0, *separator);
+                    auto value = io_line.substring_view(*separator + 1).trim_whitespace().to_number<u64>();
+                    if (key == "read_bytes"sv)
+                        disk_read_bytes = value;
+                    else if (key == "write_bytes"sv)
+                        disk_write_bytes = value;
+                }
+                if (disk_read_bytes.has_value() && disk_write_bytes.has_value()) {
+                    process->disk_read_bytes = disk_read_bytes;
+                    process->disk_write_bytes = disk_write_bytes;
+                }
+            }
         }
     }
 

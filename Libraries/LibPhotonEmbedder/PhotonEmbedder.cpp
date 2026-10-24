@@ -23,6 +23,7 @@
 #include <LibWebView/Menu.h>
 #include <LibWebView/PlatformColors.h>
 #include <LibWebView/ProcessManager.h>
+#include <LibWebView/ProcessSnapshot.h>
 #include <LibWebView/ProcessType.h>
 #if defined(AK_OS_MACOS)
 #    include <LibWebView/ProcessReaper.h>
@@ -1449,6 +1450,52 @@ std::vector<RegisteredEngineProcess> Runtime::registered_engine_processes() cons
     std::sort(processes.begin(), processes.end(), [](auto const& left, auto const& right) {
         return left.pid < right.pid;
     });
+    return processes;
+}
+
+std::vector<EngineProcessSnapshot> Runtime::process_snapshots() const
+{
+    auto process_manager = WebView::Application::process_manager_if_available();
+    if (!process_manager.has_value())
+        return {};
+
+    auto snapshots = WebView::process_snapshots(*process_manager);
+    std::vector<EngineProcessSnapshot> processes;
+    processes.reserve(snapshots.size());
+    for (auto const& snapshot : snapshots) {
+        std::optional<std::string> title;
+        if (snapshot.title.has_value()) {
+            auto utf8 = snapshot.title->to_utf8();
+            title.emplace(utf8.bytes_as_string_view().characters_without_null_termination(), utf8.bytes().size());
+        }
+
+        std::optional<std::string> page_url;
+        bool page_is_frame = false;
+        if (snapshot.page.has_value()) {
+            auto serialized_url = snapshot.page->url.serialize().bytes_as_string_view();
+            page_url.emplace(serialized_url.characters_without_null_termination(), serialized_url.length());
+            page_is_frame = snapshot.page->kind == WebView::ProcessPageKind::Frame;
+        }
+
+        processes.push_back({
+            .child_id = snapshot.child_id,
+            .pid = static_cast<int32_t>(snapshot.pid),
+            .role = [&] {
+                auto role = WebView::process_name_from_type(snapshot.type);
+                return std::string(role.characters_without_null_termination(), role.length());
+            }(),
+            .title = move(title),
+            .owner_child_id = snapshot.owner_child_id.has_value() ? std::optional<uint64_t> { *snapshot.owner_child_id } : std::nullopt,
+            .cpu_percent = snapshot.has_cpu_statistics ? std::optional<double> { snapshot.cpu_percent } : std::nullopt,
+            .memory_bytes = snapshot.has_memory_statistics ? std::optional<uint64_t> { snapshot.memory_usage_bytes } : std::nullopt,
+            .disk_read_bytes = snapshot.disk_read_bytes.has_value() ? std::optional<uint64_t> { *snapshot.disk_read_bytes } : std::nullopt,
+            .disk_write_bytes = snapshot.disk_write_bytes.has_value() ? std::optional<uint64_t> { *snapshot.disk_write_bytes } : std::nullopt,
+            .network_download_bytes_per_second = snapshot.has_network_statistics ? std::optional<uint64_t> { snapshot.network_download_bytes_per_second } : std::nullopt,
+            .network_upload_bytes_per_second = snapshot.has_network_statistics ? std::optional<uint64_t> { snapshot.network_upload_bytes_per_second } : std::nullopt,
+            .page_url = move(page_url),
+            .page_is_frame = page_is_frame,
+        });
+    }
     return processes;
 }
 

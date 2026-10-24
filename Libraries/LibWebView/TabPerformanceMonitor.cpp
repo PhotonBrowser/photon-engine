@@ -58,6 +58,7 @@ void TabPerformanceMonitor::configure(Requests::RequestControlClient& requests)
             });
             if (!owner.has_value())
                 owner = WorkerProcessManager::the().exclusive_performance_owner(entry.process_id);
+            s_monitor->m_process_networks.ensure(entry.process_id).add_network_bytes(now, interval_microseconds, entry.download_bytes, entry.upload_bytes);
             if (owner.has_value())
                 s_monitor->m_tabs.ensure(*owner).add_network_bytes(now, interval_microseconds, entry.download_bytes, entry.upload_bytes);
         }
@@ -156,9 +157,12 @@ void TabPerformanceMonitor::update_monitoring()
         m_enabled = false;
         m_sampling_interval_ms = 0;
         m_tabs.clear();
+        m_process_networks.clear();
+        m_process_network_snapshots.clear();
         return;
     }
-    auto interval_ms = diagnostics ? 500 : m_memory_pressure ? pressure_sampling_interval_ms : residency_sampling_interval_ms;
+    auto interval_ms = diagnostics ? 500 : m_memory_pressure ? pressure_sampling_interval_ms
+                                                             : residency_sampling_interval_ms;
     if (m_enabled && m_sampling_interval_ms == interval_ms)
         return;
     auto was_enabled = m_enabled;
@@ -175,6 +179,20 @@ void TabPerformanceMonitor::update_monitoring()
 bool TabPerformanceMonitor::diagnostics_enabled() const
 {
     return m_setting_enabled || !m_explicitly_enabled_views.is_empty();
+}
+
+bool TabPerformanceMonitor::process_network_statistics_enabled()
+{
+    return s_monitor && s_monitor->diagnostics_enabled();
+}
+
+Optional<ProcessNetworkUsage> TabPerformanceMonitor::process_network_usage(pid_t pid)
+{
+    if (!process_network_statistics_enabled())
+        return {};
+    if (auto usage = s_monitor->m_process_network_snapshots.get(pid); usage.has_value())
+        return *usage;
+    return {};
 }
 
 void TabPerformanceMonitor::did_present(u64 view_id)
@@ -231,6 +249,19 @@ void TabPerformanceMonitor::sample()
             processes.ensure(owners.first()).set(process.pid(), *usage);
     });
     auto now = MonotonicTime::now();
+    HashTable<pid_t> live_processes;
+    Application::process_manager().for_each_process([&](Process& process) {
+        live_processes.set(process.pid());
+    });
+    m_process_networks.remove_all_matching([&](pid_t pid, auto const&) { return !live_processes.contains(pid); });
+    m_process_network_snapshots.clear();
+    for (auto& entry : m_process_networks) {
+        auto stats = entry.value.sample(now, {});
+        m_process_network_snapshots.set(entry.key, {
+                                                       .download_bytes_per_second = stats.download_bytes_per_second,
+                                                       .upload_bytes_per_second = stats.upload_bytes_per_second,
+                                                   });
+    }
     ViewImplementation::for_each_view([&](ViewImplementation& view) {
         if (view.owner_view_id().has_value())
             return IterationDecision::Continue;

@@ -13,6 +13,10 @@
 #include <AK/Time.h>
 #include <LibCore/Platform/ProcessResourceUsage.h>
 #include <LibCore/Platform/ProcessStatisticsMach.h>
+#if defined(AK_OS_MACOS)
+#    include <libproc.h>
+#    include <sys/resource.h>
+#endif
 
 namespace Core::Platform {
 
@@ -54,6 +58,10 @@ ErrorOr<void> update_process_statistics(ProcessStatistics& statistics)
     statistics.total_time_scheduled = total_cpu_ticks;
 
     for (auto& process : statistics.processes) {
+        process->has_cpu_statistics = false;
+        process->has_memory_statistics = false;
+        process->disk_read_bytes.clear();
+        process->disk_write_bytes.clear();
         // A newly spawned process may be added to the process manager before its task port is delivered to the browser
         // event loop. Skip it for this sample; the port will be available on the next update.
         if (!MACH_PORT_VALID(process->task_name_port.port())) {
@@ -114,6 +122,17 @@ ErrorOr<void> update_process_statistics(ProcessStatistics& statistics)
         if (process->has_cpu_time_baseline && time_diff_process > AK::Duration::zero() && total_cpu_micro_diff > 0.0f)
             process->cpu_percent = 100.0f * static_cast<float>(time_diff_process.to_microseconds()) / total_cpu_micro_diff;
         process->has_cpu_time_baseline = true;
+        process->has_cpu_statistics = true;
+        process->has_memory_statistics = true;
+
+#if defined(AK_OS_MACOS)
+        rusage_info_v2 resource_usage {};
+        auto* resource_usage_pointer = reinterpret_cast<rusage_info_t*>(&resource_usage);
+        if (proc_pid_rusage(process->pid, RUSAGE_INFO_V2, resource_usage_pointer) == 0) {
+            process->disk_read_bytes = resource_usage.ri_diskio_bytesread;
+            process->disk_write_bytes = resource_usage.ri_diskio_byteswritten;
+        }
+#endif
     }
 
     return {};

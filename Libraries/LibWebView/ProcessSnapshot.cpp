@@ -10,6 +10,7 @@
 #include <LibWebView/FaviconStore.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/ProcessSnapshot.h>
+#include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/ViewImplementation.h>
 
 namespace WebView {
@@ -59,6 +60,7 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
     manager.update_all_process_statistics();
     Vector<ProcessSnapshot> snapshots;
     manager.for_each_process_statistics([&](auto& process, auto const& statistics) {
+        auto network_usage = TabPerformanceMonitor::process_network_usage(statistics.pid);
         ProcessSnapshot snapshot {
             .child_id = process.child_id(),
             .pid = statistics.pid,
@@ -67,6 +69,13 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
             .owner_child_id = process.owner_child_id(),
             .cpu_percent = statistics.cpu_percent,
             .memory_usage_bytes = statistics.memory_usage_bytes,
+            .has_cpu_statistics = statistics.has_cpu_statistics,
+            .has_memory_statistics = statistics.has_memory_statistics,
+            .disk_read_bytes = statistics.disk_read_bytes,
+            .disk_write_bytes = statistics.disk_write_bytes,
+            .has_network_statistics = TabPerformanceMonitor::process_network_statistics_enabled(),
+            .network_download_bytes_per_second = network_usage.map([](auto const& usage) { return usage.download_bytes_per_second; }).value_or(0),
+            .network_upload_bytes_per_second = network_usage.map([](auto const& usage) { return usage.upload_bytes_per_second; }).value_or(0),
             .page = {},
         };
         if (auto page = process_pages.get(process.child_id()); page.has_value()) {

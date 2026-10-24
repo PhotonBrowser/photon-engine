@@ -20,6 +20,11 @@ class RequestControlClient;
 
 namespace WebView {
 
+struct ProcessNetworkUsage {
+    u64 download_bytes_per_second { 0 };
+    u64 upload_bytes_per_second { 0 };
+};
+
 class WEBVIEW_API TabPerformanceMonitor final : public SettingsObserver {
 public:
     AK_ALLOC_WITH_KMALLOC;
@@ -33,6 +38,8 @@ public:
     static void set_memory_pressure(bool pressured);
     static bool set_view_task_queue_diagnostics_enabled(u64 view_id, bool enabled);
     static String task_queue_diagnostics_json(u64 view_id);
+    static bool process_network_statistics_enabled();
+    static Optional<ProcessNetworkUsage> process_network_usage(pid_t);
     // Every RequestServer reports its clients' network use to the monitor.
     static void configure(Requests::RequestControlClient&);
 
@@ -53,6 +60,8 @@ private:
     HashTable<u64> m_task_queue_diagnostics_views;
     RefPtr<Core::Timer> m_timer;
     HashMap<u64, TabPerformanceAccumulator> m_tabs;
+    HashMap<pid_t, TabPerformanceAccumulator> m_process_networks;
+    HashMap<pid_t, ProcessNetworkUsage> m_process_network_snapshots;
 };
 
 }
