@@ -1573,6 +1573,15 @@ void Application::set_memory_pressure(bool pressured)
             auto spare = m_spare_web_content_process.release_nonnull();
             spare->close_unassigned_spare({});
         }
+        // Each WebContent process has one shared JavaScript VM. Collect once per process so the
+        // VM and mimalloc can return unreachable allocations while keeping live page state intact.
+        WebContentClient::for_each_client([](WebContentClient& client) {
+            client.for_each_page([](WebContentPage& page) {
+                page.async_debug_request("collect-garbage"sv, "quiet"sv);
+                return IterationDecision::Break;
+            });
+            return IterationDecision::Continue;
+        });
         return;
     }
 
