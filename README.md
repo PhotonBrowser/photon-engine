@@ -1,28 +1,21 @@
 # Photon Engine
 
-Photon Engine is the web engine used by the Photon browser. It is derived from [Ladybird](https://github.com/LadybirdBrowser/ladybird) and is actively maintained as a downstream repository. Photon-specific changes include engine integration, embedding APIs, rendering and web-platform work, performance fixes, services and tests.
+Photon Engine is [Photon](https://github.com/PhotonBrowser/photon)'s web engine, maintained as a downstream of [Ladybird](https://github.com/LadybirdBrowser/ladybird). It provides web rendering, browser services, and the C++ embedder API used by Photon's Rust/GPUI-CE shell.
 
-## Relationship to Ladybird
+## Development
 
-The Git remote named `upstream` should point to `https://github.com/LadybirdBrowser/ladybird.git`. Photon Engine retains Ladybird's BSD-2-Clause license, copyright notices and attribution. This repository does not claim authorship of the inherited engine.
+For the easiest setup, build Photon from the [main browser repository](https://github.com/PhotonBrowser/photon). It pins Photon Engine as the `Engine/` submodule and provides the development CLI.
 
-Maintainers regularly merge Ladybird's `master` branch into the current Photon Engine branch:
+- [Contributor setup](https://github.com/PhotonBrowser/photon/blob/main/CONTRIBUTOR_SETUP.md)
+- [Building and running Photon](https://github.com/PhotonBrowser/photon/blob/main/Documentation/Building.md)
+- [Architecture](https://github.com/PhotonBrowser/photon/blob/main/Documentation/Architecture.md)
+- [Upstream maintenance and submodules](https://github.com/PhotonBrowser/photon/blob/main/Documentation/Upstream.md)
+- [Contributing](https://github.com/PhotonBrowser/photon/blob/main/CONTRIBUTING.md)
 
-```sh
-git fetch upstream
-git merge upstream/master
-```
+Engine-specific changes belong here; browser UI and application behavior belong in the main Photon repository. The engine exposes `Photon::Runtime` and `Photon::View` through `LibPhotonEmbedder`.
 
-Resolve conflicts in Photon Engine, validate the engine changes, then update the exact `Engine/` submodule commit in `PhotonBrowser/photon`. Do not merge Ladybird directly into the browser repository. Photon Engine is a normal maintained Git repository; it does not use a patch series or source-copy workflow.
+## Upstream and license
 
-## Architecture
+Photon Engine regularly incorporates changes from Ladybird. Keep downstream changes focused and compatible with upstream wherever possible. Follow the [upstream maintenance guide](https://github.com/PhotonBrowser/photon/blob/main/Documentation/Upstream.md) when syncing or updating the pinned engine revision.
 
-The engine repository contains the Ladybird-derived libraries (`LibWeb`, `LibJS`, `LibGfx`, `LibWebView` and supporting libraries), out-of-process services such as `WebContent`, `RequestServer`, `ImageDecoder` and `Compositor`, engine tests, Web Platform Tests and development utilities. Photon browser state and its Qt Quick/QML UI belong in `PhotonBrowser/photon`.
-
-The CMake option `ENABLE_PHOTON_EMBEDDER=ON` builds engine libraries and services while `ENABLE_LADYBIRD_UI=OFF` omits Ladybird's browser application and UI tests. The named `LibPhotonEmbedder` target is currently a boundary scaffold; the stable runtime/view/presentation API remains to be implemented before Photon can navigate through the engine.
-
-## Build
-
-For the integrated developer workflow, clone `PhotonBrowser/photon` with submodules and run `./photon setup`, `./photon build` and `./photon run`. The CLI keeps CMake, vcpkg and application build output under the browser repository's ignored `build/` directory.
-
-Photon Engine keeps upstream build documentation in `Documentation/BuildInstructionsLadybird.md`. For contribution and licensing details, see [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`LICENSE`](LICENSE).
+Photon Engine retains Ladybird's copyright notices and [BSD 2-Clause license](LICENSE). See [engine contribution guidance](CONTRIBUTING.md) for repository-specific policies.
