@@ -57,6 +57,23 @@ struct PreparedFrame {
     i32 bitmap_id { 0 };
     Gfx::IntRect damage_rect;
     double device_pixel_ratio { 1.0 };
+    enum class ScrollBlitStatus : u8 {
+        NotAttempted,
+        Used,
+        Disabled,
+        MissingSurface,
+        RasterTransform,
+        FrameChanged,
+        MissingViewportNode,
+        IncompatibleOffsets,
+        UnsafeDisplayList,
+        InnerScrollChanged,
+        NonFiniteOffset,
+        FractionalOffset,
+        ZeroOffset,
+        ExceedsViewport,
+        Count,
+    } scroll_blit_status { ScrollBlitStatus::NotAttempted };
 };
 
 // Rasterizes the scene of a context into its backing stores and keeps track of the frames it presents.
@@ -173,9 +190,9 @@ private:
     void paint_current_display_list(DisplayListPlayerSkia&, Gfx::PaintingSurface&, FrameContent const&, Optional<Gfx::IntRect> damage_rect = {}, PaintUIOverlay = PaintUIOverlay::Yes, bool apply_raster_transform = true);
     Gfx::IntSize raster_size() const;
     Gfx::IntRect raster_damage_rect(Gfx::IntRect) const;
-    Gfx::IntRect frame_damage_for(PendingFrame const&, FrameContent const&, Optional<ScrollBlit>* = nullptr);
-    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const&, Optional<ScrollBlit>*);
-    Optional<ScrollBlit> scroll_blit_for(Gfx::IntSize viewport_size, FrameContent const&);
+    Gfx::IntRect frame_damage_for(PendingFrame const&, FrameContent const&, Optional<ScrollBlit>* = nullptr, PreparedFrame::ScrollBlitStatus* = nullptr);
+    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const&, Optional<ScrollBlit>*, PreparedFrame::ScrollBlitStatus*);
+    Optional<ScrollBlit> scroll_blit_for(Gfx::IntSize viewport_size, FrameContent const&, PreparedFrame::ScrollBlitStatus&);
     void shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::IntPoint translation);
     void remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot);
     Optional<VideoFrameSlot> current_video_frame_slot(Compositing::VideoSinkResourceId);

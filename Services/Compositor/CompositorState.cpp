@@ -15,6 +15,7 @@
 #include <LibMedia/Sinks/DisplayingVideoSink.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <vector>
@@ -78,8 +79,9 @@ struct CompositorFrameProfile {
     Stage submit;
     Stage gpu_completion;
     Stage readback;
+    std::array<u64, static_cast<size_t>(PreparedFrame::ScrollBlitStatus::Count)> scroll_blit_statuses {};
 
-    void record_frame(Clock::time_point frame_started_at, u64 paint_microseconds, u64 submit_microseconds, u64 gpu_completion_microseconds, u64 readback_microseconds)
+    void record_frame(Clock::time_point frame_started_at, u64 paint_microseconds, u64 submit_microseconds, u64 gpu_completion_microseconds, u64 readback_microseconds, PreparedFrame::ScrollBlitStatus scroll_blit_status)
     {
         // Keep low-volume frame timing available without enabling the much
         // noisier per-operation diagnostics used by PHOTON_VERBOSE.
@@ -94,6 +96,7 @@ struct CompositorFrameProfile {
         submit.record(submit_microseconds);
         gpu_completion.record(gpu_completion_microseconds);
         readback.record(readback_microseconds);
+        ++scroll_blit_statuses[static_cast<size_t>(scroll_blit_status)];
 
         if (now - started_at < std::chrono::seconds(5))
             return;
@@ -108,6 +111,26 @@ struct CompositorFrameProfile {
         log_stage("Skia submit + post-submit cleanup", submit);
         log_stage("GPU completion wait", gpu_completion);
         log_stage("GPU→CPU bitmap readback", readback);
+        static constexpr char const* scroll_blit_status_names[] {
+            "not_attempted",
+            "used",
+            "disabled",
+            "missing_surface",
+            "raster_transform",
+            "frame_changed",
+            "missing_viewport_node",
+            "incompatible_offsets",
+            "unsafe_display_list",
+            "inner_scroll_changed",
+            "non_finite_offset",
+            "fractional_offset",
+            "zero_offset",
+            "exceeds_viewport",
+        };
+        for (size_t i = 0; i < scroll_blit_statuses.size(); ++i) {
+            if (scroll_blit_statuses[i] > 0)
+                dbgln("scroll blit {}={}", scroll_blit_status_names[i], scroll_blit_statuses[i]);
+        }
         *this = {};
         started_at = now;
     }
@@ -1206,7 +1229,7 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
             presentation_signal_value = metal_context.next_presentation_signal_value();
     }
 #endif
-    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, prepared_frame->device_pixel_ratio, presentation_signal_value, frame_paint_started_at, frame_paint_duration_microseconds, 0);
+    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id, prepared_frame->device_pixel_ratio, presentation_signal_value, frame_paint_started_at, frame_paint_duration_microseconds, 0, prepared_frame->scroll_blit_status);
     auto* pending_present = &m_pending_async_presents.last();
     auto* presentation = presentation_for_context(context_id);
     pending_present->publish_to_presentation = presentation != nullptr;
@@ -1251,7 +1274,8 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Context
                 pending_present->paint_duration_microseconds,
                 pending_present->submit_duration_microseconds,
                 pending_present->gpu_completion_microseconds,
-                pending_present->readback_microseconds);
+                pending_present->readback_microseconds,
+                pending_present->scroll_blit_status);
             self->did_finish_async_present(*pending_present);
         });
     };

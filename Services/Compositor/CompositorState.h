@@ -32,8 +32,8 @@
 #include <LibMedia/Forward.h>
 #include <LibMedia/Sinks/DisplayingVideoSink.h>
 #include <LibMedia/VideoSinkHandle.h>
-#include <chrono>
 #include <LibMediaCodecs/VideoFramePool.h>
+#include <chrono>
 
 namespace Compositor {
 
@@ -173,7 +173,7 @@ private:
     struct PendingAsyncPresent {
         using Clock = std::chrono::steady_clock;
 
-        PendingAsyncPresent(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio, u64 presentation_signal_value, Clock::time_point paint_started_at, u64 paint_duration_microseconds, u64 submit_duration_microseconds)
+        PendingAsyncPresent(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio, u64 presentation_signal_value, Clock::time_point paint_started_at, u64 paint_duration_microseconds, u64 submit_duration_microseconds, PreparedFrame::ScrollBlitStatus scroll_blit_status)
             : context_id(context_id)
             , viewport_rect(viewport_rect)
             , damage_rect(damage_rect)
@@ -183,6 +183,7 @@ private:
             , paint_started_at(paint_started_at)
             , paint_duration_microseconds(paint_duration_microseconds)
             , submit_duration_microseconds(submit_duration_microseconds)
+            , scroll_blit_status(scroll_blit_status)
         {
         }
 
@@ -199,6 +200,7 @@ private:
         u64 skia_flush_submit_microseconds { 0 };
         u64 gpu_completion_microseconds { 0 };
         u64 readback_microseconds { 0 };
+        PreparedFrame::ScrollBlitStatus scroll_blit_status { PreparedFrame::ScrollBlitStatus::NotAttempted };
         bool published_before_gpu_completion { false };
         bool was_cancelled { false };
         bool was_delivered { false };

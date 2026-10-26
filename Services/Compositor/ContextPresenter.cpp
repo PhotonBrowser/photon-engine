@@ -336,7 +336,8 @@ Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& d
     auto const& content = frame_content.value();
 
     Optional<ScrollBlit> scroll_blit;
-    auto damage_rect = frame_damage_for(pending_frame, content, &scroll_blit);
+    auto scroll_blit_status = PreparedFrame::ScrollBlitStatus::NotAttempted;
+    auto damage_rect = frame_damage_for(pending_frame, content, &scroll_blit, &scroll_blit_status);
     // NB: A changed content rect must still reach the client even if the pixels are identical.
     if (damage_rect.is_empty() && m_presented_frame == pending_frame.viewport_rect) {
         remember_rasterized_frame(pending_frame.viewport_rect.size(), content.presented_scroll_state_snapshot);
@@ -361,6 +362,7 @@ Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& d
         .bitmap_id = render_target->bitmap_id,
         .damage_rect = damage_rect,
         .device_pixel_ratio = m_device_pixel_ratio,
+        .scroll_blit_status = scroll_blit_status,
     };
 }
 
@@ -464,20 +466,22 @@ Gfx::IntRect ContextPresenter::raster_damage_rect(Gfx::IntRect damage_rect) cons
     return Gfx::enclosing_int_rect(rect).intersected(Gfx::IntRect { {}, raster_size() });
 }
 
-Gfx::IntRect ContextPresenter::frame_damage_for(PendingFrame const& pending_frame, FrameContent const& frame_content, Optional<ScrollBlit>* scroll_blit)
+Gfx::IntRect ContextPresenter::frame_damage_for(PendingFrame const& pending_frame, FrameContent const& frame_content, Optional<ScrollBlit>* scroll_blit, PreparedFrame::ScrollBlitStatus* scroll_blit_status)
 {
     if (scroll_blit)
         scroll_blit->clear();
+    if (scroll_blit_status)
+        *scroll_blit_status = PreparedFrame::ScrollBlitStatus::NotAttempted;
     Gfx::IntRect viewport_rect { {}, pending_frame.viewport_rect.size() };
     auto forced_damage_rect = pending_frame.forced_damage_rect.intersected(viewport_rect);
     if (forced_damage_rect.contains(viewport_rect))
         return viewport_rect;
-    auto damage_rect = damage_since_last_raster(viewport_rect.size(), frame_content, scroll_blit);
+    auto damage_rect = damage_since_last_raster(viewport_rect.size(), frame_content, scroll_blit, scroll_blit_status);
     damage_rect.unite(forced_damage_rect);
     return damage_rect;
 }
 
-Gfx::IntRect ContextPresenter::damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const& frame_content, Optional<ScrollBlit>* scroll_blit)
+Gfx::IntRect ContextPresenter::damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const& frame_content, Optional<ScrollBlit>* scroll_blit, PreparedFrame::ScrollBlitStatus* scroll_blit_status)
 {
     auto const& presented_scroll_state_snapshot = frame_content.presented_scroll_state_snapshot;
     Gfx::IntRect viewport_rect { {}, viewport_size };
@@ -490,7 +494,11 @@ Gfx::IntRect ContextPresenter::damage_since_last_raster(Gfx::IntSize viewport_si
         return viewport_rect;
     if (auto index = frame_content.viewport_scroll_node_index; index.has_value()) {
         if (last_frame.scroll_state_snapshot.device_offset_for_index(*index) != presented_scroll_state_snapshot.device_offset_for_index(*index)) {
-            if (auto reusable_scroll = scroll_blit_for(viewport_size, frame_content); reusable_scroll.has_value()) {
+            auto local_status = PreparedFrame::ScrollBlitStatus::NotAttempted;
+            auto reusable_scroll = scroll_blit_for(viewport_size, frame_content, local_status);
+            if (scroll_blit_status)
+                *scroll_blit_status = local_status;
+            if (reusable_scroll.has_value()) {
                 if (scroll_blit)
                     *scroll_blit = *reusable_scroll;
                 return reusable_scroll->exposed_damage;
@@ -539,11 +547,21 @@ Gfx::IntRect ContextPresenter::damage_since_last_raster(Gfx::IntSize viewport_si
     return damage_rect;
 }
 
-Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::IntSize viewport_size, FrameContent const& frame_content)
+Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::IntSize viewport_size, FrameContent const& frame_content, PreparedFrame::ScrollBlitStatus& status)
 {
-    if (!frame_content.can_blit_viewport_scroll || !m_latest_rendered_surface || !m_last_rasterized_frame.has_value()
-        || m_raster_scale != Gfx::FloatSize { 1, 1 } || m_raster_translation != Gfx::FloatPoint {})
+    using Status = PreparedFrame::ScrollBlitStatus;
+    if (!frame_content.can_blit_viewport_scroll) {
+        status = Status::Disabled;
         return {};
+    }
+    if (!m_latest_rendered_surface || !m_last_rasterized_frame.has_value()) {
+        status = Status::MissingSurface;
+        return {};
+    }
+    if (m_raster_scale != Gfx::FloatSize { 1, 1 } || m_raster_translation != Gfx::FloatPoint {}) {
+        status = Status::RasterTransform;
+        return {};
+    }
 
     auto& last_frame = *m_last_rasterized_frame;
     auto const& visual_context_tree = m_scene.visual_context_tree_for_compositing();
@@ -551,18 +569,24 @@ Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::In
         || last_frame.display_list->id() != m_scene.display_list()->id()
         || last_frame.visual_context_tree.structural_epoch() != visual_context_tree.structural_epoch()
         || last_frame.visual_context_tree.has_visual_animations() || visual_context_tree.has_visual_animations()
-        || m_latest_rendered_surface->size() != viewport_size)
+        || m_latest_rendered_surface->size() != viewport_size) {
+        status = Status::FrameChanged;
         return {};
+    }
 
     auto index = frame_content.viewport_scroll_node_index;
-    if (!index.has_value())
+    if (!index.has_value()) {
+        status = Status::MissingViewportNode;
         return {};
+    }
     auto scroll_node_index = *index;
     auto offsets_before_scroll = last_frame.scroll_state_snapshot.device_offsets();
     auto offsets_after_scroll = frame_content.presented_scroll_state_snapshot.device_offsets();
     if (scroll_node_index.value() >= offsets_before_scroll.size() || scroll_node_index.value() >= offsets_after_scroll.size()
-        || offsets_before_scroll.size() != offsets_after_scroll.size())
+        || offsets_before_scroll.size() != offsets_after_scroll.size()) {
+        status = Status::IncompatibleOffsets;
         return {};
+    }
 
     if (!last_frame.scroll_blit_eligibility_node.has_value() || last_frame.scroll_blit_eligibility_node->value() != scroll_node_index.value()) {
         last_frame.scroll_blit_eligibility_node = scroll_node_index;
@@ -574,28 +598,40 @@ Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::In
             last_frame.scroll_blit_is_safe = nested_display_lists_are_static(*m_scene.display_list(), m_scene.resource_storage(), visited_display_lists);
         }
     }
-    if (!last_frame.scroll_blit_is_safe)
+    if (!last_frame.scroll_blit_is_safe) {
+        status = Status::UnsafeDisplayList;
         return {};
+    }
 
     for (size_t i = 0; i < offsets_before_scroll.size(); ++i) {
-        if (i != scroll_node_index.value() && offsets_before_scroll[i] != offsets_after_scroll[i])
+        if (i != scroll_node_index.value() && offsets_before_scroll[i] != offsets_after_scroll[i]) {
+            status = Status::InnerScrollChanged;
             return {};
+        }
     }
 
     auto const& previous_offset = offsets_before_scroll[scroll_node_index.value()];
     auto const& presented_offset = offsets_after_scroll[scroll_node_index.value()];
     auto shift_x = presented_offset.x() - previous_offset.x();
     auto shift_y = presented_offset.y() - previous_offset.y();
-    if (!isfinite(shift_x) || !isfinite(shift_y))
+    if (!isfinite(shift_x) || !isfinite(shift_y)) {
+        status = Status::NonFiniteOffset;
         return {};
+    }
     auto rounded_shift_x = roundf(shift_x);
     auto rounded_shift_y = roundf(shift_y);
-    if (fabsf(shift_x - rounded_shift_x) > 0.001f || fabsf(shift_y - rounded_shift_y) > 0.001f)
+    if (fabsf(shift_x - rounded_shift_x) > 0.001f || fabsf(shift_y - rounded_shift_y) > 0.001f) {
+        status = Status::FractionalOffset;
         return {};
-    if (rounded_shift_x == 0 && rounded_shift_y == 0)
+    }
+    if (rounded_shift_x == 0 && rounded_shift_y == 0) {
+        status = Status::ZeroOffset;
         return {};
-    if (fabsf(rounded_shift_x) >= viewport_size.width() || fabsf(rounded_shift_y) >= viewport_size.height())
+    }
+    if (fabsf(rounded_shift_x) >= viewport_size.width() || fabsf(rounded_shift_y) >= viewport_size.height()) {
+        status = Status::ExceedsViewport;
         return {};
+    }
 
     Gfx::IntPoint translation { static_cast<int>(rounded_shift_x), static_cast<int>(rounded_shift_y) };
     Gfx::IntRect exposed_damage;
@@ -616,6 +652,7 @@ Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::In
         exposed_damage.unite(scrollbar.gutter_rect.united(scrollbar.expanded_gutter_rect));
     }
     exposed_damage.intersect({ {}, viewport_size });
+    status = Status::Used;
     return ScrollBlit { translation, exposed_damage };
 }
 
