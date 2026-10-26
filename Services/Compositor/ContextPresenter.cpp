@@ -851,8 +851,10 @@ void ContextPresenter::paint_current_display_list(DisplayListPlayerSkia& display
         damage_canvas.restore();
 
         // Submit the independent damage surface before snapshotting it into the backing store. Ganesh can otherwise
-        // leave the snapshot's texture proxy uninstantiated when the destination surface is flushed.
-        display_list_player.flush(*m_damage_surface);
+        // leave the snapshot's texture proxy uninstantiated when the destination surface is flushed. Keep this
+        // asynchronous: the destination work is submitted to the same GPU queue afterward, so queue ordering keeps
+        // the snapshot ready without stalling the compositor thread on GPU completion.
+        display_list_player.flush_async(*m_damage_surface, [] {});
         auto image = m_damage_surface->sk_image_snapshot<sk_sp<SkImage>>();
         SkPaint paint;
         paint.setBlendMode(SkBlendMode::kSrc);
