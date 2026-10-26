@@ -131,6 +131,11 @@ public:
     }
 
 private:
+    // Each Photon process owns its embedder runtime and its view callbacks.
+    // Joining another Ladybird browser process would leave this runtime only
+    // partially initialized before Photon creates its first headless view.
+    bool should_coordinate_browser_process() const override { return false; }
+
     virtual Optional<ViewImplementation&> active_web_view() const override;
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
     virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const override;
