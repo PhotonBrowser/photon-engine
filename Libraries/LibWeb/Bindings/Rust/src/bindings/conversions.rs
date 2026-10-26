@@ -14,8 +14,8 @@ use std::borrow::Cow;
 use ak::{Utf16String, Utf16StringUnits, convert_valid_utf16_to_utf8, utf8_length_from_valid_utf16};
 use libjs_rust::api::{
     Array, ArrayBuffer, ArrayBufferOrder, ArrayBufferShared, DataView, ErrorKind, ErrorType, FunctionObject, Gc,
-    MarkedVec, Must, Object, PrimitiveString, PropertyKey, Root, ThrowCompletionOr, Trace, TypedArrayBase,
-    TypedArrayKind, Value, Vm, create_typed_array_on_buffer, get_iterator_from_method_impl, get_view_byte_length,
+    MarkedVec, Must, Object, PrimitiveString, PropertyKey, ThrowCompletionOr, Trace, TypedArrayBase, TypedArrayKind,
+    Value, Vm, create_typed_array_on_buffer, get_iterator_from_method_impl, get_view_byte_length,
     is_typed_array_out_of_bounds, is_view_out_of_bounds, iterator_step_value,
     make_data_view_with_buffer_witness_record, make_typed_array_with_buffer_witness_record, to_well_formed,
     typed_array_byte_length,
@@ -23,6 +23,7 @@ use libjs_rust::api::{
 
 use crate::ak_format::ak_formatted;
 use crate::bindings::interface::{Interface, Ref, create_dictionary_object, wrap};
+use crate::bindings::promise::WebIdlPromise;
 use crate::bindings::services::web_bindings_object_implements_interface;
 use crate::bindings::{CallContext, Exception, WebIdlResult};
 
@@ -168,6 +169,17 @@ pub(crate) fn enumeration_value_to_js(cx: &CallContext, enumeration_value: &str)
         cx.vm(),
         enumeration_value.as_bytes(),
     ))
+}
+
+/// An object converted from a JS value, https://webidl.spec.whatwg.org/#js-object
+pub(crate) fn to_object(vm: &Vm, value: Value) -> ThrowCompletionOr<Gc<Object>> {
+    // 1. If V is not an Object, then throw a TypeError.
+    if !value.is_object() {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&value]);
+    }
+
+    // 2. Return the IDL object value that is a reference to the same object as V.
+    Ok(value.as_object())
 }
 
 /// A JS value converted to a boolean, https://webidl.spec.whatwg.org/#js-boolean
@@ -974,6 +986,13 @@ impl ToJs for Gc<Object> {
     }
 }
 
+/// https://webidl.spec.whatwg.org/#js-promise
+impl ToJs for WebIdlPromise {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(Value::from_object(self.promise()))
+    }
+}
+
 /// https://webidl.spec.whatwg.org/#js-long
 impl ToJs for i32 {
     fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
@@ -1152,17 +1171,15 @@ pub(crate) fn sequence_to_js<T>(
     Ok(Value::from_object(array))
 }
 
-/// sequence_to_js() for a sequence whose elements are cells, such as objects of interfaces. The conversion of an
-/// element can allocate, and a Vec hides the elements after it from the collector, so the sequence is kept alive.
+/// sequence_to_js() for a sequence of cells, which stay rooted while converting an element allocates.
 pub(crate) fn rooted_sequence_to_js<T: Trace + Clone + 'static>(
     cx: &CallContext,
-    sequence: Vec<T>,
+    sequence: MarkedVec<'_, T>,
     mut element_to_js: impl FnMut(T) -> ThrowCompletionOr<Value>,
 ) -> ThrowCompletionOr<Value> {
-    let sequence = Root::new(cx.vm(), sequence);
-    let array = Array::create(cx.vm(), cx.realm(), sequence.get().len() as u64, None)?;
-    for (index, element) in sequence.get().iter().enumerate() {
-        let element = element_to_js(element.clone())?;
+    let array = Array::create(cx.vm(), cx.realm(), sequence.len() as u64, None)?;
+    for index in 0..sequence.len() {
+        let element = element_to_js(sequence.get(index).expect("the index is in the sequence"))?;
         let index = u32::try_from(index).expect("an array of the length of the sequence was created");
         array.create_data_property(cx.vm(), &PropertyKey::from(index), element, None, None)?;
     }

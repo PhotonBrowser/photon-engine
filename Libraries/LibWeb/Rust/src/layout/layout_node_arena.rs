@@ -61,6 +61,8 @@ pub(crate) struct IntrinsicSizeCacheKey {
     pub(crate) percentage_basis_inline_size: Option<CssPixels>,
     pub(crate) percentage_basis_block_size: Option<CssPixels>,
     pub(crate) quirks_mode_percentage_basis_block_size: Option<CssPixels>,
+    /// Whether the box was measured in a transposed frame, where its sizes are those of the other axes.
+    pub(crate) measured_in_transposed_frame: bool,
 }
 
 impl IntrinsicSizeCacheKey {
@@ -259,6 +261,7 @@ pub(crate) struct IntrinsicInlineMeasurementLayout {
     pub(crate) first_baseline: CssPixels,
     pub(crate) has_last_baseline: bool,
     pub(crate) last_baseline: CssPixels,
+    pub(crate) inline_alignment_baseline: Option<CssPixels>,
 }
 
 impl IntrinsicMeasurement for IntrinsicInlineSizeMeasurement {
@@ -604,12 +607,16 @@ impl TextSlots {
                 PublishedTextSlot {
                     generation: slot.generation,
                     first_letter: state.first_letter,
+                    precedes_writing_suggestion: state.precedes_writing_suggestion,
                     rendered: state.content.as_ref().map(|content| content.rendered().clone()),
                 }
             })
             .unwrap_or_default();
         if self.published.get(index).is_none() {
-            if published.rendered.is_none() && published.first_letter.is_invalid() {
+            if published.rendered.is_none()
+                && published.first_letter.is_invalid()
+                && !published.precedes_writing_suggestion
+            {
                 return;
             }
             self.published.grow_to(index + 1);
@@ -648,6 +655,8 @@ impl Drop for TextStateMut<'_> {
 struct TextNodeState {
     source_range: Option<FfiTextSourceRange>,
     first_letter: NodeSlotId,
+    /// Whether the slice ends where a writing suggestion shows. See [`LayoutNodeArena::set_writing_suggestion_slices`].
+    precedes_writing_suggestion: bool,
     content: Option<TextContent>,
     /// What a generated text row renders. Generated content has no DOM text node whose characters
     /// the style mirror could hold, so the row keeps the characters it was made with.
@@ -774,10 +783,6 @@ pub(crate) type ShellStyleChangedHost = (
     *mut c_void,
     unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *const c_void, bool, bool),
 );
-
-fn style_payloads_equal_in_layout_affecting_groups(a: StylePayloadsRef, b: StylePayloadsRef) -> bool {
-    style_payloads_equal_in_groups(a, b, crate::css::computed_values::style_group_affects_layout)
-}
 
 /// Whether `a` and `b` hold equal payloads in the inherited groups, which are all an anonymous box inherits.
 fn style_payloads_equal_in_inherited_groups(a: StylePayloadsRef, b: StylePayloadsRef) -> bool {
@@ -1131,6 +1136,18 @@ struct StyleNodeTables {
     /// What each element's pseudo-elements have scrolled to, held against the element's identity,
     /// since a pseudo-element has none of its own, and published the way the element's offset is.
     pseudo_element_scroll_offsets: RefCell<HashMap<StyleNodeID, PseudoElementScrollOffsets>>,
+    /// The writing suggestion showing after the caret, if any: at most one per document, held
+    /// against the identity of the text node the caret is in.
+    writing_suggestion: RefCell<Option<PublishedWritingSuggestion>>,
+}
+
+/// A writing suggestion as the document publishes it: the text node the caret is in, where the
+/// caret is in it, and the text the suggestion would add there, in UTF-16 code units.
+#[derive(Clone)]
+pub(crate) struct PublishedWritingSuggestion {
+    pub text: StyleNodeID,
+    pub offset: usize,
+    pub remainder: Vec<u16>,
 }
 
 /// What an element's synthetic pseudo-elements have scrolled to, by kind.
@@ -1282,7 +1299,6 @@ pub(crate) struct LayoutNodeArena {
     text_slots: TextSlots,
     pub(super) searchable_text: Option<Vec<super::text_queries::MappedText>>,
     replaced_content_facts: Vec<ReplacedContentFactsSlot>,
-    raw_table_column_spans: RefCell<HashMap<NodeSlotId, u32>>,
     /// The layout kind of each row built for a MathML element, from its tag name.
     math_layout_kinds: RefCell<HashMap<NodeSlotId, super::math_formatting_context::MathLayoutKind>>,
     replaced_paint_facts: RefCell<Arc<crate::painting::replaced_paint_facts::ReplacedPaintFactsTable>>,
@@ -1311,6 +1327,11 @@ pub(crate) struct LayoutNodeArena {
     /// Layout inputs for new absolutely positioned boxes that the build confined to themselves.
     /// They stand in for the committed inputs such a box does not have yet.
     pub(crate) confined_abspos_layout_inputs: RefCell<HashMap<NodeSlotId, AbsposLayoutInputs>>,
+    /// The position option each box with position options was last laid out with.
+    /// https://drafts.csswg.org/css-anchor-position-1/#fallback-apply
+    position_options_in_use: RefCell<HashMap<NodeSlotId, super::abspos_inputs::PositionOptionChoice>>,
+    /// https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
+    last_successful_position_options: RefCell<HashMap<NodeSlotId, super::abspos_inputs::PositionOptionChoice>>,
     pub(crate) inline_boxes_lifted_out_of: RefCell<HashMap<NodeSlotId, NodeSlotId>>,
     pub(crate) out_of_flow_positioning_contained: RefCell<HashMap<NodeSlotId, u32>>,
     /// Attribution of pending updates for partial relayout. Invariant: every update recorded
@@ -1401,7 +1422,6 @@ impl LayoutNodeArena {
             text_slots: TextSlots::default(),
             searchable_text: None,
             replaced_content_facts: Vec::new(),
-            raw_table_column_spans: RefCell::default(),
             math_layout_kinds: RefCell::default(),
             replaced_paint_facts: RefCell::default(),
             layer_image_paint_facts: RefCell::default(),
@@ -1420,6 +1440,8 @@ impl LayoutNodeArena {
             pending_attached_subtree_roots: RefCell::new(Vec::new()),
             deferred_child_list_insertion_parents: RefCell::new(Vec::new()),
             confined_abspos_layout_inputs: RefCell::new(HashMap::default()),
+            position_options_in_use: RefCell::new(HashMap::default()),
+            last_successful_position_options: RefCell::new(HashMap::default()),
             inline_boxes_lifted_out_of: RefCell::new(HashMap::default()),
             out_of_flow_positioning_contained: RefCell::new(HashMap::default()),
             pending_updates_escape_partial_relayout: Cell::new(false),
@@ -1758,7 +1780,6 @@ impl LayoutNodeArena {
         self.fc_run_cache_store.remove_entry(index);
         self.in_flow_block_cache_store.remove_entry(index);
         self.remove_layout_update_flag_node(id);
-        self.raw_table_column_spans.get_mut().remove(&id);
         self.math_layout_kinds.get_mut().remove(&id);
         if self.replaced_paint_facts.get_mut().contains_key(&id) {
             Arc::make_mut(self.replaced_paint_facts.get_mut()).remove(&id);
@@ -1794,6 +1815,7 @@ impl LayoutNodeArena {
         paintable_row_reset
     }
 
+    #[inline]
     pub(crate) fn data(&self, id: NodeSlotId) -> &NodeData {
         assert!(!id.is_invalid(), "invalid layout node arena slot ID");
         let index = id.slot_index() as usize;
@@ -2171,6 +2193,11 @@ impl LayoutNodeArena {
             .find(is_acceptable)
     }
 
+    /// The parent element of `element` in the style tree, if any.
+    pub(crate) fn style_node_parent(&self, element: StyleNodeID) -> Option<StyleNodeID> {
+        self.with_style_store(|engine| engine.tree().parent(element))
+    }
+
     /// The shadow host of the shadow tree `element` is in, or none in the document tree. A shadow
     /// root has no layout row, so the tree scope is named by its host.
     pub(crate) fn tree_scope_host(&self, element: StyleNodeID) -> Option<StyleNodeID> {
@@ -2221,6 +2248,14 @@ impl LayoutNodeArena {
         let has_scroll_offset = self.data(slot).kind.get() != NodeKind::Viewport
             && self.row_scroll_offset(slot) != CssPixelPoint::default();
         self.set_node_flag(slot, NodeFlag::HasScrollOffset, has_scroll_offset);
+    }
+
+    pub(crate) fn set_writing_suggestion(&self, suggestion: Option<PublishedWritingSuggestion>) {
+        *self.style_node_tables.writing_suggestion.borrow_mut() = suggestion;
+    }
+
+    pub(crate) fn writing_suggestion(&self) -> Option<PublishedWritingSuggestion> {
+        self.style_node_tables.writing_suggestion.borrow().clone()
     }
 
     /// Records what the element has scrolled to, for every row built for it. A rebuild can leave
@@ -2329,6 +2364,7 @@ impl LayoutNodeArena {
             identities_in_focused_text_control,
             element_scroll_offsets,
             pseudo_element_scroll_offsets,
+            writing_suggestion,
         } = &self.style_node_tables;
         counters_sets.borrow_mut().forget(style_node);
         generated_content.borrow_mut().forget(style_node);
@@ -2345,6 +2381,14 @@ impl LayoutNodeArena {
         identities_in_focused_text_control.borrow_mut().remove(&style_node);
         element_scroll_offsets.borrow_mut().remove(&style_node);
         pseudo_element_scroll_offsets.borrow_mut().remove(&style_node);
+        let mut writing_suggestion = writing_suggestion.borrow_mut();
+        if writing_suggestion
+            .as_ref()
+            .is_some_and(|suggestion| suggestion.text == style_node)
+        {
+            *writing_suggestion = None;
+        }
+        drop(writing_suggestion);
         // A retired shadow host takes its tree scope with it. The registry withdraws no names from a
         // scope it can no longer name.
         anchor_name_elements
@@ -2373,6 +2417,29 @@ impl LayoutNodeArena {
         self.enroll_text_children_for_content_sync(id);
         self.enroll_node_for_replaced_content_facts_sync_if_eligible(id);
         previous != style_record
+    }
+
+    /// Whether the box `slot` keeps the layout it cached when it shows `new` in place of `previous` (see
+    /// [`crate::css::computed_values::style_payloads_layout_inputs_equal`]).
+    pub(crate) fn style_move_keeps_layout_inputs(
+        &self,
+        slot: NodeSlotId,
+        previous: StylePayloadsRef,
+        new: StylePayloadsRef,
+    ) -> bool {
+        if previous == new {
+            return true;
+        }
+        if previous.is_null() || new.is_null() {
+            return false;
+        }
+        // SAFETY: A row's non-null style addresses the payload array of the record pinned for it.
+        let (previous, new) = unsafe { (previous.deref(), new.deref()) };
+        let is_svg_box = super::node_facts::kind_is_svg_box(self.data(slot).kind.get());
+        // SAFETY: Published style-group payloads stay live while their records do.
+        unsafe {
+            crate::css::computed_values::style_payloads_layout_inputs_equal(&previous.groups, &new.groups, is_svg_box)
+        }
     }
 
     /// Applies `rows`, the rows of a style transaction a frame applies ahead of the host, to the boxes of their elements,
@@ -2423,7 +2490,7 @@ impl LayoutNodeArena {
             self.publish_new_size_container_geometry(slot);
             self.enroll_node_for_svg_paint_resources_sync(slot);
             self.set_node_flag(slot, NodeFlag::HasAnimatedOpacityOrTransform, false);
-            if !style_payloads_equal_in_layout_affecting_groups(previous_payloads, payloads) {
+            if !self.style_move_keeps_layout_inputs(slot, previous_payloads, payloads) {
                 self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
                 self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
             }
@@ -2548,7 +2615,7 @@ impl LayoutNodeArena {
         }
         self.publish_new_size_container_geometry(slot);
         self.enroll_node_for_svg_paint_resources_sync(slot);
-        if !style_payloads_equal_in_layout_affecting_groups(previous_payloads, payloads) {
+        if !self.style_move_keeps_layout_inputs(slot, previous_payloads, payloads) {
             self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
             self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
         }
@@ -2807,7 +2874,7 @@ impl LayoutNodeArena {
         self.invalidate_overflow_after_style_change(row);
         self.enroll_text_children_for_content_sync(row);
         self.enroll_node_for_svg_paint_resources_sync(row);
-        if style_payloads_equal_in_layout_affecting_groups(previous_payloads, style.payloads) {
+        if self.style_move_keeps_layout_inputs(row, previous_payloads, style.payloads) {
             return;
         }
         self.bump_fragment_cache_epoch_of_self_and_ancestors(row);
@@ -3712,14 +3779,23 @@ impl LayoutNodeArena {
                     self.reinherit_anonymous_descendants(host_calls, child);
                     self.notify_shell_of_style_change(host_calls, child, true);
                 } else {
-                    let column_source = self
-                        .anonymous_box_column_source(child)
-                        .map(|source| self.node_style_record(source));
-                    let derived = self.reinherit_anonymous_style_record(
-                        self.node_style_record(child),
-                        parent_style_record,
-                        column_source,
-                    );
+                    // A writing suggestion's box is derived from its parent again, so its text stays faded.
+                    let derived = if self.is_writing_suggestion_box(child) {
+                        self.derive_anonymous_style_record(
+                            parent_style_record,
+                            AnonymousStyleKind::WritingSuggestion,
+                            AnonymousStyleOverrides::default(),
+                        )
+                    } else {
+                        let column_source = self
+                            .anonymous_box_column_source(child)
+                            .map(|source| self.node_style_record(source));
+                        self.reinherit_anonymous_style_record(
+                            self.node_style_record(child),
+                            parent_style_record,
+                            column_source,
+                        )
+                    };
                     self.apply_reinherited_style_record(host_calls, child, derived);
                     self.reinherit_anonymous_children(host_calls, child, derived.record);
                 }
@@ -3736,7 +3812,7 @@ impl LayoutNodeArena {
     ) {
         let previous_payloads = self.data(slot).style.get();
         let changes_layout_affecting_style =
-            !style_payloads_equal_in_layout_affecting_groups(previous_payloads, derived.payloads);
+            !self.style_move_keeps_layout_inputs(slot, previous_payloads, derived.payloads);
         self.replace_arena_pinned_style_record(slot, derived);
         if changes_layout_affecting_style {
             self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
@@ -4393,14 +4469,15 @@ impl LayoutNodeArena {
         self.shape_writes.identity() + self.bound_rows.borrow().version()
     }
 
-    /// The text rows and the replaced, layer image and SVG paint resource tables as they are now,
-    /// for a recording to read. Each is shared until the arena next writes it.
+    /// The text rows, the replaced, layer image and SVG paint resource tables, and the image maps as they are now, for
+    /// a recording to read. Each is shared until the arena next writes it.
     pub(crate) fn publish_paint_facts(&mut self) -> crate::painting::published_frame::PublishedPaintFacts {
         crate::painting::published_frame::PublishedPaintFacts {
             text: self.text_slots.published.publish(),
             replaced: self.replaced_paint_facts.borrow().clone(),
             layer_images: self.layer_image_paint_facts.borrow().clone(),
             svg_paint_resources: self.svg_paint_resources.publish(),
+            image_maps: self.image_map_areas().snapshot(),
         }
     }
 
@@ -4907,6 +4984,45 @@ impl LayoutNodeArena {
         self.node_pre_order_label(node) < self.node_pre_order_label(other)
     }
 
+    /// Notes that the box `node` was laid out with the position option `choice`.
+    pub(crate) fn note_position_option_in_use(
+        &self,
+        node: NodeSlotId,
+        choice: super::abspos_inputs::PositionOptionChoice,
+    ) {
+        self.position_options_in_use.borrow_mut().insert(node, choice);
+    }
+
+    /// Notes that the box `node` was laid out with no position option.
+    pub(crate) fn forget_position_option_in_use(&self, node: NodeSlotId) {
+        let mut in_use = self.position_options_in_use.borrow_mut();
+        if !in_use.is_empty() {
+            in_use.remove(&node);
+        }
+    }
+
+    /// https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
+    pub(crate) fn last_successful_position_option(
+        &self,
+        node: NodeSlotId,
+    ) -> Option<super::abspos_inputs::PositionOptionChoice> {
+        self.last_successful_position_options.borrow().get(&node).copied()
+    }
+
+    /// Whether a box was laid out with position options, or has a last successful position option.
+    pub(crate) fn may_have_position_options(&self) -> bool {
+        !self.position_options_in_use.borrow().is_empty() || !self.last_successful_position_options.borrow().is_empty()
+    }
+
+    /// https://drafts.csswg.org/css-anchor-position-1/#record-the-last-successful-position-option
+    /// Set the last successful position option of each box with position options to the one it is now using.
+    pub(crate) fn record_last_successful_position_options(&self) {
+        let mut in_use = self.position_options_in_use.borrow_mut();
+        in_use.retain(|&node, _| self.slot_is_live(node));
+        let mut last_successful = self.last_successful_position_options.borrow_mut();
+        last_successful.clone_from(&in_use);
+    }
+
     pub(crate) fn saved_abspos_layout_inputs(&self, data: &NodeData) -> Option<AbsposLayoutInputs> {
         let (index, metadata) = self.slot_for_data(data);
         self.paintable_rows
@@ -5246,17 +5362,10 @@ impl LayoutNodeArena {
     /// they changed.
     pub(crate) fn set_table_spans(&self, id: NodeSlotId, spans: TableSpans) -> bool {
         let data = self.data(id);
-        let effective_spans_changed =
-            data.table_column_span.get() != spans.column_span || data.table_row_span.get() != spans.row_span;
+        let changed = data.table_column_span.get() != spans.column_span || data.table_row_span.get() != spans.row_span;
         data.table_column_span.set(spans.column_span);
         data.table_row_span.set(spans.row_span);
-        let mut raw_spans = self.raw_table_column_spans.borrow_mut();
-        let previous_raw_column_span = if spans.raw_column_span == 1 {
-            raw_spans.remove(&id)
-        } else {
-            raw_spans.insert(id, spans.raw_column_span)
-        };
-        effective_spans_changed || previous_raw_column_span.unwrap_or(1) != spans.raw_column_span
+        changed
     }
 
     /// The layout algorithm the MathML element a row is built for selects by its tag name.
@@ -5266,12 +5375,6 @@ impl LayoutNodeArena {
             .get(&id)
             .copied()
             .unwrap_or(super::math_formatting_context::MathLayoutKind::NotMathML)
-    }
-
-    pub(crate) fn raw_table_column_span(&self, id: NodeSlotId) -> u32 {
-        // data() validates that id names a live slot with a matching generation.
-        self.data(id);
-        self.raw_table_column_spans.borrow().get(&id).copied().unwrap_or(1)
     }
 
     pub(crate) fn text_content(&self, id: NodeSlotId) -> Option<&TextContent> {
@@ -5302,6 +5405,32 @@ impl LayoutNodeArena {
         drop(remainder_state);
         self.invalidate_text_content(first_letter);
         self.invalidate_text_content(remainder);
+    }
+
+    /// Splits a text node's box at the caret for a writing suggestion, the way a `::first-letter`
+    /// split divides it at the end of the letter: The leading slice renders the text before the
+    /// caret, and the trailing slice (the one the node is bound to) renders the rest.
+    pub(super) fn set_writing_suggestion_slices(
+        &mut self,
+        leading: NodeSlotId,
+        trailing: NodeSlotId,
+        caret: usize,
+        source_length: usize,
+    ) {
+        self.set_first_letter_slices(leading, trailing, caret, source_length);
+        self.text_node_state_mut(leading).precedes_writing_suggestion = true;
+    }
+
+    pub(crate) fn text_precedes_writing_suggestion(&self, id: NodeSlotId) -> bool {
+        self.text_node_state(id)
+            .is_some_and(|state| state.precedes_writing_suggestion)
+    }
+
+    /// Whether a box is the inline box that renders a writing suggestion, i.e. the one right after the text slice in
+    /// front of the suggestion.
+    fn is_writing_suggestion_box(&self, id: NodeSlotId) -> bool {
+        let previous_sibling = self.data(id).previous_sibling.get();
+        !previous_sibling.is_invalid() && self.text_precedes_writing_suggestion(previous_sibling)
     }
 
     pub(crate) fn text_source_range(&self, id: NodeSlotId, source_length: usize) -> FfiTextSourceRange {
@@ -5388,10 +5517,12 @@ impl LayoutNodeArena {
         self.may_have_scroll_snap_areas.get()
     }
 
+    #[inline]
     pub(crate) fn style_payloads(&self, id: NodeSlotId) -> Option<&FfiStylePayloads> {
         Self::row_style_payloads(self.data(id))
     }
 
+    #[inline]
     fn row_style_payloads(data: &NodeData) -> Option<&FfiStylePayloads> {
         // SAFETY: The arena pins the style record of each of its rows while the row holds it.
         unsafe { super::node_data::style_payloads(data.style.get()) }
@@ -6618,7 +6749,6 @@ mod tests {
         let spans = TableSpans {
             column_span: 2,
             row_span: 3,
-            raw_column_span: 1,
         };
         engine.set_element_table_spans(element, spans);
         let mut arena = LayoutNodeArena::new();
@@ -7155,8 +7285,11 @@ mod tests {
                 inline_alignment: None,
                 block_alignment: None,
                 derives_from_own_computed_values: true,
+                is_position_area: false,
             },
             resolved_anchor_insets: None,
+            resolved_anchor_sizes: Default::default(),
+            position_option: Default::default(),
         }
     }
 
@@ -7250,6 +7383,7 @@ mod tests {
                 first_baseline: CssPixels::from_raw(64),
                 has_last_baseline: true,
                 last_baseline: CssPixels::from_raw(128),
+                inline_alignment_baseline: None,
             }),
             depends_on_percentage_block_size: false,
             depends_on_percentage_inline_basis: false,
@@ -7527,6 +7661,7 @@ mod tests {
         let value = TableCellMeasurement {
             automatic_content_block_size: CssPixels::from_raw(320),
             baselines: crate::layout::layout_node_arena::DerivedBaselines {
+                inline_alignment: None,
                 first: Some(CssPixels::from_raw(64)),
                 last: None,
             },

@@ -65,6 +65,7 @@
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/InputEvent.h>
+#include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -490,6 +491,11 @@ WebIDL::ExceptionOr<void> HTMLInputElement::run_input_activation_behavior(DOM::E
         if (!is_connected())
             return {};
 
+        // INTEROP: Browsers do not fire input and change events at a radio button that was already checked before it
+        //          was activated.
+        if (type_state() == TypeAttributeState::RadioButton && m_before_legacy_pre_activation_behavior_checked)
+            return {};
+
         // 2. Fire an event named input at the element with the bubbles and composed attributes initialized to true.
         auto input_event = create_event_for_element(*this, HTML::EventNames::input);
         input_event->set_bubbles(true);
@@ -818,6 +824,7 @@ void HTMLInputElement::commit_pending_changes()
     // or else when the control loses focus
     switch (type_state()) {
     case TypeAttributeState::Email:
+    case TypeAttributeState::Number:
     case TypeAttributeState::Password:
     case TypeAttributeState::Search:
     case TypeAttributeState::Telephone:
@@ -1285,10 +1292,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
 
         auto up_callback_function = JS::NativeFunction::create(
             HTML::relevant_realm(*this), [this](JS::VM&) {
-                if (type_state() == TypeAttributeState::Number && is_mutable() && allowed_value_step().has_value()) {
-                    MUST(step_up());
-                    user_interaction_did_change_input_value();
-                }
+                step_for_user_interaction(StepDirection::Up, CommitChange::No);
                 return JS::js_undefined();
             },
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
@@ -1315,10 +1319,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
 
         auto down_callback_function = JS::NativeFunction::create(
             HTML::relevant_realm(*this), [this](JS::VM&) {
-                if (type_state() == TypeAttributeState::Number && is_mutable() && allowed_value_step().has_value()) {
-                    MUST(step_down());
-                    user_interaction_did_change_input_value();
-                }
+                step_for_user_interaction(StepDirection::Down, CommitChange::No);
                 return JS::js_undefined();
             },
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
@@ -1607,6 +1608,8 @@ void HTMLInputElement::did_receive_focus()
 
 void HTMLInputElement::did_lose_focus()
 {
+    reveal_cursor_if_pending();
+
     if (m_text_node)
         m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
@@ -1858,7 +1861,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     //     the networking task source once the resource has been fetched (defined below) has been run.
     m_load_event_delayer.emplace(document());
 
-    m_resource_request = SharedResourceRequest::get_or_create(document(), request->url());
+    m_resource_request = SharedResourceRequest::get_or_create(document(), *request);
     CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
         [this]() {
@@ -3348,17 +3351,19 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_number(double value)
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-stepup
 WebIDL::ExceptionOr<void> HTMLInputElement::step_up(WebIDL::Long n)
 {
-    return step_up_or_down(false, n);
+    TRY(step_up_or_down(false, n));
+    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-stepdown
 WebIDL::ExceptionOr<void> HTMLInputElement::step_down(WebIDL::Long n)
 {
-    return step_up_or_down(true, n);
+    TRY(step_up_or_down(true, n));
+    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-stepup
-WebIDL::ExceptionOr<void> HTMLInputElement::step_up_or_down(bool is_down, WebIDL::Long n)
+WebIDL::ExceptionOr<HTMLInputElement::StepResult> HTMLInputElement::step_up_or_down(bool is_down, WebIDL::Long n, StepTrigger trigger)
 {
     // 1. If the stepDown() and stepUp() methods do not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException.
     if (!step_up_or_down_applies())
@@ -3374,16 +3379,17 @@ WebIDL::ExceptionOr<void> HTMLInputElement::step_up_or_down(bool is_down, WebIDL
     auto maybe_minimum = min();
     auto maybe_maximum = max();
     if (maybe_minimum.has_value() && maybe_maximum.has_value() && *maybe_minimum > *maybe_maximum)
-        return {};
+        return StepResult::NotStepped;
 
     // 4. If the element has a minimum and a maximum and there is no value greater than or equal to the element's minimum and less than
     // or equal to the element's maximum that, when subtracted from the step base, is an integral multiple of the allowed value step, then return.
     if (maybe_minimum.has_value() && maybe_maximum.has_value() && ceil((*maybe_minimum - step_base()) / allowed_value_step) > floor((*maybe_maximum - step_base()) / allowed_value_step))
-        return {};
+        return StepResult::NotStepped;
 
     // 5. If applying the algorithm to convert a string to a number to the string given by the element's value does not result in an error,
     // then let value be the result of that algorithm. Otherwise, let value be zero.
-    double value = convert_string_to_number(this->value()).value_or(0);
+    auto maybe_value = convert_string_to_number(this->value());
+    double value = maybe_value.value_or(0);
 
     // 6. Let valueBeforeStepping be value.
     double value_before_stepping = value;
@@ -3427,21 +3433,56 @@ WebIDL::ExceptionOr<void> HTMLInputElement::step_up_or_down(bool is_down, WebIDL
 
     // 10. If either the method invoked was the stepDown() method and value is greater than valueBeforeStepping,
     // or the method invoked was the stepUp() method and value is less than valueBeforeStepping, then return.
-    if (is_down) {
-        if (value > value_before_stepping)
-            return {};
-    } else {
-        if (value < value_before_stepping)
-            return {};
+    // INTEROP: Browsers only do this when the element's value could be converted to a number, so stepping an
+    //          element without a value always gives it one.
+    if (maybe_value.has_value()) {
+        if (is_down && value > value_before_stepping)
+            return StepResult::NotStepped;
+        if (!is_down && value < value_before_stepping)
+            return StepResult::NotStepped;
     }
 
     // 11. Let value as string be the result of running the algorithm to convert a number to a string,
     // as defined for the input element's type attribute's current state, on value.
     auto value_as_string = convert_number_to_string(value);
 
+    // INTEROP: When the user steps the value, other engines first fire a cancelable beforeinput event with the new
+    //          value, and leave the value alone if that event is canceled or makes the element's node document no
+    //          longer fully active.
+    //          We also leave it alone if the event changes the element's type or makes it immutable.
+    if (trigger == StepTrigger::UserInteraction) {
+        auto type_state_before_event = type_state();
+        UIEvents::InputEventInit before_input_event_init;
+        before_input_event_init.input_type = UIEvents::InputTypes::insertText;
+        before_input_event_init.data = value_as_string;
+        auto before_input_event = UIEvents::InputEvent::create_from_platform_event(UIEvents::EventNames::beforeinput, before_input_event_init, {}, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
+        if (!dispatch_event(before_input_event) || !document().is_fully_active())
+            return StepResult::NotStepped;
+        if (type_state() != type_state_before_event || !is_mutable())
+            return StepResult::NotStepped;
+    }
+
     // 12. Set the value of the element to value as string.
+    auto value_before_setting = this->value();
     TRY(set_value(value_as_string));
-    return {};
+    return this->value() == value_before_setting ? StepResult::NotStepped : StepResult::Stepped;
+}
+
+// AD-HOC: Steps the value of the element for the user's interaction with its spin buttons or arrow keys, and fires the
+//         events that such a change of the value fires.
+void HTMLInputElement::step_for_user_interaction(StepDirection direction, CommitChange commit_change)
+{
+    if (type_state() != TypeAttributeState::Number || !is_mutable() || !allowed_value_step().has_value())
+        return;
+
+    auto result = step_up_or_down(direction == StepDirection::Down, 1, StepTrigger::UserInteraction);
+    if (result.is_error() || result.value() == StepResult::NotStepped)
+        return;
+
+    m_has_uncommitted_changes = true;
+    user_interaction_did_change_input_value(UIEvents::InputTypes::insertText, value());
+    if (commit_change == CommitChange::Yes)
+        commit_pending_changes();
 }
 
 Optional<ARIA::Role> HTMLInputElement::default_role() const

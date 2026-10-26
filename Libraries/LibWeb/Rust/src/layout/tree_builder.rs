@@ -1782,8 +1782,10 @@ fn update_layout_tree_for_svg_switch_children(
     let mut rendered_child = None;
     let mut child = host.first_dom_child(switch_element);
     while let Some(current) = child {
-        // FIXME: Evaluate the requiredExtensions and systemLanguage attributes.
-        if host.element_type_facts(Some(current)) & element_adjustment_fact::IS_SVG_ELEMENT != 0 {
+        // NB: A child whose conditional processing attributes evaluate to false asks for no box.
+        if host.element_type_facts(Some(current)) & element_adjustment_fact::IS_SVG_ELEMENT != 0
+            && host.arena().element_box_kind(Some(current)) != ElementBoxKind::NoBox
+        {
             rendered_child = Some(current);
             break;
         }
@@ -2273,6 +2275,8 @@ fn update_principal_node_descendants(
                     create_first_letter_boxes(host, update.mirror_identity, target);
                 }
             }
+
+            create_writing_suggestion_boxes(host, update.mirror_identity, layout_node);
         }
 
         wrap_fieldset_contents_if_needed(host, layout_node);
@@ -3581,6 +3585,14 @@ fn node_is_out_of_flow_child_of(host: &TreeBuilderHost<'_>, parent: LayoutNode, 
     !parent_lays_out_math || host.style(node).is_some_and(|style| style.is_absolutely_positioned())
 }
 
+fn lays_out_each_child_as_its_own_box(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
+    // NB: Flex, grid and MathML layout lay out each of their children as its own box.
+    host.style(node).is_some_and(|style| {
+        let display = style.display();
+        display.is_flex_inside() || display.is_grid_inside() || display.is_math_inside()
+    })
+}
+
 fn node_has_replaced_element_table_display_adjustment(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
     node_facts::has_flag(host.data(node), NodeFlag::IsReplacedElement)
         && host.style(node).is_some_and(|style| {
@@ -4229,11 +4241,8 @@ fn insertion_parent_for_block_node(
                     }
                     true
                 }));
-        let new_parent_display = host.style(new_parent).map(|style| style.display());
-        // NB: Flex, grid and MathML layout lay out each of their children as its own box.
         if appends_after_existing_children
-            && !new_parent_display
-                .is_some_and(|display| display.is_flex_inside() || display.is_grid_inside() || display.is_math_inside())
+            && !lays_out_each_child_as_its_own_box(host, new_parent)
             && !node_is_generated_for_pseudo_element(last_child_data)
             && node_facts::has_flag(last_child_data, NodeFlag::Anonymous)
             && node_facts::has_flag(last_child_data, NodeFlag::ChildrenAreInline)
@@ -4252,25 +4261,53 @@ fn insertion_parent_for_block_node(
 
     // Parent block has inline-level children (our siblings); wrap these siblings into an anonymous wrapper block.
     note_layout_tree_restructuring_at(host, state, new_parent);
-    let mut children_to_wrap = Vec::new();
-    let mut child = host.first_child(new_parent);
-    while !child.is_invalid() {
-        if !is_out_of_flow_table_internal_child_of_table_root(host, new_parent, child) {
-            children_to_wrap.push(child);
+    if lays_out_each_child_as_its_own_box(host, new_parent) {
+        // NB: An out-of-flow child of a parent that lays out each of its children as its own box stays a child of
+        //     that parent, so that it is positioned as the parent's own abspos child instead of becoming part of an
+        //     anonymous wrapper. Each run of in-flow siblings between them gets its own wrapper, in DOM order.
+        let mut runs: Vec<Vec<LayoutNode>> = vec![Vec::new()];
+        let mut child = host.first_child(new_parent);
+        while !child.is_invalid() {
+            if node_is_out_of_flow_child_of(host, new_parent, child) {
+                runs.push(Vec::new());
+            } else if let Some(run) = runs.last_mut() {
+                run.push(child);
+            }
+            child = host.next_sibling(child);
         }
-        child = host.next_sibling(child);
-    }
-    let wrapper = host.create_anonymous_wrapper_box(new_parent);
-    let wrapper_slot = wrapper.slot();
-    host.set_children_are_inline(wrapper_slot, true);
-    for child in children_to_wrap {
-        host.move_child(child, wrapper_slot, NodeSlotId::INVALID);
+        for run in runs.into_iter().filter(|run| !run.is_empty()) {
+            wrap_children_in_anonymous_wrapper(host, new_parent, &run, run[0]);
+        }
+    } else {
+        let mut children_to_wrap = Vec::new();
+        let mut child = host.first_child(new_parent);
+        while !child.is_invalid() {
+            if !is_out_of_flow_table_internal_child_of_table_root(host, new_parent, child) {
+                children_to_wrap.push(child);
+            }
+            child = host.next_sibling(child);
+        }
+        wrap_children_in_anonymous_wrapper(host, new_parent, &children_to_wrap, NodeSlotId::INVALID);
     }
     host.set_children_are_inline(new_parent, false);
-    host.attach_child(new_parent, wrapper, NodeSlotId::INVALID);
 
     // Then it's safe to insert this block into parent.
     new_parent
+}
+
+fn wrap_children_in_anonymous_wrapper(
+    host: &mut TreeBuilderHost<'_>,
+    parent: LayoutNode,
+    children: &[LayoutNode],
+    before: LayoutNode,
+) {
+    let wrapper = host.create_anonymous_wrapper_box(parent);
+    let wrapper_slot = wrapper.slot();
+    host.set_children_are_inline(wrapper_slot, true);
+    host.attach_child(parent, wrapper, before);
+    for &child in children {
+        host.move_child(child, wrapper_slot, NodeSlotId::INVALID);
+    }
 }
 
 fn insert_child_in_dom_order(
@@ -4595,6 +4632,86 @@ fn create_first_letter_boxes(host: &mut TreeBuilderHost<'_>, element: StyleNodeI
     host.attach_child(wrapper_slot, first_letter_slice, NodeSlotId::INVALID);
     host.attach_child(parent, wrapper, text_node);
     host.attach_child(parent, remainder_slice, text_node);
+    host.arena().detach_child(parent, text_node);
+    host.free_subtree(text_node);
+}
+
+/// Splits the box of the text node the caret is in at the caret, around an inline box that renders the writing
+/// suggestion showing there, so the suggestion takes up space in the line as text would. It's never in the DOM: The
+/// slices on either side keep rendering the DOM text, with source ranges that map its offsets as they do for a
+/// `::first-letter` split.
+fn create_writing_suggestion_boxes(host: &mut TreeBuilderHost<'_>, element: StyleNodeID, layout_node: LayoutNode) {
+    let Some(suggestion) = host.arena().writing_suggestion() else {
+        return;
+    };
+    let is_child_text = host.arena().with_style_store(|engine| {
+        if engine.tree().text_parent(suggestion.text) != Some(element) {
+            return false;
+        }
+        // Text that a `::first-letter` may already split is left alone, so the two splits never meet.
+        let mut ancestor = Some(element);
+        while let Some(current) = ancestor {
+            if engine.has_published_first_letter_style(current) {
+                return false;
+            }
+            ancestor = engine
+                .tree()
+                .parent(current)
+                .map(|parent| engine.tree().host_of(parent).unwrap_or(parent));
+        }
+        true
+    });
+    if !is_child_text {
+        return;
+    }
+    let text_node = host.arena().bound_row(suggestion.text);
+    if text_node.is_invalid()
+        || host.data(text_node).kind.get() != NodeKind::TextNode
+        || host.arena().text_has_source_range(text_node)
+        || !is_inclusive_layout_ancestor_of(host, layout_node, text_node)
+    {
+        return;
+    }
+    let source_length = host
+        .arena()
+        .published_text_source(text_node, false)
+        .data
+        .to_utf16()
+        .len();
+    if suggestion.offset > source_length || suggestion.remainder.is_empty() {
+        return;
+    }
+
+    // The trailing slice takes over the text node's rows, and the leading slice renders the same node without
+    // becoming the row the node is bound to.
+    let trailing_slice = host.stamp_dom_box(NodeKind::TextNode, Some(suggestion.text));
+    let leading_slice = host.arena.allocate_unbound();
+    host.arena()
+        .stamp_dom_row(leading_slice, NodeKind::TextNode, Some(suggestion.text));
+    host.arena().note_rows_share_dom_node(trailing_slice, leading_slice);
+    for slice in [leading_slice, trailing_slice] {
+        host.stamp_text_row_facts(slice, suggestion.text);
+    }
+    host.arena
+        .set_writing_suggestion_slices(leading_slice, trailing_slice, suggestion.offset, source_length);
+    let leading_slice = host.created(leading_slice);
+    let trailing_slice = host.created(trailing_slice);
+
+    let parent = host.parent(text_node);
+    assert!(!parent.is_invalid());
+    let wrapper = host.create_anonymous_box(
+        parent,
+        AnonymousStyleKind::WritingSuggestion,
+        AnonymousStyleOverrides::default(),
+        NodeKind::InlineNode,
+    );
+    let wrapper_slot = wrapper.slot();
+    host.set_children_are_inline(wrapper_slot, true);
+    let suggestion_text = host.stamp_generated_text_box(&suggestion.remainder);
+    host.attach_child(wrapper_slot, host.created(suggestion_text), NodeSlotId::INVALID);
+    host.attach_child(parent, leading_slice, text_node);
+    host.attach_child(parent, wrapper, text_node);
+    host.attach_child(parent, trailing_slice, text_node);
     host.arena().detach_child(parent, text_node);
     host.free_subtree(text_node);
 }

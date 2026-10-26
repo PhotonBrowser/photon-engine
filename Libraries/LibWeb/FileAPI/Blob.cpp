@@ -20,8 +20,8 @@
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
+#include <LibWeb/Streams/ReadableStream.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
-#include <LibWeb/Streams/ReadableStreamOperations.h>
 #include <LibWeb/WebIDL/ExceptionOrUtils.h>
 #include <LibWeb/WebIDL/Promise.h>
 
@@ -31,7 +31,7 @@ namespace Web::FileAPI {
 struct BlobBytes {
     AK_ALLOC_WITH_KMALLOC;
 
-    Variant<ByteBuffer, Core::AnonymousBuffer> bytes;
+    Variant<ByteBuffer, Core::AnonymousBuffer, Core::ImmutableBytes> bytes;
 };
 
 // The bytes as Bindings/Rust/src/file_api/blob.rs takes them over.
@@ -41,7 +41,7 @@ struct BlobBytesABI {
     size_t length { 0 };
 };
 
-static BlobBytesABI hand_over(Variant<ByteBuffer, Core::AnonymousBuffer> bytes)
+static BlobBytesABI hand_over(Variant<ByteBuffer, Core::AnonymousBuffer, Core::ImmutableBytes> bytes)
 {
     auto* owner = new BlobBytes { move(bytes) };
     auto data = owner->bytes.visit([](auto const& bytes) { return bytes.bytes(); });
@@ -61,10 +61,10 @@ bool web_blob_is_file(void* blob);
 
 // Called by Bindings/Rust/src/file_api/blob.rs.
 void web_blob_bytes_destroy(BlobBytes*);
-JSObject* web_blob_get_stream(void* realm, ReadonlyBytes);
-JSObject* web_blob_text(void* realm, ReadonlyBytes);
-JSObject* web_blob_array_buffer(void* realm, ReadonlyBytes);
-JSObject* web_blob_bytes(void* realm, ReadonlyBytes);
+void* web_blob_get_stream(void* realm, ReadonlyBytes);
+WebIDL::Promise* web_blob_text(void* realm, ReadonlyBytes);
+WebIDL::Promise* web_blob_array_buffer(void* realm, ReadonlyBytes);
+WebIDL::Promise* web_blob_bytes(void* realm, ReadonlyBytes);
 JSCompletion web_blob_deserialize_byte_sequence(Bindings::RustSerializationReader*, BlobBytesABI* out_bytes);
 }
 
@@ -105,6 +105,20 @@ ErrorOr<Core::AnonymousBuffer> Blob::shared_bytes()
     return buffer;
 }
 
+ErrorOr<Core::ImmutableBytes> Blob::immutable_bytes()
+{
+    if (auto* owner = web_blob_foreign_bytes_owner(this)) {
+        if (auto const* bytes = owner->bytes.get_pointer<Core::ImmutableBytes>())
+            return *bytes;
+        if (auto const* buffer = owner->bytes.get_pointer<Core::AnonymousBuffer>())
+            return Core::ImmutableBytes::adopt_anonymous_buffer(*buffer);
+    }
+
+    auto bytes = TRY(Core::ImmutableBytes::copy(raw_bytes()));
+    web_blob_set_foreign_bytes(this, hand_over(bytes));
+    return bytes;
+}
+
 GC::Ref<Blob> Blob::slice_blob(Optional<i64> start, Optional<i64> end, Optional<Utf16String> content_type) const
 {
     auto has_content_type = content_type.has_value();
@@ -122,7 +136,7 @@ bool Blob::is_file() const
 static GC::Ref<Streams::ReadableStream> get_stream(JS::Realm& realm, ReadonlyBytes blob_bytes)
 {
     // 1. Let stream be a new ReadableStream created in blob’s relevant Realm.
-    auto stream = GC::Heap::the().allocate<Streams::ReadableStream>();
+    auto stream = Streams::ReadableStream::create(realm);
 
     // 2. Set up stream with byte reading support.
     stream->set_up_with_byte_reading_support(realm);
@@ -150,7 +164,7 @@ static GC::Ref<Streams::ReadableStream> get_stream(JS::Realm& realm, ReadonlyByt
                 });
 
                 if (maybe_error.is_error()) {
-                    Streams::readable_stream_error(*stream, maybe_error.release_error().value());
+                    stream->error(maybe_error.release_error().value());
                     return;
                 }
 
@@ -181,17 +195,14 @@ static GC::Ref<WebIDL::Promise> read_all_blob_bytes(JS::Realm& realm, ReadonlyBy
 }
 
 // https://w3c.github.io/FileAPI/#dom-blob-stream
-JSObject* web_blob_get_stream(void* realm, ReadonlyBytes blob_bytes)
+void* web_blob_get_stream(void* realm, ReadonlyBytes blob_bytes)
 {
-    auto& js_realm = *static_cast<JS::Realm*>(realm);
-
     // The stream() method, when invoked, must return the result of calling get stream on this.
-    auto stream = get_stream(js_realm, blob_bytes);
-    return JS::HostABI::object_to_abi(Bindings::wrap(Bindings::host_defined_wrapper_world(js_realm), js_realm, stream).ptr());
+    return get_stream(*static_cast<JS::Realm*>(realm), blob_bytes).ptr();
 }
 
 // https://w3c.github.io/FileAPI/#dom-blob-text
-JSObject* web_blob_text(void* realm, ReadonlyBytes blob_bytes)
+WebIDL::Promise* web_blob_text(void* realm, ReadonlyBytes blob_bytes)
 {
     auto& js_realm = *static_cast<JS::Realm*>(realm);
     auto& vm = js_realm.vm();
@@ -205,11 +216,11 @@ JSObject* web_blob_text(void* realm, ReadonlyBytes blob_bytes)
         auto text = TRY_OR_THROW_OOM(vm, TextCodec::utf8_decode_to_utf16(ReadonlyBytes { array_buffer.data_at(0), array_buffer.byte_length() }));
         return JS::PrimitiveString::create(vm, move(text));
     }));
-    return JS::HostABI::object_to_abi(promise->promise().ptr());
+    return promise.ptr();
 }
 
 // https://w3c.github.io/FileAPI/#dom-blob-arraybuffer
-JSObject* web_blob_array_buffer(void* realm, ReadonlyBytes blob_bytes)
+WebIDL::Promise* web_blob_array_buffer(void* realm, ReadonlyBytes blob_bytes)
 {
     auto& js_realm = *static_cast<JS::Realm*>(realm);
 
@@ -221,11 +232,11 @@ JSObject* web_blob_array_buffer(void* realm, ReadonlyBytes blob_bytes)
 
         return JS::ArrayBuffer::create(js_realm, MUST(ByteBuffer::copy(ReadonlyBytes { array_buffer.data_at(0), array_buffer.byte_length() })));
     }));
-    return JS::HostABI::object_to_abi(promise->promise().ptr());
+    return promise.ptr();
 }
 
 // https://w3c.github.io/FileAPI/#dom-blob-bytes
-JSObject* web_blob_bytes(void* realm, ReadonlyBytes blob_bytes)
+WebIDL::Promise* web_blob_bytes(void* realm, ReadonlyBytes blob_bytes)
 {
     auto& js_realm = *static_cast<JS::Realm*>(realm);
 
@@ -236,7 +247,7 @@ JSObject* web_blob_bytes(void* realm, ReadonlyBytes blob_bytes)
         auto& array_buffer = static_cast<JS::ArrayBuffer&>(object);
         return JS::Uint8Array::create(js_realm, array_buffer.byte_length(), array_buffer);
     }));
-    return JS::HostABI::object_to_abi(promise->promise().ptr());
+    return promise.ptr();
 }
 
 void web_blob_bytes_destroy(BlobBytes* bytes)

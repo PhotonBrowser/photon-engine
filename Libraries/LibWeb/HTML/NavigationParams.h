@@ -65,6 +65,9 @@ struct NavigationParams : GC::Cell {
     //         browsing context group switch gave it one.
     Optional<u64> new_browsing_context_group_id;
 
+    // AD-HOC: The permissions policy the UI process created for the new Document.
+    Optional<PermissionsPolicy::PermissionsPolicy> permissions_policy;
+
     // null or an algorithm accepting a Document, once it has been created
     GC::Ptr<GC::Function<void(DOM::Document&)>> commit_early_hints { nullptr };
 
@@ -78,7 +81,7 @@ struct NavigationParams : GC::Cell {
     URL::Origin origin;
 
     // a policy container to use for the new Document
-    GC::Ptr<PolicyContainer> policy_container;
+    RefPtr<PolicyContainer> policy_container;
 
     // a sandboxing flag set to impose on the new Document
     SandboxingFlagSet final_sandboxing_flag_set = {};
@@ -111,7 +114,7 @@ protected:
         OpenerPolicyEnforcementResult coop_enforcement_result,
         Fetch::Infrastructure::Request::ReservedClientType reserved_environment,
         URL::Origin origin,
-        GC::Ptr<PolicyContainer> policy_container,
+        RefPtr<PolicyContainer> policy_container,
         SandboxingFlagSet final_sandboxing_flag_set,
         ReferrerPolicy::ReferrerPolicy iframe_element_referrer_policy,
         OpenerPolicy opener_policy,
@@ -193,6 +196,6 @@ protected:
 
 using NavigationParamsVariant = Variant<NavigationParamsNullOrError, GC::Ref<NavigationParams>, GC::Ref<NonFetchSchemeNavigationParams>>;
 
-bool check_a_navigation_responses_adherence_to_x_frame_options(GC::Ptr<Fetch::Infrastructure::Response> response, LocalNavigable* navigable, GC::Ref<ContentSecurityPolicy::PolicyList const> csp_list, URL::Origin destination_origin);
+bool check_a_navigation_responses_adherence_to_x_frame_options(GC::Ptr<Fetch::Infrastructure::Response> response, LocalNavigable* navigable, ContentSecurityPolicy::PolicyList const& csp_list, URL::Origin destination_origin);
 
 }

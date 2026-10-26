@@ -143,7 +143,7 @@ impl BorderRadii {
         &self,
         rect: libgfx_rust::IntRect,
         converter: &DevicePixelConverter,
-    ) -> Option<libgfx_rust::path::OwnedPath> {
+    ) -> Option<libgfx_rust::path::Path> {
         if !self.has_shaped_corners() {
             return None;
         }

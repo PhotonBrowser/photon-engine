@@ -1,8 +1,8 @@
 Harness status: OK
 
-Found 335 tests
+Found 341 tests
 
-325 Pass
+331 Pass
 10 Fail
 Pass	Setup
 Pass	isolation (type: discrete) has testAddition function
@@ -235,6 +235,9 @@ Pass	table-layout: "auto" onto "fixed"
 Pass	text-align (type: discrete) has testAddition function
 Pass	text-align: "end" onto "start"
 Pass	text-align: "start" onto "end"
+Pass	text-align-last (type: discrete) has testAddition function
+Pass	text-align-last: "end" onto "start"
+Pass	text-align-last: "start" onto "end"
 Pass	text-anchor (type: discrete) has testAddition function
 Pass	text-anchor: "end" onto "middle"
 Pass	text-anchor: "middle" onto "end"
@@ -257,6 +260,9 @@ Pass	text-decoration-skip-ink: "auto" onto "none"
 Pass	text-decoration-style (type: discrete) has testAddition function
 Pass	text-decoration-style: "dotted" onto "solid"
 Pass	text-decoration-style: "solid" onto "dotted"
+Pass	text-emphasis-position (type: discrete) has testAddition function
+Pass	text-emphasis-position: "under left" onto "over"
+Pass	text-emphasis-position: "over" onto "under left"
 Pass	text-overflow (type: discrete) has testAddition function
 Pass	text-overflow: "ellipsis" onto "clip"
 Pass	text-overflow: "clip" onto "ellipsis"

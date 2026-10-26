@@ -27,6 +27,15 @@ void SVGFEImageElement::visit_edges(Cell::Visitor& visitor)
     SVGFilterPrimitiveStandardAttributes::visit_edges(visitor);
     SVGURIReferenceMixin::visit_edges(visitor);
     visitor.visit(m_resource_request);
+    visitor.visit(m_preserve_aspect_ratio);
+}
+
+// https://drafts.fxtf.org/filter-effects/#dom-svgfeimageelement-preserveaspectratio
+GC::Ref<SVGAnimatedPreserveAspectRatio> SVGFEImageElement::preserve_aspect_ratio_for_bindings()
+{
+    if (!m_preserve_aspect_ratio)
+        m_preserve_aspect_ratio = SVGAnimatedPreserveAspectRatio::create(*this);
+    return *m_preserve_aspect_ratio;
 }
 
 void SVGFEImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -56,7 +65,7 @@ void SVGFEImageElement::process_href(Optional<Utf16String> const& href)
     if (!m_href.has_value())
         return;
 
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *m_href);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *m_href, HTML::CORSSettingAttribute::NoCORS);
     m_resource_request->add_callbacks(
         [this, resource_request = GC::Root { m_resource_request }] {
             document().note_svg_paint_resources_changed();

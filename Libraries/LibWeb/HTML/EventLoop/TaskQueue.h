@@ -32,6 +32,9 @@ public:
 
     void remove_tasks_matching(Function<bool(HTML::Task const&)>);
 
+    // https://html.spec.whatwg.org/multipage/workers.html#dom-workerglobalscope-closing
+    void discard_further_tasks() { m_discards_further_tasks = true; }
+
     Task const* last_added_task() const;
 
     // Diagnostics are process-scoped, bounded, and disabled unless a controlled benchmark asks for them.
@@ -52,6 +55,7 @@ private:
     Task::Queue m_idle_tasks;
     GC::Ptr<HTML::Task const> m_last_added_task;
     Vector<GC::Ref<HTML::Task>> m_discarded_tasks;
+bool m_discards_further_tasks { false };
     size_t m_normal_task_count { 0 };
     size_t m_idle_task_count { 0 };
 };

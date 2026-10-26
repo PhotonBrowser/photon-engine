@@ -902,6 +902,17 @@ void record_element_associated_with_animation(DOM::Element& element)
         note_waiting_children_may_arrive(*style_engine, element.document());
 }
 
+// The box the element asks layout for.
+static CSS::ElementBoxKind box_kind_for_layout(DOM::Element const& element)
+{
+    // https://svgwg.org/svg2-draft/struct.html#ConditionalProcessing
+    // NB: An element whose conditional processing attributes evaluate to false, and its children, are skipped and thus
+    //     will not be rendered.
+    if (auto const* svg_graphics_element = as_if<SVG::SVGGraphicsElement>(element); svg_graphics_element && !svg_graphics_element->conditional_processing_attributes_evaluate_to_true())
+        return CSS::ElementBoxKind::NoBox;
+    return element.box_kind();
+}
+
 void record_waiting_children_may_be_revealed(DOM::Element& element)
 {
     if (auto* style_engine = style_engine_for(element))
@@ -1019,7 +1030,7 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
                                             .heading_level = heading_level,
                                             .is_slot = is_slot,
                                             .associated_pseudo_kind_plus_one = associated_pseudo_kind_plus_one(element),
-                                            .box_kind = to_underlying(element.box_kind()),
+                                            .box_kind = to_underlying(box_kind_for_layout(element)),
                                             .adjustment_facts = element_style_adjustment_facts(element),
                                             .construction_facts = element_construction_facts(element),
                                         },
@@ -1366,7 +1377,7 @@ void record_element_adjustment_facts(DOM::Element& element)
         return;
     StyleEngineFFI::style_engine_set_element_adjustment_facts(style_engine->host(), element.style_node_id(), element_style_adjustment_facts(element));
     StyleEngineFFI::style_engine_set_element_construction_facts(style_engine->host(), element.style_node_id(), element_construction_facts(element));
-    StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(element.box_kind()));
+    StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(box_kind_for_layout(element)));
     StyleEngineFFI::style_engine_set_element_associated_pseudo_kind(style_engine->host(), element.style_node_id(), associated_pseudo_kind_plus_one(element));
 }
 
@@ -1382,7 +1393,7 @@ void record_element_box_kind(DOM::Element& element)
     auto* style_engine = style_engine_for_identified(element);
     if (!style_engine)
         return;
-    StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(element.box_kind()));
+    StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(box_kind_for_layout(element)));
 }
 
 static void set_replaced_content_input(StyleEngine& style_engine, StyleNodeID node, StyleEngineFFI::FfiReplacedContentInputKind kind, u8 present, u32 first, u32 second = 0, u32 third = 0, u32 fourth = 0)
@@ -1533,8 +1544,7 @@ static void record_element_initial_features(DOM::Element& element)
 
     if (!element.part_names().is_empty())
         record_element_parts_changed(element);
-    // NB: Asking the block itself does not build the views of its declarations.
-    if (auto const inline_style = element.inline_style(); inline_style && !inline_style->declaration_block().is_empty())
+    if (element.has_inline_style_declarations())
         record_element_inline_style_properties(element);
     if (element_has_presentational_hints_to_publish(element))
         StyleComputer::collect_presentational_hint_properties({ element });
@@ -1846,7 +1856,7 @@ void record_element_animation_effect_descriptions(DOM::Element& element, u8 slot
     versions.ensure_capacity(effects.size());
     for (auto const& effect : effects)
         versions.unchecked_append({ .identity = effect->animation_preparation_identity(), .generation = effect->animation_preparation_generation() });
-    if (StyleEngineFFI::style_engine_describes_animation_effects(style_engine->host(), element.style_node_id().value(), slot, versions.data(), versions.size()))
+    if (StyleEngineFFI::style_engine_describes_animation_effects(style_engine->host(), element.style_node_id().value(), slot, versions.span()))
         return;
 
     Vector<StyleEngineFFI::FfiPublishedAnimationEffect> ffi_effects;
@@ -2158,8 +2168,7 @@ static void record_element_inline_style_properties(DOM::Element& element)
     auto* style_engine = style_engine_for_published(element);
     if (!style_engine)
         return;
-    auto const inline_style = element.inline_style();
-    style_engine->set_element_inline_style_properties(element.style_node_id(), inline_style ? &inline_style->declaration_block() : nullptr);
+    style_engine->set_element_inline_style_properties(element.style_node_id(), element.inline_style_declarations());
 }
 
 // The hints an element's attributes map to, published at its arrival, wherever what they are mapped

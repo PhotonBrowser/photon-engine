@@ -22,7 +22,7 @@
 //! shapes while staying implementable without the full contour-offset
 //! algorithm.
 
-use libgfx_rust::path::{OwnedPath, PathBuilder};
+use libgfx_rust::path::Path;
 use libgfx_rust::{FloatPoint, FloatRect};
 
 /// Superellipse parameter for `corner-shape: round`.
@@ -83,18 +83,12 @@ fn superellipse_contains(u: f64, v: f64, n: f64) -> bool {
 /// Push the interior samples of one corner, walking `u` from `u_start` to
 /// `u_end` (one of which is 0.0 and the other 1.0) and mapping each `(u, v)`
 /// to device pixels with `map`.
-fn push_corner_samples(
-    builder: &mut PathBuilder,
-    n: f64,
-    u_start: f64,
-    u_end: f64,
-    map: impl Fn(f64, f64) -> (f32, f32),
-) {
+fn push_corner_samples(builder: &mut Path, n: f64, u_start: f64, u_end: f64, map: impl Fn(f64, f64) -> (f32, f32)) {
     for i in 1..SEGMENTS_PER_CORNER {
         let t = i as f64 / SEGMENTS_PER_CORNER as f64;
         let u = u_start + (u_end - u_start) * t;
         let (x, y) = map(u, superellipse_v(u, n));
-        builder.line_to(x, y);
+        builder.line_to(FloatPoint { x: x, y: y });
     }
 }
 
@@ -105,16 +99,16 @@ fn push_corner_samples(
 /// `square` shapes stay square; `notch` corners go through the inner center;
 /// every other corner is sampled as a superellipse. The path is closed and
 /// wound clockwise starting on the top edge.
-pub(crate) fn shaped_rect_path(rect: FloatRect, radii: [(f32, f32); 4], shapes: [f64; 4]) -> OwnedPath {
-    let mut builder = PathBuilder::new();
+pub(crate) fn shaped_rect_path(rect: FloatRect, radii: [(f32, f32); 4], shapes: [f64; 4]) -> Path {
+    let mut builder = Path::new();
     append_shaped_rect(&mut builder, rect, radii, shapes);
-    builder.build()
+    builder
 }
 
 /// Append a shaped rectangle subpath to `builder` (see [`shaped_rect_path`]).
 /// The subpath is closed; callers combining several subpaths (border rings)
 /// should fill the built path with [`WindingRule::EvenOdd`].
-pub(crate) fn append_shaped_rect(builder: &mut PathBuilder, rect: FloatRect, radii: [(f32, f32); 4], shapes: [f64; 4]) {
+pub(crate) fn append_shaped_rect(builder: &mut Path, rect: FloatRect, radii: [(f32, f32); 4], shapes: [f64; 4]) {
     let left = rect.x;
     let top = rect.y;
     let right = rect.x + rect.width;
@@ -124,8 +118,11 @@ pub(crate) fn append_shaped_rect(builder: &mut PathBuilder, rect: FloatRect, rad
     let [tl_shape, tr_shape, br_shape, bl_shape] = shapes;
 
     // Top edge.
-    builder.move_to(left + tl_h, top);
-    builder.line_to(right - tr_h, top);
+    builder.move_to(FloatPoint { x: left + tl_h, y: top });
+    builder.line_to(FloatPoint {
+        x: right - tr_h,
+        y: top,
+    });
     // Top-right: (1, 0) -> (0, 1).
     append_corner(
         builder,
@@ -139,7 +136,10 @@ pub(crate) fn append_shaped_rect(builder: &mut PathBuilder, rect: FloatRect, rad
         |u, v| (right - u as f32 * tr_h, top + v as f32 * tr_v),
     );
     // Right edge.
-    builder.line_to(right, bottom - br_v);
+    builder.line_to(FloatPoint {
+        x: right,
+        y: bottom - br_v,
+    });
     // Bottom-right: (0, 1) -> (1, 0).
     append_corner(
         builder,
@@ -153,7 +153,10 @@ pub(crate) fn append_shaped_rect(builder: &mut PathBuilder, rect: FloatRect, rad
         |u, v| (right - u as f32 * br_h, bottom - v as f32 * br_v),
     );
     // Bottom edge.
-    builder.line_to(left + bl_h, bottom);
+    builder.line_to(FloatPoint {
+        x: left + bl_h,
+        y: bottom,
+    });
     // Bottom-left: (1, 0) -> (0, 1).
     append_corner(
         builder,
@@ -167,7 +170,7 @@ pub(crate) fn append_shaped_rect(builder: &mut PathBuilder, rect: FloatRect, rad
         |u, v| (left + u as f32 * bl_h, bottom - v as f32 * bl_v),
     );
     // Left edge.
-    builder.line_to(left, top + tl_v);
+    builder.line_to(FloatPoint { x: left, y: top + tl_v });
     // Top-left: (0, 1) -> (1, 0).
     append_corner(
         builder,
@@ -188,7 +191,7 @@ pub(crate) fn append_shaped_rect(builder: &mut PathBuilder, rect: FloatRect, rad
 /// `center` is the inner corner used only by `notch`.
 #[allow(clippy::too_many_arguments)]
 fn append_corner(
-    builder: &mut PathBuilder,
+    builder: &mut Path,
     rx: f32,
     ry: f32,
     shape: f64,
@@ -199,25 +202,34 @@ fn append_corner(
     map: impl Fn(f64, f64) -> (f32, f32),
 ) {
     if rx <= 0.0 || ry <= 0.0 || is_square(shape) {
-        builder.line_to(end.0, end.1);
+        builder.line_to(FloatPoint { x: end.0, y: end.1 });
         return;
     }
     if is_notch(shape) {
-        builder.line_to(center.0, center.1);
-        builder.line_to(end.0, end.1);
+        builder.line_to(FloatPoint {
+            x: center.0,
+            y: center.1,
+        });
+        builder.line_to(FloatPoint { x: end.0, y: end.1 });
         return;
     }
     let n = exponent(shape);
     if !n.is_finite() || n <= 0.0 {
-        builder.line_to(end.0, end.1);
+        builder.line_to(FloatPoint { x: end.0, y: end.1 });
         return;
     }
     if is_round(shape) {
-        builder.elliptical_arc_to(end.0, end.1, rx, ry, 0.0, false, true);
+        builder.elliptical_arc_to(
+            FloatPoint { x: end.0, y: end.1 },
+            libgfx_rust::FloatSize { width: rx, height: ry },
+            0.0,
+            false,
+            true,
+        );
         return;
     }
     push_corner_samples(builder, n, u_start, u_end, map);
-    builder.line_to(end.0, end.1);
+    builder.line_to(FloatPoint { x: end.0, y: end.1 });
 }
 
 /// Whether `point` is inside the shaped rectangle `rect`.
