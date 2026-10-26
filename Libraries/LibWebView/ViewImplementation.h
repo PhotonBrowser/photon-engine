@@ -644,7 +644,7 @@ protected:
 
     virtual bool defer_backing_store_release(i32) { return false; }
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
-    void release_backing_store(i32 bitmap_id);
+    void release_backing_store(i32 bitmap_id, bool consumer_gpu_work_complete = false);
     static Gfx::IntRect rect_fitting_frame(Gfx::IntSize frame_size, Gfx::IntSize target_size);
 
     static constexpr auto ZOOM_STEP = 0.1;

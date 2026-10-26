@@ -638,7 +638,7 @@ Optional<WebContentPage::PresentedBackingStores> WebContentPage::take_presented_
     return backing_stores;
 }
 
-void WebContentPage::release_presented_bitmap(i32 bitmap_id)
+void WebContentPage::release_presented_bitmap(i32 bitmap_id, bool consumer_gpu_work_complete)
 {
     auto context_id = Web::compositor_context_id_for_page(m_id);
     if (!m_is_open || client().page_id_for_compositor_context_id(context_id) != m_id)
@@ -646,7 +646,7 @@ void WebContentPage::release_presented_bitmap(i32 bitmap_id)
 
     if (external_image_lease_trace_enabled())
         dbgln("[ExternalImageLease][WebContent] at_ns={} context={} bitmap_id={} backing_id={} generation=not-available frame_id=not-available state=RELEASE_SENT_TO_COMPOSITOR", MonotonicTime::now().nanoseconds(), context_id, bitmap_id, static_cast<u64>(bitmap_id) + 1);
-    Application::the().notify_compositor_presented_bitmap_ready_to_paint(context_id, bitmap_id);
+    Application::the().notify_compositor_presented_bitmap_ready_to_paint(context_id, bitmap_id, consumer_gpu_work_complete);
 }
 
 void WebContentPage::fail_renderer_owned_downloads()

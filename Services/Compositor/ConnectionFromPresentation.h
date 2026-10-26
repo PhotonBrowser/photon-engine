@@ -42,7 +42,7 @@ private:
     virtual void handle_and_dispatch_key_event(Web::CompositorContextId, Web::KeyEvent, bool allow_keyboard_scroll) override;
     virtual void handle_pinch_event(Web::CompositorContextId, Web::PinchEvent) override;
     virtual void handle_and_dispatch_mouse_event(Web::CompositorContextId, Web::MouseEvent) override;
-    virtual void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id) override;
+    virtual void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id, bool consumer_gpu_work_complete) override;
     virtual void set_client_gpu_presentation_capability(bool supported, u64 adapter_luid) override;
     virtual void set_scrollbar_track_press_jumps(bool jumps) override;
     virtual void set_scrolls_elastically(bool scrolls_elastically) override;

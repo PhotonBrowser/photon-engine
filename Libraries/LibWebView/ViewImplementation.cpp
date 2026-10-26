@@ -335,11 +335,11 @@ void ViewImplementation::did_respond_to_page_responsiveness_check(Badge<WebConte
     clear_page_responsiveness_check();
 }
 
-void ViewImplementation::release_backing_store(i32 bitmap_id)
+void ViewImplementation::release_backing_store(i32 bitmap_id, bool consumer_gpu_work_complete)
 {
     if (external_image_lease_trace_enabled())
         dbgln("[ExternalImageLease][View] at_ns={} backing_id={} bitmap_id={} generation=not-available frame_id=not-available state=RELEASE_SENT_TO_WEB_CONTENT", MonotonicTime::now().nanoseconds(), static_cast<u64>(bitmap_id) + 1, bitmap_id);
-    page().release_presented_bitmap(bitmap_id);
+    page().release_presented_bitmap(bitmap_id, consumer_gpu_work_complete);
 }
 
 void ViewImplementation::set_window_position(Gfx::IntPoint position)

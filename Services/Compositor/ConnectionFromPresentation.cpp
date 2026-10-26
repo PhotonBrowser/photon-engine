@@ -167,11 +167,11 @@ void ConnectionFromPresentation::handle_and_dispatch_mouse_event(Web::Compositor
     m_compositor_state->handle_and_dispatch_mouse_event(context_id, move(event));
 }
 
-void ConnectionFromPresentation::presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id)
+void ConnectionFromPresentation::presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id, bool consumer_gpu_work_complete)
 {
     if (!is_bound_to(context_id))
         return;
-    m_compositor_state->presented_bitmap_ready_to_paint(context_id, bitmap_id);
+    m_compositor_state->presented_bitmap_ready_to_paint(context_id, bitmap_id, consumer_gpu_work_complete);
 }
 
 void ConnectionFromPresentation::set_client_gpu_presentation_capability(bool supported, u64 adapter_luid)

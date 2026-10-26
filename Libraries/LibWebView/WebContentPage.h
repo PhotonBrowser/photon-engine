@@ -154,7 +154,7 @@ public:
         Vector<Gfx::SharedImage> backing_stores;
     };
     Optional<PresentedBackingStores> take_presented_backing_stores();
-    void release_presented_bitmap(i32 bitmap_id);
+    void release_presented_bitmap(i32 bitmap_id, bool consumer_gpu_work_complete = false);
     void fail_renderer_owned_downloads();
     void reset_session_history_for_testing();
 

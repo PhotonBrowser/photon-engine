@@ -499,7 +499,7 @@ public:
     // of 0 means unknown, which falls back to a timer at refresh_rate.
     void set_display_metadata(uint64_t display_id, double refresh_rate);
 #if defined(__APPLE__)
-    void release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id);
+    void release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id, bool consumer_gpu_work_complete);
     void set_native_metal_presentation(bool enabled);
 #endif
     void set_focus(bool);

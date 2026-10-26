@@ -6,7 +6,7 @@ endpoint CompositorPresentationServer
     handle_and_dispatch_key_event(Web::CompositorContextId context_id, Web::KeyEvent event, bool allow_keyboard_scroll) =|
     handle_pinch_event(Web::CompositorContextId context_id, Web::PinchEvent event) =|
     handle_and_dispatch_mouse_event(Web::CompositorContextId context_id, Web::MouseEvent event) =|
-    presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id) =|
+    presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id, bool consumer_gpu_work_complete) =|
     set_client_gpu_presentation_capability(bool supported, u64 adapter_luid) =|
     set_scrollbar_track_press_jumps(bool jumps) =|
     set_scrolls_elastically(bool scrolls_elastically) =|

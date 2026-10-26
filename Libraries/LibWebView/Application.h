@@ -280,7 +280,7 @@ public:
     bool handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&, bool allow_keyboard_scroll);
     void handle_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
     bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
-    void notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
+    void notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id, bool consumer_gpu_work_complete);
 
     Function<void()> on_compositor_process_death;
     // Called once a replacement RequestServer has reconnected every client.

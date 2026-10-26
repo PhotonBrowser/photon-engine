@@ -1505,17 +1505,12 @@ bool CompositorState::request_screenshot(Web::CompositorContextId context_id, Gf
     return true;
 }
 
-void CompositorState::presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id)
+void CompositorState::presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id, bool consumer_gpu_work_complete)
 {
     auto* context = context_if_present(context_id);
     if (!context)
         return;
 
-    bool consumer_gpu_work_complete = false;
-#ifdef AK_OS_MACOS
-    if (auto* presentation = presentation_for_context(context_id); presentation)
-        consumer_gpu_work_complete = m_presentations.get(presentation)->gpu_presentation_adapter_luid.has_value();
-#endif
     auto released = context->presenter().acknowledge_presented_bitmap(bitmap_id, consumer_gpu_work_complete);
     if (std::getenv("EXTERNAL_IMAGE_LEASE_TRACE"))
         dbgln("[ExternalImageLease][Pool] at_ns={} context={} bitmap_id={} backing_id={} generation={} frame_id=not-available event=release_ack_received released={}", MonotonicTime::now().nanoseconds(), context_id, bitmap_id, static_cast<u64>(bitmap_id) + 1, 0, released);
@@ -1559,7 +1554,7 @@ void CompositorState::deliver_rendered_frame(PendingAsyncPresent& pending_presen
     if (context->presents_to_client() && !presentation) {
         // Nobody shows the frame, so it is released here, on another turn, as a presentation would release it.
         Core::deferred_invoke([self = NonnullRefPtr { *this }, context_id, bitmap_id = pending_present.bitmap_id] {
-            self->presented_bitmap_ready_to_paint(context_id, bitmap_id);
+            self->presented_bitmap_ready_to_paint(context_id, bitmap_id, true);
         });
     } else if (context->presents_to_client()) {
         if (auto* log = Core::StatsLog::the(); log && context->page_id().has_value()) {

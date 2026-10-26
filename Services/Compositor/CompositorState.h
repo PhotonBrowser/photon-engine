@@ -145,7 +145,7 @@ public:
     // Asks for the next display tick the context's maximum rate lets through, for its render clock.
     void request_clock_tick(Web::CompositorContextId, double maximum_frames_per_second);
     bool request_screenshot(Web::CompositorContextId, Gfx::ShareableBitmap&);
-    void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
+    void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id, bool consumer_gpu_work_complete);
     void set_client_gpu_presentation_capability(CompositorStateClient&, bool supported, u64 adapter_luid);
     void set_scrollbar_track_press_jumps(CompositorStateClient&, bool jumps);
     void set_scrolls_elastically(CompositorStateClient&, bool scrolls_elastically);

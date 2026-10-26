@@ -1534,13 +1534,13 @@ bool Application::handle_and_dispatch_mouse_event_in_compositor(Web::CompositorC
     return true;
 }
 
-void Application::notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id)
+void Application::notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id, bool consumer_gpu_work_complete)
 {
     if (!can_send_compositor_process_ipc(m_compositor_presentation_client))
         return;
     VERIFY(m_compositor_presentation_client);
 
-    m_compositor_presentation_client->async_presented_bitmap_ready_to_paint(context_id, bitmap_id);
+    m_compositor_presentation_client->async_presented_bitmap_ready_to_paint(context_id, bitmap_id, consumer_gpu_work_complete);
 }
 
 void Application::crash_compositor_process()

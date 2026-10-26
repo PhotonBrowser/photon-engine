@@ -299,7 +299,7 @@ public:
     }
 
 #if defined(AK_OS_MACOS)
-    void release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id)
+    void release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id, bool consumer_gpu_work_complete)
     {
         auto it = m_native_leases.find(frame_id);
         VERIFY(it != m_native_leases.end());
@@ -308,6 +308,8 @@ public:
         auto backing = m_native_backing_to_bitmap.find(backing_id);
         VERIFY(backing != m_native_backing_to_bitmap.end());
         auto bitmap_id = backing->second;
+        if (!consumer_gpu_work_complete)
+            m_native_backing_requires_iosurface_release.emplace(bitmap_id);
         bool backing_still_leased = false;
         for (auto const& lease : m_native_leases) {
             if (lease.second.first == backing_id && lease.second.second == generation) {
@@ -319,10 +321,12 @@ public:
             dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} state=RELEASE_RECEIVED remaining_leases={} backing_still_leased={} deferred_release={}", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id, m_native_leases.size(), backing_still_leased, m_deferred_backing_releases.contains(bitmap_id));
         if (!backing_still_leased) {
             m_native_leased_backings.erase(bitmap_id);
+            bool previously_had_incomplete_consumer = m_native_backing_requires_iosurface_release.erase(bitmap_id) > 0;
+            bool all_consumer_gpu_work_complete = consumer_gpu_work_complete && !previously_had_incomplete_consumer;
             if (m_deferred_backing_releases.erase(bitmap_id) > 0) {
                 if (external_image_lease_trace_enabled())
                     dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} state=DEFERRED_RELEASE->ENGINE_BACKING_RELEASE", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id);
-                release_backing_store(bitmap_id);
+                release_backing_store(bitmap_id, all_consumer_gpu_work_complete);
             }
         }
     }
@@ -1169,6 +1173,7 @@ private:
     std::unordered_map<uint64_t, i32> m_native_backing_to_bitmap;
     std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> m_native_leases;
     std::unordered_set<i32> m_native_leased_backings;
+    std::unordered_set<i32> m_native_backing_requires_iosurface_release;
     std::unordered_set<i32> m_deferred_backing_releases;
     bool m_native_presentation_failed { false };
     bool m_native_metal_presentation { false };
@@ -1651,10 +1656,10 @@ void View::set_visible(bool visible)
     m_impl->view->set_visible(visible);
 }
 #if defined(AK_OS_MACOS)
-void View::release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id)
+void View::release_native_frame(uint64_t backing_id, uint64_t generation, uint64_t frame_id, bool consumer_gpu_work_complete)
 {
     VERIFY(m_impl && m_impl->view);
-    m_impl->view->release_native_frame(backing_id, generation, frame_id);
+    m_impl->view->release_native_frame(backing_id, generation, frame_id, consumer_gpu_work_complete);
 }
 
 void View::set_native_metal_presentation(bool enabled)
