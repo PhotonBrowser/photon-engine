@@ -132,6 +132,7 @@ fn command_can_be_reused_after_viewport_scroll(command_type: DisplayListCommandT
             | T::DrawEllipse
             | T::DrawLine
             | T::DrawRect
+            | T::PaintNestedDisplayList
     )
 }
 
@@ -231,6 +232,24 @@ pub unsafe extern "C" fn display_list_storage_can_reuse_after_viewport_scroll(
     true
 }
 
+/// # Safety
+///
+/// `storage` must be a live display-list storage handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn display_list_storage_contains_only_static_commands(storage: *const c_void) -> bool {
+    let storage = unsafe { storage_from_handle(storage) };
+    storage.command_runs().iter().all(|run| {
+        let records = &storage.bytes()[run.offset as usize..run.offset as usize + run.size as usize];
+        let mut safe = true;
+        for_each_command(records, |header, _, _| {
+            if !header.command_type.is_compositor_metadata() {
+                safe &= command_can_be_reused_after_viewport_scroll(header.command_type);
+            }
+        });
+        safe
+    })
+}
+
 #[cfg(test)]
 mod viewport_scroll_reuse_tests {
     use super::*;
@@ -282,8 +301,11 @@ mod viewport_scroll_reuse_tests {
         assert!(!command_can_be_reused_after_viewport_scroll(
             DisplayListCommandType::DrawVideoFrame
         ));
-        assert!(!command_can_be_reused_after_viewport_scroll(
+        assert!(command_can_be_reused_after_viewport_scroll(
             DisplayListCommandType::PaintNestedDisplayList
+        ));
+        assert!(!command_can_be_reused_after_viewport_scroll(
+            DisplayListCommandType::DrawCompositedContext
         ));
     }
 
@@ -345,6 +367,7 @@ mod viewport_scroll_reuse_tests {
         );
         let filtered = tree.append_effect(
             EffectNodeData::Effects(EffectsData {
+                isolation: false,
                 opacity: 1.0,
                 blend_mode: libgfx_rust::CompositingAndBlendingOperator::Normal,
                 filter: Some(std::sync::Arc::new(Vec::new())),

@@ -94,6 +94,11 @@ bool DisplayList::can_reuse_after_viewport_scroll(AccumulatedVisualContextTree c
     return RustFFI::display_list_storage_can_reuse_after_viewport_scroll(visual_context_tree.rust_handle(), m_storage, viewport_scroll_node);
 }
 
+bool DisplayList::contains_only_static_commands() const
+{
+    return RustFFI::display_list_storage_contains_only_static_commands(m_storage);
+}
+
 bool DisplayList::requires_direct_replay_without_nested_lists(AccumulatedVisualContextTree const& visual_context_tree) const
 {
     VERIFY(m_compatible_visual_context_tree_structural_epoch == visual_context_tree.structural_epoch());

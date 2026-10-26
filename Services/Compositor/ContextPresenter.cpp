@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashTable.h>
 #include <Compositor/CanvasSurfaceRegistry.h>
 #include <Compositor/ContextPresenter.h>
 #include <Compositor/ContextScene.h>
@@ -22,6 +23,30 @@
 #include <math.h>
 
 namespace Compositor {
+
+static bool nested_display_lists_are_static(
+    Compositing::DisplayList const& display_list,
+    Compositing::DisplayListResourceStorage const& resource_storage,
+    HashTable<u64>& visited_display_lists)
+{
+    for (auto id : display_list.referenced_resource_ids().display_lists) {
+        if (visited_display_lists.set(id) != HashSetResult::InsertedNewEntry)
+            continue;
+
+        Compositing::DisplayListResourceId display_list_id { id };
+        if (!resource_storage.has_display_list(display_list_id))
+            return false;
+
+        auto const& resource = resource_storage.display_list_resource(display_list_id);
+        if (resource.visual_context_tree.has_visual_animations()
+            || !resource.display_list->contains_only_static_commands()
+            || resource_storage.display_list_requires_direct_replay(display_list_id)
+            || !nested_display_lists_are_static(*resource.display_list, resource_storage, visited_display_lists))
+            return false;
+    }
+
+    return true;
+}
 
 static Gfx::FloatSize bounded_composited_raster_scale(Gfx::FloatSize scale, Gfx::IntSize viewport_size)
 {
@@ -520,7 +545,7 @@ Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::In
         || m_raster_scale != Gfx::FloatSize { 1, 1 } || m_raster_translation != Gfx::FloatPoint {})
         return {};
 
-    auto const& last_frame = *m_last_rasterized_frame;
+    auto& last_frame = *m_last_rasterized_frame;
     auto const& visual_context_tree = m_scene.visual_context_tree_for_compositing();
     if (last_frame.viewport_size != viewport_size || last_frame.raster_content_epoch != m_raster_content_epoch
         || last_frame.display_list->id() != m_scene.display_list()->id()
@@ -538,12 +563,24 @@ Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::In
     if (scroll_node_index.value() >= offsets_before_scroll.size() || scroll_node_index.value() >= offsets_after_scroll.size()
         || offsets_before_scroll.size() != offsets_after_scroll.size())
         return {};
+
+    if (!last_frame.scroll_blit_eligibility_node.has_value() || last_frame.scroll_blit_eligibility_node->value() != scroll_node_index.value()) {
+        last_frame.scroll_blit_eligibility_node = scroll_node_index;
+        last_frame.scroll_blit_is_safe = m_scene.display_list()->can_reuse_after_viewport_scroll(visual_context_tree, scroll_node_index);
+        if (last_frame.scroll_blit_is_safe) {
+            // A nested list is safe to carry with the viewport only when every nested resource is immutable for this raster.
+            // Live content, animated trees, and destination-reading blends must still repaint during scrolling.
+            HashTable<u64> visited_display_lists;
+            last_frame.scroll_blit_is_safe = nested_display_lists_are_static(*m_scene.display_list(), m_scene.resource_storage(), visited_display_lists);
+        }
+    }
+    if (!last_frame.scroll_blit_is_safe)
+        return {};
+
     for (size_t i = 0; i < offsets_before_scroll.size(); ++i) {
         if (i != scroll_node_index.value() && offsets_before_scroll[i] != offsets_after_scroll[i])
             return {};
     }
-    if (!m_scene.display_list()->can_reuse_after_viewport_scroll(visual_context_tree, scroll_node_index))
-        return {};
 
     auto const& previous_offset = offsets_before_scroll[scroll_node_index.value()];
     auto const& presented_offset = offsets_after_scroll[scroll_node_index.value()];
@@ -608,6 +645,20 @@ void ContextPresenter::shift_surface_for_scroll(Gfx::PaintingSurface& destinatio
 
 void ContextPresenter::remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot)
 {
+    auto const& visual_context_tree = m_scene.visual_context_tree_for_compositing();
+    Optional<Compositing::SpatialNodeIndex> scroll_blit_eligibility_node;
+    bool scroll_blit_is_safe = false;
+    if (m_last_rasterized_frame.has_value()) {
+        auto const& previous_frame = *m_last_rasterized_frame;
+        if (previous_frame.viewport_size == viewport_size
+            && previous_frame.raster_content_epoch == m_raster_content_epoch
+            && previous_frame.display_list->id() == m_scene.display_list()->id()
+            && previous_frame.visual_context_tree.structural_epoch() == visual_context_tree.structural_epoch()) {
+            scroll_blit_eligibility_node = previous_frame.scroll_blit_eligibility_node;
+            scroll_blit_is_safe = previous_frame.scroll_blit_is_safe;
+        }
+    }
+
     HashMap<Compositing::CanvasId, u64> canvas_content_generations;
     for (auto id : m_scene.display_list()->referenced_resource_ids().canvases) {
         Compositing::CanvasId canvas_id { id };
@@ -621,12 +672,14 @@ void ContextPresenter::remember_rasterized_frame(Gfx::IntSize viewport_size, Com
     }
     m_last_rasterized_frame = RasterizedFrame {
         .display_list = NonnullRefPtr { *m_scene.display_list() },
-        .visual_context_tree = m_scene.visual_context_tree_for_compositing(),
+        .visual_context_tree = visual_context_tree,
         .scroll_state_snapshot = presented_scroll_state_snapshot,
         .viewport_size = viewport_size,
         .canvas_content_generations = move(canvas_content_generations),
         .raster_content_epoch = m_raster_content_epoch,
         .video_frame_slots = move(video_frame_slots),
+        .scroll_blit_eligibility_node = scroll_blit_eligibility_node,
+        .scroll_blit_is_safe = scroll_blit_is_safe,
     };
 }
 

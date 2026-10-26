@@ -102,6 +102,7 @@ public:
     };
     ReferencedResourceIds referenced_resource_ids() const;
     bool can_reuse_after_viewport_scroll(AccumulatedVisualContextTree const&, SpatialNodeIndex) const;
+    bool contains_only_static_commands() const;
     // Whether reusing a raster of the list can produce different pixels than replaying it in place, leaving out the
     // display lists it nests.
     bool requires_direct_replay_without_nested_lists(AccumulatedVisualContextTree const&) const;

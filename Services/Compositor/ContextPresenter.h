@@ -155,6 +155,8 @@ private:
         HashMap<Compositing::CanvasId, u64> canvas_content_generations;
         u64 raster_content_epoch { 0 };
         HashMap<Compositing::VideoSinkResourceId, Optional<VideoFrameSlot>> video_frame_slots;
+        Optional<Compositing::SpatialNodeIndex> scroll_blit_eligibility_node;
+        bool scroll_blit_is_safe { false };
     };
 
     struct ScrollBlit {
