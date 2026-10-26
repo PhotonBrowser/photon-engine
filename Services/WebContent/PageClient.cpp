@@ -438,6 +438,7 @@ void PageClient::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color
 {
     m_preferred_color_scheme = color_scheme;
     page().invalidate_style_for_preference_change();
+    request_frame();
 }
 
 void PageClient::set_preferred_contrast(Web::CSS::PreferredContrast contrast)
