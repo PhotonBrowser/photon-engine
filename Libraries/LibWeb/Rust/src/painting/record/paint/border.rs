@@ -1741,67 +1741,43 @@ fn fill_shaped_ring(
     force_dark_role: ForceDarkRole,
     converter: &DevicePixelConverter,
 ) {
-    use crate::painting::corner_shapes::append_shaped_rect;
+    use crate::painting::corner_shape::{CornerShapes, Insets, append_border_contour_path};
     use libgfx_rust::path::Path;
 
     let [top_width, right_width, bottom_width, left_width] = edge_widths;
     if border_rect.is_empty() || edge_widths.iter().all(|width| *width <= 0) {
         return;
     }
-    let scale = converter.device_pixels_per_css_pixel();
-    let outer_rect = libgfx_rust::FloatRect::new(
-        border_rect.x as f32,
-        border_rect.y as f32,
-        border_rect.width as f32,
-        border_rect.height as f32,
-    );
-    let mut builder = Path::new();
-    append_shaped_rect(
-        &mut builder,
-        outer_rect,
-        border_radii.to_device_floats(converter),
-        border_radii.shapes,
-    );
+    let outer_rect = border_rect.to_float();
+    let mut path = Path::new();
+    let corners = border_radii.as_corners(converter);
+    let shapes = CornerShapes(border_radii.shapes);
+    append_border_contour_path(&mut path, outer_rect, corners, shapes, Insets::default());
+
     let inner_rect = border_rect.shrunken(top_width, right_width, bottom_width, left_width);
-    if !inner_rect.is_empty() {
-        // The inner radii pull in by the adjacent edge widths, matching how
-        // the elliptical ring derives its inner outline.
-        let to_css = |device: i32| CssPixels::nearest_value_for(device as f64 / scale);
-        let inner_radii_css = border_radii.shrunken(
-            to_css(top_width),
-            to_css(right_width),
-            to_css(bottom_width),
-            to_css(left_width),
-        );
-        append_shaped_rect(
-            &mut builder,
-            libgfx_rust::FloatRect::new(
-                inner_rect.x as f32,
-                inner_rect.y as f32,
-                inner_rect.width as f32,
-                inner_rect.height as f32,
-            ),
-            inner_radii_css.to_device_floats(converter),
-            border_radii.shapes,
-        );
-        let path = builder;
-        painter.fill_path(FillPathParams {
-            force_dark_role,
-            path: &path,
-            opacity: 1.0,
-            paint_style_or_color: PaintStyleOrColor::Color(color),
-            winding_rule: WindingRule::EvenOdd,
-            should_anti_alias: ShouldAntiAlias::Yes,
-        });
+    let fill_rule = if inner_rect.is_empty() {
+        WindingRule::Nonzero
     } else {
-        let path = builder;
-        painter.fill_path(FillPathParams {
-            force_dark_role,
-            path: &path,
-            opacity: 1.0,
-            paint_style_or_color: PaintStyleOrColor::Color(color),
-            winding_rule: WindingRule::Nonzero,
-            should_anti_alias: ShouldAntiAlias::Yes,
-        });
-    }
+        append_border_contour_path(
+            &mut path,
+            outer_rect,
+            corners,
+            shapes,
+            Insets {
+                top: f64::from(top_width),
+                right: f64::from(right_width),
+                bottom: f64::from(bottom_width),
+                left: f64::from(left_width),
+            },
+        );
+        WindingRule::EvenOdd
+    };
+    painter.fill_path(FillPathParams {
+        force_dark_role,
+        path: &path,
+        opacity: 1.0,
+        paint_style_or_color: PaintStyleOrColor::Color(color),
+        winding_rule: fill_rule,
+        should_anti_alias: ShouldAntiAlias::Yes,
+    });
 }

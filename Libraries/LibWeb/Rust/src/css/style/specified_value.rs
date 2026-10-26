@@ -155,18 +155,17 @@ mod tests {
     }
     #[test]
     fn authored_spelling_keeps_an_existing_identity_when_canonical_id_differs() {
-        let mut memory = MemoryController::new();
         let mut values = SpecifiedValues::new();
         let canonical = std::sync::Arc::new(StyleValueData::Number { value: 42.0 });
         let previous_authored = std::sync::Arc::new(StyleValueData::Number { value: 43.0 });
         let authored = std::sync::Arc::new(StyleValueData::Number { value: 43.0 });
 
-        let (canonical_id, _) = unsafe { values.intern(std::sync::Arc::as_ptr(&canonical), &mut memory) };
-        let (authored_id, _) = unsafe { values.intern(std::sync::Arc::as_ptr(&previous_authored), &mut memory) };
+        let (canonical_id, _) = values.intern(&canonical);
+        let (authored_id, _) = values.intern(&previous_authored);
 
-        unsafe { values.alias(std::sync::Arc::as_ptr(&authored), canonical_id, &mut memory) };
+        values.alias(&authored, canonical_id);
 
         assert_ne!(authored_id, canonical_id);
-        assert!(matches!(values.lookup(&authored), Lookup::Known(id) if id == authored_id));
+        assert_eq!(values.lookup(&authored), Some(authored_id));
     }
 }

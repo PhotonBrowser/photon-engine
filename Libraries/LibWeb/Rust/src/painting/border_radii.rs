@@ -7,7 +7,7 @@
 use crate::css::computed_value_views::LengthPercentageRef;
 use crate::css::css_pixels::{CssPixelFraction, CssPixels};
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect};
-use crate::painting::corner_shapes;
+use crate::painting::corner_shape::{self, CornerShapes, Insets};
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use libgfx_rust::{CornerRadii, CornerRadius, FloatRect};
 
@@ -102,7 +102,7 @@ impl BorderRadii {
 
     /// Whether every corner with a radius uses the elliptical `round` shape.
     pub fn is_all_round(&self) -> bool {
-        corner_shapes::all_round(&self.shapes)
+        self.shapes.iter().all(|shape| *shape == 1.0)
     }
 
     /// Whether any corner with a radius uses a non-`round` shape and therefore
@@ -121,24 +121,10 @@ impl BorderRadii {
         present
             .into_iter()
             .enumerate()
-            .any(|(corner, is_present)| is_present && !corner_shapes::is_round(self.shapes[corner]))
+            .any(|(corner, is_present)| is_present && self.shapes[corner] != 1.0)
     }
 
-    /// Device-pixel `(horizontal, vertical)` pairs in TL, TR, BR, BL order,
-    /// without the integer flooring that [`Self::as_corners`] applies.
-    pub fn to_device_floats(&self, converter: &DevicePixelConverter) -> [(f32, f32); 4] {
-        let scale = converter.device_pixels_per_css_pixel() as f32;
-        let pair = |index: usize| {
-            (
-                self.values[index].to_float() * scale,
-                self.values[index + 1].to_float() * scale,
-            )
-        };
-        [pair(0), pair(2), pair(4), pair(6)]
-    }
-
-    /// A superellipse path for `rect` (device pixels), or `None` when every
-    /// corner is `round` and the caller should use the elliptical fast path.
+    /// A shaped contour for `rect`, or `None` when every corner is round.
     pub fn shaped_path(
         &self,
         rect: libgfx_rust::IntRect,
@@ -147,10 +133,11 @@ impl BorderRadii {
         if !self.has_shaped_corners() {
             return None;
         }
-        Some(corner_shapes::shaped_rect_path(
-            FloatRect::new(rect.x as f32, rect.y as f32, rect.width as f32, rect.height as f32),
-            self.to_device_floats(converter),
-            self.shapes,
+        Some(corner_shape::border_contour_path(
+            rect.to_float(),
+            self.as_corners(converter),
+            CornerShapes(self.shapes),
+            Insets::default(),
         ))
     }
 
@@ -219,25 +206,36 @@ impl BorderRadii {
             return true;
         }
         if self.has_shaped_corners() {
-            // Hit testing runs in CSS pixels; reuse the device-pixel shape
-            // test with a 1:1 scale so superellipse corners clip correctly.
-            let device_rect = libgfx_rust::FloatRect::new(
-                rect.x.to_float(),
-                rect.y.to_float(),
-                rect.width.to_float(),
-                rect.height.to_float(),
+            // CSS pixels use 1/64 units. Build the contour in raw units to retain radius precision.
+            let to_raw_units = |value: CssPixels| value.raw_value() as f32;
+            let path = corner_shape::border_contour_path(
+                FloatRect::new(0.0, 0.0, to_raw_units(rect.width), to_raw_units(rect.height)),
+                CornerRadii {
+                    top_left: CornerRadius {
+                        horizontal_radius: self.values[0].raw_value(),
+                        vertical_radius: self.values[1].raw_value(),
+                    },
+                    top_right: CornerRadius {
+                        horizontal_radius: self.values[2].raw_value(),
+                        vertical_radius: self.values[3].raw_value(),
+                    },
+                    bottom_right: CornerRadius {
+                        horizontal_radius: self.values[4].raw_value(),
+                        vertical_radius: self.values[5].raw_value(),
+                    },
+                    bottom_left: CornerRadius {
+                        horizontal_radius: self.values[6].raw_value(),
+                        vertical_radius: self.values[7].raw_value(),
+                    },
+                },
+                CornerShapes(self.shapes),
+                Insets::default(),
             );
-            let device_point = libgfx_rust::FloatPoint {
-                x: point.x.to_float(),
-                y: point.y.to_float(),
-            };
-            let radii = [
-                (self.values[0].to_float(), self.values[1].to_float()),
-                (self.values[2].to_float(), self.values[3].to_float()),
-                (self.values[4].to_float(), self.values[5].to_float()),
-                (self.values[6].to_float(), self.values[7].to_float()),
-            ];
-            return corner_shapes::shaped_rect_contains(device_point, device_rect, radii, self.shapes);
+            return path.contains(
+                to_raw_units(point.x - rect.x),
+                to_raw_units(point.y - rect.y),
+                libgfx_rust::WindingRule::Nonzero,
+            );
         }
         let outside_ellipse =
             |horizontal: CssPixels, vertical: CssPixels, center_x: CssPixels, center_y: CssPixels| -> bool {
