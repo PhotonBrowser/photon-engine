@@ -123,8 +123,7 @@ struct CompositorFrameProfile {
             "unsafe_display_list",
             "inner_scroll_changed",
             "non_finite_offset",
-            "fractional_offset",
-            "zero_offset",
+            "used_fractional_offset",
             "exceeds_viewport",
         };
         for (size_t i = 0; i < scroll_blit_statuses.size(); ++i) {

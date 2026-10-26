@@ -76,12 +76,17 @@ ContextPresenter::ContextPresenter(ContextScene& scene, OwnedCanvasSurfaces canv
 
 ContextPresenter::~ContextPresenter()
 {
+    reset_scroll_blit_base();
+    if (m_scroll_blit_base_timer)
+        m_scroll_blit_base_timer->on_timeout = {};
     stop_backing_store_shrink_timer();
     stop_surplus_backing_store_retirement_timer();
 }
 
 void ContextPresenter::set_viewport_size(Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
+    if (m_viewport_size != viewport_size || m_device_pixel_ratio != device_pixel_ratio)
+        reset_scroll_blit_base();
     m_viewport_size = viewport_size;
     m_device_pixel_ratio = device_pixel_ratio;
     m_window_resize_in_progress = window_resize_in_progress;
@@ -152,6 +157,7 @@ Optional<BackingStoreManager::Publication> ContextPresenter::resize_backing_stor
         auto scale = bounded_composited_raster_scale(m_unbounded_raster_scale_of_embedding, m_viewport_size);
         if (m_raster_scale != scale) {
             m_raster_scale = scale;
+            reset_scroll_blit_base();
             m_latest_rendered_surface = nullptr;
             m_last_rasterized_frame.clear();
         }
@@ -160,6 +166,7 @@ Optional<BackingStoreManager::Publication> ContextPresenter::resize_backing_stor
     auto allocation = m_backing_store_manager.resize_backing_stores_if_needed(raster_size(), m_window_resize_in_progress, should_publish, client_samples_on_gpu);
     if (!allocation.has_value())
         return {};
+    reset_scroll_blit_base();
     m_latest_rendered_surface = nullptr;
     m_last_rasterized_frame.clear();
     return m_backing_store_manager.allocate_backing_stores(*allocation, skia_backend_context, should_publish, gpu_sharing);
@@ -167,6 +174,7 @@ Optional<BackingStoreManager::Publication> ContextPresenter::resize_backing_stor
 
 void ContextPresenter::invalidate_backing_stores()
 {
+    reset_scroll_blit_base();
     m_backing_store_manager.invalidate();
 }
 
@@ -237,6 +245,7 @@ bool ContextPresenter::update_composited_raster_transform(Gfx::FloatRect destina
         return false;
     m_raster_scale = scale;
     m_raster_translation = translation;
+    reset_scroll_blit_base();
     m_latest_rendered_surface = nullptr;
     m_last_rasterized_frame.clear();
     return true;
@@ -338,6 +347,10 @@ Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& d
     Optional<ScrollBlit> scroll_blit;
     auto scroll_blit_status = PreparedFrame::ScrollBlitStatus::NotAttempted;
     auto damage_rect = frame_damage_for(pending_frame, content, &scroll_blit, &scroll_blit_status);
+    auto refresh_scroll_blit_base_after_frame = scroll_blit.has_value()
+        && !pending_frame.forced_damage_rect.intersected(Gfx::IntRect { {}, pending_frame.viewport_rect.size() }).is_empty();
+    if (!scroll_blit.has_value())
+        reset_scroll_blit_base();
     // NB: A changed content rect must still reach the client even if the pixels are identical.
     if (damage_rect.is_empty() && m_presented_frame == pending_frame.viewport_rect) {
         remember_rasterized_frame(pending_frame.viewport_rect.size(), content.presented_scroll_state_snapshot);
@@ -350,12 +363,14 @@ Optional<PreparedFrame> ContextPresenter::prepare_frame(DisplayListPlayerSkia& d
     }
     auto& back_store = render_target->surface;
     if (scroll_blit.has_value()) {
-        VERIFY(m_latest_rendered_surface);
-        shift_surface_for_scroll(back_store, *m_latest_rendered_surface, scroll_blit->translation);
+        VERIFY(m_scroll_blit_base_surface);
+        shift_surface_for_scroll(back_store, *m_scroll_blit_base_surface, scroll_blit->translation);
         render_target->damage_rect = raster_damage_rect(damage_rect);
     }
     paint_current_display_list(display_list_player, back_store, content, render_target->damage_rect);
     remember_rasterized_frame(pending_frame.viewport_rect.size(), content.presented_scroll_state_snapshot);
+    if (refresh_scroll_blit_base_after_frame)
+        reset_scroll_blit_base();
 
     return PreparedFrame {
         .rendered_surface = &back_store,
@@ -387,17 +402,23 @@ bool ContextPresenter::present_synchronously(DisplayListPlayerSkia& display_list
 
     Optional<ScrollBlit> scroll_blit;
     auto damage_rect = frame_damage_for(*pending_frame, frame_content, &scroll_blit);
+    auto refresh_scroll_blit_base_after_frame = scroll_blit.has_value()
+        && !pending_frame->forced_damage_rect.intersected(Gfx::IntRect { {}, pending_frame->viewport_rect.size() }).is_empty();
+    if (!scroll_blit.has_value())
+        reset_scroll_blit_base();
     auto render_target = m_backing_store_manager.acquire_render_target(raster_damage_rect(damage_rect));
     if (!render_target.has_value())
         return false;
     auto& back_store = render_target->surface;
     if (scroll_blit.has_value()) {
-        VERIFY(m_latest_rendered_surface);
-        shift_surface_for_scroll(back_store, *m_latest_rendered_surface, scroll_blit->translation);
+        VERIFY(m_scroll_blit_base_surface);
+        shift_surface_for_scroll(back_store, *m_scroll_blit_base_surface, scroll_blit->translation);
         render_target->damage_rect = raster_damage_rect(damage_rect);
     }
     paint_current_display_list(display_list_player, back_store, frame_content, render_target->damage_rect);
     remember_rasterized_frame(pending_frame->viewport_rect.size(), frame_content.presented_scroll_state_snapshot);
+    if (refresh_scroll_blit_base_after_frame)
+        reset_scroll_blit_base();
     display_list_player.flush(back_store);
     m_backing_store_manager.complete_rendering(render_target->bitmap_id, false);
     m_latest_rendered_surface = m_backing_store_manager.latest_rendered_surface();
@@ -573,6 +594,12 @@ Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::In
         status = Status::FrameChanged;
         return {};
     }
+    if (m_scroll_blit_base_surface
+        && (m_scroll_blit_base_surface->size() != viewport_size
+            || m_scroll_blit_base_display_list_id != m_scene.display_list()->id()
+            || m_scroll_blit_base_raster_content_epoch != m_raster_content_epoch
+            || m_scroll_blit_base_structural_epoch != visual_context_tree.structural_epoch()))
+        reset_scroll_blit_base();
 
     auto index = frame_content.viewport_scroll_node_index;
     if (!index.has_value()) {
@@ -580,7 +607,10 @@ Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::In
         return {};
     }
     auto scroll_node_index = *index;
-    auto offsets_before_scroll = last_frame.scroll_state_snapshot.device_offsets();
+    auto const* scroll_state_before_scroll = m_scroll_blit_base_scroll_state_snapshot.has_value()
+        ? &*m_scroll_blit_base_scroll_state_snapshot
+        : &last_frame.scroll_state_snapshot;
+    auto offsets_before_scroll = scroll_state_before_scroll->device_offsets();
     auto offsets_after_scroll = frame_content.presented_scroll_state_snapshot.device_offsets();
     if (scroll_node_index.value() >= offsets_before_scroll.size() || scroll_node_index.value() >= offsets_after_scroll.size()
         || offsets_before_scroll.size() != offsets_after_scroll.size()) {
@@ -618,50 +648,70 @@ Optional<ContextPresenter::ScrollBlit> ContextPresenter::scroll_blit_for(Gfx::In
         status = Status::NonFiniteOffset;
         return {};
     }
-    auto rounded_shift_x = roundf(shift_x);
-    auto rounded_shift_y = roundf(shift_y);
-    if (fabsf(shift_x - rounded_shift_x) > 0.001f || fabsf(shift_y - rounded_shift_y) > 0.001f) {
-        status = Status::FractionalOffset;
-        return {};
-    }
-    if (rounded_shift_x == 0 && rounded_shift_y == 0) {
-        status = Status::ZeroOffset;
-        return {};
-    }
-    if (fabsf(rounded_shift_x) >= viewport_size.width() || fabsf(rounded_shift_y) >= viewport_size.height()) {
+    if (fabsf(shift_x) >= viewport_size.width() || fabsf(shift_y) >= viewport_size.height()) {
         status = Status::ExceedsViewport;
         return {};
     }
 
-    Gfx::IntPoint translation { static_cast<int>(rounded_shift_x), static_cast<int>(rounded_shift_y) };
+    auto fractional_shift = fabsf(shift_x - roundf(shift_x)) > 0.001f || fabsf(shift_y - roundf(shift_y)) > 0.001f;
+    Gfx::FloatPoint translation { shift_x, shift_y };
     Gfx::IntRect exposed_damage;
+    auto exposed_width = static_cast<int>(ceilf(fabsf(translation.x())));
+    auto exposed_height = static_cast<int>(ceilf(fabsf(translation.y())));
     if (translation.x() > 0)
-        exposed_damage.unite({ 0, 0, translation.x(), viewport_size.height() });
+        exposed_damage.unite({ 0, 0, exposed_width, viewport_size.height() });
     else if (translation.x() < 0)
-        exposed_damage.unite({ viewport_size.width() + translation.x(), 0, -translation.x(), viewport_size.height() });
+        exposed_damage.unite({ viewport_size.width() - exposed_width, 0, exposed_width, viewport_size.height() });
     if (translation.y() > 0)
-        exposed_damage.unite({ 0, 0, viewport_size.width(), translation.y() });
+        exposed_damage.unite({ 0, 0, viewport_size.width(), exposed_height });
     else if (translation.y() < 0)
-        exposed_damage.unite({ 0, viewport_size.height() + translation.y(), viewport_size.width(), -translation.y() });
+        exposed_damage.unite({ 0, viewport_size.height() - exposed_height, viewport_size.width(), exposed_height });
+    if (translation.x() == 0 && translation.y() == 0)
+        exposed_damage = { {}, viewport_size };
 
     for (auto const& scrollbar : frame_content.scrollbar_controller.scrollbars()) {
         if (!scrollbar.is_painted_by_compositor)
             continue;
-        if (last_frame.scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index) == frame_content.presented_scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index))
+        if (scroll_state_before_scroll->device_offset_for_index(scrollbar.scroll_node_index) == frame_content.presented_scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index))
             continue;
         exposed_damage.unite(scrollbar.gutter_rect.united(scrollbar.expanded_gutter_rect));
     }
     exposed_damage.intersect({ {}, viewport_size });
-    status = Status::Used;
+
+    if (!m_scroll_blit_base_surface) {
+        // Keep one private source for the gesture. Sampling the preceding output each tick would compound blur.
+        m_scroll_blit_base_surface = Gfx::PaintingSurface::create_with_size(
+            viewport_size,
+            Gfx::BitmapFormat::BGRA8888,
+            Gfx::AlphaType::Premultiplied,
+            m_latest_rendered_surface->skia_backend_context());
+        auto source_image = m_latest_rendered_surface->sk_image_snapshot<sk_sp<SkImage>>();
+        VERIFY(source_image);
+        SkPaint paint;
+        paint.setBlendMode(SkBlendMode::kSrc);
+        m_scroll_blit_base_surface->canvas().drawImageRect(
+            source_image.get(),
+            SkRect::MakeIWH(viewport_size.width(), viewport_size.height()),
+            SkRect::MakeIWH(viewport_size.width(), viewport_size.height()),
+            SkSamplingOptions {},
+            &paint,
+            SkCanvas::kStrict_SrcRectConstraint);
+        m_scroll_blit_base_scroll_state_snapshot = last_frame.scroll_state_snapshot;
+        m_scroll_blit_base_display_list_id = m_scene.display_list()->id();
+        m_scroll_blit_base_raster_content_epoch = m_raster_content_epoch;
+        m_scroll_blit_base_structural_epoch = visual_context_tree.structural_epoch();
+    }
+    schedule_scroll_blit_base_expiry();
+    status = fractional_shift ? Status::UsedFractionalOffset : Status::Used;
     return ScrollBlit { translation, exposed_damage };
 }
 
-void ContextPresenter::shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::IntPoint translation)
+void ContextPresenter::shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::FloatPoint translation)
 {
     VERIFY(&destination != &source);
     VERIFY(destination.size() == source.size());
-    // The latest surface is only published after its flush completion, so snapshotting it here does not need another
-    // flush, which would read back the full Vulkan surface on CPU-shareable paths.
+    // This private base surface is immutable for the gesture, so snapshotting it avoids reading back the published
+    // surface on CPU-shareable paths.
     auto image = source.sk_image_snapshot<sk_sp<SkImage>>();
     VERIFY(image);
 
@@ -674,10 +724,36 @@ void ContextPresenter::shift_surface_for_scroll(Gfx::PaintingSurface& destinatio
         image.get(),
         SkRect::MakeIWH(source.size().width(), source.size().height()),
         SkRect::MakeXYWH(translation.x(), translation.y(), source.size().width(), source.size().height()),
-        SkSamplingOptions {},
+        SkSamplingOptions { SkFilterMode::kLinear },
         &paint,
         SkCanvas::kStrict_SrcRectConstraint);
     canvas.restoreToCount(save_count);
+}
+
+void ContextPresenter::reset_scroll_blit_base()
+{
+    if (m_scroll_blit_base_timer)
+        m_scroll_blit_base_timer->stop();
+    m_scroll_blit_base_surface = nullptr;
+    m_scroll_blit_base_scroll_state_snapshot.clear();
+    m_scroll_blit_base_display_list_id = 0;
+    m_scroll_blit_base_raster_content_epoch = 0;
+    m_scroll_blit_base_structural_epoch = 0;
+}
+
+void ContextPresenter::schedule_scroll_blit_base_expiry()
+{
+    if (!m_scroll_blit_base_timer) {
+        // Keep the source through short gaps in wheel and momentum events, then release its viewport-sized texture.
+        m_scroll_blit_base_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(250), [this] {
+            m_scroll_blit_base_surface = nullptr;
+            m_scroll_blit_base_scroll_state_snapshot.clear();
+            m_scroll_blit_base_display_list_id = 0;
+            m_scroll_blit_base_raster_content_epoch = 0;
+            m_scroll_blit_base_structural_epoch = 0;
+        });
+    }
+    m_scroll_blit_base_timer->restart();
 }
 
 void ContextPresenter::remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot)

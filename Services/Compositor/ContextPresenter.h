@@ -28,6 +28,7 @@
 #include <LibCompositing/Types.h>
 #include <LibCompositing/UIOverlays.h>
 #include <LibCore/Forward.h>
+#include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibGfx/Size.h>
@@ -69,8 +70,7 @@ struct PreparedFrame {
         UnsafeDisplayList,
         InnerScrollChanged,
         NonFiniteOffset,
-        FractionalOffset,
-        ZeroOffset,
+        UsedFractionalOffset,
         ExceedsViewport,
         Count,
     } scroll_blit_status { ScrollBlitStatus::NotAttempted };
@@ -177,7 +177,7 @@ private:
     };
 
     struct ScrollBlit {
-        Gfx::IntPoint translation;
+        Gfx::FloatPoint translation;
         Gfx::IntRect exposed_damage;
     };
 
@@ -193,7 +193,9 @@ private:
     Gfx::IntRect frame_damage_for(PendingFrame const&, FrameContent const&, Optional<ScrollBlit>* = nullptr, PreparedFrame::ScrollBlitStatus* = nullptr);
     Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const&, Optional<ScrollBlit>*, PreparedFrame::ScrollBlitStatus*);
     Optional<ScrollBlit> scroll_blit_for(Gfx::IntSize viewport_size, FrameContent const&, PreparedFrame::ScrollBlitStatus&);
-    void shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::IntPoint translation);
+    void shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::FloatPoint translation);
+    void reset_scroll_blit_base();
+    void schedule_scroll_blit_base_expiry();
     void remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot);
     Optional<VideoFrameSlot> current_video_frame_slot(Compositing::VideoSinkResourceId);
     void stop_backing_store_shrink_timer();
@@ -212,7 +214,12 @@ private:
     BackingStoreManager m_backing_store_manager;
     RefPtr<Gfx::PaintingSurface> m_latest_rendered_surface;
     RefPtr<Gfx::PaintingSurface> m_damage_surface;
+    RefPtr<Gfx::PaintingSurface> m_scroll_blit_base_surface;
     Optional<RasterizedFrame> m_last_rasterized_frame;
+    Optional<Compositing::ScrollStateSnapshot> m_scroll_blit_base_scroll_state_snapshot;
+    u64 m_scroll_blit_base_display_list_id { 0 };
+    u64 m_scroll_blit_base_raster_content_epoch { 0 };
+    u64 m_scroll_blit_base_structural_epoch { 0 };
     Gfx::FloatSize m_unbounded_raster_scale_of_embedding { 1, 1 };
     Gfx::FloatSize m_raster_scale { 1, 1 };
     Gfx::FloatPoint m_raster_translation;
@@ -220,6 +227,7 @@ private:
     u64 m_raster_content_epoch { 0 };
     RefPtr<Core::Timer> m_backing_store_shrink_timer;
     RefPtr<Core::Timer> m_surplus_backing_store_retirement_timer;
+    RefPtr<Core::Timer> m_scroll_blit_base_timer;
 
     Optional<PendingFrame> m_pending_present_frame;
     bool m_pending_present_frame_scheduled { false };
