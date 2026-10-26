@@ -850,12 +850,23 @@ void ContextPresenter::paint_current_display_list(DisplayListPlayerSkia& display
         paint_display_list(*m_damage_surface);
         damage_canvas.restore();
 
-        // Submit the independent damage surface before snapshotting it into the backing store. Ganesh can otherwise
-        // leave the snapshot's texture proxy uninstantiated when the destination surface is flushed. Keep this
-        // asynchronous: the destination work is submitted to the same GPU queue afterward, so queue ordering keeps
-        // the snapshot ready without stalling the compositor thread on GPU completion.
-        display_list_player.flush_async(*m_damage_surface, [] {});
-        auto image = m_damage_surface->sk_image_snapshot<sk_sp<SkImage>>();
+        sk_sp<SkImage> image;
+#ifdef SK_GRAPHITE
+        auto damage_context = m_damage_surface->skia_backend_context();
+        if (damage_context && damage_context->graphite_context()) {
+            // Graphite snapshots copy the scratch texture. Keep the copy and destination draw in the same
+            // recording so the reusable damage surface can be modified by the next frame without a CPU wait.
+            image = m_damage_surface->sk_image_snapshot<sk_sp<SkImage>>();
+        }
+#endif
+        if (!image) {
+            // Ganesh can leave a snapshot's texture proxy uninstantiated when the destination surface is flushed.
+            // Submit the damage surface asynchronously first; queue ordering keeps it ready without blocking the
+            // compositor thread on GPU completion.
+            display_list_player.flush_async(*m_damage_surface, [] {});
+            image = m_damage_surface->sk_image_snapshot<sk_sp<SkImage>>();
+        }
+        VERIFY(image);
         SkPaint paint;
         paint.setBlendMode(SkBlendMode::kSrc);
         surface.canvas().drawImageRect(

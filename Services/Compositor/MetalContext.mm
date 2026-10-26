@@ -134,6 +134,15 @@ public:
         VERIFY(m_presentation_event_registered);
         return m_next_presentation_signal_value.fetch_add(1, std::memory_order_relaxed);
     }
+    void signal_presentation_value(uint64_t value) override
+    {
+        VERIFY(m_presentation_event_registered);
+        @autoreleasepool {
+            id<MTLCommandBuffer> command_buffer = [m_queue commandBuffer];
+            [command_buffer encodeSignalEvent:m_presentation_event value:value];
+            [command_buffer commit];
+        }
+    }
     void* create_presentation_signal_semaphore(uint64_t value) override
     {
         VERIFY(m_presentation_event_registered);

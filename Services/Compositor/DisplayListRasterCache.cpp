@@ -29,6 +29,9 @@
 #include <core/SkYUVAPixmaps.h>
 #include <gpu/ganesh/GrDirectContext.h>
 #include <gpu/ganesh/SkImageGanesh.h>
+#ifdef SK_GRAPHITE
+#    include <gpu/graphite/Image.h>
+#endif
 
 namespace Compositor {
 
@@ -166,6 +169,14 @@ void DisplayListRasterCache::evict(DisplayListResourceSet const& removed_resourc
 static sk_sp<SkImage> create_skia_image(Gfx::DecodedImageFrame const& frame, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
 {
     auto raster_image = Gfx::sk_image_from_bitmap(frame.bitmap(), frame.color_space());
+#ifdef SK_GRAPHITE
+    auto* graphite_recorder = skia_backend_context ? skia_backend_context->graphite_recorder() : nullptr;
+    if (graphite_recorder) {
+        auto texture_image = SkImages::TextureFromImage(graphite_recorder, raster_image.get());
+        if (texture_image)
+            return texture_image;
+    }
+#endif
     auto* gr_context = skia_backend_context ? skia_backend_context->sk_context() : nullptr;
     if (!gr_context)
         return raster_image;

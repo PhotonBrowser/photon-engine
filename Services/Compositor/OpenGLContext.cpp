@@ -199,6 +199,11 @@ OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia
     bool use_cpu_painting_surface = true;
 #    elif defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
     bool use_cpu_painting_surface = !skia_backend_context;
+#        if defined(AK_OS_MACOS) && defined(SK_GRAPHITE)
+    // Graphite's Metal import API does not expose a bottom-left texture origin for WebGL buffers.
+    // Keep WebGL correct through the CPU bridge until Graphite supports that import contract.
+    use_cpu_painting_surface |= skia_backend_context && skia_backend_context->graphite_context();
+#        endif
 #    elif defined(AK_OS_WINDOWS)
     // FIXME: Share the drawing buffer with Skia's Direct3D 12 device (via an NT shared handle opened on ANGLE's
     //        Direct3D 11 device) instead of reading it back to the CPU every frame.

@@ -22,6 +22,9 @@
 #include <core/SkYUVAPixmaps.h>
 #include <gpu/ganesh/GrDirectContext.h>
 #include <gpu/ganesh/SkImageGanesh.h>
+#ifdef SK_GRAPHITE
+#    include <gpu/graphite/Image.h>
+#endif
 
 namespace Compositor {
 
@@ -230,6 +233,9 @@ sk_sp<SkImage> sk_image_from_video_frame(Media::VideoFrame const& frame, RefPtr<
 {
     sk_sp<SkImage> image;
     auto* gr_context = skia_backend_context ? skia_backend_context->sk_context() : nullptr;
+#ifdef SK_GRAPHITE
+    auto* graphite_recorder = skia_backend_context ? skia_backend_context->graphite_recorder() : nullptr;
+#endif
     auto surface = frame.surface();
 
     if (surface != nullptr && skia_backend_context)
@@ -241,13 +247,25 @@ sk_sp<SkImage> sk_image_from_video_frame(Media::VideoFrame const& frame, RefPtr<
 
     auto color_space = color_space_of(frame);
 
-    if (!image && gr_context && yuv_data.has_value()) {
-        image = SkImages::TextureFromYUVAPixmaps(
-            gr_context,
-            make_yuva_pixmaps(*yuv_data),
-            skgpu::Mipmapped::kNo,
-            false,
-            Gfx::to_skia_color_space(color_space));
+    if (!image && yuv_data.has_value()) {
+#ifdef SK_GRAPHITE
+        if (graphite_recorder) {
+            image = SkImages::TextureFromYUVAPixmaps(
+                graphite_recorder,
+                make_yuva_pixmaps(*yuv_data),
+                {},
+                false,
+                Gfx::to_skia_color_space(color_space));
+        }
+#endif
+        if (!image && gr_context) {
+            image = SkImages::TextureFromYUVAPixmaps(
+                gr_context,
+                make_yuva_pixmaps(*yuv_data),
+                skgpu::Mipmapped::kNo,
+                false,
+                Gfx::to_skia_color_space(color_space));
+        }
     }
 
     if (!image) {
@@ -258,7 +276,11 @@ sk_sp<SkImage> sk_image_from_video_frame(Media::VideoFrame const& frame, RefPtr<
             return nullptr;
         }
         auto raster_image = Gfx::sk_image_adopting_bitmap(bitmap_or_error.release_value(), color_space);
-        if (gr_context)
+#ifdef SK_GRAPHITE
+        if (graphite_recorder)
+            image = SkImages::TextureFromImage(graphite_recorder, raster_image.get());
+#endif
+        if (!image && gr_context)
             image = SkImages::TextureFromImage(gr_context, raster_image.get(), skgpu::Mipmapped::kNo, skgpu::Budgeted::kYes);
         if (!image)
             image = move(raster_image);

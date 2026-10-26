@@ -46,6 +46,7 @@ public:
     // the Photon scene consumer through its persistent XPC presentation channel.
     virtual bool presentation_event_registered() const = 0;
     virtual uint64_t next_presentation_signal_value() = 0;
+    virtual void signal_presentation_value(uint64_t value) = 0;
     virtual void* create_presentation_signal_semaphore(uint64_t value) = 0;
     virtual void destroy_presentation_signal_semaphore(void*) = 0;
     virtual uint64_t device_registry_id() const = 0;

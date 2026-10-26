@@ -22,6 +22,10 @@
 
 #ifdef AK_OS_MACOS
 #    include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
+#    ifdef SK_GRAPHITE
+#        include <gpu/graphite/Surface.h>
+#        include <gpu/graphite/mtl/MtlGraphiteTypes_cpp.h>
+#    endif
 #elif defined(USE_VULKAN_DMABUF_IMAGES)
 #    include <LibGfx/VulkanImage.h>
 #    include <gpu/ganesh/vk/GrVkBackendSurface.h>
@@ -149,7 +153,14 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_with_size(IntSize size, B
         // NB: Dynamic MSAA lets Skia render complex antialiased paths on the GPU instead of
         //     rasterizing coverage masks on the CPU and uploading them as textures.
         SkSurfaceProps surface_properties { SkSurfaceProps::kDynamicMSAA_Flag, kUnknown_SkPixelGeometry };
+#ifdef SK_GRAPHITE
+        auto* graphite_recorder = context->graphite_recorder();
+        auto surface = graphite_recorder
+            ? SkSurfaces::RenderTarget(graphite_recorder, image_info, skgpu::Mipmapped::kNo, &surface_properties)
+            : SkSurfaces::RenderTarget(context->sk_context(), skgpu::Budgeted::kNo, image_info, 0, &surface_properties);
+#else
         auto surface = SkSurfaces::RenderTarget(context->sk_context(), skgpu::Budgeted::kNo, image_info, 0, &surface_properties);
+#endif
         if (surface)
             return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
         dbgln("Unable to create GPU surface for size {}x{}, falling back to CPU", size.width(), size.height());
@@ -179,6 +190,19 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_shared_image_buffer(
     auto metal_texture = context->metal_context().create_texture_from_iosurface(iosurface_handle, MetalTextureFormat::BGRA8, 0);
     IntSize const size { metal_texture->width(), metal_texture->height() };
     auto image_info = SkImageInfo::Make(size.width(), size.height(), kBGRA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
+#ifdef SK_GRAPHITE
+    if (auto* graphite_recorder = context->graphite_recorder()) {
+        // Graphite's Metal backend imports textures with a top-left origin. WebGL's bottom-left
+        // IOSurfaces use the existing CPU bridge while this prototype is active.
+        VERIFY(origin == Origin::TopLeft);
+        auto backend_texture = skgpu::graphite::BackendTextures::MakeMetal(
+            SkISize::Make(metal_texture->width(), metal_texture->height()),
+            static_cast<CFTypeRef>(metal_texture->texture()));
+        auto surface = SkSurfaces::WrapBackendTexture(graphite_recorder, backend_texture, SkColorSpace::MakeSRGB(), nullptr);
+        VERIFY(surface);
+        return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr, true, true)));
+    }
+#endif
     GrMtlTextureInfo mtl_info;
     mtl_info.fTexture = sk_ret_cfp(metal_texture->texture());
     auto backend_render_target = GrBackendRenderTargets::MakeMtl(metal_texture->width(), metal_texture->height(), mtl_info);
