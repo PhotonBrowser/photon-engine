@@ -199,9 +199,8 @@ private:
 
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions& content) override
     {
-        // The per-WebContent HTTP memory cache retains complete response bodies and JavaScript bytecode without a
-        // size limit. Photon keeps the persistent profile cache in RequestServer, so avoid unbounded per-page copies.
-        content.enable_http_memory_cache = EnableMemoryHTTPCache::No;
+        // Reuse fresh responses and JavaScript bytecode during history traversals, matching the desktop default.
+        content.enable_http_memory_cache = EnableMemoryHTTPCache::Yes;
 
         // Viewport scrollbars are painted into the page's shared GPU surface.
         content.paint_viewport_scrollbars = PaintViewportScrollbars::Yes;
