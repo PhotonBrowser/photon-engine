@@ -263,6 +263,7 @@ public:
     }
 
     void set_preferred_color_scheme(Web::CSS::PreferredColorScheme);
+    void set_preferred_color_scheme_from_application(Web::CSS::PreferredColorScheme);
     void set_preferred_contrast(Web::CSS::PreferredContrast);
     void set_preferred_motion(Web::CSS::PreferredMotion);
     // A page created to host documents of the tab in another process takes the preferences the view's page has.
@@ -639,6 +640,7 @@ protected:
     void start_page_responsiveness_check();
     void clear_page_responsiveness_check();
     void update_page_unresponsive_state();
+    void update_preferred_color_scheme(Web::CSS::PreferredColorScheme);
 
     virtual Web::Clipboard::SystemClipboardItem clipboard_item() const;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
@@ -966,6 +968,7 @@ protected:
     Gfx::Color m_page_background_color { 255, 255, 255 };
     Gfx::Color m_system_canvas_background_color { 255, 255, 255 };
     Web::CSS::PreferredColorScheme m_preferred_color_scheme { Web::CSS::PreferredColorScheme::Auto };
+    bool m_preferred_color_scheme_is_explicit { false };
     // The geometry of the window the view sits in, as the UI last reported it. Every page the tab comes to be
     // hosted by is told it, so a page created after the window was last resized or moved answers outerWidth,
     // outerHeight, screenX and screenY like the pages before it.

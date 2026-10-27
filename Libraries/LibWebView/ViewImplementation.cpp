@@ -1483,6 +1483,19 @@ void ViewImplementation::restart_unresponsive_page()
 
 void ViewImplementation::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)
 {
+    m_preferred_color_scheme_is_explicit = true;
+    update_preferred_color_scheme(color_scheme);
+}
+
+void ViewImplementation::set_preferred_color_scheme_from_application(Web::CSS::PreferredColorScheme color_scheme)
+{
+    if (m_preferred_color_scheme_is_explicit)
+        return;
+    update_preferred_color_scheme(color_scheme);
+}
+
+void ViewImplementation::update_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)
+{
     m_preferred_color_scheme = color_scheme;
     set_page_background_color(preferred_canvas_background_color());
 

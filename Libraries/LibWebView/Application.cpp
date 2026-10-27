@@ -2710,7 +2710,7 @@ void Application::initialize_actions()
             m_color_scheme = color_scheme;
 
             ViewImplementation::for_each_view([&](ViewImplementation& view) {
-                view.set_preferred_color_scheme(m_color_scheme);
+                view.set_preferred_color_scheme_from_application(m_color_scheme);
                 return IterationDecision::Continue;
             });
         };
@@ -2969,7 +2969,7 @@ bool Application::blocks_pop_ups() const
 // The options every page hosting the tab's document runs with.
 void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementation& view, WebContentPage& page)
 {
-    view.set_preferred_color_scheme(m_color_scheme);
+    view.set_preferred_color_scheme_from_application(m_color_scheme);
     view.set_preferred_contrast(m_contrast);
     auto preferred_motion = m_motion;
     if (preferred_motion == Web::CSS::PreferredMotion::Auto)

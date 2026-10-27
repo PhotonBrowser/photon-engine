@@ -54,6 +54,7 @@
 #include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
+#include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/PreloadEntry.h>
@@ -128,12 +129,22 @@ static void append_preferred_color_scheme_client_hint(Infrastructure::Request& r
         return;
 
     auto& headers = *request.header_list();
-    if (headers.contains("Sec-CH-Prefers-Color-Scheme"sv) || !request.client())
+    if (headers.contains("Sec-CH-Prefers-Color-Scheme"sv))
         return;
 
-    auto const* window = HTML::window_from_global_object(request.client()->global_object());
-    if (!window)
+    auto* window = request.client() ? HTML::window_from_global_object(request.client()->global_object()) : nullptr;
+    if (!window && request.reserved_client()) {
+        auto browsing_context = request.target_browsing_context();
+        if (browsing_context) {
+            if (auto* document = browsing_context->active_document()) {
+                if (auto active_window = document->window())
+                    window = active_window.ptr();
+            }
+        }
+    }
+    if (!window) {
         return;
+    }
 
     auto color_scheme = window->associated_document().page().preferred_color_scheme();
     auto value = color_scheme == CSS::PreferredColorScheme::Dark ? "\"dark\""sv : "\"light\""sv;
