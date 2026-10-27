@@ -11,6 +11,8 @@
 
 #include <AK/Base64.h>
 #include <AK/Debug.h>
+#include <AK/HashTable.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/ScopeGuard.h>
 #include <AK/kmalloc.h>
 #include <LibGC/Heap.h>
@@ -77,6 +79,7 @@
 #include <LibWeb/UpgradeInsecureRequests/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOrUtils.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Fetch/Infrastructure/DataURL.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
 #include <LibWebCommon/Fetch/Infrastructure/URL.h>
@@ -90,6 +93,52 @@ static bool g_http_memory_cache_enabled = false;
 // In test mode, RequestServer's disk cache stores only the responses to requests that ask for it with a header, which a
 // page cannot add to a navigation request. Tests can have every navigation request ask for it.
 static bool g_disk_cache_enabled_for_navigations_for_testing = false;
+
+// High-entropy color preferences are sent only to HTTPS origins that opted in with Accept-CH.
+static HashTable<URL::Origin>& origins_accepting_preferred_color_scheme_client_hint()
+{
+    static NeverDestroyed<HashTable<URL::Origin>> origins;
+    return origins.get();
+}
+
+static void update_preferred_color_scheme_client_hint_opt_in(URL::URL const& url, HTTP::HeaderList const& headers)
+{
+    if (url.scheme() != "https"sv)
+        return;
+
+    auto accept_ch_values = headers.extract_header_list_values("Accept-CH"sv);
+    auto* accepted_hints = accept_ch_values.get_pointer<Vector<ByteString>>();
+    if (!accepted_hints)
+        return;
+
+    bool accepts_preferred_color_scheme = any_of(*accepted_hints, [](auto const& hint) {
+        return hint.equals_ignoring_ascii_case("Sec-CH-Prefers-Color-Scheme"sv);
+    });
+    if (accepts_preferred_color_scheme)
+        origins_accepting_preferred_color_scheme_client_hint().set(url.origin());
+    else
+        origins_accepting_preferred_color_scheme_client_hint().remove(url.origin());
+}
+
+static void append_preferred_color_scheme_client_hint(Infrastructure::Request& request)
+{
+    auto const& url = request.current_url();
+    if (url.scheme() != "https"sv
+        || !origins_accepting_preferred_color_scheme_client_hint().contains(url.origin()))
+        return;
+
+    auto& headers = *request.header_list();
+    if (headers.contains("Sec-CH-Prefers-Color-Scheme"sv) || !request.client())
+        return;
+
+    auto const* window = HTML::window_from_global_object(request.client()->global_object());
+    if (!window)
+        return;
+
+    auto color_scheme = window->associated_document().page().preferred_color_scheme();
+    auto value = color_scheme == CSS::PreferredColorScheme::Dark ? "\"dark\""sv : "\"light\""sv;
+    headers.append({ "Sec-CH-Prefers-Color-Scheme"sv, value });
+}
 
 #define TRY_OR_IGNORE(expression)                                                                    \
     ({                                                                                               \
@@ -2539,6 +2588,8 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
             return;
         }
 
+        update_preferred_color_scheme_client_hint_opt_in(request->current_url(), response_headers);
+
         // AD-HOC: From here on, the response's body delivery is scheduled against the event loop (see
         //         BodyStreamPullSource::on_wake()); record that, for consume_a_preloaded_resource().
         fetch_params.controller()->set_response_arrived();
@@ -3092,6 +3143,8 @@ void append_user_agent_client_hints_for_request(Infrastructure::Request& request
 {
     if (SecureContexts::is_url_potentially_trustworthy(request.current_url()) != SecureContexts::Trustworthiness::PotentiallyTrustworthy)
         return;
+
+    append_preferred_color_scheme_client_hint(request);
 
     auto user_agent = request.header_list()->get("User-Agent"sv);
     if (!user_agent.has_value())
