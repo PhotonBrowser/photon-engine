@@ -487,6 +487,7 @@ scalar_accessors! {
         white_space_collapse: u8 => white_space_collapse,
         text_wrap_mode: u8 => text_wrap_mode,
         word_break: u8 => word_break,
+        line_break: u8 => line_break,
         letter_spacing: CssPixels => letter_spacing,
         word_spacing: CssPixels => word_spacing,
         text_indent_each_line: bool => text_indent.each_line,
@@ -740,6 +741,12 @@ impl<'a> ComputedValuesView<'a> {
     #[inline]
     fn inherited_box(self) -> &'a InheritedBoxValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_BOX)
+    }
+
+    /// https://drafts.csswg.org/css-viewport/#effective-zoom
+    #[inline]
+    pub(crate) fn effective_zoom(self) -> f32 {
+        self.inherited_box().effective_zoom()
     }
 
     #[inline]

@@ -69,6 +69,9 @@ pub struct InheritedBoxValues {
     pub content_visibility: u8,
     pub image_rendering: u8,
     pub text_orientation: u8,
+    /// https://drafts.csswg.org/css-viewport/#effective-zoom
+    /// The bits of the effective zoom, as an `f32`.
+    pub effective_zoom_bits: u32,
 }
 
 impl ComputedStyleValueHandle {
@@ -335,6 +338,7 @@ impl_content_hash_by_field!(InheritedBoxValues {
     content_visibility,
     image_rendering,
     text_orientation,
+    effective_zoom_bits,
 });
 // The anchor-inset wrappers are pure derivatives of the anchor-inset fields, so payload equality
 // excludes them and the hash follows it field for field.
@@ -654,6 +658,7 @@ impl_computed_payload_clone_and_eq!(InheritedTextValues {
     white_space_collapse,
     text_wrap_mode,
     word_break,
+    line_break,
     tab_size_is_number,
     letter_spacing,
     word_spacing,
@@ -1076,6 +1081,7 @@ impl_computed_payload_clone_and_eq!(GridValues {
     grid_column_end_style_value,
     grid_row_start_style_value,
     grid_row_end_style_value,
+    fit_tolerance_style_value,
 });
 
 macro_rules! impl_retained_grid_list {
@@ -1188,6 +1194,7 @@ impl GridValues {
             grid_column_end_style_value: ComputedStyleValueHandle::empty(),
             grid_row_start_style_value: ComputedStyleValueHandle::empty(),
             grid_row_end_style_value: ComputedStyleValueHandle::empty(),
+            fit_tolerance_style_value: ComputedStyleValueHandle::empty(),
         }
     }
 
@@ -2279,6 +2286,7 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             TAB_SIZE => RequireInitialValue,
             WHITE_SPACE_COLLAPSE @ white_space_collapse => EnumKeyword(enums::keyword_to_white_space_collapse),
             WORD_BREAK @ word_break => EnumKeyword(enums::keyword_to_word_break),
+            LINE_BREAK @ line_break => EnumKeyword(enums::keyword_to_line_break),
             OVERFLOW_WRAP @ overflow_wrap => EnumKeyword(enums::keyword_to_overflow_wrap),
             BLOCK_ELLIPSIS @ block_ellipsis => RetainedData,
             WORD_SPACING @ word_spacing => CssPixels,
@@ -2807,6 +2815,7 @@ pub(crate) fn build_inherited_box_group(
     content_visibility: &RetainedStyleValueData,
     image_rendering: &RetainedStyleValueData,
     text_orientation: &RetainedStyleValueData,
+    effective_zoom: f32,
     parent: Option<GroupPayloadRef<'_>>,
 ) -> *const c_void {
     use crate::css::style_value::StyleValueData;
@@ -2827,6 +2836,7 @@ pub(crate) fn build_inherited_box_group(
         ),
         image_rendering: keyword_code(image_rendering, crate::css::style_compute::keyword_to_image_rendering),
         text_orientation: keyword_code(text_orientation, crate::css::style_compute::keyword_to_text_orientation),
+        effective_zoom_bits: effective_zoom.to_bits(),
     };
 
     share_or_publish_group_payload::<InheritedBoxValues>(group_index, built, parent)
@@ -3433,6 +3443,7 @@ impl InheritedTextValues {
             white_space_collapse: enum_value(css_enums::keyword_to_white_space_collapse(css_enums::keyword::COLLAPSE)),
             text_wrap_mode: enum_value(css_enums::keyword_to_text_wrap_mode(css_enums::keyword::WRAP)),
             word_break: enum_value(css_enums::keyword_to_word_break(css_enums::keyword::NORMAL)),
+            line_break: enum_value(css_enums::keyword_to_line_break(css_enums::keyword::AUTO)),
             tab_size_is_number: true,
             letter_spacing: CssPixels::default(),
             word_spacing: CssPixels::default(),
@@ -4229,7 +4240,13 @@ impl InheritedBoxValues {
             content_visibility: content_visibility::VISIBLE,
             image_rendering: image_rendering::AUTO,
             text_orientation: text_orientation::MIXED,
+            effective_zoom_bits: 1.0f32.to_bits(),
         }
+    }
+
+    /// https://drafts.csswg.org/css-viewport/#effective-zoom
+    pub(crate) fn effective_zoom(&self) -> f32 {
+        f32::from_bits(self.effective_zoom_bits)
     }
 }
 

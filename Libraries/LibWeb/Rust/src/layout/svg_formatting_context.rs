@@ -168,12 +168,18 @@ pub struct FfiSvgLengthValue {
 
 /// The sizes a container-relative length on an element resolves against, as style answers them
 /// for that element: per axis, the committed content box of its nearest size query container, or
-/// the small viewport size.
+/// the small viewport size. Style writes nothing while it answers: it says which containers the
+/// lengths depend on, by style node or 0 for the viewport, and whether a container has no committed
+/// box yet, so the document must evaluate its container queries after layout.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiContainerLengthBases {
     pub width: f64,
     pub height: f64,
+    pub width_query_container: u32,
+    pub height_query_container: u32,
+    pub width_query_container_awaits_layout: bool,
+    pub height_query_container_awaits_layout: bool,
 }
 
 pub const SVG_LENGTH_KIND_NONE: u8 = 0;
@@ -1954,7 +1960,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         // An embedded SVG viewport's outer size does not depend on its descendants. Measuring it
         // only needs the root sizing above; shapes, text, and foreignObject content wait for layout.
-        if self.run.purpose.is_measurement() && kind == NodeKind::SVGSVGBox && !facts.is_document_element {
+        if self.run.fragments.is_none() && kind == NodeKind::SVGSVGBox && !facts.is_document_element {
             return;
         }
 
@@ -2049,8 +2055,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             |view_box| CssPixels::nearest_value_for(view_box.height),
         );
         self.viewport_is_committed_viewport = kind == NodeKind::SVGSVGBox
-            && self.run.purpose == formatting_context::LayoutPurpose::Commit
-            && self.run.layout_mode == LayoutMode::Normal
+            && self.run.fragments.is_some()
             && crate::painting::paint_read::GeometryRead::with_committed_fragment_link(
                 self.run.callbacks.arena(),
                 self.run.box_,
@@ -2108,15 +2113,7 @@ impl<'pass> SvgFormattingContext<'pass> {
                 sizing: RootSizingDirectives::default(),
                 participation: ParticipationInParentFormattingContext::Item,
             };
-            match formatting_context::layout_inside_child(
-                run,
-                None,
-                None,
-                child,
-                self.run.layout_mode,
-                child_input,
-                true,
-            ) {
+            match formatting_context::layout_inside_child(run, None, None, child, child_input, true) {
                 ChildLayoutOutcome::Created(_) => {}
                 ChildLayoutOutcome::Skipped | ChildLayoutOutcome::ReenterCurrent => {
                     panic!("SVG foreign object did not create an independent formatting context")
@@ -2565,9 +2562,10 @@ fn length_resolution_context(
             .dom_node_style_node(node)
             .expect("an SVG element's attribute length is resolved for the element's own box");
         let bases = callbacks.container_length_bases.bases(element);
-        if bases.is_none() {
-            callbacks.arena().note_unresolved_container_lengths(node);
-        }
+        callbacks.scratch().note_host_findings(|findings| match &bases {
+            Some(bases) => findings.note_container_length_dependencies(element, bases),
+            None => findings.note_unresolved_container_lengths(node),
+        });
         bases
     } else {
         None
@@ -2590,6 +2588,7 @@ fn length_resolution_context(
         container_height_basis_depends_on_viewport_metrics: false,
         subject_inline_axis_is_horizontal: style.writing_mode() == writing_mode::HORIZONTAL_TB,
         resolved_viewport_relative_length: std::ptr::null_mut(),
+        zoom: 1.0,
     }
 }
 

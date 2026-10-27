@@ -47,14 +47,12 @@ pub(super) fn layout_replaced_with_children(
     wrapper_state.set_content_inline_size(content_inline_size);
 
     let wrapper_result = formatting_context::run_formatting_context(
-        run.purpose,
         run.fragments.as_deref(),
         wrapper_state,
         wrapper,
         run.callbacks.in_flow_containing_block(wrapper),
         None,
         formatting_context::FormattingContextType::Block,
-        run.layout_mode,
         run.should_collect_devtools_layout_data,
         run.callbacks,
         geometry::LayoutInput {

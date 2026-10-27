@@ -199,6 +199,7 @@ set(SOURCES
     CSS/StyleInvalidation.cpp
     CSS/StyleProperty.cpp
     CSS/StylePropertyMapReadOnly.cpp
+    CSS/Zoom.cpp
     CSS/StylePropertyMap.cpp
     CSS/StyleScope.cpp
     CSS/StyleSheet.cpp
@@ -976,16 +977,7 @@ set(SOURCES
     WebLocks/LockManager.cpp
     WebLocks/LockRequest.cpp
     WebLocks/NavigatorLocks.cpp
-    WebAssembly/Builtins.cpp
-    WebAssembly/Exception.cpp
-    WebAssembly/Global.cpp
-    WebAssembly/Instance.cpp
-    WebAssembly/Memory.cpp
-    WebAssembly/Module.cpp
-    WebAssembly/Table.cpp
-    WebAssembly/Tag.cpp
     WebAssembly/WebAssembly.cpp
-    WebAssembly/WebAssemblyModule.cpp
     WebAudio/AnalyserNode.cpp
     WebAudio/AudioParamMap.cpp
     WebAudio/AudioWorklet.cpp
@@ -1133,7 +1125,7 @@ target_sources(LibWeb PRIVATE $<TARGET_OBJECTS:LibJSObjects>)
 target_compile_definitions(LibWeb PRIVATE LibJS_EXPORTS)
 target_link_libraries(LibWeb PUBLIC LibCompositing LibWebCommon LibJSHeaders)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibWasm LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibXml2::LibXml2)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile
@@ -1179,9 +1171,6 @@ sync_rust_crate_ffi_headers(
 )
 add_dependencies(LibWeb libweb_rust-ffi-headers)
 target_link_libraries(libweb_bindings_rust INTERFACE LibGfx LibGC LibUnicode)
-# The JavaScript tools link the LibJS runtime from this archive. It calls into LibGC and LibUnicode, so those must come
-# after the archive on the link line.
-target_link_libraries(libweb_bindings_rust_archive INTERFACE LibGC LibUnicode)
 test_rust_crate(MANIFEST_PATH Bindings/Rust/Cargo.toml CRATE_NAME libweb_bindings_rust)
 test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)
 

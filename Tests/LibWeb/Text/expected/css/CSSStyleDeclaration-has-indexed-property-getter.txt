@@ -48,6 +48,7 @@ All properties associated with getComputedStyle(document.body):
     "image-rendering",
     "interpolate-size",
     "letter-spacing",
+    "line-break",
     "line-height",
     "list-style-image",
     "list-style-position",
@@ -212,6 +213,7 @@ All properties associated with getComputedStyle(document.body):
     "display",
     "field-sizing",
     "filter",
+    "fit-tolerance",
     "flex-basis",
     "flex-direction",
     "flex-grow",
@@ -383,7 +385,8 @@ All properties associated with getComputedStyle(document.body):
     "will-change",
     "x",
     "y",
-    "z-index"
+    "z-index",
+    "zoom"
 ]
 All properties associated with document.body.style by default:
 []

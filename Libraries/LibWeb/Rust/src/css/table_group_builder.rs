@@ -673,6 +673,7 @@ fn build_grid_group(values: &EffectiveValues, parent: Option<GroupPayloadRef<'_>
         grid_column_end_style_value: retained_slot(property_id::GRID_COLUMN_END),
         grid_row_start_style_value: retained_slot(property_id::GRID_ROW_START),
         grid_row_end_style_value: retained_slot(property_id::GRID_ROW_END),
+        fit_tolerance_style_value: retained_slot(property_id::FIT_TOLERANCE),
     };
     rust_build_grid_group(group_index::GRID, built, parent)
 }
@@ -3367,6 +3368,7 @@ pub(crate) fn rebuild_group_from_table_and_overlay(
             values.handle(property_id::CONTENT_VISIBILITY),
             values.handle(property_id::IMAGE_RENDERING),
             values.handle(property_id::TEXT_ORIENTATION),
+            table.effective_zoom(),
             parent,
         ),
         group_index::SIZING => build_sizing_group(
@@ -3451,6 +3453,7 @@ pub(crate) unsafe fn build_group_payloads_from_table(
                     values.handle(property_id::CONTENT_VISIBILITY),
                     values.handle(property_id::IMAGE_RENDERING),
                     values.handle(property_id::TEXT_ORIENTATION),
+                    table.effective_zoom(),
                     parent,
                 ),
                 group_index::SIZING => build_sizing_group(

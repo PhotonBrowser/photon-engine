@@ -698,15 +698,28 @@ pub(crate) fn compute(
                 && !context.inline_boxes_continued_in_next_fragment.borrow().contains(&node);
             let has_low_edge = if reversed { last } else { first };
             let has_high_edge = if reversed { first } else { last };
-            let content_block_start = line
-                .first_direct_fragment_block_start
-                .or(line.fallback_block_start_from_contributions)
-                .unwrap_or_default();
-            let content_block_length = if line.first_direct_fragment_block_start.is_some() {
-                line.max_direct_fragment_block_length
-            } else {
-                context.style(node).line_height()
-            };
+            let (inline_box_baseline, inline_box_vertical_shift) = inline_box_anchor();
+            // https://www.w3.org/TR/CSS22/visudet.html#inline-non-replaced
+            // The height of the content area should be based on the font, but this specification does not specify how.
+            let (content_block_start, content_block_length) =
+                if let Some(block_start) = line.first_direct_fragment_block_start {
+                    (block_start, line.max_direct_fragment_block_length)
+                } else {
+                    let style = context.style(node);
+                    let height = line_builder::normal_line_height(style);
+                    let baseline = line_builder::LineBuilder::baseline_for_style(style, height);
+                    // NB: Line-relative alignment and atomic-only descendants can leave this box without a
+                    //     recorded baseline. In that case, retain the position of its aligned contributions.
+                    let block_start = if context.line_data().line_boxes[line.line_index]
+                        .inline_box_baseline(node)
+                        .is_some()
+                    {
+                        inline_box_baseline - baseline
+                    } else {
+                        line.fallback_block_start_from_contributions.unwrap_or_default()
+                    };
+                    (block_start, height)
+                };
             let border_inline_start = contributions_inline_start
                 - if has_low_edge {
                     border_padding_low
@@ -721,7 +734,6 @@ pub(crate) fn compute(
                 };
             let border_block_start = content_block_start - border_padding_block_low;
             let border_block_length = content_block_length + border_padding_block_low + border_padding_block_high;
-            let (inline_box_baseline, inline_box_vertical_shift) = inline_box_anchor();
             let rect = FfiCssPixelRect {
                 x: border_inline_start,
                 y: border_block_start,
@@ -957,14 +969,12 @@ impl FragmentainerLineLimit {
 pub(crate) struct InlineFormattingContext<'context> {
     pub(crate) run: &'context FormattingContextRun<'context>,
     pub(crate) containing_block: Node,
-    pub(crate) layout_mode: LayoutMode,
     pub(crate) input: LayoutInput,
     pub(crate) callbacks: LayoutPass<'context>,
     pub(crate) parent: &'context block_formatting_context::BlockFormattingContext<'context>,
     pub(crate) containing_used_values: &'context UsedValues,
     pub(crate) fragmented_inlines_in_pre_order: Vec<Node>,
     pub(crate) automatic_content_inline_size: CssPixels,
-    pub(crate) min_content_inline_size_from_max_content_layout: Option<CssPixels>,
     pub(crate) automatic_content_block_size: CssPixels,
     pub(crate) current_line_start: Cell<fragmentation::LinePosition>,
     inline_boxes_continued_from_previous_fragment: Vec<Node>,
@@ -976,7 +986,6 @@ impl<'context> InlineFormattingContext<'context> {
     pub(crate) fn new_with_rust_parent(
         run: &'context FormattingContextRun<'context>,
         containing_block: Node,
-        layout_mode: LayoutMode,
         input: LayoutInput,
         callbacks: LayoutPass<'context>,
         parent: &'context block_formatting_context::BlockFormattingContext<'context>,
@@ -986,14 +995,12 @@ impl<'context> InlineFormattingContext<'context> {
         Self {
             run,
             containing_block,
-            layout_mode,
             input,
             callbacks,
             parent,
             containing_used_values,
             fragmented_inlines_in_pre_order: Vec::new(),
             automatic_content_inline_size: CssPixels::default(),
-            min_content_inline_size_from_max_content_layout: None,
             automatic_content_block_size: CssPixels::default(),
             current_line_start: Cell::new(fragmentation::LinePosition::default()),
             inline_boxes_continued_from_previous_fragment: Vec::new(),
@@ -1008,13 +1015,6 @@ impl<'context> InlineFormattingContext<'context> {
 
     pub(crate) fn set_block_axis_float_clearance(&self, clearance: CssPixels) {
         self.block_axis_float_clearance.set(clearance);
-    }
-
-    fn forget_cached_runs_of_subtree(&self, node: Node) {
-        let arena = self.callbacks.arena();
-        let mut slots = Vec::new();
-        arena.for_each_node_in_layout_subtree_in_pre_order(node, |node| slots.push(node.slot_index()));
-        arena.fc_run_cache_store().remove_entries_stored_in_open_journal(slots);
     }
 
     fn hide_atomic_inline_for_line_clamp(&self, node: Node) {
@@ -1032,10 +1032,7 @@ impl<'context> InlineFormattingContext<'context> {
         if state_at_clamp_point.is_some() || !self.parent.line_clamp_reached() {
             return false;
         }
-        if !self.parent.clamped_content_is_scrollable_overflow()
-            || self.layout_mode != LayoutMode::Normal
-            || self.run.purpose.is_measurement()
-        {
+        if !self.parent.clamped_content_is_scrollable_overflow() || self.run.fragments.is_none() {
             return true;
         }
         let data = self.line_data();
@@ -1283,15 +1280,7 @@ impl<'context> InlineFormattingContext<'context> {
             self.input.containing_block_constraints,
             ParticipationInParentFormattingContext::AtomicInline,
         );
-        match formatting_context::layout_inside_child(
-            self.run,
-            Some(self.parent),
-            None,
-            node,
-            self.layout_mode,
-            input,
-            false,
-        ) {
+        match formatting_context::layout_inside_child(self.run, Some(self.parent), None, node, input, false) {
             ChildLayoutOutcome::Created(result) => result.baselines,
             ChildLayoutOutcome::ReenterCurrent => {
                 self.parent.run(self.run, input);
@@ -1311,24 +1300,15 @@ impl<'context> InlineFormattingContext<'context> {
 
         let content_baselines = self.layout_inside(node, available_space);
         debug_assert!(
-            self.used(node).has_definite_inline_size.get()
-                || self.used(node).inline_size_constraint.get() != SizeConstraint::None,
+            self.used(node).has_definite_inline_size.get(),
             "atomic inline-level run left its root's inline size unresolved"
         );
         content_baselines
     }
 
     #[inline]
-    pub(crate) fn sizing(&self) -> sizing_context::SizingContext<'context> {
+    pub(crate) fn sizing(&self) -> sizing_context::SizingContext<'context, 'static> {
         self.parent.sizing()
-    }
-
-    pub(crate) fn paired_min_content_inline_size_for_atomic_root(&self, node: Node) -> Option<CssPixels> {
-        self.parent.sizing().paired_min_content_inline_size_for_atomic_root(
-            node,
-            self.input.available_space,
-            self.input.containing_block_constraints,
-        )
     }
 
     fn clear_floating_boxes(&self, node: Node) -> bool {
@@ -1440,135 +1420,44 @@ impl<'context> InlineFormattingContext<'context> {
         (reused_lines, item_index)
     }
 
-    pub(crate) fn min_content_inline_size_from_max_content_items(
+    pub(crate) fn content_sizes_from_items(
         &self,
         items: &[inline_level_iterator::Item],
-    ) -> Option<CssPixels> {
-        if self.input.available_space.inline_size != AvailableSize::MaxContent {
-            return None;
-        }
-        self.intrinsic_inline_size_from_items(items, ItemMeasurement::MinContentFromMaxContentItems)
-    }
-
-    pub(crate) fn intrinsic_inline_size_from_items(
-        &self,
-        items: &[inline_level_iterator::Item],
-        measurement: ItemMeasurement,
-    ) -> Option<CssPixels> {
+        depends_on_block_size: bool,
+    ) -> sizing_context::ContentInlineSizes {
         let containing_style = self.style(self.containing_block);
-        let containing_inline_size = self.input.containing_block_constraints.inline_basis();
-        if !inline_content_is_measurable_from_items(
-            &self.facts(self.containing_block),
-            containing_style,
-            containing_inline_size,
-        ) {
-            return None;
-        }
         let container_wraps = containing_style.text_wrap_mode() == text_wrap_mode::WRAP;
-
-        let mut lines = LinesWithoutLineBoxes::new(measurement != ItemMeasurement::MaxContent);
-        let mut leading_margin = CssPixels::default();
-        let mut leading_border = CssPixels::default();
-        let mut leading_padding = CssPixels::default();
-        for (index, item) in items.iter().enumerate() {
-            let remaining_items = &items[index + 1..];
-            let line_is_empty_or_ends_in_whitespace = lines.is_empty_or_ends_in_whitespace();
-            if item.is_collapsible_whitespace && line_is_empty_or_ends_in_whitespace {
-                if lines.breaks_before_next_fragment()
-                    && matches!(
-                        self.text_item_wrap_opportunity(
-                            item,
-                            self.style(self.parent_node(item.node)),
-                            true,
-                            remaining_items,
-                            line_is_empty_or_ends_in_whitespace,
-                            false,
-                        ),
-                        TextItemWrapOpportunity::BeforeWhitespaceSequence(_)
-                    )
-                {
-                    lines.finish();
-                }
-                leading_margin += item.margin_start;
-                leading_border += item.border_start;
-                leading_padding += item.padding_start;
-                continue;
-            }
-            let margin_start = item.margin_start + std::mem::take(&mut leading_margin);
-            let border_start = item.border_start + std::mem::take(&mut leading_border);
-            let padding_start = item.padding_start + std::mem::take(&mut leading_padding);
-            let content_inline_size = match (item.type_, measurement) {
-                (inline_level_iterator::ItemType::Element, ItemMeasurement::MinContentFromMaxContentItems) => {
-                    item.min_content_inline_size?
-                }
-                _ => item.inline_size,
-            };
-            let border_box_inline_size = line_box::inline_advance(
-                margin_start,
-                border_start + padding_start,
-                content_inline_size,
-                item.padding_end + item.border_end,
-                item.margin_end,
-            );
-            match item.type_ {
-                inline_level_iterator::ItemType::ForcedBreak => lines.finish(),
-                inline_level_iterator::ItemType::Element => {
-                    lines.append_atomic_inline(border_box_inline_size, container_wraps);
-                }
-                // An absolutely positioned box only takes a static position, which the pending inline edges attach to.
-                inline_level_iterator::ItemType::AbsolutelyPositionedElement => {}
-                inline_level_iterator::ItemType::BlockLevelBox | inline_level_iterator::ItemType::FloatingElement => {
-                    return None;
-                }
-                inline_level_iterator::ItemType::Text => {
-                    let style = self.style(self.parent_node(item.node));
-                    let collapses_whitespace = matches!(
-                        style.white_space_collapse(),
-                        white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS
-                    );
-                    let trailing_whitespace_inline_size = if collapses_whitespace {
-                        item.trailing_whitespace.inline_size
-                    } else {
-                        CssPixels::default()
-                    };
-                    if style.text_wrap_mode() == text_wrap_mode::WRAP {
-                        let is_whitespace = item.is_collapsible_whitespace || item.is_ascii_whitespace(self);
-                        let opportunity = if lines.breaks_before_next_fragment() {
-                            self.text_item_wrap_opportunity(
-                                item,
-                                style,
-                                is_whitespace,
-                                remaining_items,
-                                line_is_empty_or_ends_in_whitespace,
-                                false,
-                            )
-                        } else {
-                            TextItemWrapOpportunity::None
-                        };
-                        if is_whitespace {
-                            if matches!(opportunity, TextItemWrapOpportunity::BeforeWhitespaceSequence(_)) {
-                                lines.finish();
-                                continue;
-                            }
-                            lines.append(border_box_inline_size, true, trailing_whitespace_inline_size);
-                            continue;
-                        }
-                        if lines.breaks_at_every_opportunity && breaks_between_graphemes(style) {
-                            return None;
-                        }
-                        if opportunity == TextItemWrapOpportunity::BeforeText {
-                            lines.finish();
-                        }
-                    }
-                    lines.append(
-                        border_box_inline_size,
-                        item.ends_in_ascii_space(self),
-                        trailing_whitespace_inline_size,
-                    );
-                }
-            }
+        let text_indentation =
+            TextIndentation::of(containing_style, self.input.containing_block_constraints.inline_basis());
+        let mut max_content_lines = ContentSizingLines::new(
+            LinesWithoutLineBoxes::indented_by(false, text_indentation),
+            container_wraps,
+        );
+        let mut min_content_lines = ContentSizingLines::new(
+            LinesWithoutLineBoxes::indented_by(true, text_indentation),
+            container_wraps,
+        );
+        for index in 0..items.len() {
+            max_content_lines.append(self, items, index);
+            min_content_lines.append(self, items, index);
         }
-        Some(lines.finish_measurement())
+        let (max_content_inline_size, first_line_max_content) =
+            max_content_lines.lines.finish_measurement_and_first_line();
+        let min_content_inline_size = min_content_lines.lines.finish_measurement();
+        let sizing = self.sizing();
+        sizing_context::ContentInlineSizes {
+            sizes: sizing_context::ContentSizes {
+                min: min_content_inline_size,
+                max: max_content_inline_size,
+            },
+            first_line_max_content,
+            dependencies: IntrinsicMeasurementDependencies {
+                percentage_block_size: sizing.resolve_percentage_block_size_dependency(self.containing_block),
+                percentage_inline_basis: sizing
+                    .measurement_root_observes_percentage_inline_basis(self.containing_block),
+                block_size: depends_on_block_size,
+            },
+        }
     }
 
     fn text_item_wrap_opportunity(
@@ -1687,8 +1576,6 @@ impl<'context> InlineFormattingContext<'context> {
     }
 
     pub(crate) fn generate_line_boxes(&mut self, mut iterator: inline_level_iterator::InlineLevelIterator) {
-        self.min_content_inline_size_from_max_content_layout =
-            self.min_content_inline_size_from_max_content_items(iterator.items());
         self.fragmented_inlines_in_pre_order = iterator.fragmented_inlines_in_pre_order(self);
         let fragmentation = self.parent.line_root_fragmentation(self.containing_block);
         let resume = fragmentation.and_then(|fragmentation| fragmentation.resume);
@@ -2175,7 +2062,6 @@ impl<'context> InlineFormattingContext<'context> {
                 }
                 for node in dropped_atomic_inlines.into_iter().chain(unconsumed_atomic_inlines) {
                     fragments.discard_unplaced_subtree(node, self.used(node));
-                    self.forget_cached_runs_of_subtree(node);
                 }
             }
         }
@@ -2232,62 +2118,60 @@ impl<'context> InlineFormattingContext<'context> {
             }
         }
 
-        if self.layout_mode == LayoutMode::Normal {
-            for box_ in absolute_boxes {
-                if lines_are_fragmented
-                    && !self
-                        .line_data()
-                        .line_boxes
-                        .iter()
-                        .any(|line| line.static_position_markers.iter().any(|marker| marker.box_ == box_))
-                {
-                    continue;
-                }
-                let mut static_position = abspos_inputs::StaticPositionRect {
-                    rect: Default::default(),
-                    inline_alignment: StaticPositionAlignment::Start,
-                    block_alignment: StaticPositionAlignment::Start,
-                    alignment_derives_from_own_computed_values: false,
-                    is_known: true,
-                };
-                'lines: for line in &self.line_data().line_boxes {
-                    for marker in &line.static_position_markers {
-                        if marker.box_ != box_ {
-                            continue;
-                        }
-                        if self
-                            .facts(box_)
-                            .display_before_box_type_transformation_is_block_outside()
-                        {
-                            let block_position = if marker.preceded_by_in_flow_content {
-                                line.physical_vertical_end()
-                            } else {
-                                marker.offset().1
-                            };
-                            let inline_size = self.input.containing_block_constraints.inline_basis();
-                            static_position.rect.offset.inline_offset = CssPixels::default();
-                            static_position.rect.offset.block_offset = block_position;
-                            static_position.rect.size.inline_size = inline_size;
-                        } else {
-                            let (x, y) = marker.offset();
-                            static_position.rect.offset.inline_offset = x;
-                            static_position.rect.offset.block_offset = y;
-                        }
-                        if containing_style.direction() == direction::RTL {
-                            static_position.inline_alignment = StaticPositionAlignment::End;
-                        }
-                        break 'lines;
-                    }
-                }
-                formatting_context::register_contained_abspos_child(
-                    &self.callbacks,
-                    self.run.fragments.as_deref(),
-                    self.containing_block,
-                    box_,
-                    static_position,
-                    None,
-                );
+        for box_ in absolute_boxes {
+            if lines_are_fragmented
+                && !self
+                    .line_data()
+                    .line_boxes
+                    .iter()
+                    .any(|line| line.static_position_markers.iter().any(|marker| marker.box_ == box_))
+            {
+                continue;
             }
+            let mut static_position = abspos_inputs::StaticPositionRect {
+                rect: Default::default(),
+                inline_alignment: StaticPositionAlignment::Start,
+                block_alignment: StaticPositionAlignment::Start,
+                alignment_derives_from_own_computed_values: false,
+                is_known: true,
+            };
+            'lines: for line in &self.line_data().line_boxes {
+                for marker in &line.static_position_markers {
+                    if marker.box_ != box_ {
+                        continue;
+                    }
+                    if self
+                        .facts(box_)
+                        .display_before_box_type_transformation_is_block_outside()
+                    {
+                        let block_position = if marker.preceded_by_in_flow_content {
+                            line.physical_vertical_end()
+                        } else {
+                            marker.offset().1
+                        };
+                        let inline_size = self.input.containing_block_constraints.inline_basis();
+                        static_position.rect.offset.inline_offset = CssPixels::default();
+                        static_position.rect.offset.block_offset = block_position;
+                        static_position.rect.size.inline_size = inline_size;
+                    } else {
+                        let (x, y) = marker.offset();
+                        static_position.rect.offset.inline_offset = x;
+                        static_position.rect.offset.block_offset = y;
+                    }
+                    if containing_style.direction() == direction::RTL {
+                        static_position.inline_alignment = StaticPositionAlignment::End;
+                    }
+                    break 'lines;
+                }
+            }
+            formatting_context::register_contained_abspos_child(
+                &self.callbacks,
+                self.run.fragments.as_deref(),
+                self.containing_block,
+                box_,
+                static_position,
+                None,
+            );
         }
         line_builder.remove_last_line_if_empty();
         self.parent.append_floating_boxes(floating_boxes_after_clamp_point);
@@ -2302,56 +2186,27 @@ impl<'context> InlineFormattingContext<'context> {
             }
             None => inline_level_iterator::InlineLevelIterator::new(self),
         };
-        // OPTIMIZATION: Under a min-content or max-content constraint every soft wrap opportunity breaks the line or
-        //               none does, so eligible content is measured from its items without building line boxes.
-        //               Earlier floats would shorten lines by an amount that depends on block positions the
-        //               measurement leaves unresolved.
-        let paragraph_measurement = if self.run.purpose == formatting_context::LayoutPurpose::IntrinsicInlineMeasurement
-            && !self.parent.has_floating_boxes()
-        {
-            match self.input.available_space.inline_size {
-                AvailableSize::MinContent => Some(ItemMeasurement::MinContent),
-                AvailableSize::MaxContent => Some(ItemMeasurement::MaxContent),
-                AvailableSize::Definite(_) | AvailableSize::Indefinite => None,
-            }
-        } else {
-            None
-        };
-        if let Some(inline_size) = paragraph_measurement
-            .and_then(|measurement| self.intrinsic_inline_size_from_items(iterator.items(), measurement))
-        {
-            self.min_content_inline_size_from_max_content_layout =
-                self.min_content_inline_size_from_max_content_items(iterator.items());
-            self.automatic_content_inline_size = inline_size;
-            self.run.records.note_omitted_line_layout();
-            self.callbacks
-                .arena()
-                .layout_trace
-                .inline_size_from_items(self.containing_block);
-            iterator.stash_for_reuse(self);
-        } else {
-            self.generate_line_boxes(iterator);
-            if self.layout_mode == LayoutMode::Normal && !self.run.purpose.is_measurement() {
-                self.compute_inline_box_pieces();
-                self.fold_inline_ancestor_relative_insets_into_line_data();
-            }
-            self.automatic_content_block_size = {
-                let data = self.line_data();
-                let lines = &data.line_boxes;
-                if lines.iter().any(|line| line.has_block_level_box) {
-                    lines
-                        .last()
-                        .map_or(CssPixels::default(), |line| line.physical_vertical_end())
-                } else {
-                    lines
-                        .iter()
-                        .fold(CssPixels::default(), |sum, line| sum + line.physical_vertical_extent())
-                }
-            };
-            self.automatic_content_inline_size = self
-                .parent
-                .greatest_child_inline_size_including_floats(self.containing_block);
+        self.generate_line_boxes(iterator);
+        if self.run.fragments.is_some() {
+            self.compute_inline_box_pieces();
+            self.fold_inline_ancestor_relative_insets_into_line_data();
         }
+        self.automatic_content_block_size = {
+            let data = self.line_data();
+            let lines = &data.line_boxes;
+            if lines.iter().any(|line| line.has_block_level_box) {
+                lines
+                    .last()
+                    .map_or(CssPixels::default(), |line| line.physical_vertical_end())
+            } else {
+                lines
+                    .iter()
+                    .fold(CssPixels::default(), |sum, line| sum + line.physical_vertical_extent())
+            }
+        };
+        self.automatic_content_inline_size = self
+            .parent
+            .greatest_child_inline_size_including_floats(self.containing_block);
         let baselines = formatting_context::derive_baselines(self.run.records, &self.callbacks, self.containing_block);
         if self.containing_block == self.parent.root_box() {
             self.parent.record_derived_baselines_of_root_box(baselines);
@@ -2590,35 +2445,102 @@ fn breaks_between_graphemes(style: StyleValues<'_>) -> bool {
     style.overflow_wrap() == overflow_wrap::ANYWHERE || style.word_break() == word_break::BREAK_WORD
 }
 
-pub(crate) fn inline_content_is_measurable_from_items(
-    facts: &NodeFacts,
-    style: StyleValues<'_>,
-    inline_basis: CssPixels,
-) -> bool {
-    !facts.is_scroll_container() && style.text_indent().to_px(inline_basis) == CssPixels::default()
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TextIndentation {
+    inline_size: CssPixels,
+    hanging: bool,
+    each_line: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ItemMeasurement {
-    MinContent,
-    MaxContent,
-    MinContentFromMaxContentItems,
+impl TextIndentation {
+    pub(crate) fn of(style: StyleValues<'_>, inline_basis: CssPixels) -> Self {
+        Self {
+            inline_size: style.text_indent().to_px(inline_basis),
+            hanging: style.text_indent_hanging(),
+            each_line: style.text_indent_each_line(),
+        }
+    }
+
+    pub(crate) fn indent_of_line(self, is_first_line: bool, follows_forced_break: bool) -> CssPixels {
+        let indents = is_first_line || (self.each_line && follows_forced_break);
+        if indents != self.hanging {
+            self.inline_size
+        } else {
+            CssPixels::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct FloatsBesideLine {
+    side_of_latest_float_is_left: Option<bool>,
+    clear_of_first_float: u8,
+    inline_size_of_floats_since_latest_clearance: CssPixels,
+    largest_inline_size_of_floats_before_a_clearance: CssPixels,
+    inline_size_of_floats_before_first_clearance: Option<CssPixels>,
+}
+
+impl FloatsBesideLine {
+    fn is_empty(&self) -> bool {
+        self.side_of_latest_float_is_left.is_none()
+    }
+
+    fn place(&mut self, floats_to_the_left: bool, clear: u8, margin_box_inline_size: CssPixels) {
+        let clears_latest_float = match self.side_of_latest_float_is_left {
+            Some(true) => intrinsic_sizing::clears_left_floats(clear),
+            Some(false) => intrinsic_sizing::clears_right_floats(clear),
+            None => {
+                self.clear_of_first_float = clear;
+                false
+            }
+        };
+        if clears_latest_float {
+            let inline_size_of_cleared_floats = std::mem::take(&mut self.inline_size_of_floats_since_latest_clearance);
+            self.largest_inline_size_of_floats_before_a_clearance = self
+                .largest_inline_size_of_floats_before_a_clearance
+                .max(inline_size_of_cleared_floats);
+            self.inline_size_of_floats_before_first_clearance
+                .get_or_insert(inline_size_of_cleared_floats);
+        }
+        self.inline_size_of_floats_since_latest_clearance += margin_box_inline_size.max(CssPixels::default());
+        self.side_of_latest_float_is_left = Some(floats_to_the_left);
+    }
+
+    fn largest_inline_size_beside_one_line(&self) -> CssPixels {
+        self.largest_inline_size_of_floats_before_a_clearance
+            .max(self.inline_size_of_floats_since_latest_clearance)
+    }
+
+    fn beside_first_line(&self, inline_size_of_content: CssPixels) -> FirstLineMaxContent {
+        FirstLineMaxContent {
+            inline_size_of_content,
+            inline_size_of_floats_before_first_clearance: self
+                .inline_size_of_floats_before_first_clearance
+                .unwrap_or(self.inline_size_of_floats_since_latest_clearance),
+            clear_of_first_float: self.clear_of_first_float,
+        }
+    }
 }
 
 #[derive(Default)]
 pub(super) struct LinesWithoutLineBoxes {
     breaks_at_every_opportunity: bool,
+    text_indentation: TextIndentation,
     greatest_inline_size: CssPixels,
+    first_line: Option<FirstLineMaxContent>,
     inline_size: CssPixels,
     has_fragments: bool,
     ends_in_whitespace: bool,
     trailing_whitespace_inline_size: CssPixels,
+    follows_forced_break: bool,
+    floats_beside_line: FloatsBesideLine,
 }
 
 impl LinesWithoutLineBoxes {
-    pub(super) fn new(breaks_at_every_opportunity: bool) -> Self {
+    fn indented_by(breaks_at_every_opportunity: bool, text_indentation: TextIndentation) -> Self {
         Self {
             breaks_at_every_opportunity,
+            text_indentation,
             ..Self::default()
         }
     }
@@ -2635,6 +2557,11 @@ impl LinesWithoutLineBoxes {
         self.greatest_inline_size
     }
 
+    fn finish_measurement_and_first_line(mut self) -> (CssPixels, FirstLineMaxContent) {
+        self.finish();
+        (self.greatest_inline_size, self.first_line.unwrap_or_default())
+    }
+
     fn is_empty_or_ends_in_whitespace(&self) -> bool {
         !self.has_fragments || self.ends_in_whitespace
     }
@@ -2643,26 +2570,288 @@ impl LinesWithoutLineBoxes {
         self.breaks_at_every_opportunity && self.has_fragments
     }
 
+    fn start_line_if_empty(&mut self) {
+        if !self.has_fragments {
+            self.inline_size += self
+                .text_indentation
+                .indent_of_line(self.first_line.is_none(), self.follows_forced_break);
+        }
+    }
+
     fn append(
         &mut self,
         border_box_inline_size: CssPixels,
         ends_in_whitespace: bool,
         trailing_whitespace_inline_size: CssPixels,
     ) {
+        self.start_line_if_empty();
         self.inline_size += border_box_inline_size;
         self.has_fragments = true;
         self.ends_in_whitespace = ends_in_whitespace;
         self.trailing_whitespace_inline_size = trailing_whitespace_inline_size;
     }
 
-    fn finish(&mut self) {
+    fn note_line(&mut self, inline_size: CssPixels) {
+        let floats_beside_line = std::mem::take(&mut self.floats_beside_line);
         self.greatest_inline_size = self
             .greatest_inline_size
-            .max(self.inline_size - self.trailing_whitespace_inline_size);
+            .max(inline_size + floats_beside_line.largest_inline_size_beside_one_line());
+        self.first_line
+            .get_or_insert(floats_beside_line.beside_first_line(inline_size.max(CssPixels::default())));
         self.inline_size = CssPixels::default();
         self.has_fragments = false;
         self.ends_in_whitespace = false;
         self.trailing_whitespace_inline_size = CssPixels::default();
+    }
+
+    fn finish(&mut self) {
+        if self.has_fragments || !self.floats_beside_line.is_empty() {
+            self.note_line(self.inline_size - self.trailing_whitespace_inline_size);
+            self.follows_forced_break = false;
+        }
+    }
+
+    fn place_float_beside_line(&mut self, floats_to_the_left: bool, clear: u8, margin_box_inline_size: CssPixels) {
+        self.floats_beside_line
+            .place(floats_to_the_left, clear, margin_box_inline_size);
+    }
+
+    fn note_float_on_line_of_its_own(&mut self, margin_box_inline_size: CssPixels) {
+        self.greatest_inline_size = self.greatest_inline_size.max(margin_box_inline_size);
+    }
+
+    fn force_break(&mut self) {
+        self.start_line_if_empty();
+        self.note_line(self.inline_size - self.trailing_whitespace_inline_size);
+        self.follows_forced_break = true;
+    }
+
+    fn append_block_level_box(&mut self, margin_box_inline_size: CssPixels) {
+        self.finish();
+        self.first_line.get_or_insert_default();
+        self.note_line(margin_box_inline_size);
+        self.follows_forced_break = false;
+    }
+}
+
+struct ContentSizingLines {
+    lines: LinesWithoutLineBoxes,
+    container_wraps: bool,
+    pending_start_margin: CssPixels,
+    pending_start_border: CssPixels,
+    pending_start_padding: CssPixels,
+    previous_text_item_breaks_between_graphemes: bool,
+}
+
+impl ContentSizingLines {
+    fn new(lines: LinesWithoutLineBoxes, container_wraps: bool) -> Self {
+        Self {
+            lines,
+            container_wraps,
+            pending_start_margin: CssPixels::default(),
+            pending_start_border: CssPixels::default(),
+            pending_start_padding: CssPixels::default(),
+            previous_text_item_breaks_between_graphemes: false,
+        }
+    }
+
+    fn measures_min_content(&self) -> bool {
+        self.lines.breaks_at_every_opportunity
+    }
+
+    fn append(&mut self, context: &InlineFormattingContext<'_>, items: &[inline_level_iterator::Item], index: usize) {
+        let item = &items[index];
+        if item.type_ == inline_level_iterator::ItemType::FloatingElement {
+            self.append_float(context, item);
+            return;
+        }
+        let remaining_items = &items[index + 1..];
+        let previous_text_item_breaks_between_graphemes =
+            std::mem::take(&mut self.previous_text_item_breaks_between_graphemes);
+        let line_is_empty_or_ends_in_whitespace = self.lines.is_empty_or_ends_in_whitespace();
+        if item.is_collapsible_whitespace && line_is_empty_or_ends_in_whitespace {
+            if self.lines.breaks_before_next_fragment()
+                && matches!(
+                    context.text_item_wrap_opportunity(
+                        item,
+                        context.style(context.parent_node(item.node)),
+                        true,
+                        remaining_items,
+                        line_is_empty_or_ends_in_whitespace,
+                        false,
+                    ),
+                    TextItemWrapOpportunity::BeforeWhitespaceSequence(_)
+                )
+            {
+                self.lines.finish();
+            }
+            self.pending_start_margin += item.margin_start;
+            self.pending_start_border += item.border_start;
+            self.pending_start_padding += item.padding_start;
+            return;
+        }
+        let content_inline_size = if self.measures_min_content() {
+            item.min_content_inline_size.unwrap_or(item.inline_size)
+        } else {
+            item.inline_size
+        };
+        if item.type_ == inline_level_iterator::ItemType::BlockLevelBox {
+            self.lines.append_block_level_box(line_box::inline_advance(
+                item.margin_start,
+                item.border_start + item.padding_start,
+                content_inline_size,
+                item.padding_end + item.border_end,
+                item.margin_end,
+            ));
+            return;
+        }
+        let margin_start = item.margin_start + std::mem::take(&mut self.pending_start_margin);
+        let border_start = item.border_start + std::mem::take(&mut self.pending_start_border);
+        let padding_start = item.padding_start + std::mem::take(&mut self.pending_start_padding);
+        let border_box_inline_size = line_box::inline_advance(
+            margin_start,
+            border_start + padding_start,
+            content_inline_size,
+            item.padding_end + item.border_end,
+            item.margin_end,
+        );
+        match item.type_ {
+            inline_level_iterator::ItemType::ForcedBreak => self.lines.force_break(),
+            inline_level_iterator::ItemType::Element => {
+                self.lines
+                    .append_atomic_inline(border_box_inline_size, self.container_wraps);
+            }
+            // An absolutely positioned box only takes a static position, which the pending inline edges attach to.
+            inline_level_iterator::ItemType::AbsolutelyPositionedElement => {}
+            inline_level_iterator::ItemType::BlockLevelBox | inline_level_iterator::ItemType::FloatingElement => {
+                unreachable!(
+                    "content sizing places floats beside lines and sizes block-level boxes as lines of their own"
+                )
+            }
+            inline_level_iterator::ItemType::Text => {
+                let style = context.style(context.parent_node(item.node));
+                let trailing_whitespace_inline_size = if matches!(
+                    style.white_space_collapse(),
+                    white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS
+                ) {
+                    item.trailing_whitespace.inline_size
+                } else {
+                    CssPixels::default()
+                };
+                if style.text_wrap_mode() == text_wrap_mode::WRAP {
+                    let is_whitespace = item.is_collapsible_whitespace || item.is_ascii_whitespace(context);
+                    let breaks_between_graphemes = !is_whitespace && breaks_between_graphemes(style);
+                    let opportunity = if self.lines.breaks_before_next_fragment() {
+                        let can_break_after_previous_grapheme_broken_item =
+                            previous_text_item_breaks_between_graphemes && !breaks_between_graphemes;
+                        context.text_item_wrap_opportunity(
+                            item,
+                            style,
+                            is_whitespace,
+                            remaining_items,
+                            line_is_empty_or_ends_in_whitespace || can_break_after_previous_grapheme_broken_item,
+                            false,
+                        )
+                    } else {
+                        TextItemWrapOpportunity::None
+                    };
+                    if is_whitespace {
+                        if matches!(opportunity, TextItemWrapOpportunity::BeforeWhitespaceSequence(_)) {
+                            self.lines.finish();
+                            return;
+                        }
+                        self.lines
+                            .append(border_box_inline_size, true, trailing_whitespace_inline_size);
+                        return;
+                    }
+                    if breaks_between_graphemes && self.measures_min_content() {
+                        self.previous_text_item_breaks_between_graphemes = true;
+                        self.append_text_broken_between_graphemes(
+                            context,
+                            item,
+                            style,
+                            margin_start,
+                            border_start + padding_start,
+                            trailing_whitespace_inline_size,
+                        );
+                        return;
+                    }
+                    if opportunity == TextItemWrapOpportunity::BeforeText {
+                        self.lines.finish();
+                    }
+                }
+                self.lines.append(
+                    border_box_inline_size,
+                    item.ends_in_ascii_space(context),
+                    trailing_whitespace_inline_size,
+                );
+            }
+        }
+    }
+
+    fn append_float(&mut self, context: &InlineFormattingContext<'_>, item: &inline_level_iterator::Item) {
+        let margin_box_inline_size = |content_inline_size| {
+            line_box::inline_advance(
+                item.margin_start,
+                item.border_start + item.padding_start,
+                content_inline_size,
+                item.padding_end + item.border_end,
+                item.margin_end,
+            )
+        };
+        if self.measures_min_content() {
+            self.lines.note_float_on_line_of_its_own(margin_box_inline_size(
+                item.min_content_inline_size.unwrap_or(item.inline_size),
+            ));
+            return;
+        }
+        let style = context.style(item.node);
+        self.lines.place_float_beside_line(
+            intrinsic_sizing::floats_to_the_left(style),
+            style.clear(),
+            margin_box_inline_size(item.inline_size),
+        );
+    }
+
+    fn append_text_broken_between_graphemes(
+        &mut self,
+        context: &InlineFormattingContext<'_>,
+        item: &inline_level_iterator::Item,
+        style: StyleValues<'_>,
+        margin_start: CssPixels,
+        border_and_padding_start: CssPixels,
+        trailing_whitespace_inline_size: CssPixels,
+    ) {
+        let text_content = context.callbacks.text_content(item.node);
+        let cluster_inline_sizes = item.grapheme_cluster_inline_sizes(
+            &text_content.text,
+            text_content.grapheme_segmenter(),
+            style.letter_spacing().to_double() as f32,
+            style.word_spacing().to_double() as f32,
+        );
+        let border_and_padding_end = item.padding_end + item.border_end;
+        if border_and_padding_start + item.inline_size + border_and_padding_end > CssPixels::default() {
+            self.lines.finish();
+        }
+        let last_cluster_index = cluster_inline_sizes.len() - 1;
+        for (index, cluster_inline_size) in cluster_inline_sizes.into_iter().enumerate() {
+            let leading = if index == 0 {
+                margin_start + border_and_padding_start
+            } else {
+                CssPixels::default()
+            };
+            if index < last_cluster_index {
+                self.lines
+                    .append(leading + cluster_inline_size, false, CssPixels::default());
+                self.lines.finish();
+            } else {
+                self.lines.append(
+                    leading + cluster_inline_size + border_and_padding_end + item.margin_end,
+                    item.ends_in_ascii_space(context),
+                    trailing_whitespace_inline_size,
+                );
+            }
+        }
     }
 }
 

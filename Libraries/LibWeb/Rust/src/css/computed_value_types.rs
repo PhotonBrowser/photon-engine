@@ -385,6 +385,7 @@ pub struct InheritedTextLayoutFacts {
     pub white_space_collapse: u8,
     pub text_wrap_mode: u8,
     pub word_break: u8,
+    pub line_break: u8,
     pub tab_size_is_number: bool,
     pub letter_spacing: crate::css::css_pixels::CssPixels,
     pub word_spacing: crate::css::css_pixels::CssPixels,
@@ -417,6 +418,7 @@ pub struct InheritedTextValues {
     pub white_space_collapse: u8,
     pub text_wrap_mode: u8,
     pub word_break: u8,
+    pub line_break: u8,
     pub tab_size_is_number: bool,
     pub letter_spacing: crate::css::css_pixels::CssPixels,
     pub word_spacing: crate::css::css_pixels::CssPixels,
@@ -662,6 +664,7 @@ pub struct GridValues {
     pub grid_column_end_style_value: ComputedStyleValueHandle,
     pub grid_row_start_style_value: ComputedStyleValueHandle,
     pub grid_row_end_style_value: ComputedStyleValueHandle,
+    pub fit_tolerance_style_value: ComputedStyleValueHandle,
 }
 
 /// Layout of the non-inherited SVG geometry and painting properties.

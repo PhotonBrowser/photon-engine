@@ -46,6 +46,7 @@ hyphenate-character: auto
 image-rendering: auto
 interpolate-size: numeric-only
 letter-spacing: normal
+line-break: auto
 line-height: normal
 list-style-image: none
 list-style-position: outside
@@ -210,6 +211,7 @@ d: none
 display: block
 field-sizing: fixed
 filter: none
+fit-tolerance: normal
 flex-basis: auto
 flex-direction: row
 flex-grow: 0
@@ -382,3 +384,4 @@ will-change: auto
 x: 0px
 y: 0px
 z-index: auto
+zoom: 1

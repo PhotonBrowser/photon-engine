@@ -605,6 +605,13 @@ pub(crate) fn distribute_inline_size(columns: &mut [Column], available: CssPixel
     distribute_excess(columns, available, fixed);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableCellMeasurement {
+    automatic_content_block_size: CssPixels,
+    baselines: DerivedBaselines,
+    depends_on_percentage_block_size: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TableCell {
     pub(crate) box_: Node,
@@ -623,6 +630,7 @@ pub(crate) struct TableCell {
     pub(crate) max_content_inline_size: Option<CssPixels>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Row {
     pub(crate) box_: Node,
     pub(crate) base_block_size: CssPixels,
@@ -670,6 +678,7 @@ pub(crate) struct TableGrid {
     pub(crate) occupancy: HashSet<(usize, usize)>,
 }
 
+#[derive(Clone)]
 pub(crate) struct TableInlineLayout {
     table_box: Node,
     table_constraints: ContainingBlockConstraints,
@@ -682,6 +691,14 @@ impl TableInlineLayout {
     pub(crate) fn table_box(&self) -> Node {
         self.table_box
     }
+}
+
+#[derive(Clone, Copy)]
+struct TableInlineSizeMeasures {
+    spacing: CssPixels,
+    grid_min: CssPixels,
+    grid_max: CssPixels,
+    capmin: CssPixels,
 }
 
 fn matching_children<T: TableTree>(tree: &T, parent: Node, predicate: impl Fn(FfiDisplay) -> bool) -> Vec<Node> {
@@ -869,7 +886,7 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
     }
 }
 
-const BORDER_COLLAPSE_SEPARATE: u8 = 0;
+pub(super) const BORDER_COLLAPSE_SEPARATE: u8 = 0;
 const TABLE_LAYOUT_FIXED: u8 = 1;
 
 /// The grid columns that a table-column box, or a table-column-group box without table-column children, corresponds
@@ -915,8 +932,15 @@ enum TrackAxis {
     Column,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AutoTableInlineSize {
+    FillsAvailableInlineSize,
+    ShrinksToFitAvailableInlineSize,
+}
+
 pub(super) struct TableFormattingContext<'pass> {
     run: FormattingContextRun<'pass>,
+    auto_table_inline_size: AutoTableInlineSize,
     table_constraints: ContainingBlockConstraints,
     participant_constraints: ContainingBlockConstraints,
     available_space: AvailableSpace,
@@ -1018,12 +1042,13 @@ impl<'pass> TableFormattingContext<'pass> {
         StyleValues::for_node(&self.run.callbacks, node)
     }
 
-    pub(super) fn new(run: &FormattingContextRun<'pass>) -> Self {
+    pub(super) fn new(run: &FormattingContextRun<'pass>, auto_table_inline_size: AutoTableInlineSize) -> Self {
         Self {
             run: FormattingContextRun {
                 previous_line_data: None,
                 ..run.clone()
             },
+            auto_table_inline_size,
             table_constraints: ContainingBlockConstraints::default(),
             participant_constraints: ContainingBlockConstraints::default(),
             available_space: AvailableSpace::default(),
@@ -1092,8 +1117,8 @@ impl<'pass> TableFormattingContext<'pass> {
     }
 
     #[inline]
-    fn sizing(&self) -> sizing_context::SizingContext<'pass> {
-        sizing_context::SizingContext::new(self.run.purpose, self.run.records, self.run.callbacks)
+    fn sizing(&self) -> sizing_context::SizingContext<'pass, 'static> {
+        sizing_context::SizingContext::new(self.run.records, self.run.callbacks)
     }
 
     fn parent(&self, node: Node) -> Node {
@@ -1388,7 +1413,7 @@ impl<'pass> TableFormattingContext<'pass> {
         let Some(grid) = self.collapsed_border_grid.take() else {
             return;
         };
-        if self.run.purpose.is_measurement() {
+        if self.run.fragments.is_none() {
             return;
         }
         if !grid.has_paintable_edges() {
@@ -1627,10 +1652,11 @@ impl<'pass> TableFormattingContext<'pass> {
             let (min_content_inline, max_content_inline) = if fixed {
                 (inline_size, inline_size)
             } else {
-                (
-                    self.calculate_min_content_inline_size(cell.box_),
-                    self.calculate_max_content_inline_size(cell.box_),
-                )
+                let content_sizes = self
+                    .sizing()
+                    .content_inline_sizes(cell.box_, self.participant_constraints, None)
+                    .sizes;
+                (content_sizes.min, content_sizes.max)
             };
             // The outer min-content inline size of a table cell is its minimum inline size adjusted by the cell intrinsic offsets.
             self.cells[cell_index].outer_min_inline_size = min_inline.max(min_content_inline) + inline_offsets;
@@ -2247,14 +2273,7 @@ impl<'pass> TableFormattingContext<'pass> {
             .should_treat_max_inline_size_as_none(self.run.box_, available, self.table_constraints)
     }
 
-    fn compute_table_inline_size(&mut self) {
-        // https://drafts.csswg.org/css-tables-3/#computing-the-table-width
-
-        let table_style = self.style(self.run.box_);
-        let available_inline = self.available_space.inline_size;
-        // Percentages on 'width' and 'height' on the table are relative to the table wrapper box's containing block,
-        // not the table wrapper box itself.
-        let basis = self.table_constraints.inline_basis();
+    fn table_inline_size_measures(&mut self) -> TableInlineSizeMeasures {
         // Compute undistributable space due to border spacing: https://www.w3.org/TR/css-tables-3/#computing-undistributable-space.
         let spacing = (self.columns.len() + 1) * self.border_spacing_inline();
         // The row/column-grid inline-size minimum (GRIDMIN) is the sum of the min-content inline size
@@ -2272,6 +2291,31 @@ impl<'pass> TableFormattingContext<'pass> {
             .fold(CssPixels::default(), |sum, column| sum + column.max_size)
             + spacing;
         let capmin = self.compute_capmin();
+        TableInlineSizeMeasures {
+            spacing,
+            grid_min,
+            grid_max,
+            capmin,
+        }
+    }
+
+    fn used_table_inline_size(
+        &mut self,
+        available_inline: AvailableSize,
+        measures: TableInlineSizeMeasures,
+    ) -> CssPixels {
+        // https://drafts.csswg.org/css-tables-3/#computing-the-table-width
+
+        let TableInlineSizeMeasures {
+            spacing,
+            grid_min,
+            grid_max,
+            capmin,
+        } = measures;
+        let table_style = self.style(self.run.box_);
+        // Percentages on 'width' and 'height' on the table are relative to the table wrapper box's containing block,
+        // not the table wrapper box itself.
+        let basis = self.table_constraints.inline_basis();
         // The used minimum inline size of a table is the greater of the resolved min-width, CAPMIN, and GRIDMIN.
         let mut used_min = grid_min.max(capmin);
         if !crate::layout::sizing_context::is_plain_auto(table_style.min_width()) {
@@ -2289,7 +2333,9 @@ impl<'pass> TableFormattingContext<'pass> {
             let mut value = match available_inline {
                 AvailableSize::MinContent => grid_min,
                 AvailableSize::MaxContent => grid_max,
-                AvailableSize::Definite(available) if self.run.layout_mode == LayoutMode::Normal => {
+                AvailableSize::Definite(available)
+                    if self.auto_table_inline_size == AutoTableInlineSize::FillsAvailableInlineSize =>
+                {
                     available.max(used_min)
                 }
                 AvailableSize::Definite(available) => grid_max.min(available).max(used_min),
@@ -2335,9 +2381,13 @@ impl<'pass> TableFormattingContext<'pass> {
         if !self.should_treat_max_inline_size_as_none(available_inline) {
             used = used.min(self.resolve_inline_constraint(table_style.max_width(), grid_min, grid_max, basis));
         }
-        used = used.max(used_min);
-        let table_used = self.used_values(self.run.box_);
-        table_used.set_content_inline_size(used);
+        used.max(used_min)
+    }
+
+    fn compute_table_inline_size(&mut self) {
+        let measures = self.table_inline_size_measures();
+        let used = self.used_table_inline_size(self.available_space.inline_size, measures);
+        self.used_values(self.run.box_).set_content_inline_size(used);
     }
 
     fn can_skip_row_intrinsic_measurement(&mut self) -> bool {
@@ -2370,6 +2420,72 @@ impl<'pass> TableFormattingContext<'pass> {
     }
 
     pub(super) fn run_until_inline_size_calculation(&mut self, input: LayoutInput, skip_row_measurement: bool) {
+        self.measure_tracks(input, skip_row_measurement);
+        // Compute the inline size of the table.
+        self.compute_table_inline_size();
+    }
+
+    fn measures_for_intrinsic_inline_sizes(&mut self, input: LayoutInput) -> TableInlineSizeMeasures {
+        self.measure_tracks(
+            LayoutInput {
+                available_space: AvailableSpace {
+                    inline_size: AvailableSize::MaxContent,
+                    ..input.available_space
+                },
+                ..input
+            },
+            true,
+        );
+        self.table_inline_size_measures()
+    }
+
+    pub(super) fn content_inline_sizes(&mut self, input: LayoutInput) -> sizing_context::ContentSizes {
+        let measures = self.measures_for_intrinsic_inline_sizes(input);
+        sizing_context::ContentSizes {
+            min: self.used_table_inline_size(AvailableSize::MinContent, measures),
+            max: self.used_table_inline_size(AvailableSize::MaxContent, measures),
+        }
+    }
+
+    fn max_inline_size_fits_content_to_unknown_containing_block_inline_size(&self) -> bool {
+        let max_inline_size = self.style(self.run.box_).max_width();
+        self.table_constraints.percentage_basis_inline_size.is_none()
+            && max_inline_size.is_fit_content()
+            && max_inline_size.fit_content_available_space().is_none()
+    }
+
+    fn used_table_inline_size_when_laid_out_at_intrinsic_inline_size(
+        &mut self,
+        intrinsic_sizing_constraint: AvailableSize,
+        measures: TableInlineSizeMeasures,
+    ) -> CssPixels {
+        let intrinsic_inline_size = self.used_table_inline_size(intrinsic_sizing_constraint, measures);
+        if self.max_inline_size_fits_content_to_unknown_containing_block_inline_size() {
+            return intrinsic_inline_size;
+        }
+        self.used_table_inline_size(AvailableSize::Definite(intrinsic_inline_size), measures)
+    }
+
+    pub(super) fn border_box_inline_sizes(&mut self, input: LayoutInput) -> sizing_context::ContentSizes {
+        let measures = self.measures_for_intrinsic_inline_sizes(input);
+        let content_box_inline_sizes = sizing_context::ContentSizes {
+            min: self
+                .used_table_inline_size_when_laid_out_at_intrinsic_inline_size(AvailableSize::MinContent, measures),
+            max: self
+                .used_table_inline_size_when_laid_out_at_intrinsic_inline_size(AvailableSize::MaxContent, measures),
+        };
+        let table_used = self.used_values(self.run.box_);
+        let collapsed = table_used.uses_collapsing_borders_model.get();
+        let border_box_inline_size = |content_inline_size: CssPixels| {
+            table_used.border_box_left(collapsed) + content_inline_size + table_used.border_box_right(collapsed)
+        };
+        sizing_context::ContentSizes {
+            min: border_box_inline_size(content_box_inline_sizes.min),
+            max: border_box_inline_size(content_box_inline_sizes.max),
+        }
+    }
+
+    fn measure_tracks(&mut self, input: LayoutInput, skip_row_measurement: bool) {
         self.available_space = input.available_space;
         // Determine the number of rows/columns the table requires.
         let table_grid = calculate_table_grid(self, self.run.box_, MissingTableCells::Include);
@@ -2448,8 +2564,6 @@ impl<'pass> TableFormattingContext<'pass> {
             // and the largest block size specified on cells that span only this row.
             self.compute_table_measures(TrackAxis::Row);
         }
-        // Compute the inline size of the table.
-        self.compute_table_inline_size();
     }
 
     fn layout_inside_cell(
@@ -2471,15 +2585,7 @@ impl<'pass> TableFormattingContext<'pass> {
             },
             participation: ParticipationInParentFormattingContext::Item,
         };
-        match formatting_context::layout_inside_child(
-            run,
-            None,
-            None,
-            cell.box_,
-            self.run.layout_mode,
-            layout_input,
-            false,
-        ) {
+        match formatting_context::layout_inside_child(run, None, None, cell.box_, layout_input, false) {
             ChildLayoutOutcome::Created(result) => result.baselines,
             ChildLayoutOutcome::ReenterCurrent => {
                 self.run(run, layout_input, None);
@@ -2538,144 +2644,23 @@ impl<'pass> TableFormattingContext<'pass> {
         );
     }
 
-    /// Measures a cell's content ahead of its committing layout. With the table's committing `run`, a cell whose
-    /// committing run can replay the measuring one runs ahead of its intrinsic block padding instead of being
-    /// measured in a throwaway layout (see run_table_cell_ahead_of_its_intrinsic_block_padding).
+    /// Measures a cell's content ahead of its committing layout, with everything that layout will be handed but the
+    /// intrinsic block padding, so that the committing run of the cell can replay the measuring one (see
+    /// table_cell_run_shape_ahead_of_its_intrinsic_block_padding).
     fn measure_cell(
         &self,
-        run: Option<&FormattingContextRun<'pass>>,
+        run: &FormattingContextRun<'pass>,
         cell: TableCell,
-        used: &UsedValues,
         inner: AvailableSpace,
         adopt_automatic_content_block_size: bool,
     ) -> Option<TableCellMeasurement> {
         let facts = NodeFacts::new(&self.run.callbacks, cell.box_);
-        if self.run.layout_mode == LayoutMode::IntrinsicSizing
-            && !facts.is_inline()
-            && used.inline_size_constraint.get() == SizeConstraint::None
-            && used.block_size_constraint.get() == SizeConstraint::None
-            && used.has_definite_inline_size()
-            && used.has_definite_block_size()
-        {
-            return None;
-        }
         if !facts.can_have_children() {
             return None;
         }
-
-        // OPTIMIZATION: A cell whose content repeats its measurement at every inline size at or above its max-content
-        //               inline size shares one entry for all of them, so that a table whose columns grow and shrink
-        //               measures such a cell again only when its content wraps differently.
-        let mut content_inline_size = used.content_inline_size.get();
-        let mut available_space = inner;
-        if let Some(threshold) = self.cell_measurement_repeats_at_or_above(cell)
-            && content_inline_size >= threshold
-            && let AvailableSize::Definite(available_inline_size) = inner.inline_size
-            && available_inline_size >= threshold
-        {
-            content_inline_size = threshold;
-            available_space.inline_size = AvailableSize::Definite(threshold);
-        }
-        let key = TableCellMeasurementKey {
-            layout_mode: self.run.layout_mode,
-            available_space,
-            content_inline_size,
-            content_block_size: used.content_block_size.get(),
-            has_definite_inline_size: used.has_definite_inline_size(),
-            has_definite_block_size: used.has_definite_block_size(),
-            inline_size_constraint: used.inline_size_constraint.get(),
-            block_size_constraint: used.block_size_constraint.get(),
-            uses_collapsing_borders_model: used.uses_collapsing_borders_model.get(),
-            adopt_automatic_content_block_size,
-        };
-        let caches = self.run.callbacks.intrinsic_size_caches();
-        let stamp = self.run.callbacks.intrinsic_size_cache_stamp(cell.box_);
-        let layout_trace = &self.run.callbacks.arena().layout_trace;
-        if let Some(cached) = caches.table_cell_measurement_cache_get(stamp, key) {
-            layout_trace.table_cell_measurement_hit(cell.box_);
-            return Some(cached);
-        }
-        let _trace = layout_trace.table_cell_measurement_miss(cell.box_);
-
-        let measured = run
-            .filter(|_| {
-                adopt_automatic_content_block_size
-                    && self.style(cell.box_).height().is_auto()
-                    && !self.anonymous_cell_wraps_flex_or_grid(cell)
-            })
-            .and_then(|run| {
-                formatting_context::run_table_cell_ahead_of_its_intrinsic_block_padding(
-                    run,
-                    cell.box_,
-                    LayoutInput {
-                        available_space: inner,
-                        containing_block_constraints: ContainingBlockConstraints::default(),
-                        content_box_position_in_bfc_root: None,
-                        sizing: RootSizingDirectives {
-                            adopt_automatic_content_block_size,
-                            ..RootSizingDirectives::default()
-                        },
-                        participation: ParticipationInParentFormattingContext::Item,
-                    },
-                )
-            })
-            .map(|result| TableCellMeasurement {
-                automatic_content_block_size: result.automatic_content_block_size,
-                baselines: result.baselines,
-                depends_on_percentage_block_size: result.depends_on_percentage_block_size,
-            })
-            .unwrap_or_else(|| self.measure_cell_content(cell, used, inner, adopt_automatic_content_block_size));
-        caches.table_cell_measurement_cache_put(
-            self.run.callbacks.intrinsic_size_cache_stamp(cell.box_),
-            key,
-            measured,
-        );
-        Some(measured)
-    }
-
-    /// The inline size at or above which measuring the cell's content always gives the same result, if there is one.
-    /// That is its max-content inline size when the content is only text, which reads the inline size only to break
-    /// lines and breaks none at or above it, unless a percentage text-indent reads it too.
-    fn cell_measurement_repeats_at_or_above(&self, cell: TableCell) -> Option<CssPixels> {
-        let threshold = cell.max_content_inline_size?;
-        if self.style(cell.box_).text_indent().contains_percentage() {
-            return None;
-        }
-        for child in self.run.callbacks.children(cell.box_) {
-            let facts = NodeFacts::new(&self.run.callbacks, child);
-            if !facts.is_text_node() && !facts.is_break_node() {
-                return None;
-            }
-        }
-        Some(threshold)
-    }
-
-    fn measure_cell_content(
-        &self,
-        cell: TableCell,
-        used: &UsedValues,
-        inner: AvailableSpace,
-        adopt_automatic_content_block_size: bool,
-    ) -> TableCellMeasurement {
-        // The table formatting context owns the cell's outer geometry. Seed the inputs
-        // needed to lay out its contents without copying placement or layout outputs.
-        let measurement = formatting_context::MeasurementState::create(self.run.callbacks);
-        let measured_root = measurement.create_used_values(cell.box_, ContainingBlockConstraints::default());
-        used.mirror_box_metrics_and_size_constraints_into(&measured_root);
-        measured_root
-            .has_definite_inline_size
-            .set(used.has_definite_inline_size());
-        measured_root
-            .has_definite_block_size
-            .set(used.has_definite_block_size());
-        measured_root
-            .uses_collapsing_borders_model
-            .set(used.uses_collapsing_borders_model.get());
-
-        let result = measurement.run_with_layout_mode(
+        let shape = formatting_context::table_cell_run_shape_ahead_of_its_intrinsic_block_padding(
+            run,
             cell.box_,
-            &measured_root,
-            self.run.layout_mode,
             LayoutInput {
                 available_space: inner,
                 containing_block_constraints: ContainingBlockConstraints::default(),
@@ -2686,12 +2671,13 @@ impl<'pass> TableFormattingContext<'pass> {
                 },
                 participation: ParticipationInParentFormattingContext::Item,
             },
-        );
-        TableCellMeasurement {
+        )?;
+        let result = formatting_context::lay_out_shape_for_its_result(run.callbacks, shape);
+        Some(TableCellMeasurement {
             automatic_content_block_size: result.automatic_content_block_size,
             baselines: result.baselines,
             depends_on_percentage_block_size: result.depends_on_percentage_block_size,
-        }
+        })
     }
 
     fn compute_table_block_size(&mut self, run: &FormattingContextRun<'pass>) {
@@ -2776,8 +2762,8 @@ impl<'pass> TableFormattingContext<'pass> {
             let mut content_baselines = None;
             if defer_inside_layout {
                 // This cell's final inside layout happens once row heights are final; measure its
-                // content in a throwaway state instead of laying out the committing state twice.
-                if let Some(measured) = self.measure_cell(Some(run), cell, used, inner, true) {
+                // content ahead of its intrinsic padding instead of laying out the committing state twice.
+                if let Some(measured) = self.measure_cell(run, cell, inner, true) {
                     self.cell_measurements[cell_index] = Some(measured);
                     used.set_content_block_size(measured.automatic_content_block_size);
                     content_baselines = Some(measured.baselines);
@@ -2905,7 +2891,7 @@ impl<'pass> TableFormattingContext<'pass> {
             // The first pass measured this cell at its automatic block size; measure it again at
             // the percentage-resolved size to preserve the baseline its final inside layout will use.
             let content_baselines = self
-                .measure_cell(None, cell, used, inner, false)
+                .measure_cell(run, cell, inner, false)
                 .map(|measured| measured.baselines);
             let baseline = self.cell_baseline(cell.box_, content_baselines);
             self.cells[cell_index].baseline = baseline;
@@ -3100,7 +3086,7 @@ impl<'pass> TableFormattingContext<'pass> {
             let used = self.used_values(cell.box_);
             let measured_content_block_size = used.content_block_size.get();
             if let Some(measurement) = self.cell_measurements[cell_index]
-                && run.purpose.is_measurement()
+                && run.fragments.is_none()
                 && self.style(cell.box_).height().is_auto()
                 && !self.node_facts(cell.box_).is_anonymous()
                 && !measurement.depends_on_percentage_block_size
