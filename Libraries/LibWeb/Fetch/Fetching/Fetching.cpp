@@ -133,7 +133,7 @@ static void append_preferred_color_scheme_client_hint(Infrastructure::Request& r
         return;
 
     auto* window = request.client() ? HTML::window_from_global_object(request.client()->global_object()) : nullptr;
-    if (!window && request.reserved_client()) {
+    if (!window) {
         auto browsing_context = request.target_browsing_context();
         if (browsing_context) {
             if (auto* document = browsing_context->active_document()) {
