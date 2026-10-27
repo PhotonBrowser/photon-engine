@@ -3153,8 +3153,8 @@ impl ComputedAspectRatio {
 impl BoxValues {
     fn initial() -> Self {
         use crate::css::css_enums::{
-            box_sizing, clear, field_sizing, float, overflow, overscroll_behavior, positioning, resize, table_layout, text_overflow,
-            unicode_bidi, vertical_align,
+            box_sizing, clear, field_sizing, float, overflow, overscroll_behavior, positioning, resize, table_layout,
+            text_overflow, unicode_bidi, vertical_align,
         };
         use crate::css::display::FfiDisplay;
 

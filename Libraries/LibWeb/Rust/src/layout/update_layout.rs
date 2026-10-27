@@ -45,7 +45,9 @@ fn run_layout_round_job(host: &DocumentHost, read: &BegunRead, job: LayoutRoundJ
             let elapsed_microseconds = started_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             match &answer.end {
                 LayoutRoundEnd::FullLayout => state.arena_mut().add_full_layout_microseconds(elapsed_microseconds),
-                LayoutRoundEnd::PartialLayout => state.arena_mut().add_partial_layout_microseconds(elapsed_microseconds),
+                LayoutRoundEnd::PartialLayout => {
+                    state.arena_mut().add_partial_layout_microseconds(elapsed_microseconds)
+                }
                 LayoutRoundEnd::Built { .. } | LayoutRoundEnd::NeedsDocumentStyle => {}
             }
         }

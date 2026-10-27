@@ -1229,7 +1229,7 @@ pub(crate) struct LayoutNodeArena {
     unresolved_container_lengths: RefCell<Vec<NodeSlotId>>,
     partial_layout_count: Cell<u64>,
     full_layout_count: Cell<u64>,
-partial_layout_microseconds: Cell<u64>,
+    partial_layout_microseconds: Cell<u64>,
     full_layout_microseconds: Cell<u64>,
     /// How many layouts were committed, full and partial.
     layout_commit_count: u64,
@@ -1355,7 +1355,7 @@ impl LayoutNodeArena {
             unresolved_container_lengths: RefCell::new(Vec::new()),
             partial_layout_count: Cell::new(0),
             full_layout_count: Cell::new(0),
-partial_layout_microseconds: Cell::new(0),
+            partial_layout_microseconds: Cell::new(0),
             full_layout_microseconds: Cell::new(0),
             layout_commit_count: 0,
             committed_subtree_tokens: RefCell::new(Vec::new()),
