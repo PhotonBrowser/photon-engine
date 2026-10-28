@@ -266,6 +266,10 @@ struct ViewCallbacks {
     // The page's zoom level changed, as a factor (1.0 is 100%), whether by
     // the embedder or by restoring a site's saved zoom on navigation.
     std::function<void(double zoom_level)> zoom_changed;
+    // The page's background colour changed: its canvas background, or the
+    // system canvas colour before the page sets one. The embedder shows it
+    // where the page has not painted, as while it lays out at a new size.
+    std::function<void(uint8_t red, uint8_t green, uint8_t blue)> page_background_changed;
     // A user input has gone unanswered by the page for several seconds.
     std::function<void(bool unresponsive)> page_unresponsive_changed;
     std::function<void(ContextMenuRequest const&)> context_menu_requested;

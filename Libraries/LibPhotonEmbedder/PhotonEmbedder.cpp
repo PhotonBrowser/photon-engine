@@ -829,6 +829,11 @@ private:
         };
 #endif
         on_title_change = [this](Utf16String const&) { notify_state(); };
+        // As Qt's IOSurface layer does, so uncovered page area matches the page.
+        on_page_background_color_change = [this](Gfx::Color color) {
+            if (m_callbacks.page_background_changed)
+                m_callbacks.page_background_changed(color.red(), color.green(), color.blue());
+        };
         on_loading_state_change = [this](bool) { notify_state(); };
         on_performance_stats = [this](WebView::TabPerformanceStats const& stats) {
             if (!m_callbacks.performance_stats_changed)
