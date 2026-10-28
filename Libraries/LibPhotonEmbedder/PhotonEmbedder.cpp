@@ -599,6 +599,27 @@ public:
         update_compositor_display_metadata(page());
     }
 
+    // Allows or blocks the microphone for the origin in every process hosting the view's pages. Blocking ends the
+    // origin's capture there, unless another open page of the process keeps its own grant.
+    void set_microphone_permission(StringView origin_url, bool granted)
+    {
+        auto parsed = URL::Parser::basic_parse(origin_url);
+        if (!parsed.has_value() || parsed->origin().is_opaque())
+            return;
+        auto origin = parsed->origin();
+        traversable().for_each_hosting_page([&](WebView::WebContentPage& page) {
+            if (granted) {
+                if (auto result = page.client().grant_audio_capture(origin); result.is_error()) {
+                    warnln("Unable to grant audio capture: {}", result.error());
+                    return;
+                }
+            } else {
+                page.client().revoke_audio_capture(origin);
+            }
+            page.async_set_permission_state("microphone"_utf16, origin, granted);
+        });
+    }
+
     bool toggle_audio_mute()
     {
         toggle_page_mute_state();
@@ -1597,6 +1618,10 @@ void View::stop_loading() { m_impl->view->stop_loading(); }
 void View::go_back() { m_impl->view->traverse_the_history_by_delta(-1); }
 void View::go_forward() { m_impl->view->traverse_the_history_by_delta(1); }
 bool View::toggle_audio_mute() { return m_impl->view->toggle_audio_mute(); }
+void View::set_microphone_permission(std::string const& origin, bool granted)
+{
+    m_impl->view->set_microphone_permission(StringView { origin.data(), origin.size() }, granted);
+}
 void View::resize(int width, int height, double device_pixel_ratio)
 {
     auto physical_width = max(1, static_cast<int>(std::lround(width * device_pixel_ratio)));

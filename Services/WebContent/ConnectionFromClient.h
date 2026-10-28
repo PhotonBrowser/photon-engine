@@ -275,6 +275,7 @@ private:
 
     virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) override;
     virtual void set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme) override;
+    virtual void set_permission_state(Web::PageId page_id, Utf16String name, URL::Origin origin, bool granted) override;
     virtual void set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast) override;
     virtual void set_preferred_motion(Web::PageId page_id, Web::CSS::PreferredMotion) override;
     virtual void set_preferred_languages(Web::PageId page_id, Vector<String>) override;

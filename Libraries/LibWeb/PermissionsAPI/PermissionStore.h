@@ -11,6 +11,7 @@
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
 #include <LibURL/Origin.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/PermissionsAPI/Permissions.h>
 
 namespace Web::PermissionsAPI {
@@ -23,7 +24,7 @@ struct PermissionStoreEntry {
 };
 
 // https://w3c.github.io/permissions/#dfn-permission-store
-class PermissionStore {
+class WEB_API PermissionStore {
 public:
     AK_ALLOC_WITH_KMALLOC;
 

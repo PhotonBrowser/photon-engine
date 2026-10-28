@@ -163,6 +163,8 @@ public:
     // returns, so a page told afterwards finds it in place.
     ErrorOr<void> grant_audio_capture(URL::URL const&);
     ErrorOr<void> grant_audio_capture(URL::Origin const&);
+    // The user took the origin's permission back. Its capture streams close if no other open page keeps one.
+    void revoke_audio_capture(URL::Origin const&);
     // The permission follows the origins the process's open pages show, so it goes with a navigation away.
     void update_audio_capture_permission();
     void replay_compositor_view_state_after_reconnect(Badge<Application>);

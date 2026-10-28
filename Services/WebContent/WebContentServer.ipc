@@ -4,6 +4,7 @@
 #include <LibHTTP/Cookie/Cookie.h>
 #include <LibIPC/File.h>
 #include <LibIPC/TransportHandle.h>
+#include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Bindings/Navigation.h>
 #include <LibWebCommon/Bindings/NavigationType.h>
@@ -256,6 +257,8 @@ endpoint WebContentServer routed by Web::PageId page_id
 
     set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) =|
     set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme color_scheme) =|
+    // The user allowed or blocked a powerful feature for the origin, outside any request from the page.
+    set_permission_state(Web::PageId page_id, Utf16String name, URL::Origin origin, bool granted) =|
     set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast contrast) =|
     set_preferred_motion(Web::PageId page_id, Web::CSS::PreferredMotion motion) =|
     set_preferred_languages(Web::PageId page_id, Vector<String> preferred_languages) =|

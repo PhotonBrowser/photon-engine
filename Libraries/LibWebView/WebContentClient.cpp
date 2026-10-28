@@ -912,6 +912,14 @@ ErrorOr<void> WebContentClient::grant_audio_capture(URL::Origin const& origin)
     return tell_audio_server_of_capture_permission();
 }
 
+void WebContentClient::revoke_audio_capture(URL::Origin const& origin)
+{
+    if (origin.is_opaque())
+        return;
+    m_audio_capture_grants.remove(origin.serialize());
+    update_audio_capture_permission();
+}
+
 void WebContentClient::update_audio_capture_permission()
 {
     auto permitted = audio_capture_permitted();

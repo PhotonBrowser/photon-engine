@@ -92,6 +92,7 @@
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
+#include <LibWeb/PermissionsAPI/PermissionStore.h>
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
@@ -3366,6 +3367,13 @@ void ConnectionFromClient::set_preferred_color_scheme(Web::PageId page_id, Web::
 {
     if (auto page = this->page(page_id); page.has_value())
         page->set_preferred_color_scheme(color_scheme);
+}
+
+void ConnectionFromClient::set_permission_state(Web::PageId, Utf16String name, URL::Origin origin, bool granted)
+{
+    // The store is shared by every page in the process, as the permission is the origin's, not the page's.
+    auto state = granted ? Web::PermissionsAPI::PermissionState::Granted : Web::PermissionsAPI::PermissionState::Denied;
+    Web::PermissionsAPI::PermissionStore::the().set_permission_store_entry({ .name = move(name) }, origin, state);
 }
 
 void ConnectionFromClient::set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast contrast)

@@ -484,6 +484,10 @@ public:
     void go_back();
     void go_forward();
     bool toggle_audio_mute();
+    // Allows or blocks the microphone for the origin of `origin`, a URL, as the
+    // site's permission rather than an answer to one request. Blocking ends
+    // capture the origin has running.
+    void set_microphone_permission(std::string const& origin, bool granted);
     void resize(int logical_width, int logical_height, double device_pixel_ratio);
     void set_visible(bool visible);
     void set_performance_monitor_enabled(bool enabled);
