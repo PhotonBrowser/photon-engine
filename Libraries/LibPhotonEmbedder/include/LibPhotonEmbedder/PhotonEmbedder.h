@@ -284,6 +284,11 @@ struct ViewCallbacks {
     std::function<void(std::string const& url, bool activate)> open_in_new_tab_requested;
     // A link was shift-clicked, to be shown in a preview over the page.
     std::function<void(std::string const& url)> peek_requested;
+    // The pointer moved onto a link, or off every link with an empty URL.
+    std::function<void(std::string const& url)> link_hovered;
+    // The page entered or left element fullscreen. The embedder fills its
+    // window with the page and reports the result with View::set_fullscreen.
+    std::function<void(bool fullscreen)> fullscreen_requested;
 };
 
 enum class PointerType { Move,
@@ -424,6 +429,25 @@ struct EngineProcessSnapshot {
     bool page_is_frame { false };
 };
 
+enum class DownloadStatus : uint8_t { InProgress,
+    Paused,
+    Completed,
+    Canceled,
+    Failed };
+
+// A file the Engine saves for a page, in the profile's download list.
+struct Download {
+    uint64_t id { 0 };
+    std::string url;
+    std::string path;
+    DownloadStatus status { DownloadStatus::InProgress };
+    uint64_t received_bytes { 0 };
+    std::optional<uint64_t> total_bytes;
+    std::optional<uint64_t> bytes_per_second;
+    std::string error;
+    int64_t created_time_ms { 0 };
+};
+
 class PHOTONEMBEDDER_API Runtime {
 public:
     // Keeps cookies, site storage and the cache in `profile_path`. An empty
@@ -461,6 +485,15 @@ public:
     // Returns resource metrics and the representative page for every process
     // registered by WebView's process manager.
     std::vector<EngineProcessSnapshot> process_snapshots() const;
+    // Calls `changed` with every download now, then whenever one starts or
+    // progresses, and `removed` when one leaves the list. Private downloads
+    // are not reported.
+    void set_download_callbacks(std::function<void(Download const&)> changed, std::function<void(uint64_t id)> removed);
+    void pause_download(uint64_t id);
+    void resume_download(uint64_t id);
+    void cancel_download(uint64_t id);
+    // Removes finished, cancelled and failed downloads from the list.
+    void clear_inactive_downloads();
     // Use the host's system clipboard for copying and pasting.
     void set_clipboard(Clipboard);
     // Deletes website data, then calls `done`.
@@ -516,6 +549,11 @@ public:
     void send_pointer_event(PointerEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);
     void set_preferred_color_scheme(PreferredColorScheme);
+    // Tells the page whether the embedder now shows it fullscreen.
+    void set_fullscreen(bool fullscreen);
+    // Asks the page to leave element fullscreen, as when the user presses
+    // Escape. The page answers through fullscreen_requested.
+    void exit_fullscreen();
     // Find text in the page; an empty query clears the search.
     void find_in_page(std::string const& query, bool case_sensitive, bool highlight_all_matches);
     void find_in_page_next_match();

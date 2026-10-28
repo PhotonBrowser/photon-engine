@@ -829,6 +829,24 @@ private:
         };
 #endif
         on_title_change = [this](Utf16String const&) { notify_state(); };
+        on_link_hover = [this](URL::URL const& url) {
+            if (!m_callbacks.link_hovered)
+                return;
+            auto serialized = url.serialize().bytes_as_string_view();
+            m_callbacks.link_hovered(std::string(serialized.characters_without_null_termination(), serialized.length()));
+        };
+        on_fullscreen_window = [this] {
+            if (m_callbacks.fullscreen_requested)
+                m_callbacks.fullscreen_requested(true);
+        };
+        on_exit_fullscreen_window = [this] {
+            if (m_callbacks.fullscreen_requested)
+                m_callbacks.fullscreen_requested(false);
+        };
+        on_link_unhover = [this] {
+            if (m_callbacks.link_hovered)
+                m_callbacks.link_hovered({});
+        };
         // As Qt's IOSurface layer does, so uncovered page area matches the page.
         on_page_background_color_change = [this](Gfx::Color color) {
             if (m_callbacks.page_background_changed)
@@ -1264,6 +1282,79 @@ static void perform_native_release_drain(void* info)
 }
 #endif
 
+namespace {
+
+Photon::Download download_state(WebView::FileDownloader::Download const& download)
+{
+    auto to_std = [](StringView view) { return std::string(view.characters_without_null_termination(), view.length()); };
+    auto status = Photon::DownloadStatus::InProgress;
+    switch (download.status) {
+    case WebView::FileDownloader::DownloadStatus::InProgress:
+        status = Photon::DownloadStatus::InProgress;
+        break;
+    case WebView::FileDownloader::DownloadStatus::Paused:
+        status = Photon::DownloadStatus::Paused;
+        break;
+    case WebView::FileDownloader::DownloadStatus::Completed:
+        status = Photon::DownloadStatus::Completed;
+        break;
+    case WebView::FileDownloader::DownloadStatus::Canceled:
+        status = Photon::DownloadStatus::Canceled;
+        break;
+    case WebView::FileDownloader::DownloadStatus::Failed:
+        status = Photon::DownloadStatus::Failed;
+        break;
+    }
+    Photon::Download state;
+    state.id = download.id;
+    state.url = to_std(download.url.serialize().bytes_as_string_view());
+    state.path = to_std(download.destination.string().view());
+    state.status = status;
+    state.received_bytes = download.downloaded_size;
+    if (download.total_size.has_value())
+        state.total_bytes = *download.total_size;
+    if (download.bytes_per_second.has_value())
+        state.bytes_per_second = *download.bytes_per_second;
+    if (download.error.has_value())
+        state.error = to_std(download.error->bytes_as_string_view());
+    state.created_time_ms = download.created_time.milliseconds_since_epoch();
+    return state;
+}
+
+// Reports the profile's downloads to the embedder.
+class DownloadObserver final : public WebView::FileDownloaderObserver {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    DownloadObserver(std::function<void(Photon::Download const&)> changed, std::function<void(uint64_t)> removed)
+        : m_changed(move(changed))
+        , m_removed(move(removed))
+    {
+        for (auto const& download : WebView::Application::the().file_downloader().downloads())
+            download_added(download);
+    }
+
+private:
+    virtual void download_added(WebView::FileDownloader::Download const& download) override { download_updated(download); }
+
+    virtual void download_updated(WebView::FileDownloader::Download const& download) override
+    {
+        if (download.is_private == WebView::IsPrivate::No && m_changed)
+            m_changed(download_state(download));
+    }
+
+    virtual void download_removed(u64 id, WebView::IsPrivate is_private) override
+    {
+        if (is_private == WebView::IsPrivate::No && m_removed)
+            m_removed(id);
+    }
+
+    std::function<void(Photon::Download const&)> m_changed;
+    std::function<void(uint64_t)> m_removed;
+};
+
+}
+
 struct Runtime::Impl {
     // The command line the Engine application parses. It keeps pointers into
     // `strings`, so the Impl must not move once it is built.
@@ -1308,6 +1399,8 @@ struct Runtime::Impl {
             CFRelease(owner_run_loop);
     }
 #endif
+    // Declared last so it stops observing before the application goes away.
+    OwnPtr<DownloadObserver> downloads;
 };
 
 View::Impl::~Impl() = default;
@@ -1532,6 +1625,21 @@ std::vector<EngineProcessSnapshot> Runtime::process_snapshots() const
         });
     }
     return processes;
+}
+
+void Runtime::set_download_callbacks(std::function<void(Download const&)> changed, std::function<void(uint64_t id)> removed)
+{
+    m_impl->downloads = nullptr;
+    m_impl->downloads = make<DownloadObserver>(move(changed), move(removed));
+}
+
+void Runtime::pause_download(uint64_t id) { m_impl->application->file_downloader().pause_download(id); }
+void Runtime::resume_download(uint64_t id) { m_impl->application->file_downloader().resume_download(id); }
+void Runtime::cancel_download(uint64_t id) { m_impl->application->file_downloader().cancel_download(id); }
+
+void Runtime::clear_inactive_downloads()
+{
+    m_impl->application->file_downloader().prune_inactive_downloads(WebView::IsPrivate::No);
 }
 
 void Runtime::set_clipboard(Clipboard clipboard)
@@ -1824,6 +1932,13 @@ void View::send_key_event(Key key, bool pressed, uint32_t code_point, bool shift
     };
     m_impl->view->enqueue_input_event(move(event));
 }
+
+void View::set_fullscreen(bool fullscreen)
+{
+    m_impl->view->set_is_fullscreen(fullscreen ? Web::ViewportIsFullscreen::Yes : Web::ViewportIsFullscreen::No);
+}
+
+void View::exit_fullscreen() { m_impl->view->exit_fullscreen(); }
 
 void View::set_preferred_color_scheme(PreferredColorScheme color_scheme)
 {
