@@ -608,8 +608,11 @@ public:
         if (!parsed.has_value() || parsed->origin().is_opaque())
             return;
         auto origin = parsed->origin();
+        auto decision = Optional<PermissionDecision> {
+            granted ? PermissionDecision::Allow : PermissionDecision::Block
+        };
         set_site_permission(origin, Web::Permissions::PermissionName::Microphone,
-            granted ? Optional { PermissionDecision::Allow } : Optional { PermissionDecision::Block });
+            decision);
     }
 
     bool toggle_audio_mute()
@@ -631,8 +634,7 @@ private:
         case ActionID::OpenInNewPrivateWindow:
         case ActionID::DownloadLinkedFileAs:
         case ActionID::SaveImage:
-        case ActionID::TakeVisibleScreenshot:
-        case ActionID::TakeFullScreenshot:
+        case ActionID::TakeScreenshot:
         case ActionID::ViewSource:
             return true;
         default:
@@ -741,7 +743,12 @@ private:
             auto capability = Web::Permissions::to_string(request.name);
             auto document = ByteString::formatted("{}", request.requesting_document_id);
             auto bytes = [](auto const& value) {
-                auto view = value.bytes_as_string_view();
+                auto view = [&] {
+                    if constexpr (requires { value.view(); })
+                        return value.view();
+                    else
+                        return value.bytes_as_string_view();
+                }();
                 return std::string(view.characters_without_null_termination(), view.length());
             };
             auto doc_id = bytes(document);
@@ -767,11 +774,13 @@ private:
         };
         on_cancel_permission_prompt = [this](PermissionPromptRequest const& request) {
             auto top_level_origin = request.top_level_origin.serialize();
-            auto top_level_origin_string = std::string(top_level_origin.bytes_as_string_view().characters_without_null_termination(), top_level_origin.bytes_as_string_view().length());
+            auto top_level_origin_view = top_level_origin.bytes_as_string_view();
+            auto top_level_origin_string = std::string(top_level_origin_view.characters_without_null_termination(), top_level_origin_view.length());
             auto capability = Web::Permissions::to_string(request.name);
             auto capability_string = std::string(capability.characters_without_null_termination(), capability.length());
             auto document = ByteString::formatted("{}", request.requesting_document_id);
-            auto document_string = std::string(document.bytes_as_string_view().characters_without_null_termination(), document.bytes_as_string_view().length());
+            auto document_view = document.view();
+            auto document_string = std::string(document_view.characters_without_null_termination(), document_view.length());
             Optional<uint64_t> embedder_request_id;
             for (auto const& entry : m_pending_permission_requests) {
                 if (entry.value.document_id == document_string && entry.value.top_level_origin == top_level_origin_string && entry.value.capability == capability_string) {
