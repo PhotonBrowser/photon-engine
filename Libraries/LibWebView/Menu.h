@@ -48,8 +48,7 @@ enum class ActionID {
     IgnoreSpelling,
     LearnSpelling,
 
-    TakeVisibleScreenshot,
-    TakeFullScreenshot,
+    TakeScreenshot,
     ReportWebsiteIssue,
 
     ToggleVerticalTabsExpanded,
@@ -77,6 +76,7 @@ enum class ActionID {
     OpenSettingsPage,
     ToggleDevTools,
     ViewSource,
+    InspectElement,
 
     OpenInNewTab,
     OpenInNewWindow,

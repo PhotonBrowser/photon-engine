@@ -23,6 +23,7 @@
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
@@ -273,7 +274,7 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             //    "object", and whose use-URL-credentials flag is set.
             auto request = Fetch::Infrastructure::Request::create();
             request->set_url(url.release_value());
-            request->set_client(&document().relevant_settings_object());
+            request->set_client(document().relevant_settings_object().address());
             request->set_destination(Fetch::Infrastructure::Request::Destination::Object);
             request->set_credentials_mode(Fetch::Infrastructure::Request::CredentialsMode::Include);
             request->set_mode(Fetch::Infrastructure::Request::Mode::Navigate);
@@ -281,7 +282,7 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             request->set_use_url_credentials(true);
 
             Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
-            fetch_algorithms_input.process_response = [this](GC::Ref<Fetch::Infrastructure::Response> response) {
+            fetch_algorithms_input.process_response = [this](GC::Ref<Fetch::Infrastructure::ResponseView> response) {
                 auto& realm = HTML::relevant_realm(*this);
                 auto& global = document().relevant_settings_object().realm().global_object();
 
@@ -303,10 +304,8 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
                     return;
                 }
 
-                if (response->type() == Fetch::Infrastructure::Response::Type::Opaque || response->type() == Fetch::Infrastructure::Response::Type::OpaqueRedirect) {
-                    auto& filtered_response = static_cast<Fetch::Infrastructure::FilteredResponse&>(*response);
-                    response = filtered_response.internal_response();
-                }
+                if (response->type() == Fetch::Infrastructure::Response::Type::Opaque || response->type() == Fetch::Infrastructure::Response::Type::OpaqueRedirect)
+                    response = response->unsafe_response();
 
                 auto on_data_read = GC::create_function(GC::Heap::the(), [this, response](ByteBuffer data) {
                     resource_did_load(response, data);
@@ -353,7 +352,7 @@ void HTMLObjectElement::resource_did_fail()
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#object-type-detection
-void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::Response const& response, ReadonlyBytes data)
+void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::ResponseView const& response, ReadonlyBytes data)
 {
     ScopeGuard guard { [&]() { m_document_load_event_delayer_for_resource_load.take_last(); } };
 
@@ -437,7 +436,7 @@ void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::Response const&
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:plugin-11
-void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastructure::Response const& response, MimeSniff::MimeType const& resource_type, ReadonlyBytes data)
+void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastructure::ResponseView const& response, MimeSniff::MimeType const& resource_type, ReadonlyBytes data)
 {
     // 3.9. Handler: Handle the content as given by the first of the following cases that matches:
 
@@ -570,7 +569,7 @@ void HTMLObjectElement::load_image()
 
     if (m_resource_request->needs_fetching()) {
         auto request = HTML::create_potential_CORS_request(*url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
-        request->set_client(&document().relevant_settings_object());
+        request->set_client(document().relevant_settings_object().address());
         m_resource_request->fetch_resource(request);
     }
 }

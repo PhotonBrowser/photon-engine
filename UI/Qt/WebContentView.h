@@ -19,6 +19,7 @@
 #endif
 #include <LibGfx/Cursor.h>
 #include <LibGfx/Forward.h>
+#include <LibGfx/GpuDeviceIdentity.h>
 #include <LibGfx/Rect.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Forward.h>
@@ -27,6 +28,8 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebCompatReport.h>
+#include <UI/Qt/BackingStoreRelease.h>
+#include <UI/Qt/ScreenshotSelectionOverlay.h>
 
 #include <LibWebCommon/Page/QueuedInputEvent.h>
 #include <QImage>
@@ -35,6 +38,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <QVariant>
+#include <memory>
 
 #ifdef AK_OS_MACOS
 #    define LADYBIRD_QT_USE_IOSURFACE_LAYER 1
@@ -78,6 +82,12 @@ struct WindowsD3DHandle;
 
 namespace Ladybird {
 
+class WaylandPageSurface;
+
+}
+
+namespace Ladybird {
+
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
 using WebContentViewBase = QRhiWidget;
 #else
@@ -87,13 +97,11 @@ using WebContentViewBase = QWidget;
 class CrashOverlayUrlLabel;
 class CrashReportReviewWidget;
 class PageOverlay;
-class ScreenshotSelectionOverlay;
 class ScreenshotViewer;
 class SelectDropdown;
 
 struct WebCompatReportCapture {
     WebView::WebCompatReport::Page page;
-    QImage frame;
     QImage screenshot;
     NonnullRefPtr<Core::Promise<String>> page_dumps;
 };
@@ -118,6 +126,17 @@ public:
 
     WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable = {}, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
+
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    // The GPU that the views present on, when the window system says which one it presents on.
+    static Optional<Gfx::GpuDeviceIdentity> presentation_gpu_device();
+    static Vector<u64> presentation_drm_format_modifiers();
+#endif
+
+    // Shows an image over the page, at a position in the view, where the window system can stack it above the page
+    // itself. Returns false where it cannot, and Qt has to show the image some other way.
+    bool show_image_over_page(QImage const&, QPoint position);
+    void hide_image_over_page();
 
 #if !defined(LADYBIRD_QT_USE_RHI_WIDGET)
     virtual void paintEvent(QPaintEvent*) override;
@@ -150,6 +169,12 @@ public:
     void set_zoom_level(double);
     void set_vertical_tab_overlay_insets(int left, int right);
     void set_bookmarks_bar_overlay_height(int);
+    // How much the page is dimmed under a page dialog, from 0 to 1, where the page is presented above anything Qt paints
+    // over it.
+    void set_page_dim(qreal);
+    // A card that floats over the page, such as the find bar. Qt paints it above the page, so whatever presents the
+    // page above Qt's painting steps aside while it shows.
+    void add_floating_surface(QWidget&);
     void prepare_for_window_move();
     void finish_window_move();
     void close_select_dropdown_after_crash();
@@ -157,8 +182,11 @@ public:
     void review_hidden_crash_report(ByteString const& report_name);
     void leave_report_review();
     void review_web_compat_report(WebCompatReportCapture);
+    void select_web_compat_report_screenshot(Function<void(QImage)> on_selected, Function<void()> on_close = {});
 
     Function<void(WebCompatReportCapture)> on_request_web_compat_report_review;
+    Function<void(Function<void(QImage)> on_selected)> on_request_web_compat_report_screenshot;
+    Function<void()> on_close_web_compat_report_tab;
 
     enum class PaletteMode {
         Default,
@@ -166,10 +194,6 @@ public:
     };
     void update_palette(PaletteMode = PaletteMode::Default);
     Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size) const;
-
-#ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
-    void set_has_rounded_corners(bool);
-#endif
 
     WebView::AccessibilityTreeManager const* accessibility_tree_manager() const { return m_accessibility_manager.ptr(); }
 
@@ -185,6 +209,8 @@ public:
 
 signals:
     void ready_to_paint();
+    void crash_overlay_changed();
+    void image_overlay_unavailable();
     void urls_dropped(QList<QUrl> const&);
 
 private:
@@ -208,9 +234,17 @@ private:
     struct Paintable {
         Gfx::SharedImageBuffer const* shared_image_buffer { nullptr };
         Gfx::IntSize bitmap_size;
+        // The backing store's ID, or -1 for a frame kept from backing stores that are gone.
+        i32 bitmap_id { -1 };
+        // The page that the backing store belongs to.
+        u64 page_id { 0 };
     };
 
     Optional<Paintable> current_paintable() const;
+    // The pixels of a frame, which a frame that lives only in GPU memory has once they are read back from there.
+    RefPtr<Gfx::Bitmap const> cpu_bitmap_of(Paintable const&) const;
+    // The pixels of a frame for Qt to paint, which there is no need to read back while the page's window covers them.
+    RefPtr<Gfx::Bitmap const> cpu_bitmap_to_paint(Paintable const&) const;
     QImage visible_snapshot() const;
 
     void update_viewport_size();
@@ -222,7 +256,8 @@ private:
 #endif
     Web::DevicePixelPoint node_picker_position_for(QSinglePointEvent const&) const;
 
-    void enqueue_native_event(Web::MouseEvent::Type, QSinglePointEvent const& event);
+    // The platform may report a phase of a wheel event's gesture that Qt does not pass on.
+    void enqueue_native_event(Web::MouseEvent::Type, QSinglePointEvent const& event, Optional<Web::ScrollGesturePhase> scroll_gesture_phase_the_platform_reports = {});
     void handle_pointer_leave();
 
     void enqueue_native_event(Web::DragEvent::Type, QDropEvent const& event);
@@ -237,12 +272,14 @@ private:
     void show_crash_report_review(Optional<ByteString> const& hidden_crash_report_name = {});
 
     void start_web_compat_report();
-    void select_screenshot(QImage const& frame, Function<void(QImage)> on_selected);
+    ScreenshotSelectionOverlay& select_screenshot(QImage const& frame, ScreenshotSelectionOverlay::Purpose, Function<void()> on_close = {});
+    void start_screenshot();
     QPointer<QWidget> show_transient_overlay(QWidget&);
     void close_transient_overlay(QWidget&, QPointer<QWidget> const& focus_to_restore);
 
     Array<QWidget*, 4> overlays() const;
     bool is_page_covered_by_overlay() const;
+    bool has_floating_surface_over_page() const;
 
 #if !defined(Q_OS_WIN)
     virtual void accessibilityActiveChanged(bool active) override;
@@ -297,22 +334,36 @@ private:
 
     QPointer<ScreenshotSelectionOverlay> m_screenshot_selection_overlay;
     QPointer<ScreenshotViewer> m_screenshot_viewer;
+    Vector<QPointer<QWidget>> m_floating_surfaces;
     PageOverlay* m_web_compat_report_overlay { nullptr };
 
 #ifdef AK_OS_MACOS
     NativeTextEditingBindings m_native_text_editing_bindings;
+
+    // The end of a flick's fingers, held back while the momentum AppKit said would follow it has yet to begin.
+    std::unique_ptr<QWheelEvent> m_wheel_end_awaiting_momentum;
+    Qt::ScrollPhase m_last_wheel_event_phase { Qt::NoScrollPhase };
+    quint64 m_last_wheel_event_timestamp { 0 };
+#endif
+
+#if defined(LADYBIRD_QT_USE_IOSURFACE_LAYER) || defined(LADYBIRD_HAS_WAYLAND_GPU_QUERY)
+    virtual bool eventFilter(QObject*, QEvent*) override;
+    void watch_ancestors_for_moves();
+    void place_native_view_again();
+    Vector<QPointer<QWidget>> m_watched_ancestors;
 #endif
 
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
+
     bool ensure_iosurface_layer_attached_to_native_view();
     void present_current_paintable_as_layer_contents();
     void update_iosurface_layer_frame();
     void update_iosurface_layer_background_color();
-    void update_iosurface_layer_border();
     void detach_iosurface_layer_from_native_view();
     void destroy_iosurface_layer();
 
     void* m_iosurface_layer { nullptr };
+    void* m_page_dim_layer { nullptr };
 #endif
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
@@ -357,10 +408,71 @@ private:
     bool vulkan_window_has_native_focus() const;
     void set_vulkan_window_container_visible(bool);
     void fall_back_to_bitmap_rendering();
+    void vulkan_window_exposure_changed();
+    QRect rect_covered_by_page_window() const;
+    bool vulkan_window_update_would_only_resize() const;
+    void remap_unexposed_vulkan_window();
+
+    virtual void release_backing_store(i32 bitmap_id) override;
+
+#    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    bool create_page_surface();
+    void update_page_surface();
+    void hide_page_surface();
+    bool page_surface_can_show_frames() const;
+    void fall_back_from_page_surface();
+    void destroy_page_surface();
+    void release_retired_backing_stores_no_longer_painted();
+    void release_all_retired_backing_stores();
+    Vector<Gfx::SharedImageBuffer const*> backing_stores() const;
+    QRect rect_shown_in_window() const;
+
+    // Shows the page's frames on Wayland by handing their dma-bufs to the compositor of the desktop. Without it, the
+    // page's window draws them in a swap chain of its own.
+    OwnPtr<WaylandPageSurface> m_page_surface;
+    bool m_page_surface_failed { false };
+    // Where the page surface shows a frame, in device pixels of the view.
+    QRect m_page_surface_rect;
+    // Where the page surface last showed a frame, in the logical coordinates of the browser window.
+    QPoint m_page_surface_position;
+    // The backing stores the view is done with that the compositor of the desktop may still read. The page they belong
+    // to can stop displaying the tab before the compositor is done.
+    struct BackingStoreWaitingForRelease {
+        NonnullRefPtr<WebView::WebContentPage> page;
+        i32 bitmap_id { -1 };
+    };
+    Vector<BackingStoreWaitingForRelease> m_backing_stores_waiting_for_release;
+    struct RetiredBackingStore {
+        u64 page_id;
+        i32 bitmap_id;
+        u64 device;
+        u64 inode;
+        NonnullRefPtr<BackingStoreRelease> release;
+    };
+    Vector<RetiredBackingStore> m_retired_backing_stores;
+#    endif
 
     VulkanWindow* m_vulkan_window { nullptr };
     QWidget* m_vulkan_window_container { nullptr };
     Optional<bool> m_vulkan_window_supports_alpha_blending;
+    // Whether frames come in a format or layout that the page's window can never import.
+    bool m_vulkan_window_cannot_import_frames { false };
+    bool m_remapped_unexposed_vulkan_window { false };
+    QTimer m_unexposed_vulkan_window_timer;
+    // Waits for the browser window to be exposed again, before the page's window is mapped again.
+    QObject* m_top_level_expose_watcher { nullptr };
+    // The size of the page's last frame on screen, in device pixels.
+    QSize m_presented_page_window_size;
+    // Counts the changes to what the page's window shows, so that a present that would only resize it can be skipped.
+    u64 m_page_window_content_serial { 0 };
+    u64 m_presented_page_window_content_serial { 0 };
+
+    // The pixels of the frame on screen, read back from GPU memory once for each frame that Qt paints itself.
+    struct FrameReadFromGpu {
+        Gfx::SharedImageBuffer const* shared_image_buffer { nullptr };
+        RefPtr<Gfx::Bitmap const> bitmap;
+    };
+    mutable FrameReadFromGpu m_frame_read_from_gpu;
 
     int m_vertical_tab_overlay_left { 0 };
     int m_vertical_tab_overlay_right { 0 };

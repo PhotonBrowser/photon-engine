@@ -33,6 +33,8 @@ static constexpr auto LANGUAGES_KEY = "languages"sv;
 static constexpr auto APPEARANCE_KEY = "appearance"sv;
 static constexpr auto SHOW_MENU_BAR_KEY = "showMenuBar"sv;
 static constexpr auto SHOW_BOOKMARKS_BAR_KEY = "showBookmarksBar"sv;
+static constexpr auto INTERFACE_THEME_KEY = "interfaceTheme"sv;
+static constexpr auto WEBSITE_COLOR_SCHEME_KEY = "websiteColorScheme"sv;
 
 static constexpr auto WINDOW_SETTINGS_KEY = "window"sv;
 static constexpr auto WINDOW_POSITION_KEY = "position"sv;
@@ -72,7 +74,7 @@ static constexpr auto SITE_SETTING_POLICY_KEY = "policy"sv;
 static constexpr auto SITE_SETTING_SITE_FILTERS_KEY = "siteFilters"sv;
 
 static constexpr auto AUTOPLAY_KEY = "autoplay"sv;
-static constexpr auto GEOLOCATION_ENABLED_KEY = "geolocationEnabled"sv;
+static constexpr auto LOCATION_POLICY_KEY = "locationPolicy"sv;
 
 static constexpr auto BROWSING_DATA_KEY = "browsingData"sv;
 static constexpr auto DISK_CACHE_KEY = "diskCache"sv;
@@ -86,7 +88,6 @@ static constexpr auto BACKGROUND_NETWORKING_FEATURES_KEY = "features"sv;
 
 static constexpr auto CONTENT_BLOCKERS_KEY = "contentBlockers"sv;
 static constexpr auto CONTENT_BLOCKER_SUBSCRIPTION_UPDATES_KEY = "contentBlockerSubscriptionUpdates"sv;
-static constexpr auto CONTENT_BLOCKER_SHOW_BLOCKED_COUNT_KEY = "showBlockedCount"sv;
 static constexpr auto CONTENT_BLOCKER_DISABLED_SITES_KEY = "disabledSites"sv;
 static constexpr auto CONTENT_BLOCKER_BUILT_IN_LISTS_KEY = "builtInLists"sv;
 static constexpr auto CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY = "customSubscriptions"sv;
@@ -223,6 +224,30 @@ static constexpr Optional<ShowBookmarksBar> bookmarks_bar_position_from_string(S
         return ShowBookmarksBar::Never;
     if (show_bookmarks_bar == "onHover"sv)
         return ShowBookmarksBar::OnHover;
+    return {};
+}
+
+static constexpr StringView theme_preference_to_string(ThemePreference preference)
+{
+    switch (preference) {
+    case ThemePreference::System:
+        return "system"sv;
+    case ThemePreference::Light:
+        return "light"sv;
+    case ThemePreference::Dark:
+        return "dark"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static constexpr Optional<ThemePreference> theme_preference_from_string(StringView preference)
+{
+    if (preference == "system"sv)
+        return ThemePreference::System;
+    if (preference == "light"sv)
+        return ThemePreference::Light;
+    if (preference == "dark"sv)
+        return ThemePreference::Dark;
     return {};
 }
 
@@ -398,8 +423,10 @@ Settings Settings::create(ByteString settings_path, Vector<String> platform_lang
 
     load_site_setting(settings.m_autoplay, AUTOPLAY_KEY);
 
-    if (auto geolocation_enabled = settings_json.value().get_bool(GEOLOCATION_ENABLED_KEY); geolocation_enabled.has_value())
-        settings.m_geolocation_enabled = *geolocation_enabled && Core::GeolocationProvider::is_available();
+    // NB: The geolocationEnabled key this replaced was written on every save, so its false was rarely the user's
+    //     choice; it's ignored, and every profile starts out letting sites ask.
+    if (auto location_policy = settings_json.value().get_string(LOCATION_POLICY_KEY); location_policy.has_value() && *location_policy == "block"sv)
+        settings.m_location_policy = LocationPolicy::Block;
 
     if (auto browsing_data_settings = settings_json.value().get(BROWSING_DATA_KEY); browsing_data_settings.has_value())
         settings.m_browsing_data_settings = parse_browsing_data_settings(*browsing_data_settings);
@@ -420,8 +447,6 @@ Settings Settings::create(ByteString settings_path, Vector<String> platform_lang
     if (auto content_blockers = settings_json.value().get_object(CONTENT_BLOCKERS_KEY); content_blockers.has_value()) {
         if (auto content_blocker_enabled = content_blockers->get_bool(CONTENT_BLOCKER_ENABLED_KEY); content_blocker_enabled.has_value())
             settings.m_content_blocker_enabled = *content_blocker_enabled;
-        if (auto show_content_blocker_count = content_blockers->get_bool(CONTENT_BLOCKER_SHOW_BLOCKED_COUNT_KEY); show_content_blocker_count.has_value())
-            settings.m_show_content_blocker_count = *show_content_blocker_count;
 
         if (auto sites = content_blockers->get_array(CONTENT_BLOCKER_DISABLED_SITES_KEY); sites.has_value()) {
             sites->for_each([&](JsonValue const& entry) {
@@ -480,7 +505,7 @@ Settings Settings::create(ByteString settings_path, Vector<String> platform_lang
 
 Settings::Settings(ByteString settings_path)
     : m_settings_path(move(settings_path))
-    , m_new_tab_page_url(URL::about_newtab())
+    , m_new_tab_page_url(URL::about_blank())
     , m_languages(Web::default_preferred_languages())
 {
     for (auto const& variable : config_variable_definitions()) {
@@ -555,6 +580,8 @@ JsonValue Settings::serialize_json() const
     JsonObject appearance;
     appearance.set(SHOW_MENU_BAR_KEY, m_appearance.show_menu_bar);
     appearance.set(SHOW_BOOKMARKS_BAR_KEY, show_bookmarks_bar_to_string(m_appearance.show_bookmarks_bar));
+    appearance.set(INTERFACE_THEME_KEY, theme_preference_to_string(m_appearance.interface_theme));
+    appearance.set(WEBSITE_COLOR_SCHEME_KEY, theme_preference_to_string(m_appearance.website_color_scheme));
     settings.set(APPEARANCE_KEY, move(appearance));
 
     JsonObject zoom_per_host;
@@ -618,7 +645,7 @@ JsonValue Settings::serialize_json() const
 
     save_site_setting(m_autoplay, AUTOPLAY_KEY);
 
-    settings.set(GEOLOCATION_ENABLED_KEY, m_geolocation_enabled);
+    settings.set(LOCATION_POLICY_KEY, m_location_policy == LocationPolicy::Block ? "block"_string : "ask"_string);
 
     JsonObject disk_cache_settings;
     disk_cache_settings.set(DISK_CACHE_MAXIMUM_SIZE_KEY, m_browsing_data_settings.disk_cache_settings.maximum_size);
@@ -664,7 +691,6 @@ JsonValue Settings::serialize_json() const
 
     JsonObject content_blockers;
     content_blockers.set(CONTENT_BLOCKER_ENABLED_KEY, m_content_blocker_enabled);
-    content_blockers.set(CONTENT_BLOCKER_SHOW_BLOCKED_COUNT_KEY, m_show_content_blocker_count);
     content_blockers.set(CONTENT_BLOCKER_DISABLED_SITES_KEY, move(disabled_sites));
     content_blockers.set(CONTENT_BLOCKER_BUILT_IN_LISTS_KEY, move(built_in_content_blocker_lists));
     content_blockers.set(CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY, move(custom_content_blocker_subscriptions));
@@ -824,6 +850,14 @@ Appearance Settings::parse_appearance(JsonValue const& settings)
     if (auto show_bookmarks_bar = settings.as_object().get_string(SHOW_BOOKMARKS_BAR_KEY); show_bookmarks_bar.has_value()) {
         if (auto parsed = bookmarks_bar_position_from_string(*show_bookmarks_bar); parsed.has_value())
             appearance.show_bookmarks_bar = *parsed;
+    }
+    if (auto interface_theme = settings.as_object().get_string(INTERFACE_THEME_KEY); interface_theme.has_value()) {
+        if (auto parsed = theme_preference_from_string(*interface_theme); parsed.has_value())
+            appearance.interface_theme = *parsed;
+    }
+    if (auto website_color_scheme = settings.as_object().get_string(WEBSITE_COLOR_SCHEME_KEY); website_color_scheme.has_value()) {
+        if (auto parsed = theme_preference_from_string(*website_color_scheme); parsed.has_value())
+            appearance.website_color_scheme = *parsed;
     }
 
     return appearance;
@@ -1079,9 +1113,9 @@ void Settings::remove_all_autoplay_site_filters()
         observer.autoplay_settings_changed();
 }
 
-void Settings::set_geolocation_enabled(bool enabled)
+void Settings::set_location_policy(LocationPolicy policy)
 {
-    m_geolocation_enabled = enabled && Core::GeolocationProvider::is_available();
+    m_location_policy = policy;
     persist_settings();
 
     for (auto& observer : m_observers)
@@ -1218,16 +1252,6 @@ void Settings::set_content_blocker_enabled(bool enabled)
     persist_settings();
     for (auto& observer : m_observers)
         observer.content_blocker_settings_changed();
-}
-
-void Settings::set_show_content_blocker_count(bool show)
-{
-    if (m_show_content_blocker_count == show)
-        return;
-    m_show_content_blocker_count = show;
-    persist_settings();
-    for (auto& observer : m_observers)
-        observer.content_blocker_count_visibility_changed();
 }
 
 void Settings::set_content_blocker_list_enabled(StringView identifier, bool enabled)

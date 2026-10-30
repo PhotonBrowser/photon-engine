@@ -152,8 +152,6 @@ public:
 
     void toggle_fullscreen();
 
-    void page_mute_state_changed(Badge<Page>);
-
     double effective_media_volume() const;
     bool is_playing_audio() const { return m_is_playing_audio; }
 
@@ -236,6 +234,7 @@ protected:
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
+    virtual WebIDL::ExceptionOr<void> cloned(DOM::Node&, bool) const override;
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     virtual void removed_from(IsSubtreeRoot, DOM::Node* old_ancestor, DOM::Node& old_root) override;
     virtual void adopted_from(DOM::Document&) override;
@@ -276,7 +275,7 @@ private:
     void add_current_video_sink(Media::VideoSinkHandle);
     void release_active_video_sink();
 
-    Optional<Utf16String> verify_response_or_get_failure_reason(GC::Ref<Fetch::Infrastructure::Response>, ByteRange const&);
+    Optional<Utf16String> verify_response_or_get_failure_reason(GC::Ref<Fetch::Infrastructure::ResponseView>, ByteRange const&);
     bool should_hold_screen_wake_lock() const;
     void update_screen_wake_lock();
 

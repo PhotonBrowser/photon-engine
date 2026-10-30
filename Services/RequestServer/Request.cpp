@@ -34,6 +34,7 @@ namespace RequestServer {
 extern OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
 
 static long s_connect_timeout_seconds = 90L;
+static constexpr long s_alternative_service_connect_timeout_seconds = 2L;
 
 static constexpr size_t max_response_header_count = 1000;
 static AK::Duration s_wait_for_cache_timeout = AK::Duration::from_seconds(10);
@@ -543,7 +544,7 @@ Request::Request(
     , m_transfer_lease(move(transfer_lease))
 {
     // A response for another site is only passing through this RequestServer on its way to that site's.
-    if (auto const& site = process_top_level_site(); site.has_value() && m_disk_cache.has_value() && m_network_isolation_key->top_level_site != *site)
+    if (m_disk_cache.has_value() && !process_keeps_responses_under(m_network_isolation_key->top_level_site))
         m_disk_cache.clear();
 
     if constexpr (REQUESTSERVER_WIRE_DEBUG)
@@ -850,6 +851,16 @@ void Request::handle_fetch_complete(int result_code)
         // would receive an empty response with HTTP status 0 — and then wait forever for a body that will never arrive.
         if (result_code == CURLE_OK)
             transfer_headers_to_client_if_needed();
+    }
+
+    // https://fetch.spec.whatwg.org/#concept-http-network-fetch
+    // 11. If bytes is failure, then terminate fetchParams’s controller.
+    // NB: A decoding failure is a body error after the response headers arrived. Expose that response even if libcurl
+    //     could not produce a single decoded byte, after storing its cookies and HSTS policy.
+    if (result_code == CURLE_BAD_CONTENT_ENCODING) {
+        if (defer_until_response_cookies_and_hsts_policy_are_stored([this, result_code] { handle_fetch_complete(result_code); }))
+            return;
+        transfer_headers_to_client_if_needed();
     }
 
     m_curl_result_code = result_code;
@@ -1473,12 +1484,17 @@ void Request::handle_fetch_state()
     set_option(CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
     set_option(CURLOPT_CONNECTTIMEOUT, s_connect_timeout_seconds);
 
-    // https://www.rfc-editor.org/rfc/rfc7838#section-2.4
-    // If the connection to the alternative service does not negotiate the expected protocol (for example, ALPN fails to
-    // negotiate h2, or an Upgrade request to h2c is not accepted), the connection to the alternative service MUST be
-    // considered to have failed.
-    if (m_alternative_service.has_value())
+    if (m_alternative_service.has_value()) {
+        // https://www.rfc-editor.org/rfc/rfc7838#section-2.4
+        // If the connection to the alternative service does not negotiate the expected protocol (for example, ALPN
+        // fails to negotiate h2, or an Upgrade request to h2c is not accepted), the connection to the alternative
+        // service MUST be considered to have failed.
         set_option(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_3ONLY);
+
+        // NB: Advertised HTTP/3 is often unreachable (e.g. UDP blocked along the path). Give up on the alternative
+        //     quickly so the request falls back to the origin instead of waiting out the full connect timeout.
+        set_option(CURLOPT_CONNECTTIMEOUT, s_alternative_service_connect_timeout_seconds);
+    }
 
     // Nobody waits on a background revalidation, so nothing else would ever notice one whose connection silently died.
     // While it lives, it holds its cache entry open and every request for the same URL waits on it, so give up on it
@@ -1969,8 +1985,11 @@ size_t Request::on_header_received(void* buffer, size_t size, size_t nmemb, void
         // We need to extract the HTTP reason phrase since it can be a custom value. Fetching infrastructure needs this
         // value for setting the status message.
         auto space_index = header_line.find(' ');
-        if (space_index.has_value())
+        if (space_index.has_value()) {
+            // NB: Observers need the HTTP version before the response body finishes.
+            request.m_http_version = ByteString(header_line.substring_view(0, *space_index)).to_lowercase();
             space_index = header_line.find(' ', *space_index + 1);
+        }
 
         if (space_index.has_value()) {
             if (auto reason_phrase = HTTP::normalize_header_value(header_line.substring_view(*space_index + 1)); !reason_phrase.is_empty()) {
@@ -2258,7 +2277,7 @@ void Request::send_headers_to_client(Optional<IPC::File> javascript_bytecode, u6
     auto cache_state = Requests::CacheState::NotCached;
     if (m_cache_status == CacheStatus::ReadFromCache)
         cache_state = m_cache_entry_was_revalidated ? Requests::CacheState::Validated : Requests::CacheState::Local;
-    m_client->async_headers_became_available(m_request_id, m_response_headers->headers(), m_status_code, m_reason_phrase, move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key, cache_state);
+    m_client->async_headers_became_available(m_request_id, m_response_headers->headers(), m_status_code, m_reason_phrase, move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key, cache_state, m_http_version);
 }
 
 ErrorOr<void> Request::write_queued_bytes_without_blocking()

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
 #include <LibGC/Function.h>
 #include <LibGC/Ptr.h>
 #include <LibJS/Heap/Cell.h>
@@ -13,6 +14,7 @@
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
 
@@ -21,12 +23,13 @@ class SharedResourceRequest final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(SharedResourceRequest);
 
 public:
-    // NB: Only requests with the same CORS mode and credentials mode share a resource, so that each of them gets the
-    //     CORS and Cross-Origin-Resource-Policy checks for its own kind of request. Like the key of the list of
-    //     available images, this leaves out the origin, which is the same for every request of a document.
+    // NB: Only requests with the same CORS mode, credentials mode, integrity metadata and referrer policy share a
+    //     resource. The origin is the same for every request of a document.
     struct Key {
         URL::URL url;
         CORSSettingAttribute cors_setting { CORSSettingAttribute::NoCORS };
+        Utf16String integrity_metadata;
+        ReferrerPolicy::ReferrerPolicy referrer_policy { ReferrerPolicy::ReferrerPolicy::EmptyString };
 
         [[nodiscard]] bool operator==(Key const&) const = default;
     };
@@ -46,14 +49,25 @@ public:
     [[nodiscard]] GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller();
     void set_fetch_controller(GC::Ptr<Fetch::Infrastructure::FetchController>);
 
-    void fetch_resource(GC::Ref<Fetch::Infrastructure::Request>);
+    void fetch_resource(NonnullRefPtr<Fetch::Infrastructure::Request>);
 
     void add_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop = {});
+
+    enum class DelaysLoadEvent : u8 {
+        No,
+        Yes,
+    };
+
+    // Returns an ID for remove_callbacks(), or nothing if the callbacks already ran.
+    Optional<u64> add_removable_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop = {}, DelaysLoadEvent = DelaysLoadEvent::Yes);
+    void remove_callbacks(u64 id);
 
     bool is_fetching() const;
     bool needs_fetching() const;
 
 private:
+    [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(DOM::Document&, Key);
+
     explicit SharedResourceRequest(GC::Ref<Page>, Key, GC::Ref<DOM::Document>);
 
     virtual void finalize() override;
@@ -83,11 +97,18 @@ private:
     GC::Ref<Page> m_page;
 
     struct Callbacks {
+        // NB: Zero when nothing waits for these callbacks anymore.
+        u64 id { 0 };
+        DelaysLoadEvent delays_load_event { DelaysLoadEvent::Yes };
         GC::Ptr<GC::Function<void()>> on_finish;
         GC::Ptr<GC::Function<void()>> on_fail;
         GC::Ptr<GC::Function<void()>> on_stop;
     };
     Vector<Callbacks> m_callbacks;
+    u64 m_next_callbacks_id { 1 };
+
+    // NB: Set when the fetch was started for a user that waits for it without callbacks.
+    bool m_fetch_has_user_without_callbacks { false };
 
     Key m_key;
     GC::Ptr<DecodedImageData> m_image_data;
@@ -107,7 +128,9 @@ template<>
 struct Traits<Web::HTML::SharedResourceRequest::Key> : public DefaultTraits<Web::HTML::SharedResourceRequest::Key> {
     static unsigned hash(Web::HTML::SharedResourceRequest::Key const& key)
     {
-        return pair_int_hash(Traits<URL::URL>::hash(key.url), to_underlying(key.cors_setting));
+        auto hash = pair_int_hash(Traits<URL::URL>::hash(key.url), to_underlying(key.cors_setting));
+        hash = pair_int_hash(hash, key.integrity_metadata.hash());
+        return pair_int_hash(hash, to_underlying(key.referrer_policy));
     }
 };
 

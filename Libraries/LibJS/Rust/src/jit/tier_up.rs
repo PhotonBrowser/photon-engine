@@ -6,15 +6,16 @@
 
 //! The tier-up policy, which runs when an executable has used up its tier-up budget.
 
+use core::ops::ControlFlow;
 use core::ptr::NonNull;
 
 use libjs_jit::code::CompiledCode;
 
-use super::code::{CompileState, JitCode, SnapshotExecutable};
+use super::code::{CompileState, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL, JitCode, SnapshotExecutable};
 use super::compile_queue::CompileResult;
 use super::executable_memory::ExecutableMemory;
 use super::snapshot::{CapturedSnapshot, capture_snapshot};
-use super::{CompileJob, JitState};
+use super::{CompileJob, JitState, executable_of};
 use crate::bytecode::executable::Executable;
 use crate::bytecode::feedback::tier_up_costs;
 use crate::gc::defer_gc::DeferGc;
@@ -127,9 +128,18 @@ impl CompileTarget {
     }
 }
 
+/// Executables with more bytecode than this are never compiled. The compile of one takes time and memory in proportion
+/// to its size or worse (YouTube's top-level script code, 8.8 MiB of bytecode, took minutes and over 1 GiB), and code
+/// that large rarely runs hot as a whole. Compiled C code is the exception: hot functions of Emscripten output can have
+/// over 200 KiB of bytecode (Octane zlib has one with 209 KiB).
+const MAX_COMPILED_BYTECODE_SIZE: usize = 256 * 1024;
+
 /// What to compile the running frame's executable for, if it should be compiled at all.
 fn code_to_compile(vm: &Vm) -> Option<CompileTarget> {
     if vm.debugging_enabled() {
+        return None;
+    }
+    if vm.current_executable().bytecode().len() > MAX_COMPILED_BYTECODE_SIZE {
         return None;
     }
     let frame = vm.running_execution_context_ref();
@@ -368,6 +378,14 @@ fn install(
     code.set_osr_outer_loop_back_edges(compiled.osr_outer_loop_back_edges);
     code.set_uncaught_handlers(compiled.uncaught_handlers);
     vm.jit.dependents.register(vm, executable, id, &compiled.dependencies);
+    // NB: A callee's tier-up check may install the code while its caller still runs in the interpreter, possibly
+    //     past the loop the code has an on-stack replacement entry at.
+    vm.for_each_live_execution_context(|frame| {
+        if !frame.runs_jit_code.get() && frame.executable.get().is_some() && executable_of(frame) == executable {
+            code.note_interpreted_frame(vm, frame, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL);
+        }
+        ControlFlow::Continue(())
+    });
     // NB: Code may be installed while frames of the executable loop in the interpreter, because the compile was
     //     queued (from the tier-up check of another executable, like a callee's), or because they exited from the
     //     code before. Those frames keep counting, so that they continue in the code at its on-stack replacement

@@ -23,6 +23,7 @@
 #include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
 #include <LibWebCommon/Page/PageId.h>
+#include <LibWebCommon/Permissions/Permissions.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Forward.h>
@@ -65,8 +66,6 @@ public:
     void remove_web_worker_owner(WebWorkerClient&);
 
     void post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage, CanonicalEnvironmentSettingsObject const& source_settings, pid_t source_process_id, IsPrivate);
-    // Reconnects the workers whose RequestServer client the predicate picks out to the given RequestServer.
-    ErrorOr<void> reconnect_to_request_server(RequestServerInstance&, Function<bool(RequestServerSiteBindings const&)> should_reconnect);
     void for_each_request_server_site_bindings(Function<IterationDecision(RequestServerSiteBindings&)> const&);
     ErrorOr<void> simulate_request_server_connection_loss_for_testing(WebContentClient&, Web::PageId page_id);
 
@@ -75,6 +74,9 @@ public:
     Optional<u64> exclusive_performance_owner(pid_t) const;
 
     size_t client_count() const { return m_agents.size(); }
+
+    void update_permission_snapshot(PermissionManager const&);
+    Optional<URL::Origin> top_level_origin(Web::HTML::WorkerAgentId) const;
 
     template<CallableAs<IterationDecision, WebWorkerClient&> Callback>
     void for_each_client(Callback callback)

@@ -19,6 +19,7 @@
 #include <LibIPC/Transport.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibRequests/Request.h>
+#include <LibURL/Site.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/WebDriver/Error.h>
@@ -38,11 +39,13 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
+#include <LibWebView/PermissionManager.h>
 #include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentTestClient.h>
+#include <LibWebView/WebDriverBiDi.h>
 #include <LibWebView/WebUI.h>
 #include <LibWebView/WorkerProcessManager.h>
 
@@ -124,6 +127,9 @@ WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPr
     : IPC::ConnectionToServer<WebContentClientEndpoint, WebContentServerEndpoint, WebContentClientPageRoutingStub>(*this, move(transport))
     , m_is_private(is_private)
     , m_session(Application::existing_session(is_private))
+    , m_request_server_site_bindings([this](RequestServerClientConnection& connection, Optional<Utf16String> const& top_level_site) {
+        async_connect_to_request_server(move(connection.handle), connection.client_id, top_level_site);
+    })
     , m_unassigned_initial_page_id(initial_page_id)
     , m_root_navigable_id(root_navigable_id)
     , m_audio_tab_id(allocate_audio_tab_id())
@@ -275,6 +281,8 @@ WebContentPage& WebContentClient::open_page_for_new_top_level_traversable(Web::P
 
     auto& page = open_page(page_id, traversable);
     traversable.active_document().set_host(page);
+    if (auto* bidi = WebDriverBiDi::the())
+        bidi->push_session_state_for_client(*this);
     return page;
 }
 
@@ -496,6 +504,7 @@ void WebContentClient::replay_compositor_view_state_after_reconnect(Badge<Applic
         Application::the().update_compositor_viewport(context_id, view.viewport_size().to_type<int>(), view.device_pixel_ratio());
         Application::the().update_compositor_display_metadata(context_id, view.display_id(), view.maximum_frames_per_second());
         Application::the().update_compositor_context_visibility(context_id, view.traversable().system_visibility_state());
+        Application::the().update_compositor_context_presents_from_cpu_memory(context_id, view.presents_from_cpu_memory());
         view.update_ui_overlays();
     }
 }
@@ -755,20 +764,20 @@ Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentCli
     return Optional<u64> {};
 }
 
-Messages::WebContentClient::DidStartDownloadResponse WebContentClient::did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
+Messages::WebContentClient::DidStartDownloadResponse WebContentClient::did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
 {
     if (auto* page = this->page(page_id))
-        return page->did_start_download(navigable_id, move(navigation_id), move(url), move(suggested_filename), total_size, request_server_client_id, request_server_request_id, move(initial_data));
+        return page->did_start_download(navigable_id, move(navigation_id), move(url), move(suggested_filename), total_size, request_server_client_id, request_server_request_id, move(initial_data), move(network_response));
 
     return Optional<u64> {};
 }
 
-Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(Web::PageId page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set)
+Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(Web::PageId page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Web::HTML::CrossProcessId current_navigable_id, Utf16String name, bool no_opener, Optional<URL::URL> current_document_base_url)
 {
     if (auto* page = this->page(page_id))
-        return page->did_request_new_web_view(activate_tab, hints, opener_navigable_id, move(opener_base_url), move(target_name), popup_sandboxing_flag_set);
+        return page->did_request_new_web_view(activate_tab, hints, current_navigable_id, move(name), no_opener, move(current_document_base_url));
 
-    return { Optional<Web::PageId> {}, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> {}, Optional<Web::HTML::EnvironmentId> {}, Optional<Web::HTML::CrossProcessId> {}, Optional<u64> {}, Web::HTML::VisibilityState::Hidden, String {} };
+    return { Optional<Web::PageId> {}, Optional<Web::HTML::CrossProcessId> {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> {}, Optional<Web::HTML::EnvironmentId> {}, Optional<Web::HTML::CrossProcessId> {}, Optional<u64> {}, Web::HTML::WindowType::ExistingOrNone, Web::HTML::VisibilityState::Hidden, String {} };
 }
 
 Messages::WebContentClient::StartWorkerAgentResponse WebContentClient::start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request)
@@ -814,27 +823,45 @@ Messages::WebContentClient::DidIsKnownHstsHostResponse WebContentClient::did_is_
     return m_session->hsts_store->is_known_hsts_host(domain);
 }
 
-Messages::WebContentClient::DidLoseRequestServerConnectionResponse WebContentClient::did_lose_request_server_connection()
+Messages::WebContentClient::DidLoseRequestServerConnectionResponse WebContentClient::did_lose_request_server_connection(Optional<Utf16String> top_level_site)
 {
-    // The replacement client is on the RequestServer the process was using.
-    RefPtr<RequestServerInstance> instance;
-    if (auto client_id = m_request_server_site_bindings.client_id(); client_id.has_value())
-        instance = RequestServerManager::the().instance_for_client(*client_id);
-    auto connection = instance
-        ? RequestServerManager::the().connect_new_client(*instance, *m_session, RequestServer::SiteBinding::Bound)
-        : connect_new_request_server_client(*m_session, RequestServer::SiteBinding::Bound);
+    bool navigation_authorized = false;
+    if (top_level_site.has_value() && !m_request_server_site_bindings.client_id_for(top_level_site).has_value()) {
+        ViewImplementation::for_each_view([&](ViewImplementation& view) {
+            if (!view.has_traversable())
+                return IterationDecision::Continue;
+            auto& traversable = view.traversable();
+            auto navigation = traversable.uncommitted_navigation();
+            if (navigation && navigation->state.has<CanonicalNavigation::CreatingNavigationParams>()
+                && navigation->worker() && &navigation->worker()->client() == this
+                && URL::Site::serialize_for_partitioning(navigation->url.origin()) == *top_level_site)
+                navigation_authorized = true;
+            if (traversable.client_populates_a_history_entry_for_site(*this, *top_level_site))
+                navigation_authorized = true;
+            return navigation_authorized ? IterationDecision::Break : IterationDecision::Continue;
+        });
+    }
+    if (!m_request_server_site_bindings.client_id_for(top_level_site).has_value() && !navigation_authorized) {
+        did_misbehave("did_lose_request_server_connection"sv, "site has neither an existing client nor an authorized navigation"sv);
+        return OptionalNone {};
+    }
+
+    auto connection = m_request_server_site_bindings.replace_client(top_level_site, navigation_authorized);
     if (connection.is_error()) {
         warnln("Unable to connect a replacement RequestServer client: {}", connection.error());
         return OptionalNone {};
     }
-
-    m_request_server_site_bindings.did_connect(connection.value().client_id);
     return move(connection.value().handle);
 }
 
 Messages::WebContentClient::RequestMediaServerConnectionResponse WebContentClient::request_media_server_connection()
 {
-    auto connection = connect_new_media_server_client(m_media_server_client, [this] { return connect_audio_server_client(); });
+    auto connection = connect_new_media_server_client(m_media_server_client, child_id(), [weak_self = make_weak_ptr<WebContentClient>()]() -> ErrorOr<IPC::TransportHandle> {
+        auto self = weak_self.strong_ref();
+        if (!self)
+            return Error::from_string_literal("The WebContent process is gone");
+        return self->connect_audio_server_client();
+    });
     if (connection.is_error()) {
         warnln("Unable to connect a MediaServer client: {}", connection.error());
         return OptionalNone {};
@@ -862,23 +889,54 @@ void WebContentClient::request_video_presentation_channel()
 
 ErrorOr<IPC::TransportHandle> WebContentClient::connect_audio_server_client()
 {
-    // The server must know of the permission before any client gets its connection.
-    TRY(ensure_audio_server_controller());
-    return connect_new_audio_server_client(m_audio_server_client, m_audio_tab_id);
+    // The server must know of the permission and the authorizations before any client gets its connection. A failed
+    // request can reveal that the existing server has died, so the connection is tried once more, letting a closed
+    // controller be replaced and initialized first.
+    auto connect = [this]() -> ErrorOr<IPC::TransportHandle> {
+        TRY(ensure_audio_server_controller());
+        return connect_new_audio_server_client(*m_audio_server_client, m_audio_tab_id);
+    };
+    auto handle = connect();
+    if (handle.is_error())
+        handle = connect();
+    return handle;
 }
 
 ErrorOr<void> WebContentClient::ensure_audio_server_controller()
 {
     auto* previous_controller = m_audio_server_client.ptr();
-    TRY(ensure_audio_server_is_running(m_audio_server_client));
+    TRY(ensure_audio_server_is_running(m_audio_server_client, child_id()));
     if (m_audio_server_client.ptr() == previous_controller)
         return {};
-    m_audio_server_client->on_capture_requested = [this](u64 tab_id, u64 request_id, ByteString const&) {
-        if (tab_id == m_audio_tab_id)
-            decide_audio_capture_request(request_id);
+    // A server that isn't told everything gets no clients; the next attempt starts over with another.
+    if (auto result = initialize_audio_server_controller(); result.is_error()) {
+        m_audio_server_client->shutdown();
+        return result.release_error();
+    }
+    return {};
+}
+
+ErrorOr<void> WebContentClient::initialize_audio_server_controller()
+{
+    m_audio_server_client->on_capture_requested = [weak_self = make_weak_ptr<WebContentClient>()](u64 tab_id, u64 request_id, ByteString const&) {
+        auto self = weak_self.strong_ref();
+        if (self && tab_id == self->m_audio_tab_id)
+            self->decide_audio_capture_request(request_id);
     };
+    m_audio_server_audibility.watch(*m_audio_server_client, [weak_self = make_weak_ptr<WebContentClient>()](u64 tab_id, Audio::PlaybackGroupId group, Audio::Audibility audibility) {
+        auto self = weak_self.strong_ref();
+        if (!self || tab_id != self->m_audio_tab_id)
+            return false;
+        // A report of sound can trail the revocation of the page's authorization.
+        return audibility == Audio::Audibility::Inaudible || self->m_authorized_audio_playback_groups.contains(group);
+    });
     if (m_audio_capture_permitted)
         TRY(tell_audio_server_of_capture_permission());
+    // A muted group is never heard: the mutes land before the authorizations.
+    for (auto group : m_muted_audio_playback_groups)
+        m_audio_server_client->async_mute_playback_group(m_audio_tab_id, group);
+    for (auto group : m_authorized_audio_playback_groups)
+        TRY(tell_audio_server_of_playback_authorization(group));
     return {};
 }
 
@@ -890,7 +948,7 @@ String WebContentClient::audio_capture_permission_key(URL::URL const& url)
     return url.serialize(URL::ExcludeFragment::Yes);
 }
 
-ErrorOr<void> WebContentClient::grant_audio_capture(URL::URL const& url)
+ErrorOr<void> WebContentClient::grant_audio_capture_to_file(URL::URL const& url)
 {
     m_audio_capture_grants.set(audio_capture_permission_key(url));
     m_audio_capture_permitted = audio_capture_permitted();
@@ -898,26 +956,6 @@ ErrorOr<void> WebContentClient::grant_audio_capture(URL::URL const& url)
         return {};
     TRY(ensure_audio_server_controller());
     return tell_audio_server_of_capture_permission();
-}
-
-ErrorOr<void> WebContentClient::grant_audio_capture(URL::Origin const& origin)
-{
-    if (origin.is_opaque())
-        return Error::from_string_literal("Cannot grant audio capture to an opaque origin");
-    m_audio_capture_grants.set(origin.serialize());
-    // The permission is tied to an active requesting environment, which can
-    // be a cross-origin frame rather than the view's top-level URL.
-    m_audio_capture_permitted = true;
-    TRY(ensure_audio_server_controller());
-    return tell_audio_server_of_capture_permission();
-}
-
-void WebContentClient::revoke_audio_capture(URL::Origin const& origin)
-{
-    if (origin.is_opaque())
-        return;
-    m_audio_capture_grants.remove(origin.serialize());
-    update_audio_capture_permission();
 }
 
 void WebContentClient::update_audio_capture_permission()
@@ -932,13 +970,46 @@ void WebContentClient::update_audio_capture_permission()
         warnln("Unable to update the AudioServer's capture permission: {}", result.error());
 }
 
+void WebContentClient::add_permission_origin(URL::Origin const& origin)
+{
+    if (!origin.is_opaque() && !m_permission_origins.contains_slow(origin))
+        m_permission_origins.append(origin);
+}
+
+// A process may learn the permissions only of a site it shows; asking about any other is refused, and gets just the
+// defaults.
+Messages::WebContentClient::DidRequestPermissionSnapshotResponse WebContentClient::did_request_permission_snapshot(Web::PageId, URL::Origin top_level_origin)
+{
+    auto& manager = *session().permission_manager;
+    auto shows_site = false;
+    for (auto const& it : m_pages) {
+        if (it.value->is_open() && it.value->hosts_a_document_with_top_level_origin(top_level_origin)) {
+            shows_site = true;
+            break;
+        }
+    }
+    if (shows_site)
+        add_permission_origin(top_level_origin);
+    return manager.snapshot_for(m_permission_origins);
+}
+
+bool WebContentClient::page_may_capture_audio(WebContentPage const& page) const
+{
+    // The top-level document's origin, which a popup on about:blank has from its opener; only a file page is left with
+    // an opaque one, and reads its own grant by URL.
+    auto origin = page.view().permission_origin();
+    if (origin.is_opaque())
+        return m_audio_capture_grants.contains(audio_capture_permission_key(page.view().url()));
+    return session().permission_manager->effective_state(Web::Permissions::PermissionName::Microphone, origin) == Web::Permissions::EffectiveState::Granted;
+}
+
 bool WebContentClient::audio_capture_permitted() const
 {
     // A tab's grant reaches only the documents whose permissions policy allows them the microphone. The process may
     // capture if it hosts one, as it can act for any document it hosts.
     for (auto const& it : m_pages) {
         auto const& page = it.value;
-        if (!page->is_open() || !m_audio_capture_grants.contains(audio_capture_permission_key(page->view().url())))
+        if (!page->is_open() || !page_may_capture_audio(*page))
             continue;
         if (page->hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature::Microphone))
             return true;
@@ -956,6 +1027,78 @@ ErrorOr<void> WebContentClient::tell_audio_server_of_capture_permission()
     auto response = m_audio_server_client->send_sync_but_allow_failure<Messages::AudioServerControl::SetCapturePermission>(m_audio_tab_id, m_audio_capture_permitted);
     if (!response)
         return Error::from_string_literal("Failed to tell the AudioServer of the capture permission");
+    return {};
+}
+
+// WebContent derives the group of a page's sound from the page's ID too.
+static Audio::PlaybackGroupId audio_playback_group(Web::PageId page_id)
+{
+    return Audio::PlaybackGroupId { page_id.value() };
+}
+
+static Web::PageId page_id_of_audio_playback_group(Audio::PlaybackGroupId group)
+{
+    return Web::PageId { group.value() };
+}
+
+void WebContentClient::did_change_audio_playback_audibility(Audio::PlaybackGroupId group, Audio::Audibility audibility)
+{
+    if (auto page = m_pages.get(page_id_of_audio_playback_group(group)); page.has_value())
+        page.value()->set_audibility(audibility);
+}
+
+void WebContentClient::authorize_audio_playback(Web::PageId page_id)
+{
+    auto group = audio_playback_group(page_id);
+    if (m_authorized_audio_playback_groups.set(group) != HashSetResult::InsertedNewEntry)
+        return;
+    // An AudioServer launched later hears of the group before it connects a client.
+    if (!m_audio_server_client || !m_audio_server_client->is_open())
+        return;
+    if (auto result = tell_audio_server_of_playback_authorization(group); result.is_error())
+        warnln("Unable to authorize audio playback: {}", result.error());
+}
+
+void WebContentClient::revoke_audio_playback(Web::PageId page_id)
+{
+    auto group = audio_playback_group(page_id);
+    if (!m_authorized_audio_playback_groups.remove(group))
+        return;
+    if (m_audio_server_client && m_audio_server_client->is_open())
+        m_audio_server_client->async_revoke_playback_group(m_audio_tab_id, group);
+    m_audio_server_audibility.forget(group);
+}
+
+void WebContentClient::set_audio_playback_mute_state(Web::PageId page_id, Web::HTML::MuteState mute_state)
+{
+    auto group = audio_playback_group(page_id);
+    switch (mute_state) {
+    case Web::HTML::MuteState::Muted:
+        if (m_muted_audio_playback_groups.set(group) != HashSetResult::InsertedNewEntry)
+            return;
+        if (m_audio_server_client && m_audio_server_client->is_open())
+            m_audio_server_client->async_mute_playback_group(m_audio_tab_id, group);
+        break;
+    case Web::HTML::MuteState::Unmuted:
+        if (!m_muted_audio_playback_groups.remove(group))
+            return;
+        if (m_audio_server_client && m_audio_server_client->is_open())
+            m_audio_server_client->async_unmute_playback_group(m_audio_tab_id, group);
+        break;
+    }
+}
+
+void WebContentClient::forget_audio_playback(Web::PageId page_id)
+{
+    revoke_audio_playback(page_id);
+    set_audio_playback_mute_state(page_id, Web::HTML::MuteState::Unmuted);
+}
+
+ErrorOr<void> WebContentClient::tell_audio_server_of_playback_authorization(Audio::PlaybackGroupId group)
+{
+    auto response = m_audio_server_client->send_sync_but_allow_failure<Messages::AudioServerControl::AuthorizePlaybackGroup>(m_audio_tab_id, group);
+    if (!response)
+        return Error::from_string_literal("Failed to tell the AudioServer of a playback authorization");
     return {};
 }
 

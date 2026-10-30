@@ -754,8 +754,8 @@ void CompositorState::handle_and_dispatch_key_event(Web::CompositorContextId con
     }
 
     if (allow_keyboard_scroll) {
-        if (event.type == Web::KeyEvent::Type::KeyDown && Web::is_keyboard_scroll_key(event.key, Web::UIEvents::Mod_None))
-            dispatch_scroll_fling_step(context_id, *context, context->end_scroll_fling(), MonotonicTime::now());
+        if (auto box = context->box_scrolled_for_key_event(event); box.has_value())
+            dispatch_scroll_fling_step(context_id, *context, context->end_momentum_scrolling(box.value()), MonotonicTime::now());
         auto handled = apply_context_update_result(context_id, *context, context->handle_key_event(event));
         event.async_scroll_performed_default_action = handled && event.type == Web::KeyEvent::Type::KeyDown;
     }
@@ -787,7 +787,14 @@ void CompositorState::handle_and_dispatch_mouse_event(Web::CompositorContextId c
 
     auto is_wheel_event = event.type == Web::MouseEvent::Type::MouseWheel;
     if (is_wheel_event) {
-        context->note_wheel_event_from_ui(event);
+        // A key or a script that scrolls takes over from momentum, until wheel input other than the momentum takes
+        // over again.
+        if (context->absorbs_wheel_event_of_interrupted_momentum(event)) {
+            record_routing(Web::InputRoutingDecision::MomentumInterrupted);
+            presentation->did_consume_input_event(context_id, event.id);
+            return;
+        }
+        event.wheel_gesture_mark = context->note_wheel_event_from_ui(event);
 
         // The UI can send the end of a gesture more than once. An end that arrives during a fling belongs to the
         // flicked gesture, so it does not stop the fling.
@@ -933,7 +940,7 @@ CompositorState::WheelStepHandedToNestedContext CompositorState::hand_wheel_step
         step.position = taking_context->position;
         auto nested_result = taking_context->context->take_first_wheel_step_from_containing_context(taking_context->route, step, now);
         handed_step = apply_result_of_nested_context(taking_context->context_id, *taking_context->context, nested_result);
-        context.latch_wheel_gesture_to_nested_context(taking_context->context_id, handed_step.result.routed_scroller, event, now);
+        context.latch_wheel_gesture_to_nested_context(taking_context->context_id, handed_step.result.routed_scroller, event);
     } else {
         handed_step.result = ContextState::ContextUpdateResult::declined(taking_context->route.decision);
     }
@@ -998,16 +1005,42 @@ void CompositorState::dispatch_scroll_fling_step(Web::CompositorContextId contex
         context.input_trace().record({ .input_event_id = event->id, .stage = Web::InputTraceStage::Compositor, .decision = *result.routing_decision, .scroller = result.routed_scroller });
     event->async_scroll_performed_default_action = apply_context_update_result(context_id, context, result);
     schedule_animation_frames_if_needed(context);
+    // The steps this context makes itself carry on the gesture of the wheel events before them.
+    event->wheel_gesture_mark = Web::WheelGestureMark { .continues_gesture = true, .lasts_until_fingers_lift = false };
     context.dispatch_mouse_event_to_web_content(*event);
 }
 
-void CompositorState::handle_pinch_event(Web::CompositorContextId context_id, Web::PinchEvent const& event)
+// A pinch over a document nested in the context is a ctrl+wheel event to that document first, which its blocking wheel
+// event listeners may cancel before anything zooms. Rather than hit test contexts the pinch may be zooming, any nested
+// context that would hold back a pinch of its own holds back the pinch of the context it is nested in.
+bool CompositorState::nested_context_may_cancel_pinch(Web::CompositorContextId context_id) const
 {
-    auto* context = context_if_present(context_id);
-    if (!context)
-        return;
+    for (auto const& context_entry : m_contexts) {
+        auto const& nested_context = *context_entry.value;
+        if (!nested_context.admits_async_pinch() && is_nested_in(context_id, nested_context))
+            return true;
+    }
+    return false;
+}
 
-    apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
+void CompositorState::handle_and_dispatch_pinch_event(Web::CompositorContextId context_id, Web::PinchEvent event)
+{
+    // NB: The presentation connection only passes on input for the contexts bound to it.
+    auto* presentation = presentation_for_context(context_id);
+    VERIFY(presentation);
+    auto* context = context_if_present(context_id);
+    if (!context || !context->can_dispatch_input_to_web_content()) {
+        presentation->did_not_dispatch_input_event(context_id, event.id);
+        return;
+    }
+
+    // A nested document that already let the event through leaves only the zoom to do.
+    if (context->admits_async_pinch() && (event.wheel_event_was_dispatched || !nested_context_may_cancel_pinch(context_id)))
+        event.async_zoom_performed_default_action = apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
+
+    // The scroll updates the event produced reach WebContent ahead of the event itself on the same connection.
+    publish_pending_async_scroll_updates(context_id, *context);
+    context->dispatch_pinch_event_to_web_content(event);
 }
 
 Compositing::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
@@ -1028,24 +1061,29 @@ Compositing::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Web::Comp
     return result.enqueue_result;
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorState::smooth_scroll_to(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator, Optional<Compositing::AsyncScrollOperationID> operation_to_continue)
+static bool scroll_request_scrolls_for_script(Compositing::ScrollRequest const& scroll_request)
 {
-    auto* context = context_if_present(context_id);
-    VERIFY(context);
-
-    auto result = context->smooth_scroll_to(stable_node_id, offset, main_thread_offset, viewport_rect, animation_kind, initiator, operation_to_continue);
-    if (result.frame_to_present.has_value())
-        schedule_present_frame(context_id, *context, *result.frame_to_present);
-    publish_pending_async_scroll_updates(context_id, *context);
-    return result.enqueue_result;
+    bool has_instant_scroll = scroll_request.jump_offset.has_value() || scroll_request.relative_scroll.has_value();
+    if (has_instant_scroll && !scroll_request.instant_scroll_is_for_user_input)
+        return true;
+    return scroll_request.smooth_scroll.has_value() && scroll_request.smooth_scroll->initiator == Compositing::SmoothScrollInitiator::Programmatic;
 }
 
-void CompositorState::cancel_smooth_scroll(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
+void CompositorState::apply_scroll_requests(Web::CompositorContextId context_id, ReadonlySpan<Compositing::ScrollRequest> scroll_requests)
 {
     auto* context = context_if_present(context_id);
     if (!context)
         return;
-    context->cancel_smooth_scroll(stable_node_id);
+
+    // A script's scroll of a box ends the momentum scrolling it, as a key's does.
+    auto now = MonotonicTime::now();
+    for (auto const& scroll_request : scroll_requests) {
+        if (scroll_request.takes_over_from_momentum || scroll_request_scrolls_for_script(scroll_request))
+            dispatch_scroll_fling_step(context_id, *context, context->end_momentum_scrolling(scroll_request.stable_node_id), now);
+    }
+    if (auto frame_to_present = context->apply_scroll_requests(scroll_requests); frame_to_present.has_value())
+        schedule_present_frame(context_id, *context, frame_to_present.value());
+    schedule_animation_frames_if_needed(*context);
     publish_pending_async_scroll_updates(context_id, *context);
 }
 
@@ -1131,6 +1169,22 @@ void CompositorState::set_context_visibility(Web::CompositorContextId context_id
 
     if (visibility == Compositing::ContextVisibility::Visible)
         resume_presentation_after_becoming_visible(context_id, *context);
+}
+
+void CompositorState::set_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)
+{
+    auto* context = context_if_present(context_id);
+    if (!context || context->presents_from_cpu_memory() == presents_from_cpu_memory)
+        return;
+    auto previous_gpu_sharing = gpu_sharing_for_context(context_id);
+    context->set_presents_from_cpu_memory(presents_from_cpu_memory);
+    // NB: Without a GPU, the backing stores are in CPU memory either way.
+    if (!m_skia_backend_context || gpu_sharing_for_context(context_id) == previous_gpu_sharing)
+        return;
+
+    // NB: Otherwise, the presentation would read every frame back from GPU memory on its main thread.
+    context->presenter().invalidate_backing_stores();
+    resize_backing_stores_if_needed(context_id, *context);
 }
 
 void CompositorState::resume_presentation_after_becoming_visible(Web::CompositorContextId root_context_id, ContextState& root_context)
@@ -1696,28 +1750,40 @@ void CompositorState::resize_backing_stores_if_needed(Web::CompositorContextId c
     }
 }
 
-BackingStoreManager::GpuSharing CompositorState::gpu_sharing_for_context([[maybe_unused]] Web::CompositorContextId context_id) const
+BackingStoreManager::GpuSharing CompositorState::gpu_sharing_for_context(Web::CompositorContextId context_id) const
 {
     [[maybe_unused]] auto* presentation = presentation_for_context(context_id);
 #ifdef USE_VULKAN_DMABUF_IMAGES
     if (!presentation || !m_presentations.get(presentation)->gpu_presentation_adapter_luid.has_value())
         return BackingStoreManager::GpuSharing::Disallowed;
 #endif
+    if (auto const* context = context_if_present(context_id); context && context->presents_from_cpu_memory())
+        return BackingStoreManager::GpuSharing::Disallowed;
 #ifdef USE_DIRECTX
     // Shared Direct3D textures can only be opened by the presentation if it presents on the same adapter.
     if (!presentation || !m_skia_backend_context || m_presentations.get(presentation)->gpu_presentation_adapter_luid != m_skia_backend_context->direct3d_context().adapter_luid())
+        return BackingStoreManager::GpuSharing::Disallowed;
+#else
+    if (auto* presentation = presentation_for_context(context_id); presentation && m_presentations.get(presentation)->cannot_present_gpu_images)
         return BackingStoreManager::GpuSharing::Disallowed;
 #endif
     return BackingStoreManager::GpuSharing::Allowed;
 }
 
-// A context scrolls elastically, and takes presses on scrollbar tracks, as the presentation of its root context does.
+// A context scrolls elastically, takes presses on scrollbar tracks, and ends touchpad gestures as the presentation of
+// its root context does. A platform that reports the momentum of a flick reports when the fingers lift for it.
 void CompositorState::update_scroll_capabilities()
 {
     for (auto& [context_id, context] : m_contexts) {
-        auto* presentation = presentation_for_context(root_context_of(*context)->context_id());
-        context->set_scrolls_elastically(presentation && m_presentations.get(presentation)->scrolls_elastically);
-        context->set_scrollbar_track_press_jumps(presentation && m_presentations.get(presentation)->scrollbar_track_press_jumps);
+        ContextState::ScrollCapabilities capabilities;
+        if (auto* presentation = presentation_for_context(root_context_of(*context)->context_id())) {
+            auto const& presentation_capabilities = *m_presentations.get(presentation);
+            capabilities.scrolls_elastically = presentation_capabilities.scrolls_elastically;
+            capabilities.scrollbar_track_press_jumps = presentation_capabilities.scrollbar_track_press_jumps;
+            if (!presentation_capabilities.synthesizes_scroll_momentum)
+                capabilities.touchpad_gesture_end = Compositing::TouchpadGestureEnd::WhenFingersLift;
+        }
+        context->set_scroll_capabilities(capabilities);
     }
 }
 
@@ -1770,6 +1836,12 @@ void CompositorState::begin_input_trace_for_testing(Web::CompositorContextId con
         context->input_trace().begin();
 }
 
+void CompositorState::clear_per_test_input_state_for_testing(Web::CompositorContextId context_id)
+{
+    if (auto* context = context_if_present(context_id))
+        context->clear_per_test_input_state();
+}
+
 Vector<Web::InputTraceRecord> CompositorState::take_input_trace_for_testing(Web::CompositorContextId context_id)
 {
     auto* context = context_if_present(context_id);
@@ -1783,10 +1855,11 @@ void CompositorState::set_client_gpu_presentation_capability(CompositorStateClie
     Optional<u64> new_adapter_luid;
     if (supported)
         new_adapter_luid = adapter_luid;
-    auto& presentation_adapter_luid = m_presentations.get(&presentation)->gpu_presentation_adapter_luid;
-    if (presentation_adapter_luid == new_adapter_luid)
+    auto& capabilities = *m_presentations.get(&presentation);
+    if (capabilities.gpu_presentation_adapter_luid == new_adapter_luid && capabilities.cannot_present_gpu_images == !supported)
         return;
-    presentation_adapter_luid = new_adapter_luid;
+    capabilities.gpu_presentation_adapter_luid = new_adapter_luid;
+    capabilities.cannot_present_gpu_images = !supported;
 
     // Reallocate the backing stores of the presentation's contexts so they match the new capability.
     for (auto& context_entry : m_contexts) {

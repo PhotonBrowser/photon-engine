@@ -37,9 +37,18 @@ enum class ShowBookmarksBar : u8 {
     OnHover,
 };
 
+// Whether something follows the system's light or dark appearance, or always uses one of them.
+enum class ThemePreference : u8 {
+    System,
+    Light,
+    Dark,
+};
+
 struct Appearance {
     bool show_menu_bar { false };
     ShowBookmarksBar show_bookmarks_bar { ShowBookmarksBar::Always };
+    ThemePreference interface_theme { ThemePreference::System };
+    ThemePreference website_color_scheme { ThemePreference::System };
 };
 
 struct ContentSettings {
@@ -76,6 +85,12 @@ protected:
 
 struct AutoplaySiteSetting : public SiteSetting {
     Web::HTML::AutoplayPolicy policy { Web::HTML::AutoplayPolicy::BlockAudio };
+};
+
+// Whether sites may ask for the user's location at all.
+enum class LocationPolicy : u8 {
+    Ask,
+    Block,
 };
 
 struct BrowsingDataSettings {
@@ -145,7 +160,6 @@ public:
     virtual void geolocation_settings_changed() { }
     virtual void background_networking_settings_changed() { }
     virtual void content_blocker_settings_changed() { }
-    virtual void content_blocker_count_visibility_changed() { }
 
 private:
     WeakPtr<Settings> m_settings;
@@ -211,8 +225,8 @@ public:
     void remove_autoplay_site_filter(String const&);
     void remove_all_autoplay_site_filters();
 
-    bool geolocation_enabled() const { return m_geolocation_enabled; }
-    void set_geolocation_enabled(bool);
+    LocationPolicy location_policy() const { return m_location_policy; }
+    void set_location_policy(LocationPolicy);
 
     static BrowsingDataSettings parse_browsing_data_settings(JsonValue const&);
     BrowsingDataSettings const& browsing_data_settings() const { return m_browsing_data_settings; }
@@ -229,9 +243,6 @@ public:
 
     bool content_blocker_enabled() const { return m_content_blocker_enabled; }
     void set_content_blocker_enabled(bool);
-
-    bool show_content_blocker_count() const { return m_show_content_blocker_count; }
-    void set_show_content_blocker_count(bool);
 
     HashTable<String> const& content_blocker_disabled_sites() const { return m_content_blocker_disabled_sites; }
     bool content_blocker_enabled_for_site(StringView) const;
@@ -290,7 +301,7 @@ private:
     Vector<SearchEngine> m_custom_search_engines;
 
     AutoplaySiteSetting m_autoplay;
-    bool m_geolocation_enabled { false };
+    LocationPolicy m_location_policy { LocationPolicy::Ask };
 
     BrowsingDataSettings m_browsing_data_settings;
     GlobalPrivacyControl m_global_privacy_control { GlobalPrivacyControl::No };
@@ -298,7 +309,6 @@ private:
     bool m_background_networking_enabled { true };
     bool m_filter_list_updates_enabled { false };
     bool m_content_blocker_enabled { false };
-    bool m_show_content_blocker_count { false };
     HashTable<String> m_content_blocker_disabled_sites;
     Vector<ContentBlockerList> m_content_blocker_lists;
     String m_custom_content_blocker_filters;

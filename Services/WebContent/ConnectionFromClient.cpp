@@ -84,6 +84,7 @@
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
+#include <LibWeb/Loader/LoaderConfig.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Loader/SourceHighlighter.h>
 #include <LibWeb/Namespace.h>
@@ -309,6 +310,12 @@ void ConnectionFromClient::deliver_posted_message(Web::PageId page_id, Web::HTML
 {
     if (auto page = this->page(page_id); page.has_value())
         page->deliver_posted_message(navigable_id, move(message));
+}
+
+void ConnectionFromClient::report_violation_of_environment(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, URL::URL resource)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->report_violation_of_environment(environment_id, policy_index, directive, move(resource));
 }
 
 void ConnectionFromClient::close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id)
@@ -643,6 +650,9 @@ void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle ha
     m_compositor_connection->on_key_event = [this](Web::PageId page_id, Web::KeyEvent event) {
         key_event(page_id, move(event));
     };
+    m_compositor_connection->on_pinch_event = [this](Web::PageId page_id, Web::PinchEvent event) {
+        pinch_event(page_id, event);
+    };
     m_compositor_connection->on_compositor_lost = [this] {
         m_page_host->compositor_process_lost();
     };
@@ -659,10 +669,10 @@ void ConnectionFromClient::compositor_process_reconnected()
     m_page_host->compositor_process_reconnected();
 }
 
-void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle, int client_id)
+void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle, int client_id, Optional<Utf16String> top_level_site)
 {
     if (on_request_server_connection)
-        on_request_server_connection(handle, client_id);
+        on_request_server_connection(handle, client_id, top_level_site);
 }
 
 ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_media_server_transport()
@@ -711,7 +721,12 @@ void ConnectionFromClient::set_site_compatibility_data(JsonValue data)
         warnln("Ignoring invalid site compatibility data: {}", parsed_data.error());
         return;
     }
-    Web::ResourceLoader::the().set_site_compatibility_data(parsed_data.release_value());
+    Web::set_site_compatibility_data(parsed_data.release_value());
+}
+
+void ConnectionFromClient::set_permission_snapshot(Web::Permissions::PermissionSnapshot snapshot)
+{
+    Web::PermissionsAPI::PermissionStore::the().apply_snapshot(move(snapshot));
 }
 
 void ConnectionFromClient::update_screen_rects(Web::PageId page_id, Vector<Web::DevicePixelRect> rects, Vector<Web::DevicePixelRect> available_rects, u32 main_screen)
@@ -1087,10 +1102,17 @@ void ConnectionFromClient::enqueue_mouse_event(Web::PageId page_id, Optional<Web
         if (auto const* mouse_event = m_input_event_queue.tail().event.get_pointer<Web::MouseEvent>()) {
             if (mouse_event->type != event.type)
                 return nullptr;
+            auto* previous_pointer = mouse_event->pointer_data.ptr();
+            auto* pointer = event.pointer_data.ptr();
+            if (!!previous_pointer != !!pointer)
+                return nullptr;
+            if (pointer && (previous_pointer->pointer_id != pointer->pointer_id || previous_pointer->pointer_type != pointer->pointer_type))
+                return nullptr;
             if (event.type == Web::MouseEvent::Type::MouseWheel
                 && (mouse_event->async_scroll_performed_default_action != event.async_scroll_performed_default_action
                     || mouse_event->wheel_delta_precision != event.wheel_delta_precision
-                    || mouse_event->scroll_gesture_phase != event.scroll_gesture_phase))
+                    || mouse_event->scroll_gesture_phase != event.scroll_gesture_phase
+                    || mouse_event->wheel_gesture_mark != event.wheel_gesture_mark))
                 return nullptr;
             return mouse_event;
         }
@@ -1122,6 +1144,16 @@ void ConnectionFromClient::drag_event(Web::PageId page_id, Web::DragEvent event)
 
 void ConnectionFromClient::pinch_event(Web::PageId page_id, Web::PinchEvent event)
 {
+    enqueue_pinch_event(page_id, {}, move(event));
+}
+
+void ConnectionFromClient::pinch_event_in_hosted_root(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::PinchEvent event)
+{
+    enqueue_pinch_event(page_id, navigable_id, move(event));
+}
+
+void ConnectionFromClient::enqueue_pinch_event(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> navigable_id, Web::PinchEvent event)
+{
     auto page = m_page_host->page(page_id);
     if (!page.has_value()) {
         async_did_finish_handling_input_event(page_id, event.id, Web::EventResult::Dropped);
@@ -1132,11 +1164,15 @@ void ConnectionFromClient::pinch_event(Web::PageId page_id, Web::PinchEvent even
     //               deltas are multiplicative, so preserve the combined scale change.
     //               Only coalesce events with the same focal point, as applying
     //               one combined zoom around a different point is not equivalent
-    //               to applying each zoom in sequence.
-    if (!m_input_event_queue.is_empty() && m_input_event_queue.tail().page_id == page_id) {
+    //               to applying each zoom in sequence. A frame another process hosts
+    //               hands each pinch it lets through back for its own zoom, so the
+    //               events to such a frame stay apart.
+    if (!navigable_id.has_value() && !m_input_event_queue.is_empty() && m_input_event_queue.tail().page_id == page_id && !m_input_event_queue.tail().navigable_id.has_value()) {
         if (auto const* pinch_event = m_input_event_queue.tail().event.get_pointer<Web::PinchEvent>()) {
-            if (pinch_event->position != event.position || pinch_event->modifiers != event.modifiers)
-                return enqueue_input_event({ page_id, move(event), {}, {} });
+            if (pinch_event->position != event.position || pinch_event->modifiers != event.modifiers
+                || pinch_event->async_zoom_performed_default_action != event.async_zoom_performed_default_action
+                || pinch_event->wheel_event_was_dispatched != event.wheel_event_was_dispatched)
+                return enqueue_input_event({ page_id, move(event), {}, navigable_id });
 
             event.scale_delta = (1.0 + pinch_event->scale_delta) * (1.0 + event.scale_delta) - 1.0;
             auto coalesced_event_id = pinch_event->id;
@@ -1148,7 +1184,7 @@ void ConnectionFromClient::pinch_event(Web::PageId page_id, Web::PinchEvent even
         }
     }
 
-    enqueue_input_event({ page_id, move(event), {}, {} });
+    enqueue_input_event({ page_id, move(event), {}, navigable_id });
 }
 
 static bool is_discrete_input_event(Web::InputEvent const& event)
@@ -1356,7 +1392,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
     }
 
     if (request == "spoof-user-agent") {
-        Web::ResourceLoader::the().set_user_agent(MUST(String::from_byte_string(argument)));
+        Web::update_loader_config([&](auto& config) { config.user_agent = MUST(String::from_byte_string(argument)); });
         return;
     }
 
@@ -1712,7 +1748,12 @@ static void append_grid_layouts_for_node_and_frame_descendants(Web::DOM::Node& r
         if (!content_navigable)
             return Web::TraversalDecision::Continue;
 
-        auto content_document = as<Web::HTML::LocalNavigable>(*content_navigable).active_document();
+        // A cross-site frame's document lives in another process, so its grids can't be inspected from here.
+        auto* local_content_navigable = as_if<Web::HTML::LocalNavigable>(*content_navigable);
+        if (!local_content_navigable)
+            return Web::TraversalDecision::Continue;
+
+        auto content_document = local_content_navigable->active_document();
         if (!content_document)
             return Web::TraversalDecision::Continue;
 
@@ -2406,19 +2447,21 @@ void ConnectionFromClient::evaluate_javascript_in_debugger_frame(Web::PageId pag
     async_did_evaluate_javascript_in_debugger_frame(page_id, request_id, {}, result.release_value());
 }
 
-void ConnectionFromClient::get_debugger_object_properties(Web::PageId page_id, u64 request_id, u64 object_id)
+void ConnectionFromClient::get_debugger_object_properties(Web::PageId page_id, u64 request_id, u64 object_id, WebView::DebuggerObjectScope scope)
 {
     auto page = this->page(page_id);
     if (!page.has_value()) {
         async_did_get_debugger_object_properties(page_id, request_id, "Unable to locate page"_string, {});
         return;
     }
-    if (!m_devtools_debugger) {
+    if (scope == WebView::DebuggerObjectScope::Pause && !m_devtools_debugger) {
         async_did_get_debugger_object_properties(page_id, request_id, "No debugger client is attached"_string, {});
         return;
     }
 
-    auto properties = m_devtools_debugger->properties_for_object(*page, object_id);
+    auto properties = scope == WebView::DebuggerObjectScope::Console
+        ? page->console_object_properties(object_id)
+        : m_devtools_debugger->properties_for_object(*page, object_id);
     if (properties.is_error()) {
         async_did_get_debugger_object_properties(page_id, request_id, MUST(String::from_utf8(properties.release_error().string_literal())), {});
         return;
@@ -3369,13 +3412,6 @@ void ConnectionFromClient::set_preferred_color_scheme(Web::PageId page_id, Web::
         page->set_preferred_color_scheme(color_scheme);
 }
 
-void ConnectionFromClient::set_permission_state(Web::PageId, Utf16String name, URL::Origin origin, bool granted)
-{
-    // The store is shared by every page in the process, as the permission is the origin's, not the page's.
-    auto state = granted ? Web::PermissionsAPI::PermissionState::Granted : Web::PermissionsAPI::PermissionState::Denied;
-    Web::PermissionsAPI::PermissionStore::the().set_permission_store_entry({ .name = move(name) }, origin, state);
-}
-
 void ConnectionFromClient::set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast contrast)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -3394,7 +3430,7 @@ void ConnectionFromClient::set_preferred_languages(Web::PageId, Vector<String> p
     // object global return a new set of language tags, the user agent must queue a global task on the DOM manipulation
     // task source given global to fire an event named languagechange at global, and wait until that task begins to be
     // executed before actually returning a new value.
-    Web::ResourceLoader::the().set_preferred_languages(move(preferred_languages));
+    Web::update_loader_config([&](auto& config) { config.preferred_languages = move(preferred_languages); });
 }
 
 void ConnectionFromClient::set_browsing_behavior(Web::PageId page_id, WebView::BrowsingBehavior browsing_behavior)
@@ -3413,7 +3449,7 @@ void ConnectionFromClient::consume_user_activation(Web::PageId page_id, Web::HTM
 
 void ConnectionFromClient::set_enable_global_privacy_control(Web::PageId, bool enable)
 {
-    Web::ResourceLoader::the().set_enable_global_privacy_control(enable);
+    Web::update_loader_config([&](auto& config) { config.enable_global_privacy_control = enable; });
 }
 
 void ConnectionFromClient::set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData position, Optional<u16> error_code)
@@ -3428,10 +3464,10 @@ void ConnectionFromClient::geolocation_position_response(Web::PageId page_id, u6
         page->geolocation_position_response(request_id, position, error_code);
 }
 
-void ConnectionFromClient::permission_request_completed(Web::PageId page_id, u64 request_id, Web::HTML::EnvironmentId document_id, bool granted)
+void ConnectionFromClient::permission_request_completed(Web::PageId page_id, u64 request_id, Web::Permissions::EffectiveState state)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->permission_request_completed(request_id, document_id, granted);
+        page->permission_request_completed(request_id, state);
 }
 
 void ConnectionFromClient::set_has_focus(Web::PageId page_id, bool has_focus)
@@ -3468,12 +3504,6 @@ void ConnectionFromClient::set_frame_rate_capped(Web::PageId page_id, bool cappe
 {
     if (auto page = this->page(page_id); page.has_value())
         page->set_frame_rate_capped(capped);
-}
-
-void ConnectionFromClient::set_viewport_corner_radius(Web::PageId page_id, double radius)
-{
-    if (auto page = this->page(page_id); page.has_value())
-        page->set_viewport_corner_radius(radius);
 }
 
 void ConnectionFromClient::set_window_position(Web::PageId page_id, Web::DevicePixelPoint position)
@@ -3567,6 +3597,18 @@ void ConnectionFromClient::js_console_input(Web::PageId page_id, String js_sourc
         return;
 
     page->js_console_input(js_source);
+}
+
+void ConnectionFromClient::complete_js_console_input(Web::PageId page_id, u64 request_id, String input)
+{
+    auto page = this->page(page_id);
+    auto completion = page.has_value() ? page->complete_js_console_input(input) : OptionalNone {};
+    if (!completion.has_value()) {
+        async_did_complete_js_console_input(page_id, request_id, OptionalNone {}, String {});
+        return;
+    }
+
+    async_did_complete_js_console_input(page_id, request_id, move(completion->matches), move(completion->match_prop));
 }
 
 void ConnectionFromClient::run_javascript(Web::PageId page_id, String js_source)
@@ -3717,12 +3759,6 @@ void ConnectionFromClient::toggle_media_controls_state(Web::PageId page_id)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().toggle_media_controls_state();
-}
-
-void ConnectionFromClient::set_page_mute_state(Web::PageId page_id, Web::HTML::MuteState mute_state)
-{
-    if (auto page = this->page(page_id); page.has_value())
-        page->page().set_page_mute_state(mute_state);
 }
 
 void ConnectionFromClient::system_time_zone_changed()

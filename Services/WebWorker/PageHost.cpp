@@ -89,6 +89,14 @@ Web::CSS::PreferredMotion PageHost::preferred_motion() const
 }
 
 // NB: A worker process hosts one environment, which the UI process knows to be the requesting one.
+Optional<Web::Permissions::PermissionSnapshot> PageHost::page_did_request_permission_snapshot(URL::Origin const& top_level_origin)
+{
+    auto response = m_client.send_sync_but_allow_failure<Messages::WebWorkerClient::DidRequestPermissionSnapshot>(top_level_origin);
+    if (!response)
+        return {};
+    return response->take_snapshot();
+}
+
 HTTP::Cookie::VersionedCookie PageHost::page_did_request_cookie(Optional<Web::HTML::EnvironmentId> const&, URL::URL const& url, HTTP::Cookie::Source source)
 {
     return m_client.did_request_cookie(url, source);
@@ -104,7 +112,8 @@ void PageHost::page_did_report_worker_exception(Utf16String const& message, Utf1
     m_client.async_did_report_worker_exception(message, filename, lineno, colno);
 }
 
-void PageHost::did_report_outside_settings_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource)
+// NB: The worker's only client another process hosts is outside settings, whose violations its owner reports.
+void PageHost::page_did_report_violation_of_remote_client(u64 policy_index, String effective_directive, URL::URL resource)
 {
     m_client.async_did_report_outside_settings_content_security_policy_violation(policy_index, effective_directive, resource);
 }

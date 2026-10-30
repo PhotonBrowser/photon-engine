@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::css::custom_properties::CustomPropertyValueToFinalize;
 use crate::css::easing::{Easing, FfiEasingDescriptor, FfiLinearEasingPoint, evaluate_easing_descriptor};
 use crate::css::property_metadata::{property_animation_type, property_numeric_ranges};
 use crate::css::style::effect_descriptions::{PublishedEffect, PublishedValue};
@@ -201,6 +202,7 @@ pub(crate) unsafe fn style_value_from_easing(descriptor: &FfiEasingDescriptor) -
         y2,
         number_of_intervals,
         step_position: descriptor.step_position,
+        is_keyword: false,
     }))
 }
 
@@ -327,6 +329,7 @@ struct AnimationKeyframeValue {
     keyframe: usize,
     /// The keyframe's computed value, or none where the keyframe leaves the property out.
     value: RetainedStyleValueData,
+    is_implicit: bool,
 }
 
 struct AnimationValueInput<'a> {
@@ -570,6 +573,7 @@ pub(crate) struct ResolvedAnimationProperty {
     pub(crate) value_source: FfiAnimationSpecifiedValueSource,
     pub(crate) style_sheet_resource_context: FfiAnimationStyleSheetResourceContext,
     pub(crate) is_transition: bool,
+    is_implicit: bool,
 }
 
 /// The `SUBSTITUTION_MARK_*` bits of the arbitrary-substitution functions a written value holds.
@@ -685,6 +689,7 @@ fn resolve_animation_declarations(
                 value_source,
                 style_sheet_resource_context: candidate.style_sheet_resource_context,
                 is_transition: candidate.is_transition,
+                is_implicit: candidate.use_initial,
             });
         }
     }
@@ -844,11 +849,15 @@ fn interpolate_f64(from: f64, to: f64, delta: f32, range: Option<(f64, f64)>) ->
 }
 
 fn interpolate_i32(from: i32, to: i32, delta: f32, range: Option<(f64, f64)>) -> i32 {
-    // https://drafts.csswg.org/css-values/#combine-integers
+    // https://drafts.csswg.org/css-values-4/#combine-integers
     // Interpolation of <integer> is defined as Vresult = round((1 - p) × VA + p × VB);
     // that is, interpolation happens in the real number space as for <number>s, and the result is converted to an <integer> by rounding to the nearest integer.
-    let value = (from as f32 + (to as f32 - from as f32) * delta).round();
-    clamp_to_range(f64::from(value), range) as i32
+    let value = interpolate_f64(f64::from(from), f64::from(to), delta, None);
+    // https://drafts.csswg.org/css-values-4/#integers
+    // Unless otherwise specified, in the CSS specifications rounding to the nearest integer requires rounding in the
+    // direction of +∞ when the fractional portion is exactly 0.5. (For example, 1.5 rounds to 2, while -1.5 rounds to
+    // -1.)
+    clamp_to_range((value + 0.5).floor(), range) as i32
 }
 
 // https://drafts.csswg.org/css-borders-4/#normalized-superellipse-half-corner
@@ -1174,6 +1183,7 @@ fn interpolate_scale(from: &StyleValueData, to: &StyleValueData, delta: f32) -> 
             TRANSFORM_FUNCTION_SCALE
         },
         values: RetainedStyleValueDataList::from_retained_values(values),
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     })
 }
 
@@ -1198,14 +1208,17 @@ fn is_sizing_property(property_id: u16) -> bool {
     )
 }
 
-/// Interpolates two sizes where one is a sizing keyword or a calc-size(), as calc-size() values, or returns None
-/// where they do not interpolate that way.
-/// https://drafts.csswg.org/css-values-5/#interpolate-calc-size
-fn interpolate_calc_size(
+/// NB: Combines two sizes where one is a sizing keyword or a calc-size(), as calc-size() values, or returns None
+///     where they cannot combine that way.
+/// https://drafts.csswg.org/css-sizing-4/#interpolate-calc-size
+fn combine_calc_size(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    combine: impl FnOnce(
+        Arc<crate::css::calc::CalcNode>,
+        Arc<crate::css::calc::CalcNode>,
+    ) -> Option<(Arc<crate::css::calc::CalcNode>, crate::css::calc::FfiNumericType)>,
 ) -> Option<StyleValueData> {
     use crate::css::css_enums::keyword;
 
@@ -1236,7 +1249,7 @@ fn interpolate_calc_size(
     if from_kind == to_kind && from_kind != Kind::CalcSize {
         return None;
     }
-    // https://drafts.csswg.org/css-values-5/#valdef-interpolate-size-allow-keywords
+    // https://drafts.csswg.org/css-sizing-4/#valdef-interpolate-size-allow-keywords
     // Sizing values can also be combined if one of them is an <size-keyword> and the other is a <length-percentage>.
     let keyword_and_length =
         [&from_kind, &to_kind].contains(&&Kind::Keyword) && [&from_kind, &to_kind].contains(&&Kind::LengthPercentage);
@@ -1263,9 +1276,7 @@ fn interpolate_calc_size(
     } else {
         return None;
     };
-    // The result's calc-size calculation is the interpolation of the two input calc-size calculations.
-    let (calculation, resolved_type) =
-        crate::css::calc::interpolate_calc_size_calculations(from_calculation, to_calculation, delta)?;
+    let (calculation, resolved_type) = combine(from_calculation, to_calculation)?;
     let calculation = crate::css::calc::length_percentage_calculated_style_value(calculation, resolved_type);
     Some(crate::css::calc_size::calc_size_function(basis, calculation))
 }
@@ -1560,10 +1571,156 @@ fn interpolate_translate(from: &StyleValueData, to: &StyleValueData, delta: f32)
             TRANSFORM_FUNCTION_TRANSLATE
         },
         values: RetainedStyleValueDataList::from_retained_values(values),
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     })
 }
 
+fn has_transform_matrix_values(value: &StyleValueData) -> bool {
+    match value {
+        StyleValueData::Transformation { matrix_values, .. } => !matrix_values.as_slice().is_empty(),
+        StyleValueData::ValueList { values, .. } => values
+            .as_slice()
+            .iter()
+            .any(|value| has_transform_matrix_values(value.data())),
+        _ => false,
+    }
+}
+
+// Retain a literal's matrix precision when arithmetic leaves its canonical angle unchanged.
+// Match angle ordinal because primitive conversion can move rotate()'s angle to rotate3d()'s fourth slot.
+fn preserve_transform_matrix_values(mut result: StyleValueData, sources: &[&StyleValueData]) -> StyleValueData {
+    if has_transform_matrix_values(&result) || !sources.iter().any(|source| has_transform_matrix_values(source)) {
+        return result;
+    }
+    match &mut result {
+        StyleValueData::Transformation {
+            values, matrix_values, ..
+        } => {
+            let mut mapped = Vec::new();
+            for (ordinal, (index, value)) in values
+                .as_slice()
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| matches!(value.data(), StyleValueData::Angle { .. }))
+                .enumerate()
+            {
+                let mut candidate: Option<&RetainedStyleValueData> = None;
+                let mut phase: Option<f32> = None;
+                let mut compatible = true;
+                for source in sources {
+                    let StyleValueData::Transformation {
+                        values: source_values,
+                        matrix_values: source_matrix,
+                        ..
+                    } = source
+                    else {
+                        continue;
+                    };
+                    let Some((source_index, source_value)) = source_values
+                        .as_slice()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, value)| matches!(value.data(), StyleValueData::Angle { .. }))
+                        .nth(ordinal)
+                    else {
+                        continue;
+                    };
+                    if source_value.data() != value.data() {
+                        continue;
+                    }
+                    let effective = source_matrix.as_slice().get(source_index).unwrap_or(source_value);
+                    let effective_phase =
+                        crate::css::table_group_builder::transform_angle_radians(effective.data()) as f32;
+                    if phase.is_some_and(|phase| phase.to_bits() != effective_phase.to_bits()) {
+                        compatible = false;
+                        break;
+                    }
+                    phase = Some(effective_phase);
+                    if effective.data() != source_value.data() {
+                        candidate = Some(effective);
+                    }
+                }
+                if compatible && let Some(candidate) = candidate {
+                    if mapped.is_empty() {
+                        mapped = values.as_slice().to_vec();
+                    }
+                    mapped[index] = candidate.clone_retained();
+                }
+            }
+            *matrix_values = RetainedStyleValueDataList::from_retained_values(mapped);
+        }
+        StyleValueData::ValueList { values, .. } => {
+            let mapped = values
+                .as_slice()
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let sources: Vec<_> = sources
+                        .iter()
+                        .filter_map(|source| {
+                            let StyleValueData::ValueList { values, .. } = source else {
+                                return None;
+                            };
+                            values.as_slice().get(index).map(RetainedStyleValueData::data)
+                        })
+                        .collect();
+                    RetainedStyleValueData::from_arc(Arc::new(preserve_transform_matrix_values(
+                        value.data().clone(),
+                        &sources,
+                    )))
+                })
+                .collect();
+            *values = RetainedStyleValueDataList::from_retained_values(mapped);
+        }
+        _ => {}
+    }
+    result
+}
+
+fn effective_rotation_radians(value: &StyleValueData) -> Option<f64> {
+    let StyleValueData::Transformation {
+        values, matrix_values, ..
+    } = value
+    else {
+        return None;
+    };
+    let (index, angle) = values
+        .as_slice()
+        .iter()
+        .enumerate()
+        .find(|(_, value)| matches!(value.data(), StyleValueData::Angle { .. }))?;
+    Some(crate::css::table_group_builder::transform_angle_radians(
+        matrix_values.as_slice().get(index).unwrap_or(angle).data(),
+    ))
+}
+
 fn interpolate_individual_rotate(
+    context: Option<&FfiAnimationContext>,
+    from: &StyleValueData,
+    to: &StyleValueData,
+    delta: f32,
+) -> AnimationValueResult {
+    let mut result = interpolate_individual_rotate_impl(context, from, to, delta);
+    if has_transform_matrix_values(from) || has_transform_matrix_values(to) {
+        let endpoints = [from, to];
+        let sources = if delta == 0.0 {
+            &endpoints[..1]
+        } else if delta == 1.0 {
+            &endpoints[1..]
+        } else {
+            &endpoints[..]
+        };
+        result.value = result.value.map(|value| {
+            RetainedStyleValueData::from_arc(Arc::new(preserve_transform_matrix_values(
+                value.data().clone(),
+                sources,
+            )))
+        });
+    }
+    result
+}
+
+fn interpolate_individual_rotate_impl(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
@@ -1612,6 +1769,7 @@ fn interpolate_individual_rotate(
             property: crate::css::property_metadata::property_id::ROTATE,
             transform_function: TRANSFORM_FUNCTION_ROTATE,
             values: RetainedStyleValueDataList::from_retained_values(vec![angle]),
+            matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
         });
     }
 
@@ -1657,16 +1815,18 @@ fn interpolate_individual_rotate(
             _ => None,
         }
     };
+    let phases = effective_rotation_radians(from).zip(effective_rotation_radians(to));
     let (Some(from), Some(to)) = (normalize(from), normalize(to)) else {
         return not_handled();
     };
-    interpolate_rotate_3d(
+    interpolate_rotate_3d_with_phases(
         context,
         crate::css::property_metadata::property_id::ROTATE,
         TRANSFORM_FUNCTION_ROTATE_3D,
         &from,
         &to,
         delta,
+        phases,
     )
     .map_or_else(not_handled, owned)
 }
@@ -3330,6 +3490,7 @@ fn individual_rotation_value(axis: [f64; 3], angle_degrees: f64) -> StyleValueDa
             property: crate::css::property_metadata::property_id::ROTATE,
             transform_function: TRANSFORM_FUNCTION_ROTATE,
             values: RetainedStyleValueDataList::from_retained_values(vec![angle]),
+            matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
         };
     }
     StyleValueData::Transformation {
@@ -3341,10 +3502,16 @@ fn individual_rotation_value(axis: [f64; 3], angle_degrees: f64) -> StyleValueDa
             retained_number(axis[2]),
             angle,
         ]),
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     }
 }
 
 fn composite_rotate(underlying: &StyleValueData, animated: &StyleValueData) -> Option<StyleValueData> {
+    composite_rotate_impl(underlying, animated)
+        .map(|value| preserve_transform_matrix_values(value, &[underlying, animated]))
+}
+
+fn composite_rotate_impl(underlying: &StyleValueData, animated: &StyleValueData) -> Option<StyleValueData> {
     let (underlying_axis, underlying_angle) = decode_rotation(underlying)?;
     let (animated_axis, animated_angle) = decode_rotation(animated)?;
 
@@ -3365,8 +3532,18 @@ fn composite_rotate(underlying: &StyleValueData, animated: &StyleValueData) -> O
             half_angle.cos(),
         ]
     };
-    let [x1, y1, z1, w1] = to_quaternion(underlying_axis, underlying_angle);
-    let [x2, y2, z2, w2] = to_quaternion(animated_axis, animated_angle);
+    let [x1, y1, z1, w1] = to_quaternion(
+        underlying_axis,
+        effective_rotation_radians(underlying)
+            .map(f64::to_degrees)
+            .unwrap_or(underlying_angle),
+    );
+    let [x2, y2, z2, w2] = to_quaternion(
+        animated_axis,
+        effective_rotation_radians(animated)
+            .map(f64::to_degrees)
+            .unwrap_or(animated_angle),
+    );
 
     let mut product = [
         w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
@@ -3425,6 +3602,7 @@ fn composite_scale(
             TRANSFORM_FUNCTION_SCALE
         },
         values: RetainedStyleValueDataList::from_retained_values(values),
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     })
 }
 
@@ -3459,6 +3637,7 @@ fn composite_translate(
             TRANSFORM_FUNCTION_TRANSLATE
         },
         values: RetainedStyleValueDataList::from_retained_values(values),
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     })
 }
 
@@ -4909,6 +5088,7 @@ fn interpolate_scalar_value(
     }
 }
 
+#[cfg(test)]
 fn interpolate_rotate_3d(
     context: Option<&FfiAnimationContext>,
     property: u16,
@@ -4917,13 +5097,33 @@ fn interpolate_rotate_3d(
     to_arguments: &RetainedStyleValueDataList,
     delta: f32,
 ) -> Option<StyleValueData> {
+    interpolate_rotate_3d_with_phases(
+        context,
+        property,
+        transform_function,
+        from_arguments,
+        to_arguments,
+        delta,
+        None,
+    )
+}
+
+fn interpolate_rotate_3d_with_phases(
+    context: Option<&FfiAnimationContext>,
+    property: u16,
+    transform_function: u8,
+    from_arguments: &RetainedStyleValueDataList,
+    to_arguments: &RetainedStyleValueDataList,
+    delta: f32,
+    phases: Option<(f64, f64)>,
+) -> Option<StyleValueData> {
     let ([from_x, from_y, from_z, from_angle], [to_x, to_y, to_z, to_angle]) =
         (from_arguments.as_slice(), to_arguments.as_slice())
     else {
         return None;
     };
-    let from_angle = resolve_animation_angle(context, from_angle.data())?.to_radians();
-    let to_angle = resolve_animation_angle(context, to_angle.data())?.to_radians();
+    let from_angle = resolve_animation_angle(context, from_angle.data())?;
+    let to_angle = resolve_animation_angle(context, to_angle.data())?;
     let from_axis = [
         resolve_animation_number(context, from_x.data())?,
         resolve_animation_number(context, from_y.data())?,
@@ -4983,8 +5183,9 @@ fn interpolate_rotate_3d(
                 half_angle.cos(),
             ]
         };
-        let mut from_quaternion = to_quaternion(from_axis_normalized, from_angle);
-        let to_quaternion = to_quaternion(to_axis_normalized, to_angle);
+        let (from_phase, to_phase) = phases.unwrap_or((from_angle.to_radians(), to_angle.to_radians()));
+        let mut from_quaternion = to_quaternion(from_axis_normalized, from_phase);
+        let to_quaternion = to_quaternion(to_axis_normalized, to_phase);
 
         // https://drafts.csswg.org/css-transforms-2/#interpolation-of-decomposed-3d-matrix-values
         let mut product = from_quaternion
@@ -5032,7 +5233,7 @@ fn interpolate_rotate_3d(
             // The rotation angle is zero, so the axis is arbitrary.
             axis = [0.0, 0.0, 1.0];
         }
-        (axis, angle)
+        (axis, angle.to_degrees())
     };
 
     let mut arguments = Vec::with_capacity(4);
@@ -5041,7 +5242,7 @@ fn interpolate_rotate_3d(
         arguments.push(argument);
     }
     let angle = RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Angle {
-        value: result_angle.to_degrees(),
+        value: result_angle,
         unit: 0,
     }));
     arguments.push(angle);
@@ -5050,6 +5251,7 @@ fn interpolate_rotate_3d(
         property,
         transform_function,
         values: RetainedStyleValueDataList::from_retained_values(arguments),
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     })
 }
 
@@ -5341,6 +5543,7 @@ fn identity_transformation(property: u16, function: u8) -> Option<RetainedStyleV
         property,
         transform_function: function,
         values: RetainedStyleValueDataList::from_retained_values(arguments),
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     }));
     Some(transformation)
 }
@@ -5647,7 +5850,7 @@ fn transformation_to_matrix(
         _ => None,
     };
     let angle = |argument: &RetainedStyleValueData| match argument.data() {
-        StyleValueData::Angle { value, unit } => angle_to_degrees(*value, *unit).map(f64::to_radians),
+        value @ StyleValueData::Angle { .. } => Some(crate::css::table_group_builder::transform_angle_radians(value)),
         _ => None,
     };
     let numbers = || arguments.iter().map(number).collect::<Option<Vec<_>>>();
@@ -5795,6 +5998,7 @@ fn matrix_transformation(property: u16, matrix: Matrix4) -> StyleValueData {
         property,
         transform_function: TRANSFORM_FUNCTION_MATRIX_3D,
         values: RetainedStyleValueDataList::from_retained_values(arguments),
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     }
 }
 
@@ -5854,6 +6058,25 @@ fn interpolate_transform_list(
     to: &StyleValueData,
     delta: f32,
 ) -> Option<Option<StyleValueData>> {
+    let endpoints = [from, to];
+    let sources = if delta == 0.0 {
+        &endpoints[..1]
+    } else if delta == 1.0 {
+        &endpoints[1..]
+    } else {
+        &endpoints[..]
+    };
+    interpolate_transform_list_impl(context, property_id, from, to, delta)
+        .map(|result| result.map(|value| preserve_transform_matrix_values(value, sources)))
+}
+
+fn interpolate_transform_list_impl(
+    context: Option<&FfiAnimationContext>,
+    property_id: u16,
+    from: &StyleValueData,
+    to: &StyleValueData,
+    delta: f32,
+) -> Option<Option<StyleValueData>> {
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword())
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword())
     {
@@ -5895,6 +6118,7 @@ fn interpolate_transform_list(
                 property: from_property,
                 transform_function: from_function,
                 values: from_arguments,
+                ..
             },
             StyleValueData::Transformation {
                 transform_function: to_function,
@@ -5931,6 +6155,7 @@ fn interpolate_transform_list(
                 property: *from_property,
                 transform_function: *from_function,
                 values: RetainedStyleValueDataList::from_retained_values(vec![argument]),
+                matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
             }));
             transformations.push(transformation);
             continue;
@@ -5993,13 +6218,14 @@ fn interpolate_transform_list(
                     .map(RetainedStyleValueData::clone_retained)
                     .collect(),
             );
-            let transformation = interpolate_rotate_3d(
+            let transformation = interpolate_rotate_3d_with_phases(
                 context,
                 *from_property,
                 transform_function,
                 &from_arguments,
                 &to_arguments,
                 delta,
+                effective_rotation_radians(from.data()).zip(effective_rotation_radians(to.data())),
             )?;
             let transformation = RetainedStyleValueData::from_arc(Arc::new(transformation));
             transformations.push(transformation);
@@ -6026,6 +6252,7 @@ fn interpolate_transform_list(
             property: *from_property,
             transform_function,
             values: RetainedStyleValueDataList::from_retained_values(arguments),
+            matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
         }));
         transformations.push(transformation);
     }
@@ -6073,6 +6300,7 @@ fn post_multiply_transformations(
         let StyleValueData::Transformation {
             transform_function,
             values,
+            matrix_values,
             ..
         } = transformation.data()
         else {
@@ -6080,7 +6308,15 @@ fn post_multiply_transformations(
         };
         result = multiply_matrices(
             result,
-            transformation_to_matrix(context, *transform_function, values.as_slice())?,
+            transformation_to_matrix(
+                context,
+                *transform_function,
+                if matrix_values.as_slice().is_empty() {
+                    values.as_slice()
+                } else {
+                    matrix_values.as_slice()
+                },
+            )?,
         );
     }
     Some(result)
@@ -6151,6 +6387,7 @@ fn accumulate_rotate_3d(
     context: Option<&FfiAnimationContext>,
     underlying: &[RetainedStyleValueData],
     animated: &[RetainedStyleValueData],
+    phases: Option<(f64, f64)>,
 ) -> Option<Vec<RetainedStyleValueData>> {
     let decode = |arguments: &[RetainedStyleValueData]| {
         let [x, y, z, angle] = arguments else {
@@ -6194,8 +6431,10 @@ fn accumulate_rotate_3d(
     }
 
     // NB: Rotations about different axes accumulate by composing them, which multiplying their quaternions does.
-    let [ax, ay, az, aw] = rotation_quaternion(underlying_axis, underlying_angle.to_radians())?;
-    let [bx, by, bz, bw] = rotation_quaternion(animated_axis, animated_angle.to_radians())?;
+    let (underlying_phase, animated_phase) =
+        phases.unwrap_or((underlying_angle.to_radians(), animated_angle.to_radians()));
+    let [ax, ay, az, aw] = rotation_quaternion(underlying_axis, underlying_phase)?;
+    let [bx, by, bz, bw] = rotation_quaternion(animated_axis, animated_phase)?;
     let quaternion = [
         aw * bx + ax * bw + ay * bz - az * by,
         aw * by - ax * bz + ay * bw + az * bx,
@@ -6243,6 +6482,21 @@ fn accumulate_transform_functions(
     underlying: &StyleValueData,
     animated: &StyleValueData,
 ) -> Option<RetainedStyleValueData> {
+    let value = accumulate_transform_functions_impl(context, property, underlying, animated)?;
+    if !has_transform_matrix_values(underlying) && !has_transform_matrix_values(animated) {
+        return Some(value);
+    }
+    Some(RetainedStyleValueData::from_arc(Arc::new(
+        preserve_transform_matrix_values(value.data().clone(), &[underlying, animated]),
+    )))
+}
+
+fn accumulate_transform_functions_impl(
+    context: Option<&FfiAnimationContext>,
+    property: u16,
+    underlying: &StyleValueData,
+    animated: &StyleValueData,
+) -> Option<RetainedStyleValueData> {
     let (
         StyleValueData::Transformation {
             transform_function: underlying_function,
@@ -6263,6 +6517,7 @@ fn accumulate_transform_functions(
             property,
             transform_function,
             values: RetainedStyleValueDataList::from_retained_values(arguments),
+            matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
         }))
     };
 
@@ -6293,7 +6548,12 @@ fn accumulate_transform_functions(
         animated_arguments,
     )?;
     let arguments = match transform_function {
-        TRANSFORM_FUNCTION_ROTATE_3D => accumulate_rotate_3d(context, &underlying_arguments, &animated_arguments)?,
+        TRANSFORM_FUNCTION_ROTATE_3D => accumulate_rotate_3d(
+            context,
+            &underlying_arguments,
+            &animated_arguments,
+            effective_rotation_radians(underlying).zip(effective_rotation_radians(animated)),
+        )?,
         TRANSFORM_FUNCTION_SCALE | TRANSFORM_FUNCTION_SCALE_3D => underlying_arguments
             .iter()
             .zip(&animated_arguments)
@@ -7552,7 +7812,11 @@ pub(crate) fn interpolate_value(
         return discrete_value(context, from, to, delta);
     }
     if is_sizing_property(property_id)
-        && let Some(value) = interpolate_calc_size(context, from, to, delta)
+        && let Some(value) = combine_calc_size(context, from, to, |from, to| {
+            // https://drafts.csswg.org/css-sizing-4/#interpolate-calc-size
+            // If they can be interpolated, the result’s calc-size calculation is the interpolation of the two input calc-size calculations.
+            crate::css::calc::interpolate_calc_size_calculations(from, to, delta)
+        })
     {
         return owned(value);
     }
@@ -7707,15 +7971,11 @@ pub(crate) fn interpolate_value(
         ) else {
             return discrete_value(context, from, to, delta);
         };
-        let font_style = if from_font_style == to_font_style {
-            from_font_style
-        } else if !context.is_some_and(|context| context.allow_discrete) {
-            return handled_without_value();
-        } else if delta < 0.5 {
-            from_font_style
-        } else {
-            to_font_style
-        };
+        // https://drafts.csswg.org/web-animations-1/#by-computed-value
+        // If the number of components or the types of corresponding components do not match, or if any component value uses discrete animation and the two corresponding values do not match, then the property values combine as discrete.
+        if from_font_style != to_font_style {
+            return discrete_value(context, from, to, delta);
+        }
         let angle_value = match (from_angle, to_angle) {
             (Some((from_value, from_unit)), Some((to_value, to_unit))) => {
                 let (Some(from_value), Some(to_value)) = (
@@ -7732,7 +7992,7 @@ pub(crate) fn interpolate_value(
             _ => RetainedStyleValueData::none(),
         };
         return owned(StyleValueData::FontStyle {
-            font_style,
+            font_style: from_font_style,
             angle_value,
         });
     }
@@ -7927,6 +8187,14 @@ fn composite_batch_value<'a>(
         composite_offset_rotate(underlying, animated).map_or_else(handled_without_value, owned)
     } else if property_id == crate::css::property_metadata::property_id::TRANSFORM {
         composite_transform_list(context, underlying, animated, operation).map_or_else(handled_without_value, owned)
+    } else if is_sizing_property(property_id) {
+        combine_calc_size(
+            Some(context),
+            underlying,
+            animated,
+            crate::css::calc::add_calc_size_calculations,
+        )
+        .map_or_else(|| composite_scalar_value(underlying, animated, operation), owned)
     } else {
         composite_scalar_value(underlying, animated, operation)
     };
@@ -8026,8 +8294,20 @@ fn evaluate_animation_value(
         .optional_data()
         .or(input.initial)
         .expect("an animated property must have an initial value");
-    let start = composite_batch_value(context, input.property_id, underlying, start, start_plan.composite);
-    let end = composite_batch_value(context, input.property_id, underlying, end, end_plan.composite);
+    // https://drafts.csswg.org/web-animations-1/#the-effect-value-of-a-keyframe-animation-effect
+    // NB: Steps 8 and 9 generate implicit endpoints with "a property value set to underlying value, a
+    //     keyframe-specific composite operation of replace". Take the current underlying value, including
+    //     the effects already composed beneath this one, rather than the value captured during preparation.
+    let start = if start_keyframe.is_implicit {
+        BatchAnimationValue::Borrowed(underlying)
+    } else {
+        composite_batch_value(context, input.property_id, underlying, start, start_plan.composite)
+    };
+    let end = if end_keyframe.is_implicit {
+        BatchAnimationValue::Borrowed(underlying)
+    } else {
+        composite_batch_value(context, input.property_id, underlying, end, end_plan.composite)
+    };
     let result = interpolate_value(Some(context), input.property_id, start.data(), end.data(), progress);
     assert!(result.handled);
     AnimatedProperty {
@@ -8083,6 +8363,8 @@ pub(crate) struct AnimatedCustomProperties {
     stores: KeyframeStores,
     names: Vec<crate::css::retained_fly_string::RetainedUtf16FlyString>,
     units: Vec<Vec<u16>>,
+    /// Whether any interval values are resolved afresh rather than retained across samples.
+    pub(crate) has_uncached_interval_values: bool,
 }
 
 type Registry = crate::css::custom_properties::CustomPropertyRegistry;
@@ -8182,12 +8464,14 @@ impl AnimatedCustomProperties {
         if !registry.name_has_syntax(self.units(name_id)) {
             return value;
         }
+        // SAFETY: The sample keeps the name alive while it is retained for the lookup.
+        let name = unsafe { ak::Utf16FlyString::from_raw_borrowed(self.name(name_id).raw()) };
         registry
             .finalize_custom_property_value(
                 unsafe { KeyframeStores::store(self.stores.inheritance) },
-                self.name(name_id).raw(),
-                self.units(name_id),
-                value,
+                name.raw_identity(),
+                &name,
+                CustomPropertyValueToFinalize::StyleValue(value),
                 finalization,
             )
             .map_or_else(|fallback| fallback, |(value, _)| value)
@@ -8332,6 +8616,7 @@ pub(crate) fn resolve_published_animation_declarations(
         stores,
         names: Vec::new(),
         units: Vec::new(),
+        has_uncached_interval_values: false,
     };
     let substitution_marks = std::cell::Cell::new(0_u8);
     let style_query_references = std::cell::RefCell::new(None);
@@ -8506,7 +8791,7 @@ pub(crate) fn resolve_published_animation_declarations(
             }
             let name = custom_properties.units(name_id);
             let interval_span = select_custom_property_interval_span(effect, &keyframe_lookups, selection.current_key);
-            let interval_values = effect.resolve_custom_property_interval_values(
+            let (interval_values, values_are_retained) = effect.resolve_custom_property_interval_values(
                 interval_span.map(|lookup| lookup.declaration_index),
                 registry.name_has_interpolable_syntax(name),
                 || {
@@ -8524,13 +8809,16 @@ pub(crate) fn resolve_published_animation_declarations(
                     })
                 },
             );
+            // SAFETY: The sample keeps the name alive while it is retained for the lookup.
+            let interned_name = unsafe { ak::Utf16FlyString::from_raw_borrowed(custom_properties.name(name_id).raw()) };
+            let custom_is_inherited = registry.name_inherits(&interned_name);
             for (lookup, value) in interval_span.into_iter().zip(interval_values) {
                 let declaration = effect.custom_declaration_at(lookup.declaration_index);
                 declarations.push(AnimationDeclaration {
                     keyframe_index: first_keyframe_index + lookup.keyframe_index,
                     property_id: crate::css::property_metadata::property_id::CUSTOM,
                     custom_name_id: name_id,
-                    custom_is_inherited: registry.name_inherits(name),
+                    custom_is_inherited,
                     custom_is_important: important,
                     value,
                     style_sheet_resource_context,
@@ -8538,6 +8826,7 @@ pub(crate) fn resolve_published_animation_declarations(
                     is_transition,
                 });
             }
+            custom_properties.has_uncached_interval_values |= !values_are_retained;
         }
         effects.push(FfiAnimationEffect {
             first_keyframe_index,
@@ -8715,6 +9004,7 @@ pub(crate) fn evaluate_animations(batch: ComputedAnimationBatch<'_>) -> Vec<(u32
                         .map(|&property_index| AnimationKeyframeValue {
                             keyframe: resolved.properties[property_index].keyframe_index,
                             value: computed_keyframe_values[property_index].clone(),
+                            is_implicit: resolved.properties[property_index].is_implicit,
                         })
                         .collect()
                 })
@@ -9198,6 +9488,7 @@ mod tests {
             .map(|(keyframe, value)| AnimationKeyframeValue {
                 keyframe,
                 value: number(value),
+                is_implicit: false,
             })
             .collect::<Vec<_>>();
         let input = AnimationValueInput {
@@ -9233,6 +9524,7 @@ mod tests {
             .map(|(keyframe, value)| AnimationKeyframeValue {
                 keyframe,
                 value: RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Number { value })),
+                is_implicit: false,
             })
             .collect::<Vec<_>>();
         let evaluate = |current_key| {
@@ -9283,10 +9575,12 @@ mod tests {
                 AnimationKeyframeValue {
                     keyframe: 0,
                     value: start_value,
+                    is_implicit: false,
                 },
                 AnimationKeyframeValue {
                     keyframe: 1,
                     value: end_value,
+                    is_implicit: false,
                 },
             ];
             let input = AnimationValueInput {
@@ -9554,6 +9848,116 @@ mod tests {
             panic!("invalid test value {source}");
         };
         value
+    }
+
+    fn computed_transform_value(property: u16, source: &str) -> RetainedStyleValueData {
+        let value = parsed(property, source);
+        match crate::css::absolutize::absolutize_with_element_facts(
+            &value,
+            &crate::css::style_compute::FfiLengthResolutionContext::default(),
+            None,
+            &[],
+            None,
+        )
+        .unwrap()
+        {
+            crate::css::absolutize::Absolutized::Changed(value) => value,
+            crate::css::absolutize::Absolutized::Unchanged => RetainedStyleValueData::from_arc(value),
+        }
+    }
+
+    fn assert_identity_transform(value: &StyleValueData) {
+        let values = if let StyleValueData::ValueList { values, .. } = value {
+            values.as_slice().to_vec()
+        } else {
+            vec![RetainedStyleValueData::from_arc(Arc::new(value.clone()))]
+        };
+        let matrix = post_multiply_transformations(None, &values).unwrap();
+        for (actual, expected) in matrix
+            .into_iter()
+            .flatten()
+            .zip(identity_matrix().into_iter().flatten())
+        {
+            assert!((actual - expected).abs() < 1e-6, "{matrix:?}");
+        }
+    }
+
+    #[test]
+    fn unchanged_transform_angles_retain_precision_through_animation() {
+        use crate::css::property_metadata::property_id;
+        for (property, source) in [
+            (property_id::TRANSFORM, "rotate(1e30turn)"),
+            (property_id::TRANSFORM, "rotate3d(0,0,1,1e30turn)"),
+            (property_id::ROTATE, "1e30turn"),
+            (property_id::ROTATE, "z 1e30turn"),
+        ] {
+            let value = computed_transform_value(property, source);
+            for delta in [0.0, 0.25, 0.5, 1.0] {
+                let result = interpolate_value(None, property, value.data(), value.data(), delta)
+                    .into_value()
+                    .unwrap();
+                assert_identity_transform(result.data());
+            }
+        }
+    }
+
+    #[test]
+    fn transform_accumulation_retains_unchanged_angle_precision() {
+        use crate::css::property_metadata::property_id;
+        let value = computed_transform_value(property_id::TRANSFORM, "rotate(1e30turn)");
+        let zero = computed_transform_value(property_id::TRANSFORM, "rotate(0deg)");
+        let context = animation_context(false);
+        let result =
+            composite_transform_list(&context, value.data(), zero.data(), FfiCompositeOperation::Accumulate).unwrap();
+        assert_identity_transform(&result);
+        let value = computed_transform_value(property_id::ROTATE, "1e30turn");
+        let zero = computed_transform_value(property_id::ROTATE, "0deg");
+        assert_identity_transform(&composite_rotate(value.data(), zero.data()).unwrap());
+    }
+
+    #[test]
+    fn changed_animation_angles_do_not_reuse_literal_precision() {
+        use crate::css::property_metadata::property_id;
+        let from = computed_transform_value(property_id::TRANSFORM, "rotate(1e30turn)");
+        let to = computed_transform_value(property_id::TRANSFORM, "rotate(90deg)");
+        let value = interpolate_value(None, property_id::TRANSFORM, from.data(), to.data(), 0.5)
+            .into_value()
+            .unwrap();
+        assert!(!has_transform_matrix_values(value.data()));
+        // Equal canonical values with distinct used phases must not pick an arbitrary source.
+        let to = computed_transform_value(property_id::TRANSFORM, &format!("rotate({}deg)", 1e30f64 * 360.0));
+        let value = interpolate_value(None, property_id::TRANSFORM, from.data(), to.data(), 0.0)
+            .into_value()
+            .unwrap();
+        assert_identity_transform(value.data());
+        let value = interpolate_value(None, property_id::TRANSFORM, from.data(), to.data(), 0.5)
+            .into_value()
+            .unwrap();
+        assert!(!has_transform_matrix_values(value.data()));
+    }
+
+    #[test]
+    fn different_axis_quaternions_use_precise_literal_angles() {
+        use crate::css::property_metadata::property_id;
+        let from = computed_transform_value(property_id::TRANSFORM, "rotate3d(1,0,0,1e30turn)");
+        let to = computed_transform_value(property_id::TRANSFORM, "rotate3d(0,1,0,1e30turn)");
+        let result = interpolate_value(None, property_id::TRANSFORM, from.data(), to.data(), 0.5)
+            .into_value()
+            .unwrap();
+        assert_identity_transform(result.data());
+        let context = animation_context(false);
+        let result =
+            composite_transform_list(&context, from.data(), to.data(), FfiCompositeOperation::Accumulate).unwrap();
+        assert_identity_transform(&result);
+        let from = computed_transform_value(property_id::ROTATE, "x 1e30turn");
+        let to = computed_transform_value(property_id::ROTATE, "y 1e30turn");
+        assert_identity_transform(&composite_rotate(from.data(), to.data()).unwrap());
+        assert_identity_transform(
+            interpolate_value(None, property_id::ROTATE, from.data(), to.data(), 0.5)
+                .into_value()
+                .unwrap()
+                .data(),
+        );
     }
 
     // The value a handled interpolation or composition produced, serialized; nothing where it declined to combine.

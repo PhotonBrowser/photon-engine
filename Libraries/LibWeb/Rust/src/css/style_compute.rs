@@ -148,6 +148,8 @@ enum FontMetricSelector {
 enum ViewportAxis {
     Width,
     Height,
+    Inline,
+    Block,
     Min,
     Max,
 }
@@ -233,13 +235,20 @@ fn length_unit_kinds() -> &'static [LengthUnitKind] {
                     metric: FontMetricSelector::LineHeight,
                     root: true,
                 },
-                // NB: vi maps to the width and vb to the height until the C++
-                //     side selects by inline axis, matching the FIXME there.
-                "vw" | "svw" | "lvw" | "dvw" | "vi" | "svi" | "lvi" | "dvi" => LengthUnitKind::ViewportRelative {
+                "vw" | "svw" | "lvw" | "dvw" => LengthUnitKind::ViewportRelative {
                     axis: ViewportAxis::Width,
                 },
-                "vh" | "svh" | "lvh" | "dvh" | "vb" | "svb" | "lvb" | "dvb" => LengthUnitKind::ViewportRelative {
+                "vh" | "svh" | "lvh" | "dvh" => LengthUnitKind::ViewportRelative {
                     axis: ViewportAxis::Height,
+                },
+                // https://drafts.csswg.org/css-values-4/#vi
+                // Equal to 1% of the size of the large viewport size, small viewport size, large viewport size, and
+                // dynamic viewport size (respectively) in the box’s inline axis.
+                "vi" | "svi" | "lvi" | "dvi" => LengthUnitKind::ViewportRelative {
+                    axis: ViewportAxis::Inline,
+                },
+                "vb" | "svb" | "lvb" | "dvb" => LengthUnitKind::ViewportRelative {
+                    axis: ViewportAxis::Block,
                 },
                 "vmin" | "svmin" | "lvmin" | "dvmin" => LengthUnitKind::ViewportRelative {
                     axis: ViewportAxis::Min,
@@ -370,6 +379,20 @@ pub(crate) fn absolutize_length(value: f64, unit: usize, context: &FfiLengthReso
             let basis = match axis {
                 ViewportAxis::Width => context.viewport_width,
                 ViewportAxis::Height => context.viewport_height,
+                ViewportAxis::Inline => {
+                    if context.subject_inline_axis_is_horizontal {
+                        context.viewport_width
+                    } else {
+                        context.viewport_height
+                    }
+                }
+                ViewportAxis::Block => {
+                    if context.subject_inline_axis_is_horizontal {
+                        context.viewport_height
+                    } else {
+                        context.viewport_width
+                    }
+                }
                 ViewportAxis::Min => context.viewport_width.min(context.viewport_height),
                 ViewportAxis::Max => context.viewport_width.max(context.viewport_height),
             };
@@ -608,6 +631,7 @@ pub extern "C" fn rust_compute_font_width(absolutized_value: &StyleValueData) ->
     compute_font_width(absolutized_value)
 }
 
+/// https://drafts.csswg.org/css-fonts-4/#absolute-size-mapping
 /// An <absolute-size> keyword refers to an entry in a table of font sizes computed and kept by
 /// the user agent. See 2.5.1 Absolute Size Keyword Mapping Table.
 fn absolute_size_font_mapping(keyword: u16, default_font_size: CssPixels) -> Option<CssPixels> {
@@ -617,6 +641,35 @@ fn absolute_size_font_mapping(keyword: u16, default_font_size: CssPixels) -> Opt
                 .div_as_fraction(CssPixels::from_integer(denominator)),
         )
     };
+    // INTEROP: Other browsers share this keyword table for integral default sizes from 9px through 16px, so we use
+    //          it instead of the ratios from the spec's guideline table.
+    let column = match keyword {
+        keyword::XX_SMALL => 0,
+        keyword::X_SMALL => 1,
+        keyword::SMALL => 2,
+        keyword::MEDIUM => 3,
+        keyword::LARGE => 4,
+        keyword::X_LARGE => 5,
+        keyword::XX_LARGE => 6,
+        keyword::XXX_LARGE => 7,
+        _ => return None,
+    };
+    const FONT_SIZE_TABLE: [[i64; 8]; 8] = [
+        [9, 9, 9, 9, 11, 14, 18, 27],
+        [9, 9, 9, 10, 12, 15, 20, 30],
+        [9, 9, 10, 11, 13, 17, 22, 33],
+        [9, 9, 10, 12, 14, 18, 24, 36],
+        [9, 10, 12, 13, 16, 20, 26, 39],
+        [9, 10, 12, 14, 17, 21, 28, 42],
+        [9, 10, 13, 15, 18, 23, 30, 45],
+        [9, 10, 13, 16, 18, 24, 32, 48],
+    ];
+    let default_size = default_font_size.to_int();
+    if (9..=16).contains(&default_size) && default_font_size == CssPixels::from_integer(i64::from(default_size)) {
+        return Some(CssPixels::from_integer(
+            FONT_SIZE_TABLE[(default_size - 9) as usize][column],
+        ));
+    }
     match keyword {
         keyword::XX_SMALL => entry(3, 5),
         keyword::X_SMALL => entry(3, 4),
@@ -640,8 +693,8 @@ fn relative_size_font_mapping(keyword: u16, inherited_font_size: CssPixels) -> O
         )
     };
     match keyword {
-        keyword::SMALLER => entry(4, 5),
-        keyword::LARGER => entry(5, 4),
+        keyword::SMALLER => entry(5, 6),
+        keyword::LARGER => entry(6, 5),
         _ => None,
     }
 }
@@ -657,6 +710,7 @@ fn compute_font_size(
     inherited_font_size: CssPixels,
     inherited_math_depth: i32,
     default_font_size: CssPixels,
+    default_font_size_scale: f64,
 ) -> FfiComputedNumber {
     let computed = |px: f64| FfiComputedNumber {
         handled: true,
@@ -677,7 +731,7 @@ fn compute_font_size(
         StyleValueData::Percentage { value } => computed(inherited_font_size.to_double() * (value / 100.0)),
         StyleValueData::Keyword { keyword } => {
             if let Some(px) = absolute_size_font_mapping(*keyword, default_font_size) {
-                return computed(px.to_double());
+                return computed(px.scaled(default_font_size_scale).to_double());
             }
             if let Some(px) = relative_size_font_mapping(*keyword, inherited_font_size) {
                 return computed(px.to_double());
@@ -756,6 +810,7 @@ pub extern "C" fn rust_compute_font_size(
         CssPixels::from_raw(inherited_font_size_raw),
         inherited_math_depth,
         CssPixels::from_raw(default_font_size_raw),
+        1.0,
     )
 }
 
@@ -875,8 +930,8 @@ pub(crate) fn recascade_font_size_batch<'a>(
                 if *keyword == keyword::INHERIT {
                     continue;
                 }
-                if let Some(px) = absolute_size_font_mapping(*keyword, zoomed_default_size) {
-                    current_size = px;
+                if let Some(px) = absolute_size_font_mapping(*keyword, default_size) {
+                    current_size = px.scaled(length_zoom);
                     depends_on_viewport_metrics = false;
                     continue;
                 }
@@ -908,8 +963,13 @@ pub(crate) fn recascade_font_size_batch<'a>(
                         metric: FontMetricSelector::FontSize,
                         root: false,
                     }) => Some((*value * current_size.to_double(), depends_on_viewport_metrics)),
+                    // NB: Logical viewport units need the ancestor's writing mode from its resolution context.
+                    Some(LengthUnitKind::ViewportRelative {
+                        axis: ViewportAxis::Inline | ViewportAxis::Block,
+                    }) => None,
                     Some(LengthUnitKind::ViewportRelative { axis }) => {
                         let basis = match axis {
+                            ViewportAxis::Inline | ViewportAxis::Block => unreachable!(),
                             ViewportAxis::Width => document_inputs.viewport_width,
                             ViewportAxis::Height => document_inputs.viewport_height,
                             ViewportAxis::Min => document_inputs.viewport_width.min(document_inputs.viewport_height),
@@ -1559,6 +1619,14 @@ pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> Ext
             } => {
                 dependencies.needs_document_base_url |= !url.is_empty() && !resource_context.has_base_url;
                 dependencies.may_need_style_sheet_resource_context |= !url.is_empty();
+            }
+            StyleValueData::Url { url, .. } => {
+                if !url.is_empty() && !url.is_fragment() {
+                    let needs_base_url =
+                        liburl_rust::basic_parse(url.url_input(), liburl_rust::BasicParseOptions::new()).is_none();
+                    dependencies.needs_document_base_url |= needs_base_url;
+                    dependencies.may_need_style_sheet_resource_context |= needs_base_url;
+                }
             }
             StyleValueData::Calculated { rust_calculation, .. } => {
                 collect_calculation(rust_calculation.node(), dependencies);
@@ -3061,8 +3129,8 @@ pub(crate) fn value_absolutization_is_identity(value: &StyleValueData) -> bool {
         | StyleValueData::CustomIdent { .. }
         | StyleValueData::Percentage { .. }
         | StyleValueData::Flex { .. }
-        | StyleValueData::UnicodeRange { .. }
-        | StyleValueData::Url { .. } => true,
+        | StyleValueData::UnicodeRange { .. } => true,
+        StyleValueData::Url { url, .. } => url.is_empty() || url.is_fragment(),
         _ => false,
     }
 }
@@ -3151,6 +3219,7 @@ fn compute_animation_name(value: &StyleValueData) -> Option<Arc<StyleValueData>>
             StyleValueData::String {
                 string,
                 is_valid_animation_name_custom_ident,
+                ..
             } => Some(if *is_valid_animation_name_custom_ident {
                 RetainedStyleValueData::from_arc(Arc::new(StyleValueData::CustomIdent {
                     custom_ident: string.clone(),
@@ -3375,10 +3444,31 @@ pub(crate) fn property_computation_order_for_phase(phase: u8) -> &'static [u16] 
         (line_height, color_scheme)
     });
     match phase {
-        LONGHAND_DRIVE_PHASE_FONT => &order[..line_height],
+        LONGHAND_DRIVE_PHASE_FONT => {
+            // NB: Font sizes can use logical viewport units, so their subject's writing mode must be computed first.
+            static FONT_ORDER: OnceLock<Vec<u16>> = OnceLock::new();
+            FONT_ORDER.get_or_init(|| {
+                std::iter::once(prop::WRITING_MODE)
+                    .chain(order[..line_height].iter().copied())
+                    .collect()
+            })
+        }
         LONGHAND_DRIVE_PHASE_LINE_HEIGHT => &order[line_height..color_scheme],
         LONGHAND_DRIVE_PHASE_COLOR_SCHEME => &order[color_scheme..color_scheme + 1],
-        LONGHAND_DRIVE_PHASE_REMAINING => &order[color_scheme + 1..],
+        LONGHAND_DRIVE_PHASE_REMAINING => {
+            // NB: A partial remaining-phase drive must resolve the current axis before any length, including images.
+            static REMAINING_ORDER: OnceLock<Vec<u16>> = OnceLock::new();
+            REMAINING_ORDER.get_or_init(|| {
+                std::iter::once(prop::WRITING_MODE)
+                    .chain(
+                        order[color_scheme + 1..]
+                            .iter()
+                            .copied()
+                            .filter(|&property| property != prop::WRITING_MODE),
+                    )
+                    .collect()
+            })
+        }
         _ => unreachable!("unknown longhand drive phase"),
     }
 }
@@ -3701,7 +3791,12 @@ pub(crate) unsafe fn drive_property_computation(
     let mut background_image_list_length: Option<usize> = None;
     // The computed writing-mode and direction, tracked for logical alias pairing;
     // both properties only take keywords, whose computed value is the specified one.
-    let mut computed_writing_mode: Option<u8> = None;
+    let mut computed_writing_mode = longhand_table
+        .get(prop::WRITING_MODE)
+        .and_then(|value| match value.data() {
+            StyleValueData::Keyword { keyword } => keyword_to_writing_mode(*keyword),
+            _ => None,
+        });
     let mut computed_direction: Option<u8> = None;
     let mut computed_overflow_x: Option<u16> = None;
     let mut computed_overflow_y: Option<u16> = None;
@@ -3904,14 +3999,27 @@ pub(crate) unsafe fn drive_property_computation(
             };
         let requires_computation = property_requires_computation_level(property_id) >= required_level || zooms_value;
 
-        let zoomed_length_resolution_context;
+        let mut zoomed_length_resolution_context;
         let length_resolution_context = match length_resolution_context {
-            Some(context) if !zoom.is_identity() => {
-                zoomed_length_resolution_context = zoom.context(
-                    context,
-                    inherit_fetch_attempted && !use_initial,
-                    phase == LONGHAND_DRIVE_PHASE_FONT,
-                );
+            Some(context)
+                if !zoom.is_identity()
+                    || computed_writing_mode.is_some_and(|writing_mode| {
+                        context.subject_inline_axis_is_horizontal != (writing_mode == writing_mode::HORIZONTAL_TB)
+                    }) =>
+            {
+                zoomed_length_resolution_context = if zoom.is_identity() {
+                    *context
+                } else {
+                    zoom.context(
+                        context,
+                        inherit_fetch_attempted && !use_initial,
+                        phase == LONGHAND_DRIVE_PHASE_FONT,
+                    )
+                };
+                if let Some(writing_mode) = computed_writing_mode {
+                    zoomed_length_resolution_context.subject_inline_axis_is_horizontal =
+                        writing_mode == writing_mode::HORIZONTAL_TB;
+                }
                 Some(&zoomed_length_resolution_context)
             }
             context => context,
@@ -4287,7 +4395,8 @@ pub(crate) unsafe fn drive_property_computation(
                                     computed_math_depth,
                                     inherited_font_size,
                                     inherited_math_depth,
-                                    CssPixels::from_raw(default_font_size_raw).scaled(zoom.length_effective_zoom()),
+                                    CssPixels::from_raw(default_font_size_raw),
+                                    zoom.length_effective_zoom(),
                                 );
                                 if result.handled {
                                     if result.unchanged {
@@ -6297,6 +6406,8 @@ pub struct FfiHostAnimationSample {
     /// The identities of the element's custom-property environment and the one it inherits, under
     /// which values substituted against the element hold.
     pub custom_property_environments: [u64; 2],
+    /// The host's current registrations, which the engine may not have consumed yet.
+    pub custom_property_registration_generation: u64,
     pub inheritance_parent_style_record: u64,
     /// The document's side of the environment keyframes compute in. The engine fills in the
     /// element's own: its place among its siblings and its random bases.
@@ -6334,6 +6445,7 @@ pub struct FfiAnimatedCustomPropertyResult {
 #[repr(C)]
 pub struct FfiHostAnimationSampleResult {
     pub outcome: FfiHostAnimationSampleOutcome,
+    pub custom_properties_trigger_restyle: bool,
     /// The non-inherited style groups a keyframe saying `inherit` read from the parent.
     pub keyframes_inherited_non_inherited_style_groups: u32,
     pub depends_on_viewport_metrics: bool,
@@ -6354,6 +6466,7 @@ impl FfiHostAnimationSampleResult {
     fn with_outcome(outcome: FfiHostAnimationSampleOutcome) -> Self {
         Self {
             outcome,
+            custom_properties_trigger_restyle: true,
             keyframes_inherited_non_inherited_style_groups: 0,
             depends_on_viewport_metrics: false,
             font_metrics_depend_on_viewport_metrics: false,
@@ -6438,6 +6551,7 @@ pub(crate) struct AnimationSampleInput<'a> {
     /// The identities of the element's custom-property environment and the one it inherits, under
     /// which values substituted against the element hold.
     pub(crate) custom_property_environments: [u64; 2],
+    pub(crate) custom_property_registration_generation: u64,
     pub(crate) inheritance_parent_style_record: u64,
     /// The document's side of the environment keyframes compute in.
     pub(crate) environment: &'a FfiStyleComputationEnvironment,
@@ -6552,6 +6666,7 @@ impl FfiHostAnimationSample {
                 element_declares_custom_properties: self.element_declares_own_custom_properties,
             },
             custom_property_environments: self.custom_property_environments,
+            custom_property_registration_generation: self.custom_property_registration_generation,
             inheritance_parent_style_record: self.inheritance_parent_style_record,
             environment,
             element_box_slot: self.element_box_slot,
@@ -7030,6 +7145,9 @@ fn finish_animation_sample(
         && resolved.container_relative_length_unit_mask == 0
         && !resolved.needs_document_base_url
         && resolved.unfixed_random_sharings.is_empty();
+
+    let has_non_custom_property_animation = resolved.properties.iter().any(|property| property.custom_name_id == 0);
+
     let custom_results = anim::evaluate_animations(anim::ComputedAnimationBatch {
         context: input.animation_context(Some(&length_contexts.remaining), reference_box),
         device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
@@ -7064,7 +7182,22 @@ fn finish_animation_sample(
             &retained,
             finalization,
         );
-        retained.extend(readers);
+        // Failed resolution keeps the default full restyle. On success, only consumers not
+        // updated by this sample can require one.
+        if let Ok(readers) = readers {
+            retained.extend(readers);
+
+            let uncached_interval_values_may_need_substitution =
+                custom_properties.has_uncached_interval_values && result.substitution_marks != 0;
+
+            result.custom_properties_trigger_restyle = engine.animated_custom_properties_trigger_restyle(
+                node,
+                pseudo,
+                has_non_custom_property_animation,
+                uncached_interval_values_may_need_substitution,
+                input.custom_property_registration_generation,
+            );
+        }
         let rows = retained
             .iter()
             .map(|(name, value)| FfiAnimatedCustomPropertyResult {
@@ -8194,6 +8327,12 @@ pub(crate) mod ffi_test_stubs {
         unreachable!("no unit test makes a string the host owns");
     }
     #[unsafe(no_mangle)]
+    unsafe extern "C" fn ladybird_utf16_fly_string_from_utf8(data: *const u8, length: usize) -> usize {
+        let bytes = unsafe { ak::slice_from_raw_parts(data, length) };
+        let units = std::str::from_utf8(bytes).unwrap().encode_utf16().collect::<Vec<_>>();
+        unsafe { ladybird_utf16_fly_string_from_utf16(units.as_ptr(), units.len()) }
+    }
+    #[unsafe(no_mangle)]
     unsafe extern "C" fn ladybird_utf16_fly_string_from_utf16(data: *const u16, length: usize) -> usize {
         // Keep a process-wide test atom table with AK's header layout so worker-parsed
         // names remain alive after the worker exits.
@@ -8313,6 +8452,31 @@ pub(crate) mod ffi_test_stubs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_dependencies_only_read_a_base_for_relative_urls() {
+        for (url, needs_base) in [
+            ("https://example.com/paint.svg#fill", false),
+            ("data:image/svg+xml,paint", false),
+            ("https://example.com/色.svg#fill", false),
+            ("paint.svg#fill", true),
+            ("色.svg#fill", true),
+            ("/paint.svg#fill", true),
+            ("//example.com/paint.svg#fill", true),
+            ("#fill", false),
+            ("", false),
+        ] {
+            let value = StyleValueData::Url {
+                url: crate::css::style_value::RetainedString::from_utf16(&url.encode_utf16().collect::<Vec<_>>())
+                    .unwrap(),
+                url_type: 0,
+                modifiers: crate::css::style_value::RetainedRequestUrlModifierList::from_retained_modifiers(Vec::new()),
+            };
+            let dependencies = collect_external_value_dependencies(&value);
+            assert_eq!(dependencies.needs_document_base_url, needs_base, "{url}");
+            assert_eq!(dependencies.may_need_style_sheet_resource_context, needs_base, "{url}");
+        }
+    }
 
     #[test]
     fn calculated_random_values_record_their_document_dependency() {
@@ -8769,6 +8933,7 @@ mod tests {
             sixteen,
             0,
             sixteen,
+            1.0,
         );
         assert_eq!(medium.value, 16.0);
         let large = compute_font_size(
@@ -8779,9 +8944,17 @@ mod tests {
             sixteen,
             0,
             sixteen,
+            1.0,
         );
-        assert_eq!(large.value, 19.1875); // 16 * 6 / 5 in 6-bit fixed point
-        let percent = compute_font_size(&StyleValueData::Percentage { value: 150.0 }, 0, sixteen, 0, sixteen);
+        assert_eq!(large.value, 18.0);
+        let percent = compute_font_size(
+            &StyleValueData::Percentage { value: 150.0 },
+            0,
+            sixteen,
+            0,
+            sixteen,
+            1.0,
+        );
         assert_eq!(percent.value, 24.0);
         let math = compute_font_size(
             &StyleValueData::Keyword { keyword: keyword::MATH },
@@ -8789,6 +8962,7 @@ mod tests {
             sixteen,
             0,
             sixteen,
+            1.0,
         );
         assert_eq!(math.value, CssPixels::from_integer(16).scaled(0.71).to_double());
         let math_two_levels = compute_font_size(
@@ -8797,6 +8971,7 @@ mod tests {
             sixteen,
             0,
             sixteen,
+            1.0,
         );
         assert_eq!(
             math_two_levels.value,
@@ -9017,5 +9192,269 @@ mod tests {
         assert_eq!(result.px, 80.0);
         assert!(result.resolved_viewport_relative_length);
         assert!(dependency_was_recorded);
+    }
+
+    fn svg_axis_case(svg: bool, vertical: bool) -> [f64; 3] {
+        use crate::css::property_metadata::property_id as prop;
+        let mut table = ComputedLonghandTable::new();
+        table.set(prop::ZOOM, retained_new(StyleValueData::Number { value: 2.0 }), -1);
+        let mut store = crate::css::cascaded_properties::CascadedPropertyStore::new();
+        store.seed_retained_property(
+            prop::WRITING_MODE,
+            retained_new(StyleValueData::Keyword {
+                keyword: if vertical {
+                    keyword::VERTICAL_RL
+                } else {
+                    keyword::HORIZONTAL_TB
+                },
+            }),
+            false,
+            false,
+        );
+        for (property, value, unit) in [
+            (prop::WIDTH, 7.0, "px"),
+            (prop::HEIGHT, 1.0, "rem"),
+            (prop::MARGIN_LEFT, 10.0, "vi"),
+        ] {
+            store.seed_retained_property(
+                property,
+                retained_new(StyleValueData::Length {
+                    value,
+                    unit: unit_code(unit) as u8,
+                }),
+                false,
+                false,
+            );
+        }
+        let mut box_type_input = element_adjustment_input();
+        box_type_input.is_svg_element = svg;
+        let environment = FfiStyleComputationEnvironment {
+            box_type_input,
+            color_scheme_input: FfiEffectiveColorSchemeInput {
+                preferred_color_scheme: 0,
+                has_document_supported_schemes: false,
+                document_supported_scheme_codes: std::ptr::null(),
+                document_supported_scheme_count: 0,
+            },
+            is_th_element: false,
+            has_new_font_size: false,
+            has_tree_counting_context: false,
+            sibling_count: 0,
+            sibling_index: 0,
+            random_base_values: std::ptr::null(),
+            random_base_value_count: 0,
+            document_base_url: std::ptr::null(),
+            document_base_url_length: 0,
+            style_sheet_resource_contexts: std::ptr::null(),
+            style_sheet_resource_context_count: 0,
+            device_pixels_per_css_pixel: 1.0,
+            initial_font_size_raw: 1024,
+            default_font_size_raw: 1024,
+            root_effective_zoom: 1.0,
+        };
+        let context = FfiLengthResolutionContext {
+            viewport_width: 200.0,
+            viewport_height: 100.0,
+            root_font_metrics: FfiFontMetrics {
+                font_size: 20.0,
+                ..Default::default()
+            },
+            subject_inline_axis_is_horizontal: true,
+            zoom: 1.0,
+            ..Default::default()
+        };
+        let mut results = empty_longhand_driver_results();
+        let mut color_scheme = -1;
+        // SAFETY: All environment slices are empty and the borrowed contexts live throughout the drive.
+        unsafe {
+            drive_property_computation(
+                &mut table,
+                &store,
+                None,
+                None,
+                &environment,
+                None,
+                LONGHAND_DRIVE_PHASE_REMAINING,
+                Some(&context),
+                None,
+                &mut results,
+                &mut color_scheme,
+                false,
+            );
+        }
+        [prop::WIDTH, prop::HEIGHT, prop::MARGIN_LEFT].map(|property| match table.get(property).unwrap().data() {
+            StyleValueData::Length { value, unit } if *unit == px_length_unit() => *value,
+            _ => panic!("expected absolute computed length"),
+        })
+    }
+
+    #[test]
+    fn svg_vertical_axis_preserves_unzoomed_lengths() {
+        assert_eq!(svg_axis_case(true, true), [7.0, 20.0, 10.0]);
+    }
+    #[test]
+    fn html_vertical_axis_applies_zoom() {
+        assert_eq!(svg_axis_case(false, true), [14.0, 40.0, 20.0]);
+    }
+    #[test]
+    fn svg_horizontal_axis_preserves_unzoomed_lengths() {
+        assert_eq!(svg_axis_case(true, false), [7.0, 20.0, 20.0]);
+    }
+    fn font_phase_axis_case(
+        declared: Option<u16>,
+        parent_mode: u16,
+        inherit_font: bool,
+        context_horizontal: bool,
+    ) -> [f64; 2] {
+        use crate::css::property_metadata::property_id as prop;
+        let mut table = ComputedLonghandTable::new();
+        table.set(prop::ZOOM, retained_new(StyleValueData::Number { value: 1.0 }), -1);
+        let mut store = crate::css::cascaded_properties::CascadedPropertyStore::new();
+        if let Some(keyword) = declared {
+            store.seed_retained_property(
+                prop::WRITING_MODE,
+                retained_new(StyleValueData::Keyword { keyword }),
+                false,
+                false,
+            );
+        }
+        if !inherit_font {
+            store.seed_retained_property(
+                prop::FONT_SIZE,
+                retained_new(StyleValueData::Length {
+                    value: 10.0,
+                    unit: unit_code("vi") as u8,
+                }),
+                false,
+                false,
+            );
+        }
+        store.seed_retained_property(
+            prop::LINE_HEIGHT,
+            retained_new(StyleValueData::Length {
+                value: 10.0,
+                unit: unit_code("vb") as u8,
+            }),
+            false,
+            false,
+        );
+        let mut parent = ComputedLonghandTable::new();
+        parent.set(
+            prop::WRITING_MODE,
+            retained_new(StyleValueData::Keyword { keyword: parent_mode }),
+            -1,
+        );
+        parent.set(
+            prop::FONT_SIZE,
+            retained_new(StyleValueData::Length {
+                value: 23.0,
+                unit: px_length_unit(),
+            }),
+            -1,
+        );
+        parent.set(
+            prop::FONT_WEIGHT,
+            retained_new(StyleValueData::Number { value: 400.0 }),
+            -1,
+        );
+        let snapshot = ParentSnapshot::new(&parent, None, false);
+        let mut box_type_input = element_adjustment_input();
+        box_type_input.is_svg_element = false;
+        let environment = FfiStyleComputationEnvironment {
+            box_type_input,
+            color_scheme_input: FfiEffectiveColorSchemeInput {
+                preferred_color_scheme: 0,
+                has_document_supported_schemes: false,
+                document_supported_scheme_codes: std::ptr::null(),
+                document_supported_scheme_count: 0,
+            },
+            is_th_element: false,
+            has_new_font_size: false,
+            has_tree_counting_context: false,
+            sibling_count: 0,
+            sibling_index: 0,
+            random_base_values: std::ptr::null(),
+            random_base_value_count: 0,
+            document_base_url: std::ptr::null(),
+            document_base_url_length: 0,
+            style_sheet_resource_contexts: std::ptr::null(),
+            style_sheet_resource_context_count: 0,
+            device_pixels_per_css_pixel: 1.0,
+            initial_font_size_raw: 1024,
+            default_font_size_raw: 1024,
+            root_effective_zoom: 1.0,
+        };
+        let context = FfiLengthResolutionContext {
+            viewport_width: 800.0,
+            viewport_height: 600.0,
+            root_font_metrics: FfiFontMetrics {
+                font_size: 20.0,
+                ..Default::default()
+            },
+            subject_inline_axis_is_horizontal: context_horizontal,
+            zoom: 1.0,
+            ..Default::default()
+        };
+        let mut results = empty_longhand_driver_results();
+        let mut color_scheme = -1;
+        // SAFETY: All environment slices are empty and the borrowed contexts live throughout the drive.
+        for phase in [LONGHAND_DRIVE_PHASE_FONT, LONGHAND_DRIVE_PHASE_LINE_HEIGHT] {
+            unsafe {
+                drive_property_computation(
+                    &mut table,
+                    &store,
+                    Some(&snapshot),
+                    None,
+                    &environment,
+                    None,
+                    phase,
+                    Some(&context),
+                    None,
+                    &mut results,
+                    &mut color_scheme,
+                    false,
+                );
+            }
+        }
+        [prop::FONT_SIZE, prop::LINE_HEIGHT].map(|property| match table.get(property).unwrap().data() {
+            StyleValueData::Length { value, unit } if *unit == px_length_unit() => *value,
+            _ => panic!("expected absolute computed length"),
+        })
+    }
+
+    #[test]
+    fn font_and_line_height_follow_explicit_vertical_axis() {
+        assert_eq!(
+            font_phase_axis_case(Some(keyword::VERTICAL_RL), keyword::HORIZONTAL_TB, false, true),
+            [60.0, 80.0]
+        );
+    }
+    #[test]
+    fn font_and_line_height_follow_explicit_horizontal_axis() {
+        assert_eq!(
+            font_phase_axis_case(Some(keyword::HORIZONTAL_TB), keyword::VERTICAL_RL, false, false),
+            [80.0, 60.0]
+        );
+    }
+    #[test]
+    fn font_and_line_height_follow_inherited_axis() {
+        assert_eq!(
+            font_phase_axis_case(None, keyword::VERTICAL_RL, false, true),
+            [60.0, 80.0]
+        );
+    }
+    #[test]
+    fn inherited_computed_font_size_is_not_reinterpreted_in_child_axis() {
+        assert_eq!(
+            font_phase_axis_case(Some(keyword::VERTICAL_RL), keyword::HORIZONTAL_TB, true, true),
+            [23.0, 80.0]
+        );
+    }
+    #[test]
+    fn font_axis_initial_keyword_uses_initial_writing_mode() {
+        assert_eq!(
+            font_phase_axis_case(Some(keyword::INITIAL), keyword::VERTICAL_RL, false, false),
+            [80.0, 60.0]
+        );
     }
 }

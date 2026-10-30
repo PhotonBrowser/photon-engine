@@ -21,6 +21,9 @@ void Client::die()
 
     for (auto& promise : pending_promises)
         promise.value->reject(Error::from_string_literal("ImageDecoder disconnected"));
+
+    if (auto on_death = move(this->on_death))
+        on_death();
 }
 
 NonnullRefPtr<Core::Promise<DecodedImage>> Client::decode_image(ReadonlyBytes encoded_data, Function<ErrorOr<void>(DecodedImage&)> on_resolved, Function<void(Error&)> on_rejected, Optional<Gfx::IntSize> ideal_size, Optional<ByteString> mime_type)
@@ -53,6 +56,27 @@ NonnullRefPtr<Core::Promise<DecodedImage>> Client::decode_image(ReadonlyBytes en
     async_decode_image(encoded_buffer, ideal_size, mime_type, request_id);
 
     return promise;
+}
+
+ErrorOr<DecodedFirstFrame> Client::decode_first_frame_synchronously(ReadonlyBytes encoded_data, Optional<ByteString> mime_type)
+{
+    verify_event_loop();
+    if (encoded_data.is_empty())
+        return Error::from_string_literal("No encoded data");
+
+    auto encoded_buffer = TRY(Core::AnonymousBuffer::create_with_size(encoded_data.size()));
+    memcpy(encoded_buffer.data<void>(), encoded_data.data(), encoded_data.size());
+
+    auto response_or_error = try_decode_first_frame_synchronously(move(encoded_buffer), move(mime_type));
+    if (response_or_error.is_error())
+        return Error::from_string_literal("ImageDecoder disconnected");
+    auto response = response_or_error.release_value();
+
+    // NB: The decoder parses untrusted data, so its reply is checked rather than trusted.
+    auto bitmaps = response.take_bitmaps().bitmaps;
+    if (bitmaps.size() != 1 || !bitmaps[0])
+        return Error::from_string_literal("Image decoding failed");
+    return DecodedFirstFrame { bitmaps[0].release_nonnull(), response.take_color_profile() };
 }
 
 void Client::did_decode_image(i64 request_id, bool is_animated, u32 loop_count, Gfx::BitmapSequence bitmap_sequence, Vector<u32> durations, Gfx::FloatPoint scale, Gfx::ColorSpace color_space, i64 session_id)

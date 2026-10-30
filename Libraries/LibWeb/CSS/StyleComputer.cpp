@@ -93,6 +93,7 @@
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
+#include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
@@ -157,7 +158,7 @@ static RustDeclarationBlock const& declaration_of_rule(CSSRule const& rule)
 
 StyleComputer::StyleComputer(DOM::Document& document)
     : m_document(document)
-    , m_default_font_metrics(16, Platform::FontPlugin::the().default_font(16)->pixel_metrics(), InitialValues::line_height())
+    , m_default_font_metrics(16, Platform::FontPlugin::the().default_font(16)->pixel_metrics(), normal_line_height(Platform::FontPlugin::the().default_font(16)->pixel_metrics()))
     , m_root_element_font_metrics(m_default_font_metrics)
     , m_style_engine(this)
 {
@@ -789,6 +790,7 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
             custom_property_data ? custom_property_data->identity() : 0,
             inheritance_custom_property_data ? inheritance_custom_property_data->identity() : 0,
         },
+        .custom_property_registration_generation = document().custom_property_registration_generation(),
         .inheritance_parent_style_record = inheritance_parent.has_value() ? inheritance_parent->style_record_identity().value() : 0,
         .environment = &sample->environment,
         .element_box_slot = Layout::Node::slot_id(abstract_element.element().unsafe_layout_node(read)).index,
@@ -841,6 +843,7 @@ void StyleComputer::finish_animation_sample(AnimationSample& sample, ComputedVal
     case ComputedValuesFFI::FfiHostAnimationSampleOutcome::Evaluated:
         break;
     }
+    computed_properties.set_animated_custom_properties_trigger_restyle(Badge<StyleComputer> {}, result.custom_properties_trigger_restyle);
     m_keyframes_inherited_non_inherited_style_groups |= result.keyframes_inherited_non_inherited_style_groups;
     if (result.depends_on_viewport_metrics)
         computed_properties.set_depends_on_viewport_metrics();
@@ -867,7 +870,7 @@ void StyleComputer::publish_animated_custom_properties(Layout::BegunRead const& 
     if (animated_values.is_empty()) {
         if (base.ptr() != data.ptr()) {
             abstract_element.replace_custom_property_data(Badge<StyleComputer> {}, base);
-            invalidate_animated_custom_property_readers(read, abstract_element, animated_values, move(data));
+            invalidate_animated_custom_property_readers(read, abstract_element, animated_values, move(data), true);
         }
         return;
     }
@@ -895,21 +898,25 @@ void StyleComputer::publish_animated_custom_properties(Layout::BegunRead const& 
             });
     }
     abstract_element.replace_custom_property_data(Badge<StyleComputer> {}, CustomPropertyData::create_animation_overlay(move(overlay_values), move(base), abstract_element));
-    invalidate_animated_custom_property_readers(read, abstract_element, animated_values, move(data));
+    invalidate_animated_custom_property_readers(read, abstract_element, animated_values, move(data), computed_properties.animated_custom_properties_trigger_restyle());
 }
 
-void StyleComputer::invalidate_animated_custom_property_readers(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> const& animated_values, RefPtr<CustomPropertyData const> old_data) const
+void StyleComputer::invalidate_animated_custom_property_readers(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> const& animated_values, RefPtr<CustomPropertyData const> old_data, bool recompute_style) const
 {
     auto& element = abstract_element.element();
-    // Which custom properties the element's own declarations read is not recorded: an element
-    // whose custom properties animate recomputes.
     auto& style_engine = element.document().style_computer().style_engine();
-    style_engine.record_derived_element_style_input_change(element.style_node_id(), StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle);
+    if (recompute_style) {
+        style_engine.record_derived_element_style_input_change(element.style_node_id(), StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle);
+    } else if (!abstract_element.pseudo_element().has_value()) {
+        // Style container queries can read animated values even when those values do not inherit.
+        element.invalidate_descendant_styles_depending_on_style_container_query();
+    }
 
-    auto any_animated_custom_property_inherits = [&] {
-        if (animated_values.is_empty())
-            return true;
-        for (auto const& [name, value] : animated_values) {
+    if (abstract_element.pseudo_element().has_value())
+        return;
+
+    auto any_custom_property_inherits = [&](auto const& values) {
+        for (auto const& [name, value] : values) {
             auto registration = m_document->get_registered_custom_property(name);
             if (!registration.has_value() || registration->inherit)
                 return true;
@@ -917,8 +924,12 @@ void StyleComputer::invalidate_animated_custom_property_readers(Layout::BegunRea
         return false;
     };
     // What the element hands down moved too. Its descendants take the moved environment as they take one a style
-    // reaction moved: only those that read a name whose value moved compute again.
-    if (!abstract_element.pseudo_element().has_value() && any_animated_custom_property_inherits())
+    // reaction moved: only those that read a name whose value moved compute again. Include names from the previous
+    // animation overlay, since an inheriting property may have stopped animating while non-inheriting ones remain.
+    bool const new_values_inherit = any_custom_property_inherits(animated_values);
+    bool const old_values_inherit = old_data && old_data->is_animation_overlay_for(abstract_element)
+        && any_custom_property_inherits(old_data->own_values());
+    if (new_values_inherit || old_values_inherit)
         move_custom_property_environment_below_animated_element(read, element, move(old_data));
 }
 
@@ -1088,17 +1099,44 @@ void StyleComputer::compose_installed_engine_record(Layout::BegunRead const& rea
     context.publish();
 }
 
-static void collect_dimension_attribute(Vector<StyleProperty>& properties, DOM::Element const& element, Utf16FlyString const& attribute_name, CSS::PropertyID property_id)
+static Optional<double> collect_dimension_attribute(Vector<StyleProperty>& properties, DOM::Element const& element, Utf16FlyString const& attribute_name, CSS::PropertyID property_id)
 {
     auto attribute = element.attribute(attribute_name);
     if (!attribute.has_value())
-        return;
+        return {};
 
-    auto parsed_value = HTML::parse_dimension_value(*attribute);
+    double unclamped_value;
+    auto parsed_value = HTML::parse_dimension_value(*attribute, unclamped_value);
     if (!parsed_value)
+        return {};
+
+    properties.append({ .property_id = property_id, .value = *parsed_value });
+    // NB: The ratio uses the parsed number, rather than the clamped layout dimension. Values beyond the numeric
+    //     representation's range cannot form a finite ratio hint, but keep their ordinary dimension mapping.
+    if (!parsed_value->is_length() || !__builtin_isfinite(unclamped_value))
+        return {};
+    return unclamped_value;
+}
+
+// https://html.spec.whatwg.org/multipage/rendering.html#map-to-the-aspect-ratio-property-(using-dimension-rules)
+static void collect_aspect_ratio_from_dimension_values(Vector<StyleProperty>& properties, Optional<double> width, Optional<double> height)
+{
+    // if element has both attributes w and h, and parsing those attributes' values using the rules for parsing
+    // dimension values doesn't generate an error or return a percentage for either,
+    if (!width.has_value() || !height.has_value())
         return;
 
-    properties.append({ .property_id = property_id, .value = parsed_value.release_nonnull() });
+    // then the user agent is expected to use the parsed dimensions as a presentational hint for the 'aspect-ratio'
+    // property of the form auto w / h.
+    auto aspect_ratio = CSS::StyleValueList::create(
+        CSS::StyleValueVector {
+            CSS::KeywordStyleValue::create(CSS::Keyword::Auto),
+            CSS::RatioStyleValue::create(
+                CSS::NumberStyleValue::create(*width),
+                CSS::NumberStyleValue::create(*height)),
+        },
+        CSS::StyleValueList::Separator::Space);
+    properties.append({ .property_id = CSS::PropertyID::AspectRatio, .value = aspect_ratio });
 }
 
 // The whole transition step for an element's record, run once the record is installed.
@@ -1801,8 +1839,14 @@ Vector<StyleProperty> StyleComputer::collect_presentational_hint_properties(DOM:
         auto const& dimension_source = is<HTML::HTMLImageElement>(element)
             ? static_cast<HTML::HTMLImageElement const&>(element).dimension_attribute_source()
             : element;
-        collect_dimension_attribute(properties, dimension_source, HTML::AttributeNames::width, CSS::PropertyID::Width);
-        collect_dimension_attribute(properties, dimension_source, HTML::AttributeNames::height, CSS::PropertyID::Height);
+        auto width = collect_dimension_attribute(properties, dimension_source, HTML::AttributeNames::width, CSS::PropertyID::Width);
+        auto height = collect_dimension_attribute(properties, dimension_source, HTML::AttributeNames::height, CSS::PropertyID::Height);
+
+        // The width and height attributes map to the aspect-ratio property (using dimension rules) on img and video
+        // elements, and input elements with a type attribute in the Image Button state.
+        // NB: An input element only supports dimension attributes in the Image Button state.
+        if (is<HTML::HTMLImageElement>(element) || is<HTML::HTMLVideoElement>(element) || is<HTML::HTMLInputElement>(element))
+            collect_aspect_ratio_from_dimension_values(properties, width, height);
     }
     HashTable<CSS::PropertyID> seen_properties;
     for (size_t i = properties.size(); i > 0; --i) {
@@ -1876,6 +1920,22 @@ CSSPixels StyleComputer::absolute_size_mapping(AbsoluteSize absolute_size, CSSPi
 {
     // An <absolute-size> keyword refers to an entry in a table of font sizes computed and kept by the user agent. See
     // § 2.5.1 Absolute Size Keyword Mapping Table.
+    // INTEROP: Other browsers share this keyword table for integral default sizes from 9px through 16px, so we use
+    //          it instead of the ratios from the spec's guideline table.
+    static constexpr Array<Array<u8, 8>, 8> font_size_table { {
+        { 9, 9, 9, 9, 11, 14, 18, 27 },
+        { 9, 9, 9, 10, 12, 15, 20, 30 },
+        { 9, 9, 10, 11, 13, 17, 22, 33 },
+        { 9, 9, 10, 12, 14, 18, 24, 36 },
+        { 9, 10, 12, 13, 16, 20, 26, 39 },
+        { 9, 10, 12, 14, 17, 21, 28, 42 },
+        { 9, 10, 13, 15, 18, 23, 30, 45 },
+        { 9, 10, 13, 16, 18, 24, 32, 48 },
+    } };
+    auto default_size = default_font_size.to_int();
+    if (default_size >= 9 && default_size <= 16 && default_font_size == CSSPixels(default_size))
+        return CSSPixels(font_size_table[default_size - 9][to_underlying(absolute_size)]);
+
     switch (absolute_size) {
     case AbsoluteSize::XxSmall:
         return default_font_size * CSSPixels(3) / 5;
@@ -1951,6 +2011,7 @@ ComputationContext StyleComputer::make_computation_context_for_property(Layout::
             : Length::ResolutionContext::for_document(m_document);
         length_resolution_context.subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal;
         length_resolution_context.subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr;
+        length_resolution_context.subject_is_pseudo_element = abstract_element.has_value() && abstract_element->pseudo_element().has_value();
 
         return {
             .length_resolution_context = length_resolution_context,
@@ -1963,7 +2024,7 @@ ComputationContext StyleComputer::make_computation_context_for_property(Layout::
         auto line_height_font_metrics = Length::FontMetrics {
             style.font_size(),
             style.first_available_computed_font(document().font_computer())->pixel_metrics(),
-            inheritance_parent.has_value() && inheritance_parent->has_style() ? inheritance_parent->computed_style()->line_height() : InitialValues::line_height()
+            inheritance_parent.has_value() && inheritance_parent->has_style() ? inheritance_parent->computed_style()->line_height() : normal_line_height(document().font_computer().initial_font().pixel_metrics())
         };
 
         return {
@@ -1978,6 +2039,7 @@ ComputationContext StyleComputer::make_computation_context_for_property(Layout::
                     ? style.font_metrics_depend_on_viewport_metrics()
                     : m_root_element_font_metrics_depend_on_viewport_metrics,
                 .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+                .subject_is_pseudo_element = abstract_element.has_value() && abstract_element->pseudo_element().has_value(),
                 .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
             },
             .abstract_element = abstract_element
@@ -1997,6 +2059,7 @@ ComputationContext StyleComputer::make_computation_context_for_property(Layout::
                 .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
                 .root_font_metrics_depend_on_viewport_metrics = is_document_element ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
                 .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+                .subject_is_pseudo_element = abstract_element.has_value() && abstract_element->pseudo_element().has_value(),
                 .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
             },
             .abstract_element = abstract_element,

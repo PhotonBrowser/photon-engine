@@ -13,6 +13,7 @@
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/RemoteWindow.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/FetchClient.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Layout/Node.h>
@@ -123,6 +124,13 @@ GC::Ptr<Navigable> RemoteNavigable::active_browsing_context_opener_navigable() c
     if (!m_replicated_state.opener_navigable_id.has_value())
         return nullptr;
     return navigable_with_id_in_any_page(page(), *m_replicated_state.opener_navigable_id);
+}
+
+GC::Ptr<Navigable> RemoteNavigable::active_browsing_context_one_permitted_sandboxed_navigator() const
+{
+    if (!m_replicated_state.one_permitted_sandboxed_navigator_navigable_id.has_value())
+        return nullptr;
+    return navigable_with_id_in_any_page(page(), *m_replicated_state.one_permitted_sandboxed_navigator_navigable_id);
 }
 
 GC::Ref<RemoteWindow> RemoteNavigable::active_window()
@@ -240,7 +248,7 @@ WebIDL::ExceptionOr<void> RemoteNavigable::continue_navigation_in_active_documen
     //    window to continue these steps.
     // NB: The active window lives in the process hosting the active document, so the task is a request to the UI
     //     process, which forwards it to that process.
-    auto fetch_client = navigation.source_snapshot_params->fetch_client;
+    auto fetch_client = settings_object_of_fetch_client(navigation.source_snapshot_params->fetch_client);
     if (!fetch_client)
         return {};
     auto& source_document = window_from_global_object(fetch_client->global_object())->associated_document();

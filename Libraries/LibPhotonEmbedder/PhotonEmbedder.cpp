@@ -16,6 +16,7 @@
 #include <LibURL/Parser.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Page/InputEvent.h>
+#include <LibWebCommon/Permissions/Permissions.h>
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/WebView/ConsoleOutput.h>
 #include <LibWebView/Application.h>
@@ -607,24 +608,15 @@ public:
         if (!parsed.has_value() || parsed->origin().is_opaque())
             return;
         auto origin = parsed->origin();
-        traversable().for_each_hosting_page([&](WebView::WebContentPage& page) {
-            if (granted) {
-                if (auto result = page.client().grant_audio_capture(origin); result.is_error()) {
-                    warnln("Unable to grant audio capture: {}", result.error());
-                    return;
-                }
-            } else {
-                page.client().revoke_audio_capture(origin);
-            }
-            page.async_set_permission_state("microphone"_utf16, origin, granted);
-        });
+        set_site_permission(origin, Web::Permissions::PermissionName::Microphone,
+            granted ? Optional { PermissionDecision::Allow } : Optional { PermissionDecision::Block });
     }
 
     bool toggle_audio_mute()
     {
         toggle_page_mute_state();
         auto muted = page_mute_state() == Web::HTML::MuteState::Muted;
-        notify_audio_state(audio_play_state());
+        notify_audio_state(audibility());
         return muted;
     }
 
@@ -690,11 +682,11 @@ private:
             m_callbacks.context_menu_requested(request);
     }
 
-    void notify_audio_state(Web::HTML::AudioPlayState play_state)
+    void notify_audio_state(Audio::Audibility audibility)
     {
         if (m_callbacks.audio_state_changed)
             m_callbacks.audio_state_changed(
-                play_state == Web::HTML::AudioPlayState::Playing,
+                audibility == Audio::Audibility::Audible,
                 page_mute_state() == Web::HTML::MuteState::Muted);
     }
 
@@ -736,18 +728,18 @@ private:
                 request_context_menu(*menu, position);
             };
         }
-        on_audio_play_state_changed = [this](Web::HTML::AudioPlayState play_state) {
-            notify_audio_state(play_state);
+        on_audibility_changed = [this](Audio::Audibility audibility) {
+            notify_audio_state(audibility);
         };
-        on_request_permission = [this](u64 request_id, Utf16String const& name, URL::Origin const& requesting_origin, URL::Origin const& top_level_origin, Web::HTML::EnvironmentId const& document_id, Function<void(bool)> on_decided) {
+        on_request_permission = [this](PermissionPromptRequest const& request, PermissionPromptCallback on_outcome) {
             if (!m_callbacks.permission_requested) {
-                on_decided(false);
+                on_outcome(Web::Permissions::PromptOutcome::Block);
                 return;
             }
-            auto requesting_origin_string = requesting_origin.serialize();
-            auto top_level_origin_string = top_level_origin.serialize();
-            auto capability = name.to_utf8();
-            auto document = document_id.to_string();
+            auto requesting_origin_string = request.requesting_origin.serialize();
+            auto top_level_origin_string = request.top_level_origin.serialize();
+            auto capability = Web::Permissions::to_string(request.name);
+            auto document = ByteString::formatted("{}", request.requesting_document_id);
             auto bytes = [](auto const& value) {
                 auto view = value.bytes_as_string_view();
                 return std::string(view.characters_without_null_termination(), view.length());
@@ -757,26 +749,32 @@ private:
             if (embedder_request_id == 0)
                 embedder_request_id = m_next_permission_request_id++;
             m_pending_permission_requests.set(embedder_request_id, PendingPermission {
-                                                                       .renderer_request_id = request_id,
                                                                        .document_id = doc_id,
                                                                        .document_generation = m_document_generation,
-                                                                       .on_decided = move(on_decided),
+                                                                       .top_level_origin = bytes(top_level_origin_string),
+                                                                       .capability = std::string(capability.characters_without_null_termination(), capability.length()),
+                                                                       .on_decided = [on_outcome = move(on_outcome)](bool granted) mutable {
+                                                                           on_outcome(granted ? Web::Permissions::PromptOutcome::AllowAlways : Web::Permissions::PromptOutcome::Block);
+                                                                       },
                                                                    });
             m_callbacks.permission_requested(Photon::PermissionRequest {
                 .request_id = embedder_request_id,
                 .document_id = move(doc_id),
                 .requesting_origin = bytes(requesting_origin_string),
                 .top_level_origin = bytes(top_level_origin_string),
-                .capability = bytes(capability),
+                .capability = std::string(capability.characters_without_null_termination(), capability.length()),
             });
         };
-        on_cancel_permission_request = [this](u64 request_id, Web::HTML::EnvironmentId const& document_id) {
-            auto document = document_id.to_string();
-            auto document_bytes = document.bytes_as_string_view();
-            auto document_string = std::string(document_bytes.characters_without_null_termination(), document_bytes.length());
+        on_cancel_permission_prompt = [this](PermissionPromptRequest const& request) {
+            auto top_level_origin = request.top_level_origin.serialize();
+            auto top_level_origin_string = std::string(top_level_origin.bytes_as_string_view().characters_without_null_termination(), top_level_origin.bytes_as_string_view().length());
+            auto capability = Web::Permissions::to_string(request.name);
+            auto capability_string = std::string(capability.characters_without_null_termination(), capability.length());
+            auto document = ByteString::formatted("{}", request.requesting_document_id);
+            auto document_string = std::string(document.bytes_as_string_view().characters_without_null_termination(), document.bytes_as_string_view().length());
             Optional<uint64_t> embedder_request_id;
             for (auto const& entry : m_pending_permission_requests) {
-                if (entry.value.renderer_request_id == request_id && entry.value.document_id == document_string) {
+                if (entry.value.document_id == document_string && entry.value.top_level_origin == top_level_origin_string && entry.value.capability == capability_string) {
                     embedder_request_id = entry.key;
                     break;
                 }
@@ -786,7 +784,6 @@ private:
             auto pending = m_pending_permission_requests.take(*embedder_request_id).release_value();
             if (m_callbacks.permission_cancelled)
                 m_callbacks.permission_cancelled(*embedder_request_id, pending.document_id);
-            pending.on_decided(false);
         };
         on_page_unresponsive_changed = [this](bool unresponsive) {
             if (m_callbacks.page_unresponsive_changed)
@@ -1154,6 +1151,7 @@ public:
     ~PhotonHeadlessWebView() override
     {
         invalidate_pending_permission_requests();
+        on_cancel_permission_prompt = {};
     }
 
     void permission_request_completed(uint64_t request_id, std::string const& document_id, bool granted)
@@ -1183,9 +1181,10 @@ private:
 
     Photon::ViewCallbacks m_callbacks;
     struct PendingPermission {
-        uint64_t renderer_request_id { 0 };
         std::string document_id;
         uint64_t document_generation { 0 };
+        std::string top_level_origin;
+        std::string capability;
         Function<void(bool)> on_decided;
     };
     HashMap<uint64_t, PendingPermission> m_pending_permission_requests;

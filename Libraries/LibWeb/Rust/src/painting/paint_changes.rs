@@ -142,7 +142,7 @@ impl PaintChange {
                 }
                 let selection =
                     super::selection::apply(&mut arena.paintable_rows_mut(), &entries, start_offset, end_offset);
-                arena.paint_state().borrow_mut().selection = Some(Arc::new(selection));
+                arena.paint_state_mut().selection = Some(Arc::new(selection));
             }
             Self::ClearSelection { viewport } => {
                 if arena.paintable_row_is_populated(viewport) {
@@ -211,7 +211,7 @@ impl PaintChange {
             }
             Self::SetReplacedPaintFacts { target, facts } => arena.set_replaced_paint_facts(target, facts),
             Self::SupersededReplacedPaintFacts => {}
-            Self::PublishImageMapAreas { node, areas } => arena.image_map_areas().publish(node, areas),
+            Self::PublishImageMapAreas { node, areas } => arena.image_map_areas_mut().publish(node, areas),
             Self::NoteVisualContextBoxDirty { node, kind } => {
                 if arena.paintable_row_is_populated(node) {
                     arena.note_visual_context_box_dirty(node, kind);
@@ -220,9 +220,9 @@ impl PaintChange {
             Self::InvalidateAllPaintCaches => arena.push_all_paint_damage(),
             Self::RequestFullVisualContextRebuild(scope) => arena.request_full_visual_context_rebuild(scope),
             Self::SvgPaintResourcesChanged => {
-                arena.svg_paint_resources().note_changed();
+                arena.svg_paint_resources_mut().note_changed();
             }
-            Self::SetRecordingTraceEnabled(enabled) => arena.paint_state().borrow_mut().trace_recordings = enabled,
+            Self::SetRecordingTraceEnabled(enabled) => arena.paint_state_mut().trace_recordings = enabled,
             Self::TakeInRecording {
                 output,
                 hit_test_list_changed,

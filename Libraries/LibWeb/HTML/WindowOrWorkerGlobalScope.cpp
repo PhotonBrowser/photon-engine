@@ -10,6 +10,7 @@
 #include <AK/Base64.h>
 #include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
+#include <AK/StdLibExtras.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
@@ -61,12 +62,10 @@
 #include <LibWeb/HighResolutionTime/Performance.h>
 #include <LibWeb/HighResolutionTime/SupportedPerformanceTypes.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/IndexedDB/IDBDatabase.h>
 #include <LibWeb/IndexedDB/IDBFactory.h>
-#include <LibWeb/IndexedDB/Internal/Algorithms.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/LargestContentfulPaint/LargestContentfulPaint.h>
-#include <LibWeb/Loader/ResourceLoader.h>
+#include <LibWeb/Loader/LoaderConfig.h>
 #include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
@@ -76,6 +75,7 @@
 #include <LibWeb/PerformanceTimeline/EventNames.h>
 #include <LibWeb/PerformanceTimeline/PerformanceObserver.h>
 #include <LibWeb/PerformanceTimeline/PerformanceObserverEntryList.h>
+#include <LibWeb/PermissionsAPI/PermissionStatus.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
 #include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
@@ -129,6 +129,11 @@ void WindowOrWorkerGlobalScopeMixin::initialize()
 #undef __ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES
 }
 
+void WindowOrWorkerGlobalScopeMixin::register_permission_status(PermissionsAPI::PermissionStatus& status)
+{
+    m_permission_statuses.append(status);
+}
+
 void WindowOrWorkerGlobalScopeMixin::visit_edges(JS::Cell::Visitor& visitor)
 {
     visitor.visit(m_performance);
@@ -139,6 +144,14 @@ void WindowOrWorkerGlobalScopeMixin::visit_edges(JS::Cell::Visitor& visitor)
         entry.value.visit_edges(visitor);
     visitor.visit(m_registered_event_sources);
     visitor.visit(m_strongly_referenced_broadcast_channels);
+
+    // A PermissionStatus with a change listener must stay alive while its global does, so the listener can hear of a
+    // change even when nothing else refers to the status.
+    m_permission_statuses.remove_all_matching([](auto const& status) { return !status; });
+    for (auto const& status : m_permission_statuses) {
+        if (status->has_event_listener(EventNames::change))
+            visitor.visit(*status);
+    }
     visitor.visit(m_crypto);
     visitor.visit(m_cache_storage);
     visitor.visit(m_resource_timing_secondary_buffer);
@@ -416,8 +429,18 @@ static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatt
     }
     auto output_color_space = input_frame.color_space();
 
-    // FIXME: 8. If the value of the imageOrientation member of options is "flipY", output must be flipped vertically,
-    //  disregarding any image orientation metadata of the source (such as EXIF metadata), if any. [EXIF]
+    // 8. If the value of the imageOrientation member of options is "flipY", output must be flipped vertically,
+    //    disregarding any image orientation metadata of the source (such as EXIF metadata), if any. [EXIF]
+    //    If the value is "from-image", no extra step is needed.
+    if (options.image_orientation == Bindings::ImageOrientation::FlipY) {
+        // NB: Cropping and scaling produced a copy, so swapping rows does not modify the source bitmap.
+        for (i32 y = 0; y < output->height() / 2; ++y) {
+            auto* top_row = output->scanline(y);
+            auto* bottom_row = output->scanline(output->height() - y - 1);
+            for (i32 x = 0; x < output->width(); ++x)
+                AK::swap(top_row[x], bottom_row[x]);
+        }
+    }
 
     // 9. If image is an img element or a Blob object, let val be the value of the colorSpaceConversion member of
     //    options, and then run these substeps:
@@ -910,7 +933,7 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
                 }
 
                 // 6. Let script be the result of creating a classic script given handler, settings object, base URL, and fetch options.
-                auto filename = base_url.to_byte_string();
+                auto filename = initiating_script ? initiating_script->filename() : base_url.to_byte_string();
                 auto script = ClassicScript::create(move(filename), source, settings_object, move(base_url));
                 script->set_fetch_options(move(options));
 
@@ -1360,14 +1383,7 @@ void WindowOrWorkerGlobalScopeMixin::remove_strong_reference_to_broadcast_channe
 
 void WindowOrWorkerGlobalScopeMixin::close_all_idb_connections()
 {
-    IndexedDB::Database::for_each_database([&](IndexedDB::Database& database) {
-        for (auto& connection : database.associated_connections_as_root_vector()) {
-            if (connection->close_pending())
-                continue;
-            if (&connection->relevant_global_scope() == this)
-                IndexedDB::close_a_database_connection(connection);
-        }
-    });
+    IndexedDB::close_all_database_connections(relevant_realm(*this));
 }
 
 void WindowOrWorkerGlobalScopeMixin::register_web_socket(Badge<WebSockets::WebSocket>, GC::Ref<WebSockets::WebSocket> web_socket)
@@ -1694,7 +1710,7 @@ GC::Ref<HighResolutionTime::Performance> WindowOrWorkerGlobalScopeMixin::perform
 GC::Ref<IndexedDB::IDBFactory> WindowOrWorkerGlobalScopeMixin::indexed_db()
 {
     if (!m_indexed_db)
-        m_indexed_db = GC::Heap::the().allocate<IndexedDB::IDBFactory>(*this);
+        m_indexed_db = IndexedDB::IDBFactory::create(relevant_realm(*this));
     return *m_indexed_db;
 }
 
@@ -1762,11 +1778,7 @@ bool WindowOrWorkerGlobalScopeMixin::expose_experimental_interface(EnvironmentSe
     if (s_experimental_interfaces_exposed)
         return true;
 
-    // The first global of a page is set up before the loader exists, and holds nothing a rule could match anyway.
-    if (!ResourceLoader::is_initialized())
-        return false;
-
-    return ResourceLoader::the().site_compatibility_exposes_experimental_interface(settings.creation_url, name);
+    return current_loader_config()->config.exposes_experimental_interface(settings.creation_url, name);
 }
 
 }

@@ -556,6 +556,15 @@ class Response;
 
 }
 
+namespace Web::Fetch::Engine {
+
+class FetchBodyDeliveryGate;
+class FetchByteChannel;
+class NetworkTransportHandle;
+class WholeBodyTransport;
+
+}
+
 namespace Web::Fetch::Fetching {
 
 class PendingResponse;
@@ -567,13 +576,17 @@ namespace Web::Fetch::Infrastructure {
 
 class Body;
 class FetchAlgorithms;
+class FetchControlBlock;
 class FetchController;
+class FetchControllerRegistry;
 class FetchParams;
 class FetchRecord;
 class FetchTimingInfo;
 class IncrementalReadLoopReadRequest;
+class KeepaliveQuotaAccountant;
 class Request;
 class Response;
+class ResponseView;
 
 struct BodyWithType;
 
@@ -843,6 +856,7 @@ struct NavigationParams;
 struct PreparedNavigation;
 struct PaintConfig;
 struct PolicyContainer;
+struct RemoteClientNavigation;
 struct SerializedFormData;
 struct SourceSnapshotParams;
 struct ToggleTaskTracker;
@@ -857,25 +871,7 @@ class Performance;
 
 namespace Web::IndexedDB {
 
-class Database;
-class IDBCursor;
-class IDBCursorWithValue;
-class IDBDatabase;
 class IDBFactory;
-class IDBIndex;
-class IDBKeyRange;
-class IDBObjectStore;
-class IDBOpenDBRequest;
-class IDBRecord;
-class IDBRequest;
-class IDBTransaction;
-class IDBVersionChangeEvent;
-class Index;
-class Key;
-class ObjectStore;
-class RequestList;
-
-using CursorDirection = Bindings::IDBCursorDirection;
 
 }
 
@@ -1108,6 +1104,7 @@ class SVGAnimatedLengthList;
 class SVGAnimatedNumber;
 class SVGAnimatedNumberList;
 class SVGAnimatedRect;
+class SVGAnimateElement;
 class SVGAnimateMotionElement;
 class SVGAnimationElement;
 class SVGCircleElement;
@@ -1160,6 +1157,7 @@ class SVGSymbolElement;
 class SVGTitleElement;
 class SVGTransformList;
 class SVGViewElement;
+class TimeEvent;
 
 }
 
@@ -1171,6 +1169,9 @@ class KeyboardEvent;
 class MouseEvent;
 class PointerEvent;
 class TextEvent;
+class Touch;
+class TouchEvent;
+class TouchList;
 class UIEvent;
 
 }

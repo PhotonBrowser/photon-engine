@@ -129,6 +129,12 @@ void ConnectionFromClient::purge_unused_gpu_resources()
 {
     m_compositor_state->purge_unused_gpu_resources();
 }
+
+void ConnectionFromClient::set_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)
+{
+    m_compositor_state->set_context_presents_from_cpu_memory(context_id, presents_from_cpu_memory);
+}
+
 void ConnectionFromClient::crash()
 {
     warnln("Crashing Compositor process by request from Browser");

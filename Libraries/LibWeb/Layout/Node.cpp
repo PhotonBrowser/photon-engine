@@ -276,7 +276,7 @@ void NodeWithStyle::ImageObserver::report_to_paint_timing_if_available()
     if (!image_data)
         return;
     m_reported_to_paint_timing = true;
-    PaintTiming::process_an_image_that_finished_loading(*m_background_image_element, PaintTiming::image_request_info(Utf16String::from_utf8(m_resource->url().serialize()), image_data));
+    PaintTiming::process_an_image_that_finished_loading(*m_background_image_element, PaintTiming::image_request_info(Utf16String::from_utf8(m_resource->key().url.serialize()), image_data));
 }
 
 NodeWithStyle::~NodeWithStyle()
@@ -523,7 +523,6 @@ bool Node::is_fragmented_inline() const
 
 void NodeWithStyle::set_computed_values(Layout::BegunRead const& read, NonnullRefPtr<CSS::ComputedValues const> computed_values)
 {
-    VERIFY(!RustFFI::render_state_layout_pass_is_running(document_host()));
     CSS::StyleRecordID record;
     if (is_generated_for_pseudo_element())
         record = document().style_computer().intern_computed_style_inputs(read, { *pseudo_element_generator(), generated_for_pseudo_element() }, *computed_values);

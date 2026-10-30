@@ -11,6 +11,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/IncrementalReadLoopReadRequest.h>
 #include <LibWeb/Fetch/Infrastructure/Task.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Streams/ReadableStream.h>
@@ -26,98 +27,53 @@ FetchBody::FetchBody(Optional<Core::ImmutableBytes> source, Optional<u64> length
 {
 }
 
-void FetchBody::set_source(Core::ImmutableBytes source, Optional<u64> length)
+ResponseBody::ResponseBody(Bytes bytes, Optional<u64> length)
+    : m_bytes(move(bytes))
+    , m_length(length)
 {
-    m_source = move(source);
-    m_length = length;
 }
 
-void FetchBody::append_sniff_bytes(ReadonlyBytes bytes)
+ResponseBody ResponseBody::from_bytes(Core::ImmutableBytes bytes)
 {
-    if (m_sniff_outcome.has_value())
-        return;
-
-    size_t space_remaining = MAX_SNIFF_BYTES - m_sniff_bytes.size();
-    if (space_remaining == 0) {
-        set_sniff_bytes_complete();
-        return;
-    }
-
-    size_t to_append = min(bytes.size(), space_remaining);
-    m_sniff_bytes.append(bytes.slice(0, to_append));
-
-    if (m_sniff_bytes.size() >= MAX_SNIFF_BYTES)
-        set_sniff_bytes_complete();
+    auto length = bytes.size();
+    return ResponseBody { move(bytes), length };
 }
 
-void FetchBody::set_sniff_bytes_complete()
+ResponseBody ResponseBody::from_extracted_body(Body const& body)
 {
-    if (!m_sniff_outcome.has_value())
-        m_sniff_outcome = SniffOutcome::Complete;
+    if (auto const& source = body.source(); source.has_value())
+        return ResponseBody { *source, body.length() };
+    return ResponseBody { ReadThroughStream {}, body.length() };
 }
 
-void FetchBody::set_sniff_bytes_failed()
+Optional<Core::ImmutableBytes const&> ResponseBody::source() const
 {
-    if (!m_sniff_outcome.has_value())
-        m_sniff_outcome = SniffOutcome::Failed;
-}
-
-Optional<FetchBody::SniffBytes> FetchBody::sniff_bytes_if_available() const
-{
-    // Non-streaming body: source has bytes
-    if (m_source.has_value()) {
-        auto bytes = m_source->bytes();
-        return SniffBytes { bytes.slice(0, min(bytes.size(), MAX_SNIFF_BYTES)) };
-    }
-
-    // Streaming body: bytes captured during fetch
-    if (m_sniff_outcome.has_value())
-        return SniffBytes { m_sniff_bytes, *m_sniff_outcome };
-
-    // Still waiting for bytes
+    if (auto const* bytes = m_bytes.get_pointer<Core::ImmutableBytes>())
+        return *bytes;
     return {};
 }
 
 GC::Ref<Body> Body::create(GC::Ref<Streams::ReadableStream> stream, FetchBody fetch_body)
 {
-    return GC::Heap::the().allocate<Body>(stream, move(fetch_body));
+    return GC::Heap::the().allocate<Body>(stream, move(fetch_body), NeverSniffed {});
 }
 
-GC::Ref<Body> Body::create_from_source(JS::Realm& realm, FetchBody fetch_body)
+GC::Ref<Body> Body::create_over_bytes(JS::Realm& realm, Core::ImmutableBytes bytes)
 {
-    VERIFY(fetch_body.source().has_value());
-    HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-
-    auto stream = Streams::ReadableStream::create(realm);
-    auto pull_algorithm = GC::create_function(GC::Heap::the(), [&realm, stream, source = *fetch_body.source(), offset = size_t { 0 }]() mutable {
-        // A BYOB pull may consume only the current view's length.
-        auto remaining = source.size() - offset;
-        auto pull_size = remaining;
-        if (auto byte_length = stream->current_byob_request_view_byte_length(); byte_length.has_value())
-            pull_size = min(remaining, *byte_length);
-
-        if (pull_size > 0) {
-            if (auto result = stream->pull_from_bytes(source.bytes().slice(offset, pull_size)); result.is_error()) {
-                if (stream->is_readable())
-                    stream->error(WebIDL::exception_to_throw_completion(realm.vm(), realm, result.release_error()).release_value());
-                return WebIDL::create_resolved_promise(realm, JS::js_undefined());
-            }
-            offset += pull_size;
-        }
-        if (offset == source.size() && stream->is_readable())
-            stream->close();
-        return WebIDL::create_resolved_promise(realm, JS::js_undefined());
-    });
-    stream->set_up_with_byte_reading_support(realm, pull_algorithm);
-
-    return create(stream, move(fetch_body));
+    auto [extracted_body, _] = safely_extract_body(realm, bytes);
+    auto resource_header = bytes.slice(0, min(bytes.size(), MAX_SNIFF_BYTES));
+    return GC::Heap::the().allocate<Body>(extracted_body->stream(), FetchBody {}, ReadResourceHeader { move(resource_header) });
 }
 
-// NB: Source-backed bodies are complete even when their streams still have queued bytes.
-Body::Body(GC::Ref<Streams::ReadableStream> stream, FetchBody fetch_body)
+GC::Ref<Body> Body::create_over_arriving_bytes(GC::Ref<Streams::ReadableStream> stream, ResourceHeaderReader reader)
+{
+    return GC::Heap::the().allocate<Body>(stream, FetchBody {}, UnreadResourceHeader { reader });
+}
+
+Body::Body(GC::Ref<Streams::ReadableStream> stream, FetchBody fetch_body, ResourceHeader resource_header)
     : m_stream(stream)
     , m_fetch_body(move(fetch_body))
-    , m_network_complete(m_fetch_body.source().has_value() || stream->is_closed())
+    , m_resource_header(move(resource_header))
 {
 }
 
@@ -125,32 +81,17 @@ void Body::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_stream);
+    if (auto const* unread = m_resource_header.get_pointer<UnreadResourceHeader>())
+        visitor.visit(unread->reader);
     visitor.visit(m_sniff_bytes_callback);
-    visitor.visit(m_network_complete_callback);
 }
 
-void Body::set_source(Core::ImmutableBytes source, Optional<u64> length)
+Optional<Body::SniffBytes> Body::sniff_bytes_if_available() const
 {
-    m_fetch_body.set_source(move(source), length);
-    notify_sniff_bytes_waiter();
-}
-
-void Body::append_sniff_bytes(ReadonlyBytes bytes)
-{
-    m_fetch_body.append_sniff_bytes(bytes);
-    notify_sniff_bytes_waiter();
-}
-
-void Body::set_sniff_bytes_complete()
-{
-    m_fetch_body.set_sniff_bytes_complete();
-    notify_sniff_bytes_waiter();
-}
-
-void Body::set_sniff_bytes_failed()
-{
-    m_fetch_body.set_sniff_bytes_failed();
-    notify_sniff_bytes_waiter();
+    VERIFY(!m_resource_header.has<NeverSniffed>());
+    if (auto const* read = m_resource_header.get_pointer<ReadResourceHeader>())
+        return SniffBytes { read->bytes.bytes(), read->outcome };
+    return {};
 }
 
 void Body::wait_for_sniff_bytes(SniffBytesCallback on_ready)
@@ -160,36 +101,29 @@ void Body::wait_for_sniff_bytes(SniffBytesCallback on_ready)
         return;
     }
 
-    // Wait for bytes to arrive
+    VERIFY(!m_sniff_bytes_callback);
     m_sniff_bytes_callback = on_ready;
+
+    auto const* unread = m_resource_header.get_pointer<UnreadResourceHeader>();
+    if (!unread)
+        return;
+    auto reader = unread->reader;
+    m_resource_header = ReadingResourceHeader {};
+    reader->function()(GC::create_function(heap(), [body = GC::Ref { *this }](Core::ImmutableBytes bytes, SniffOutcome outcome) {
+        body->did_read_resource_header(move(bytes), outcome);
+    }));
 }
 
-void Body::notify_sniff_bytes_waiter()
+void Body::did_read_resource_header(Core::ImmutableBytes bytes, SniffOutcome outcome)
 {
-    if (!m_sniff_bytes_callback)
-        return;
-    auto sniff_bytes = sniff_bytes_if_available();
-    if (!sniff_bytes.has_value())
-        return;
-    auto callback = exchange(m_sniff_bytes_callback, nullptr);
-    callback->function()(sniff_bytes.value());
-}
+    VERIFY(m_resource_header.has<ReadingResourceHeader>());
+    m_resource_header = ReadResourceHeader { move(bytes), outcome };
 
-void Body::when_network_complete(ProcessEndOfBodyCallback callback)
-{
-    if (m_network_complete) {
-        callback->function()();
-        return;
-    }
-    VERIFY(!m_network_complete_callback);
-    m_network_complete_callback = callback;
-}
-
-void Body::set_network_complete()
-{
-    m_network_complete = true;
-    if (auto callback = exchange(m_network_complete_callback, nullptr))
-        callback->function()();
+    auto steps = GC::create_function(heap(), [body = GC::Ref { *this }] {
+        auto callback = exchange(body->m_sniff_bytes_callback, nullptr);
+        callback->function()(*body->sniff_bytes_if_available());
+    });
+    HTML::queue_a_task(HTML::Task::Source::Networking, HTML::main_thread_event_loop(), nullptr, steps);
 }
 
 // https://fetch.spec.whatwg.org/#concept-body-clone
@@ -287,6 +221,13 @@ GC::Ref<Body> byte_sequence_as_body(JS::Realm& realm, ReadonlyBytes bytes)
     // To get a byte sequence bytes as a body, return the body of the result of safely extracting bytes.
     auto [body, _] = safely_extract_body(realm, bytes);
     return body;
+}
+
+// https://fetch.spec.whatwg.org/#byte-sequence-as-a-body
+// NB: The body's stream is made from its bytes where the body is first read.
+ResponseBody byte_sequence_as_response_body(ReadonlyBytes bytes)
+{
+    return ResponseBody::from_bytes(MUST(Core::ImmutableBytes::copy(bytes)));
 }
 
 void cancel_incremental_read(Streams::ReadableStreamDefaultReader& reader)

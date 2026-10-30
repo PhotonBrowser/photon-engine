@@ -61,6 +61,7 @@ static RefPtr<Core::Promise<Empty>> s_all_tests_complete;
 static Vector<ByteString> s_skipped_tests;
 static Vector<ByteString> s_loaded_from_http_server;
 static Vector<ByteString> s_frame_rate_capped;
+static Vector<ByteString> s_loaded_from_insecure_origin;
 static HashMap<WebView::ViewImplementation const*, size_t> s_current_test_index_by_view;
 
 struct TestRunContext {
@@ -119,9 +120,9 @@ static ErrorOr<void> add_config_paths(StringView test_root_path, Vector<ByteStri
     return {};
 }
 
-static ByteString unique_localhost_hostname(StringView prefix)
+static ByteString unique_hostname_within(StringView domain, StringView prefix)
 {
-    return ByteString::formatted("{}-{}.localhost", prefix, generate_random_uuid().to_byte_string());
+    return ByteString::formatted("{}-{}.{}", prefix, generate_random_uuid().to_byte_string(), domain);
 }
 
 static ErrorOr<void> load_test_config(StringView test_root_path)
@@ -144,6 +145,8 @@ static ErrorOr<void> load_test_config(StringView test_root_path)
             TRY(add_config_paths(test_root_path, config->keys(group), s_loaded_from_http_server));
         } else if (group == "CapFrameRate"sv) {
             TRY(add_config_paths(test_root_path, config->keys(group), s_frame_rate_capped));
+        } else if (group == "LoadFromInsecureOrigin"sv) {
+            TRY(add_config_paths(test_root_path, config->keys(group), s_loaded_from_insecure_origin));
         } else {
             warnln("Unknown group '{}' in config {}", group, config_path);
         }
@@ -668,7 +671,12 @@ static ErrorOr<void> write_screenshot_failure_results(Test& test, Gfx::Bitmap co
     return {};
 }
 
-static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL const& test_url)
+enum class WriteFailureResults {
+    No,
+    Yes,
+};
+
+static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL const& test_url, WriteFailureResults write_failure_results)
 {
     VERIFY(test.ref_test_expectation_index < test.ref_test_expectations.size());
 
@@ -679,7 +687,8 @@ static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL c
     if (should_match == screenshot_matches)
         return true;
 
-    TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
+    if (write_failure_results == WriteFailureResults::Yes)
+        TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
     return false;
 }
 
@@ -719,10 +728,28 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
                 test.expectation_screenshot = move(screenshot);
                 view.reset_zoom();
 
-                auto expectation_passed = compare_current_ref_test_expectation(test, url);
+                // A test passes if at least one of its match references matches, and all of its mismatch references
+                // mismatch. https://web-platform-tests.org/writing-tests/reftests.html#multiple-references
+                auto is_match = [](RefTestExpectation const& expectation) { return expectation.type == RefTestExpectationType::Match; };
+                auto const& expectations = test.ref_test_expectations;
+                auto current_is_match = is_match(expectations[test.ref_test_expectation_index]);
+                auto another_match_follows = current_is_match
+                    && any_of(expectations.span().slice(test.ref_test_expectation_index + 1), is_match);
+
+                // NB: A failed match is only a failure of the test if no other match reference remains to try.
+                auto expectation_passed = compare_current_ref_test_expectation(test, url,
+                    another_match_follows ? WriteFailureResults::No : WriteFailureResults::Yes);
                 if (expectation_passed.is_error() || !expectation_passed.value()) {
-                    view.on_test_complete({ test_index, TestResult::Fail });
-                    return;
+                    if (expectation_passed.is_error() || !another_match_follows) {
+                        view.on_test_complete({ test_index, TestResult::Fail });
+                        return;
+                    }
+                } else if (current_is_match) {
+                    // NB: One matching reference is enough, so only the mismatch references remain to be checked.
+                    for (size_t index = expectations.size() - 1; index > test.ref_test_expectation_index; --index) {
+                        if (is_match(expectations[index]))
+                            test.ref_test_expectations.remove(index);
+                    }
                 }
 
                 ++test.ref_test_expectation_index;
@@ -951,7 +978,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
     view.on_test_finish = {};
 
     promise->when_resolved([&view, test_index, &app, &context](auto) {
-        view.reset_session_history()->when_resolved([&view, test_index, &app, &context](auto) {
+        view.reset_state_for_next_test()->when_resolved([&view, test_index, &app, &context](auto) {
             auto& test = context.tests[test_index];
             test.did_start_test = true;
 
@@ -961,15 +988,17 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
             auto headers_path = ByteString::formatted("{}.headers", real_path);
 
             Optional<URL::URL> url;
-            if (FileSystem::exists(headers_path) || s_loaded_from_http_server.contains_slow(test.input_path)) {
+            auto is_loaded_from_insecure_origin = s_loaded_from_insecure_origin.contains_slow(test.input_path);
+            if (FileSystem::exists(headers_path) || is_loaded_from_insecure_origin || s_loaded_from_http_server.contains_slow(test.input_path)) {
                 // Some tests need to be served via the echo server so, for example, HTTP headers from .headers
                 // files are sent, or so that the resulting HTML document has a HTTP based origin (e.g for testing
-                // cookies).
+                // cookies), or one that is not potentially trustworthy.
                 auto echo_server_port = Application::web_content_options().echo_server_port;
                 VERIFY(echo_server_port.has_value());
                 auto relative_path = LexicalPath::relative_path(real_path, app.test_root_path);
                 VERIFY(relative_path.has_value());
-                url = URL::Parser::basic_parse(ByteString::formatted("http://{}:{}/static/{}", unique_localhost_hostname("test-web"sv), echo_server_port.value(), relative_path.value())).release_value();
+                auto hostname = unique_hostname_within(is_loaded_from_insecure_origin ? "test"sv : "localhost"sv, "test-web"sv);
+                url = URL::Parser::basic_parse(ByteString::formatted("http://{}:{}/static/{}", hostname, echo_server_port.value(), relative_path.value())).release_value();
             } else {
                 url = URL::create_with_file_scheme(real_path).release_value();
             }
@@ -1266,6 +1295,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
                 view->reset_line_box_borders();
                 view->reset_user_style();
                 view->reset_geolocation_emulated_position();
+                view->reset_permissions();
                 view->reset_viewport_size(window_size);
             }
 

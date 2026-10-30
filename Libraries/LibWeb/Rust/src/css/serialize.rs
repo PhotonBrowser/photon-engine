@@ -10,6 +10,8 @@
 //! The output stays ASCII until the first non-ASCII code unit forces UTF-16 storage, matching
 //! AK::Utf16String's ASCII-or-UTF16 representation, then moves a native string owner to C++.
 
+use std::fmt::Write;
+
 mod shorthand;
 
 use crate::css::css_enums::keyword;
@@ -213,6 +215,18 @@ impl TextSink {
     }
 }
 
+impl Write for TextSink {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if text.is_ascii() {
+            self.push_ascii(text);
+        } else {
+            text.chars()
+                .for_each(|character| self.push_code_point(u32::from(character)));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn serialize_computed_size(size: &crate::css::computed_value_types::ComputedSize) -> String {
     use crate::css::computed_value_types::ComputedSizeKind;
 
@@ -284,6 +298,25 @@ pub(crate) fn serialize_component_values_to_utf16(
     sink.into_utf16()
 }
 
+pub(crate) fn normalized_component_values_equal(
+    first: &[crate::css::parser::component_value::ComponentValue],
+    second: &[crate::css::parser::component_value::ComponentValue],
+) -> bool {
+    let mut first_sink = TextSink::new();
+    let mut second_sink = TextSink::new();
+    assert!(serialize_component_values_into(
+        &mut first_sink,
+        first,
+        ComponentSerializationMode::Normalized,
+    ));
+    assert!(serialize_component_values_into(
+        &mut second_sink,
+        second,
+        ComponentSerializationMode::Normalized,
+    ));
+    first_sink.content_equals(&second_sink)
+}
+
 pub(crate) fn original_component_values_source(
     values: &[crate::css::parser::component_value::ComponentValue],
 ) -> Option<Vec<u16>> {
@@ -295,15 +328,6 @@ pub(crate) fn original_component_values_source(
         value.original_source_text.append_to(&mut source);
     }
     Some(source)
-}
-
-pub(crate) fn trim_ascii_whitespace(value: &[u16]) -> &[u16] {
-    let value = trim_ascii_whitespace_start(value);
-    let end = value
-        .iter()
-        .rposition(|unit| !matches!(*unit, 0x09 | 0x0a | 0x0c | 0x0d | 0x20))
-        .map_or(0, |position| position + 1);
-    &value[..end]
 }
 
 pub(crate) fn trim_ascii_whitespace_start(value: &[u16]) -> &[u16] {
@@ -508,7 +532,7 @@ fn format_double_with_precision(sink: &mut TextSink, mut value: f64, precision: 
     } else if sign_always {
         sink.push_ascii("+");
     }
-    sink.push_ascii(&format!("{integer_part:.0}"));
+    write!(sink, "{integer_part:.0}").unwrap();
     if fraction_length > 0 {
         sink.push_ascii(".");
         for &digit in &fraction_digits[..fraction_length] {
@@ -528,7 +552,7 @@ pub(crate) fn serialize_a_number(sink: &mut TextSink, value: f64, mode: Serializ
         } else if value.is_nan() {
             sink.push_ascii("NaN");
         } else {
-            sink.push_ascii(&value.to_string());
+            write!(sink, "{value}").unwrap();
         }
         return;
     }
@@ -585,7 +609,7 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
             serialize_a_number(sink, *value, mode);
         }
         StyleValueData::Integer { value } => {
-            sink.push_ascii(&value.to_string());
+            write!(sink, "{value}").unwrap();
         }
         StyleValueData::Percentage { value } => {
             serialize_a_number(sink, *value, mode);
@@ -653,8 +677,18 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
                 serialize_a_dimension(sink, *value, LENGTH_UNIT_NAMES[*unit as usize], mode);
             }
         }
-        StyleValueData::String { string, .. } => {
-            with_fly_string_units(string, |units| serialize_a_string(sink, &units));
+        StyleValueData::String {
+            string,
+            serialize_without_quotes,
+            ..
+        } => {
+            if *serialize_without_quotes {
+                for &unit in string.units() {
+                    sink.push_code_unit(unit);
+                }
+            } else {
+                with_fly_string_units(string, |units| serialize_a_string(sink, &units));
+            }
         }
         StyleValueData::CustomIdent { custom_ident } => {
             with_fly_string_units(custom_ident, |units| serialize_an_identifier(sink, &units));
@@ -1081,10 +1115,27 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
             url,
             url_type,
             url_modifiers,
-            ..
+            resource_context,
         } => {
             sink.push_ascii(if *url_type == 0 { "url(" } else { "src(" });
-            serialize_url_text(sink, url);
+            // NB: Image values retain their base URL separately from their source text. CSSOM exposes the resolved URL.
+            let resolved_url = if mode.is_resolved()
+                && resource_context.has_base_url
+                && !url.is_empty()
+                && !url.is_fragment()
+                && liburl_rust::basic_parse(url.url_input(), liburl_rust::BasicParseOptions::new()).is_none()
+            {
+                std::str::from_utf8(resource_context.base_url.ascii_bytes())
+                    .ok()
+                    .and_then(|base| liburl_rust::basic_parse(base, liburl_rust::BasicParseOptions::new()))
+                    .and_then(|base| {
+                        liburl_rust::basic_parse(url.url_input(), liburl_rust::BasicParseOptions::new().base_url(&base))
+                    })
+                    .map(|url| RetainedString::from_ascii(url.into()))
+            } else {
+                None
+            };
+            serialize_url_text(sink, resolved_url.as_ref().unwrap_or(url));
             for modifier in url_modifiers.as_slice() {
                 sink.push_ascii(" ");
                 serialize_request_url_modifier(sink, modifier);
@@ -1350,6 +1401,7 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
             y2,
             number_of_intervals,
             step_position,
+            ..
         } => {
             use crate::css::css_enums::step_position as step_position_enum;
             match kind {
@@ -1539,10 +1591,15 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
                 sink.push_ascii("repeating-");
             }
             sink.push_ascii("conic-gradient(");
-            let has_from_angle = from_angle.optional_data().is_some();
+            // https://drafts.csswg.org/css-images-4/#conic-gradients
+            // The entire gradient is rotated by this angle. If omitted, defaults to 0deg.
+            let from_angle = from_angle
+                .optional_data()
+                .filter(|angle| !matches!(angle, StyleValueData::Angle { value, .. } if *value == 0.0));
+            let has_from_angle = from_angle.is_some();
             let position = position.data();
             let has_at_position = !position_is_center(position, mode);
-            if let Some(from_angle) = from_angle.optional_data() {
+            if let Some(from_angle) = from_angle {
                 sink.push_ascii("from ");
                 serialize_style_value(sink, from_angle, mode);
             }
@@ -1780,6 +1837,7 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
             property,
             transform_function,
             values,
+            ..
         } => {
             use crate::css::property_metadata::property_id;
             let entries = values.as_slice();
@@ -1943,7 +2001,7 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
                         }
                         sink.push_ascii(exponent);
                     } else {
-                        sink.push_ascii(&number.to_string());
+                        write!(sink, "{number}").unwrap();
                     }
                     continue;
                 }
@@ -3470,6 +3528,7 @@ fn serialize_shorthand(
         property_id::BORDER,
         property_id::BACKGROUND_POSITION,
         property_id::FONT,
+        property_id::FONT_SYNTHESIS,
         property_id::FONT_VARIANT,
         property_id::GRID,
         property_id::GRID_AREA,

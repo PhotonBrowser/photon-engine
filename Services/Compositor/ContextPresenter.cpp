@@ -535,8 +535,8 @@ Gfx::IntRect ContextPresenter::damage_since_last_raster(Gfx::IntSize viewport_si
     }
     Vector<Compositing::VideoSinkResourceId> video_sinks_with_new_frames;
     auto video_sinks_drawn_by_list = m_scene.display_list()->referenced_resource_ids().video_sinks;
-    for (auto const& [video_sink_id, frame_slot] : last_frame.video_frame_slots) {
-        if (current_video_frame_slot(video_sink_id) == frame_slot)
+    for (auto const& [video_sink_id, frame_id] : last_frame.video_frame_ids) {
+        if (current_video_frame_id(video_sink_id) == frame_id)
             continue;
         // A video drawn only by a nested display list, such as an SVG image's, has no command in
         // this list to damage.
@@ -778,10 +778,10 @@ void ContextPresenter::remember_rasterized_frame(Gfx::IntSize viewport_size, Com
         canvas_content_generations.set(canvas_id, m_canvas_surfaces.canvas_content_generation(canvas_id));
     }
     // Every video the context holds is drawn by the list or by a display list it nests.
-    HashMap<Compositing::VideoSinkResourceId, Optional<VideoFrameSlot>> video_frame_slots;
+    HashMap<Compositing::VideoSinkResourceId, Optional<u64>> video_frame_ids;
     for (auto const& [id, handle] : m_scene.video_sink_handles()) {
         Compositing::VideoSinkResourceId video_sink_id { id };
-        video_frame_slots.set(video_sink_id, current_video_frame_slot(video_sink_id));
+        video_frame_ids.set(video_sink_id, current_video_frame_id(video_sink_id));
     }
     m_last_rasterized_frame = RasterizedFrame {
         .display_list = NonnullRefPtr { *m_scene.display_list() },
@@ -790,13 +790,13 @@ void ContextPresenter::remember_rasterized_frame(Gfx::IntSize viewport_size, Com
         .viewport_size = viewport_size,
         .canvas_content_generations = move(canvas_content_generations),
         .raster_content_epoch = m_raster_content_epoch,
-        .video_frame_slots = move(video_frame_slots),
+        .video_frame_ids = move(video_frame_ids),
         .scroll_blit_eligibility_node = scroll_blit_eligibility_node,
         .scroll_blit_is_safe = scroll_blit_is_safe,
     };
 }
 
-Optional<ContextPresenter::VideoFrameSlot> ContextPresenter::current_video_frame_slot(Compositing::VideoSinkResourceId video_sink_id)
+Optional<u64> ContextPresenter::current_video_frame_id(Compositing::VideoSinkResourceId video_sink_id)
 {
     auto sink = m_scene.resource_storage().video_sink(video_sink_id);
     if (!sink)
@@ -804,12 +804,7 @@ Optional<ContextPresenter::VideoFrameSlot> ContextPresenter::current_video_frame
     auto frame = sink->current_frame();
     if (!frame)
         return {};
-    auto handle = Media::VideoFrameHandle::for_frame(*frame);
-    return VideoFrameSlot {
-        .pool_id = handle.pool_id,
-        .slot_index = handle.slot_index,
-        .slot_acquisition_id = handle.slot_acquisition_id,
-    };
+    return frame->id();
 }
 
 void ContextPresenter::paint_current_display_list(DisplayListPlayerSkia& display_list_player, Gfx::PaintingSurface& surface, FrameContent const& frame_content, Optional<Gfx::IntRect> damage_rect, PaintUIOverlay paint_ui_overlay, bool apply_raster_transform)

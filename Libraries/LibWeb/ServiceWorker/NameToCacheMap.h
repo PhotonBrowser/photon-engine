@@ -19,16 +19,12 @@ struct RequestResponse : public GC::Cell {
     GC_CELL(RequestResponse, GC::Cell);
     GC_DECLARE_ALLOCATOR(RequestResponse);
 
-    RequestResponse(GC::Ref<Fetch::Infrastructure::Request> request, GC::Ref<Fetch::Infrastructure::Response> response)
-        : request(request)
-        , response(response)
-    {
-    }
+    RequestResponse(NonnullRefPtr<Fetch::Infrastructure::Request>, GC::Ref<Fetch::Infrastructure::ResponseView>);
 
     virtual void visit_edges(Visitor&) override;
 
-    GC::Ref<Fetch::Infrastructure::Request> request;
-    GC::Ref<Fetch::Infrastructure::Response> response;
+    NonnullRefPtr<Fetch::Infrastructure::Request> request;
+    GC::Ref<Fetch::Infrastructure::ResponseView> response;
 };
 
 // https://w3c.github.io/ServiceWorker/#dfn-request-response-list

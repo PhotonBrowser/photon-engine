@@ -421,6 +421,7 @@ scalar_accessors! {
         clear: u8 => clear,
         box_sizing: u8 => box_sizing,
         field_sizing: u8 => field_sizing,
+        baseline_source: u8 => baseline_source,
         overflow_x: u8 => overflow_x,
         overflow_y: u8 => overflow_y,
         text_overflow: u8 => text_overflow,
@@ -516,10 +517,14 @@ scalar_accessors! {
         order: i32 => order,
         align_items: u8 => align_items,
         align_self: u8 => align_self,
+        align_items_is_last_baseline: bool => align_items_is_last_baseline,
+        align_self_is_last_baseline: bool => align_self_is_last_baseline,
         align_content: u8 => align_content,
         justify_content: u8 => justify_content,
         justify_items: u8 => justify_items,
         justify_self: u8 => justify_self,
+        align_items_overflow: u8 => align_items_overflow,
+        justify_items_overflow: u8 => justify_items_overflow,
         align_self_overflow: u8 => align_self_overflow,
         justify_self_overflow: u8 => justify_self_overflow,
         flex_basis_is_content: bool => flex_basis.is_content,
@@ -1068,6 +1073,10 @@ impl<'a> ComputedValuesView<'a> {
 
     pub(crate) fn overflow_wrap(self) -> u8 {
         self.inherited_text().overflow_wrap
+    }
+
+    pub(crate) fn text_wrap_style(self) -> u8 {
+        self.inherited_text().text_wrap_style
     }
 
     pub(crate) fn text_indent(self) -> LengthPercentageRef<'a> {

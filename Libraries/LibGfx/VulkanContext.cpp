@@ -85,7 +85,7 @@ static bool supports_photon_shared_image_extensions(VkPhysicalDevice device)
 }
 #endif
 
-static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
+static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance, Optional<GpuDeviceIdentity> const& preferred_device)
 {
     uint32_t device_count = 0;
     vkEnumeratePhysicalDevices(instance, &device_count, nullptr);
@@ -101,6 +101,17 @@ static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
     VkPhysicalDevice first_device = VK_NULL_HANDLE;
     // Prefer a discrete adapter that supports the enabled external-memory
     // extensions. The frontend logs its own device for comparison.
+    if (preferred_device.has_value()) {
+        for (auto const& device : devices) {
+#ifdef USE_VULKAN_DMABUF_IMAGES
+            if (!supports_photon_shared_image_extensions(device))
+                continue;
+#endif
+            if (gpu_device_identity_of(device) == *preferred_device)
+                return device;
+        }
+        dbgln("The preferred GPU is not a Vulkan device here, picking another one");
+    }
     for (auto const& device : devices) {
 #ifdef USE_VULKAN_DMABUF_IMAGES
         if (!supports_photon_shared_image_extensions(device))
@@ -277,11 +288,11 @@ GpuDeviceIdentity gpu_device_identity_of(VkPhysicalDevice physical_device)
     return identity;
 }
 
-ErrorOr<VulkanContext> create_vulkan_context()
+ErrorOr<VulkanContext> create_vulkan_context(Optional<GpuDeviceIdentity> const& preferred_device)
 {
     uint32_t const api_version = VK_API_VERSION_1_1; // v1.1 needed for vkGetPhysicalDeviceFormatProperties2
     auto* instance = TRY(create_instance(api_version));
-    auto* physical_device = TRY(pick_physical_device(instance));
+    auto* physical_device = TRY(pick_physical_device(instance, preferred_device));
 
     if (photon_verbose_logging_enabled()) {
         VkPhysicalDeviceDriverProperties driver_properties {};
@@ -331,6 +342,7 @@ ErrorOr<VulkanContext> create_vulkan_context()
         .instance = instance,
         .physical_device = physical_device,
         .device_identity = gpu_device_identity_of(physical_device),
+        .is_preferred_device = preferred_device.has_value() && gpu_device_identity_of(physical_device) == *preferred_device,
         .logical_device = logical_device,
         .graphics_queue = graphics_queue,
         .graphics_queue_family = graphics_queue_family,

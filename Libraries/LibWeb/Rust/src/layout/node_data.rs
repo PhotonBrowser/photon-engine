@@ -6,7 +6,6 @@
 
 use super::tree_shape::ShapeCell;
 use crate::layout::CssPixels;
-use std::cell::Cell;
 use std::ffi::c_void;
 
 pub const GENERATED_FOR_AFTER: u8 = 1;
@@ -55,22 +54,6 @@ pub(crate) unsafe fn style_payloads<'a>(style: StylePayloadsRef) -> Option<&'a F
     // SAFETY: A non-null style pointer addresses the group pointer array of the style record, which
     // FfiStylePayloads mirrors exactly, and the caller keeps the record alive for 'a.
     (!style.is_null()).then(|| unsafe { style.deref() })
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiReplacedContentFacts {
-    pub has_auto_content_width: bool,
-    pub auto_content_width: CssPixels,
-    pub has_auto_content_height: bool,
-    pub auto_content_height: CssPixels,
-    pub auto_content_aspect_ratio_numerator: CssPixels,
-    pub auto_content_aspect_ratio_denominator: CssPixels,
-    pub has_default_preferred_width: bool,
-    pub default_preferred_width: CssPixels,
-    pub has_default_preferred_height: bool,
-    pub default_preferred_height: CssPixels,
-    pub text_entry_content_is_ordinary_box: bool,
 }
 
 impl From<crate::painting::host::FfiNaturalSize> for crate::css::style::NaturalSize {
@@ -232,13 +215,11 @@ pub(crate) enum AncestorFact {
     IsAnonymousButtonContentWrapper = 1 << 2,
     /// An anonymous box whose parent is an anonymous button content wrapper.
     IsAnonymousButtonContentBox = 1 << 3,
-    /// The node or one of its ancestors has an inline outer display type.
-    HasInlineLevelInclusiveAncestor = 1 << 4,
     /// An anonymous box whose nearest non-anonymous ancestor puts an ellipsis on overflowing lines.
-    InheritsTextOverflowEllipsis = 1 << 5,
-    ParentLaysOutInColumns = 1 << 6,
+    InheritsTextOverflowEllipsis = 1 << 4,
+    ParentLaysOutInColumns = 1 << 5,
     /// The parent lays out its children with a MathML layout algorithm.
-    ParentUsesMathLayout = 1 << 7,
+    ParentUsesMathLayout = 1 << 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,7 +276,7 @@ pub(crate) struct NodeData {
     pub next_sibling: ShapeCell<NodeSlotId>,
     pub kind: ShapeCell<NodeKind>,
     pub generated_for: ShapeCell<u8>,
-    pub intrinsic_cache_epoch: Cell<u16>,
+    pub intrinsic_cache_epoch: u16,
     pub flags: ShapeCell<u32>,
     /// Advanced on every layout invalidation that reaches this node or its
     /// subtree, with no propagation boundary: unlike the intrinsic epoch,
@@ -303,13 +284,13 @@ pub(crate) struct NodeData {
     /// every ancestor, because their fragments live in ancestor run trees.
     /// Wide enough that wrapping between a cache store and the next probe
     /// is unreachable.
-    pub fragment_cache_epoch: Cell<u32>,
+    pub fragment_cache_epoch: u32,
     pub slot_generation: ShapeCell<u8>,
     pub compositor_animation_frame_kinds: ShapeCell<u8>,
-    pub table_column_span: Cell<u16>,
-    pub table_row_span: Cell<u16>,
+    pub table_column_span: u16,
+    pub table_row_span: u16,
     pub dom_paint_facts: ShapeCell<u8>,
-    pub ancestor_facts: Cell<u8>,
+    pub ancestor_facts: u8,
     pub style: ShapeCell<StylePayloadsRef>,
 }
 
@@ -323,16 +304,38 @@ impl Default for NodeData {
             next_sibling: ShapeCell::new(NodeSlotId::INVALID),
             kind: ShapeCell::new(NodeKind::Unset),
             generated_for: ShapeCell::new(0),
-            intrinsic_cache_epoch: Cell::new(0),
+            intrinsic_cache_epoch: 0,
             flags: ShapeCell::new(0),
             slot_generation: ShapeCell::new(0),
             compositor_animation_frame_kinds: ShapeCell::new(0),
-            table_column_span: Cell::new(1),
-            table_row_span: Cell::new(1),
+            table_column_span: 1,
+            table_row_span: 1,
             dom_paint_facts: ShapeCell::new(0),
-            ancestor_facts: Cell::new(0),
-            fragment_cache_epoch: Cell::new(0),
+            ancestor_facts: 0,
+            fragment_cache_epoch: 0,
             style: ShapeCell::new(StylePayloadsRef::null()),
+        }
+    }
+}
+
+/// The facts of a node that no publication carries, for writing: writing them marks nothing for the paint side,
+/// unlike a write to the node's shape.
+pub(crate) struct UnpublishedNodeFactsMut<'a> {
+    pub(crate) intrinsic_cache_epoch: &'a mut u16,
+    pub(crate) fragment_cache_epoch: &'a mut u32,
+    pub(crate) table_column_span: &'a mut u16,
+    pub(crate) table_row_span: &'a mut u16,
+    pub(crate) ancestor_facts: &'a mut u8,
+}
+
+impl NodeData {
+    pub(super) fn unpublished_facts_mut(&mut self) -> UnpublishedNodeFactsMut<'_> {
+        UnpublishedNodeFactsMut {
+            intrinsic_cache_epoch: &mut self.intrinsic_cache_epoch,
+            fragment_cache_epoch: &mut self.fragment_cache_epoch,
+            table_column_span: &mut self.table_column_span,
+            table_row_span: &mut self.table_row_span,
+            ancestor_facts: &mut self.ancestor_facts,
         }
     }
 }

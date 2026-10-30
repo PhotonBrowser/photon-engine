@@ -36,7 +36,7 @@
 
 #include <openssl/thread.h>
 
-static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id);
+static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id, Optional<Utf16String> const& top_level_site);
 static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
 
 static ErrorOr<Web::HTML::AgentType> agent_type_from_string(StringView type)
@@ -144,8 +144,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         if (auto bytes = heap.last_swept_live_bytes(); bytes.has_value())
             client->async_did_update_managed_heap_bytes(static_cast<u64>(*bytes));
     });
-    client->on_request_server_connection = [&heap](auto const& handle, auto client_id) {
-        if (auto result = connect_to_resource_loader(heap, handle, client_id); result.is_error())
+    client->on_request_server_connection = [&heap](auto const& handle, auto client_id, auto const& top_level_site) {
+        if (auto result = connect_to_resource_loader(heap, handle, client_id, top_level_site); result.is_error())
             dbgln("Failed to connect to resource loader: {}", result.error());
     };
     client->on_image_decoder_connection = [](auto const& handle) {
@@ -163,17 +163,16 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     return event_loop.exec();
 }
 
-static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id)
+static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id, Optional<Utf16String> const& top_level_site)
 {
     auto transport = TRY(handle.create_transport());
     // Querying the client ID runs the event loop and could dispatch a request before the client is ready.
     auto request_client = client_id.has_value()
         ? TRY(try_make_ref_counted<Requests::RequestClient>(move(transport), *client_id))
         : TRY(try_make_ref_counted<Requests::RequestClient>(move(transport)));
-    if (Web::ResourceLoader::is_initialized())
-        Web::ResourceLoader::the().set_client(move(request_client));
-    else
-        Web::ResourceLoader::initialize(heap, move(request_client));
+    if (!Web::ResourceLoader::is_initialized())
+        Web::ResourceLoader::initialize(heap);
+    Web::ResourceLoader::the().set_client(top_level_site, move(request_client));
     return {};
 }
 

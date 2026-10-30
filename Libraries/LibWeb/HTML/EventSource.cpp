@@ -17,7 +17,7 @@
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
@@ -99,7 +99,7 @@ WebIDL::ExceptionOr<GC::Ref<EventSource>> EventSource::create(WindowOrWorkerGlob
     auto request = create_potential_CORS_request(event_source->m_url, {}, cors_attribute_state);
 
     // 9. Set request's client to settings.
-    request->set_client(&settings);
+    request->set_client(settings.address());
 
     // 10. User agents may set (`Accept`, `text/event-stream`) in request's header list.
     request->header_list()->set({ "Accept"sv, "text/event-stream"sv });
@@ -115,7 +115,7 @@ WebIDL::ExceptionOr<GC::Ref<EventSource>> EventSource::create(WindowOrWorkerGlob
 
     // 14. Let processEventSourceEndOfBody given response res be the following step: if res is not a network error, then
     //     reestablish the connection.
-    auto process_event_source_end_of_body = [event_source](GC::Ref<Fetch::Infrastructure::Response> response) {
+    auto process_event_source_end_of_body = [event_source](GC::Ref<Fetch::Infrastructure::ResponseView> response) {
         if (!response->is_network_error())
             event_source->reestablish_the_connection();
     };
@@ -125,7 +125,7 @@ WebIDL::ExceptionOr<GC::Ref<EventSource>> EventSource::create(WindowOrWorkerGlob
     Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
     fetch_algorithms_input.process_response_end_of_body = move(process_event_source_end_of_body);
 
-    fetch_algorithms_input.process_response = [event_source](GC::Ref<Fetch::Infrastructure::Response> response) {
+    fetch_algorithms_input.process_response = [event_source](GC::Ref<Fetch::Infrastructure::ResponseView> response) {
         auto& realm = HTML::relevant_realm(event_source->relevant_global_object());
 
         // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
@@ -226,7 +226,6 @@ void EventSource::finalize()
 void EventSource::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(m_request);
     visitor.visit(m_fetch_algorithms);
     visitor.visit(m_fetch_controller);
     visitor.visit(m_reconnection_timer);
@@ -358,7 +357,7 @@ void EventSource::reestablish_the_connection()
                 return;
 
             // 2. Let request be the EventSource object's request.
-            GC::Ref request { *m_request };
+            NonnullRefPtr request { *m_request };
 
             // 3. If the EventSource object's last event ID string is not the empty string, then:
             if (!m_last_event_id.is_empty()) {

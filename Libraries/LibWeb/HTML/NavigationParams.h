@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <AK/RefCounted.h>
 #include <AK/Utf16String.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Ptr.h>
@@ -28,6 +29,18 @@
 
 namespace Web::HTML {
 
+// NB: Reconstructed response callbacks and download adoption share one terminal-event owner.
+struct NavigationResponseNetworkEventState : RefCounted<NavigationResponseNetworkEventState> {
+    AK_ALLOC_WITH_KMALLOC;
+
+    enum class Owner {
+        Renderer,
+        Download,
+        Completed,
+    };
+    Owner owner { Owner::Renderer };
+};
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigation-params
 struct NavigationParams : GC::Cell {
     GC_CELL(NavigationParams, GC::Cell);
@@ -40,10 +53,10 @@ struct NavigationParams : GC::Cell {
     GC::Ptr<LocalNavigable> navigable;
 
     // null or a request that started the navigation
-    GC::Ptr<Fetch::Infrastructure::Request> request;
+    RefPtr<Fetch::Infrastructure::Request> request;
 
     // a response that ultimately was navigated to (potentially a network error)
-    GC::Ptr<Fetch::Infrastructure::Response> response;
+    GC::Ptr<Fetch::Infrastructure::ResponseView> response;
 
     // null or a fetch controller
     GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller { nullptr };
@@ -53,9 +66,15 @@ struct NavigationParams : GC::Cell {
     //         still sees it.
     RefPtr<Fetch::Infrastructure::FetchTimingInfo> fetch_timing_info { nullptr };
 
+    // AD-HOC: The terminal network event follows the owner of a transferred
+    // response, including a download.
+    JsonValue webdriver_bidi_network_response;
+    RefPtr<NavigationResponseNetworkEventState> webdriver_bidi_network_response_state;
+
     // AD-HOC: The agent cluster of the agent the UI process obtained for the new Document's window, and that agent
     //         cluster's cross-origin isolation mode.
     Optional<u64> agent_cluster_id;
+    bool agent_cluster_is_origin_keyed { false };
     CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode { CrossOriginIsolationMode::None };
 
     // AD-HOC: The id the UI process gave the new Document.
@@ -75,7 +94,7 @@ struct NavigationParams : GC::Cell {
     OpenerPolicyEnforcementResult coop_enforcement_result;
 
     // null or an environment reserved for the new Document
-    Fetch::Infrastructure::Request::ReservedClientType reserved_environment;
+    GC::Ptr<Environment> reserved_environment;
 
     // an origin to use for the new Document
     URL::Origin origin;
@@ -101,18 +120,22 @@ struct NavigationParams : GC::Cell {
     // a user navigation involvement used when obtaining a browsing context for the new Document
     UserNavigationInvolvement user_involvement;
 
+    // The fetch controller, or else the transport of a body adopted without one.
+    using BodyDelivery = Variant<Empty, GC::Ref<Fetch::Infrastructure::FetchController>, NonnullRefPtr<Fetch::Engine::NetworkTransportHandle>>;
+    [[nodiscard]] BodyDelivery body_delivery() const;
+
 protected:
     void visit_edges(Visitor& visitor) override;
 
     NavigationParams(
         Optional<Utf16String> id,
         GC::Ptr<LocalNavigable> navigable,
-        GC::Ptr<Fetch::Infrastructure::Request> request,
-        GC::Ptr<Fetch::Infrastructure::Response> response,
+        RefPtr<Fetch::Infrastructure::Request> request,
+        GC::Ptr<Fetch::Infrastructure::ResponseView> response,
         GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller,
         GC::Ptr<GC::Function<void(DOM::Document&)>> commit_early_hints,
         OpenerPolicyEnforcementResult coop_enforcement_result,
-        Fetch::Infrastructure::Request::ReservedClientType reserved_environment,
+        GC::Ptr<Environment> reserved_environment,
         URL::Origin origin,
         RefPtr<PolicyContainer> policy_container,
         SandboxingFlagSet final_sandboxing_flag_set,
@@ -196,6 +219,9 @@ protected:
 
 using NavigationParamsVariant = Variant<NavigationParamsNullOrError, GC::Ref<NavigationParams>, GC::Ref<NonFetchSchemeNavigationParams>>;
 
-bool check_a_navigation_responses_adherence_to_x_frame_options(GC::Ptr<Fetch::Infrastructure::Response> response, LocalNavigable* navigable, ContentSecurityPolicy::PolicyList const& csp_list, URL::Origin destination_origin);
+// Returns whether a fetch controller or network transport was stopped.
+bool stop_body_delivery(NavigationParams::BodyDelivery const&);
+
+bool check_a_navigation_responses_adherence_to_x_frame_options(GC::Ptr<Fetch::Infrastructure::ResponseView> response, LocalNavigable* navigable, ContentSecurityPolicy::PolicyList const& csp_list, URL::Origin destination_origin);
 
 }

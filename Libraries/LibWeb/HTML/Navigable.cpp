@@ -5,7 +5,6 @@
  */
 
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -262,13 +261,10 @@ bool Navigable::allowed_by_sandboxing_to_navigate(Navigable const& target, Sourc
     if (source.is_ancestor_of(target))
         return true;
 
-    // 3. If target is an ancestor of source, then:
-    if (target.is_ancestor_of(source)) {
-
-        // 1. If target is not a top-level traversable, then return true.
-        if (!target.is_top_level_traversable())
-            return true;
-
+    // 3. If target is an ancestor of source:
+    // AD-HOC: Only for a top-level target, which drops step 1, so that other ancestors reach step 5.
+    //         See https://github.com/whatwg/html/pull/13150
+    if (target.is_top_level_traversable() && target.is_ancestor_of(source)) {
         // 2. If sourceSnapshotParams's has transient activation is true, and sourceSnapshotParams's sandboxing flags's
         //    sandboxed top-level navigation with user activation browsing context flag is set, then return false.
         if (source_snapshot_params.has_transient_activation && has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedTopLevelNavigationWithUserActivation))
@@ -286,15 +282,8 @@ bool Navigable::allowed_by_sandboxing_to_navigate(Navigable const& target, Sourc
     // 4. If target is a top-level traversable:
     if (target.is_top_level_traversable()) {
         // 1. If source is the one permitted sandboxed navigator of target, then return true.
-        // NB: The one permitted sandboxed navigator is a browsing context, so we compare the active browsing contexts.
-        auto const* local_source = as_if<LocalNavigable>(source);
-        auto const* local_target = as_if<LocalNavigable>(target);
-        if (local_source && local_target) {
-            auto source_browsing_context = const_cast<LocalNavigable&>(*local_source).active_browsing_context();
-            auto target_browsing_context = const_cast<LocalNavigable&>(*local_target).active_browsing_context();
-            if (source_browsing_context && target_browsing_context && target_browsing_context->the_one_permitted_sandboxed_navigator() == source_browsing_context)
-                return true;
-        }
+        if (target.active_browsing_context_one_permitted_sandboxed_navigator().ptr() == &source)
+            return true;
 
         // 2. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
         if (has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedNavigation))

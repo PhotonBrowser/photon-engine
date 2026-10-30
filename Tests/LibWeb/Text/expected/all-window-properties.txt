@@ -21,6 +21,7 @@ AudioListener
 AudioNode
 AudioParam
 AudioParamMap
+AudioProcessingEvent
 AudioScheduledSourceNode
 AudioTrack
 AudioTrackList
@@ -409,6 +410,7 @@ ResizeObserverSize
 Response
 SVGAElement
 SVGAngle
+SVGAnimateElement
 SVGAnimateMotionElement
 SVGAnimatedAngle
 SVGAnimatedBoolean
@@ -555,8 +557,12 @@ TextTrack
 TextTrackCue
 TextTrackCueList
 TextTrackList
+TimeEvent
 TimeRanges
 ToggleEvent
+Touch
+TouchEvent
+TouchList
 TrackEvent
 TransformStream
 TransformStreamDefaultController
@@ -650,7 +656,9 @@ scrollendEvent
 spoofCurrentURL
 test
 timeout
+uniqueID
 uniqueLocalhostHostname
+uniqueTestHostname
 webkitURL
 wheelTargetToString
 withCollectedWrapper

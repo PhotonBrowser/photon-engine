@@ -4,17 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-import { populateSearchEngineSelect, updateSearchSuggestionsControl } from "./search-engine-controls.js";
-
 const form = document.querySelector("#welcome-form");
 const setupOptions = document.querySelector("#setup-options");
 const startBrowsing = document.querySelector("#start-browsing");
-const searchEngine = document.querySelector("#search-engine");
-const searchSuggestions = document.querySelector("#search-suggestions-enabled");
+const searchEngines = document.querySelector("#search-engines");
+const searchSuggestions = document.querySelector("#search-suggestions");
+const searchSuggestionsEnabled = document.querySelector("#search-suggestions-enabled");
 const searchSuggestionsDescription = document.querySelector("#search-suggestions-description");
 const enableContentBlocking = document.querySelector("#enable-content-blocking");
-const blockingOptions = document.querySelector("#blocking-options");
-const contentBlockerLists = document.querySelector("#content-blocker-lists");
 const saveStatus = document.querySelector("#save-status");
 
 let settings;
@@ -22,14 +19,78 @@ let engines;
 let features;
 let initialized = false;
 
-const filterListDescriptions = {
-    easyList: "Blocks most ads.",
-    easyPrivacy: "Blocks trackers.",
-    fanboyAnnoyances: "Blocks pop-ups and other annoyances.",
-};
+function setSearchEngineSettings(name, suggestions) {
+    // NB: Keep our copy current, as the settings update for this change can arrive after the next one is made.
+    settings.searchEngine = { ...settings.searchEngine, engine: name, suggestions };
+    ladybird.sendMessage("setSearchEngineSettings", { engine: name, suggestions });
+    updateSearchSuggestions();
+}
 
-function updateBlockingOptions() {
-    blockingOptions.classList.toggle("hidden", !enableContentBlocking.checked);
+function setSearchEngine(name) {
+    setSearchEngineSettings(name, name !== null || settings.searchEngine.suggestions);
+}
+
+// The suggestions switch is only shown for a chosen engine that offers suggestions, and says where typed text goes.
+function updateSearchSuggestions() {
+    const name = settings.searchEngine.engine;
+    const engine = engines.search.find(engine => engine.name === name);
+    searchSuggestions.classList.toggle("hidden", !engine?.supportsSuggestions);
+    searchSuggestionsEnabled.checked = settings.searchEngine.suggestions;
+    if (engine)
+        searchSuggestionsDescription.textContent = `Your typing in the address bar is sent to ${name} before you press Enter.`;
+}
+
+// The search engines are shown in a new random order each time, so that none is favored by its place in the list.
+function shuffled(items) {
+    const result = [...items];
+    for (let i = result.length - 1; i > 0; --i) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [result[i], result[j]] = [result[j], result[i]];
+    }
+    return result;
+}
+
+function renderSearchEngines() {
+    const names = shuffled(engines.search.map(engine => engine.name));
+
+    searchEngines.replaceChildren();
+    for (const name of names) {
+        const tile = document.createElement("label");
+        tile.className = "search-engine";
+
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "search-engine";
+        radio.value = name;
+        radio.checked = settings.searchEngine.engine === name;
+        radio.addEventListener("change", () => {
+            if (!initialized) return;
+            setSearchEngine(name);
+        });
+
+        // A search engine is optional, so choosing the chosen one again goes without one.
+        let wasChecked = false;
+        tile.addEventListener("pointerdown", () => {
+            wasChecked = radio.checked;
+        });
+        tile.addEventListener("click", event => {
+            if (!initialized || !wasChecked || event.target !== radio) return;
+            wasChecked = false;
+            radio.checked = false;
+            setSearchEngine(null);
+        });
+
+        const letter = document.createElement("span");
+        letter.className = "letter-tile";
+        letter.setAttribute("aria-hidden", "true");
+        letter.textContent = name.charAt(0).toUpperCase();
+
+        const label = document.createElement("span");
+        label.textContent = name;
+
+        tile.append(radio, letter, label);
+        searchEngines.append(tile);
+    }
 }
 
 function initialize() {
@@ -40,41 +101,10 @@ function initialize() {
     const tabMode = settings.tabs.verticalTabsEnabled ? "vertical" : "horizontal";
     document.querySelector(`input[name="tab-mode"][value="${tabMode}"]`).checked = true;
 
-    populateSearchEngineSelect(searchEngine, engines.search, settings.searchEngine);
-    searchSuggestions.checked = settings.searchEngine.suggestions;
-    updateSearchSuggestionsControl(searchEngine, searchSuggestions, searchSuggestionsDescription);
+    renderSearchEngines();
+    updateSearchSuggestions();
 
     enableContentBlocking.checked = settings.contentBlockers.enabled;
-    for (const list of settings.contentBlockerLists) {
-        if (!Object.hasOwn(filterListDescriptions, list.identifier)) continue;
-
-        const row = document.createElement("label");
-        row.className = "filter-list";
-        row.title = list.url;
-
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.dataset.identifier = list.identifier;
-        checkbox.checked = list.enabled;
-        checkbox.addEventListener("change", () => {
-            ladybird.sendMessage("setContentBlockerListEnabled", {
-                identifier: list.identifier,
-                enabled: checkbox.checked,
-            });
-        });
-
-        const name = document.createElement("span");
-        name.textContent = list.name;
-
-        const description = document.createElement("p");
-        description.id = `description-${list.identifier}`;
-        description.textContent = filterListDescriptions[list.identifier];
-        checkbox.setAttribute("aria-describedby", description.id);
-
-        row.append(checkbox, name, description);
-        contentBlockerLists.append(row);
-    }
-    updateBlockingOptions();
     setupOptions.disabled = false;
     startBrowsing.disabled = false;
 }
@@ -89,26 +119,20 @@ for (const input of document.querySelectorAll('input[name="tab-mode"]')) {
     });
 }
 
-function saveSearchEngineSettings() {
+searchSuggestionsEnabled.addEventListener("change", () => {
     if (!initialized) return;
-
-    ladybird.sendMessage("setSearchEngineSettings", {
-        engine: searchEngine.value || null,
-        suggestions: searchSuggestions.checked,
-    });
-}
-
-searchEngine.addEventListener("change", () => {
-    updateSearchSuggestionsControl(searchEngine, searchSuggestions, searchSuggestionsDescription);
-    saveSearchEngineSettings();
+    setSearchEngineSettings(settings.searchEngine.engine, searchSuggestionsEnabled.checked);
 });
-
-searchSuggestions.addEventListener("change", saveSearchEngineSettings);
 
 enableContentBlocking.addEventListener("change", () => {
     if (!initialized) return;
 
-    updateBlockingOptions();
+    // Enable the lists before the content blocker, which then downloads every enabled list.
+    if (enableContentBlocking.checked) {
+        for (const identifier of ["easyList", "easyPrivacy"])
+            ladybird.sendMessage("setContentBlockerListEnabled", { identifier, enabled: true });
+    }
+
     ladybird.sendMessage("setContentBlockerEnabled", enableContentBlocking.checked);
     ladybird.sendMessage("setFilterListUpdatesEnabled", enableContentBlocking.checked);
 });
@@ -141,24 +165,12 @@ document.addEventListener("WebUIMessage", event => {
                 document.querySelector(`input[name="tab-mode"][value="${mode}"]`).checked = true;
             }
             if (Object.hasOwn(data, "searchEngine")) {
-                populateSearchEngineSelect(searchEngine, engines.search, settings.searchEngine);
-                searchSuggestions.checked = settings.searchEngine.suggestions;
-                updateSearchSuggestionsControl(searchEngine, searchSuggestions, searchSuggestionsDescription);
+                for (const radio of searchEngines.querySelectorAll("input"))
+                    radio.checked = radio.value === settings.searchEngine.engine;
+                updateSearchSuggestions();
             }
-            if (Object.hasOwn(data, "contentBlockers")) {
+            if (Object.hasOwn(data, "contentBlockers"))
                 enableContentBlocking.checked = settings.contentBlockers.enabled;
-                updateBlockingOptions();
-            }
-            if (Object.hasOwn(data, "contentBlockerLists")) {
-                for (const checkbox of contentBlockerLists.querySelectorAll("input")) {
-                    const list = settings.contentBlockerLists.find(
-                        list => list.identifier === checkbox.dataset.identifier
-                    );
-                    if (list) {
-                        checkbox.checked = list.enabled;
-                    }
-                }
-            }
         }
     } else if (name === "loadEngines") {
         engines = data;

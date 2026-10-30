@@ -686,6 +686,7 @@ impl super::StyleEngine {
             custom_property_environments,
             inheritance_parent_style_record,
             environment: &environment,
+            custom_property_registration_generation: inputs.custom_property_registration_generation,
             element_box_slot: crate::layout::node_data::NodeSlotId::INVALID.index,
         };
         crate::css::style_compute::sample_without_host(
@@ -954,8 +955,9 @@ impl super::StyleEngine {
             | RENDERED_IN_TOP_LAYER
             | IS_SHADOW_HOST_PSEUDO_ELEMENT
             | HAS_ANIMATIONS;
-        let is_container =
-            |record: super::computed::FinalStyleRecordID| self.container_query_input_row(record.raw(), false).is_some();
+        let is_container = |record: super::computed::FinalStyleRecordID| {
+            self.container_query_input_row(node, record.raw(), false).is_some()
+        };
         let generates_pseudo_boxes = [AFTER, BACKDROP, BEFORE, FIRST_LETTER, FIRST_LINE, MARKER]
             .iter()
             .any(|&kind| {

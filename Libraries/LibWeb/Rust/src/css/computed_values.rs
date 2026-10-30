@@ -456,9 +456,13 @@ impl_computed_payload_clone_and_eq!(AlignmentValues {
     align_content,
     align_items,
     align_self,
+    align_items_is_last_baseline,
+    align_self_is_last_baseline,
     justify_content,
     justify_items,
     justify_self,
+    align_items_overflow,
+    justify_items_overflow,
     align_self_overflow,
     justify_self_overflow,
     column_gap,
@@ -1014,6 +1018,7 @@ impl_computed_payload_clone_and_eq!(BoxValues {
     overscroll_behavior_y,
     box_sizing,
     field_sizing,
+    baseline_source,
     resize,
     text_overflow,
     unicode_bidi,
@@ -2513,6 +2518,9 @@ impl StyleGroupMasks {
         //     element's own color.
         masks[index(crate::css::property_metadata::property_id::COLOR)] |=
             1 << crate::css::table_group_builder::group_index::INHERITED_UI;
+        // NB: The box group holds the used containment flags implied by hidden content visibility.
+        masks[index(crate::css::property_metadata::property_id::CONTENT_VISIBILITY)] |=
+            1 << crate::css::table_group_builder::group_index::BOX;
         Self { masks, output_masks }
     }
 
@@ -2993,9 +3001,13 @@ impl AlignmentValues {
             align_content: align_content::STRETCH,
             align_items: align_items::STRETCH,
             align_self: align_self::AUTO,
+            align_items_is_last_baseline: false,
+            align_self_is_last_baseline: false,
             justify_content: justify_content::FLEX_START,
             justify_items: justify_items::LEGACY,
             justify_self: justify_self::AUTO,
+            align_items_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
+            justify_items_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
             align_self_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
             justify_self_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
             column_gap: ComputedGap {
@@ -3153,7 +3165,8 @@ impl ComputedAspectRatio {
 impl BoxValues {
     fn initial() -> Self {
         use crate::css::css_enums::{
-            box_sizing, clear, field_sizing, float, overflow, overscroll_behavior, positioning, resize, table_layout,
+            baseline_source, box_sizing, clear, field_sizing, float, overflow, overscroll_behavior, positioning, resize,
+            table_layout,
             text_overflow, unicode_bidi, vertical_align,
         };
         use crate::css::display::FfiDisplay;
@@ -3170,6 +3183,7 @@ impl BoxValues {
             overscroll_behavior_y: overscroll_behavior::AUTO,
             box_sizing: box_sizing::CONTENT_BOX,
             field_sizing: field_sizing::FIXED,
+            baseline_source: baseline_source::AUTO,
             resize: resize::NONE,
             text_overflow: text_overflow::CLIP,
             unicode_bidi: unicode_bidi::NORMAL,
@@ -3865,6 +3879,12 @@ fn alignment_position_keyword(data: &RetainedStyleValueData, is_content: bool, u
     }
 }
 
+fn alignment_is_last_baseline(data: &RetainedStyleValueData) -> bool {
+    matches!(data.optional_data(), Some(StyleValueData::ValueList { values, .. })
+        if matches!(values.as_slice().first().and_then(|value| value.optional_data()),
+            Some(StyleValueData::Keyword { keyword: crate::css::css_enums::keyword::LAST })))
+}
+
 /// The explicit overflow alignment of a computed self-alignment value.
 fn alignment_overflow(data: &RetainedStyleValueData) -> u8 {
     use crate::css::css_enums::keyword as k;
@@ -3934,9 +3954,13 @@ pub(crate) fn rust_build_alignment_group(
             align_content: alignment_code(align_content, css_enums::keyword_to_align_content, true, k::NORMAL)?,
             align_items: alignment_code(align_items, css_enums::keyword_to_align_items, false, k::NORMAL)?,
             align_self: alignment_code(align_self, css_enums::keyword_to_align_self, false, k::AUTO)?,
+            align_items_is_last_baseline: alignment_is_last_baseline(align_items),
+            align_self_is_last_baseline: alignment_is_last_baseline(align_self),
             justify_content: alignment_code(justify_content, css_enums::keyword_to_justify_content, true, k::NORMAL)?,
             justify_items: alignment_code(justify_items, css_enums::keyword_to_justify_items, false, k::LEGACY)?,
             justify_self: alignment_code(justify_self, css_enums::keyword_to_justify_self, false, k::AUTO)?,
+            align_items_overflow: alignment_overflow(align_items),
+            justify_items_overflow: alignment_overflow(justify_items),
             align_self_overflow: alignment_overflow(align_self),
             justify_self_overflow: alignment_overflow(justify_self),
             column_gap: ComputedGap::from_data(column_gap),
@@ -4317,8 +4341,11 @@ pub(crate) fn copy_fieldset_content_alignment(source: &AlignmentValues, target: 
     target.flex_wrap = source.flex_wrap;
     target.align_content = source.align_content;
     target.align_items = source.align_items;
+    target.align_items_is_last_baseline = source.align_items_is_last_baseline;
+    target.align_items_overflow = source.align_items_overflow;
     target.justify_content = source.justify_content;
     target.justify_items = source.justify_items;
+    target.justify_items_overflow = source.justify_items_overflow;
     target.row_gap = source.row_gap.clone();
     target.column_gap = source.column_gap.clone();
 }

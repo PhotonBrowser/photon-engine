@@ -24,5 +24,6 @@ endpoint CompositorControlServer
 
     set_context_visibility(Web::CompositorContextId context_id, Compositing::ContextVisibility visibility) =|
     purge_unused_gpu_resources() =|
+    set_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory) =|
     crash() =|
 }

@@ -161,7 +161,15 @@ macro_rules! impl_trace_for_tuples {
     };
 }
 
-impl_trace_for_tuples!((A, B), (A, B, C), (A, B, C, D), (A, B, C, D, E));
+impl_trace_for_tuples!(
+    (A, B),
+    (A, B, C),
+    (A, B, C, D),
+    (A, B, C, D, E),
+    (A, B, C, D, E, F),
+    (A, B, C, D, E, F, G),
+    (A, B, C, D, E, F, G, H),
+);
 
 // SAFETY: A Gc reaches exactly its cell.
 unsafe impl<T> Trace for Gc<T> {
@@ -175,6 +183,16 @@ unsafe impl<T: Trace> Trace for Option<T> {
     fn trace(&self, visitor: &mut Visitor) {
         if let Some(value) = self {
             value.trace(visitor);
+        }
+    }
+}
+
+// SAFETY: Forwards to the contained value or error.
+unsafe impl<T: Trace, E: Trace> Trace for Result<T, E> {
+    fn trace(&self, visitor: &mut Visitor) {
+        match self {
+            Ok(value) => value.trace(visitor),
+            Err(error) => error.trace(visitor),
         }
     }
 }

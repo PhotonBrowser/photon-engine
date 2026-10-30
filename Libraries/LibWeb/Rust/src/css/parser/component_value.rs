@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::fmt::Write;
+
 use crate::css::css_tokenizer::{
     ParserSource, ParserString, ParserToken, ParserTokenKind, SmallParserTokenList, SourcePosition, TextDetacher,
 };
@@ -173,8 +175,12 @@ impl ComponentValue {
     }
 
     pub(crate) fn ident(&self) -> Option<&[u16]> {
+        self.ident_string().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn ident_string(&self) -> Option<&ParserString> {
         match &self.kind {
-            ComponentKind::Token(ParserTokenKind::Ident(value)) => Some(value.as_ref()),
+            ComponentKind::Token(ParserTokenKind::Ident(value)) => Some(value),
             _ => None,
         }
     }
@@ -336,13 +342,10 @@ fn serialize_token(sink: &mut TextSink, kind: &ParserTokenKind) {
         }
         ParserTokenKind::BadUrl => sink.push_ascii("url()"),
         ParserTokenKind::Delim(value) => sink.push_code_point(*value),
-        ParserTokenKind::Number { value, .. } => sink.push_ascii(&value.to_string()),
-        ParserTokenKind::Percentage { value, .. } => {
-            sink.push_ascii(&value.to_string());
-            sink.push_ascii("%");
-        }
+        ParserTokenKind::Number { value, .. } => write!(sink, "{value}").unwrap(),
+        ParserTokenKind::Percentage { value, .. } => write!(sink, "{value}%").unwrap(),
         ParserTokenKind::Dimension { value, unit, .. } => {
-            sink.push_ascii(&value.to_string());
+            write!(sink, "{value}").unwrap();
             unit.iter().for_each(|&code_unit| sink.push_code_unit(code_unit));
         }
         ParserTokenKind::Whitespace => sink.push_ascii(" "),

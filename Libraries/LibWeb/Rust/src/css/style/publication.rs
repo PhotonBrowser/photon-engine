@@ -2880,14 +2880,15 @@ impl RetainedState {
         let mut summary = cascade::StateSummary::default();
         // NB: A winner whose written value `node` does not find, such as an element declaration hidden for a demand,
         //     says nothing of other nodes, so the summary is only kept when every value was found.
-        let mut every_value_found = true;
         for winner in self.winner_groups.winners_in_state(state) {
             let inherited = crate::css::property_metadata::property_is_inherited(winner.property);
             let Some(winner) = self.winner_groups.resolved_winner(winner) else {
+                summary.has_unknown_values = true;
                 continue;
             };
             let longhand = winner.property >= crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID;
             if inherited && !longhand {
+                summary.has_unknown_values = true;
                 continue;
             }
             let group_mask = || match crate::css::computed_values::StyleGroupMasks::get().dependencies(winner.property)
@@ -2904,6 +2905,7 @@ impl RetainedState {
                     declarations.winner_value(winner.property, winner.important, winner.key.value)
                 }),
                 WinnerSource::ExactCascade => {
+                    summary.has_unknown_values = true;
                     if !inherited {
                         summary.explicitly_inherited_groups = u32::MAX;
                     }
@@ -2911,7 +2913,7 @@ impl RetainedState {
                 }
             };
             let Some(value) = value else {
-                every_value_found = false;
+                summary.has_unknown_values = true;
                 if !inherited {
                     summary.explicitly_inherited_groups |= group_mask();
                 }
@@ -2932,7 +2934,7 @@ impl RetainedState {
                 summary.has_substitutions = true;
             }
         }
-        if every_value_found {
+        if !summary.has_unknown_values {
             self.winner_groups.note_state_summary(state, summary);
         }
         summary
@@ -3175,6 +3177,104 @@ impl RetainedState {
     /// from it reads the node's custom-property environment.
     pub(super) fn state_has_substitutions(&self, node: StyleNodeID, state: CascadeStateID) -> bool {
         self.state_summary(node, state).has_substitutions
+    }
+
+    /// Whether publishing sampled custom properties requires another style computation.
+    /// The sample has already resolved the target's custom declarations that read animated values.
+    pub(crate) fn animated_custom_properties_trigger_restyle(
+        &self,
+        node: StyleNodeID,
+        pseudo: Option<u8>,
+        has_non_custom_property_animation: bool,
+        uncached_interval_values_may_need_substitution: bool,
+        host_custom_property_registration_generation: u64,
+    ) -> bool {
+        // Animations of non-custom properties may read the sampled custom properties or change the font context
+        // their registered readers compute against.
+        if has_non_custom_property_animation {
+            return true;
+        }
+
+        let has_unresolved_keyframe_easing = self
+            .element_animation_effects(node, pseudo.map_or(0, |kind| kind + 1))
+            .iter()
+            .any(|effect| {
+                effect.keyframes.iter().any(|keyframe| {
+                    keyframe
+                        .easing_value
+                        .as_ref()
+                        .is_some_and(|value| matches!(value.data(), StyleValueData::Unresolved { .. }))
+                })
+            });
+
+        // Unresolved keyframe easing may read the sampled custom properties.
+        if has_unresolved_keyframe_easing {
+            return true;
+        }
+
+        // Retained discrete intervals keep their substituted values. Fresh intervals may need
+        // another sample against the custom properties this sample publishes.
+        if uncached_interval_values_may_need_substitution {
+            return true;
+        }
+
+        // Animation sampling precedes the transaction that consumes pending registration changes.
+        // In that case, the sample used the engine's outdated registrations and underlying values.
+        if host_custom_property_registration_generation != self.custom_property_registration_generation() {
+            return true;
+        }
+
+        let target = computed::ComputedStyleTarget::new(node, pseudo.unwrap_or(u8::MAX));
+
+        // Without an assigned style record, we cannot establish that sampling covers all consumers.
+        let Some(record) = self.computed_group_sets.assigned_final_style_record(target) else {
+            return true;
+        };
+
+        // The record must still be available so we can inspect the target's current style.
+        let Some(view) = self.computed_group_sets.style_record_view(record.raw()) else {
+            return true;
+        };
+
+        if pseudo.is_none() && self.has_pseudo_styles_to_recompute(node, &view) {
+            return true;
+        }
+
+        self.ordinary_properties_may_need_substitution(node, pseudo)
+    }
+
+    /// Whether pseudo styles need updating when the element's custom properties change.
+    fn has_pseudo_styles_to_recompute(&self, node: StyleNodeID, view: &computed::StyleRecordView<'_>) -> bool {
+        // Existing pseudo-element styles may inherit the sampled values and need to be recomputed.
+        if self.computed_group_sets.assigned_pseudo_kinds(node).next().is_some() {
+            return true;
+        }
+
+        // Ignore rules for pseudo-elements that generate no box.
+        let pseudo_kinds = view.pseudo_element_styles & !self.inert_pseudo_kinds(node);
+        let marker_is_live = view.longhand_table.is_none_or(|table| table.display_is_list_item());
+        self.filter_non_generating_pseudo_kinds(node, pseudo_kinds, marker_is_live) != 0
+    }
+
+    /// Whether ordinary properties may need to compute against changed custom properties.
+    /// Missing winners or values prevent ruling out substitution.
+    fn ordinary_properties_may_need_substitution(&self, node: StyleNodeID, pseudo: Option<u8>) -> bool {
+        let key = match pseudo {
+            Some(kind) => WinnerGroupKey::current_pseudo(
+                node,
+                tree::PseudoElementTarget::new(tree::PseudoElementKind(u16::from(kind))),
+                self.program.version(),
+            ),
+            None => WinnerGroupKey::current(node, self.program.version()),
+        };
+
+        let Lookup::Known((_, state)) = self.current_winner_groups().token_for(key) else {
+            return true;
+        };
+
+        let summary = self.state_summary(node, state);
+
+        summary.has_unknown_values || summary.has_substitutions
     }
 
     pub(super) fn state_custom_property_reads(
@@ -4063,7 +4163,10 @@ impl RetainedState {
     }
 
     pub(crate) fn begin_style_record_view_epoch(&mut self) {
-        self.computed_group_sets.begin_style_record_view_epoch();
+        self.style_record_view_epoch_depth = self
+            .style_record_view_epoch_depth
+            .checked_add(1)
+            .expect("style-record view epoch depth overflow");
     }
 
     /// Publishes how many identities each catalog has minted. These count the sharing partition
@@ -4279,7 +4382,12 @@ impl StyleEngine {
 
     /// Reclaims the unreachable computed records, if they are due and nothing views them, and answers whether it did.
     pub(super) fn reclaim_unreachable_computed_records(&mut self) -> bool {
-        let Some(retention) = self.retained.computed_group_sets.reclaim_unreachable_if_needed() else {
+        let records_are_viewed = self.retained.style_record_view_epoch_depth != 0;
+        let Some(retention) = self
+            .retained
+            .computed_group_sets
+            .reclaim_unreachable_if_needed(records_are_viewed)
+        else {
             return false;
         };
         self.retained
@@ -5324,25 +5432,17 @@ mod tests {
 
         let inherited_name = ak::Utf16FlyString::from_utf16(&"--inherited".encode_utf16().collect::<Vec<_>>());
         let own_name = ak::Utf16FlyString::from_utf16(&"--own".encode_utf16().collect::<Vec<_>>());
-        let make_store = |parent: Option<Arc<CustomPropertyStore>>, name: &ak::Utf16FlyString, text: &str, value| {
+        let make_store = |parent: Option<Arc<CustomPropertyStore>>, name: &ak::Utf16FlyString, value| {
             let value = RetainedStyleValueData::from_owned(StyleValueData::Number { value });
             // SAFETY: The parent is null or retained by this test, and both the name and value
             //         remain live while cascaded_child retains them.
             unsafe {
-                CustomPropertyStore::cascaded_child(
-                    parent,
-                    vec![(
-                        name.raw_identity(),
-                        text.encode_utf16().collect::<Vec<_>>().into(),
-                        false,
-                        value.pointer().cast(),
-                    )],
-                )
+                CustomPropertyStore::cascaded_child(parent, vec![(name.raw_identity(), false, value.pointer().cast())])
             }
         };
-        let old_parent = make_store(None, &inherited_name, "--inherited", 1.0);
-        let new_parent = make_store(None, &inherited_name, "--inherited", 2.0);
-        let own = make_store(Some(old_parent.clone()), &own_name, "--own", 42.0);
+        let old_parent = make_store(None, &inherited_name, 1.0);
+        let new_parent = make_store(None, &inherited_name, 2.0);
+        let own = make_store(Some(old_parent.clone()), &own_name, 42.0);
         let mut engine = StyleEngine::new();
         let mut raw_nodes = [0; 3];
         engine.allocate_style_nodes(&mut raw_nodes);
@@ -5511,6 +5611,13 @@ mod tests {
             source: WinnerSource::Element(kind),
         };
         let state = engine.winner_groups.intern_sorted(&[winner], None);
+        // Missing declaration inputs must not cache an answer that hides a later complete summary.
+        assert!(engine.state_summary(second, state).has_unknown_values);
+        assert!(engine.winner_groups.state_summary(state).is_none());
+        let summary = engine.state_summary(first, state);
+        assert!(!summary.has_unknown_values);
+        assert!(!summary.has_substitutions);
+        assert_eq!(engine.winner_groups.state_summary(state), Some(summary));
         let cascade_state = (0, state);
         for order in [[first, second], [second, first]] {
             let mut scratch = EngineComputabilityScratch::default();
@@ -5884,7 +5991,11 @@ mod tests {
 
 impl StyleEngine {
     pub(crate) fn end_style_record_view_epoch(&mut self) {
-        self.retained.computed_group_sets.end_style_record_view_epoch();
+        assert!(
+            self.retained.style_record_view_epoch_depth > 0,
+            "style-record view epoch underflow"
+        );
+        self.retained.style_record_view_epoch_depth -= 1;
         self.reclaim_unreachable_computed_records();
     }
 }

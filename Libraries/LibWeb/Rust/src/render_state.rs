@@ -89,9 +89,12 @@ impl RenderState {
         if let Some(streamed) = self.streamed_marks.take() {
             marks.fold(streamed);
         }
-        *self.arena.arena().layout_tree_update_marks().borrow_mut() = marks;
+        *self.arena.arena_mut().layout_tree_update_marks_mut() = marks;
         let answer = job(self);
-        (answer, Some(self.arena.arena().layout_tree_update_marks().take()))
+        (
+            answer,
+            Some(std::mem::take(self.arena.arena_mut().layout_tree_update_marks_mut())),
+        )
     }
 
     /// Applies `changes`, writes the host streamed to the state beside its task, into marks of their own, which the
@@ -99,9 +102,9 @@ impl RenderState {
     /// its writes wait in its queue.
     fn apply_streamed(&mut self, changes: Vec<ArenaChange>) {
         let streamed = self.streamed_marks.take().unwrap_or_default();
-        *self.arena.arena().layout_tree_update_marks().borrow_mut() = streamed;
+        *self.arena.arena_mut().layout_tree_update_marks_mut() = streamed;
         self.apply(changes);
-        self.streamed_marks = Some(self.arena.arena().layout_tree_update_marks().take());
+        self.streamed_marks = Some(std::mem::take(self.arena.arena_mut().layout_tree_update_marks_mut()));
     }
 
     /// A fork of the state, as it is now: a copy of it that the render clock may write and present from while the host
@@ -210,6 +213,14 @@ impl RenderState {
         (unsafe { self.engine.get_mut() }, self.arena.arena())
     }
 
+    /// The style engine to read, beside the layout arena to write.
+    pub(crate) fn engine_ref_and_arena_mut(
+        &mut self,
+    ) -> (&crate::css::style::StyleEngine, &mut crate::layout::LayoutNodeArena) {
+        // SAFETY: As for a change. The arena only links the engine, and its caller changes the engine through neither.
+        (unsafe { self.engine.get() }, self.arena.arena_mut())
+    }
+
     /// The layout arena.
     pub(crate) fn arena_mut(&mut self) -> &mut crate::layout::LayoutNodeArena {
         self.arena.arena_mut()
@@ -237,7 +248,7 @@ impl RenderState {
         };
         // What applying the rows owes the host, the host's install of the rows makes good again.
         let work = OwedHostWork::default();
-        let Ok(applied) = self.arena.arena().apply_flight_style_rows(HostCalls(&work), rows) else {
+        let Ok(applied) = self.arena.arena_mut().apply_flight_style_rows(HostCalls(&work), rows) else {
             return (Vec::new(), None);
         };
         (applied, self.run_round(round, work))
@@ -894,6 +905,14 @@ const _: () = {
     assert_send::<ArenaChange>();
 };
 
+// A shared borrow of the layout arena changes nothing in it: every field is plain, written only through `&mut`, and the
+// style engine it links is reached through a shared borrow only as the engine's retained state. So the layout passes of a
+// stage may share the arena across threads, which the compiler checks here.
+const _: () = {
+    const fn assert_sync<T: Sync + ?Sized>() {}
+    assert_sync::<crate::layout::LayoutNodeArena>();
+};
+
 // Only a forced read waits for a frame in flight.
 impl crate::stage_thread::Flown for Landing {
     type JoinRight = ForcedRead;
@@ -1095,7 +1114,7 @@ mod tests {
             let viewport = arena.allocate_for_test().slot;
             arena.write_shape(viewport).set_kind(NodeKind::Viewport);
             arena.populate_paintable_row(viewport);
-            arena.scrollable_overflow.viewport.set(Some(viewport));
+            arena.scrollable_overflow.viewport = Some(viewport);
             // The viewport had scrollable overflow before it was laid out again, and a read measures it first since.
             arena
                 .committed_side_data_mut(viewport)
@@ -1113,7 +1132,7 @@ mod tests {
         document_host_note_paint_preparation_is_current(host);
         measure();
         assert!(!document_host_paint_preparation_is_current(host));
-        assert!(host.with_arena_for_test(|arena| arena.scrollable_overflow.scrollability_changed.get()));
+        assert!(host.with_arena_for_test(|arena| arena.scrollable_overflow.scrollability_changed));
 
         // A read that measures nothing leaves the preparation as it is.
         document_host_note_paint_preparation_is_current(host);
@@ -1174,7 +1193,7 @@ mod tests {
         host.fresh_rows(ScriptForcedRead::for_test());
 
         host.with_arena_untold_for_test(|arena| {
-            let shape = arena.write_shape(row);
+            let mut shape = arena.write_shape(row);
             shape.set_style(StylePayloadsRef::new(NonNull::dangling().as_ptr()));
             shape.mark();
         });

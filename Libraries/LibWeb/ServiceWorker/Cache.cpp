@@ -9,6 +9,7 @@
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/AbortSignal.h>
+#include <LibWeb/Fetch/Fetching/ClientContextSnapshots.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
@@ -29,7 +30,7 @@ namespace Web::ServiceWorker {
 GC_DEFINE_ALLOCATOR(Cache);
 GC_DEFINE_ALLOCATOR(CacheBatchOperation);
 
-static void resolve_cache_response_list(JS::Realm& realm, WebIDL::Promise& promise, GC::Ref<GC::HeapVector<GC::Ref<Fetch::Infrastructure::Response>>> responses)
+static void resolve_cache_response_list(JS::Realm& realm, WebIDL::Promise& promise, GC::Ref<GC::HeapVector<GC::Ref<Fetch::Infrastructure::ResponseView>>> responses)
 {
     auto response_list = GC::Heap::the().allocate<GC::HeapVector<JS::Value>>();
 
@@ -39,11 +40,11 @@ static void resolve_cache_response_list(JS::Realm& realm, WebIDL::Promise& promi
     WebIDL::resolve_promise(promise, JS::Array::create_from(realm, response_list->elements()));
 }
 
-static void resolve_cache_request_list(JS::Realm& realm, WebIDL::Promise& promise, GC::Ref<GC::HeapVector<GC::Ref<Fetch::Infrastructure::Request>>> requests)
+static void resolve_cache_request_list(JS::Realm& realm, WebIDL::Promise& promise, Vector<NonnullRefPtr<Fetch::Infrastructure::Request>> const& requests)
 {
     auto request_list = GC::Heap::the().allocate<GC::HeapVector<JS::Value>>();
 
-    for (auto request : requests->elements())
+    for (auto const& request : requests)
         request_list->elements().append(Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, Fetch::Request::create(request, Fetch::Headers::Guard::Immutable, DOM::AbortSignal::create())));
 
     WebIDL::resolve_promise(promise, JS::Array::create_from(realm, request_list->elements()));
@@ -107,7 +108,7 @@ void Cache::match(JS::Realm& realm, Fetch::RequestInfo request, CacheQueryOption
 void Cache::match_all(JS::Realm& realm, Optional<Fetch::RequestInfo> request, CacheQueryOptions options, GC::Ref<WebIDL::Promise> promise)
 {
     // 1. Let r be null.
-    GC::Ptr<Fetch::Infrastructure::Request> inner_request;
+    RefPtr<Fetch::Infrastructure::Request> inner_request;
     bool completed_synchronously = false;
 
     // 2. If the optional argument request is not omitted, then:
@@ -155,7 +156,7 @@ void Cache::match_all(JS::Realm& realm, Optional<Fetch::RequestInfo> request, Ca
     // 5. Run these substeps in parallel:
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this, &realm, inner_request, promise, request = move(request), options]() {
         // 1. Let responses be an empty list.
-        auto responses = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<Fetch::Infrastructure::Response>>>();
+        auto responses = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<Fetch::Infrastructure::ResponseView>>>();
 
         // 2. If the optional argument request is omitted, then:
         if (!request.has_value()) {
@@ -230,7 +231,7 @@ void Cache::add_all(JS::Realm& realm, ReadonlySpan<Fetch::RequestInfo> requests,
     auto response_promises = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<WebIDL::Promise>>>();
 
     // 2. Let requestList be an empty list.
-    auto request_list = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<Fetch::Infrastructure::Request>>>();
+    Vector<NonnullRefPtr<Fetch::Infrastructure::Request>> request_list;
 
     // 3. For each request whose type is Request in requests:
     for (auto const& request_info : requests) {
@@ -274,11 +275,12 @@ void Cache::add_all(JS::Realm& realm, ReadonlySpan<Fetch::RequestInfo> requests,
         }
 
         // 3. If r’s client’s global object is a ServiceWorkerGlobalScope object, set request’s service-workers mode to "none".
-        if (Bindings::service_worker_global_scope_from_global_object(inner_request->client()->global_object()))
+        auto client = Fetch::Fetching::resolve_client(inner_request);
+        if (Bindings::service_worker_global_scope_from_global_object(client->global_object()))
             inner_request->set_service_workers_mode(Fetch::Infrastructure::Request::ServiceWorkersMode::None);
 
         // 4. Add r to requestList.
-        request_list->elements().append(inner_request);
+        request_list.append(inner_request);
 
         // 5. Let responsePromise be a new promise.
         auto response_promise = WebIDL::create_promise(realm);
@@ -289,7 +291,7 @@ void Cache::add_all(JS::Realm& realm, ReadonlySpan<Fetch::RequestInfo> requests,
             Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
 
             // * To processResponse for response, run these substeps:
-            fetch_algorithms_input.process_response = [&realm, fetch_controllers, response_promise](GC::Ref<Fetch::Infrastructure::Response> response) {
+            fetch_algorithms_input.process_response = [&realm, fetch_controllers, response_promise](GC::Ref<Fetch::Infrastructure::ResponseView> response) {
                 HTML::TemporaryExecutionContext context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
                 bool did_reject_promise = false;
 
@@ -358,7 +360,7 @@ void Cache::add_all(JS::Realm& realm, ReadonlySpan<Fetch::RequestInfo> requests,
 
     // 7. Return the result of reacting to p with a fulfillment handler that, when called with argument responses, performs the following substeps:
     WebIDL::react_to_promise(wait_for_responses_promise,
-        GC::create_function(GC::Heap::the(), [this, &realm, request_list, promise](JS::Value result) -> WebIDL::ExceptionOr<JS::Value> {
+        GC::create_function(GC::Heap::the(), [this, &realm, request_list = move(request_list), promise](JS::Value result) -> WebIDL::ExceptionOr<JS::Value> {
             HTML::TemporaryExecutionContext context { realm };
             auto& responses = result.as<JS::Array>();
 
@@ -369,14 +371,14 @@ void Cache::add_all(JS::Realm& realm, ReadonlySpan<Fetch::RequestInfo> requests,
             // 3. For each response in responses:
             for (size_t index = 0; index < responses.indexed_array_like_size(); ++index) {
                 auto response_value = TRY(responses.get(index));
-                auto& response = as<Fetch::Infrastructure::Response>(response_value.as_cell());
+                auto& response = as<Fetch::Infrastructure::ResponseView>(response_value.as_cell());
 
                 // 1. Let operation be a cache batch operation.
                 auto operation = GC::Heap::the().allocate<CacheBatchOperation>(
                     // 2. Set operation’s type to "put".
                     CacheBatchOperation::Type::Put,
                     // 3. Set operation’s request to requestList[index].
-                    request_list->elements()[index],
+                    request_list[index],
                     // 4. Set operation’s response to response.
                     response);
 
@@ -424,7 +426,7 @@ void Cache::add_all(JS::Realm& realm, ReadonlySpan<Fetch::RequestInfo> requests,
 void Cache::put(JS::Realm& realm, Fetch::RequestInfo request, GC::Ref<Fetch::Response> response, GC::Ref<WebIDL::Promise> promise)
 {
     // 1. Let innerRequest be null.
-    GC::Ptr<Fetch::Infrastructure::Request> inner_request;
+    RefPtr<Fetch::Infrastructure::Request> inner_request;
 
     auto request_result = request.visit(
         // 2. If request is a Request object, then set innerRequest to request’s request.
@@ -570,7 +572,7 @@ void Cache::put(JS::Realm& realm, Fetch::RequestInfo request, GC::Ref<Fetch::Res
 void Cache::delete_(JS::Realm& realm, Fetch::RequestInfo request, CacheQueryOptions options, GC::Ref<WebIDL::Promise> promise)
 {
     // 1. Let r be null.
-    GC::Ptr<Fetch::Infrastructure::Request> inner_request;
+    RefPtr<Fetch::Infrastructure::Request> inner_request;
     bool completed_synchronously = false;
 
     auto result = request.visit(
@@ -660,7 +662,7 @@ void Cache::delete_(JS::Realm& realm, Fetch::RequestInfo request, CacheQueryOpti
 void Cache::keys(JS::Realm& realm, Optional<Fetch::RequestInfo> request, CacheQueryOptions options, GC::Ref<WebIDL::Promise> promise)
 {
     // 1. Let r be null.
-    GC::Ptr<Fetch::Infrastructure::Request> inner_request;
+    RefPtr<Fetch::Infrastructure::Request> inner_request;
     bool completed_synchronously = false;
 
     // 2. If the optional argument request is not omitted, then:
@@ -708,25 +710,26 @@ void Cache::keys(JS::Realm& realm, Optional<Fetch::RequestInfo> request, CacheQu
     // 5. Run these substeps in parallel:
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this, &realm, inner_request, promise, request = move(request), options]() {
         // 1. Let requests be an empty list.
-        auto requests = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<Fetch::Infrastructure::Request>>>();
+        Vector<NonnullRefPtr<Fetch::Infrastructure::Request>> requests;
 
         // 2. If the optional argument request is omitted, then:
         if (!request.has_value()) {
             // 1. For each requestResponse of the relevant request response list:
             for (auto& request_response : m_request_response_list->elements()) {
                 // 1. Add requestResponse’s request to requests.
-                requests->elements().append(request_response->request);
+                requests.append(request_response->request);
             }
         }
         // 3. Else:
         else {
             // 1. Let requestResponses be the result of running Query Cache with r and options.
-            auto request_responses = query_cache(realm, *inner_request, options);
+            // NB: Only the requests are used, so we copy them below. Copying the responses would tee their bodies.
+            auto request_responses = query_cache(realm, *inner_request, options, {}, CloneCache::No);
 
             // 2. For each requestResponse of requestResponses:
             for (auto request_response : request_responses->elements()) {
                 // 1. Add requestResponse’s request to requests.
-                requests->elements().append(request_response->request);
+                requests.append(request_response->request->clone());
             }
         }
 
@@ -736,7 +739,7 @@ void Cache::keys(JS::Realm& realm, Optional<Fetch::RequestInfo> request, CacheQu
             HTML::Task::Source::DOMManipulation,
             HTML::relevant_settings_object(promise->promise()).responsible_event_loop(),
             {},
-            GC::create_function(GC::Heap::the(), [&realm, promise, requests]() {
+            GC::create_function(GC::Heap::the(), [&realm, promise, requests = move(requests)]() {
                 HTML::TemporaryExecutionContext context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
                 resolve_cache_request_list(realm, promise, requests);
@@ -746,9 +749,9 @@ void Cache::keys(JS::Realm& realm, Optional<Fetch::RequestInfo> request, CacheQu
 
 // https://w3c.github.io/ServiceWorker/#request-matches-cached-item-algorithm
 static bool request_matches_cached_item(
-    GC::Ref<Fetch::Infrastructure::Request> request_query,
-    GC::Ref<Fetch::Infrastructure::Request> request,
-    GC::Ptr<Fetch::Infrastructure::Response> response,
+    NonnullRefPtr<Fetch::Infrastructure::Request> request_query,
+    NonnullRefPtr<Fetch::Infrastructure::Request> request,
+    GC::Ptr<Fetch::Infrastructure::ResponseView> response,
     CacheQueryOptions options)
 {
     // 1. If options["ignoreMethod"] is false and request’s method is not `GET`, return false.
@@ -797,7 +800,7 @@ static bool request_matches_cached_item(
 }
 
 // https://w3c.github.io/ServiceWorker/#query-cache-algorithm
-GC::Ref<RequestResponseList> Cache::query_cache(JS::Realm& realm, GC::Ref<Fetch::Infrastructure::Request> request_query, CacheQueryOptions options, GC::Ptr<RequestResponseList> target_storage, CloneCache clone_cache)
+GC::Ref<RequestResponseList> Cache::query_cache(JS::Realm& realm, NonnullRefPtr<Fetch::Infrastructure::Request> request_query, CacheQueryOptions options, GC::Ptr<RequestResponseList> target_storage, CloneCache clone_cache)
 {
     // 1. Let resultList be an empty list.
     auto result_list = GC::Heap::the().allocate<RequestResponseList>();
@@ -825,7 +828,7 @@ GC::Ref<RequestResponseList> Cache::query_cache(JS::Realm& realm, GC::Ref<Fetch:
             }
 
             // 1. Let requestCopy be a copy of cachedRequest.
-            auto request_copy = cached_request->clone(realm, Fetch::Infrastructure::Request::BodyCloning::Tee);
+            auto request_copy = cached_request->clone();
 
             // 2. Let responseCopy be a copy of cachedResponse.
             auto response_copy = cached_response->clone(realm);
@@ -846,15 +849,10 @@ WebIDL::ExceptionOr<bool> Cache::batch_cache_operations(JS::Realm& realm, GC::Re
     auto cache = m_request_response_list;
 
     // 2. Let backupCache be a new request response list that is a copy of cache.
+    // NB: This copies the list, not its items. The operations below only add and remove items, so restoring the list
+    //     undoes them, and cloning the responses would tee the body of every cached response on every operation.
     auto backup_cache = GC::Heap::the().allocate<RequestResponseList>();
-
-    for (auto request_response : cache->elements()) {
-        auto backup_request = request_response->request->clone(realm, Fetch::Infrastructure::Request::BodyCloning::Tee);
-        auto backup_response = request_response->response->clone(realm);
-
-        auto backup_request_response = GC::Heap::the().allocate<RequestResponse>(backup_request, backup_response);
-        backup_cache->elements().append(backup_request_response);
-    }
+    backup_cache->elements().extend(cache->elements());
 
     // 3. Let addedItems be an empty list.
     auto added_items = GC::Heap::the().allocate<RequestResponseList>();
@@ -947,7 +945,9 @@ WebIDL::ExceptionOr<bool> Cache::batch_cache_operations(JS::Realm& realm, GC::Re
         // 1. Remove all the items from the relevant request response list.
         // 2. For each requestResponse of backupCache:
         //     1. Append requestResponse to the relevant request response list.
-        m_request_response_list = backup_cache;
+        // NB: The list is shared with every other Cache object for this cache, so restore it in place.
+        cache->elements().clear();
+        cache->elements().extend(backup_cache->elements());
 
         // 3. Throw the exception.
         return result.release_error();
@@ -962,7 +962,6 @@ WebIDL::ExceptionOr<bool> Cache::batch_cache_operations(JS::Realm& realm, GC::Re
 void CacheBatchOperation::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(request);
     visitor.visit(response);
 }
 

@@ -5,6 +5,7 @@
  */
 
 #include <AK/ByteString.h>
+#include <AK/ScopeGuard.h>
 #include <LibCore/Environment.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
@@ -16,9 +17,11 @@
 #    include <stddef.h>
 #    include <sys/prctl.h>
 #    include <sys/resource.h>
+#    include <sys/stat.h>
 #    include <sys/syscall.h>
-#    include <sys/wait.h>
 #endif
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static ByteString run_and_read_output(Core::ProcessSpawnOptions options)
@@ -110,6 +113,30 @@ TEST_CASE(duplicated_descriptor_is_close_on_exec)
 }
 
 #if defined(AK_OS_LINUX)
+#    if defined(__GLIBC__)
+TEST_CASE(spawned_shell_script_without_shebang_accepts_many_arguments)
+{
+    char path[] = "/tmp/test-libcore-process-XXXXXX";
+    auto fd = MUST(Core::System::mkstemp(path));
+    ScopeGuard remove_script = [&] { MUST(Core::System::unlink(StringView { path, sizeof(path) - 1 })); };
+    // No shebang: execvpe() must build the shell's argv on the child stack.
+    MUST(Core::System::write(fd, "printf '%s\\n' \"$#\"\n"sv.bytes()));
+    VERIFY(fchmod(fd, 0700) == 0);
+    MUST(Core::System::close(fd));
+
+    Vector<ByteString> arguments;
+    for (size_t i = 0; i < 40'000; ++i)
+        arguments.append(""sv);
+    auto output = run_and_read_output({
+        .executable = path,
+        .search_for_executable_in_path = true,
+        .arguments = arguments,
+        .environment = Vector<ByteString> {},
+    });
+    EXPECT_EQ(output, "40000\n"sv);
+}
+#    endif
+
 TEST_CASE(spawned_process_found_in_path_gets_the_given_environment)
 {
     auto output = run_and_read_output({
@@ -215,6 +242,30 @@ TEST_CASE(spawned_process_gets_only_the_given_descriptors_without_close_range)
 
     int status = 0;
     VERIFY(waitpid(child, &status, 0) == child);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+#endif
+
+#if defined(AK_OS_MACOS) || defined(AK_OS_LINUX)
+TEST_CASE(spawned_process_in_a_new_process_group_is_not_stopped_by_sigttou)
+{
+    Vector<ByteString> arguments { "-c"sv, "kill -TTOU $$"sv };
+    auto process = MUST(Core::Process::spawn({
+        .executable = "/bin/sh"sv,
+        .new_process_group = true,
+        .arguments = arguments,
+    }));
+
+    int status = 0;
+    EXPECT_EQ(waitpid(process.pid(), &status, WUNTRACED), process.pid());
+    if (WIFSTOPPED(status)) {
+        (void)kill(process.pid(), SIGKILL);
+        (void)waitpid(process.pid(), &status, 0);
+        FAIL("The child was stopped by SIGTTOU");
+        return;
+    }
     EXPECT(WIFEXITED(status));
     if (WIFEXITED(status))
         EXPECT_EQ(WEXITSTATUS(status), 0);

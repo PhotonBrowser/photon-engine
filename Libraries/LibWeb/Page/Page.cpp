@@ -426,12 +426,9 @@ DevicePixelRect Page::rounded_device_rect(CSSPixelRect rect) const
     };
 }
 
-ChromeMetrics Page::chrome_metrics(DOM::Document const& document) const
+ChromeMetrics Page::chrome_metrics() const
 {
-    // Only the top-level viewport is the one the UI shows with rounded corners.
-    auto navigable = document.navigable();
-    auto is_top_level = navigable && navigable->is_top_level_traversable();
-    return ChromeMetrics { m_client->zoom_level(), is_top_level ? m_client->viewport_corner_radius() : 0 };
+    return ChromeMetrics { m_client->zoom_level() };
 }
 
 EventResult Page::handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target)
@@ -528,21 +525,25 @@ bool Page::select_word_for_dictionary_lookup(DevicePixelPoint position)
 
 UniqueNodeID Page::node_id_at_position(DevicePixelPoint position)
 {
-    auto node = local_traversable()->event_handler().target_node_for_mouse_position(device_to_css_point(position));
+    // DevTools selects only elements, and its DOM tree leaves out whitespace-only text, so a hit on text resolves to
+    // the element around it here.
+    GC::Ptr<DOM::Node> node = local_traversable()->event_handler().target_node_for_mouse_position(device_to_css_point(position));
+    while (node && !is<DOM::Element>(*node))
+        node = node->parent_or_shadow_host();
     if (!node)
         return 0;
 
     return node->unique_id();
 }
 
-EventResult Page::handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target)
+EventResult Page::handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target, Optional<Web::WheelGestureMark> wheel_gesture_mark)
 {
-    return root.event_handler().handle_mousewheel(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, remote_target);
+    return root.event_handler().handle_mousewheel(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, remote_target, wheel_gesture_mark);
 }
 
 EventResult Page::handle_mousewheel(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation)
 {
-    return handle_mousewheel(local_traversable(), position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, nullptr);
+    return handle_mousewheel(local_traversable(), position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, nullptr, {});
 }
 
 EventResult Page::handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files)
@@ -555,14 +556,21 @@ EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPo
     return handle_drag_and_drop_event(local_traversable(), type, position, screen_position, button, buttons, modifiers, move(files));
 }
 
-EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint position, unsigned modifiers, double scale)
+EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, PinchEvent const& event, Optional<RemoteInputEventTarget>* remote_target)
 {
-    return root.event_handler().handle_pinch_event(device_to_css_point(position), modifiers, scale);
+    if (event.async_zoom_performed_default_action && root.is_top_level_traversable())
+        root.adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
+    return root.event_handler().handle_pinch_event(device_to_css_point(event.position), event, remote_target);
 }
 
 EventResult Page::handle_pinch_event(DevicePixelPoint position, unsigned modifiers, double scale)
 {
-    return handle_pinch_event(local_traversable(), position, modifiers, scale);
+    PinchEvent event {
+        .position = position,
+        .modifiers = static_cast<UIEvents::KeyModifier>(modifiers),
+        .scale_delta = scale,
+    };
+    return handle_pinch_event(local_traversable(), event, nullptr);
 }
 
 EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved)
@@ -1512,38 +1520,33 @@ void Page::unregister_emulated_position_data_observer(u64 observer_id)
     m_emulated_position_data_observers.remove(observer_id);
 }
 
-void Page::request_permission(Utf16String const& name, URL::Origin const& requesting_origin, URL::Origin const& top_level_origin, HTML::EnvironmentId const& document_id, PermissionPromptCallback callback)
+void Page::request_permission(HTML::CrossProcessId requesting_document_id, Utf16String const& name, PermissionPromptCallback callback)
 {
     auto request_id = m_next_permission_request_id++;
     m_pending_permission_requests.set(request_id, callback);
-    m_permission_request_documents.set(request_id, document_id);
-    client().page_did_request_permission(request_id, name, requesting_origin, top_level_origin, document_id);
+    client().page_did_request_permission(request_id, requesting_document_id, name);
 }
 
-void Page::permission_request_completed(u64 request_id, HTML::EnvironmentId const& document_id, bool granted)
+void Page::permission_request_completed(u64 request_id, Web::Permissions::EffectiveState state)
 {
-    auto expected_document = m_permission_request_documents.get(request_id);
-    if (!expected_document.has_value() || expected_document.value() != document_id)
-        return;
-    m_permission_request_documents.remove(request_id);
     if (auto callback = m_pending_permission_requests.take(request_id); callback.has_value())
-        callback.value()->function()(granted);
+        callback.value()->function()(state);
 }
 
-u64 Page::request_geolocation_position(GeolocationPositionCallback callback, GeolocationRequestType type)
+u64 Page::request_geolocation_position(HTML::CrossProcessId requesting_document_id, GeolocationPositionCallback callback, GeolocationRequestType type)
 {
     // This is the browser-process bridge for the Geolocation spec's "try to acquire position data from the underlying system" step.
     auto request_id = m_next_geolocation_request_id++;
-    m_pending_geolocation_requests.set(request_id, { callback, type });
+    m_pending_geolocation_requests.set(request_id, { callback, type, requesting_document_id });
 
     if (type == GeolocationRequestType::Watch) {
-        client().page_did_start_geolocation_position_watch(request_id);
+        client().page_did_start_geolocation_position_watch(request_id, requesting_document_id);
         return request_id;
     }
 
     if (!m_active_geolocation_request_id.has_value()) {
         m_active_geolocation_request_id = request_id;
-        client().page_did_request_geolocation_position(request_id);
+        client().page_did_request_geolocation_position(request_id, requesting_document_id);
     }
 
     return request_id;
@@ -1565,10 +1568,15 @@ void Page::cancel_geolocation_position_request(u64 request_id)
 
     client().page_did_cancel_geolocation_position_request(request_id);
     m_active_geolocation_request_id = {};
+    start_next_geolocation_position_request();
+}
+
+void Page::start_next_geolocation_position_request()
+{
     for (auto const& entry : m_pending_geolocation_requests) {
         if (entry.value.type == GeolocationRequestType::OneShot) {
             m_active_geolocation_request_id = entry.key;
-            client().page_did_request_geolocation_position(entry.key);
+            client().page_did_request_geolocation_position(entry.key, entry.value.requesting_document_id);
             return;
         }
     }
@@ -1594,10 +1602,18 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
 
     m_active_geolocation_request_id = {};
 
+    // A position, or a failure to get one, is the same answer for every document on the page, so the queued requests
+    // complete with it too. A denial is the answer for the requesting document alone, so the others stay queued, and
+    // the next of them is sent.
+    auto denied = result.has<Geolocation::GeolocationPositionError::ErrorCode>()
+        && result.get<Geolocation::GeolocationPositionError::ErrorCode>() == Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied;
+
     GC::RootVector<GeolocationPositionCallback> callbacks;
     Vector<u64> completed_request_ids;
     for (auto const& entry : m_pending_geolocation_requests) {
         if (entry.value.type != GeolocationRequestType::OneShot)
+            continue;
+        if (denied && entry.value.requesting_document_id != request->requesting_document_id)
             continue;
         callbacks.append(entry.value.callback);
         completed_request_ids.append(entry.key);
@@ -1605,6 +1621,9 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
 
     for (auto completed_request_id : completed_request_ids)
         m_pending_geolocation_requests.remove(completed_request_id);
+
+    if (denied)
+        start_next_geolocation_position_request();
 
     for (auto const& callback : callbacks)
         callback->function()(result);
@@ -1845,18 +1864,6 @@ void Page::set_picture_in_picture_window_controls_in_use(bool in_use)
     document->for_each_in_inclusive_subtree_of_type<HTML::HTMLMediaElement>([&](auto& media_element) {
         media_element.set_picture_in_picture_window_controls_in_use(in_use);
         return TraversalDecision::Continue;
-    });
-}
-
-void Page::set_page_mute_state(HTML::MuteState mute_state)
-{
-    if (m_mute_state == mute_state)
-        return;
-
-    m_mute_state = mute_state;
-
-    for_each_media_element([&](auto& media_element) {
-        media_element.page_mute_state_changed({});
     });
 }
 
@@ -2435,6 +2442,21 @@ void PageClient::navigation_params_creation_finished(HTML::LocalNavigable&, HTML
 }
 
 void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId, HTML::HistoryNavigationPopulation)
+{
+    VERIFY_NOT_REACHED();
+}
+
+NonnullRefPtr<Media::AudioOutputFactory> PageClient::create_audio_output_factory()
+{
+    VERIFY_NOT_REACHED();
+}
+
+NonnullOwnPtr<MediaClient::RemotePlaybackManager> PageClient::create_media_playback_manager()
+{
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::rebind_media_playback_manager(MediaClient::RemotePlaybackManager&)
 {
     VERIFY_NOT_REACHED();
 }

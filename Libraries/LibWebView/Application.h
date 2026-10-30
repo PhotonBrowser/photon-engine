@@ -21,6 +21,7 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/Forward.h>
 #include <LibCore/GeolocationProvider.h>
+#include <LibCore/Timer.h>
 #include <LibDatabase/Forward.h>
 #include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/Forward.h>
@@ -76,6 +77,7 @@ struct PinchEvent;
 namespace WebView {
 
 struct ApplicationSettingsObserver;
+struct ApplicationPermissionManagerObserver;
 struct ApplicationBookmarkStoreObserver;
 
 class WEBVIEW_API Application : public DevTools::DevToolsDelegate {
@@ -114,6 +116,9 @@ public:
 
     virtual Optional<String> system_font_family() const { return {}; }
     virtual Optional<String> ui_font_family() const { return {}; }
+    // The browser's own pages, such as about:settings, are part of its interface, so they follow the interface theme
+    // rather than the website color scheme.
+    virtual Web::CSS::PreferredColorScheme interface_color_scheme() const;
 
     static RequestServerManager& request_server_manager() { return *the().m_request_server_manager; }
     // The UI process's own client of the session's RequestServer with no site.
@@ -123,7 +128,6 @@ public:
 
     virtual bool supports_system_menu_bar() const { return false; }
     virtual bool supports_vertical_tabs() const { return false; }
-    virtual bool supports_content_blocking_controls() const { return false; }
     virtual bool supports_private_browsing_windows() const { return false; }
     virtual bool supports_client_side_window_decorations() const { return false; }
     virtual bool supports_picture_in_picture() const;
@@ -146,6 +150,11 @@ public:
     void platform_scrollbar_track_press_behavior_changed();
     // The languages the user prefers, as the platform lists them (BCP 47 tags, most preferred first).
     virtual Vector<String> platform_preferred_languages() const { return {}; }
+    // The GPU the platform presents on, which the compositor paints on too, so that it can share its frames without a copy.
+    virtual Optional<Gfx::GpuDeviceIdentity> platform_presentation_gpu_device() const { return {}; }
+    // The DRM format modifiers the platform can present frames in that are shared from that GPU, or empty if it does
+    // not say.
+    virtual Vector<u64> platform_presentation_drm_format_modifiers() const { return {}; }
 
     virtual OwnPtr<PictureInPictureWindow> create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable&, Gfx::IntSize video_size);
 
@@ -163,6 +172,12 @@ public:
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
 
     void background_networking_settings_changed(Badge<ApplicationSettingsObserver>);
+
+    // True unless the user has turned location off, or there's no way to find it.
+    bool sites_can_ask_for_location() const;
+    Core::GeolocationAuthorization geolocation_authorization();
+    void location_policy_changed(Badge<ApplicationSettingsObserver>);
+    void permissions_changed(Badge<ApplicationPermissionManagerObserver>, PermissionManager const&);
 
     bool content_blocking_enabled() const;
     bool has_content_blocking_rules() const;
@@ -277,8 +292,9 @@ public:
     void update_compositor_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays const&);
     void update_compositor_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void update_compositor_context_visibility(Web::CompositorContextId, Web::HTML::VisibilityState);
+    void update_compositor_context_presents_from_cpu_memory(Web::CompositorContextId, bool);
     bool handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&, bool allow_keyboard_scroll);
-    void handle_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
+    bool handle_and_dispatch_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
     bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
     void notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id, bool consumer_gpu_work_complete);
 
@@ -398,7 +414,9 @@ public:
     Action& toggle_menu_bar_action() { return *m_toggle_menu_bar_action; }
 
     Menu& bookmarks_menu() { return *m_bookmarks_menu; }
-    void toggle_bookmark_for_view(ViewImplementation&);
+    virtual void toggle_bookmark_for_view(ViewImplementation&);
+
+    Menu& show_bookmarks_bar_menu() { return *m_show_bookmarks_bar_menu; }
     Action& toggle_bookmark_bar_action() { return *m_toggle_bookmark_bar_action; }
 
     Menu& history_menu() { return *m_history_menu; }
@@ -446,8 +464,7 @@ protected:
     virtual Core::EventLoop& create_platform_event_loop();
 
     virtual bool should_coordinate_browser_process() const { return true; }
-    // An application whose state must not leak between runs — or into a developer's own browsing state.
-    virtual bool should_use_temporary_profile_by_default() const { return false; }
+    virtual bool should_use_os_geolocation() const { return true; }
     virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::IFrame; }
 
     virtual Optional<ByteString> ask_user_for_download_path([[maybe_unused]] ByteString const& file) const { return {}; }
@@ -468,7 +485,11 @@ protected:
     bool has_spare_web_content_process() const { return m_spare_web_content_process; }
 
 private:
+    ErrorOr<void> create_profile(Optional<StringView> profile_name, Optional<StringView> profile_path, bool force_new_process, bool temporary_profile);
+    void create_mach_port_server(ByteString const& profile_identity);
+    void update_website_color_scheme();
     ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(IsPrivate, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
+
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
     ErrorOr<void> launch_compositor_process();
@@ -495,6 +516,9 @@ private:
     void stop_current_content_blocker_list_update_and_continue();
     void finish_current_content_blocker_list_update();
     ErrorOr<NonnullRawPtr<Core::GeolocationProvider>> ensure_geolocation_provider();
+    void update_permission_defaults();
+    void update_os_location_authorization();
+    void schedule_permission_expiry();
 
     void initialize_actions();
     void update_vertical_tabs_action();
@@ -582,8 +606,9 @@ private:
     virtual void remove_debugger_breakpoint(DevTools::TabDescription const&, DebuggerBreakpointLocation, OnDebuggerBreakpointOperationComplete) const override;
     virtual void retrieve_debugger_environments(DevTools::TabDescription const&, u64 frame_id, OnDebuggerEnvironmentsReceived) const override;
     virtual void evaluate_javascript_in_debugger_frame(DevTools::TabDescription const&, u64 frame_id, String const&, OnDebuggerEvaluationComplete) const override;
-    virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, OnDebuggerObjectPropertiesReceived) const override;
+    virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, DebuggerObjectScope, OnDebuggerObjectPropertiesReceived) const override;
     virtual void retrieve_debugger_source_positions(DevTools::TabDescription const&, Web::HTML::ScriptRegistryIdentifier, OnDebuggerSourcePositionsReceived) const override;
+    virtual void complete_console_input(DevTools::TabDescription const&, String const&, OnConsoleInputCompleted) const override;
     virtual void resolve_dom_node_url(DevTools::TabDescription const&, Optional<Web::UniqueNodeID>, String const&, OnResolvedURLReceived) const override;
     virtual void evaluate_javascript(DevTools::TabDescription const&, String const&, OnScriptEvaluationComplete) const override;
     virtual void listen_for_console_messages(DevTools::TabDescription const&, OnConsoleMessage) const override;
@@ -592,6 +617,8 @@ private:
     virtual void stop_listening_for_network_events(DevTools::TabDescription const&) const override;
     virtual void listen_for_navigation_events(DevTools::TabDescription const&, OnNavigationStarted, OnNavigationFinished) const override;
     virtual void stop_listening_for_navigation_events(DevTools::TabDescription const&) const override;
+    virtual void listen_for_inspect_element_requests(DevTools::TabDescription const&, OnInspectElementRequest) const override;
+    virtual void stop_listening_for_inspect_element_requests(DevTools::TabDescription const&) const override;
     virtual void did_connect_devtools_client(DevTools::TabDescription const&) const override;
     virtual void did_disconnect_devtools_client(DevTools::TabDescription const&) const override;
     virtual void did_close_devtools_connection() override;
@@ -603,6 +630,8 @@ private:
     OwnPtr<BrowserProcess> m_browser_process;
     bool m_should_exit_after_profile_coordination { false };
     OwnPtr<ApplicationSettingsObserver> m_settings_observer;
+    OwnPtr<ApplicationPermissionManagerObserver> m_permission_manager_observer;
+    RefPtr<Core::Timer> m_permission_expiry_timer;
 
     OwnPtr<BookmarkStore> m_bookmark_store;
     OwnPtr<ApplicationBookmarkStoreObserver> m_bookmark_store_observer;
@@ -729,11 +758,11 @@ private:
 
     RefPtr<Menu> m_bookmarks_menu;
     RefPtr<Action> m_toggle_bookmark_action;
-    RefPtr<Action> m_toggle_bookmark_bar_action;
     RefPtr<Menu> m_show_bookmarks_bar_menu;
     RefPtr<Action> m_show_bookmarks_bar_always_action;
     RefPtr<Action> m_show_bookmarks_bar_never_action;
     RefPtr<Action> m_show_bookmarks_bar_on_hover_action;
+    RefPtr<Action> m_toggle_bookmark_bar_action;
     size_t m_bookmarks_menu_static_size { 0 };
 
     RefPtr<Menu> m_history_menu;

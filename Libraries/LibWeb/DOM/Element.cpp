@@ -45,6 +45,7 @@
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
 #include <LibWeb/CSS/Invalidation/PartInvalidator.h>
+#include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/SelectorMatching.h>
@@ -86,7 +87,7 @@
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/Geometry/DOMRectList.h>
@@ -640,7 +641,12 @@ void Element::follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML:
         target_attribute_value = get_an_elements_target();
 
     // 4. Let urlRecord be the result of encoding-parsing a URL given subject's href attribute value, relative to subject's node document.
-    auto url_record = document().encoding_parse_url(attribute(HTML::AttributeNames::href).value_or({}));
+    auto href = get_attribute_ns({}, HTML::AttributeNames::href);
+    // https://svgwg.org/svg2-draft/linking.html#XLinkRefAttrs
+    // NB: SVG links use xlink:href when the unnamespaced href attribute is absent.
+    if (!href.has_value() && is_svg_a_element())
+        href = get_attribute_ns(Namespace::XLink, HTML::AttributeNames::href);
+    auto url_record = document().encoding_parse_url(href.value_or({}));
 
     // 5. If urlRecord is failure, then return.
     if (!url_record.has_value())
@@ -774,16 +780,20 @@ void Element::download_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTM
     //         document's relevant settings object is used as the request client instead.
     auto request = Fetch::Infrastructure::Request::create();
     request->set_url(url);
-    request->set_client(&document().relevant_settings_object());
+    request->set_client(document().relevant_settings_object().address());
     request->set_initiator(Fetch::Infrastructure::Request::Initiator::Download);
     request->set_use_url_credentials(true);
     // NB: The synchronous flag is not set; the response is instead processed asynchronously on the main thread.
+
+    // AD-HOC: The request's referrer policy is subject's hyperlink referrer policy, as when following the hyperlink.
+    //         See https://github.com/whatwg/html/issues/5623
+    request->set_referrer_policy(hyperlink_referrer_policy());
 
     //    3. Let response be the result of fetching request.
     //    4. Handle as a download response with subject's node navigable and null.
     auto controller_holder = Fetch::Infrastructure::FetchControllerHolder::create();
     Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
-    fetch_algorithms_input.process_response = [navigable = GC::Ref { *navigable }, url, proposed_filename = move(proposed_filename), interface_origin = document().origin(), controller_holder](GC::Ref<Fetch::Infrastructure::Response> response) {
+    fetch_algorithms_input.process_response = [navigable = GC::Ref { *navigable }, url, proposed_filename = move(proposed_filename), interface_origin = document().origin(), controller_holder](GC::Ref<Fetch::Infrastructure::ResponseView> response) {
         if (response->is_network_error())
             return;
         navigable->handle_as_a_download(response->unsafe_response(), url, controller_holder->controller(), proposed_filename, interface_origin);
@@ -1290,7 +1300,7 @@ GC::Ptr<DOM::Element> Element::get_the_attribute_associated_element(Utf16FlyStri
     auto const& element = *this;
 
     // 2. Let contentAttributeValue be the result of running reflectedTarget's get the content attribute.
-    auto content_attribute_value = element.get_attribute(content_attribute);
+    auto content_attribute_value = element.get_attribute_ns({}, content_attribute);
 
     return DOM::get_the_attribute_associated_element(element, content_attribute_value, explicitly_set_attribute_element);
 }
@@ -1351,7 +1361,7 @@ Optional<GC::RootVector<GC::Ref<DOM::Element>>> Element::get_the_attribute_assoc
     auto const& element = *this;
 
     return DOM::get_the_attribute_associated_elements(
-        element, [&] { return element.get_attribute(content_attribute); }, explicitly_set_attribute_elements);
+        element, [&] { return element.get_attribute_ns({}, content_attribute); }, explicitly_set_attribute_elements);
 }
 
 CSS::ElementBoxKind Element::box_kind() const
@@ -3428,6 +3438,12 @@ void Element::children_changed(ChildrenChangedMetadata const& metadata)
         document().style_computer().style_engine().note_children_changed_beside_flown_transaction(style_node_id());
     if (child_style_uses_tree_counting_function())
         document().style_computer().style_engine().restyle_children_reading_sibling_position(*this);
+
+    // NB: Option labels include descendant text, so mutations below a wrapper must update their cached labels too.
+    for (auto* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
+        if (auto* option = as_if<HTML::HTMLOptionElement>(ancestor))
+            option->descendant_text_content_changed({});
+    }
 }
 
 void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
@@ -3478,6 +3494,17 @@ void Element::set_rendered_in_top_layer(bool rendered_in_top_layer)
         return;
     m_rendered_in_top_layer = rendered_in_top_layer;
     CSS::record_element_adjustment_facts(*this);
+    // NB: Changing the top layer boundary moves ancestor state even when focus and the pointer stay put.
+    CSS::Invalidation::invalidate_style_after_subtree_place_changed(*this, flat_tree_parent());
+    if (is_being_activated()) {
+        for (auto* node = flat_tree_parent(); node; node = node->flat_tree_parent()) {
+            if (auto* element = as_if<Element>(*node)) {
+                element->set_being_activated(!rendered_in_top_layer);
+                if (element->rendered_in_top_layer())
+                    break;
+            }
+        }
+    }
 }
 
 Layout::NodeWithStyle* Element::pseudo_element_layout_node(Layout::BegunRead const& read, CSS::PseudoElement pseudo_element) const
@@ -3641,9 +3668,14 @@ bool Element::matches_focus_within_pseudo_class() const
     if (!focused_area)
         return false;
 
+    // https://drafts.csswg.org/selectors-4/#useraction-pseudos
+    // Specifically, if these match on a given element, they also match on the element's flat tree ancestors, up to and
+    // including the first top layer element or the root element, whichever is encountered first.
     for (auto const* node = focused_area.ptr(); node; node = node->flat_tree_parent()) {
         if (node == this)
             return true;
+        if (auto const* element = as_if<Element>(*node); element && element->rendered_in_top_layer())
+            break;
     }
     return false;
 }
@@ -4969,13 +5001,27 @@ ENUMERATE_ARIA_ATTRIBUTES
 
 bool Element::is_hidden(Layout::BegunRead const& read) const
 {
-    if (layout_node(read) == nullptr)
+    // https://drafts.csswg.org/css-display-3/#valdef-display-contents
+    // The element itself does not generate any boxes, but its children and pseudo-elements still generate boxes and text sequences as normal.
+    if (!layout_node(read) && !has_display_contents())
         return true;
-    if (layout_node(read)->visibility() == CSS::Visibility::Hidden || layout_node(read)->visibility() == CSS::Visibility::Collapse || layout_node(read)->content_visibility() == CSS::ContentVisibility::Hidden)
+    auto const* inherited_box_values = style_group<CSS::ComputedValues::InheritedBoxValues>();
+    if (inherited_box_values
+        && (static_cast<CSS::Visibility>(inherited_box_values->visibility) != CSS::Visibility::Visible
+            || static_cast<CSS::ContentVisibility>(inherited_box_values->content_visibility) == CSS::ContentVisibility::Hidden))
         return true;
     for (ParentNode const* self_or_ancestor = this; self_or_ancestor; self_or_ancestor = self_or_ancestor->parent_or_shadow_host()) {
         if (self_or_ancestor->is_element()) {
-            auto aria_hidden = static_cast<DOM::Element const*>(self_or_ancestor)->aria_hidden();
+            auto const& element = static_cast<DOM::Element const&>(*self_or_ancestor);
+            // NB: A boxless display:contents element can also be inside an undisplayed subtree.
+            auto const* box_values = element.style_group<CSS::ComputedValues::BoxValues>();
+            if (box_values && CSS::display_from_ffi_display(box_values->display).is_none())
+                return true;
+            auto const* ancestor_inherited_box_values = element.style_group<CSS::ComputedValues::InheritedBoxValues>();
+            if (ancestor_inherited_box_values
+                && static_cast<CSS::ContentVisibility>(ancestor_inherited_box_values->content_visibility) == CSS::ContentVisibility::Hidden)
+                return true;
+            auto aria_hidden = element.aria_hidden();
             if (aria_hidden.has_value() && aria_hidden->utf16_view() == u"true"sv)
                 return true;
         }
@@ -5585,8 +5631,11 @@ void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
         CSS::record_waiting_children_may_be_revealed(*this);
     // The resources an SVG graphics element's `mask`, `clip-path`, `fill` and `stroke` name are published beside its
     // attributes for the layout tree build to resolve, so they follow every record the element takes.
-    if (is<SVG::SVGGraphicsElement>(*this) && !!style_record_identity)
+    if (is<SVG::SVGGraphicsElement>(*this) && !!style_record_identity) {
         Layout::publish_svg_style_references(*this);
+        if (held_before && Layout::svg_style_references_differ(held_before, m_installed_style))
+            set_needs_layout_tree_rebuild(read, SetNeedsLayoutTreeUpdateReason::SVGResourceReferenceChange, CSS::LayoutTreeRebuildRoot::Self);
+    }
     if (timeline_declarations_changed)
         document().did_change_timeline_declarations();
 }
@@ -6261,19 +6310,24 @@ void Element::set_last_relative_scroll_direction(u8 direction)
 // That is why the unchecked layout node accessor is the right one here.
 void Element::set_scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type, CSSPixelPoint offset)
 {
+    Web::AsyncScrollNodeStableID stable_node_id { .node_id = unique_id(), .kind = Web::AsyncScrollNodeKind::Element };
     if (pseudo_element_type.has_value()) {
         auto pseudo_element = get_synthetic_pseudo_element(*pseudo_element_type);
         if (!pseudo_element.has_value())
             return;
         pseudo_element->set_scroll_offset(offset);
-        return;
+        stable_node_id.kind = Web::AsyncScrollNodeKind::PseudoElement;
+        stable_node_id.pseudo_element_type = static_cast<u8>(to_underlying(pseudo_element_type.value()));
+    } else {
+        if (!offset.is_zero())
+            ensure_element_rare_data().scroll_offset = offset;
+        else if (auto* rare_data = element_rare_data())
+            rare_data->scroll_offset = {};
+        Layout::publish_element_scroll_offset(*this);
     }
 
-    if (!offset.is_zero())
-        ensure_element_rare_data().scroll_offset = offset;
-    else if (auto* rare_data = element_rare_data())
-        rare_data->scroll_offset = {};
-    Layout::publish_element_scroll_offset(*this);
+    if (auto navigable = document().navigable())
+        navigable->did_change_scroll_offset(stable_node_id);
 }
 
 Optional<Element::Dir> Element::dir() const
@@ -6557,6 +6611,12 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
             CSS::Invalidation::invalidate_style_after_language_change(*this);
         return;
     }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#render-blocking-mechanism
+    // Whenever a render-blocking element el becomes browsing-context disconnected, or el's blocking attribute's
+    // value is changed so that el is no longer potentially render-blocking, then unblock rendering on el.
+    if (local_name == HTML::AttributeNames::blocking && document().is_render_blocking_element(*this) && !is_potentially_render_blocking())
+        unblock_rendering();
 
     // https://dom.spec.whatwg.org/#ref-for-concept-element-attributes-change-ext①
     // 1. If localName is slot and namespace is null, then:
@@ -6997,7 +7057,12 @@ bool Element::meets_focusable_area_rendering_requirements() const
     if (!is_connected())
         return false;
 
-    return const_cast<Element&>(*this).document().update_style_for_element(AbstractElement { *this }, Document::StyleUpdateMode::StopAtDisplayNone);
+    if (!const_cast<Element&>(*this).document().update_style_for_element(AbstractElement { *this }, Document::StyleUpdateMode::StopAtDisplayNone))
+        return false;
+
+    // NB: Elements whose boxes are not visible cannot be focused.
+    auto const* values = style_group<CSS::ComputedValues::InheritedBoxValues>();
+    return values && values->visibility_value() == CSS::Visibility::Visible;
 }
 
 // https://drafts.csswg.org/css-view-transitions-1/#document-scoped-view-transition-name
@@ -7032,10 +7097,17 @@ Optional<Gfx::DecodedImageFrame> Element::capture_the_image()
 }
 
 // https://w3c.github.io/pointerevents/#dfn-active-pointer
-// A mouse connected to the device is always active, and it is the one pointer there is.
-static bool pointer_id_names_an_active_pointer(WebIDL::Long pointer_id)
+static bool pointer_id_names_an_active_pointer(Element const& element, WebIDL::Long pointer_id)
 {
-    return pointer_id == UIEvents::mouse_pointer_id;
+    if (pointer_id == UIEvents::mouse_pointer_id)
+        return true;
+    if (auto owner = element.document().navigable()) {
+        for (auto const& navigable : owner->page().hosted_navigables()) {
+            if (navigable->event_handler().is_active_pointer(pointer_id))
+                return true;
+        }
+    }
+    return false;
 }
 
 // https://w3c.github.io/pointerevents/#setting-pointer-capture
@@ -7043,7 +7115,7 @@ WebIDL::ExceptionOr<void> Element::set_pointer_capture(WebIDL::Long pointer_id)
 {
     // 1. If the pointerId provided as the method's argument does not match any of the active pointers, then throw a
     //    "NotFoundError" DOMException.
-    if (!pointer_id_names_an_active_pointer(pointer_id))
+    if (!pointer_id_names_an_active_pointer(*this, pointer_id))
         return WebIDL::NotFoundError::create("No active pointer has the given pointerId"_utf16);
 
     // 2. Let the pointer be the active pointer specified by the given pointerId.
@@ -7060,12 +7132,12 @@ WebIDL::ExceptionOr<void> Element::set_pointer_capture(WebIDL::Long pointer_id)
     if (!navigable)
         return {};
     auto& event_handler = navigable->event_handler();
-    if (!event_handler.is_mouse_pointer_in_active_buttons_state())
+    if (!event_handler.is_pointer_in_active_buttons_state(pointer_id))
         return {};
 
     // 6. For the specified pointerId, set the pending pointer capture target override to the Element on which this
     //    method was invoked.
-    event_handler.set_pending_pointer_capture_target_override({}, *this);
+    event_handler.set_pending_pointer_capture_target_override({}, pointer_id, *this);
     return {};
 }
 
@@ -7075,7 +7147,7 @@ WebIDL::ExceptionOr<void> Element::release_pointer_capture(WebIDL::Long pointer_
     // 1. If the pointerId provided as the method's argument does not match any of the active pointers and these steps
     //    are not being invoked as a result of the implicit release of pointer capture, then throw a "NotFoundError"
     //    DOMException.
-    if (!pointer_id_names_an_active_pointer(pointer_id))
+    if (!pointer_id_names_an_active_pointer(*this, pointer_id))
         return WebIDL::NotFoundError::create("No active pointer has the given pointerId"_utf16);
 
     // 2. If hasPointerCapture is false for the Element with the specified pointerId, then terminate these steps.
@@ -7083,7 +7155,7 @@ WebIDL::ExceptionOr<void> Element::release_pointer_capture(WebIDL::Long pointer_
         return {};
 
     // 3. For the specified pointerId, clear the pending pointer capture target override, if set.
-    document().navigable()->event_handler().clear_pending_pointer_capture_target_override({});
+    document().navigable()->event_handler().clear_pending_pointer_capture_target_override({}, pointer_id);
     return {};
 }
 
@@ -7093,12 +7165,10 @@ bool Element::has_pointer_capture(WebIDL::Long pointer_id) const
     // Indicates whether the element on which this method is invoked has pointer capture for the pointer identified by
     // the argument pointerId. In particular, returns true if the pending pointer capture target override for pointerId
     // is set to the element on which this method is invoked, and false otherwise.
-    if (!pointer_id_names_an_active_pointer(pointer_id))
-        return false;
     auto navigable = document().navigable();
     if (!navigable)
         return false;
-    return navigable->event_handler().pending_pointer_capture_target_override().ptr() == this;
+    return navigable->event_handler().pending_pointer_capture_target_override(pointer_id).ptr() == this;
 }
 
 GC::Ptr<NamedNodeMap> Element::attributes()
@@ -7188,7 +7258,9 @@ bool Element::should_indicate_focus() const
 
     // * If the element which supports keyboard input (such as an input element, or any other element that would
     //   triggers a virtual keyboard to be shown on focus if a physical keyboard were not present), indicate focus.
-    if (is<HTML::FormAssociatedTextControlElement>(this) || is_editable_or_editing_host())
+    if (is<HTML::HTMLTextAreaElement>(this) || is_editable_or_editing_host())
+        return true;
+    if (auto const* input = as_if<HTML::HTMLInputElement>(this); input && input->has_selectable_text())
         return true;
 
     // * If the user interacts with the page via keyboard or some other non-pointing device, indicate focus. (This means
@@ -7347,10 +7419,25 @@ void Element::unblock_rendering()
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#potentially-render-blocking
 bool Element::is_potentially_render_blocking()
 {
-    // An element is potentially render-blocking if
-    // FIXME: its blocking tokens set contains "render",
-    // or if it is implicitly potentially render-blocking, which will be defined at the individual elements.
-    return is_implicitly_potentially_render_blocking();
+    // An element is potentially render-blocking if its blocking tokens set contains "render", or if it is
+    // implicitly potentially render-blocking, which will be defined at the individual elements.
+    if (is_implicitly_potentially_render_blocking())
+        return true;
+    if (namespace_uri() != Namespace::HTML || !local_name().is_one_of(HTML::TagNames::link, HTML::TagNames::script, HTML::TagNames::style))
+        return false;
+    auto value = attribute(HTML::AttributeNames::blocking);
+    if (!value.has_value())
+        return false;
+    auto tokens = value->utf16_view();
+    size_t start = 0;
+    for (size_t i = 0; i <= tokens.length_in_code_units(); ++i) {
+        if (i != tokens.length_in_code_units() && !Infra::is_ascii_whitespace(tokens.code_unit_at(i)))
+            continue;
+        if (i > start && tokens.substring_view(start, i - start).equals_ignoring_ascii_case(u"render"sv))
+            return true;
+        start = i + 1;
+    }
+    return false;
 }
 
 }

@@ -24,7 +24,6 @@ GC::Ref<PreloadEntry> PreloadEntry::create()
 void PreloadEntry::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(response);
     visitor.visit(on_response_available);
     visitor.visit(controller);
 }
@@ -61,7 +60,7 @@ bool consume_a_preloaded_resource(
     Fetch::Infrastructure::Request::Mode mode,
     Fetch::Infrastructure::Request::CredentialsMode credentials_mode,
     Utf16View integrity_metadata,
-    GC::Ref<GC::Function<void(GC::Ref<Fetch::Infrastructure::Response>)>> on_response_available,
+    GC::Ref<GC::Function<void(NonnullRefPtr<Fetch::Infrastructure::Response>)>> on_response_available,
     Fetch::Engine::BodyIntent consumer_body_intent,
     bool& preload_reports_timing)
 {
@@ -127,12 +126,8 @@ bool consume_a_preloaded_resource(
         //         in-flight preload (XMLHttpRequestMainThread::FindPreload, FetchPreloader::AsyncConsume); Blink never
         //         reuses a resource for a sync request (Resource::CanReuse), and WebKit's sync load bypasses its cache
         //         and preloads (DocumentThreadableLoader::loadRequest).
-        if (consumer_body_intent == Fetch::Engine::BodyIntent::SyncAccumulate && entry->controller) {
-            if (auto fetch_params = entry->controller->fetch_params()) {
-                fetch_params->set_task_destination(ParallelQueue::create());
-                fetch_params->set_algorithms(fetch_params->algorithms()->with_body_intent(consumer_body_intent));
-            }
-        }
+        if (consumer_body_intent == Fetch::Engine::BodyIntent::SyncAccumulate && entry->controller)
+            entry->controller->retarget(ParallelQueue::create(), consumer_body_intent);
     }
     // 10. Otherwise, call onResponseAvailable with entry's response.
     else {

@@ -12,6 +12,7 @@
 #include <LibIPC/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
@@ -54,13 +55,16 @@ struct ReplicatedContainerState {
     PermissionsPolicy::PolicyDirective container_policy {};
 
     // https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy, of the container's node
-    // document's relevant settings object, which a browsing context created for the navigable in another process
-    // inherits.
+    // document's policy container, which a document created in the navigable inherits.
     UpgradeInsecureRequests::InsecureRequestsPolicy document_insecure_requests_policy { UpgradeInsecureRequests::InsecureRequestsPolicy::DoNotUpgrade };
 
     // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set, of the container's
-    // node document's relevant settings object.
+    // node document's policy container.
     UpgradeInsecureRequests::UpgradeInsecureNavigationsSet document_upgrade_insecure_navigations_set {};
+
+    // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
+    // The container's used color scheme, which decides whether the canvas of the navigable's document is opaque.
+    CSS::PreferredColorScheme used_color_scheme { CSS::PreferredColorScheme::Light };
 };
 
 // What the process hosting a navigable's active document reports of it to the UI process, which composes the
@@ -88,6 +92,7 @@ struct ReplicatedNavigableState {
     OpenerPolicy opener_policy;
     bool active_browsing_context_is_auxiliary { false };
     Optional<CrossProcessId> opener_navigable_id {};
+    Optional<CrossProcessId> one_permitted_sandboxed_navigator_navigable_id {};
 
     bool active_document_is_completely_loaded { false };
     bool is_closing { false };

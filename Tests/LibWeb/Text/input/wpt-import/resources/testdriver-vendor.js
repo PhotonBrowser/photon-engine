@@ -32,6 +32,16 @@ window.test_driver_internal.delete_all_cookies = function(context) {
 const pointerStates = new Map();
 
 window.test_driver_internal.action_sequence = async function(actions, context) {
+    if (actions.some(source => source.type === "pointer" && ["touch", "pen"].includes(source.parameters?.pointerType))) {
+        const converted = actions.map(source => ({ ...source, actions: source.actions.map(action => {
+            if (!(action.origin instanceof Element))
+                return action;
+            const center = elementCenter(action.origin);
+            return { ...action, origin: "viewport", x: Math.round(center.x + (action.x ?? 0)), y: Math.round(center.y + (action.y ?? 0)) };
+        }) }));
+        return window.internals.performActions(JSON.stringify({ actions: converted }));
+    }
+
     // Modifier key codes from WebDriver spec
     const SHIFT = "\uE008";
     const CTRL = "\uE009";
@@ -140,4 +150,33 @@ window.test_driver_internal.action_sequence = async function(actions, context) {
             await window.internals.wheel(x, y, action.deltaX, action.deltaY);
         }
     }
+};
+
+window.test_driver_internal.set_permission = function(permission_params, context) {
+    return window.internals.setPermission(permission_params.descriptor.name, permission_params.state);
+};
+
+// The WebDriver BiDi forms of the same, which the geolocation tests use.
+window.test_driver_internal.bidi.permissions.set_permission = function(params) {
+    return window.internals.setPermission(params.descriptor.name, params.state);
+};
+
+// An error override makes every request fail with POSITION_UNAVAILABLE, the one error WebDriver BiDi can emulate.
+// Clearing the override (coordinates: null) puts back the position the harness emulates for every test.
+window.test_driver_internal.bidi.emulation.set_geolocation_override = function(params) {
+    if (params.error) {
+        window.internals.setGeolocationEmulatedPositionUnavailable();
+        return Promise.resolve();
+    }
+    const coordinates = params.coordinates ?? { latitude: 37.7647658, longitude: -122.4345892, accuracy: 100 };
+    window.internals.setGeolocationEmulatedPosition(
+        coordinates.latitude,
+        coordinates.longitude,
+        coordinates.accuracy ?? 100,
+        coordinates.altitude ?? null,
+        coordinates.altitudeAccuracy ?? null,
+        coordinates.heading ?? null,
+        coordinates.speed ?? null
+    );
+    return Promise.resolve();
 };

@@ -23,6 +23,7 @@
 #include <AK/Types.h>
 #include <AK/Utf16String.h>
 #include <AK/Weakable.h>
+#include <LibAudio/Audibility.h>
 #include <LibCompositing/UIOverlays.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Forward.h>
@@ -44,11 +45,11 @@
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestPriority.h>
 #include <LibWebCommon/Forward.h>
 #include <LibWebCommon/HTML/ActivateTab.h>
-#include <LibWebCommon/HTML/AudioPlayState.h>
 #include <LibWebCommon/HTML/ColorPickerUpdateState.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/FileFilter.h>
 #include <LibWebCommon/HTML/HistoryOperation.h>
-#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
+#include <LibWebCommon/HTML/MuteState.h>
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
 #include <LibWebCommon/HTML/SelectItem.h>
@@ -59,6 +60,7 @@
 #include <LibWebCommon/Page/QueuedInputEvent.h>
 #include <LibWebCommon/Page/ScreenWakeLockState.h>
 #include <LibWebCommon/Page/ViewportIsFullscreen.h>
+#include <LibWebCommon/Permissions/Permissions.h>
 #include <LibWebCommon/WebDriver/Response.h>
 #include <LibWebCommon/WebDriver/SessionBrowsingContext.h>
 #include <LibWebCommon/WebView/DOMNodeProperties.h>
@@ -67,6 +69,7 @@
 #include <LibWebCommon/WebView/PageInfo.h>
 #include <LibWebCommon/WebView/StorageSetResult.h>
 #include <LibWebCommon/WebView/ZoomLevel.h>
+#include <LibWebView/AudibilityHold.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
@@ -74,6 +77,7 @@
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HistoryVisitTransition.h>
+#include <LibWebView/PermissionManager.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
@@ -92,6 +96,32 @@ struct GeolocationRequestKey {
     bool operator==(GeolocationRequestKey const&) const = default;
 };
 
+// What the UI shows the user when a site asks for a permission. The origin is the top-level one the decision is kept
+// for; a file: page has none worth showing, so the prompt names it as a file instead.
+struct PermissionPromptRequest {
+    Web::Permissions::PermissionName name;
+    URL::Origin top_level_origin;
+    URL::Origin requesting_origin;
+    Web::HTML::CrossProcessId requesting_document_id;
+    bool is_file { false };
+    bool show_os_hint { false };
+
+    bool is_same_request_as(PermissionPromptRequest const& other) const
+    {
+        return name == other.name && is_file == other.is_file && top_level_origin.is_same_origin(other.top_level_origin);
+    }
+};
+
+using PermissionPromptCallback = Function<void(Web::Permissions::PromptOutcome)>;
+
+// One permission as the site information panel shows it for the site a view shows.
+struct SitePermissionRow {
+    Web::Permissions::PermissionName name;
+    Optional<PermissionDecision> decision;
+    bool one_time_grant_is_live { false };
+    bool requested_by_page { false };
+};
+
 class WEBVIEW_API ViewImplementation
     : public SettingsObserver
     , public BookmarkStoreObserver
@@ -108,6 +138,28 @@ public:
 
     IsPrivate is_private() const { return m_is_private; }
     BrowsingSession& session() const { return *m_session; }
+
+    // Asks the user, unless an identical prompt is already up, in which case its answer goes to every request for it.
+    void request_permission_prompt(PermissionPromptRequest, PermissionPromptCallback);
+    void set_next_permission_prompt_outcome_for_testing(Web::Permissions::PermissionName, Web::Permissions::PromptOutcome, bool held);
+    // Answers the held prompt once this many requests wait on it, since the requests arrive over another connection.
+    void release_held_permission_prompt_for_testing(u32 waiters);
+    void reset_permission_prompts_for_testing();
+
+    // The origin the view's permissions are kept for: its top-level document's, which an inherited about:blank keeps
+    // while the URL's origin is opaque.
+    URL::Origin permission_origin() const;
+    // The site information panel's view of, and changes to, the permissions of the site this view shows.
+    Vector<SitePermissionRow> site_permission_rows() const;
+    // These act on the site given, which a panel showing it keeps even after the view moves on to another site.
+    void set_site_permission(URL::Origin const&, Web::Permissions::PermissionName, Optional<PermissionDecision>);
+    void reset_site_permissions(URL::Origin const&);
+    void did_request_permission(Badge<WebContentPage>, Web::Permissions::PermissionName);
+
+    bool location_in_use() const { return m_location_in_use; }
+
+    // Ends every location request and watch whose document the user has since taken the permission away from.
+    void revoke_geolocation_without_permission();
 
     u64 view_id() const { return m_view_id; }
     pid_t web_content_pid() const;
@@ -148,6 +200,10 @@ public:
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
     void set_system_visibility_state(Web::HTML::VisibilityState);
+    // Whether the view shows its frames from CPU memory for now, so that the Compositor shares them there rather than
+    // in GPU memory that the view would have to read back for every frame.
+    void set_presents_from_cpu_memory(bool);
+    bool presents_from_cpu_memory() const { return m_presents_from_cpu_memory; }
     void set_has_system_focus(bool);
 
     void load(URL::URL const&, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
@@ -169,8 +225,6 @@ public:
     void reload_for_webdriver_bidi(BypassCache, Utf16String navigation_id);
     void stop_loading();
     bool is_loading() const { return m_is_loading; }
-    // Whether the most recent load ran to completion, rather than being stopped or canceled.
-    bool last_load_finished() const { return m_last_load_finished; }
 
     bool crash_overlay_active() const { return m_crash_state.has_value(); }
     String crash_overlay_failed_url() const;
@@ -214,8 +268,6 @@ public:
     // Sends the display metadata to every page hosting documents of the tab.
     void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second);
     void set_frame_rate_capped(bool);
-    double viewport_corner_radius() const { return m_viewport_corner_radius; }
-    void set_viewport_corner_radius(double);
 
     struct ScreenRects {
         Vector<Web::DevicePixelRect> rects;
@@ -232,6 +284,7 @@ public:
     void did_finish_handling_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result);
     void did_detect_history_swipe_candidate(Badge<WebContentPage>, u64 gesture_id, bool back, float unconsumed_delta);
     void did_forward_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, WebContentPage& endpoint);
+    void did_forward_pinch_event(Badge<WebContentPage>, WebContentPage const& reporting_page, Web::PinchEvent const&, WebContentPage& endpoint);
     // Whether the page has yet to finish handling input that gives it user activation.
     bool is_delivering_user_activation_to(WebContentPage const&) const;
     // Consumes the activation of the earliest input giving the page activation that the page has yet to finish
@@ -264,6 +317,8 @@ public:
 
     void set_preferred_color_scheme(Web::CSS::PreferredColorScheme);
     void set_preferred_color_scheme_from_application(Web::CSS::PreferredColorScheme);
+    // Sends the interface theme to the pages showing the browser's own pages, which follow it.
+    void update_interface_color_scheme();
     void set_preferred_contrast(Web::CSS::PreferredContrast);
     void set_preferred_motion(Web::CSS::PreferredMotion);
     // A page created to host documents of the tab in another process takes the preferences the view's page has.
@@ -351,9 +406,10 @@ public:
     void did_complete_debugger_breakpoint_operation(u64 request_id, Optional<String> error);
     void retrieve_debugger_environments(u64 frame_id, DevTools::DevToolsDelegate::OnDebuggerEnvironmentsReceived);
     void evaluate_javascript_in_debugger_frame(u64 frame_id, String const&, DevTools::DevToolsDelegate::OnDebuggerEvaluationComplete);
-    void retrieve_debugger_object_properties(u64 object_id, DevTools::DevToolsDelegate::OnDebuggerObjectPropertiesReceived);
+    void retrieve_debugger_object_properties(u64 object_id, DebuggerObjectScope, DevTools::DevToolsDelegate::OnDebuggerObjectPropertiesReceived);
     void retrieve_debugger_source_positions(Web::HTML::ScriptRegistryIdentifier, DevTools::DevToolsDelegate::OnDebuggerSourcePositionsReceived);
     void resolve_dom_node_url(Optional<Web::UniqueNodeID> node_id, String const& url, DevTools::DevToolsDelegate::OnResolvedURLReceived);
+    void complete_js_console_input(String const& input, DevTools::DevToolsDelegate::OnConsoleInputCompleted);
     void clear_inspected_dom_node();
 
     void highlight_dom_node(Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element);
@@ -382,8 +438,8 @@ public:
     void list_style_sheets();
     void request_style_sheet_source(Web::CSS::StyleSheetIdentifier const&);
 
-    void did_block_resource(Badge<WebContentPage>);
-    void reset_blocked_request_count();
+    void did_block_resource(Badge<WebContentPage>, URL::URL const&, StringView kind);
+    void reset_blocked_resources();
     void notify_content_blocking_changed();
     ContentBlockingSnapshot content_blocking_snapshot() const;
 
@@ -426,11 +482,16 @@ public:
     Web::HTML::MuteState page_mute_state() const { return m_mute_state; }
     void toggle_page_mute_state();
 
-    void did_change_audio_play_state(Badge<WebContentPage>, Web::HTML::AudioPlayState);
-    Web::HTML::AudioPlayState audio_play_state() const { return m_audio_play_state; }
+    // The tab is audible while the AudioServer has recently heard any page of it, and for a while after a page leaves it
+    // while heard. A page lost along with its process doesn't leave.
+    void update_audibility(Badge<WebContentPage>) { update_audibility(); }
+    void did_release_page(Badge<CanonicalTraversable>, WebContentPage const& page) { page_left(page); }
+    void did_close_page(Badge<WebContentPage>, Web::PageId page_id) { m_audibility_hold.page_closed(page_id); }
+    Audio::Audibility audibility() const { return m_audibility; }
+    u64 audibility_change_count() const { return m_audibility_change_count; }
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
 
-    void did_reset_session_history_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
+    void did_reset_state_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
     bool capture_session_history_snapshot_for_testing(Badge<WebContentPage>);
     bool restore_captured_session_history_snapshot_for_testing(Badge<WebContentPage>);
     bool register_session_store_tab_for_testing(Badge<WebContentPage>);
@@ -443,10 +504,12 @@ public:
     void run_webdriver_content_command(u64 command_id, Web::WebDriver::SessionBrowsingContext, String const& name, JsonValue payload, Vector<String> arguments);
     // https://w3c.github.io/webdriver-bidi/#commands
     void run_webdriver_bidi_content_command(u64 command_id, Web::HTML::CrossProcessId navigable_id, String const& method, JsonValue params);
+    void run_webdriver_bidi_content_command(WebContentPage&, u64 command_id, Web::HTML::CrossProcessId navigable_id, String const& method, JsonValue params);
     void run_webdriver_commands_waiting_for_a_document(Badge<CanonicalTraversable>);
     void did_complete_webdriver_content_command(WebContentPage&, u64 command_id, Web::WebDriver::Response);
     void did_set_webdriver_current_browsing_context(Badge<WebContentPage>, u64 command_id, Web::HTML::CrossProcessId navigable_id);
     void enqueue_webdriver_mouse_event(Badge<WebContentPage>, Web::MouseEvent, Function<void()> on_handled);
+    void enqueue_pinch_event_for_testing(Badge<WebContentPage>, Web::PinchEvent);
     void did_lose_page(Badge<CanonicalTraversable>, WebContentPage&, WebContentProcessLost);
     void move_pending_webdriver_commands_to_new_host(Badge<CanonicalNavigable>, Web::HTML::CrossProcessId navigable_id, WebContentPage& old_host, WebContentPage& new_host);
     void set_webdriver_current_browsing_context_to_top_level();
@@ -469,6 +532,8 @@ public:
         Full,
     };
     NonnullRefPtr<Core::Promise<LexicalPath>> take_screenshot(ScreenshotType);
+    void take_and_save_screenshot(ScreenshotType);
+    void save_screenshot(Gfx::Bitmap const&);
     NonnullRefPtr<Core::Promise<LexicalPath>> take_dom_node_screenshot(Web::UniqueNodeID);
     virtual void did_receive_screenshot(Badge<WebContentPage>, Gfx::ShareableBitmap const&);
 
@@ -525,6 +590,7 @@ public:
     Function<void(URL::URL const&, URL::Origin const&, ExternalURLHandler const&, Function<void(bool)>)> on_request_external_url_confirmation;
     Function<void()> on_request_accept_dialog;
     Function<void()> on_request_website_issue_report;
+    Function<void()> on_request_screenshot;
     Function<void()> on_request_dismiss_dialog;
     Function<void(JsonObject)> on_received_dom_tree;
     Function<void(DOMNodeProperties)> on_received_dom_node_properties;
@@ -544,11 +610,13 @@ public:
     HashMap<u64, DevTools::DevToolsDelegate::OnSourcesReceived> on_received_devtools_sources;
     HashMap<Web::HTML::ScriptRegistryIdentifier, Function<void(Optional<Web::HTML::ScriptRegistryContent>)>> on_received_devtools_source;
     HashMap<u64, DevTools::DevToolsDelegate::OnResolvedURLReceived> on_resolved_dom_node_url;
+    HashMap<u64, DevTools::DevToolsDelegate::OnConsoleInputCompleted> on_completed_js_console_input;
     Function<void(Web::HTML::ScriptRegistryDescription)> on_devtools_source_available;
     DevTools::DevToolsDelegate::OnDebuggerPaused on_debugger_paused;
     DevTools::DevToolsDelegate::OnDebuggerResumed on_debugger_resumed;
-    Function<void(JsonValue)> on_received_js_console_result;
+    Function<void(DebuggerValue)> on_received_js_console_result;
     Function<void(ConsoleOutput)> on_console_message;
+    Function<void(Web::UniqueNodeID)> on_inspect_element_request;
     Function<void(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ByteBuffer, Optional<String>, String, bool, Web::Fetch::Infrastructure::RequestPriority)> on_network_request_started;
     Function<void(u64 request_id, u32 status_code, Optional<String> const&, Vector<HTTP::Header> const&, Requests::CacheState)> on_network_response_headers_received;
     Function<void(u64 request_id, ByteBuffer)> on_network_response_body_received;
@@ -562,12 +630,13 @@ public:
     Function<void()> on_fullscreen_window;
     Function<void()> on_exit_fullscreen_window;
     Function<void(Color current_color)> on_request_color_picker;
-    Function<void(WebContentPage& requesting_page, u64 request_id)> on_request_geolocation_position;
+    Function<void(WebContentPage& requesting_page, u64 request_id, Web::HTML::CrossProcessId document_id)> on_request_geolocation_position;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_cancel_geolocation_position_request;
-    Function<void(WebContentPage& requesting_page, u64 request_id)> on_start_geolocation_position_watch;
+    Function<void(WebContentPage& requesting_page, u64 request_id, Web::HTML::CrossProcessId document_id)> on_start_geolocation_position_watch;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_stop_geolocation_position_watch;
-    Function<void(u64 request_id, Utf16String const& name, URL::Origin const& requesting_origin, URL::Origin const& top_level_origin, Web::HTML::EnvironmentId const& document_id, Function<void(bool granted)> on_decided)> on_request_permission;
-    Function<void(u64 request_id, Web::HTML::EnvironmentId const& document_id)> on_cancel_permission_request;
+    Function<void(PermissionPromptRequest const&, PermissionPromptCallback)> on_request_permission;
+    Function<void(PermissionPromptRequest const&)> on_cancel_permission_prompt;
+    Function<void(bool)> on_location_in_use_change;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;
     Function<void(Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)> on_request_select_dropdown;
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
@@ -581,8 +650,8 @@ public:
     Function<void(size_t current_match_index, Optional<size_t> const& total_match_count)> on_find_in_page;
     Function<void(Gfx::Color)> on_theme_color_change;
     Function<void(Gfx::Color)> on_page_background_color_change;
-    Function<void(Web::HTML::AudioPlayState)> on_audio_play_state_changed;
     Function<void(bool)> on_page_unresponsive_changed;
+    Function<void(Audio::Audibility)> on_audibility_changed;
     Function<void(Web::ScreenWakeLockState)> on_screen_wake_lock_state_changed;
     enum class WebContentCrashReason {
         ProcessCrash,
@@ -647,7 +716,9 @@ protected:
 
     virtual bool defer_backing_store_release(i32) { return false; }
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
-    void release_backing_store(i32 bitmap_id, bool consumer_gpu_work_complete = false);
+    // Lets the Compositor paint into a backing store again. A view whose frames something else still reads may wait
+    // for that to finish first.
+    virtual void release_backing_store(i32 bitmap_id, bool consumer_gpu_work_complete = false);
     static Gfx::IntRect rect_fitting_frame(Gfx::IntSize frame_size, Gfx::IntSize target_size);
 
     static constexpr auto ZOOM_STEP = 0.1;
@@ -661,6 +732,10 @@ protected:
     void set_owner_view(ViewImplementation const& owner_view) { m_owner_view_id = owner_view.view_id(); }
 
     void did_update_url();
+    void settle_permission_prompt(PermissionPromptRequest const&, Web::Permissions::PromptOutcome);
+    void report_permission_presence();
+    void update_location_in_use();
+    void ignore_pending_permission_prompts();
     void set_title(Utf16String);
     void set_favicon(Optional<Gfx::Bitmap const&>);
     Optional<URL::URL const&> browser_ui_load_url() const;
@@ -689,7 +764,7 @@ protected:
     void dump_session_history(StringView reason, SessionHistoryDumpMode = SessionHistoryDumpMode::IfDebuggingEnabled) const;
     void recover_current_session_history_entry_with_history_operation();
     void reconstruct_current_session_history_entry_with_history_operation(StringView reason);
-    NonnullRefPtr<Core::Promise<Empty>> reset_session_history_for_testing();
+    NonnullRefPtr<Core::Promise<Empty>> reset_state_for_testing();
 
     virtual void update_zoom();
 
@@ -723,6 +798,7 @@ protected:
     void set_page_background_color_to_system_canvas(bool dark);
     void set_page_background_color(Gfx::Color);
     Gfx::Color preferred_canvas_background_color() const;
+    Web::CSS::PreferredColorScheme preferred_color_scheme_for_page(WebContentPage const&) const;
 
     void initialize_tab(Web::HTML::VisibilityState, Optional<CanonicalTraversable&> = {});
     void display_traversable(CanonicalTraversable&, Web::HTML::VisibilityState);
@@ -731,6 +807,8 @@ protected:
     void send_geolocation_emulated_position(WebContentPage&);
     WebContentPage& focused_navigable_host() const;
     void reset_page_media_state();
+    void update_audibility();
+    void page_left(WebContentPage const&);
 
     // A navigation to make again on reload: one the user stopped before its document was activated, or one a crash cut
     // short. It's made again from the source it was first made from, when it has one (a javascript: URL has none).
@@ -790,6 +868,7 @@ protected:
     SharedBitmap m_front_bitmap;
     Vector<SharedBitmap> m_other_bitmaps;
     bool m_has_usable_bitmap { false };
+    bool m_presents_from_cpu_memory { false };
 
     // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
     // asked for its tree too.
@@ -822,7 +901,6 @@ protected:
     Optional<u64> m_display_id;
     double m_maximum_frames_per_second { 60.0 };
     bool m_frame_rate_capped { false };
-    double m_viewport_corner_radius { 0 };
     bool m_scales_frames_to_fit { false };
 
     RefPtr<Menu> m_page_context_menu;
@@ -863,9 +941,13 @@ protected:
     HashMap<u64, NonnullRefPtr<Core::Promise<bool>>> m_pending_select_word_for_dictionary_lookup_requests;
     HashMap<u64, NonnullRefPtr<Core::Promise<ByteString>>> m_pending_cut_selected_text_requests;
 
-    RefPtr<Action> m_take_visible_screenshot_action;
-    RefPtr<Action> m_take_full_screenshot_action;
-    RefPtr<Action> m_report_website_issue_action;
+    RefPtr<Action> m_take_screenshot_action;
+
+    void prepare_inspect_element_action(Gfx::IntPoint content_position);
+    RefPtr<Action> m_inspect_element_action;
+    Optional<u64> m_inspect_element_hit_test_request_id;
+    Optional<Web::UniqueNodeID> m_inspect_element_node_id;
+    bool m_inspect_element_activated_before_hit_test { false };
 
     RefPtr<Action> m_open_in_new_tab_action;
     RefPtr<Action> m_open_in_new_window_action;
@@ -901,6 +983,9 @@ protected:
         // The page handling the event, which is not the view's own page when another process hosts the focused
         // navigable. A lost page never finishes the events it held.
         NonnullRefPtr<WebContentPage> endpoint;
+
+        // Set once a page forwarded the event to a child frame another process hosts.
+        bool forwarded_to_child_frame { false };
 
         // Unset while the event waits for the compositor to decide where an earlier key event goes.
         bool sent { false };
@@ -983,7 +1068,6 @@ protected:
     bool m_can_undo { false };
     bool m_can_redo { false };
     bool m_is_loading { false };
-    bool m_last_load_finished { false };
     // WebDriver's observation of the top-level navigation completion state. The navigation itself is the
     // canonical traversable's ongoing navigation record.
     struct WebDriverNavigationObservation {
@@ -1018,6 +1102,7 @@ protected:
         String name;
         Optional<Web::HTML::CrossProcessId> navigable_id;
         WebDriverProtocol protocol { WebDriverProtocol::Classic };
+        bool stays_on_page { false };
     };
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_commands;
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_crash_commands;
@@ -1052,8 +1137,10 @@ protected:
     // https://w3c.github.io/webdriver/#dfn-current-parent-browsing-context
     Optional<Web::HTML::CrossProcessId> m_webdriver_current_parent_navigable_id;
 
-    Web::HTML::AudioPlayState m_audio_play_state { Web::HTML::AudioPlayState::Paused };
-    size_t m_number_of_elements_playing_audio { 0 };
+    Audio::Audibility m_audibility { Audio::Audibility::Inaudible };
+    u64 m_audibility_change_count { 0 };
+    AudibilityHold m_audibility_hold;
+    RefPtr<Core::Timer> m_audibility_hold_timer;
     Web::ScreenWakeLockState m_screen_wake_lock_state { Web::ScreenWakeLockState::Released };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
@@ -1061,8 +1148,8 @@ protected:
     CanonicalTraversable* m_top_level_traversable { nullptr };
     Optional<SessionTabId> m_session_tab_id;
     Optional<SessionHistorySnapshot> m_captured_session_history_snapshot_for_testing;
-    RefPtr<Core::Promise<Empty>> m_pending_session_history_reset_for_testing;
-    RefPtr<Core::Promise<Empty>> m_pending_session_history_reset_queue_promise;
+    RefPtr<Core::Promise<Empty>> m_pending_test_state_reset;
+    RefPtr<Core::Promise<Empty>> m_pending_test_state_reset_queue_promise;
 
     struct WebDriverNavigationCompletionRequest {
         AK_ALLOC_WITH_KMALLOC;
@@ -1099,6 +1186,25 @@ protected:
 
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::RequestId> m_geolocation_position_request_ids;
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::WatchId> m_geolocation_watch_ids;
+    HashMap<GeolocationRequestKey, Web::HTML::CrossProcessId> m_geolocation_request_documents;
+    bool m_location_in_use { false };
+    Vector<Web::Permissions::PermissionName> m_permissions_requested_by_page;
+
+    struct PendingPermissionPrompt {
+        PermissionPromptRequest request;
+        Vector<PermissionPromptCallback> waiters;
+    };
+    Vector<PendingPermissionPrompt> m_pending_permission_prompts;
+
+    struct PermissionPromptOutcomeForTesting {
+        Web::Permissions::PromptOutcome outcome;
+        bool held { false };
+    };
+    HashMap<Web::Permissions::PermissionName, PermissionPromptOutcomeForTesting> m_next_permission_prompt_outcomes_for_testing;
+    Optional<PermissionPromptRequest> m_held_permission_prompt_for_testing;
+    Web::Permissions::PromptOutcome m_held_permission_prompt_outcome_for_testing { Web::Permissions::PromptOutcome::Cancelled };
+    Optional<u32> m_held_permission_prompt_release_waiters_for_testing;
+    void release_held_permission_prompt_if_ready_for_testing();
 
     Core::AnonymousBuffer m_document_cookie_version_buffer;
     HashMap<String, Core::SharedVersionIndex> m_document_cookie_version_indices;
@@ -1115,6 +1221,8 @@ protected:
     u64 m_next_debugger_object_properties_request_id { 1 };
     u64 m_next_debugger_source_positions_request_id { 1 };
     u64 m_next_resolve_dom_node_url_request_id { 1 };
+    void answer_pending_console_input_completions();
+    u64 m_next_js_console_completion_request_id { 1 };
 
     HashMap<u64, DevTools::DevToolsDelegate::OnDebuggerBreakpointOperationComplete> m_pending_debugger_breakpoint_requests;
     HashMap<u64, DevTools::DevToolsDelegate::OnDebuggerEnvironmentsReceived> m_pending_debugger_environments_requests;
@@ -1137,7 +1245,7 @@ protected:
     HashMap<u64, NavigationListener> m_navigation_listeners;
     u64 m_next_navigation_listener_id { 1 };
 
-    u64 m_blocked_request_count { 0 };
+    Vector<BlockedResource> m_blocked_resources;
 
     enum class NodePickerRequestType : u8 {
         Hovered,
@@ -1145,12 +1253,13 @@ protected:
         Previewed,
     };
     void request_node_picker_hit_test(NodePickerRequestType, Web::DevicePixelPoint);
+    void did_receive_node_hit_test(u64 request_id, Web::UniqueNodeID);
     void did_receive_node_picker_hit_test(u64 request_id, Web::UniqueNodeID);
     void did_receive_indexed_database_inspection(u64 request_id, JsonObject);
 
     bool m_node_picker_active { false };
     Optional<Web::UniqueNodeID> m_node_picker_hovered_node_id;
-    u64 m_next_node_picker_request_id { 1 };
+    u64 m_next_node_hit_test_request_id { 1 };
     HashMap<u64, NodePickerRequestType> m_pending_node_picker_requests;
     DevTools::DevToolsDelegate::OnNodePickerEvent m_on_node_picker_event;
 

@@ -80,10 +80,14 @@ pub struct AlignmentValues {
     pub align_content: u8,
     pub align_items: u8,
     pub align_self: u8,
+    pub align_items_is_last_baseline: bool,
+    pub align_self_is_last_baseline: bool,
     pub justify_content: u8,
     pub justify_items: u8,
     pub justify_self: u8,
-    /// The explicit overflow alignment of 'align-self' and 'justify-self': one of the OVERFLOW_ALIGNMENT_* values.
+    /// The explicit overflow alignment: one of the OVERFLOW_ALIGNMENT_* values.
+    pub align_items_overflow: u8,
+    pub justify_items_overflow: u8,
     pub align_self_overflow: u8,
     pub justify_self_overflow: u8,
     pub column_gap: ComputedGap,
@@ -193,6 +197,7 @@ pub struct BoxValues {
     pub overscroll_behavior_y: u8,
     pub box_sizing: u8,
     pub field_sizing: u8,
+    pub baseline_source: u8,
     pub resize: u8,
     pub text_overflow: u8,
     pub unicode_bidi: u8,

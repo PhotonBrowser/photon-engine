@@ -58,7 +58,7 @@ impl OwedHostWork {
     /// Resolves what the change owes the host against `arena`, the arena it changed, as it ends: which nodes gained
     /// or lost a box, and the style a row whose layout node hears of it has. The host pays it with nothing but its own
     /// tables. A row the change freed again, such as whitespace table fixup removed, is owed no style change.
-    pub(crate) fn resolve(self, arena: &LayoutNodeArena) -> HostWorkDue {
+    pub(crate) fn resolve(self, arena: &mut LayoutNodeArena) -> HostWorkDue {
         let box_presence = arena.take_queued_box_presence();
         let calls = self
             .owed
@@ -251,15 +251,15 @@ fn next_sibling_of(arena: &LayoutNodeArena, node: NodeSlotId) -> NodeSlotId {
 }
 
 impl LayoutNodeArena {
-    pub(crate) fn attach_child(&self, parent: NodeSlotId, child: UnplacedLayoutNode, before: NodeSlotId) {
+    pub(crate) fn attach_child(&mut self, parent: NodeSlotId, child: UnplacedLayoutNode, before: NodeSlotId) {
         self.insert_child(parent, child.into_slot(), before);
     }
 
-    pub(crate) fn detach_child(&self, parent: NodeSlotId, child: NodeSlotId) {
+    pub(crate) fn detach_child(&mut self, parent: NodeSlotId, child: NodeSlotId) {
         self.remove_child(parent, child);
     }
 
-    pub(crate) fn detach_from_parent(&self, node: NodeSlotId) -> bool {
+    pub(crate) fn detach_from_parent(&mut self, node: NodeSlotId) -> bool {
         let parent = parent_of(self, node);
         if parent.is_invalid() {
             return false;
@@ -268,7 +268,7 @@ impl LayoutNodeArena {
         true
     }
 
-    pub(crate) fn move_child(&self, child: NodeSlotId, new_parent: NodeSlotId, before: NodeSlotId) {
+    pub(crate) fn move_child(&mut self, child: NodeSlotId, new_parent: NodeSlotId, before: NodeSlotId) {
         let old_parent = parent_of(self, child);
         assert!(!old_parent.is_invalid(), "moved layout node has no parent");
         self.remove_child(old_parent, child);
@@ -276,7 +276,7 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn replace_child(
-        &self,
+        &mut self,
         parent: NodeSlotId,
         old_child: NodeSlotId,
         new_child: UnplacedLayoutNode,
@@ -330,7 +330,7 @@ mod tests {
     }
 
     fn fragment_cache_epoch(arena: &LayoutNodeArena, node: NodeSlotId) -> u32 {
-        arena.data(node).fragment_cache_epoch.get()
+        arena.data(node).fragment_cache_epoch
     }
 
     fn owned(slot: NodeSlotId) -> UnplacedLayoutNode {

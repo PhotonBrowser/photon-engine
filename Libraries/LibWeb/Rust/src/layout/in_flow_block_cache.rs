@@ -38,10 +38,7 @@ impl InFlowBlockKey {
         incoming_margins: block_formatting_context::BlockMarginState,
     ) -> Self {
         Self {
-            input: LayoutInput {
-                content_box_position_in_bfc_root: None,
-                ..input
-            },
+            input,
             containing_block_inline_size,
             containing_block_is_right_to_left,
             incoming_margins,
@@ -63,8 +60,10 @@ impl InFlowBlockKey {
 pub(super) struct InFlowBlockEntry {
     pub(super) key: InFlowBlockKey,
     pub(super) validity: fc_run_cache::FcRunCacheValidity,
-    /// The child's record as it was before its placement.
-    pub(super) cells: used_values::UsedValuesCellState,
+    /// The child's cells as its layout left them.
+    pub(super) cells: used_values::RootInputCells,
+    /// The baselines of the child's contents as its layout left them.
+    pub(super) baselines: formatting_context::DerivedBaselines,
     pub(super) offset_from_flow_position: FfiCssPixelPoint,
     pub(super) flow_position_advance: CssPixels,
     pub(super) outgoing_margins: block_formatting_context::BlockMarginState,
@@ -82,7 +81,7 @@ struct InFlowBlockSlot {
     committed: Option<std::sync::Arc<InFlowBlockEntry>>,
 }
 
-/// Per-document store of in-flow block layouts, surviving across layout passes on the node arena.
+/// Per-document store of in-flow block layouts, surviving across layout passes in the layout stage's scratch.
 #[derive(Clone, Default)]
 pub(crate) struct InFlowBlockCacheStore {
     entries: RefCell<Vec<InFlowBlockSlot>>,

@@ -139,11 +139,12 @@
 #include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
+#include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/BeforeUnloadEvent.h>
@@ -196,6 +197,7 @@
 #include <LibWeb/HTML/NavigationActivation.h>
 #include <LibWeb/HTML/NavigationHistoryEntry.h>
 #include <LibWeb/HTML/NavigationParams.h>
+#include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/PolicyContainers.h>
@@ -246,6 +248,7 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
+#include <LibWeb/SVG/SMILAnimation.h>
 #include <LibWeb/SVG/SMILTimeContainer.h>
 #include <LibWeb/SVG/SVGAnimateMotionElement.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
@@ -268,7 +271,7 @@
 #include <LibWeb/UIEvents/PointerEvent.h>
 #include <LibWeb/UIEvents/PointerTypes.h>
 #include <LibWeb/UIEvents/TextEvent.h>
-#include <LibWeb/UpgradeInsecureRequests/AbstractOperations.h>
+#include <LibWeb/UIEvents/TouchEvent.h>
 #include <LibWeb/ViewTransition/ViewTransition.h>
 #include <LibWeb/WebDriver/BiDi/BiDi.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -403,12 +406,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     }
     // 7. Otherwise:
     else {
-        // FIXME: 1. Let oacHeader be the result of getting a structured field value given `Origin-Agent-Cluster` and "item" from response's header list.
-
-        // FIXME: 2. Let requestsOAC be true if oacHeader is not null and oacHeader[0] is the boolean true; otherwise false.
-        [[maybe_unused]] auto requests_oac = false;
-
-        // FIXME: 3. If navigationParams's reserved environment is a non-secure context, then set requestsOAC to false.
+        // NB: The UI process performs steps 1 through 4 and passes the selected agent cluster's properties.
 
         // 4. Let agent be the result of obtaining a similar-origin window agent given navigationParams's origin, browsingContext's group, and requestsOAC.
         // NB: The UI process obtains the agent, and names its agent cluster.
@@ -456,11 +454,14 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
             agent_cluster_cross_origin_isolation_mode);
     }
 
+    // NB: The UI process selects the window's agent even when an initial about:blank Window is reused.
+    as<HTML::WindowEnvironmentSettingsObject>(HTML::relevant_settings_object(*window)).set_agent_cluster_is_origin_keyed(navigation_params.agent_cluster_is_origin_keyed || navigation_params.origin.is_opaque() || navigation_params.agent_cluster_cross_origin_isolation_mode != HTML::CrossOriginIsolationMode::None);
+
     // AD-HOC: The fetch controller is only available in the process that ran the navigation fetch. Navigation params
     //         rebuilt from a descriptor carry the fetch's timing info directly.
     RefPtr<Fetch::Infrastructure::FetchTimingInfo> navigation_fetch_timing_info = navigation_params.fetch_timing_info;
     if (navigation_params.fetch_controller)
-        navigation_fetch_timing_info = navigation_params.fetch_controller->timing_info();
+        navigation_fetch_timing_info = navigation_params.fetch_controller->full_timing_info();
 
     // 8. Let loadTimingInfo be a new document load timing info with its navigation start time set to navigationParams's response's timing info's start time.
     DOM::DocumentLoadTimingInfo load_timing_info;
@@ -542,8 +543,13 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     // 10. Set window's associated Document to document.
     window->set_associated_document(*document);
 
-    // NB: Upgrade Insecure Requests has a new Document inherit its browsing context's insecure requests policy.
-    UpgradeInsecureRequests::inherit_the_insecure_requests_policy_into_a_new_document(document->relevant_settings_object(), browsing_context);
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#nesting
+    // AD-HOC: A Document in a child navigable inherits the insecure requests policy of its container's node document
+    //         when it is created, as Chromium and WebKit do, instead of through its browsing context.
+    if (navigation_params.navigable->parent()) {
+        auto container_state = navigation_params.navigable->container_state();
+        document->policy_container()->inherit_insecure_requests_policy(container_state.document_insecure_requests_policy, container_state.document_upgrade_insecure_navigations_set);
+    }
 
     // 11. Set document's internal ancestor origin objects list to the result of running the internal ancestor origin
     //     objects list creation steps given document and navigationParams's iframe element referrer policy.
@@ -595,8 +601,8 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
                 || request.referrer().get<Fetch::Infrastructure::Request::Referrer>() != Fetch::Infrastructure::Request::Referrer::NoReferrer;
 
             // - navigation TAO check given navigationParams's response and navigationParams's origin returns success,
-            may_expose_redirect_count = (!request.client() || request_has_eligible_referrer)
-                && Fetch::Fetching::navigation_tao_check(*navigation_params.response, navigation_params.origin);
+            may_expose_redirect_count = (!request.client().has_value() || request_has_eligible_referrer)
+                && Fetch::Fetching::navigation_tao_check(navigation_params.response->record(), navigation_params.origin);
         }
 
         // then set redirectCount to navigationParams's request's redirect count.
@@ -634,10 +640,9 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
             navigation_params.response->status());
     }
 
-    // AD-HOC: Retain the navigation fetch controller so aborting the document can cancel the main resource after
-    //         response commitment. Navigation fetches are not included in the document's subresource fetch group.
-    if (navigation_params.fetch_controller)
-        document->m_ongoing_navigation_fetch_controller = navigation_params.fetch_controller;
+    // AD-HOC: Retain the navigation's fetch controller, or an adopted body's transport, so aborting the document
+    //         cancels its main resource, which is not in its fetch group.
+    document->m_ongoing_navigation_fetch = navigation_params.body_delivery();
 
     // 17. If navigationParams's response has a `Refresh` header, then:
     if (auto maybe_refresh = navigation_params.response->header_list()->get("Refresh"sv); maybe_refresh.has_value()) {
@@ -989,7 +994,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_pending_parsing_blocking_svg_script);
     visitor.visit(m_history);
     visitor.visit(m_html_parser_end_state);
-    visitor.visit(m_ongoing_navigation_fetch_controller);
+    visitor.visit(m_ongoing_navigation_fetch);
     visitor.visit(m_navigation_timing_entry);
     visitor.visit(m_style_computer);
     visitor.visit(m_font_computer);
@@ -1033,6 +1038,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     visitor.visit(m_shared_resource_requests);
     for (auto& resource : m_css_image_resources)
+        resource.value->visit_edges(visitor);
+    for (auto& resource : m_css_image_resources_with_request_url_modifiers)
         resource.value->visit_edges(visitor);
 
     visitor.visit(m_associated_animation_timelines);
@@ -1495,7 +1502,14 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<Utf16String> const&, Opti
     // INTEROP: The HTML Standard says the document open steps do not affect whether a Document is ready for post-load
     //          tasks. Blink and WebKit reset their corresponding frame load-completion state, while Gecko marks the
     //          document loader as opened but not loaded. Reset our load gating flag for the replacement contents too.
-    set_ready_for_post_load_tasks(false);
+    //          Blink only treats document.open() as part of a load when the parent document still has to fire
+    //          its load event, so keep the flag when the container's document has already fired its load event:
+    //          nothing waits on the replacement contents then, and a later load of an ancestor must not wait on
+    //          them either. The replacement contents still fire a load event of their own, so a document that is
+    //          reopened in turn below them is part of their load.
+    if (auto container_document = this->container_document(); !container_document || container_document->load_event_still_needed())
+        set_ready_for_post_load_tasks(false);
+    m_opened_contents_still_loading = true;
 
     // INTEROP: The HTML Standard does not reset the page showing flag in the document open steps. Browsers allow a
     //          completed Document to be reopened and complete loading again, so mark the replaced contents as no longer
@@ -3333,14 +3347,18 @@ static void mark_mouse_transition_event_as_trusted_if_needed(Event& event, Optio
 
 void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hover_event_data)
 {
-    Layout::ForcedReadScope read { *this };
+    dispatch_boundary_events(m_hovered_node, node, hover_event_data, BoundaryEventTypes::All);
+}
+
+void Document::dispatch_boundary_events(GC::Ptr<Node> old_hovered_node, GC::Ptr<Node> node, Optional<HoverEventData> hover_event_data, BoundaryEventTypes types)
+{
     // The style's hover follows the node the events hover. A hover beside the host may have moved it already, while
     // the hovered node of the events stayed.
     CSS::move_style_hover(*this, node);
-    if (m_hovered_node == node)
+    m_hovered_node = node;
+    if (old_hovered_node == node)
         return;
-
-    GC::Ptr<Node> old_hovered_node = move(m_hovered_node);
+    Layout::ForcedReadScope read { *this };
     // AD-HOC: The boundary event steps in the Pointer Events spec walk the target's inclusive ancestors, which stop at
     //         the shadow root and ignore slot assignment. Chromium and Gecko walk the flat tree instead, so content
     //         assigned to a slot is inside the elements around that slot.
@@ -3377,12 +3395,15 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     for (auto* target = node.ptr(); target && target != common_ancestor; target = target->flat_tree_parent())
         entered_ancestors.append(make_hover_event_target(*target));
 
-    m_hovered_node = node;
-
     auto current_event_time_stamp = [&] {
         return HighResolutionTime::current_high_resolution_time(relevant_global_object(*this));
     };
     auto create_pointer_event = [&](Utf16FlyString const& event_name, UIEvents::PointerEventOptions options, CSSPixelPoint offset) {
+        // https://w3c.github.io/pointerevents/#the-button-property
+        // Neither buttons nor touch/pen contact changed since last event
+        options.button = -1;
+        // https://w3c.github.io/pointerevents/#dom-pointerevent-pressure
+        options.pressure = options.buttons ? UIEvents::PointerEvent::ACTIVE_PRESSURE_DEFAULT_IN_ACTIVE_BUTTON_STATE : 0;
         auto utf8_name = event_name.to_utf16_string().to_utf8();
         return UIEvents::PointerEvent::create(
             MUST(FlyString::from_utf8(utf8_name.bytes_as_string_view())), move(options),
@@ -3400,12 +3421,12 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     };
 
     // https://w3c.github.io/pointerevents/#the-pointerout-event
-    if (old_hovered_node && old_hovered_node != m_hovered_node) {
+    if (types != BoundaryEventTypes::Mouse && old_hovered_node && old_hovered_node != node) {
         UIEvents::PointerEventOptions pointer_event_options;
         pointer_event_options.bubbles = true;
         pointer_event_options.cancelable = true;
         pointer_event_options.composed = true;
-        pointer_event_options.related_target = m_hovered_node;
+        pointer_event_options.related_target = node;
         pointer_event_options.is_primary = true;
         pointer_event_options.pointer_type = UIEvents::PointerTypes::Mouse;
         pointer_event_options.view = window_proxy;
@@ -3418,12 +3439,12 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     }
 
     // https://w3c.github.io/uievents/#mouseout
-    if (old_hovered_node && old_hovered_node != m_hovered_node) {
+    if (types != BoundaryEventTypes::Pointer && old_hovered_node && old_hovered_node != node) {
         UIEvents::MouseEventOptions mouse_event_options;
         mouse_event_options.bubbles = true;
         mouse_event_options.cancelable = true;
         mouse_event_options.composed = true;
-        mouse_event_options.related_target = m_hovered_node;
+        mouse_event_options.related_target = node;
         mouse_event_options.view = window_proxy;
         if (hover_event_data.has_value())
             populate_mouse_event_options_from_hover_event_data(mouse_event_options, *hover_event_data, window_proxy);
@@ -3434,10 +3455,10 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     }
 
     // https://w3c.github.io/pointerevents/#the-pointerleave-event
-    if (!left_ancestors.is_empty()) {
+    if (types != BoundaryEventTypes::Mouse && !left_ancestors.is_empty()) {
         for (auto const& target : left_ancestors) {
             UIEvents::PointerEventOptions pointer_event_options;
-            pointer_event_options.related_target = m_hovered_node;
+            pointer_event_options.related_target = node;
             pointer_event_options.is_primary = true;
             pointer_event_options.pointer_type = UIEvents::PointerTypes::Mouse;
             pointer_event_options.view = window_proxy;
@@ -3451,10 +3472,10 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     }
 
     // https://w3c.github.io/uievents/#mouseleave
-    if (!left_ancestors.is_empty()) {
+    if (types != BoundaryEventTypes::Pointer && !left_ancestors.is_empty()) {
         for (auto const& target : left_ancestors) {
             UIEvents::MouseEventOptions mouse_event_options;
-            mouse_event_options.related_target = m_hovered_node;
+            mouse_event_options.related_target = node;
             if (hover_event_data.has_value())
                 populate_mouse_event_options_from_hover_event_data(mouse_event_options, *hover_event_data, window_proxy);
             auto offset = target.offset;
@@ -3465,7 +3486,7 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     }
 
     // https://w3c.github.io/pointerevents/#the-pointerover-event
-    if (m_hovered_node && m_hovered_node != old_hovered_node) {
+    if (types != BoundaryEventTypes::Mouse && node && node != old_hovered_node) {
         UIEvents::PointerEventOptions pointer_event_options;
         pointer_event_options.bubbles = true;
         pointer_event_options.cancelable = true;
@@ -3479,11 +3500,11 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
         auto offset = *hovered_node_offset;
         auto event = create_pointer_event(UIEvents::EventNames::pointerover, move(pointer_event_options), offset);
         mark_mouse_transition_event_as_trusted_if_needed(event, hover_event_data);
-        m_hovered_node->dispatch_event(event);
+        node->dispatch_event(event);
     }
 
     // https://w3c.github.io/uievents/#mouseover
-    if (m_hovered_node && m_hovered_node != old_hovered_node) {
+    if (types != BoundaryEventTypes::Pointer && node && node != old_hovered_node) {
         UIEvents::MouseEventOptions mouse_event_options;
         mouse_event_options.bubbles = true;
         mouse_event_options.cancelable = true;
@@ -3495,7 +3516,7 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
         auto offset = *hovered_node_offset;
         auto event = create_mouse_event(UIEvents::EventNames::mouseover, mouse_event_options, offset);
         mark_mouse_transition_event_as_trusted_if_needed(event, hover_event_data);
-        m_hovered_node->dispatch_event(event);
+        node->dispatch_event(event);
     }
 
     // https://w3c.github.io/pointerevents/#the-pointerenter-event
@@ -3504,24 +3525,28 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
     // Leave events are dispatched in the opposite order.
     if (!entered_ancestors.is_empty()) {
         for (auto target : entered_ancestors.in_reverse()) {
-            UIEvents::PointerEventOptions pointer_event_options;
-            pointer_event_options.related_target = old_hovered_node;
-            pointer_event_options.is_primary = true;
-            pointer_event_options.pointer_type = UIEvents::PointerTypes::Mouse;
-            pointer_event_options.view = window_proxy;
-            if (hover_event_data.has_value())
-                populate_mouse_event_options_from_hover_event_data(pointer_event_options, *hover_event_data, window_proxy);
             auto offset = target.offset;
-            auto pointer_event = create_pointer_event(UIEvents::EventNames::pointerenter, move(pointer_event_options), offset);
-            mark_mouse_transition_event_as_trusted_if_needed(pointer_event, hover_event_data);
-            target.node->dispatch_event(pointer_event);
-            UIEvents::MouseEventOptions mouse_event_options;
-            mouse_event_options.related_target = old_hovered_node;
-            if (hover_event_data.has_value())
-                populate_mouse_event_options_from_hover_event_data(mouse_event_options, *hover_event_data, window_proxy);
-            auto mouse_event = create_mouse_event(UIEvents::EventNames::mouseenter, mouse_event_options, offset);
-            mark_mouse_transition_event_as_trusted_if_needed(mouse_event, hover_event_data);
-            target.node->dispatch_event(mouse_event);
+            if (types != BoundaryEventTypes::Mouse) {
+                UIEvents::PointerEventOptions pointer_event_options;
+                pointer_event_options.related_target = old_hovered_node;
+                pointer_event_options.is_primary = true;
+                pointer_event_options.pointer_type = UIEvents::PointerTypes::Mouse;
+                pointer_event_options.view = window_proxy;
+                if (hover_event_data.has_value())
+                    populate_mouse_event_options_from_hover_event_data(pointer_event_options, *hover_event_data, window_proxy);
+                auto pointer_event = create_pointer_event(UIEvents::EventNames::pointerenter, move(pointer_event_options), offset);
+                mark_mouse_transition_event_as_trusted_if_needed(pointer_event, hover_event_data);
+                target.node->dispatch_event(pointer_event);
+            }
+            if (types != BoundaryEventTypes::Pointer) {
+                UIEvents::MouseEventOptions mouse_event_options;
+                mouse_event_options.related_target = old_hovered_node;
+                if (hover_event_data.has_value())
+                    populate_mouse_event_options_from_hover_event_data(mouse_event_options, *hover_event_data, window_proxy);
+                auto mouse_event = create_mouse_event(UIEvents::EventNames::mouseenter, mouse_event_options, offset);
+                mark_mouse_transition_event_as_trusted_if_needed(mouse_event, hover_event_data);
+                target.node->dispatch_event(mouse_event);
+            }
         }
     }
 }
@@ -3849,7 +3874,9 @@ WebIDL::ExceptionOr<GC::Ref<Event>> Document::create_event(Utf16FlyString const&
     } else if (interface.equals_ignoring_ascii_case("textevent"sv)) {
         event = UIEvents::TextEvent::create(Utf16FlyString {}, time_stamp);
     } else if (interface.equals_ignoring_ascii_case("touchevent"sv)) {
-        event = Event::create(FlyString {}, time_stamp); // FIXME: Create TouchEvent
+        // INTEROP: Blink gates this legacy factory on touch feature detection even though its constructor is exposed.
+        if (HTML::Navigator::max_touch_points() > 0)
+            event = UIEvents::TouchEvent::create(FlyString {}, Bindings::TouchEventInit {}, time_stamp);
     } else if (interface.equals_ignoring_ascii_case("uievent"sv)
         || interface.equals_ignoring_ascii_case("uievents"sv)) {
         event = UIEvents::UIEvent::create(FlyString {}, time_stamp);
@@ -4138,6 +4165,8 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
         return;
 
     page().invalidate_compositor_keyboard_scroll_state_for_document(*this);
+    if (auto navigable = this->navigable())
+        navigable->event_handler().cancel_keyboard_activation();
     if (node)
         m_sequential_focus_navigation_starting_point = nullptr;
 
@@ -4637,6 +4666,11 @@ void Document::dispatch_events_for_transition(GC::Ref<CSS::CSSTransition> transi
 // https://www.w3.org/TR/css-animations-2/#event-dispatch
 void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::Animation> animation)
 {
+    if (animation->is_smil_animation()) {
+        as<SVG::SMILAnimation>(*animation).animation_element().queue_time_events_if_necessary();
+        return;
+    }
+
     if (animation->is_css_transition()) {
         dispatch_events_for_transition(as<CSS::CSSTransition>(*animation));
         return;
@@ -4687,11 +4721,14 @@ void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::An
         }
         event_init.animation = css_animation;
 
+        auto event = CSS::AnimationEvent::create(
+            name,
+            event_init,
+            HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(owning_element->element())));
+        event->set_is_trusted(true);
+
         append_pending_animation_event({
-            .event = CSS::AnimationEvent::create(
-                name,
-                event_init,
-                HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(owning_element->element()))),
+            .event = event,
             .animation = css_animation,
             .target = owning_element->element(),
             .scheduled_event_time = timeline && timeline->can_convert_a_timeline_time_to_an_origin_relative_time()
@@ -5239,7 +5276,7 @@ void Document::schedule_svg_referenced_motion_path_update(SVG::SVGAnimateMotionE
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#completely-finish-loading
 void Document::completely_finish_loading()
 {
-    m_ongoing_navigation_fetch_controller = nullptr;
+    m_ongoing_navigation_fetch = Empty {};
 
     // 2. Set document's completely loaded time to the current time.
     // AD-HOC: Set this unconditionally, even if the document has no navigable yet.
@@ -6060,6 +6097,7 @@ void Document::set_ready_for_post_load_tasks(bool ready)
 {
     m_ready_for_post_load_tasks = ready;
     if (ready) {
+        m_opened_contents_still_loading = false;
         if (auto navigable = this->navigable()) {
             if (auto container = navigable->container())
                 container->document().schedule_html_parser_end_check();
@@ -6547,10 +6585,12 @@ void Document::destroy()
             auto& child_navigable = *navigable_container->content_navigable();
             page().client().page_did_destroy_child_frame(child_navigable.id());
             child_navigable.set_has_been_destroyed();
-            if (auto* local_child_navigable = as_if<HTML::LocalNavigable>(child_navigable))
+            if (auto* local_child_navigable = as_if<HTML::LocalNavigable>(child_navigable)) {
                 local_child_navigable->remove_from_all_local_navigables();
-            else
+            } else {
+                page().discard_provisional_navigable(child_navigable.id());
                 as<HTML::RemoteNavigable>(child_navigable).remove_from_all_remote_navigables();
+            }
         }
     }
 
@@ -6698,7 +6738,9 @@ void Document::abort()
     //    If this resulted in any instances of the fetch algorithm being canceled
     //    or any queued tasks or any network data getting discarded,
     //    then make document unsalvageable given document and "fetch".
-    bool canceled_fetch = false;
+    bool canceled_fetch = HTML::stop_body_delivery(m_ongoing_navigation_fetch);
+    m_ongoing_navigation_fetch = Empty {};
+
     auto cancel_fetch = [&](GC::Ptr<Fetch::Infrastructure::FetchController> controller) {
         if (!controller || controller->state() != Fetch::Infrastructure::FetchController::State::Ongoing)
             return;
@@ -6706,14 +6748,21 @@ void Document::abort()
         canceled_fetch = true;
     };
 
-    cancel_fetch(m_ongoing_navigation_fetch_controller);
-    m_ongoing_navigation_fetch_controller = nullptr;
-
     // AD-HOC: The fetch group belongs to the document's Window. Once the Window is associated with another document,
     //         as when the initial about:blank document is replaced, its fetches are not in the context of this document.
     if (auto window = this->window(); window && window->associated_document_if_any().ptr() == this) {
         for (auto& fetch_record : relevant_settings_object().fetch_group())
             cancel_fetch(fetch_record.fetch_controller());
+
+        for (auto& controller : HTML::relevant_agent(*this).fetch_controller_registry.controllers()) {
+            if (!controller->task_destination().is_for_document(*this))
+                continue;
+            // AD-HOC: A keepalive fetch without a fetch record, such as a violation report, outlives the document, as
+            //         terminating a fetch group leaves its keepalive fetches running.
+            if (controller->is_keepalive())
+                continue;
+            cancel_fetch(controller.ptr());
+        }
     }
 
     if (canceled_fetch)
@@ -6743,6 +6792,12 @@ void Document::abort()
 
         // 3. Make document unsalvageable given document and "parser-aborted".
         make_unsalvageable("parser-aborted"_utf16);
+    }
+
+    // NB: Stopped fetches discard their completion tasks, so their elements cannot release rendering themselves.
+    while (!m_render_blocking_elements.is_empty()) {
+        auto element = *m_render_blocking_elements.begin();
+        element->unblock_rendering();
     }
 }
 
@@ -7126,6 +7181,16 @@ void Document::make_active()
     auto current_navigable = this->navigable();
     if (current_navigable && current_navigable->is_top_level_traversable()) {
         page().client().page_did_change_active_document_in_top_level_browsing_context(*this);
+        // NB: A document whose title element was parsed before it became active, such as an error page made from
+        //     inline content, hasn't reported its title yet. It's reported in a task, after the page has learned of
+        //     the new active document, which resets the title it shows.
+        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(*this), GC::create_function(heap(), [document = GC::Ref { *this }] {
+            auto navigable = document->navigable();
+            if (!navigable || !navigable->is_top_level_traversable() || !document->is_active())
+                return;
+            if (auto title = document->title(); !title.is_empty())
+                document->page().client().page_did_change_title(title);
+        }));
     }
 
     // 4. Set window's relevant settings object's execution ready flag.
@@ -7719,14 +7784,19 @@ void Document::shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::H
     //   flag set, then navigate document's node navigable to urlRecord using document, with historyHandling set to
     //   "replace".
     m_active_refresh_timer = Core::Timer::create_single_shot(AK::Duration::from_seconds(time), [this, has_meta_element = !!meta_element, url_record = move(url_record)]() {
-        if (has_meta_element && has_flag(active_sandboxing_flag_set(), HTML::SandboxingFlagSet::SandboxedAutomaticFeatures))
-            return;
+        // AD-HOC: Navigate from a task, so that the refresh comes after the tasks that "completely finish loading"
+        //         queued, such as the one that fires the load event at the container, as the refresh is due only
+        //         after the document has completely loaded.
+        HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*this), GC::create_function(heap(), [document = GC::Ref { *this }, has_meta_element, url_record] {
+            if (has_meta_element && has_flag(document->active_sandboxing_flag_set(), HTML::SandboxingFlagSet::SandboxedAutomaticFeatures))
+                return;
 
-        auto navigable = this->navigable();
-        if (!navigable || navigable->has_been_destroyed())
-            return;
+            auto navigable = document->navigable();
+            if (!navigable || navigable->has_been_destroyed())
+                return;
 
-        MUST(navigable->navigate({ .url = url_record, .source_document = *this, .history_handling = HTML::NavigationHistoryBehavior::Replace }));
+            MUST(navigable->navigate({ .url = url_record, .source_document = document, .history_handling = HTML::NavigationHistoryBehavior::Replace }));
+        }));
     });
 
     // For the purposes of the previous paragraph, a refresh is said to have come due as soon as the later of the
@@ -8034,25 +8104,40 @@ CSS::ImageStyleValueResource* Document::css_image_resource(URL::URL const& url)
     return it->value.ptr();
 }
 
-CSS::ImageStyleValueResource& Document::create_css_image_resource(GC::Ref<HTML::SharedResourceRequest> request)
+CSS::ImageStyleValueResource* Document::css_image_resource(CSS::ImageStyleValueResourceKey const& key)
+{
+    if (!key.has_request_url_modifiers())
+        return css_image_resource(key.url);
+
+    auto it = m_css_image_resources_with_request_url_modifiers.find(key);
+    if (it == m_css_image_resources_with_request_url_modifiers.end())
+        return nullptr;
+    return it->value.ptr();
+}
+
+CSS::ImageStyleValueResource& Document::create_css_image_resource(CSS::ImageStyleValueResourceKey key, GC::Ref<HTML::SharedResourceRequest> request)
 {
     // NB: The caller should guard against creating already existing resources.
-    VERIFY(!m_css_image_resources.contains(request->url()));
+    VERIFY(!css_image_resource(key));
 
-    auto resource = make<CSS::ImageStyleValueResource>(request, *this);
+    auto resource = make<CSS::ImageStyleValueResource>(key, request, *this);
     auto& resource_ref = *resource;
-    m_css_image_resources.set(request->url(), move(resource));
+    if (key.has_request_url_modifiers())
+        m_css_image_resources_with_request_url_modifiers.set(move(key), move(resource));
+    else
+        m_css_image_resources.set(move(key.url), move(resource));
     return resource_ref;
 }
 
-void Document::remove_css_image_resource_if_unused(URL::URL const& url)
+void Document::remove_css_image_resource_if_unused(CSS::ImageStyleValueResourceKey const& key)
 {
-    auto it = m_css_image_resources.find(url);
-    if (it == m_css_image_resources.end())
+    auto* resource = css_image_resource(key);
+    if (!resource || !resource->can_be_removed())
         return;
-    if (!it->value->can_be_removed())
-        return;
-    m_css_image_resources.remove(it);
+    if (key.has_request_url_modifiers())
+        m_css_image_resources_with_request_url_modifiers.remove(key);
+    else
+        m_css_image_resources.remove(key.url);
 }
 
 void Document::prune_image_resource_caches()
@@ -8061,8 +8146,16 @@ void Document::prune_image_resource_caches()
     static constexpr size_t decoded_image_resource_cache_count_limit = 96;
 
     auto is_used_by_css_image_resource = [&](URL::URL const& url, HTML::SharedResourceRequest const& request) {
-        auto* css_image_resource = this->css_image_resource(url);
-        return css_image_resource && css_image_resource->decoded_image_data() == request.image_data();
+        auto uses_request = [&](CSS::ImageStyleValueResource const* css_image_resource) {
+            return css_image_resource && css_image_resource->decoded_image_data() == request.image_data();
+        };
+        if (uses_request(this->css_image_resource(url)))
+            return true;
+        for (auto const& it : m_css_image_resources_with_request_url_modifiers) {
+            if (it.key.url == url && uses_request(it.value.ptr()))
+                return true;
+        }
+        return false;
     };
 
     struct CacheSize {
@@ -9431,12 +9524,83 @@ static void insert_in_tree_order(Vector<GC::Ref<DOM::Element>>& elements, DOM::E
     }
 
     auto index = elements.find_first_index_if([&](auto& existing_element) {
-        return existing_element->compare_document_position(element) & Node::DOCUMENT_POSITION_FOLLOWING;
+        return element.compare_document_position(existing_element) & Node::DOCUMENT_POSITION_FOLLOWING;
     });
     if (index.has_value())
         elements.insert(index.value(), element);
     else
         elements.append(element);
+}
+
+void Document::subtree_was_moved(Badge<DOM::Node>, DOM::Node& subtree, DOM::Node& old_root)
+{
+    if (!subtree.is_connected())
+        return;
+
+    auto& new_root = subtree.root();
+    bool moved_ids = false;
+    bool named_elements_changed = false;
+    GC::RootVector<GC::Ref<Element>> moved_named_elements;
+    subtree.for_each_shadow_including_inclusive_descendant([&](Node& node) {
+        auto* element = as_if<Element>(node);
+        if (!element)
+            return TraversalDecision::Continue;
+
+        auto id = element->id();
+        auto name = element->name();
+        if (!id.has_value() && !name.has_value())
+            return TraversalDecision::Continue;
+
+        auto& scope_root = element->root();
+        if (id.has_value()) {
+            // NB: Descendants in a nested shadow tree keep their original tree scope.
+            auto& previous_root = &scope_root == &new_root ? old_root : scope_root;
+            if (&previous_root != &scope_root) {
+                if (auto* shadow_root = as_if<ShadowRoot>(previous_root))
+                    shadow_root->element_by_id().remove(*id, *element);
+                else
+                    element_by_id().remove(*id, *element);
+            }
+            element->document_or_shadow_root_element_by_id_map().add(*id, *element);
+            moved_ids = true;
+        }
+
+        if (m_potentially_named_elements.remove_first_matching([&](auto& existing) { return existing.ptr() == element; }))
+            named_elements_changed = true;
+        if (scope_root.is_document()
+            && ((name.has_value() && is_potentially_named_element(*element))
+                || (id.has_value() && is_potentially_named_element_by_id(*element)))) {
+            moved_named_elements.append(*element);
+        }
+        return TraversalDecision::Continue;
+    });
+
+    // NB: Remove every moved entry before reinserting any of them, so stale positions of later descendants cannot
+    //     affect where earlier descendants are inserted.
+    for (auto& element : moved_named_elements) {
+        insert_in_tree_order(m_potentially_named_elements, element);
+        named_elements_changed = true;
+    }
+
+    if (named_elements_changed)
+        did_add_supported_property_name();
+
+    // NB: Form owners and SVG references must observe all of the subtree's IDs in their final scopes and order.
+    for (auto* form_associated_element : m_form_associated_elements_with_form_attribute) {
+        auto& element = form_associated_element->form_associated_element_to_html_element();
+        // NB: An ID-less control can gain a form owner when it enters a different tree scope. Descendants in a nested
+        //     shadow tree keep their scope, so only ordinary descendants need this additional reset.
+        if (moved_ids || (&old_root != &new_root && subtree.is_inclusive_ancestor_of(element)))
+            form_associated_element->element_with_id_was_added_or_removed({});
+    }
+    if (moved_ids) {
+        note_svg_paint_resources_changed();
+        subtree.for_each_shadow_including_inclusive_descendant([&](Node& node) {
+            if (auto* element = as_if<Element>(node); element && element->id().has_value())
+                republish_svg_patterns_inheriting_from(*element->id());
+            return TraversalDecision::Continue;
+        });
+    }
 }
 
 void Document::element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<Utf16FlyString> old_id)
@@ -9605,86 +9769,14 @@ WebIDL::ExceptionOr<void> Document::set_design_mode(Utf16View design_mode)
     return {};
 }
 
-// https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
 Element const* Document::element_from_point(double x, double y)
 {
-    Layout::ForcedReadScope read { *this };
-    // 1. If either argument is negative, x is greater than the viewport width excluding the size of a rendered scroll
-    //    bar (if any), or y is greater than the viewport height excluding the size of a rendered scroll bar (if any), or
-    //    there is no viewport associated with the document, return null and terminate these steps.
-    auto viewport_rect = this->viewport_rect();
-    CSSPixelPoint position { x, y };
-    // FIXME: This should account for the size of the scroll bar.
-    if (x < 0 || y < 0 || position.x() > viewport_rect.width() || position.y() > viewport_rect.height())
-        return nullptr;
-
-    // Ensure the layout tree exists prior to hit testing.
-    update_layout(UpdateLayoutReason::DocumentElementFromPoint);
-
-    // 2. If there is a box in the viewport that would be a target for hit testing at coordinates x,y, when applying the transforms
-    //    that apply to the descendants of the viewport, return the associated element and terminate these steps.
-    GC::Ptr<Element> hit_element;
-    (void)hit_test_all(read, position, [&](Painting::HitTestResult result) {
-        if (auto* element = as_if<Element>(result.dom_node())) {
-            hit_element = element;
-            return TraversalDecision::Break;
-        }
-        return TraversalDecision::Continue;
-    });
-    if (hit_element) {
-        // AD-HOC: If element is inside a UA internal shadow root, retarget to the host.
-        return retarget_from_ua_internal_shadow_root(*hit_element);
-    }
-
-    // 3. If the document has a root element, return the root element and terminate these steps.
-    if (auto const* root_element = document_element())
-        return root_element;
-
-    // 4. Return null.
-    return nullptr;
+    return calculate_element_from_point(*this, x, y);
 }
 
-// https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint
 GC::RootVector<GC::Ref<Element>> Document::elements_from_point(double x, double y)
 {
-    Layout::ForcedReadScope read { *this };
-    // 1. Let sequence be a new empty sequence.
-    GC::RootVector<GC::Ref<Element>> sequence;
-
-    // 2. If either argument is negative, x is greater than the viewport width excluding the size of a rendered scroll bar (if any),
-    //    or y is greater than the viewport height excluding the size of a rendered scroll bar (if any),
-    //    or there is no viewport associated with the document, return sequence and terminate these steps.
-    auto viewport_rect = this->viewport_rect();
-    CSSPixelPoint position { x, y };
-    // FIXME: This should account for the size of the scroll bar.
-    if (x < 0 || y < 0 || position.x() > viewport_rect.width() || position.y() > viewport_rect.height())
-        return sequence;
-
-    // Ensure the layout tree exists prior to hit testing.
-    update_layout(UpdateLayoutReason::DocumentElementsFromPoint);
-
-    // 3. For each box in the viewport, in paint order, starting with the topmost box, that would be a target for
-    //    hit testing at coordinates x,y even if nothing would be overlapping it, when applying the transforms that
-    //    apply to the descendants of the viewport, append the associated element to sequence.
-    (void)hit_test_all(read, position, [&](Painting::HitTestResult result) {
-        if (auto* element = as_if<Element>(result.dom_node())) {
-            // AD-HOC: If element is inside a UA internal shadow root, retarget to the host.
-            element = retarget_from_ua_internal_shadow_root(*element);
-            // AD-HOC: Avoid adding duplicates when multiple boxes resolve to the same element, or when multiple
-            // internal elements retarget to the same host.
-            if (!sequence.contains_slow(GC::Ref { *element }))
-                sequence.append(*element);
-        }
-        return TraversalDecision::Continue;
-    });
-
-    // 4. If the document has a root element, and the last item in sequence is not the root element,
-    //    append the root element to sequence.
-    if (auto* root_element = document_element(); root_element && (sequence.is_empty() || (sequence.last().ptr() != root_element)))
-        sequence.append(*root_element);
-
-    // 5. Return sequence.
-    return sequence;
+    return calculate_elements_from_point(*this, x, y);
 }
 
 static bool shadow_root_is_allowed_for_caret_position(ShadowRoot const& shadow_root, Document::CaretPositionFromPointOptions const& options)
@@ -9879,7 +9971,7 @@ static size_t calculate_depth_for_node(Node const& node)
 }
 
 // https://drafts.csswg.org/resize-observer-1/#gather-active-observations-h
-void Document::gather_active_observations_at_depth(size_t depth)
+void Document::gather_active_observations_at_depth(size_t depth, u64 rendering_update_serial)
 {
     // 1. Let depth be the depth passed in.
 
@@ -9899,6 +9991,10 @@ void Document::gather_active_observations_at_depth(size_t depth)
 
         // 2. For each observation in observer.[[observationTargets]] run this step:
         for (auto& observation : observer->observation_targets()) {
+            // NB: An observation made beside a rendering update in flight is gathered by the rendering updates after it.
+            if (observation->first_rendering_update_to_gather() > rendering_update_serial)
+                continue;
+
             // 1. If observation.isActive() is true
             if (observation->is_active()) {
                 auto target = observation->target();
@@ -10398,10 +10494,6 @@ bool Document::is_render_blocked() const
     auto now = HighResolutionTime::current_high_resolution_time(relevant_global_object(*this));
     if (now > max_time_to_block_rendering_in_ms)
         return false;
-
-    // AD-HOC: Consider pending CSS @import rules as render-blocking
-    if (!m_pending_css_import_rules.is_empty())
-        return true;
 
     if (!m_render_blocking_elements.is_empty())
         return true;
@@ -11324,7 +11416,7 @@ Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunR
         paint_state().visual_context_tree_without_update(read, *this),
         scroll_state_snapshot(),
         page().client().device_pixels_per_css_pixel(),
-        page().chrome_metrics(*this),
+        page().chrome_metrics(),
     };
 }
 
@@ -11866,6 +11958,16 @@ Optional<CSS::CustomPropertyRegistration const&> Document::get_registered_custom
     return {};
 }
 
+void Document::for_each_registered_custom_property(Function<void(CSS::CustomPropertyRegistration const&)> const& callback) const
+{
+    for (auto const& [name, registration] : m_registered_property_set)
+        callback(registration);
+    for (auto const& [name, registration] : m_cached_registered_properties_from_css_property_rules) {
+        if (!m_registered_property_set.contains(name))
+            callback(registration);
+    }
+}
+
 void Document::did_change_custom_property_registrations(Optional<Utf16FlyString> registered_property_set_change)
 {
     ++m_custom_property_registration_generation;
@@ -12386,7 +12488,7 @@ static WebIDL::ExceptionOr<Utf16String> document_write_compliant_string(DOM::Doc
             HTML::relevant_global_object(document),
             string.to_string(),
             sink,
-            "script"_utf16));
+            TrustedTypes::Script.view()));
         string.clear();
         string.append(new_string);
     }
