@@ -1,0 +1,1 @@
+nested SVG use survived cross-document adoption

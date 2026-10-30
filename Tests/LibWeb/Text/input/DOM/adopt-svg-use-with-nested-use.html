@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    test(() => {
+        const source = document.implementation.createHTMLDocument("");
+        const destination = document.implementation.createHTMLDocument("");
+        const svgNamespace = "http://www.w3.org/2000/svg";
+
+        const svg = source.createElementNS(svgNamespace, "svg");
+        const defs = source.createElementNS(svgNamespace, "defs");
+        const referencedGroup = source.createElementNS(svgNamespace, "g");
+        referencedGroup.id = "outer";
+        const nestedUse = source.createElementNS(svgNamespace, "use");
+        nestedUse.setAttribute("href", "#inner");
+        referencedGroup.appendChild(nestedUse);
+
+        const innerGroup = source.createElementNS(svgNamespace, "g");
+        innerGroup.id = "inner";
+        innerGroup.appendChild(source.createElementNS(svgNamespace, "rect"));
+        defs.append(referencedGroup, innerGroup);
+        svg.appendChild(defs);
+
+        const outerUse = source.createElementNS(svgNamespace, "use");
+        outerUse.setAttribute("href", "#outer");
+        svg.appendChild(outerUse);
+        source.body.appendChild(svg);
+
+        destination.adoptNode(svg);
+        destination.body.appendChild(svg);
+        println("nested SVG use survived cross-document adoption");
+    });
+</script>

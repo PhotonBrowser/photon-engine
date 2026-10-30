@@ -3996,27 +3996,36 @@ void Document::adopt_node_steps(Node& node)
         if (old_document.may_have_blocking_wheel_event_listener())
             set_may_have_blocking_wheel_event_listener();
 
+        // Adopting steps can mutate the shadow-including tree. Keep the set of nodes to adopt stable so nodes created
+        // during those steps (for example, while an SVG <use> element rebuilds its shadow tree) are not adopted again.
+        GC::RootVector<GC::Ref<Node>> inclusive_descendants;
+        node.for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
+            inclusive_descendants.append(inclusive_descendant);
+            return TraversalDecision::Continue;
+        });
+
         GC::RootVector<GC::Ref<ShadowRoot>> shadow_roots_with_adopted_sheets;
 
         // A sheet adopted into a shadow root travels with it, and its identity in the style engine
         // belongs to the document it is leaving. Give it up here, while that document is still the
         // one the sheet answers to, and take a new one below.
-        node.for_each_shadow_including_inclusive_descendant([&](DOM::Node& inclusive_descendant) {
-            if (auto* shadow_root = as_if<ShadowRoot>(inclusive_descendant)) {
+        for (auto const& inclusive_descendant : inclusive_descendants) {
+            auto& descendant = *inclusive_descendant;
+            if (auto* shadow_root = as_if<ShadowRoot>(descendant)) {
                 shadow_roots_with_adopted_sheets.append(*shadow_root);
                 for_each_adopted_style_sheet(AdoptedStyleSheetsAccess::adopted_style_sheets(*shadow_root), [&](CSS::StyleSheetState& sheet) {
                     CSS::record_stylesheet_detached(sheet, *shadow_root);
                 });
             }
-            return TraversalDecision::Continue;
-        });
+        }
 
         // 1. For each inclusiveDescendant in node’s shadow-including inclusive descendants:
-        node.for_each_shadow_including_inclusive_descendant([&](DOM::Node& inclusive_descendant) {
+        for (auto const& inclusive_descendant : inclusive_descendants) {
+            auto& descendant = *inclusive_descendant;
             // 1. Set inclusiveDescendant’s node document to document.
-            inclusive_descendant.set_document(Badge<Document> {}, *this);
+            descendant.set_document(Badge<Document> {}, *this);
 
-            if (auto const* registered_observers = inclusive_descendant.registered_observer_list()) {
+            if (auto const* registered_observers = descendant.registered_observer_list()) {
                 for (auto const& registered_observer : *registered_observers)
                     add_mutation_observer_types(registered_observer->options());
             }
@@ -4027,7 +4036,7 @@ void Document::adopt_node_steps(Node& node)
             //    - inclusiveDescendant’s custom element registry is a global custom element registry,
             //    then set inclusiveDescendant’s custom element registry to document’s effective global custom element
             //    registry.
-            if (auto* shadow_root = as_if<ShadowRoot>(inclusive_descendant); shadow_root
+            if (auto* shadow_root = as_if<ShadowRoot>(descendant); shadow_root
                 && ((shadow_root->custom_element_registry() == nullptr && !shadow_root->keep_custom_element_registry_null())
                     || HTML::is_a_global_custom_element_registry(shadow_root->custom_element_registry()))) {
 
@@ -4036,7 +4045,7 @@ void Document::adopt_node_steps(Node& node)
             }
 
             // 3. Otherwise, if inclusiveDescendant is an element:
-            else if (auto* element = as_if<Element>(inclusive_descendant)) {
+            else if (auto* element = as_if<Element>(descendant)) {
                 // 1. Set the node document of each attribute in inclusiveDescendant’s attribute list to document.
                 // NB: An attribute node that has not been created yet takes its document when it is.
                 element->move_attribute_nodes_to_document({}, *this);
@@ -4048,28 +4057,22 @@ void Document::adopt_node_steps(Node& node)
                     element->set_custom_element_registry(effective_global_custom_element_registry());
                 }
             }
-
-            return TraversalDecision::Continue;
-        });
+        }
 
         // 2. For each inclusiveDescendant in node’s shadow-including inclusive descendants that is custom, in
         //    shadow-including tree order:
         //    enqueue a custom element callback reaction with inclusiveDescendant, callback name "adoptedCallback", and
         //    « oldDocument, document ».
-        node.for_each_shadow_including_inclusive_descendant([&](DOM::Node& inclusive_descendant) {
-            if (auto* element = as_if<Element>(inclusive_descendant); element && element->is_custom())
+        for (auto const& inclusive_descendant : inclusive_descendants) {
+            if (auto* element = as_if<Element>(*inclusive_descendant); element && element->is_custom())
                 element->enqueue_an_adopted_callback_reaction(old_document, *this);
-
-            return TraversalDecision::Continue;
-        });
+        }
 
         // 3. For each inclusiveDescendant in node’s shadow-including inclusive descendants, in shadow-including tree
         //     order:
         //    run the adopting steps with inclusiveDescendant and oldDocument.
-        node.for_each_shadow_including_inclusive_descendant([&](auto& inclusive_descendant) {
-            inclusive_descendant.adopted_from(old_document);
-            return TraversalDecision::Continue;
-        });
+        for (auto const& inclusive_descendant : inclusive_descendants)
+            inclusive_descendant->adopted_from(old_document);
 
         // The engine the adopted sheets were attached to belongs to the document they left;
         // attaching them again is what tells this one that they decide here. Do this after the
