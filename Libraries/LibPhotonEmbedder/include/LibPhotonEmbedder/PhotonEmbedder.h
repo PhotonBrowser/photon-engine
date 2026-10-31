@@ -307,6 +307,8 @@ struct ViewCallbacks {
     std::function<void(bool allow_multiple)> file_picker_requested;
     std::function<void(PermissionRequest const&)> permission_requested;
     std::function<void(HTTPCredentialsRequest const&)> http_credentials_requested;
+    // A download took over the view's first navigation, so it shows only its initial blank page.
+    std::function<void()> download_replaced_initial_document;
     // The request was denied by Engine because its document was replaced.
     std::function<void(uint64_t request_id, std::string const& document_id)> permission_cancelled;
     // A context menu action opened a link in a new tab.

@@ -752,6 +752,10 @@ private:
         on_audibility_changed = [this](Audio::Audibility audibility) {
             notify_audio_state(audibility);
         };
+        on_download_replaced_initial_document = [this] {
+            if (m_callbacks.download_replaced_initial_document)
+                m_callbacks.download_replaced_initial_document();
+        };
         on_request_http_credentials = [this](HTTPCredentialsRequest const& request, HTTPCredentialsCallback on_answer) {
             if (!m_callbacks.http_credentials_requested) {
                 on_answer({}, {});
