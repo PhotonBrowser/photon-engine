@@ -95,6 +95,11 @@ public:
     void disk_cache_settings_changed();
     void dns_settings_changed();
 
+    // Lets requests to `host` proceed although its certificate cannot be verified, for this run of the browser.
+    void allow_certificate_errors_for_host(ByteString host);
+    // The certificate `host` last presented to any of the RequestServers, if one connected to it.
+    NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> peer_certificate_for_host(ByteString const& host);
+
     NonnullRefPtr<Core::Promise<Requests::CacheSizes>> estimate_cache_size_accessed_since(UnixDateTime since);
     NonnullRefPtr<Core::Promise<Empty>> clear_cache(UnixDateTime since);
 
@@ -127,6 +132,7 @@ private:
     HashMap<ByteString, DormantSiteCache>& dormant_site_caches();
 
     Vector<NonnullRefPtr<RequestServerInstance>> m_instances;
+    HashTable<ByteString> m_hosts_allowing_certificate_errors;
     size_t m_maximum_site_instances { 0 };
 
     Optional<HashMap<ByteString, DormantSiteCache>> m_dormant_site_caches;

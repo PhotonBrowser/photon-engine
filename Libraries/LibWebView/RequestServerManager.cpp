@@ -138,6 +138,8 @@ ErrorOr<void> RequestServerManager::launch_process(RequestServerInstance& instan
             the().disk_cache_size_changed(*instance, size);
     };
     Application::the().configure_request_server_control_client(*control_client);
+    for (auto const& host : m_hosts_allowing_certificate_errors)
+        control_client->async_allow_certificate_errors_for_host(host);
 
     instance.m_control_client = move(control_client);
     instance.m_ui_client = nullptr;
@@ -260,6 +262,41 @@ void RequestServerManager::dns_settings_changed()
 {
     for (auto& instance : m_instances)
         apply_dns_settings(instance->control_client());
+}
+
+void RequestServerManager::allow_certificate_errors_for_host(ByteString host)
+{
+    if (m_hosts_allowing_certificate_errors.set(host) != HashSetResult::InsertedNewEntry)
+        return;
+    for (auto& instance : m_instances)
+        instance->control_client().async_allow_certificate_errors_for_host(host);
+}
+
+NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> RequestServerManager::peer_certificate_for_host(ByteString const& host)
+{
+    struct Lookup : public RefCounted<Lookup> {
+        Optional<Requests::CertificateSummary> certificate;
+        size_t pending { 0 };
+        NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> promise { Core::Promise<Optional<Requests::CertificateSummary>>::construct() };
+    };
+    auto lookup = adopt_ref(*new Lookup);
+    auto settle = [lookup] {
+        if (--lookup->pending == 0)
+            lookup->promise->resolve(move(lookup->certificate));
+    };
+
+    // Each site's RequestServer connects to the hosts its pages load from, so any of them may know this one.
+    lookup->pending = m_instances.size() + 1;
+    for (auto& instance : m_instances) {
+        instance->control_client().retrieve_peer_certificate(host)->when_resolved([lookup, settle](Optional<Requests::CertificateSummary> certificate) {
+                                                                      if (certificate.has_value() && !lookup->certificate.has_value())
+                                                                          lookup->certificate = move(certificate);
+                                                                      settle();
+                                                                  })
+            .when_rejected([settle](Error&) { settle(); });
+    }
+    settle();
+    return lookup->promise;
 }
 
 ByteString RequestServerManager::sites_directory() const
