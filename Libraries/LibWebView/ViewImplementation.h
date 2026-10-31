@@ -575,6 +575,9 @@ public:
     Function<void()> on_close;
     // A download took over the first navigation of a tab, leaving it showing its initial about:blank document.
     Function<void()> on_download_replaced_initial_document;
+    // AD-HOC: Saving a link or image asks the embedder where to, rather than blocking on
+    //         Application::ask_user_for_download_path. The answer is none when the user cancels.
+    Function<void(ByteString suggested_filename, Function<void(Optional<ByteString>)> on_chosen)> on_request_download_path;
     // The page's navigation failed because the server's certificate could not be verified.
     Function<void(URL::URL const&)> on_certificate_verification_failed;
     Function<void(URL::URL const&)> on_link_hover;

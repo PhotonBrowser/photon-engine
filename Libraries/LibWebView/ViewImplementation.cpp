@@ -25,6 +25,7 @@
 #include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
 #include <LibWebCommon/Infra/Strings.h>
 #include <LibWebCommon/Loader/ContentBlocking.h>
+#include <LibWebCommon/Loader/DownloadFilename.h>
 #include <LibWebCommon/WebDriver/Error.h>
 #include <LibWebCommon/WebDriver/Input.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
@@ -5656,6 +5657,20 @@ void ViewImplementation::download_context_menu_url(PromptForPath prompt_for_path
     // URLs with an opaque path, such as data: URLs, do not contain a usable filename, so the default filename is
     // used instead.
     auto suggested_filename = m_context_menu_url.has_an_opaque_path() ? ByteString {} : m_context_menu_url.basename();
+    if (prompt_for_path == PromptForPath::Yes && on_request_download_path) {
+        // NB: The view may be gone by the time the user chooses, so the download keeps only what it needs.
+        on_request_download_path(Web::sanitize_suggested_download_filename(suggested_filename),
+            [url = m_context_menu_url, is_private = is_private()](Optional<ByteString> path) {
+                if (!path.has_value())
+                    return;
+                // NB: A file at a path the user chose was there when the user chose to replace it.
+                auto may_replace_destination = FileSystem::exists(*path)
+                    ? FileDownloader::MayReplaceDestination::Yes
+                    : FileDownloader::MayReplaceDestination::No;
+                Application::the().file_downloader().download_file(is_private, url, LexicalPath { path.release_value() }, may_replace_destination);
+            });
+        return;
+    }
     auto download_path = prompt_for_path == PromptForPath::Yes
         ? Application::the().path_for_downloaded_file(suggested_filename)
         : Application::the().default_path_for_downloaded_file(suggested_filename);
