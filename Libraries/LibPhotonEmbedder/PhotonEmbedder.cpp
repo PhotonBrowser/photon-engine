@@ -141,6 +141,8 @@ private:
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
     virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const override;
     virtual void open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor) const override;
+    virtual void open_url_in_new_window(URL::URL const&, IsPrivate) override;
+    virtual void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate) override;
 
     virtual bool platform_scrolls_elastically() const override
     {
@@ -361,6 +363,16 @@ public:
         m_callbacks.open_in_new_tab_requested(
             std::string(serialized.characters_without_null_termination(), serialized.length()),
             activate_tab == Web::HTML::ActivateTab::Yes);
+    }
+
+    void open_in_new_window(URL::URL const& url, IsPrivate is_private)
+    {
+        if (!m_callbacks.open_in_new_window_requested)
+            return;
+        auto serialized = url.serialize().bytes_as_string_view();
+        m_callbacks.open_in_new_window_requested(
+            std::string(serialized.characters_without_null_termination(), serialized.length()),
+            is_private == IsPrivate::Yes);
     }
 
     void peek(URL::URL const& url)
@@ -643,10 +655,6 @@ private:
     {
         switch (id) {
         case ActionID::LookUpSelectedText:
-        case ActionID::OpenInNewWindow:
-        case ActionID::OpenInNewPrivateWindow:
-        case ActionID::DownloadLinkedFileAs:
-        case ActionID::SaveImage:
         case ActionID::TakeScreenshot:
         case ActionID::ViewSource:
             return true;
@@ -760,6 +768,15 @@ private:
         on_download_replaced_initial_document = [this] {
             if (m_callbacks.download_replaced_initial_document)
                 m_callbacks.download_replaced_initial_document();
+        };
+        on_request_download_path = [this](ByteString suggested_filename, Function<void(Optional<ByteString>)> on_chosen) {
+            if (!m_callbacks.download_path_requested) {
+                on_chosen({});
+                return;
+            }
+            auto request_id = m_next_download_path_request_id++;
+            m_pending_download_path_requests.set(request_id, move(on_chosen));
+            m_callbacks.download_path_requested(request_id, std::string(suggested_filename.characters(), suggested_filename.length()));
         };
         on_request_http_credentials = [this](HTTPCredentialsRequest const& request, HTTPCredentialsCallback on_answer) {
             if (!m_callbacks.http_credentials_requested) {
@@ -1242,6 +1259,17 @@ public:
         request.on_decided(granted);
     }
 
+    void download_path_chosen(uint64_t request_id, std::string const& path)
+    {
+        auto on_chosen = m_pending_download_path_requests.take(request_id);
+        if (!on_chosen.has_value())
+            return;
+        if (path.empty())
+            on_chosen.value()({});
+        else
+            on_chosen.value()(ByteString(path.c_str()));
+    }
+
     void http_credentials_provided(uint64_t request_id, bool signed_in, std::string const& username, std::string const& password)
     {
         auto on_answer = m_pending_http_credentials_requests.take(request_id);
@@ -1282,6 +1310,8 @@ private:
     HashMap<uint64_t, PendingPermission> m_pending_permission_requests;
     uint64_t m_next_permission_request_id { 1 };
     HashMap<uint64_t, HTTPCredentialsCallback> m_pending_http_credentials_requests;
+    HashMap<uint64_t, Function<void(Optional<ByteString>)>> m_pending_download_path_requests;
+    uint64_t m_next_download_path_request_id { 1 };
     uint64_t m_next_http_credentials_request_id { 1 };
     RefPtr<Core::Timer> m_hidden_gc_timer;
     bool m_navigation_timing_waiting_for_first_frame { false };
@@ -1341,6 +1371,18 @@ void PhotonApplication::open_url_in_new_tab(URL::URL const& url, Web::HTML::Acti
 void PhotonApplication::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab) const
 {
     open_url_in_new_tab(navigation.url, activate_tab);
+}
+
+void PhotonApplication::open_url_in_new_window(URL::URL const& url, IsPrivate is_private)
+{
+    if (m_active_view)
+        m_active_view->open_in_new_window(url, is_private);
+}
+
+// Photon opens the window by URL, like a link the user entered.
+void PhotonApplication::open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor navigation, IsPrivate is_private)
+{
+    open_url_in_new_window(navigation.url, is_private);
 }
 
 void PhotonApplication::open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor navigation) const
@@ -1411,6 +1453,7 @@ Photon::Download download_state(WebView::FileDownloader::Download const& downloa
     if (download.error.has_value())
         state.error = to_std(download.error->bytes_as_string_view());
     state.created_time_ms = download.created_time.milliseconds_since_epoch();
+    state.is_private = download.is_private == WebView::IsPrivate::Yes;
     return state;
 }
 
@@ -1432,13 +1475,13 @@ private:
 
     virtual void download_updated(WebView::FileDownloader::Download const& download) override
     {
-        if (download.is_private == WebView::IsPrivate::No && m_changed)
+        if (m_changed)
             m_changed(download_state(download));
     }
 
-    virtual void download_removed(u64 id, WebView::IsPrivate is_private) override
+    virtual void download_removed(u64 id, WebView::IsPrivate) override
     {
-        if (is_private == WebView::IsPrivate::No && m_removed)
+        if (m_removed)
             m_removed(id);
     }
 
@@ -2168,6 +2211,12 @@ void View::permission_request_completed(uint64_t request_id, std::string const& 
 {
     VERIFY(m_impl && m_impl->view);
     m_impl->view->permission_request_completed(request_id, document_id, granted);
+}
+
+void View::download_path_chosen(uint64_t request_id, std::string const& path)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->download_path_chosen(request_id, path);
 }
 
 void View::http_credentials_provided(uint64_t request_id, bool signed_in, std::string const& username, std::string const& password)

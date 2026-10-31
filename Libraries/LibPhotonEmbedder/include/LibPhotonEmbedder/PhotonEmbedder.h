@@ -328,6 +328,10 @@ struct ViewCallbacks {
     std::function<void(uint64_t request_id, std::string const& document_id)> permission_cancelled;
     // A context menu action opened a link in a new tab.
     std::function<void(std::string const& url, bool activate)> open_in_new_tab_requested;
+    // A link is to open in a new window, private or not.
+    std::function<void(std::string const& url, bool is_private)> open_in_new_window_requested;
+    // Saving a link or image asks where to; answer with View::download_path_chosen, also when cancelled.
+    std::function<void(uint64_t request_id, std::string const& suggested_name)> download_path_requested;
     // A link was shift-clicked, to be shown in a preview over the page.
     std::function<void(std::string const& url)> peek_requested;
     // The pointer moved onto a link, or off every link with an empty URL.
@@ -494,6 +498,8 @@ struct Download {
     std::optional<uint64_t> bytes_per_second;
     std::string error;
     int64_t created_time_ms { 0 };
+    // Whether a private view started it; it leaves the list with the private session.
+    bool is_private { false };
 };
 
 class PHOTONEMBEDDER_API Runtime {
@@ -535,7 +541,7 @@ public:
     std::vector<EngineProcessSnapshot> process_snapshots() const;
     // Calls `changed` with every download now, then whenever one starts or
     // progresses, and `removed` when one leaves the list. Private downloads
-    // are not reported.
+    // are marked, and leave the list when the private session ends.
     void set_download_callbacks(std::function<void(Download const&)> changed, std::function<void(uint64_t id)> removed);
     void pause_download(uint64_t id);
     void resume_download(uint64_t id);
@@ -642,6 +648,8 @@ public:
     void permission_request_completed(uint64_t request_id, std::string const& document_id, bool granted);
     // Answers an HTTP sign-in request; `signed_in` is false when the user cancelled.
     void http_credentials_provided(uint64_t request_id, bool signed_in, std::string const& username, std::string const& password);
+    // Answers download_path_requested; an empty path cancels.
+    void download_path_chosen(uint64_t request_id, std::string const& path);
     // Answer the open dialog. A prompt's response is empty when cancelled.
     void alert_closed();
     void confirm_closed(bool accepted);
