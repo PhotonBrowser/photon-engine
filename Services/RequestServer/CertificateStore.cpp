@@ -77,6 +77,13 @@ void record_peer_certificate(CURL* handle, URL::URL const& url)
     if (url.scheme() != "https"sv || !url.host().has_value())
         return;
 
+    // A reused connection presents the certificate already recorded for its host, so only a new one needs reading.
+    long new_connections = 0;
+    auto host = url.serialized_host().to_byte_string();
+    if (curl_easy_getinfo(handle, CURLINFO_NUM_CONNECTS, &new_connections) == CURLE_OK && new_connections == 0
+        && certificates().contains(host))
+        return;
+
     curl_tlssessioninfo* session = nullptr;
     if (curl_easy_getinfo(handle, CURLINFO_TLS_SSL_PTR, &session) != CURLE_OK || !session
         || session->backend != CURLSSLBACKEND_OPENSSL || !session->internals)
@@ -98,7 +105,7 @@ void record_peer_certificate(CURL* handle, URL::URL const& url)
     summary.sha256_fingerprint = sha256_fingerprint(certificate);
     // The request got this far, so curl either verified the certificate or was told not to.
     summary.verified = !certificate_errors_allowed_for(url);
-    certificates().set(url.serialized_host().to_byte_string(), move(summary));
+    certificates().set(move(host), move(summary));
 }
 
 Optional<Requests::CertificateSummary> peer_certificate_for_host(ByteString const& host)
