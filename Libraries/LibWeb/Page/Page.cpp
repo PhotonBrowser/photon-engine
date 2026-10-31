@@ -158,6 +158,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     for (auto const& request : m_pending_geolocation_requests)
         visitor.visit(request.value.callback);
     visitor.visit(m_pending_permission_requests);
+    visitor.visit(m_pending_http_credentials_requests);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
         operation.visit([&](PendingFullscreenEnter const& enter_operation) {
                 visitor.visit(enter_operation.element);
@@ -1531,6 +1532,20 @@ void Page::permission_request_completed(u64 request_id, Web::Permissions::Effect
 {
     if (auto callback = m_pending_permission_requests.take(request_id); callback.has_value())
         callback.value()->function()(state);
+}
+
+void Page::request_http_credentials(URL::URL const& url, String const& realm, HTTPCredentialsCallback callback)
+{
+    auto request_id = m_next_http_credentials_request_id++;
+    m_pending_http_credentials_requests.set(request_id, callback);
+    if (!client().page_did_request_http_credentials(request_id, url, realm))
+        http_credentials_provided(request_id, {});
+}
+
+void Page::http_credentials_provided(u64 request_id, Optional<HTTPCredentials> credentials)
+{
+    if (auto callback = m_pending_http_credentials_requests.take(request_id); callback.has_value())
+        callback.value()->function()(move(credentials));
 }
 
 u64 Page::request_geolocation_position(HTML::CrossProcessId requesting_document_id, GeolocationPositionCallback callback, GeolocationRequestType type)

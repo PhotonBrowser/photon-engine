@@ -352,6 +352,16 @@ public:
 
     // The browser-process bridge for the Permissions spec's "ask the user for express permission" step.
     using PermissionPromptCallback = GC::Ref<GC::Function<void(Web::Permissions::EffectiveState)>>;
+    // A username and password the user entered for an HTTP authentication challenge.
+    struct HTTPCredentials {
+        String username;
+        String password;
+    };
+    using HTTPCredentialsCallback = GC::Ref<GC::Function<void(Optional<HTTPCredentials>)>>;
+    // Asks the user to sign in to `realm` at `url`. The callback gets no credentials when the user cancels, or when the
+    // client cannot ask.
+    void request_http_credentials(URL::URL const& url, String const& realm, HTTPCredentialsCallback);
+    void http_credentials_provided(u64 request_id, Optional<HTTPCredentials>);
     void request_permission(HTML::CrossProcessId requesting_document_id, Utf16String const& name, PermissionPromptCallback);
     void permission_request_completed(u64 request_id, Web::Permissions::EffectiveState);
 
@@ -586,6 +596,8 @@ private:
     Optional<u64> m_active_geolocation_request_id;
 
     HashMap<u64, PermissionPromptCallback> m_pending_permission_requests;
+    HashMap<u64, HTTPCredentialsCallback> m_pending_http_credentials_requests;
+    u64 m_next_http_credentials_request_id { 0 };
     u64 m_next_permission_request_id { 0 };
 
     // AD-HOC: Denied until the UI process sends the browser-wide setting, so a request cannot observe the test
@@ -882,6 +894,8 @@ public:
     virtual void page_did_start_geolocation_position_watch([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId requesting_document_id) { }
     virtual void page_did_stop_geolocation_position_watch([[maybe_unused]] u64 request_id) { }
     virtual void page_did_request_permission([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId requesting_document_id, [[maybe_unused]] Utf16String const& name) { }
+    // Returns whether the client will answer with Page::http_credentials_provided.
+    virtual bool page_did_request_http_credentials([[maybe_unused]] u64 request_id, [[maybe_unused]] URL::URL const& url, [[maybe_unused]] String const& realm) { return false; }
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_request_permission_snapshot([[maybe_unused]] URL::Origin const& top_level_origin) { return {}; }
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_set_permission_for_testing([[maybe_unused]] HTML::CrossProcessId document_id, [[maybe_unused]] String const& name, [[maybe_unused]] String const& state) { return {}; }
     virtual void page_did_set_next_permission_prompt_outcome_for_testing([[maybe_unused]] String const& name, [[maybe_unused]] String const& outcome, [[maybe_unused]] bool held) { }
