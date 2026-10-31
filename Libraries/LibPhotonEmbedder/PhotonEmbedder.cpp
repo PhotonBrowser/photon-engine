@@ -752,6 +752,10 @@ private:
         on_audibility_changed = [this](Audio::Audibility audibility) {
             notify_audio_state(audibility);
         };
+        on_certificate_verification_failed = [this](URL::URL const& url) {
+            if (m_callbacks.certificate_verification_failed)
+                m_callbacks.certificate_verification_failed(url.serialize().to_byte_string().characters(), url.serialized_host().to_byte_string().characters());
+        };
         on_download_replaced_initial_document = [this] {
             if (m_callbacks.download_replaced_initial_document)
                 m_callbacks.download_replaced_initial_document();
@@ -1733,6 +1737,34 @@ void Runtime::clear_inactive_downloads()
 void Runtime::set_clipboard(Clipboard clipboard)
 {
     m_impl->application->set_clipboard(move(clipboard));
+}
+
+void Runtime::allow_certificate_errors_for_host(std::string const& host)
+{
+    WebView::Application::request_server_manager().allow_certificate_errors_for_host(ByteString(host.c_str()));
+}
+
+void Runtime::peer_certificate(std::string const& host, std::function<void(std::optional<CertificateInfo> const&)> done)
+{
+    auto promise = WebView::Application::request_server_manager().peer_certificate_for_host(ByteString(host.c_str()));
+    promise->when_resolved([done](Optional<Requests::CertificateSummary> const& summary) {
+        if (!summary.has_value()) {
+            done(std::nullopt);
+            return;
+        }
+        auto text = [](ByteString const& value) { return std::string(value.characters(), value.length()); };
+        done(CertificateInfo {
+            text(summary->subject_common_name),
+            text(summary->subject_organization),
+            text(summary->issuer_common_name),
+            text(summary->issuer_organization),
+            text(summary->valid_from),
+            text(summary->valid_until),
+            text(summary->sha256_fingerprint),
+            summary->verified,
+        });
+    });
+    promise->when_rejected([done](Error&) { done(std::nullopt); });
 }
 
 void Runtime::clear_browsing_data(ClearBrowsingData const& request, std::function<void()> done)

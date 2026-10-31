@@ -209,6 +209,19 @@ struct Clipboard {
     std::function<void(std::vector<ClipboardEntry> const&)> write;
 };
 
+// The certificate a host presented, as a certificate viewer shows it.
+struct CertificateInfo {
+    std::string subject_common_name;
+    std::string subject_organization;
+    std::string issuer_common_name;
+    std::string issuer_organization;
+    std::string valid_from;
+    std::string valid_until;
+    std::string sha256_fingerprint;
+    // False once the user chose to proceed past a certificate error.
+    bool verified { false };
+};
+
 // Website data to delete. Data last used before `since_unix_seconds` is kept.
 struct ClearBrowsingData {
     int64_t since_unix_seconds { 0 };
@@ -309,6 +322,8 @@ struct ViewCallbacks {
     std::function<void(HTTPCredentialsRequest const&)> http_credentials_requested;
     // A download took over the view's first navigation, so it shows only its initial blank page.
     std::function<void()> download_replaced_initial_document;
+    // The page failed to load because the certificate of `host` could not be verified.
+    std::function<void(std::string const& url, std::string const& host)> certificate_verification_failed;
     // The request was denied by Engine because its document was replaced.
     std::function<void(uint64_t request_id, std::string const& document_id)> permission_cancelled;
     // A context menu action opened a link in a new tab.
@@ -531,6 +546,10 @@ public:
     void set_clipboard(Clipboard);
     // Deletes website data, then calls `done`.
     void clear_browsing_data(ClearBrowsingData const&, std::function<void()> done);
+    // Lets pages from `host` load although its certificate cannot be verified, until the browser quits.
+    void allow_certificate_errors_for_host(std::string const& host);
+    // Calls `done` with the certificate `host` last presented, or nothing if Engine has not connected to it.
+    void peer_certificate(std::string const& host, std::function<void(std::optional<CertificateInfo> const&)> done);
     std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks);
     std::unique_ptr<View> create_view_for_traversable(View& opener, void* traversable, int width, int height, double device_pixel_ratio, ViewCallbacks);
 
