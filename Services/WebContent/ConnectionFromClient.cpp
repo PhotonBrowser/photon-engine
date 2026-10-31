@@ -3470,6 +3470,17 @@ void ConnectionFromClient::permission_request_completed(Web::PageId page_id, u64
         page->permission_request_completed(request_id, state);
 }
 
+void ConnectionFromClient::http_credentials_provided(Web::PageId page_id, u64 request_id, Optional<String> username, Optional<String> password)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return;
+    Optional<Web::Page::HTTPCredentials> credentials;
+    if (username.has_value() && password.has_value())
+        credentials = Web::Page::HTTPCredentials { username.release_value(), password.release_value() };
+    page->page().http_credentials_provided(request_id, move(credentials));
+}
+
 void ConnectionFromClient::set_has_focus(Web::PageId page_id, bool has_focus)
 {
     if (auto page = this->page(page_id); page.has_value())

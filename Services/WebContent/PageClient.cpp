@@ -1313,6 +1313,12 @@ void PageClient::page_did_request_permission(u64 request_id, Web::HTML::CrossPro
     client().async_did_request_permission(m_id, request_id, requesting_document_id, name);
 }
 
+bool PageClient::page_did_request_http_credentials(u64 request_id, URL::URL const& url, String const& realm)
+{
+    client().async_did_request_http_credentials(m_id, request_id, url, realm);
+    return true;
+}
+
 Optional<Web::Permissions::PermissionSnapshot> PageClient::page_did_request_permission_snapshot(URL::Origin const& top_level_origin)
 {
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestPermissionSnapshot>(m_id, top_level_origin);
