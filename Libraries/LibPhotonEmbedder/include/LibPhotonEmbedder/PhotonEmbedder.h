@@ -229,6 +229,24 @@ enum class Cursor : uint8_t {
     Disallowed,
 };
 
+// The focused editable's state, for platform input methods (IME). Offsets
+// count UTF-16 code units from the start of the editable's text; the
+// surrounding text is a window around the cursor that starts at
+// `cursor_position - text_before_cursor`'s UTF-16 length.
+struct InputMethodState {
+    bool enabled { false };
+    int32_t cursor_position { 0 };
+    int32_t anchor_position { 0 };
+    std::string text_before_cursor;
+    std::string text_after_cursor;
+    // The caret in logical pixels from the view's top-left corner.
+    bool has_caret_rect { false };
+    double caret_x { 0 };
+    double caret_y { 0 };
+    double caret_width { 0 };
+    double caret_height { 0 };
+};
+
 struct ViewCallbacks {
     std::function<void(ViewState const&)> state_changed;
     std::function<void(std::shared_ptr<PresentedFrame const>)> frame_ready;
@@ -286,6 +304,8 @@ struct ViewCallbacks {
     std::function<void(std::string const& url)> peek_requested;
     // The pointer moved onto a link, or off every link with an empty URL.
     std::function<void(std::string const& url)> link_hovered;
+    // The focused editable or its caret changed, for platform input methods.
+    std::function<void(InputMethodState const&)> input_method_state_changed;
     // The page entered or left element fullscreen. The embedder fills its
     // window with the page and reports the result with View::set_fullscreen.
     std::function<void(bool fullscreen)> fullscreen_requested;
@@ -548,6 +568,13 @@ public:
     std::string window_handle() const;
     void send_pointer_event(PointerEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);
+    // Platform input method composition, as Qt's inputMethodEvent drives it.
+    // Marked text replaces the previous marked text; an empty string ends the
+    // composition. Committed text replaces the marked text, or with a
+    // replacement range relative to the cursor, that range.
+    void set_marked_text(std::string const& text);
+    void commit_text(std::string const& text, int32_t replacement_start, int32_t replacement_length);
+    void unmark_text();
     void set_preferred_color_scheme(PreferredColorScheme);
     void set_force_dark_mode_enabled(bool enabled);
     // Tells the page whether the embedder now shows it fullscreen.

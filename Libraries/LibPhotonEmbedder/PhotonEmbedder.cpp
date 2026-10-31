@@ -868,6 +868,30 @@ private:
             if (m_callbacks.fullscreen_requested)
                 m_callbacks.fullscreen_requested(false);
         };
+        on_input_method_state_change = [this] {
+            if (!m_callbacks.input_method_state_changed)
+                return;
+            auto to_std_string = [](Utf16String const& text) {
+                auto utf8 = text.to_utf8();
+                return std::string(utf8.bytes_as_string_view().characters_without_null_termination(), utf8.bytes().size());
+            };
+            auto const& engine_state = input_method_state();
+            Photon::InputMethodState state;
+            state.enabled = engine_state.is_enabled;
+            state.cursor_position = engine_state.cursor_position;
+            state.anchor_position = engine_state.anchor_position;
+            state.text_before_cursor = to_std_string(engine_state.text_before_cursor);
+            state.text_after_cursor = to_std_string(engine_state.text_after_cursor);
+            if (engine_state.caret_rect.has_value()) {
+                auto const& caret = *engine_state.caret_rect;
+                state.has_caret_rect = true;
+                state.caret_x = caret.x().value() / m_device_pixel_ratio;
+                state.caret_y = caret.y().value() / m_device_pixel_ratio;
+                state.caret_width = max(caret.width().value() / m_device_pixel_ratio, 1.0);
+                state.caret_height = max(caret.height().value() / m_device_pixel_ratio, 1.0);
+            }
+            m_callbacks.input_method_state_changed(state);
+        };
         on_link_unhover = [this] {
             if (m_callbacks.link_hovered)
                 m_callbacks.link_hovered({});
@@ -1959,6 +1983,24 @@ void View::send_key_event(Key key, bool pressed, uint32_t code_point, bool shift
         .id = 0,
     };
     m_impl->view->enqueue_input_event(move(event));
+}
+
+void View::set_marked_text(std::string const& text)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->set_marked_text_from_input_method(Utf16String::from_utf8(StringView { text.data(), text.size() }));
+}
+
+void View::commit_text(std::string const& text, int32_t replacement_start, int32_t replacement_length)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->commit_text_from_input_method(Utf16String::from_utf8(StringView { text.data(), text.size() }), replacement_start, replacement_length);
+}
+
+void View::unmark_text()
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->unmark_text_from_input_method();
 }
 
 void View::set_fullscreen(bool fullscreen)
