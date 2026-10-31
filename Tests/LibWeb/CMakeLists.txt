@@ -27,6 +27,7 @@ set(TEST_SOURCES
     TestEventLoop.cpp
     TestFaviconDecoding.cpp
     TestFetchAlgorithms.cpp
+    TestFetchHTTPAuthentication.cpp
     TestFetchBodyDeliveryGate.cpp
     TestFetchBodyStream.cpp
     TestFetchByteChannel.cpp
