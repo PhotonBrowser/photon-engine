@@ -185,6 +185,16 @@ struct PermissionRequest {
     std::string capability;
 };
 
+// A server asked the user to sign in with HTTP authentication. The embedder
+// answers with View::http_credentials_provided, also when cancelled.
+struct HTTPCredentialsRequest {
+    uint64_t request_id { 0 };
+    std::string url;
+    std::string origin;
+    // The server's name for the protected area, which may be empty.
+    std::string realm;
+};
+
 // One representation of the clipboard's contents, such as "text/plain" or
 // "image/png" data.
 struct ClipboardEntry {
@@ -296,6 +306,7 @@ struct ViewCallbacks {
     // View::file_picker_closed, also when cancelled.
     std::function<void(bool allow_multiple)> file_picker_requested;
     std::function<void(PermissionRequest const&)> permission_requested;
+    std::function<void(HTTPCredentialsRequest const&)> http_credentials_requested;
     // The request was denied by Engine because its document was replaced.
     std::function<void(uint64_t request_id, std::string const& document_id)> permission_cancelled;
     // A context menu action opened a link in a new tab.
@@ -607,6 +618,8 @@ public:
     // Resolves a pending permission request. The document identity must match
     // the request, and the Engine rejects replies after that document changes.
     void permission_request_completed(uint64_t request_id, std::string const& document_id, bool granted);
+    // Answers an HTTP sign-in request; `signed_in` is false when the user cancelled.
+    void http_credentials_provided(uint64_t request_id, bool signed_in, std::string const& username, std::string const& password);
     // Answer the open dialog. A prompt's response is empty when cancelled.
     void alert_closed();
     void confirm_closed(bool accepted);

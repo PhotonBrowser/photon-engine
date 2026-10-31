@@ -752,6 +752,23 @@ private:
         on_audibility_changed = [this](Audio::Audibility audibility) {
             notify_audio_state(audibility);
         };
+        on_request_http_credentials = [this](HTTPCredentialsRequest const& request, HTTPCredentialsCallback on_answer) {
+            if (!m_callbacks.http_credentials_requested) {
+                on_answer({}, {});
+                return;
+            }
+            auto to_std_string = [](auto const& text) {
+                return std::string(text.bytes_as_string_view().characters_without_null_termination(), text.bytes().size());
+            };
+            auto request_id = m_next_http_credentials_request_id++;
+            m_pending_http_credentials_requests.set(request_id, move(on_answer));
+            m_callbacks.http_credentials_requested(Photon::HTTPCredentialsRequest {
+                .request_id = request_id,
+                .url = to_std_string(request.url.serialize()),
+                .origin = to_std_string(request.url.origin().serialize()),
+                .realm = to_std_string(request.realm),
+            });
+        };
         on_request_permission = [this](PermissionPromptRequest const& request, PermissionPromptCallback on_outcome) {
             if (!m_callbacks.permission_requested) {
                 on_outcome(Web::Permissions::PromptOutcome::Block);
@@ -1216,6 +1233,19 @@ public:
         request.on_decided(granted);
     }
 
+    void http_credentials_provided(uint64_t request_id, bool signed_in, std::string const& username, std::string const& password)
+    {
+        auto on_answer = m_pending_http_credentials_requests.take(request_id);
+        if (!on_answer.has_value())
+            return;
+        if (!signed_in) {
+            on_answer.value()({}, {});
+            return;
+        }
+        auto to_string = [](std::string const& text) { return String::from_utf8_with_replacement_character(StringView { text.data(), text.size() }, String::WithBOMHandling::No); };
+        on_answer.value()(to_string(username), to_string(password));
+    }
+
 private:
     void invalidate_pending_permission_requests()
     {
@@ -1242,6 +1272,8 @@ private:
     };
     HashMap<uint64_t, PendingPermission> m_pending_permission_requests;
     uint64_t m_next_permission_request_id { 1 };
+    HashMap<uint64_t, HTTPCredentialsCallback> m_pending_http_credentials_requests;
+    uint64_t m_next_http_credentials_request_id { 1 };
     RefPtr<Core::Timer> m_hidden_gc_timer;
     bool m_navigation_timing_waiting_for_first_frame { false };
     std::shared_ptr<CpuFallbackFramePool> m_cpu_fallback_frame_pool;
@@ -2099,6 +2131,12 @@ void View::permission_request_completed(uint64_t request_id, std::string const& 
 {
     VERIFY(m_impl && m_impl->view);
     m_impl->view->permission_request_completed(request_id, document_id, granted);
+}
+
+void View::http_credentials_provided(uint64_t request_id, bool signed_in, std::string const& username, std::string const& password)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->http_credentials_provided(request_id, signed_in, username, password);
 }
 
 void View::find_in_page_end()
