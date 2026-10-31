@@ -549,6 +549,7 @@ public:
     void send_pointer_event(PointerEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);
     void set_preferred_color_scheme(PreferredColorScheme);
+    void set_force_dark_mode_enabled(bool enabled);
     // Tells the page whether the embedder now shows it fullscreen.
     void set_fullscreen(bool fullscreen);
     // Asks the page to leave element fullscreen, as when the user presses

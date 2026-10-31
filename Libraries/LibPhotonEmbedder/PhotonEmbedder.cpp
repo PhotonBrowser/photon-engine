@@ -273,6 +273,7 @@ public:
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
         auto view = adopt_own(*new PhotonHeadlessWebView(opener.m_theme, { physical_width, physical_height }, dpr, move(callbacks)));
+        view->m_force_dark_mode_enabled = opener.m_force_dark_mode_enabled;
         view->initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
         view->resize(width, height, dpr);
         view->notify_state();
@@ -623,6 +624,17 @@ public:
         return muted;
     }
 
+    void set_force_dark_mode_enabled(bool enabled)
+    {
+        if (m_force_dark_mode_enabled == enabled)
+            return;
+        m_force_dark_mode_enabled = enabled;
+        send_force_dark(page(), enabled);
+        traversable().for_each_pending_host([enabled](WebContentPage const& pending_page) {
+            send_force_dark(pending_page, enabled);
+        });
+    }
+
 private:
     // Context menu actions Photon has no UI for yet: dictionary lookup, a
     // save panel, more windows, and screenshot confirmation.
@@ -699,7 +711,14 @@ private:
     void prepare_page_for_navigable(WebContentPage& page) override
     {
         HeadlessWebView::prepare_page_for_navigable(page);
+        send_force_dark(page, m_force_dark_mode_enabled);
         update_compositor_display_metadata(page);
+    }
+
+    static void send_force_dark(WebContentPage const& page, bool enabled)
+    {
+        // Ladybird currently routes this preference through its debug request channel.
+        page.async_debug_request("set-force-dark"sv, enabled ? "on"sv : "off"sv);
     }
 
     void update_compositor_display_metadata(WebContentPage& page)
@@ -1189,6 +1208,7 @@ private:
     virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) override { return nullptr; }
 
     Photon::ViewCallbacks m_callbacks;
+    bool m_force_dark_mode_enabled { false };
     struct PendingPermission {
         std::string document_id;
         uint64_t document_generation { 0 };
@@ -1963,6 +1983,12 @@ void View::set_preferred_color_scheme(PreferredColorScheme color_scheme)
         break;
     }
     m_impl->view->set_preferred_color_scheme(engine_color_scheme);
+}
+
+void View::set_force_dark_mode_enabled(bool enabled)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->set_force_dark_mode_enabled(enabled);
 }
 
 void View::find_in_page(std::string const& query, bool case_sensitive, bool highlight_all_matches)
