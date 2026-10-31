@@ -2611,7 +2611,15 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
     // received that response may claim it, and only while its population is in flight.
     FileDownloader::ResponseFinished on_response_finished;
     bool matches_in_flight_navigation = false;
-    if (auto navigable = population_worker_navigable(navigable_id); navigable.has_value()) {
+    auto navigable = population_worker_navigable(navigable_id);
+    // AD-HOC: Population reaches the download in the page that is to host the document, which for a navigation to
+    //         another process is the navigation's host rather than its worker.
+    if (!navigable.has_value()) {
+        if (auto candidate = traversable().top_level_traversable().find(navigable_id); candidate.has_value()
+            && candidate->uncommitted_navigation() && candidate->uncommitted_navigation()->host() == this)
+            navigable = candidate;
+    }
+    if (navigable.has_value()) {
         if (auto* bidi = WebDriverBiDi::the();
             bidi && network_response.is_object()) {
             on_response_finished = [weak_bidi = bidi->make_weak_ptr(),
