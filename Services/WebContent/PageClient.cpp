@@ -1319,6 +1319,11 @@ bool PageClient::page_did_request_http_credentials(u64 request_id, URL::URL cons
     return true;
 }
 
+void PageClient::page_did_fail_certificate_verification(URL::URL const& url)
+{
+    client().async_did_fail_certificate_verification(m_id, url);
+}
+
 Optional<Web::Permissions::PermissionSnapshot> PageClient::page_did_request_permission_snapshot(URL::Origin const& top_level_origin)
 {
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestPermissionSnapshot>(m_id, top_level_origin);

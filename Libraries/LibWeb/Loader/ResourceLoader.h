@@ -26,6 +26,11 @@
 
 namespace Web {
 
+// How a failed request describes its network error.
+WEB_API String network_error_description(Requests::NetworkError);
+// Whether a failed request's description says the server's certificate could not be verified.
+WEB_API bool is_certificate_error_description(StringView);
+
 class WEB_API ResourceLoader : public Core::EventReceiver {
     C_OBJECT_ABSTRACT(ResourceLoader)
 

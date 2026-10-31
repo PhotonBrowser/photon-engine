@@ -86,6 +86,7 @@
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
+#include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -3152,6 +3153,9 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
             // AD-HOC: Name the URL that actually failed to load: The last URL the navigation was redirected to, if
             //         any — rather than the URL it started at.
             auto error_url = output->redirected_url.value_or(url);
+            // AD-HOC: Let the browser warn about a page whose certificate could not be verified, and offer to proceed.
+            if (is_top_level_traversable() && is_certificate_error_description(error_message.to_utf8()))
+                page().client().page_did_fail_certificate_verification(error_url);
             output->document = create_navigation_error_document(*this, navigation_id, navigation_timing_type, user_involvement, output->inline_content_origin.value(), output->document_id, error_url, error_message);
 
             // 2. Make document unsalvageable given entry's document state's document and "navigation-failure".

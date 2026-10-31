@@ -896,6 +896,8 @@ public:
     virtual void page_did_request_permission([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId requesting_document_id, [[maybe_unused]] Utf16String const& name) { }
     // Returns whether the client will answer with Page::http_credentials_provided.
     virtual bool page_did_request_http_credentials([[maybe_unused]] u64 request_id, [[maybe_unused]] URL::URL const& url, [[maybe_unused]] String const& realm) { return false; }
+    // A top-level navigation failed because the server's certificate could not be verified.
+    virtual void page_did_fail_certificate_verification([[maybe_unused]] URL::URL const& url) { }
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_request_permission_snapshot([[maybe_unused]] URL::Origin const& top_level_origin) { return {}; }
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_set_permission_for_testing([[maybe_unused]] HTML::CrossProcessId document_id, [[maybe_unused]] String const& name, [[maybe_unused]] String const& state) { return {}; }
     virtual void page_did_set_next_permission_prompt_outcome_for_testing([[maybe_unused]] String const& name, [[maybe_unused]] String const& outcome, [[maybe_unused]] bool held) { }
