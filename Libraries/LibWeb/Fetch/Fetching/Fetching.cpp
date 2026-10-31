@@ -2031,6 +2031,34 @@ enum class AuthenticationHandled {
     Yes,
 };
 
+// https://fetch.spec.whatwg.org/#authentication-entries
+// NB: Kept for this process's lifetime and keyed by origin, which stands in for the protection space until requests
+//     carry their realm.
+static HashMap<String, Page::HTTPCredentials>& authentication_entries()
+{
+    static NeverDestroyed<HashMap<String, Page::HTTPCredentials>> entries;
+    return *entries;
+}
+
+static Optional<String> authentication_entry_key(URL::URL const& url)
+{
+    auto origin = url.origin();
+    if (origin.is_opaque())
+        return {};
+    return origin.serialize();
+}
+
+// The realm named by a `WWW-Authenticate` challenge, shown to the user when they are asked to sign in.
+static String authentication_realm(StringView www_authenticate)
+{
+    auto start = www_authenticate.find("realm=\""sv);
+    if (!start.has_value())
+        return {};
+    auto value = www_authenticate.substring_view(*start + "realm=\""sv.length());
+    auto end = value.find('"');
+    return MUST(String::from_utf8(end.has_value() ? value.substring_view(0, *end) : value));
+}
+
 // https://fetch.spec.whatwg.org/#concept-http-network-or-cache-fetch
 static void process_http_network_or_cache_response(JS::Object& global_object, Infrastructure::FetchParams const& fetch_params, NonnullRefPtr<Infrastructure::Request> http_request, NonnullRefPtr<Infrastructure::Response> response, GC::Ref<PendingResponse> returned_pending_response, IsAuthenticationFetch is_authentication_fetch, IsNewConnectionFetch is_new_connection_fetch, HTTP::Cookie::IncludeCredentials include_credentials, AuthenticationHandled authentication_handled = AuthenticationHandled::No)
 {
@@ -2118,13 +2146,36 @@ static void process_http_network_or_cache_response(JS::Object& global_object, In
                 WebDriver::BiDi::network_auth_required(fetch_params, *response);
             }
 
-            // FIXME: 2. Let username and password be the result of prompting the end user for a username and password,
-            //           respectively, in request’s window.
-            // FIXME: 3. Set the username given request’s current URL and username.
-            // FIXME: 4. Set the password given request’s current URL and password.
-            stop_discarded_response_body(*fetch_params.controller(), *response);
-            dbgln("Fetch: Username/password prompt is not implemented. Aborting the request.");
-            returned_pending_response->resolve(Infrastructure::Response::aborted_network_error());
+            // 2. Let username and password be the result of prompting the end user for a username and password,
+            //    respectively, in request’s window.
+            auto navigable = HTML::local_navigable_with_id(request->traversable_for_user_prompts().get<HTML::CrossProcessId>());
+            auto entry_key = authentication_entry_key(request->current_url());
+            if (!navigable || !entry_key.has_value()) {
+                stop_discarded_response_body(*fetch_params.controller(), *response);
+                returned_pending_response->resolve(Infrastructure::Response::aborted_network_error());
+                return;
+            }
+            auto realm_name = authentication_realm(response->header_list()->get("WWW-Authenticate"sv).value_or({}));
+            navigable->page().request_http_credentials(request->current_url(), realm_name, GC::create_function(realm.heap(), [&realm, fetch_params = NonnullRefPtr { fetch_params }, response, returned_pending_response, entry_key = entry_key.release_value()](Optional<Page::HTTPCredentials> credentials) {
+                // NB: A user who cancels sees the server's own response to the unauthenticated request, as in other
+                //     browsers.
+                if (!credentials.has_value() || fetch_params->is_canceled()) {
+                    authentication_entries().remove(entry_key);
+                    returned_pending_response->resolve(response);
+                    return;
+                }
+
+                // 3. Set the username given request’s current URL and username.
+                // 4. Set the password given request’s current URL and password.
+                // NB: The credentials become this origin's authentication entry instead, so they reach this request's
+                //     retry and later requests without appearing in any URL the page or user can see.
+                authentication_entries().set(entry_key, credentials.release_value());
+
+                // 4. Set response to the result of running HTTP-network-or-cache fetch given fetchParams and true.
+                stop_discarded_response_body(*fetch_params->controller(), *response);
+                auto pending_response = http_network_or_cache_fetch(realm, *fetch_params, IsAuthenticationFetch::Yes);
+                pending_response->when_loaded([returned_pending_response](auto response) { returned_pending_response->resolve(response); });
+            }));
             return;
         }
 
@@ -2526,9 +2577,17 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
                 // 2. If there’s an authentication entry for httpRequest and either httpRequest’s use-URL-credentials
                 //    flag is unset or httpRequest’s current URL does not include credentials, then set
                 //    authorizationValue to authentication entry.
-                if (false // FIXME: "If there’s an authentication entry for httpRequest"
+                auto entry_key = authentication_entry_key(http_request->current_url());
+                Optional<Page::HTTPCredentials> authentication_entry;
+                if (entry_key.has_value()) {
+                    if (auto entry = authentication_entries().get(*entry_key); entry.has_value())
+                        authentication_entry = *entry;
+                }
+                if (authentication_entry.has_value()
                     && (!http_request->use_url_credentials() || !http_request->current_url().includes_credentials())) {
-                    // FIXME: "set authorizationValue to authentication entry."
+                    auto payload = ByteString::formatted("{}:{}", authentication_entry->username, authentication_entry->password);
+                    // NB: The spec leaves this conversion undefined. Use the `Basic` scheme, as per RFC 7617.
+                    authorization_value = MUST(String::formatted("Basic {}", MUST(encode_base64(payload.bytes()))));
                 }
                 // 3. Otherwise, if httpRequest’s current URL does include credentials and isAuthenticationFetch is
                 //    true, set authorizationValue to httpRequest’s current URL, converted to an `Authorization` value.
