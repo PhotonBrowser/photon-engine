@@ -573,6 +573,8 @@ public:
     Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, CanonicalTraversable&)> on_new_web_view;
     Function<void()> on_activate_tab;
     Function<void()> on_close;
+    // A download took over the first navigation of a tab, leaving it showing its initial about:blank document.
+    Function<void()> on_download_replaced_initial_document;
     Function<void(URL::URL const&)> on_link_hover;
     Function<void()> on_link_unhover;
     Function<void(Utf16String const&)> on_title_change;

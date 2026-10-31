@@ -2668,6 +2668,12 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
     if (!is_download_in_progress(file_downloader, download_id))
         return { Optional<u64> {} };
 
+    // AD-HOC: Browsers close a tab opened only for what became a download. Tell the view when this tab has nothing
+    //         but its initial document left, so its embedder can decide.
+    if (navigable->is_top_level_traversable() && navigable->active_document().is_initial_about_blank()
+        && view().on_download_replaced_initial_document)
+        view().on_download_replaced_initial_document();
+
     return { download_id };
 }
 
