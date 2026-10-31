@@ -227,7 +227,7 @@ public:
     bool has_completed_document_load() const { return m_document_load_finished; }
     uint64_t document_generation() const { return m_document_generation; }
 
-    static OwnPtr<PhotonHeadlessWebView> create(int width, int height, double dpr, Photon::ViewCallbacks callbacks)
+    static OwnPtr<PhotonHeadlessWebView> create(int width, int height, double dpr, Photon::ViewCallbacks callbacks, IsPrivate is_private)
     {
         auto resource_root = s_ladybird_resource_root;
         auto theme_path = LexicalPath::join(resource_root, "themes"sv, "Default.ini"sv);
@@ -245,7 +245,7 @@ public:
 
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
-        auto view = adopt_own(*new PhotonHeadlessWebView(theme.release_value(), { physical_width, physical_height }, dpr, move(callbacks)));
+        auto view = adopt_own(*new PhotonHeadlessWebView(theme.release_value(), { physical_width, physical_height }, dpr, move(callbacks), is_private));
         if (!view->m_callbacks.native_metal_presentation
             || !view->m_callbacks.native_backing_registered
             || !view->m_callbacks.native_frame_ready)
@@ -272,7 +272,8 @@ public:
     {
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
-        auto view = adopt_own(*new PhotonHeadlessWebView(opener.m_theme, { physical_width, physical_height }, dpr, move(callbacks)));
+        // A page opened from a private page stays in its private session.
+        auto view = adopt_own(*new PhotonHeadlessWebView(opener.m_theme, { physical_width, physical_height }, dpr, move(callbacks), opener.is_private()));
         view->m_force_dark_mode_enabled = opener.m_force_dark_mode_enabled;
         view->initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
         view->resize(width, height, dpr);
@@ -739,8 +740,8 @@ private:
     }
 #endif
 
-    PhotonHeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize size, double dpr, Photon::ViewCallbacks callbacks)
-        : HeadlessWebView(move(theme), size)
+    PhotonHeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize size, double dpr, Photon::ViewCallbacks callbacks, IsPrivate is_private)
+        : HeadlessWebView(move(theme), size, is_private)
         , m_callbacks(move(callbacks))
     {
         m_device_pixel_ratio = dpr;
@@ -1799,10 +1800,10 @@ void Runtime::schedule_native_release_drain()
 }
 #endif
 
-std::unique_ptr<View> Runtime::create_view(int width, int height, double device_pixel_ratio, ViewCallbacks callbacks)
+std::unique_ptr<View> Runtime::create_view(int width, int height, double device_pixel_ratio, ViewCallbacks callbacks, bool is_private)
 {
     auto impl = std::make_unique<View::Impl>();
-    impl->view = WebView::PhotonHeadlessWebView::create(width, height, device_pixel_ratio, move(callbacks));
+    impl->view = WebView::PhotonHeadlessWebView::create(width, height, device_pixel_ratio, move(callbacks), is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
     if (!impl->view)
         return {};
     impl->last_viewport_width = max(1, static_cast<int>(std::lround(width * device_pixel_ratio)));

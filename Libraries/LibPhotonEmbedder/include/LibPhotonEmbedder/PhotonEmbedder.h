@@ -550,7 +550,8 @@ public:
     void allow_certificate_errors_for_host(std::string const& host);
     // Calls `done` with the certificate `host` last presented, or nothing if Engine has not connected to it.
     void peer_certificate(std::string const& host, std::function<void(std::optional<CertificateInfo> const&)> done);
-    std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks);
+    // A private view keeps nothing once it and the other private views close.
+    std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks, bool is_private = false);
     std::unique_ptr<View> create_view_for_traversable(View& opener, void* traversable, int width, int height, double device_pixel_ratio, ViewCallbacks);
 
 private:
