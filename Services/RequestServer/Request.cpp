@@ -21,6 +21,7 @@
 #include <LibTextCodec/Decoder.h>
 #include <RequestServer/AIA.h>
 #include <RequestServer/CURL.h>
+#include <RequestServer/CertificateStore.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/ControlConnectionFromClient.h>
 #include <RequestServer/Request.h>
@@ -1463,6 +1464,12 @@ void Request::handle_fetch_state()
     if (auto const& path = default_certificate_path(); !path.is_empty())
         set_option(CURLOPT_CAINFO, path.characters());
 
+    // AD-HOC: The user chose to proceed to this host although its certificate could not be verified.
+    if (certificate_errors_allowed_for(m_url)) {
+        set_option(CURLOPT_SSL_VERIFYPEER, 0L);
+        set_option(CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
     set_option(CURLOPT_SSL_CTX_FUNCTION, configure_ssl_context);
 #ifndef AK_OS_MACOS
     if (!m_aia_collector)
@@ -2219,6 +2226,9 @@ void Request::transfer_headers_to_client_if_needed()
     // m_status_code may already be set (e.g. from a resource substitution).
     if (!m_status_code.has_value())
         m_status_code = acquire_status_code();
+
+    if (m_curl_easy_handle)
+        record_peer_certificate(m_curl_easy_handle, m_url);
 
     // https://httpwg.org/specs/rfc9111.html#invalidation
     // A cache MUST invalidate the target URI (Section 7.1 of [HTTP]) when it receives a non-error status code in

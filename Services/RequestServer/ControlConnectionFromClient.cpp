@@ -8,6 +8,7 @@
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibIPC/TransportHandle.h>
 #include <RequestServer/AlternativeServices.h>
+#include <RequestServer/CertificateStore.h>
 #include <RequestServer/ControlConnectionFromClient.h>
 #include <RequestServer/Request.h>
 #include <RequestServer/Resolver.h>
@@ -180,6 +181,18 @@ void ControlConnectionFromClient::set_use_system_dns()
 void ControlConnectionFromClient::set_proxy_configuration(HTTP::ProxyConfiguration proxy_configuration)
 {
     RequestServer::set_proxy_configuration(move(proxy_configuration));
+}
+
+void ControlConnectionFromClient::retrieve_peer_certificate(u64 certificate_request_id, ByteString host)
+{
+    async_retrieved_peer_certificate(certificate_request_id, peer_certificate_for_host(host));
+}
+
+void ControlConnectionFromClient::allow_certificate_errors_for_host(ByteString host)
+{
+    RequestServer::allow_certificate_errors_for_host(move(host));
+    // Connections verified before cannot be told apart from new ones, so start afresh.
+    Resolver::reset_connections();
 }
 
 void ControlConnectionFromClient::set_performance_monitor_enabled(bool enabled)

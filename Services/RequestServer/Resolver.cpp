@@ -5,8 +5,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashTable.h>
 #include <AK/NeverDestroyed.h>
 #include <LibTLS/TLSv12.h>
+#include <LibURL/URL.h>
 #include <RequestServer/Resolver.h>
 
 namespace RequestServer {
@@ -24,6 +26,7 @@ void set_default_certificate_path(ByteString default_certificate_path)
 }
 
 static HTTP::ProxyConfiguration g_proxy_configuration;
+static HashTable<ByteString> g_hosts_allowing_certificate_errors;
 static Optional<Utf16String> g_process_top_level_site;
 static bool g_process_sites_have_their_own { false };
 
@@ -35,6 +38,18 @@ HTTP::ProxyConfiguration const& proxy_configuration()
 void set_proxy_configuration(HTTP::ProxyConfiguration proxy_configuration)
 {
     g_proxy_configuration = move(proxy_configuration);
+}
+
+void allow_certificate_errors_for_host(ByteString host)
+{
+    g_hosts_allowing_certificate_errors.set(move(host));
+}
+
+bool certificate_errors_allowed_for(URL::URL const& url)
+{
+    if (g_hosts_allowing_certificate_errors.is_empty() || !url.host().has_value())
+        return false;
+    return g_hosts_allowing_certificate_errors.contains(url.serialized_host().to_byte_string());
 }
 
 Optional<Utf16String> const& process_top_level_site()

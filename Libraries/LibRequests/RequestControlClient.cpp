@@ -24,10 +24,13 @@ void RequestControlClient::die()
         promise->reject(Error::from_string_literal("RequestServer process died"));
     for (auto& [id, promise] : m_pending_cache_access_profile_requests)
         promise->reject(Error::from_string_literal("RequestServer process died"));
+    for (auto& [id, promise] : m_pending_certificate_requests)
+        promise->reject(Error::from_string_literal("RequestServer process died"));
 
     m_pending_cache_size_estimations.clear();
     m_pending_clear_cache_requests.clear();
     m_pending_cache_access_profile_requests.clear();
+    m_pending_certificate_requests.clear();
 
     if (auto request_server_died_callback = move(on_request_server_died)) {
         Core::deferred_invoke([request_server_died_callback = move(request_server_died_callback)]() mutable {
@@ -64,6 +67,21 @@ void RequestControlClient::store_response_cookies_and_hsts_policy(int client_id,
         on_store_response_cookies_and_hsts_policy(client_id, url, partition_context, cookies, hsts_policy);
 
     async_stored_response_cookies_and_hsts_policy(client_id, request_id, store_request_id);
+}
+
+NonnullRefPtr<Core::Promise<Optional<CertificateSummary>>> RequestControlClient::retrieve_peer_certificate(ByteString host)
+{
+    auto promise = Core::Promise<Optional<CertificateSummary>>::construct();
+    auto certificate_request_id = m_next_certificate_request_id++;
+    m_pending_certificate_requests.set(certificate_request_id, promise);
+    async_retrieve_peer_certificate(certificate_request_id, move(host));
+    return promise;
+}
+
+void RequestControlClient::retrieved_peer_certificate(u64 certificate_request_id, Optional<CertificateSummary> certificate)
+{
+    if (auto promise = m_pending_certificate_requests.take(certificate_request_id); promise.has_value())
+        (*promise)->resolve(move(certificate));
 }
 
 NonnullRefPtr<Core::Promise<CacheSizes>> RequestControlClient::estimate_cache_size_accessed_since(UnixDateTime since)

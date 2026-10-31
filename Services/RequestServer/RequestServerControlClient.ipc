@@ -2,6 +2,7 @@
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibRequests/CacheSizes.h>
+#include <LibRequests/CertificateSummary.h>
 #include <LibRequests/NetworkUsage.h>
 #include <LibURL/URL.h>
 #include <RequestServer/IsPrivate.h>
@@ -19,6 +20,7 @@ endpoint RequestServerControlClient
     network_usage(Vector<Requests::NetworkUsage> usage, u64 interval_microseconds) =|
 
     estimated_cache_size(u64 cache_size_estimation_id, Requests::CacheSizes sizes) =|
+    retrieved_peer_certificate(u64 certificate_request_id, Optional<Requests::CertificateSummary> certificate) =|
     removed_cache_entries(u64 clear_cache_request_id) =|
 
     // Sent once the disk cache's size settles after changing.

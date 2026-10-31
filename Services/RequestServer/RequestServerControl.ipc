@@ -25,6 +25,10 @@ endpoint RequestServerControl
 
     set_proxy_configuration(HTTP::ProxyConfiguration proxy_configuration) =|
 
+    // The user chose to proceed to this host although its certificate could not be verified.
+    allow_certificate_errors_for_host(ByteString host) =|
+    retrieve_peer_certificate(u64 certificate_request_id, ByteString host) =|
+
     set_performance_monitor_enabled(bool enabled) =|
 
     estimate_cache_size_accessed_since(u64 cache_size_estimation_id, UnixDateTime since) =|

@@ -46,6 +46,8 @@ private:
     virtual void set_use_system_dns() override;
 
     virtual void set_proxy_configuration(HTTP::ProxyConfiguration) override;
+    virtual void allow_certificate_errors_for_host(ByteString) override;
+    virtual void retrieve_peer_certificate(u64 certificate_request_id, ByteString host) override;
 
     virtual void set_performance_monitor_enabled(bool) override;
 

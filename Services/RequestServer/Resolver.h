@@ -14,6 +14,7 @@
 #include <LibCore/Forward.h>
 #include <LibDNS/Resolver.h>
 #include <LibHTTP/Proxy.h>
+#include <LibURL/Forward.h>
 
 namespace RequestServer {
 
@@ -57,6 +58,10 @@ void set_default_certificate_path(ByteString);
 
 HTTP::ProxyConfiguration const& proxy_configuration();
 void set_proxy_configuration(HTTP::ProxyConfiguration);
+
+// Hosts the user chose to reach although their certificates could not be verified.
+void allow_certificate_errors_for_host(ByteString host);
+bool certificate_errors_allowed_for(URL::URL const&);
 
 // The top-level site this RequestServer serves, when there is one per site.
 Optional<Utf16String> const& process_top_level_site();
