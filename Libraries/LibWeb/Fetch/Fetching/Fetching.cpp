@@ -36,6 +36,7 @@
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Fetching/ClientContextSnapshots.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
+#include <LibWeb/Fetch/Fetching/HTTPAuthentication.h>
 #include <LibWeb/Fetch/Fetching/NetworkBodyPump.h>
 #include <LibWeb/Fetch/Fetching/PendingResponse.h>
 #include <LibWeb/Fetch/Fetching/RefCountedFlag.h>
@@ -2031,34 +2032,6 @@ enum class AuthenticationHandled {
     Yes,
 };
 
-// https://fetch.spec.whatwg.org/#authentication-entries
-// NB: Kept for this process's lifetime and keyed by origin, which stands in for the protection space until requests
-//     carry their realm.
-static HashMap<String, Page::HTTPCredentials>& authentication_entries()
-{
-    static NeverDestroyed<HashMap<String, Page::HTTPCredentials>> entries;
-    return *entries;
-}
-
-static Optional<String> authentication_entry_key(URL::URL const& url)
-{
-    auto origin = url.origin();
-    if (origin.is_opaque())
-        return {};
-    return origin.serialize();
-}
-
-// The realm named by a `WWW-Authenticate` challenge, shown to the user when they are asked to sign in.
-static String authentication_realm(StringView www_authenticate)
-{
-    auto start = www_authenticate.find("realm=\""sv);
-    if (!start.has_value())
-        return {};
-    auto value = www_authenticate.substring_view(*start + "realm=\""sv.length());
-    auto end = value.find('"');
-    return MUST(String::from_utf8(end.has_value() ? value.substring_view(0, *end) : value));
-}
-
 // https://fetch.spec.whatwg.org/#concept-http-network-or-cache-fetch
 static void process_http_network_or_cache_response(JS::Object& global_object, Infrastructure::FetchParams const& fetch_params, NonnullRefPtr<Infrastructure::Request> http_request, NonnullRefPtr<Infrastructure::Response> response, GC::Ref<PendingResponse> returned_pending_response, IsAuthenticationFetch is_authentication_fetch, IsNewConnectionFetch is_new_connection_fetch, HTTP::Cookie::IncludeCredentials include_credentials, AuthenticationHandled authentication_handled = AuthenticationHandled::No)
 {
@@ -2155,8 +2128,27 @@ static void process_http_network_or_cache_response(JS::Object& global_object, In
                 returned_pending_response->resolve(Infrastructure::Response::aborted_network_error());
                 return;
             }
-            auto realm_name = authentication_realm(response->header_list()->get("WWW-Authenticate"sv).value_or({}));
-            navigable->page().request_http_credentials(request->current_url(), realm_name, GC::create_function(realm.heap(), [&realm, fetch_params = NonnullRefPtr { fetch_params }, response, returned_pending_response, entry_key = entry_key.release_value()](Optional<Page::HTTPCredentials> credentials) {
+            auto challenge = choose_authentication_challenge(response->header_list()->get("WWW-Authenticate"sv).value_or({}));
+            if (!challenge.has_value()) {
+                returned_pending_response->resolve(response);
+                return;
+            }
+
+            // AD-HOC: A Digest challenge marked stale accepts the credentials already given and only needs a fresh
+            //         nonce, so retry once with it rather than asking again (RFC 7616 section 3.3).
+            if (challenge->stale && is_authentication_fetch == IsAuthenticationFetch::No) {
+                if (auto entry = authentication_entries().find(*entry_key); entry != authentication_entries().end()) {
+                    entry->value.challenge = challenge.release_value();
+                    entry->value.nonce_count = 0;
+                    stop_discarded_response_body(*fetch_params.controller(), *response);
+                    auto pending_response = http_network_or_cache_fetch(realm, fetch_params, IsAuthenticationFetch::Yes);
+                    pending_response->when_loaded([returned_pending_response](auto response) { returned_pending_response->resolve(response); });
+                    return;
+                }
+            }
+
+            auto realm_name = challenge->realm;
+            navigable->page().request_http_credentials(request->current_url(), realm_name, GC::create_function(realm.heap(), [&realm, fetch_params = NonnullRefPtr { fetch_params }, response, returned_pending_response, entry_key = entry_key.release_value(), challenge = challenge.release_value()](Optional<Page::HTTPCredentials> credentials) mutable {
                 // NB: A user who cancels sees the server's own response to the unauthenticated request, as in other
                 //     browsers.
                 if (!credentials.has_value() || fetch_params->is_canceled()) {
@@ -2169,7 +2161,7 @@ static void process_http_network_or_cache_response(JS::Object& global_object, In
                 // 4. Set the password given request’s current URL and password.
                 // NB: The credentials become this origin's authentication entry instead, so they reach this request's
                 //     retry and later requests without appearing in any URL the page or user can see.
-                authentication_entries().set(entry_key, credentials.release_value());
+                authentication_entries().set(entry_key, { move(credentials->username), move(credentials->password), move(challenge), 0 });
 
                 // 4. Set response to the result of running HTTP-network-or-cache fetch given fetchParams and true.
                 stop_discarded_response_body(*fetch_params->controller(), *response);
@@ -2578,24 +2570,19 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
                 //    flag is unset or httpRequest’s current URL does not include credentials, then set
                 //    authorizationValue to authentication entry.
                 auto entry_key = authentication_entry_key(http_request->current_url());
-                Optional<Page::HTTPCredentials> authentication_entry;
-                if (entry_key.has_value()) {
-                    if (auto entry = authentication_entries().get(*entry_key); entry.has_value())
-                        authentication_entry = *entry;
-                }
-                if (authentication_entry.has_value()
+                auto authentication_entry = entry_key.has_value() ? authentication_entries().find(*entry_key) : authentication_entries().end();
+                if (authentication_entry != authentication_entries().end()
                     && (!http_request->use_url_credentials() || !http_request->current_url().includes_credentials())) {
-                    auto payload = ByteString::formatted("{}:{}", authentication_entry->username, authentication_entry->password);
-                    // NB: The spec leaves this conversion undefined. Use the `Basic` scheme, as per RFC 7617.
-                    authorization_value = MUST(String::formatted("Basic {}", MUST(encode_base64(payload.bytes()))));
+                    // NB: The spec leaves this conversion undefined. Answer the challenge the entry was made for, with
+                    //     the Basic (RFC 7617) or Digest (RFC 7616) scheme.
+                    authorization_value = authorization_value_for(authentication_entry->value, http_request->method(), http_request->current_url());
                 }
                 // 3. Otherwise, if httpRequest’s current URL does include credentials and isAuthenticationFetch is
                 //    true, set authorizationValue to httpRequest’s current URL, converted to an `Authorization` value.
                 else if (http_request->current_url().includes_credentials() && is_authentication_fetch == IsAuthenticationFetch::Yes) {
                     auto const& url = http_request->current_url();
-                    auto payload = ByteString::formatted("{}:{}", URL::percent_decode(url.username()), URL::percent_decode(url.password()));
                     // NB: The spec leaves this conversion undefined. Use the `Basic` scheme, as per RFC 7617.
-                    authorization_value = MUST(String::formatted("Basic {}", MUST(encode_base64(payload.bytes()))));
+                    authorization_value = basic_authorization_value(URL::percent_decode(url.username()), URL::percent_decode(url.password()));
                 }
 
                 // 4. If authorizationValue is non-null, then append (`Authorization`, authorizationValue) to

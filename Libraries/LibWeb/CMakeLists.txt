@@ -362,6 +362,7 @@ set(SOURCES
     Fetch/Fetching/ClientContextSnapshots.cpp
     Fetch/Fetching/NetworkBodyPump.cpp
     Fetch/Fetching/Fetching.cpp
+    Fetch/Fetching/HTTPAuthentication.cpp
     Fetch/Fetching/PendingResponse.cpp
     Fetch/Fetching/RefCountedFlag.cpp
     Fetch/FetchMethod.cpp
