@@ -114,6 +114,15 @@ struct PermissionPromptRequest {
 
 using PermissionPromptCallback = Function<void(Web::Permissions::PromptOutcome)>;
 
+// A server asked the user to sign in with HTTP authentication.
+struct HTTPCredentialsRequest {
+    URL::URL url;
+    String realm;
+};
+
+// Called with the username and password the user entered, or with neither when they cancel.
+using HTTPCredentialsCallback = Function<void(Optional<String> username, Optional<String> password)>;
+
 // One permission as the site information panel shows it for the site a view shows.
 struct SitePermissionRow {
     Web::Permissions::PermissionName name;
@@ -155,6 +164,7 @@ public:
     void set_site_permission(URL::Origin const&, Web::Permissions::PermissionName, Optional<PermissionDecision>);
     void reset_site_permissions(URL::Origin const&);
     void did_request_permission(Badge<WebContentPage>, Web::Permissions::PermissionName);
+    void did_request_http_credentials(Badge<WebContentPage>, WebContentPage&, u64 request_id, URL::URL, String realm);
 
     bool location_in_use() const { return m_location_in_use; }
 
@@ -635,6 +645,8 @@ public:
     Function<void(WebContentPage& requesting_page, u64 request_id, Web::HTML::CrossProcessId document_id)> on_start_geolocation_position_watch;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_stop_geolocation_position_watch;
     Function<void(PermissionPromptRequest const&, PermissionPromptCallback)> on_request_permission;
+    // Without a handler, every request is answered as cancelled.
+    Function<void(HTTPCredentialsRequest const&, HTTPCredentialsCallback)> on_request_http_credentials;
     Function<void(PermissionPromptRequest const&)> on_cancel_permission_prompt;
     Function<void(bool)> on_location_in_use_change;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;

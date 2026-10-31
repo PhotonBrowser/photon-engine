@@ -1716,6 +1716,11 @@ RefPtr<CanonicalDocument> WebContentPage::hosted_document_with_id(Web::HTML::Cro
     return found;
 }
 
+void WebContentPage::did_request_http_credentials(u64 request_id, URL::URL url, String realm)
+{
+    view().did_request_http_credentials({}, *this, request_id, move(url), move(realm));
+}
+
 void WebContentPage::did_request_permission(u64 request_id, Web::HTML::CrossProcessId document_id, Utf16String name)
 {
     auto permission_name = permission_name_from(name);

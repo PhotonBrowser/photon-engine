@@ -4617,6 +4617,18 @@ void ViewImplementation::reset_site_permissions(URL::Origin const& origin)
     session().permission_manager->reset_origin(origin);
 }
 
+void ViewImplementation::did_request_http_credentials(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, URL::URL url, String realm)
+{
+    NonnullRefPtr<WebContentPage> page = requesting_page;
+    if (!on_request_http_credentials) {
+        page->async_http_credentials_provided(request_id, {}, {});
+        return;
+    }
+    on_request_http_credentials(HTTPCredentialsRequest { move(url), move(realm) }, [page, request_id](Optional<String> username, Optional<String> password) {
+        page->async_http_credentials_provided(request_id, move(username), move(password));
+    });
+}
+
 void ViewImplementation::did_request_permission(Badge<WebContentPage>, Web::Permissions::PermissionName name)
 {
     if (!m_permissions_requested_by_page.contains_slow(name))
