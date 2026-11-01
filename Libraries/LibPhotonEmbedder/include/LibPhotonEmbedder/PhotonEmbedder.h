@@ -209,6 +209,15 @@ struct Clipboard {
     std::function<void(std::vector<ClipboardEntry> const&)> write;
 };
 
+// Opens links the browser cannot load itself, such as mailto: and tel:, in
+// other apps. Without it, such links do nothing.
+struct ExternalApps {
+    // The name of the app that opens `url`, or nothing when no app does.
+    std::function<std::optional<std::string>(std::string const& url)> app_for_url;
+    // Opens `url` in that app, returning whether it could.
+    std::function<bool(std::string const& url)> open_url;
+};
+
 // The certificate a host presented, as a certificate viewer shows it.
 struct CertificateInfo {
     std::string subject_common_name;
@@ -220,6 +229,10 @@ struct CertificateInfo {
     std::string sha256_fingerprint;
     // False once the user chose to proceed past a certificate error.
     bool verified { false };
+    std::string protocol;
+    std::string cipher;
+    // Who each certificate the server sent is issued to, from the site's own towards its root.
+    std::vector<std::string> chain;
 };
 
 // Website data to delete. Data last used before `since_unix_seconds` is kept.
@@ -330,6 +343,8 @@ struct ViewCallbacks {
     std::function<void(std::string const& url, bool activate)> open_in_new_tab_requested;
     // A link is to open in a new window, private or not.
     std::function<void(std::string const& url, bool is_private)> open_in_new_window_requested;
+    // A page asks to open `url` in `app_name`; answer with View::external_url_answered, also when cancelled.
+    std::function<void(uint64_t request_id, std::string const& url, std::string const& app_name)> external_url_requested;
     // Saving a link or image asks where to; answer with View::download_path_chosen, also when cancelled.
     std::function<void(uint64_t request_id, std::string const& suggested_name)> download_path_requested;
     // A link was shift-clicked, to be shown in a preview over the page.
@@ -550,6 +565,7 @@ public:
     void clear_inactive_downloads();
     // Use the host's system clipboard for copying and pasting.
     void set_clipboard(Clipboard);
+    void set_external_apps(ExternalApps);
     // Deletes website data, then calls `done`.
     void clear_browsing_data(ClearBrowsingData const&, std::function<void()> done);
     // Lets pages from `host` load although its certificate cannot be verified, until the browser quits.
@@ -648,6 +664,8 @@ public:
     void permission_request_completed(uint64_t request_id, std::string const& document_id, bool granted);
     // Answers an HTTP sign-in request; `signed_in` is false when the user cancelled.
     void http_credentials_provided(uint64_t request_id, bool signed_in, std::string const& username, std::string const& password);
+    // Answers external_url_requested.
+    void external_url_answered(uint64_t request_id, bool open);
     // Answers download_path_requested; an empty path cancels.
     void download_path_chosen(uint64_t request_id, std::string const& path);
     // Answer the open dialog. A prompt's response is empty when cancelled.

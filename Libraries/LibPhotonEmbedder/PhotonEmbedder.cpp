@@ -20,6 +20,7 @@
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/WebView/ConsoleOutput.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/PlatformColors.h>
@@ -125,6 +126,11 @@ public:
     // one most recently focused or asked for a context menu.
     void set_active_view(PhotonHeadlessWebView&);
     void set_clipboard(Photon::Clipboard clipboard) { m_system_clipboard = move(clipboard); }
+    void set_external_apps(Photon::ExternalApps apps) { m_external_apps = move(apps); }
+    bool open_external_url(URL::URL const& url) const
+    {
+        return m_external_apps.open_url && m_external_apps.open_url(url.serialize().to_byte_string().characters());
+    }
     void set_elastic_scroll_enabled(bool enabled)
     {
         m_elastic_scroll_enabled = enabled;
@@ -143,6 +149,7 @@ private:
     virtual void open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor) const override;
     virtual void open_url_in_new_window(URL::URL const&, IsPrivate) override;
     virtual void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate) override;
+    virtual void resolve_external_url_handler(URL::URL const&, ExternalURLHandlerCallback) const override;
 
     virtual bool platform_scrolls_elastically() const override
     {
@@ -220,6 +227,7 @@ private:
     }
 
     Photon::Clipboard m_system_clipboard;
+    Photon::ExternalApps m_external_apps;
     WeakPtr<PhotonHeadlessWebView> m_active_view;
     bool m_elastic_scroll_enabled { false };
 };
@@ -486,8 +494,10 @@ public:
         state.loading = is_loading();
         state.can_go_back = navigate_back_action().enabled();
         state.can_go_forward = navigate_forward_action().enabled();
+        // A page from a host whose certificate error the user chose to ignore is not secure.
         if (url().scheme() == "https"sv)
-            state.connection_secure = true;
+            state.connection_secure = !url().host().has_value()
+                || !Application::request_server_manager().allows_certificate_errors_for_host(url().serialized_host().to_byte_string());
         else if (url().scheme() == "http"sv)
             state.connection_secure = false;
         m_callbacks.state_changed(state);
@@ -768,6 +778,17 @@ private:
         on_download_replaced_initial_document = [this] {
             if (m_callbacks.download_replaced_initial_document)
                 m_callbacks.download_replaced_initial_document();
+        };
+        on_request_external_url_confirmation = [this](URL::URL const& url, URL::Origin const&, ExternalURLHandler const& handler, Function<void(bool)> on_answer) {
+            if (!m_callbacks.external_url_requested) {
+                on_answer(false);
+                return;
+            }
+            auto request_id = m_next_external_url_request_id++;
+            m_pending_external_url_requests.set(request_id, move(on_answer));
+            auto name = handler.application_name().bytes_as_string_view();
+            m_callbacks.external_url_requested(request_id, url.serialize().to_byte_string().characters(),
+                std::string(name.characters_without_null_termination(), name.length()));
         };
         on_request_download_path = [this](ByteString suggested_filename, Function<void(Optional<ByteString>)> on_chosen) {
             if (!m_callbacks.download_path_requested) {
@@ -1259,6 +1280,12 @@ public:
         request.on_decided(granted);
     }
 
+    void external_url_answered(uint64_t request_id, bool open)
+    {
+        if (auto on_answer = m_pending_external_url_requests.take(request_id); on_answer.has_value())
+            on_answer.value()(open);
+    }
+
     void download_path_chosen(uint64_t request_id, std::string const& path)
     {
         auto on_chosen = m_pending_download_path_requests.take(request_id);
@@ -1311,6 +1338,8 @@ private:
     uint64_t m_next_permission_request_id { 1 };
     HashMap<uint64_t, HTTPCredentialsCallback> m_pending_http_credentials_requests;
     HashMap<uint64_t, Function<void(Optional<ByteString>)>> m_pending_download_path_requests;
+    HashMap<uint64_t, Function<void(bool)>> m_pending_external_url_requests;
+    uint64_t m_next_external_url_request_id { 1 };
     uint64_t m_next_download_path_request_id { 1 };
     uint64_t m_next_http_credentials_request_id { 1 };
     RefPtr<Core::Timer> m_hidden_gc_timer;
@@ -1383,6 +1412,30 @@ void PhotonApplication::open_url_in_new_window(URL::URL const& url, IsPrivate is
 void PhotonApplication::open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor navigation, IsPrivate is_private)
 {
     open_url_in_new_window(navigation.url, is_private);
+}
+
+// The app the embedder names for a link, which it opens there.
+class PhotonExternalURLHandler final : public ExternalURLHandler {
+public:
+    explicit PhotonExternalURLHandler(String application_name)
+        : ExternalURLHandler(move(application_name), false)
+    {
+    }
+
+    virtual void launch(URL::URL const& url, LaunchCallback callback) const override
+    {
+        callback(static_cast<PhotonApplication&>(Application::the()).open_external_url(url));
+    }
+};
+
+void PhotonApplication::resolve_external_url_handler(URL::URL const& url, ExternalURLHandlerCallback callback) const
+{
+    auto name = m_external_apps.app_for_url ? m_external_apps.app_for_url(url.serialize().to_byte_string().characters()) : std::nullopt;
+    if (!name.has_value()) {
+        callback(nullptr);
+        return;
+    }
+    callback(adopt_ref(*new PhotonExternalURLHandler(String::from_utf8_with_replacement_character(StringView { name->data(), name->size() }))));
 }
 
 void PhotonApplication::open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor navigation) const
@@ -1783,6 +1836,11 @@ void Runtime::set_clipboard(Clipboard clipboard)
     m_impl->application->set_clipboard(move(clipboard));
 }
 
+void Runtime::set_external_apps(ExternalApps apps)
+{
+    m_impl->application->set_external_apps(move(apps));
+}
+
 void Runtime::allow_certificate_errors_for_host(std::string const& host)
 {
     WebView::Application::request_server_manager().allow_certificate_errors_for_host(ByteString(host.c_str()));
@@ -1797,6 +1855,9 @@ void Runtime::peer_certificate(std::string const& host, std::function<void(std::
             return;
         }
         auto text = [](ByteString const& value) { return std::string(value.characters(), value.length()); };
+        std::vector<std::string> chain;
+        for (auto const& name : summary->chain)
+            chain.push_back(text(name));
         done(CertificateInfo {
             text(summary->subject_common_name),
             text(summary->subject_organization),
@@ -1806,6 +1867,9 @@ void Runtime::peer_certificate(std::string const& host, std::function<void(std::
             text(summary->valid_until),
             text(summary->sha256_fingerprint),
             summary->verified,
+            text(summary->protocol),
+            text(summary->cipher),
+            move(chain),
         });
     });
     promise->when_rejected([done](Error&) { done(std::nullopt); });
@@ -2211,6 +2275,12 @@ void View::permission_request_completed(uint64_t request_id, std::string const& 
 {
     VERIFY(m_impl && m_impl->view);
     m_impl->view->permission_request_completed(request_id, document_id, granted);
+}
+
+void View::external_url_answered(uint64_t request_id, bool open)
+{
+    VERIFY(m_impl && m_impl->view);
+    m_impl->view->external_url_answered(request_id, open);
 }
 
 void View::download_path_chosen(uint64_t request_id, std::string const& path)
