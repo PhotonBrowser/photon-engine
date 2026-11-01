@@ -89,7 +89,8 @@ void record_peer_certificate(CURL* handle, URL::URL const& url)
         || session->backend != CURLSSLBACKEND_OPENSSL || !session->internals)
         return;
 
-    auto* certificate = SSL_get0_peer_certificate(static_cast<SSL*>(session->internals));
+    auto* ssl = static_cast<SSL*>(session->internals);
+    auto* certificate = SSL_get0_peer_certificate(ssl);
     if (!certificate)
         return;
 
@@ -105,6 +106,19 @@ void record_peer_certificate(CURL* handle, URL::URL const& url)
     summary.sha256_fingerprint = sha256_fingerprint(certificate);
     // The request got this far, so curl either verified the certificate or was told not to.
     summary.verified = !certificate_errors_allowed_for(url);
+    if (auto const* protocol = SSL_get_version(ssl))
+        summary.protocol = protocol;
+    if (auto const* cipher = SSL_get_cipher_name(ssl))
+        summary.cipher = cipher;
+    if (auto* chain = SSL_get_peer_cert_chain(ssl)) {
+        for (int i = 0; i < sk_X509_num(chain); ++i) {
+            auto* link = sk_X509_value(chain, i);
+            auto name = name_entry(X509_get_subject_name(link), NID_commonName);
+            if (name.is_empty())
+                name = name_entry(X509_get_subject_name(link), NID_organizationName);
+            summary.chain.append(move(name));
+        }
+    }
     certificates().set(move(host), move(summary));
 }
 

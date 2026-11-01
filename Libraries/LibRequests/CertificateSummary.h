@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/ByteString.h>
+#include <AK/Vector.h>
 #include <LibIPC/Forward.h>
 
 namespace Requests {
@@ -23,6 +24,11 @@ struct CertificateSummary {
     ByteString sha256_fingerprint;
     // Whether the connection verified it; false once the user chose to proceed past a certificate error.
     bool verified { false };
+    // The connection's protocol and cipher, such as "TLSv1.3" and "TLS_AES_128_GCM_SHA256".
+    ByteString protocol;
+    ByteString cipher;
+    // Who each certificate the server sent is issued to, from the site's own towards its root.
+    Vector<ByteString> chain;
 };
 
 }
