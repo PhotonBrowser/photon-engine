@@ -568,6 +568,9 @@ public:
     void set_external_apps(ExternalApps);
     // Deletes website data, then calls `done`.
     void clear_browsing_data(ClearBrowsingData const&, std::function<void()> done);
+    // Deletes the cookies and localStorage of one site in the default profile: cookies for `host`, its subdomains and
+    // the domains it shares cookies with, and localStorage of its http and https origins on their default ports.
+    void clear_site_data(std::string const& host, std::function<void()> done);
     // Lets pages from `host` load although its certificate cannot be verified, until the browser quits.
     void allow_certificate_errors_for_host(std::string const& host);
     // Calls `done` with the certificate `host` last presented, or nothing if Engine has not connected to it.

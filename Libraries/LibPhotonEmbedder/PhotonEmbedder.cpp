@@ -18,8 +18,11 @@
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Permissions/Permissions.h>
 #include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/StorageAPI/StorageEndpoint.h>
 #include <LibWebCommon/WebView/ConsoleOutput.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/BrowsingSession.h>
+#include <LibWebView/CookieJar.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Menu.h>
@@ -27,6 +30,7 @@
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/ProcessSnapshot.h>
 #include <LibWebView/ProcessType.h>
+#include <LibWebView/StorageJar.h>
 #if defined(AK_OS_MACOS)
 #    include <LibWebView/ProcessReaper.h>
 #endif
@@ -1890,6 +1894,32 @@ void Runtime::clear_browsing_data(ClearBrowsingData const& request, std::functio
         if (done)
             done();
     });
+}
+
+// Whether `host` is `domain` or one of its subdomains.
+static bool is_same_or_subdomain(StringView host, StringView domain)
+{
+    if (host == domain)
+        return true;
+    return host.length() > domain.length() && host.ends_with(domain) && host[host.length() - domain.length() - 1] == '.';
+}
+
+void Runtime::clear_site_data(std::string const& host, std::function<void()> done)
+{
+    auto site = MUST(String::from_utf8(StringView { host.data(), host.size() })).to_ascii_lowercase();
+    if (!site.is_empty()) {
+        auto& session = WebView::Application::default_session();
+        for (auto& cookie : session.cookie_jar->get_all_cookies()) {
+            if (!is_same_or_subdomain(site, cookie.domain) && !is_same_or_subdomain(cookie.domain, site))
+                continue;
+            cookie.expiry_time = UnixDateTime::earliest();
+            session.cookie_jar->update_cookie(move(cookie));
+        }
+        for (auto scheme : { "https"sv, "http"sv })
+            session.storage_jar->clear_storage_key(Web::StorageAPI::StorageEndpointType::LocalStorage, MUST(String::formatted("{}://{}", scheme, site)));
+    }
+    if (done)
+        done();
 }
 
 #if defined(__APPLE__)
