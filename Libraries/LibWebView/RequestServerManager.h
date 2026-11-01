@@ -97,6 +97,7 @@ public:
 
     // Lets requests to `host` proceed although its certificate cannot be verified, for this run of the browser.
     void allow_certificate_errors_for_host(ByteString host);
+    bool allows_certificate_errors_for_host(ByteString const& host) const { return m_hosts_allowing_certificate_errors.contains(host); }
     // The certificate `host` last presented to any of the RequestServers, if one connected to it.
     NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> peer_certificate_for_host(ByteString const& host);
 
