@@ -240,7 +240,7 @@ struct ClearBrowsingData {
     int64_t since_unix_seconds { 0 };
     // The network cache.
     bool cache { false };
-    // Cookies and site storage such as localStorage and IndexedDB.
+    // Cookies and web storage such as localStorage.
     bool site_data { false };
 };
 
@@ -328,9 +328,10 @@ struct ViewCallbacks {
     std::function<void(bool unresponsive)> page_unresponsive_changed;
     std::function<void(ContextMenuRequest const&)> context_menu_requested;
     std::function<void(SelectDropdownRequest const&)> select_dropdown_requested;
-    // A file input asked for files. The embedder answers with
-    // View::file_picker_closed, also when cancelled.
-    std::function<void(bool allow_multiple)> file_picker_requested;
+    // A file input asked for files. `accept` lists the kinds it takes, each a filename extension with its leading dot
+    // (".pdf"), a MIME type ("image/png") or a MIME type family ("image/*"); empty takes any file. The embedder answers
+    // with View::file_picker_closed, also when cancelled.
+    std::function<void(bool allow_multiple, std::vector<std::string> const& accept)> file_picker_requested;
     std::function<void(PermissionRequest const&)> permission_requested;
     std::function<void(HTTPCredentialsRequest const&)> http_credentials_requested;
     // A download took over the view's first navigation, so it shows only its initial blank page.
@@ -568,8 +569,9 @@ public:
     void set_external_apps(ExternalApps);
     // Deletes website data, then calls `done`.
     void clear_browsing_data(ClearBrowsingData const&, std::function<void()> done);
-    // Deletes the cookies and localStorage of one site in the default profile: cookies for `host`, its subdomains and
-    // the domains it shares cookies with, and localStorage of its http and https origins on their default ports.
+    // Deletes the cookies and web storage of one site in the default profile: cookies for `host`, its subdomains and
+    // the domains it shares cookies with, and the web storage of every origin on `host` or its subdomains, whatever
+    // its scheme or port. IndexedDB keeps nothing past its page, so there is none to delete.
     void clear_site_data(std::string const& host, std::function<void()> done);
     // Lets pages from `host` load although its certificate cannot be verified, until the browser quits.
     void allow_certificate_errors_for_host(std::string const& host);

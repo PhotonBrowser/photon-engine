@@ -47,6 +47,7 @@ ErrorOr<NonnullOwnPtr<StorageJar>> StorageJar::create(Database::Database& databa
     statements.set_item = TRY(database.prepare_statement("INSERT OR REPLACE INTO WebStorage (storage_endpoint, storage_key, bottle_key, bottle_value, last_access_time) VALUES (?, ?, ?, ?, ?);"sv));
     statements.delete_item = TRY(database.prepare_statement("DELETE FROM WebStorage WHERE storage_endpoint = ? AND storage_key = ? AND bottle_key = ?;"sv));
     statements.delete_items_accessed_since = TRY(database.prepare_statement("DELETE FROM WebStorage WHERE last_access_time >= ?;"sv));
+    statements.bottles = TRY(database.prepare_statement("SELECT DISTINCT storage_endpoint, storage_key FROM WebStorage;"sv));
     statements.bottles_accessed_since = TRY(database.prepare_statement("SELECT DISTINCT storage_endpoint, storage_key FROM WebStorage WHERE last_access_time >= ?;"sv));
     statements.mark_accessed = TRY(database.prepare_statement("UPDATE WebStorage SET last_access_time = ? WHERE storage_endpoint = ? AND storage_key = ?;"sv));
     statements.clear = TRY(database.prepare_statement("DELETE FROM WebStorage WHERE storage_endpoint = ? AND storage_key = ?;"sv));
@@ -135,6 +136,11 @@ void StorageJar::remove_items_accessed_since(UnixDateTime since)
 
     for (auto const& bottle : affected_bottles)
         notify({ StorageChange::Type::Reset, bottle.storage_endpoint, bottle.storage_key, {}, {}, {} });
+}
+
+Vector<StorageBottleLocation> StorageJar::bottles() const
+{
+    return m_persisted_storage.has_value() ? m_persisted_storage->bottles() : m_transient_storage.bottles();
 }
 
 void StorageJar::clear_storage_key(StorageEndpointType storage_endpoint, String const& storage_key)
@@ -262,6 +268,16 @@ Vector<StorageBottleLocation> StorageJar::TransientStorage::delete_items_accesse
             affected_bottles.append(location);
     }
     return affected_bottles;
+}
+
+Vector<StorageBottleLocation> StorageJar::TransientStorage::bottles() const
+{
+    Vector<StorageBottleLocation> bottles;
+    for (auto const& [location, bottle] : m_bottles) {
+        if (!bottle.items.is_empty())
+            bottles.append(location);
+    }
+    return bottles;
 }
 
 void StorageJar::TransientStorage::mark_accessed(StorageEndpointType storage_endpoint, String const& storage_key)
@@ -399,6 +415,18 @@ Vector<StorageBottleLocation> StorageJar::PersistedStorage::delete_items_accesse
 
     database->execute_statement(statements.delete_items_accessed_since, {}, since);
     return affected_bottles;
+}
+
+Vector<StorageBottleLocation> StorageJar::PersistedStorage::bottles() const
+{
+    Vector<StorageBottleLocation> bottles;
+    database->execute_statement(
+        statements.bottles,
+        [&](auto statement_id) -> ErrorOr<void> {
+            bottles.append({ static_cast<StorageEndpointType>(database->result_column<i64>(statement_id, 0)), database->result_column<String>(statement_id, 1) });
+            return {};
+        });
+    return bottles;
 }
 
 void StorageJar::PersistedStorage::mark_accessed(StorageEndpointType storage_endpoint, String const& storage_key)

@@ -452,13 +452,41 @@ public:
         m_callbacks.select_dropdown_requested(request);
     }
 
-    void request_file_picker(Web::HTML::AllowMultipleFiles allow_multiple_files)
+    void request_file_picker(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files)
     {
         if (!m_callbacks.file_picker_requested) {
             file_picker_closed({});
             return;
         }
-        m_callbacks.file_picker_requested(allow_multiple_files == Web::HTML::AllowMultipleFiles::Yes);
+        auto to_std_string = [](Utf16String const& value) {
+            auto utf8 = value.to_utf8();
+            auto bytes = utf8.bytes_as_string_view();
+            return std::string(bytes.characters_without_null_termination(), bytes.length());
+        };
+        std::vector<std::string> accept;
+        for (auto const& filter : accepted_file_types.filters) {
+            filter.visit(
+                [&](Web::HTML::FileFilter::FileType type) {
+                    switch (type) {
+                    case Web::HTML::FileFilter::FileType::Audio:
+                        accept.emplace_back("audio/*");
+                        break;
+                    case Web::HTML::FileFilter::FileType::Image:
+                        accept.emplace_back("image/*");
+                        break;
+                    case Web::HTML::FileFilter::FileType::Video:
+                        accept.emplace_back("video/*");
+                        break;
+                    }
+                },
+                [&](Web::HTML::FileFilter::MimeType const& mime_type) {
+                    accept.push_back(to_std_string(mime_type.value));
+                },
+                [&](Web::HTML::FileFilter::Extension const& extension) {
+                    accept.push_back("." + to_std_string(extension.value));
+                });
+        }
+        m_callbacks.file_picker_requested(allow_multiple_files == Web::HTML::AllowMultipleFiles::Yes, accept);
     }
 
     void choose_files(std::vector<std::string> const& paths)
@@ -1115,8 +1143,8 @@ private:
         on_request_select_dropdown = [this](Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) {
             request_select_dropdown(content_position, minimum_width, items);
         };
-        on_request_file_picker = [this](Web::HTML::FileFilter const&, Web::HTML::AllowMultipleFiles allow_multiple_files) {
-            request_file_picker(allow_multiple_files);
+        on_request_file_picker = [this](Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) {
+            request_file_picker(accepted_file_types, allow_multiple_files);
         };
         on_request_alert = [this](Utf16String const& message) {
             request_dialog(Photon::DialogType::Alert, message, {});
@@ -1915,8 +1943,13 @@ void Runtime::clear_site_data(std::string const& host, std::function<void()> don
             cookie.expiry_time = UnixDateTime::earliest();
             session.cookie_jar->update_cookie(move(cookie));
         }
-        for (auto scheme : { "https"sv, "http"sv })
-            session.storage_jar->clear_storage_key(Web::StorageAPI::StorageEndpointType::LocalStorage, MUST(String::formatted("{}://{}", scheme, site)));
+        for (auto const& bottle : session.storage_jar->bottles()) {
+            auto url = URL::Parser::basic_parse(bottle.storage_key);
+            if (!url.has_value() || !url->host().has_value())
+                continue;
+            if (is_same_or_subdomain(url->serialized_host(), site))
+                session.storage_jar->clear_storage_key(bottle.storage_endpoint, bottle.storage_key);
+        }
     }
     if (done)
         done();

@@ -302,3 +302,34 @@ TEST_CASE(get_all_items_returns_every_pair_persisted)
     auto jar = TRY_OR_FAIL(WebView::StorageJar::create(*database));
     get_all_items_returns_every_pair_in(*jar);
 }
+
+static void expect_bottles_list_each_nonempty_bottle(WebView::StorageJar& jar)
+{
+    jar.set_item(WebView::StorageEndpointType::LocalStorage, "https://example.com"_string, "a"_utf16, "1"_utf16);
+    jar.set_item(WebView::StorageEndpointType::LocalStorage, "https://example.com"_string, "b"_utf16, "2"_utf16);
+    jar.set_item(WebView::StorageEndpointType::LocalStorage, "http://example.com:8080"_string, "a"_utf16, "1"_utf16);
+    jar.set_item(WebView::StorageEndpointType::SessionStorage, "https://other.test"_string, "a"_utf16, "1"_utf16);
+
+    auto bottles = jar.bottles();
+    EXPECT_EQ(bottles.size(), 3u);
+    EXPECT(bottles.contains_slow(WebView::StorageBottleLocation { WebView::StorageEndpointType::LocalStorage, "https://example.com"_string }));
+    EXPECT(bottles.contains_slow(WebView::StorageBottleLocation { WebView::StorageEndpointType::LocalStorage, "http://example.com:8080"_string }));
+    EXPECT(bottles.contains_slow(WebView::StorageBottleLocation { WebView::StorageEndpointType::SessionStorage, "https://other.test"_string }));
+
+    jar.clear_storage_key(WebView::StorageEndpointType::LocalStorage, "http://example.com:8080"_string);
+    EXPECT_EQ(jar.bottles().size(), 2u);
+}
+
+TEST_CASE(transient_storage_lists_its_bottles)
+{
+    auto jar = WebView::StorageJar::create();
+    expect_bottles_list_each_nonempty_bottle(*jar);
+}
+
+TEST_CASE(persisted_storage_lists_its_bottles)
+{
+    auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
+    EXPECT_EQ(TRY_OR_FAIL(WebView::StorageJar::migrate_schema(*database)), Database::MigrationOutcome::Success);
+    auto jar = TRY_OR_FAIL(WebView::StorageJar::create(*database));
+    expect_bottles_list_each_nonempty_bottle(*jar);
+}

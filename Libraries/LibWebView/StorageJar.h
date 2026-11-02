@@ -84,6 +84,8 @@ public:
     StorageSetResult set_item(StorageEndpointType storage_endpoint, String const& storage_key, Utf16String const& bottle_key, Utf16String const& bottle_value);
     void remove_item(StorageEndpointType storage_endpoint, String const& storage_key, Utf16String const& key);
     void remove_items_accessed_since(UnixDateTime);
+    // Every bottle that holds at least one item.
+    Vector<StorageBottleLocation> bottles() const;
     void clear_storage_key(StorageEndpointType storage_endpoint, String const& storage_key);
     Vector<Utf16String> get_all_keys(StorageEndpointType storage_endpoint, String const& storage_key);
     // Reads don't reach the jar once a process mirrors a bottle, so a mirror marks the bottle accessed when it loads it.
@@ -101,6 +103,7 @@ private:
         Database::StatementID delete_item { 0 };
         Database::StatementID delete_items_accessed_since { 0 };
         Database::StatementID bottles_accessed_since { 0 };
+        Database::StatementID bottles { 0 };
         Database::StatementID mark_accessed { 0 };
         Database::StatementID clear { 0 };
         Database::StatementID get_keys { 0 };
@@ -119,6 +122,7 @@ private:
         void delete_item(StorageLocation const& key);
         // Returns the bottles that lost at least one item.
         Vector<StorageBottleLocation> delete_items_accessed_since(UnixDateTime);
+        Vector<StorageBottleLocation> bottles() const;
         void clear(StorageEndpointType storage_endpoint, String const& storage_key);
         Vector<Utf16String> get_keys(StorageEndpointType storage_endpoint, String const& storage_key);
         void mark_accessed(StorageEndpointType storage_endpoint, String const& storage_key);
@@ -150,6 +154,7 @@ private:
         void delete_item(StorageLocation const& key);
         // Returns the bottles that lost at least one item.
         Vector<StorageBottleLocation> delete_items_accessed_since(UnixDateTime);
+        Vector<StorageBottleLocation> bottles() const;
         void clear(StorageEndpointType storage_endpoint, String const& storage_key);
         Vector<Utf16String> get_keys(StorageEndpointType storage_endpoint, String const& storage_key);
         void mark_accessed(StorageEndpointType storage_endpoint, String const& storage_key);
