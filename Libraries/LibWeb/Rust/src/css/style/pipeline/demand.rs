@@ -364,17 +364,25 @@ impl StyleEngine {
 
     /// The installation of the current record of `node`, computed on demand where it holds none, for a read of its
     /// style, which installs it as a style update does. No transaction lies behind it, and the render side leaves the
-    /// element's boxes to the host. None for a document with no live style.
+    /// element's boxes to the host. None for a document with no live style, or where an input is still pending above
+    /// the element, for which the read answers the style the element holds until the next style update.
     pub(in super::super) fn demand_installation(
         &mut self,
         node: StyleNodeID,
     ) -> Option<super::install::StyleInstallation> {
         // NB: A document that is never styled, as the one holding a template's contents, has no live style.
         self.retained.live_style.as_ref()?;
-        assert!(
-            self.retained.record_demand_reads_current_inputs(node, &self.host),
+        // FIXME: A read runs style updates until none is pending, so no input should be pending as the engine answers
+        //        it, but installing a record earlier in the read's walk can still record one (seen on a
+        //        getComputedStyle() read since 71ecd56b8f2). Answer the held style rather than abort the page.
+        let reads_current_inputs = self.retained.record_demand_reads_current_inputs(node, &self.host);
+        debug_assert!(
+            reads_current_inputs,
             "a read runs style updates until none is pending, so no input is pending as the engine answers it"
         );
+        if !reads_current_inputs {
+            return None;
+        }
         let demanded = self.demand_element(node, false);
         let projection = &self.retained.projection;
         let root = std::iter::successors(Some(node), |&node| projection.inheritance_parent(node))
