@@ -7,7 +7,11 @@
 #include <LibJS/ToolEntryPoints.h>
 #include <LibMain/Main.h>
 
-#if !defined(AK_OS_WINDOWS) && !defined(AK_OS_ANDROID)
+#if !defined(AK_OS_WINDOWS) && !defined(AK_OS_ANDROID) && !defined(JS_WITHOUT_LINE_EDITOR)
+#    define JS_HAS_LINE_EDITOR
+#endif
+
+#ifdef JS_HAS_LINE_EDITOR
 #    include <editline/readline.h>
 #endif
 
@@ -25,7 +29,7 @@ struct JSLineEditor {
 };
 }
 
-#if !defined(AK_OS_WINDOWS) && !defined(AK_OS_ANDROID)
+#ifdef JS_HAS_LINE_EDITOR
 static LineCompletionFunction s_complete_line;
 
 static char** complete_line_being_edited(char const*, int, int)
@@ -50,10 +54,10 @@ static constexpr JSLineEditor s_libedit_line_editor {
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
-#if defined(AK_OS_WINDOWS) || defined(AK_OS_ANDROID)
-    JSLineEditor const* line_editor = nullptr;
-#else
+#ifdef JS_HAS_LINE_EDITOR
     JSLineEditor const* line_editor = &s_libedit_line_editor;
+#else
+    JSLineEditor const* line_editor = nullptr;
 #endif
     return JS::js_main(arguments.argc, arguments.argv, line_editor);
 }

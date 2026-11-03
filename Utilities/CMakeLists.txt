@@ -1,6 +1,9 @@
 ladybird_utility(js SOURCES js.cpp LIBS LibJSStandalone LibMain)
 if (NOT WIN32 AND NOT ANDROID AND LIBEDIT_FOUND)
     target_link_libraries(js PRIVATE PkgConfig::LIBEDIT)
+else()
+    # Builds that leave libedit out, such as the Photon embedder's, get the REPL without line editing.
+    target_compile_definitions(js PRIVATE JS_WITHOUT_LINE_EDITOR)
 endif()
 ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibMain LibJSStandalone LibCrypto LibGC)
 
