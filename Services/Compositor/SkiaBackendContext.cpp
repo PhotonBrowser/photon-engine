@@ -72,6 +72,13 @@ namespace Gfx {
 // cannot retain hundreds of MiB outside the per-tab memory totals shown by the shell.
 static constexpr size_t skia_resource_cache_limit = 128 * MiB;
 #endif
+// NB: Asked on every flush, so the environment is read once.
+[[maybe_unused]] static bool photon_verbose()
+{
+    static bool enabled = std::getenv("PHOTON_VERBOSE") != nullptr;
+    return enabled;
+}
+
 static constexpr auto skia_deferred_cleanup_interval = AK::Duration::from_seconds(1);
 static constexpr auto skia_aggressive_cleanup_interval = AK::Duration::from_seconds(5);
 static constexpr auto skia_deferred_cleanup_resource_age = std::chrono::seconds(1);
@@ -129,13 +136,18 @@ static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurfac
     }
     flush_info.fFinishedProc = invoke_async_flush_callback;
     flush_info.fFinishedContext = new Function<void()>(move(callback));
+    if (!photon_verbose()) {
+        context.flush(surface, to_backend_surface_access(access), flush_info);
+        VERIFY(context.submit(GrSyncCpu::kNo));
+        return;
+    }
     auto const flush_started_at = MonotonicTime::now();
     context.flush(surface, to_backend_surface_access(access), flush_info);
     auto const flush_duration = MonotonicTime::now() - flush_started_at;
     auto const submit_started_at = MonotonicTime::now();
     VERIFY(context.submit(GrSyncCpu::kNo));
     auto const submit_duration = MonotonicTime::now() - submit_started_at;
-    if (std::getenv("PHOTON_VERBOSE") && (flush_duration.to_microseconds() >= 5000 || submit_duration.to_microseconds() >= 5000))
+    if ((flush_duration.to_microseconds() >= 5000 || submit_duration.to_microseconds() >= 5000))
         dbgln("Photon Skia submit detail: flush={:.2f}ms metal_submit={:.2f}ms", flush_duration.to_seconds_f64() * 1000.0, submit_duration.to_seconds_f64() * 1000.0);
 }
 #endif
@@ -194,7 +206,7 @@ void SkiaBackendContext::purge_resources_unused_for(AK::Duration age)
     size_t resource_bytes_before = 0;
     context->getResourceCacheUsage(nullptr, &resource_bytes_before);
     context->performDeferredCleanup(std::chrono::milliseconds(age.to_milliseconds()));
-    if (std::getenv("PHOTON_VERBOSE")) {
+    if (photon_verbose()) {
         size_t resource_bytes_after = 0;
         context->getResourceCacheUsage(nullptr, &resource_bytes_after);
         dbgln("Photon Skia idle purge: cache_bytes={}->{}", resource_bytes_before, resource_bytes_after);
@@ -244,7 +256,7 @@ void SkiaBackendContext::perform_post_flush_cleanup()
             context->performDeferredCleanup(std::chrono::milliseconds(0));
             recorder->performDeferredCleanup(std::chrono::milliseconds(0));
         }
-        if (std::getenv("PHOTON_VERBOSE")) {
+        if (photon_verbose()) {
             auto const bytes_after = context->currentBudgetedBytes() + recorder->currentBudgetedBytes();
             dbgln("Photon Graphite cleanup: cache_bytes={}->{}", bytes_before, bytes_after);
         }
@@ -276,12 +288,12 @@ void SkiaBackendContext::perform_post_flush_cleanup()
     context->getResourceCacheUsage(&resource_count_after_deferred_cleanup, &resource_bytes);
     auto const resource_bytes_after_deferred_cleanup = resource_bytes;
     if (resource_bytes < skia_resource_cache_high_watermark) {
-        if (std::getenv("PHOTON_VERBOSE") && deferred_cleanup_duration.to_microseconds() >= 5000)
+        if (photon_verbose() && deferred_cleanup_duration.to_microseconds() >= 5000)
             dbgln("Photon Skia cleanup detail: deferred={:.2f}ms aggressive=skipped purge=skipped resources={}->{} cache_bytes={}->{}", deferred_cleanup_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_bytes_before, resource_bytes);
         return;
     }
     if (s_last_aggressive_cleanup.has_value() && now - *s_last_aggressive_cleanup < skia_aggressive_cleanup_interval) {
-        if (std::getenv("PHOTON_VERBOSE") && deferred_cleanup_duration.to_microseconds() >= 5000)
+        if (photon_verbose() && deferred_cleanup_duration.to_microseconds() >= 5000)
             dbgln("Photon Skia cleanup detail: deferred={:.2f}ms aggressive=throttled purge=skipped resources={}->{} cache_bytes={}->{}", deferred_cleanup_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_bytes_before, resource_bytes);
         return;
     }
@@ -303,7 +315,7 @@ void SkiaBackendContext::perform_post_flush_cleanup()
     size_t resource_bytes_after_purge = 0;
     context->getResourceCacheUsage(&resource_count_after_purge, &resource_bytes_after_purge);
     auto const cleanup_duration = MonotonicTime::now() - deferred_cleanup_started_at;
-    if (std::getenv("PHOTON_VERBOSE") && cleanup_duration.to_microseconds() >= 5000)
+    if (photon_verbose() && cleanup_duration.to_microseconds() >= 5000)
         dbgln("Photon Skia cleanup detail: total={:.2f}ms deferred={:.2f}ms aggressive={:.2f}ms purge={:.2f}ms resources={}/{}/{}/{} cache_bytes={}/{}/{}/{}", cleanup_duration.to_seconds_f64() * 1000.0, deferred_cleanup_duration.to_seconds_f64() * 1000.0, aggressive_cleanup_duration.to_seconds_f64() * 1000.0, purge_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_count_after_aggressive_cleanup, resource_count_after_purge, resource_bytes_before, resource_bytes_after_deferred_cleanup, resource_bytes, resource_bytes_after_purge);
 }
 
@@ -661,7 +673,7 @@ public:
         m_context->precompileShader(*entry.key, *entry.data);
         m_warm_duration += MonotonicTime::now() - started_at;
         auto remaining = m_next_warm_entry < m_warm_entries->size();
-        if (!remaining && std::getenv("PHOTON_VERBOSE"))
+        if (!remaining && photon_verbose())
             dbgln("Photon Skia precompiled {} programs in {:.2f}ms", m_warm_entries->size(), m_warm_duration.to_seconds_f64() * 1000.0);
         return remaining;
     }

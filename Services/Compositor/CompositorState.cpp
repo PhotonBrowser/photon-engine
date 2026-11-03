@@ -28,9 +28,17 @@ static bool photon_frame_trace_enabled()
     return enabled;
 }
 
+// NB: These are asked every frame, so the environment is read once.
 static bool photon_frame_profile_enabled()
 {
-    return std::getenv("PHOTON_VERBOSE") || std::getenv("PHOTON_FRAME_PROFILE");
+    static bool enabled = std::getenv("PHOTON_VERBOSE") || std::getenv("PHOTON_FRAME_PROFILE");
+    return enabled;
+}
+
+static bool external_image_lease_trace_enabled()
+{
+    static bool enabled = std::getenv("EXTERNAL_IMAGE_LEASE_TRACE") != nullptr;
+    return enabled;
 }
 
 static constexpr int gpu_completion_check_interval_ms = 1;
@@ -1956,7 +1964,7 @@ void CompositorState::presented_bitmap_ready_to_paint(Web::CompositorContextId c
         return;
 
     auto released = context->presenter().acknowledge_presented_bitmap(bitmap_id, consumer_gpu_work_complete);
-    if (std::getenv("EXTERNAL_IMAGE_LEASE_TRACE"))
+    if (external_image_lease_trace_enabled())
         dbgln("[ExternalImageLease][Pool] at_ns={} context={} bitmap_id={} backing_id={} generation={} frame_id=not-available event=release_ack_received released={}", MonotonicTime::now().nanoseconds(), context_id, bitmap_id, static_cast<u64>(bitmap_id) + 1, 0, released);
     if (!released)
         return;
