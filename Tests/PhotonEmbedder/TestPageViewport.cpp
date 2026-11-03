@@ -50,25 +50,23 @@ TEST_CASE(viewport_size_handles_local_and_remote_top_level_traversables)
     EXPECT(!remote_page.set_viewport_size_from_device_pixels_if_local({ 640, 480 }, Web::InvalidateDisplayList::No));
 }
 
-TEST_CASE(permission_response_requires_matching_request_and_document_and_resolves_once)
+// The browser checks the requesting document before it answers, so the page only has to match the request and
+// resolve it once.
+TEST_CASE(permission_response_requires_matching_request_and_resolves_once)
 {
     auto realm = Web::Bindings::create_a_principal_javascript_realm();
     auto& page = Web::Bindings::principal_host_defined_page(*realm);
-    auto document_id = Web::HTML::EnvironmentId::generate();
-    auto stale_document_id = Web::HTML::EnvironmentId::generate();
-    Optional<bool> decision;
-    auto callback = GC::create_function(realm->heap(), [&](bool granted) { decision = granted; });
+    Optional<Web::Permissions::EffectiveState> decision;
+    auto callback = GC::create_function(realm->heap(), [&](Web::Permissions::EffectiveState state) { decision = state; });
 
-    auto origin = URL::Origin::create_opaque();
-    page.request_permission("microphone"_utf16, origin, origin, document_id, callback);
+    page.request_permission(Web::HTML::CrossProcessId { 1 }, "microphone"_utf16, callback);
 
-    page.permission_request_completed(0, stale_document_id, true);
+    page.permission_request_completed(1, Web::Permissions::EffectiveState::Granted);
     EXPECT(!decision.has_value());
 
-    page.permission_request_completed(0, document_id, false);
-    EXPECT(decision.has_value());
-    EXPECT(!*decision);
+    page.permission_request_completed(0, Web::Permissions::EffectiveState::Denied);
+    EXPECT(decision == Web::Permissions::EffectiveState::Denied);
 
-    page.permission_request_completed(0, document_id, true);
-    EXPECT(!*decision);
+    page.permission_request_completed(0, Web::Permissions::EffectiveState::Granted);
+    EXPECT(decision == Web::Permissions::EffectiveState::Denied);
 }
