@@ -20,13 +20,16 @@ jobs:
       image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.08.28
 
     env:
-      VCPKG_ROOT: ${{ runner.temp }}/vcpkg-debug
-      LADYBIRD_MAIN_SOURCE_DIR: ${{ runner.temp }}/photon-engine-build
-      PHOTON_ENGINE_BUILD_DIR: ${{ runner.temp }}/photon-engine-build/engine-debug
       VCPKG_MAX_CONCURRENCY: 2
 
     steps:
       - uses: actions/checkout@v7.0.1
+
+      - name: Set engine build paths
+        run: |
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg-debug" >> "$GITHUB_ENV"
+          echo "LADYBIRD_MAIN_SOURCE_DIR=$RUNNER_TEMP/photon-engine-build" >> "$GITHUB_ENV"
+          echo "PHOTON_ENGINE_BUILD_DIR=$RUNNER_TEMP/photon-engine-build/engine-debug" >> "$GITHUB_ENV"
 
       - name: Bootstrap the pinned vcpkg tool
         run: |
