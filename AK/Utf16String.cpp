@@ -162,9 +162,10 @@ String Utf16String::to_well_formed_utf8() const
 
 ErrorOr<void> Formatter<Utf16String>::format(FormatBuilder& builder, Utf16String const& utf16_string)
 {
-    if (utf16_string.has_long_utf16_storage())
-        return builder.put_string(utf16_string.utf16_view());
-    return builder.put_string(utf16_string.ascii_view());
+    // NB: One-byte storage may hold Latin-1, which is not UTF-8, so only ASCII may be written as its bytes.
+    if (utf16_string.has_ascii_storage())
+        return builder.put_string(utf16_string.ascii_view());
+    return builder.put_string(utf16_string.utf16_view());
 }
 
 template<Integral T>

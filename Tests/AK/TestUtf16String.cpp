@@ -1371,6 +1371,9 @@ TEST_CASE(latin1_storage)
     builder.append(string);
     EXPECT_EQ(builder.to_string(), utf16_string);
 
+    // Formatting writes UTF-8, never the Latin-1 bytes themselves.
+    EXPECT_EQ(MUST(String::formatted("{}", string)), "crème brûlée"sv);
+
     // Latin-1 storage whose code units are all ASCII is ASCII storage.
     static constexpr u8 ascii_bytes[] = { 'c', 'r', 'e', 'm', 'e', ' ', 'b', 'r', 'u', 'l', 'e', 'e' };
     auto ascii_string = Utf16String::from_utf16(Utf16View::from_latin1(ascii_bytes, false));
