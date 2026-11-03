@@ -23,6 +23,7 @@ use crate::painting::paintable_data::PaintableFlag;
 use crate::painting::record::damage::PaintDamage;
 use crate::painting::record::svg_resources::MaskLayerSet;
 use crate::painting::scroll_snap;
+use libgfx_rust::Color;
 use smallvec::SmallVec;
 use std::ops::Range;
 
@@ -59,12 +60,17 @@ fn hit_phase(kind: ProducerKind) -> Option<PaintPhase> {
 }
 
 impl<O: Observer> PaintRecorder<'_, O> {
-    pub(crate) fn record_canvas(&mut self) {
+    pub(crate) fn record_canvas(&mut self) -> Color {
+        let mut root_group_color = Color::TRANSPARENT;
         self.trace_paint(Operation::Named(None, "canvas"), |this| {
             let inputs = this.inputs;
+            let canvas_color = this
+                .recorder
+                .resolve_color(inputs.uncaptured.canvas_color, ForceDarkRole::Background);
             if let Some(rect) = inputs.canvas_fill_rect {
                 this.recorder
                     .fill_rect(rect, inputs.uncaptured.canvas_color, ForceDarkRole::Background);
+                root_group_color = canvas_color;
             }
             // .. in the case of embedded documents typically rendered over a transparent canvas
             // (such as provided via an HTML iframe element), if the used color scheme of the element
@@ -77,13 +83,19 @@ impl<O: Observer> PaintRecorder<'_, O> {
                     inputs.uncaptured.canvas_color,
                     ForceDarkRole::Background,
                 );
+                root_group_color = canvas_color;
             }
             this.recorder.fill_rect(
                 inputs.bitmap_rect,
                 inputs.uncaptured.background_color,
                 ForceDarkRole::Background,
             );
+            root_group_color = root_group_color.blend(
+                this.recorder
+                    .resolve_color(inputs.uncaptured.background_color, ForceDarkRole::Background),
+            );
         });
+        root_group_color
     }
 
     // https://drafts.csswg.org/css-transforms-1/#transform-function-lists
@@ -182,9 +194,10 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
         if self.producer_is_skipped(owner, kind) {
             self.observer
                 .observe(|log| log.leaf(Operation::Producer(owner, kind), Action::Skip, true));
-            return ProducerOutcome { live: false };
+            return ProducerOutcome::default();
         }
         self.live_producer = false;
+        self.producer_reads_window_focus.set(false);
         let start = self.output_position();
         self.observer
             .observe(|log| log.begin(Operation::Producer(owner, kind), Action::Record));
@@ -224,6 +237,7 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
         );
         ProducerOutcome {
             live: self.live_producer,
+            reads_window_focus: self.producer_reads_window_focus.get(),
         }
     }
 

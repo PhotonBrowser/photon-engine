@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use ak::Utf16String;
 use libjs_abi::Builtin;
 use libjs_runtime_macros::Trace;
 
@@ -14,7 +13,7 @@ use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{get_prototype_from_constructor, length_of_array_like};
-use crate::runtime::completion::{Must, ThrowCompletionOr};
+use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_object::FunctionObject;
@@ -106,7 +105,7 @@ impl StringConstructor {
 
         // 1. If value is not present, let s be the empty String.
         if vm.argument_count() == 0 {
-            return Ok(Value::from_string(PrimitiveString::create(vm, Utf16String::default())));
+            return Ok(Value::from_string(vm.empty_string()));
         }
 
         // 2. Else,
@@ -130,7 +129,7 @@ impl StringConstructor {
 
         // 1. If value is not present, let s be the empty String.
         let primitive_string = if vm.argument_count() == 0 {
-            PrimitiveString::create(vm, Utf16String::default())
+            vm.empty_string()
         }
         // 2. Else,
         else {
@@ -184,10 +183,9 @@ impl StringConstructor {
                 return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidCodePoint, &[&next_code_point]);
             }
 
-            let code_point = next_code_point.to_i32(vm).must();
-
             // c. If ℝ(nextCP) < 0 or ℝ(nextCP) > 0x10FFFF, throw a RangeError exception.
-            if !(0..=0x10FFFF).contains(&code_point) {
+            let code_point = next_code_point.as_f64();
+            if !(0.0..=f64::from(0x10FFFF)).contains(&code_point) {
                 return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidCodePoint, &[&next_code_point]);
             }
 
@@ -225,7 +223,7 @@ impl StringConstructor {
 
         // 5. If literalCount ≤ 0, return the empty String.
         if literal_count == 0 {
-            return Ok(Value::from_string(PrimitiveString::create(vm, Utf16String::default())));
+            return Ok(Value::from_string(vm.empty_string()));
         }
 
         // 6. Let R be the empty String.

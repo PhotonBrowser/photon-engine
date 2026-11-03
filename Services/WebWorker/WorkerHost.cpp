@@ -45,6 +45,13 @@ WorkerHost::WorkerHost(URL::URL url, Web::HTML::WorkerType type, String name)
 
 WorkerHost::~WorkerHost() = default;
 
+void WorkerHost::notify_script_ran()
+{
+    m_script_has_run = true;
+    if (auto callback = move(m_on_script_ready))
+        callback();
+}
+
 // https://html.spec.whatwg.org/multipage/workers.html#relevant-owner-to-add
 static Web::HTML::WorkerGlobalScope::Owner relevant_owner_to_add(Web::HTML::SerializedEnvironmentSettingsObject const& outside_settings)
 {
@@ -139,6 +146,11 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
         shared_global_scope.set_credentials(static_cast<Web::Fetch::Infrastructure::Request::CredentialsMode>(credentials));
 
         // FIXME: 5. Set worker global scope's extended lifetime to options["extendedLifetime"].
+    }
+    // AD-HOC: The spec only sets a shared worker's type, which leaves a dedicated module worker "classic" and lets it
+    //         call importScripts().
+    else {
+        worker_global_scope->set_type(m_type);
     }
 
     // 11. Let destination be "sharedworker" if is shared is true, and "worker" otherwise.
@@ -255,15 +267,14 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
         //         (step 5) to connect_shared_worker_impl. Each connecting page gets its own pair
         //         since the connect event fires once per owner, not once at worker startup.
         if (!is_shared) {
-            inside_port = Web::HTML::MessagePort::create(worker_global_scope);
+            Web::HTML::TransferDataDecoder decoder { move(message_port_data) };
+            inside_port = Web::HTML::MessagePort::create_from_transfer(realm, decoder);
 
-            // FIXME:  1. Set inside port's message event target to worker global scope.
+            // 1. Set inside port's message event target to worker global scope.
+            inside_port->set_message_event_target(*worker_global_scope);
 
             // 2. Set worker global scope's inside port to inside port.
             worker_global_scope->set_internal_port(*inside_port);
-
-            Web::HTML::TransferDataDecoder decoder { move(message_port_data) };
-            MUST(inside_port->transfer_receiving_steps(realm, decoder));
         }
 
         // 6. Create a new WorkerLocation object and associate it with worker global scope.
@@ -287,6 +298,7 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
             (void)classic_script->run();
         else
             (void)as<Web::HTML::ModuleScript>(*script).run();
+        protected_this->notify_script_ran();
 
         as<WebWorker::PageHost>(page->client()).did_finish_loading_worker_script(Web::HTML::is_secure_context(*inside_settings));
 
@@ -336,8 +348,7 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
         //    Fetch a module worker script graph given url, outside settings, destination, the value of the credentials
         //    member of options, inside settings, and with onComplete and performFetch as defined below.
         VERIFY(m_type == Web::HTML::WorkerType::Module);
-        // FIXME: Pass credentials
-        if (auto err = Web::HTML::fetch_module_worker_script_graph(m_url, outside_settings, destination, inside_settings, perform_fetch, on_complete); err.is_error()) {
+        if (auto err = Web::HTML::fetch_module_worker_script_graph(m_url, outside_settings, destination, inside_settings, perform_fetch, on_complete, static_cast<Web::Fetch::Infrastructure::Request::CredentialsMode>(credentials)); err.is_error()) {
             dbgln("Failed to run worker script");
             // FIXME: Abort the worker properly
             TODO();
@@ -365,12 +376,10 @@ void WorkerHost::connect_shared_worker_impl(Web::HTML::TransferDataEncoder messa
     VERIFY(m_inside_settings);
 
     // 11.5.5. Let insidePort be a new MessagePort in insideSettings's realm.
-    auto inside_port = Web::HTML::MessagePort::create(*m_worker_global_scope);
-
     // 11.5.6. Entangle outsidePort and insidePort.
     auto& realm = m_inside_settings->realm();
     Web::HTML::TransferDataDecoder decoder { move(message_port_data) };
-    MUST(inside_port->transfer_receiving_steps(realm, decoder));
+    auto inside_port = Web::HTML::MessagePort::create_from_transfer(realm, decoder);
 
     // 11.5.7. Queue a global task on the DOM manipulation task source given workerGlobalScope to
     //         fire an event named connect at workerGlobalScope, using MessageEvent, with the data

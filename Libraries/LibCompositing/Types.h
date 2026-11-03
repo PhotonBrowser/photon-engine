@@ -18,6 +18,7 @@
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Page/CompositorContextId.h>
+#include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Page/InputRoutingDecision.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/PixelUnits.h>
@@ -109,9 +110,45 @@ struct AsyncScrollEnqueueResult {
     Optional<Web::AsyncScrollNodeStableID> routed_scroller {};
 };
 
+// What the compositor did with a wheel event that WebContent's main thread passed on to it, as the compositor does with
+// the UI's wheel events before the main thread gets them.
+struct WheelEventAnswer {
+    bool performed_default_action { false };
+    Optional<Web::WheelGestureMark> wheel_gesture_mark {};
+    // The operation the event started, whose end the scroll updates of the context report.
+    Optional<AsyncScrollOperationID> operation_id {};
+    Optional<Web::CompositorContextId> operation_context_id {};
+    // Why the compositor took or turned away the event, and the scroller it routed the event to.
+    Optional<Web::InputRoutingDecision> routing_decision {};
+    Optional<Web::AsyncScrollNodeStableID> routed_scroller {};
+};
+
 enum class AsyncScrollOperationTracking {
     No,
     Yes,
+};
+
+// When the compositor routes a wheel event that WebContent's main thread passes on to it, which it names the gesture of
+// either way: before the page dispatches the event, as it routes the UI's wheel events, or only once the page lets the
+// event through with the scrollers around its target. The main thread asks for the latter while the compositor's
+// display list misses changes to the scrollers.
+enum class WheelEventRouting : u8 {
+    BeforeDispatch,
+    AfterDispatch,
+};
+
+// A step of a wheel gesture that WebContent's page dispatched and did not cancel, which the compositor scrolls by.
+struct WheelStepLetThrough {
+    Web::UniqueNodeID document_id;
+    Web::WheelGestureMark wheel_gesture_mark;
+    // In the device pixels of the viewport of the context the step is let through in.
+    Gfx::FloatPoint position;
+    // In CSS pixels, with the axes already swapped for Shift.
+    Gfx::FloatPoint delta_in_css_pixels;
+    Web::WheelDeltaPrecision wheel_delta_precision { Web::WheelDeltaPrecision::Discrete };
+    Web::ScrollGesturePhase scroll_gesture_phase { Web::ScrollGesturePhase::None };
+    // The scroll containers around the target of the step, innermost first, ending at the viewport.
+    Vector<Web::AsyncScrollNodeStableID> scroll_chain;
 };
 
 // Blocking wheel event listeners hold a wheel step back from the compositor until the page has dispatched it. A step
@@ -300,8 +337,13 @@ template<>
 COMPOSITING_API ErrorOr<Compositing::ScrollRequest> decode(Decoder&);
 
 template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::AsyncScrollEnqueueResult const&);
+COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::WheelEventAnswer const&);
 template<>
-COMPOSITING_API ErrorOr<Compositing::AsyncScrollEnqueueResult> decode(Decoder&);
+COMPOSITING_API ErrorOr<Compositing::WheelEventAnswer> decode(Decoder&);
+
+template<>
+COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::WheelStepLetThrough const&);
+template<>
+COMPOSITING_API ErrorOr<Compositing::WheelStepLetThrough> decode(Decoder&);
 
 }

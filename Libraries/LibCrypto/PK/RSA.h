@@ -138,6 +138,7 @@ public:
     using KeyPairType = RSAKeyPair<PublicKeyType, PrivateKeyType>;
 
     static ErrorOr<KeyPairType> parse_rsa_key(ReadonlyBytes der, bool is_private, Vector<StringView> current_scope);
+    static ErrorOr<void> validate_key_generation_parameters(size_t bits);
     static ErrorOr<KeyPairType> generate_key_pair(size_t bits, UnsignedBigInteger e = 65537);
 
     RSA(KeyPairType const& pair)
@@ -327,13 +328,15 @@ public:
         return "RSA_PSS-EMSA";
     }
 
-    void set_salt_length(int value) { m_salt_length = value; }
+    void set_salt_length(u32 value) { m_salt_length = value; }
+
+    virtual ErrorOr<bool> verify(ReadonlyBytes message, ReadonlyBytes signature) override;
 
 protected:
     ErrorOr<void> configure(OpenSSL_PKEY_CTX& ctx) override;
 
 private:
-    Optional<int> m_salt_length;
+    Optional<u32> m_salt_length;
 };
 
 }

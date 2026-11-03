@@ -53,11 +53,12 @@ public:
     [[nodiscard]] State state() const { return m_control_block->state(); }
     [[nodiscard]] RefPtr<FetchTimingInfo> full_timing_info() const { return m_control_block->full_timing_info(); }
 
+    [[nodiscard]] bool has_report_timing_steps() const { return m_report_timing_steps != nullptr; }
     void report_timing(JS::Object&) const;
     void process_next_manual_redirect() const;
 
-    // Runs the steps once the network has delivered all of the body whose bytes arrive through the channel, in place of
-    // any steps set before.
+    // Runs the steps once the network has delivered all of the body whose bytes arrive through the channel, unless the
+    // fetch is aborted, terminated or stopped first. A later call replaces them.
     void when_network_completes_body(Engine::FetchByteChannel const&, GC::Ref<GC::Function<void()>> steps);
     void did_complete_network_body(Engine::FetchByteChannel const&);
     [[nodiscard]] NonnullRefPtr<FetchTimingInfo> extract_full_timing_info() const;

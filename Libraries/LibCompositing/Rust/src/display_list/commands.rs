@@ -53,7 +53,6 @@ pub enum DisplayListCommandType {
     PaintScrollBar,
     CompositorSnapContainer,
     CompositorSnapArea,
-    CompositorScrollChainingBarrier,
     CompositorNestedContextWheelRegion,
     Canvas2DFillPath,
     Canvas2DStrokePath,
@@ -95,7 +94,6 @@ impl DisplayListCommandType {
                 | Self::CompositorBlockingWheelEventRegion
                 | Self::CompositorSnapContainer
                 | Self::CompositorSnapArea
-                | Self::CompositorScrollChainingBarrier
                 | Self::CompositorNestedContextWheelRegion
         )
     }
@@ -163,7 +161,6 @@ impl DisplayListCommandType {
             Self::PaintScrollBar => "PaintScrollBar",
             Self::CompositorSnapContainer => "CompositorSnapContainer",
             Self::CompositorSnapArea => "CompositorSnapArea",
-            Self::CompositorScrollChainingBarrier => "CompositorScrollChainingBarrier",
             Self::CompositorNestedContextWheelRegion => "CompositorNestedContextWheelRegion",
             Self::Canvas2DFillPath => "Canvas2DFillPath",
             Self::Canvas2DStrokePath => "Canvas2DStrokePath",
@@ -263,6 +260,8 @@ pub struct ReplayLayer {
     pub backdrop_filter_bytes_size: usize,
     pub backdrop_region: IntRect,
     pub backdrop_corner_radii: CornerRadii,
+    /// The color the backdrop is read over, transparent unless the parent layer is the root isolation layer.
+    pub backdrop_base_color: Color,
     pub effect: EffectNodeIndex,
     /// Bounds of everything replay draws into the layer, in the effect's space, when known.
     pub content_bounds: OptionalFloatRect,
@@ -564,6 +563,15 @@ pub struct DisplayListGlyph {
     pub glyph_id: u32,
 }
 ffi_bytes_fields!(DisplayListGlyph { position, glyph_id });
+
+impl From<&text_layout::DrawGlyph> for DisplayListGlyph {
+    fn from(glyph: &text_layout::DrawGlyph) -> Self {
+        Self {
+            position: FloatPoint { x: glyph.x, y: glyph.y },
+            glyph_id: glyph.glyph_id,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -1476,7 +1484,6 @@ impl DisplayListCommand for DeclareMaskContent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorScrollNode {
-    pub document_id: UniqueNodeId,
     pub scrollable_node_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub parent_scroll_node_index: SpatialNodeIndex,
@@ -1496,7 +1503,6 @@ pub struct CompositorScrollNode {
     pub shows_overscroll_effect_vertically: bool,
 }
 ffi_bytes_fields!(CompositorScrollNode {
-    document_id,
     scrollable_node_id,
     scroll_node_index,
     parent_scroll_node_index,
@@ -1523,7 +1529,6 @@ impl DisplayListCommand for CompositorScrollNode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorSnapContainer {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub snapport: FfiCssPixelRect,
     pub min_scroll_offset: FfiCssPixelPoint,
@@ -1534,7 +1539,6 @@ pub struct CompositorSnapContainer {
     pub horizontal_writing_mode: bool,
 }
 ffi_bytes_fields!(CompositorSnapContainer {
-    document_id,
     scroll_node_index,
     snapport,
     min_scroll_offset,
@@ -1554,7 +1558,6 @@ impl DisplayListCommand for CompositorSnapContainer {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorSnapArea {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub area_node_id: UniqueNodeId,
     pub pseudo_element_type: u8,
@@ -1564,7 +1567,6 @@ pub struct CompositorSnapArea {
     pub always_stop: bool,
 }
 ffi_bytes_fields!(CompositorSnapArea {
-    document_id,
     scroll_node_index,
     area_node_id,
     pseudo_element_type,
@@ -1592,12 +1594,10 @@ impl DisplayListCommand for CompositorBlockingWheelEventRegion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorWheelHitTestTarget {
-    pub document_id: UniqueNodeId,
     pub target_scroll_node_index: SpatialNodeIndex,
     pub rect: FloatRect,
 }
 ffi_bytes_fields!(CompositorWheelHitTestTarget {
-    document_id,
     target_scroll_node_index,
     rect
 });
@@ -1609,13 +1609,11 @@ impl DisplayListCommand for CompositorWheelHitTestTarget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorWheelHitTestTargetWithCornerRadii {
-    pub document_id: UniqueNodeId,
     pub target_scroll_node_index: SpatialNodeIndex,
     pub rect: FloatRect,
     pub corner_radii: CornerRadii,
 }
 ffi_bytes_fields!(CompositorWheelHitTestTargetWithCornerRadii {
-    document_id,
     target_scroll_node_index,
     rect,
     corner_radii
@@ -1623,29 +1621,6 @@ ffi_bytes_fields!(CompositorWheelHitTestTargetWithCornerRadii {
 
 impl DisplayListCommand for CompositorWheelHitTestTargetWithCornerRadii {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii;
-}
-
-/// A scroll container that has no scroll node, because a wheel can scroll nothing in it, and that keeps the scrolls
-/// along an axis to itself all the same: a wheel inside `rect` is not passed on to the scroll node above it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct CompositorScrollChainingBarrier {
-    pub document_id: UniqueNodeId,
-    pub scroll_node_index_above_barrier: SpatialNodeIndex,
-    pub rect: FloatRect,
-    pub keeps_horizontal_scrolls: bool,
-    pub keeps_vertical_scrolls: bool,
-}
-ffi_bytes_fields!(CompositorScrollChainingBarrier {
-    document_id,
-    scroll_node_index_above_barrier,
-    rect,
-    keeps_horizontal_scrolls,
-    keeps_vertical_scrolls
-});
-
-impl DisplayListCommand for CompositorScrollChainingBarrier {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorScrollChainingBarrier;
 }
 
 /// Where a nested context is painted: its content box, clipped to the rounded padding edge. The compositor can hand a
@@ -1681,7 +1656,6 @@ impl DisplayListCommand for CompositorMainThreadWheelEventRegion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorScrollbar {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub gutter_rect: IntRect,
     pub thumb_rect: IntRect,
@@ -1696,10 +1670,8 @@ pub struct CompositorScrollbar {
     pub track_color: Color,
     pub vertical: bool,
     pub is_painted_by_compositor: bool,
-    pub display_list_paints_enlarged_scrollbar: bool,
 }
 ffi_bytes_fields!(CompositorScrollbar {
-    document_id,
     scroll_node_index,
     gutter_rect,
     thumb_rect,
@@ -1713,8 +1685,7 @@ ffi_bytes_fields!(CompositorScrollbar {
     thumb_color,
     track_color,
     vertical,
-    is_painted_by_compositor,
-    display_list_paints_enlarged_scrollbar
+    is_painted_by_compositor
 });
 
 impl DisplayListCommand for CompositorScrollbar {
@@ -1728,6 +1699,8 @@ pub struct PaintScrollBar {
     pub gutter_rect: IntRect,
     pub thumb_rect: IntRect,
     pub track_rect: IntRect,
+    // The compositor presents the scrollbar growing into this rect as it is hovered.
+    pub expanded_gutter_rect: IntRect,
     pub scroll_size: f64,
     pub thumb_color: Color,
     pub track_color: Color,
@@ -1738,6 +1711,7 @@ ffi_bytes_fields!(PaintScrollBar {
     gutter_rect,
     thumb_rect,
     track_rect,
+    expanded_gutter_rect,
     scroll_size,
     thumb_color,
     track_color,
@@ -1747,7 +1721,11 @@ ffi_bytes_fields!(PaintScrollBar {
 impl DisplayListCommand for PaintScrollBar {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintScrollBar;
     fn bounding_rect(&self) -> Option<IntRect> {
-        Some(self.track_rect.united(self.thumb_rect))
+        Some(
+            self.track_rect
+                .united(self.thumb_rect)
+                .united(self.expanded_gutter_rect),
+        )
     }
 }
 

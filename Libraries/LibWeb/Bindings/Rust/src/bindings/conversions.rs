@@ -25,7 +25,7 @@ use crate::ak_format::ak_formatted;
 use crate::bindings::interface::{Interface, Ref, create_dictionary_object, wrap};
 use crate::bindings::promise::WebIdlPromise;
 use crate::bindings::services::web_bindings_object_implements_interface;
-use crate::bindings::{CallContext, Exception, WebIdlResult};
+use crate::bindings::{CallContext, WebIdlResult};
 
 /// A USVString, a string without lone surrogates. Its UTF-16 code units are always well-formed.
 #[derive(Clone, Eq, PartialEq)]
@@ -47,6 +47,7 @@ impl UsvString {
     pub(crate) fn utf8_length(&self) -> usize {
         match self.units() {
             Utf16StringUnits::Ascii(bytes) => bytes.len(),
+            Utf16StringUnits::Latin1(bytes) => bytes.len() + bytes.iter().filter(|&&byte| byte >= 0x80).count(),
             Utf16StringUnits::Utf16(code_units) => utf8_length_from_valid_utf16(code_units),
         }
     }
@@ -64,6 +65,16 @@ impl UsvString {
                 output[..bytes.len()].write_copy_of_slice(bytes);
                 bytes.len()
             }
+            Utf16StringUnits::Latin1(bytes) => {
+                let mut length = 0;
+                for &byte in bytes {
+                    let mut buffer = [0; 2];
+                    let encoded = char::from(byte).encode_utf8(&mut buffer).as_bytes();
+                    output[length..length + encoded.len()].write_copy_of_slice(encoded);
+                    length += encoded.len();
+                }
+                length
+            }
             Utf16StringUnits::Utf16(code_units) => {
                 debug_assert!(output.len() >= utf8_length_from_valid_utf16(code_units));
                 // SAFETY: A USVString is well-formed, and the caller gives the output room for its encoding.
@@ -76,6 +87,11 @@ impl UsvString {
     pub(crate) fn strip_ascii_prefix(&self, prefix: u8) -> Option<Self> {
         match self.units() {
             Utf16StringUnits::Ascii(bytes) => bytes.strip_prefix(&[prefix]).map(Self::from_ascii),
+            Utf16StringUnits::Latin1(bytes) => bytes.strip_prefix(&[prefix]).map(|rest| {
+                Self(Utf16String::from_utf16(
+                    &rest.iter().map(|&byte| u16::from(byte)).collect::<Vec<_>>(),
+                ))
+            }),
             Utf16StringUnits::Utf16(code_units) => code_units
                 .strip_prefix(&[u16::from(prefix)])
                 .map(|rest| Self(Utf16String::from_utf16(rest))),
@@ -93,6 +109,7 @@ impl UsvString {
     pub(crate) fn to_utf8(&self) -> String {
         match self.units() {
             Utf16StringUnits::Ascii(bytes) => String::from_utf8(bytes.to_vec()),
+            Utf16StringUnits::Latin1(bytes) => Ok(bytes.iter().map(|&byte| char::from(byte)).collect()),
             Utf16StringUnits::Utf16(code_units) => String::from_utf16(code_units).map_err(|_| unreachable!()),
         }
         .expect("a USVString is well-formed")
@@ -151,6 +168,8 @@ pub(crate) fn to_enumeration_value(
         .iter()
         .position(|enumeration_value| match string.as_units() {
             Utf16StringUnits::Ascii(units) => units == enumeration_value.as_bytes(),
+            // NB: Every enumeration value is ASCII.
+            Utf16StringUnits::Latin1(_) => false,
             Utf16StringUnits::Utf16(units) => units.iter().copied().eq(enumeration_value.bytes().map(u16::from)),
         });
     match index {
@@ -562,9 +581,9 @@ impl BufferSource {
                 BufferSourceExtent {
                     buffer: typed_array.viewed_array_buffer(),
                     is_out_of_bounds,
-                    byte_offset: typed_array.byte_offset() as usize,
+                    byte_offset: typed_array.byte_offset(),
                     byte_length,
-                    element_size: typed_array.element_size() as usize,
+                    element_size: typed_array.element_size(),
                 }
             }
             Self::DataView(view) => {
@@ -580,7 +599,7 @@ impl BufferSource {
                 BufferSourceExtent {
                     buffer: view.viewed_array_buffer(),
                     is_out_of_bounds,
-                    byte_offset: view.byte_offset() as usize,
+                    byte_offset: view.byte_offset(),
                     byte_length,
                     element_size: 1,
                 }
@@ -692,8 +711,6 @@ pub(crate) fn buffer_source_type_of(value: Value) -> Option<BufferSource> {
 
 /// https://webidl.spec.whatwg.org/#arraybufferview-create, for a Uint8Array in the realm of the call context.
 pub(crate) fn create_uint8_array(cx: &CallContext, bytes: &[u8]) -> WebIdlResult<Gc<Object>> {
-    let length = u32::try_from(bytes.len())
-        .map_err(|_| Exception::RangeError(ErrorType::InvalidLength.message(&[&"typed array"])))?;
     let buffer =
         ArrayBuffer::try_create_written_by(cx.vm(), cx.realm(), bytes.len(), ArrayBufferShared::No, |output| {
             for (byte, value) in output.iter_mut().zip(bytes) {
@@ -701,7 +718,7 @@ pub(crate) fn create_uint8_array(cx: &CallContext, bytes: &[u8]) -> WebIdlResult
             }
             bytes.len()
         })?;
-    Ok(create_typed_array_on_buffer(cx.vm(), cx.realm(), TypedArrayKind::Uint8Array, length, buffer).upcast())
+    Ok(create_typed_array_on_buffer(cx.vm(), cx.realm(), TypedArrayKind::Uint8Array, bytes.len(), buffer).upcast())
 }
 
 impl ArrayBufferView {

@@ -13,6 +13,10 @@
 //! every crate it links, so linking the runtime would make it link every C function the runtime imports as well; the
 //! modules that use the runtime are left out of the tests instead, as the runtime's own crate leaves out its engine.
 
+// NB: The implementations of Serializable return concrete types where the trait has an opaque one. The trait is
+//     pub(crate), so refining it exposes nothing.
+#![allow(refining_impl_trait)]
+
 #[cfg(feature = "allocator")]
 extern crate ladybird_allocator;
 
@@ -49,6 +53,8 @@ pub(crate) mod canvas_2d;
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
 pub(crate) mod compression;
+#[cfg(not(test))]
+pub(crate) mod crypto;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the dictionaries")
@@ -110,6 +116,8 @@ pub(crate) mod indexed_db;
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
 pub(crate) mod speech;
+#[cfg(not(test))]
+pub(crate) mod storage_api;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
@@ -143,6 +151,10 @@ pub(crate) mod web_assembly;
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
 pub(crate) mod web_gl;
+#[cfg(not(test))]
+pub(crate) mod webidl;
+#[cfg(not(test))]
+pub(crate) mod webrtc;
 
 // The generators of the build script, whose tests run with those of the crate.
 #[cfg(test)]

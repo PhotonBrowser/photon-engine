@@ -1,11 +1,15 @@
+ladybird_test_suite(LibWebCommon)
+
 set(TEST_SOURCES
     TestCSSPixels.cpp
+    TestConsoleOutputBuffer.cpp
     TestGamepadSharedState.cpp
     TestGamepadStateBuffer.cpp
     TestInsecureRequestsPolicy.cpp
     TestKeyEvent.cpp
     TestPermissionSnapshot.cpp
     TestPermissionsPolicy.cpp
+    TestProhibitsMixedSecurityContexts.cpp
     TestRemoteViolationDirective.cpp
     TestSiteCompatibility.cpp
     TestStorageEndpoint.cpp
@@ -14,16 +18,5 @@ set(TEST_SOURCES
     TestWebDriverInputResponse.cpp
 )
 
-foreach(source IN LISTS TEST_SOURCES)
-    ladybird_test("${source}" LibWebCommon LIBS LibWebCommon)
-endforeach()
-
-target_link_libraries(TestSiteCompatibility PRIVATE LibURL)
-target_link_libraries(TestGamepadStateBuffer PRIVATE LibCore LibIPC)
-target_link_libraries(TestInsecureRequestsPolicy PRIVATE LibIPC)
-target_link_libraries(TestKeyEvent PRIVATE LibIPC)
-target_link_libraries(TestPermissionSnapshot PRIVATE LibIPC LibURL)
-target_link_libraries(TestPermissionsPolicy PRIVATE LibHTTP LibIPC LibURL)
-target_link_libraries(TestRemoteViolationDirective PRIVATE LibIPC)
-target_link_libraries(TestStorageEndpoint PRIVATE LibIPC)
-target_link_libraries(TestStorageKey PRIVATE LibURL)
+target_sources(TestLibWebCommon PRIVATE ${TEST_SOURCES})
+target_link_libraries(TestLibWebCommon PRIVATE LibHTTP LibIPC LibURL LibWebCommon)

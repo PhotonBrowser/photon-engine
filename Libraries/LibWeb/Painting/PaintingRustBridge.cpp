@@ -54,7 +54,6 @@
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/ResizeHandle.h>
 #include <LibWeb/Painting/ScrollSnap.h>
-#include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Painting/Scrolling.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
@@ -592,7 +591,6 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
     inputs.force_dark_foreground_threshold = config.force_dark_foreground_threshold;
     inputs.force_dark_background_threshold = config.force_dark_background_threshold;
     inputs.should_paint_overlay = config.paint_overlay;
-    inputs.document_id = document.unique_id().value();
     inputs.has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport;
     inputs.wheel_event_listener_state_generation = document.page().wheel_event_listener_state_generation();
     inputs.chrome_metrics = document.page().chrome_metrics();
@@ -735,6 +733,7 @@ NonnullRefPtr<Compositing::DisplayList> display_list_of_published_recording(Disp
     auto display_list = Compositing::DisplayList::share_rust_command_storage(recording.visual_context_tree, presented.display_list);
     if (recording.surface_clear_color.has_value())
         display_list->set_surface_clear_color(*recording.surface_clear_color);
+    display_list->set_root_group_color(presented.root_group_color);
     stamp_async_scrolling_metadata(*display_list);
     return display_list;
 }

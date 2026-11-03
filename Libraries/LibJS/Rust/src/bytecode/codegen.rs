@@ -2752,10 +2752,16 @@ fn generate_for_statement_without_disposal(
     // CreatePerIterationEnvironment after init (first iteration setup).
     emit_per_iteration_bindings(generator, &per_iteration_binding_names);
 
-    // Block creation order: body → update (if exists) → test (if exists) → end.
+    // Block creation order: body → per-iteration (if needed) → update (if exists) → test (if exists) → end.
     // If 'test' is missing, fuse 'test' and 'body' blocks.
     // If 'update' is missing, fuse 'body' and 'update' blocks.
     let body_block = generator.make_block();
+    // `continue` targets this block too, so CreatePerIterationEnvironment runs before every update.
+    let per_iteration_block = if per_iteration_binding_names.is_empty() {
+        None
+    } else {
+        Some(generator.make_block())
+    };
     let update_block = if update.is_some() {
         generator.make_block()
     } else {
@@ -2809,8 +2815,9 @@ fn generate_for_statement_without_disposal(
     // Body
     generator.switch_to_basic_block(body_block);
     let labels = std::mem::take(&mut generator.pending_labels);
-    let continue_target = if update.is_some() { update_block } else { test_block };
-    generator.begin_continuable_scope(continue_target, labels.clone(), completion.clone());
+    let next_iteration_block = if update.is_some() { update_block } else { test_block };
+    let continue_block = per_iteration_block.unwrap_or(next_iteration_block);
+    generator.begin_continuable_scope(continue_block, labels.clone(), completion.clone());
     generator.begin_breakable_scope(end_block, labels, completion.clone());
 
     generate_with_completion(body, generator, completion.as_ref(), preferred_dst);
@@ -2818,13 +2825,15 @@ fn generate_for_statement_without_disposal(
     generator.end_breakable_scope();
     generator.end_continuable_scope();
     if !generator.is_current_block_terminated() {
-        // CreatePerIterationEnvironment at end of each iteration.
+        generator.emit(Instruction::Jump { target: continue_block });
+    }
+
+    if let Some(per_iteration_block) = per_iteration_block {
+        generator.switch_to_basic_block(per_iteration_block);
         emit_per_iteration_bindings(generator, &per_iteration_binding_names);
-        if update.is_some() {
-            generator.emit(Instruction::Jump { target: update_block });
-        } else {
-            generator.emit(Instruction::Jump { target: test_block });
-        }
+        generator.emit(Instruction::Jump {
+            target: next_iteration_block,
+        });
     }
 
     generator.switch_to_basic_block(end_block);
@@ -2895,6 +2904,19 @@ fn generate_scope_children(
     scope: &ScopeData,
     _preferred_dst: Option<&ScopedOperand>,
 ) -> Option<ScopedOperand> {
+    // A labelled statement that completes empty keeps the running value, so it needs that value in a register.
+    let running_completion = if generator.must_propagate_completion
+        && generator.current_completion_register.is_none()
+        && reaches_labelled_statement(&scope.children, &generator.arena)
+    {
+        generator.allocate_completion_register()
+    } else {
+        None
+    };
+    if running_completion.is_some() {
+        generator.current_completion_register = running_completion.clone();
+    }
+
     let mut last_result = None;
     for child in &scope.children {
         let result = generate_statement(child, generator, None);
@@ -2916,7 +2938,19 @@ fn generate_scope_children(
             break;
         }
     }
-    last_result
+
+    if running_completion.is_some() {
+        generator.current_completion_register = None;
+    }
+    running_completion.or(last_result)
+}
+
+fn reaches_labelled_statement(statements: &[Statement], arena: &AstArena) -> bool {
+    statements.iter().any(|statement| match &statement.inner {
+        StatementKind::Labelled(_) => true,
+        StatementKind::Block(scope) => reaches_labelled_statement(&arena.scopes[*scope].children, arena),
+        _ => false,
+    })
 }
 
 /// Generate bytecode for a block statement, creating a lexical environment
@@ -5879,6 +5913,17 @@ fn generate_switch_statement(
 
     let discriminant = generate_expression(&data.discriminant, generator, None)?;
 
+    // A case test may reassign the local or argument the discriminant was read from.
+    let discriminant = if data
+        .cases
+        .iter()
+        .any(|case| case.test.as_ref().is_some_and(might_contain_assignment_expression))
+    {
+        generator.copy_if_needed_to_preserve_evaluation_order(&discriminant)
+    } else {
+        discriminant
+    };
+
     // Block declaration instantiation: create lexical environment for
     // function declarations and let/const across all switch cases.
     let did_create_env = emit_switch_block_declaration_instantiation(generator, data);
@@ -6517,6 +6562,7 @@ fn generate_optional_chain_inner(
                 );
                 generator.emit_mov(current_base, &this_value);
             } else if member_data.computed {
+                let obj = generator.copy_if_needed_to_preserve_evaluation_order(&obj);
                 let property = generate_expression(&member_data.property, generator, None)?;
                 emit_get_by_value(generator, &val, &obj, &property, None);
                 generator.emit_mov(current_base, &obj);
@@ -6664,6 +6710,7 @@ fn generate_optional_chain_start(
                 );
                 generator.emit_mov(current_base, &this_value);
             } else if member_data.computed {
+                let obj = generator.copy_if_needed_to_preserve_evaluation_order(&obj);
                 let property = generate_expression(&member_data.property, generator, None)?;
                 emit_get_by_value(generator, &val, &obj, &property, None);
                 generator.emit_mov(current_base, &obj);
@@ -7706,13 +7753,14 @@ fn generate_labelled_statement(
         result
     } else {
         // Non-iteration: wrap in a breakable scope so `break label;` works. When completion
-        // propagation is on we allocate a completion register initialized to undefined and hand it
-        // to the breakable scope. `break label;` then yields undefined, the empty completion the
-        // spec requires. Without it the break path would leave whatever stale value the reused
-        // completion register last held, which can surface an internal object (such as a for-in
-        // iterator) as the statement's completion value.
+        // propagation is on, the breakable scope shares the running completion register of the
+        // enclosing statement list, so a body that completes empty, or `break label;` with an empty
+        // value, leaves the running value in place.
         let end_block = generator.make_block();
-        let completion = generator.allocate_completion_register();
+        let completion = generator
+            .current_completion_register
+            .clone()
+            .or_else(|| generator.allocate_completion_register());
         generator.begin_breakable_scope(end_block, labels, completion.clone());
         let result = generate_with_completion(inner, generator, completion.as_ref(), preferred_dst);
         generator.end_breakable_scope();
@@ -10043,7 +10091,7 @@ fn try_constant_loosely_equals(lhs: &ConstantValue, rhs: &ConstantValue) -> Opti
     // String == Number → compare number to ToNumber(string).
     match (lhs, rhs) {
         (ConstantValue::Number(n), ConstantValue::String(s)) | (ConstantValue::String(s), ConstantValue::Number(n)) => {
-            Some(*n == string_to_number(s))
+            Some(*n == crate::host::string_to_number(&s.0))
         }
         // BigInt == Number or Number == BigInt: compare mathematical values.
         (ConstantValue::BigInt(b), ConstantValue::Number(n)) | (ConstantValue::Number(n), ConstantValue::BigInt(b)) => {
@@ -10068,7 +10116,7 @@ fn try_constant_loosely_equals(lhs: &ConstantValue, rhs: &ConstantValue) -> Opti
         // BigInt == String or String == BigInt: parse string as BigInt per StringToBigInt.
         // If the string cannot be parsed, the result is false (not equal).
         (ConstantValue::BigInt(b), ConstantValue::String(s)) | (ConstantValue::String(s), ConstantValue::BigInt(b)) => {
-            match string_to_bigint(s) {
+            match crate::host::string_to_bigint(&s.0) {
                 Some(s_bi) => {
                     let bi = parse_bigint(b)?;
                     Some(bi == s_bi)
@@ -10078,87 +10126,6 @@ fn try_constant_loosely_equals(lhs: &ConstantValue, rhs: &ConstantValue) -> Opti
         }
         _ => None,
     }
-}
-
-#[derive(Clone, Copy)]
-enum NonDecimalRadix {
-    Binary,
-    Octal,
-    Hexadecimal,
-}
-
-impl NonDecimalRadix {
-    fn as_u32(self) -> u32 {
-        match self {
-            Self::Binary => 2,
-            Self::Octal => 8,
-            Self::Hexadecimal => 16,
-        }
-    }
-}
-
-fn is_utf16_whitespace(code_unit: u16) -> bool {
-    char::from_u32(code_unit.into()).is_some_and(char::is_whitespace)
-}
-
-fn trim_utf16_whitespace(text: &[u16]) -> &[u16] {
-    let mut start = 0;
-    while start < text.len() && is_utf16_whitespace(text[start]) {
-        start += 1;
-    }
-
-    let mut end = text.len();
-    while end > start && is_utf16_whitespace(text[end - 1]) {
-        end -= 1;
-    }
-
-    &text[start..end]
-}
-
-fn strip_non_decimal_prefix_utf16(text: &[u16]) -> Option<(NonDecimalRadix, &[u16])> {
-    if text.len() < 3 || text[0] != b'0'.into() {
-        return None;
-    }
-
-    let radix = match text[1] {
-        code_unit if code_unit == b'b'.into() || code_unit == b'B'.into() => NonDecimalRadix::Binary,
-        code_unit if code_unit == b'o'.into() || code_unit == b'O'.into() => NonDecimalRadix::Octal,
-        code_unit if code_unit == b'x'.into() || code_unit == b'X'.into() => NonDecimalRadix::Hexadecimal,
-        _ => return None,
-    };
-
-    Some((radix, &text[2..]))
-}
-
-fn is_valid_non_decimal_digits_utf16(text: &[u16], radix: NonDecimalRadix) -> bool {
-    // Keep this JS-specific precheck even though parse_bytes() also validates:
-    // num-bigint accepts forms that are invalid in JS StringToNumber/StringToBigInt
-    // non-decimal parsing (for example a leading '+' and '_' separators).
-    // strip_non_decimal_prefix_utf16() guarantees that this suffix is non-empty.
-    debug_assert!(!text.is_empty());
-    match radix {
-        NonDecimalRadix::Binary => text
-            .iter()
-            .all(|&code_unit| code_unit == b'0'.into() || code_unit == b'1'.into()),
-        NonDecimalRadix::Octal => text
-            .iter()
-            .all(|&code_unit| (b'0'.into()..=b'7'.into()).contains(&code_unit)),
-        NonDecimalRadix::Hexadecimal => text.iter().all(|&code_unit| {
-            (b'0'.into()..=b'9'.into()).contains(&code_unit)
-                || (b'a'.into()..=b'f'.into()).contains(&code_unit)
-                || (b'A'.into()..=b'F'.into()).contains(&code_unit)
-        }),
-    }
-}
-
-fn ascii_code_units_to_bytes(text: &[u16]) -> Option<Vec<u8>> {
-    text.iter()
-        .map(|&code_unit| {
-            u8::try_from(code_unit)
-                .ok()
-                .and_then(|byte| byte.is_ascii().then_some(byte))
-        })
-        .collect()
 }
 
 fn ascii_code_units_to_string(text: &[u16]) -> Option<String> {
@@ -10171,64 +10138,8 @@ fn ascii_code_units_to_string(text: &[u16]) -> Option<String> {
         .collect()
 }
 
-fn ascii_code_units_eq(text: &[u16], ascii: &[u8]) -> bool {
-    text.len() == ascii.len()
-        && text
-            .iter()
-            .zip(ascii)
-            .all(|(&code_unit, &byte)| code_unit == byte.into())
-}
-
-fn is_ascii_decimal_number_code_unit(code_unit: u16) -> bool {
-    (b'0'.into()..=b'9'.into()).contains(&code_unit)
-        || code_unit == b'.'.into()
-        || code_unit == b'e'.into()
-        || code_unit == b'E'.into()
-        || code_unit == b'+'.into()
-        || code_unit == b'-'.into()
-}
-
 fn bigint_literal_digits(literal: &Utf16String) -> &[u16] {
     literal.0.strip_suffix(&[b'n'.into()]).unwrap_or(literal.0.as_slice())
-}
-
-/// Implements StringToBigInt per https://tc39.es/ecma262/#sec-stringtobigint.
-/// Trims whitespace, handles optional sign (decimal only), and handles
-/// 0b/0o/0x prefixes. Returns None if the string is not a valid
-/// StringIntegerLiteral.
-fn string_to_bigint(s: &Utf16String) -> Option<BigInt> {
-    use num_bigint::BigInt;
-    let s_trimmed = trim_utf16_whitespace(&s.0);
-    if s_trimmed.is_empty() {
-        return Some(BigInt::from(0));
-    }
-    // Check for non-decimal prefixes (no sign allowed).
-    if let Some((radix, rest)) = strip_non_decimal_prefix_utf16(s_trimmed) {
-        if !is_valid_non_decimal_digits_utf16(rest, radix) {
-            return None;
-        }
-        // Convert validated suffix digits using the parser.
-        let bytes = ascii_code_units_to_bytes(rest)?;
-        return BigInt::parse_bytes(&bytes, radix.as_u32());
-    }
-    // Decimal with optional sign. Only allow digits (no dots, no exponents).
-    let (is_negative, digits) = if let Some(rest) = s_trimmed.strip_prefix(&[b'-'.into()]) {
-        (true, rest)
-    } else if let Some(rest) = s_trimmed.strip_prefix(&[b'+'.into()]) {
-        (false, rest)
-    } else {
-        (false, s_trimmed)
-    };
-    if digits.is_empty()
-        || !digits
-            .iter()
-            .all(|code_unit| (b'0'.into()..=b'9'.into()).contains(code_unit))
-    {
-        return None;
-    }
-    let bytes = ascii_code_units_to_bytes(digits)?;
-    let bi = BigInt::parse_bytes(&bytes, 10)?;
-    Some(if is_negative { -bi } else { bi })
 }
 
 /// Constant-fold a binary operation on two BigInt operands.
@@ -10299,62 +10210,6 @@ fn try_constant_fold_bigint_binary(
     }
 }
 
-/// Try to constant-fold a binary operation when both operands are constants.
-// 6.1.6.1.3 Number::exponentiate ( base, exponent )
-// https://tc39.es/ecma262/#sec-numeric-types-number-exponentiate
-// Rust's f64::powf follows C's pow() which returns 1.0 for pow(±1, ±∞),
-// but JS specifies NaN when abs(base) is 1 and exponent is ±∞.
-fn js_exponentiate(base: f64, exponent: f64) -> f64 {
-    if exponent.is_infinite() && base.abs() == 1.0 {
-        return f64::NAN;
-    }
-    base.powf(exponent)
-}
-
-/// Parse a non-decimal integer string via BigInt to f64, matching
-/// UnsignedBigInteger::from_base() + to_double(). This avoids u64 overflow
-/// for large literals like 0x10000000000000000.
-fn bigint_digits_to_f64(digits: &[u16], radix: u32) -> f64 {
-    use num_bigint::BigUint;
-    let Some(bytes) = ascii_code_units_to_bytes(digits) else {
-        return f64::NAN;
-    };
-    match BigUint::parse_bytes(&bytes, radix) {
-        Some(n) => {
-            use num_traits::ToPrimitive;
-            n.to_f64().unwrap_or(f64::INFINITY)
-        }
-        None => f64::NAN,
-    }
-}
-
-// 7.1.4.1.1 StringToNumber ( str ), https://tc39.es/ecma262/#sec-stringtonumber
-fn string_to_number(s: &Utf16String) -> f64 {
-    let trimmed = trim_utf16_whitespace(&s.0);
-    if trimmed.is_empty() {
-        return 0.0;
-    }
-    if ascii_code_units_eq(trimmed, b"Infinity") || ascii_code_units_eq(trimmed, b"+Infinity") {
-        return f64::INFINITY;
-    }
-    if ascii_code_units_eq(trimmed, b"-Infinity") {
-        return f64::NEG_INFINITY;
-    }
-    if let Some((radix, rest)) = strip_non_decimal_prefix_utf16(trimmed) {
-        if !is_valid_non_decimal_digits_utf16(rest, radix) {
-            return f64::NAN;
-        }
-        return bigint_digits_to_f64(rest, radix.as_u32());
-    }
-    if !trimmed.iter().copied().all(is_ascii_decimal_number_code_unit) {
-        return f64::NAN;
-    }
-    let Some(text) = ascii_code_units_to_string(trimmed) else {
-        return f64::NAN;
-    };
-    text.parse::<f64>().unwrap_or(f64::NAN)
-}
-
 /// Convert a constant value to a JS number for constant folding purposes.
 fn constant_to_number(val: &ConstantValue) -> Option<f64> {
     match val {
@@ -10362,7 +10217,7 @@ fn constant_to_number(val: &ConstantValue) -> Option<f64> {
         ConstantValue::Boolean(b) => Some(if *b { 1.0 } else { 0.0 }),
         ConstantValue::Null => Some(0.0),
         ConstantValue::Undefined => Some(f64::NAN),
-        ConstantValue::String(s) => Some(string_to_number(s)),
+        ConstantValue::String(s) => Some(crate::host::string_to_number(&s.0)),
         _ => None,
     }
 }
@@ -10433,6 +10288,7 @@ fn compare_bigint_and_number(bigint_str: &str, number: f64) -> Option<Option<std
     Some(Some(bigint.cmp(&number_bigint)))
 }
 
+/// Try to constant-fold a binary operation when both operands are constants.
 fn try_constant_fold_binary(
     generator: &mut Generator,
     op: BinaryOp,
@@ -10488,7 +10344,7 @@ fn try_constant_fold_binary(
         BinaryOp::Exponentiation => {
             let a = constant_to_number(lhs_const)?;
             let b = constant_to_number(rhs_const)?;
-            Some(generator.add_constant_number(js_exponentiate(a, b)))
+            Some(generator.add_constant_number(crate::host::exponentiate(a, b)))
         }
         BinaryOp::StrictlyEquals | BinaryOp::StrictlyInequals => {
             let equal = match (lhs_const, rhs_const) {
@@ -10539,14 +10395,14 @@ fn try_constant_fold_binary(
                 // using StringToBigInt, then compare the two BigInts.
                 // If the string is not a valid StringIntegerLiteral,
                 // the result is undefined (= false for all comparisons).
-                (ConstantValue::BigInt(b), ConstantValue::String(s)) => match string_to_bigint(s) {
+                (ConstantValue::BigInt(b), ConstantValue::String(s)) => match crate::host::string_to_bigint(&s.0) {
                     Some(rhs_bi) => {
                         let lhs_bi = parse_bigint(b)?;
                         Some(Some(lhs_bi.cmp(&rhs_bi)))
                     }
                     None => Some(None),
                 },
-                (ConstantValue::String(s), ConstantValue::BigInt(b)) => match string_to_bigint(s) {
+                (ConstantValue::String(s), ConstantValue::BigInt(b)) => match crate::host::string_to_bigint(&s.0) {
                     Some(lhs_bi) => {
                         let rhs_bi = parse_bigint(b)?;
                         Some(Some(lhs_bi.cmp(&rhs_bi)))

@@ -39,8 +39,10 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
+#include <LibWebView/NotificationManager.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/PictureInPictureManager.h>
+#include <LibWebView/RecordingNotificationBackend.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -162,11 +164,6 @@ Optional<WebContentClient&> WebContentClient::client_for_compositor_context_id(W
         return IterationDecision::Break;
     });
     return client;
-}
-
-void WebContentClient::did_start_using_gamepads()
-{
-    GamepadManager::the().client_did_start_using_gamepads(*this);
 }
 
 void WebContentClient::gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect)
@@ -653,6 +650,13 @@ Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse WebContentCl
     return Vector<HTTP::Cookie::Cookie> {};
 }
 
+Messages::WebContentClient::DidRequestNotificationsStateForTestingResponse WebContentClient::did_request_notifications_state_for_testing(Web::PageId page_id)
+{
+    if (auto* recording_backend = NotificationManager::the().backend().as_recording_backend())
+        return recording_backend->state_json(page_id, NotificationManager::the().ids_without_a_page_for_testing(page_id));
+    return "{}"_string;
+}
+
 Messages::WebContentClient::DidRequestNamedCookieResponse WebContentClient::did_request_named_cookie(URL::URL url, String name)
 {
     if (!renderers_may_access_cookies_like_http()) {
@@ -1126,6 +1130,27 @@ Vector<u64> WebContentClient::performance_owners() const
     }
     quick_sort(owners);
     return owners;
+}
+
+Messages::WebContentClient::RequestWebrtcClientConnectionResponse WebContentClient::request_webrtc_client_connection()
+{
+    // A renderer asks again whenever its helper dies, so a helper that keeps crashing, or a renderer that keeps asking,
+    // would otherwise have us spawn processes in a loop.
+    static constexpr size_t MAX_WEBRTC_CLIENT_LAUNCHES_PER_MINUTE = 5;
+    auto now = MonotonicTime::now_coarse();
+    m_webrtc_client_launch_times.remove_all_matching([&](auto launch_time) { return now - launch_time >= AK::Duration::from_seconds(60); });
+    if (m_webrtc_client_launch_times.size() >= MAX_WEBRTC_CLIENT_LAUNCHES_PER_MINUTE) {
+        warnln("Not launching another WebRTCClient for WebContent {}: it had {} in the last minute", child_id(), m_webrtc_client_launch_times.size());
+        return OptionalNone {};
+    }
+    m_webrtc_client_launch_times.append(now);
+
+    auto handle = launch_webrtc_client_process(*this);
+    if (handle.is_error()) {
+        warnln("Unable to launch a WebRTCClient: {}", handle.error());
+        return OptionalNone {};
+    }
+    return handle.release_value();
 }
 
 Optional<u64> WebContentClient::exclusive_performance_owner() const

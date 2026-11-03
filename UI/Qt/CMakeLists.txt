@@ -71,6 +71,7 @@ target_sources(ladybird PRIVATE
     WindowCloseCoordinator.cpp
     WindowControlButton.cpp
     WindowScreenObserver.cpp
+    WindowToolbar.cpp
     ladybird.qrc
 )
 if (NOT APPLE AND NOT WIN32 AND NOT ANDROID)
@@ -263,6 +264,10 @@ if (BUILD_TESTING AND NOT BUILD_BROWSER_TESTS_ONLY)
     if (APPLE)
         target_sources(TestPerformanceMonitorWidget PRIVATE SystemAppearanceMac.mm)
         target_link_libraries(TestPerformanceMonitorWidget PRIVATE "-framework AppKit")
+    endif()
+    if (LINUX AND NOT ANDROID)
+        target_sources(TestPerformanceMonitorWidget PRIVATE X11Window.cpp)
+        target_link_libraries(TestPerformanceMonitorWidget PRIVATE PkgConfig::XCB_ICCCM)
     endif()
     set_target_properties(TestPerformanceMonitorWidget PROPERTIES AUTOMOC ON)
     target_include_directories(TestPerformanceMonitorWidget PRIVATE ${LADYBIRD_SOURCE_DIR})

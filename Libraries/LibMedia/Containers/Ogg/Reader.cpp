@@ -8,6 +8,7 @@
 #include <AK/Checked.h>
 #include <LibMedia/Codecs/FLAC.h>
 #include <LibMedia/Containers/Ogg/Reader.h>
+#include <LibMediaCodecs/Limits.h>
 
 namespace Media::Ogg {
 
@@ -366,6 +367,8 @@ static DecoderErrorOr<StreamIdentification> identify_vorbis(ReadonlyBytes packet
     identification.sample_rate = load_little_endian<u32>(packet, 12);
     if (identification.channel_count == 0 || identification.sample_rate == 0)
         return DecoderError::corrupted("Vorbis identification header is invalid"sv);
+    if (audio_sample_rate_is_outside_limits(identification.sample_rate))
+        return DecoderError::format(DecoderErrorCategory::NotImplemented, "Vorbis sample rate of {} Hz is not supported", identification.sample_rate);
     return identification;
 }
 
@@ -386,24 +389,21 @@ static DecoderErrorOr<StreamIdentification> identify_opus(ReadonlyBytes packet)
 }
 
 static constexpr size_t OGG_FLAC_STREAM_INFO_OFFSET = 17;
-static constexpr size_t FLAC_STREAM_INFO_SIZE = 34;
 
 static DecoderErrorOr<StreamIdentification> identify_flac(ReadonlyBytes packet)
 {
     // The mapping header, the native stream marker, then the STREAMINFO block with its own header.
-    if (packet.size() < OGG_FLAC_STREAM_INFO_OFFSET + FLAC_STREAM_INFO_SIZE || packet[5] != 1
+    if (packet.size() < OGG_FLAC_STREAM_INFO_OFFSET + Codecs::FLAC::STREAM_INFO_SIZE || packet[5] != 1
         || !packet.slice(9).starts_with("fLaC"sv.bytes()) || (packet[13] & 0x7F) != 0)
         return DecoderError::corrupted("FLAC identification header is invalid"sv);
-    auto stream_info = packet.slice(OGG_FLAC_STREAM_INFO_OFFSET, FLAC_STREAM_INFO_SIZE);
+    auto stream_info = TRY(Codecs::FLAC::parse_stream_info(packet.slice(OGG_FLAC_STREAM_INFO_OFFSET, Codecs::FLAC::STREAM_INFO_SIZE)));
     StreamIdentification identification;
     identification.codec_id = CodecID::FLAC;
     auto following_header_count = load_big_endian<u16>(packet, 7);
     if (following_header_count != 0)
         identification.header_packet_count = following_header_count + 1;
-    identification.sample_rate = (static_cast<u32>(stream_info[10]) << 12) | (static_cast<u32>(stream_info[11]) << 4) | (stream_info[12] >> 4);
-    identification.channel_count = ((stream_info[12] >> 1) & 0x07) + 1;
-    if (identification.sample_rate == 0)
-        return DecoderError::corrupted("FLAC identification header is invalid"sv);
+    identification.sample_rate = stream_info.sample_rate;
+    identification.channel_count = stream_info.channel_count;
     return identification;
 }
 
@@ -472,13 +472,13 @@ DecoderErrorOr<FixedArray<u8>> build_codec_initialization_data(StreamIdentificat
         return DECODER_TRY_ALLOC(FixedArray<u8>::create(header_packets[0].span()));
     case CodecID::FLAC: {
         // The native stream marker and a STREAMINFO block marked as the last, which is what FLAC streams start with.
-        auto stream_info = header_packets[0].span().slice(OGG_FLAC_STREAM_INFO_OFFSET, FLAC_STREAM_INFO_SIZE);
-        auto data = DECODER_TRY_ALLOC(FixedArray<u8>::create(8 + FLAC_STREAM_INFO_SIZE));
+        auto stream_info = header_packets[0].span().slice(OGG_FLAC_STREAM_INFO_OFFSET, Codecs::FLAC::STREAM_INFO_SIZE);
+        auto data = DECODER_TRY_ALLOC(FixedArray<u8>::create(8 + Codecs::FLAC::STREAM_INFO_SIZE));
         "fLaC"sv.bytes().copy_to(data.span());
         data[4] = 0x80;
         data[5] = 0;
         data[6] = 0;
-        data[7] = FLAC_STREAM_INFO_SIZE;
+        data[7] = Codecs::FLAC::STREAM_INFO_SIZE;
         stream_info.copy_to(data.span().slice(8));
         return data;
     }

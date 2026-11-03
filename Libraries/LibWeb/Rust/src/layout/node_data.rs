@@ -35,25 +35,56 @@ pub(crate) const fn pseudo_kind_of(generated_for: u8) -> u8 {
     generated_for - 1
 }
 
-// The full C++ StyleGroupIndex space; LayoutRustBridge.cpp static-asserts the
-// count so the style container array and the registered group indices line up.
-pub const STYLE_GROUP_COUNT: usize = 23;
+/// The style a row is laid out by: the groups at the front of the style record the row pins, of an
+/// anonymous box's style or of an animation overlay. A copy counts no reference: whoever made the
+/// row's style keeps it alive while the row holds it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub(crate) struct LayoutStyleRef(std::ptr::NonNull<crate::css::computed_value_views::StyleRecordGroups>);
 
-/// Where a row's computed style is: the group payload array of the style record pinned for the
-/// row, or null for a row with no style. The array and the groups it names are immutable, so the
-/// row shares it as a `HostShared` rather than as a raw pointer.
-pub(crate) type StylePayloadsRef = crate::css::host_shared::HostShared<FfiStylePayloads>;
+const _: () = assert!(size_of::<LayoutStyleRef>() == 8 && size_of::<Option<LayoutStyleRef>>() == 8);
 
-/// The group payload array a row's style addresses, or `None` for a row with no style.
-///
-/// # Safety
-///
-/// The style record pinned for the row must outlive `'a`.
-#[inline]
-pub(crate) unsafe fn style_payloads<'a>(style: StylePayloadsRef) -> Option<&'a FfiStylePayloads> {
-    // SAFETY: A non-null style pointer addresses the group pointer array of the style record, which
-    // FfiStylePayloads mirrors exactly, and the caller keeps the record alive for 'a.
-    (!style.is_null()).then(|| unsafe { style.deref() })
+// SAFETY: A style's groups are immutable while a row holds them, and the handle touches no
+//         reference count, so sharing one shares only reads.
+unsafe impl Send for LayoutStyleRef {}
+unsafe impl Sync for LayoutStyleRef {}
+
+impl LayoutStyleRef {
+    pub(crate) fn of(groups: &crate::css::computed_value_views::StyleRecordGroups) -> Self {
+        Self(std::ptr::NonNull::from(groups))
+    }
+
+    pub(crate) fn of_groups(groups: &crate::css::computed_values::StyleGroups) -> Self {
+        Self::of(crate::css::computed_value_views::StyleRecordGroups::of(groups))
+    }
+
+    /// The style `pointer` names, as the host passes one, or `None` for null.
+    ///
+    /// # Safety
+    /// A non-null `pointer` must point at the groups of a style that outlives every row holding it.
+    pub(crate) unsafe fn from_raw(pointer: *const c_void) -> Option<Self> {
+        std::ptr::NonNull::new(pointer.cast_mut()).map(|pointer| Self(pointer.cast()))
+    }
+
+    pub(crate) fn as_ptr(self) -> *const c_void {
+        self.0.as_ptr().cast_const().cast()
+    }
+
+    /// A style no read reaches, for a row a test lays out without reading its style.
+    #[cfg(test)]
+    pub(crate) fn dangling() -> Self {
+        Self(std::ptr::NonNull::dangling())
+    }
+
+    /// The style's computed values.
+    ///
+    /// # Safety
+    /// The style must stay alive and unchanged for `'a`.
+    #[inline]
+    pub(crate) unsafe fn view<'a>(self) -> crate::css::computed_value_views::ComputedValuesView<'a> {
+        // SAFETY: As the caller guarantees.
+        crate::css::computed_value_views::ComputedValuesView::of_record_groups(unsafe { self.0.as_ref() })
+    }
 }
 
 impl From<crate::painting::host::FfiNaturalSize> for crate::css::style::NaturalSize {
@@ -78,25 +109,6 @@ impl From<crate::css::style::NaturalSize> for crate::painting::host::FfiNaturalS
             has_aspect_ratio: size.aspect_ratio.is_some(),
             aspect_ratio_numerator: CssPixels::from_raw(numerator),
             aspect_ratio_denominator: CssPixels::from_raw(denominator),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiStylePayloads {
-    pub groups: [*const c_void; STYLE_GROUP_COUNT],
-}
-
-// SAFETY: A style record's payload array is written once, as the record is interned, and never
-// through a shared reference, and the groups it points at are immutable while the record is pinned.
-// Sharing one shares only reads.
-unsafe impl Sync for FfiStylePayloads {}
-
-impl Default for FfiStylePayloads {
-    fn default() -> Self {
-        Self {
-            groups: [std::ptr::null(); STYLE_GROUP_COUNT],
         }
     }
 }
@@ -247,6 +259,9 @@ pub enum DomPaintFact {
     EditableOrEditingHost = 1 << 1,
     InsideBlockingWheelEventHandler = 1 << 2,
     NestedNavigableContainer = 1 << 3,
+    /// The node is an element HTML classifies as a devolvable widget.
+    /// https://drafts.csswg.org/css-ui/#devolvable
+    DevolvableWidget = 1 << 4,
 }
 
 #[cfg(test)]
@@ -276,10 +291,9 @@ pub(crate) struct NodeData {
     pub next_sibling: ShapeCell<NodeSlotId>,
     pub kind: ShapeCell<NodeKind>,
     pub generated_for: ShapeCell<u8>,
-    pub intrinsic_cache_epoch: u16,
     pub flags: ShapeCell<u32>,
     /// Advanced on every layout invalidation that reaches this node or its
-    /// subtree, with no propagation boundary: unlike the intrinsic epoch,
+    /// subtree, with no propagation boundary: unlike intrinsic size resets,
     /// changes inside absolutely positioned and SVG descendants must reach
     /// every ancestor, because their fragments live in ancestor run trees.
     /// Wide enough that wrapping between a cache store and the next probe
@@ -291,7 +305,7 @@ pub(crate) struct NodeData {
     pub table_row_span: u16,
     pub dom_paint_facts: ShapeCell<u8>,
     pub ancestor_facts: u8,
-    pub style: ShapeCell<StylePayloadsRef>,
+    pub style: ShapeCell<Option<LayoutStyleRef>>,
 }
 
 impl Default for NodeData {
@@ -304,7 +318,6 @@ impl Default for NodeData {
             next_sibling: ShapeCell::new(NodeSlotId::INVALID),
             kind: ShapeCell::new(NodeKind::Unset),
             generated_for: ShapeCell::new(0),
-            intrinsic_cache_epoch: 0,
             flags: ShapeCell::new(0),
             slot_generation: ShapeCell::new(0),
             compositor_animation_frame_kinds: ShapeCell::new(0),
@@ -313,7 +326,7 @@ impl Default for NodeData {
             dom_paint_facts: ShapeCell::new(0),
             ancestor_facts: 0,
             fragment_cache_epoch: 0,
-            style: ShapeCell::new(StylePayloadsRef::null()),
+            style: ShapeCell::new(None),
         }
     }
 }
@@ -321,7 +334,6 @@ impl Default for NodeData {
 /// The facts of a node that no publication carries, for writing: writing them marks nothing for the paint side,
 /// unlike a write to the node's shape.
 pub(crate) struct UnpublishedNodeFactsMut<'a> {
-    pub(crate) intrinsic_cache_epoch: &'a mut u16,
     pub(crate) fragment_cache_epoch: &'a mut u32,
     pub(crate) table_column_span: &'a mut u16,
     pub(crate) table_row_span: &'a mut u16,
@@ -331,7 +343,6 @@ pub(crate) struct UnpublishedNodeFactsMut<'a> {
 impl NodeData {
     pub(super) fn unpublished_facts_mut(&mut self) -> UnpublishedNodeFactsMut<'_> {
         UnpublishedNodeFactsMut {
-            intrinsic_cache_epoch: &mut self.intrinsic_cache_epoch,
             fragment_cache_epoch: &mut self.fragment_cache_epoch,
             table_column_span: &mut self.table_column_span,
             table_row_span: &mut self.table_row_span,
@@ -354,7 +365,7 @@ pub(crate) struct PaintNode {
     pub(crate) last_child: NodeSlotId,
     pub(crate) previous_sibling: NodeSlotId,
     pub(crate) next_sibling: NodeSlotId,
-    pub(crate) style: StylePayloadsRef,
+    pub(crate) style: Option<LayoutStyleRef>,
     /// The style record the row is built from, or 0.
     pub(crate) style_record: u64,
     /// The node whose style the row carries.
@@ -377,7 +388,7 @@ impl Default for PaintNode {
             last_child: NodeSlotId::INVALID,
             previous_sibling: NodeSlotId::INVALID,
             next_sibling: NodeSlotId::INVALID,
-            style: StylePayloadsRef::null(),
+            style: None,
             style_record: 0,
             style_node: None,
             style_is_derived: false,
@@ -416,10 +427,7 @@ impl PaintNode {
     /// The node's computed style, or `None` for a node without one.
     pub(crate) fn style(&self) -> Option<crate::css::computed_value_views::ComputedValuesView<'_>> {
         // SAFETY: No style record is released while a recording reads the rows published for it.
-        let payloads = unsafe { style_payloads(self.style) }?;
-        Some(crate::css::computed_value_views::ComputedValuesView::new(
-            &payloads.groups,
-        ))
+        self.style.map(|style| unsafe { style.view() })
     }
 }
 
@@ -434,9 +442,8 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_cache_epoch_uses_existing_node_data_padding() {
+    fn node_data_keeps_its_size_and_field_offsets() {
         assert_eq!(std::mem::size_of::<NodeData>(), 48);
-        assert_eq!(std::mem::offset_of!(NodeData, intrinsic_cache_epoch), 22);
         assert_eq!(std::mem::offset_of!(NodeData, flags), 24);
         assert_eq!(std::mem::offset_of!(NodeData, fragment_cache_epoch), 28);
         assert_eq!(std::mem::offset_of!(NodeData, slot_generation), 32);

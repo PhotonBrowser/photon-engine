@@ -35,9 +35,9 @@
 #include <LibJS/Runtime/Date.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/CSS/PerformanceDiagnostics.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
+#include <LibWeb/CSS/PerformanceDiagnostics.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleSheetState.h>
@@ -417,29 +417,20 @@ HashMap<void const*, ConnectionFromClient::PerformanceDocumentCounters> Connecti
             auto const& style = document->style_invalidation_counters();
             auto const layout = document->layout_counts();
             counters_by_document.set(document.ptr(), {
-                .style_update_microseconds = style.style_update_microseconds,
-                .style_reaction_elements = style.style_engine_reaction_elements,
-                .style_reaction_batches = style.style_engine_reaction_batch_runs,
-                .style_update_submission_microseconds = style.style_update_submission_microseconds,
-                .style_update_bridge_microseconds = style.style_update_bridge_microseconds,
-                .style_update_apply_microseconds = style.style_update_apply_microseconds,
-                .style_update_remainder_microseconds = style.style_update_remainder_microseconds,
-                .style_engine_transaction_setup_microseconds = style.style_engine_transaction_setup_microseconds,
-                .style_engine_transaction_setups = style.style_engine_transaction_setups,
-                .style_engine_transaction_count = style.style_engine_transaction_count,
-                .style_unscoped_transaction_count = style.style_unscoped_transaction_count,
-                .style_unscoped_transaction_reaction_entries = style.style_unscoped_transaction_reaction_entries,
-                .style_broad_matching_batch_runs = style.style_broad_matching_batch_runs,
-                .style_narrow_matching_batch_runs = style.style_narrow_matching_batch_runs,
-                .style_broad_matching_reaction_elements = style.style_broad_matching_reaction_elements,
-                .style_narrow_matching_reaction_elements = style.style_narrow_matching_reaction_elements,
-                .style_broad_matching_apply_microseconds = style.style_broad_matching_apply_microseconds,
-                .style_narrow_matching_apply_microseconds = style.style_narrow_matching_apply_microseconds,
-                .full_layout_count = layout.full_layouts,
-                .partial_layout_count = layout.partial_layouts,
-                .full_layout_microseconds = layout.full_layout_microseconds,
-                .partial_layout_microseconds = layout.partial_layout_microseconds,
-            });
+                                                         .style_update_microseconds = style.style_update_microseconds,
+                                                         .style_reaction_elements = style.style_engine_reaction_elements,
+                                                         .style_reaction_batches = style.style_engine_reaction_batch_runs,
+                                                         .style_update_submission_microseconds = style.style_update_submission_microseconds,
+                                                         .style_update_bridge_microseconds = style.style_update_bridge_microseconds,
+                                                         .style_update_apply_microseconds = style.style_update_apply_microseconds,
+                                                         .style_update_remainder_microseconds = style.style_update_remainder_microseconds,
+                                                         .style_engine_transaction_setup_microseconds = style.style_engine_transaction_setup_microseconds,
+                                                         .style_engine_transaction_setups = style.style_engine_transaction_setups,
+                                                         .full_layout_count = layout.full_layouts,
+                                                         .partial_layout_count = layout.partial_layouts,
+                                                         .full_layout_microseconds = layout.full_layout_microseconds,
+                                                         .partial_layout_microseconds = layout.partial_layout_microseconds,
+                                                     });
         }
     });
     return counters_by_document;
@@ -459,7 +450,7 @@ JsonObject ConnectionFromClient::style_and_layout_diagnostics() const
             continue;
         }
         auto const& start = *baseline;
-        auto add_delta = [&](u64 PerformanceDocumentCounters::*field) {
+        auto add_delta = [&](u64 PerformanceDocumentCounters::* field) {
             if (counters.*field < start.*field) {
                 counters_monotonic = false;
                 return;
@@ -476,15 +467,6 @@ JsonObject ConnectionFromClient::style_and_layout_diagnostics() const
                  &PerformanceDocumentCounters::style_update_remainder_microseconds,
                  &PerformanceDocumentCounters::style_engine_transaction_setup_microseconds,
                  &PerformanceDocumentCounters::style_engine_transaction_setups,
-                 &PerformanceDocumentCounters::style_engine_transaction_count,
-                 &PerformanceDocumentCounters::style_unscoped_transaction_count,
-                 &PerformanceDocumentCounters::style_unscoped_transaction_reaction_entries,
-                 &PerformanceDocumentCounters::style_broad_matching_batch_runs,
-                 &PerformanceDocumentCounters::style_narrow_matching_batch_runs,
-                 &PerformanceDocumentCounters::style_broad_matching_reaction_elements,
-                 &PerformanceDocumentCounters::style_narrow_matching_reaction_elements,
-                 &PerformanceDocumentCounters::style_broad_matching_apply_microseconds,
-                 &PerformanceDocumentCounters::style_narrow_matching_apply_microseconds,
                  &PerformanceDocumentCounters::full_layout_count,
                  &PerformanceDocumentCounters::partial_layout_count,
                  &PerformanceDocumentCounters::full_layout_microseconds,
@@ -501,9 +483,6 @@ JsonObject ConnectionFromClient::style_and_layout_diagnostics() const
     result.set("style_update_duration_semantics"sv, "sum of elapsed wall time for update_style() calls over active documents; includes the pre-style embedding-container layout check; nested document calls can overlap; not CPU time or a disjoint phase budget"sv);
     result.set("style_reaction_elements_semantics"sv, "published style-reaction entries counted by the existing style engine; not every element visited or every computed style recomputed"sv);
     result.set("style_reaction_batches_semantics"sv, "style application passes that contain published style reactions; not transaction count or full-document traversal count"sv);
-    result.set("style_unscoped_transaction_semantics"sv, "consumed transactions whose existing is_scoped flag is false; this is not a per-element traversal count or proof of full computed-style recomputation"sv);
-    result.set("style_broad_matching_semantics"sv, "passes selected by the existing Rust broad-matching heuristic; reaction element counts are published entries, not nodes visited; broad matching is not equivalent to a full-document style recomputation"sv);
-    result.set("style_fallback_reason_available"sv, false);
     result.set("layout_duration_semantics"sv, "elapsed wall time inside classified full or partial render-state layout rounds, summed over active document arenas; includes round work and committed-layout preparation, excludes waiting before the render-state job and paint recording; not CPU time"sv);
     if (document_set_unchanged && counters_monotonic) {
         auto set_duration = [&](StringView name, u64 microseconds) {
@@ -519,15 +498,6 @@ JsonObject ConnectionFromClient::style_and_layout_diagnostics() const
         set_duration("style_update_remainder_duration_ms"sv, totals.style_update_remainder_microseconds);
         set_duration("style_engine_transaction_setup_duration_ms"sv, totals.style_engine_transaction_setup_microseconds);
         set_count("style_engine_transaction_setup_count"sv, totals.style_engine_transaction_setups);
-        set_count("style_engine_transaction_count"sv, totals.style_engine_transaction_count);
-        set_count("style_unscoped_transaction_count"sv, totals.style_unscoped_transaction_count);
-        set_count("style_unscoped_transaction_reaction_entries"sv, totals.style_unscoped_transaction_reaction_entries);
-        set_count("style_broad_matching_batch_count"sv, totals.style_broad_matching_batch_runs);
-        set_count("style_narrow_matching_batch_count"sv, totals.style_narrow_matching_batch_runs);
-        set_count("style_broad_reaction_elements"sv, totals.style_broad_matching_reaction_elements);
-        set_count("style_narrow_reaction_elements"sv, totals.style_narrow_matching_reaction_elements);
-        set_duration("style_broad_matching_apply_duration_ms"sv, totals.style_broad_matching_apply_microseconds);
-        set_duration("style_narrow_matching_apply_duration_ms"sv, totals.style_narrow_matching_apply_microseconds);
         set_count("full_layout_count"sv, totals.full_layout_count);
         set_count("partial_layout_count"sv, totals.partial_layout_count);
         set_duration("layout_full_duration_ms"sv, totals.full_layout_microseconds);
@@ -544,15 +514,6 @@ JsonObject ConnectionFromClient::style_and_layout_diagnostics() const
                  "style_update_remainder_duration_ms"sv,
                  "style_engine_transaction_setup_duration_ms"sv,
                  "style_engine_transaction_setup_count"sv,
-                 "style_engine_transaction_count"sv,
-                 "style_unscoped_transaction_count"sv,
-                 "style_unscoped_transaction_reaction_entries"sv,
-                 "style_broad_matching_batch_count"sv,
-                 "style_narrow_matching_batch_count"sv,
-                 "style_broad_reaction_elements"sv,
-                 "style_narrow_reaction_elements"sv,
-                 "style_broad_matching_apply_duration_ms"sv,
-                 "style_narrow_matching_apply_duration_ms"sv,
                  "full_layout_count"sv,
                  "partial_layout_count"sv,
                  "layout_full_duration_ms"sv,
@@ -688,6 +649,14 @@ ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_audio_serve
     auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestAudioServerConnection>();
     if (!response || !response->handle().has_value())
         return Error::from_string_literal("The Browser did not connect an audio server");
+    return response->take_handle()->create_transport();
+}
+
+ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_webrtc_client_transport()
+{
+    auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestWebrtcClientConnection>();
+    if (!response || !response->handle().has_value())
+        return Error::from_string_literal("The Browser did not launch a WebRTCClient");
     return response->take_handle()->create_transport();
 }
 
@@ -1081,6 +1050,14 @@ void ConnectionFromClient::mouse_event_in_hosted_root(Web::PageId page_id, Web::
     enqueue_mouse_event(page_id, navigable_id, move(event));
 }
 
+// The compositor numbers every wheel step, so only the gesture of the steps decides whether they may become one.
+static bool wheel_steps_are_of_one_gesture(Optional<Web::WheelGestureMark> const& first, Optional<Web::WheelGestureMark> const& second)
+{
+    if (!first.has_value() || !second.has_value())
+        return first.has_value() == second.has_value();
+    return first->gesture_id == second->gesture_id && first->lasts_until_fingers_lift == second->lasts_until_fingers_lift;
+}
+
 void ConnectionFromClient::enqueue_mouse_event(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> navigable_id, Web::MouseEvent event)
 {
     auto page = m_page_host->page(page_id);
@@ -1112,7 +1089,7 @@ void ConnectionFromClient::enqueue_mouse_event(Web::PageId page_id, Optional<Web
                 && (mouse_event->async_scroll_performed_default_action != event.async_scroll_performed_default_action
                     || mouse_event->wheel_delta_precision != event.wheel_delta_precision
                     || mouse_event->scroll_gesture_phase != event.scroll_gesture_phase
-                    || mouse_event->wheel_gesture_mark != event.wheel_gesture_mark))
+                    || !wheel_steps_are_of_one_gesture(mouse_event->wheel_gesture_mark, event.wheel_gesture_mark)))
                 return nullptr;
             return mouse_event;
         }
@@ -1383,6 +1360,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "clear-cache") {
         Web::Fetch::Fetching::clear_http_memory_cache();
+        Web::CSS::StyleScope::release_kept_data();
         return;
     }
 
@@ -2079,7 +2057,7 @@ void ConnectionFromClient::clear_grid_highlight(Web::PageId page_id, Web::Unique
 
 void ConnectionFromClient::inspect_accessibility_tree(Web::PageId page_id)
 {
-    if (auto page = this->page(page_id); page.has_value()) {
+    if (auto page = this->page(page_id); page.has_value() && page->page().has_local_traversable()) {
         if (auto doc = page->page().local_traversable()->active_document())
             async_did_inspect_accessibility_tree(page_id, doc->dump_accessibility_tree_as_json().to_utf8());
     }
@@ -2093,6 +2071,10 @@ void ConnectionFromClient::request_accessibility_tree(Web::PageId page_id)
     // path, so they pay for neither.
     if (auto page = this->page(page_id); page.has_value()) {
         page->page().set_accessibility_interested(true);
+        // A request can arrive after the tab's document moved to another process, which leaves this page's traversable
+        // remote, with no document of its own to report.
+        if (!page->page().has_local_traversable())
+            return;
         if (auto doc = page->page().local_traversable()->active_document()) {
             doc->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
             async_did_get_accessibility_tree(page_id, doc->build_accessibility_node_data());
@@ -2513,6 +2495,12 @@ void ConnectionFromClient::set_has_devtools_client(Web::PageId page_id, bool has
 {
     if (auto page = this->page(page_id); page.has_value())
         page->set_has_devtools_client(has_devtools_client);
+}
+
+void ConnectionFromClient::start_sending_console_output(Web::PageId page_id, bool messages, bool errors)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->start_sending_console_output(messages, errors);
 }
 
 void ConnectionFromClient::get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id)
@@ -3401,6 +3389,12 @@ void ConnectionFromClient::set_content_blockers(Core::AnonymousBuffer patterns_b
         m_page_host->invalidate_user_style();
 }
 
+void ConnectionFromClient::set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host)
+{
+    if (auto page = this->page(page_id); page.has_value() && page->page().has_local_traversable())
+        page->page().local_traversable()->set_force_dark_settings(enabled, move(per_host));
+}
+
 void ConnectionFromClient::set_autoplay_settings(Web::PageId, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist)
 {
     Web::HTML::AutoplaySettings::the().set_policy(policy, allowlist);
@@ -3447,6 +3441,12 @@ void ConnectionFromClient::consume_user_activation(Web::PageId page_id, Web::HTM
         Web::HTML::Window::consume_user_activation_of_windows_hosted_by(page->page(), consumption);
 }
 
+void ConnectionFromClient::notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notify_document_about_user_activation(document_id);
+}
+
 void ConnectionFromClient::set_enable_global_privacy_control(Web::PageId, bool enable)
 {
     Web::update_loader_config([&](auto& config) { config.enable_global_privacy_control = enable; });
@@ -3479,6 +3479,30 @@ void ConnectionFromClient::http_credentials_provided(Web::PageId page_id, u64 re
     if (username.has_value() && password.has_value())
         credentials = Web::Page::HTTPCredentials { username.release_value(), password.release_value() };
     page->page().http_credentials_provided(request_id, move(credentials));
+}
+
+void ConnectionFromClient::notification_shown(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_shown(notification_id);
+}
+
+void ConnectionFromClient::notification_show_failed(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_show_failed(notification_id);
+}
+
+void ConnectionFromClient::notification_clicked(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_clicked(notification_id);
+}
+
+void ConnectionFromClient::notification_closed(Web::PageId page_id, u64 notification_id, bool by_user)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_closed(notification_id, by_user);
 }
 
 void ConnectionFromClient::set_has_focus(Web::PageId page_id, bool has_focus)
@@ -3664,6 +3688,12 @@ void ConnectionFromClient::color_picker_update(Web::PageId page_id, Optional<Col
         page->page().color_picker_update(picked_color, state);
 }
 
+void ConnectionFromClient::date_picker_closed(Web::PageId page_id, Optional<Utf16String> picked_value)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().date_picker_closed(move(picked_value));
+}
+
 void ConnectionFromClient::file_picker_closed(Web::PageId page_id, Vector<Web::HTML::SelectedFile> selected_files)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -3831,14 +3861,6 @@ void ConnectionFromClient::dispatch_changed_gamepad_states()
     }
 }
 
-void ConnectionFromClient::notify_started_using_gamepads()
-{
-    if (m_did_notify_started_using_gamepads)
-        return;
-    m_did_notify_started_using_gamepads = true;
-    async_did_start_using_gamepads();
-}
-
 void ConnectionFromClient::pump_and_dispatch_gamepad_events()
 {
     auto* test_connection = this->test_connection();
@@ -3882,7 +3904,7 @@ void ConnectionFromClient::cookies_changed(Web::PageId page_id, Vector<HTTP::Coo
 
 void ConnectionFromClient::broadcast_channel_message(Web::HTML::BroadcastChannelMessage message)
 {
-    Web::HTML::BroadcastChannel::deliver_message_locally(message);
+    Web::HTML::deliver_broadcast_channel_message_locally(move(message));
 }
 
 void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
@@ -3908,6 +3930,11 @@ void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerTok
 void ConnectionFromClient::did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_worker_agent_die(owner_token);
+}
+
+void ConnectionFromClient::did_worker_rtc_transform_encoded_audio_frame_written(Web::HTML::WorkerAgentOwnerToken owner_token, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
+{
+    Web::HTML::WorkerAgentParent::did_write_rtc_transform_encoded_audio_frame(owner_token, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 // https://html.spec.whatwg.org/multipage/speculative-loading.html#nav-traversal-ui:close-a-top-level-traversable

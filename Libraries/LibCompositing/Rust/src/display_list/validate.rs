@@ -340,7 +340,6 @@ fn command_struct_size(command_type: DisplayListCommandType) -> usize {
         T::PaintScrollBar => size_of::<PaintScrollBar>(),
         T::CompositorSnapContainer => size_of::<CompositorSnapContainer>(),
         T::CompositorSnapArea => size_of::<CompositorSnapArea>(),
-        T::CompositorScrollChainingBarrier => size_of::<CompositorScrollChainingBarrier>(),
         T::CompositorNestedContextWheelRegion => size_of::<CompositorNestedContextWheelRegion>(),
         T::Canvas2DFillPath => size_of::<Canvas2DFillPath>(),
         T::Canvas2DStrokePath => size_of::<Canvas2DStrokePath>(),
@@ -525,7 +524,6 @@ fn validate_command_fields(
         T::CompositorScrollbar => {
             p.bool_at(offset_of!(CompositorScrollbar, vertical))?;
             p.bool_at(offset_of!(CompositorScrollbar, is_painted_by_compositor))?;
-            p.bool_at(offset_of!(CompositorScrollbar, display_list_paints_enlarged_scrollbar))?;
         }
         T::PaintScrollBar => p.bool_at(offset_of!(PaintScrollBar, vertical))?,
         T::CompositorSnapContainer => {
@@ -533,10 +531,6 @@ fn validate_command_fields(
             p.bool_at(offset_of!(CompositorSnapContainer, snaps_x))?;
             p.bool_at(offset_of!(CompositorSnapContainer, snaps_y))?;
             p.bool_at(offset_of!(CompositorSnapContainer, horizontal_writing_mode))?;
-        }
-        T::CompositorScrollChainingBarrier => {
-            p.bool_at(offset_of!(CompositorScrollChainingBarrier, keeps_horizontal_scrolls))?;
-            p.bool_at(offset_of!(CompositorScrollChainingBarrier, keeps_vertical_scrolls))?;
         }
         T::CompositorSnapArea => {
             p.u8_below(offset_of!(CompositorSnapArea, align_x), SNAP_ALIGN_COUNT)?;
@@ -606,6 +600,7 @@ fn validate_inline_clip(payload: Payload, offset: usize) -> Result<(), Validatio
     payload.enum_at::<ClipMode>(offset + offset_of!(DisplayListInlineClip, mode))?;
     payload.enum_at::<WindingRule>(offset + offset_of!(DisplayListInlineClip, path_winding_rule))?;
     payload.span_at(offset + offset_of!(DisplayListInlineClip, path_data))?;
+    payload.bool_at(offset + offset_of!(DisplayListInlineClip, has_own_space))?;
     Ok(())
 }
 

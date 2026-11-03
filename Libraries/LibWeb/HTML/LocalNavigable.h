@@ -170,6 +170,8 @@ public:
 
     [[nodiscard]] bool is_focused() const;
     [[nodiscard]] virtual GC::Ptr<DOM::Node> currently_focused_area() override;
+    // What currently_focused_area() would be with system focus.
+    [[nodiscard]] GC::Ptr<DOM::Node> focused_area_regardless_of_system_focus();
 
     struct ChosenNavigable {
         GC::Ptr<Navigable> navigable;
@@ -233,6 +235,7 @@ public:
         Blocked,
     };
     NavigationOrHistoryUpdatePermission allowed_to_perform_a_navigation_or_history_update();
+    void reset_navigation_or_history_update_rate_limit_for_testing();
 
     virtual bool is_local_navigable() const override { return true; }
 
@@ -257,6 +260,10 @@ public:
     void adopt_started_user_scroll(DOM::Document&, Compositing::StartedUserScroll const&);
     void process_main_thread_smooth_scrolls();
     void wait_for_async_scroll_operation(Compositing::AsyncScrollOperationID, GC::Ref<WebIDL::Promise>);
+    // The input that started the operation is still being handled, and whoever handed it in waits for the operation
+    // once it is. An operation that ends before then is remembered until the wait begins.
+    void expect_wait_for_async_scroll_operation(Compositing::AsyncScrollOperationID);
+    void forget_expected_wait_for_async_scroll_operation(Compositing::AsyncScrollOperationID);
     void wait_for_wheel_scrolls(Vector<GC::Ref<WebIDL::Promise>>&);
     void clamp_viewport_scroll_offset();
 
@@ -317,7 +324,7 @@ public:
     bool has_recording_in_flight() const { return m_recording_in_flight; }
 
     // Paints into the target, which must be a shareable bitmap, then calls the callback.
-    void render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig, Function<void()>&& callback);
+    void render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig, Function<void(Compositor::ScreenshotResult)>&& callback);
     Compositing::DisplayListResourceStorage& display_list_resource_storage() { return presenter().display_list_resource_storage(); }
 
     // Tells the clock lanes of the active document whether a task begins or the event loop goes idle: a task that begins
@@ -365,6 +372,8 @@ public:
     OwnPtr<Compositor::CompositorContextHandle> take_compositor_context();
 
     void set_should_show_line_box_borders(bool);
+    void set_force_dark_settings(bool, HashMap<String, bool>);
+    void update_force_dark_for_active_document();
     void set_force_dark_enabled(bool);
     void set_force_dark_thresholds(i32 foreground, i32 background);
     bool active_document_opts_out_of_force_dark() const;
@@ -393,23 +402,13 @@ public:
         PerScroll,
     };
 
-    // How long the offset a gesture's input deltas have reached goes on being the offset its next step travels from.
-    // A wheel gesture stays latched between its steps, so its deltas keep accumulating until it settles, and crossing a
-    // snap position costs the distance between them however slowly the steps arrive. Keys are separate commands rather
-    // than one gesture, so each press travels from the scrolling box itself.
-    enum class SnapStepAccumulation {
-        UntilScrollFinishes,
-        UntilGestureSettles,
-    };
-
     bool scroll_scrolling_box_by_delta(Layout::Node&, CSSPixelPoint delta, Painting::ScrollKind, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll);
     bool continued_scroll_step_moves(Layout::Node&, CSSPixelPoint delta, Compositing::ScrollAnimationKind);
     bool scroll_viewport_by_delta(CSSPixelPoint delta, Bindings::ScrollBehavior, Painting::ScrollKind, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll);
     GC::Ref<WebIDL::Promise> perform_a_scroll_of_the_viewport(CSSPixelPoint position, Bindings::ScrollBehavior = Bindings::ScrollBehavior::Auto, ScrollTrigger = ScrollTrigger::Programmatic, Optional<CSSPixelPoint> relative_displacement = {}, Painting::ScrollKind = Painting::ScrollKind::Absolute, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll);
     GC::Ref<WebIDL::Promise> perform_a_scroll_of_an_element(DOM::Element&, CSSPixelPoint position, Bindings::ScrollBehavior, Optional<CSSPixelPoint> relative_displacement = {});
-    bool perform_a_snapped_relative_user_scroll(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type, SnapStepAccumulation, Compositing::ScrollAnimationKind = Compositing::ScrollAnimationKind::SmoothScroll, Painting::ScrollKind = Painting::ScrollKind::Relative);
+    bool perform_a_snapped_relative_user_scroll(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type, Painting::ScrollKind = Painting::ScrollKind::Relative);
     bool perform_a_scroll_step_for_key_input(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type);
-    bool perform_a_snapped_momentum_scroll(Layout::Node&, CSSPixelPoint momentum_delta);
     Layout::Node* layout_node_for_async_scroll_node_stable_id(Web::AsyncScrollNodeStableID);
     void re_snap_scroll_containers_after_layout_change(Layout::BegunRead const& read);
     void abort_in_flight_smooth_scrolls(Web::AsyncScrollNodeStableID);
@@ -421,15 +420,16 @@ public:
     };
     void note_user_scroll_gesture_of(Web::AsyncScrollNodeStableID, Optional<CSSPixelPoint> scroll_offset_at_gesture_start, UserScrollMovedBox, SnapPositionSelection = SnapPositionSelection::AtGestureEnd);
     void note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type);
-    RefPtr<Painting::Scrollbar> scrollbar_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const&);
+    // The element whose scrollbar the compositor drags, or the element generating the pseudo-element whose scrollbar
+    // it drags, as long as the box the compositor scrolls is still there.
+    DOM::Element* element_whose_scrollbar_is_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const&);
     // Returns false if the scroller is not in this navigable's active document.
     bool set_overlay_scrollbar_hidden(Web::AsyncScrollNodeStableID, bool vertical, bool hidden);
     void note_user_scroll_gesture_phase(Web::ScrollGesturePhase);
     // A gesture that lasts until its fingers lift is held until their lift arrives, not until its events pause.
     void did_handle_wheel_event(bool gesture_lasts_until_fingers_lift);
-    void note_wheel_user_scroll_gesture_scrolls(Web::AsyncScrollNodeStableID);
     void extend_user_scroll_gesture_of(Web::AsyncScrollNodeStableID);
-    void extend_wheel_user_scroll_gesture(Optional<Web::AsyncScrollNodeStableID> box_latched_on_this_thread);
+    void extend_wheel_user_scroll_gesture();
     void snap_user_scroll_gestures_that_awaited_layout();
     void end_scroll_sequences_that_completed_since_the_last_frame();
     // The boxes that user input scrolls on this thread while the returned change is alive are held by the hold.
@@ -582,7 +582,6 @@ private:
     void abandon_snapping_of_user_scroll_gesture(Web::AsyncScrollNodeStableID);
     void note_user_scroll_gesture_input_ended(Web::AsyncScrollNodeStableID);
     void release_wheel_user_scroll_gesture_hold();
-    void reset_momentum_fling_state();
     void cancel_scroll_sequences();
     void schedule_hover_update_after_async_scroll();
     void update_hover_after_async_scroll_stops();
@@ -663,6 +662,8 @@ private:
 
     bool m_should_show_line_box_borders { false };
     bool m_force_dark_enabled { false };
+    bool m_force_dark_default { false };
+    HashMap<String, bool> m_force_dark_per_host;
     i32 m_force_dark_foreground_threshold { default_force_dark_foreground_threshold };
     i32 m_force_dark_background_threshold { default_force_dark_background_threshold };
     bool m_should_show_caret_hit_test_debug_overlay { false };
@@ -684,15 +685,6 @@ private:
     bool m_scroll_sequences_may_have_completed { false };
     Compositing::SnapSelectionStrategy::Type m_user_scroll_input_intent { Compositing::SnapSelectionStrategy::Type::EndPosition };
     bool m_user_scroll_gesture_travels_under_momentum { false };
-    // Momentum that selects no snap position is scrolled by for the rest of the gesture rather than being asked again
-    // for each delta it produces.
-    enum class MomentumSnapPositionSelection : u8 {
-        NotSelectedYet,
-        ScrollingToSelectedPosition,
-        NoPositionSelected,
-    };
-    MomentumSnapPositionSelection m_momentum_snap_position_selection { MomentumSnapPositionSelection::NotSelectedYet };
-    Compositing::MomentumFlingEstimator m_momentum_fling_estimator;
     bool m_is_re_snapping_scroll_containers { false };
 
     struct PendingAsyncScrollOperation {
@@ -704,6 +696,8 @@ private:
         Compositing::ScrollAnimationKind animation_kind { Compositing::ScrollAnimationKind::SmoothScroll };
     };
     Vector<PendingAsyncScrollOperation> m_pending_async_scroll_operations;
+    // The operations whose wait is expected to begin, and whether each has ended already.
+    HashMap<Compositing::AsyncScrollOperationID, bool> m_async_scroll_operations_with_expected_wait;
     // A script's instant scroll, which ends once the compositor answers its request with where the box went.
     struct InstantScrollAwaitingAnswer {
         Web::AsyncScrollNodeStableID stable_node_id;
@@ -760,8 +754,8 @@ private:
     static FinishedScroll finished_scroll(MainThreadSmoothScroll const&);
 };
 
-// Held user input, such as a pressed key or a grabbed scrollbar thumb, keeps the gesture of each box it holds going until
-// it is released.
+// Held user input, such as a pressed key or a scrollbar thumb the compositor drags, keeps the gesture of each box it
+// holds going until it is released.
 class WEB_API UserScrollGestureHold {
     AK_MAKE_NONCOPYABLE(UserScrollGestureHold);
     AK_MAKE_NONMOVABLE(UserScrollGestureHold);
@@ -774,7 +768,7 @@ public:
         No,
         Yes,
     };
-    explicit UserScrollGestureHold(LocalNavigable&, TakesOverMomentum = TakesOverMomentum::No, Optional<Web::AsyncScrollNodeStableID> held_box = {});
+    explicit UserScrollGestureHold(LocalNavigable&, TakesOverMomentum = TakesOverMomentum::No);
     ~UserScrollGestureHold();
 
     void hold(Web::AsyncScrollNodeStableID);

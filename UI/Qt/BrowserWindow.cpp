@@ -64,7 +64,6 @@ namespace Ladybird {
 
 static constexpr auto AUDIO_STATE_BUTTON_POSITION = QTabBar::LeftSide;
 static constexpr auto TAB_CLOSE_BUTTON_POSITION = QTabBar::RightSide;
-static constexpr auto WINDOW_DRAG_REGION_PROPERTY = "LadybirdWindowDragRegion";
 static constexpr int LADYBIRD_MENU_WIDTH = 280;
 static constexpr int WINDOW_RESIZE_BORDER_WIDTH = 6;
 static constexpr int WINDOW_RESIZE_CORNER_WIDTH = WINDOW_RESIZE_BORDER_WIDTH * 2;
@@ -312,6 +311,9 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     , m_tabs_container(new TabWidget(is_private, this))
     , m_is_popup_window(is_popup_window)
 {
+    // NB: The toolbar is made before the rest of the window, so it learns of the session's downloads once it is all here.
+    toolbar().update_downloads_button();
+
     auto const& browser_options = WebView::Application::browser_options();
 
     // A restored window keeps the session row the store re-adopted for it.
@@ -520,8 +522,7 @@ void BrowserWindow::initialize_ladybird_menu()
 #endif
     downloads_action->setShortcutContext(Qt::WidgetShortcut);
     QObject::connect(downloads_action, &QAction::triggered, this, [this] {
-        if (m_current_tab)
-            m_current_tab->show_downloads_popover();
+        toolbar().show_downloads_popover();
     });
     m_ladybird_menu->addSeparator();
 
@@ -636,9 +637,7 @@ void BrowserWindow::update_tabs_display()
 
 void BrowserWindow::rebuild_bookmarks_menu()
 {
-    for_each_tab([](Tab& tab) {
-        tab.bookmarks_bar().rebuild();
-    });
+    m_tabs_container->bookmarks_bar().rebuild();
 }
 
 void BrowserWindow::on_devtools_enabled()
@@ -1013,9 +1012,7 @@ void BrowserWindow::set_failed_download_count(size_t count)
 void BrowserWindow::acknowledge_failed_downloads()
 {
     m_acknowledged_failed_download_count = m_failed_download_count;
-    for_each_tab([](Tab& tab) {
-        tab.update_downloads_button();
-    });
+    toolbar().update_downloads_button();
 }
 
 void BrowserWindow::set_current_tab(Tab* tab)
@@ -1537,9 +1534,7 @@ void BrowserWindow::enter_fullscreen()
     m_restore_to_maximized = isMaximized();
     showFullScreen();
 
-    for_each_tab([](Tab& tab) {
-        tab.update_bookmarks_bar_visibility();
-    });
+    m_tabs_container->update_bookmarks_bar_visibility();
 }
 
 void BrowserWindow::exit_fullscreen()
@@ -1554,9 +1549,7 @@ void BrowserWindow::exit_fullscreen()
     else
         showNormal();
 
-    for_each_tab([](Tab& tab) {
-        tab.update_bookmarks_bar_visibility();
-    });
+    m_tabs_container->update_bookmarks_bar_visibility();
 
     // A crash report that came in while the toolbar was hidden can be offered now, even on a tab other than the one
     // that was current back then.
@@ -1621,6 +1614,27 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
     if (!has_chrome_in_titlebar())
         return QMainWindow::eventFilter(object, event);
 
+    // A double click whose first click landed on another widget, such as the sidebar's toggle, which then moved away
+    // from under the pointer, is no double click on what is under the pointer now. On the empty chrome, it does not
+    // toggle whether the window is maximized. Other widgets still get it, as it is their only event for that click.
+    // NB: Widgets get the second click of a double click only as a double click, not as a press. An event that a
+    //     widget ignores goes on to its parent, and is seen here again with the same timestamp. Only the widget it
+    //     first went to counts.
+    if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonDblClick) {
+        auto* mouse_event = static_cast<QMouseEvent*>(event);
+        if (mouse_event->button() == Qt::LeftButton) {
+            if (event->type() == QEvent::MouseButtonPress && mouse_event->timestamp() != m_last_left_press_timestamp) {
+                m_last_left_press_widget = widget;
+                m_last_left_press_timestamp = mouse_event->timestamp();
+            } else if (event->type() == QEvent::MouseButtonDblClick && mouse_event->timestamp() != m_last_double_click_timestamp) {
+                m_last_double_click_timestamp = mouse_event->timestamp();
+                m_double_click_started_elsewhere = m_last_left_press_widget != widget;
+                m_last_left_press_widget = widget;
+                m_last_left_press_timestamp = mouse_event->timestamp();
+            }
+        }
+    }
+
     if (event->type() == QEvent::ContextMenu) {
         auto* context_menu_event = static_cast<QContextMenuEvent*>(event);
         auto position = context_menu_event->pos();
@@ -1673,7 +1687,8 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
 
     if (is_empty_window_drag_region(*widget, mouse_event->position().toPoint()) && !isFullScreen()) {
         if (event->type() == QEvent::MouseButtonDblClick) {
-            toggle_window_maximized();
+            if (!m_double_click_started_elsewhere)
+                toggle_window_maximized();
             return true;
         }
 
@@ -1685,7 +1700,8 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
         return QMainWindow::eventFilter(object, event);
 
     if (event->type() == QEvent::MouseButtonDblClick) {
-        toggle_window_maximized();
+        if (!m_double_click_started_elsewhere)
+            toggle_window_maximized();
         return true;
     }
 
@@ -1878,8 +1894,8 @@ void BrowserWindow::appearance_changed()
     SystemAppearance::the().apply_interface_theme(WebView::Application::settings().appearance().interface_theme);
     update_menu_bar_visibility();
 
+    m_tabs_container->update_bookmarks_bar_visibility();
     for_each_tab([](Tab& tab) {
-        tab.update_bookmarks_bar_visibility();
         tab.view().update_palette();
     });
 }
@@ -2026,10 +2042,25 @@ void BrowserWindow::raise_for_close_prompt()
 
     // A page's beforeunload prompt shows inside this window, which may sit behind other windows or in the Dock while a
     // close check asks it, so the window comes to the front first, where the user can see the prompt.
+    bring_to_front();
+}
+
+void BrowserWindow::bring_to_front()
+{
     if (isMinimized())
         setWindowState(windowState() & ~Qt::WindowMinimized);
     raise();
     activateWindow();
+}
+
+Tab* BrowserWindow::tab_for_view(WebView::ViewImplementation const& view) const
+{
+    for (int index = 0; index < m_tabs_container->count(); ++index) {
+        auto* tab = m_tabs_container->tab(index);
+        if (tab && &tab->view() == &view)
+            return tab;
+    }
+    return nullptr;
 }
 
 void BrowserWindow::report_activation_to_session_store()

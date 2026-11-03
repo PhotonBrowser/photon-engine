@@ -10,10 +10,13 @@
 use crate::css::computed_value_views::{ComputedValuesView, LengthPercentageRef};
 use crate::css::css_enums::keyword;
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
-use crate::css::style_value::{BasicShapeData, OwnedBasicShapeData, RetainedStyleValueData, StyleValueData};
+use crate::css::style_value::{
+    BasicShapeData, OwnedBasicShapeData, RetainedStyleValueData, StyleValueBox, StyleValueData,
+};
+use crate::css::style_value::{BorderRadiusPayload, BorderRadiusRectPayload, PositionPayload, RayPayload};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::paint_read::PaintRead;
-use crate::painting::{paintable_geometry, style_queries};
+use crate::painting::style_queries;
 use libgfx_rust::{FloatMatrix4x4, FloatPoint, rotation_matrix, translation_matrix};
 
 use super::basic_shapes::{basic_shape_kind, position_resolved};
@@ -44,25 +47,10 @@ fn position_value_at(point: (f64, f64), rect: CssPixelRect) -> StyleValueData {
             }),
         })
     };
-    StyleValueData::Position {
+    StyleValueData::Position(StyleValueBox::new(PositionPayload {
         edge_x: edge(point.0 - rect.x.to_double()),
         edge_y: edge(point.1 - rect.y.to_double()),
-    }
-}
-
-// https://drafts.csswg.org/motion-1/#offset-path-property
-// In CSS contexts, the boxes being referenced are from the element that establishes the containing block for this
-// element.
-// FIXME: In SVG contexts, all values behave as view-box.
-fn containing_block_reference_box(arena: &impl PaintRead, node: NodeSlotId, coord_box: u16) -> CssPixelRect {
-    let Some(containing_block) = arena.node_containing_block_if_live(node) else {
-        return CssPixelRect::default();
-    };
-    match coord_box {
-        keyword::CONTENT_BOX | keyword::FILL_BOX => paintable_geometry::absolute_rect(arena, containing_block),
-        keyword::PADDING_BOX => paintable_geometry::absolute_padding_box_rect(arena, containing_block),
-        _ => paintable_geometry::absolute_border_box_rect(arena, containing_block),
-    }
+    }))
 }
 
 /// inset(0 round X), where X is the border-radius of the containing block of `node`.
@@ -87,19 +75,21 @@ fn containing_block_inset_shape(arena: &impl PaintRead, node: NodeSlotId) -> Own
             Some(value) => unsafe {
                 RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(value))
             },
-            None => RetainedStyleValueData::from_owned(StyleValueData::BorderRadius {
-                is_elliptical: false,
-                horizontal_radius: zero(),
-                vertical_radius: zero(),
-            }),
+            None => RetainedStyleValueData::from_owned(StyleValueData::BorderRadius(StyleValueBox::new(
+                BorderRadiusPayload {
+                    is_elliptical: false,
+                    horizontal_radius: zero(),
+                    vertical_radius: zero(),
+                },
+            ))),
         }
     };
-    let radii = StyleValueData::BorderRadiusRect {
+    let radii = StyleValueData::BorderRadiusRect(StyleValueBox::new(BorderRadiusRectPayload {
         top_left: radius(|border| &border.border_top_left_radius),
         top_right: radius(|border| &border.border_top_right_radius),
         bottom_right: radius(|border| &border.border_bottom_right_radius),
         bottom_left: radius(|border| &border.border_bottom_left_radius),
-    };
+    }));
     OwnedBasicShapeData::new(BasicShapeData {
         kind: basic_shape_kind::INSET,
         v0: zero(),
@@ -168,6 +158,7 @@ pub(crate) fn compute_offset_transform(
     style: ComputedValuesView<'_>,
     arena: &impl PaintRead,
     node: NodeSlotId,
+    geometry: &impl super::node_values::TransformGeometry,
     reference_box: CssPixelRect,
     origin: (f64, f64),
 ) -> Option<FloatMatrix4x4> {
@@ -189,8 +180,12 @@ pub(crate) fn compute_offset_transform(
         path => (Some(path), keyword::BORDER_BOX),
     };
 
-    let border_box = paintable_geometry::absolute_border_box_rect(arena, node);
-    let containing_box = containing_block_reference_box(arena, node, coord_box);
+    // https://drafts.csswg.org/motion-1/#offset-path-property
+    // In CSS contexts, the boxes being referenced are from the element that establishes the containing block for this
+    // element.
+    // FIXME: In SVG contexts, all values behave as view-box.
+    let border_box = geometry.border_box();
+    let containing_box = geometry.containing_block_box(coord_box);
 
     // https://drafts.csswg.org/motion-1/#offset-position-property
     let offset_position = style_queries::handle_value(&transform_values.offset_position);
@@ -211,12 +206,13 @@ pub(crate) fn compute_offset_transform(
     let mut is_closed_loop = false;
     let mut ray_contain_reduction = None;
     let (path_length, point_at): (f64, Box<dyn Fn(f64) -> PathPosition>) = match path {
-        Some(StyleValueData::Ray {
-            size,
-            contain,
-            angle,
-            position,
-        }) => {
+        Some(StyleValueData::Ray(ray_payload)) => {
+            let RayPayload {
+                size,
+                contain,
+                angle,
+                position,
+            } = &**ray_payload;
             // at <position>: Specifies the origin of the ray. If omitted, it uses the offset starting position of the
             // element. If the element doesn't have an offset starting position either, it behaves as at center.
             let origin = position

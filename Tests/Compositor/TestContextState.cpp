@@ -8,7 +8,6 @@
 #include <Compositor/CompositorState.h>
 #include <Compositor/ContextState.h>
 #include <Compositor/DisplayListPlayerSkia.h>
-#include <LibCompositing/DisplayList/CanvasSurfaceRegistry.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/VisualContextTreeTestBuilder.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
@@ -52,8 +51,8 @@ static Web::PinchEvent pinch_event(double scale_delta)
 TEST_CASE(frame_can_arrive_before_the_first_display_list)
 {
     NullWebContentClient client;
-    Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Web::CompositorContextId { 1 }, 1, client, canvas_surface_registry };
+    Compositor::CanvasSurfaceRegistry canvas_surface_registry;
+    Compositor::ContextState context { Web::CompositorContextId { 1 }, 1, client, Compositor::OwnedCanvasSurfaces { canvas_surface_registry, client.canvas_surface_owner_id() } };
     Compositor::DisplayListPlayerSkia display_list_player;
 
     auto prepared_frame = context.prepare_frame(display_list_player, { .viewport_rect = { 0, 0, 800, 600 }, .forced_damage_rect = {} }, nullptr);
@@ -148,11 +147,11 @@ TEST_CASE(wheel_pans_the_zoomed_visual_viewport_of_a_page_without_scroll_nodes)
     wheel_event.wheel_delta_precision = Web::WheelDeltaPrecision::Precise;
 
     // Before the page is zoomed in, there is nothing for the wheel to pan.
-    EXPECT(!context.handle_wheel_event(wheel_event).accepted);
+    EXPECT(!context.handle_wheel_event(wheel_event, false, {}).accepted);
 
     EXPECT(context.handle_pinch_event(pinch_event(1.0)).accepted);
     (void)context.take_pending_async_scroll_updates();
-    auto result = context.handle_wheel_event(wheel_event);
+    auto result = context.handle_wheel_event(wheel_event, false, {});
     EXPECT(result.accepted);
     EXPECT(result.frame_to_present.has_value());
 

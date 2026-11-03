@@ -62,7 +62,6 @@
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 #include <LibWeb/WebDriver/BiDi/BiDi.h>
@@ -155,7 +154,7 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
 {
     setup_palette();
 
-    // A hover of the render clock asks for its cursor on the StyleLayout thread, as the main thread does on its own: both
+    // A hover of the render clock asks for its cursor on the Render thread, as the main thread does on its own: both
     // over the one connection, under the page cursor's lock.
     m_page->cursor().set_send([&client = client(), id = m_id](Gfx::Cursor const& cursor) {
         client.async_did_request_cursor_change(id, cursor);
@@ -212,8 +211,8 @@ void PageClient::set_has_focus(bool has_focus)
     page().invalidate_compositor_keyboard_scroll_state();
     m_has_focus = has_focus;
 
-    // The focus ring, the text caret, and selection highlight colors all depend on the window focus state, so
-    // nothing painted before the change can be reused; repaint every document the page hosts.
+    // The focus ring, the text caret, and selection highlight colors all depend on the window focus state, so every
+    // document the page hosts records again, which records the output that read the focus state again.
     for (auto const& navigable : page().hosted_navigables()) {
         if (!has_focus)
             navigable->event_handler().release_held_scroll_key();
@@ -225,11 +224,10 @@ void PageClient::set_has_focus(bool has_focus)
         // A writing suggestion is for the user typing in the window, so leaving the window drops it.
         if (auto* controller = document->writing_suggestion_controller_if_exists(); controller && !has_focus)
             controller->dismiss();
-        // Focus changes can arrive while layout is invalidated. We only need to invalidate cached paint
-        // on the current paintable tree here, without requiring layout to be up to date first.
-        if (document->has_committed_viewport_box())
-            document->paint_state().invalidate_all_cached_paint(*document);
+        Web::Painting::request_document_repaint(*document, Web::InvalidateDisplayList::PaintCommands);
     }
+
+    page().system_focus_changed();
 }
 
 void PageClient::set_window_handle(Utf16String window_handle)
@@ -1026,26 +1024,39 @@ void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin 
 
 void PageClient::page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document& document)
 {
-    auto& realm = document.relevant_settings_object().realm();
-
     clear_pending_dom_mutations();
 
     if (m_web_ui && &m_web_ui->document() != &document)
         m_web_ui.clear();
 
-    // NB: Only the active document of the top-level browsing context has its console client read, so a document gets
-    //     one when it becomes that, and the many documents that never do (such as those DOMParser creates) never pay
-    //     for one.
+    // The output that DevTools gets once it asks belongs to the document that the tab shows.
+    if (m_top_level_document_console_client && document.console_client() != m_top_level_document_console_client)
+        m_console_output_buffer = {};
+
+    if (auto console_client = attach_js_console(document))
+        m_top_level_document_console_client = *console_client;
+}
+
+void PageClient::page_did_change_active_document_in_child_navigable(Web::DOM::Document& document)
+{
+    // An iframe's document logs to the tab's console too.
+    (void)attach_js_console(document);
+}
+
+// NB: Only an active document has its console client read, so a document gets one when it becomes active, and the many
+//     documents that never do (such as those DOMParser creates) never incur one.
+GC::Ptr<WebContentConsoleClient> PageClient::attach_js_console(Web::DOM::Document& document)
+{
     if (!document.console_client())
         initialize_js_console(document);
 
-    if (auto console_client = document.console_client()) {
-        auto& web_content_console_client = as<WebContentConsoleClient>(*console_client);
-        m_top_level_document_console_client = web_content_console_client;
+    auto console_client = document.console_client();
+    if (!console_client)
+        return {};
 
-        auto console_object = realm.intrinsics().console_object();
-        console_object->console().set_client(*console_client);
-    }
+    auto& realm = document.relevant_settings_object().realm();
+    realm.intrinsics().console_object()->console().set_client(*console_client);
+    return as<WebContentConsoleClient>(*console_client);
 }
 
 void PageClient::page_did_finish_loading(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id)
@@ -1161,6 +1172,10 @@ void PageClient::schedule_accessibility_tree_update()
     if (!m_accessibility_update_timer) {
         m_accessibility_update_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(200), [this] {
             if (m_is_closed)
+                return;
+            // The tab's document can move to another process before the timer fires, which leaves this page's
+            // traversable remote, with no document of its own to report.
+            if (!page().has_local_traversable())
                 return;
             if (auto doc = page().local_traversable()->active_document()) {
                 doc->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
@@ -1322,6 +1337,49 @@ bool PageClient::page_did_request_http_credentials(u64 request_id, URL::URL cons
 void PageClient::page_did_fail_certificate_verification(URL::URL const& url)
 {
     client().async_did_fail_certificate_verification(m_id, url);
+}
+
+void PageClient::page_did_request_show_notification(u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData const& data, RefPtr<Gfx::Bitmap const> icon)
+{
+    Optional<Gfx::ShareableBitmap> shareable_icon;
+    if (icon)
+        shareable_icon = icon->to_shareable_bitmap();
+    client().async_did_request_show_notification(m_id, notification_id, document_id, data, move(shareable_icon));
+}
+
+void PageClient::page_did_request_close_notification(u64 notification_id)
+{
+    client().async_did_request_close_notification(m_id, notification_id);
+}
+
+void PageClient::page_did_abandon_notification(u64 notification_id)
+{
+    client().async_did_abandon_notification(m_id, notification_id);
+}
+
+void PageClient::page_did_handle_notification_click(u64 notification_id, bool into_focus)
+{
+    client().async_did_handle_notification_click(m_id, notification_id, into_focus);
+}
+
+String PageClient::page_did_request_notifications_state_for_testing()
+{
+    return client().did_request_notifications_state_for_testing(m_id);
+}
+
+void PageClient::page_did_request_click_notification_for_testing(u64 notification_id)
+{
+    client().async_did_request_click_notification_for_testing(m_id, notification_id);
+}
+
+void PageClient::page_did_request_click_notification_by_id_for_testing(u64 browser_notification_id)
+{
+    client().async_did_request_click_notification_by_id_for_testing(m_id, browser_notification_id);
+}
+
+void PageClient::page_did_request_dismiss_notification_for_testing(u64 notification_id)
+{
+    client().async_did_request_dismiss_notification_for_testing(m_id, notification_id);
 }
 
 Optional<Web::Permissions::PermissionSnapshot> PageClient::page_did_request_permission_snapshot(URL::Origin const& top_level_origin)
@@ -1754,7 +1812,8 @@ void PageClient::page_did_set_session_history_entry_document_state_reload_pendin
 
 void PageClient::page_did_request_set_system_focus(bool has_system_focus)
 {
-    client().async_did_request_set_system_focus(m_id, has_system_focus);
+    // Synchronous, so that the UI process has the new focus before input the test sends next over the test connection.
+    client().did_request_set_system_focus(m_id, has_system_focus);
 }
 
 void PageClient::page_did_change_focused_navigable(Web::HTML::CrossProcessId navigable_id)
@@ -2001,6 +2060,11 @@ void PageClient::page_did_request_color_picker(Color current_color)
     client().async_did_request_color_picker(m_id, current_color);
 }
 
+void PageClient::page_did_request_date_picker(Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum)
+{
+    client().async_did_request_date_picker(m_id, move(input_type), move(value), move(minimum), move(maximum));
+}
+
 void PageClient::page_did_request_file_picker(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files)
 {
     client().async_did_request_file_picker(m_id, accepted_file_types, allow_multiple_files);
@@ -2085,7 +2149,10 @@ void PageClient::page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState
 
 void PageClient::page_did_start_using_gamepads()
 {
-    client().notify_started_using_gamepads();
+    if (m_did_start_using_gamepads)
+        return;
+    m_did_start_using_gamepads = true;
+    client().async_did_start_using_gamepads(m_id);
 }
 
 void PageClient::page_did_play_gamepad_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect const& effect)
@@ -2147,6 +2214,13 @@ void PageClient::pump_gamepad_events()
     client().pump_and_dispatch_gamepad_events();
 }
 
+void PageClient::reset_gamepad_access_for_testing()
+{
+    m_did_start_using_gamepads = false;
+    if (auto* test_connection = client().test_connection(); test_connection && test_connection->is_open())
+        test_connection->async_reset_gamepad_access_for_testing(m_id);
+}
+
 Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)
 {
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::StartWorkerAgent>(m_id, move(request));
@@ -2161,6 +2235,21 @@ Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentSt
 void PageClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     client().async_close_worker_agent(m_id, agent_id, owner_token);
+}
+
+void PageClient::rtc_transform_init(Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record)
+{
+    client().async_rtc_transform_init(m_id, agent_id, transform_id, move(options_record));
+}
+
+void PageClient::rtc_transform_teardown(Web::HTML::WorkerAgentId agent_id, u64 transform_id)
+{
+    client().async_rtc_transform_teardown(m_id, agent_id, transform_id);
+}
+
+void PageClient::rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
+{
+    client().async_rtc_transform_encoded_audio_frame(m_id, agent_id, transform_id, payload.bytes(), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 void PageClient::page_did_mutate_dom(Utf16FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node>, GC::Ptr<Web::DOM::Node>, Optional<Utf16FlyString> const& attribute_name)
@@ -2371,6 +2460,50 @@ void PageClient::set_has_devtools_client(bool has_devtools_client)
         else
             active_document->clear_devtools_layout_inspection_data();
     }
+
+    // No client is left to take messages, or to expand the objects of those logged for the last one.
+    if (!has_devtools_client) {
+        m_devtools_takes_console_messages = false;
+        m_devtools_takes_console_errors = false;
+        for_each_devtools_console_client([](DevToolsConsoleClient& client) { client.forget_logged_objects(); });
+    }
+}
+
+// A DevTools client takes the console's messages, and its errors, each from the moment it asks for them: first those
+// the console output before, and then each new one as it comes.
+void PageClient::start_sending_console_output(bool messages, bool errors)
+{
+    auto new_messages = messages && !m_devtools_takes_console_messages;
+    auto new_errors = errors && !m_devtools_takes_console_errors;
+    m_devtools_takes_console_messages |= messages;
+    m_devtools_takes_console_errors |= errors;
+
+    if (!new_messages && !new_errors)
+        return;
+    m_console_output_buffer.for_each([&](WebView::ConsoleOutput const& console_output) {
+        auto is_error = console_output.output.has<WebView::ConsoleError>();
+        if (is_error ? new_errors : new_messages)
+            did_output_js_console_message(console_output);
+    });
+}
+
+void PageClient::buffer_console_output(WebView::ConsoleOutput console_output)
+{
+    m_console_output_buffer.append(move(console_output));
+}
+
+// The console clients of the active documents that the page shows: the top-level one's and its iframes'.
+void PageClient::for_each_devtools_console_client(Function<void(DevToolsConsoleClient&)> const& callback)
+{
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
+        if (&navigable->page() != &page())
+            continue;
+        auto active_document = navigable->active_document();
+        if (!active_document)
+            continue;
+        if (auto* console_client = as_if<DevToolsConsoleClient>(active_document->console_client().ptr()))
+            callback(*console_client);
+    }
 }
 
 void PageClient::page_did_finish_network_request(u64 request_id, u64 body_size, Requests::RequestTimingInfo const& timing_info, Optional<Requests::NetworkError> const& network_error)
@@ -2395,11 +2528,18 @@ void PageClient::did_execute_js_console_input(WebView::DebuggerValue const& resu
     client().async_did_execute_js_console_input(m_id, result);
 }
 
+// An object of a console result is in the top-level document's console, but a logged one is in the console of whichever
+// document logged it.
 ErrorOr<WebView::DebuggerObjectProperties> PageClient::console_object_properties(u64 object_id)
 {
-    if (!m_top_level_document_console_client)
+    GC::Ptr<DevToolsConsoleClient> console_client;
+    for_each_devtools_console_client([&](DevToolsConsoleClient& client) {
+        if (!console_client && client.has_object(object_id))
+            console_client = client;
+    });
+    if (!console_client)
         return Error::from_string_literal("Unable to locate console object");
-    return as<DevToolsConsoleClient>(*m_top_level_document_console_client).properties_for_object(object_id);
+    return console_client->properties_for_object(object_id);
 }
 
 void PageClient::js_console_input(StringView js_source)

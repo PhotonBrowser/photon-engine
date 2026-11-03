@@ -5,6 +5,7 @@
  */
 
 use crate::font::FontHandle;
+use hashbrown::hash_map::EntryRef;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -44,6 +45,19 @@ pub struct DrawGlyph {
     pub cluster_start: u32,
     pub should_paint: bool,
     pub is_rtl: bool,
+}
+
+impl DrawGlyph {
+    fn is_bitwise_equal_to(&self, other: &DrawGlyph) -> bool {
+        self.x.to_bits() == other.x.to_bits()
+            && self.y.to_bits() == other.y.to_bits()
+            && self.length_in_code_units == other.length_in_code_units
+            && self.glyph_width.to_bits() == other.glyph_width.to_bits()
+            && self.glyph_id == other.glyph_id
+            && self.cluster_start == other.cluster_start
+            && self.should_paint == other.should_paint
+            && self.is_rtl == other.is_rtl
+    }
 }
 
 unsafe extern "C" {
@@ -255,6 +269,7 @@ impl ShapeParams {
     }
 }
 
+#[derive(Debug)]
 struct CachedShape {
     glyphs: Arc<[DrawGlyph]>,
     width: f32,
@@ -262,9 +277,69 @@ struct CachedShape {
     trailing_whitespace_advance: f32,
 }
 
+impl CachedShape {
+    fn is_bitwise_equal_to(&self, other: &CachedShape) -> bool {
+        self.width.to_bits() == other.width.to_bits()
+            && self.trailing_whitespace_length_in_code_units == other.trailing_whitespace_length_in_code_units
+            && self.trailing_whitespace_advance.to_bits() == other.trailing_whitespace_advance.to_bits()
+            && self.glyphs.len() == other.glyphs.len()
+            && std::iter::zip(self.glyphs.iter(), other.glyphs.iter())
+                .all(|(glyph, other_glyph)| glyph.is_bitwise_equal_to(other_glyph))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedShape(Arc<CachedShape>);
+
+impl SharedShape {
+    pub fn from_glyphs(
+        glyphs: Vec<DrawGlyph>,
+        width: f32,
+        trailing_whitespace_length_in_code_units: usize,
+        trailing_whitespace_advance: f32,
+    ) -> Self {
+        Self(Arc::new(CachedShape {
+            glyphs: Arc::from(glyphs),
+            width,
+            trailing_whitespace_length_in_code_units,
+            trailing_whitespace_advance,
+        }))
+    }
+
+    #[inline]
+    pub fn glyphs(&self) -> &Arc<[DrawGlyph]> {
+        &self.0.glyphs
+    }
+
+    #[inline]
+    pub fn width(&self) -> f32 {
+        self.0.width
+    }
+
+    #[inline]
+    pub fn trailing_whitespace_length_in_code_units(&self) -> usize {
+        self.0.trailing_whitespace_length_in_code_units
+    }
+
+    #[inline]
+    pub fn trailing_whitespace_advance(&self) -> f32 {
+        self.0.trailing_whitespace_advance
+    }
+
+    pub fn with_baseline_start(&self, baseline_start_x: f32) -> ShapedText {
+        shaped_text_with_baseline_start(&self.0, baseline_start_x)
+    }
+}
+
+impl PartialEq for SharedShape {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0.is_bitwise_equal_to(&other.0)
+    }
+}
+
 struct ShapeForParams {
     params: ShapeParams,
-    shape: CachedShape,
+    shape: Arc<CachedShape>,
 }
 
 struct ShapesForText {
@@ -272,11 +347,11 @@ struct ShapesForText {
     shapes: Vec<ShapeForParams>,
 }
 
-type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
+type FastMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
 
 struct FontShapeCache {
     last_used_tick: u64,
-    single_ascii_common_shapes: [Option<Box<CachedShape>>; SINGLE_ASCII_SHAPE_CACHE_SIZE],
+    single_ascii_common_shapes: [Option<Arc<CachedShape>>; SINGLE_ASCII_SHAPE_CACHE_SIZE],
     shapes_by_text: FastMap<Box<[u16]>, ShapesForText>,
 }
 
@@ -297,7 +372,7 @@ impl FontShapeCache {
         text: &[u16],
         params: ShapeParams,
         shape_uncached: impl FnOnce() -> CachedShape,
-    ) -> &CachedShape {
+    ) -> &Arc<CachedShape> {
         if let &[code_unit] = text
             && (code_unit as usize) < SINGLE_ASCII_SHAPE_CACHE_SIZE
             && params.text_type == TextType::Common
@@ -305,25 +380,22 @@ impl FontShapeCache {
             && params.word_spacing == 0.0
         {
             return self.single_ascii_common_shapes[code_unit as usize]
-                .get_or_insert_with(|| Box::new(shape_uncached()));
+                .get_or_insert_with(|| Arc::new(shape_uncached()));
         }
 
-        if !self.shapes_by_text.contains_key(text) {
-            if self.shapes_by_text.len() >= MAX_SHAPE_CACHE_TEXTS_PER_FONT {
-                self.evict_least_recently_used_texts();
-            }
-            self.shapes_by_text.insert(
+        if self.shapes_by_text.len() > MAX_SHAPE_CACHE_TEXTS_PER_FONT {
+            self.evict_least_recently_used_texts();
+        }
+        let entry = match self.shapes_by_text.entry_ref(text) {
+            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Vacant(entry) => entry.insert_with_key(
                 Box::from(text),
                 ShapesForText {
                     last_used_tick: tick,
                     shapes: Vec::new(),
                 },
-            );
-        }
-        let entry = self
-            .shapes_by_text
-            .get_mut(text)
-            .expect("the entry was inserted just above");
+            ),
+        };
         entry.last_used_tick = tick;
         let shapes = &mut entry.shapes;
         let index = shapes
@@ -332,7 +404,7 @@ impl FontShapeCache {
             .unwrap_or_else(|| {
                 shapes.push(ShapeForParams {
                     params,
-                    shape: shape_uncached(),
+                    shape: Arc::new(shape_uncached()),
                 });
                 shapes.len() - 1
             });
@@ -361,9 +433,9 @@ impl ShapingCache {
         text: &[u16],
         params: ShapeParams,
         shape_uncached: impl FnOnce() -> CachedShape,
-    ) -> &CachedShape {
+    ) -> &Arc<CachedShape> {
         self.tick += 1;
-        if !self.caches_by_font_id.contains_key(&font_id) && self.caches_by_font_id.len() >= MAX_SHAPE_CACHE_FONTS {
+        if self.caches_by_font_id.len() > MAX_SHAPE_CACHE_FONTS {
             self.evict_least_recently_used_font();
         }
         let font_cache = self.caches_by_font_id.entry(font_id).or_default();
@@ -463,6 +535,38 @@ fn shaped_text_with_baseline_start(shape: &CachedShape, baseline_start_x: f32) -
     }
 }
 
+fn with_cached_shape<R>(
+    font: &FontHandle,
+    text: &[u16],
+    text_type: TextType,
+    letter_spacing: f32,
+    word_spacing: f32,
+    use_shape: impl FnOnce(&Arc<CachedShape>) -> R,
+) -> R {
+    let params = ShapeParams {
+        text_type,
+        letter_spacing,
+        word_spacing,
+    };
+    SHAPING_CACHE.with_borrow_mut(|cache| {
+        use_shape(cache.shape_for(font.id().0, text, params, || {
+            shape_text_uncached(font, text, text_type, letter_spacing, word_spacing)
+        }))
+    })
+}
+
+pub fn shape_text_shared(
+    font: &FontHandle,
+    text: &[u16],
+    text_type: TextType,
+    letter_spacing: f32,
+    word_spacing: f32,
+) -> SharedShape {
+    with_cached_shape(font, text, text_type, letter_spacing, word_spacing, |shape| {
+        SharedShape(shape.clone())
+    })
+}
+
 pub fn shaped_text_width(
     font: &FontHandle,
     text: &[u16],
@@ -470,18 +574,7 @@ pub fn shaped_text_width(
     letter_spacing: f32,
     word_spacing: f32,
 ) -> f32 {
-    let params = ShapeParams {
-        text_type,
-        letter_spacing,
-        word_spacing,
-    };
-    SHAPING_CACHE.with_borrow_mut(|cache| {
-        cache
-            .shape_for(font.id().0, text, params, || {
-                shape_text_uncached(font, text, text_type, letter_spacing, word_spacing)
-            })
-            .width
-    })
+    with_cached_shape(font, text, text_type, letter_spacing, word_spacing, |shape| shape.width)
 }
 
 pub fn shape_text(
@@ -492,15 +585,7 @@ pub fn shape_text(
     letter_spacing: f32,
     word_spacing: f32,
 ) -> ShapedText {
-    let params = ShapeParams {
-        text_type,
-        letter_spacing,
-        word_spacing,
-    };
-    SHAPING_CACHE.with_borrow_mut(|cache| {
-        let shape = cache.shape_for(font.id().0, text, params, || {
-            shape_text_uncached(font, text, text_type, letter_spacing, word_spacing)
-        });
+    with_cached_shape(font, text, text_type, letter_spacing, word_spacing, |shape| {
         shaped_text_with_baseline_start(shape, baseline_start_x)
     })
 }
@@ -527,15 +612,7 @@ pub unsafe extern "C" fn ladybird_gfx_shape_text_cached(
     } else {
         unsafe { ak::slice_from_raw_parts(text, length) }
     };
-    let params = ShapeParams {
-        text_type,
-        letter_spacing,
-        word_spacing,
-    };
-    SHAPING_CACHE.with_borrow_mut(|cache| {
-        let shape = cache.shape_for(font.id().0, text, params, || {
-            shape_text_uncached(&font, text, text_type, letter_spacing, word_spacing)
-        });
+    with_cached_shape(&font, text, text_type, letter_spacing, word_spacing, |shape| {
         // SAFETY: The glyphs remain live for the synchronous callback.
         unsafe {
             emit(
@@ -630,9 +707,11 @@ mod shaping_cache_tests {
         cache.shape_for(one_font_over_capacity, &text, params_with_letter_spacing(0.0), || {
             shape_with_glyph_count(1)
         });
+        cache.shape_for(0, &text, params_with_letter_spacing(0.0), || unreachable!());
         assert_eq!(cache.caches_by_font_id.len(), MAX_SHAPE_CACHE_FONTS);
         assert!(cache.caches_by_font_id.contains_key(&0));
         assert!(!cache.caches_by_font_id.contains_key(&1));
+        assert!(cache.caches_by_font_id.contains_key(&one_font_over_capacity));
     }
 
     #[test]
@@ -654,6 +733,7 @@ mod shaping_cache_tests {
         cache.shape_for(1, &overflowing_text, params_with_letter_spacing(0.0), || {
             shape_with_glyph_count(1)
         });
+        cache.shape_for(1, &texts[0], params_with_letter_spacing(0.0), || unreachable!());
         let font_cache = &cache.caches_by_font_id[&1];
         assert_eq!(font_cache.shapes_by_text.len(), MAX_SHAPE_CACHE_TEXTS_PER_FONT / 2);
         assert!(font_cache.shapes_by_text.contains_key(texts[0].as_slice()));
@@ -666,7 +746,6 @@ mod shaping_cache_tests {
         assert!(font_cache.shapes_by_text.contains_key(overflowing_text.as_slice()));
         assert_eq!(cache.caches_by_font_id[&2].shapes_by_text.len(), 1);
 
-        cache.shape_for(1, &texts[0], params_with_letter_spacing(0.0), || unreachable!());
         cache.shape_for(1, &overflowing_text, params_with_letter_spacing(0.0), || unreachable!());
     }
 }

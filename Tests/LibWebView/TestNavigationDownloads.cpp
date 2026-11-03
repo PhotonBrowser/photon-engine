@@ -4,24 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/Array.h>
 #include <AK/Atomic.h>
 #include <AK/LexicalPath.h>
-#include <AK/Random.h>
-#include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
-#include <LibCore/Directory.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibCore/Timer.h>
-#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/SystemTheme.h>
-#include <LibMain/Main.h>
+#include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 #include <LibURL/Parser.h>
-#include <LibWebView/Application.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Utilities.h>
@@ -31,25 +26,6 @@
 #include <sys/socket.h>
 
 namespace {
-
-class TestApplication : public WebView::Application {
-    WEB_VIEW_APPLICATION(TestApplication)
-
-public:
-    explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
-    {
-    }
-
-    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options) override
-    {
-        browser_options.headless_mode = WebView::HeadlessMode::Test;
-        browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
-        web_content_options.is_test_mode = WebView::IsTestMode::Yes;
-    }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
-};
 
 // Answers a request for its page with a small document, and every other request with the same response, pausing
 // after the first pause_after bytes of its body when given.
@@ -70,6 +46,8 @@ public:
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         MUST(Core::System::bind(m_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)));
         MUST(Core::System::listen(m_socket, 16));
+        // accept() must not block when a connection that poll() reported is gone by then.
+        MUST(Core::System::fcntl(m_socket, F_SETFL, O_NONBLOCK));
 
         socklen_t address_size = sizeof(address);
         VERIFY(::getsockname(m_socket, reinterpret_cast<sockaddr*>(&address), &address_size) == 0);
@@ -85,7 +63,6 @@ public:
     ~TestHttpServer()
     {
         m_shutting_down.store(true);
-        wake_server();
         (void)m_thread->join();
         (void)Core::System::close(m_socket);
     }
@@ -104,29 +81,28 @@ public:
     size_t request_count() const { return m_request_count.load(); }
 
 private:
+    // A connection made to wake accept() can be lost to a signal, so poll and recheck for shutdown instead.
     void run()
     {
         while (!m_shutting_down.load()) {
-            auto client = ::accept(m_socket, nullptr, nullptr);
-            if (client < 0)
+            pollfd poll_fd { .fd = m_socket, .events = POLLIN, .revents = 0 };
+            auto ready = Core::System::poll({ &poll_fd, 1 }, 100);
+            if (ready.is_error() && ready.error().code() != EINTR)
                 return;
+            if (ready.is_error() || ready.value() == 0)
+                continue;
+
+            auto client = ::accept(m_socket, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EAGAIN || errno == ECONNABORTED)
+                    continue;
+                return;
+            }
+            // Accepted sockets inherit O_NONBLOCK on some platforms.
+            MUST(Core::System::fcntl(client, F_SETFL, 0));
             respond(client);
             (void)Core::System::close(client);
         }
-    }
-
-    void wake_server()
-    {
-        auto socket = Core::System::socket(AF_INET, SOCK_STREAM, 0);
-        if (socket.is_error())
-            return;
-
-        sockaddr_in address {};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = htons(m_port);
-        (void)::connect(socket.value(), reinterpret_cast<sockaddr*>(&address), sizeof(address));
-        (void)Core::System::close(socket.value());
     }
 
     void respond(int client)
@@ -280,27 +256,19 @@ void expect_navigation_downloads_cached_body(Core::AnonymousBuffer const& theme,
 
 }
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(navigation_downloads)
 {
-    auto test_directory = ByteString::formatted("{}/Ladybird-TestNavigationDownloads-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_directory, FileSystem::RecursionMode::Allowed));
-    });
-    VERIFY(setenv("XDG_CONFIG_HOME", test_directory.characters(), 1) == 0);
+    Test::HeadlessTestEnvironment environment { "TestNavigationDownloads"sv, 120 };
+    auto const& test_directory = environment.directory();
+
     VERIFY(setenv("XDG_CACHE_HOME", test_directory.characters(), 1) == 0);
     VERIFY(setenv("XDG_DOWNLOAD_DIR", test_directory.characters(), 1) == 0);
-
     signal(SIGPIPE, SIG_IGN);
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application());
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
-    auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
+    auto theme = TRY_OR_FAIL(Gfx::load_system_theme(theme_path.string()));
 
     auto body = make_body(1 * MiB);
     expect_navigation_downloads_body(theme, "an attachment"sv, "Content-Disposition: attachment; filename=\"attachment.bin\"\r\n"sv, body);
@@ -310,5 +278,4 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     expect_navigation_downloads_cached_body(theme, "an attachment from the disk cache"sv, "Cache-Control: max-age=3600\r\nContent-Disposition: attachment; filename=\"attachment.bin\"\r\n"sv, body);
 
     outln("PASS: navigation responses download byte for byte");
-    return 0;
 }

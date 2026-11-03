@@ -17,6 +17,7 @@
 #include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibCore/Forward.h>
+#include <LibGC/ActivityRoot.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Rect.h>
 #include <LibJS/Forward.h>
@@ -157,6 +158,8 @@ public:
 
     GC::Ref<AudioTrackList> audio_tracks() const { return *m_audio_tracks; }
     GC::Ref<VideoTrackList> video_tracks() const { return *m_video_tracks; }
+
+    GC::Ptr<MediaSourceExtensions::MediaSource> attached_media_source() const { return m_attached_media_source; }
     GC::Ref<TextTrackList> text_tracks() const { return *m_text_tracks; }
     enum class TimeMarchesOnReason : u8 {
         NormalPlayback,
@@ -337,6 +340,12 @@ private:
     bool is_eligible_for_autoplay() const;
     bool is_allowed_to_play() const;
 
+    void set_network_state(NetworkState);
+    void set_can_autoplay(bool);
+    void set_delaying_the_load_event(bool);
+    bool should_be_kept_alive() const;
+    void update_activity_root();
+
     enum class PlaybackDirection : u8 {
         Forwards,
         Backwards,
@@ -466,6 +475,8 @@ private:
     // https://html.spec.whatwg.org/multipage/media.html#delaying-the-load-event-flag
     Optional<DOM::DocumentLoadEventDelayer> m_delaying_the_load_event;
 
+    GC::ActivityRoot m_activity_root;
+
     bool m_running_time_update_event_handler { false };
     Optional<MonotonicTime> m_last_time_update_event_time;
 
@@ -481,6 +492,7 @@ private:
     bool m_current_resource_selection_is_explicit { false };
 
     OwnPtr<MediaClient::RemotePlaybackManager> m_playback_manager;
+    OwnPtr<MediaStreamPlayback> m_media_stream_playback;
     Function<void(Utf16String)> m_playback_manager_failure_callback;
 
     RefPtr<Core::Timer> m_playback_position_update_timer;

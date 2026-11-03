@@ -4,11 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
+#include <AK/Atomic.h>
 #include <AK/ByteBuffer.h>
+#include <AK/ConditionVariable.h>
 #include <AK/Endian.h>
+#include <AK/Function.h>
 #include <AK/IPv4Address.h>
 #include <AK/IPv6Address.h>
 #include <AK/MemoryStream.h>
+#include <AK/Optional.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Socket.h>
 #include <LibCore/TCPServer.h>
@@ -172,7 +177,33 @@ ErrorOr<ByteBuffer> build_truncated_response(ReadonlyBytes query_bytes)
     return out;
 }
 
-void expect_successful_lookup(DNS::Resolver& resolver, Core::EventLoop& loop)
+// The resolver's system-lookup workers post their results to the event loop they were started from, and expect it to
+// live as long as the process, as a real process's main loop does: A worker can still be waking the loop after posting
+// the result that ends a test. So all the tests share one event loop that's never destroyed. And since an event loop
+// can't run again once it's been asked to quit, each test runs that loop through a TestLoop of its own.
+class TestLoop {
+public:
+    TestLoop()
+    {
+        static auto& event_loop = *new Core::EventLoop;
+        VERIFY(&Core::EventLoop::current() == &event_loop);
+    }
+
+    int exec()
+    {
+        spin_until([this] { return m_exit_code.has_value(); });
+        return *m_exit_code;
+    }
+
+    void quit(int code) { m_exit_code = code; }
+    bool was_exit_requested() const { return m_exit_code.has_value(); }
+    void spin_until(Function<bool()> goal_condition) { Core::EventLoop::current().spin_until(move(goal_condition)); }
+
+private:
+    Optional<int> m_exit_code;
+};
+
+void expect_successful_lookup(DNS::Resolver& resolver, TestLoop& loop)
 {
     TRY_OR_FAIL(resolver.when_socket_ready()->await());
 
@@ -193,7 +224,7 @@ void expect_successful_lookup(DNS::Resolver& resolver, Core::EventLoop& loop)
 
 TEST_CASE(test_udp)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -221,7 +252,7 @@ TEST_CASE(test_udp)
 
 TEST_CASE(test_tcp)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = MUST(Core::TCPServer::try_create());
     MUST(server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
@@ -279,7 +310,7 @@ TEST_CASE(test_tcp)
 
 TEST_CASE(test_dnssec_response_rejects_unknown_key_tag)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -316,7 +347,7 @@ TEST_CASE(test_dnssec_response_rejects_unknown_key_tag)
 
 TEST_CASE(test_dnssec_response_rejects_unhandled_algorithm)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -353,7 +384,7 @@ TEST_CASE(test_dnssec_response_rejects_unhandled_algorithm)
 
 TEST_CASE(test_localhost_resolves_to_loopback_without_a_socket)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     // The socket factory must never run: localhost names are answered in-process, never sent upstream.
     DNS::Resolver resolver {
@@ -397,7 +428,7 @@ TEST_CASE(test_localhost_resolves_to_loopback_without_a_socket)
 
 TEST_CASE(test_loopback_domains_resolve_to_loopback_without_a_socket)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto resolves_to_loopback = [](DNS::Resolver& resolver, StringView name) {
         auto result = resolver.lookup(name, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA })->await();
@@ -438,7 +469,7 @@ TEST_CASE(test_loopback_domains_resolve_to_loopback_without_a_socket)
 
 TEST_CASE(test_lookup_rejects_names_that_must_not_go_upstream)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     DNS::Resolver resolver {
         [&] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> {
@@ -461,7 +492,7 @@ TEST_CASE(test_lookup_rejects_names_that_must_not_go_upstream)
 
 TEST_CASE(test_configured_server_failure_does_not_fall_back_to_the_system_resolver)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     DNS::Resolver resolver {
         [&] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> {
@@ -477,7 +508,7 @@ TEST_CASE(test_configured_server_failure_does_not_fall_back_to_the_system_resolv
 
 TEST_CASE(test_unrelated_answers_are_not_cached)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     size_t queries = 0;
     auto server = Core::UDPServer::construct();
@@ -517,7 +548,7 @@ TEST_CASE(test_unrelated_answers_are_not_cached)
 
 TEST_CASE(test_concurrent_lookups_for_one_name_all_resolve)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     size_t queries = 0;
     auto server = Core::UDPServer::construct();
@@ -556,7 +587,7 @@ TEST_CASE(test_concurrent_lookups_for_one_name_all_resolve)
 
 TEST_CASE(test_validated_lookup_settles_on_a_negative_response)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -596,7 +627,7 @@ TEST_CASE(test_validated_lookup_settles_on_a_negative_response)
 
 TEST_CASE(test_short_udp_datagram_does_not_block_the_event_loop)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -628,7 +659,7 @@ TEST_CASE(test_short_udp_datagram_does_not_block_the_event_loop)
 
 TEST_CASE(test_partial_tcp_frame_does_not_block_the_event_loop)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = MUST(Core::TCPServer::try_create());
     MUST(server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
@@ -694,7 +725,7 @@ TEST_CASE(test_partial_tcp_frame_does_not_block_the_event_loop)
 
 TEST_CASE(test_tcp_connection_is_replaced_after_the_server_closes_it)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = MUST(Core::TCPServer::try_create());
     MUST(server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
@@ -758,14 +789,40 @@ TEST_CASE(test_tcp_connection_is_replaced_after_the_server_closes_it)
 
 TEST_CASE(test_truncated_udp_response_is_retried_over_tcp)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
-    auto tcp_server = MUST(Core::TCPServer::try_create());
-    MUST(tcp_server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
-    auto server_port = tcp_server->local_port().value();
+    // The server answers on one port over both UDP and TCP. A port the system picks for TCP may be one it won't let
+    // UDP bind to, so take the port it picks for UDP, and listen for TCP on that one — trying again with a fresh port
+    // if TCP can't have it. A UDP server whose port TCP turns down stays open for the rest of the test: Closing it
+    // would free the port for the next bind, so a port the system reserves against TCP could keep coming back.
+    RefPtr<Core::TCPServer> tcp_server;
+    RefPtr<Core::UDPServer> udp_server;
+    Vector<NonnullRefPtr<Core::UDPServer>> rejected_udp_servers;
+    Vector<u16> tried_ports;
+    u16 server_port = 0;
+    Optional<Error> listen_error;
+    for (size_t attempt = 0; attempt < 10 && !tcp_server; ++attempt) {
+        if (udp_server)
+            rejected_udp_servers.append(udp_server.release_nonnull());
+        udp_server = Core::UDPServer::construct();
+        if (!udp_server->bind(IPv4Address { 127, 0, 0, 1 }, 0)) {
+            FAIL("Couldn't bind UDP to a port the system picks");
+            return;
+        }
+        server_port = udp_server->local_port().value();
+        tried_ports.append(server_port);
 
-    auto udp_server = Core::UDPServer::construct();
-    EXPECT(udp_server->bind(IPv4Address { 127, 0, 0, 1 }, server_port));
+        auto candidate = MUST(Core::TCPServer::try_create());
+        if (auto result = candidate->listen(IPv4Address { 127, 0, 0, 1 }, server_port); result.is_error())
+            listen_error = result.release_error();
+        else
+            tcp_server = move(candidate);
+    }
+    if (!tcp_server) {
+        FAIL(ByteString::formatted("Couldn't listen for TCP on the port of a UDP server (tried {}): {}", ByteString::join(", "sv, tried_ports), listen_error.value()));
+        return;
+    }
+
     size_t udp_queries = 0;
     udp_server->on_ready_to_receive = [&] {
         sockaddr_in from {};
@@ -835,7 +892,7 @@ TEST_CASE(test_truncated_udp_response_is_retried_over_tcp)
 
 TEST_CASE(test_expired_addresses_are_not_mistaken_for_a_negative_answer)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     // A long-lived CNAME to short-lived addresses: Once the addresses expire, the CNAME is still cached.
     size_t queries = 0;
@@ -897,4 +954,240 @@ TEST_CASE(test_expired_addresses_are_not_mistaken_for_a_negative_answer)
     auto second = TRY_OR_FAIL(lookup());
     EXPECT_EQ(second->cached_addresses().size(), 1u);
     EXPECT(queries > queries_for_first_lookup);
+}
+
+namespace {
+
+// A system resolver that answers for IPv6 right away, and for IPv4 only once the test lets it.
+class SystemResolverWithHeldBackIPv4 {
+public:
+    DNS::Resolver::SystemResolverForTesting system_resolver(bool is_ipv6_globally_reachable = true)
+    {
+        m_ipv6_is_globally_reachable.store(is_ipv6_globally_reachable);
+        return {
+            .resolve_host = [this](ByteString const&, Core::Socket::AddressFamily family) -> ErrorOr<Vector<Variant<IPv4Address, IPv6Address>>> {
+                if (family == Core::Socket::AddressFamily::IPv6Only) {
+                    m_ipv6_answered.store(true);
+                    return Vector<Variant<IPv4Address, IPv6Address>> { IPv6Address::loopback() };
+                }
+                MutexLocker locker { m_mutex };
+                m_condition.wait_while([&] { return !m_ipv4_may_answer; });
+                return Vector<Variant<IPv4Address, IPv6Address>> { IPv4Address { 192, 0, 2, 1 } };
+            },
+            .is_ipv6_globally_reachable = [this] { return m_ipv6_is_globally_reachable.load(); },
+        };
+    }
+
+    bool ipv6_answered() const { return m_ipv6_answered.load(); }
+    void set_ipv6_is_globally_reachable(bool reachable) { m_ipv6_is_globally_reachable.store(reachable); }
+
+    void let_ipv4_answer()
+    {
+        MutexLocker locker { m_mutex };
+        m_ipv4_may_answer = true;
+        m_condition.broadcast();
+    }
+
+private:
+    Mutex m_mutex;
+    ConditionVariable m_condition { m_mutex };
+    bool m_ipv4_may_answer { false };
+    Atomic<bool> m_ipv6_answered { false };
+    Atomic<bool> m_ipv6_is_globally_reachable { true };
+};
+
+bool has_address_of_family(DNS::LookupResult const& result, bool ipv6)
+{
+    return any_of(result.cached_addresses(), [ipv6](auto const& address) { return address.template has<IPv6Address>() == ipv6; });
+}
+
+}
+
+TEST_CASE(test_system_resolver_waits_for_ipv4_addresses_after_ipv6_addresses)
+{
+    TestLoop loop;
+    SystemResolverWithHeldBackIPv4 system_resolver;
+    DNS::Resolver resolver {
+        [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
+        system_resolver.system_resolver(),
+    };
+
+    auto promise = resolver.lookup("example.com"sv, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA });
+    loop.spin_until([&] { return system_resolver.ipv6_answered(); });
+
+    // Well past the 50 ms that the AAAA side gets after the A side, and well short of the 1 s the A side gets.
+    auto timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(200), [&] { loop.quit(0); });
+    timer->start();
+    loop.exec();
+
+    // IPv6 addresses alone are no use if they turn out to be unreachable, so the lookup waits for the IPv4 addresses.
+    EXPECT(!promise->is_resolved());
+    EXPECT(!promise->is_rejected());
+
+    system_resolver.let_ipv4_answer();
+    auto result = TRY_OR_FAIL(promise->await());
+    EXPECT_EQ(result->cached_addresses().size(), 2u);
+    EXPECT(has_address_of_family(*result, false));
+    EXPECT(has_address_of_family(*result, true));
+}
+
+TEST_CASE(test_system_resolver_goes_ahead_with_ipv6_addresses_when_ipv4_addresses_take_too_long)
+{
+    TestLoop loop;
+    SystemResolverWithHeldBackIPv4 system_resolver;
+    DNS::Resolver resolver {
+        [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
+        system_resolver.system_resolver(),
+    };
+
+    auto result = TRY_OR_FAIL(resolver.lookup("example.com"sv, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA })->await());
+    EXPECT_EQ(result->cached_addresses().size(), 1u);
+    EXPECT(has_address_of_family(*result, true));
+
+    // The IPv4 addresses that come later are still cached for later lookups.
+    system_resolver.let_ipv4_answer();
+    loop.spin_until([&] { return resolver.lookup_in_cache("example.com"sv); });
+    EXPECT_EQ(resolver.expect_cached("example.com"sv)->cached_addresses().size(), 2u);
+}
+
+TEST_CASE(test_system_resolver_skips_ipv6_addresses_when_ipv6_is_unreachable)
+{
+    TestLoop loop;
+    SystemResolverWithHeldBackIPv4 system_resolver;
+    DNS::Resolver resolver {
+        [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
+        system_resolver.system_resolver(false),
+    };
+
+    system_resolver.let_ipv4_answer();
+    auto result = TRY_OR_FAIL(resolver.lookup("example.com"sv, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA })->await());
+    EXPECT_EQ(result->cached_addresses().size(), 1u);
+    EXPECT(has_address_of_family(*result, false));
+    EXPECT(!system_resolver.ipv6_answered());
+}
+
+TEST_CASE(test_system_resolver_resolves_ipv6_addresses_of_local_names_when_ipv6_is_unreachable)
+{
+    TestLoop loop;
+    SystemResolverWithHeldBackIPv4 system_resolver;
+    DNS::Resolver resolver {
+        [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
+        system_resolver.system_resolver(false),
+    };
+
+    // Link-local IPv6 addresses work without a route to the IPv6 internet, so ".local" names keep the AAAA side.
+    system_resolver.let_ipv4_answer();
+    auto result = TRY_OR_FAIL(resolver.lookup("printer.local"sv, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA })->await());
+    EXPECT(system_resolver.ipv6_answered());
+    EXPECT(has_address_of_family(*result, true));
+}
+
+TEST_CASE(test_system_resolver_looks_up_ipv6_addresses_again_once_ipv6_is_reachable)
+{
+    TestLoop loop;
+    SystemResolverWithHeldBackIPv4 system_resolver;
+    DNS::Resolver resolver {
+        [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
+        system_resolver.system_resolver(false),
+    };
+
+    system_resolver.let_ipv4_answer();
+    auto lookup = [&] {
+        return resolver.lookup("example.com"sv, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA })->await();
+    };
+
+    auto first = TRY_OR_FAIL(lookup());
+    EXPECT_EQ(first->cached_addresses().size(), 1u);
+    EXPECT(!system_resolver.ipv6_answered());
+
+    // While IPv6 stays unreachable, the cached result without IPv6 addresses is used.
+    auto second = TRY_OR_FAIL(lookup());
+    EXPECT_EQ(second.ptr(), first.ptr());
+
+    // Reachability is checked again at most once a second.
+    system_resolver.set_ipv6_is_globally_reachable(true);
+    auto timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1100), [&] { loop.quit(0); });
+    timer->start();
+    loop.exec();
+
+    // The cached result never asked for IPv6 addresses, so it does not answer for them now that IPv6 is reachable.
+    auto third = TRY_OR_FAIL(lookup());
+    EXPECT(system_resolver.ipv6_answered());
+    EXPECT_EQ(third->cached_addresses().size(), 2u);
+    EXPECT(has_address_of_family(*third, false));
+    EXPECT(has_address_of_family(*third, true));
+}
+
+TEST_CASE(test_system_resolver_does_not_join_a_lookup_without_ipv6_addresses_once_ipv6_is_reachable)
+{
+    TestLoop loop;
+    SystemResolverWithHeldBackIPv4 system_resolver;
+    DNS::Resolver resolver {
+        [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
+        system_resolver.system_resolver(false),
+    };
+
+    auto lookup = [&] {
+        return resolver.lookup("example.com"sv, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA });
+    };
+
+    auto first = lookup();
+
+    // Reachability is checked again at most once a second.
+    system_resolver.set_ipv6_is_globally_reachable(true);
+    auto timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1100), [&] { loop.quit(0); });
+    timer->start();
+    loop.exec();
+
+    // The first lookup is still waiting for IPv4 addresses, but it never asked for IPv6 addresses.
+    auto second = lookup();
+    bool gave_up = false;
+    timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(500), [&] { gave_up = true; });
+    timer->start();
+    loop.spin_until([&] { return system_resolver.ipv6_answered() || gave_up; });
+    EXPECT(system_resolver.ipv6_answered());
+
+    system_resolver.let_ipv4_answer();
+    auto first_result = TRY_OR_FAIL(first->await());
+    EXPECT_EQ(first_result->cached_addresses().size(), 1u);
+    EXPECT(has_address_of_family(*first_result, false));
+
+    auto second_result = TRY_OR_FAIL(second->await());
+    EXPECT_EQ(second_result->cached_addresses().size(), 2u);
+    EXPECT(has_address_of_family(*second_result, false));
+    EXPECT(has_address_of_family(*second_result, true));
+}
+
+TEST_CASE(test_system_resolver_does_not_join_a_lookup_without_ipv4_addresses_once_ipv6_is_unreachable)
+{
+    TestLoop loop;
+    SystemResolverWithHeldBackIPv4 system_resolver;
+    DNS::Resolver resolver {
+        [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
+        system_resolver.system_resolver(),
+    };
+
+    auto lookup = [&] {
+        return resolver.lookup("example.com"sv, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA });
+    };
+
+    // The first lookup goes ahead with IPv6 addresses alone while it keeps waiting for IPv4 addresses.
+    auto first = TRY_OR_FAIL(lookup()->await());
+    EXPECT_EQ(first->cached_addresses().size(), 1u);
+    EXPECT(has_address_of_family(*first, true));
+
+    // Reachability is checked again at most once a second.
+    system_resolver.set_ipv6_is_globally_reachable(false);
+    auto timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1100), [&] { loop.quit(0); });
+    timer->start();
+    loop.exec();
+
+    // IPv6 addresses are of no use now, so the second lookup waits for its own IPv4 addresses.
+    auto second = lookup();
+    system_resolver.let_ipv4_answer();
+    auto second_result = TRY_OR_FAIL(second->await());
+    EXPECT_EQ(second_result->cached_addresses().size(), 1u);
+    EXPECT(has_address_of_family(*second_result, false));
+
+    loop.spin_until([&] { return has_address_of_family(*first, false); });
 }

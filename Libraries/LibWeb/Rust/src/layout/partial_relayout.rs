@@ -7,7 +7,7 @@
 use crate::layout::LayoutNodeArena;
 use crate::layout::abspos_inputs::AbsposLayoutInputs;
 use crate::layout::formatting_context::{FormattingContextType, formatting_context_type_created_by_node_data};
-use crate::layout::layout_node_arena::AncestorInvalidation;
+use crate::layout::layout_node_arena::{AncestorIntrinsicSizes, AncestorInvalidation};
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::paint_read::PaintRead;
@@ -189,9 +189,8 @@ impl LayoutNodeArena {
         //       boundary triggers ancestor scrollable overflow recomputation after commit.
 
         let parent_style = (!data.parent.get().is_invalid())
-            .then(|| self.style_payloads(data.parent.get()))
-            .flatten()
-            .map(|payloads| crate::css::computed_value_views::ComputedValuesView::new(&payloads.groups));
+            .then(|| self.style_view(data.parent.get()))
+            .flatten();
         matches!(
             formatting_context_type_created_by_node_data(
                 data,
@@ -236,7 +235,6 @@ impl LayoutNodeArena {
 
     pub(crate) fn record_partial_relayout_escape(&mut self) {
         self.pending_updates_escape_partial_relayout = true;
-        self.set_needs_full_scrollable_overflow_recalculation();
     }
 
     pub(crate) fn clear_partial_relayout_escape(&mut self) {
@@ -284,7 +282,7 @@ impl LayoutNodeArena {
 
     /// Selects the boundary subtrees to relay out after the layout tree build. Consumes the
     /// escape bit either way: a refusal here is followed by a full layout pass in the same
-    /// update, which re-derives every fact the bit stands in for.
+    /// update.
     pub(crate) fn plan_partial_relayout(
         &mut self,
         root: NodeSlotId,
@@ -294,10 +292,11 @@ impl LayoutNodeArena {
     ) -> Option<Vec<PlannedBoundary>> {
         let pending_updates_escaped = std::mem::replace(&mut self.pending_updates_escape_partial_relayout, false)
             || layout_tree_update_escaped_rebuild_roots;
-        if pending_updates_escaped {
-            self.set_needs_full_scrollable_overflow_recalculation();
-        }
-        if self.node_needs_layout_update(root) || pending_updates_escaped {
+        // NB: A build can replace the root, which leaves nothing laid out around the boundaries, and no mark on the new box.
+        if self.node_needs_layout_update(root)
+            || pending_updates_escaped
+            || !self.paintable_rows().paintable_row_is_populated(root)
+        {
             return None;
         }
         self.collect_partial_relayout_roots(registered_root_slots, rebuilt_subtree_root_slots)
@@ -455,6 +454,10 @@ impl LayoutNodeArena {
         if inputs.containing_block_info.derives_from_own_computed_values {
             return false;
         }
+        // What the box's anchor functions resolved to last time says nothing of the style it has now.
+        if inputs.resolved_anchor_insets.is_some() {
+            return false;
+        }
 
         let Some(style) = node_facts::node_style_view(data) else {
             return false;
@@ -477,21 +480,20 @@ impl LayoutNodeArena {
     pub(crate) fn defer_child_list_insertion_layout_update(&mut self, parent: NodeSlotId) {
         let grandparent = self.data(parent).parent.get();
         self.deferred_child_list_insertion_parents.push((parent, grandparent));
+        self.deferred_child_list_insertion_parent_slots.insert(parent);
     }
 
-    /// Invalidate what the children attached by a layout tree build reach. `attached_roots` are the
-    /// roots of every subtree the build attached.
+    /// Invalidate what the children attached by a layout tree build reach. `inserted_children` are
+    /// the children the build attached to the deferred parents, each with the parent it was attached to.
     ///
     /// A child that is absolutely positioned against the box it was inserted into, with both axes
     /// placed by insets, changes neither that box nor anything around it: its containing block
     /// is the box's committed padding box, and it is laid out on its own from there. Only the
     /// cached runs above it have to forget their children. Any other insertion invalidates the
     /// box as the mutation did before the build.
-    pub(crate) fn resolve_deferred_child_list_insertions(
-        &mut self,
-        attached_roots: &crate::css::style::fast_hash::FastSet<NodeSlotId>,
-    ) {
+    pub(crate) fn resolve_deferred_child_list_insertions(&mut self, inserted_children: &[(NodeSlotId, NodeSlotId)]) {
         self.confined_abspos_layout_inputs.clear();
+        self.deferred_child_list_insertion_parent_slots.clear();
         let mut parents = std::mem::take(&mut self.deferred_child_list_insertion_parents);
         parents.sort_unstable_by_key(|(parent, _)| parent.index);
         parents.dedup_by_key(|(parent, _)| *parent);
@@ -508,11 +510,15 @@ impl LayoutNodeArena {
                 }
                 continue;
             }
-            let inserted: Vec<NodeSlotId> = attached_roots
+            let mut inserted: Vec<NodeSlotId> = inserted_children
                 .iter()
-                .copied()
-                .filter(|&root| self.slot_is_live(root) && self.data(root).parent.get() == parent)
+                .filter(|&&(inserted_parent, child)| {
+                    inserted_parent == parent && self.slot_is_live(child) && self.data(child).parent.get() == parent
+                })
+                .map(|&(_, child)| child)
                 .collect();
+            inserted.sort_unstable_by_key(|child| child.index);
+            inserted.dedup();
             let confined_inputs: Option<Vec<(NodeSlotId, AbsposLayoutInputs)>> = (!inserted.is_empty()
                 && !self.node_needs_layout_update(parent))
             .then(|| {
@@ -557,7 +563,7 @@ impl LayoutNodeArena {
         }
         let style = node_facts::node_style_view(data)?;
         let anchor = style.anchor();
-        if style.box_values().position != positioning::ABSOLUTE
+        if style.position() != positioning::ABSOLUTE
             || style.has_position_anchor()
             || anchor.position_area.length != 0
             || anchor.position_try_fallbacks.length != 0
@@ -609,9 +615,8 @@ impl LayoutNodeArena {
         let parent_style = node_facts::node_style_view(parent_data);
         let grandparent = parent_data.parent.get();
         let grandparent_style = (!grandparent.is_invalid())
-            .then(|| self.style_payloads(grandparent))
-            .flatten()
-            .map(|payloads| crate::css::computed_value_views::ComputedValuesView::new(&payloads.groups));
+            .then(|| self.style_view(grandparent))
+            .flatten();
         if !matches!(
             formatting_context_type_created_by_node_data(
                 parent_data,
@@ -673,7 +678,7 @@ impl LayoutNodeArena {
             return;
         }
         self.note_contained_child_list_change(parent);
-        self.schedule_scrollable_overflow_recalculation(parent);
+        self.request_fragment_overflow_recalculation(parent);
     }
 
     /// What a box that is not laid out again still owes a child list change that stays inside its
@@ -682,7 +687,7 @@ impl LayoutNodeArena {
         use crate::layout::node_data::DomPaintFact;
         use crate::painting::record::damage::PaintDamage;
 
-        self.bump_fragment_cache_epoch_of_self_and_ancestors(parent);
+        self.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(parent);
         // A committed row plans its children's paint, and an empty editable box is a caret target
         // only while it has nothing to paint in it.
         let mut damage = PaintDamage::ORDER;
@@ -694,37 +699,39 @@ impl LayoutNodeArena {
         self.push_paint_damage(parent, damage);
     }
 
-    pub(crate) fn reset_cached_intrinsic_sizes_of_self_and_ancestors(&mut self, node: NodeSlotId) {
-        let node_kind = self.data(node).kind.get();
-        if node_facts::kind_is_box(node_kind) {
-            self.reset_cached_intrinsic_sizes(node);
-        }
-        self.reset_cached_intrinsic_sizes_of_ancestors(node);
-    }
-
-    // Reset intrinsic size caches for ancestors up to abspos or SVG root boundary.
-    fn reset_cached_intrinsic_sizes_of_ancestors(&mut self, node: NodeSlotId) {
-        let mut ancestor = self.data(node).parent.get();
-        while !ancestor.is_invalid() {
-            if node_facts::kind_is_box(self.data(ancestor).kind.get()) {
-                self.reset_cached_intrinsic_sizes(ancestor);
-                if self.content_does_not_size_box(ancestor) {
-                    break;
+    /// Marks for layout every box whose style renders in one of the font cascades of `font_lists`, which loads filled
+    /// faces into in place: as with a font fallback list resolving a loaded face, the styles stay, and only what lays
+    /// their text out runs again.
+    pub(crate) fn relayout_users_of_font_lists(&mut self, font_lists: &[u64]) {
+        let mut users = Vec::new();
+        let mut node = self.bound_viewport_row();
+        while !node.is_invalid() {
+            if self
+                .node_style_if_live(node)
+                .is_some_and(|style| font_lists.contains(&(style.font().font_cascade_list.as_raw() as u64)))
+            {
+                users.push(node);
+            }
+            let data = self.data(node);
+            node = data.first_child.get();
+            if node.is_invalid() {
+                let mut current = data;
+                loop {
+                    node = current.next_sibling.get();
+                    if !node.is_invalid() {
+                        break;
+                    }
+                    let parent = current.parent.get();
+                    if parent.is_invalid() {
+                        break;
+                    }
+                    current = self.data(parent);
                 }
             }
-            ancestor = self.data(ancestor).parent.get();
         }
-    }
-
-    /// Whether a change inside the box leaves the intrinsic sizes of its ancestors as they are.
-    /// Absolutely positioned elements don't contribute to ancestor intrinsic sizes. SVG root
-    /// elements have intrinsic sizes determined solely by their own attributes (width, height,
-    /// viewBox), not by their children.
-    fn content_does_not_size_box(&self, node: NodeSlotId) -> bool {
-        self.data(node).kind.get() == NodeKind::SVGSVGBox
-            || self
-                .node_style_if_live(node)
-                .is_some_and(|style| style.is_absolutely_positioned())
+        for user in users {
+            self.set_needs_layout_update(user, true);
+        }
     }
 
     pub(crate) fn set_needs_layout_update(&mut self, node: NodeSlotId, propagate_through_ancestors: bool) {
@@ -739,6 +746,12 @@ impl LayoutNodeArena {
                 data.parent.get(),
             )
         };
+        let ancestor_intrinsic_sizes_after_change =
+            if node_is_box && self.box_contributes_to_no_ancestor_intrinsic_size(node) {
+                AncestorIntrinsicSizes::Kept
+            } else {
+                AncestorIntrinsicSizes::Reset
+            };
 
         // A dirty node normally implies dirty ancestors, but the walk that marked a partial
         // relayout boundary stopped there and left its ancestors clean, so a through-ancestors
@@ -747,9 +760,17 @@ impl LayoutNodeArena {
             && propagate_through_ancestors
             && !(node_is_box && self.node_is_partial_relayout_boundary(node))
         {
-            // NB: A dirty node does not imply its whole ancestor chain was bumped for the current epoch values, and
-            //     over-bumping is free.
-            self.bump_fragment_cache_epoch_of_self_and_ancestors(parent);
+            // NB: A dirty node does not imply that its whole ancestor chain was bumped for the current epoch values or
+            //     had its intrinsic sizes reset: the walk that dirtied it may have stopped resetting below it. Doing
+            //     either again is free.
+            if node_is_box {
+                self.reset_cached_intrinsic_sizes(node);
+            }
+            self.invalidate_ancestors_for_change_below(
+                node,
+                AncestorInvalidation::ContentChange,
+                ancestor_intrinsic_sizes_after_change,
+            );
             return;
         }
 
@@ -780,10 +801,18 @@ impl LayoutNodeArena {
         }
 
         let mut marks_ancestors_for_layout_update = propagate_through_ancestors;
-        let mut resets_ancestor_intrinsic_sizes = propagate_through_ancestors;
+        let mut ancestor_intrinsic_sizes = if propagate_through_ancestors {
+            ancestor_intrinsic_sizes_after_change
+        } else {
+            AncestorIntrinsicSizes::Kept
+        };
         let mut ancestor = parent;
         while !ancestor.is_invalid() {
-            self.invalidate_one(ancestor, AncestorInvalidation::ContentChange);
+            ancestor_intrinsic_sizes = self.invalidate_ancestor_for_change_below(
+                ancestor,
+                AncestorInvalidation::ContentChange,
+                ancestor_intrinsic_sizes,
+            );
             let ancestor_data = self.data(ancestor);
             let (ancestor_is_box, ancestor_is_dirty, ancestor_parent) = {
                 (
@@ -802,10 +831,6 @@ impl LayoutNodeArena {
                         marks_ancestors_for_layout_update = false;
                     }
                 }
-            }
-            if resets_ancestor_intrinsic_sizes && ancestor_is_box {
-                self.reset_cached_intrinsic_sizes(ancestor);
-                resets_ancestor_intrinsic_sizes = !self.content_does_not_size_box(ancestor);
             }
             ancestor = ancestor_parent;
         }
@@ -837,8 +862,12 @@ pub(crate) struct FfiPartialRelayoutHostFacts {
 mod tests {
     use super::FfiPartialRelayoutHostFacts;
     use crate::css::style::tree::StyleNodeID;
-    use crate::layout::layout_node_arena::{LayoutNodeArena, NodeAllocation};
+    use crate::layout::CssPixels;
+    use crate::layout::layout_node_arena::{
+        FirstLineMaxContent, IntrinsicInlineSizeMeasurement, IntrinsicSizeCacheKey, LayoutNodeArena, NodeAllocation,
+    };
     use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
+    use crate::layout::run_state::LayoutScratch;
 
     fn allocate_box_with_a_dummy_shell(arena: &mut LayoutNodeArena) -> NodeAllocation {
         let allocation = arena.allocate_for_test();
@@ -905,23 +934,49 @@ mod tests {
         arena.data(allocation.slot).flags.get() & NodeFlag::NeedsLayoutUpdate as u32 != 0
     }
 
-    fn intrinsic_cache_epoch(arena: &LayoutNodeArena, allocation: &NodeAllocation) -> u16 {
-        arena.data(allocation.slot).intrinsic_cache_epoch
+    fn store_intrinsic_sizes(scratch: &LayoutScratch, allocations: &[&NodeAllocation]) {
+        for allocation in allocations {
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_put(
+                    allocation.slot,
+                    IntrinsicSizeCacheKey::default(),
+                    IntrinsicInlineSizeMeasurement {
+                        min_content_inline_size: CssPixels::from_raw(10),
+                        max_content_inline_size: CssPixels::from_raw(20),
+                        first_line_max_content: FirstLineMaxContent::default(),
+                        depends_on_percentage_block_size: false,
+                        depends_on_percentage_inline_basis: false,
+                        depends_on_block_size: false,
+                    },
+                );
+        }
+    }
+
+    fn intrinsic_sizes_are_kept(scratch: &LayoutScratch, allocation: &NodeAllocation) -> bool {
+        scratch
+            .intrinsic_size_caches
+            .intrinsic_inline_size_measurement_cache_get(allocation.slot, IntrinsicSizeCacheKey::default())
+            .is_some()
     }
 
     #[test]
-    fn marking_a_node_marks_clean_ancestors_and_bumps_their_intrinsic_epochs() {
+    fn marking_a_node_marks_clean_ancestors_and_drops_their_intrinsic_sizes() {
         let mut arena = LayoutNodeArena::new();
+        let scratch = LayoutScratch::default();
         let parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
         arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);
+        scratch.apply_memo_invalidations(&mut arena);
+        store_intrinsic_sizes(&scratch, &[&parent, &child]);
 
         arena.set_needs_layout_update(child.slot, true);
+        scratch.apply_memo_invalidations(&mut arena);
 
         assert!(node_is_dirty(&arena, &child));
         assert!(node_is_dirty(&arena, &parent));
-        assert_eq!(intrinsic_cache_epoch(&arena, &child), 1);
-        assert_eq!(intrinsic_cache_epoch(&arena, &parent), 1);
+        assert!(!intrinsic_sizes_are_kept(&scratch, &child));
+        assert!(!intrinsic_sizes_are_kept(&scratch, &parent));
         free_node(&mut arena, &parent);
     }
 
@@ -943,17 +998,22 @@ mod tests {
     }
 
     #[test]
-    fn remarking_a_dirty_non_boundary_node_leaves_its_parent_clean() {
+    fn remarking_a_dirty_non_boundary_node_leaves_its_parent_clean_and_drops_their_intrinsic_sizes() {
         let mut arena = LayoutNodeArena::new();
+        let scratch = LayoutScratch::default();
         let parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
         arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);
         arena.set_node_flag(child.slot, NodeFlag::NeedsLayoutUpdate, true);
+        scratch.apply_memo_invalidations(&mut arena);
+        store_intrinsic_sizes(&scratch, &[&parent, &child]);
 
         arena.set_needs_layout_update(child.slot, true);
+        scratch.apply_memo_invalidations(&mut arena);
 
         assert!(!node_is_dirty(&arena, &parent));
-        assert_eq!(intrinsic_cache_epoch(&arena, &parent), 0);
+        assert!(!intrinsic_sizes_are_kept(&scratch, &child));
+        assert!(!intrinsic_sizes_are_kept(&scratch, &parent));
         free_node(&mut arena, &parent);
     }
 

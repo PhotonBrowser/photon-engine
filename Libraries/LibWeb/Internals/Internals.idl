@@ -129,6 +129,9 @@ interface Internals {
     DOMString? generateTextFragmentURL(Range range, USVString currentURL);
     DOMString devtoolsGrip(any value);
     DOMString devtoolsProperties(any value);
+    DOMString devtoolsLog(sequence<any> arguments);
+    DOMString devtoolsLoggedProperties(unsigned long long objectId);
+    DOMString devtoolsLogTable(object tableData);
     sequence<DOMString>? completeConsoleInput(DOMString input);
 
     // Drive marked/preedit-text composition via the same path platform input methods use. setMarkedTextFromInputMethod
@@ -201,6 +204,7 @@ interface Internals {
     DOMString getComputedLabel(Element element);
     DOMString getComputedAriaLevel(Element element);
     undefined setAccessibilityFocusTarget(Element element);
+    undefined setAccessibilityInterested();
     unsigned short getEchoServerPort();
     unsigned short getHttpsEchoServerPort();
 
@@ -226,6 +230,7 @@ interface Internals {
     DOMString dumpStackingContextTree();
     DOMString stackingContextStructureVerificationReport();
     DOMString dumpGCGraph();
+    DOMString heapCensus();
     DOMString dumpSessionHistory();
     DOMString dumpUIProcessSessionHistory();
     DOMString dumpUIProcessSessionHistoryWithoutUpdate();
@@ -269,6 +274,16 @@ interface Internals {
     Promise<undefined> advancePermissionClock(unsigned long long milliseconds);
     sequence<DOMString> permissionCacheOrigins();
 
+    // What the UI process's recording notification backend has seen, as JSON: the notifications shown (with the
+    // browser's id of each), the ids closed, the pages focused by a click, and the URLs opened by a click on a
+    // notification whose page was gone. "{}" outside test-web.
+    DOMString notificationsStateForTesting();
+    // Acts on a shown notification as the user would: by its Notification object, or by the browser's id, for a
+    // notification whose page is gone.
+    undefined clickNotificationForTesting(Notification notification);
+    undefined clickNotificationByIdForTesting(unsigned long long browserNotificationId);
+    undefined dismissNotificationForTesting(Notification notification);
+
     InternalGamepad connectVirtualGamepad();
 
     undefined setHighlightedNode(Node? node);
@@ -290,6 +305,8 @@ interface Internals {
     // Hands the clock lanes of the current document a tick at the given time, and waits until it has run.
     // With a viewport scroll offset, the compositor had scrolled the viewport down to it at the tick.
     undefined injectClockTick(double frameTimeMs, optional double viewportScrollY);
+    // As injectClockTick(), with the compositor having scrolled the given element to the given offset, in CSS pixels.
+    undefined injectClockTickScrollingElement(double frameTimeMs, Element scroller, double x, double y);
     // Hands the clock lanes of the current document a pointer move to the given point in CSS pixels as the compositor
     // would, beside the mouse event with the given input event id, if any, and waits until the tick that hovers what is
     // under it has run, at the given frame time, or now.
@@ -328,7 +345,9 @@ interface Internals {
     undefined synchronizeCompositor();
     // Keeps the next recording that flies in flight, before it reads its frame, until releaseHeldFrame(), or until a
     // read waits for it. With "layout", only the next rendering update's layout that flies, or recording, is held,
-    // before it reads anything.
+    // before it reads anything. With "style", the next style update that flies is held, before it reads anything.
+    // With "claim", the Render thread does not begin the next style update that flies, which the read that waits for it
+    // takes back and runs itself, and the event loop treats its rendering update as it treats any other.
     undefined holdNextFrame(optional DOMString hold = "");
     // What presented the last frame of the document's navigable: "commit" for a frame a rendering update committed,
     // "clock" for a tick of the document's clock lane, or "none" before the first frame.
@@ -361,6 +380,12 @@ interface Internals {
     // operation, counting calls into the Rust style core and callbacks it makes into C++.
     object styleFfiCounters();
     object styleEngineCounters();
+    // What the document's style engine holds on the heap, by owner, with the C++ style state its elements hold:
+    // { owners: { name: bytes }, elements, styledElements }.
+    object styleMemoryReport();
+    // What the style engines of the document and the documents in its frames hold on the heap, each allocation counted
+    // once however many of them share it.
+    unsigned long long styleMemoryOfFrames();
     unsigned long long styleRecordIdentity(Element element);
     unsigned long long layoutStyleRecordIdentity(Element element);
     unsigned long long beforeStyleRecordIdentity(Element element);
@@ -373,10 +398,27 @@ interface Internals {
     // Makes the document's render state panic answering this call, which waits for it: the WebContent process crashes.
     undefined panicRenderStateForTesting();
     unsigned long long layoutArenaShellCount();
-    double styleEngineMatchDocument();
+    // Styles the whole document from scratch in a cold pass, without installing anything, and reports what it measured
+    // and how its answers compared with the records installed.
+    object styleColdPass(optional boolean verify = true, optional unsigned long threads = 0);
+    // Reports what live style measured since it started, checking the records it holds against the records installed
+    // when asked to.
+    object styleLiveReport(optional boolean verify = true);
+    // Reports what live style did since the counters were last reset, on the render state the
+    // host writes. Keys: passes, fullPasses, styledElements, changedElements, hintedElements,
+    // hintedSubtrees, invalidationVisits, invalidationTests, coldPasses, sharedElements,
+    // reusedElements, indexBuilds, indexedEntries, compiledSelectors, userAgentIndexBuilds (see
+    // StyleCounter in pipeline/counters.rs).
+    object styleCounters();
+    // Zeroes the counters styleCounters() reports and forgets the last pass.
+    undefined resetStyleCounters();
+    // Reports the most recent pass of live style, with the passes after it that restyled what it
+    // left waiting on fonts, as { fullPass, styled, changed }: whether it restyled every element,
+    // the elements it styled, and those whose records it changed, each as its id, or its tag name
+    // without one, in tree order.
+    object styleLastPass();
     // Reports a snapshot of StyleEngine's matched rules for the whole document.
     DOMString styleEngineMatchedRules();
-    object styleEngineTransactionReactions();
     undefined resetStyleFfiCounters();
     // Returns, for each ComputedValues style value group of the given element, whether the
     // group payload is shared with the parent element, whether it is the default payload,

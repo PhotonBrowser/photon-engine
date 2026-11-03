@@ -115,6 +115,14 @@ void HTMLTableCellElement::apply_presentational_hints(Vector<CSS::StyleProperty>
 
 // This implements step 8 in the spec here:
 // https://html.spec.whatwg.org/multipage/tables.html#algorithm-for-processing-rows
+bool HTMLTableCellElement::take_table_span_change()
+{
+    auto spans_changed = col_span() != m_last_col_span || row_span() != m_last_row_span;
+    m_last_col_span = col_span();
+    m_last_row_span = row_span();
+    return spans_changed;
+}
+
 WebIDL::UnsignedLong HTMLTableCellElement::col_span() const
 {
     // If the current cell has a colspan attribute, then parse that attribute's value, and let colspan be the result.
@@ -204,6 +212,11 @@ WebIDL::Long HTMLTableCellElement::cell_index() const
 
 Optional<ARIA::Role> HTMLTableCellElement::default_role() const
 {
+    // A cell that isn't in a table (one a script inserted into some other element, e.g.) has none of the roles below.
+    auto const* table_element = first_ancestor_of_type<HTMLTableElement>();
+    if (!table_element)
+        return {};
+
     if (local_name() == TagNames::th) {
         // https://w3c.github.io/html-aam/#el-th-columnheader
         // th (is a column header or column group header): columnheader role
@@ -235,7 +248,6 @@ Optional<ARIA::Role> HTMLTableCellElement::default_role() const
                 return ARIA::Role::rowheader;
         }
     }
-    auto const* table_element = first_ancestor_of_type<HTMLTableElement>();
     // https://w3c.github.io/html-aam/#el-td
     // https://w3c.github.io/html-aam/#el-th/
     // (ancestor table element has table role)

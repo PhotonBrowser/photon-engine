@@ -77,6 +77,7 @@ public:
     // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_audio_server_transport();
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_webrtc_client_transport();
 
     // Null outside test mode: the UI process connects the test endpoint only when it runs tests.
     TestConnection* test_connection();
@@ -84,7 +85,6 @@ public:
     Queue<Web::QueuedInputEvent>& input_event_queue() { return m_input_event_queue; }
     void update_input_method_state(Web::PageId page_id);
 
-    void notify_started_using_gamepads();
     void pump_and_dispatch_gamepad_events();
 
 private:
@@ -98,15 +98,6 @@ private:
         u64 style_update_remainder_microseconds { 0 };
         u64 style_engine_transaction_setup_microseconds { 0 };
         u64 style_engine_transaction_setups { 0 };
-        u64 style_engine_transaction_count { 0 };
-        u64 style_unscoped_transaction_count { 0 };
-        u64 style_unscoped_transaction_reaction_entries { 0 };
-        u64 style_broad_matching_batch_runs { 0 };
-        u64 style_narrow_matching_batch_runs { 0 };
-        u64 style_broad_matching_reaction_elements { 0 };
-        u64 style_narrow_matching_reaction_elements { 0 };
-        u64 style_broad_matching_apply_microseconds { 0 };
-        u64 style_narrow_matching_apply_microseconds { 0 };
         u64 full_layout_count { 0 };
         u64 partial_layout_count { 0 };
         u64 full_layout_microseconds { 0 };
@@ -261,6 +252,7 @@ private:
 
     virtual void set_listen_for_dom_mutations(Web::PageId page_id, bool) override;
     virtual void set_has_devtools_client(Web::PageId page_id, bool has_devtools_client) override;
+    virtual void start_sending_console_output(Web::PageId page_id, bool messages, bool errors) override;
     virtual void get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void get_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void set_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id, String html) override;
@@ -277,6 +269,7 @@ private:
     virtual void set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) override;
     virtual void set_content_blockers(Core::AnonymousBuffer patterns) override;
 
+    virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
     virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) override;
     virtual void set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme) override;
     virtual void set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast) override;
@@ -290,9 +283,14 @@ private:
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void permission_request_completed(Web::PageId page_id, u64 request_id, Web::Permissions::EffectiveState state) override;
     virtual void http_credentials_provided(Web::PageId page_id, u64 request_id, Optional<String> username, Optional<String> password) override;
+    virtual void notification_shown(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_show_failed(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_clicked(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_closed(Web::PageId page_id, u64 notification_id, bool by_user) override;
     virtual void set_has_focus(Web::PageId page_id, bool) override;
     virtual void set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption) override;
+    virtual void notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id) override;
     virtual void set_is_scripting_enabled(Web::PageId page_id, bool) override;
     virtual void set_zoom_level(Web::PageId page_id, double zoom_level) override;
     virtual void set_maximum_frames_per_second(Web::PageId page_id, double) override;
@@ -318,6 +316,7 @@ private:
     virtual void confirm_closed(Web::PageId page_id, bool accepted) override;
     virtual void prompt_closed(Web::PageId page_id, Optional<Utf16String> response) override;
     virtual void color_picker_update(Web::PageId page_id, Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state) override;
+    virtual void date_picker_closed(Web::PageId page_id, Optional<Utf16String> picked_value) override;
     virtual void file_picker_closed(Web::PageId page_id, Vector<Web::HTML::SelectedFile> selected_files) override;
     virtual void select_dropdown_closed(Web::PageId page_id, Optional<u32> selected_item_id) override;
 
@@ -380,6 +379,7 @@ private:
     virtual void did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) override;
     virtual void did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) override;
+    virtual void did_worker_rtc_transform_encoded_audio_frame_written(Web::HTML::WorkerAgentOwnerToken owner_token, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) override;
 
     virtual void request_close(Web::PageId page_id) override;
     virtual void request_close_preflight(Web::PageId page_id, u64 request_id) override;
@@ -398,8 +398,6 @@ private:
     RefPtr<Web::Compositor::CompositorConnection> m_compositor_connection;
     NonnullOwnPtr<PageHost> m_page_host;
     OwnPtr<DevToolsDebugger> m_devtools_debugger;
-
-    bool m_did_notify_started_using_gamepads { false };
 
     HashMap<int, Web::FileRequest> m_requested_files {};
     int last_id { 0 };

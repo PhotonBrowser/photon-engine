@@ -12,9 +12,6 @@ use super::*;
 pub(crate) struct LayoutScratch {
     /// The intrinsic sizes passes measured, kept for the passes after them.
     pub(super) intrinsic_size_caches: super::layout_node_arena::IntrinsicSizeCaches,
-    /// The inline items a block container generated, kept for its later runs in the same pass. The
-    /// items borrow fonts for the current pass, so the stashes are cleared when the pass ends.
-    inline_item_stashes: RefCell<HashMap<NodeSlotId, super::inline_level_iterator::StashedInlineItems>>,
     /// What the pass found out for the host outside any run, which its driver reports itself.
     pub(super) host_findings_outside_runs: RefCell<HostFindings>,
     /// The results of formatting context runs, kept for the runs after them in this pass and the passes after it.
@@ -26,6 +23,8 @@ pub(crate) struct LayoutScratch {
     pub(super) layout_trace: super::trace::LayoutTrace,
     /// The chunks and grapheme segmenters of the text rows the passes laid out.
     text_memos: super::rendered_text::TextMemos,
+    inline_content_preparation_buffers: Cell<super::prepared_inline_content::InlineContentPreparationBuffers>,
+    prepared_inline_content_memos: super::prepared_inline_content::PreparedInlineContentMemos,
 }
 
 /// What layout found out that the host hears of once the layout that found it is committed: what the
@@ -95,12 +94,13 @@ impl Default for LayoutScratch {
     fn default() -> Self {
         Self {
             intrinsic_size_caches: Default::default(),
-            inline_item_stashes: RefCell::new(HashMap::default()),
             host_findings_outside_runs: RefCell::new(HostFindings::default()),
             fc_run_cache_store: Default::default(),
             in_flow_block_cache_store: Default::default(),
             layout_trace: Default::default(),
             text_memos: Default::default(),
+            inline_content_preparation_buffers: Default::default(),
+            prepared_inline_content_memos: Default::default(),
         }
     }
 }
@@ -113,6 +113,7 @@ impl LayoutScratch {
             fc_run_cache_store: self.fc_run_cache_store.clone(),
             in_flow_block_cache_store: self.in_flow_block_cache_store.clone(),
             text_memos: self.text_memos.fork(),
+            prepared_inline_content_memos: self.prepared_inline_content_memos.fork(),
             ..Self::default()
         }
     }
@@ -129,28 +130,25 @@ impl LayoutScratch {
         &self.text_memos
     }
 
+    pub(super) fn prepared_inline_content_memos(&self) -> &super::prepared_inline_content::PreparedInlineContentMemos {
+        &self.prepared_inline_content_memos
+    }
+
+    pub(super) fn inline_content_preparation_buffers(
+        &self,
+    ) -> &Cell<super::prepared_inline_content::InlineContentPreparationBuffers> {
+        &self.inline_content_preparation_buffers
+    }
+
     /// Brings the run memos up to date with what the arena's writes since the last call did to their boxes.
     pub(super) fn apply_memo_invalidations(&self, arena: &mut LayoutNodeArena) {
         arena.take_memo_invalidations().apply_to(
             &self.fc_run_cache_store,
             &self.in_flow_block_cache_store,
             &self.text_memos,
+            &self.prepared_inline_content_memos,
+            &self.intrinsic_size_caches,
         );
-    }
-
-    pub(super) fn store_inline_item_stash(
-        &self,
-        block_container: NodeSlotId,
-        stash: super::inline_level_iterator::StashedInlineItems,
-    ) {
-        self.inline_item_stashes.borrow_mut().insert(block_container, stash);
-    }
-
-    pub(super) fn inline_item_stash(
-        &self,
-        block_container: NodeSlotId,
-    ) -> Option<super::inline_level_iterator::StashedInlineItems> {
-        self.inline_item_stashes.borrow().get(&block_container).cloned()
     }
 
     /// What the pass found out outside any run, which its driver reports itself.
@@ -158,11 +156,10 @@ impl LayoutScratch {
         std::mem::take(&mut self.host_findings_outside_runs.borrow_mut())
     }
 
-    /// Lets go of what the pass that just committed into `arena` kept for itself, and sweeps the run cache.
+    /// Brings the run memos up to date with what the commit into `arena` did to their boxes, and sweeps the run cache.
     pub(crate) fn end_layout_pass(&self, arena: &mut LayoutNodeArena) {
         self.apply_memo_invalidations(arena);
         arena.sweep_stale_fc_run_cache_entries(&self.fc_run_cache_store);
-        self.inline_item_stashes.borrow_mut().clear();
     }
 }
 
@@ -189,7 +186,8 @@ pub(crate) struct BoxPlacement {
     pub(crate) containing_block: Node,
 }
 
-/// What a box's fragment shows of the layout of its parent, which decides it.
+/// What the placement of a box shows of the layout of its parent, which decides it: the link that places the box's
+/// fragment shows the table and line clamp facts, and the fragment shows whether fragmentation broke the box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FragmentFactsDecidedByParent {
     /// For table cells and table-column(-group) boxes: the first grid column the box occupies and the number of grid
@@ -347,10 +345,6 @@ impl RunState {
         content_sizing: ContentSizing,
         run: impl for<'run> FnOnce(&'run Self, LayoutPass<'run>) -> R,
     ) -> R {
-        debug_assert!(
-            !callbacks.arena().has_intrinsic_size_cache_drops(),
-            "the layout stage drops released intrinsic size cache entries before its runs read a cache"
-        );
         let state = Self {
             root,
             content_sizing,

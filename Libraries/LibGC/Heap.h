@@ -122,6 +122,10 @@ public:
     void enable_stats();
     void add_stats(AK::JsonObject&) const;
 
+    // Per allocator: its blocks, its live cells and bytes, and per class the live cells and the edges to cells they
+    // visit. Finishes any pending sweep first.
+    AK::JsonObject census();
+
     void register_sweep_callback(AK::Function<void()>);
     void register_sweep_completed_callback(AK::Function<void()>);
     Optional<size_t> last_swept_live_bytes() const { return m_last_swept_live_bytes; }
@@ -249,7 +253,6 @@ private:
     void clear_weak_pointers_to_dead_cells(bool report);
     void run_post_mark_phases(bool report);
     void gather_conservative_roots(ConservativeScanOrigin const&, HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr);
-    void gather_asan_fake_stack_roots(HashMap<FlatPtr, HeapRoot>&, FlatPtr, FlatPtr heap_region_start, FlatPtr heap_region_end, FlatPtr stack_reference, FlatPtr stack_top);
     void mark_live_cells(HashMap<Cell*, HeapRoot>& roots);
     void finalize_unmarked_cells();
     void sweep_dead_cells(bool print_report, Core::ElapsedTimer const&);

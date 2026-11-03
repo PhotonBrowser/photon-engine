@@ -70,6 +70,7 @@ private:
     void set_languages(JsonValue const&);
     void set_appearance(JsonValue const&);
     void set_content_settings(JsonValue const&);
+    void reset_force_dark_for_host(JsonValue const&);
     void set_tab_settings(JsonValue const&);
     void set_browsing_behavior(JsonValue const&);
     void set_config_variable(JsonValue const&);
@@ -85,6 +86,7 @@ private:
     void remove_site_setting_filter(JsonValue const&);
     void remove_all_site_setting_filters(JsonValue const&);
     void set_location_policy(JsonValue const&);
+    void set_notifications_policy(JsonValue const&);
     void set_site_permission(JsonValue const&);
 
     OwnPtr<SettingsUISitePermissionsObserver> m_site_permissions_observer;

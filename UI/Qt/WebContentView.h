@@ -64,6 +64,7 @@
 
 class QKeyEvent;
 class QLabel;
+class QMenu;
 class QPushButton;
 class QScreen;
 class QShortcut;
@@ -222,6 +223,7 @@ private:
     virtual Web::DevicePixelSize viewport_size() const override;
     virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override;
     virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const override;
+    virtual void show_context_menu(WebView::Menu&, Gfx::IntPoint widget_position) override;
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) override;
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
@@ -322,7 +324,8 @@ private:
     QPointF m_last_click_position;
     int m_click_count { 0 };
 
-    SelectDropdown* m_select_dropdown { nullptr };
+    QPointer<SelectDropdown> m_select_dropdown;
+    QPointer<QMenu> m_context_menu;
 
     PageOverlay* m_crash_overlay { nullptr };
     CrashOverlayUrlLabel* m_crash_overlay_url { nullptr };
@@ -361,6 +364,9 @@ private:
     void update_iosurface_layer_background_color();
     void detach_iosurface_layer_from_native_view();
     void destroy_iosurface_layer();
+    void update_whether_qt_paints_view();
+    virtual QPaintEngine* paintEngine() const override;
+    virtual void childEvent(QChildEvent*) override;
 
     void* m_iosurface_layer { nullptr };
     void* m_page_dim_layer { nullptr };

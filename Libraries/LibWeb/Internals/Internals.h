@@ -13,6 +13,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/Scripting/DevToolsLoggedObjects.h>
 #include <LibWeb/HTML/Scripting/DevToolsObjectTable.h>
 #include <LibWeb/Internals/InternalAnimationTimeline.h>
 #include <LibWeb/Internals/InternalsBase.h>
@@ -137,6 +138,9 @@ public:
     Optional<Utf16String> generate_text_fragment_url(DOM::Range&, Utf16String const& current_url);
     Utf16String devtools_grip(JS::Value);
     Utf16String devtools_properties(JS::Value);
+    Utf16String devtools_log(GC::RootVector<JS::Value> const& arguments);
+    Utf16String devtools_logged_properties(u64 object_id);
+    Utf16String devtools_log_table(GC::Root<JS::Object> const& table_data);
     Optional<Vector<String>> complete_console_input(Utf16String const& input);
 
     void find_in_page(Utf16String const& query, bool highlight_all);
@@ -197,6 +201,7 @@ public:
     Utf16String get_computed_label(DOM::Element& element);
     Utf16String get_computed_aria_level(DOM::Element& element);
     void set_accessibility_focus_target(DOM::Element& element);
+    void set_accessibility_interested();
 
     static u16 get_echo_server_port();
     static void set_echo_server_port(u16 port);
@@ -225,6 +230,7 @@ public:
     Utf16String dump_stacking_context_tree();
     Utf16String stacking_context_structure_verification_report();
     Utf16String dump_gc_graph();
+    Utf16String heap_census();
     Utf16String dump_session_history();
     Utf16String dump_ui_process_session_history();
     Utf16String dump_ui_process_session_history_without_update();
@@ -267,6 +273,10 @@ public:
     void release_held_permission_prompt(WebIDL::UnsignedLong waiters);
     GC::Ref<WebIDL::Promise> advance_permission_clock(WebIDL::UnsignedLongLong milliseconds);
     Vector<String> permission_cache_origins();
+    String notifications_state_for_testing();
+    void click_notification_for_testing(NotificationsAPI::Notification&);
+    void click_notification_by_id_for_testing(WebIDL::UnsignedLongLong browser_notification_id);
+    void dismiss_notification_for_testing(NotificationsAPI::Notification&);
 
     u64 parser_non_append_insertions();
     DOM::Document::StyleInvalidationCounters const& style_invalidation_counters() const;
@@ -281,6 +291,7 @@ public:
     void hold_next_frame(Utf16String const& hold);
     Utf16String last_frame_presented_by(DOM::Document&);
     void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
+    void inject_clock_tick_scrolling_element(double frame_time_ms, DOM::Element& scroller, double x, double y);
     void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id);
     u64 queue_mouse_move(double x, double y, u32 buttons);
     void move_hover_pointer(double x, double y, Optional<u64> input_event_id);
@@ -304,6 +315,8 @@ public:
     GC::Ref<JS::Object> computed_values_stats();
     GC::Ref<JS::Object> style_ffi_counters();
     GC::Ref<JS::Object> style_engine_counters();
+    GC::Ref<JS::Object> style_memory_report();
+    u64 style_memory_of_frames();
     u64 style_record_identity(DOM::Element&);
     u64 layout_style_record_identity(DOM::Element&);
     u64 before_style_record_identity(DOM::Element&);
@@ -313,9 +326,12 @@ public:
     u64 layout_arena_live_slot_count();
     void panic_render_state_for_testing();
     u64 layout_arena_shell_count();
-    double style_engine_match_document();
+    GC::Ref<JS::Object> style_cold_pass(bool verify, u32 threads);
+    GC::Ref<JS::Object> style_live_report(bool verify);
+    GC::Ref<JS::Object> style_counters();
+    void reset_style_counters();
+    GC::Ref<JS::Object> style_last_pass();
     Utf16String style_engine_matched_rules();
-    GC::Ref<JS::Object> style_engine_transaction_reactions();
     void reset_style_ffi_counters();
     GC::Ref<JS::Object> style_group_sharing_info(DOM::Element&);
     void update_style();
@@ -360,6 +376,7 @@ private:
     Optional<Utf16String> m_pending_action_test_result;
     Vector<GC::Ref<InternalGamepad>> m_gamepads;
     Optional<HTML::DevToolsObjectTable> m_devtools_object_table;
+    HTML::DevToolsLoggedObjects m_devtools_logged_objects;
 };
 
 }

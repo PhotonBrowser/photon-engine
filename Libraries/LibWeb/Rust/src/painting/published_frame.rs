@@ -63,6 +63,11 @@ pub(crate) struct PublishedRows {
 }
 
 impl PublishedRows {
+    /// The column of the nodes, as published.
+    pub(crate) fn paint_nodes(&self) -> &ColumnSnapshot<PaintNode, PUBLISHED_ROWS_PER_CHUNK> {
+        &self.nodes
+    }
+
     /// What a live text row published.
     pub(crate) fn text(&self, id: NodeSlotId) -> Option<&PublishedTextSlot> {
         self.node(id)?;
@@ -80,6 +85,14 @@ impl PublishedRows {
         self.nodes
             .get(id.slot_index() as usize)
             .filter(|node| node.generation != 0 && node.generation == id.generation())
+    }
+
+    /// The nodes the slots hold, with the slot of each.
+    pub(crate) fn live_nodes(&self) -> impl Iterator<Item = (NodeSlotId, &PaintNode)> {
+        (0..self.nodes.slot_capacity()).filter_map(|index| {
+            let node = self.nodes.get(index).filter(|node| node.generation != 0)?;
+            Some((NodeSlotId::new(index as u32, node.generation), node))
+        })
     }
 
     pub(crate) fn paintable_data(&self, id: NodeSlotId) -> &PaintableData {
@@ -279,13 +292,13 @@ mod tests {
         link.inset_left = CssPixels::from_integer(10);
         arena.set_committed_fragment_link(node, link.clone(), None);
         arena.paintable_rows_mut().paintable_data_mut(node).offset.x = CssPixels::from_integer(10).into();
-        arena.committed_side_data_mut(node).piece_indices = Some([0].into());
+        arena.committed_side_data_mut(node).inline_content = Some(Default::default());
 
         let published = arena.publish_rows();
         link.inset_left = CssPixels::from_integer(20);
         arena.set_committed_fragment_link(node, link, None);
         arena.paintable_rows_mut().paintable_data_mut(node).offset.x = CssPixels::from_integer(20).into();
-        arena.committed_side_data_mut(node).piece_indices = None;
+        arena.committed_side_data_mut(node).inline_content = None;
 
         assert_eq!(
             published.paintable_data(node).offset.x,
@@ -295,7 +308,7 @@ mod tests {
             published.with_committed_fragment_link(node, |link| link.map(|link| link.inset_left)),
             Some(CssPixels::from_integer(10))
         );
-        assert_eq!(published.committed_side_data(node).piece_indices(), [0]);
+        assert!(published.committed_side_data(node).inline_content.is_some());
         assert_eq!(
             arena.live_paintable_data(node).offset.x,
             CssPixels::from_integer(20).into()
@@ -304,7 +317,7 @@ mod tests {
             arena.with_committed_fragment_link(node, |link| link.map(|link| link.inset_left)),
             Some(CssPixels::from_integer(20))
         );
-        assert!(arena.committed_side_data(node).piece_indices().is_empty());
+        assert!(arena.committed_side_data(node).inline_content.is_none());
     }
 
     fn derived_facts<'a>(row: Option<impl PaintRow<'a>>) -> Option<[bool; 5]> {
@@ -337,7 +350,6 @@ mod tests {
                 let mut link = fragment_tree::FragmentLink::for_test(node);
                 link.inset_top = CssPixels::from_integer(index as i64);
                 arena.set_committed_fragment_link(node, link, None);
-                arena.committed_side_data_mut(node).overflow_valid_across_recommits = true;
             }
         }
 

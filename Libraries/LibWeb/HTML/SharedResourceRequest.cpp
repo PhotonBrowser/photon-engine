@@ -196,8 +196,12 @@ void SharedResourceRequest::fetch_resource(NonnullRefPtr<Fetch::Infrastructure::
     };
 
     m_state = State::Fetching;
-    m_load_event_delayer.emplace(*m_document);
-    m_fetch_has_user_without_callbacks = m_callbacks.is_empty();
+    // NB: A user that waits for the fetch decides if the fetch delays the load event; a lazy image's callbacks don't.
+    auto some_waiter_delays = any_of(m_callbacks, [](auto const& callbacks) {
+        return callbacks.id != 0 && callbacks.delays_load_event == DelaysLoadEvent::Yes;
+    });
+    if (m_fetch_has_user_without_callbacks || some_waiter_delays)
+        m_load_event_delayer.emplace(*m_document);
 
     auto fetch_controller = Fetch::Fetching::fetch(
         realm,
@@ -209,6 +213,13 @@ void SharedResourceRequest::fetch_resource(NonnullRefPtr<Fetch::Infrastructure::
             self->handle_stopped_fetch();
     }));
     set_fetch_controller(fetch_controller);
+}
+
+void SharedResourceRequest::wait_without_callbacks()
+{
+    m_fetch_has_user_without_callbacks = true;
+    if (m_state == State::Fetching && !m_load_event_delayer.has_value())
+        m_load_event_delayer.emplace(*m_document);
 }
 
 void SharedResourceRequest::add_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop)
@@ -257,11 +268,16 @@ Optional<u64> SharedResourceRequest::add_removable_callbacks(Function<void()> on
 
 void SharedResourceRequest::remove_callbacks(u64 id)
 {
-    // NB: Only mark the entry as no longer waiting, and skip it when invoking the callbacks. A callback that is being
-    //     invoked can get here, and the invocation goes on over m_callbacks.
-    for (auto& callbacks : m_callbacks) {
-        if (callbacks.id == id)
-            callbacks.id = 0;
+    // NB: The callbacks are only invoked once the request is no longer new or fetching. A callback that is being
+    //     invoked can get here, and the invocation goes on over m_callbacks, so then only mark the entry as no longer
+    //     waiting, and skip it when invoking the callbacks.
+    if (m_state == State::New || m_state == State::Fetching) {
+        m_callbacks.remove_first_matching([id](auto const& callbacks) { return callbacks.id == id; });
+    } else {
+        for (auto& callbacks : m_callbacks) {
+            if (callbacks.id == id)
+                callbacks.id = 0;
+        }
     }
 
     // NB: The fetch keeps going so that its result can still be cached, but once nothing waits for it anymore, it

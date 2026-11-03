@@ -121,7 +121,7 @@ static ImportedModulePayload imported_module_payload_from_abi(JSImportedModulePa
 
 static void append_utf16_string_to_sink(JSStringSink const& sink, Utf16View string)
 {
-    if (!string.has_ascii_storage()) {
+    if (!string.has_latin1_storage()) {
         sink.append(sink.context, reinterpret_cast<u16 const*>(string.utf16_span().data()), string.length_in_code_units());
         return;
     }
@@ -505,6 +505,13 @@ Vector<StackTraceElement> VM::stack_trace() const
     };
     js_vm_stack_trace(vm_abi(*this), &stack_trace_sink);
     return stack_trace;
+}
+
+Optional<SourceRange> VM::take_throw_site_of(Value value)
+{
+    auto throw_site = source_range_from_abi(js_vm_throw_site_of(vm_abi(*this), value_to_abi(value)));
+    js_vm_forget_throw_site_of(vm_abi(*this), value_to_abi(value));
+    return throw_site;
 }
 
 ThrowCompletionOr<GC::Ptr<Environment>> VM::resolve_binding(Utf16FlyString const& name, Strict strict, GC::Ptr<Environment> environment)

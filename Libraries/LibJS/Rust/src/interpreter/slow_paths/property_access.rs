@@ -390,7 +390,7 @@ pub fn get_by_value_with_this(vm: &Vm, pc: u32, values: &mut op::GetByValueWithT
 fn length_property_key(executable: &Executable) -> &PropertyKey {
     executable.get_property_key(
         executable
-            .length_identifier
+            .length_identifier()
             .expect("an executable that reads a length has the length in its property key table"),
     )
 }
@@ -488,7 +488,11 @@ pub fn put_by_value(
         );
         return SlowPathControl::continue_at(pc + op::PutByValue::LENGTH);
     }
-    if base.is_object() && property_key.is_string() && put_kind_from_operand(instruction.kind) == PutKind::Normal {
+    if base.is_object()
+        && base.as_object().is_cacheable_across_realms()
+        && property_key.is_string()
+        && put_kind_from_operand(instruction.kind) == PutKind::Normal
+    {
         asm_try!(
             vm,
             pc,
@@ -821,7 +825,7 @@ pub fn has_private_id(
 
 pub fn add_private_name(vm: &Vm, pc: u32, instruction: &op::AddPrivateName) -> SlowPathControl {
     let name = vm.current_executable().get_identifier(instruction.name).clone();
-    running_private_environment(vm).add_private_name(name);
+    running_private_environment(vm).add_private_name(vm, name);
     SlowPathControl::continue_at(pc + op::AddPrivateName::LENGTH)
 }
 
@@ -1637,7 +1641,7 @@ pub fn try_get_by_value_typed_array(vm: &Vm, values: &mut op::GetByValueValues) 
     }
 
     let length = array_length.length();
-    if index >= length {
+    if index as usize >= length {
         values.dst = Value::UNDEFINED;
         return true;
     }
@@ -1649,8 +1653,8 @@ pub fn try_get_by_value_typed_array(vm: &Vm, values: &mut op::GetByValueValues) 
 
     let buffer = typed_array.viewed_array_buffer();
     let Some(byte_index) = (index as usize)
-        .checked_mul(typed_array.element_size() as usize)
-        .and_then(|byte_index| byte_index.checked_add(typed_array.byte_offset() as usize))
+        .checked_mul(typed_array.element_size())
+        .and_then(|byte_index| byte_index.checked_add(typed_array.byte_offset()))
     else {
         return false;
     };
@@ -1700,7 +1704,7 @@ pub fn try_put_by_value_typed_array(vm: &Vm, values: &op::PutByValueValues) -> b
     // NB: An out-of-bounds write is not simply a no-op: TypedArraySetElement still
     //     evaluates ToNumber(value) for its side effects before discarding the store.
     //     Fall back to the slow path so those side effects happen.
-    if index >= array_length.length() {
+    if index as usize >= array_length.length() {
         return false;
     }
 
@@ -1710,8 +1714,8 @@ pub fn try_put_by_value_typed_array(vm: &Vm, values: &op::PutByValueValues) -> b
 
     let buffer = typed_array.viewed_array_buffer();
     let Some(byte_index) = (index as usize)
-        .checked_mul(typed_array.element_size() as usize)
-        .and_then(|byte_index| byte_index.checked_add(typed_array.byte_offset() as usize))
+        .checked_mul(typed_array.element_size())
+        .and_then(|byte_index| byte_index.checked_add(typed_array.byte_offset()))
     else {
         return false;
     };

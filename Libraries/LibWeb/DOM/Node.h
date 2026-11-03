@@ -120,6 +120,7 @@ enum class SetNeedsLayoutReason {
     X(DetailsElementOpenedOrClosed)                       \
     X(HTMLImageElementUpdateTheImageData)                 \
     X(HTMLInputElementSrcAttribute)                       \
+    X(HTMLInputElementTypeAttribute)                      \
     X(HTMLObjectElementUpdateLayoutAndChildObjects)       \
     X(KeyframeEffect)                                     \
     X(LanguageChangeUnderCasingTextTransform)             \
@@ -128,6 +129,7 @@ enum class SetNeedsLayoutReason {
     X(NodeInsertBefore)                                   \
     X(NodeInsertBeforeWithDisplayContents)                \
     X(NodeRemove)                                         \
+    X(TableCellSpanAttribute)                             \
     X(NodeSetTextContent)                                 \
     X(None)                                               \
     X(PseudoElementBoxEscapedRebuildRoot)                 \
@@ -138,6 +140,7 @@ enum class SetNeedsLayoutReason {
     X(SVGResourceElementRemoved)                          \
     X(SVGResourceReferenceChange)                         \
     X(TopLayerMembershipChange)                           \
+    X(WhitespaceTextBoxChange)                            \
     X(WritingSuggestionChange)
 
 enum class SetNeedsLayoutTreeUpdateReason {
@@ -413,11 +416,11 @@ public:
     Node* parent_node() { return parent(); }
     Node const* parent_node() const { return parent(); }
 
-    static constexpr size_t parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
-    static constexpr size_t first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
-    static constexpr size_t last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
-    static constexpr size_t previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
-    static constexpr size_t next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }
+    static constexpr GC::MemberOffset parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
+    static constexpr GC::MemberOffset first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
+    static constexpr GC::MemberOffset last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
+    static constexpr GC::MemberOffset previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
+    static constexpr GC::MemberOffset next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }
 
     GC::Ptr<Element> parent_element();
     GC::Ptr<Element const> parent_element() const;
@@ -464,6 +467,7 @@ public:
     // that only needs to know whether there is a box should ask these instead of reaching for the box. The layout
     // node arena writes both as it changes the boxes they describe, so asking reads the node, not the arena.
     [[nodiscard]] bool has_layout_box() const { return m_has_layout_box; }
+    [[nodiscard]] bool may_have_layout_box() const;
     [[nodiscard]] bool is_rendered() const { return m_has_committed_box; }
     void set_box_presence(Badge<Layout::NodeArena>, bool has_layout_box, bool has_committed_box)
     {
@@ -517,12 +521,6 @@ public:
     [[nodiscard]] u32 associated_animation_count_in_subtree() const { return m_associated_animation_count_in_subtree; }
     void change_associated_animation_count_in_subtree(i32 delta);
 
-    [[nodiscard]] u32 children_explicitly_inherited_non_inherited_style_groups() const { return m_children_explicitly_inherited_non_inherited_style_groups; }
-    void add_children_explicitly_inherited_non_inherited_style_groups(u32 style_groups);
-    // Tell the style engine of this node's mark, which it keeps for the node's style node.
-    void publish_children_explicitly_inherit_mark();
-
-    void record_style_environment_change();
     CSS::StyleScope& style_scope();
     CSS::StyleScope const& style_scope() const { return const_cast<Node*>(this)->style_scope(); }
 
@@ -555,8 +553,6 @@ public:
     bool is_shadow_including_inclusive_ancestor_of(Node const&) const;
 
     [[nodiscard]] UniqueNodeID unique_id() const;
-    // The node's unique id, without giving it one if it has none.
-    [[nodiscard]] Optional<UniqueNodeID> unique_id_if_assigned() const;
     static Node* from_unique_id(UniqueNodeID);
 
     Optional<String> webdriver_node_id() const;
@@ -674,8 +670,8 @@ protected:
         // "Nodes have a strong reference to registered observers in their registered observer list." https://dom.spec.whatwg.org/#garbage-collection
         OwnPtr<Vector<GC::Ref<RegisteredObserver>>> registered_observer_list;
 
-        GC::Ptr<NodeList> child_nodes;
-        GC::Ptr<HTMLCollection> children;
+        GC::Member<NodeList> child_nodes;
+        GC::Member<HTMLCollection> children;
         OwnPtr<HTMLCollectionCacheRegistration::List> html_collections_with_valid_caches;
 
         // The collections getElementsByTagName() returned, which it may return again for the same argument while the
@@ -706,8 +702,8 @@ protected:
     virtual void finalize() override;
     virtual size_t external_memory_size() const override;
 
-    GC::Ptr<Document> m_document;
-    GC::Ptr<Node> m_root;
+    GC::Member<Document> m_document;
+    GC::Member<Node> m_root;
     NodeType m_type { NodeType::INVALID };
     bool m_has_layout_box { false };
     bool m_has_committed_box { false };
@@ -718,7 +714,6 @@ protected:
     };
     [[nodiscard]] u8 layout_tree_update_reuse_reasons() const;
 
-    u32 m_children_explicitly_inherited_non_inherited_style_groups { 0 };
     u32 m_associated_animation_count_in_subtree { 0 };
     bool m_in_editable_subtree { false };
     bool m_is_connected { false };

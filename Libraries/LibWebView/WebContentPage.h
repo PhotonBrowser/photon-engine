@@ -89,6 +89,7 @@ public:
     bool displays_tab() const;
     String dump_process_tree() const;
     Optional<CanonicalNavigable&> hosted_navigable(Web::HTML::CrossProcessId) const;
+    bool hosts_active_document_of(CanonicalNavigable const&) const;
     Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
 
     // Whether the document of an environment the page hosts has a cross-site ancestor, or nothing if the page hosts no
@@ -119,6 +120,7 @@ public:
 
     // Whether a document this page hosts may use the feature. The process hosting the page can act for any of them.
     bool hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature) const;
+    void for_each_navigable_with_a_hosted_active_document(Function<IterationDecision(CanonicalNavigable const&)> const&) const;
     RefPtr<CanonicalDocument> hosted_document_with_id(Web::HTML::CrossProcessId) const;
     bool hosts_a_document_with_top_level_origin(URL::Origin const&) const;
     bool document_may_use(Web::HTML::CrossProcessId, Web::Permissions::PermissionName) const;
@@ -135,6 +137,7 @@ public:
     // The user activation the UI process gives a page when it delivers input the user produced. Unlike the activation
     // a renderer reports, a compromised renderer cannot claim it.
     void give_user_activation();
+    void notify_about_user_activation(Web::HTML::CrossProcessId document_id);
     bool has_transient_user_activation() const;
     // Consumes the activation of every page of the tab, as consuming a window's activation does for the windows of its
     // top-level traversable. Returns false, consuming nothing, when the page has no transient activation.
@@ -275,6 +278,7 @@ private:
     virtual void did_change_picture_in_picture_player_controls_visibility(bool shown) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
     virtual void did_request_color_picker(Color current_color) override;
+    virtual void did_request_date_picker(Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum) override;
     virtual void did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId document_id) override;
     virtual void did_cancel_geolocation_position_request(u64 request_id) override;
     virtual void did_start_geolocation_position_watch(u64 request_id, Web::HTML::CrossProcessId document_id) override;
@@ -282,6 +286,13 @@ private:
     virtual void did_request_permission(u64 request_id, Web::HTML::CrossProcessId document_id, Utf16String name) override;
     virtual void did_request_http_credentials(u64 request_id, URL::URL url, String realm) override;
     virtual void did_fail_certificate_verification(URL::URL url) override;
+    virtual void did_request_show_notification(u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData data, Optional<Gfx::ShareableBitmap> icon) override;
+    virtual void did_request_close_notification(u64 notification_id) override;
+    virtual void did_abandon_notification(u64 notification_id) override;
+    virtual void did_handle_notification_click(u64 notification_id, bool into_focus) override;
+    virtual void did_request_click_notification_for_testing(u64 notification_id) override;
+    virtual void did_request_click_notification_by_id_for_testing(u64 browser_notification_id) override;
+    virtual void did_request_dismiss_notification_for_testing(u64 notification_id) override;
     virtual void did_request_file_picker(Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) override;
     virtual void did_finish_handling_input_event(u64 event_id, Web::EventResult event_result) override;
     virtual void did_update_input_method_state(Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) override;
@@ -289,6 +300,7 @@ private:
     virtual void did_change_background_color(Gfx::Color color) override;
     virtual void did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem item, String) override;
     virtual void did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state) override;
+    virtual void did_start_using_gamepads() override;
     virtual void did_update_session_history_entry_navigation_api_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::StorageSerializationRecord navigation_api_state) override;
     virtual void did_update_session_history_entry_document_state_navigable_target_name(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Utf16String navigable_target_name) override;
     virtual void did_set_session_history_entry_document_state_reload_pending(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, bool reload_pending) override;
@@ -377,6 +389,9 @@ private:
     Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Web::HTML::EnvironmentId environment_id);
     virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) override;
+    virtual void rtc_transform_init(Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record) override;
+    virtual void rtc_transform_teardown(Web::HTML::WorkerAgentId agent_id, u64 transform_id) override;
+    virtual void rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) override;
     Messages::WebContentClient::DidRequestCookieResponse did_request_cookie(Optional<Web::HTML::EnvironmentId> const&, URL::URL, HTTP::Cookie::Source);
     Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse did_request_all_cookies_cookiestore(Web::HTML::EnvironmentId const&, URL::URL);
     Messages::WebContentClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry);
@@ -395,6 +410,7 @@ private:
     virtual void did_request_reload_for_testing(bool bypass_cache) override;
     virtual void did_request_traverse_history_by_delta_for_testing(i32 delta) override;
     virtual void did_reset_state_for_testing(Web::HTML::SessionHistoryEntryDescriptor) override;
+    virtual void reset_gamepad_access_for_testing() override;
     Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) const;
     Messages::WebContentTestClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse did_request_capture_session_history_snapshot_for_testing();
     Messages::WebContentTestClient::DidRequestRestoreSessionHistorySnapshotForTestingResponse did_request_restore_session_history_snapshot_for_testing();

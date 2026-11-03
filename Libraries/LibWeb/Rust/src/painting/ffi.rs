@@ -50,6 +50,11 @@ pub(crate) fn paintable_cleared_from_node(
     arena: &mut LayoutNodeArena,
     layout_node: NodeSlotId,
 ) {
+    // NB: A box can stay in the tree after it gives up its committed box, until its parent's rebuild frees it, and a
+    //     layout before that keeps the fragments of its ancestors that hold it.
+    if arena.slot_is_live(layout_node) {
+        arena.invalidate_committed_geometry_of_ancestors(layout_node);
+    }
     arena.clear_committed_fragment_link(layout_node);
     if let Some(reset) = arena.prepare_paintable_row_cleared_reset(layout_node) {
         host_calls.paintable_row_reset(reset);
@@ -82,22 +87,6 @@ pub struct FfiChromeMetrics {
 pub struct FfiPhysicalResizeAxes {
     pub horizontal: bool,
     pub vertical: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiScrollbarData {
-    pub gutter_rect: FfiCssPixelRect,
-    pub thumb_rect: FfiCssPixelRect,
-    pub track_rect: FfiCssPixelRect,
-    pub thumb_travel_to_scroll_ratio: f64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiOptionalScrollbarData {
-    pub has_value: bool,
-    pub value: FfiScrollbarData,
 }
 
 /// # Safety
@@ -173,7 +162,7 @@ pub extern "C" fn render_state_paintable_scrollable_overflow(
 ) {
     // The host reads the overflow from the rows it holds, where they were measured and still read as the arena.
     let known = host.read_known_rows(|rows, source| {
-        rows.overflow_is_measured()
+        rows.overflow_is_settled()
             .then(|| FfiOptionalOverflowData::of(source, slot))
     });
     if let Some(Some(overflow)) = known {
@@ -182,7 +171,7 @@ pub extern "C" fn render_state_paintable_scrollable_overflow(
     }
     *out = {
         read_arena(host, node_read(), slot, |arena, slot| {
-            arena.measure_scrollable_overflow();
+            arena.settle_scrollable_overflow();
             FfiOptionalOverflowData::of(&arena.paintable_rows(), slot)
         })
     };
@@ -201,9 +190,13 @@ impl FfiOptionalOverflowData {
         let Some(rect) = crate::painting::paintable_geometry::scrollable_overflow_rect(rows, slot) else {
             return Self::default();
         };
-        let mut value = rows.committed_side_data(slot).overflow_relative_to_padding_box;
-        value.rect = rect.into();
-        Self { has_value: true, value }
+        Self {
+            has_value: true,
+            value: crate::painting::paintable_data::FfiOverflowData {
+                rect: rect.into(),
+                has_scrollable_overflow: crate::painting::paintable_geometry::has_scrollable_overflow(rows, slot),
+            },
+        }
     }
 }
 
@@ -417,7 +410,7 @@ pub enum FfiRecordingStart {
     Recorded,
 }
 
-/// Why a rendering update's frame (its style transaction, or its recording) may not fly beside the
+/// Why a rendering update's frame (its style update, or its recording) may not fly beside the
 /// event loop: something reads what it computes before the next task.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -488,6 +481,8 @@ pub struct FfiPresentedRecording {
     /// The recorded display list, which the document's last recording holds until the next
     /// recording replaces it. The host takes a reference of its own to keep it longer.
     pub display_list: *const c_void,
+    /// The color the canvas holds below the recording's layers.
+    pub root_group_color: libgfx_rust::Color,
 }
 
 impl FfiPresentedRecording {
@@ -498,6 +493,7 @@ impl FfiPresentedRecording {
             is_identical_to_published_recording: output.is_identical_to_published_recording,
             has_blocking_wheel_event_listeners: output.has_blocking_wheel_event_listeners,
             display_list: std::sync::Arc::as_ptr(&output.display_list).cast(),
+            root_group_color: output.root_group_color,
         }
     }
 
@@ -513,6 +509,7 @@ impl FfiPresentedRecording {
             display_list: recording.map_or(std::ptr::null(), |recording| {
                 std::sync::Arc::as_ptr(&recording.display_list).cast()
             }),
+            root_group_color: recording.map_or(libgfx_rust::Color::TRANSPARENT, |recording| recording.root_group_color),
         }
     }
 }
@@ -834,7 +831,7 @@ pub extern "C" fn render_state_inline_paintable_has_content_pieces(
 ) -> bool {
     read_arena(host, node_read(), inline_paintable, |arena, inline_paintable| {
         let mut has_content = false;
-        with_inline_pieces(&arena.paintable_rows(), inline_paintable, |piece, _| {
+        with_inline_pieces(&arena.paintable_rows(), inline_paintable, |piece| {
             if !piece.is_geometry_only_placeholder {
                 has_content = true;
                 return false;
@@ -871,7 +868,7 @@ pub extern "C" fn render_state_inline_paintable_first_piece_position(
             };
             let border_widths = crate::painting::paintable_geometry::committed_border(arena, inline_paintable);
             let padding_widths = crate::painting::paintable_geometry::committed_padding(arena, inline_paintable);
-            with_inline_pieces(&paintable_rows, inline_paintable, |piece, _data| {
+            with_inline_pieces(&paintable_rows, inline_paintable, |piece| {
                 let border_rect = CssPixelRect::from(piece.border_box_rect);
                 let rect = if piece.is_geometry_only_placeholder {
                     border_rect
@@ -1136,7 +1133,10 @@ pub extern "C" fn render_state_paintable_used_grid_tracks(
                 return std::ptr::null();
             };
             let list = if columns { &tracks.columns } else { &tracks.rows };
-            std::sync::Arc::into_raw(std::sync::Arc::new(list.style_value())).cast()
+            crate::css::style_value_arc::StyleValueArc::into_raw(crate::css::style_value_arc::StyleValueArc::new(
+                list.style_value(),
+            ))
+            .cast()
         },
     )
 }
@@ -1416,137 +1416,4 @@ pub extern "C" fn render_state_note_svg_paint_resources_changed(host: &DocumentH
         queue(host, PaintChange::SvgPaintResourcesChanged);
     }
     enrolled
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::css::css_pixels::CssPixelRect;
-    use crate::layout::LayoutNodeArena;
-    use crate::layout::node_data::NodeKind;
-    use crate::painting::host::RootBackgroundSource;
-    use crate::painting::paintable_data::FfiOverflowData;
-    use crate::painting::record::damage::PaintDamage;
-    use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
-    use crate::painting::visual_context::{TransformData, TransformDataRole, VisualContextTree};
-
-    #[test]
-    fn publishing_measured_rows_can_remeasure_viewport_overflow_and_invalidate_painting() {
-        {
-            let mut arena = LayoutNodeArena::new();
-            let viewport = arena.allocate_for_test().slot;
-            arena.write_shape(viewport).set_kind(NodeKind::Viewport);
-            arena.populate_paintable_row(viewport);
-            arena.scrollable_overflow.viewport = Some(viewport);
-            let root = arena.allocate_for_test().slot;
-            arena.populate_paintable_row(root);
-            {
-                let state = arena.paint_state_mut();
-                state.root_background_source = Some(RootBackgroundSource {
-                    root_layout_node: root,
-                    ..Default::default()
-                });
-                state.visual_context.tree = Some(std::sync::Arc::new(VisualContextTree::create(TransformData {
-                    matrix: libgfx_rust::FloatMatrix4x4::identity(),
-                    origin: Default::default(),
-                    sorting_context_root_index: None,
-                    flattens_inherited_transform: false,
-                    role: TransformDataRole::CssTransform,
-                    synthetic_plane: false,
-                    establishes_sorting_context: false,
-                })));
-                state.visual_context.dirty_boxes.clear();
-            }
-            // Leave stale overflow for the hit-test geometry query to remeasure. Losing
-            // scrollability must invalidate both the root background and visual context.
-            arena.committed_side_data_mut(viewport).overflow_relative_to_padding_box = FfiOverflowData {
-                rect: CssPixelRect::new(
-                    CssPixels::from_integer(0),
-                    CssPixels::from_integer(0),
-                    CssPixels::from_integer(100),
-                    CssPixels::from_integer(2000),
-                )
-                .into(),
-                has_scrollable_overflow: true,
-            };
-            arena.paintable_side_data_mut(viewport).overflow_measured_this_commit = true;
-            arena.note_publishing_paint_recording_started();
-            arena.clear_paint_damage_consumed_by_published_recording();
-
-            // Hit testing reads rows published with every row's overflow measured.
-            let rows = arena.publish_row_snapshot(true);
-            let absolute_rects = std::cell::RefCell::default();
-            let source = crate::painting::paint_read::PaintSource::over_rows(&rows.paintable, &absolute_rects);
-            let rect = crate::painting::paintable_geometry::scrollable_overflow_rect(&source, viewport);
-            assert_eq!(rect, Some(CssPixelRect::default()));
-            assert!(arena.scrollable_overflow.geometry_changed);
-            assert!(arena.scrollable_overflow.scrollability_changed);
-            assert!(arena.paint_damage_of_row(root).contains(PaintDamage::DRAW_BACKGROUND));
-            assert!(
-                arena
-                    .paint_damage_of_row(viewport)
-                    .contains(PaintDamage::SCROLL_METADATA)
-            );
-            assert!(
-                arena.paint_state().visual_context.dirty_boxes.boxes[&viewport]
-                    .contains(VisualContextBoxDirtyKind::ScrollableOverflowFlipped)
-            );
-        }
-    }
-
-    #[test]
-    fn preparing_for_rendering_measures_root_overflow_before_recording_reads_it() {
-        let mut arena = LayoutNodeArena::new();
-        let viewport = arena.allocate_for_test().slot;
-        arena.write_shape(viewport).set_kind(NodeKind::Viewport);
-        arena.populate_paintable_row(viewport);
-        arena.scrollable_overflow.viewport = Some(viewport);
-        let root = arena.allocate_for_test().slot;
-        arena.write_shape(root).set_kind(NodeKind::BlockContainer);
-        arena.populate_paintable_row(root);
-        // A structural change invalidated the root's overflow, measured earlier in this commit,
-        // without queueing a recalculation, so nothing but a query measures it again. Measuring
-        // it drops its scrollable overflow.
-        arena.committed_side_data_mut(root).overflow_relative_to_padding_box = FfiOverflowData {
-            rect: CssPixelRect::new(
-                CssPixels::from_integer(0),
-                CssPixels::from_integer(0),
-                CssPixels::from_integer(100),
-                CssPixels::from_integer(2000),
-            )
-            .into(),
-            has_scrollable_overflow: true,
-        };
-        arena.paintable_side_data_mut(root).overflow_measured_this_commit = true;
-        arena.paint_state_mut().visual_context.dirty_boxes.clear();
-
-        let outcome = crate::painting::paint_passes::prepare_for_rendering(
-            &mut arena,
-            RootBackgroundSource {
-                root_layout_node: root,
-                ..Default::default()
-            },
-            Some(&crate::painting::host::FfiVisualContextTreeInputs {
-                device_pixels_per_css_pixel: 1.0,
-                visual_viewport_offset_x: 0.0,
-                visual_viewport_offset_y: 0.0,
-                visual_viewport_scale: 1.0,
-            }),
-        )
-        .outcome;
-        assert!(outcome.requires_visual_context_update);
-        assert!(
-            arena.paint_state().visual_context.dirty_boxes.boxes[&root]
-                .contains(VisualContextBoxDirtyKind::ScrollableOverflowFlipped)
-        );
-
-        // Recording reads the root's overflow while it holds the paint state.
-        let _paint_state = arena.paint_state();
-        let canvas_rect = crate::painting::record::paint::background_resolution::root_background_canvas_rect(
-            &arena.paintable_rows(),
-            root,
-            CssPixelRect::default(),
-        );
-        assert_eq!(canvas_rect, CssPixelRect::default());
-    }
 }

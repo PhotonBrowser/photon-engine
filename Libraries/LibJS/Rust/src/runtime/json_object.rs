@@ -555,6 +555,15 @@ fn json_text_bytes(text: Utf16View<'_>) -> Option<JSONTextBytes<'_>> {
 
     match text {
         Utf16View::Ascii(bytes) => utf8.extend_from_slice(bytes),
+        Utf16View::Latin1(bytes) => {
+            let mut code_unit_offset = 0;
+            offsets.push(0);
+            for &byte in bytes {
+                let mut buffer = [0; 4];
+                utf8.extend_from_slice(char::from(byte).encode_utf8(&mut buffer).as_bytes());
+            }
+            append_code_unit_offsets_of_utf8(&mut offsets, &utf8, &mut code_unit_offset);
+        }
         Utf16View::Utf16(code_units) => {
             let mut code_unit_offset = 0;
             offsets.push(0);
@@ -1681,6 +1690,12 @@ impl JSONObject {
         records: &JSONParseRecords<'_>,
         parse_record: Option<usize>,
     ) -> ThrowCompletionOr<Value> {
+        // NB: A reviver can replace a value with an arbitrarily deep object graph, which would otherwise run out of
+        //     stack.
+        if vm.did_reach_stack_space_limit() {
+            return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+        }
+
         let realm = vm.current_realm().expect("JSON is parsed in a realm");
 
         // 1. Let value be ? Get(holder, name).

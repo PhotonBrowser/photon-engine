@@ -7,8 +7,9 @@
 use core::cell::Cell;
 use core::ptr::NonNull;
 
-use super::capi::{GCVisitor, gc_visitor_visit_cell, gc_visitor_visit_values};
+use super::capi::{GCVisitor, gc_visitor_visit_cell, gc_visitor_visit_ephemeron, gc_visitor_visit_values};
 use crate::layout::cell::Gc;
+use crate::layout::member::{Member, NullableMember};
 use crate::layout::value::Value;
 
 /// A LibGC visitor, which marks what it visits during a collection and roots it while roots are gathered.
@@ -32,9 +33,28 @@ impl Visitor {
         unsafe { gc_visitor_visit_cell(self.0.as_ptr(), cell.as_ptr().cast()) };
     }
 
+    /// Visits the cell a member names. It takes the slot so that a collector that moves cells can update it.
+    pub fn visit_member<T>(&mut self, slot: &Member<T>) {
+        self.visit(slot.get());
+    }
+
+    /// Visits the cell a member names, if it is not null. It takes the slot so that a collector that moves cells can
+    /// update it.
+    pub fn visit_nullable_member<T>(&mut self, slot: &NullableMember<T>) {
+        if let Some(cell) = slot.get() {
+            self.visit(cell);
+        }
+    }
+
     pub fn visit_values(&mut self, values: &[Value]) {
         // SAFETY: The visitor is live, and Value is a NaN-boxed u64.
         unsafe { gc_visitor_visit_values(self.0.as_ptr(), values.as_ptr().cast(), values.len()) };
+    }
+
+    /// Visits a value that is reachable only while `key` is, such as a WeakMap entry's.
+    pub fn visit_ephemeron<T>(&mut self, key: Gc<T>, value: &Value) {
+        // SAFETY: The visitor is live, a Gc points to a live cell, and Value is a NaN-boxed u64.
+        unsafe { gc_visitor_visit_ephemeron(self.0.as_ptr(), key.as_ptr().cast(), core::ptr::from_ref(value).cast()) };
     }
 }
 
@@ -175,6 +195,20 @@ impl_trace_for_tuples!(
 unsafe impl<T> Trace for Gc<T> {
     fn trace(&self, visitor: &mut Visitor) {
         visitor.visit(*self);
+    }
+}
+
+// SAFETY: A member reaches exactly its cell.
+unsafe impl<T> Trace for Member<T> {
+    fn trace(&self, visitor: &mut Visitor) {
+        visitor.visit_member(self);
+    }
+}
+
+// SAFETY: A nullable member reaches exactly its cell, if it has one.
+unsafe impl<T> Trace for NullableMember<T> {
+    fn trace(&self, visitor: &mut Visitor) {
+        visitor.visit_nullable_member(self);
     }
 }
 

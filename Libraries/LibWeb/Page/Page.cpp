@@ -14,6 +14,7 @@
 #include <LibIPC/Encoder.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -33,6 +34,7 @@
 #include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -41,6 +43,8 @@
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
+#include <LibWeb/MediaCapture/MediaDevices.h>
+#include <LibWeb/NotificationsAPI/Notification.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -159,6 +163,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
         visitor.visit(request.value.callback);
     visitor.visit(m_pending_permission_requests);
     visitor.visit(m_pending_http_credentials_requests);
+    visitor.visit(m_notifications_list);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
         operation.visit([&](PendingFullscreenEnter const& enter_operation) {
                 visitor.visit(enter_operation.element);
@@ -169,6 +174,34 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
                 visitor.visit(exit_operation.promise);
             });
     });
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#user-attention
+bool Page::top_level_traversable_has_user_attention() const
+{
+    // A top-level traversable has user attention when its system visibility state is "visible", and it either has
+    // system focus or user agent widgets directly related to it can receive keyboard input channeled from the
+    // operating system.
+    // FIXME: Also give the top-level traversable user attention while a user agent widget related to it, such as the
+    //        location bar, can receive keyboard input.
+    return m_system_visibility_state == HTML::VisibilityState::Visible && client().has_focus();
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#activation-notification
+// NB: The UI process gathers the windows of steps 2 to 4, which documents in other processes can hold, and names each
+//     one this page hosts.
+void Page::notify_document_about_user_activation(HTML::CrossProcessId document_id)
+{
+    for (auto const& navigable : hosted_navigables()) {
+        auto document = navigable->active_document();
+        if (!document || !document->is_fully_active() || document->id() != document_id)
+            continue;
+
+        // 5.1. Set window's last activation timestamp to the current high resolution time.
+        // 5.2. Notify the close watcher manager about user activation given window.
+        document->window()->notify_about_user_activation();
+        return;
+    }
 }
 
 // The navigable keyboard input goes to in the tab, which is the top-level traversable until focus moves into another.
@@ -182,6 +215,22 @@ GC::Ptr<HTML::Navigable> Page::focused_navigable() const
 GC::Ptr<HTML::LocalNavigable> Page::hosted_focused_navigable() const
 {
     return as_if<HTML::LocalNavigable>(focused_navigable().ptr());
+}
+
+void Page::system_focus_changed()
+{
+    for (auto const& navigable : hosted_navigables()) {
+        auto document = navigable->active_document();
+        if (!document)
+            continue;
+        auto window = document->window();
+        if (!window)
+            continue;
+        if (auto navigator = window->navigator_if_created(); navigator) {
+            if (auto media_devices = navigator->media_devices_if_created())
+                media_devices->system_focus_changed();
+        }
+    }
 }
 
 void Page::set_focused_navigable(HTML::Navigable& navigable)
@@ -212,9 +261,18 @@ void Page::focused_navigable_changed_in_another_page(HTML::CrossProcessId id)
 void Page::update_focused_navigable(GC::Ptr<HTML::Navigable> navigable)
 {
     invalidate_compositor_keyboard_scroll_state();
+    GC::Ptr<HTML::Navigable> previously_focused_navigable = m_focused_navigable.ptr();
     m_focused_navigable = navigable;
     for (auto const& root : local_roots())
         root->set_needs_repaint();
+
+    // A navigable below the top-level traversable paints its focus ring, caret and selection as focused only while it
+    // is the focused navigable, so the two navigables focus moved between record again.
+    for (auto navigable_whose_focus_changed : { previously_focused_navigable, navigable }) {
+        auto* local_navigable = navigable_whose_focus_changed ? as_if<HTML::LocalNavigable>(*navigable_whose_focus_changed) : nullptr;
+        if (auto document = local_navigable ? local_navigable->active_document() : nullptr)
+            Painting::request_document_repaint(*document, InvalidateDisplayList::PaintCommands);
+    }
 }
 
 void Page::navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable& navigable)
@@ -262,7 +320,11 @@ void Page::process_screenshot_requests()
             }
             auto bitmap = bitmap_or_error.release_value();
             HTML::PaintConfig paint_config { .canvas_fill_rect = rect.to_type<int>() };
-            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client] {
+            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client](auto result) {
+                if (result == Compositor::ScreenshotResult::Failed) {
+                    client.page_did_take_screenshot({});
+                    return;
+                }
                 client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
             });
         } else {
@@ -279,7 +341,11 @@ void Page::process_screenshot_requests()
             }
             auto bitmap = bitmap_or_error.release_value();
             HTML::PaintConfig paint_config { .paint_overlay = true, .canvas_fill_rect = rect.to_type<int>() };
-            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client] {
+            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client](auto result) {
+                if (result == Compositor::ScreenshotResult::Failed) {
+                    client.page_did_take_screenshot({});
+                    return;
+                }
                 client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
             });
         }
@@ -1270,6 +1336,9 @@ void Page::did_request_color_picker(GC::Weak<HTML::HTMLInputElement> target, Col
         m_pending_non_blocking_dialog_target = move(target);
 
         m_client->page_did_request_color_picker(current_color);
+    } else if (target && target.ptr() != m_pending_non_blocking_dialog_target.ptr()) {
+        // NB: Another dialog is showing, so no picker opens for this input.
+        target->set_is_open(false);
     }
 }
 
@@ -1285,6 +1354,37 @@ void Page::color_picker_update(Optional<Color> picked_color, HTML::ColorPickerUp
             if (state == HTML::ColorPickerUpdateState::Closed)
                 m_pending_non_blocking_dialog_target = nullptr;
         }
+    }
+}
+
+void Page::did_request_date_picker(GC::Weak<HTML::HTMLInputElement> target, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum)
+{
+    if (m_pending_non_blocking_dialog == PendingNonBlockingDialog::None) {
+        m_pending_non_blocking_dialog = PendingNonBlockingDialog::DatePicker;
+        m_pending_non_blocking_dialog_target = move(target);
+        m_pending_date_picker_input_type = input_type;
+
+        m_client->page_did_request_date_picker(move(input_type), move(value), move(minimum), move(maximum));
+    } else if (target && target.ptr() != m_pending_non_blocking_dialog_target.ptr()) {
+        // NB: Another dialog is showing, so no picker opens for this input.
+        target->set_is_open(false);
+    }
+}
+
+void Page::date_picker_closed(Optional<Utf16String> picked_value)
+{
+    if (m_pending_non_blocking_dialog != PendingNonBlockingDialog::DatePicker)
+        return;
+    m_pending_non_blocking_dialog = PendingNonBlockingDialog::None;
+    auto requested_input_type = move(m_pending_date_picker_input_type);
+
+    if (m_pending_non_blocking_dialog_target) {
+        auto& input_element = as<HTML::HTMLInputElement>(*m_pending_non_blocking_dialog_target);
+        m_pending_non_blocking_dialog_target = nullptr;
+        // NB: A picker opened for another type of input gives a value that does not apply to this one.
+        if (input_element.type() != requested_input_type)
+            picked_value = {};
+        input_element.did_pick_date(move(picked_value));
     }
 }
 
@@ -1546,6 +1646,51 @@ void Page::http_credentials_provided(u64 request_id, Optional<HTTPCredentials> c
 {
     if (auto callback = m_pending_http_credentials_requests.take(request_id); callback.has_value())
         callback.value()->function()(move(credentials));
+}
+
+void Page::register_showing_notification(u64 notification_id, GC::Ref<NotificationsAPI::Notification> notification)
+{
+    m_notifications_list.set(notification_id, notification);
+}
+
+void Page::unregister_notification(u64 notification_id)
+{
+    m_notifications_list.remove(notification_id);
+}
+
+void Page::notification_shown(u64 notification_id)
+{
+    if (auto notification = m_notifications_list.get(notification_id); notification.has_value())
+        (*notification)->did_show();
+}
+
+void Page::notification_show_failed(u64 notification_id)
+{
+    if (auto notification = m_notifications_list.get(notification_id); notification.has_value())
+        (*notification)->did_fail_to_show();
+}
+
+void Page::notification_clicked(u64 notification_id)
+{
+    if (auto notification = m_notifications_list.get(notification_id); notification.has_value())
+        (*notification)->did_click();
+}
+
+void Page::notification_closed(u64 notification_id, bool by_user)
+{
+    if (auto notification = m_notifications_list.get(notification_id); notification.has_value())
+        (*notification)->did_close(by_user);
+}
+
+void Page::notifications_document_destroyed(DOM::Document const& document)
+{
+    GC::RootVector<GC::Ref<NotificationsAPI::Notification>> abandoned;
+    for (auto const& [id, notification] : m_notifications_list) {
+        if (notification->document() == &document)
+            abandoned.append(notification);
+    }
+    for (auto const& notification : abandoned)
+        notification->abandon();
 }
 
 u64 Page::request_geolocation_position(HTML::CrossProcessId requesting_document_id, GeolocationPositionCallback callback, GeolocationRequestType type)
@@ -1914,13 +2059,15 @@ void Page::invalidate_user_style()
     if (!has_top_level_traversable())
         return;
 
+    // NB: The new user sheet is attached in place of the old one, which restyles the elements the rules of either
+    //     match. It is attached now, so a style read before the next style update sees it pending. Its rules
+    //     match in shadow trees as in the document, and the animations naming its @keyframes, which the document's
+    //     scope publishes, are planned again, so no element of a shadow tree restyles for it otherwise.
     auto invalidate_document = [](DOM::Document& document) {
         document.invalidate_content_blocker_style_sheet();
         document.style_scope().invalidate_user_style_sheet();
-        document.for_each_shadow_root([](auto& shadow_root) {
-            shadow_root.record_style_environment_change();
-        });
-        document.record_style_environment_change();
+        if (document.style_computer_if_created())
+            CSS::record_non_author_stylesheets(document);
     };
 
     // Each page invalidates the documents it hosts.
@@ -1936,7 +2083,7 @@ void Page::invalidate_style_for_preference_change()
         return;
 
     auto invalidate_document = [](DOM::Document& document) {
-        document.record_style_environment_change();
+        document.record_style_environment_change(DOM::StyleEnvironmentChange::ColorScheme | DOM::StyleEnvironmentChange::MediaFeatures);
         document.set_needs_media_query_evaluation();
     };
 

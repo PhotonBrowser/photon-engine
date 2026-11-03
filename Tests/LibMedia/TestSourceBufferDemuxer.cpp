@@ -187,6 +187,53 @@ TEST_CASE(evicting_the_first_frame_of_a_run_preserves_its_configuration)
     EXPECT_EQ(sample.new_codec_configuration(), initial_configuration.span());
 }
 
+TEST_CASE(buffered_bytes_include_the_codec_configurations_that_frames_carry)
+{
+    Media::Track track { Media::TrackType::Video, 1, Media::Track::Kind::Main, {}, {} };
+    Array<u8, 100> configuration {};
+    auto demuxer = make_ref_counted<Media::MediaSourceExtensions::SourceBufferDemuxer>(Vector { track });
+
+    // Each switch of configuration is charged, and so is the copy that starts a new run.
+    demuxer->add_coded_frame(track, coded_frame_at(0, configuration.span()));
+    demuxer->add_coded_frame(track, coded_frame_at(1));
+    demuxer->add_coded_frame(track, coded_frame_at(2, configuration.span()));
+    demuxer->add_coded_frame(track, coded_frame_at(10));
+    EXPECT_EQ(demuxer->total_bytes(track), 304u);
+
+    // The next frame carries the evicted frame's configuration forward, so only its sample is freed.
+    EXPECT_EQ(demuxer->take_earliest_frame_and_dependants(track), 1u);
+    EXPECT_EQ(demuxer->total_bytes(track), 303u);
+
+    EXPECT_EQ(demuxer->take_latest_frame(track).byte_size, 101u);
+    EXPECT_EQ(demuxer->take_earliest_frame_and_dependants(track), 101u);
+    EXPECT_EQ(demuxer->take_earliest_frame_and_dependants(track), 101u);
+    EXPECT_EQ(demuxer->total_bytes(track), 0u);
+}
+
+TEST_CASE(evictable_bytes_leave_out_the_configuration_that_eviction_moves_forward)
+{
+    Media::Track track { Media::TrackType::Video, 1, Media::Track::Kind::Main, {}, {} };
+    Array<u8, 100> initial_configuration {};
+    Array<u8, 50> changed_configuration {};
+    auto demuxer = make_ref_counted<Media::MediaSourceExtensions::SourceBufferDemuxer>(Vector { track });
+
+    demuxer->add_coded_frame(track, coded_frame_at(0, initial_configuration.span()));
+    demuxer->add_coded_frame(track, coded_frame_at(1));
+    demuxer->add_coded_frame(track, coded_frame_at(2, changed_configuration.span()));
+    demuxer->add_coded_frame(track, coded_frame_at(3));
+    demuxer->add_coded_frame(track, coded_frame_at(10));
+
+    // Eviction stops at the frame at 3 seconds, which receives the changed configuration.
+    auto current_time = AK::Duration::from_seconds(3);
+    auto evictable_bytes = demuxer->evictable_bytes_when_taking_all_earliest_frames(track, current_time);
+    EXPECT_EQ(evictable_bytes, 103u);
+
+    size_t evicted_bytes = 0;
+    while (demuxer->earliest_evictable_frame_timestamp(track, current_time).has_value())
+        evicted_bytes += demuxer->take_earliest_frame_and_dependants(track);
+    EXPECT_EQ(evicted_bytes, evictable_bytes);
+}
+
 // Removing the run that the cursor sits in leaves it with no position to jump from, so a later removal that
 // would otherwise displace it must not discard that.
 TEST_CASE(a_pending_reanchor_outranks_a_later_jump)
@@ -261,6 +308,41 @@ TEST_CASE(a_track_stops_where_another_tracks_data_ends)
 
     demuxer->add_coded_frame(audio_track, coded_frame_at(3, {}, Media::CodecID::Opus));
     EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(video_track)).presentation_timestamp(), AK::Duration::from_seconds(3));
+}
+
+static Media::CodedFrame tenth_of_a_second_frame_at(u64 milliseconds, Media::CodecID codec_id)
+{
+    auto data = MUST(FixedArray<u8>::create(1));
+    auto timestamp = AK::Duration::from_milliseconds(milliseconds);
+    return { codec_id, timestamp, timestamp, AK::Duration::from_milliseconds(100), Media::FrameFlags::Keyframe, move(data), {} };
+}
+
+TEST_CASE(a_seek_into_a_gap_after_the_first_range_does_not_play_across_it)
+{
+    Media::Track video_track { Media::TrackType::Video, 1, Media::Track::Kind::Main, {}, {} };
+    Media::Track audio_track { Media::TrackType::Audio, 2, Media::Track::Kind::Main, {}, {} };
+    auto demuxer = make_ref_counted<Media::MediaSourceExtensions::SourceBufferDemuxer>(Vector { video_track, audio_track });
+
+    for (u64 milliseconds = 0; milliseconds < 1'000; milliseconds += 100)
+        demuxer->add_coded_frame(video_track, tenth_of_a_second_frame_at(milliseconds, Media::CodecID::H264));
+    for (u64 milliseconds : { 0, 100, 800, 900 })
+        demuxer->add_coded_frame(audio_track, tenth_of_a_second_frame_at(milliseconds, Media::CodecID::Opus));
+
+    // The range after the gap starts within the allowance for playing from the start, but a gap between ranges is
+    // not the start.
+    auto buffered = demuxer->buffered_ranges();
+    EXPECT_EQ(buffered.size(), 2u);
+    EXPECT_EQ(buffered[1].start, AK::Duration::from_milliseconds(800));
+
+    MUST(demuxer->seek_to_most_recent_keyframe(video_track, AK::Duration::from_milliseconds(400), Media::DemuxerSeekOptions::None));
+    EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(video_track)).presentation_timestamp(), AK::Duration::from_milliseconds(400));
+
+    // The next video frame lies in the gap, so the read would wait; aborting it shows that it did not deliver the
+    // frame.
+    demuxer->set_blocking_reads_aborted_for_track(video_track);
+    auto blocked_read = demuxer->get_next_sample_for_track(video_track);
+    EXPECT(blocked_read.is_error());
+    EXPECT_EQ(blocked_read.error().category(), Media::DecoderErrorCategory::Aborted);
 }
 
 TEST_CASE(the_end_of_the_stream_lets_the_longer_track_play_out)

@@ -56,6 +56,7 @@ struct ContentSettings {
     HashMap<String, double> zoom_per_host;
 
     bool enable_force_dark { false };
+    HashMap<String, bool> force_dark_per_host;
 };
 
 enum class VerticalTabsPosition : u8 {
@@ -89,6 +90,12 @@ struct AutoplaySiteSetting : public SiteSetting {
 
 // Whether sites may ask for the user's location at all.
 enum class LocationPolicy : u8 {
+    Ask,
+    Block,
+};
+
+// Whether sites may ask to send the user notifications at all.
+enum class NotificationsPolicy : u8 {
     Ask,
     Block,
 };
@@ -142,6 +149,7 @@ WEBVIEW_API Optional<ConfigVariableID> config_variable_id_from_name(StringView);
 class WEBVIEW_API SettingsObserver {
 public:
     explicit SettingsObserver();
+    explicit SettingsObserver(Settings&);
     virtual ~SettingsObserver();
 
     virtual void new_tab_page_url_changed() { }
@@ -158,6 +166,7 @@ public:
     virtual void dns_settings_changed() { }
     virtual void config_variable_changed(ConfigVariableID) { }
     virtual void geolocation_settings_changed() { }
+    virtual void notifications_settings_changed() { }
     virtual void background_networking_settings_changed() { }
     virtual void content_blocker_settings_changed() { }
 
@@ -200,6 +209,10 @@ public:
     ContentSettings const& content_settings() const { return m_content_settings; }
     void set_content_settings(ContentSettings);
 
+    bool force_dark_for_host(StringView host) const;
+    void set_force_dark_for_host(String const& host, bool enabled);
+    void reset_force_dark_for_host(StringView host);
+
     double zoom_for_host(StringView host) const;
     void set_zoom_for_host(String const& host, double zoom_level);
 
@@ -227,6 +240,9 @@ public:
 
     LocationPolicy location_policy() const { return m_location_policy; }
     void set_location_policy(LocationPolicy);
+
+    NotificationsPolicy notifications_policy() const { return m_notifications_policy; }
+    void set_notifications_policy(NotificationsPolicy);
 
     static BrowsingDataSettings parse_browsing_data_settings(JsonValue const&);
     BrowsingDataSettings const& browsing_data_settings() const { return m_browsing_data_settings; }
@@ -302,6 +318,7 @@ private:
 
     AutoplaySiteSetting m_autoplay;
     LocationPolicy m_location_policy { LocationPolicy::Ask };
+    NotificationsPolicy m_notifications_policy { NotificationsPolicy::Ask };
 
     BrowsingDataSettings m_browsing_data_settings;
     GlobalPrivacyControl m_global_privacy_control { GlobalPrivacyControl::No };

@@ -309,7 +309,8 @@ public:
                 output.output.visit(
                     [](WebView::ConsoleError const& error) { dbgln("[HTMLScript] error name={} message={}", error.name, error.message); },
                     [](WebView::ConsoleLog const&) { dbgln("[HTMLScript] console_message at_ns={}", MonotonicTime::now().nanoseconds()); },
-                    [](WebView::ConsoleTrace const&) { });
+                    [](WebView::ConsoleTrace const&) { },
+                    [](WebView::ConsoleGroupEnd const&) { });
             };
         }
         reset_viewport_size({ physical_width, physical_height });
@@ -747,6 +748,11 @@ private:
             m_callbacks.context_menu_requested(request);
     }
 
+    void show_context_menu(Menu& menu, Gfx::IntPoint widget_position) override
+    {
+        request_context_menu(menu, widget_position);
+    }
+
     void notify_audio_state(Audio::Audibility audibility)
     {
         if (m_callbacks.audio_state_changed)
@@ -795,11 +801,6 @@ private:
         , m_callbacks(move(callbacks))
     {
         m_device_pixel_ratio = dpr;
-        for (auto* menu : { &page_context_menu(), &link_context_menu(), &selected_text_link_context_menu(), &image_context_menu(), &media_context_menu() }) {
-            menu->on_activation = [this, menu](Gfx::IntPoint position) {
-                request_context_menu(*menu, position);
-            };
-        }
         on_audibility_changed = [this](Audio::Audibility audibility) {
             notify_audio_state(audibility);
         };
@@ -1765,6 +1766,9 @@ std::vector<RegisteredEngineProcess> Runtime::registered_engine_processes() cons
             break;
         case WebView::ProcessType::AudioServer:
             role = "audio_server";
+            break;
+        case WebView::ProcessType::WebRTCClient:
+            role = "webrtc_client";
             break;
         }
         processes.push_back({

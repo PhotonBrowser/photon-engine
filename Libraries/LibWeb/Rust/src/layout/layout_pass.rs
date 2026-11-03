@@ -27,7 +27,6 @@ pub(crate) struct LayoutPass<'arena> {
     pub(crate) initial_containing_block_inline_size: CssPixels,
     pub(crate) initial_containing_block_block_size: CssPixels,
     pub(crate) document_in_quirks_mode: bool,
-    pub(crate) root_font_metrics: Option<crate::css::style_compute::FfiFontMetrics>,
     /// The frame of the formatting context the pass is laying out, in which style reads see sizes and box sides.
     pub(crate) frame: super::geometry::Frame,
     /// The root of the run this pass view was handed to and that root's containing block, where containing block
@@ -39,7 +38,7 @@ pub(crate) struct LayoutPass<'arena> {
     /// passes after them, or inside a run whose result is discarded, that run's own.
     intrinsic_size_caches: &'arena super::layout_node_arena::IntrinsicSizeCaches,
     /// Whether this pass view is inside a run whose result is discarded, which reads no memoized layout from before it
-    /// and keeps none: the run cache, the in-flow block cache, inline item stashes and intrinsic sizes.
+    /// and keeps none: the run cache, the in-flow block cache, prepared inline content and intrinsic sizes.
     reads_no_memoized_layout: bool,
     /// The innermost of the position options the boxes this pass view lays out are laid out with.
     position_option_styles: Option<&'arena PositionOptionStyle<'arena>>,
@@ -50,7 +49,7 @@ pub(crate) struct LayoutPass<'arena> {
 /// https://drafts.csswg.org/css-anchor-position-1/#apply-a-position-option
 struct PositionOptionStyle<'pass> {
     node: Node,
-    style: super::node_data::StylePayloadsRef,
+    style: super::node_data::LayoutStyleRef,
     enclosing: Option<&'pass PositionOptionStyle<'pass>>,
 }
 
@@ -66,7 +65,6 @@ impl<'arena> LayoutPass<'arena> {
             initial_containing_block_inline_size: stage.viewport_inline_size,
             initial_containing_block_block_size: stage.viewport_block_size,
             document_in_quirks_mode: stage.document_in_quirks_mode,
-            root_font_metrics: svg_formatting_context::document_root_font_metrics(arena),
             frame: super::geometry::Frame::PHYSICAL,
             innermost_run: (NodeSlotId::INVALID, NodeSlotId::INVALID),
             host_findings: &scratch.host_findings_outside_runs,
@@ -134,13 +132,17 @@ impl<'arena> LayoutPass<'arena> {
         })
     }
 
+    pub(crate) fn lays_out_with_position_option(&self) -> bool {
+        self.position_option_styles.is_some()
+    }
+
     /// Runs `run` with this pass as it lays out `node` with `style`, the style of one of its position options, which
     /// the style reads of `node` see in place of the style of its row. The payloads `style` names must stay alive
     /// until `run` returns.
     pub(crate) fn with_position_option_style<R>(
         self,
         node: Node,
-        style: super::node_data::StylePayloadsRef,
+        style: super::node_data::LayoutStyleRef,
         run: impl for<'option> FnOnce(LayoutPass<'option>) -> R,
     ) -> R {
         let position_option_style = PositionOptionStyle {
@@ -157,7 +159,7 @@ impl<'arena> LayoutPass<'arena> {
 
     /// The style the style reads of `node` see in place of the style of its row, if any.
     #[inline]
-    fn position_option_style(&self, node: Node) -> Option<super::node_data::StylePayloadsRef> {
+    fn position_option_style(&self, node: Node) -> Option<super::node_data::LayoutStyleRef> {
         let mut position_option_style = self.position_option_styles;
         while let Some(option) = position_option_style {
             if option.node == node {
@@ -189,31 +191,6 @@ impl<'arena> LayoutPass<'arena> {
         self.reads_no_memoized_layout
     }
 
-    /// The inline items a block container generated earlier in the pass, which a run whose result is discarded does not
-    /// read.
-    pub(crate) fn inline_item_stash(
-        &self,
-        block_container: Node,
-    ) -> Option<super::inline_level_iterator::StashedInlineItems> {
-        if self.reads_no_memoized_layout {
-            return None;
-        }
-        self.scratch.inline_item_stash(block_container)
-    }
-
-    /// Keeps the inline items `block_container` generated for its later runs in the pass, unless this pass view is
-    /// inside a run whose result is discarded.
-    pub(crate) fn store_inline_item_stash(
-        &self,
-        block_container: Node,
-        stash: super::inline_level_iterator::StashedInlineItems,
-    ) {
-        if self.reads_no_memoized_layout {
-            return;
-        }
-        self.scratch.store_inline_item_stash(block_container, stash);
-    }
-
     /// Notes what the run this pass view was handed to found out for the host, or the pass outside any run.
     pub(crate) fn note_host_findings(&self, note: impl FnOnce(&mut super::run_state::HostFindings)) {
         note(&mut self.host_findings.borrow_mut());
@@ -230,11 +207,6 @@ impl<'arena> LayoutPass<'arena> {
     /// that run's own.
     pub(crate) fn intrinsic_size_caches(&self) -> &'arena super::layout_node_arena::IntrinsicSizeCaches {
         self.intrinsic_size_caches
-    }
-
-    /// What an intrinsic size cache entry measured for `node` now is valid for.
-    pub(crate) fn intrinsic_size_cache_stamp(&self, node: Node) -> super::layout_node_arena::IntrinsicSizeCacheStamp {
-        self.arena.intrinsic_size_cache_stamp(node)
     }
 
     #[inline]
@@ -261,6 +233,25 @@ impl<'arena> LayoutPass<'arena> {
             .text_chunks(node, self.text_content(node).rendered(), key, compute)
     }
 
+    pub(crate) fn prepared_inline_content_memos(
+        &self,
+    ) -> &'arena super::prepared_inline_content::PreparedInlineContentMemos {
+        self.scratch.prepared_inline_content_memos()
+    }
+
+    pub(crate) fn take_inline_content_preparation_buffers(
+        &self,
+    ) -> super::prepared_inline_content::InlineContentPreparationBuffers {
+        self.scratch.inline_content_preparation_buffers().take()
+    }
+
+    pub(crate) fn return_inline_content_preparation_buffers(
+        &self,
+        buffers: super::prepared_inline_content::InlineContentPreparationBuffers,
+    ) {
+        self.scratch.inline_content_preparation_buffers().set(buffers);
+    }
+
     /// Runs `read` with the grapheme segmenter of the text row `node`.
     pub(crate) fn with_grapheme_segmenter<R>(
         &self,
@@ -273,28 +264,28 @@ impl<'arena> LayoutPass<'arena> {
     }
 
     #[inline]
-    pub(crate) fn style_payloads(&self, node: Node) -> &'arena FfiStylePayloads {
-        self.style_payloads_if_styled(node)
+    pub(crate) fn style_view(&self, node: Node) -> ComputedValuesView<'arena> {
+        self.computed_values_view_if_styled(node)
             .expect("styled node must publish its style container before layout")
-    }
-
-    /// The style of `node`: that of its row, or the position option it is being laid out with.
-    #[inline]
-    pub(crate) fn style_payloads_if_styled(&self, node: Node) -> Option<&'arena FfiStylePayloads> {
-        if let Some(style) = self.position_option_style(node) {
-            // SAFETY: A position option's style stays alive while a box is laid out with it.
-            return unsafe { super::node_data::style_payloads(style) };
-        }
-        self.arena.style_payloads(node)
     }
 
     pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<ReplacedContentFacts> {
         self.arena.replaced_content_facts(node)
     }
 
+    #[inline]
+    pub(crate) fn has_replaced_content_facts(&self, node: Node) -> bool {
+        self.arena.has_replaced_content_facts(node)
+    }
+
+    /// The style of `node`: that of its row, or the position option it is being laid out with.
+    #[inline]
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'arena>> {
-        self.style_payloads_if_styled(node)
-            .map(|payloads| ComputedValuesView::new(&payloads.groups))
+        if let Some(style) = self.position_option_style(node) {
+            // SAFETY: A position option's style stays alive while a box is laid out with it.
+            return Some(unsafe { style.view() });
+        }
+        self.arena.style_view(node)
     }
 
     pub(crate) fn can_skip_is_anonymous_text_run(&self, node: Node) -> bool {

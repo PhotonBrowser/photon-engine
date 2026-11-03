@@ -38,8 +38,8 @@ GC_API FlatPtr js_heap_region_base = 0;
 
 namespace GC {
 
-// Each BlockAllocator gets type-isolated 2 MiB chunks from one process-wide
-// reserved region and carves its 16 KiB HeapBlock slots out of those chunks.
+// Every BlockAllocator takes 2 MiB chunks from one process-wide reserved
+// region, and carves 16 KiB HeapBlock slots out of those chunks.
 //
 // Per-block madvise() is deferred to a single global background "decommit
 // worker" so it never costs us GC pause time, and slots that are recycled
@@ -49,6 +49,8 @@ static constexpr size_t BLOCKS_PER_CHUNK = CHUNK_SIZE / HeapBlock::BLOCK_SIZE;
 static_assert((HeapBlock::BLOCK_SIZE & (HeapBlock::BLOCK_SIZE - 1)) == 0);
 static_assert(CHUNK_SIZE % HeapBlock::BLOCK_SIZE == 0);
 static_assert(BLOCKS_PER_CHUNK == 128);
+static_assert(HEAP_REGION_LOW_GUARD_SIZE % CHUNK_SIZE == 0);
+static_assert(HEAP_REGION_HIGH_GUARD_SIZE % CHUNK_SIZE == 0);
 
 class HeapRegion {
 public:
@@ -82,7 +84,15 @@ public:
 
         m_base = reinterpret_cast<u8*>(aligned_start);
         VERIFY(reinterpret_cast<FlatPtr>(m_base) % size == 0);
-        js_heap_region_base = reinterpret_cast<FlatPtr>(m_base);
+        publish_base(reinterpret_cast<FlatPtr>(m_base));
+    }
+
+    static void register_base_copy(HeapRegionBaseCopyRegistration& registration)
+    {
+        MutexLocker locker(base_copies_mutex());
+        registration.m_next = exchange(s_base_copies, &registration);
+        if (js_heap_region_base)
+            *registration.m_copy = js_heap_region_base;
     }
 
     // This process-global region is shared by every Heap. GC block allocation is single-threaded per process, but the
@@ -108,7 +118,7 @@ public:
         {
             MutexLocker locker(m_mutex);
             // NB: Running out of the region is left to allocate_chunk(), on the thread that needs another chunk.
-            if (m_prepared_chunk || m_next_chunk_offset > size - CHUNK_SIZE)
+            if (m_prepared_chunk || m_next_chunk_offset > LAST_CHUNK_OFFSET)
                 return;
             chunk = commit_next_chunk();
         }
@@ -123,12 +133,41 @@ public:
     FlatPtr start() const { return reinterpret_cast<FlatPtr>(m_base); }
     FlatPtr end() const { return start() + size; }
 
+    FlatPtr committed_end()
+    {
+        MutexLocker locker(m_mutex);
+        return start() + m_next_chunk_offset;
+    }
+
 private:
     static void request_prepared_chunk();
 
+    static void publish_base(FlatPtr base)
+    {
+        MutexLocker locker(base_copies_mutex());
+        js_heap_region_base = base;
+        for (auto* registration = s_base_copies; registration; registration = registration->m_next)
+            *registration->m_copy = base;
+    }
+
+    // NB: Static initialization registers copies, possibly before that of this file has run, so the list starts out
+    //     constant-initialized and its mutex is set up on first use.
+    static Mutex& base_copies_mutex()
+    {
+        static AK::NeverDestroyed<Mutex> mutex;
+        return *mutex;
+    }
+
+    static constinit inline HeapRegionBaseCopyRegistration* s_base_copies { nullptr };
+
+    // The guards at either end of the region are never committed.
+    static constexpr size_t FIRST_CHUNK_OFFSET = HEAP_REGION_LOW_GUARD_SIZE;
+    static constexpr size_t LAST_CHUNK_OFFSET = size - HEAP_REGION_HIGH_GUARD_SIZE - CHUNK_SIZE;
+
     u8* commit_next_chunk()
     {
-        VERIFY(m_next_chunk_offset <= size - CHUNK_SIZE);
+        VERIFY(m_next_chunk_offset >= FIRST_CHUNK_OFFSET);
+        VERIFY(m_next_chunk_offset <= LAST_CHUNK_OFFSET);
         auto* chunk = m_base + m_next_chunk_offset;
         MUST(Core::System::commit_memory(chunk, CHUNK_SIZE, Core::System::MemoryTag::GarbageCollector));
         m_next_chunk_offset += CHUNK_SIZE;
@@ -137,7 +176,7 @@ private:
 
     u8* m_base { nullptr };
     Mutex m_mutex;
-    size_t m_next_chunk_offset { 0 };
+    size_t m_next_chunk_offset { FIRST_CHUNK_OFFSET };
     // A committed chunk whose pages are faulted in already, which the next allocate_chunk() takes.
     u8* m_prepared_chunk { nullptr };
 };
@@ -381,6 +420,12 @@ size_t BlockAllocator::block_count()
     return m_blocks.size();
 }
 
+HeapRegionBaseCopyRegistration::HeapRegionBaseCopyRegistration(FlatPtr& copy)
+    : m_copy(&copy)
+{
+    HeapRegion::register_base_copy(*this);
+}
+
 FlatPtr BlockAllocator::heap_region_start()
 {
     return heap_region().start();
@@ -389,6 +434,11 @@ FlatPtr BlockAllocator::heap_region_start()
 FlatPtr BlockAllocator::heap_region_end()
 {
     return heap_region().end();
+}
+
+FlatPtr BlockAllocator::heap_region_committed_end()
+{
+    return heap_region().committed_end();
 }
 
 void* BlockAllocator::allocate_block([[maybe_unused]] char const* name)

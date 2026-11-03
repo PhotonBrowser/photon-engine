@@ -95,7 +95,6 @@
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/ScrollSnap.h>
-#include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Platform/Timer.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/CompositionEvent.h>
@@ -612,7 +611,7 @@ static bool handle_navigation_response_as_download(GC::Ref<NavigationParams> nav
         }
         auto suggested_filename = suggested_download_filename(download_url, *response->header_list(), {}, interface_origin);
 
-        // The UI process downloads the bytes this process received from the body first, then the rest of the request.
+        // A download the UI process starts reads the bytes released here before the rest of the request.
         ByteBuffer initial_data;
         for (auto const& received : response->release_body_for_transfer())
             initial_data.append(received.bytes());
@@ -967,7 +966,17 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
     auto history_entry = create_session_history_entry_from_ui_process(create_session_history_entry_descriptor(move(request.history_entry), 0), reconstruction_state);
     history_entry->set_step(SessionHistoryEntry::Pending::Tag);
 
-    navigable->set_ongoing_navigation(request.navigation_id);
+    // AD-HOC: A navigation this process started after the UI process sent this request supersedes it, and the UI
+    //         process ends this one once it hears of that one. Until then the newer navigation stays parked here, or
+    //         queued if it is to a javascript: URL, and must stay the ongoing navigation: otherwise its unload check
+    //         would find itself superseded, leaving no navigation to go on. The task below finds this navigation
+    //         superseded, as it does one superseded after this point.
+    auto ongoing_navigation = navigable->ongoing_navigation();
+    auto const* ongoing_navigation_id = ongoing_navigation.get_pointer<Utf16String>();
+    auto is_superseded_by_newer_navigation = ongoing_navigation_id && *ongoing_navigation_id != request.navigation_id
+        && (navigable->has_navigation_parked_for_population(*ongoing_navigation_id) || navigable->m_queued_javascript_url_navigations.contains_slow(*ongoing_navigation_id));
+    if (!is_superseded_by_newer_navigation)
+        navigable->set_ongoing_navigation(request.navigation_id);
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
     // 15. If navigable's parent is non-null, then set navigable's is delaying load events to true.
@@ -981,8 +990,10 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
     TemporaryExecutionContext execution_context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
     auto navigation_params_or_error = create_navigation_params_from_descriptor(realm, *navigable, move(result.navigation_params));
     if (navigation_params_or_error.is_error()) {
-        navigable->set_ongoing_navigation({});
-        navigable->set_delaying_load_events(false);
+        if (!is_superseded_by_newer_navigation) {
+            navigable->set_ongoing_navigation({});
+            navigable->set_delaying_load_events(false);
+        }
         page().client().navigation_population_failed(request.navigable_id, request.navigation_id);
         return;
     }
@@ -1174,6 +1185,11 @@ void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_
     //         top-level traversable by the window handle it gets once it is created, so it does that once it has one.
     if (WebDriver::BiDi::is_active() && !is_top_level_traversable() && !is_stand_in)
         WebDriver::BiDi::document_is_ready_for_scripts(document);
+
+    // A child navigable's first document became active before it had a navigable, so the page client hears of it here,
+    // as it hears of each document that later becomes active in the navigable.
+    if (!is_top_level_traversable() && !is_stand_in)
+        page().client().page_did_change_active_document_in_child_navigable(document);
 }
 
 // AD-HOC: The debug settings and the compositor tree are per page, so a child navigable starts from its parent's. A
@@ -1645,6 +1661,7 @@ void LocalNavigable::set_active_document(GC::Ptr<DOM::Document> document)
     DOM::Document::invalidate_full_activity();
     if (document)
         document->set_navigable(this);
+    update_force_dark_for_active_document();
     set_needs_to_record_display_list();
 
     VERIFY(m_active_session_history_entry);
@@ -1675,6 +1692,12 @@ LocalNavigable::NavigationOrHistoryUpdatePermission LocalNavigable::allowed_to_p
 
     ++m_navigation_or_history_updates_in_rate_limit_window;
     return NavigationOrHistoryUpdatePermission::Allowed;
+}
+
+void LocalNavigable::reset_navigation_or_history_update_rate_limit_for_testing()
+{
+    m_navigation_or_history_update_rate_limit_window_start = MonotonicTime::now_coarse();
+    m_navigation_or_history_updates_in_rate_limit_window = 0;
 }
 
 Optional<u64> LocalNavigable::browsing_context_group_id() const
@@ -2407,7 +2430,12 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
             // 3. If finalSandboxFlags is not empty and responseCOOP's value is not "unsafe-none", then set response to an appropriate network error and break.
             // NOTE: This results in a network error as one cannot simultaneously provide a clean slate to a response
             //       using opener policy and sandbox the result of navigating to that response.
-            if (state_holder->final_sandbox_flags != SandboxingFlagSet {} && state_holder->response_coop.value != OpenerPolicyValue::UnsafeNone) {
+            // AD-HOC: The spec checks finalSandboxFlags, which include the sandboxing flags of the response's own CSP.
+            //         But a response that sandboxes itself isn't one the navigation sandboxed, and its opener policy
+            //         still gives it a clean slate, so check only the sandboxing flags the navigation brings. A page
+            //         served with both a CSP sandbox and an opener policy then loads rather than failing.
+            // https://github.com/web-platform-tests/wpt/blob/master/html/cross-origin-opener-policy/coop-navigate-same-origin-csp-sandbox.html
+            if (state_holder->target_snapshot_params.sandboxing_flags != SandboxingFlagSet {} && state_holder->response_coop.value != OpenerPolicyValue::UnsafeNone) {
                 // AD-HOC: Stop the fetch, as nothing will consume the response this replaces.
                 state_holder->fetch_controller->stop_fetch();
                 state_holder->response = Fetch::Infrastructure::ResponseView::network_error("Opener policy on a sandboxed navigation response"_string);
@@ -3211,11 +3239,16 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
                 // Async path: bytes not yet available, wait for them
                 nav_params->response->resume_body_delivery_up_to(Fetch::Infrastructure::MAX_SNIFF_BYTES);
                 body->wait_for_sniff_bytes(GC::create_function(heap(),
-                    [output, nav_params, navigation_params, completion_steps, source_allows_downloading, source_interface_origin, url](Fetch::Infrastructure::Body::SniffBytes sniff_bytes) {
+                    [output, nav_params, navigation_params, completion_steps, source_allows_downloading, source_interface_origin, url, navigation_id, is_reload_traversal](Fetch::Infrastructure::Body::SniffBytes sniff_bytes) {
                         // AD-HOC: The document may have been destroyed between when the fetch started and when the
                         //         bytes arrived. A response that failed mid-sniff must not be loaded as a document
                         //         off its partial bytes either.
-                        if (nav_params->navigable->active_browsing_context() && sniff_bytes.outcome == Fetch::Infrastructure::Body::SniffOutcome::Complete) {
+                        // AD-HOC: A navigation that a newer one superseded during the wait makes no document either:
+                        //         the document would take over the Window of an initial about:blank, whose tasks then
+                        //         wait for a document that never becomes active, among them those of the newer
+                        //         navigation.
+                        auto is_superseded = navigation_id.has_value() && nav_params->navigable->ongoing_navigation() != navigation_id && !is_reload_traversal;
+                        if (!is_superseded && nav_params->navigable->active_browsing_context() && sniff_bytes.outcome == Fetch::Infrastructure::Body::SniffOutcome::Complete) {
                             load_document_or_handle_download(nav_params, sniff_bytes.bytes, url, source_allows_downloading, source_interface_origin, *output);
                         } else {
                             stop_response_body_delivery(navigation_params);
@@ -4063,6 +4096,12 @@ GC::Ptr<DOM::Document> LocalNavigable::evaluate_javascript_url(URL::URL const& u
         return nullptr;
     }
 
+    // AD-HOC: As navigate_to_a_javascript_url() goes on for a navigation that a later one superseded, that one can be the
+    //         ongoing navigation here, or one the script itself began. It is what the navigable ends on, so the script's
+    //         result makes no document.
+    if (!ongoing_navigation().has<Empty>())
+        return nullptr;
+
     // 11. Let response be a new response with
     //     URL: targetNavigable's active document's URL
     //     header list: «(`Content-Type`, `text/html;charset=utf-8`)»
@@ -4164,7 +4203,10 @@ void LocalNavigable::navigate_to_a_javascript_url(NonnullRefPtr<Fetch::Infrastru
     }
 
     // 3. Set the ongoing navigation for targetNavigable to null.
-    set_ongoing_navigation({});
+    // AD-HOC: As step 2 goes on for a navigation a later one superseded, the ongoing navigation can be that later one.
+    bool const superseded = ongoing_navigation() != navigation_id;
+    if (!superseded)
+        set_ongoing_navigation({});
 
     // 4. If initiatorOrigin is not same origin-domain with targetNavigable's active document's origin, then return.
     if (!initiator_origin.is_same_origin_domain(active_document()->origin())) {
@@ -4192,7 +4234,9 @@ void LocalNavigable::navigate_to_a_javascript_url(NonnullRefPtr<Fetch::Infrastru
         //    about:blank is true:
         // NOTE: container can be null if author code, such as the Trusted Types default policy or
         //       javascript:frameElement.remove(), removed it.
-        if (initial_insertion == InitialInsertion::Yes && container && active_document()->is_initial_about_blank()) {
+        // AD-HOC: A navigation a later one superseded would have returned at step 2, and that one is still to replace the
+        //         document, so nothing has loaded yet.
+        if (!superseded && initial_insertion == InitialInsertion::Yes && container && active_document()->is_initial_about_blank()) {
             // 1. If container is an iframe element, then run the iframe load event steps given container.
             if (auto* iframe = as_if<HTMLIFrameElement>(*container)) {
                 run_iframe_load_event_steps(*iframe);
@@ -4683,6 +4727,7 @@ void LocalNavigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList 
     if (m_viewport_size == size && invalidate_display_list == InvalidateDisplayList::No)
         return;
 
+    auto previous_viewport_size = m_viewport_size;
     m_viewport_size = size;
 
     if (has_compositor_context()) {
@@ -4693,10 +4738,11 @@ void LocalNavigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList 
     }
 
     if (auto document = active_document()) {
+        // NB: A display list invalidated with the viewport is for a device pixel ratio that moved, as a zoom moves it.
         if (invalidate_display_list == InvalidateDisplayList::PaintCommandsAndHitTestList)
-            document->record_style_environment_change();
-        else
-            document->invalidate_style_for_viewport_change();
+            document->record_style_environment_change(DOM::StyleEnvironmentChange::DevicePixelRatio | DOM::StyleEnvironmentChange::MediaFeatures);
+        if (previous_viewport_size != size)
+            document->invalidate_style_for_viewport_change(previous_viewport_size);
         document->set_needs_media_query_evaluation();
         document->set_needs_layout_update(DOM::SetNeedsLayoutReason::NavigableSetViewportSize);
     }
@@ -4899,8 +4945,23 @@ void LocalNavigable::wait_for_async_scroll_operation(Compositing::AsyncScrollOpe
         return;
     }
 
+    if (auto ended = m_async_scroll_operations_with_expected_wait.take(operation_id); ended.has_value() && *ended) {
+        queue_async_scroll_operation_promise_resolution(promise);
+        return;
+    }
+
     // The compositor may have reported the scroll it started for this operation already, which registered it here.
     ensure_pending_async_scroll_operation(operation_id).promises.append(promise);
+}
+
+void LocalNavigable::expect_wait_for_async_scroll_operation(Compositing::AsyncScrollOperationID operation_id)
+{
+    m_async_scroll_operations_with_expected_wait.set(operation_id, false);
+}
+
+void LocalNavigable::forget_expected_wait_for_async_scroll_operation(Compositing::AsyncScrollOperationID operation_id)
+{
+    m_async_scroll_operations_with_expected_wait.remove(operation_id);
 }
 
 void LocalNavigable::wait_for_wheel_scrolls(Vector<GC::Ref<WebIDL::Promise>>& promises)
@@ -4926,6 +4987,9 @@ void LocalNavigable::wait_for_wheel_scrolls(Vector<GC::Ref<WebIDL::Promise>>& pr
 
 void LocalNavigable::resolve_async_scroll_operation(Compositing::AsyncScrollOperationID operation_id)
 {
+    if (m_async_scroll_operations_with_expected_wait.contains(operation_id))
+        m_async_scroll_operations_with_expected_wait.set(operation_id, true);
+
     // Notifying a scroll's completion can start the next scroll of the same scrolling box, so the finished scroll
     // leaves the list of scrolls in progress before it is reported.
     Optional<FinishedScroll> finished;
@@ -5063,7 +5127,7 @@ bool LocalNavigable::set_scroll_offset_for(Web::AsyncScrollNodeStableID stable_n
     return Painting::set_scroll_offset(*layout_node, scroll_offset) == Painting::ScrollHandled::Yes;
 }
 
-RefPtr<Painting::Scrollbar> LocalNavigable::scrollbar_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const& scrollbar)
+DOM::Element* LocalNavigable::element_whose_scrollbar_is_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const& scrollbar)
 {
     auto document = active_document();
     if (!document)
@@ -5071,8 +5135,7 @@ RefPtr<Painting::Scrollbar> LocalNavigable::scrollbar_dragged_by_compositor(Layo
     auto* scrolling_box = layout_node_for_async_scroll_node(read, *document, scrollbar.scroller_stable_node_id);
     if (!scrolling_box || !Painting::has_committed_box(*scrolling_box))
         return nullptr;
-    auto direction = scrollbar.vertical ? Painting::ScrollDirection::Vertical : Painting::ScrollDirection::Horizontal;
-    return document->chrome_widget_registry().get_or_create_scrollbar(document->layout_node_arena(), Painting::committed_row_slot(*scrolling_box), direction);
+    return element_for_async_scroll_node_stable_id(*document, scrollbar.scroller_stable_node_id);
 }
 
 // NB: A scroll the compositor reports can arrive while layout is out of date, so this reads the committed layout.
@@ -5244,22 +5307,14 @@ void LocalNavigable::extend_user_scroll_gesture_of(Web::AsyncScrollNodeStableID 
     schedule_end_of_user_scroll_gesture_input();
 }
 
-void LocalNavigable::extend_wheel_user_scroll_gesture(Optional<Web::AsyncScrollNodeStableID> box_latched_on_this_thread)
+void LocalNavigable::extend_wheel_user_scroll_gesture()
 {
-    if (box_latched_on_this_thread.has_value())
-        extend_user_scroll_gesture_of(box_latched_on_this_thread.value());
     if (m_compositor_wheel_latched_scroller.has_value())
         extend_user_scroll_gesture_of(m_compositor_wheel_latched_scroller.value());
     if (m_wheel_user_scroll_gesture_hold) {
         for (auto box : m_wheel_user_scroll_gesture_hold->held_boxes())
             extend_user_scroll_gesture_of(box);
     }
-}
-
-void LocalNavigable::note_wheel_user_scroll_gesture_scrolls(Web::AsyncScrollNodeStableID stable_node_id)
-{
-    if (m_wheel_user_scroll_gesture_hold)
-        m_wheel_user_scroll_gesture_hold->hold(stable_node_id);
 }
 
 TemporaryChange<UserScrollGestureHold*> LocalNavigable::hold_boxes_user_input_scrolls_with(UserScrollGestureHold& hold)
@@ -5272,15 +5327,11 @@ void LocalNavigable::note_user_scroll_gesture_phase(Web::ScrollGesturePhase phas
     switch (phase) {
     case Web::ScrollGesturePhase::None:
         m_user_scroll_gesture_travels_under_momentum = false;
-        reset_momentum_fling_state();
         release_wheel_user_scroll_gesture_hold();
         break;
     case Web::ScrollGesturePhase::Ongoing:
     case Web::ScrollGesturePhase::Momentum: {
         bool travels_under_momentum = phase == Web::ScrollGesturePhase::Momentum;
-
-        if (!travels_under_momentum)
-            reset_momentum_fling_state();
 
         // Fingers that touch down during momentum start another gesture, which settles the flicked one.
         if (m_wheel_user_scroll_gesture_hold && m_user_scroll_gesture_travels_under_momentum && !travels_under_momentum)
@@ -5293,7 +5344,6 @@ void LocalNavigable::note_user_scroll_gesture_phase(Web::ScrollGesturePhase phas
     }
     case Web::ScrollGesturePhase::Ended:
         m_user_scroll_gesture_travels_under_momentum = false;
-        reset_momentum_fling_state();
         if (m_wheel_user_scroll_gesture_hold) {
             release_wheel_user_scroll_gesture_hold();
             break;
@@ -5328,12 +5378,6 @@ void LocalNavigable::release_wheel_user_scroll_gesture_hold()
     if (m_wheel_user_scroll_gesture_hold_expiry_timer)
         m_wheel_user_scroll_gesture_hold_expiry_timer->stop();
     m_wheel_user_scroll_gesture_hold = nullptr;
-}
-
-void LocalNavigable::reset_momentum_fling_state()
-{
-    m_momentum_snap_position_selection = MomentumSnapPositionSelection::NotSelectedYet;
-    m_momentum_fling_estimator.reset();
 }
 
 void LocalNavigable::snap_user_scroll_gestures_that_awaited_layout()
@@ -6077,7 +6121,16 @@ void LocalNavigable::inform_the_navigation_api_about_aborting_navigation()
 GC::Ptr<DOM::Node> LocalNavigable::currently_focused_area()
 {
     // 1. If traversable does not have system focus, then return null.
-    if (!is_focused())
+    if (!page().client().has_focus())
+        return nullptr;
+    return focused_area_regardless_of_system_focus();
+}
+
+// The rest of the currently focused area's steps, which don't depend on system focus.
+GC::Ptr<DOM::Node> LocalNavigable::focused_area_regardless_of_system_focus()
+{
+    // NB: Below a top-level traversable, focus is here only while this is the tab's focused navigable.
+    if (!is_top_level_traversable() && page().focused_navigable().ptr() != this)
         return nullptr;
 
     // 2. Let candidate be traversable's active document.
@@ -6095,7 +6148,7 @@ GC::Ptr<DOM::Node> LocalNavigable::currently_focused_area()
         // NB: The active document of a navigable another process hosts is there. The walk goes on from it as the tab's
         //     focused navigable shows, and the container is as far as focus is seen here otherwise.
         if (!is<LocalNavigable>(*content_navigable)) {
-            if (auto focused_area = content_navigable->currently_focused_area_shown_by_focused_navigable())
+            if (auto focused_area = content_navigable->focused_area_shown_by_focused_navigable_regardless_of_system_focus())
                 return focused_area;
             return container;
         }
@@ -6735,6 +6788,26 @@ void LocalNavigable::set_should_show_line_box_borders(bool value)
         child_navigable->set_should_show_line_box_borders(value);
 }
 
+void LocalNavigable::set_force_dark_settings(bool enabled, HashMap<String, bool> per_host)
+{
+    m_force_dark_default = enabled;
+    m_force_dark_per_host = move(per_host);
+    update_force_dark_for_active_document();
+}
+
+void LocalNavigable::update_force_dark_for_active_document()
+{
+    if (!is_top_level_traversable())
+        return;
+    auto enabled = m_force_dark_default;
+    if (auto document = active_document(); document && document->url().host().has_value()) {
+        auto host = MUST(String::from_utf8(document->url().serialized_host()));
+        if (!host.is_empty())
+            enabled = m_force_dark_per_host.get(host).value_or(enabled);
+    }
+    set_force_dark_enabled(enabled);
+}
+
 void LocalNavigable::set_force_dark_enabled(bool value)
 {
     if (m_force_dark_enabled == value)
@@ -7124,10 +7197,10 @@ bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_r
     return true;
 }
 
-void LocalNavigable::render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig paint_config, Function<void()>&& callback)
+void LocalNavigable::render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig paint_config, Function<void(Compositor::ScreenshotResult)>&& callback)
 {
     if (!has_compositor_context()) {
-        callback();
+        callback(Compositor::ScreenshotResult::Failed);
         return;
     }
 
@@ -7141,7 +7214,7 @@ void LocalNavigable::render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintC
     }
 
     if (!commit_frame(paint_config)) {
-        callback();
+        callback(Compositor::ScreenshotResult::Failed);
         return;
     }
     // The screenshot is of what the compositor composes, so every frame committed before it is presented first.
@@ -7339,7 +7412,7 @@ void LocalNavigable::abort_in_flight_smooth_scrolls_taken_over_by_user_input(Web
 static bool scrolls_smoothly(Bindings::ScrollBehavior behavior, GC::Ptr<DOM::Element> associated_element)
 {
     if (behavior == Bindings::ScrollBehavior::Auto && associated_element) {
-        if (auto const* values = associated_element->style_group<CSS::ComputedValues::MiscResetValues>())
+        if (auto const* values = associated_element->style_group<CSS::ComputedValues::MiscInteractionValues>())
             return static_cast<CSS::ScrollBehavior>(values->scroll_behavior) == CSS::ScrollBehavior::Smooth;
     }
     return behavior == Bindings::ScrollBehavior::Smooth;
@@ -7581,7 +7654,7 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_an_element(DOM::Ele
 
 bool LocalNavigable::perform_a_scroll_step_for_key_input(Layout::Node& scroll_container, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type strategy_type)
 {
-    if (perform_a_snapped_relative_user_scroll(scroll_container, delta, strategy_type, SnapStepAccumulation::UntilScrollFinishes))
+    if (perform_a_snapped_relative_user_scroll(scroll_container, delta, strategy_type))
         return true;
 
     auto document = active_document();
@@ -7622,7 +7695,7 @@ bool LocalNavigable::perform_a_scroll_step_for_key_input(Layout::Node& scroll_co
     return true;
 }
 
-bool LocalNavigable::perform_a_snapped_relative_user_scroll(Layout::Node& scroll_container, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type strategy_type, SnapStepAccumulation step_accumulation, Compositing::ScrollAnimationKind animation_kind, Painting::ScrollKind scroll_kind)
+bool LocalNavigable::perform_a_snapped_relative_user_scroll(Layout::Node& scroll_container, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type strategy_type, Painting::ScrollKind scroll_kind)
 {
     auto document = active_document();
     if (!document)
@@ -7647,8 +7720,7 @@ bool LocalNavigable::perform_a_snapped_relative_user_scroll(Layout::Node& scroll
     // snap position it is scrolling to, so a burst of steps advances by the distance they asked for instead of by one
     // snap position each.
     auto* latched_gesture = user_scroll_gesture_for(*stable_node_id);
-    bool travels_from_input_deltas = latched_gesture
-        && (step_accumulation == SnapStepAccumulation::UntilGestureSettles || in_flight_destination.has_value());
+    bool travels_from_input_deltas = latched_gesture && in_flight_destination.has_value();
     auto step_start = travels_from_input_deltas
         ? latched_gesture->unsnapped_scroll_destination.value_or(*current_scroll_offset)
         : *current_scroll_offset;
@@ -7690,31 +7762,8 @@ bool LocalNavigable::perform_a_snapped_relative_user_scroll(Layout::Node& scroll
                                                              .position = snap_destination.position,
                                                              .behavior = Bindings::ScrollBehavior::Smooth,
                                                              .trigger = ScrollTrigger::UserInput,
-                                                             .animation_kind = animation_kind,
                                                              .scroll_kind = scroll_kind,
                                                          });
-    return true;
-}
-
-// https://drafts.csswg.org/css-scroll-snap-1/#choosing
-bool LocalNavigable::perform_a_snapped_momentum_scroll(Layout::Node& scroll_container, CSSPixelPoint momentum_delta)
-{
-    if (m_momentum_snap_position_selection == MomentumSnapPositionSelection::ScrollingToSelectedPosition)
-        return true;
-
-    if (m_momentum_snap_position_selection == MomentumSnapPositionSelection::NoPositionSelected)
-        return false;
-
-    auto remaining_displacement = m_momentum_fling_estimator.estimate_remaining_displacement(momentum_delta);
-    if (!remaining_displacement.has_value())
-        return false;
-
-    if (!perform_a_snapped_relative_user_scroll(scroll_container, *remaining_displacement, Compositing::SnapSelectionStrategy::Type::EndPositionAndDirection, SnapStepAccumulation::UntilScrollFinishes, Compositing::ScrollAnimationKind::Momentum)) {
-        m_momentum_snap_position_selection = MomentumSnapPositionSelection::NoPositionSelected;
-        return false;
-    }
-
-    m_momentum_snap_position_selection = MomentumSnapPositionSelection::ScrollingToSelectedPosition;
     return true;
 }
 
@@ -7977,8 +8026,8 @@ void LocalNavigable::reset_zoom()
 bool LocalNavigable::has_inclusive_ancestor_with_visibility_hidden() const
 {
     if (auto container = this->container()) {
-        if (auto const* values = container->style_group<CSS::ComputedValues::InheritedBoxValues>()) {
-            if (static_cast<CSS::Visibility>(values->visibility) == CSS::Visibility::Hidden)
+        if (auto const* values = container->style_inherited_set_values()) {
+            if (CSS::visibility_from_inherited_bits(values->bits) == CSS::Visibility::Hidden)
                 return true;
         }
         if (auto ancestor_navigable = container->document().navigable()) {
@@ -7989,12 +8038,10 @@ bool LocalNavigable::has_inclusive_ancestor_with_visibility_hidden() const
     return false;
 }
 
-UserScrollGestureHold::UserScrollGestureHold(LocalNavigable& navigable, TakesOverMomentum takes_over_momentum, Optional<Web::AsyncScrollNodeStableID> held_box)
+UserScrollGestureHold::UserScrollGestureHold(LocalNavigable& navigable, TakesOverMomentum takes_over_momentum)
     : m_navigable(navigable)
     , m_takes_over_momentum(takes_over_momentum)
 {
-    if (held_box.has_value())
-        hold(held_box.value());
 }
 
 UserScrollGestureHold::~UserScrollGestureHold()

@@ -160,6 +160,8 @@ public:
     int tab_index(Tab*);
     Tab* tab_at(int index) const { return m_tabs_container->tab(index); }
     TabWidget& tab_widget() const { return *m_tabs_container; }
+    WindowToolbar& toolbar() const { return m_tabs_container->toolbar(); }
+    BookmarksBar& bookmarks_bar() const { return m_tabs_container->bookmarks_bar(); }
     // Closes a tab that isn't worth reopening, such as an empty tab that other tabs took the place of.
     void close_tab_without_keeping_it(int index);
 
@@ -184,6 +186,10 @@ public:
     void request_close_preflight(Function<void(bool approved)> on_complete);
     // Brings the window forward for a page's beforeunload prompt during an application-wide close check.
     void raise_for_close_prompt();
+    // Unminimizes, raises and activates the window, so the user sees it in front.
+    void bring_to_front();
+    // The tab showing this view, if it's one of this window's.
+    Tab* tab_for_view(WebView::ViewImplementation const&) const;
     bool is_window_close_approved() const { return m_window_close_approved; }
     void report_activation_to_session_store();
     void cancel_window_close_preflight();
@@ -353,6 +359,12 @@ private:
     // Determine if window should restore to maximized or normal, when exiting fullscreen.
     bool m_restore_to_maximized { false };
     bool m_resize_cursor_active { false };
+    // The widget the last left button press in the window landed on, so a double click can tell whether its first
+    // click landed on the same widget as its second.
+    QPointer<QWidget> m_last_left_press_widget;
+    u64 m_last_left_press_timestamp { 0 };
+    u64 m_last_double_click_timestamp { 0 };
+    bool m_double_click_started_elsewhere { false };
 };
 
 }

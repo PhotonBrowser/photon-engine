@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use super::LayoutNodeArena;
 use super::node_data::NodeSlotId;
 use super::text_transform::{TextRenderingOptions, may_require_bidi_processing, render_text};
-use super::{ComputedValuesView, LayoutNodeArena};
 use crate::css::css_enums::text_transform;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -120,8 +120,7 @@ pub(crate) fn enroll_text_after_language_change(arena: &mut LayoutNodeArena, roo
         }
         let parent = arena.data(node).parent.get();
         !parent.is_invalid()
-            && arena.style_payloads(parent).is_some_and(|style| {
-                let values = ComputedValuesView::new(&style.groups);
+            && arena.style_view(parent).is_some_and(|values| {
                 transform_uses_locale(values.inherited_text().text_transform)
                     || values.line_break() == crate::css::css_enums::line_break::LOOSE
             })
@@ -163,6 +162,9 @@ pub(crate) struct TextChunkCacheKey {
     pub(crate) line_break_language: super::text_chunker::LineBreakLanguage,
     pub(crate) font_variant_emoji: u8,
     pub(crate) frozen_font_list: std::sync::Arc<libgfx_rust::font::FrozenFontList>,
+    /// How many times loads had filled faces of the frozen cascade in, each of which can move the
+    /// font of a chunk.
+    pub(crate) frozen_font_list_fill_generation: u32,
     pub(crate) splits_at_orientation_changes: bool,
 }
 
@@ -177,8 +179,9 @@ impl PartialEq for TextChunkCacheKey {
             && self.line_break_language == other.line_break_language
             && self.font_variant_emoji == other.font_variant_emoji
             && self.splits_at_orientation_changes == other.splits_at_orientation_changes
-            // A frozen cascade is immutable, so naming the same one is the whole of equality.
+            // A frozen cascade only moves when a load fills one of its faces in.
             && std::sync::Arc::ptr_eq(&self.frozen_font_list, &other.frozen_font_list)
+            && self.frozen_font_list_fill_generation == other.frozen_font_list_fill_generation
     }
 }
 
@@ -227,9 +230,13 @@ impl TextContent {
 /// text is still that text.
 #[derive(Default)]
 pub(crate) struct TextMemos {
-    chunks: RefCell<Vec<Option<ChunksOfText>>>,
+    /// In chunks a fork of the arena shares until either side writes one, so forking does not copy every row's memo.
+    chunks: RefCell<crate::cow_column::CowVec<Option<ChunksOfText>, CHUNK_MEMOS_PER_CHUNK>>,
     grapheme_segmenters: RefCell<Vec<Option<GraphemeSegmenterOfText>>>,
 }
+
+/// How many rows' chunk memos a chunk of [`TextMemos::chunks`] holds: a write after a fork copies this many.
+const CHUNK_MEMOS_PER_CHUNK: usize = 128;
 
 /// The chunks a run made of a row's rendered text, and that text.
 #[derive(Clone)]
@@ -279,7 +286,7 @@ impl TextMemos {
         });
         let mut chunks = self.chunks.borrow_mut();
         if chunks.len() <= index {
-            chunks.resize_with(index + 1, || None);
+            chunks.resize_with_default(index + 1);
         }
         chunks[index] = Some(ChunksOfText {
             rendered: rendered.clone(),
@@ -312,8 +319,9 @@ impl TextMemos {
 
     /// Lets go of what the memos keep for the row in `slot`, which the arena freed.
     pub(crate) fn forget(&self, slot: u32) {
-        if let Some(chunks) = self.chunks.borrow_mut().get_mut(slot as usize) {
-            *chunks = None;
+        let mut chunks = self.chunks.borrow_mut();
+        if chunks.get(slot as usize).is_some_and(Option::is_some) {
+            chunks[slot as usize] = None;
         }
         if let Some(segmenter) = self.grapheme_segmenters.borrow_mut().get_mut(slot as usize) {
             *segmenter = None;
@@ -428,10 +436,10 @@ impl TextFragments {
     }
 }
 
-/// The code units a published string spells, without widening ASCII storage to count them.
+/// The code units a published string spells, without widening Latin-1 storage to count them.
 pub(super) fn length_in_code_units(text: &ak::Utf16String) -> usize {
     match text.as_units() {
-        ak::Utf16StringUnits::Ascii(units) => units.len(),
+        ak::Utf16StringUnits::Ascii(units) | ak::Utf16StringUnits::Latin1(units) => units.len(),
         ak::Utf16StringUnits::Utf16(units) => units.len(),
     }
 }
@@ -445,20 +453,15 @@ pub(super) fn ensure_text_content(arena: &mut LayoutNodeArena, id: NodeSlotId) {
 
 fn sync_text_content(arena: &mut LayoutNodeArena, id: NodeSlotId) {
     let parent = arena.data(id).parent.get();
-    let inherited = ComputedValuesView::new(
-        &arena
-            .style_payloads(parent)
-            .expect("text parent must have style")
-            .groups,
-    )
-    .inherited_text();
+    let parent_style = arena.style_view(parent).expect("text parent must have style");
+    let inherited = parent_style.inherited_text();
     let uses_locale = transform_uses_locale(inherited.text_transform);
     let input = arena.published_text_source(id, uses_locale);
     let source_length = length_in_code_units(&input.data);
     let source_range = arena.text_source_range(id, source_length);
     let options = TextRenderingOptions {
         text_transform: inherited.text_transform,
-        white_space_collapse: inherited.white_space_collapse,
+        white_space_collapse: parent_style.white_space_collapse(),
         is_password_input: input.is_password_input,
         dom_start_offset: source_range.start,
         dom_length_in_code_units: source_range.length,
@@ -529,6 +532,7 @@ mod tests {
             line_break_language: LineBreakLanguage::Japanese,
             font_variant_emoji: 0,
             frozen_font_list: std::sync::Arc::new(libgfx_rust::font::FrozenFontList::empty()),
+            frozen_font_list_fill_generation: 0,
             splits_at_orientation_changes: false,
         };
         let memos = TextMemos::default();
@@ -576,6 +580,7 @@ mod tests {
             line_break_language: crate::layout::text_chunker::LineBreakLanguage::Other,
             font_variant_emoji: 0,
             frozen_font_list: std::sync::Arc::new(libgfx_rust::font::FrozenFontList::empty()),
+            frozen_font_list_fill_generation: 0,
             splits_at_orientation_changes: false,
         };
         let chunk = TextChunk {
@@ -645,6 +650,52 @@ mod tests {
         let _ = arena.free_subtree(node);
         scratch.apply_memo_invalidations(&mut arena);
         assert_eq!(Arc::strong_count(&new_chunks), 1);
+    }
+
+    #[test]
+    fn kept_prepared_inline_content_goes_with_an_epoch_bump_or_a_freed_slot_and_survives_a_fork() {
+        use crate::layout::LayoutPass;
+        use crate::layout::fc_run_cache::run_root_validity;
+        use crate::layout::prepared_inline_content::PreparedInlineContent;
+        use crate::layout::run_state::LayoutScratch;
+        use std::sync::Arc;
+
+        let mut arena = LayoutNodeArena::new();
+        let scratch = LayoutScratch::default();
+        let block = arena.allocate_for_test().slot;
+        scratch.apply_memo_invalidations(&mut arena);
+        let keep = |arena: &LayoutNodeArena, scratch: &LayoutScratch| {
+            let validity = run_root_validity(&LayoutPass::for_test(arena, scratch), block);
+            let prepared = Arc::new(PreparedInlineContent {
+                validity,
+                items: Box::default(),
+                box_events: Box::default(),
+                fonts: Box::default(),
+                tab_stops: Box::default(),
+            });
+            scratch.prepared_inline_content_memos().keep(block, prepared.clone());
+            (validity, Arc::downgrade(&prepared))
+        };
+        let kept = |scratch: &LayoutScratch, validity| scratch.prepared_inline_content_memos().kept(block, validity);
+
+        let (validity, prepared) = keep(&arena, &scratch);
+        arena.clear_committed_fragment_link(block);
+        scratch.apply_memo_invalidations(&mut arena);
+        assert!(kept(&scratch, validity).is_some_and(|kept| Arc::ptr_eq(&kept, &prepared.upgrade().unwrap())));
+
+        let fork = scratch.fork();
+        arena.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(block);
+        scratch.apply_memo_invalidations(&mut arena);
+        assert!(kept(&scratch, validity).is_none());
+        assert!(kept(&fork, validity).is_some_and(|kept| Arc::ptr_eq(&kept, &prepared.upgrade().unwrap())));
+        drop(fork);
+        assert!(prepared.upgrade().is_none());
+
+        let (validity, prepared) = keep(&arena, &scratch);
+        assert!(kept(&scratch, validity).is_some());
+        let _ = arena.free_subtree(block);
+        scratch.apply_memo_invalidations(&mut arena);
+        assert!(prepared.upgrade().is_none());
     }
 
     #[test]
@@ -799,7 +850,7 @@ mod tests {
         arena.set_text_content(node, text);
         assert!(!arena.text_content_needs_sync(node));
 
-        arena.set_node_style(parent, 1, crate::layout::node_data::StylePayloadsRef::null());
+        arena.set_node_style(parent, 1, None);
         let pending = arena.pending_text_nodes_for_content_sync();
         assert_eq!(pending, [node]);
         assert!(arena.text_content_needs_sync(node));

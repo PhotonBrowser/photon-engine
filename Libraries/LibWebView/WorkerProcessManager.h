@@ -62,6 +62,10 @@ public:
 
     void close_worker_agent(WebContentClient&, Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken);
     void close_worker_agent(WebWorkerClient&, Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken);
+
+    void rtc_transform_init(WebContentClient&, Web::HTML::WorkerAgentId, u64 transform_id, Web::HTML::SerializedTransferRecord options_record);
+    void rtc_transform_teardown(WebContentClient&, Web::HTML::WorkerAgentId, u64 transform_id);
+    void rtc_transform_encoded_audio_frame(WebContentClient&, Web::HTML::WorkerAgentId, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number);
     void remove_web_content_owner(WebContentClient&);
     void remove_web_worker_owner(WebWorkerClient&);
 
@@ -122,9 +126,14 @@ private:
     void worker_did_die(Web::HTML::WorkerAgentId);
     void worker_process_did_exit(WebWorkerClient&);
     void worker_did_request_file(Web::HTML::WorkerAgentId, ByteString path, i32 request_id);
+    void worker_did_write_rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number);
+
+    struct WorkerAgent;
+    WorkerAgent* agent_owned_by(WebContentClient&, Web::HTML::WorkerAgentId);
 
     enum class AgentRemovalCause {
         OwnerSetEmptied,
+        ExtendedLifetimeEnded,
         AgentTerminated,
     };
     void remove_agent(Web::HTML::WorkerAgentId, AgentRemovalCause);
@@ -137,6 +146,7 @@ private:
         Web::HTML::WorkerType worker_type { Web::HTML::WorkerType::Classic };
         Web::HTML::RequestCredentials credentials { Web::HTML::RequestCredentials::SameOrigin };
         bool extended_lifetime { false };
+        RefPtr<Core::Timer> extended_lifetime_timer;
         Optional<bool> worker_is_secure_context;
         bool closing { false };
         IsPrivate is_private { IsPrivate::No };

@@ -4,22 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/ByteString.h>
 #include <AK/Mutex.h>
-#include <AK/Random.h>
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
-#include <LibCore/Directory.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibCore/Timer.h>
-#include <LibFileSystem/FileSystem.h>
-#include <LibMain/Main.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
+#include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 #include <LibURL/Parser.h>
 #include <LibWebView/Application.h>
@@ -29,25 +26,6 @@
 #include <sys/socket.h>
 
 namespace {
-
-class TestApplication : public WebView::Application {
-    WEB_VIEW_APPLICATION(TestApplication)
-
-public:
-    explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
-    {
-    }
-
-    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options) override
-    {
-        browser_options.headless_mode = WebView::HeadlessMode::Test;
-        browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
-        web_content_options.is_test_mode = WebView::IsTestMode::Yes;
-    }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
-};
 
 enum class RangeSupport {
     Yes,
@@ -94,6 +72,8 @@ public:
 
         MUST(Core::System::bind(m_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)));
         MUST(Core::System::listen(m_socket, 16));
+        // accept() must not block when a connection that poll() reported is gone by then.
+        MUST(Core::System::fcntl(m_socket, F_SETFL, O_NONBLOCK));
 
         socklen_t address_size = sizeof(address);
         VERIFY(::getsockname(m_socket, reinterpret_cast<sockaddr*>(&address), &address_size) == 0);
@@ -109,7 +89,6 @@ public:
     ~TestHttpServer()
     {
         m_shutting_down.store(true);
-        wake_server();
         (void)m_thread->join();
         for (auto& thread : m_stalled_connection_threads)
             (void)thread->join();
@@ -137,31 +116,29 @@ public:
     }
 
 private:
+    // A connection made to wake accept() can be lost to a signal, so poll and recheck for shutdown instead.
     void run()
     {
         while (!m_shutting_down.load()) {
-            auto client = ::accept(m_socket, nullptr, nullptr);
-            if (client < 0)
+            pollfd poll_fd { .fd = m_socket, .events = POLLIN, .revents = 0 };
+            auto ready = Core::System::poll({ &poll_fd, 1 }, 100);
+            if (ready.is_error() && ready.error().code() != EINTR)
                 return;
+            if (ready.is_error() || ready.value() == 0)
+                continue;
+
+            auto client = ::accept(m_socket, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EAGAIN || errno == ECONNABORTED)
+                    continue;
+                return;
+            }
+            // Accepted sockets inherit O_NONBLOCK on some platforms.
+            MUST(Core::System::fcntl(client, F_SETFL, 0));
 
             if (handle_connection(client))
                 (void)Core::System::close(client);
         }
-    }
-
-    void wake_server()
-    {
-        auto socket = Core::System::socket(AF_INET, SOCK_STREAM, 0);
-        if (socket.is_error())
-            return;
-
-        sockaddr_in address {};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = htons(m_port);
-
-        (void)::connect(socket.value(), reinterpret_cast<sockaddr*>(&address), sizeof(address));
-        (void)Core::System::close(socket.value());
     }
 
     // Returns whether the caller still owns the client socket and should close it.
@@ -549,23 +526,15 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
 
 }
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(file_downloader)
 {
-    auto test_directory = ByteString::formatted("{}/Ladybird-TestFileDownloader-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_directory, FileSystem::RecursionMode::Allowed));
-    });
-    VERIFY(setenv("XDG_CONFIG_HOME", test_directory.characters(), 1) == 0);
-    VERIFY(setenv("XDG_DOWNLOAD_DIR", test_directory.characters(), 1) == 0);
+    Test::HeadlessTestEnvironment environment { "TestFileDownloader"sv, 120 };
+    auto const& test_directory = environment.directory();
 
+    VERIFY(setenv("XDG_DOWNLOAD_DIR", test_directory.characters(), 1) == 0);
     signal(SIGPIPE, SIG_IGN);
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application());
 
     {
         auto response_body = make_body(4 * KiB);
@@ -786,5 +755,4 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     }
 
     outln("PASS");
-    return 0;
 }

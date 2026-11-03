@@ -61,6 +61,7 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/NoOpNotificationBackend.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/PictureInPictureWindow.h>
 #include <LibWebView/ProcessType.h>
@@ -122,6 +123,11 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
         Application::the().appearance_changed({});
     }
 
+    virtual void content_settings_changed() override
+    {
+        Application::the().update_force_dark_action();
+    }
+
     virtual void tab_settings_changed() override
     {
         Application::the().tab_settings_changed({});
@@ -163,6 +169,11 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
     virtual void geolocation_settings_changed() override
     {
         Application::the().location_policy_changed({});
+    }
+
+    virtual void notifications_settings_changed() override
+    {
+        Application::the().notifications_policy_changed({});
     }
 };
 
@@ -2391,6 +2402,9 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     case ProcessType::VideoDecoderServer:
         // The MediaServer it served asks for a new one once its decoders notice the loss.
         break;
+    case ProcessType::WebRTCClient:
+        // The WebContent process it served asks for a new one the next time it needs one.
+        break;
     case ProcessType::RequestServer:
         if (auto client = process.client<Requests::RequestControlClient>()) {
             dbgln_if(WEBVIEW_PROCESS_DEBUG, "Restart request server");
@@ -2481,16 +2495,23 @@ ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString co
     return unique_download_path(downloads_directory, Web::sanitize_suggested_download_filename(file));
 }
 
-ErrorOr<LexicalPath> Application::path_for_downloaded_file(ByteString const& file) const
+NonnullRefPtr<Core::Promise<LexicalPath>> Application::path_for_downloaded_file(ByteString const& file) const
 {
-    if (browser_options().headless_mode.has_value())
-        return default_path_for_downloaded_file(file);
+    if (browser_options().headless_mode.has_value()) {
+        auto download_path = default_path_for_downloaded_file(file);
+        if (download_path.is_error())
+            return Core::Promise<LexicalPath>::rejected(download_path.release_error());
+        return Core::Promise<LexicalPath>::resolved(download_path.release_value());
+    }
 
-    auto download_path = ask_user_for_download_path(Web::sanitize_suggested_download_filename(file));
-    if (!download_path.has_value())
-        return Error::from_errno(ECANCELED);
+    return ask_user_for_download_path(Web::sanitize_suggested_download_filename(file))->map<LexicalPath>([](auto& download_path) {
+        return LexicalPath { download_path };
+    });
+}
 
-    return LexicalPath { download_path.release_value() };
+NonnullRefPtr<Core::Promise<ByteString>> Application::ask_user_for_download_path(ByteString const&) const
+{
+    return Core::Promise<ByteString>::rejected(Error::from_errno(ECANCELED));
 }
 
 void Application::display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const
@@ -2536,6 +2557,11 @@ bool Application::supports_clipboard_type(ClipboardType type) const
 bool Application::supports_picture_in_picture() const
 {
     return browser_options().headless_mode.has_value();
+}
+
+NonnullOwnPtr<NotificationBackend> Application::create_notification_backend()
+{
+    return make<NoOpNotificationBackend>();
 }
 
 OwnPtr<PictureInPictureWindow> Application::create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable& traversable, Gfx::IntSize video_size)
@@ -2770,6 +2796,13 @@ void Application::initialize_actions()
             m_settings->set_appearance(appearance);
         };
     };
+
+    m_force_dark_action = Action::create_checkable("Force Dark Mode"sv, ActionID::ForceDark, [this] {
+        if (auto view = active_web_view(); view.has_value())
+            view->set_force_dark_enabled(!view->force_dark_enabled());
+        update_force_dark_action();
+    });
+    update_force_dark_action();
 
     m_color_scheme_menu = Menu::create_group("Color Scheme"sv);
     m_color_scheme_menu->add_action(Action::create_checkable("Auto"sv, ActionID::PreferredColorScheme, set_website_color_scheme(ThemePreference::System)));
@@ -3108,6 +3141,16 @@ void Application::location_policy_changed(Badge<ApplicationSettingsObserver>)
     update_permission_defaults();
 }
 
+bool Application::sites_can_ask_for_notifications() const
+{
+    return settings().notifications_policy() == NotificationsPolicy::Ask;
+}
+
+void Application::notifications_policy_changed(Badge<ApplicationSettingsObserver>)
+{
+    update_permission_defaults();
+}
+
 void Application::update_os_location_authorization()
 {
     auto denied = m_geolocation_provider && m_geolocation_provider->authorization() == Core::GeolocationAuthorization::Denied;
@@ -3127,8 +3170,9 @@ Core::GeolocationAuthorization Application::geolocation_authorization()
 void Application::update_permission_defaults()
 {
     // NB: A private session reads its defaults from the ordinary one.
-    auto state = sites_can_ask_for_location() ? Web::Permissions::EffectiveState::Prompt : Web::Permissions::EffectiveState::Denied;
-    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Geolocation, state);
+    auto state_for = [](bool sites_can_ask) { return sites_can_ask ? Web::Permissions::EffectiveState::Prompt : Web::Permissions::EffectiveState::Denied; };
+    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Geolocation, state_for(sites_can_ask_for_location()));
+    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Notifications, state_for(sites_can_ask_for_notifications()));
 }
 
 void Application::languages_changed(Badge<ApplicationSettingsObserver>)
@@ -3308,6 +3352,8 @@ void Application::update_actions_for_active_web_view()
     update_bookmark_action_for_current_web_view();
     update_editing_history_actions();
     update_report_website_issue_action();
+    update_force_dark_action();
+    update_view_source_action();
 }
 
 void Application::bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>)
@@ -3763,10 +3809,25 @@ void Application::inspect_indexed_database_objects(DevTools::TabDescription cons
     view->inspect_indexed_database_objects(host, move(names), move(options), move(on_complete));
 }
 
+void Application::update_force_dark_action()
+{
+    if (!m_force_dark_action)
+        return;
+    auto view = active_web_view();
+    m_force_dark_action->set_enabled(view.has_value() && view->can_set_force_dark());
+    m_force_dark_action->set_checked(view.has_value() ? view->force_dark_enabled() : settings().content_settings().enable_force_dark);
+}
+
 void Application::update_report_website_issue_action()
 {
     auto view = active_web_view();
     m_report_website_issue_action->set_enabled(view.has_value() && view->can_report_website_issue());
+}
+
+void Application::update_view_source_action()
+{
+    auto view = active_web_view();
+    m_view_source_action->set_enabled(!view.has_value() || view->can_view_source());
 }
 
 void Application::update_editing_history_actions()
@@ -4383,6 +4444,15 @@ void Application::stop_listening_for_console_messages(DevTools::TabDescription c
         return;
 
     view->on_console_message = nullptr;
+}
+
+void Application::start_sending_console_output(DevTools::TabDescription const& description, bool messages, bool errors) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return;
+
+    view->start_sending_console_output(messages, errors);
 }
 
 void Application::listen_for_network_events(DevTools::TabDescription const& description, OnNetworkRequestStarted on_request_started, OnNetworkResponseHeadersReceived on_response_headers, OnNetworkResponseBodyReceived on_response_body, OnNetworkRequestFinished on_request_finished) const

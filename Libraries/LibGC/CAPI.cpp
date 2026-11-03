@@ -66,8 +66,8 @@ static_assert(decode_primitive_storage_handle(GC_PRIMITIVE_STORAGE_NULL_HANDLE).
 
 class CAPICellAllocator final : public CellAllocatorDescriptorBase {
 public:
-    CAPICellAllocator(CellTypeInfo const& type_info, StringView class_name)
-        : CellAllocatorDescriptorBase(type_info, class_name)
+    CAPICellAllocator(CellTypeInfo const& type_info, StringView class_name, void const* foreign_type)
+        : CellAllocatorDescriptorBase(type_info, class_name, foreign_type)
     {
     }
 };
@@ -127,6 +127,8 @@ struct CAPI {
             .heap_allocated_bytes_since_last_gc_offset = offsetof(Heap, m_allocated_bytes_since_last_gc),
             .heap_gc_bytes_threshold_offset = offsetof(Heap, m_gc_bytes_threshold),
             .heap_total_allocated_bytes_offset = offsetof(Heap, m_total_allocated_bytes),
+            .block_size = HeapBlockBase::BLOCK_SIZE,
+            .block_foreign_type_offset = offsetof(HeapBlockBase, m_foreign_type),
             .heap_region_offset_mask = HEAP_REGION_OFFSET_MASK,
             .primitive_storage_cage_offset_mask = PrimitiveStorage::cage_offset_mask,
         };
@@ -316,14 +318,14 @@ void gc_heap_did_free_external_memory(GCHeap* heap, size_t size)
     as_heap(heap).did_free_external_memory(size);
 }
 
-GCAllocator* gc_allocator_create(GCCellTypeInfo const* type_info, char const* name, size_t name_length)
+GCAllocator* gc_allocator_create(GCCellTypeInfo const* type_info, char const* name, size_t name_length, void const* foreign_type)
 {
     VERIFY(type_info->visit_edges);
     VERIFY(type_info->cell_size >= HeapBlock::min_possible_cell_size);
     VERIFY(type_info->cell_size <= HeapBlock::BLOCK_SIZE - sizeof(HeapBlock));
     VERIFY(type_info->alignment <= max_cell_alignment);
     VERIFY(type_info->cell_size % type_info->alignment == 0);
-    auto* allocator = new CAPICellAllocator(*reinterpret_cast<CellTypeInfo const*>(type_info), StringView { name, name_length });
+    auto* allocator = new CAPICellAllocator(*reinterpret_cast<CellTypeInfo const*>(type_info), StringView { name, name_length }, foreign_type);
     return reinterpret_cast<GCAllocator*>(allocator);
 }
 
@@ -420,6 +422,11 @@ void gc_visitor_visit_cells(GCVisitor* visitor, GCCell* const* cells, size_t cou
 void gc_visitor_visit_values(GCVisitor* visitor, uint64_t const* values, size_t count)
 {
     as_visitor(visitor).visit(ReadonlySpan<NanBoxedValue> { reinterpret_cast<NanBoxedValue const*>(values), count });
+}
+
+void gc_visitor_visit_ephemeron(GCVisitor* visitor, GCCell* key, uint64_t const* value)
+{
+    as_visitor(visitor).visit_ephemeron(*from_gc_cell(key), *reinterpret_cast<NanBoxedValue const*>(value));
 }
 
 void gc_visitor_visit_possible_values(GCVisitor* visitor, uint8_t const* data, size_t size)

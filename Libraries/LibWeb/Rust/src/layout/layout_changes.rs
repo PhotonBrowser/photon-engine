@@ -29,6 +29,11 @@ pub(crate) enum LayoutChange {
     },
     /// The whole layout tree is built again.
     SetNeedsFullLayoutTreeUpdate,
+    /// Loads filled faces into the font cascades of these addresses in place, so the styles naming them stay as they
+    /// are: the boxes whose text renders in one of them lay out again.
+    RelayoutUsersOfFontLists {
+        font_lists: Box<[u64]>,
+    },
     /// The box takes `marks`.
     MarkBox {
         target: super::tree_update_marks::MarkedBox,
@@ -127,7 +132,7 @@ pub(crate) enum LayoutChange {
     SetNodeStyle {
         node: NodeSlotId,
         record: u64,
-        payloads: super::node_data::StylePayloadsRef,
+        payloads: Option<super::node_data::LayoutStyleRef>,
     },
     /// The style record of the box the node `style_node` is bound to, or of the box of its pseudo-element
     /// `generated_for`, stays readable once the node has left the document.
@@ -170,6 +175,7 @@ impl LayoutChange {
             Self::SetNodeStyle { .. } => RowWrite::NamedStyles,
             Self::SetNeedsLayoutUpdate { .. }
             | Self::SetNeedsFullLayoutTreeUpdate
+            | Self::RelayoutUsersOfFontLists { .. }
             | Self::MarkBox { .. }
             | Self::ApplyLayoutTreeUpdateMark { .. }
             | Self::RecordPartialRelayoutEscape
@@ -237,6 +243,7 @@ impl LayoutChange {
                 }
             }
             Self::SetNeedsFullLayoutTreeUpdate => arena.set_needs_full_layout_tree_update(true),
+            Self::RelayoutUsersOfFontLists { font_lists } => arena.relayout_users_of_font_lists(&font_lists),
             Self::MarkBox { target, marks } => marks.apply(arena, target),
             Self::ApplyLayoutTreeUpdateMark { node, mark } => arena.apply_layout_tree_update_mark(node, mark),
             Self::RecordPartialRelayoutEscape => arena.record_partial_relayout_escape(),
@@ -344,6 +351,10 @@ pub(crate) enum LayoutWrite<'a> {
     AdoptDerivedNodeStyle { node: NodeSlotId, record: u64 },
     /// The anonymous rows below the row inherit its style again.
     ReinheritAnonymousDescendants { node: NodeSlotId },
+    /// The anonymous boxes that give the text of a `display: contents` element its style take it again.
+    ReinheritDisplayContentsText { element: StyleNodeID },
+    /// Each `::first-letter` box whose element containing the letter took another style takes its style again.
+    RefreshFirstLetterStyles,
     /// The viewport and the boxes of the root element and its body take the styles viewport propagation gives them.
     PropagateRootStylesToViewport,
     /// Prepares every row of the subtree the row heads for leaving the layout tree.
@@ -395,6 +406,14 @@ impl LayoutWrite<'_> {
             }
             Self::ReinheritAnonymousDescendants { node } => {
                 arena.reinherit_anonymous_descendants(host_calls, node);
+                false
+            }
+            Self::ReinheritDisplayContentsText { element } => {
+                arena.reinherit_display_contents_text(host_calls, element);
+                false
+            }
+            Self::RefreshFirstLetterStyles => {
+                arena.refresh_first_letter_styles(host_calls);
                 false
             }
             Self::PropagateRootStylesToViewport => {
@@ -468,6 +487,18 @@ pub extern "C" fn render_state_detach_remaining_rows_for_removal(host: &Document
         return;
     }
     host.queue_change(ArenaChange::DetachForRemoval(style_nodes.into()));
+}
+
+/// Marks for layout every box whose text renders in one of the font cascades of `font_lists`, which loads filled faces
+/// into in place.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_relayout_users_of_font_lists(host: &DocumentHost, font_lists: ak::Span<'_, u64>) {
+    queue(
+        host,
+        LayoutChange::RelayoutUsersOfFontLists {
+            font_lists: font_lists.as_slice().into(),
+        },
+    );
 }
 
 #[unsafe(no_mangle)]

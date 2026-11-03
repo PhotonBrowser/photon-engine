@@ -423,6 +423,7 @@ pub unsafe extern "C" fn display_list_animated_content_may_affect_viewport(
 pub unsafe extern "C" fn display_list_replay(
     tree: *const c_void,
     storage: *const c_void,
+    root_group_color: libgfx_rust::Color,
     scroll_offsets: *const libgfx_rust::FloatPoint,
     scroll_offsets_len: usize,
     callbacks: *const crate::host::FfiDisplayListReplayCallbacks,
@@ -442,6 +443,7 @@ pub unsafe extern "C" fn display_list_replay(
         storage.bytes(),
         storage.command_runs(),
         storage.effect_clip_plan(tree),
+        root_group_color,
         scroll_offsets,
         &mut painter,
     );
@@ -471,7 +473,9 @@ pub unsafe extern "C" fn display_list_replay_records(
     };
     // SAFETY: The caller guarantees `callbacks` is live for the call.
     let mut painter = unsafe { *callbacks };
-    crate::display_list::replay::replay_records(records, scroll_offsets, &mut painter);
+    // NB: Nested records share the context of the command they are nested in, and none of their inline clips has a
+    //     space of its own.
+    crate::display_list::replay::replay_records(records, scroll_offsets, &|_| None, &mut painter);
 }
 
 /// # Safety

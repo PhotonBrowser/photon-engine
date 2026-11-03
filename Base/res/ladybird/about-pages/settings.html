@@ -297,7 +297,8 @@
                 flex-grow: 1;
             }
 
-            dialog .dialog-list-item {
+            dialog .dialog-list-item,
+            #force-dark-sites .dialog-list-item {
                 padding: 10px;
 
                 display: flex;
@@ -305,7 +306,8 @@
                 align-items: center;
             }
 
-            dialog .dialog-list-item:hover {
+            dialog .dialog-list-item:hover,
+            #force-dark-sites .dialog-list-item:hover {
                 background-color: var(--control);
             }
 
@@ -314,8 +316,22 @@
                 opacity: 0.6;
             }
 
-            dialog .dialog-list-item-label {
+            dialog .dialog-list-item-label,
+            #force-dark-sites .dialog-list-item-label {
                 flex-grow: 1;
+            }
+
+            #force-dark-sites .dialog-list-item {
+                gap: 16px;
+            }
+
+            #force-dark-sites .dialog-list-item-label {
+                min-width: 0;
+                overflow-wrap: anywhere;
+            }
+
+            #force-dark-sites button {
+                flex-shrink: 0;
             }
 
             dialog .dialog-controls {
@@ -792,12 +808,12 @@
                             <label for="enable-force-dark">
                                 Force dark mode
                                 <p class="description">
-                                    Darken web pages that don’t provide a dark theme of their own. Photos are left as
-                                    they are; icons and line art are darkened along with the page.
+                                    Darken web pages that don’t provide a dark theme of their own.
                                 </p>
                             </label>
                             <input id="enable-force-dark" type="checkbox" switch />
                         </div>
+                        <div id="force-dark-sites" class="card-group" aria-label="Sites with a force-dark choice"></div>
                     </div>
                 </div>
 
@@ -983,6 +999,18 @@
                 <div class="card">
                     <div class="card-body">
                         <div class="card-group inline-container">
+                            <label for="enable-notifications">
+                                Sites can ask to send you notifications
+                                <p class="description">When this is off, sites can't send you notifications.</p>
+                            </label>
+                            <input id="enable-notifications" type="checkbox" switch />
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-body">
+                        <div class="card-group inline-container">
                             <span>
                                 Location
                                 <p class="description">The sites you allowed or blocked from knowing your location.</p>
@@ -995,6 +1023,15 @@
                                 <p class="description">The sites you allowed or blocked from using your microphone.</p>
                             </span>
                             <button id="microphone-permissions-settings" class="secondary-button">Settings…</button>
+                        </div>
+                        <div class="card-group inline-container">
+                            <span>
+                                Notifications
+                                <p class="description">
+                                    The sites you allowed or blocked from sending you notifications.
+                                </p>
+                            </span>
+                            <button id="notifications-permissions-settings" class="secondary-button">Settings…</button>
                         </div>
                     </div>
                 </div>
@@ -1327,6 +1364,16 @@
             </div>
         </dialog>
 
+        <dialog id="site-permissions-notifications" class="site-permissions" closedby="any">
+            <div class="dialog-header">
+                <h3 class="dialog-title">Notifications</h3>
+                <button class="close-button dialog-button">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="site-permissions-list dialog-list"></div>
+            </div>
+        </dialog>
+
         <dialog id="site-settings" closedby="any">
             <div class="dialog-header">
                 <h3 id="site-settings-title" class="dialog-title"></h3>
@@ -1420,6 +1467,7 @@
         <script src="resource://ladybird/about-pages/settings/geolocation.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/languages.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/network.js" type="module"></script>
+        <script src="resource://ladybird/about-pages/settings/notifications.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/permissions.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/site-permissions.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/privacy.js" type="module"></script>

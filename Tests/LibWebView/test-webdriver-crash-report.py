@@ -19,6 +19,21 @@ from pathlib import Path
 webdriver_helpers = importlib.import_module("test-webdriver-delete-session")
 
 
+def wait_for_compositor(port, session):
+    # The Compositor takes a screenshot, so once one succeeds, the Compositor is done starting up and waiting in its
+    # event loop. A signal sent while it's still starting can land in a system library built without frame pointers,
+    # which leaves the report with a single frame. Until then, taking a screenshot fails with "unable to capture screen".
+    deadline = time.monotonic() + webdriver_helpers.EVENT_TIMEOUT_SECONDS
+    while True:
+        status, _, body = webdriver_helpers.request(port, "GET", f"/session/{session}/screenshot")
+        if status == 200:
+            return
+        assert "unable to capture screen" in body, body
+        if time.monotonic() >= deadline:
+            raise AssertionError("The Compositor never took a screenshot")
+        time.sleep(0.05)
+
+
 def crash_helper(webdriver_pid, process_name):
     rows = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True).splitlines()
     children = {}
@@ -50,12 +65,8 @@ def run_test(webdriver_binary, process_name):
             ("XDG_CACHE_HOME", "cache"),
         ):
             environment[variable] = str(Path(temporary) / directory)
-        port = webdriver_helpers.unused_port()
-        webdriver = subprocess.Popen(
-            [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(port)], env=environment
-        )
+        webdriver, port = webdriver_helpers.launch_webdriver(webdriver_binary, "--headless", env=environment)
         try:
-            webdriver_helpers.wait_for_port(port)
             status, payload, body = webdriver_helpers.request(
                 port,
                 "POST",
@@ -95,6 +106,8 @@ def run_test(webdriver_binary, process_name):
                         },
                     )
                     assert status == 200 and payload == {"value": None}, body
+                elif process_name == "Compositor":
+                    wait_for_compositor(port, session)
                 crash_helper(webdriver.pid, process_name)
             directory = Path(temporary) / "data/Ladybird/CrashReports"
             deadline = time.monotonic() + webdriver_helpers.EVENT_TIMEOUT_SECONDS

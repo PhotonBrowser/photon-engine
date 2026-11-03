@@ -19,7 +19,6 @@
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
-#include <LibGfx/Point.h>
 #include <LibWebView/Forward.h>
 
 namespace WebView {
@@ -109,6 +108,7 @@ enum class ActionID {
     ResetZoomViaToolbar,
 
     PreferredColorScheme,
+    ForceDark,
     PreferredContrast,
     PreferredMotion,
 
@@ -278,8 +278,6 @@ public:
 
     void add_observer(NonnullOwnPtr<Observer>);
     void remove_observer(Observer const& observer);
-
-    Function<void(Gfx::IntPoint)> on_activation;
 
 private:
     explicit Menu(ActionText title)

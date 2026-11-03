@@ -176,8 +176,13 @@ void IntersectionObserver::visit_edges(GC::Cell::Visitor& visitor)
     visitor.visit(m_root);
     visitor.visit(m_callback);
     visitor.visit(m_queued_entries);
-    for (auto& observed_target : m_observation_targets)
-        visitor.visit(observed_target.target);
+}
+
+void IntersectionObserver::remove_dead_observation_targets()
+{
+    m_observation_targets.remove_all_matching([](auto const& observed_target) {
+        return !observed_target.target;
+    });
 }
 
 // https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-observe
@@ -187,7 +192,7 @@ void IntersectionObserver::observe(DOM::Element& target)
     // https://www.w3.org/TR/intersection-observer/#observe-a-target-element
     // 1. If target is in observer’s internal [[ObservationTargets]] slot, return.
     auto observed_target = m_observation_targets.find_if([&target](auto const& entry) {
-        return entry.target.ptr() == &target;
+        return entry.target == &target;
     });
     if (!observed_target.is_end())
         return;
@@ -228,7 +233,7 @@ void IntersectionObserver::unobserve(DOM::Element& target)
 
     // 2. Remove target from this’s internal [[ObservationTargets]] slot, if present
     m_observation_targets.remove_first_matching([&target](ObservationTarget const& entry) {
-        return entry.target.ptr() == &target;
+        return entry.target == &target;
     });
 }
 
@@ -240,7 +245,8 @@ void IntersectionObserver::disconnect()
     //    [[RegisteredIntersectionObservers]] slot.
     // 2. Remove target from this’s internal [[ObservationTargets]] slot.
     for (auto& observed_target : m_observation_targets) {
-        observed_target.target->unregister_intersection_observer({}, *this);
+        if (auto target = observed_target.target.ptr())
+            target->unregister_intersection_observer({}, *this);
     }
     m_observation_targets.clear();
 }
@@ -448,8 +454,8 @@ Optional<Vector<CSS::LengthPercentage>> IntersectionObserver::parse_a_margin(Str
     auto source = Utf16String::from_utf8(margin_string);
     auto source_view = source.utf16_view();
     CSS::Parser::ValueParserFFI::FfiUtf16View ffi_source {
-        .ascii = source_view.has_ascii_storage() ? reinterpret_cast<u8 const*>(source_view.ascii_span().data()) : nullptr,
-        .utf16 = source_view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(source_view.utf16_span().data()),
+        .latin1 = source_view.has_latin1_storage() ? source_view.latin1_span().data() : nullptr,
+        .utf16 = source_view.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(source_view.utf16_span().data()),
         .length = source_view.length_in_code_units(),
     };
     auto visit = [](void* context, u8 type, double value, u16 const* unit, size_t unit_length) {

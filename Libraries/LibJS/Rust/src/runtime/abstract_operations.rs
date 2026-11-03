@@ -824,6 +824,24 @@ pub fn new_object_environment(
     )
 }
 
+/// The environment of a call of `function`, which needs one: a function environment if the function's code reads
+/// anything of one through its environment, and otherwise the same without the fields it would never read.
+pub fn new_call_environment(
+    vm: &Vm,
+    function: Gc<EcmascriptFunctionObject>,
+    new_target: Option<Gc<Object>>,
+) -> Gc<DeclarativeEnvironment> {
+    let shared_data = function.shared_data();
+    if shared_data.function_environment_has_this_binding() {
+        return new_function_environment(vm, function, new_target).upcast();
+    }
+    DeclarativeEnvironment::create_with_binding_capacity(
+        vm,
+        function.environment(),
+        shared_data.function_environment_bindings_count(),
+    )
+}
+
 // 9.1.2.4 NewFunctionEnvironment ( F, newTarget ), https://tc39.es/ecma262/#sec-newfunctionenvironment
 // 4.1.2.2 NewFunctionEnvironment ( F, newTarget ), https://tc39.es/proposal-explicit-resource-management/#sec-newfunctionenvironment
 pub fn new_function_environment(
@@ -1687,7 +1705,7 @@ pub fn create_unmapped_arguments_object(vm: &Vm, arguments: &[Cell<Value>]) -> G
 
     // 2. Let obj be OrdinaryObjectCreate(%Object.prototype%, « [[ParameterMap]] »).
     // 3. Set obj.[[ParameterMap]] to undefined.
-    let object = Object::create_with_premade_shape(vm, realm.unmapped_arguments_object_shape());
+    let object = Object::create_with_premade_shape_for_indexed_elements(vm, realm.unmapped_arguments_object_shape());
 
     // 4. Perform ! DefinePropertyOrThrow(obj, "length", PropertyDescriptor { [[Value]]: 𝔽(len), [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }).
     object.initialize_direct(
@@ -2500,9 +2518,13 @@ pub fn canonical_numeric_index_string(property_key: &PropertyKey, mode: Canonica
         return CanonicalIndex::new(CanonicalIndexType::Undefined, 0);
     };
 
-    // FIXME: We return 0 instead of n but it might not observable?
     // 3. If SameValue(! ToString(n), argument) is true, return n.
     if Utf16View::Utf16(&number_to_utf16_string(number)) == argument {
+        // NB: Array index keys are numbers, so the only integer a u32 holds that reaches here is 2^32 - 1, the last
+        //     index of a typed array of 2^32 elements. Other numbers are never valid integer indices.
+        if number == f64::from(u32::MAX) {
+            return CanonicalIndex::new(CanonicalIndexType::Index, u32::MAX);
+        }
         return CanonicalIndex::new(CanonicalIndexType::Numeric, 0);
     }
 

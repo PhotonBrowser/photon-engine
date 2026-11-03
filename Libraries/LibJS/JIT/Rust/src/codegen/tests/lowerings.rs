@@ -139,9 +139,9 @@ extern "C" fn marker_record(vm: *mut u64, pc: u32, instruction: *const u8, outpu
 
 static NO_PROPERTY_CACHES: [u64; 16] = [0; 16];
 
-/// Word 0 of fake plain objects, like the virtual table pointer of real
-/// ones.
-const PLAIN_OBJECT_VTABLE: u64 = 0x7000;
+/// The class of fake plain objects, in their word 0 (see
+/// `cell_block_mask`).
+const PLAIN_OBJECT_CLASS: u64 = 0x7000;
 
 /// Word 0 of fake String objects and of the fake `%String.prototype%`, like
 /// the classes of real ones.
@@ -290,9 +290,10 @@ fn marker_runtime() -> RuntimeInfo {
     runtime.offsets.object_shape = 48;
     runtime.offsets.object_named_properties = 56;
     runtime.object_allocation.inline_storage_offset = 64;
+    runtime.object_allocation.plain_inline_storage_offset = 64;
     runtime.object_allocation.inline_capacity_offset = 40;
     runtime.offsets.shape_dictionary_generation = 84;
-    runtime.object_allocation.template = vec![PLAIN_OBJECT_VTABLE];
+    runtime.object_allocation.template = vec![PLAIN_OBJECT_CLASS];
     runtime.dynamic_calls.object_flag_is_ecmascript_function = FLAG_IS_ECMASCRIPT_FUNCTION;
     for opcode in [O::Increment, O::Decrement, O::PostfixIncrement, O::PostfixDecrement] {
         set(opcode, marker_record as *const () as u64);
@@ -1190,11 +1191,13 @@ fn fake_object_layout() -> RuntimeLayout {
         indexed_storage_kind_holey: HOLEY,
         object_flag_is_extensible: FLAG_IS_EXTENSIBLE,
         object_flag_has_magical_length: FLAG_HAS_MAGICAL_LENGTH,
+        object_class: PLAIN_OBJECT_CLASS,
         string_object_class: STRING_OBJECT_CLASS,
         string_prototype_class: STRING_PROTOTYPE_CLASS,
         object_flag_may_interfere: FLAG_MAY_INTERFERE,
-        array_length_writable: 0,
-        array_is_proxy_target: 0,
+        array_flags: 0,
+        array_flag_length_not_writable: 1,
+        array_flag_is_proxy_target: 2,
         shape_prototype: 0,
         object_flag_is_typed_array: FLAG_IS_TYPED_ARRAY,
         object_flag_is_htmldda: HTMLDDA_FLAG,
@@ -1206,7 +1209,7 @@ fn fake_object_layout() -> RuntimeLayout {
         typed_array_cached_data_offset: 32,
         typed_array_cached_data_offset_invalid: u64::MAX,
         typed_array_array_length: 40,
-        typed_array_kind: 44,
+        typed_array_kind: 48,
         typed_array_kind_uint8: 0,
         typed_array_kind_uint8_clamped: 1,
         typed_array_kind_uint16: 2,
@@ -1230,8 +1233,7 @@ fn fake_object_layout() -> RuntimeLayout {
         utf16_string_data_has_utf16_storage: 1,
         utf16_string_data_storage: 24,
         single_ascii_character_strings: 0,
-        function_object_builtin: 24,
-        function_object_has_builtin: 25,
+        function_object_builtin: 15,
         builtin_string_prototype_char_code_at: 7,
         builtin_string_prototype_char_at: 8,
         builtin_math_abs: 9,
@@ -1267,7 +1269,7 @@ fn fake_object_layout() -> RuntimeLayout {
         generator_object_pending_completion_value: 0,
         generator_object_pending_completion_type: 0,
         declarative_environment_binding_values_size: 32,
-        declarative_environment_binding_values_capacity: 40,
+        declarative_environment_inline_binding_capacity: 40,
         environment_shape_binding_names: 48,
         environment_shape_has_unique_binding_names: 32,
         declarative_environment_shape: 24,
@@ -1314,6 +1316,12 @@ fn fake_object_layout() -> RuntimeLayout {
         property_lookup_cache_entry_type_add_own_property: 1,
         property_lookup_cache_entry_type_get_own_property: 3,
         property_lookup_cache_entry_type_change_own_property: 2,
+        // NB: Fake cells keep their class in their first word: the mask
+        //     keeps every bit, so the block of a fake cell is the cell.
+        cell_block_mask: u64::MAX,
+        block_class_offset: 0,
+        block_class_tail_tag: 1,
+        class_cell_size: 0,
         class_object_methods: 8,
         object_methods_get_prototype_of: 0,
         object_methods_is_cacheable_for_property_absence: 0,
@@ -1373,12 +1381,24 @@ impl FakeArray {
     }
 }
 
+/// A fake cell with `words`, in the low fake heap so that other cells can
+/// point to it compressed (see `fake_heap::low_cell()`).
+fn low_cell(words: &[u64]) -> &'static mut [u64] {
+    super::fake_heap::low_cell(words)
+}
+
+/// The compressed pointer to the low fake cell `cell`.
+fn compressed(cell: &[u64]) -> u64 {
+    super::fake_heap::low_compressed(cell.as_ptr() as u64)
+}
+
 /// A typed array of `kind` over `data`.
 fn fake_typed_array(kind: u8, data: &[u8], length: u32) -> Vec<u64> {
     let mut object = vec![0; 8];
     object[1] = u64::from(FLAG_IS_TYPED_ARRAY);
     object[4] = data.as_ptr() as u64 - PRIMITIVE_STORAGE_CAGE_BASE;
-    object[5] = u64::from(length) | u64::from(kind) << 32;
+    object[5] = u64::from(length);
+    object[6] = u64::from(kind);
     object
 }
 
@@ -1717,7 +1737,7 @@ fn get_length() {
 // word 7. Key snapshots of for-in loops have the fast path kind (byte 8),
 // whether the shape is a dictionary (byte 9) and its dictionary generation
 // (bytes 12-15) in word 1, the shape at word 2, the indexed property count
-// at word 3, the prototype chain validity at word 4, and the keys and their
+// at word 3, the prototype chain validity at word 4 (both compressed), and the keys and their
 // count at words 5 and 6. Shapes have their dictionary generation at byte 84.
 
 /// A for-in key snapshot of `keys` for objects with `shape`.
@@ -1733,7 +1753,7 @@ impl FakeKeySnapshot {
             keys: keys.to_vec(),
         });
         snapshot.words[1] = u64::from(fast_path);
-        snapshot.words[2] = shape.as_ptr() as u64;
+        snapshot.words[2] = compressed(shape);
         snapshot.words[5] = snapshot.keys.as_ptr() as u64;
         snapshot.words[6] = keys.len() as u64;
         snapshot
@@ -1773,9 +1793,9 @@ fn property_iterator_next(receiver: u64, keys: u64, cursor: u64) -> (u64, u64, u
 
 #[test]
 fn property_iterator_next_reads_key_snapshots() {
-    let shape = vec![0u64; 12];
+    let shape = low_cell(&[0; 12]);
     let mut object = FakeArray::new(0, PACKED, 2, &[], 2);
-    object.object[6] = shape.as_ptr() as u64;
+    object.object[6] = compressed(shape);
     let keys = [value::int32(100), value::int32(101)];
     let named = FakeKeySnapshot::new(1, &shape, &keys);
     let empty = value::EMPTY;
@@ -1794,8 +1814,8 @@ fn property_iterator_next_reads_key_snapshots() {
         (empty, value::TRUE, value::int32(2), 0)
     );
     // Other shapes, cursors and receivers are slow.
-    let other_shape = vec![0u64; 12];
-    let other = FakeKeySnapshot::new(1, &other_shape, &keys);
+    let other_shape = low_cell(&[0; 12]);
+    let other = FakeKeySnapshot::new(1, other_shape, &keys);
     assert_eq!(
         property_iterator_next(object.value(), other.value(), value::int32(0)).3,
         1
@@ -1816,9 +1836,9 @@ fn property_iterator_next_reads_key_snapshots() {
     );
 
     // An invalidated prototype chain is slow.
-    let mut validity = [1u64];
+    let validity = low_cell(&[1]);
     let mut checked = FakeKeySnapshot::new(1, &shape, &keys);
-    checked.words[4] = validity.as_ptr() as u64;
+    checked.words[4] = compressed(validity);
     assert_eq!(
         property_iterator_next(object.value(), checked.value(), value::int32(0)).3,
         0
@@ -1845,7 +1865,9 @@ fn property_iterator_next_reads_key_snapshots() {
 }
 
 // Environments, laid out like this, in words: 2 the outer environment, 3
-// the shape, 6 the binding values, 7 the rare data, 8 the serial number.
+// the shape (both compressed, in the low half), 6 the binding values, 7 the
+// rare data, 8 the serial number. Environments and their shapes are cells in
+// the fake heap region.
 // Rare data has its binding flags at word 5. Environment shapes have their
 // flag count at word 5 and their flags at word 7. Realms have the global
 // object at word 3 and the global declarative environment at word 4. The
@@ -1854,11 +1876,11 @@ fn property_iterator_next_reads_key_snapshots() {
 const BINDING_MUTABLE: u8 = 2;
 
 struct FakeEnvironment {
-    words: Vec<u64>,
+    words: &'static mut [u64],
     values: Vec<u64>,
-    rare_data: Vec<u64>,
+    rare_data: &'static mut [u64],
     rare_flags: Vec<u8>,
-    shape: Vec<u64>,
+    shape: &'static mut [u64],
     shape_flags: Vec<u8>,
 }
 
@@ -1867,23 +1889,23 @@ impl FakeEnvironment {
     /// a shape (if any) and whose other flags are in its rare data.
     fn new(values: &[u64], flags: &[u8], shape_flags: Option<usize>, outer: Option<&FakeEnvironment>) -> Box<Self> {
         let in_shape = shape_flags.unwrap_or(0);
-        let mut environment = Box::new(Self {
-            words: vec![0; 10],
+        let environment = Box::new(Self {
+            words: super::fake_heap::cell(&[0; 10]),
             values: values.to_vec(),
-            rare_data: vec![0; 8],
+            rare_data: super::fake_heap::cell(&[0; 8]),
             rare_flags: flags[in_shape..].to_vec(),
-            shape: vec![0; 8],
+            shape: super::fake_heap::cell(&[0; 8]),
             shape_flags: flags[..in_shape].to_vec(),
         });
         environment.rare_data[5] = environment.rare_flags.as_ptr() as u64;
         environment.shape[5] = in_shape as u64;
         environment.shape[7] = environment.shape_flags.as_ptr() as u64;
-        environment.words[2] = outer.map_or(0, |outer| outer.words.as_ptr() as u64);
+        environment.words[2] = outer.map_or(0, |outer| super::fake_heap::compressed(outer.address()));
         if shape_flags.is_some() {
-            environment.words[3] = environment.shape.as_ptr() as u64;
+            environment.words[3] = super::fake_heap::compressed(environment.shape.as_ptr() as u64);
         }
         environment.words[6] = environment.values.as_ptr() as u64;
-        environment.words[7] = environment.rare_data.as_ptr() as u64;
+        environment.words[7] = super::fake_heap::compressed(environment.rare_data.as_ptr() as u64);
         environment
     }
 
@@ -1910,7 +1932,10 @@ fn run_with_environments(
     let (result, machine) = run_program_with_snapshot(
         &program,
         arguments,
-        |snapshot| snapshot.executables[0].exit_sites = exit_sites,
+        |snapshot| {
+            snapshot.executables[0].exit_sites = exit_sites;
+            super::fake_heap::use_in(&mut snapshot.runtime);
+        },
         |machine| {
             machine.frame[1] = lexical.address();
             machine.frame[12] = variable.address();
@@ -2091,7 +2116,10 @@ fn create_variable() {
         let (result, machine) = run_program_with_snapshot(
             &program,
             &[],
-            |snapshot| snapshot.executables[0].identifiers = NAMES.to_vec(),
+            |snapshot| {
+                snapshot.executables[0].identifiers = NAMES.to_vec();
+                super::fake_heap::use_in(&mut snapshot.runtime);
+            },
             |machine| {
                 machine.frame[1] = environment.address();
                 machine.frame[12] = environment.address();
@@ -2103,7 +2131,7 @@ fn create_variable() {
     // A declarative environment with room for `capacity` values, `size` of
     // them bindings already.
     let environment = |size: u64, capacity: usize| {
-        let mut environment = FakeEnvironment::new(&vec![value::int32(7); capacity], &flags, Some(2), None);
+        let environment = FakeEnvironment::new(&vec![value::int32(7); capacity], &flags, Some(2), None);
         environment.words[1] = 1 << 40;
         environment.words[4] = size;
         environment.words[5] = capacity as u64;
@@ -2132,14 +2160,14 @@ fn create_variable() {
     assert_eq!(slow(environment(0, 2), 1, true, true), 0);
     assert_eq!(slow(environment(0, 2), 0, true, false), 0);
     assert_eq!(slow(environment(0, 2), 0, false, true), 0);
-    let mut duplicates = environment(0, 2);
+    let duplicates = environment(0, 2);
     duplicates.shape[4] = 0;
     assert_eq!(slow(duplicates, 0, false, false), 0);
     assert_eq!(slow(environment(1, 1), 1, true, true), 1);
-    let mut module = environment(0, 2);
+    let module = environment(0, 2);
     module.words[0] = MODULE_ENVIRONMENT_CLASS;
     assert_eq!(slow(module, 0, false, false), 0);
-    let mut object_environment = environment(0, 2);
+    let object_environment = environment(0, 2);
     object_environment.words[1] = 0;
     assert_eq!(slow(object_environment, 0, false, false), 0);
 }
@@ -2150,7 +2178,7 @@ struct FakeGlobals {
     realm: Vec<u64>,
     object: Vec<u64>,
     named_properties: Vec<u64>,
-    shape: Vec<u64>,
+    shape: &'static mut [u64],
     environment: Box<FakeEnvironment>,
     executable: Vec<u64>,
     caches: Vec<u64>,
@@ -2162,7 +2190,7 @@ impl FakeGlobals {
             realm: vec![0; 8],
             object: vec![0; 8],
             named_properties: vec![value::int32(10), u64::from(0xFFFC_u16) << 48 | 0x1000, value::int32(12)],
-            shape: vec![0; 12],
+            shape: low_cell(&[0; 12]),
             environment: FakeEnvironment::new(
                 &[value::int32(20), value::EMPTY, value::int32(22)],
                 &[BINDING_MUTABLE, BINDING_MUTABLE, 0],
@@ -2172,10 +2200,14 @@ impl FakeGlobals {
             executable: vec![0; 4],
             caches: vec![0; 16],
         });
-        globals.object[6] = globals.shape.as_ptr() as u64;
+        globals.object[6] = compressed(globals.shape);
         globals.object[7] = globals.named_properties.as_ptr() as u64;
         globals.shape[10] = 7 << 32;
         globals.environment.words[8] = 99;
+        // NB: The code of these tests has a heap region base of 0, so compressed pointers name low fake cells.
+        let rare_data = low_cell(&[0; 8]);
+        rare_data[5] = globals.environment.rare_flags.as_ptr() as u64;
+        globals.environment.words[7] = compressed(rare_data);
         globals.realm[3] = globals.object.as_ptr() as u64;
         globals.realm[4] = globals.environment.address();
         globals.executable[1] = globals.caches.as_ptr() as u64;
@@ -2436,21 +2468,21 @@ fn instance_of_global_functions_walks_prototype_chains() {
     let (ordinary_methods, exotic_methods) = (vec![0u64], vec![0x1234u64]);
     let ordinary_class = vec![0, ordinary_methods.as_ptr() as u64];
     let exotic_class = vec![0, exotic_methods.as_ptr() as u64];
-    // Objects of the class whose shape has the prototype (at
+    // Objects of the class whose shape has the compressed prototype (at
     // `shape_prototype`, 0), with named properties.
     struct Fake {
-        object: Vec<u64>,
-        shape: Vec<u64>,
+        object: &'static mut [u64],
+        shape: &'static mut [u64],
         properties: Vec<u64>,
     }
     let fake = |class: &[u64], prototype: Option<&Fake>, properties: Vec<u64>| {
-        let mut fake = Box::new(Fake {
-            object: vec![0; 8],
-            shape: vec![prototype.map_or(0, |prototype| prototype.object.as_ptr() as u64)],
+        let fake = Box::new(Fake {
+            object: low_cell(&[0; 8]),
+            shape: low_cell(&[prototype.map_or(0, |prototype| compressed(prototype.object))]),
             properties,
         });
         fake.object[0] = class.as_ptr() as u64;
-        fake.object[6] = fake.shape.as_ptr() as u64;
+        fake.object[6] = compressed(fake.shape);
         fake.object[7] = fake.properties.as_ptr() as u64;
         fake
     };
@@ -2465,7 +2497,7 @@ fn instance_of_global_functions_walks_prototype_chains() {
         None,
         vec![value::int32(1), object_value(&prototype.object)],
     );
-    let (function_value, function_shape) = (object_value(&function.object), function.object[6]);
+    let (function_value, function_shape) = (object_value(&function.object), function.shape.as_ptr() as u64);
 
     let program = assemble(|_| {
         vec![
@@ -2822,7 +2854,7 @@ struct PrimitivePrototypes {
 struct FakeCachedObject {
     object: Vec<u64>,
     properties: Vec<u64>,
-    shape: Vec<u64>,
+    shape: &'static mut [u64],
     entry: Vec<u64>,
     caches: Vec<u64>,
     executable: Vec<u64>,
@@ -2843,7 +2875,7 @@ impl FakeCachedObject {
                 .into_iter()
                 .chain(properties.iter().copied())
                 .collect(),
-            shape: vec![0; 12],
+            shape: low_cell(&[0; 12]),
             entry: vec![0; 6],
             caches: vec![0; 2],
             executable: vec![0; 4],
@@ -2852,7 +2884,7 @@ impl FakeCachedObject {
             keyed_store_cache: std::cell::Cell::new(0),
         });
         fake.object[5] = 2;
-        fake.object[6] = fake.shape.as_ptr() as u64;
+        fake.object[6] = compressed(fake.shape);
         fake.object[7] = fake.properties[1..].as_ptr() as u64;
         fake.shape[10] = 5 << 32;
         fake.caches[1] = fake.entry.as_ptr() as u64 | 1;
@@ -3027,24 +3059,39 @@ extern "C" fn fake_native_getter(_vm: u64) -> FakeNativeResult {
 
 #[test]
 fn get_by_id_reads_direct_getter_wrappers_inline() {
+    get_by_id_reads_direct_getter_wrappers_inline_from(false);
+}
+
+#[test]
+fn get_by_id_reads_direct_getter_wrappers_of_compressed_fields_inline() {
+    get_by_id_reads_direct_getter_wrappers_inline_from(true);
+}
+
+fn get_by_id_reads_direct_getter_wrappers_inline_from(compressed_field: bool) {
     use crate::builder::tests::property_access::{cache, own};
     use crate::snapshot::{
         AccessorFunctionSnapshot, CellId, DirectGetterFields, NativeCallTarget, PropertyCacheEntryType,
     };
     // A wrapper whose implementation is in its word 10, with an accessor
-    // property 1 whose getter reads the implementation's word 2, and the
-    // main world wrapper of that through the implementation's word 1 and
-    // the weak reference's word 1.
-    let function = vec![0u64; 4];
+    // property 1 whose getter reads the implementation's word 2 (or, as a
+    // compressed pointer, the high half of it), and the main world wrapper
+    // of that through the implementation's word 1 and the weak reference's
+    // word 1.
+    let function = low_cell(&[0; 4]);
     let mut accessor = vec![0u64; 3];
-    accessor[1] = function.as_ptr() as u64;
+    accessor[1] = compressed(function);
     let accessor_value = u64::from(0xFFFC_u16) << 48 | accessor.as_ptr() as u64;
     let mut fake = FakeCachedObject::new(&[value::int32(10), accessor_value]);
     let mut result = vec![0u64; 2];
     let mut result_weak = vec![0, result.as_ptr() as u64];
-    let result_implementation = [0, result_weak.as_ptr() as u64, 0];
+    let result_implementation = low_cell(&[0, result_weak.as_ptr() as u64, 0]);
+    let result_implementation_field = if compressed_field {
+        compressed(result_implementation) << 32
+    } else {
+        result_implementation.as_ptr() as u64
+    };
     let mut weak = vec![0, fake.object.as_ptr() as u64];
-    let mut implementation = vec![0, weak.as_ptr() as u64, result_implementation.as_ptr() as u64];
+    let mut implementation = vec![0, weak.as_ptr() as u64, result_implementation_field];
     fake.object[1] = u64::from(FLAG_IS_PLATFORM_OBJECT);
     fake.object[10] = implementation.as_ptr() as u64;
     let target = NativeCallTarget {
@@ -3053,7 +3100,8 @@ fn get_by_id_reads_direct_getter_wrappers_inline() {
         entry: fake_native_getter as *const () as u64,
         direct_getter: Some(DirectGetterFields {
             wrapper_implementation: 80,
-            implementation_value: 16,
+            implementation_value: if compressed_field { 20 } else { 16 },
+            implementation_value_is_compressed: compressed_field,
             main_world_wrapper: 8,
             weak_impl_value: 8,
         }),
@@ -3094,7 +3142,7 @@ fn get_by_id_reads_direct_getter_wrappers_inline() {
     assert_eq!(get(&fake), object_value(&result));
     implementation[2] = 0;
     assert_eq!(get(&fake), value::NULL);
-    implementation[2] = result_implementation.as_ptr() as u64;
+    implementation[2] = result_implementation_field;
 
     // The getter runs for a global object (which it returns as its window
     // proxy), an implementation without a main world wrapper, a receiver
@@ -3137,9 +3185,9 @@ fn put_by_id_calls_native_setters_of_prototypes() {
     use crate::builder::tests::property_access::{cache, own};
     use crate::snapshot::{AccessorFunctionSnapshot, CellId, NativeCallTarget, PropertyCacheEntryType};
     // A prototype whose property 0 is an accessor with a native setter.
-    let function = vec![0u64; 4];
+    let function = low_cell(&[0; 4]);
     let mut accessor = vec![0u64; 3];
-    accessor[2] = function.as_ptr() as u64;
+    accessor[2] = compressed(function);
     let accessor_value = u64::from(0xFFFC_u16) << 48 | accessor.as_ptr() as u64;
     let prototype = FakeCachedObject::new(&[accessor_value]);
     let validity = vec![1u64];
@@ -3198,17 +3246,17 @@ fn put_by_id_calls_native_setters_of_prototypes() {
 #[test]
 fn put_by_id_adds_properties_through_property_caches() {
     let mut fake = FakeCachedObject::new(&[value::int32(10), value::int32(11), value::EMPTY]);
-    let old_shape = fake.shape.as_ptr() as u64;
+    let old_shape = compressed(fake.shape);
     // A shape with three properties, and dictionary generation 5.
-    let mut new_shape = vec![0u64; 12];
+    let new_shape = low_cell(&[0; 12]);
     new_shape[10] = 3 | 5 << 32;
-    let new_shape_address = new_shape.as_ptr() as u64;
-    fake.set_add_entry(&new_shape, 2);
+    let new_shape_word = compressed(new_shape);
+    fake.set_add_entry(new_shape, 2);
     let add = |fake: &mut FakeCachedObject, flags: u16| {
         fake.object[1] = u64::from(flags);
         fake.object[6] = old_shape;
         let slow_paths = fake.put(fake.value(), value::TRUE);
-        assert_eq!(fake.object[6] == new_shape_address, slow_paths == 0);
+        assert_eq!(fake.object[6] == new_shape_word, slow_paths == 0);
         slow_paths
     };
     assert_eq!(add(&mut fake, FLAG_IS_EXTENSIBLE), 0);
@@ -3447,12 +3495,11 @@ fn saw_builtin(snapshot: &mut Snapshot, builtin: u8) {
     }];
 }
 
-/// Fake function memory: its flags at byte 8, and the builtin it is (if
-/// any) at bytes 24 and 25, see `function_object_builtin` in the test
-/// layout.
+/// Fake function memory: its flags at byte 8, and the builtin it is plus one
+/// (if any) at byte 15, see `function_object_builtin` in the test layout.
 fn fake_function(builtin: Option<u8>) -> u64 {
-    let builtin = builtin.map_or(0, |builtin| u64::from(builtin) | 1 << 8);
-    let memory: &'static mut [u64; 4] = Box::leak(Box::new([0, u64::from(FUNCTION_FLAG), 0, builtin]));
+    let builtin = builtin.map_or(0, |builtin| u64::from(builtin) + 1);
+    let memory: &'static mut [u64; 2] = Box::leak(Box::new([0, u64::from(FUNCTION_FLAG) | builtin << 56]));
     u64::from(value::OBJECT_TAG) << 48 | memory.as_ptr() as u64
 }
 
@@ -3880,7 +3927,7 @@ fn short_string_concatenations_through_the_fly_string_cache() {
                     cell_size: 64,
                     template: vec![0; 8],
                     lhs_offset: 32,
-                    rhs_offset: 40,
+                    rhs_offset: 36,
                     length_offset: 16,
                     min_length: 8,
                     slow_path: 0,
@@ -4125,7 +4172,7 @@ fn get_by_value_through_megamorphic_property_caches() {
 fn get_by_id_of_missing_properties_through_property_caches() {
     let mut fake = FakeCachedObject::new(&[value::int32(10)]);
     fake.set_entry(6, 0, false);
-    fake.object[0] = PLAIN_OBJECT_VTABLE;
+    fake.object[0] = PLAIN_OBJECT_CLASS;
     assert_eq!(fake.get(fake.value()), value::UNDEFINED);
     // Objects of other classes may have properties their shapes do not
     // describe: the probe, then the slow path. ECMAScript functions, arrays
@@ -4142,7 +4189,7 @@ fn get_by_id_of_missing_properties_through_property_caches() {
         assert_eq!(fake.get(fake.value()), value::UNDEFINED);
     }
     // Shapes with a prototype need a valid prototype chain.
-    fake.object[0] = PLAIN_OBJECT_VTABLE;
+    fake.object[0] = PLAIN_OBJECT_CLASS;
     fake.shape[0] = 0x8000;
     assert_eq!(fake.get(fake.value()), MARKER);
     let mut validity = vec![1u64];
@@ -4264,7 +4311,7 @@ fn get_by_id_of_strings_through_megamorphic_property_caches() {
 fn keyed_accesses_of_missing_and_added_properties_through_property_caches() {
     const ENTRY_WORDS: usize = 8;
     let mut fake = FakeCachedObject::new(&[value::int32(10), value::int32(11), value::EMPTY]);
-    fake.object[0] = PLAIN_OBJECT_VTABLE;
+    fake.object[0] = PLAIN_OBJECT_CLASS;
     fake.object[1] = u64::from(FLAG_IS_EXTENSIBLE);
     let shape = fake.shape.as_ptr() as u64;
     let key = u64::from(STRING_TAG) << 48 | 0x5000;
@@ -4319,7 +4366,7 @@ fn keyed_accesses_of_missing_and_added_properties_through_property_caches() {
     assert_eq!(get(&fake, other_key), MARKER);
     fake.object[0] = 0;
     assert_eq!(get(&fake, key), MARKER);
-    fake.object[0] = PLAIN_OBJECT_VTABLE;
+    fake.object[0] = PLAIN_OBJECT_CLASS;
 
     // Changes of existing properties.
     set_entry(&mut data, 2, 1, 0, shape);
@@ -4327,23 +4374,23 @@ fn keyed_accesses_of_missing_and_added_properties_through_property_caches() {
     assert_eq!(fake.properties[2], value::NULL);
 
     // Additions, from the shape the entry adds a property to.
-    let mut new_shape = vec![0u64; 12];
+    let new_shape = low_cell(&[0; 12]);
     new_shape[10] = 3 | 5 << 32;
     let new_shape_address = new_shape.as_ptr() as u64;
     set_entry(&mut data, 1, 2, new_shape_address, shape);
     assert_eq!(put(&fake, other_key, value::TRUE), 1);
     assert_eq!(put(&fake, key, value::TRUE), 0);
-    assert_eq!(fake.object[6], new_shape_address);
+    assert_eq!(fake.object[6], compressed(new_shape));
     assert_eq!(fake.properties[3], value::TRUE);
     // Objects that already have the new shape take the slow path.
     assert_eq!(put(&fake, key, value::FALSE), 1);
     assert_eq!(fake.properties[3], value::TRUE);
     // So do objects that may not cache additions.
-    fake.object[6] = shape;
+    fake.object[6] = compressed(fake.shape);
     fake.object[1] = u64::from(FLAG_IS_EXTENSIBLE | FLAG_HAS_MAGICAL_LENGTH);
     assert_eq!(put(&fake, key, value::FALSE), 1);
-    assert_eq!(fake.object[6], shape);
-    std::hint::black_box((&data, &new_shape));
+    assert_eq!(fake.object[6], compressed(fake.shape));
+    std::hint::black_box(&data);
 }
 
 #[test]
@@ -4450,7 +4497,7 @@ fn rope_strings_come_from_the_runtime_without_a_local_free_cell() {
                     cell_size: 64,
                     template: vec![0x1234; 8],
                     lhs_offset: 32,
-                    rhs_offset: 40,
+                    rhs_offset: 36,
                     length_offset: 16,
                     min_length: 8,
                     slow_path: fake_create_rope_string as *const () as u64,
@@ -4482,7 +4529,19 @@ fn rope_strings_come_from_the_runtime_without_a_local_free_cell() {
     // A local free cell becomes the rope string.
     let (result, strings, cell, address) = concatenate(lhs, rhs, 10_000, true);
     assert_eq!((result, strings), (string(address), [0, 0]));
-    assert_eq!(cell, [0x1234, 0x1234, 9, 0x1234, pointer(lhs), pointer(rhs)]);
+    // NB: The halves are compressed, and the heap region base is 0 here.
+    let compressed = |string: u64| (pointer(string) >> 3) & u64::from(u32::MAX);
+    assert_eq!(
+        cell,
+        [
+            0x1234,
+            0x1234,
+            9,
+            0x1234,
+            compressed(lhs) | compressed(rhs) << 32,
+            0x1234
+        ]
+    );
 
     // Without one, or without room before the next collection, the runtime
     // makes it.

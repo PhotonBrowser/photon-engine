@@ -18,8 +18,6 @@ static constexpr u64 PRECEDING_DATA_SIZE = 1 * KiB;
 static constexpr u64 FORWARD_REQUEST_THRESHOLD = 1 * MiB;
 static constexpr AK::Duration CURSOR_ACTIVE_TIME = AK::Duration::from_milliseconds(50);
 
-static constexpr size_t UNKNOWN_SIZE_READ_CHUNK_SIZE = 64 * KiB;
-
 NonnullRefPtr<IncrementallyPopulatedStream> IncrementallyPopulatedStream::create_empty()
 {
     return adopt_ref(*new IncrementallyPopulatedStream());
@@ -178,6 +176,13 @@ bool IncrementallyPopulatedStream::is_closed() const
     return m_closed;
 }
 
+void IncrementallyPopulatedStream::make_missing_data_permanently_unavailable()
+{
+    MutexLocker locker { m_mutex };
+    m_missing_data_is_permanently_unavailable = true;
+    m_state_changed.broadcast();
+}
+
 void IncrementallyPopulatedStream::set_available_ranges_change_observer(Function<void()> observer)
 {
     MutexLocker locker { m_mutex };
@@ -193,9 +198,12 @@ void IncrementallyPopulatedStream::notify_available_ranges_changed_while_locked(
 u64 IncrementallyPopulatedStream::size()
 {
     MutexLocker locker { m_mutex };
-    while (!m_expected_size.has_value())
+    while (!m_expected_size.has_value() && !m_missing_data_is_permanently_unavailable)
         m_state_changed.wait();
-    return m_expected_size.value();
+    if (m_expected_size.has_value())
+        return m_expected_size.value();
+    auto const* last_chunk = m_chunks.find_largest_not_above(NumericLimits<u64>::max());
+    return last_chunk ? last_chunk->end() : 0;
 }
 
 void IncrementallyPopulatedStream::set_expected_size(u64 expected_size)
@@ -308,7 +316,7 @@ u64 IncrementallyPopulatedStream::select_request_position_while_locked(u64 posit
 bool IncrementallyPopulatedStream::check_if_data_is_available_or_begin_request_while_locked(Cursor& cursor, u64 position, u64 length)
 {
     auto* chunk = m_chunks.find_largest_not_above(position);
-    auto data_is_available = m_closed;
+    auto data_is_available = m_closed && position >= m_expected_size.value();
     if (chunk) {
         VERIFY(position >= chunk->offset());
         u64 end = saturating_add(position, length);
@@ -360,14 +368,17 @@ size_t IncrementallyPopulatedStream::read_from_chunks_while_locked(u64 position,
     return copy_size;
 }
 
-DecoderErrorOr<size_t> IncrementallyPopulatedStream::read_at(Cursor& cursor, size_t position, Bytes& bytes)
+DecoderErrorOr<void> IncrementallyPopulatedStream::wait_for_data_while_locked(Cursor& cursor, u64 position, u64 length)
 {
-    MutexLocker locker { m_mutex };
-
     bool notified_blocked = false;
+    bool data_is_permanently_unavailable = false;
     while (!cursor.m_aborted.load(AK::MemoryOrder::memory_order_relaxed) && cursor.m_is_blocking) {
-        if (check_if_data_is_available_or_begin_request_while_locked(cursor, position, bytes.size()))
+        if (check_if_data_is_available_or_begin_request_while_locked(cursor, position, length))
             break;
+        if (m_missing_data_is_permanently_unavailable) {
+            data_is_permanently_unavailable = true;
+            break;
+        }
 
         cursor.m_blocked = true;
         if (!notified_blocked) {
@@ -387,6 +398,15 @@ DecoderErrorOr<size_t> IncrementallyPopulatedStream::read_at(Cursor& cursor, siz
 
     if (cursor.m_aborted.load(AK::MemoryOrder::memory_order_relaxed))
         return DecoderError::with_description(DecoderErrorCategory::Aborted, "Blocking read was aborted"sv);
+    if (data_is_permanently_unavailable)
+        return DecoderError::with_description(DecoderErrorCategory::PermanentlyUnavailable, "The data will never arrive"sv);
+    return {};
+}
+
+DecoderErrorOr<size_t> IncrementallyPopulatedStream::read_at(Cursor& cursor, size_t position, Bytes& bytes)
+{
+    MutexLocker locker { m_mutex };
+    TRY(wait_for_data_while_locked(cursor, position, bytes.size()));
 
     if (m_closed && position >= m_expected_size.value())
         return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "Blocking read reached end of stream"sv);
@@ -395,6 +415,41 @@ DecoderErrorOr<size_t> IncrementallyPopulatedStream::read_at(Cursor& cursor, siz
         return 0;
 
     return read_from_chunks_while_locked(position, bytes);
+}
+
+DecoderErrorOr<void> IncrementallyPopulatedStream::wait_for_every_byte_while_locked(Cursor& cursor, size_t position, size_t length)
+{
+    auto extends_past_the_expected_size = [&] {
+        return m_expected_size.has_value() && (position >= m_expected_size.value() || length > m_expected_size.value() - position);
+    };
+    if (extends_past_the_expected_size())
+        return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "The bytes extend past the end of the stream"sv);
+
+    TRY(wait_for_data_while_locked(cursor, position, length));
+
+    if (extends_past_the_expected_size())
+        return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "The bytes extend past the end of the stream"sv);
+    if (!cursor.m_is_blocking && !check_if_data_is_available_or_begin_request_while_locked(cursor, position, length))
+        return DecoderError::with_description(DecoderErrorCategory::NeedsMoreInput, "The bytes are not all present"sv);
+    return {};
+}
+
+DecoderErrorOr<FixedArray<u8>> IncrementallyPopulatedStream::read_bytes_at(Cursor& cursor, size_t position, size_t length)
+{
+    MutexLocker locker { m_mutex };
+    TRY(wait_for_every_byte_while_locked(cursor, position, length));
+
+    auto buffer = DECODER_TRY_ALLOC(FixedArray<u8>::create(length));
+    auto bytes = buffer.span();
+    auto read_count = read_from_chunks_while_locked(position, bytes);
+    VERIFY(read_count == length);
+    return buffer;
+}
+
+DecoderErrorOr<void> IncrementallyPopulatedStream::discard_at(Cursor& cursor, size_t position, size_t length)
+{
+    MutexLocker locker { m_mutex };
+    return wait_for_every_byte_while_locked(cursor, position, length);
 }
 
 NonnullRefPtr<MediaStreamCursor> IncrementallyPopulatedStream::create_cursor()
@@ -460,30 +515,27 @@ DecoderErrorOr<size_t> IncrementallyPopulatedStream::Cursor::read_into(Bytes byt
     return read_count;
 }
 
+DecoderErrorOr<void> IncrementallyPopulatedStream::Cursor::read_and_discard(size_t size)
+{
+    if (size == 0)
+        return {};
+
+    if (size > static_cast<size_t>(NumericLimits<i64>::max()) - m_position)
+        return DecoderError::corrupted("Discarded bytes extend outside the stream"sv);
+
+    TRY(m_stream->discard_at(*this, m_position, size));
+    m_position += size;
+    return {};
+}
+
 DecoderErrorOr<FixedArray<u8>> IncrementallyPopulatedStream::Cursor::read_bytes(size_t size)
 {
     if (size == 0)
         return FixedArray<u8>();
 
-    auto expected_size = m_stream->expected_size();
-    if (expected_size.has_value()) {
-        if (m_position >= expected_size.value() || size > expected_size.value() - m_position)
-            return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "Not enough data to read the requested bytes"sv);
-
-        auto buffer = DECODER_TRY_ALLOC(FixedArray<u8>::create(size));
-        TRY(read_until_filled(buffer.span()));
-        return buffer;
-    }
-
-    // If the size is unknown, grow a buffer in chunks before copying it out.
-    ByteBuffer buffer;
-    while (buffer.size() < size) {
-        auto filled_size = buffer.size();
-        auto chunk_size = min(size - filled_size, UNKNOWN_SIZE_READ_CHUNK_SIZE);
-        DECODER_TRY_ALLOC(buffer.try_resize(filled_size + chunk_size));
-        TRY(read_until_filled(buffer.span().slice(filled_size, chunk_size)));
-    }
-    return DECODER_TRY_ALLOC(FixedArray<u8>::create(buffer.span()));
+    auto buffer = TRY(m_stream->read_bytes_at(*this, m_position, size));
+    m_position += size;
+    return buffer;
 }
 
 void IncrementallyPopulatedStream::Cursor::abort()

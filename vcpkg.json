@@ -46,6 +46,7 @@
         "avcodec",
         "swresample",
         "dav1d",
+        "opus",
         "zlib",
         "ladybird-components",
         {
@@ -287,7 +288,7 @@
     },
     {
       "name": "curl",
-      "version": "8.23.0#0"
+      "version": "8.23.0#1"
     },
     {
       "name": "dav1d",
@@ -458,7 +459,7 @@
     },
     {
       "name": "zmij",
-      "version": "1.2#0"
+      "version": "1.2#1"
     }
   ]
 }

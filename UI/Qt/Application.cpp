@@ -7,9 +7,17 @@
 #include <LibCore/ArgsParser.h>
 #include <LibURL/InternalURLs.h>
 #include <LibURL/URL.h>
+#include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/NotificationBackend.h>
+#if defined(AK_OS_MACOS)
+#    include <LibWebView/NotificationBackendMacOS.h>
+#elif defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
+#    include <LibWebView/NotificationBackendFreedesktop.h>
+#endif
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
+#include <LibWebView/WebContentPage.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/BookmarkDialog.h>
 #include <UI/Qt/ChromeLayout.h>
@@ -27,6 +35,10 @@
 #if defined(AK_OS_MACOS)
 #    include <UI/Qt/MacWindow.h>
 #    include <UI/Qt/ScrollbarPreferencesMac.h>
+#endif
+
+#if defined(AK_OS_LINUX)
+#    include <UI/Qt/X11Window.h>
 #endif
 
 #include <QAction>
@@ -343,6 +355,7 @@ public:
 #if defined(AK_OS_MACOS)
             QKeySequence(Qt::META | Qt::Key_Tab),
             QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_BracketRight),
+            QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Right),
 #endif
         });
         QObject::connect(m_open_next_tab_action, &QAction::triggered, this, []() {
@@ -357,6 +370,7 @@ public:
 #if defined(AK_OS_MACOS)
             QKeySequence(Qt::META | Qt::SHIFT | Qt::Key_Tab),
             QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_BracketLeft),
+            QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Left),
 #endif
         });
         QObject::connect(m_open_previous_tab_action, &QAction::triggered, this, []() {
@@ -461,7 +475,7 @@ public:
     void rebuild_bookmarks_menu()
     {
         if (m_bookmarks_menu)
-            repopulate_application_menu(*m_bookmarks_menu, *m_application_widget, WebView::Application::the().bookmarks_menu());
+            repopulate_application_menu(*m_bookmarks_menu, WebView::Application::the().bookmarks_menu());
     }
 
 private:
@@ -629,6 +643,7 @@ Core::EventLoop& Application::create_platform_event_loop()
         m_application = make<LadybirdQApplication>(arguments());
 #if defined(AK_OS_LINUX)
         QGuiApplication::setDesktopFileName(QStringLiteral("org.ladybird.Ladybird"));
+        Ladybird::clip_translucent_windows_that_cannot_blend();
 #endif
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
         install_orca_scripts();
@@ -1280,6 +1295,65 @@ OwnPtr<WebView::PictureInPictureWindow> Application::create_picture_in_picture_w
     return Ladybird::create_picture_in_picture_window(traversable, requesting_page.view(), video_size);
 }
 
+// The window that shows this view in one of its tabs, if any.
+static BrowserWindow* window_for_view(WebView::ViewImplementation const& view)
+{
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget); window && window->tab_for_view(view))
+            return window;
+    }
+    return nullptr;
+}
+
+NonnullOwnPtr<WebView::NotificationBackend> Application::create_notification_backend()
+{
+#if defined(AK_OS_MACOS)
+    return make<WebView::NotificationBackendMacOS>();
+#elif defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
+    return make<WebView::NotificationBackendFreedesktop>();
+#else
+    return WebView::Application::create_notification_backend();
+#endif
+}
+
+void Application::focus_page_from_notification(WebView::WebContentPage& page)
+{
+    auto* window = window_for_view(page.view());
+    if (!window)
+        return;
+    window->activate_tab(window->tab_index(window->tab_for_view(page.view())));
+    window->bring_to_front();
+}
+
+void Application::open_url_in_new_tab_from_notification(URL::URL const& url, Web::PageId, WebView::CanonicalTraversable* traversable, WebView::IsPrivate is_private)
+{
+    BrowserWindow* window = nullptr;
+    if (traversable) {
+        if (auto view = traversable->view(); view.has_value())
+            window = window_for_view(*view);
+    }
+    // The site opens in the notification's own session: a private window's notification never lands in a normal
+    // window, nor a normal one in a private window.
+    if (window && window->is_private() != is_private)
+        window = nullptr;
+    if (!window && m_active_window && m_active_window->is_private() == is_private)
+        window = m_active_window;
+    if (!window) {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (auto* candidate = qobject_cast<BrowserWindow*>(widget); candidate && candidate->is_private() == is_private) {
+                window = candidate;
+                break;
+            }
+        }
+    }
+    if (!window) {
+        new_window({ url }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
+        return;
+    }
+    window->new_tab_from_url(url, Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::end());
+    window->bring_to_front();
+}
+
 Optional<WebView::ViewImplementation&> Application::active_web_view() const
 {
     if (auto* active_tab = this->active_tab())
@@ -1412,37 +1486,46 @@ void Application::open_navigation_in_new_window(Web::HTML::PreparedNavigationDes
     new_window({ move(url) }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private, nullptr, {}, ShowWindow::Yes, move(navigation));
 }
 
-Optional<ByteString> Application::ask_user_for_download_path(ByteString const& file) const
+NonnullRefPtr<Core::Promise<ByteString>> Application::ask_user_for_download_path(ByteString const& file) const
 {
-    auto default_path = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    auto* dialog = new QFileDialog(nullptr, "Select save location", QStandardPaths::writableLocation(QStandardPaths::DownloadLocation));
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setAcceptMode(QFileDialog::AcceptSave);
+    dialog->selectFile(qstring_from_ak_string(file.view()));
 
-    if (default_path.isNull() || default_path.isEmpty())
-        default_path = qstring_from_ak_string(file.view());
-    else
-        default_path = QDir { default_path }.filePath(qstring_from_ak_string(file.view()));
+    auto promise = Core::Promise<ByteString>::construct();
 
-    auto path = QFileDialog::getSaveFileName(nullptr, "Select save location", default_path);
-    if (path.isNull())
-        return {};
+    QObject::connect(dialog, &QDialog::finished, [promise, dialog = QPointer { dialog }](auto result) {
+        if (result != QDialog::Accepted || !dialog || dialog->selectedFiles().isEmpty()) {
+            promise->reject(Error::from_errno(ECANCELED));
+            return;
+        }
 
-    return ak_byte_string_from_qstring(path);
+        promise->resolve(ak_byte_string_from_qstring(dialog->selectedFiles().first()));
+    });
+
+    dialog->open();
+    return promise;
 }
 
 void Application::display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const
 {
     auto message = MUST(String::formatted("{} saved to: {}", download_name, path));
 
-    QMessageBox dialog(active_tab());
-    dialog.setWindowTitle("Ladybird");
-    dialog.setIcon(QMessageBox::Information);
-    dialog.setText(qstring_from_ak_string(message));
-    dialog.addButton(QMessageBox::Ok);
-    dialog.addButton(QMessageBox::Open)->setText("Open folder");
+    auto* dialog = new QMessageBox(active_window_if_any());
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle("Ladybird");
+    dialog->setIcon(QMessageBox::Information);
+    dialog->setText(qstring_from_ak_string(message));
+    dialog->addButton(QMessageBox::Ok);
 
-    if (dialog.exec() == QMessageBox::Open) {
-        auto path_url = QUrl::fromLocalFile(qstring_from_ak_string(path.dirname()));
+    auto* open_folder_button = dialog->addButton(QMessageBox::Open);
+    open_folder_button->setText("Open folder");
+    QObject::connect(open_folder_button, &QAbstractButton::clicked, [path_url = QUrl::fromLocalFile(qstring_from_ak_string(path.dirname()))] {
         QDesktopServices::openUrl(path_url);
-    }
+    });
+
+    dialog->open();
 }
 
 void Application::display_error_dialog(StringView error_message) const
@@ -1452,7 +1535,9 @@ void Application::display_error_dialog(StringView error_message) const
         return;
     }
 
-    QMessageBox::warning(active_tab(), "Ladybird", qstring_from_ak_string(error_message));
+    auto* dialog = new QMessageBox(QMessageBox::Warning, "Ladybird", qstring_from_ak_string(error_message), QMessageBox::Ok, active_window_if_any());
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->open();
 }
 
 void Application::open_download(WebView::FileDownloader::Download const& download) const
@@ -1636,16 +1721,16 @@ void Application::update_reopen_recently_closed_actions() const
 
 void Application::show_bookmark_context_menu(Gfx::IntPoint content_position, Optional<WebView::BookmarkItem const&> item, Optional<String const&> target_folder_id, Optional<String const&> parent_folder_id)
 {
-    if (auto* active_tab = this->active_tab()) {
+    if (auto* active_tab = this->active_tab(); active_tab && m_active_window) {
         auto position = active_tab->view().mapToGlobal(QPoint { content_position.x(), content_position.y() });
-        active_tab->bookmarks_bar().show_context_menu(position, item, target_folder_id, parent_folder_id);
+        m_active_window->bookmarks_bar().show_context_menu(position, item, target_folder_id, parent_folder_id);
     }
 }
 
 Optional<Application::BookmarkID> Application::bookmark_item_id_for_context_menu() const
 {
-    if (auto* active_tab = this->active_tab()) {
-        auto const& bookmarks_bar = active_tab->bookmarks_bar();
+    if (m_active_window) {
+        auto const& bookmarks_bar = m_active_window->bookmarks_bar();
 
         return Application::BookmarkID {
             .id = bookmarks_bar.selected_bookmark_menu_item_id(),
@@ -1841,6 +1926,7 @@ QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_
         view_menu->addSeparator();
     }
     view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));
+    view_menu->addAction(create_application_action(*view_menu, application.force_dark_action(), IncludeActionIcon::No));
     view_menu->addMenu(create_application_menu(*view_menu, application.contrast_menu()));
     view_menu->addMenu(create_application_menu(*view_menu, application.motion_menu()));
 

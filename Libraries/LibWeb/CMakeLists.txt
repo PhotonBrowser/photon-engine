@@ -196,6 +196,7 @@ set(SOURCES
     CSS/SelectorMatching.cpp
     CSS/Serialize.cpp
     CSS/Sizing.cpp
+    CSS/DevToolsAppliedStyleRules.cpp
     CSS/StyleComputer.cpp
     CSS/StyleEngineBridge.cpp
     CSS/StyleEngineInput.cpp
@@ -262,6 +263,7 @@ set(SOURCES
     DOM/CommitMessages.cpp
     DOM/CustomEvent.cpp
     DOM/Document.cpp
+    DOM/DocumentHighlightStyles.cpp
     DOM/DocumentFragment.cpp
     DOM/DocumentLoadEventDelayer.cpp
     DOM/DocumentLoading.cpp
@@ -517,6 +519,7 @@ set(SOURCES
     HTML/HTMLIFrameElement.cpp
     HTML/HTMLImageElement.cpp
     HTML/HTMLInputElement.cpp
+    HTML/HTMLInputElementDateTimeFields.cpp
     HTML/HTMLInsertion.cpp
     HTML/HTMLLabelElement.cpp
     HTML/HTMLLegendElement.cpp
@@ -574,8 +577,8 @@ set(SOURCES
     HTML/LocalTraversableNavigable.cpp
     HTML/Location.cpp
     HTML/MediaError.cpp
+    HTML/MediaStreamPlayback.cpp
     HTML/MediaTrackBase.cpp
-    HTML/MessageChannel.cpp
     HTML/MessageEvent.cpp
     HTML/MessagePort.cpp
     HTML/MimeType.cpp
@@ -630,6 +633,7 @@ set(SOURCES
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
     HTML/Scripting/ConsoleInputCompletion.cpp
+    HTML/Scripting/DevToolsLoggedObjects.cpp
     HTML/Scripting/DevToolsObjectTable.cpp
     HTML/Scripting/Environments.cpp
     HTML/Scripting/ExceptionReporter.cpp
@@ -660,6 +664,7 @@ set(SOURCES
     HTML/Storage.cpp
     HTML/StorageEvent.cpp
     HTML/StructuredSerialize.cpp
+    HTML/StructuredSerializeRustIntegration.cpp
     HTML/SubmitEvent.cpp
     HTML/SupportedImageTypes.cpp
     HTML/SyntaxHighlighter/SyntaxHighlighter.cpp
@@ -756,6 +761,7 @@ set(SOURCES
     NavigationTiming/PerformanceNavigationTiming.cpp
     NavigationTiming/PerformanceTiming.cpp
     NotificationsAPI/Notification.cpp
+    NotificationsAPI/NotificationPermission.cpp
     Page/AutoScrollHandler.cpp
     Page/DragAndDropEventHandler.cpp
     Page/ElementResizeAction.cpp
@@ -778,7 +784,6 @@ set(SOURCES
     Painting/CompositorAnimationEffectState.cpp
     Painting/PaintingRustBridge.cpp
     Painting/ResizeHandle.cpp
-    Painting/Scrollbar.cpp
     Painting/Scrolling.cpp
     Painting/ScrollSnap.cpp
     Painting/SvgPaintResources.cpp
@@ -840,6 +845,7 @@ set(SOURCES
     StorageAPI/StorageShelf.cpp
     Streams/ReadableStream.cpp
     Streams/TransformStream.cpp
+    Streams/WritableStream.cpp
     SVG/AttributeNames.cpp
     SVG/AttributeParsing.cpp
     SVG/Path.cpp
@@ -1063,6 +1069,38 @@ set(SOURCES
     WebIDL/OverloadTypes.cpp
     WebIDL/Promise.cpp
     WebIDL/QuotaExceededError.cpp
+    WebRTC/RTCCertificate.cpp
+    WebRTC/RTCDataChannel.cpp
+    WebRTC/RTCDataChannelEvent.cpp
+    WebRTC/RTCDtlsTransport.cpp
+    WebRTC/RTCDTMFSender.cpp
+    WebRTC/RTCDTMFToneChangeEvent.cpp
+    WebRTC/RTCEncodedAudioFrame.cpp
+    WebRTC/RTCEncodedVideoFrame.cpp
+    WebRTC/RTCError.cpp
+    WebRTC/RTCErrorEvent.cpp
+    WebRTC/RTCIceCandidate.cpp
+    WebRTC/RTCIceTransport.cpp
+    WebRTC/RTCPeerConnection.cpp
+    WebRTC/RTCPeerConnectionIceErrorEvent.cpp
+    WebRTC/RTCPeerConnectionIceEvent.cpp
+    WebRTC/RTCRtpReceiver.cpp
+    WebRTC/RTCRtpScriptTransform.cpp
+    WebRTC/RTCRtpScriptTransformer.cpp
+    WebRTC/RTCRtpSender.cpp
+    WebRTC/RTCRtpTransceiver.cpp
+    WebRTC/RTCSctpTransport.cpp
+    WebRTC/RTCSessionDescription.cpp
+    WebRTC/RTCSFrameReceiverTransform.cpp
+    WebRTC/RTCSFrameSenderTransform.cpp
+    WebRTC/RTCStatsReport.cpp
+    WebRTC/RTCTrackEvent.cpp
+    WebRTC/RTCTransformEvent.cpp
+    WebRTC/SFrameDecrypterStream.cpp
+    WebRTC/SFrameEncrypterStream.cpp
+    WebRTC/SFrameTransformErrorEvent.cpp
+    WebRTC/KeyFrameRequestEvent.cpp
+    WebRTC/WebRTCAgent.cpp
     WebSockets/WebSocket.cpp
     WebVTT/Parser.cpp
     WebVTT/VTTCue.cpp
@@ -1128,7 +1166,7 @@ target_sources(LibWeb PRIVATE $<TARGET_OBJECTS:LibJSObjects>)
 target_compile_definitions(LibWeb PRIVATE LibJS_EXPORTS)
 target_link_libraries(LibWeb PUBLIC LibCompositing LibWebCommon LibJSHeaders)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibWebRTCClient LibXml2::LibXml2)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile

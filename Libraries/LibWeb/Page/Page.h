@@ -53,6 +53,7 @@
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
+#include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
 #include <LibWeb/HTML/WebViewHints.h>
@@ -164,6 +165,8 @@ public:
 
     HTML::VisibilityState system_visibility_state() const { return m_system_visibility_state; }
     void set_system_visibility_state(HTML::VisibilityState visibility_state) { m_system_visibility_state = visibility_state; }
+    bool top_level_traversable_has_user_attention() const;
+    void notify_document_about_user_activation(HTML::CrossProcessId document_id);
     void unfullscreen_descendant_documents(Vector<GC::Root<HTML::Navigable>> const&);
     enum class ElementIsRequestedElement : u8 {
         No,
@@ -180,6 +183,7 @@ public:
     GC::Ptr<HTML::Navigable> focused_navigable() const;
     GC::Ptr<HTML::LocalNavigable> hosted_focused_navigable() const;
     void set_focused_navigable(HTML::Navigable&);
+    void system_focus_changed();
     void focused_navigable_changed_in_another_page(HTML::CrossProcessId);
     void navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable&);
 
@@ -305,6 +309,9 @@ public:
     void did_request_color_picker(GC::Weak<HTML::HTMLInputElement> target, Color current_color);
     void color_picker_update(Optional<Color> picked_color, HTML::ColorPickerUpdateState state);
 
+    void did_request_date_picker(GC::Weak<HTML::HTMLInputElement> target, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum);
+    void date_picker_closed(Optional<Utf16String> picked_value);
+
     void did_request_file_picker(GC::Weak<HTML::HTMLInputElement> target, HTML::FileFilter const& accepted_file_types, HTML::AllowMultipleFiles);
     void file_picker_closed(Span<HTML::SelectedFile> selected_files);
 
@@ -365,6 +372,19 @@ public:
     void request_permission(HTML::CrossProcessId requesting_document_id, Utf16String const& name, PermissionPromptCallback);
     void permission_request_completed(u64 request_id, Web::Permissions::EffectiveState);
 
+    // The list of notifications (https://notifications.spec.whatwg.org/#list-of-notifications) this page has asked
+    // the UI process to show, by the id that names each one across the bridge.
+    u64 allocate_notification_id() { return m_next_notification_id++; }
+    void register_showing_notification(u64 notification_id, GC::Ref<NotificationsAPI::Notification>);
+    void unregister_notification(u64 notification_id);
+    void notification_shown(u64 notification_id);
+    void notification_show_failed(u64 notification_id);
+    void notification_clicked(u64 notification_id);
+    void notification_closed(u64 notification_id, bool by_user);
+    // The document whose script created notifications is gone: Their objects can't get events any more, and the UI
+    // process hears that, so a later click opens the site instead.
+    void notifications_document_destroyed(DOM::Document const&);
+
     // https://w3c.github.io/geolocation/#dfn-emulated-position-data
     // NB: The top-level traversable's, which the UI process tells every page representing it.
     Geolocation::EmulatedPositionData const& emulated_position_data() const { return m_emulated_position_data; }
@@ -376,6 +396,7 @@ public:
     enum class PendingNonBlockingDialog {
         None,
         ColorPicker,
+        DatePicker,
         FilePicker,
         Select,
     };
@@ -571,6 +592,7 @@ private:
 
     PendingNonBlockingDialog m_pending_non_blocking_dialog { PendingNonBlockingDialog::None };
     GC::Weak<HTML::HTMLElement> m_pending_non_blocking_dialog_target;
+    Utf16String m_pending_date_picker_input_type;
 
     HashMap<u64, ClipboardRequest> m_pending_clipboard_requests;
     u64 m_next_clipboard_request_id { 0 };
@@ -599,6 +621,9 @@ private:
     HashMap<u64, HTTPCredentialsCallback> m_pending_http_credentials_requests;
     u64 m_next_http_credentials_request_id { 0 };
     u64 m_next_permission_request_id { 0 };
+
+    HashMap<u64, GC::Ref<NotificationsAPI::Notification>> m_notifications_list;
+    u64 m_next_notification_id { 0 };
 
     // AD-HOC: Denied until the UI process sends the browser-wide setting, so a request cannot observe the test
     //         position in the short window before that arrives.
@@ -764,6 +789,7 @@ public:
     virtual void page_did_change_picture_in_picture_video_size(Gfx::IntSize) { }
     virtual void page_did_change_picture_in_picture_player_controls_visibility(bool) { }
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) { }
+    virtual void page_did_change_active_document_in_child_navigable(Web::DOM::Document&) { }
     virtual void page_did_finish_loading(HTML::CrossProcessId, HTML::CrossProcessId) { }
     virtual Optional<u64> page_did_start_download(HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
     {
@@ -887,6 +913,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
     virtual void page_did_request_color_picker([[maybe_unused]] Color current_color) { }
+    virtual void page_did_request_date_picker([[maybe_unused]] Utf16String input_type, [[maybe_unused]] Utf16String value, [[maybe_unused]] Utf16String minimum, [[maybe_unused]] Utf16String maximum) { }
     virtual void page_did_request_file_picker([[maybe_unused]] HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles) { }
     virtual void page_did_request_select_dropdown([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Web::CSSPixelPoint content_position, [[maybe_unused]] Web::CSSPixels minimum_width, [[maybe_unused]] Vector<Web::HTML::SelectItem> items) { }
     virtual void page_did_request_geolocation_position([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId requesting_document_id) { }
@@ -903,6 +930,14 @@ public:
     virtual void page_did_set_next_permission_prompt_outcome_for_testing([[maybe_unused]] String const& name, [[maybe_unused]] String const& outcome, [[maybe_unused]] bool held) { }
     virtual void page_did_release_held_permission_prompt_for_testing([[maybe_unused]] u32 waiters) { }
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_advance_permission_clock_for_testing([[maybe_unused]] u64 milliseconds) { return {}; }
+    virtual void page_did_request_show_notification([[maybe_unused]] u64 notification_id, [[maybe_unused]] HTML::CrossProcessId document_id, [[maybe_unused]] NotificationsAPI::NotificationData const&, [[maybe_unused]] RefPtr<Gfx::Bitmap const> icon) { }
+    virtual void page_did_request_close_notification([[maybe_unused]] u64 notification_id) { }
+    virtual void page_did_abandon_notification([[maybe_unused]] u64 notification_id) { }
+    virtual void page_did_handle_notification_click([[maybe_unused]] u64 notification_id, [[maybe_unused]] bool into_focus) { }
+    virtual String page_did_request_notifications_state_for_testing() { return "{}"_string; }
+    virtual void page_did_request_click_notification_for_testing([[maybe_unused]] u64 notification_id) { }
+    virtual void page_did_request_click_notification_by_id_for_testing([[maybe_unused]] u64 browser_notification_id) { }
+    virtual void page_did_request_dismiss_notification_for_testing([[maybe_unused]] u64 notification_id) { }
 
     virtual void page_did_finish_test([[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_set_test_timeout([[maybe_unused]] double milliseconds) { }
@@ -939,6 +974,7 @@ public:
     virtual void disconnect_virtual_gamepad([[maybe_unused]] Gamepad::GamepadHandle handle) { }
     virtual Gamepad::ReceivedRumbleEffects virtual_gamepad_received_rumble_effects([[maybe_unused]] Gamepad::GamepadHandle handle) { return {}; }
     virtual void pump_gamepad_events() { }
+    virtual void reset_gamepad_access_for_testing() { }
 
     virtual void page_did_block_resource([[maybe_unused]] URL::URL const& url, [[maybe_unused]] StringView kind) { }
     virtual void page_did_start_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] URL::URL const& url, [[maybe_unused]] ByteString const& method, [[maybe_unused]] Vector<HTTP::Header> const& request_headers, [[maybe_unused]] ReadonlyBytes request_body, [[maybe_unused]] Optional<String> initiator_type, [[maybe_unused]] String const& referrer_policy, [[maybe_unused]] bool is_navigation_request, [[maybe_unused]] Fetch::Infrastructure::Request::Priority priority) { }
@@ -955,6 +991,9 @@ public:
 
     virtual HTML::WorkerAgentId start_worker_agent([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
     virtual void close_worker_agent([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] HTML::WorkerAgentOwnerToken owner_token) { }
+    virtual void rtc_transform_init([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] u64 transform_id, [[maybe_unused]] HTML::SerializedTransferRecord options_record) { }
+    virtual void rtc_transform_teardown([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] u64 transform_id) { }
+    virtual void rtc_transform_encoded_audio_frame([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] u64 transform_id, [[maybe_unused]] ByteBuffer payload, [[maybe_unused]] u32 ssrc, [[maybe_unused]] u8 payload_type, [[maybe_unused]] u32 rtp_timestamp, [[maybe_unused]] u16 sequence_number) { }
 
     virtual void page_did_mutate_dom([[maybe_unused]] Utf16FlyString const& type, [[maybe_unused]] DOM::Node const& target, [[maybe_unused]] DOM::NodeList& added_nodes, [[maybe_unused]] DOM::NodeList& removed_nodes, [[maybe_unused]] GC::Ptr<DOM::Node> previous_sibling, [[maybe_unused]] GC::Ptr<DOM::Node> next_sibling, [[maybe_unused]] Optional<Utf16FlyString> const& attribute_name) { }
     virtual void flush_pending_dom_mutations() { }

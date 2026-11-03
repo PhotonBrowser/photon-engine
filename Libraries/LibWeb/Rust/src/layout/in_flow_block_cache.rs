@@ -23,6 +23,7 @@ pub(super) struct InFlowBlockKey {
     pub(super) containing_block_inline_size: CssPixels,
     pub(super) containing_block_is_right_to_left: bool,
     pub(super) incoming_margins: block_formatting_context::BlockMarginState,
+    pub(super) incoming_outside_marker_line: Option<block_formatting_context::OutsideMarkerLine>,
     pub(super) run_root: Node,
     pub(super) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
     pub(super) initial_containing_block_size: (CssPixels, CssPixels),
@@ -36,12 +37,14 @@ impl InFlowBlockKey {
         containing_block_inline_size: CssPixels,
         containing_block_is_right_to_left: bool,
         incoming_margins: block_formatting_context::BlockMarginState,
+        incoming_outside_marker_line: Option<block_formatting_context::OutsideMarkerLine>,
     ) -> Self {
         Self {
             input,
             containing_block_inline_size,
             containing_block_is_right_to_left,
             incoming_margins,
+            incoming_outside_marker_line,
             run_root: run.box_,
             treat_block_axis_percentage_insets_as_auto_beyond_root: run
                 .treat_block_axis_percentage_insets_as_auto_beyond_root,
@@ -67,6 +70,7 @@ pub(super) struct InFlowBlockEntry {
     pub(super) offset_from_flow_position: FfiCssPixelPoint,
     pub(super) flow_position_advance: CssPixels,
     pub(super) outgoing_margins: block_formatting_context::BlockMarginState,
+    pub(super) outgoing_outside_marker_line: Option<block_formatting_context::OutsideMarkerLine>,
     pub(super) margin_box_bottom_from_flow_position: CssPixels,
     pub(super) depends_on_percentage_block_size: bool,
     /// The fragment the stored layout placed. The committed subtree is reused only while it is still that fragment.
@@ -84,8 +88,12 @@ struct InFlowBlockSlot {
 /// Per-document store of in-flow block layouts, surviving across layout passes in the layout stage's scratch.
 #[derive(Clone, Default)]
 pub(crate) struct InFlowBlockCacheStore {
-    entries: RefCell<Vec<InFlowBlockSlot>>,
+    /// In chunks a fork of the arena shares until either side writes one, so forking does not copy every box's entries.
+    entries: RefCell<crate::cow_column::CowVec<InFlowBlockSlot, IN_FLOW_BLOCK_SLOTS_PER_CHUNK>>,
 }
+
+/// How many boxes' entries a chunk of [`InFlowBlockCacheStore::entries`] holds: a write after a fork copies this many.
+const IN_FLOW_BLOCK_SLOTS_PER_CHUNK: usize = 128;
 
 impl InFlowBlockCacheStore {
     /// The stored layout of the box in `slot` for `key` that placed the fragment the box committed, `committed_identity`.
@@ -111,7 +119,7 @@ impl InFlowBlockCacheStore {
     pub(super) fn store(&self, slot: u32, entry: InFlowBlockEntry, committed_identity: Option<u64>) {
         let mut entries = self.entries.borrow_mut();
         if entries.len() <= slot as usize {
-            entries.resize_with(slot as usize + 1, InFlowBlockSlot::default);
+            entries.resize_with_default(slot as usize + 1);
         }
         let slot = &mut entries[slot as usize];
         let places_committed_fragment = |entry: &Option<std::sync::Arc<InFlowBlockEntry>>| {
@@ -133,8 +141,12 @@ impl InFlowBlockCacheStore {
     }
 
     pub(crate) fn remove_entry(&self, slot: u32) {
-        if let Some(slot) = self.entries.borrow_mut().get_mut(slot as usize) {
-            *slot = InFlowBlockSlot::default();
+        let mut entries = self.entries.borrow_mut();
+        if entries
+            .get(slot as usize)
+            .is_some_and(|entries| entries.latest.is_some() || entries.committed.is_some())
+        {
+            entries[slot as usize] = InFlowBlockSlot::default();
         }
     }
 }

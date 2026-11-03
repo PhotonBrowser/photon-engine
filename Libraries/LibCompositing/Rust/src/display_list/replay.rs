@@ -4,10 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::display_list::builder::{for_each_command, inline_clips_of, inline_transform_of, read_command};
+use crate::display_list::builder::{
+    for_each_command, has_inline_clip_in_its_own_space, inline_clips_of, inline_transform_of, read_command,
+};
 use crate::display_list::commands::{
-    ClipNodeIndex, DisplayListCommandRun, DisplayListCommandType, EffectNodeIndex, InlineClipKind, OptionalFloatRect,
-    PaintScrollBar, ReplayClip, ReplayLayer, ReplayMask, SpatialNodeIndex,
+    ClipMode, ClipNodeIndex, DisplayListCommandHeader, DisplayListCommandRun, DisplayListCommandType, EffectNodeIndex,
+    InlineClipKind, OptionalFloatRect, PaintScrollBar, ReplayClip, ReplayLayer, ReplayMask, SpatialNodeIndex,
 };
 use crate::display_list::depth_sorted_plan::{DepthSortedReplayStepKind, build_depth_sorted_replay_plan};
 use crate::display_list::effect_clip_plan::EffectClipPlan;
@@ -16,13 +18,13 @@ use crate::display_list::ffi_bytes::FfiBytes;
 use crate::display_list::nested_records::span_bytes;
 use crate::visual_context::queries::TreeCullingScratch;
 use crate::visual_context::{
-    ClipNodeData, ContextRef, EffectNodeData, SpatialData, VisualContextTree, device_offset_for_index,
+    ClipNodeData, ContextRef, EffectNodeData, SpatialData, SpatialNode, VisualContextTree, device_offset_for_index,
     resolve_leaf_to_context_matrices, should_cull_back_face,
 };
 use libgfx_rust::path::Path;
 use libgfx_rust::{
-    AffineTransform, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatVector3, IntRect, WindingRule,
-    enclosing_int_rect, translation_matrix,
+    AffineTransform, Color, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatVector3, IntRect, WindingRule,
+    enclosing_int_rect, multiply_affine, translation_matrix,
 };
 use std::cell::RefCell;
 
@@ -44,17 +46,68 @@ pub trait ReplayPainter {
     // `payload`; the command's spans point into `payload`.
     fn play_command(&mut self, command_type: DisplayListCommandType, command: &[u8], payload: &[u8]);
 
-    fn execute_run(&mut self, _run_index: usize, records: &[u8], scroll_offsets: &[FloatPoint]) {
-        replay_records(records, scroll_offsets, self);
+    fn execute_run(
+        &mut self,
+        _run_index: usize,
+        records: &[u8],
+        scroll_offsets: &[FloatPoint],
+        clip_space_matrix: &dyn Fn(SpatialNodeIndex) -> Option<FloatMatrix4x4>,
+    ) {
+        replay_records(records, scroll_offsets, clip_space_matrix, self);
     }
+}
+
+/// How far the inline clips of a command that apply in spaces of their own let it draw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum OwnSpaceClipExtent {
+    /// One of the clips cannot be mapped into the space of the command, or cuts a hole out of it.
+    Unbounded,
+    /// Within this rect, in the space of the command.
+    Within(FloatRect),
+}
+
+/// The part of `bounds`, in the space of a command whose to-root matrix is `command_to_root`, that its inline clips
+/// in spaces of their own leave the command to draw in, or None if it has no such clip. `clip_space_matrix` gives
+/// the to-root matrix of a clip's space.
+pub(crate) fn own_space_clip_extent(
+    header: &DisplayListCommandHeader,
+    payload: &[u8],
+    bounds: FloatRect,
+    command_to_root: FloatMatrix4x4,
+    mut clip_space_matrix: impl FnMut(SpatialNodeIndex) -> Option<FloatMatrix4x4>,
+) -> Option<OwnSpaceClipExtent> {
+    let mut extent = None;
+    for clip in inline_clips_of(header, payload).filter(|clip| clip.has_own_space) {
+        let mapped_clip_rect = (clip.mode == ClipMode::Intersect && command_to_root.is_2d_affine())
+            .then(|| clip_space_matrix(clip.space))
+            .flatten()
+            .filter(|clip_to_root| clip_to_root.is_2d_affine())
+            .and_then(|clip_to_root| {
+                let root_to_command = command_to_root.extract_2d_affine().inverse()?;
+                let clip_to_command = multiply_affine(root_to_command, clip_to_root.extract_2d_affine());
+                Some(clip_to_command.map_rect(clip.clip_rect_or_path_device_bounds))
+            });
+        let Some(mapped_clip_rect) = mapped_clip_rect else {
+            return Some(OwnSpaceClipExtent::Unbounded);
+        };
+        let previous = match extent {
+            Some(OwnSpaceClipExtent::Within(rect)) => rect,
+            _ => bounds,
+        };
+        extent = Some(OwnSpaceClipExtent::Within(previous.intersected(mapped_clip_rect)));
+    }
+    extent
 }
 
 /// Plays one stream of records: the records of a run, or the records nested in a command. Compositor
 /// metadata is skipped, a command whose bounds are empty or clipped away is culled, and each command plays
 /// inside its inline clips and transform. A scroll bar's thumb moves by the offset of its scroll node.
+/// `clip_space_matrix` gives the to-root matrix of the space an inline clip of its own space is applied in;
+/// a clip whose space it does not know applies in the space of its command.
 pub fn replay_records<Painter: ReplayPainter + ?Sized>(
     records: &[u8],
     scroll_offsets: &[FloatPoint],
+    clip_space_matrix: &dyn Fn(SpatialNodeIndex) -> Option<FloatMatrix4x4>,
     painter: &mut Painter,
 ) {
     for_each_command(records, |header, _, payload| {
@@ -64,7 +117,29 @@ pub fn replay_records<Painter: ReplayPainter + ?Sized>(
         if header.bounding_rect.is_empty() || painter.would_be_fully_clipped_by_painter(header.bounding_rect) {
             return;
         }
+        // The matrix of the command's space, while an inline clip in a space of its own has the canvas in another.
+        let mut command_space_matrix = None;
+        if header.inline_clip_count != 0 && has_inline_clip_in_its_own_space(header, payload) {
+            let command_to_root = painter.canvas_matrix();
+            // NB: The bounds of a command do not include its clips in spaces of their own, which move apart from it
+            //     as they scroll, so the command is culled against where they are now.
+            if let Some(OwnSpaceClipExtent::Within(rect)) = own_space_clip_extent(
+                header,
+                payload,
+                header.bounding_rect.to_float(),
+                command_to_root,
+                clip_space_matrix,
+            ) && (rect.is_empty() || painter.would_be_fully_clipped_by_painter(enclosing_int_rect(rect)))
+            {
+                return;
+            }
+        }
         for clip in inline_clips_of(header, payload) {
+            let own_space_matrix = clip.has_own_space.then(|| clip_space_matrix(clip.space)).flatten();
+            if let Some(matrix) = &own_space_matrix {
+                command_space_matrix.get_or_insert_with(|| painter.canvas_matrix());
+                painter.set_matrix(matrix);
+            }
             match clip.kind {
                 InlineClipKind::Path => {
                     painter.push_clip_path_bytes(span_bytes(payload, clip.path_data), clip.path_winding_rule);
@@ -74,6 +149,11 @@ pub fn replay_records<Painter: ReplayPainter + ?Sized>(
                     corner_radii: clip.corner_radii,
                     mode: clip.mode,
                 }),
+            }
+            if own_space_matrix.is_some()
+                && let Some(matrix) = &command_space_matrix
+            {
+                painter.set_matrix(matrix);
             }
         }
         let inline_transform = inline_transform_of(header, payload);
@@ -101,6 +181,10 @@ pub fn replay_records<Painter: ReplayPainter + ?Sized>(
         }
         for _ in 0..header.inline_clip_count {
             painter.pop();
+        }
+        // Popping a clip pushed in another space restores the matrix it was pushed with.
+        if let Some(matrix) = &command_space_matrix {
+            painter.set_matrix(matrix);
         }
     });
 }
@@ -190,6 +274,7 @@ struct ReplayDriver<'a, Painter: ReplayPainter> {
     command_runs: &'a [DisplayListCommandRun],
     scroll_offsets: &'a [FloatPoint],
     effect_clips: &'a EffectClipPlan,
+    root_group_color: Color,
     painter: &'a mut Painter,
     palette: ReplayPaletteStorage,
     culling: TreeCullingScratch,
@@ -246,6 +331,7 @@ fn replay_layer_of(
         backdrop_filter_bytes_size,
         backdrop_region,
         backdrop_corner_radii,
+        backdrop_base_color: Color::TRANSPARENT,
         effect,
         content_bounds: OptionalFloatRect::from(content_bounds),
     }
@@ -280,6 +366,27 @@ fn int_rect_enclosing(rect: FloatRect) -> Option<IntRect> {
         .into_iter()
         .all(fits)
         .then(|| enclosing_int_rect(rect))
+}
+
+// The cull state of the element that establishes the 3D rendering context rooted at root: the cull state of the
+// plane the context is flattened into.
+fn backface_culled_outside_sorting_context(
+    spatial_nodes: &[SpatialNode],
+    backface_culled: &[bool],
+    root: SpatialNodeIndex,
+) -> bool {
+    let mut index = root.0 as usize;
+    loop {
+        if let SpatialData::Transform(transform) = &spatial_nodes[index].data
+            && transform.establishes_sorting_context
+        {
+            return backface_culled[index];
+        }
+        if index == 0 {
+            return false;
+        }
+        index = spatial_nodes[index].parent.0 as usize;
+    }
 }
 
 fn fill_replay_palette_in_dependency_order(
@@ -341,8 +448,16 @@ fn fill_replay_palette_in_dependency_order(
                     transform.matrix_including_origin(),
                     transform.flattens_inherited_transform,
                 );
-                if transform.sorting_context_root_index.is_some() || transform.establishes_sorting_context {
-                    palette.backface_culled[i] = false;
+                // https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts
+                // A participant in a 3D rendering context is its own plane, so the hidden backfaces of other planes in
+                // the context don't cull it. But a context is part of the content flattened into the plane its
+                // establishing element sits in, so whatever culls that plane culls the whole context: A participant
+                // starts from the cull state of the element that establishes its context. The spec doesn't yet say if a
+                // hidden backface culls the 3D rendering contexts nested in it:
+                // https://github.com/w3c/csswg-drafts/issues/918
+                if let Some(root) = transform.sorting_context_root_index {
+                    palette.backface_culled[i] =
+                        backface_culled_outside_sorting_context(spatial_nodes, &palette.backface_culled, root);
                 }
             }
             SpatialData::Perspective(perspective) => {
@@ -467,11 +582,36 @@ impl<Painter: ReplayPainter> ReplayDriver<'_, Painter> {
             };
             match &tree.effect_nodes[effect.0 as usize].data {
                 EffectNodeData::Effects(effects) if backdrop_is_drawn_by_masks(tree, effect) => {
-                    Some(replay_layer_of(effects, effect, None))
+                    let mut layer = replay_layer_of(effects, effect, None);
+                    layer.backdrop_base_color = self.backdrop_base_color(mask_effect);
+                    Some(layer)
                 }
                 _ => None,
             }
         })
+    }
+
+    // https://drafts.fxtf.org/filter-effects-2/#BackdropRoot
+    // The root element group is a backdrop root, yet engines read the canvas surface below it into the backdrop, see
+    // https://github.com/w3c/fxtf-drafts/issues/557. Skia reads a backdrop from the parent layer only, so a layer
+    // whose nearest enclosing effect is the root isolation effect reads its backdrop over the color the canvas holds
+    // outside every layer. Any other effect is a backdrop root, even one that pushes no layer, such as will-change.
+    fn backdrop_base_color(&self, layer_effect: EffectNodeIndex) -> Color {
+        let tree = self.tree;
+        let mut enclosing_effect = tree.effect_nodes[layer_effect.0 as usize].parent;
+        while !enclosing_effect.is_none()
+            && matches!(
+                tree.effect_nodes[enclosing_effect.0 as usize].data,
+                EffectNodeData::BackgroundColorAnimation
+            )
+        {
+            enclosing_effect = tree.effect_nodes[enclosing_effect.0 as usize].parent;
+        }
+        if tree.root_isolation_effect == Some(enclosing_effect) {
+            self.root_group_color
+        } else {
+            Color::TRANSPARENT
+        }
     }
 
     // Merge the clip and effect chains from leaf to root. Each effect goes immediately
@@ -637,6 +777,8 @@ impl<Painter: ReplayPainter> ReplayDriver<'_, Painter> {
                                     layer.backdrop_filter_bytes_size = 0;
                                     layer.opacity = 1.0;
                                     layer.blend_mode = libgfx_rust::CompositingAndBlendingOperator::Normal;
+                                } else if effects.backdrop_filter.is_some() {
+                                    layer.backdrop_base_color = self.backdrop_base_color(effect);
                                 }
                                 self.painter.push_layer(&layer);
                             }
@@ -679,7 +821,13 @@ impl<Painter: ReplayPainter> ReplayDriver<'_, Painter> {
             return;
         }
         let records = &self.tape[run.offset as usize..(run.offset + run.size) as usize];
-        self.painter.execute_run(run_index, records, self.scroll_offsets);
+        let palette = &self.palette;
+        let clip_space_matrix = |space: SpatialNodeIndex| {
+            let draw_space = palette.draw_spaces.get(space.0 as usize)?;
+            palette.to_root_matrices.get(draw_space.0 as usize).copied()
+        };
+        self.painter
+            .execute_run(run_index, records, self.scroll_offsets, &clip_space_matrix);
     }
 
     fn execute(&mut self) {
@@ -759,6 +907,7 @@ pub fn replay_display_list(
     tape: &[u8],
     command_runs: &[DisplayListCommandRun],
     effect_clips: &EffectClipPlan,
+    root_group_color: Color,
     scroll_offsets: &[FloatPoint],
     painter: &mut impl ReplayPainter,
 ) {
@@ -771,6 +920,7 @@ pub fn replay_display_list(
         command_runs,
         scroll_offsets,
         effect_clips,
+        root_group_color,
         painter,
         palette: scratch.palette,
         culling: scratch.culling,
@@ -928,6 +1078,7 @@ mod tests {
         base_matrix: FloatMatrix4x4,
         fully_clipped_x: i32,
         layer_content_bounds: Vec<Option<FloatRect>>,
+        backdrop_base_colors: Vec<Color>,
     }
 
     impl RecordingPainter {
@@ -937,6 +1088,7 @@ mod tests {
                 base_matrix: translation_matrix(100.0, 200.0, 0.0),
                 fully_clipped_x: i32::MIN,
                 layer_content_bounds: Vec::new(),
+                backdrop_base_colors: Vec::new(),
             }
         }
     }
@@ -960,6 +1112,9 @@ mod tests {
         fn push_layer(&mut self, layer: &ReplayLayer) {
             self.events.push(PainterEvent::PushLayer(layer.opacity));
             self.layer_content_bounds.push(layer.content_bounds.get());
+            if layer.backdrop_filter_bytes_size != 0 {
+                self.backdrop_base_colors.push(layer.backdrop_base_color);
+            }
         }
         fn push_mask(&mut self, mask: &ReplayMask, _backdrop: Option<&ReplayLayer>) {
             self.events.push(PainterEvent::PushMask(mask.rect));
@@ -979,7 +1134,13 @@ mod tests {
 
         fn play_command(&mut self, _command_type: DisplayListCommandType, _command: &[u8], _payload: &[u8]) {}
 
-        fn execute_run(&mut self, run_index: usize, _records: &[u8], _scroll_offsets: &[FloatPoint]) {
+        fn execute_run(
+            &mut self,
+            run_index: usize,
+            _records: &[u8],
+            _scroll_offsets: &[FloatPoint],
+            _clip_space_matrix: &dyn Fn(SpatialNodeIndex) -> Option<FloatMatrix4x4>,
+        ) {
             self.events.push(PainterEvent::Run(run_index));
         }
     }
@@ -1070,7 +1231,120 @@ mod tests {
     }
 
     fn replay(tree: &VisualContextTree, runs: &[DisplayListCommandRun], painter: &mut RecordingPainter) {
-        replay_display_list(tree, &[], runs, &EffectClipPlan::new(tree, runs).unwrap(), &[], painter);
+        replay_display_list(
+            tree,
+            &[],
+            runs,
+            &EffectClipPlan::new(tree, runs).unwrap(),
+            Color::TRANSPARENT,
+            &[],
+            painter,
+        );
+    }
+
+    #[test]
+    fn an_inline_clip_in_a_space_of_its_own_is_pushed_under_the_matrix_of_that_space() {
+        let clip_space = SpatialNodeIndex(7);
+        let clip_rect = FloatRect::new(1.0, 2.0, 3.0, 4.0);
+        let mut builder = crate::display_list::builder::DisplayListBuilder::new();
+        builder.append_with_inline_clips(
+            &crate::display_list::commands::FillRect {
+                rect: IntRect::new(0, 0, 10, 10),
+                color: Color::default(),
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_effect: EffectNodeIndex::NONE,
+            },
+            &[],
+            ContextRef::default(),
+            &[
+                crate::display_list::builder::PendingInlineClip::intersecting_float_rect(clip_rect),
+                crate::display_list::builder::PendingInlineClip::intersecting_float_rect(clip_rect)
+                    .in_space(clip_space),
+            ],
+        );
+        // The clip lands on the command, at (3, 5) in its space.
+        let clip_space_matrix = translation_matrix(102.0, 203.0, 0.0);
+        let mut painter = RecordingPainter::new();
+        let command_space_matrix = painter.base_matrix;
+        replay_records(
+            builder.bytes(),
+            &[],
+            &|space| (space == clip_space).then_some(clip_space_matrix),
+            &mut painter,
+        );
+        assert_eq!(
+            painter.events,
+            vec![
+                PainterEvent::PushClip(clip_rect),
+                PainterEvent::SetMatrix(clip_space_matrix),
+                PainterEvent::PushClip(clip_rect),
+                PainterEvent::SetMatrix(command_space_matrix),
+                PainterEvent::Pop,
+                PainterEvent::Pop,
+                PainterEvent::SetMatrix(command_space_matrix),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_command_whose_inline_clip_in_a_space_of_its_own_has_scrolled_off_it_is_culled() {
+        let clip_space = SpatialNodeIndex(7);
+        let mut builder = crate::display_list::builder::DisplayListBuilder::new();
+        builder.append_with_inline_clips(
+            &crate::display_list::commands::FillRect {
+                rect: IntRect::new(0, 0, 10, 10),
+                color: Color::default(),
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_effect: EffectNodeIndex::NONE,
+            },
+            &[],
+            ContextRef::default(),
+            &[
+                crate::display_list::builder::PendingInlineClip::intersecting_float_rect(FloatRect::new(
+                    1.0, 2.0, 3.0, 4.0,
+                ))
+                .in_space(clip_space),
+            ],
+        );
+        let clip_space_matrix = translation_matrix(0.0, -50.0, 0.0);
+        let mut painter = RecordingPainter::new();
+        replay_records(
+            builder.bytes(),
+            &[],
+            &|space| (space == clip_space).then_some(clip_space_matrix),
+            &mut painter,
+        );
+        assert_eq!(painter.events, vec![]);
+    }
+
+    #[test]
+    fn an_inline_clip_in_an_unknown_space_is_pushed_in_the_space_of_its_command() {
+        let mut builder = crate::display_list::builder::DisplayListBuilder::new();
+        builder.append_with_inline_clips(
+            &crate::display_list::commands::FillRect {
+                rect: IntRect::new(0, 0, 10, 10),
+                color: Color::default(),
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_effect: EffectNodeIndex::NONE,
+            },
+            &[],
+            ContextRef::default(),
+            &[
+                crate::display_list::builder::PendingInlineClip::intersecting_float_rect(FloatRect::new(
+                    1.0, 2.0, 3.0, 4.0,
+                ))
+                .in_space(SpatialNodeIndex(u32::MAX - 1)),
+            ],
+        );
+        let mut painter = RecordingPainter::new();
+        replay_records(builder.bytes(), &[], &|_| None, &mut painter);
+        assert_eq!(
+            painter.events,
+            vec![
+                PainterEvent::PushClip(FloatRect::new(1.0, 2.0, 3.0, 4.0)),
+                PainterEvent::Pop
+            ]
+        );
     }
 
     #[test]
@@ -1697,6 +1971,52 @@ mod tests {
         assert_eq!(layer.backdrop_region, IntRect::default());
     }
 
+    #[test]
+    fn only_a_backdrop_whose_backdrop_root_is_the_root_isolation_effect_reads_the_root_group_color() {
+        let mut tree = identity_tree();
+        let root = effect_under(&mut tree, effects(1.0), EffectNodeIndex::NONE, ClipNodeIndex::NONE);
+        tree.root_isolation_effect = Some(root);
+        // will-change: opacity keeps an effects node that pushes no layer, which is a backdrop root nonetheless.
+        let will_change = effect_under(&mut tree, effects(1.0), root, ClipNodeIndex::NONE);
+        let backdrop = || {
+            EffectNodeData::Effects(EffectsData {
+                isolation: false,
+                opacity: 1.0,
+                blend_mode: CompositingAndBlendingOperator::Normal,
+                filter: None,
+                backdrop_filter: Some(BackdropFilterData {
+                    filter: std::sync::Arc::new(vec![1]),
+                    region: visible_bounds(),
+                    corner_radii: CornerRadii::default(),
+                }),
+            })
+        };
+        let in_root = effect_under(&mut tree, backdrop(), root, ClipNodeIndex::NONE);
+        let in_will_change = effect_under(&mut tree, backdrop(), will_change, ClipNodeIndex::NONE);
+        let runs = [in_root, in_will_change].map(|effect| {
+            run(
+                VISUAL_VIEWPORT_NODE_INDEX,
+                ContextRef {
+                    effect,
+                    ..ContextRef::default()
+                },
+                visible_bounds(),
+            )
+        });
+        let white = Color::from_rgb(255, 255, 255);
+        let mut painter = RecordingPainter::new();
+        replay_display_list(
+            &tree,
+            &[],
+            &runs,
+            &EffectClipPlan::new(&tree, &runs).unwrap(),
+            white,
+            &[],
+            &mut painter,
+        );
+        assert_eq!(painter.backdrop_base_colors, vec![white, Color::TRANSPARENT]);
+    }
+
     // A background-color animation marker is an effect without canvas state: entering or leaving
     // it neither pushes nor invalidates the matrix.
     #[test]
@@ -1817,6 +2137,7 @@ mod tests {
             &[],
             &runs,
             &EffectClipPlan::new(&tree, &runs).unwrap(),
+            Color::TRANSPARENT,
             &scroll_offsets,
             &mut painter,
         );

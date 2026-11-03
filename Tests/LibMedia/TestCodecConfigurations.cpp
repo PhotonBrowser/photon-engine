@@ -14,6 +14,7 @@
 #include <LibMediaCodecs/Codecs/H265.h>
 #include <LibMediaCodecs/Codecs/NALUnit.h>
 #include <LibMediaCodecs/Codecs/VP9.h>
+#include <LibMediaCodecs/Limits.h>
 #include <LibTest/TestCase.h>
 
 TEST_CASE(opus_isobmff_configuration_is_normalized_to_opus_head)
@@ -219,10 +220,10 @@ TEST_CASE(av1_configuration_record_reads_a_reduced_still_picture_sequence_header
 
     auto parameters = Media::Codecs::AV1::parse_configuration_record(record);
     EXPECT(parameters.has_value());
-    EXPECT(parameters->optional_fields.cicp.color_primaries() == Media::ColorPrimaries::BT2020);
-    EXPECT(parameters->optional_fields.cicp.transfer_characteristics() == Media::TransferCharacteristics::SMPTE2084);
-    EXPECT(parameters->optional_fields.cicp.matrix_coefficients() == Media::MatrixCoefficients::BT2020NonConstantLuminance);
-    EXPECT(parameters->optional_fields.cicp.video_full_range_flag() == Media::VideoFullRangeFlag::Studio);
+    EXPECT_EQ(parameters->optional_fields.cicp.color_primaries(), Media::ColorPrimaries::BT2020);
+    EXPECT_EQ(parameters->optional_fields.cicp.transfer_characteristics(), Media::TransferCharacteristics::SMPTE2084);
+    EXPECT_EQ(parameters->optional_fields.cicp.matrix_coefficients(), Media::MatrixCoefficients::BT2020NonConstantLuminance);
+    EXPECT_EQ(parameters->optional_fields.cicp.video_full_range_flag(), Media::VideoFullRangeFlag::Studio);
 }
 
 TEST_CASE(av1_configuration_record_without_configuration_obus_reports_unspecified_color)
@@ -235,9 +236,9 @@ TEST_CASE(av1_configuration_record_without_configuration_obus_reports_unspecifie
     EXPECT_EQ(parameters->level, 8);
     EXPECT_EQ(parameters->bit_depth, 8);
     EXPECT(parameters->optional_fields.subsampling == Media::Subsampling::yuv420());
-    EXPECT(parameters->optional_fields.cicp.color_primaries() == Media::ColorPrimaries::Unspecified);
-    EXPECT(parameters->optional_fields.cicp.transfer_characteristics() == Media::TransferCharacteristics::Unspecified);
-    EXPECT(parameters->optional_fields.cicp.matrix_coefficients() == Media::MatrixCoefficients::Unspecified);
+    EXPECT_EQ(parameters->optional_fields.cicp.color_primaries(), Media::ColorPrimaries::Unspecified);
+    EXPECT_EQ(parameters->optional_fields.cicp.transfer_characteristics(), Media::TransferCharacteristics::Unspecified);
+    EXPECT_EQ(parameters->optional_fields.cicp.matrix_coefficients(), Media::MatrixCoefficients::Unspecified);
 }
 
 TEST_CASE(av1_sequence_header_without_a_color_description_reports_unspecified_color)
@@ -250,9 +251,9 @@ TEST_CASE(av1_sequence_header_without_a_color_description_reports_unspecified_co
 
     auto parameters = Media::Codecs::AV1::parse_configuration_record(record);
     EXPECT(parameters.has_value());
-    EXPECT(parameters->optional_fields.cicp.color_primaries() == Media::ColorPrimaries::Unspecified);
-    EXPECT(parameters->optional_fields.cicp.transfer_characteristics() == Media::TransferCharacteristics::Unspecified);
-    EXPECT(parameters->optional_fields.cicp.matrix_coefficients() == Media::MatrixCoefficients::Unspecified);
+    EXPECT_EQ(parameters->optional_fields.cicp.color_primaries(), Media::ColorPrimaries::Unspecified);
+    EXPECT_EQ(parameters->optional_fields.cicp.transfer_characteristics(), Media::TransferCharacteristics::Unspecified);
+    EXPECT_EQ(parameters->optional_fields.cicp.matrix_coefficients(), Media::MatrixCoefficients::Unspecified);
 }
 
 TEST_CASE(av1_configuration_record_rejects_invalid_wrapper)
@@ -1237,4 +1238,19 @@ TEST_CASE(h264_max_num_reorder_frames_infers_zero_from_profile_constraints)
     };
     check_inference(without_vui);
     check_inference(without_bitstream_restriction);
+}
+
+TEST_CASE(aac_configuration_record_refuses_sample_rates_outside_the_supported_range)
+{
+    auto create = [](u32 sample_rate, Optional<u32> spectral_band_replication_sample_rate = {}) {
+        return Media::Codecs::AAC::create_configuration_record(Media::Codecs::AAC::LOW_COMPLEXITY_AUDIO_OBJECT_TYPE, sample_rate, 2, spectral_band_replication_sample_rate);
+    };
+
+    EXPECT(!create(Media::MIN_AUDIO_SAMPLE_RATE).is_error());
+    EXPECT(!create(Media::MAX_AUDIO_SAMPLE_RATE / 2, Media::MAX_AUDIO_SAMPLE_RATE).is_error());
+
+    EXPECT_EQ(create(Media::MIN_AUDIO_SAMPLE_RATE - 1).error().category(), Media::DecoderErrorCategory::NotImplemented);
+    EXPECT_EQ(create(Media::MAX_AUDIO_SAMPLE_RATE + 1).error().category(), Media::DecoderErrorCategory::NotImplemented);
+    EXPECT_EQ(create(Media::MAX_AUDIO_SAMPLE_RATE / 2, Media::MAX_AUDIO_SAMPLE_RATE + 2).error().category(), Media::DecoderErrorCategory::NotImplemented);
+    EXPECT_EQ(create(Media::MIN_AUDIO_SAMPLE_RATE - 1, (Media::MIN_AUDIO_SAMPLE_RATE - 1) * 2).error().category(), Media::DecoderErrorCategory::NotImplemented);
 }

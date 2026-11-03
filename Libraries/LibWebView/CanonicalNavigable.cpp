@@ -569,6 +569,50 @@ bool CanonicalNavigable::is_ancestor_of(CanonicalNavigable const& potential_desc
     return false;
 }
 
+// https://html.spec.whatwg.org/multipage/interaction.html#fully-active-descendant-of-a-top-level-traversable-with-user-attention
+bool CanonicalNavigable::active_document_is_fully_active_descendant_of_a_top_level_traversable_with_user_attention() const
+{
+    // A Document d is a fully active descendant of a top-level traversable with user attention when d is fully active
+    // and d's node navigable's top-level traversable has user attention.
+    // NB: The process hosting the active document reports whether it is fully active. A lost document has no host, and
+    //     is not fully active whatever its host last reported.
+    if (!active_document().host())
+        return false;
+    return m_hosted_state.has_value() && m_hosted_state->active_document_is_fully_active && top_level_traversable().has_user_attention();
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#activation-notification
+void CanonicalNavigable::run_activation_notification_steps_for_active_document(HashTable<Web::HTML::CrossProcessId>& notified_document_ids) const
+{
+    auto const& document = active_document();
+
+    // 2. Let windows be « document's relevant global object ».
+    Vector<NonnullRefPtr<CanonicalDocument const>> windows { document };
+
+    // 3. Extend windows with the active window of each of document's ancestor navigables.
+    for (auto const* ancestor = parent(); ancestor; ancestor = ancestor->parent())
+        windows.append(ancestor->active_document());
+
+    // 4. Extend windows with the active window of each of document's descendant navigables, filtered to include only
+    //    those navigables whose active document's origin is same origin with document's origin.
+    for_each_in_subtree([&](CanonicalNavigable const& descendant) {
+        auto const& descendant_document = descendant.active_document();
+        if (descendant_document.origin().is_same_origin(document.origin()))
+            windows.append(descendant_document);
+        return IterationDecision::Continue;
+    });
+
+    // 5. For each window in windows:
+    // NB: The page hosting the window's document runs steps 5.1 and 5.2. Running them again for the same input changes
+    //     nothing, so a window already notified for it is skipped.
+    for (auto const& window : windows) {
+        if (notified_document_ids.set(window->id()) != HashSetResult::InsertedNewEntry)
+            continue;
+        if (auto const& host = window->host())
+            host->notify_about_user_activation(window->id());
+    }
+}
+
 // https://html.spec.whatwg.org/multipage/document-sequences.html#familiar-with
 // NB: Stated on the navigables whose active browsing contexts are compared, as in the renderer.
 bool CanonicalNavigable::is_familiar_with(CanonicalNavigable const& other) const
@@ -1128,7 +1172,7 @@ void CanonicalNavigable::discard_pending_host()
 
 void CanonicalNavigable::discard_pending_host(WebContentPage const& page)
 {
-    if (active_document().host() == &page)
+    if (page.hosts_active_document_of(*this))
         return;
     Vector<NonnullRefPtr<CanonicalDocumentState>> document_states;
     for_each_populated_document_state([&](CanonicalDocumentState& document_state) {

@@ -115,6 +115,13 @@ pub unsafe extern "C" fn render_state_adopt_derived_node_style(host: &DocumentHo
     unsafe { write_and_pay(host, node_read(), LayoutWrite::AdoptDerivedNodeStyle { node, record }) };
 }
 
+/// The style record the render side installed in the box `node` ahead of the host with the style update the host
+/// took last, which the box's layout node adopts without publishing it again, or 0 where it installed none.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_installed_style_record(host: &DocumentHost, node: NodeSlotId) -> u64 {
+    host.render_state_installed_box_record(node).unwrap_or(0)
+}
+
 /// The anonymous rows below the row inherit its style again, which their layout nodes hear of once the host has its next
 /// job back. A table box, which `is_table_box` says the row's style makes it, may itself take a record the arena derives
 /// as its wrapper inherits its style again, which its layout node hears of before it reads its style again.
@@ -134,6 +141,25 @@ pub unsafe extern "C" fn render_state_reinherit_anonymous_descendants(
         return;
     }
     host.queue_change(crate::render_state::ArenaChange::ReinheritAnonymousDescendants(node));
+}
+
+/// The anonymous boxes that give the text of the `display: contents` element `element` its style take it again, which
+/// their layout nodes hear of once the host has its next job back.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_reinherit_display_contents_text(host: &DocumentHost, element: u32) {
+    let Some(element) = StyleNodeID::from_raw(element) else {
+        return;
+    };
+    host.queue_change(crate::render_state::ArenaChange::ReinheritDisplayContentsText(element));
+}
+
+/// Each `::first-letter` box whose element containing the letter took another style takes its style again, which its
+/// layout node hears of once the host has its next job back.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_refresh_first_letter_styles(host: &DocumentHost) {
+    if host.first_letter_styles_may_be_derived() {
+        host.queue_change(crate::render_state::ArenaChange::RefreshFirstLetterStyles);
+    }
 }
 
 /// The viewport and the boxes of the root element and its body take the styles viewport propagation gives them, which

@@ -40,44 +40,6 @@ pub extern "C" fn layout_row_paintable_physical_resize_axes(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn layout_row_paintable_compute_scrollbar_data(
-    host: &crate::render_state::DocumentHost,
-    slot: NodeSlotId,
-    direction: ScrollDirection,
-    metrics: FfiChromeMetrics,
-    enlarged: bool,
-    has_device_scroll_offset: bool,
-    device_scroll_offset: f32,
-    device_pixels_per_css_pixel: f64,
-    out: &mut FfiOptionalScrollbarData,
-) {
-    let data = read_measured_rows(host, super::node_read(), |rows| {
-        crate::painting::chrome_geometry::ChromeGeometry { arena: rows, metrics }.compute_scrollbar_data(
-            slot,
-            direction,
-            enlarged,
-            has_device_scroll_offset.then_some(crate::painting::chrome_geometry::ScrollbarScrollState {
-                device_scroll_offset,
-                device_pixels_per_css_pixel,
-            }),
-        )
-    });
-    let Some(data) = data else {
-        *out = FfiOptionalScrollbarData::default();
-        return;
-    };
-    *out = FfiOptionalScrollbarData {
-        has_value: true,
-        value: FfiScrollbarData {
-            gutter_rect: data.gutter_rect.into(),
-            thumb_rect: data.thumb_rect.into(),
-            track_rect: data.track_rect.into(),
-            thumb_travel_to_scroll_ratio: data.thumb_travel_to_scroll_ratio.to_double(),
-        },
-    };
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn layout_row_paintable_minimum_scroll_offset(
     host: &crate::render_state::DocumentHost,
     slot: NodeSlotId,
@@ -177,7 +139,7 @@ pub extern "C" fn render_state_scroll_target_for_text_position(
             super::node_read(),
             (text, offset, affinity_is_downstream, scroll_block_axis),
             |arena, (text, offset, affinity_is_downstream, scroll_block_axis)| {
-                arena.measure_scrollable_overflow();
+                arena.settle_scrollable_overflow();
                 crate::painting::scroll_chain::scroll_target_for_text_position(
                     &arena.paintable_rows(),
                     text,
@@ -193,66 +155,6 @@ pub extern "C" fn render_state_scroll_target_for_text_position(
     };
     *offset_out = scroll_offset.into();
     container
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_scrolling_box_for_scroll_step(
-    host: &crate::render_state::DocumentHost,
-    target: NodeSlotId,
-    viewport: NodeSlotId,
-    delta: FfiCssPixelPoint,
-) -> NodeSlotId {
-    read_arena(
-        host,
-        super::node_read(),
-        (target, viewport, delta),
-        |arena, (target, viewport, delta)| {
-            arena.measure_scrollable_overflow();
-            crate::painting::scroll_chain::scrolling_box_for_scroll_step(
-                &arena.paintable_rows(),
-                target,
-                viewport,
-                delta.into(),
-            )
-        },
-    )
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread. The host callback receives the slots of live rows.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_for_each_wheel_scrollable_box_in_containing_block_chain(
-    host: &crate::render_state::DocumentHost,
-    start: NodeSlotId,
-    wheel_delta_x: f64,
-    wheel_delta_y: f64,
-    context: *mut c_void,
-    push_scrollable_box: unsafe extern "C" fn(*mut c_void, NodeSlotId, f64, f64),
-) {
-    let boxes = {
-        read_arena(
-            host,
-            super::node_read(),
-            (start, wheel_delta_x, wheel_delta_y),
-            |arena, (start, wheel_delta_x, wheel_delta_y)| {
-                arena.measure_scrollable_overflow();
-                let mut boxes = Vec::new();
-                crate::painting::scroll_chain::for_each_wheel_scrollable_box_in_containing_block_chain(
-                    &arena.paintable_rows(),
-                    start,
-                    wheel_delta_x,
-                    wheel_delta_y,
-                    |node, accepted_delta_x, accepted_delta_y| boxes.push((node, accepted_delta_x, accepted_delta_y)),
-                );
-                boxes
-            },
-        )
-    };
-    for (node, accepted_delta_x, accepted_delta_y) in boxes {
-        // SAFETY: The C++ callback appends the slot and deltas to a caller-owned collection.
-        unsafe { push_scrollable_box(context, node, accepted_delta_x, accepted_delta_y) };
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -278,7 +180,7 @@ pub extern "C" fn render_state_first_wheel_scrollable_box_in_containing_block_ch
     start: NodeSlotId,
 ) -> NodeSlotId {
     read_arena(host, node_read(), start, |arena, start| {
-        arena.measure_scrollable_overflow();
+        arena.settle_scrollable_overflow();
         crate::painting::scroll_chain::first_wheel_scrollable_box_in_containing_block_chain(
             &arena.paintable_rows(),
             start,
@@ -787,6 +689,20 @@ pub unsafe extern "C" fn render_state_render_vector_images(
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_hold_next_recording_for_testing() {
     crate::painting::recording_slot::hold_next_recording_for_testing();
+}
+
+/// Keeps the Render thread from claiming the next style update that flies, until the test releases it or the host waits
+/// for it, which then takes it back.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_hold_next_style_flight_claim_for_testing() {
+    crate::painting::recording_slot::hold_next_style_flight_claim_for_testing();
+}
+
+/// Holds the next style update that flies before it reads anything, until the test releases it or the host waits
+/// for it.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_hold_next_style_flight_for_testing() {
+    crate::painting::recording_slot::hold_next_style_flight_for_testing();
 }
 
 /// Lets the recording held for the test go.

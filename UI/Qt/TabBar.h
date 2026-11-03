@@ -16,7 +16,9 @@
 #include <AK/kmalloc.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Settings.h>
+#include <UI/Qt/BookmarksBar.h>
 #include <UI/Qt/Tab.h>
+#include <UI/Qt/WindowToolbar.h>
 
 #include <QHash>
 #include <QPixmap>
@@ -309,11 +311,15 @@ public:
     Tab* tab(int index) const { return as<Tab>(m_stacked_widget->widget(index)); }
     void set_current_tab(Tab*);
 
+    WindowToolbar& toolbar() const { return *m_toolbar; }
+    BookmarksBar& bookmarks_bar() const { return m_bookmarks_bar->bar(); }
+    void update_bookmarks_bar_visibility();
+
     int index_of(Tab* widget) const;
 
-    void set_tab_text(int index, QString const& text) { m_tab_bar->setTabText(index, text); }
+    void set_tab_text(int index, QString const& text);
     void set_tab_tooltip(int index, QString const& tip) { m_tab_bar->setTabToolTip(index, tip); }
-    void set_tab_icon(int index, QIcon const& icon) { m_tab_bar->setTabIcon(index, icon); }
+    void set_tab_icon(int index, QIcon const& icon);
 
     void set_tab_bar_visible(bool visible);
     void set_new_tab_action(QAction* action);
@@ -335,6 +341,8 @@ public:
     void place_horizontal_new_tab_button();
     int horizontal_tab_strip_drag_space() const;
     void show_all_tabs();
+    void update_all_tabs_entries();
+    void update_all_tabs_entries_soon();
 
 signals:
     void current_tab_changed(int index);
@@ -367,17 +375,17 @@ private:
     void float_sidebar_buttons_while_toggling();
     bool slides_page_with_toggling_sidebar() const;
     void slide_page_with_toggling_sidebar();
-    QLabel* m_floating_ladybird_button { nullptr };
+    QLabel* m_floating_ladybird_buttons { nullptr };
     QLabel* m_floating_sidebar_toggle { nullptr };
     // Where the toolbar's slot for the buttons ends when the sidebar starts to open, in the window. The slot keeps
     // ending there until the sidebar is open, so the toolbar's other buttons stay in place under the sidebar.
     void rebuild_layout_for_vertical_tabs();
     void rebuild_page_column();
+    void add_page_to_page_column();
     void place_toolbar_over_page_column();
     void update_vertical_tabs_column_margins();
     void paint_vertical_tabs_column();
-    void update_toolbar_placement();
-    void update_tab_toolbar_window_controls_visibility();
+    void update_toolbar_window_controls_visibility();
     int current_vertical_tabs_width() const;
     void apply_vertical_tabs_expanded_width(int width);
     void persist_vertical_tabs_expanded_width();
@@ -409,14 +417,18 @@ private:
     QToolButton* m_new_tab_button { nullptr };
     QToolButton* m_all_tabs_button { nullptr };
     AllTabsPopover* m_all_tabs_popover { nullptr };
+    bool m_all_tabs_entries_update_is_pending { false };
     Vector<WebView::SessionWindowId> m_recently_closed_unit_ids;
     LadybirdButton* m_ladybird_button { nullptr };
+    // The Ladybird button and the all-tabs button after it, which move together.
+    QWidget* m_ladybird_buttons { nullptr };
     QToolButton* m_vertical_tabs_toggle_button { nullptr };
     QToolButton* m_minimize_window_button { nullptr };
     QToolButton* m_maximize_window_button { nullptr };
     QToolButton* m_close_window_button { nullptr };
     QWidget* m_window_controls { nullptr };
-    QStackedWidget* m_toolbar_container { nullptr };
+    WindowToolbar* m_toolbar { nullptr };
+    BookmarksBarContainer* m_bookmarks_bar { nullptr };
     QWidget* m_page_column { nullptr };
     QWidget* m_toolbar_placeholder { nullptr };
     bool m_toolbar_follows_page_column { false };

@@ -61,7 +61,6 @@ class ChromeWidgetRegistry;
 enum class PaintCommandCacheMode : u8;
 struct GradientPaintStyle;
 struct PatternPaintStyle;
-class Scrollbar;
 
 }
 
@@ -149,6 +148,42 @@ class MediaStreamTrack;
 
 }
 
+namespace Web::WebRTC {
+
+class KeyFrameRequestEvent;
+class RTCCertificate;
+class RTCDataChannel;
+class RTCDataChannelEvent;
+class RTCDTMFSender;
+class RTCDTMFToneChangeEvent;
+class RTCDtlsTransport;
+class RTCEncodedAudioFrame;
+class RTCEncodedVideoFrame;
+class RTCError;
+class RTCErrorEvent;
+class RTCIceCandidate;
+class RTCIceTransport;
+class RTCPeerConnection;
+class RTCPeerConnectionIceErrorEvent;
+class RTCPeerConnectionIceEvent;
+class RTCRtpReceiver;
+class RTCRtpScriptTransform;
+class RTCRtpScriptTransformer;
+class RTCRtpSender;
+class RTCRtpTransceiver;
+class RTCSctpTransport;
+class RTCSessionDescription;
+class RTCSFrameReceiverTransform;
+class RTCSFrameSenderTransform;
+class RTCStatsReport;
+class RTCTrackEvent;
+class RTCTransformEvent;
+class SFrameDecrypterStream;
+class SFrameEncrypterStream;
+class SFrameTransformErrorEvent;
+
+}
+
 namespace Web::Clipboard {
 
 class Clipboard;
@@ -208,6 +243,7 @@ class BackgroundSizeStyleValue;
 class BlurFilterStyleValue;
 class CalculatedStyleValue;
 class CustomPropertyData;
+enum class IsAnimationOverlay : bool;
 class ColorFilterStyleValue;
 class ColorFunctionStyleValue;
 class ColorSchemeStyleValue;
@@ -641,7 +677,6 @@ class AudioTrackList;
 class AutoplaySettings;
 class BarProp;
 class BeforeUnloadEvent;
-class BroadcastChannel;
 class BrowsingContext;
 class Canvas2DContextBase;
 class CanvasHost;
@@ -763,7 +798,7 @@ class LocalNavigable;
 class LocalTraversableNavigable;
 class Location;
 class MediaError;
-class MessageChannel;
+class MediaStreamPlayback;
 class MessageEvent;
 class MessagePort;
 class MimeType;
@@ -802,8 +837,6 @@ class SharedResourceRequest;
 class SharedWorker;
 class SharedWorkerGlobalScope;
 class Storage;
-class StructuredSerializeReader;
-class StructuredSerializeWriter;
 class SubmitEvent;
 class TextTrack;
 class TextTrackCue;
@@ -955,6 +988,7 @@ class PerformanceTiming;
 namespace Web::NotificationsAPI {
 
 class Notification;
+struct NotificationData;
 
 }
 

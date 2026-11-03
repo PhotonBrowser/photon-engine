@@ -82,6 +82,7 @@ private:
         DecoderErrorOr<void> receive_coded_frame(CodedFrame const&);
         DecoderErrorOr<bool> replace_drained_decoder();
         bool check_if_seek_is_needed_or_allow_demuxer_reads(u32 seek_id);
+        void wait_for_another_seek_or_exit(u32 seek_id);
         void release_decoder();
         void exit();
 
@@ -146,13 +147,14 @@ private:
         AudioDecoderSelection m_decoder_selection;
         AudioDecoderSelection m_decoder_that_failed_due_to_missing_features;
         Optional<CodedFrame> m_frame_awaiting_decoder_replacement;
+        bool m_decoder_is_draining_before_unavailable_data { false };
         OwnPtr<AudioDecoder> m_decoder;
         NonnullOwnPtr<Audio::AudioConverter> m_converter;
         i64 m_last_output_frame { NumericLimits<i64>::min() };
 
         size_t m_queue_max_size { 8 };
         AudioQueue m_queue;
-        AK::Duration m_earliest_available_timestamp;
+        AK::Duration m_consumed_media_time_end;
         ErrorHandler m_error_handler;
         ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };

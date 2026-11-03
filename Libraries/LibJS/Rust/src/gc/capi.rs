@@ -65,6 +65,8 @@ pub struct GCLayout {
     pub heap_allocated_bytes_since_last_gc_offset: u32,
     pub heap_gc_bytes_threshold_offset: u32,
     pub heap_total_allocated_bytes_offset: u32,
+    pub block_size: u32,
+    pub block_foreign_type_offset: u32,
     pub heap_region_offset_mask: u64,
     pub primitive_storage_cage_offset_mask: u64,
 }
@@ -119,6 +121,7 @@ unsafe extern "C" {
         type_info: *const CellTypeInfo,
         name: *const c_char,
         name_length: usize,
+        foreign_type: *const c_void,
     ) -> *mut GCAllocator;
     pub fn gc_allocator_destroy(allocator: *mut GCAllocator);
     pub fn gc_heap_allocate_cell(heap: *mut GCHeap, allocator: *mut GCAllocator, must_mark: *mut bool) -> *mut c_void;
@@ -143,6 +146,7 @@ unsafe extern "C" {
     pub fn gc_visitor_visit_cell(visitor: *mut GCVisitor, cell: *mut c_void);
     pub fn gc_visitor_visit_cells(visitor: *mut GCVisitor, cells: *const *mut c_void, count: usize);
     pub fn gc_visitor_visit_values(visitor: *mut GCVisitor, values: *const u64, count: usize);
+    pub fn gc_visitor_visit_ephemeron(visitor: *mut GCVisitor, key: *mut c_void, value: *const u64);
     pub fn gc_visitor_visit_possible_values(visitor: *mut GCVisitor, data: *const u8, size: usize);
 
     pub fn gc_primitive_storage_allocate(

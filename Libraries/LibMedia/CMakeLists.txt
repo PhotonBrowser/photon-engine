@@ -4,6 +4,7 @@ set(SOURCES
     Audio/WSOLAInternals.cpp
     Audio/WSOLATimeStretcher.cpp
     AudioDiscardIntervals.cpp
+    Codecs/AudioPacketDurationParser.cpp
     Codecs/FLAC.cpp
     Codecs/Opus.cpp
     Codecs/Vorbis.cpp
@@ -105,6 +106,7 @@ endif()
 target_sources(LibMedia PRIVATE
         FFmpeg/FFmpegAudioConverter.cpp
         FFmpeg/FFmpegAudioDecoder.cpp
+        FFmpeg/FFmpegAudioEncoder.cpp
         FFmpeg/FFmpegChannelLayout.cpp
 )
 

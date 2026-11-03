@@ -93,6 +93,10 @@ typedef struct GCLayout {
     uint32_t heap_allocated_bytes_since_last_gc_offset;
     uint32_t heap_gc_bytes_threshold_offset;
     uint32_t heap_total_allocated_bytes_offset;
+    // A cell's block starts at the cell's address rounded down to a multiple of block_size, and holds the foreign
+    // type the cell's allocator was created with at block_foreign_type_offset.
+    uint32_t block_size;
+    uint32_t block_foreign_type_offset;
     uint64_t heap_region_offset_mask;
     uint64_t primitive_storage_cage_offset_mask;
 } GCLayout;
@@ -129,7 +133,8 @@ GC_API void gc_heap_did_allocate_external_memory(GCHeap*, size_t);
 GC_API void gc_heap_did_free_external_memory(GCHeap*, size_t);
 
 // The type info and the name must outlive the allocator, and the allocator must outlive every heap it allocated from.
-GC_API GCAllocator* gc_allocator_create(GCCellTypeInfo const*, char const* name, size_t name_length);
+// The blocks of the allocator hold foreign_type, which LibGC never reads.
+GC_API GCAllocator* gc_allocator_create(GCCellTypeInfo const*, char const* name, size_t name_length, void const* foreign_type);
 GC_API void gc_allocator_destroy(GCAllocator*);
 
 // Returns uninitialized storage for one cell. *must_mark tells the caller what to store as the cell's mark: cells that
@@ -182,6 +187,8 @@ GC_API void gc_weak_impl_unref(GCWeakImpl*);
 GC_API void gc_visitor_visit_cell(GCVisitor*, GCCell*);
 GC_API void gc_visitor_visit_cells(GCVisitor*, GCCell* const*, size_t count);
 GC_API void gc_visitor_visit_values(GCVisitor*, uint64_t const*, size_t count);
+// Visits a NaN-boxed value that is reachable only while key is, such as a WeakMap entry's.
+GC_API void gc_visitor_visit_ephemeron(GCVisitor*, GCCell* key, uint64_t const* value);
 // Treats every aligned word in the range as a possible pointer to a cell or NaN-boxed cell value.
 GC_API void gc_visitor_visit_possible_values(GCVisitor*, uint8_t const*, size_t size);
 

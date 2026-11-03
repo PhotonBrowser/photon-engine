@@ -7,7 +7,6 @@
 //! Snapshots of executables for compile jobs, captured on the main thread straight from the runtime's structures.
 //! A snapshot refers to cells only by address; the cells it captured are kept alive by whoever owns the job.
 
-use core::mem::offset_of;
 use libjs_abi::Builtin;
 use std::collections::HashMap;
 
@@ -37,7 +36,6 @@ use crate::gc::defer_gc::{DeferGc, Deferred};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::DeclarativeEnvironment;
-use crate::layout::execution_context::ExecutionContext;
 use crate::layout::function_object::{
     DirectGetterFunction, EcmascriptFunctionObject, FunctionObject, RawNativeFunction,
 };
@@ -357,27 +355,16 @@ fn native_call_target(vm: &Vm, feedback: &CallFeedback) -> Option<Gc<RawNativeFu
 
 /// The words of an ECMAScript function its frames start with, which stay the same for its lifetime.
 fn function_frame_fields(function: Gc<EcmascriptFunctionObject>) -> FunctionFrameFields {
+    let shared_data = function.shared_data();
     FunctionFrameFields {
-        script_or_module: [
-            word_of(function, offset_of!(EcmascriptFunctionObject, script_or_module)),
-            word_of(function, offset_of!(EcmascriptFunctionObject, script_or_module) + 8),
-        ],
-        environment: word_of(function, offset_of!(EcmascriptFunctionObject, environment)),
-        private_environment: word_of(function, offset_of!(EcmascriptFunctionObject, private_environment)),
+        script_or_module: shared_data.script_or_module.word(),
+        environment: function
+            .environment()
+            .map_or(0, |environment| environment.as_ptr() as u64),
+        private_environment: function
+            .private_environment()
+            .map_or(0, |environment| environment.as_ptr() as u64),
     }
-}
-
-/// The words of the `[[ScriptOrModule]]` of a frame, like `function_frame_fields()` has them of a function.
-fn script_or_module_words(frame: &ExecutionContext) -> [u64; 2] {
-    let address = core::ptr::from_ref(&frame.script_or_module).cast::<u64>();
-    // SAFETY: The field is two words.
-    unsafe { [address.read_unaligned(), address.add(1).read_unaligned()] }
-}
-
-/// The words at `offset` of a cell.
-fn word_of<T>(cell: Gc<T>, offset: usize) -> u64 {
-    // SAFETY: The callers read fields of the cell that are words.
-    unsafe { cell.as_ptr().cast::<u8>().add(offset).cast::<u64>().read_unaligned() }
 }
 
 impl SnapshotBuilder<'_> {
@@ -612,7 +599,8 @@ impl SnapshotBuilder<'_> {
                     Some(TypedArraySnapshot {
                         element,
                         fixed_length: (array.cached_data_offset() != TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID)
-                            .then(|| array.array_length.length.get()),
+                            .then(|| array.array_length.length.get())
+                            .and_then(|length| u32::try_from(length).ok()),
                     })
                 }),
         }
@@ -957,7 +945,8 @@ impl SnapshotBuilder<'_> {
                 let bytes = |word_offset: u32| word_offset * size_of::<u64>() as u32;
                 DirectGetterFields {
                     wrapper_implementation: bytes(getter.wrapper_implementation_word_offset.get()),
-                    implementation_value: bytes(getter.implementation_value_word_offset.get()),
+                    implementation_value: getter.implementation_value_offset.get(),
+                    implementation_value_is_compressed: getter.implementation_value_is_compressed.get() != 0,
                     main_world_wrapper: bytes(getter.main_world_wrapper_word_offset.get()),
                     weak_impl_value: bytes(getter.weak_impl_value_word_offset.get()),
                 }
@@ -1163,7 +1152,7 @@ impl SnapshotBuilder<'_> {
             let Some(environment) = environment.as_declarative_environment() else {
                 continue;
             };
-            if coordinate.index as usize >= environment.binding_values.size() {
+            if coordinate.index as usize >= environment.binding_count.get() as usize {
                 continue;
             }
             let value = environment.get_initialized_binding_value_direct(coordinate.index as usize);
@@ -1264,7 +1253,7 @@ pub fn capture_snapshot<'d>(
     let compiled_function_fields = match function {
         Some(function) => function_frame_fields(function),
         None => FunctionFrameFields {
-            script_or_module: script_or_module_words(vm.running_execution_context_ref()),
+            script_or_module: vm.running_execution_context_ref().script_or_module.word(),
             ..FunctionFrameFields::default()
         },
     };

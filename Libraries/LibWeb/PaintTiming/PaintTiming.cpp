@@ -126,6 +126,7 @@ static bool svg_has_rendered_descendants(Layout::Node const& svg_box)
 // NB: This answers the question for the box of an element, or for a text node's box, which stands for the element
 //     the text node is a child of. Generated content has boxes of its own, so a pseudo-element's content is found
 //     the same way as an element's.
+// NB: A box this can answer yes for must also make layout_rows_may_be_contentful() answer yes.
 static bool is_contentful(Layout::Node const& node)
 {
     // An element target is contentful when one or more of the following apply:
@@ -144,8 +145,6 @@ static bool is_contentful(Layout::Node const& node)
     if (!node_with_style)
         return false;
 
-    auto const* dom_node = node.dom_node();
-
     switch (node.kind()) {
     // - target is a replaced element representing an available image.
     case Layout::RustFFI::NodeKind::ImageBox:
@@ -157,13 +156,13 @@ static bool is_contentful(Layout::Node const& node)
     }
     // - target is a canvas with its context mode set to any value other than none.
     case Layout::RustFFI::NodeKind::CanvasBox:
-        if (auto const* canvas = as_if<HTML::HTMLCanvasElement>(dom_node); canvas && !canvas->context().has<Empty>())
+        if (auto const* canvas = as_if<HTML::HTMLCanvasElement>(node.dom_node()); canvas && !canvas->context().has<Empty>())
             return true;
         break;
     // - target is a video element that represents its poster frame or the first video frame and the frame is
     //   available.
     case Layout::RustFFI::NodeKind::VideoBox:
-        if (auto const* video = as_if<HTML::HTMLVideoElement>(dom_node)) {
+        if (auto const* video = as_if<HTML::HTMLVideoElement>(node.dom_node())) {
             auto representation = video->current_representation();
             if (representation == HTML::HTMLVideoElement::Representation::PosterFrame && video->poster_frame().has_value())
                 return true;
@@ -179,7 +178,7 @@ static bool is_contentful(Layout::Node const& node)
     // - target is an input element with a non-empty value attribute.
     // NB: The value is what the control renders, which the value attribute only provides the default for.
     case Layout::RustFFI::NodeKind::TextInputBox:
-        if (auto const* input = as_if<HTML::HTMLInputElement>(dom_node)) {
+        if (auto const* input = as_if<HTML::HTMLInputElement>(node.dom_node())) {
             auto value = input->value();
             if (is_non_empty(value.utf16_view()))
                 return true;
@@ -347,6 +346,11 @@ static PaintedContent find_painted_content(PaintableChecker const& checker, Pain
 
     auto const* viewport = checker.viewport();
     if (!viewport)
+        return result;
+
+    // OPTIMIZATION: This runs every frame until first contentful paint is reported, which a document with nothing that
+    //               can be contentful never does, so its boxes are not walked.
+    if (result.has_non_default_content && !Layout::RustFFI::layout_rows_may_be_contentful(viewport->document_host(), &checker.read()))
         return result;
 
     viewport->for_each_in_inclusive_subtree([&](Layout::Node const& node) {
@@ -658,8 +662,6 @@ void DocumentPaintTimingState::visit_edges(GC::Cell::Visitor& visitor)
     for (auto& record : images_pending_rendering)
         visitor.visit(record.element);
     visitor.visit(text_nodes_pending_first_paint);
-    if (current_largest_contentful_paint_candidate.has_value())
-        visitor.visit(current_largest_contentful_paint_candidate->element);
 }
 
 }

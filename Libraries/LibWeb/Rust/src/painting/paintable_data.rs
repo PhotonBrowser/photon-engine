@@ -13,16 +13,14 @@ use crate::painting::display_list::commands::{ContextRef, SpatialNodeIndex};
 #[repr(u32)]
 pub enum PaintableFlag {
     HasNonInvertibleCssTransform = 1 << 0,
-    HorizontalScrollbarEnlarged = 1 << 1,
-    VerticalScrollbarEnlarged = 1 << 2,
-    HorizontalScrollbarHidden = 1 << 3,
-    VerticalScrollbarHidden = 1 << 4,
-    InLaterContainingBlockFragment = 1 << 5,
-    HasLaterBoxFragments = 1 << 6,
+    HorizontalScrollbarHidden = 1 << 1,
+    VerticalScrollbarHidden = 1 << 2,
+    InLaterContainingBlockFragment = 1 << 3,
+    HasLaterBoxFragments = 1 << 4,
 }
 
 /// The flag bits that hold the writing mode of the frame a box was laid out in.
-const FRAME_WRITING_MODE_SHIFT: u32 = 7;
+const FRAME_WRITING_MODE_SHIFT: u32 = 5;
 const FRAME_WRITING_MODE_MASK: u32 = 0b111;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,8 +49,6 @@ pub struct PaintableData {
 
     pub offset: used_values::FfiCssPixelPoint,
     pub content_size: used_values::FfiCssPixelSize,
-    pub local_padding_box_union: used_values::FfiCssPixelRect,
-    pub local_border_box_union: used_values::FfiCssPixelRect,
 
     pub establishes_stacking_context: bool,
 
@@ -73,8 +69,6 @@ impl Default for PaintableData {
             flags: 0,
             offset: used_values::FfiCssPixelPoint::default(),
             content_size: used_values::FfiCssPixelSize::default(),
-            local_padding_box_union: used_values::FfiCssPixelRect::default(),
-            local_border_box_union: used_values::FfiCssPixelRect::default(),
             establishes_stacking_context: false,
             enclosing_scroll_node_index: SpatialNodeIndex::default(),
             own_scroll_node_index: SpatialNodeIndex::default(),
@@ -195,7 +189,6 @@ pub struct PaintableSideData {
     // Invalidation also runs while paint geometry is borrowed. Keep this
     // mutable cache state out of the plain-data row shared with C++.
     pub(crate) overflow_style: Option<crate::painting::scrollable_overflow::OverflowStyle>,
-    pub(crate) overflow_measured_this_commit: bool,
     // The filter a recommit cleared, kept so the next assignment can tell whether the box
     // paints a different selection of fragments than before.
     pub(crate) fragment_ownership_before_recommit:
@@ -208,16 +201,12 @@ pub(crate) struct CommittedBoxFragment {
     pub(crate) containing_block_fragment: u32,
 }
 
-/// What a row committed beside its geometry that painting reads with it: its inline content, the
-/// pieces an inline box has in its line root's content, its measured scrollable overflow, and what
-/// paint preparation adds for the recording. Shared records are held by `Arc`, so copying a row
+/// What a row committed beside its geometry that painting reads with it: its inline content and what paint
+/// preparation adds for the recording. Shared records are held by `Arc`, so copying a row
 /// copies reference counts.
 #[derive(Clone, Default)]
 pub(crate) struct CommittedSideData {
     pub(crate) inline_content: Option<std::sync::Arc<crate::layout::inline_content::InlineContent>>,
-    pub(crate) piece_indices: Option<std::sync::Arc<[u32]>>,
-    pub(crate) overflow_valid_across_recommits: bool,
-    pub(crate) overflow_relative_to_padding_box: FfiOverflowData,
     /// The bounds of the SVG filter the box references, as the visual context update resolved
     /// them.
     pub(crate) svg_filter_bounds: Option<used_values::FfiCssPixelRect>,
@@ -235,11 +224,8 @@ pub(crate) struct CommittedSideData {
 impl PartialEq for CommittedSideData {
     fn eq(&self, other: &Self) -> bool {
         use crate::cow_column::same_payload;
-        self.overflow_valid_across_recommits == other.overflow_valid_across_recommits
-            && self.overflow_relative_to_padding_box == other.overflow_relative_to_padding_box
-            && self.svg_filter_bounds == other.svg_filter_bounds
+        self.svg_filter_bounds == other.svg_filter_bounds
             && self.order_inputs == other.order_inputs
-            && same_payload(self.piece_indices.as_ref(), other.piece_indices.as_ref(), |a, b| a == b)
             && same_payload(
                 self.fragment_ownership.as_ref(),
                 other.fragment_ownership.as_ref(),
@@ -264,32 +250,12 @@ impl CommittedSideData {
         self.order_inputs.is_initialized().then_some(self.order_inputs)
     }
 
-    pub(crate) fn clear_committed_records(&mut self) {
-        self.inline_content = None;
-        self.piece_indices = None;
-    }
-
     pub(crate) fn box_fragments(&self) -> &[CommittedBoxFragment] {
         self.box_fragments.as_deref().map_or(&[], Vec::as_slice)
     }
 
-    /// The indices of an inline box's pieces in its line root's inline content.
-    pub(crate) fn piece_indices(&self) -> &[u32] {
-        self.piece_indices.as_deref().unwrap_or_default()
-    }
-
     pub(crate) fn lines(&self) -> &[crate::layout::inline_content::LineRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.lines)
-    }
-    pub(crate) fn elided_content_rects(&self) -> &[(u32, used_values::FfiCssPixelRect)] {
-        self.inline_content
-            .as_ref()
-            .map_or(&[], |content| &content.elided_content_rects)
-    }
-    pub(crate) fn lines_after_clamp_point_rect(&self) -> Option<used_values::FfiCssPixelRect> {
-        self.inline_content
-            .as_ref()
-            .and_then(|content| content.lines_after_clamp_point_rect.as_deref().copied())
     }
     pub(crate) fn fragments(&self) -> &[FragmentRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.fragments)
@@ -298,5 +264,11 @@ impl CommittedSideData {
         self.inline_content
             .as_ref()
             .map_or(&[], |content| &content.inline_box_pieces)
+    }
+    /// For a line root, the indices of the pieces of the inline box `node` among its inline box pieces, in line order.
+    pub(crate) fn inline_box_piece_indices(&self, node: NodeSlotId) -> &[u32] {
+        self.inline_content
+            .as_ref()
+            .map_or(&[], |content| content.inline_boxes.piece_indices_of(node))
     }
 }

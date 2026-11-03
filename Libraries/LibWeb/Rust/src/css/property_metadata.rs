@@ -190,11 +190,11 @@ pub(crate) fn property_initial_value(property_id: u16) -> &'static str {
 }
 
 pub(crate) fn pseudo_element_supports_property(pseudo_element: u8, property_id: u16) -> bool {
-    if PSEUDO_ELEMENT_ALWAYS_ALLOWED_PROPERTIES
+    if PSEUDO_ELEMENT_TRANSITION_AND_ANIMATION_PROPERTIES
         .binary_search(&property_id)
         .is_ok()
     {
-        return true;
+        return PSEUDO_ELEMENT_ACCEPTS_ANIMATIONS[pseudo_element as usize];
     }
     match PSEUDO_ELEMENT_PROPERTY_WHITELISTS[pseudo_element as usize] {
         Some(whitelist) => whitelist.binary_search(&property_id).is_ok(),
@@ -202,8 +202,8 @@ pub(crate) fn pseudo_element_supports_property(pseudo_element: u8, property_id: 
     }
 }
 
-/// Whether a pseudo-element's own whitelist names the property, leaving out the properties every
-/// pseudo-element accepts.
+/// Whether a pseudo-element's own whitelist names the property, leaving out the transition and animation
+/// properties.
 pub(crate) fn pseudo_element_whitelist_names_property(pseudo_element: u8, property_id: u16) -> bool {
     PSEUDO_ELEMENT_PROPERTY_WHITELISTS[pseudo_element as usize]
         .is_some_and(|whitelist| whitelist.binary_search(&property_id).is_ok())
@@ -297,15 +297,13 @@ fn shorthand_leaf_longhands() -> &'static [(u16, Box<[u16]>)] {
     })
 }
 
-/// The shorthand whose longhands, through any shorthand nested in it, are exactly `longhands`: the one a value pending
-/// substitution in each of them was written for.
-pub(crate) fn shorthand_with_leaf_longhands(mut longhands: Vec<u16>) -> Option<u16> {
-    longhands.sort_unstable();
-    longhands.dedup();
-    shorthand_leaf_longhands()
-        .iter()
-        .find(|(_, leaves)| **leaves == *longhands)
-        .map(|(shorthand, _)| *shorthand)
+/// Whether `longhand` is one of the longhands of `shorthand`, through any shorthand nested in it.
+pub(crate) fn shorthand_has_leaf_longhand(shorthand: u16, longhand: u16) -> bool {
+    property_is_shorthand(shorthand)
+        && shorthand_leaf_longhands()[usize::from(shorthand - FIRST_SHORTHAND_PROPERTY_ID)]
+            .1
+            .binary_search(&longhand)
+            .is_ok()
 }
 
 /// The shorthands whose longhands, through any shorthand nested in it, include all of `longhands`, with the fewest

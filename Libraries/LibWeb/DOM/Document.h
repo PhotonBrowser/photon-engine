@@ -11,6 +11,7 @@
 #pragma once
 
 #include <AK/Array.h>
+#include <AK/EnumBits.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
@@ -35,6 +36,7 @@
 #include <LibWeb/Bindings/NavigationType.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/ImageStyleValueResourceKey.h>
+#include <LibWeb/CSS/RustInlineStyleBlocks.h>
 #include <LibWeb/CSS/ScrollStateContainerQuery.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleUpdateInputs.h>
@@ -69,6 +71,7 @@
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGUseElement.h>
+#include <LibWeb/TrustedTypes/TrustedHTML.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/XPath/EvaluateResult.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
@@ -114,6 +117,23 @@ enum class QuirksMode {
     Limited,
     Yes
 };
+
+// The parts of the document's environment a style change moves, as the style engine's StyleEnvironment bits. Each
+// restyles the elements whose computation read it.
+enum class StyleEnvironmentChange : u8 {
+    // The user's preferred color scheme or the schemes the document supports.
+    ColorScheme = 1 << 0,
+    DevicePixelRatio = 1 << 1,
+    // The media features a value's if() or custom function may test.
+    MediaFeatures = 1 << 2,
+    // The axes of the viewport, which viewport-relative lengths resolve against.
+    ViewportWidth = 1 << 3,
+    ViewportHeight = 1 << 4,
+    // What every element may compute from: the quirks mode, which only the parser and document.open() move, before
+    // the document holds an element.
+    Everything = 1 << 7,
+};
+AK_ENUM_BITWISE_OPERATORS(StyleEnvironmentChange);
 
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASONS(X) \
     X(InternalsFullRebuildComparison)               \
@@ -337,8 +357,9 @@ public:
     WebIDL::ExceptionOr<void> populate_with_html_head_and_body();
 
     GC::Ptr<Selection::Selection> get_selection() const;
-    bool highlight_styles_are_observable(CSS::PseudoElement) const;
     void set_needs_highlight_style_update(CSS::PseudoElement);
+    [[nodiscard]] bool needs_highlight_style_update() const;
+    void update_highlight_style_observability();
 
     GC::Ptr<Range> find_in_page_active_match() const { return m_find_in_page_active_match; }
     void set_find_in_page_active_match(GC::Ptr<Range>);
@@ -534,22 +555,20 @@ public:
     Color theme_color(Layout::BegunRead const& read);
 
     void update_style();
-    // A style update, or a read of style or layout, joins the style transaction that flew beside the event loop first,
+    // update_style(), or a read of style or layout, joins the style update that flew beside the event loop first,
     // and drains its reactions against the inputs it was sealed with: what was written beside it is the next
     // transaction's. Where none flew, that is one test.
-    void drain_flown_style_transaction(Layout::BegunRead const& read)
+    void drain_flown_style_update(Layout::BegunRead const& read)
     {
         if (m_flown_style_update_inputs.has_value()) [[unlikely]]
-            drain_style_transaction_that_flew(read);
+            drain_style_update_that_flew(read);
     }
-    // Whether a style transaction flew whose reactions no style update has drained yet.
-    bool has_flown_style_transaction() const { return m_flown_style_update_inputs.has_value(); }
-    // Records what a style update records before it takes the document's style transaction, and lets the transaction
-    // fly beside the event loop where `blocker` is none. The next style update takes its reactions in. Answers whether
-    // the transaction flies.
+    // Whether a style update flew whose reactions have not been drained yet.
+    bool has_flown_style_update() const { return m_flown_style_update_inputs.has_value(); }
+    // Records what update_style() records before it runs the document's style update, and lets the update fly
+    // beside the event loop where `blocker` is none. The next update_style() takes its reactions in. Answers whether
+    // the update flies.
     bool let_style_update_fly(Layout::RustFFI::FfiFlightBlocker blocker);
-    // Seals the first round of a rendering update's layout for the frame its style flies in.
-    void seal_first_layout_round(Layout::BegunRead const&);
     // Brings the style up to date, and lets the first round of the rendering update's layout fly beside the event loop
     // where `blocker` is none and the layout is not up to date. The next layout update takes it in. Answers whether the
     // round flies.
@@ -584,7 +603,10 @@ public:
     bool compositor_animation_wakeup_timer_is_active() const;
     bool compositor_animation_observation_timer_is_active() const;
     void throttled_animation_visibility_changed();
-    void invalidate_style_for_viewport_change();
+    // Restyle the elements whose style read an axis of the viewport that moved from previous_viewport_size.
+    void invalidate_style_for_viewport_change(CSSPixelSize previous_viewport_size);
+    // Restyle the elements whose style computed from what `changes` names of the document's environment.
+    void record_style_environment_change(StyleEnvironmentChange changes);
     void add_element_with_viewport_dependent_style(Element& element) { m_elements_with_viewport_dependent_style.set(element); }
     bool suppresses_attribute_style_invalidation() const { return m_suppresses_attribute_style_invalidation; }
     void set_suppresses_attribute_style_invalidation(bool suppresses) { m_suppresses_attribute_style_invalidation = suppresses; }
@@ -601,8 +623,6 @@ public:
     };
     void update_layout(UpdateLayoutReason);
     void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
-    // Flushes layout before the parser completes so text shaping can start any font loads that delay the load event.
-    void update_layout_for_document_readiness_complete();
     void update_style_and_layout_once(Layout::BegunRead const&, UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
     [[nodiscard]] u64 partial_layout_count() const;
@@ -724,6 +744,8 @@ public:
 
     QuirksMode mode() const { return m_quirks_mode; }
     bool in_quirks_mode() const { return m_quirks_mode == QuirksMode::Yes; }
+
+    CSS::RustInlineStyleBlocks& inline_style_blocks() { return m_inline_style_blocks; }
     bool in_limited_quirks_mode() const { return m_quirks_mode == QuirksMode::Limited; }
     void set_quirks_mode(QuirksMode);
 
@@ -783,6 +805,32 @@ public:
 
     HTML::FocusTrigger last_focus_trigger() const { return m_last_focus_trigger; }
     void set_last_focus_trigger(HTML::FocusTrigger trigger) { m_last_focus_trigger = trigger; }
+
+    // Whether the user last moved focus with a pointing device and hasn't used the keyboard since. Focus that a script
+    // moves leaves this alone, since this decides whether that focus is indicated.
+    bool last_user_focus_was_by_pointer() const { return m_last_user_focus_was_by_pointer; }
+    void set_last_user_focus_was_by_pointer(bool value) { m_last_user_focus_was_by_pointer = value; }
+
+    // Using the keyboard clears last_user_focus_was_by_pointer(), which can change whether the focused element matches
+    // :focus-visible without focus moving.
+    void note_keyboard_interaction();
+
+    // The focusVisible option of the focus() call that last moved focus here, if it had one, for the element it focused.
+    // Any other focus move here clears it, and it never applies to another element this document's focus moves to.
+    Optional<bool> requested_focus_visibility_for(Node const& node) const
+    {
+        if (m_focus_visibility_request_target.ptr() != &node)
+            return {};
+        return m_requested_focus_visibility;
+    }
+    void set_requested_focus_visibility(GC::Ptr<Node> target, Optional<bool> value)
+    {
+        m_focus_visibility_request_target = value.has_value() ? target : nullptr;
+        m_requested_focus_visibility = value.value_or(false);
+    }
+
+    // A focus() call with a focusVisible option on the element that already has focus applies the option to it.
+    void request_focus_visibility_for_focused_element(bool focus_visible);
 
     Element const* active_element() const;
     void set_active_element(GC::Ptr<Element>);
@@ -902,6 +950,7 @@ public:
         return update_is_fully_active();
     }
     bool is_active() const;
+    bool observers_consider_fully_active() const { return m_observers_consider_document_fully_active; }
 
     // To call whenever anything that decides if a document is fully active changes: a navigable's parent, its being
     // destroyed, or its active document, or a document's navigable or unload counter.
@@ -970,6 +1019,8 @@ public:
     bool has_focus_for_bindings() const;
     bool has_focus() const;
 
+    bool is_fully_active_descendant_of_a_top_level_traversable_with_user_attention() const;
+
     bool allow_focus() const;
 
     void set_parser(Badge<HTML::HTMLParser>, HTML::HTMLParser&);
@@ -1007,6 +1058,27 @@ public:
     }
 
     bool has_completed_style_update() const { return m_has_completed_style_update; }
+    bool has_dirty_style_attributes() const { return !m_elements_with_dirty_style_attributes.is_empty(); }
+    // Whether a style update would report the style attributes it left out while nothing read them.
+    bool has_unreported_style_attributes_to_report() const;
+    // Whether a tree scope's counter styles may have moved since a style update last settled every scope's.
+    bool counter_style_scopes_need_update() const { return m_counter_style_scopes_need_update; }
+    void set_counter_style_scopes_need_update(bool value) { m_counter_style_scopes_need_update = value; }
+    void note_counter_style_scope_to_settle(ShadowRoot&);
+    void settle_counter_style_scopes(Layout::BegunRead const&);
+
+    // Where a slottable's slot leaves or takes it out of a `display: none` subtree, its animations terminate or resume.
+    // That is decided at the next style update, as an assignment can go through no slot on its way to another.
+    void note_element_assigned_slot_changed(Element&);
+    void forget_assigned_slot_change_note(Element&);
+    bool has_assigned_slot_change_notes() const { return !m_elements_whose_assigned_slot_changed.is_empty(); }
+    // What a style update that flies knows of is settled as it lands. What comes beside it is the next update's.
+    void note_style_update_flew_past_assigned_slot_changes();
+    enum class AssignedSlotChanges : u8 {
+        Recorded,
+        FlewPast,
+    };
+    void settle_elements_whose_assigned_slot_changed(AssignedSlotChanges, Layout::BegunRead const&, Function<void(Element&)> const& compose_element);
     void set_has_completed_style_update() { m_has_completed_style_update = true; }
     void mark_style_attribute_dirty(Element&);
     void synchronize_dirty_style_attributes();
@@ -1149,7 +1221,7 @@ public:
         No,
         Yes,
     };
-    WebIDL::ExceptionOr<bool> exec_command(Utf16FlyString const& command, bool show_ui, Utf16View value);
+    WebIDL::ExceptionOr<bool> exec_command(Utf16FlyString const& command, bool show_ui, TrustedTypes::TrustedHTMLOrString const& value);
     WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {}, GC::Ptr<StaticRange> deletion_range = nullptr);
     WebIDL::ExceptionOr<bool> query_command_enabled(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_indeterm(Utf16FlyString const& command);
@@ -1247,6 +1319,13 @@ public:
     void disassociate_with_animation(GC::Ref<Animations::Animation>);
     size_t associated_animation_count() const;
     bool has_associated_animations() const { return !m_associated_animations.is_empty(); }
+    // Negative where `first` comes before `second` in tree order and positive where it comes after, for sorting
+    // animations by composite order. Two distinct elements of this document take no walk of their siblings once a tree
+    // has been asked about often enough, so that sorting many sibling elements is not quadratic in them per comparison.
+    int compare_elements_in_tree_order_for_composite_order(Element& first, Element& second);
+    // An attribute moves the DOM tree version, from `version_before`, but no element: the tree positions held at that
+    // version stand.
+    void keep_element_tree_positions_across_attribute_change(u64 version_before);
 
     struct PendingAnimationEvent {
         GC::Ref<DOM::Event> event;
@@ -1309,32 +1388,9 @@ public:
         u64 style_engine_reaction_batch_runs { 0 };
         u64 style_engine_reaction_elements { 0 };
         u64 style_engine_published_reactions { 0 };
-        u64 style_engine_record_deltas_applied { 0 };
         u64 layout_style_record_publications { 0 };
-        u64 style_engine_materialized_gaps { 0 };
-        u64 element_style_recomputations { 0 };
-        u64 element_style_noop_recomputations { 0 };
-        u64 unchanged_style_record_deltas { 0 };
-        u64 style_record_property_diffs_skipped { 0 };
-        u64 style_record_property_damage_cache_hits { 0 };
-        // Semantic output cardinalities, distinct from how many elements entered recomputation.
-        u64 element_computed_style_changes { 0 };
-        u64 committed_style_observer_consequences { 0 };
-        u64 element_style_shared_computations { 0 };
-        // Whether a recomputation could have been answered from what its last one read. The record
-        // is the sharing key minus the style being replaced, so a recomputation whose input is
-        // unchanged is one the engine could keep the existing style for outright.
-        u64 element_style_input_changed_by_parent_style { 0 };
-        u64 element_style_input_changed_by_parent_custom_properties { 0 };
-        u64 element_style_input_reused { 0 };
-        // Reactions whose new record the style engine computed itself, applied without a style
-        // computation.
-        u64 engine_computed_style_records { 0 };
         // Animation frames that rebuilt only the groups the animated properties write, against
         // frames that had to rebuild the whole style.
-        u64 animated_style_reconstruction_fallbacks { 0 };
-        u64 animated_style_overlay_builds { 0 };
-        u64 animated_style_full_builds { 0 };
         u64 animation_frame_pump_requests { 0 };
         u64 animation_style_skip_cache_hits { 0 };
         u64 animation_style_skip_cache_misses { 0 };
@@ -1343,15 +1399,13 @@ public:
         u64 compositor_visual_animation_updates { 0 };
         u64 compositor_visual_animation_timing_anchor_updates { 0 };
         u64 compositor_keyframe_value_resolutions { 0 };
-        u64 base_style_partial_builds { 0 };
-        u64 base_style_full_builds { 0 };
-        u64 computed_longhand_evaluations { 0 };
-        u64 computed_longhand_drives_started { 0 };
         u64 style_stabilization_epochs { 0 };
         u64 style_stabilization_feedback_epochs { 0 };
         u64 provisional_style_passes { 0 };
         u64 style_stabilization_round_guard_hits { 0 };
         u64 style_update_pass_guard_hits { 0 };
+        // What sorting animations in tree order asked of the tree itself, rather than of the document's tree positions.
+        u64 composite_order_document_position_compares { 0 };
         u64 exact_stabilization_passes { 0 };
         u64 style_stabilization_bound_failures { 0 };
         u64 provisional_animation_events { 0 };
@@ -1365,15 +1419,6 @@ public:
         u64 style_query_container_scans { 0 };
         u64 style_engine_transaction_setups { 0 };
         u64 style_engine_transaction_setup_microseconds { 0 };
-        u64 style_engine_transaction_count { 0 };
-        u64 style_unscoped_transaction_count { 0 };
-        u64 style_unscoped_transaction_reaction_entries { 0 };
-        u64 style_broad_matching_batch_runs { 0 };
-        u64 style_narrow_matching_batch_runs { 0 };
-        u64 style_broad_matching_reaction_elements { 0 };
-        u64 style_narrow_matching_reaction_elements { 0 };
-        u64 style_broad_matching_apply_microseconds { 0 };
-        u64 style_narrow_matching_apply_microseconds { 0 };
         // Exclusive intervals within style_update_microseconds. Rust phases subdivide bridge.
         u64 style_update_submission_microseconds { 0 };
         u64 style_update_bridge_microseconds { 0 };
@@ -1381,17 +1426,6 @@ public:
         u64 style_update_remainder_microseconds { 0 };
         u64 relayouts_performed { 0 };
         u64 style_update_microseconds { 0 };
-        u64 custom_property_resolutions { 0 };
-        u64 custom_property_elements { 0 };
-        // What resolving those declared values actually walked: every entry into computing one
-        // custom property's value, however reached. A value referenced by three others is entered
-        // for each of them unless something remembers the answer, so this exceeding
-        // custom_property_resolutions is repeated work made visible.
-        u64 custom_property_value_computations { 0 };
-        u64 custom_property_overlay_hits { 0 };
-        u64 custom_property_cycle_participants { 0 };
-        u64 style_cascade_microseconds { 0 };
-        u64 style_values_microseconds { 0 };
     };
     StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
     void reset_style_invalidation_counters(Layout::BegunRead const& read) const;
@@ -1513,6 +1547,9 @@ public:
     size_t transition_generation() const { return m_transition_generation; }
     void begin_style_stabilization_epoch();
     void record_style_stabilization_pass(Layout::BegunRead const& read);
+    [[nodiscard]] bool is_at_style_stabilization_bound(Layout::BegunRead const& read) const;
+    // How many times an element's animated custom properties moved in this style stabilization epoch, counting this one.
+    [[nodiscard]] u64 note_animated_custom_properties_moved_in_stabilization_epoch(CSS::StyleNodeID);
     void end_style_stabilization_epoch();
     void note_style_stabilization_has_style_reactions()
     {
@@ -1780,7 +1817,6 @@ private:
 
     // Whether the first round of a rendering update's layout may be sealed: list items that wait to be renumbered and top
     // layer work are the layout update's to do first.
-    bool may_seal_first_layout_round() const;
     Layout::RustFFI::FfiLayoutUpdateInputs first_layout_round_inputs() const;
     // Whether nothing this document has pending could change layout geometry: style, layout and every input
     // that feeds them are settled.
@@ -1794,7 +1830,7 @@ private:
     void finish_animated_style_update();
     void service_compositor_animation_wakeup(double timestamp);
 
-    void drain_style_transaction_that_flew(Layout::BegunRead const&);
+    void drain_style_update_that_flew(Layout::BegunRead const&);
 
     GC::Ref<WebIDL::ObservableArray> adopted_style_sheets() const;
 
@@ -1948,6 +1984,9 @@ private:
 
     QuirksMode m_quirks_mode { QuirksMode::No };
 
+    // The declaration blocks of the document's style attributes, by their text.
+    CSS::RustInlineStyleBlocks m_inline_style_blocks;
+
     // The MathML and SVG user-agent sheets decide nothing until the document holds an element in one
     // of those namespaces, so they are attached the first time one arrives. Once attached they stay:
     // a document that held one is likely to again, and every element pays for the flip.
@@ -1970,6 +2009,12 @@ private:
     GC::Ptr<Node> m_sequential_focus_navigation_starting_point;
 
     HTML::FocusTrigger m_last_focus_trigger { HTML::FocusTrigger::Other };
+    bool m_last_user_focus_was_by_pointer { false };
+    GC::Ptr<Node> m_focus_visibility_request_target;
+    bool m_requested_focus_visibility { false };
+
+    bool focused_element_indicates_focus() const;
+    void publish_focus_visibility_change(bool indicated_focus_before);
 
     GC::Ptr<Element> m_active_element;
     GC::Ptr<Element> m_target_element;
@@ -1981,6 +2026,8 @@ private:
     // https://html.spec.whatwg.org/multipage/interaction.html#autofocus-processed-flag
     bool m_autofocus_processed_flag { false };
 
+    HashMap<CSS::StyleNodeID, u64> m_animated_custom_property_changes_in_stabilization_epoch;
+    u64 m_animated_custom_property_moves_in_stabilization_epoch { 0 };
     bool m_created_for_appropriate_template_contents { false };
     GC::Ptr<Document> m_associated_inert_template_document;
     GC::Ptr<Document> m_appropriate_template_contents_owner_document;
@@ -2067,6 +2114,7 @@ private:
     Vector<GC::Weak<CSS::MediaQueryList>> m_media_query_lists;
 
     bool m_has_completed_style_update { false };
+    bool m_counter_style_scopes_need_update { true };
     bool m_style_engine_tracks_tree { false };
     CSS::StyleNodeID m_style_node_id;
     GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
@@ -2088,7 +2136,7 @@ private:
     bool m_needs_throttled_animation_style_update_check { false };
     bool m_force_throttled_animation_style_update { false };
     Optional<u64> m_last_forced_throttled_animation_style_update_task_generation;
-    // The inputs the style transaction that flew was sealed with, which its drain takes its reactions in against.
+    // The inputs the style update that flew was sealed with, which its drain takes its reactions in against.
     Optional<CSS::StyleUpdateInputs> m_flown_style_update_inputs;
 
     HashTable<GC::Ptr<NodeIterator>> m_node_iterators;
@@ -2206,7 +2254,6 @@ private:
     Array<HighlightStyleObservability, 3> m_highlight_style_observability;
     HighlightStyleObservability& highlight_style_observability(CSS::PseudoElement);
     void update_highlight_style_observability(CSS::PseudoElement);
-    void update_highlight_style_observability();
 
     // NOTE: This is a cache to make finding the first <base href> or <base target> element O(1).
     GC::Ptr<HTML::HTMLBaseElement> m_first_base_element_with_href_in_tree_order;
@@ -2272,6 +2319,12 @@ private:
     // NB: Weak so the document does not unnecessarily keep animations alive. Note that this also includes animations
     //     associated with elements in shadow trees so differs from getAnimations()
     GC::WeakHashSet<Animations::Animation> m_associated_animations;
+    // The tree position of every element of the document by its unique ID, valid for one DOM tree version. Sorting
+    // animations fills it once it asked the tree enough at that version.
+    HashMap<UniqueNodeID, u32> m_element_tree_positions;
+    u64 m_element_tree_positions_dom_tree_version { 0 };
+    u32 m_tree_order_compares_at_dom_tree_version { 0 };
+    u32 m_element_count_at_last_tree_positions_walk { 0 };
 
     // https://www.w3.org/TR/web-animations-1/#document-default-document-timeline
     GC::Ptr<Animations::DocumentTimeline> m_default_timeline;
@@ -2343,6 +2396,10 @@ private:
     // Document should not visit ShadowRoot list to avoid leaks.
     // It's responsibility of object that allocated ShadowRoot to keep it alive.
     ShadowRoot::DocumentShadowRootList m_shadow_roots;
+    // The shadow roots whose counter style registry may resolve or publish differently since the last style update.
+    ShadowRoot::DocumentCounterStyleSettleList m_shadow_roots_with_counter_styles_to_settle;
+    Vector<GC::Ref<Element>> m_elements_whose_assigned_slot_changed;
+    Vector<GC::Ref<Element>> m_elements_whose_assigned_slot_change_flew_past;
     u64 m_style_sheet_set_generation { 0 };
     // The `@keyframes` rows the style engine still holds for shadow roots that left this document.
     Vector<CSS::StyleScope::DepartedAnimationKeyframes> m_departed_animation_keyframes;
@@ -2473,7 +2530,7 @@ private:
 
     // Cache of parsed selector queries for querySelectorAll/querySelector/matches/closest.
     // A null value means the selector string failed to parse.
-    mutable HashMap<Utf16String, RefPtr<SelectorQuery const>> m_selector_query_cache;
+    mutable OrderedHashMap<Utf16String, RefPtr<SelectorQuery const>> m_selector_query_cache;
     mutable Optional<Utf16String> m_last_selector_query_text;
     mutable RefPtr<SelectorQuery const> m_last_selector_query;
 

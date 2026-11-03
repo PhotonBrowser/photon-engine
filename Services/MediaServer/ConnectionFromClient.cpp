@@ -230,10 +230,11 @@ static Media::DecoderErrorOr<DecodedAudioSamples> decode_audio_data_to_shared_bu
     auto planar_samples = planar_samples_or_error.release_value();
 
     auto* destination = planar_samples.data<float>();
-    for (auto const& channel : decoded.channels) {
+    for (auto& channel : decoded.channels) {
         VERIFY(channel.size() == frame_count);
         memcpy(destination, channel.data(), frame_count * sizeof(float));
         destination += frame_count;
+        channel.clear();
     }
     return DecodedAudioSamples { decoded.sample_specification.sample_rate(), static_cast<u32>(decoded.channels.size()), frame_count, move(planar_samples) };
 }
@@ -292,7 +293,7 @@ void ConnectionFromClient::destroy_media_stream(u64 stream_id)
     if (!stream.has_value())
         return;
     (*stream)->set_data_request_callback(nullptr);
-    (*stream)->close();
+    (*stream)->make_missing_data_permanently_unavailable();
 }
 
 void ConnectionFromClient::add_media_stream_chunk(u64 stream_id, u64 offset, ByteBuffer data)

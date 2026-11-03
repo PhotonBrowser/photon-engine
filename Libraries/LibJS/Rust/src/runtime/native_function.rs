@@ -17,9 +17,11 @@ use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::ExecutionContext;
+use crate::layout::function_object::FUNCTION_LENGTH_AND_NAME_SLOTS;
 pub use crate::layout::function_object::{
     DirectGetterFunction, NativeFunction, NativeFunctionTableEntry, NativeFunctionType, RawNativeFunction,
 };
+use crate::layout::member::Member;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::layout_forward::FlyStringSlot;
@@ -131,11 +133,14 @@ impl NativeFunction {
     }
 
     fn from_function_object(base: FunctionObject, name: Option<Utf16FlyString>, realm: Gc<Realm>) -> NativeFunction {
+        base.inline_named_capacity.set(FUNCTION_LENGTH_AND_NAME_SLOTS as u8);
         NativeFunction {
             base,
+            inline_named_storage: [const { Cell::new(Value::UNDEFINED) }; FUNCTION_LENGTH_AND_NAME_SLOTS],
             name: FlyStringSlot::new(name),
             initial_name: FlyStringSlot::new(None),
-            realm: Cell::new(realm),
+            realm: Member::new(realm),
+            raw_native_function_index: Cell::new(0),
         }
     }
 
@@ -715,13 +720,12 @@ impl RawNativeFunction {
     ) -> RawNativeFunction {
         let base = NativeFunction::new_with_realm(vm, class, prototype, realm, builtin);
         base.set_is_raw_native_function();
-        RawNativeFunction {
-            base,
-            native_function_index: Cell::new(vm.register_native_function(NativeFunctionTableEntry {
+        base.raw_native_function_index
+            .set(vm.register_native_function(NativeFunctionTableEntry {
                 function: native_function,
                 function_type: NativeFunctionType::RawNativeFunction,
-            })),
-        }
+            }));
+        RawNativeFunction { base }
     }
 
     pub fn new_with_name(
@@ -733,13 +737,12 @@ impl RawNativeFunction {
     ) -> RawNativeFunction {
         let base = NativeFunction::new_with_name(vm, class, name, prototype);
         base.set_is_raw_native_function();
-        RawNativeFunction {
-            base,
-            native_function_index: Cell::new(vm.register_native_function(NativeFunctionTableEntry {
+        base.raw_native_function_index
+            .set(vm.register_native_function(NativeFunctionTableEntry {
                 function: native_function,
                 function_type: NativeFunctionType::RawNativeFunction,
-            })),
-        }
+            }));
+        RawNativeFunction { base }
     }
 
     // 10.3.3 CreateBuiltinFunction ( behaviour, length, name, additionalInternalSlotsList [ , realm [ , prototype [ , prefix ] ] ] ), https://tc39.es/ecma262/#sec-createbuiltinfunction
@@ -782,22 +785,26 @@ impl RawNativeFunction {
     }
 
     pub fn native_function(&self, vm: &Vm) -> RawNativeFunctionPointer {
-        vm.native_function(self.native_function_index.get(), NativeFunctionType::RawNativeFunction)
+        vm.native_function(
+            self.raw_native_function_index.get(),
+            NativeFunctionType::RawNativeFunction,
+        )
     }
 }
 
 /// Where a DirectGetterFunction finds the value it returns in a platform object.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DirectGetterConfiguration {
-    // These are byte offsets to pointer-sized fields read directly by the interpreter. The bindings
-    // generator obtains them from PlatformObject::wrapped_implementation_offset(), the implementation
-    // field's generated offset helper, Wrappable::main_world_wrapper_offset(), and
-    // GC::WeakImpl::value_offset(), respectively. DirectGetterFunction validates their alignment and
-    // converts them to word offsets.
+    // These are byte offsets to fields read directly by the interpreter. The bindings generator obtains them from
+    // PlatformObject::wrapped_implementation_offset(), the implementation field's generated offset helper,
+    // Wrappable::main_world_wrapper_offset(), and GC::WeakImpl::value_offset(), respectively. They are pointer-sized,
+    // but for the implementation value, which is a compressed cell pointer if implementation_value_is_compressed is set.
+    // DirectGetterFunction validates their alignment and converts all but the implementation value to word offsets.
     pub wrapper_implementation_offset: usize,
     pub implementation_value_offset: usize,
     pub main_world_wrapper_offset: usize,
     pub weak_impl_value_offset: usize,
+    pub implementation_value_is_compressed: bool,
 }
 
 define_cell!(
@@ -850,8 +857,13 @@ impl DirectGetterFunction {
     ) -> DirectGetterFunction {
         let base = RawNativeFunction::new_with_realm(vm, Self::CLASS, native_function, Some(prototype), realm, None);
         let word_size = size_of::<usize>();
+        let value_size = if configuration.implementation_value_is_compressed {
+            size_of::<u32>()
+        } else {
+            word_size
+        };
         assert!(configuration.wrapper_implementation_offset.is_multiple_of(word_size));
-        assert!(configuration.implementation_value_offset.is_multiple_of(word_size));
+        assert!(configuration.implementation_value_offset.is_multiple_of(value_size));
         assert!(configuration.main_world_wrapper_offset.is_multiple_of(word_size));
         assert!(configuration.weak_impl_value_offset.is_multiple_of(word_size));
         let word_offset =
@@ -859,9 +871,12 @@ impl DirectGetterFunction {
         let function = DirectGetterFunction {
             base,
             wrapper_implementation_word_offset: Cell::new(word_offset(configuration.wrapper_implementation_offset)),
-            implementation_value_word_offset: Cell::new(word_offset(configuration.implementation_value_offset)),
+            implementation_value_offset: Cell::new(
+                u32::try_from(configuration.implementation_value_offset).expect("the offset of a field fits in u32"),
+            ),
             main_world_wrapper_word_offset: Cell::new(word_offset(configuration.main_world_wrapper_offset)),
             weak_impl_value_word_offset: Cell::new(word_offset(configuration.weak_impl_value_offset)),
+            implementation_value_is_compressed: Cell::new(u32::from(configuration.implementation_value_is_compressed)),
         };
         function.set_is_direct_getter_function();
         function

@@ -1031,8 +1031,7 @@ impl SvgShapeGeometry {
 #[repr(C)]
 pub struct FfiSvgGeometryElementShape {
     pub geometry: FfiSvgAttributeFacts,
-    pub payloads: *const *const c_void,
-    pub payload_count: usize,
+    pub style: *const c_void,
     pub points: *const FfiFloatPoint,
     pub point_count: usize,
     pub viewport_size: FfiCssPixelSize,
@@ -1043,21 +1042,19 @@ impl FfiSvgGeometryElementShape {
     /// shape builders layout uses, and of the element's style.
     ///
     /// # Safety
-    /// `payloads` must point to `payload_count` live style group payloads, and `points` to `point_count` points.
+    /// `style` must point at the groups of a live style record, and `points` to `point_count` points.
     unsafe fn measure<R>(&self, measure: impl FnOnce(&libgfx_rust::path::Path, StyleValues<'_>) -> R) -> R {
-        assert!(!self.payloads.is_null(), "style group payload array is null");
-        let mut style_payloads = FfiStylePayloads::default();
         // SAFETY: Guaranteed by the caller.
-        style_payloads
-            .groups
-            .copy_from_slice(unsafe { ak::slice_from_raw_parts(self.payloads, self.payload_count) });
+        let style = unsafe { crate::layout::node_data::LayoutStyleRef::from_raw(self.style) }
+            .expect("an SVG geometry element's style record is not null");
         // SAFETY: Guaranteed by the caller.
         let points = unsafe { ak::slice_from_raw_parts(self.points, self.point_count) };
         let shape_geometry = SvgShapeGeometry {
             viewport_width: self.viewport_size.width,
             viewport_height: self.viewport_size.height,
         };
-        let style = StyleValues::new(&style_payloads);
+        // SAFETY: Guaranteed by the caller.
+        let style = StyleValues::new(unsafe { style.view() });
         measure(&shape_geometry.path(self.geometry, style, Some(points)), style)
     }
 }
@@ -1363,16 +1360,16 @@ impl<'pass> SvgFormattingContext<'pass> {
         // NB: The dominant-baseline offset is resolved against the metrics of the first available
         //     font - while each glyph is rendered with the first font in the cascade that contains
         //     its code point.
-        let font = style.font();
+        let font = style.font().first_available_font_metrics();
         match metric {
-            baseline_metric::CENTRAL => (font.font_ascent - font.font_descent) / 2.0,
-            baseline_metric::MIDDLE => font.font_x_height / 2.0,
+            baseline_metric::CENTRAL => (font.ascent - font.descent) / 2.0,
+            baseline_metric::MIDDLE => font.x_height / 2.0,
             // FIXME: Read the hanging baseline from the font's BASE table.
-            baseline_metric::HANGING => font.font_ascent * 0.8,
+            baseline_metric::HANGING => font.ascent * 0.8,
             // FIXME: Read the ideographic baseline from the font's BASE table.
-            baseline_metric::IDEOGRAPHIC => -font.font_descent,
+            baseline_metric::IDEOGRAPHIC => -font.descent,
             // FIXME: Read the math baseline from the font's BASE table.
-            baseline_metric::MATHEMATICAL => font.font_ascent * 0.5,
+            baseline_metric::MATHEMATICAL => font.ascent * 0.5,
             // FIXME: Support text-top and text-bottom.
             _ => 0.0,
         }
@@ -1666,11 +1663,12 @@ impl<'pass> SvgFormattingContext<'pass> {
         if attributes.geometry_kind == SVG_GEOMETRY_KIND_NONE {
             return None;
         }
-        let payloads = arena.style_node_style_payloads(shape)?;
+        let style = arena.style_node_style(shape)?;
         let points = arena.style_node_svg_points(shape);
         Some(
             self.shape_geometry()
-                .path(attributes, StyleValues::new(&payloads), points.as_deref()),
+                // SAFETY: The record the element published is retained for the pass.
+                .path(attributes, StyleValues::new(unsafe { style.view() }), points.as_deref()),
         )
     }
 
@@ -1810,7 +1808,8 @@ impl<'pass> SvgFormattingContext<'pass> {
         let style = self.style(node);
         let svg = style.inherited_svg();
         let stroke_is_visible =
-            crate::painting::record::paint::svg::svg_paint_color(&svg.stroke).is_some_and(|color| color >> 24 != 0);
+            crate::painting::record::paint::svg::svg_paint_color(&svg.stroke, style.current_color())
+                .is_some_and(|color| color >> 24 != 0);
         if !stroke_is_visible {
             return 0.0;
         }
@@ -1890,7 +1889,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         placed_child: formatting_context::PlacedChild,
         x: CssPixels,
         y: CssPixels,
-        fragment_arrival: Option<fragment_tree::ChildFragmentArrival>,
+        fragment_arrival: Option<fragment_tree::RunRootFragment>,
     ) {
         formatting_context::place_child(
             &self.run,
@@ -2233,10 +2232,6 @@ impl<'pass> SvgFormattingContext<'pass> {
         {
             return None;
         }
-        // An anchor registers itself only when its box is placed with a fragment of its own.
-        if NodeFacts::new(&self.run.callbacks, shape).has_anchor_names() {
-            return None;
-        }
         // A line's coordinates are attribute lengths resolved here against the initial containing block, the root font
         // and size query containers, and a change to any of those does not mark the line for layout.
         if self.svg_attributes(shape).geometry_kind == SVG_GEOMETRY_KIND_LINE {
@@ -2244,17 +2239,14 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
         self.run.fragments.as_ref()?;
         // A committed fragment stops being current when something marks its box for layout.
-        let fragment = self
+        let link = self
             .run
             .callbacks
             .arena()
-            .with_current_committed_fragment(shape, |fragment| fragment.clone())?;
+            .with_current_committed_fragment_link(shape, |link| link.clone())?;
+        let fragment = link.fragment.clone();
         fragment.computed_svg_path.as_ref()?;
-        let committed_offset = crate::painting::paint_read::GeometryRead::with_committed_fragment_link(
-            self.run.callbacks.arena(),
-            shape,
-            |link| link.map(|link| link.committed_offset),
-        )?;
+        let committed_offset = link.committed_offset;
         // The transforms and the stroke's percentage basis are what the shape's facts take from outside its own
         // geometry.
         let committed = fragment.svg.as_deref().copied().unwrap_or_default();
@@ -2266,7 +2258,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             return None;
         }
         cells.update_cells(|cells| {
-            cells.take_box_metrics_of_fragment(&fragment);
+            cells.take_box_metrics_of_committed_link(&link);
             cells.has_definite_block_size = true;
         });
         self.place_laid_out_child(
@@ -2274,10 +2266,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             formatting_context::PlacedChild::laid_out_here(cells.get(), None, &self.run),
             committed_offset.x,
             committed_offset.y,
-            Some(fragment_tree::ChildFragmentArrival::CommittedFragment {
-                fragment,
-                reuses_subtree: false,
-            }),
+            Some(fragment_tree::RunRootFragment::propagating_nothing(fragment)),
         );
         Some(LaidOutSvgElement {
             cells: cells.get(),
@@ -2523,34 +2512,15 @@ impl<'pass> SvgFormattingContext<'pass> {
 }
 
 fn font_metrics_for_length_resolution(style: StyleValues<'_>) -> crate::css::style_compute::FfiFontMetrics {
-    let font = style.font();
+    let font = style.font().first_available_font_metrics();
     crate::css::style_compute::FfiFontMetrics {
         font_size: style.font_size().to_double(),
-        x_height: CssPixels::nearest_value_for_f32(font.font_x_height).to_double(),
+        x_height: CssPixels::nearest_value_for_f32(font.x_height).to_double(),
         // FIXME: This is only approximately the cap height, exactly as Length::FontMetrics has it.
-        cap_height: CssPixels::nearest_value_for_f32(font.font_ascent).to_double(),
-        zero_advance: CssPixels::nearest_value_for_f32(font.font_zero_advance).to_double(),
+        cap_height: CssPixels::nearest_value_for_f32(font.ascent).to_double(),
+        zero_advance: CssPixels::nearest_value_for_f32(font.zero_advance).to_double(),
         line_height: style.line_height().to_double(),
     }
-}
-
-/// Snapshot the document element's font metrics before a layout run narrows its read scope.
-pub(super) fn document_root_font_metrics(arena: &LayoutNodeArena) -> Option<crate::css::style_compute::FfiFontMetrics> {
-    let viewport = arena.layout_root();
-    if viewport.is_invalid() {
-        return None;
-    }
-    let mut child = arena.data(viewport).first_child.get();
-    while !child.is_invalid() {
-        let data = arena.data(child);
-        if node_facts::has_flag(data, NodeFlag::IsDocumentElement) {
-            return arena
-                .style_payloads(child)
-                .map(|payloads| font_metrics_for_length_resolution(StyleValues::new(payloads)));
-        }
-        child = data.next_sibling.get();
-    }
-    None
 }
 
 /// What a length one of an SVG element's attributes gives resolves against: the element's own style,
@@ -2561,6 +2531,7 @@ fn length_resolution_context(
     unit: u8,
 ) -> crate::css::style_compute::FfiLengthResolutionContext {
     let style = StyleValues::for_node(callbacks, node);
+    let root_style = document_element_style(callbacks, node).unwrap_or(style);
     let viewport_width = callbacks.initial_containing_block_inline_size.to_double();
     let viewport_height = callbacks.initial_containing_block_block_size.to_double();
     // A container unit resolves against the committed content box of the nearest size query container on its axis, or
@@ -2581,9 +2552,7 @@ fn length_resolution_context(
         viewport_width,
         viewport_height,
         font_metrics: font_metrics_for_length_resolution(style),
-        root_font_metrics: callbacks
-            .root_font_metrics
-            .unwrap_or_else(|| font_metrics_for_length_resolution(style)),
+        root_font_metrics: font_metrics_for_length_resolution(root_style),
         // Only the out-flag below consumes these, and this resolution reports no dependency.
         font_metrics_depend_on_viewport_metrics: false,
         root_font_metrics_depend_on_viewport_metrics: false,
@@ -2603,6 +2572,18 @@ fn length_resolution_context(
     context
 }
 
+/// The style of the document element, which a root-relative length resolves against.
+fn document_element_style<'pass>(callbacks: &LayoutPass<'pass>, node: Node) -> Option<StyleValues<'pass>> {
+    let mut ancestor = node;
+    while !ancestor.is_invalid() {
+        let data = callbacks.node_data(ancestor);
+        if node_facts::has_flag(data, NodeFlag::IsDocumentElement) {
+            return callbacks.arena().style_view(ancestor).map(StyleValues::new);
+        }
+        ancestor = data.parent.get();
+    }
+    None
+}
 /// The pixels an absolute or relative `<length>` an SVG element's attribute gives resolves to.
 fn resolve_svg_length(callbacks: &LayoutPass<'_>, node: Node, length: FfiSvgLengthValue) -> CssPixels {
     let context = length_resolution_context(callbacks, node, length.unit);

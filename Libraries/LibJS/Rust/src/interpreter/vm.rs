@@ -11,6 +11,7 @@ use core::ptr::NonNull;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use ak::{Utf16FlyString, Utf16String};
 use libjs_runtime_macros::Trace;
@@ -74,7 +75,7 @@ use crate::runtime::module::{Module, finish_loading_imported_module};
 use crate::runtime::module_loading::{ImportedModulePayload, ImportedModuleReferrer};
 use crate::runtime::module_request::ModuleRequest;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
-use crate::runtime::object::IntrinsicAccessor;
+use crate::runtime::object::{IndexedDictionary, IntrinsicAccessor};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 use crate::runtime::property_key::PropertyKey;
@@ -322,6 +323,12 @@ pub struct LoadedModules {
 
 define_cell!(LoadedModules, Other);
 
+/// An exception, and where in its source code the instruction that threw it is.
+struct ThrowSite {
+    value: Value,
+    source_range: Option<SourceRange>,
+}
+
 /// HostResizeArrayBuffer, which hosts may override.
 pub type HostResizeArrayBuffer = fn(&Vm, &ArrayBuffer, usize) -> ThrowCompletionOr<HandledByHost>;
 
@@ -513,9 +520,16 @@ pub struct Vm {
     native_function_count: Cell<u32>,
     /// The index of each function in the native function table, by its address and type.
     native_function_indices: RefCell<HashMap<(usize, u32), u32>>,
+    /// The indexed property dictionaries of the ECMAScript function objects that have one, by address. Those objects
+    /// have no pointer to their indexed elements (see `EcmascriptFunctionFields`), and hardly any of them has indexed
+    /// properties. The objects trace and free their dictionaries.
+    pub(crate) function_indexed_dictionaries:
+        RefCell<HashMap<usize, *mut IndexedDictionary, foldhash::fast::RandomState>>,
     roots: RootSet,
 
     pub names: CommonPropertyNames,
+    /// What functions without parameter names share, since an empty Rc slice is an allocation of its own.
+    pub(crate) no_parameter_names: Rc<[Utf16FlyString]>,
     /// The strings in these two caches are weak: the sweep callback drops the ones that die.
     string_to_atom_cache: RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>>,
     fly_string_cache: Box<[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE]>,
@@ -580,12 +594,14 @@ pub struct Vm {
     module_async_evaluation_count: Cell<u64>, // [[ModuleAsyncEvaluationCount]]
     /// The id the next PrivateEnvironment gives its names. It starts at one such that 0 can be invalid / default
     /// initialized.
-    next_private_environment_id: Cell<u64>,
     /// The properties defined with Object::define_intrinsic_accessor that have not been read yet, by the address of
     /// their object. The objects are weak: the sweep callback forgets the ones that die.
     intrinsic_accessors: RefCell<IntrinsicAccessorMap>,
     /// The debugger, which the head points to while it is attached.
     debugger: RefCell<Option<Box<Debugger>>>,
+    /// The last exception thrown, and where. A thrown value that is not an Error carries no location of its own, and
+    /// its frames are gone by the time the embedder reports it.
+    last_throw: RefCell<Option<ThrowSite>>,
     /// The properties defined with Object::define_unimplemented_property. The objects are weak: the sweep callback
     /// forgets the ones that die.
     unimplemented_properties: RefCell<UnimplementedPropertyMap>,
@@ -668,8 +684,10 @@ impl Vm {
             native_function_table: RefCell::new(native_function_table),
             native_function_count: Cell::new(0),
             native_function_indices: RefCell::new(HashMap::new()),
+            function_indexed_dictionaries: RefCell::default(),
             roots: RootSet::default(),
             names: CommonPropertyNames::new(),
+            no_parameter_names: Rc::from([]),
             string_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| StringToAtomCacheEntry::default()))),
             fly_string_cache: Box::new([const { Cell::new(None) }; FLY_STRING_CACHE_SIZE]),
             numeric_string_cache: Box::new([const { Cell::new(None) }; NUMERIC_STRING_CACHE_SIZE]),
@@ -725,9 +743,9 @@ impl Vm {
             loaded_modules: OnceCell::new(),
             module_execution_depth: Cell::new(0),
             module_async_evaluation_count: Cell::new(0),
-            next_private_environment_id: Cell::new(1),
             intrinsic_accessors: RefCell::new(HashMap::default()),
             debugger: RefCell::new(None),
+            last_throw: RefCell::new(None),
             unimplemented_properties: RefCell::new(HashMap::default()),
             on_unimplemented_property_access: Cell::new(None),
             options,
@@ -1088,6 +1106,9 @@ impl Vm {
         if let Some(debugger) = self.debugger.borrow().as_ref() {
             debugger.trace(visitor);
         }
+        if let Some(throw_site) = self.last_throw.borrow().as_ref() {
+            throw_site.value.trace(visitor);
+        }
     }
 
     pub fn enable_debugging(&self) {
@@ -1295,6 +1316,40 @@ impl Vm {
         self.head.type_error_realm_override_depth.set(previous.depth);
     }
 
+    /// Remembers that the running executable's instruction at `program_counter` threw `value`.
+    pub fn did_throw(&self, value: Value, program_counter: u32) {
+        *self.last_throw.borrow_mut() = Some(ThrowSite {
+            value,
+            source_range: self.current_executable().source_range_at(program_counter),
+        });
+    }
+
+    /// Whether `value` is the last exception thrown.
+    pub fn is_last_throw(&self, value: Value) -> bool {
+        self.last_throw
+            .borrow()
+            .as_ref()
+            .is_some_and(|throw_site| throw_site.value == value)
+    }
+
+    /// Forgets where `value` was thrown once a catch clause catches it or a report takes its location, so that reporting
+    /// an equal value later does not take its location from this throw.
+    pub fn forget_throw_site_of(&self, value: Value) {
+        let mut last_throw = self.last_throw.borrow_mut();
+        if last_throw.as_ref().is_some_and(|throw_site| throw_site.value == value) {
+            *last_throw = None;
+        }
+    }
+
+    /// Where `value` was thrown, if it is the last exception thrown.
+    pub fn throw_site_of(&self, value: Value) -> Option<SourceRange> {
+        self.last_throw
+            .borrow()
+            .as_ref()
+            .filter(|throw_site| throw_site.value == value)
+            .and_then(|throw_site| throw_site.source_range.clone())
+    }
+
     /// The frames of every execution context, from the running one down, with where each is in its executable.
     pub fn stack_trace(&self) -> MarkedVec<'_, StackTraceElement> {
         let stack_trace = MarkedVec::new(self);
@@ -1403,6 +1458,10 @@ impl Vm {
 
     pub fn static_property_lookup_cache(&self, site: StaticPropertyLookupCacheSite) -> &PropertyLookupCache {
         self.static_property_lookup_caches.get(site)
+    }
+
+    pub fn is_static_property_lookup_cache(&self, cache: &PropertyLookupCache) -> bool {
+        self.static_property_lookup_caches.contains(cache)
     }
 
     pub fn keyed_property_lookup_cache(&self) -> &KeyedPropertyLookupCache {
@@ -1701,10 +1760,6 @@ impl Vm {
             .loaded_modules
             .get()
             .expect("the VM allocates its list of loaded modules")
-    }
-
-    pub fn next_private_environment_id(&self) -> &Cell<u64> {
-        &self.next_private_environment_id
     }
 
     pub fn string_to_atom_cache(&self) -> &RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>> {

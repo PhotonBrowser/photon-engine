@@ -6,6 +6,7 @@
  */
 
 #include <AK/ByteBuffer.h>
+#include <AK/NumericLimits.h>
 #include <LibCrypto/ASN1/DER.h>
 #include <LibCrypto/ASN1/PEM.h>
 #include <LibCrypto/Certificate/Certificate.h>
@@ -117,8 +118,21 @@ ErrorOr<RSA::KeyPairType> RSA::parse_rsa_key(ReadonlyBytes der, bool is_private,
     }
 }
 
+ErrorOr<void> RSA::validate_key_generation_parameters(size_t bits)
+{
+    // OpenSSL refuses to generate keys with shorter moduli.
+    static constexpr size_t minimum_modulus_length = 512;
+
+    if (bits < minimum_modulus_length)
+        return Error::from_string_literal("RSA modulus length must be at least 512 bits");
+
+    return {};
+}
+
 ErrorOr<RSA::KeyPairType> RSA::generate_key_pair(size_t bits, UnsignedBigInteger e)
 {
+    TRY(validate_key_generation_parameters(bits));
+
     auto ctx = TRY(OpenSSL_PKEY_CTX::wrap(EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr)));
 
     OPENSSL_TRY(EVP_PKEY_keygen_init(ctx.ptr()));
@@ -584,11 +598,32 @@ ErrorOr<void> RSA_OAEP_EME::configure(OpenSSL_PKEY_CTX& ctx)
     return {};
 }
 
+// NB: OpenSSL takes the salt length as an int and gives negative values special meanings, such as salt length
+//     auto-detection, so a length that does not fit in an int must never reach it. No RSA key is large enough
+//     for such a salt.
+static bool salt_length_fits_in_int(Optional<u32> salt_length)
+{
+    return !salt_length.has_value() || *salt_length <= static_cast<u32>(NumericLimits<int>::max());
+}
+
+ErrorOr<bool> RSA_PSS_EMSA::verify(ReadonlyBytes message, ReadonlyBytes signature)
+{
+    if (!salt_length_fits_in_int(m_salt_length))
+        return false;
+    return RSA_EMSA::verify(message, signature);
+}
+
 ErrorOr<void> RSA_PSS_EMSA::configure(OpenSSL_PKEY_CTX& ctx)
 {
+    if (!salt_length_fits_in_int(m_salt_length))
+        return Error::from_string_literal("Salt length is too large");
+
     OPENSSL_TRY(EVP_PKEY_CTX_set_rsa_padding(ctx.ptr(), RSA_PKCS1_PSS_PADDING));
     OPENSSL_TRY(EVP_PKEY_CTX_set_rsa_mgf1_md(ctx.ptr(), TRY(hash_kind_to_hash_type(m_hash_kind))));
-    OPENSSL_TRY(EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx.ptr(), m_salt_length.value_or(RSA_PSS_SALTLEN_MAX)));
+    if (m_salt_length.has_value())
+        OPENSSL_TRY(EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx.ptr(), static_cast<int>(*m_salt_length)));
+    else
+        OPENSSL_TRY(EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx.ptr(), RSA_PSS_SALTLEN_MAX));
     return {};
 }
 

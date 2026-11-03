@@ -39,6 +39,7 @@
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 #include <LibWebCommon/HTML/SameDocumentNavigationEntry.h>
+#include <LibWebCommon/NotificationsAPI/NotificationData.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
 #include <LibWebCommon/HTML/SelectItem.h>
@@ -202,6 +203,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_lose_request_server_connection(Optional<Utf16String> top_level_site) => (Optional<IPC::TransportHandle> handle)
     request_media_server_connection() => (Optional<IPC::TransportHandle> handle)
     request_audio_server_connection() => (Optional<IPC::TransportHandle> handle)
+    request_webrtc_client_connection() => (Optional<IPC::TransportHandle> handle)
     request_video_presentation_channel() =|
 
     [NotRouted] did_request_storage_usage(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) => (u64 usage)
@@ -236,6 +238,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_change_picture_in_picture_player_controls_visibility(Web::PageId page_id, bool shown) =|
     did_request_file(Web::PageId page_id, ByteString path, i32 request_id) =|
     did_request_color_picker(Web::PageId page_id, Color current_color) =|
+    did_request_date_picker(Web::PageId page_id, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum) =|
     did_request_geolocation_position(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId document_id) =|
     did_cancel_geolocation_position_request(Web::PageId page_id, u64 request_id) =|
     did_start_geolocation_position_watch(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId document_id) =|
@@ -244,6 +247,14 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_request_http_credentials(Web::PageId page_id, u64 request_id, URL::URL url, String realm) =|
     did_fail_certificate_verification(Web::PageId page_id, URL::URL url) =|
     [NotRouted] did_request_permission_snapshot(Web::PageId page_id, URL::Origin top_level_origin) => (Web::Permissions::PermissionSnapshot snapshot)
+    did_request_show_notification(Web::PageId page_id, u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData data, Optional<Gfx::ShareableBitmap> icon) =|
+    did_request_close_notification(Web::PageId page_id, u64 notification_id) =|
+    did_abandon_notification(Web::PageId page_id, u64 notification_id) =|
+    did_handle_notification_click(Web::PageId page_id, u64 notification_id, bool into_focus) =|
+    [NotRouted] did_request_notifications_state_for_testing(Web::PageId page_id) => (String json)
+    did_request_click_notification_for_testing(Web::PageId page_id, u64 notification_id) =|
+    did_request_click_notification_by_id_for_testing(Web::PageId page_id, u64 browser_notification_id) =|
+    did_request_dismiss_notification_for_testing(Web::PageId page_id, u64 notification_id) =|
     did_request_file_picker(Web::PageId page_id, Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) =|
     did_request_select_dropdown(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) =|
     did_finish_handling_input_event(Web::PageId page_id, u64 event_id, Web::EventResult event_result) =|
@@ -262,7 +273,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_update_session_history_entry_scroll_restoration_mode(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::ScrollRestorationMode scroll_restoration_mode) =|
     did_update_session_history_entry_document_state_navigable_target_name(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Utf16String navigable_target_name) =|
     did_set_session_history_entry_document_state_reload_pending(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, bool reload_pending) =|
-    did_request_set_system_focus(Web::PageId page_id, bool has_system_focus) =|
+    did_request_set_system_focus(Web::PageId page_id, bool has_system_focus) => ()
     did_change_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     did_request_key_event_for_testing(Web::PageId page_id, Web::KeyEvent event) =|
     did_request_spelling_menu_action_for_testing(Web::PageId page_id, Web::SpellingMenuActionForTesting action, u32 guess_index) =|
@@ -289,7 +300,7 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     did_change_screen_wake_lock_state(Web::PageId page_id, Web::ScreenWakeLockState wake_lock_state) =|
 
-    did_start_using_gamepads() =|
+    did_start_using_gamepads(Web::PageId page_id) =|
     gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect) =|
     gamepad_stop_effects(Web::Gamepad::GamepadHandle handle) =|
 
@@ -310,4 +321,7 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     [NotRouted] start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id)
     close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
+    rtc_transform_init(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record) =|
+    rtc_transform_teardown(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id) =|
+    rtc_transform_encoded_audio_frame(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) =|
 }

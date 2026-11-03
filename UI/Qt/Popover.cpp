@@ -35,6 +35,10 @@
 #    include <UI/Qt/MacWindow.h>
 #endif
 
+#if defined(AK_OS_LINUX)
+#    include <UI/Qt/X11Window.h>
+#endif
+
 namespace Ladybird {
 
 static constexpr int POPOVER_ANCHOR_GAP = 4;
@@ -50,6 +54,9 @@ Popover::Popover(QWidget* parent)
     setAttribute(Qt::WA_NativeWindow);
 #endif
     setAttribute(Qt::WA_TranslucentBackground);
+    // NB: The window is placed by its card, and macOS can report a safe area at its top, which would take a point from
+    //     the card's height.
+    setAttribute(Qt::WA_ContentsMarginsRespectsSafeArea, false);
 
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(POPOVER_SHADOW_MARGINS);
@@ -121,6 +128,18 @@ private:
 };
 #endif
 
+#if !defined(AK_OS_MACOS)
+// NB: Where windows do not blend with the desktop, a popover would fade in from black and fade out to black.
+static bool popovers_fade()
+{
+#    if defined(AK_OS_LINUX)
+    return windows_blend_with_desktop();
+#    else
+    return true;
+#    endif
+}
+#endif
+
 // A popover fades in quickly as it opens, growing out of its anchor.
 void Popover::showEvent(QShowEvent* event)
 {
@@ -154,7 +173,8 @@ void Popover::showEvent(QShowEvent* event)
         });
     }
 #else
-    fade_in(origin);
+    if (popovers_fade())
+        fade_in(origin);
 #endif
 
     if (on_visibility_change)
@@ -249,7 +269,7 @@ void Popover::setVisible(bool visible)
 #else
     if (visible) {
         stop_fading();
-    } else if (isVisible() && !m_is_finishing_close) {
+    } else if (isVisible() && !m_is_finishing_close && popovers_fade()) {
         fade_out(AfterFadingOut::Hide);
         return;
     }
@@ -264,7 +284,7 @@ void Popover::setVisible(bool visible)
 //     click outside it, is already gone.
 void Popover::closeEvent(QCloseEvent* event)
 {
-    if (!event->spontaneous() && isVisible() && !m_is_finishing_close) {
+    if (!event->spontaneous() && isVisible() && !m_is_finishing_close && popovers_fade()) {
         event->ignore();
         fade_out(AfterFadingOut::Close);
         return;

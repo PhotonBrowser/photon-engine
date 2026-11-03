@@ -89,6 +89,16 @@ static GC::Ptr<Navigable> focus_root(DOM::Document& document)
     return navigable->top_level_traversable();
 }
 
+// The currently focused area of root, or without system focus, the area the tab's focused navigable shows: where focus
+// would be with system focus. Starting at the focused navigable means a focused area another process took focus from
+// doesn't count as focused.
+static GC::Ptr<DOM::Node> currently_or_otherwise_focused_area(Navigable& root)
+{
+    if (root.page().client().has_focus())
+        return root.currently_focused_area();
+    return root.focused_area_shown_by_focused_navigable_regardless_of_system_focus();
+}
+
 static GC::Ptr<Navigable> navigable_of_focused_area(DOM::Node& focused_area)
 {
     if (auto* container = as_if<NavigableContainer>(focused_area)) {
@@ -102,6 +112,20 @@ static bool is_top_level_document_viewport(DOM::Node const* node)
 {
     auto const* document = as_if<DOM::Document>(node);
     return document && document->navigable() && !document->navigable()->parent();
+}
+
+// Whether a listener can run on `element` as its blur and focusout events are dispatched: on its flat tree path, or on
+// its document or window.
+static bool a_handler_may_read_style_during_blur(DOM::Element& element)
+{
+    auto listens = [](DOM::EventTarget const& target) {
+        return target.has_event_listener(HTML::EventNames::blur) || target.has_event_listener(HTML::EventNames::focusout);
+    };
+    for (DOM::Node* node = &element; node; node = node->flat_tree_parent()) {
+        if (listens(*node))
+            return true;
+    }
+    return listens(element.document()) || listens(relevant_window(element));
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps
@@ -121,6 +145,8 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
     auto new_focus_target_is_document_viewport = new_focus_target && new_focus_target->is_document();
     GC::Ptr<DOM::Node> focus_transition_source;
     Vector<GC::Root<DOM::Element>> old_focus_within_chain;
+    bool focus_transition_source_indicated_focus = false;
+    bool focus_state_published_for_blur_handlers = false;
 
     auto build_focus_within_chain = [](GC::Ptr<DOM::Node> source) {
         Vector<GC::Root<DOM::Element>> chain;
@@ -134,9 +160,29 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
         return chain;
     };
 
+    // AD-HOC: What a blur handler reads of the old area's style is what it matches now, while the focusability check of
+    //         the new area runs over the state the old area left, so that a selector keeping the new area rendered
+    //         does not hide it first.
+    auto publish_focus_state_of_transition_source = [&](bool focused) {
+        auto* element = as_if<DOM::Element>(focus_transition_source.ptr());
+        if (!element)
+            return;
+        CSS::record_element_state_changed(*element, CSS::PseudoClass::Focus, focused);
+        if (focus_transition_source_indicated_focus)
+            CSS::record_element_state_changed(*element, CSS::PseudoClass::FocusVisible, focused);
+        for (auto& ancestor : old_focus_within_chain)
+            CSS::record_element_state_changed(*ancestor, CSS::PseudoClass::FocusWithin, focused);
+    };
+
+    auto restore_focus_state_for_focusability_check = [&] {
+        if (exchange(focus_state_published_for_blur_handlers, false))
+            publish_focus_state_of_transition_source(true);
+    };
+
     auto finish_focus_transition = [&](GC::Ptr<DOM::Node> destination) {
         if (!focus_transition_source)
             return;
+        restore_focus_state_for_focusability_check();
 
         CSS::Invalidation::invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass::Focus, focus_transition_source, destination);
         CSS::Invalidation::invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass::FocusVisible, focus_transition_source, destination);
@@ -223,8 +269,13 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
             if (preserve_focus_state) {
                 focus_transition_source = element;
                 old_focus_within_chain = build_focus_within_chain(element);
+                focus_transition_source_indicated_focus = element->should_indicate_focus();
             }
             element->document().set_focused_area(nullptr, preserve_focus_state ? DOM::Document::InvalidateFocusPseudoClasses::No : DOM::Document::InvalidateFocusPseudoClasses::Yes);
+            if (preserve_focus_state && a_handler_may_read_style_during_blur(*element)) {
+                publish_focus_state_of_transition_source(false);
+                focus_state_published_for_blur_handlers = true;
+            }
         }
 
         // 4. If blur event target is not null, fire a focus event named blur at blur event target, with related blur
@@ -262,6 +313,7 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
         if (entry->is_document()) {
             designate_document_viewport_as_focused_area(entry->document());
         } else if (entry->document().focused_area().ptr() != entry.ptr()) {
+            restore_focus_state_for_focusability_check();
             if (entry->is_focusable()) {
                 relevant_window(*entry).navigation()->set_focus_changed_during_ongoing_navigation(true);
 
@@ -598,8 +650,10 @@ static GC::Ptr<DOM::Node> get_focusable_area(DOM::Node& focus_target, FocusTrigg
             return nullptr;
 
         // 1. Let focusedElement be the currently focused area of a top-level traversable's DOM anchor.
+        // AD-HOC: Without system focus, that's null; take the area it would be with system focus instead, so the
+        //         shadow host keeps the delegate that has focus (see the focusing steps' step 5).
         if (auto root = focus_root(element->document())) {
-            if (auto focused_element = root->currently_focused_area()) {
+            if (auto focused_element = currently_or_otherwise_focused_area(*root)) {
                 // 2. If focus target is a shadow-including inclusive ancestor of focusedElement, then
                 //    return focusedElement.
                 if (element->is_shadow_including_inclusive_ancestor_of(*focused_element))
@@ -616,7 +670,7 @@ static GC::Ptr<DOM::Node> get_focusable_area(DOM::Node& focus_target, FocusTrigg
 
 // https://html.spec.whatwg.org/multipage/interaction.html#focusing-steps
 // FIXME: This should accept more types.
-void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> fallback_target, FocusTrigger focus_trigger, ScrollIntoView scroll_into_view)
+void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> fallback_target, FocusTrigger focus_trigger, ScrollIntoView scroll_into_view, Optional<bool> focus_visible)
 {
     // 1. If new focus target is not a focusable area, then set new focus target to the result of getting the focusable
     //    area for new focus target, given focus trigger if it was passed.
@@ -667,8 +721,17 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
     auto root = focus_root(new_focus_target->document());
     if (!root)
         return;
-    if (new_focus_target.ptr() == root->currently_focused_area().ptr())
+    // AD-HOC: Without system focus, the currently focused area of the top-level traversable is null, so the spec's
+    //         check never matches. Focusing the area that keeps focus then fires the focus events again, and a page
+    //         whose focus handler focuses its own target again recurses until the stack runs out. Compare against the
+    //         area that would be focused with system focus.
+    if (new_focus_target.ptr() == currently_or_otherwise_focused_area(*root).ptr()) {
+        // NB: focus()'s focusVisible option still applies to the element that already has focus, e.g. the delegate a
+        //     shadow host resolved to.
+        if (focus_visible.has_value())
+            new_focus_target->document().request_focus_visibility_for_focused_element(*focus_visible);
         return;
+    }
 
     // 6. Let old chain be the current focus chain of the top-level browsing context in which
     //    new focus target finds itself.
@@ -679,6 +742,9 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
 
     // AD-HOC: Remember last focus trigger for :focus-visible / focus indication.
     new_focus_target->document().set_last_focus_trigger(focus_trigger);
+    new_focus_target->document().set_requested_focus_visibility(new_focus_target, focus_visible);
+    if (focus_trigger == FocusTrigger::Click || focus_trigger == FocusTrigger::Key)
+        new_focus_target->document().set_last_user_focus_was_by_pointer(focus_trigger == FocusTrigger::Click);
 
     // NB: The tab's focused navigable shows the walk below a top-level traversable another process hosts, and the other
     //     pages of the tab follow it, so it moves to the navigable of new focus target before any focus event fires.

@@ -29,6 +29,9 @@ static constexpr size_t maximum_worker_count_per_top_level_site = 64;
 
 static constexpr auto worker_exit_grace_period = AK::Duration::from_seconds(5);
 
+// https://html.spec.whatwg.org/multipage/workers.html#extended-lifetime-shared-worker-timeout
+static constexpr auto extended_lifetime_shared_worker_timeout = AK::Duration::from_seconds(30);
+
 WorkerProcessManager& WorkerProcessManager::the()
 {
     static auto& manager = *new WorkerProcessManager;
@@ -136,7 +139,6 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
                     // AD-HOC: Error firing is routed back over IPC via notify_worker_script_load_failure;
                     //         the spec's queue-global-task happens inside WorkerAgentParent in the
                     //         requesting process.
-                    // FIXME: The extendedLifetime comparison becomes observable once SharedWorkerOptions is implemented.
                     if (agent.worker_type != request.type
                         || agent.credentials != request.credentials
                         || agent.extended_lifetime != request.extended_lifetime
@@ -151,6 +153,7 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
                     //         owner_set() is appended inside connect_shared_worker_impl (which also
                     //         handles steps 11.5.5-11.5.7).
                     agent.owners.append(owner);
+                    agent.extended_lifetime_timer = nullptr;
                     agent.client->async_connect_shared_worker(move(request.outside_port), request.outside_settings);
                     return agent.id;
                 }
@@ -292,6 +295,7 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
         .worker_type = request.type,
         .credentials = request.credentials,
         .extended_lifetime = request.extended_lifetime,
+        .extended_lifetime_timer = {},
         .worker_is_secure_context = request.caller_is_secure_context,
         .is_private = is_private,
         .top_level_origin = top_level_origin,
@@ -438,8 +442,6 @@ void WorkerProcessManager::post_broadcast_channel_message(Web::HTML::PostedBroad
         .source_origin = source_settings.origin(),
         .serialized_message = move(posted_message.serialized_message),
         .shared_buffers = move(posted_message.shared_buffers),
-        .source_process_id = source_process_id,
-        .source_channel_id = posted_message.source_channel_id,
     };
 
     WebContentClient::for_each_client([&](auto& client) {
@@ -534,6 +536,55 @@ void WorkerProcessManager::notify_worker_content_security_policy_violation(Owner
         [&](WebWorkerOwner const& web_worker_owner) {
             web_worker_owner.client->async_did_worker_agent_report_content_security_policy_violation(owner.token, policy_index, effective_directive, resource);
         });
+}
+
+WorkerProcessManager::WorkerAgent* WorkerProcessManager::agent_owned_by(WebContentClient& client, Web::HTML::WorkerAgentId agent_id)
+{
+    auto agent = m_agents.find(agent_id);
+    if (agent == m_agents.end())
+        return nullptr;
+    for (auto const& owner : agent->value.owners) {
+        auto const* web_content_owner = owner.client.get_pointer<WebContentOwner>();
+        if (web_content_owner && web_content_owner->client.ptr() == &client)
+            return &agent->value;
+    }
+    return nullptr;
+}
+
+void WorkerProcessManager::rtc_transform_init(WebContentClient& client, Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record)
+{
+    if (auto* agent = agent_owned_by(client, agent_id))
+        agent->client->async_rtc_transform_init(transform_id, move(options_record));
+}
+
+void WorkerProcessManager::rtc_transform_teardown(WebContentClient& client, Web::HTML::WorkerAgentId agent_id, u64 transform_id)
+{
+    if (auto* agent = agent_owned_by(client, agent_id))
+        agent->client->async_rtc_transform_teardown(transform_id);
+}
+
+void WorkerProcessManager::rtc_transform_encoded_audio_frame(WebContentClient& client, Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
+{
+    if (auto* agent = agent_owned_by(client, agent_id))
+        agent->client->async_rtc_transform_encoded_audio_frame(transform_id, payload.bytes(), ssrc, payload_type, rtp_timestamp, sequence_number);
+}
+
+void WorkerProcessManager::worker_did_write_rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
+{
+    auto agent = m_agents.find(agent_id);
+    if (agent == m_agents.end())
+        return;
+
+    for (auto const& owner : agent->value.owners) {
+        owner.client.visit(
+            [&](WebContentOwner const& web_content_owner) {
+                if (web_content_owner.client)
+                    web_content_owner.client->async_did_worker_rtc_transform_encoded_audio_frame_written(owner.token, transform_id, payload, ssrc, payload_type, rtp_timestamp, sequence_number);
+            },
+            [&](WebWorkerOwner const&) {
+                // FIXME: Route transform frames back to nested-worker owners once the WebWorkerServer endpoint carries this message.
+            });
+    }
 }
 
 void WorkerProcessManager::notify_worker_close(Owner const& owner)
@@ -688,11 +739,30 @@ void WorkerProcessManager::remove_agent(Web::HTML::WorkerAgentId agent_id, Agent
 
     // A worker still reachable from an owner is actively needed, and closing it here would be the
     // wrapper-lifetime bug this ownership model exists to prevent.
-    if (cause == AgentRemovalCause::OwnerSetEmptied)
+    if (cause == AgentRemovalCause::OwnerSetEmptied) {
         VERIFY(maybe_agent->value.owners.is_empty());
+
+        // https://html.spec.whatwg.org/multipage/workers.html#in-extended-lifetime-worker
+        // A shared worker with an extended lifetime stays protected for the extended lifetime shared worker timeout
+        // after its owner set empties, and a new owner may connect to it meanwhile.
+        auto& agent = maybe_agent->value;
+        if (agent.extended_lifetime) {
+            if (!agent.extended_lifetime_timer) {
+                agent.extended_lifetime_timer = Core::Timer::create_single_shot(extended_lifetime_shared_worker_timeout, [this, agent_id] {
+                    remove_agent(agent_id, AgentRemovalCause::ExtendedLifetimeEnded);
+                });
+                agent.extended_lifetime_timer->start();
+            }
+            return;
+        }
+    }
 
     auto agent = move(maybe_agent->value);
     m_agents.remove(agent_id);
+
+    // NB: The extended lifetime timer may be what is removing the agent, so it outlives its own handler.
+    if (agent.extended_lifetime_timer)
+        Core::deferred_invoke([timer = move(agent.extended_lifetime_timer)] { });
 
     if (agent.shared_worker_key.has_value())
         m_shared_workers.remove(*agent.shared_worker_key);

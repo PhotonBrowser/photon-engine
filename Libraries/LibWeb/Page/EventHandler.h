@@ -15,7 +15,6 @@
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
-#include <LibCompositing/Scrolling/WheelGestureIdentity.h>
 #include <LibCompositing/Types.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Weak.h>
@@ -231,6 +230,7 @@ private:
         Compositing::RustFFI::NodeSlotId hit_node;
         NonnullRefPtr<Layout::NodeArena> arena;
         RefPtr<Painting::ChromeWidget> chrome_widget;
+        bool is_scrollbar { false };
         DOM::NodeIdentity node;
         Optional<int> index_in_node;
         bool is_text_fragment { false };
@@ -269,8 +269,7 @@ private:
     void update_hover_after_scroll(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target = {});
     EventResult dispatch_wheel_event(Layout::BegunRead const& read, Layout::Node&, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, bool is_cancelable);
     // Both drop the latch when what it refers to is gone from the document, so that the event is targeted afresh.
-    Layout::Node* validated_wheel_scroll_latch_target_layout_node(Layout::BegunRead const& read, DOM::Document&);
-    Layout::Node* validated_latched_wheel_scrolling_box();
+    Layout::Node* validated_latched_wheel_event_target_layout_node(Layout::BegunRead const& read, DOM::Document&);
     EventResult dispatch_synthetic_pinch_wheel_event(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned modifiers, double wheel_delta_y, bool is_cancelable, Optional<RemoteInputEventTarget>* remote_target);
 
     enum class PointerEventType : u8 {
@@ -283,7 +282,6 @@ private:
         RunDefaultActions,
         CancelledByPage,
         MouseEventPrevented,
-        SwallowedByChromeWidget,
     };
     struct DispatchedPointerEvent {
         PointerEventDispatchResult result;
@@ -304,8 +302,7 @@ private:
     void track_the_effective_position_of_the_legacy_mouse_pointer(GC::Ptr<DOM::Node>, Optional<DOM::HoverEventData> = {});
     void report_hovered_node_to_client(GC::Ptr<DOM::Node>);
 
-    bool dispatch_chrome_widget_pointer_event(RefPtr<Painting::ChromeWidget>, Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position);
-    void update_hovered_chrome_widget(RefPtr<Painting::ChromeWidget>);
+    void dispatch_chrome_widget_pointer_event(RefPtr<Painting::ChromeWidget>, Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position);
     void update_nested_navigable_under_pointer(GC::Ptr<HTML::LocalNavigable>);
 
     void update_cursor(Layout::BegunRead const& read, Layout::Node const*, GC::Ptr<DOM::Node> host_element, RefPtr<Painting::ChromeWidget>, bool hit_text_fragment = false);
@@ -320,7 +317,6 @@ private:
     InputEventsTarget* m_mouse_selection_target { nullptr };
     GC::Ptr<DOM::Range> m_selection_origin;
 
-    RefPtr<Painting::ChromeWidget> m_hovered_chrome_widget;
     RefPtr<Painting::ChromeWidget> m_captured_chrome_widget;
 
     GC::Weak<DOM::Node> m_effective_legacy_mouse_pointer_position;
@@ -360,19 +356,18 @@ private:
     Optional<UIEvents::KeyCode> m_held_scroll_key;
     OwnPtr<HTML::UserScrollGestureHold> m_scroll_key_gesture_hold;
 
-    // The target and the scrolling box of the wheel gesture in progress: the gesture's later wheel events go to them
-    // without hit testing, and the scrolling box absorbs the gesture at its edge. The compositor latches by the same
-    // rules, so the two agree on the scroller of an event.
-    struct WheelScrollLatch {
-        Compositing::WheelGestureIdentity gesture;
+    // The target of the wheel gesture in progress, which the gesture's later wheel events go to without hit testing.
+    // The compositor latches the scroller of the gesture.
+    struct WheelEventTargetLatch {
+        // The gesture the compositor named for the event that started the latch, which only events it names the same
+        // gesture for continue.
+        Optional<u64> wheel_gesture_id;
         GC::Weak<DOM::Node> wheel_event_target;
-        // The default action walks the boxes of this pseudo-element rather than the target's own.
+        // The events go to the box of this pseudo-element rather than the target's own.
         Optional<CSS::PseudoElement> wheel_event_target_pseudo_element {};
         bool gesture_handed_to_nested_navigable { false };
-        // Unset until the default action of this thread has moved a box, so for as long as the compositor scrolls.
-        Optional<Web::AsyncScrollNodeStableID> scrolling_box {};
     };
-    Optional<WheelScrollLatch> m_wheel_scroll_latch;
+    Optional<WheelEventTargetLatch> m_wheel_event_target_latch;
 };
 
 }

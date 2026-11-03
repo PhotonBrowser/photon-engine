@@ -66,6 +66,10 @@ public:
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
 
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-textarea-element-2
+    // The textarea element is a devolvable widget [...]
+    virtual bool is_devolvable_widget() const override { return true; }
+
     virtual void reset_algorithm() override;
     virtual void clear_algorithm() override;
 
@@ -156,6 +160,7 @@ private:
     virtual CSS::ElementBoxKind box_kind() const override;
 
     void set_raw_value(Utf16String);
+    bool replace_value(Utf16View);
 
     // ^DOM::Element
     virtual i32 default_tab_index_value() const override;

@@ -27,7 +27,7 @@ use crate::bytecode::executable::{
     MAX_NUMBER_OF_SHAPES_TO_REMEMBER, MEGAMORPHIC_DATA_TAG, MEGAMORPHIC_HASH_MULTIPLIER, MEGAMORPHIC_INDEX_BITS,
     MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET, MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET,
 };
-use crate::gc::class::{Class, GcCell};
+use crate::gc::class::{BLOCK_CLASS_OFFSET, BLOCK_CLASS_TAIL_TAG, BLOCK_SIZE, Class, GcCell};
 use crate::gc::defer_gc::DeferGc;
 use crate::interpreter::runtime_functions::runtime_function_addresses;
 use crate::interpreter::vm::{
@@ -37,18 +37,19 @@ use crate::layout::accessor::Accessor;
 use crate::layout::cell::Gc;
 use crate::layout::environment::{
     BINDING_FLAG_MUTABLE, DeclarativeEnvironment, DeclarativeEnvironmentRareData, Environment, EnvironmentShape,
-    PrivateEnvironment,
+    GlobalDeclarativeEnvironment, PrivateEnvironment,
 };
 use crate::layout::executable::ExecutableHead;
 use crate::layout::execution_context::ExecutionContext;
 use crate::layout::function_object::{
-    CallEnvironmentTemplate, EcmascriptFunctionObject, FUNCTION_ENVIRONMENT_WORDS, FunctionObject,
-    NATIVE_FUNCTION_TABLE_INDEX_MASK, NativeFunctionTableEntry, RawNativeFunction, SharedFunctionInstanceData,
-    asm_call_metadata,
+    CallEnvironmentTemplate, ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT_OFFSET,
+    ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA_OFFSET, EcmascriptFunctionObjectWithRareData, FUNCTION_ENVIRONMENT_WORDS,
+    NATIVE_FUNCTION_TABLE_INDEX_MASK, NativeFunction, NativeFunctionTableEntry, SharedFunctionInstanceData,
+    asm_call_metadata, ecmascript_function_flags,
 };
 use crate::layout::object::{
     INDEXED_ELEMENTS_HEADER_SIZE, IndexedStorageKind, Object, TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID, TypedArrayBase,
-    object_flag, typed_array_kind,
+    array_flags, object_flag, typed_array_kind,
 };
 use crate::layout::primitive_string::{DEFERRED_KIND_MASK, DeferredKind, INTERNED_FLAG, InlineString, PrimitiveString};
 use crate::layout::property_lookup_cache::{
@@ -60,7 +61,6 @@ use crate::layout::realm::Realm;
 use crate::layout::shape::{Shape, WatchpointSet};
 use crate::layout::value::Value;
 use crate::layout::vm::VmHead;
-use crate::runtime::array::{ARRAY_IS_PROXY_TARGET_OFFSET, ARRAY_LENGTH_WRITABLE_OFFSET};
 use crate::runtime::array_iterator::ArrayIterator;
 use crate::runtime::function_environment::{
     FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET, FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET,
@@ -70,6 +70,10 @@ use crate::runtime::module_environment::ModuleEnvironment;
 use crate::runtime::object::{ORDINARY_OBJECT_METHODS, ObjectMethods, PropertyKind};
 use crate::runtime::string_object::StringObject;
 use crate::runtime::string_prototype::StringPrototype;
+
+// JIT code compresses and decodes the compressed cell pointers of cells like the runtime does.
+const _: () =
+    assert!(libjs_jit::snapshot::COMPRESSED_POINTER_SHIFT as u32 == crate::layout::member::COMPRESSED_POINTER_SHIFT);
 
 /// The addresses of the runtime functions JIT code calls, which every compile job's runtime info has.
 pub struct RuntimeFunctionAddresses {
@@ -159,9 +163,14 @@ fn runtime_offsets() -> RuntimeOffsets {
         execution_context_argument_count: offset(offset_of!(ExecutionContext, argument_count)),
         execution_context_returns_to_native_caller: offset(offset_of!(ExecutionContext, returns_to_native_caller)),
         execution_context_runs_jit_code: offset(offset_of!(ExecutionContext, runs_jit_code)),
-        ecmascript_function_environment: offset(offset_of!(EcmascriptFunctionObject, environment)),
-        ecmascript_function_private_environment: offset(offset_of!(EcmascriptFunctionObject, private_environment)),
-        ecmascript_function_script_or_module: offset(offset_of!(EcmascriptFunctionObject, script_or_module)),
+        ecmascript_function_environment: offset(ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT_OFFSET),
+        ecmascript_function_private_environment: offset(offset_of!(
+            EcmascriptFunctionObjectWithRareData,
+            private_environment
+        )),
+        shared_function_script_or_module: offset(offset_of!(SharedFunctionInstanceData, script_or_module)),
+        object_class_bits: offset(offset_of!(Object, class_bits)),
+        ecmascript_function_flag_has_rare_data: ecmascript_function_flags::HAS_RARE_DATA.into(),
         vm_execution_generation: offset(offset_of!(VmHead, execution_generation)),
     }
 }
@@ -178,11 +187,13 @@ fn runtime_layout() -> RuntimeLayout {
         indexed_storage_kind_holey: IndexedStorageKind::Holey as u8,
         object_flag_is_extensible: object_flag::IS_EXTENSIBLE,
         object_flag_has_magical_length: object_flag::HAS_MAGICAL_LENGTH_PROPERTY,
+        object_class: core::ptr::from_ref(Object::CLASS) as u64,
         string_object_class: core::ptr::from_ref(StringObject::CLASS) as u64,
         string_prototype_class: core::ptr::from_ref(StringPrototype::CLASS) as u64,
         object_flag_may_interfere: object_flag::MAY_INTERFERE_WITH_INDEXED_PROPERTY_ACCESS,
-        array_length_writable: offset(ARRAY_LENGTH_WRITABLE_OFFSET),
-        array_is_proxy_target: offset(ARRAY_IS_PROXY_TARGET_OFFSET),
+        array_flags: offset(offset_of!(Object, class_bits)),
+        array_flag_length_not_writable: array_flags::LENGTH_NOT_WRITABLE,
+        array_flag_is_proxy_target: array_flags::IS_PROXY_TARGET,
         shape_prototype: offset(offset_of!(Shape, prototype)),
         object_flag_is_typed_array: object_flag::IS_TYPED_ARRAY,
         object_flag_is_htmldda: object_flag::IS_HTMLDDA,
@@ -221,8 +232,7 @@ fn runtime_layout() -> RuntimeLayout {
         utf16_string_data_storage: offset(size_of::<ak::Utf16StringDataHeader>()),
         // NB: Filled in by runtime_info().
         single_ascii_character_strings: 0,
-        function_object_builtin: offset(offset_of!(FunctionObject, builtin)),
-        function_object_has_builtin: offset(offset_of!(FunctionObject, has_builtin)),
+        function_object_builtin: offset(offset_of!(Object, class_bits)),
         builtin_string_prototype_char_code_at: Builtin::StringPrototypeCharCodeAt as u8,
         builtin_string_prototype_char_at: Builtin::StringPrototypeCharAt as u8,
         builtin_math_abs: Builtin::MathAbs as u8,
@@ -258,20 +268,17 @@ fn runtime_layout() -> RuntimeLayout {
         generator_object_class: core::ptr::from_ref(GeneratorObject::CLASS) as u64,
         generator_object_pending_completion_value: offset(offset_of!(GeneratorObject, pending_completion_value)),
         generator_object_pending_completion_type: offset(offset_of!(GeneratorObject, pending_completion_type)),
-        declarative_environment_binding_values_size: offset(offset_of!(DeclarativeEnvironment, binding_values.size)),
-        declarative_environment_binding_values_capacity: offset(offset_of!(
-            DeclarativeEnvironment,
-            binding_values.capacity
-        )),
+        declarative_environment_binding_values_size: offset(offset_of!(DeclarativeEnvironment, binding_count)),
+        declarative_environment_inline_binding_capacity: offset(offset_of!(Environment, inline_binding_capacity)),
         environment_shape_binding_names: offset(offset_of!(EnvironmentShape, binding_names)),
         environment_shape_has_unique_binding_names: offset(offset_of!(EnvironmentShape, has_unique_binding_names)),
-        declarative_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values.data)),
-        declarative_environment_shape: offset(offset_of!(DeclarativeEnvironment, shape)),
+        declarative_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values)),
+        declarative_environment_shape: offset(offset_of!(Environment, shape)),
         declarative_environment_rare_data: offset(offset_of!(DeclarativeEnvironment, rare_data)),
         rare_data_binding_flags: offset(offset_of!(DeclarativeEnvironmentRareData, binding_flags.data)),
         environment_shape_binding_flags_size: offset(offset_of!(EnvironmentShape, binding_flags.size)),
         environment_shape_binding_flags: offset(offset_of!(EnvironmentShape, binding_flags.data)),
-        declarative_environment_serial: offset(offset_of!(DeclarativeEnvironment, serial_number)),
+        declarative_environment_serial: offset(offset_of!(GlobalDeclarativeEnvironment, serial_number)),
         realm_global_object: offset(offset_of!(Realm, global_object)),
         realm_global_declarative_environment: offset(offset_of!(Realm, global_declarative_environment)),
         executable_global_variable_caches: offset(offset_of!(ExecutableHead, global_variable_caches.data)),
@@ -340,6 +347,10 @@ fn runtime_layout() -> RuntimeLayout {
         property_lookup_cache_entry_type_add_own_property: PropertyLookupCacheEntryType::AddOwnProperty as u32,
         property_lookup_cache_entry_type_get_own_property: PropertyLookupCacheEntryType::GetOwnProperty as u32,
         property_lookup_cache_entry_type_change_own_property: PropertyLookupCacheEntryType::ChangeOwnProperty as u32,
+        cell_block_mask: !(BLOCK_SIZE as u64 - 1),
+        block_class_offset: offset(BLOCK_CLASS_OFFSET),
+        block_class_tail_tag: BLOCK_CLASS_TAIL_TAG as u64,
+        class_cell_size: offset(offset_of!(Class, type_info.cell_size)),
         class_object_methods: offset(offset_of!(Class, object_methods)),
         object_methods_get_prototype_of: offset(offset_of!(ObjectMethods, internal_get_prototype_of)),
         object_methods_is_cacheable_for_property_absence: offset(offset_of!(
@@ -558,7 +569,7 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
         .expect("the VM has a JIT entry table while the JIT is on");
     DynamicCallLayout {
         object_flag_is_ecmascript_function: object_flag::IS_ECMASCRIPT_FUNCTION_OBJECT,
-        ecmascript_function_shared_data: offset(offset_of!(EcmascriptFunctionObject, shared_data)),
+        ecmascript_function_shared_data: offset(ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA_OFFSET),
         shared_data_executable: offset(offset_of!(SharedFunctionInstanceData, executable)),
         shared_data_asm_call_metadata: offset(offset_of!(SharedFunctionInstanceData, asm_call_metadata)),
         executable_jit_entry_slot: offset(offset_of!(ExecutableHead, jit_entry_slot)),
@@ -580,7 +591,7 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
         } else {
             0
         },
-        raw_native_function_index: offset(offset_of!(RawNativeFunction, native_function_index)),
+        raw_native_function_index: offset(offset_of!(NativeFunction, raw_native_function_index)),
         vm_native_function_table: offset(offset_of!(VmHead, native_function_table_data)),
         native_function_table_index_mask: NATIVE_FUNCTION_TABLE_INDEX_MASK,
         native_function_table_entry_size: offset(size_of::<NativeFunctionTableEntry>()),
@@ -599,9 +610,11 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
             binding_values_offset
         )),
         call_environment_template_binds_this: offset(offset_of!(CallEnvironmentTemplate, binds_this)),
+        call_environment_template_has_function_fields: offset(offset_of!(CallEnvironmentTemplate, has_function_fields)),
         call_environment_template_words: offset(offset_of!(CallEnvironmentTemplate, words)),
         function_environment_words: offset(FUNCTION_ENVIRONMENT_WORDS),
-        function_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values.data)),
+        declarative_environment_words: offset(size_of::<DeclarativeEnvironment>() / 8),
+        function_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values)),
         function_environment_outer: offset(offset_of!(Environment, outer)),
         function_environment_function_object: offset(FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET),
         function_environment_this_value: offset(FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET),

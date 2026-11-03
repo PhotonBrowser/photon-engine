@@ -46,6 +46,7 @@
 #    include <UI/Qt/MacWindow.h>
 #endif
 #include <UI/Qt/InputMethodUtils.h>
+#include <UI/Qt/Menu.h>
 #include <UI/Qt/SelectDropdown.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/SystemAppearance.h>
@@ -133,7 +134,8 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     setParent(window);
     setApi(QRhiWidget::Api::Direct3D11);
 #elif defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
-    // The page is shown by a layer of this widget's own native view; Qt only paints the chrome behind its corners.
+    // The page is shown by a layer of this widget's own native view, and Qt paints the widget only while that layer does
+    // not cover it (see update_whether_qt_paints_view()).
     setAttribute(Qt::WA_DontCreateNativeAncestors);
     setAttribute(Qt::WA_NativeWindow);
     setAttribute(Qt::WA_OpaquePaintEvent);
@@ -417,6 +419,10 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     };
 
     on_request_select_dropdown = [this](Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) {
+        // NB: The view has a native window of its own, which Qt refuses as the transient parent of a popup. The
+        //     dropdown opens from the top-level window instead, which can change when the tab moves to another one.
+        if (m_select_dropdown->parentWidget() != this->window())
+            m_select_dropdown->setParent(this->window(), m_select_dropdown->windowFlags());
         m_select_dropdown->open(map_point_to_global_position(content_position), minimum_width, items);
     };
 }
@@ -436,6 +442,9 @@ WebContentView::~WebContentView()
     release_all_retired_backing_stores();
 #    endif
 #endif
+
+    // NB: The dropdown can belong to the top-level window, which outlives the view.
+    delete m_select_dropdown;
 
 #if !defined(Q_OS_WIN)
     QAccessible::removeActivationObserver(this);
@@ -461,6 +470,10 @@ void WebContentView::prepare_for_window_move()
 
 void WebContentView::finish_window_move()
 {
+    // NB: The dropdown moves to the new top-level window too, because the old one can close and delete it.
+    if (m_select_dropdown->parentWidget() != window())
+        m_select_dropdown->setParent(window(), m_select_dropdown->windowFlags());
+
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     create();
 #    if defined(Q_OS_MACOS)
@@ -1264,6 +1277,9 @@ void WebContentView::paintEvent(QPaintEvent*)
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
 void WebContentView::paintEvent(QPaintEvent*)
 {
+    // Qt still sends paint events to a view that paints on screen, which has no paint engine to paint with.
+    if (testAttribute(Qt::WA_PaintOnScreen))
+        return;
     // The page layer covers the view, except before its first frame, which shows the chrome's color.
     QPainter painter(this);
     painter.fillRect(rect(), ChromeStyle::chrome_background(window()->palette()));
@@ -2332,6 +2348,11 @@ Gfx::IntPoint WebContentView::to_content_position(Gfx::IntPoint widget_position)
 Gfx::IntPoint WebContentView::to_widget_position(Gfx::IntPoint content_position) const
 {
     return content_position;
+}
+
+void WebContentView::show_context_menu(WebView::Menu& menu, Gfx::IntPoint widget_position)
+{
+    execute_context_menu_later(m_context_menu, *this, menu, map_point_to_global_position(widget_position));
 }
 
 #if defined(LADYBIRD_QT_USE_IOSURFACE_LAYER) || defined(LADYBIRD_HAS_WAYLAND_GPU_QUERY)

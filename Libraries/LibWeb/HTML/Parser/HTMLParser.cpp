@@ -18,6 +18,7 @@
 #include <LibGC/RootVector.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
@@ -1747,6 +1748,14 @@ static decltype(auto) with_code_unit_span(Utf16View input, Callback&& callback)
 {
     if (input.has_ascii_storage())
         return callback(ReadonlySpan<char> { input.ascii_span().data(), input.length_in_code_units() });
+    // NB: The fast path makes UTF-8 strings of one-byte spans, so Latin-1 is parsed as UTF-16.
+    if (input.has_latin1_storage()) {
+        Vector<char16_t> code_units;
+        code_units.ensure_capacity(input.length_in_code_units());
+        for (auto byte : input.latin1_span())
+            code_units.unchecked_append(byte);
+        return callback(ReadonlySpan<char16_t> { code_units.data(), code_units.size() });
+    }
     return callback(input.utf16_span());
 }
 
@@ -2960,6 +2969,7 @@ extern "C" void ladybird_html_parser_set_document_quirks_mode(void* parser, Rust
     auto& document = parser_from_html_parser_ffi(parser).document();
     if (!document.parser_cannot_change_the_mode())
         document.set_quirks_mode(quirks_mode_from_html_parser_ffi(mode));
+    CSS::prepare_non_author_stylesheets(document);
 }
 
 extern "C" bool ladybird_html_parser_document_is_iframe_srcdoc_document(void* parser)

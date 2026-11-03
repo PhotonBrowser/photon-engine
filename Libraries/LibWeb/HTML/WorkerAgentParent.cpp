@@ -52,19 +52,20 @@ static void report_worker_exception(WindowOrWorkerGlobalScopeMixin& window_or_wo
     report_an_exception(relevant_global_object(window_or_worker), wrapped_error, move(error_info), OmitError::Yes);
 }
 
-GC::Ref<WorkerAgentParent> WorkerAgentParent::create(URL::URL url, WorkerOptions const& options,
+GC::Ref<WorkerAgentParent> WorkerAgentParent::create(URL::URL url, WorkerOptions const& options, bool extended_lifetime,
     GC::Ptr<MessagePort> outside_port, GC::Ref<EnvironmentSettingsObject> outside_settings,
     GC::Ref<DOM::EventTarget> worker_event_target, AgentType agent_type)
 {
-    auto agent = GC::Heap::the().allocate<WorkerAgentParent>(move(url), options, outside_port, outside_settings, worker_event_target, agent_type);
+    auto agent = GC::Heap::the().allocate<WorkerAgentParent>(move(url), options, extended_lifetime, outside_port, outside_settings, worker_event_target, agent_type);
     agent->start();
     return agent;
 }
 
-WorkerAgentParent::WorkerAgentParent(URL::URL url, WorkerOptions const& options, GC::Ptr<MessagePort> outside_port,
+WorkerAgentParent::WorkerAgentParent(URL::URL url, WorkerOptions const& options, bool extended_lifetime, GC::Ptr<MessagePort> outside_port,
     GC::Ref<EnvironmentSettingsObject> outside_settings, GC::Ref<DOM::EventTarget> worker_event_target,
     AgentType agent_type)
     : m_worker_options(options)
+    , m_extended_lifetime(extended_lifetime)
     , m_agent_type(agent_type)
     , m_url(move(url))
     , m_owner_token(next_owner_token())
@@ -79,9 +80,7 @@ void WorkerAgentParent::start()
     auto& realm = m_outside_settings->realm();
     m_outside_settings->add_owned_worker_agent(*this);
 
-    auto* global_scope = window_or_worker_global_scope_from_global_object(realm.global_object());
-    VERIFY(global_scope);
-    m_message_port = MessagePort::create(global_scope->this_impl());
+    m_message_port = MessagePort::create(realm);
     m_message_port->entangle_with(*m_outside_port);
 
     TransferDataEncoder data_holder;
@@ -90,7 +89,7 @@ void WorkerAgentParent::start()
     // FIXME: Specification says this supposed to happen in step 11 of onComplete handler defined in https://html.spec.whatwg.org/multipage/workers.html#run-a-worker
     //        but that would require introducing a new IPC message type to communicate this from WebWorker to WebContent process,
     //        so let's do it here for now.
-    m_outside_port->start();
+    m_outside_port->enable();
 
     auto serialized_outside_settings = m_outside_settings->serialize();
 
@@ -115,6 +114,7 @@ void WorkerAgentParent::start()
         .type = m_worker_options.type,
         .credentials = m_worker_options.credentials,
         .name = m_worker_options.name.to_utf8(),
+        .extended_lifetime = m_extended_lifetime,
         .outside_port = move(data_holder),
         .outside_settings = serialized_outside_settings,
         .caller_is_secure_context = is_secure_context(*m_outside_settings),
@@ -266,6 +266,47 @@ void WorkerAgentParent::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_outside_port);
     visitor.visit(m_outside_settings);
     visitor.visit(m_worker_event_target);
+}
+
+void WorkerAgentParent::rtc_transform_init(u64 transform_id, SerializedTransferRecord options_record)
+{
+    if (m_agent_id == 0)
+        return;
+    Bindings::principal_host_defined_page(m_outside_settings->realm()).client().rtc_transform_init(m_agent_id, transform_id, move(options_record));
+}
+
+void WorkerAgentParent::rtc_transform_teardown(u64 transform_id)
+{
+    m_transform_frame_callbacks.remove(transform_id);
+    if (m_agent_id == 0)
+        return;
+    Bindings::principal_host_defined_page(m_outside_settings->realm()).client().rtc_transform_teardown(m_agent_id, transform_id);
+}
+
+void WorkerAgentParent::rtc_transform_encoded_audio_frame(u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
+{
+    if (m_agent_id == 0)
+        return;
+    Bindings::principal_host_defined_page(m_outside_settings->realm()).client().rtc_transform_encoded_audio_frame(m_agent_id, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
+}
+
+void WorkerAgentParent::register_transform_frame_callback(u64 transform_id, TransformFrameWrittenCallback callback)
+{
+    m_transform_frame_callbacks.set(transform_id, move(callback));
+}
+
+void WorkerAgentParent::unregister_transform_frame_callback(u64 transform_id)
+{
+    m_transform_frame_callbacks.remove(transform_id);
+}
+
+void WorkerAgentParent::did_write_rtc_transform_encoded_audio_frame(WorkerAgentOwnerToken owner_token, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
+{
+    auto parent = worker_agent_parents().find(owner_token);
+    if (parent == worker_agent_parents().end())
+        return;
+    if (auto it = parent->value->m_transform_frame_callbacks.find(transform_id); it != parent->value->m_transform_frame_callbacks.end())
+        it->value(move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 }

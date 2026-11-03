@@ -13,8 +13,11 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ak::Utf16String;
-use libjs_rust::api::{Gc, Realm, Trace, Value};
+use libjs_rust::api::{FunctionObject, Gc, Object, Realm, Trace, Value};
+use liburl_rust::FfiOrigin;
+use liburl_rust::origin::Origin;
 
+use crate::bindings::CallContext;
 use crate::bindings::cpp_cell::CppCell;
 use crate::bindings::interface::{Interface, Ref, Wrappable, cell_from_abi, cell_into_abi};
 
@@ -26,8 +29,19 @@ unsafe extern "C" {
         owner: *mut c_void,
         get_the_parent: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     );
+    fn web_bindings_set_event_listener_list_changed_steps(
+        event_target: *mut c_void,
+        steps: unsafe extern "C" fn(*mut c_void),
+    );
+    fn web_bindings_has_event_listener(event_target: *mut c_void, r#type: ak::Span<'_, u8>) -> bool;
     fn web_bindings_event_handler_attribute(event_target: *mut c_void, name: ak::Span<'_, u8>) -> u64;
     fn web_bindings_set_event_handler_attribute(event_target: *mut c_void, name: ak::Span<'_, u8>, value: u64);
+    fn web_bindings_add_event_listener(
+        realm: *mut c_void,
+        event_target: *mut c_void,
+        r#type: ak::Span<'_, u8>,
+        callback: *mut c_void,
+    );
     fn web_bindings_create_event(
         realm: *mut c_void,
         r#type: ak::Span<'_, u8>,
@@ -42,7 +56,22 @@ unsafe extern "C" {
         cancelable: bool,
         composed: bool,
     ) -> *mut c_void;
+    fn web_bindings_create_message_event(
+        realm: *mut c_void,
+        r#type: ak::Span<'_, u8>,
+        data: u64,
+        ports: *const *mut c_void,
+        count: usize,
+    ) -> *mut c_void;
+    fn web_bindings_create_message_event_with_origin(
+        realm: *mut c_void,
+        r#type: ak::Span<'_, u8>,
+        data: u64,
+        origin: *const FfiOrigin,
+    ) -> *mut c_void;
+    fn web_bindings_message_event_data(event: u64) -> u64;
     fn web_bindings_set_event_owner(event: *mut c_void, interface_name: u16, owner: *mut c_void);
+    fn web_bindings_event_set_is_trusted(event: *mut c_void, is_trusted: bool);
     fn web_bindings_dispatch_event(target: *mut c_void, event: *mut c_void) -> bool;
     fn web_bindings_dispatch_event_with_legacy_output_did_listeners_throw_flag(
         target: *mut c_void,
@@ -61,10 +90,25 @@ pub(crate) trait GetTheParent: Interface {
     fn get_the_parent(&self) -> Option<CppEventTarget>;
 }
 
+/// The steps that run whenever an event listener is added to or removed from the EventTarget of an owner.
+pub(crate) trait EventListenerListChanged: Interface {
+    fn event_listener_list_changed(this: Ref<Self>);
+}
+
 impl CppEventTarget {
     pub(crate) fn new() -> Self {
         // SAFETY: LibWeb returns a new, live EventTarget.
         Self(unsafe { CppCell::from_raw(web_bindings_create_event_target()) })
+    }
+
+    /// An EventTarget of LibWeb's C++ code, which this keeps alive.
+    ///
+    /// # Safety
+    ///
+    /// `event_target` must be a live EventTarget.
+    pub(crate) unsafe fn from_raw(event_target: *mut c_void) -> Self {
+        // SAFETY: The caller passes a live EventTarget.
+        Self(unsafe { CppCell::from_raw(event_target) })
     }
 
     pub(crate) fn set_owner<T: GetTheParent>(&self, owner: Ref<T>) {
@@ -86,8 +130,39 @@ impl CppEventTarget {
         }
     }
 
+    /// Runs the owner's event_listener_list_changed() whenever the event listener list changes. The owner must be the
+    /// one that set_owner() gave.
+    pub(crate) fn set_event_listener_list_changed_steps<T: EventListenerListChanged>(&self) {
+        unsafe extern "C" fn event_listener_list_changed<T: EventListenerListChanged>(owner: *mut c_void) {
+            // SAFETY: LibWeb passes the owner that set_owner() gave it, which is the live cell of an object of T.
+            T::event_listener_list_changed(unsafe { cell_from_abi::<T>(owner) });
+        }
+        // SAFETY: The EventTarget is live.
+        unsafe { web_bindings_set_event_listener_list_changed_steps(self.as_ptr(), event_listener_list_changed::<T>) };
+    }
+
     pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.0.as_ptr()
+    }
+
+    /// Whether the event listener list has a listener for the event type.
+    pub(crate) fn has_event_listener(&self, event_type: &str) -> bool {
+        // SAFETY: The EventTarget is live, and the type is lent for the call.
+        unsafe { web_bindings_has_event_listener(self.as_ptr(), ak::Span::new(event_type.as_bytes())) }
+    }
+
+    /// Adds an event listener for the event type whose callback is the function, with no options,
+    /// https://dom.spec.whatwg.org/#add-an-event-listener
+    pub(crate) fn add_event_listener(&self, cx: &CallContext, event_type: &str, callback: Gc<FunctionObject>) {
+        // SAFETY: The realm, the EventTarget and the callback are live, and the type is lent for the call.
+        unsafe {
+            web_bindings_add_event_listener(
+                cx.realm().as_ptr().cast(),
+                self.as_ptr(),
+                ak::Span::new(event_type.as_bytes()),
+                callback.as_ptr().cast(),
+            );
+        }
     }
 
     /// https://dom.spec.whatwg.org/#concept-event-dispatch
@@ -143,6 +218,45 @@ impl CppEvent {
         })
     }
 
+    /// A MessageEvent in the realm, https://html.spec.whatwg.org/multipage/comms.html#messageevent, with its data
+    /// attribute initialized to the data and its ports attribute initialized to the MessagePorts that the objects are.
+    pub(crate) fn create_message_event(realm: Gc<Realm>, r#type: &str, data: Value, ports: &[Gc<Object>]) -> Self {
+        let ports: Vec<*mut c_void> = ports.iter().map(|port| port.as_ptr().cast()).collect();
+        // SAFETY: The realm, the data and the ports are live, the type and the ports are lent for the call, and LibWeb
+        //         returns a live event.
+        Self(unsafe {
+            CppCell::from_raw(web_bindings_create_message_event(
+                realm.as_ptr().cast(),
+                ak::Span::new(r#type.as_bytes()),
+                data.to_raw(),
+                ports.as_ptr(),
+                ports.len(),
+            ))
+        })
+    }
+
+    /// A MessageEvent in the realm with its data attribute initialized to the data and its origin attribute initialized
+    /// to the serialization of the origin.
+    pub(crate) fn create_message_event_with_origin(
+        realm: Gc<Realm>,
+        r#type: &str,
+        data: Value,
+        origin: &Origin,
+    ) -> Self {
+        FfiOrigin::with_origin(origin, |origin| {
+            // SAFETY: The realm and the data are live, the type and the origin are lent for the call, and LibWeb returns a
+            //         live event.
+            Self(unsafe {
+                CppCell::from_raw(web_bindings_create_message_event_with_origin(
+                    realm.as_ptr().cast(),
+                    ak::Span::new(r#type.as_bytes()),
+                    data.to_raw(),
+                    origin,
+                ))
+            })
+        })
+    }
+
     pub(crate) fn set_owner<T: Interface>(&self, owner: Ref<T>) {
         // SAFETY: The event and the owner are live, and the owner keeps the event alive.
         unsafe { web_bindings_set_event_owner(self.as_ptr(), T::INTERFACE_NAME, cell_into_abi(owner)) };
@@ -152,11 +266,23 @@ impl CppEvent {
         self.0.as_ptr()
     }
 
+    /// https://dom.spec.whatwg.org/#dom-event-istrusted
+    pub(crate) fn set_is_trusted(&self, is_trusted: bool) {
+        // SAFETY: The event is live.
+        unsafe { web_bindings_event_set_is_trusted(self.as_ptr(), is_trusted) };
+    }
+
     /// https://dom.spec.whatwg.org/#canceled-flag
     pub(crate) fn canceled(&self) -> bool {
         // SAFETY: The event is live.
         unsafe { web_bindings_event_canceled(self.as_ptr()) }
     }
+}
+
+/// The data attribute of a MessageEvent, which the value is a wrapper of.
+pub(crate) fn message_event_data(event: Value) -> Value {
+    // SAFETY: The event is live, and LibWeb returns its data, which is live.
+    unsafe { Value::from_raw(web_bindings_message_event_data(event.to_raw())) }
 }
 
 fn event_target_of(object: &impl Wrappable) -> *mut c_void {

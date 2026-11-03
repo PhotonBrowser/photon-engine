@@ -1057,7 +1057,7 @@ pub(super) struct TableFormattingContext<'pass> {
     deferred_cell_inside_layouts: Vec<bool>,
     cell_measurements: Vec<Option<TableCellMeasurement>>,
     /// What the layout of each cell hands its placement, which places every cell once the rows are positioned.
-    cell_fragment_arrivals: Vec<Option<fragment_tree::ChildFragmentArrival>>,
+    cell_fragment_arrivals: Vec<Option<fragment_tree::RunRootFragment>>,
     /// What placing each cell takes of the box its committing layout handed back.
     placed_cells: Vec<Option<formatting_context::PlacedChild>>,
     /// The baselines of the contents of each cell whose layout handed the box back to this table, which keeps them.
@@ -1711,6 +1711,19 @@ impl<'pass> TableFormattingContext<'pass> {
         }
     }
 
+    /// A cell's percentage block size resolves against the table's block size only when the table's own block size
+    /// isn't auto, just like the percentage block sizes of its participants; otherwise the cell is sized as if its
+    /// block size were auto. (CSS 2.1 leaves percentage cell heights undefined: "CSS 2.1 does not define how the height
+    /// of table cells and table rows is calculated when their height is specified using percentage values.")
+    /// https://www.w3.org/TR/CSS21/tables.html#height-layout
+    fn cell_has_resolvable_percentage_block_size(&self, cell_box: Node) -> bool {
+        self.style(cell_box).height().is_percentage() && !self.table_block_size_is_auto()
+    }
+
+    fn table_block_size_is_auto(&self) -> bool {
+        self.style(self.run.box_).height().is_auto()
+    }
+
     fn use_fixed_mode_layout(&self) -> bool {
         // Implements https://www.w3.org/TR/css-tables-3/#in-fixed-mode.
         // A table-root is said to be laid out in fixed mode whenever the computed value of the table-layout property is equal to fixed, and the
@@ -1899,8 +1912,11 @@ impl<'pass> TableFormattingContext<'pass> {
                 let max_height = style.max_height();
                 // The specified block size takes part in the row measures as an outer size (see
                 // initialize_table_measures); a percentage resolves against the basis the table forwards from its
-                // containing block.
-                let specified_outer = if height.is_auto() {
+                // containing block, and a block size that contains a percentage takes no part at all when the table's
+                // own block size is auto (see cell_has_resolvable_percentage_block_size).
+                let specified_outer = if height.is_auto()
+                    || (height.contains_percentage() && self.table_block_size_is_auto())
+                {
                     CssPixels::default()
                 } else {
                     self.cell_specified_outer_block_size(cell.box_, &style, height.to_px(block_basis), block_offsets)
@@ -2807,7 +2823,7 @@ impl<'pass> TableFormattingContext<'pass> {
         input: AvailableSpace,
         adopt_automatic_content_block_size: bool,
         intrinsic_block_padding: Option<(CssPixels, CssPixels)>,
-    ) -> (DerivedBaselines, Option<fragment_tree::ChildFragmentArrival>) {
+    ) -> (DerivedBaselines, Option<fragment_tree::RunRootFragment>) {
         let layout_input = LayoutInput {
             available_space: input,
             containing_block_constraints: ContainingBlockConstraints::default(),
@@ -2845,7 +2861,7 @@ impl<'pass> TableFormattingContext<'pass> {
     fn keep_fragment_arrival_of_cell(
         &mut self,
         cell_index: usize,
-        fragment_arrival: Option<fragment_tree::ChildFragmentArrival>,
+        fragment_arrival: Option<fragment_tree::RunRootFragment>,
     ) {
         debug_assert!(
             self.cell_fragment_arrivals[cell_index].is_none(),
@@ -3139,10 +3155,10 @@ impl<'pass> TableFormattingContext<'pass> {
         // At this point, percentage cell block sizes can be resolved because the final table block size is calculated.
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
-            let style = self.style(cell.box_);
-            if !style.height().is_percentage() {
+            if !self.cell_has_resolvable_percentage_block_size(cell.box_) {
                 continue;
             }
+            let style = self.style(cell.box_);
             let mut cell_box = self.cell_box_cells[cell_index];
             let offsets = cell_box.border_box_top(collapsed) + cell_box.border_box_bottom(collapsed);
             let cell_size = self.cell_specified_outer_block_size(
@@ -3393,7 +3409,7 @@ impl<'pass> TableFormattingContext<'pass> {
                 continue;
             }
             let cell = self.cells[cell_index];
-            let adopt_automatic_content_block_size = !self.style(cell.box_).height().is_percentage();
+            let adopt_automatic_content_block_size = !self.cell_has_resolvable_percentage_block_size(cell.box_);
             let intrinsic_block_padding = self.cell_intrinsic_block_padding(cell_index, collapsed);
             let measured_content_block_size = self.cell_box_cells[cell_index].content_block_size;
             if let Some(measurement) = self.cell_measurements[cell_index]
@@ -3715,12 +3731,13 @@ impl<'pass> TableFormattingContext<'pass> {
         inline_layout: Option<TableInlineLayout>,
     ) {
         self.available_space = input.available_space;
-        self.min_border_box_block_size_from_flex_item = input.sizing.forced_min_border_box_block_size;
+        self.min_border_box_block_size_from_flex_item = input.sizing.forced_min_border_box_block_size.get();
         self.table_box_content_block_offset_in_wrapper = input
             .sizing
             .table_box_content_block_offset_in_wrapper
+            .get()
             .unwrap_or_default();
-        if inline_layout.is_none_or(|layout| !self.reuse_inline_layout(input, layout)) {
+        if inline_layout.is_none_or(|layout| !self.reuse_inline_layout(input.clone(), layout)) {
             self.run_until_inline_size_calculation(input, false);
         }
         if matches!(

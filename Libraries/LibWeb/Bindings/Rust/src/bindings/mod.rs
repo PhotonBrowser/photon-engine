@@ -25,12 +25,14 @@ pub(crate) mod cpp_cell;
 pub(crate) mod event_target;
 #[cfg(web_idl_bindings)]
 pub(crate) mod generated;
+pub(crate) mod global_object;
 pub(crate) mod interface;
 pub(crate) mod iterable;
 pub(crate) mod promise;
 pub(crate) mod realm_data;
 pub(crate) mod services;
 pub(crate) mod structured_data;
+pub(crate) mod transport;
 
 use core::ptr::NonNull;
 

@@ -220,6 +220,7 @@ endpoint WebContentServer routed by Web::PageId page_id
 
     set_listen_for_dom_mutations(Web::PageId page_id, bool listen_for_dom_mutations) =|
     set_has_devtools_client(Web::PageId page_id, bool has_devtools_client) =|
+    start_sending_console_output(Web::PageId page_id, bool messages, bool errors) =|
     get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id) =|
     get_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id) =|
     set_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id, String html) =|
@@ -260,6 +261,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) =|
     set_content_blockers(Core::AnonymousBuffer patterns) =|
 
+    set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) =|
     set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) =|
     set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme color_scheme) =|
     // The user allowed or blocked a powerful feature for the origin, outside any request from the page.
@@ -274,9 +276,14 @@ endpoint WebContentServer routed by Web::PageId page_id
     geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData position, Optional<u16> error_code) =|
     permission_request_completed(Web::PageId page_id, u64 request_id, Web::Permissions::EffectiveState state) =|
     http_credentials_provided(Web::PageId page_id, u64 request_id, Optional<String> username, Optional<String> password) =|
+    notification_shown(Web::PageId page_id, u64 notification_id) =|
+    notification_show_failed(Web::PageId page_id, u64 notification_id) =|
+    notification_clicked(Web::PageId page_id, u64 notification_id) =|
+    notification_closed(Web::PageId page_id, u64 notification_id, bool by_user) =|
     set_has_focus(Web::PageId page_id, bool has_focus) =|
     set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption consumption) =|
+    notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id) =|
     set_is_scripting_enabled(Web::PageId page_id, bool is_scripting_enabled) =|
     set_zoom_level(Web::PageId page_id, double zoom_level) =|
     set_maximum_frames_per_second(Web::PageId page_id, double maximum_frames_per_second) =|
@@ -300,6 +307,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     confirm_closed(Web::PageId page_id, bool accepted) =|
     prompt_closed(Web::PageId page_id, Optional<Utf16String> response) =|
     color_picker_update(Web::PageId page_id, Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state) =|
+    date_picker_closed(Web::PageId page_id, Optional<Utf16String> picked_value) =|
     file_picker_closed(Web::PageId page_id, Vector<Web::HTML::SelectedFile> selected_files) =|
     select_dropdown_closed(Web::PageId page_id, Optional<u32> selected_item_id) =|
 
@@ -331,6 +339,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) =|
     did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) =|
     did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) =|
+    did_worker_rtc_transform_encoded_audio_frame_written(Web::HTML::WorkerAgentOwnerToken owner_token, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) =|
 
     request_close(Web::PageId page_id) =|
     request_close_preflight(Web::PageId page_id, u64 request_id) =|

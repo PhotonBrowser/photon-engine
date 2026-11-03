@@ -17,6 +17,7 @@
 #include <QAction>
 #include <QMenu>
 #include <QPointer>
+#include <QTimer>
 #include <QToolButton>
 #include <QWidget>
 
@@ -30,6 +31,12 @@ public:
     static NonnullOwnPtr<ActionObserver> create(WebView::Action& action, QAction& qaction, IncludeActionIcon include_action_icon)
     {
         return adopt_own(*new ActionObserver(action, qaction, include_action_icon));
+    }
+
+    virtual ~ActionObserver() override
+    {
+        QObject::disconnect(m_triggered_connection);
+        QObject::disconnect(m_destroyed_connection);
     }
 
     virtual void on_text_changed(WebView::Action& action) override
@@ -104,7 +111,7 @@ private:
         : m_action(&qaction)
         , m_include_action_icon(include_action_icon)
     {
-        QObject::connect(m_action, &QAction::triggered, [weak_action = action.make_weak_ptr()](bool checked) {
+        m_triggered_connection = QObject::connect(m_action, &QAction::triggered, [weak_action = action.make_weak_ptr()](bool checked) {
             if (auto action = weak_action.strong_ref()) {
                 if (action->is_checkable())
                     action->set_checked(checked);
@@ -116,7 +123,7 @@ private:
                 }
             }
         });
-        QObject::connect(m_action->parent(), &QObject::destroyed, [this, weak_action = action.make_weak_ptr()]() {
+        m_destroyed_connection = QObject::connect(&qaction, &QObject::destroyed, [this, weak_action = action.make_weak_ptr()]() {
             if (auto action = weak_action.strong_ref())
                 action->remove_observer(*this);
         });
@@ -124,13 +131,15 @@ private:
 
     QPointer<QAction> m_action;
     IncludeActionIcon m_include_action_icon { IncludeActionIcon::Yes };
+    QMetaObject::Connection m_triggered_connection;
+    QMetaObject::Connection m_destroyed_connection;
 };
 
 class MenuObserver final : public WebView::Menu::Observer {
 public:
-    static NonnullOwnPtr<MenuObserver> create(QMenu& qmenu)
+    static NonnullOwnPtr<MenuObserver> create(WebView::Menu& menu, QMenu& qmenu)
     {
-        return adopt_own(*new MenuObserver(qmenu));
+        return adopt_own(*new MenuObserver(menu, qmenu));
     }
 
     virtual void on_visible_state_changed(WebView::Menu& menu) override
@@ -140,9 +149,13 @@ public:
     }
 
 private:
-    explicit MenuObserver(QMenu& qmenu)
+    MenuObserver(WebView::Menu& menu, QMenu& qmenu)
         : m_menu(&qmenu)
     {
+        QObject::connect(&qmenu, &QObject::destroyed, [this, weak_menu = menu.make_weak_ptr()]() {
+            if (auto menu = weak_menu.strong_ref())
+                menu->remove_observer(*this);
+        });
     }
 
     QPointer<QMenu> m_menu;
@@ -155,7 +168,7 @@ static void add_properties(QObject& object, T& menu_or_action)
         object.setProperty(key.to_byte_string().characters(), qstring_from_ak_string(value));
 }
 
-static void initialize_native_control(WebView::Action& action, QAction& qaction, QPalette const& palette, IncludeActionIcon include_action_icon)
+static WebView::Action::Observer& initialize_native_control(WebView::Action& action, QAction& qaction, QPalette const& palette, IncludeActionIcon include_action_icon)
 {
     static constexpr int const MENU_ICON_SIZE = 16;
 
@@ -312,29 +325,27 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
     if (action.is_checkable())
         qaction.setCheckable(true);
 
-    action.add_observer(ActionObserver::create(action, qaction, include_action_icon));
+    auto observer = ActionObserver::create(action, qaction, include_action_icon);
+    auto& observer_reference = *observer;
+    action.add_observer(move(observer));
     add_properties(qaction, action);
+    return observer_reference;
 }
 
-static void add_items_to_menu(QMenu& qmenu, QWidget& parent, WebView::Menu& menu)
+static void add_items_to_menu(QMenu& qmenu, WebView::Menu& menu)
 {
-    menu.add_observer(MenuObserver::create(qmenu));
-    add_properties(qmenu, menu);
-
     for (auto& menu_item : menu.items()) {
         menu_item.visit(
             [&](NonnullRefPtr<WebView::Action>& action) {
-                auto* qaction = create_application_action(parent, action, IncludeActionIcon::No);
+                auto* qaction = create_application_action(qmenu, action, IncludeActionIcon::No);
                 qmenu.addAction(qaction);
             },
             [&](NonnullRefPtr<WebView::Menu> const& submenu) {
-                auto* qsubmenu = new QMenu(qstring_from_ak_string(submenu->title()), &qmenu);
-                add_items_to_menu(*qsubmenu, parent, submenu);
+                auto* qsubmenu = create_application_menu(qmenu, submenu);
 
                 if (submenu->render_group_icon())
-                    qsubmenu->setIcon(create_chrome_icon(ChromeIcon::Folder, parent.palette()));
+                    qsubmenu->setIcon(create_chrome_icon(ChromeIcon::Folder, qmenu.palette()));
 
-                add_properties(*qsubmenu, *submenu);
                 qmenu.addMenu(qsubmenu);
             },
             [&](WebView::Separator) {
@@ -386,14 +397,42 @@ void populate_session_history_traversal_menu(QMenu& menu, WebContentView& view, 
 QMenu* create_application_menu(QWidget& parent, WebView::Menu& menu)
 {
     auto* application_menu = new QMenu(qstring_from_ak_string(menu.title()), &parent);
-    add_items_to_menu(*application_menu, parent, menu);
+    menu.add_observer(MenuObserver::create(menu, *application_menu));
+    add_properties(*application_menu, menu);
+    add_items_to_menu(*application_menu, menu);
     return application_menu;
 }
 
-void repopulate_application_menu(QMenu& menu, QWidget& parent, WebView::Menu& source)
+QMenu& replace_context_menu(QPointer<QMenu>& shown_menu, QWidget& parent, WebView::Menu& menu)
 {
+    // NB: A menu is kept until another is shown in its place, as Cocoa delivers a native menu's choice through queued
+    //     events after the menu closes.
+    if (shown_menu)
+        shown_menu->deleteLater();
+    shown_menu = create_application_menu(parent, menu);
+    return *shown_menu;
+}
+
+void execute_context_menu_later(QPointer<QMenu>& shown_menu, QWidget& parent, WebView::Menu& menu, QPoint const& global_position)
+{
+    auto& context_menu = replace_context_menu(shown_menu, parent, menu);
+
+    // NB: Showing a menu runs a nested event loop, which may destroy whatever asked for the menu. So it runs with
+    //     nothing of the caller's on the stack.
+    QTimer::singleShot(0, &context_menu, [&context_menu, global_position] {
+        execute_context_menu(context_menu, global_position);
+    });
+}
+
+void repopulate_application_menu(QMenu& menu, WebView::Menu& source)
+{
+    // NB: A submenu's action belongs to the submenu, so clearing the menu only removes it.
+    for (auto* action : menu.actions()) {
+        if (auto* submenu = action->menu())
+            submenu->deleteLater();
+    }
     menu.clear();
-    add_items_to_menu(menu, parent, source);
+    add_items_to_menu(menu, source);
 }
 
 static void insert_dynamic_history_action(QMenu& menu, QAction* before, QAction& action)
@@ -475,23 +514,29 @@ void update_history_menu(QMenu& menu, WebContentView* view)
 #endif
 }
 
-QMenu* create_context_menu(QWidget& parent, WebContentView& view, WebView::Menu& menu)
-{
-    auto* application_menu = create_application_menu(parent, menu);
-
-    menu.on_activation = [view = QPointer { &view }, application_menu = QPointer { application_menu }](Gfx::IntPoint position) {
-        if (view && application_menu)
-            execute_context_menu(*application_menu, view->map_point_to_global_position(position));
-    };
-
-    return application_menu;
-}
-
 QAction* create_application_action(QWidget& parent, WebView::Action& action, IncludeActionIcon include_action_icon)
 {
     auto* qaction = new QAction(&parent);
     initialize_native_control(action, *qaction, parent.palette(), include_action_icon);
     return qaction;
+}
+
+ActionBinding::ActionBinding(QWidget& parent, IncludeActionIcon include_action_icon)
+    : m_action(new QAction(&parent))
+    , m_include_action_icon(include_action_icon)
+{
+}
+
+void ActionBinding::bind(WebView::Action& action)
+{
+    if (m_bound_action.ptr() == &action)
+        return;
+    if (auto bound_action = m_bound_action.strong_ref())
+        bound_action->remove_observer(*m_observer);
+
+    m_bound_action = action;
+    auto const& palette = static_cast<QWidget*>(m_action->parent())->palette();
+    m_observer = &initialize_native_control(action, *m_action, palette, m_include_action_icon);
 }
 
 #if !defined(AK_OS_MACOS)

@@ -26,6 +26,10 @@
 #include <QStyleOption>
 #include <QWidget>
 
+#if defined(AK_OS_LINUX)
+#    include <UI/Qt/X11Window.h>
+#endif
+
 namespace Ladybird::ChromeStyle {
 
 bool is_dark(QPalette const& palette)
@@ -50,6 +54,22 @@ QColor mix(QColor const& from, QColor const& to, double amount)
 static QColor over(QColor const& color, QColor const& background)
 {
     return mix(background, color, static_cast<double>(color.alphaF()));
+}
+
+QColor opaque_panel_edge()
+{
+    auto const& panel = Theme::panel();
+    return over(panel.edge, panel.surface);
+}
+
+bool shows_opaque_pixels_only(QWidget const& widget)
+{
+#if defined(AK_OS_LINUX)
+    return is_clipped_to_its_opaque_pixels(*widget.window());
+#else
+    (void)widget;
+    return false;
+#endif
 }
 
 WindowActivity window_activity(QWidget const& widget)
@@ -273,6 +293,12 @@ QWidget#LadybirdNavigationToolbar QToolButton {{
     min-width: 30px;
     min-height: 28px;
     padding: 0;
+}}
+
+/* NB: Beside the collapsed sidebar, the all-tabs button sits in the toolbar, and keeps its own size there. */
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdAllTabsButton {{
+    min-width: 0;
+    min-height: 0;
 }}
 
 QWidget#LadybirdNavigationToolbar QToolButton:hover {{
@@ -1051,6 +1077,7 @@ QWidget#LadybirdVerticalTabBar[verticalTabsPosition="right"][active="true"] {{
     border-left: 1px solid {8};
 }}
 
+QToolButton#LadybirdAllTabsButton,
 QToolButton#LadybirdVerticalTabsToggleButton {{
     background: transparent;
     border: 0;
@@ -1784,6 +1811,7 @@ static constexpr int SUBMENU_DELAY_MS = 150;
 static constexpr int MENU_PADDING = 6;
 static constexpr int MENU_RADIUS = 10;
 static constexpr int MENU_ROW_HEIGHT = 26;
+static constexpr int SELECT_DROPDOWN_ROW_HEIGHT = 22;
 static constexpr int MENU_ROW_INSET = 10;
 static constexpr int MENU_ROW_RADIUS = 6;
 static constexpr int MENU_SEPARATOR_HEIGHT = 11;
@@ -1892,7 +1920,7 @@ public:
         if (element == PE_PanelMenu) {
             auto const& panel = Theme::panel();
             painter->save();
-            painter->setRenderHint(QPainter::Antialiasing, true);
+            painter->setRenderHint(QPainter::Antialiasing, !widget || !shows_opaque_pixels_only(*widget));
             painter->setPen(QPen(over(panel.edge, panel.surface), 1));
             painter->setBrush(panel.surface);
             painter->drawRoundedRect(QRectF(option->rect).adjusted(0.5, 0.5, -0.5, -0.5), MENU_RADIUS - 0.5, MENU_RADIUS - 0.5);
@@ -1932,13 +1960,15 @@ public:
             if (auto const* item = qstyleoption_cast<QStyleOptionMenuItem const*>(option)) {
                 if (item->menuItemType == QStyleOptionMenuItem::Separator)
                     return { contents_size.width(), MENU_SEPARATOR_HEIGHT };
+                // A select's options have no shortcuts, and sit in compact rows like the options of a list box.
+                bool const is_select_dropdown = widget && widget->objectName() == QLatin1StringView("LadybirdSelectDropdown");
                 // NB: Qt measures the label and the shortcut column into the contents' width.
-                auto width = contents_size.width() + (2 * MENU_ROW_INSET) + MENU_SHORTCUT_GAP;
+                auto width = contents_size.width() + (2 * MENU_ROW_INSET) + (is_select_dropdown ? 0 : MENU_SHORTCUT_GAP);
                 if (menu_item_has_leading_column(*item))
                     width += MENU_ICON_SIZE + MENU_ICON_GAP;
                 if (item->menuItemType == QStyleOptionMenuItem::SubMenu)
                     width += MENU_CHEVRON_SIZE + MENU_SHORTCUT_GAP;
-                return { width, MENU_ROW_HEIGHT };
+                return { width, is_select_dropdown ? SELECT_DROPDOWN_ROW_HEIGHT : MENU_ROW_HEIGHT };
             }
         }
         return QProxyStyle::sizeFromContents(type, option, contents_size, widget);
@@ -1956,6 +1986,10 @@ public:
             return true;
         if (hint == SH_Menu_SubMenuUniDirectionFailCount)
             return 1;
+        // NB: Qt flashes a chosen menu item by running a nested event loop, in which the tab that owns the menu can be
+        //     closed and destroy the menu while Qt is still using it.
+        if (hint == SH_Menu_FlashTriggeredItem)
+            return false;
         return QProxyStyle::styleHint(hint, option, widget, return_data);
     }
 };

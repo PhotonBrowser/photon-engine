@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! What the arena's writes leave the layout stage's run memos to drop or reconsider. The memos live in the stage's
-//! scratch, which the arena cannot reach, so the arena notes what a write did to a box and the stage applies the notes
-//! to its memos before a layout pass reads them and before it sweeps them.
+//! What the arena's writes leave the layout stage's memos to drop or reconsider. The memos live in the stage's scratch,
+//! which the arena cannot reach, so the arena notes what a write did to a box and the stage applies the notes to its
+//! memos before a layout pass reads them and before it sweeps them.
 //!
 //! The notes of a box coalesce. Only a layout pass stores memo entries, and a stage applies the notes before each pass,
 //! so between two applications a box's entries change only through the notes: entries a note drops stay dropped, and
@@ -14,15 +14,19 @@
 
 use super::fc_run_cache::FcRunCacheStore;
 use super::in_flow_block_cache::InFlowBlockCacheStore;
+use super::layout_node_arena::IntrinsicSizeCaches;
 use super::node_data::NodeSlotId;
+use super::prepared_inline_content::PreparedInlineContentMemos;
 use super::rendered_text::TextMemos;
 
 #[derive(Clone, Copy, Default)]
 struct SlotNotes {
     noted: bool,
     text_memos_dropped: bool,
+    prepared_inline_content_dropped: bool,
     run_cache_entries_dropped: bool,
     in_flow_block_entries_dropped: bool,
+    intrinsic_sizes_dropped: bool,
     fragment_cache_epoch_bumped: bool,
     structural_inline_changes: u32,
     generation: u8,
@@ -62,7 +66,14 @@ impl MemoInvalidations {
         self.note_run_cache_entries_dropped(slot);
         let notes = self.notes_of(slot);
         notes.text_memos_dropped = true;
+        notes.prepared_inline_content_dropped = true;
         notes.in_flow_block_entries_dropped = true;
+        notes.intrinsic_sizes_dropped = true;
+    }
+
+    /// Something the intrinsic sizes of the box in `slot` were measured from changed.
+    pub(crate) fn note_intrinsic_sizes_dropped(&mut self, slot: u32) {
+        self.notes_of(slot).intrinsic_sizes_dropped = true;
     }
 
     /// The text row in `slot` got other rendered text, which the chunks and segmenter made of the old text no longer
@@ -71,11 +82,12 @@ impl MemoInvalidations {
         self.notes_of(slot).text_memos_dropped = true;
     }
 
-    /// The fragment cache epoch of `node` moved on: its run cache entries need the sweep, and its in-flow block entry,
-    /// valid for one epoch only, is dropped.
+    /// The fragment cache epoch of `node` moved on: its run cache entries need the sweep, and its in-flow block entry
+    /// and prepared inline content, valid for one epoch only, are dropped.
     pub(crate) fn note_fragment_cache_epoch_bumped(&mut self, node: NodeSlotId) {
         let notes = self.notes_of(node.slot_index());
         notes.in_flow_block_entries_dropped = true;
+        notes.prepared_inline_content_dropped = true;
         if !notes.run_cache_entries_dropped {
             notes.fragment_cache_epoch_bumped = true;
             notes.generation = node.generation();
@@ -97,6 +109,8 @@ impl MemoInvalidations {
         run_cache: &FcRunCacheStore,
         in_flow_block_cache: &InFlowBlockCacheStore,
         text_memos: &TextMemos,
+        prepared_inline_content: &PreparedInlineContentMemos,
+        intrinsic_size_caches: &IntrinsicSizeCaches,
     ) {
         for slot in self.noted_slots {
             let notes = self.slots[slot as usize];
@@ -116,6 +130,12 @@ impl MemoInvalidations {
             }
             if notes.text_memos_dropped {
                 text_memos.forget(slot);
+            }
+            if notes.prepared_inline_content_dropped {
+                prepared_inline_content.forget(slot);
+            }
+            if notes.intrinsic_sizes_dropped {
+                intrinsic_size_caches.drop_entries_of_slot(slot);
             }
         }
     }

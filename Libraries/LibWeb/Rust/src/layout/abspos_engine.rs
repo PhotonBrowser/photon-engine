@@ -8,6 +8,7 @@ use super::*;
 use crate::css::style::layout_style::LayoutStyle;
 use crate::css::style::position_try::PositionOptionStyle;
 use crate::css::style::tree::StyleNodeID;
+use crate::css::style_value::{AnchorPayload, AnchorSizePayload};
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 
 pub(super) fn axis_modes(style: StyleValues) -> (abspos_inputs::AbsposAxisMode, abspos_inputs::AbsposAxisMode) {
@@ -78,7 +79,7 @@ fn static_position_rect_for_sizing(inputs: &abspos_inputs::AbsposLayoutInputs) -
     )
 }
 
-fn out_of_flow_root_space(inputs: abspos_inputs::AbsposLayoutInputs) -> (AvailableSpace, ContainingBlockConstraints) {
+fn out_of_flow_root_space(inputs: &abspos_inputs::AbsposLayoutInputs) -> (AvailableSpace, ContainingBlockConstraints) {
     let containing_block_size = geometry::LogicalSize {
         inline_size: clamp_to_max_dimension_value(inputs.containing_block_info.rect.size.inline_size),
         block_size: clamp_to_max_dimension_value(inputs.containing_block_info.rect.size.block_size),
@@ -498,8 +499,9 @@ impl AbsposEngine<'_> {
         let arena = self.callbacks.arena();
         let mut candidate = Some(element);
         while let Some(current) = candidate {
-            if let Some(payloads) = arena.style_node_style_payloads(current) {
-                let anchor = ComputedValuesView::new(&payloads.groups).anchor();
+            if let Some(style) = arena.style_node_style(current) {
+                // SAFETY: The record the element published is retained for the pass.
+                let anchor = unsafe { style.view() }.anchor();
                 // The <anchor-name> represents a strictly matched tree-scoped name, i.e. it can only match against
                 // anchor names in the same shadow tree.
                 if (anchor.anchor_scope_all || anchor.anchor_scope_names.raws().contains(&anchor_name))
@@ -1559,21 +1561,12 @@ unsafe extern "C" fn resolve_anchor_non_math_function(context: *mut c_void, shel
     let engine = unsafe { &*context.engine };
     // SAFETY: `shell` is the live Rust style-value data retained by the CSS
     // calc core's non-math-function node for this synchronous resolution.
-    let (has_anchor_name, explicit_anchor_name, fallback_value) = match unsafe { &*shell.cast::<StyleValueData>() } {
-        StyleValueData::Anchor {
-            has_anchor_name,
-            anchor_name,
-            fallback_value,
-            ..
-        }
-        | StyleValueData::AnchorSize {
-            has_anchor_name,
-            anchor_name,
-            fallback_value,
-            ..
-        } => (*has_anchor_name, anchor_name, fallback_value),
-        _ => return std::ptr::null(),
+    let Some((has_anchor_name, explicit_anchor_name, fallback_value)) =
+        unsafe { &*shell.cast::<StyleValueData>() }.anchor_name_and_fallback()
+    else {
+        return std::ptr::null();
     };
+
     let style = engine.style(context.positioned_box);
     let bound_anchor_name = has_anchor_name.then(|| explicit_anchor_name.to_fly_string());
     let anchor_name = if let Some(name) = &bound_anchor_name {
@@ -1594,37 +1587,43 @@ unsafe extern "C" fn resolve_anchor_non_math_function(context: *mut c_void, shel
         );
         // SAFETY: As above.
         let resolved = match unsafe { &*shell.cast::<StyleValueData>() } {
-            StyleValueData::Anchor { anchor_side, .. } => engine
-                .anchor_side(
-                    anchor_side_from_style_value(anchor_side.data()),
+            StyleValueData::Anchor(anchor_payload) => {
+                let AnchorPayload { anchor_side, .. } = &**anchor_payload;
+                engine
+                    .anchor_side(
+                        anchor_side_from_style_value(anchor_side.data()),
+                        rect,
+                        context.positioned_box,
+                        context.containing_block,
+                        context.is_from_end,
+                        context.is_horizontal_axis,
+                    )
+                    .map(|side| {
+                        // SAFETY: The state pointer is live and uniquely used by this
+                        // synchronous resolver.
+                        let resolution_state = unsafe { &mut *context.resolution_state };
+                        engine.note_resolved_anchor_function(anchor_box, context.is_horizontal_axis, resolution_state);
+                        if context.is_from_end {
+                            context.containing_block_extent - side
+                        } else {
+                            side
+                        }
+                    })
+            }
+            StyleValueData::AnchorSize(anchor_size_payload) => {
+                let AnchorSizePayload {
+                    has_anchor_size,
+                    anchor_size,
+                    ..
+                } = &**anchor_size_payload;
+                Some(engine.anchor_size(
+                    has_anchor_size.then_some(*anchor_size),
                     rect,
                     context.positioned_box,
                     context.containing_block,
-                    context.is_from_end,
                     context.is_horizontal_axis,
-                )
-                .map(|side| {
-                    // SAFETY: The state pointer is live and uniquely used by this
-                    // synchronous resolver.
-                    let resolution_state = unsafe { &mut *context.resolution_state };
-                    engine.note_resolved_anchor_function(anchor_box, context.is_horizontal_axis, resolution_state);
-                    if context.is_from_end {
-                        context.containing_block_extent - side
-                    } else {
-                        side
-                    }
-                }),
-            StyleValueData::AnchorSize {
-                has_anchor_size,
-                anchor_size,
-                ..
-            } => Some(engine.anchor_size(
-                has_anchor_size.then_some(*anchor_size),
-                rect,
-                context.positioned_box,
-                context.containing_block,
-                context.is_horizontal_axis,
-            )),
+                ))
+            }
             _ => unreachable!("the shell was matched as an anchor function above"),
         };
         if let Some(resolved) = resolved {
@@ -2352,7 +2351,9 @@ pub(crate) struct InsideLayoutBlockSizes {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockSizePass {
-    BeforeInsideLayout,
+    BeforeInsideLayout {
+        inside_layout_resolves_automatic_block_size: bool,
+    },
     AfterInsideLayout {
         inside_layout: Option<InsideLayoutBlockSizes>,
     },
@@ -2434,9 +2435,15 @@ impl AbsposEngine<'_> {
         {
             return Some(inside_layout.automatic_content_block_size);
         }
+        if let BlockSizePass::BeforeInsideLayout {
+            inside_layout_resolves_automatic_block_size: true,
+        } = pass
+        {
+            return None;
+        }
         if self.facts(node).creates_block_formatting_context() {
             return match pass {
-                BlockSizePass::BeforeInsideLayout => None,
+                BlockSizePass::BeforeInsideLayout { .. } => None,
                 BlockSizePass::AfterInsideLayout { .. } => Some(CssPixels::default()),
             };
         }
@@ -2718,7 +2725,7 @@ impl AbsposEngine<'_> {
 
         let used = sized.cells;
         used.set_content_block_size(auto_px_value(solution.block_size));
-        if style.height().is_auto() && pass == BlockSizePass::BeforeInsideLayout {
+        if style.height().is_auto() && matches!(pass, BlockSizePass::BeforeInsideLayout { .. }) {
             // NB: A box that establishes an orthogonal flow is sized in this axis before its contents are laid out,
             //     which they are at that size.
             if solution.block_size.is_some() && self.sizing().establishes_orthogonal_flow(node) {
@@ -2808,7 +2815,7 @@ impl AbsposEngine<'_> {
 
         let used = sized.cells;
         used.set_content_block_size(block_size);
-        if style.height().is_auto() && pass == BlockSizePass::BeforeInsideLayout {
+        if style.height().is_auto() && matches!(pass, BlockSizePass::BeforeInsideLayout { .. }) {
             // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
             // A block size transferred through the preferred aspect ratio from a definite inline size is definite, so
             // the content resolves percentages against it.
@@ -2872,11 +2879,14 @@ impl<'pass> AbsposEngine<'pass> {
     // Run-prelude sizing for an absolutely positioned root: box-model
     // metrics, the inset-aware inline solve, the pre-inside-layout block
     // pass, and the definiteness overrides insets and aspect ratios provide.
+    // Answers the space a flex root resolves its own automatic block size in,
+    // if it does.
     pub(crate) fn dimension_out_of_flow_root(
         &self,
         sized: OutOfFlowBox<'_>,
-        inputs: abspos_inputs::AbsposLayoutInputs,
-    ) {
+        inputs: &abspos_inputs::AbsposLayoutInputs,
+        inside_layout_follows: bool,
+    ) -> Option<AvailableSpace> {
         let node = sized.node;
         let (available_space, constraints) = out_of_flow_root_space(inputs);
         let containing_block_inline_size = available_space.inline_size.to_px_or_zero();
@@ -2905,16 +2915,32 @@ impl<'pass> AbsposEngine<'pass> {
             sized,
             available_space,
             constraints,
-            static_position_rect_for_sizing(&inputs),
+            static_position_rect_for_sizing(inputs),
             resolved,
             self.auto_margin_overflow(inputs.containing_block, SizingAxis::Inline),
         );
+        let fc_type = formatting_context::formatting_context_type_created_by_box(self.facts(node));
+        let flex_self_resolution_space = AvailableSpace {
+            inline_size: AvailableSize::definite(sized.cells.content_inline_size()),
+            block_size: AvailableSize::Indefinite,
+        };
+        let inside_layout_resolves_automatic_block_size = inside_layout_follows
+            && self.inside_layout_resolves_automatic_block_size(
+                sized,
+                style,
+                fc_type,
+                available_space,
+                flex_self_resolution_space,
+                constraints,
+            );
         self.compute_block_size(
             sized,
             available_space,
             constraints,
-            static_position_rect_for_sizing(&inputs),
-            BlockSizePass::BeforeInsideLayout,
+            static_position_rect_for_sizing(inputs),
+            BlockSizePass::BeforeInsideLayout {
+                inside_layout_resolves_automatic_block_size,
+            },
             resolved,
             self.auto_margin_overflow(inputs.containing_block, SizingAxis::Block),
         );
@@ -2946,12 +2972,72 @@ impl<'pass> AbsposEngine<'pass> {
 
         self.sizing()
             .make_form_control_content_box_definite(sized.sized_cells(), available_space, constraints, None);
+        (inside_layout_resolves_automatic_block_size
+            && fc_type == Some(formatting_context::FormattingContextType::Flex))
+        .then_some(flex_self_resolution_space)
+    }
+
+    fn inside_layout_resolves_automatic_block_size(
+        &self,
+        sized: OutOfFlowBox<'_>,
+        style: StyleValues<'_>,
+        fc_type: Option<formatting_context::FormattingContextType>,
+        available_space: AvailableSpace,
+        flex_self_resolution_space: AvailableSpace,
+        constraints: ContainingBlockConstraints,
+    ) -> bool {
+        let node = sized.node;
+        let sizing = self.sizing();
+        let facts = self.facts(node);
+        if !crate::layout::sizing_context::is_plain_auto(style.height())
+            || (!style.inset_top().is_auto() && !style.inset_bottom().is_auto())
+            || sizing.establishes_orthogonal_flow(node)
+            || facts.has_preferred_aspect_ratio()
+            || facts.node_has_size_containment()
+            || sizing.box_is_sized_as_replaced_element(sized.sized_box(), available_space, constraints)
+        {
+            return false;
+        }
+        let style_seen_by_inside_layout = self.style(node);
+        let inside_layout_reads_the_same_min_and_max_height = style_seen_by_inside_layout.min_height()
+            == style.min_height()
+            && style_seen_by_inside_layout.max_height() == style.max_height();
+        if !inside_layout_reads_the_same_min_and_max_height {
+            return false;
+        }
+        match fc_type {
+            Some(formatting_context::FormattingContextType::Grid) => {
+                crate::layout::sizing_context::is_plain_auto(style_seen_by_inside_layout.min_height())
+                    || style_seen_by_inside_layout.max_height().is_none()
+            }
+            Some(formatting_context::FormattingContextType::Flex) => {
+                let main_axis_is_block_axis = matches!(
+                    style_seen_by_inside_layout.effective_flex_direction(),
+                    flex_direction::COLUMN | flex_direction::COLUMN_REVERSE
+                );
+                let lays_out_its_lines_against_its_block_size =
+                    main_axis_is_block_axis && style_seen_by_inside_layout.flex_wrap() != flex_wrap::NOWRAP;
+                !lays_out_its_lines_against_its_block_size
+                    && matches!(
+                        style_seen_by_inside_layout.max_height().kind,
+                        ComputedSizeKind::None | ComputedSizeKind::Length | ComputedSizeKind::Percentage
+                    )
+                    && formatting_context::flex_self_block_size_resolution_space(
+                        &sizing,
+                        sized.sized_box(),
+                        flex_self_resolution_space,
+                        constraints,
+                    )
+                    .is_some()
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn finalize_out_of_flow_root_after_inside_layout(
         &self,
         sized: OutOfFlowBox<'_>,
-        inputs: abspos_inputs::AbsposLayoutInputs,
+        inputs: &abspos_inputs::AbsposLayoutInputs,
         inside_layout: Option<InsideLayoutBlockSizes>,
     ) {
         let (available_space, constraints) = out_of_flow_root_space(inputs);
@@ -2966,7 +3052,7 @@ impl<'pass> AbsposEngine<'pass> {
                 sized,
                 available_space,
                 constraints,
-                static_position_rect_for_sizing(&inputs),
+                static_position_rect_for_sizing(inputs),
                 BlockSizePass::AfterInsideLayout { inside_layout },
                 resolved,
                 self.auto_margin_overflow(inputs.containing_block, SizingAxis::Block),
@@ -3218,7 +3304,8 @@ impl<'pass> AbsposEngine<'pass> {
         default_scroll_shift: Option<abspos_inputs::DefaultScrollShift>,
     ) -> CssPixels {
         assert!(!self.facts(node).is_svg_box());
-        let (available_space, constraints) = out_of_flow_root_space(inputs);
+        let (available_space, constraints) = out_of_flow_root_space(&inputs);
+        let inputs = std::sync::Arc::new(inputs);
 
         let formatting_context::ChildLayout {
             outcome,
@@ -3232,7 +3319,7 @@ impl<'pass> AbsposEngine<'pass> {
             LayoutInput::new(
                 available_space,
                 constraints,
-                ParticipationInParentFormattingContext::AbsolutelyPositioned(inputs),
+                ParticipationInParentFormattingContext::AbsolutelyPositioned(inputs.clone()),
             ),
             cells,
             false,
@@ -3387,12 +3474,12 @@ impl<'pass> AbsposEngine<'pass> {
 
         // OPTIMIZATION: The styles of an option are made the first time it is tried, so that a box that fits with
         //               its current styles makes no other.
-        let made_styles: std::cell::RefCell<Vec<(u32, Option<Option<node_data::StylePayloadsRef>>)>> =
+        let made_styles: std::cell::RefCell<Vec<(u32, Option<Option<node_data::LayoutStyleRef>>)>> =
             std::cell::RefCell::new(Vec::new());
         let option_styles = std::cell::RefCell::new(Vec::new());
         // The styles the option applies: none where the entry makes no option, and no styles of its own for the base
         // styles or an option that changes none of them.
-        let option_style = |option: u32| -> Option<Option<node_data::StylePayloadsRef>> {
+        let option_style = |option: u32| -> Option<Option<node_data::LayoutStyleRef>> {
             let Some((index, _)) = entry_of(option) else {
                 return Some(None);
             };
@@ -3468,7 +3555,11 @@ impl<'pass> AbsposEngine<'pass> {
             .last_successful_position_option(node)
             .filter(|choice| {
                 choice.base_style_record == base_style_record
-                    && entry_of(choice.option).map_or(0, |(_, rule)| rule) == choice.rule
+                    && entry_of(choice.option)
+                        .map_or(crate::css::style::position_try::PositionTryRuleID::NONE, |(_, rule)| {
+                            rule
+                        })
+                        == choice.rule
             })
             .map_or(0, |choice| choice.option);
         let current = options
@@ -3479,7 +3570,9 @@ impl<'pass> AbsposEngine<'pass> {
         let choice_of = |option: u32| abspos_inputs::PositionOptionChoice {
             option,
             base_style_record,
-            rule: entry_of(option).map_or(0, |(_, rule)| rule),
+            rule: entry_of(option).map_or(crate::css::style::position_try::PositionTryRuleID::NONE, |(_, rule)| {
+                rule
+            }),
         };
         let fits = |index: usize| {
             let option = options[index];
@@ -3520,7 +3613,7 @@ impl<'pass> AbsposEngine<'pass> {
     fn with_position_option_style<T>(
         &self,
         node: Node,
-        style: Option<node_data::StylePayloadsRef>,
+        style: Option<node_data::LayoutStyleRef>,
         callback: impl for<'option> FnOnce(&AbsposEngine<'option>) -> T,
     ) -> T {
         let Some(style) = style else {
@@ -3575,9 +3668,10 @@ impl<'pass> AbsposEngine<'pass> {
         let mut child = *child;
         let (mut inputs, _) = self.pending_child_layout_inputs(&mut child);
         inputs.position_option = Some(choice);
+        let inputs = std::sync::Arc::new(inputs);
         // 3. Let el rect be the size and position of abspos's margin box, and cb rect be the size and position of
         //    abspos's inset-modified containing block, when laid out with adjusted styles.
-        let (available_space, constraints) = out_of_flow_root_space(inputs);
+        let (available_space, constraints) = out_of_flow_root_space(&inputs);
         let laid_out = formatting_context::run_root_without_parent_fragments(
             self.callbacks,
             node,
@@ -3585,7 +3679,7 @@ impl<'pass> AbsposEngine<'pass> {
             LayoutInput::new(
                 available_space,
                 constraints,
-                ParticipationInParentFormattingContext::AbsolutelyPositioned(inputs),
+                ParticipationInParentFormattingContext::AbsolutelyPositioned(inputs.clone()),
             ),
         );
         let used = laid_out.root_cells_left_by_run;
@@ -3973,7 +4067,7 @@ pub(crate) fn compute_inset_native(
 /// options, which the style reads of the box address while this lives.
 struct PositionOptionStyles {
     choice: Option<abspos_inputs::PositionOptionChoice>,
-    style: Option<node_data::StylePayloadsRef>,
+    style: Option<node_data::LayoutStyleRef>,
     /// Boxed so that the payloads the style reads address stay in place as the list grows.
     #[expect(clippy::vec_box)]
     option_styles: Vec<Box<LayoutStyle>>,

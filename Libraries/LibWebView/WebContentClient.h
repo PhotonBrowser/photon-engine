@@ -15,6 +15,7 @@
 #include <AK/SourceLocation.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
+#include <AK/Time.h>
 #include <AK/WeakPtr.h>
 #include <LibAudio/Audibility.h>
 #include <LibAudio/PlaybackGroupId.h>
@@ -208,6 +209,7 @@ private:
     virtual Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse did_request_all_cookies_cookiestore(Web::PageId page_id, Web::HTML::EnvironmentId, URL::URL) override;
     virtual Messages::WebContentClient::DidRequestPermissionSnapshotResponse did_request_permission_snapshot(Web::PageId, URL::Origin top_level_origin) override;
     virtual Messages::WebContentClient::DidRequestNamedCookieResponse did_request_named_cookie(URL::URL, String) override;
+    virtual Messages::WebContentClient::DidRequestNotificationsStateForTestingResponse did_request_notifications_state_for_testing(Web::PageId) override;
     virtual Messages::WebContentClient::DidRequestCookieResponse did_request_cookie(Web::PageId page_id, Optional<Web::HTML::EnvironmentId>, URL::URL, HTTP::Cookie::Source) override;
     virtual void did_close_browsing_context(Web::PageId page_id) override;
     virtual Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) override;
@@ -232,8 +234,8 @@ private:
     virtual Messages::WebContentClient::DidLoseRequestServerConnectionResponse did_lose_request_server_connection(Optional<Utf16String> top_level_site) override;
     virtual Messages::WebContentClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
     virtual Messages::WebContentClient::RequestAudioServerConnectionResponse request_audio_server_connection() override;
+    virtual Messages::WebContentClient::RequestWebrtcClientConnectionResponse request_webrtc_client_connection() override;
     virtual void request_video_presentation_channel() override;
-    virtual void did_start_using_gamepads() override;
     virtual void gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect) override;
     virtual void gamepad_stop_effects(Web::Gamepad::GamepadHandle handle) override;
 
@@ -295,6 +297,9 @@ private:
     HashTable<Audio::PlaybackGroupId> m_muted_audio_playback_groups;
     AudioServerAudibility m_audio_server_audibility { [this](Audio::PlaybackGroupId group, Audio::Audibility audibility) { did_change_audio_playback_audibility(group, audibility); } };
     RefPtr<Core::Timer> m_detached_page_close_timer;
+
+    // When this process last got a WebRTCClient, so that it can't make us spawn them in a loop.
+    Vector<MonotonicTime> m_webrtc_client_launch_times;
 
     static HashTable<WebContentClient*>& clients();
 };

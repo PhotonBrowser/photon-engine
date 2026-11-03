@@ -29,15 +29,15 @@ StyleValueFFI::StyleValueData const* ImageStyleValue::make_image_url_data(URL co
     auto resource_base_url = style_resource_base_url.has_value() ? style_resource_base_url->to_string() : String {};
     auto resource_base_url_bytes = resource_base_url.bytes();
     return StyleValueFFI::rust_style_value_create_image(
-        { url_string.has_ascii_storage() ? reinterpret_cast<u8 const*>(url_string.ascii_span().data()) : nullptr,
-            url_string.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(url_string.utf16_span().data()), url_string.length_in_code_units() },
+        { url_string.has_latin1_storage() ? url_string.latin1_span().data() : nullptr,
+            url_string.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(url_string.utf16_span().data()), url_string.length_in_code_units() },
         to_underlying(url.type()), modifiers.data(), modifiers.size(),
         { resource_base_url_bytes.data(), nullptr, resource_base_url_bytes.size() }, style_resource_base_url.has_value());
 }
 
 URL ImageStyleValue::url_value() const
 {
-    auto const& data = m_value->image;
+    auto const& data = *m_value->image._0;
     return url_from_rust_data(data.url, data.url_type, data.url_modifiers);
 }
 
@@ -143,7 +143,7 @@ ImageStyleValue::ImageStyleValue(URL const& url, Optional<::URL::URL> style_reso
 ImageStyleValue::ImageStyleValue(StyleValueFFI::StyleValueData const* data)
     : AbstractImageStyleValue(Type::Image, data)
 {
-    auto const& context = data->image.resource_context;
+    auto const& context = data->image._0->resource_context;
     if (context.has_base_url)
         m_style_resource_base_url = DOMURL::parse(url_text_from_rust_data(context.base_url));
     if (context.has_parent_style_sheet_origin_clean)
@@ -283,7 +283,7 @@ Optional<::URL::URL> ImageStyleValue::resolved_url(DOM::Document const& document
     if (m_resolved_url.has_value())
         return m_resolved_url;
 
-    auto url = url_text_from_rust_data(m_value->image.url);
+    auto url = url_text_from_rust_data(m_value->image._0->url);
     if (url.is_empty())
         return {};
 
@@ -305,7 +305,7 @@ Optional<ImageStyleValueResourceKey> ImageStyleValue::resource_key(DOM::Document
         return {};
 
     // OPTIMIZATION: Most url() values have no request modifiers, so don't rebuild the URL value for those.
-    if (m_value->image.url_modifiers.length == 0)
+    if (m_value->image._0->url_modifiers.length == 0)
         return ImageStyleValueResourceKey { .url = resolved_url.release_value(), .cross_origin = {}, .integrity = {}, .referrer_policy = {} };
     return ImageStyleValueResourceKey::create(resolved_url.release_value(), url_value());
 }
