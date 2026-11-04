@@ -395,6 +395,15 @@ struct PointerEvent {
     bool history_swipe_forward_enabled { false };
     uint64_t history_swipe_gesture_id { 0 };
 };
+struct PinchEvent {
+    double x { 0 };
+    double y { 0 };
+    bool shift { false };
+    bool control { false };
+    bool alt { false };
+    bool meta { false };
+    double scale_delta { 0 };
+};
 
 enum class Key : uint16_t {
     Unknown = 0,
@@ -627,6 +636,8 @@ public:
     void notify_state();
     std::string window_handle() const;
     void send_pointer_event(PointerEvent const&);
+    // Forwards a platform pinch gesture, like Qt's ZoomNativeGesture handler does.
+    void send_pinch_event(PinchEvent const&);
     void send_key_event(Key, bool pressed, uint32_t code_point, bool shift, bool control, bool alt, bool meta, bool repeat, bool insert_text);
     // Platform input method composition, as Qt's inputMethodEvent drives it.
     // Marked text replaces the previous marked text; an empty string ends the

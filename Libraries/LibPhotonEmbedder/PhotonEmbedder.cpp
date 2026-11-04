@@ -2203,6 +2203,17 @@ void View::send_pointer_event(PointerEvent const& event)
     m_impl->view->enqueue_input_event(move(native_event));
 }
 
+void View::send_pinch_event(PinchEvent const& event)
+{
+    auto to_device = [&](double value) { return Web::DevicePixels(static_cast<int>(std::lround(value * m_impl->view->device_pixel_ratio()))); };
+    Web::PinchEvent native_event {
+        .position = { to_device(event.x), to_device(event.y) },
+        .modifiers = modifiers(event.shift, event.control, event.alt, event.meta),
+        .scale_delta = event.scale_delta,
+    };
+    m_impl->view->enqueue_input_event(move(native_event));
+}
+
 static Web::UIEvents::KeyCode engine_key_code(Key key, uint32_t code_point)
 {
     if (key == Key::Unknown)
