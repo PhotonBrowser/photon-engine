@@ -19,10 +19,10 @@
 #include <AK/Weakable.h>
 #include <LibGC/Cell.h>
 #include <LibGC/Weak.h>
-#include <LibWeb/Bindings/CSSStyleSheet.h>
 #include <LibWeb/CSS/CSSRule.h>
 #include <LibWeb/CSS/CSSRuleList.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
+#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/MediaList.h>
 #include <LibWeb/CSS/RustStyleSheet.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
@@ -45,7 +45,12 @@ class StyleSheetImport;
 class StyleScope;
 struct StyleRuleCache;
 
-using CSSStyleSheetOptions = Bindings::CSSStyleSheetInit;
+// https://drafts.csswg.org/cssom/#dictdef-cssstylesheetinit
+struct CSSStyleSheetOptions {
+    Optional<Utf16String> base_url;
+    Variant<GC::Ref<MediaList>, Utf16String> media { Utf16String {} };
+    bool disabled { false };
+};
 
 WEB_API StyleSheetState* css_style_sheet_from_value(JS::Value);
 WEB_API JS::Value css_style_sheet(JS::Realm&, StyleSheetState&);
@@ -91,13 +96,14 @@ public:
     CSSRuleList* css_rules() { return &rules(); }
     CSSRuleList const* css_rules() const { return &rules(); }
 
+    // NB: For the rules that LibWeb writes itself, which skips what the CSSOM method checks about its caller.
     WebIDL::ExceptionOr<unsigned> insert_rule(Utf16View rule, unsigned index);
-    WebIDL::ExceptionOr<WebIDL::Long> add_rule(Optional<Utf16String> selector, Optional<Utf16String> style, Optional<WebIDL::UnsignedLong> index);
-    WebIDL::ExceptionOr<void> remove_rule(Optional<WebIDL::UnsignedLong> index);
-    WebIDL::ExceptionOr<void> delete_rule(unsigned index);
+    Optional<RustRule> parse_rule(Utf16View rule) const;
+    void rule_inserted(RustRule const&);
+    void remove_rule(u32 index);
 
     GC::Ref<WebIDL::Promise> replace(Utf16String text);
-    WebIDL::ExceptionOr<void> replace_sync(Utf16View text);
+    void replace_rules(Utf16View text);
 
     void for_each_effective_rule_data(TraversalOrder, Function<void(RustRuleView const&, Utf16View)> const&) const;
     // Returns whether the match state of any media queries changed after evaluation.
@@ -105,6 +111,7 @@ public:
     bool evaluate_media_queries(DOM::Document const&, Parser::ValueParserFFI::NativeStyleSheetMediaEvaluation&);
     void reload_fonts_after_media_query_change();
     void synchronize_fonts_after_rule_change();
+    void recalculate_rule_caches();
     void record_conditions_for_owners();
 
     HashTable<GC::Ptr<DOM::Node>> const& owning_documents_or_shadow_roots() const { return m_owning_documents_or_shadow_roots; }
@@ -183,7 +190,6 @@ public:
     Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy() const { return m_fetched_referrer_policy; }
 
     Utf16String const& title() const { return m_title; }
-    Optional<Utf16String> title_for_bindings() const;
     void set_title(Utf16String title) { m_title = move(title); }
 
     GC::Ref<MediaList> media() const;
@@ -205,7 +211,6 @@ public:
 private:
     StyleSheetState(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy);
 
-    void recalculate_rule_caches();
     void set_rules(RustRuleList);
     bool has_document_owner() const;
     void forget_font_feature_values();

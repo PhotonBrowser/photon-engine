@@ -54,7 +54,6 @@
 #include <QGraphicsPixmapItem>
 #include <QGraphicsScene>
 #include <QHBoxLayout>
-#include <QHelpEvent>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLayoutItem>
@@ -73,7 +72,6 @@
 #include <QStylePainter>
 #include <QTimer>
 #include <QToolButton>
-#include <QToolTip>
 #include <QVBoxLayout>
 #include <QVariant>
 #include <QVariantAnimation>
@@ -645,12 +643,19 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     explicit TabPreviewPopup(QWidget* parent)
-        // NB: The preview only shows, and the room around it for its shadow lies over the tabs, so it lets the mouse through.
-        : QWidget(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint | Qt::WindowTransparentForInput)
+        // NB: The preview only shows, and the room around it for its shadow lies over the tabs, so it lets the mouse
+        //     through. On X11, Qt adds the stays-on-top hint to a tooltip itself, takes that for a change of flags, and
+        //     recreates the window as it is first shown, and the new window takes the mouse again. Asking for the hint
+        //     here keeps the window from being recreated.
+        : QWidget(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint | Qt::WindowTransparentForInput | Qt::WindowStaysOnTopHint)
     {
         setAttribute(Qt::WA_TranslucentBackground);
         setAttribute(Qt::WA_ShowWithoutActivating);
         setAttribute(Qt::WA_TransparentForMouseEvents);
+
+        // NB: KDE's widget styles have the window system cast a shadow around any tooltip window. The card casts its own
+        //     within this window, so that would be a second shadow around the room left for the first.
+        setProperty("_KDE_NET_WM_SKIP_SHADOW", true);
 
         auto* outer_layout = new QVBoxLayout(this);
         outer_layout->setContentsMargins(TAB_PREVIEW_SHADOW_MARGINS);
@@ -1149,34 +1154,33 @@ bool TabBar::event(QEvent* event)
     if (event->type() == QEvent::Show)
         update_loading_ring_animation();
 
-    if (event->type() == QEvent::ToolTip) {
-        auto* help_event = static_cast<QHelpEvent*>(event);
-        auto hovered_tab = tab_index_at(help_event->pos());
-        if (hovered_tab >= 0 && hovered_tab != currentIndex()) {
-            if (auto* tab = m_tab_widget ? m_tab_widget->tab(hovered_tab) : nullptr) {
-                if (!tab->is_loaded() || tab->view().tab_preview_pixmap({ TAB_PREVIEW_THUMBNAIL_WIDTH, TAB_PREVIEW_THUMBNAIL_HEIGHT }).has_value()) {
-                    event->accept();
-                    return true;
-                }
-            }
-        }
+    return QTabBar::event(event);
+}
 
-        // The selected tab shows no preview, so a title too long for it shows in full, with the site, in a tooltip.
-        if (hovered_tab >= 0 && hovered_tab == currentIndex()) {
-            auto* tab = m_tab_widget ? m_tab_widget->tab(hovered_tab) : nullptr;
-            if (tab && m_tabs_with_cut_titles.contains(tab)) {
-                auto text = tabText(hovered_tab);
-                // A URL without a host (about:blank, e.g.) has no site to show.
-                if (auto url = tab->view().url(); url.host().has_value() && !url.serialized_host().is_empty())
-                    text = qformatted("{}\n{}", ak_string_from_qstring(text), url.serialized_host());
-                QToolTip::showText(help_event->globalPos(), text, this, tabRect(hovered_tab));
-                event->accept();
-                return true;
-            }
-        }
+Optional<ToolTipContent> TabBar::tooltip_at(QPoint position) const
+{
+    auto hovered_tab = tab_index_at(position);
+    if (hovered_tab < 0)
+        return {};
+
+    auto* tab = m_tab_widget ? m_tab_widget->tab(hovered_tab) : nullptr;
+
+    // A tab that shows a preview doesn't need a tooltip as well.
+    if (tab && hovered_tab != currentIndex() && (!tab->is_loaded() || tab->view().tab_preview_pixmap({ TAB_PREVIEW_THUMBNAIL_WIDTH, TAB_PREVIEW_THUMBNAIL_HEIGHT }).has_value()))
+        return ToolTipContent {};
+
+    // The selected tab shows no preview, so a title too long for it shows in full, with the site, in a tooltip.
+    if (tab && hovered_tab == currentIndex() && m_tabs_with_cut_titles.contains(tab)) {
+        auto text = tabText(hovered_tab);
+        // A URL without a host (about:blank, e.g.) has no site to show.
+        if (auto url = tab->view().url(); url.host().has_value() && !url.serialized_host().is_empty())
+            text = qformatted("{}\n{}", ak_string_from_qstring(text), url.serialized_host());
+        return ToolTipContent { .text = AK::move(text), .rect = visual_tab_rect(hovered_tab) };
     }
 
-    return QTabBar::event(event);
+    if (auto text = tabToolTip(hovered_tab); !text.isEmpty())
+        return ToolTipContent { .text = AK::move(text), .rect = {} };
+    return {};
 }
 
 void TabBar::paintEvent(QPaintEvent*)
@@ -2566,7 +2570,7 @@ void TabBar::schedule_tab_preview(int index)
 
     hide_tab_preview();
     m_tab_preview_index = index;
-    QToolTip::hideText();
+    hide_tooltip();
     m_tab_preview_timer->start();
 }
 

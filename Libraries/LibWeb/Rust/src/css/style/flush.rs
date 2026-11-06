@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use super::pipeline::projection::NoteChanges;
 use super::*;
 
 /// One clock shared by every phase; rounded cumulative endpoints make the intervals additive.
@@ -73,9 +74,9 @@ impl StyleEngine {
     fn run_style_update_with_clock(
         &mut self,
         root: StyleNodeID,
-        mut emit: impl FnMut(StyleUpdateVersion, &[PublishedStyleDeltaRecord]),
+        mut emit: impl FnMut(&[PublishedStyleDeltaRecord]),
         clock: &mut TransactionClock,
-    ) -> bool {
+    ) {
         self.reclaim_unreachable_computed_records();
         for (node, input) in std::mem::take(&mut self.host.deferred_element_style_inputs) {
             self.host.element_inputs.note_style_input(
@@ -89,7 +90,13 @@ impl StyleEngine {
         self.host.deferred_element_style_inputs_are_pending = false;
 
         let mut transaction = self.drain_transaction();
-        self.apply_staged_transaction(&mut transaction);
+        // NB: Only the live style reads what a transaction changed. The first transaction of a document brings all of
+        //     its elements, and a cold pass styles them whatever they changed.
+        let note_changes = match self.retained.live_style.is_some() {
+            true => NoteChanges::Yes,
+            false => NoteChanges::No,
+        };
+        self.apply_staged_transaction(&mut transaction, note_changes);
         if let Some(mut live) = self.retained.live_style.take() {
             live.note_transaction(&self.retained, &transaction);
             self.retained.live_style = Some(live);
@@ -108,30 +115,17 @@ impl StyleEngine {
         let rows = self.install_restyled(root);
         self.release_transaction_and_sweep_atoms(transaction);
         if !rows.is_empty() {
-            let transaction_version = self.retained.next_style_update_version;
-            self.retained.next_style_update_version = StyleUpdateVersion(
-                transaction_version
-                    .0
-                    .checked_add(1)
-                    .expect("style update version space exhausted"),
-            );
-            emit(transaction_version, &rows);
+            emit(&rows);
         }
         clock.enter(Counter::TransactionRemainderMicroseconds, &self.retained.counters);
-        true
     }
 }
 
 impl StyleEngine {
-    pub fn run_style_update(
-        &mut self,
-        root: StyleNodeID,
-        emit: impl FnMut(StyleUpdateVersion, &[PublishedStyleDeltaRecord]),
-    ) -> bool {
+    pub fn run_style_update(&mut self, root: StyleNodeID, emit: impl FnMut(&[PublishedStyleDeltaRecord])) {
         let mut clock = TransactionClock::new();
-        let scoped = self.run_style_update_with_clock(root, emit, &mut clock);
-        // Include transaction-local destruction on both ordinary and early-return paths.
+        self.run_style_update_with_clock(root, emit, &mut clock);
+        // Include transaction-local destruction.
         clock.finish(&self.retained.counters);
-        scoped
     }
 }

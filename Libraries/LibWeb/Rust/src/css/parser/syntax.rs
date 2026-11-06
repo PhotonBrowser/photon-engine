@@ -457,11 +457,6 @@ pub extern "C" fn rust_syntax_is_universal(syntax: &SyntaxNode) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_syntax_is_single_component(syntax: &SyntaxNode) -> bool {
-    is_single_syntax_component(syntax)
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn rust_syntax_value_is_list(syntax: &SyntaxNode, value: &StyleValueData) -> bool {
     match syntax {
         SyntaxNode::Multiplier { .. } => true,
@@ -516,6 +511,20 @@ pub unsafe extern "C" fn rust_parse_with_syntax(
     };
     *out_status = FfiParseStatus::Parsed;
     crate::css::style_value_arc::StyleValueArc::into_raw(crate::css::style_value_arc::StyleValueArc::new(parsed)).cast()
+}
+
+impl SyntaxNode {
+    pub(crate) fn is_universal(&self) -> bool {
+        rust_syntax_is_universal(self)
+    }
+
+    pub(crate) fn is_single_component(&self) -> bool {
+        is_single_syntax_component(self)
+    }
+
+    pub(crate) fn serialize_to(&self, sink: &mut TextSink) {
+        serialize_syntax(self, sink);
+    }
 }
 
 #[cfg(test)]

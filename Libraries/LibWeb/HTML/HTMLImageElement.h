@@ -97,6 +97,9 @@ public:
 
     void set_source_set(SourceSet);
 
+    // NB: The next update of the image data presents this resource instead of fetching the image.
+    void set_resource_from_navigation_response(GC::Ref<SharedResourceRequest>);
+
     // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attribute-source
     DOM::Element const& dimension_attribute_source() const;
     void set_dimension_attribute_source(DOM::Element const*);
@@ -189,6 +192,7 @@ private:
     Optional<Utf16String> m_last_selected_source;
 
     // https://html.spec.whatwg.org/multipage/images.html#current-request
+    GC::Ptr<SharedResourceRequest> m_resource_from_navigation_response;
     GC::Ptr<ImageRequest> m_current_request;
 
     // https://html.spec.whatwg.org/multipage/images.html#pending-request
@@ -201,6 +205,8 @@ private:
     SourceSet m_source_set;
 
     CSSPixelSize m_last_seen_viewport_size;
+
+    bool m_is_child_of_picture { false };
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attribute-source
     // Each img element has a dimension attribute source, which must initially be the img element itself.

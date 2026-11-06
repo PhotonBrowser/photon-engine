@@ -15,8 +15,14 @@ use super::super::container_queries::ContainerVerdict;
 use super::super::publication::{DemandedEngineRecord, RecordDemand, RecordDemandAnswer};
 use super::super::*;
 use super::live::Live;
-use super::records::{PseudoElementRecords, Record, RecordCells, Records, RetainedRecords};
+use super::records::{
+    ChildImpact, MatchList, PseudoElementRecords, PseudoElementTarget, Record, RecordCells, Records, RetainedRecords,
+    highlights_moved,
+};
+use super::rule_changes::RuleIndexChanges;
+use super::rules::RuleIndex;
 use super::traversal::{self, DemandedPseudoElement, PassContext, PseudoElementRead};
+use crate::css::style::input_types::StyleEnvironment;
 use std::sync::Arc;
 
 /// The records computed on demand in one generation of the engine.
@@ -27,6 +33,152 @@ pub(super) struct DemandOverlay {
     records: Option<RetainedRecords>,
     /// The elements whose records were computed on demand.
     computed: HashSet<StyleNodeID>,
+}
+
+/// What an element kept styled below one that is not displayed was computed from.
+struct KeptComputation {
+    /// The parts of the environment it read.
+    environment_reads: StyleEnvironment,
+    /// The entries of the rule index it matched.
+    matches: Option<MatchList>,
+    /// What it computed, which what inherits through it computed from.
+    record: Arc<Record>,
+    /// The records of its highlight pseudo-elements beside `record`, which those of what inherits
+    /// through it computed from.
+    highlights: PseudoElementRecords,
+}
+
+/// Which records of the elements that keep their style below an element that is not displayed
+/// still stand. No pass styles these elements or notes what they read, so an installation computes
+/// them on demand, and nothing but what is noted here can move how they compute.
+#[derive(Default)]
+pub(in super::super) struct KeptHiddenRecords {
+    /// The elements computed for an installation.
+    computed: HashMap<StyleNodeID, KeptComputation>,
+    /// The elements an input or a hint reached since the last installation, or whose children a
+    /// pass found to compute from something else: what inherits through one computes anew, unless
+    /// it comes out as it was.
+    moved: HashSet<StyleNodeID>,
+    /// Those of `moved` where a hint reached the elements below too, however it comes out.
+    descendants_moved: HashSet<StyleNodeID>,
+}
+
+impl KeptHiddenRecords {
+    /// Every element computes anew, as for a change to the rules.
+    pub(super) fn forget(&mut self) {
+        self.computed.clear();
+    }
+
+    pub(super) fn note_environment_moved(&mut self, environment: StyleEnvironment) {
+        if !environment.is_empty() {
+            self.moved.extend(
+                self.computed
+                    .iter()
+                    .filter(|(_, computation)| computation.environment_reads.intersects(environment))
+                    .map(|(&node, _)| node),
+            );
+        }
+    }
+
+    /// Only the elements that matched an entry that left, or that match one that arrived, compute
+    /// anew where nothing but the conditions of rules moved, as the same width flips the rules of
+    /// a media query.
+    pub(super) fn note_rule_index_update(
+        &mut self,
+        state: &RetainedState,
+        index: &RuleIndex,
+        records: &RetainedRecords,
+        changes: &RuleIndexChanges,
+    ) {
+        if !changes.conditions_moved_alone {
+            self.forget();
+            return;
+        }
+        if self.computed.is_empty() {
+            return;
+        }
+        let numbering = changes.numbering(index);
+        let mut moves_element = changes.moves_element(state, index, records);
+        self.computed.retain(|&node, computation| {
+            computation.matches.as_ref().is_some_and(|matches| {
+                // NB: An element is computed anew rather than taking a list numbered anew.
+                !moves_element(node, matches)
+                    && matches
+                        .iter()
+                        .all(|&entry| numbering.get(entry as usize).copied().flatten() == Some(entry))
+            })
+        });
+    }
+
+    pub(super) fn note_moved(&mut self, nodes: impl IntoIterator<Item = StyleNodeID>) {
+        // NB: An element below no computation has nothing to compute anew.
+        if !self.computed.is_empty() {
+            self.moved.extend(nodes);
+        }
+    }
+
+    pub(super) fn note_descendants_moved(&mut self, node: StyleNodeID) {
+        self.moved.insert(node);
+        self.descendants_moved.insert(node);
+    }
+
+    /// Elements that left the tree compute nothing anymore.
+    pub(super) fn note_left(&mut self, nodes: impl IntoIterator<Item = StyleNodeID>) {
+        for node in nodes {
+            self.computed.remove(&node);
+        }
+    }
+
+    /// Whether `node` is one this holds a computation of.
+    pub(super) fn computed(&self, node: StyleNodeID) -> bool {
+        self.computed.contains_key(&node)
+    }
+
+    pub(super) fn holds_computations(&self) -> bool {
+        !self.computed.is_empty()
+    }
+
+    /// The elements with a computation, for a check of what they computed.
+    pub(super) fn computed_nodes(&self) -> impl Iterator<Item = (StyleNodeID, &Arc<Record>)> {
+        self.computed
+            .iter()
+            .map(|(&node, computation)| (node, &computation.record))
+    }
+
+    /// Whether what `node` computes from stands, as `standing` remembers of the elements it
+    /// inherits through.
+    pub(super) fn stands(
+        &self,
+        state: &RetainedState,
+        records: &RetainedRecords,
+        node: StyleNodeID,
+        standing: &mut HashMap<StyleNodeID, bool>,
+    ) -> bool {
+        if !self.computed.contains_key(&node) {
+            return false;
+        }
+        let mut walked: SmallVec<[StyleNodeID; 32]> = SmallVec::new();
+        let mut current = Some(node);
+        let mut stands = true;
+        while let Some(element) = current {
+            if let Some(&known) = standing.get(&element) {
+                stands = known;
+                break;
+            }
+            walked.push(element);
+            // NB: The sampled values of animations move with no input.
+            if self.moved.contains(&element)
+                || state.projection.adjustment_facts(element) & bridge::element_adjustment_fact::HAS_ANIMATIONS != 0
+                || !(self.computed.contains_key(&element) || records.get(element).is_some())
+            {
+                stands = false;
+                break;
+            }
+            current = state.projection.inheritance_parent(element);
+        }
+        standing.extend(walked.into_iter().map(|element| (element, stands)));
+        stands
+    }
 }
 
 /// What a computation of an element's style for a clock frame found: its record, with those of the
@@ -47,6 +199,64 @@ enum DemandedElement {
 }
 
 impl Live {
+    /// What the computation kept of each element below one that is not displayed differs in from
+    /// what computing it now finds, one line per element.
+    pub(super) fn kept_hidden_differences(
+        &self,
+        state: &RetainedState,
+        describe: &dyn Fn(StyleNodeID) -> String,
+    ) -> Vec<String> {
+        let mut differences = Vec::new();
+        let mut standing = HashMap::default();
+        for (node, kept) in self.kept_hidden_records.computed_nodes() {
+            if !state.projection.is_live(node)
+                || !self
+                    .kept_hidden_records
+                    .stands(state, &self.records, node, &mut standing)
+            {
+                continue;
+            }
+            let mut chain: SmallVec<[StyleNodeID; 32]> =
+                std::iter::successors(Some(node), |&node| state.projection.inheritance_parent(node)).collect();
+            chain.reverse();
+            // NB: The records held below an element that is not displayed are what they were as it stopped being
+            //     displayed, and nothing computes from them.
+            let mut parent_is_displayed = true;
+            let Some(first) = chain.iter().position(|&element| {
+                let record = self.records.get(element).filter(|_| parent_is_displayed);
+                parent_is_displayed = record.is_some_and(|record| record.is_displayed());
+                record.is_none()
+            }) else {
+                continue;
+            };
+            let mut cells = RecordCells::default();
+            cells.reserve(state.projection.element_slot_count());
+            let records = Records::new(state, &cells, Some(&self.records));
+            let context = PassContext::new(
+                state,
+                &self.index,
+                &self.initial,
+                &records,
+                traversal::held_root_font(state, &records, chain[0]),
+            );
+            let statistics = traversal::style_chain(&context, &chain[first..]);
+            if !statistics.font_requests.is_empty() || !statistics.random_requests.is_empty() {
+                continue;
+            }
+            if let Some(fresh) = records.get_shared(node) {
+                let moved = super::self_check::record_differences(kept, fresh);
+                if !moved.is_empty() {
+                    differences.push(format!(
+                        "the kept computation of {}: {}",
+                        describe(node),
+                        moved.join(", ")
+                    ));
+                }
+            }
+        }
+        differences
+    }
+
     /// The records computed on demand, for the current generation.
     fn demand_overlay(&mut self) -> &mut DemandOverlay {
         if self.demanded.generation != self.generation || self.demanded.records.is_none() {
@@ -82,13 +292,22 @@ impl Live {
         }
     }
 
-    /// The records of the pseudo-elements of `node` that generate a box, by kind, beside its
+    /// The records of the pseudo-elements of `node` that generate a box, by target, beside its
     /// current record.
-    pub(super) fn demanded_pseudo_element_records(&self, node: StyleNodeID) -> &[(u8, Arc<Record>)] {
+    pub(super) fn demanded_pseudo_element_records(&self, node: StyleNodeID) -> &[(PseudoElementTarget, Arc<Record>)] {
         match self.computed_on_demand(node) {
             true => self.demand_records().pseudo_element_records(node),
             false => self.records.pseudo_element_records(node),
         }
+    }
+
+    /// The records of the highlight pseudo-elements of `node`, beside its current record.
+    fn demanded_highlights(&self, node: StyleNodeID) -> PseudoElementRecords {
+        self.demanded_pseudo_element_records(node)
+            .iter()
+            .filter(|(target, _)| super::super::publication::pseudo_kind::is_highlight(target.kind))
+            .cloned()
+            .collect()
     }
 
     /// What the container conditions of the current record of `node` read of its containers.
@@ -155,6 +374,9 @@ impl Live {
         let records = Records::new(state, &cells, Some(&base));
         let context = PassContext {
             cache_audit: self.cache_audit,
+            // NB: What an element kept below one that is not displayed matched tells whether a change
+            //     to the rules reaches it.
+            keeps_matches: true,
             ..PassContext::new(
                 state,
                 &self.index,
@@ -236,7 +458,7 @@ impl Live {
         &self,
         state: &RetainedState,
         node: StyleNodeID,
-        kind: u8,
+        target: PseudoElementTarget,
         read: PseudoElementRead,
         inheritance_parent: Option<StyleNodeID>,
     ) -> DemandedPseudoElement {
@@ -245,7 +467,7 @@ impl Live {
         // has one. The passes style those only while the host shows a highlight of the kind, and
         // then only for the elements it shows it in, so those of the ancestors are styled for the
         // read too.
-        let styles_ancestor_highlights = super::HIGHLIGHT_KINDS.contains(&kind);
+        let styles_ancestor_highlights = super::super::publication::pseudo_kind::is_highlight(target.kind);
         let mut cells = RecordCells::default();
         if styles_ancestor_highlights {
             cells.reserve(state.projection.element_slot_count());
@@ -275,9 +497,9 @@ impl Live {
                 .collect();
             for &ancestor in ancestors.iter().rev() {
                 let mut held: PseudoElementRecords = records.pseudo_element_records(ancestor).into();
-                held.retain(|(held_kind, _)| *held_kind != kind);
-                match traversal::style_pseudo_element(&context, ancestor, kind, PseudoElementRead::Styled) {
-                    DemandedPseudoElement::Styled(record) => held.push((kind, record)),
+                held.retain(|(held_target, _)| *held_target != target);
+                match traversal::style_pseudo_element(&context, ancestor, target, PseudoElementRead::Styled) {
+                    DemandedPseudoElement::Styled(record) => held.push((target, record)),
                     DemandedPseudoElement::Unstyled => {}
                     demanded @ (DemandedPseudoElement::Waiting(..) | DemandedPseudoElement::Declined) => {
                         return demanded;
@@ -286,7 +508,7 @@ impl Live {
                 records.insert_pseudo_element_records(ancestor, held);
             }
         }
-        traversal::style_pseudo_element_inheriting_from(&context, node, kind, read, inheritance_parent)
+        traversal::style_pseudo_element_inheriting_from(&context, node, target, read, inheritance_parent)
     }
 }
 
@@ -324,8 +546,12 @@ impl StyleEngine {
                 let answered = self.install_demanded_element(node, &record);
                 RecordDemandAnswer::Record { record: answered }
             }
-            RecordDemand::PseudoElement(_, pseudo_element) => {
-                self.answer_pseudo_element_demand(node, &record, pseudo_element as u8, demand.is_read_only())
+            RecordDemand::PseudoElement(_, pseudo_element, highlight_name) => {
+                let target = PseudoElementTarget {
+                    kind: pseudo_element as u8,
+                    highlight_name,
+                };
+                self.answer_pseudo_element_demand(node, &record, target, demand.is_read_only())
             }
         }
     }
@@ -341,25 +567,118 @@ impl StyleEngine {
         let mut kept = std::mem::take(&mut live.kept_hidden);
         kept.sort_unstable();
         kept.dedup();
-        let mut installed = Vec::new();
+        live.note_hints_moved_kept_hidden_records();
+        let mut installed = self.settle_moved_kept_hidden();
+        let mut standing = HashMap::default();
         for node in kept {
             if !self.retained.projection.is_live(node) || !self.retained.keeps_style_in_display_none_subtree(node) {
                 continue;
             }
-            let live = self.retained.live_style.as_ref().expect("the engine owns the document");
-            let (chain, first_stale) = live.demand_chain(&self.retained, node);
-            if let Some(live) = self.retained.live_style.as_mut() {
-                live.kept_hidden.push(node);
+            let mut live = self.retained.live_style.take().expect("the engine owns the document");
+            live.kept_hidden.push(node);
+            let stands = live
+                .kept_hidden_records
+                .stands(&self.retained, &live.records, node, &mut standing);
+            self.retained.live_style = Some(live);
+            if !stands {
+                installed.extend(self.demand_kept_chain(node));
             }
-            let Some(first_stale) = first_stale else {
-                continue;
-            };
-            self.demand_element(node, false);
-            installed.extend_from_slice(&chain[first_stale..]);
+        }
+        if let Some(live) = self.retained.live_style.as_mut() {
+            live.kept_hidden_records.moved.clear();
+            live.kept_hidden_records.descendants_moved.clear();
         }
         installed.sort_unstable();
         installed.dedup();
         installed
+    }
+
+    /// Compute the elements an input reached anew, and let those whose children compute from what
+    /// they did stand for what inherits through them, as a viewport change reaches an element that
+    /// reads the viewport for a property its children do not inherit. Answers the elements to
+    /// install.
+    fn settle_moved_kept_hidden(&mut self) -> Vec<StyleNodeID> {
+        let live = self.retained.live_style.as_ref().expect("the engine owns the document");
+        let kept = &live.kept_hidden_records;
+        // NB: The chain of one element can compute another of them, so what each held is taken first.
+        let mut reached: Vec<(StyleNodeID, Arc<Record>, PseudoElementRecords)> = kept
+            .moved
+            .iter()
+            .filter(|node| !kept.descendants_moved.contains(node) && self.retained.projection.is_live(**node))
+            .filter_map(|&node| {
+                let computation = kept.computed.get(&node)?;
+                Some((node, computation.record.clone(), computation.highlights.clone()))
+            })
+            .collect();
+        reached.sort_unstable_by_key(|&(node, ..)| node);
+        let mut installed = Vec::new();
+        for (node, held, held_highlights) in reached {
+            let mut demanded = self.demand_kept_chain(node);
+            let state = &self.retained;
+            let live = state.live_style.as_ref().expect("the engine owns the document");
+            let kept = &live.kept_hidden_records;
+            // NB: An element a pass styles now holds its record, not one computed on demand.
+            let current = live.demanded_record(node).filter(|_| kept.computed(node)).cloned();
+            let highlights = live.demanded_highlights(node);
+            let holds_the_same = current.as_ref().is_some_and(|record| record.holds_the_same_as(&held));
+            let children_stand = current.as_ref().is_some_and(|record| {
+                record.pseudo_element_styles() == held.pseudo_element_styles()
+                    && !highlights_moved(&highlights, &held_highlights)
+                    && match state.child_impact_of_records(node, record, &held) {
+                        ChildImpact::None => true,
+                        ChildImpact::ResetReaders => state.projection.style_children(node).all(|child| {
+                            let record = kept.computed.get(&child).map(|computation| &computation.record);
+                            record
+                                .or_else(|| live.records.get(child))
+                                .is_none_or(|record| !state.reads_parent_reset_values(child, record))
+                        }),
+                        _ => false,
+                    }
+            });
+            let live = self.retained.live_style.as_mut().expect("the engine owns the document");
+            if let (Some(record), Some(computation)) = (current, live.kept_hidden_records.computed.get_mut(&node)) {
+                computation.record = record;
+                computation.highlights = highlights;
+            }
+            if children_stand {
+                live.kept_hidden_records.moved.remove(&node);
+            }
+            if holds_the_same {
+                demanded.retain(|&element| element != node);
+            }
+            installed.append(&mut demanded);
+        }
+        installed
+    }
+
+    /// Compute the elements of the chain of `node` that hold no current record, and note what they
+    /// computed from. Answers them.
+    fn demand_kept_chain(&mut self, node: StyleNodeID) -> Vec<StyleNodeID> {
+        let live = self.retained.live_style.as_ref().expect("the engine owns the document");
+        let (chain, first_stale) = live.demand_chain(&self.retained, node);
+        let Some(first_stale) = first_stale else {
+            return Vec::new();
+        };
+        self.demand_element(node, false);
+        let live = self.retained.live_style.as_mut().expect("the engine owns the document");
+        for &element in &chain[first_stale..] {
+            let computation = live.demanded_record(element).and_then(|record| {
+                // NB: The sizes of containers and the places of elements among their siblings move with no
+                //     input an element holding no record is told of.
+                let reads_container = live.demand_records().container_reads(element).is_some();
+                (!reads_container && !record.rare().reads.reads_sibling_position).then(|| KeptComputation {
+                    environment_reads: record.rare().reads.environment_reads,
+                    matches: live.demand_records().matches_of(element).cloned(),
+                    record: record.clone(),
+                    highlights: live.demanded_highlights(element),
+                })
+            });
+            match computation {
+                Some(computation) => live.kept_hidden_records.computed.insert(element, computation),
+                None => live.kept_hidden_records.computed.remove(&element),
+            };
+        }
+        chain[first_stale..].to_vec()
     }
 
     /// The installation of the current record of `node`, computed on demand where it holds none, for a read of its
@@ -516,16 +835,20 @@ impl StyleEngine {
             style_record: style_record.raw(),
             ..DemandedEngineRecord::default()
         };
-        for (kind, pseudo_record) in pseudo_element_records {
+        for (target, pseudo_record) in pseudo_element_records
+            .iter()
+            .filter(|(target, _)| !target.is_custom_highlight())
+        {
+            let kind = target.kind;
             let pseudo_environment =
                 self.retained
                     .pseudo_element_environment(node, pseudo_record, record, environment, minted);
             let pseudo_record = &self.retained.record_in_environment(pseudo_record, pseudo_environment);
             let pseudo_style_record = self.retained.install_record(pseudo_record, &mut installed);
             self.retained
-                .hold_demand_record(computed::ComputedStyleTarget::new(node, *kind), pseudo_style_record);
+                .hold_demand_record(computed::ComputedStyleTarget::new(node, kind), pseudo_style_record);
             answered.pseudo_records_present |= 1 << kind;
-            answered.pseudo_records[usize::from(*kind)] = pseudo_style_record.raw();
+            answered.pseudo_records[usize::from(kind)] = pseudo_style_record.raw();
         }
         answered
     }
@@ -589,7 +912,7 @@ impl StyleEngine {
         self.install_demanded_records(node, &record, &pseudo_element_records, environment, &mut minted)
     }
 
-    /// Answer a read of the pseudo-element of `kind` of `node`, whose current record is `element`:
+    /// Answer a read of the pseudo-element `target` of `node`, whose current record is `element`:
     /// the record of a pseudo-element of a kind the passes style that generates a box, and for any other
     /// read the style the kind computes to from the element's rules for it, whether or not it
     /// generates a box. A `read_only` read styles any kind; another one a kind no rule styles not,
@@ -598,19 +921,20 @@ impl StyleEngine {
         &mut self,
         node: StyleNodeID,
         element: &Arc<Record>,
-        kind: u8,
+        target: PseudoElementTarget,
         read_only: bool,
     ) -> RecordDemandAnswer {
         let live = self.retained.live_style.take().expect("the engine owns the document");
         // The passes keep the highlight pseudo-elements current only where the host shows them.
-        let generated = (super::PSEUDO_ELEMENT_KINDS.contains(&kind) && !super::HIGHLIGHT_KINDS.contains(&kind))
-            .then(|| {
-                live.demanded_pseudo_element_records(node)
-                    .iter()
-                    .find(|(held, _)| *held == kind)
-                    .map(|(_, record)| record.clone())
-            })
-            .flatten();
+        let generated = (super::PSEUDO_ELEMENT_KINDS.contains(&target.kind)
+            && !super::HIGHLIGHT_KINDS.contains(&target.kind))
+        .then(|| {
+            live.demanded_pseudo_element_records(node)
+                .iter()
+                .find(|(held, _)| *held == target)
+                .map(|(_, record)| record.clone())
+        })
+        .flatten();
         let mut minted = HashMap::default();
         let element_environment = self.demanded_environment(&live, node, element, &mut minted);
         self.retained.live_style = Some(live);
@@ -621,7 +945,7 @@ impl StyleEngine {
                     true => PseudoElementRead::Any,
                     false => PseudoElementRead::Styled,
                 };
-                self.demand_pseudo_element(node, kind, read, None)
+                self.demand_pseudo_element(node, target, read, None)
             }
         };
         let record = match demanded {
@@ -641,7 +965,7 @@ impl StyleEngine {
         let record = self.retained.record_in_environment(&record, pseudo_environment);
         let style_record = self.retained.install_record(&record, &mut HashMap::default());
         self.retained
-            .hold_demand_record(computed::ComputedStyleTarget::new(node, kind), style_record);
+            .hold_demand_record(computed::ComputedStyleTarget::new(node, target.kind), style_record);
         RecordDemandAnswer::Record {
             record: DemandedEngineRecord {
                 style_record: style_record.raw(),
@@ -650,18 +974,60 @@ impl StyleEngine {
         }
     }
 
-    /// Style the pseudo-element of `kind` of `node` as [`Live::demand_pseudo_element`] does,
+    /// The record of the `::selection` of `element`, or zero where no rule styles it, for the fork of a clock lane, whose
+    /// drag reaches an element the host shows no selection in. Answers none where what it takes to style it is the
+    /// host's to resolve, as a font is.
+    pub(crate) fn demand_selection_record(&mut self, element: StyleNodeID) -> Option<u64> {
+        let mut live = self.retained.live_style.take()?;
+        let record = self.selection_record_with(&mut live, element);
+        self.retained.live_style = Some(live);
+        record
+    }
+
+    fn selection_record_with(&mut self, live: &mut Live, element: StyleNodeID) -> Option<u64> {
+        let kind = super::super::publication::pseudo_kind::SELECTION;
+        let DemandedElement::Styled(element_record) = live.demand_element(&self.retained, element, false) else {
+            return None;
+        };
+        let record = match live.demand_pseudo_element(
+            &self.retained,
+            element,
+            PseudoElementTarget::of_kind(kind),
+            PseudoElementRead::Styled,
+            None,
+        ) {
+            DemandedPseudoElement::Styled(record) => record,
+            DemandedPseudoElement::Unstyled => return Some(0),
+            DemandedPseudoElement::Waiting(..) | DemandedPseudoElement::Declined => return None,
+        };
+        let mut minted = HashMap::default();
+        let element_environment = self.demanded_environment(live, element, &element_record, &mut minted);
+        let environment = self.retained.pseudo_element_environment(
+            element,
+            &record,
+            &element_record,
+            element_environment,
+            &mut minted,
+        );
+        let record = self.retained.record_in_environment(&record, environment);
+        let style_record = self.retained.install_record(&record, &mut HashMap::default());
+        self.retained
+            .hold_demand_record(computed::ComputedStyleTarget::new(element, kind), style_record);
+        Some(style_record.raw())
+    }
+
+    /// Style the pseudo-element `target` of `node` as [`Live::demand_pseudo_element`] does,
     /// resolving the fonts and random base values it asks for first.
     fn demand_pseudo_element(
         &mut self,
         node: StyleNodeID,
-        kind: u8,
+        target: PseudoElementTarget,
         read: PseudoElementRead,
         inheritance_parent: Option<StyleNodeID>,
     ) -> DemandedPseudoElement {
         self.until_resolved(node, |engine| {
             let live = engine.retained.live_style.take().expect("the engine owns the document");
-            let demanded = live.demand_pseudo_element(&engine.retained, node, kind, read, inheritance_parent);
+            let demanded = live.demand_pseudo_element(&engine.retained, node, target, read, inheritance_parent);
             engine.retained.live_style = Some(live);
             match demanded {
                 DemandedPseudoElement::Waiting(fonts, random_bases) => Err(super::Waits { fonts, random_bases }),
@@ -682,9 +1048,12 @@ impl StyleEngine {
         let parent = self.retained.first_letter_inheritance_parent(node, text)?;
         self.retained.live_style.as_ref()?;
         let kind = pseudo_kind::FIRST_LETTER;
-        let DemandedPseudoElement::Styled(record) =
-            self.demand_pseudo_element(node, kind, PseudoElementRead::Styled, Some(parent))
-        else {
+        let DemandedPseudoElement::Styled(record) = self.demand_pseudo_element(
+            node,
+            PseudoElementTarget::of_kind(kind),
+            PseudoElementRead::Styled,
+            Some(parent),
+        ) else {
             return None;
         };
         let parent_record = self.retained.computed_group_sets.assigned_style_record(parent)?;

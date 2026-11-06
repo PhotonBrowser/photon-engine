@@ -158,7 +158,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
     main_thread_vm_ptr()->host_ensure_can_add_private_element = [](JS::Object const& object) -> JS::ThrowCompletionOr<void> {
         // 1. If O is a WindowProxy object, or implements Location, then return ThrowCompletion(a new TypeError).
         if (HTML::WindowProxy::from_object(object) || impl_from<HTML::Location>(&object))
-            return main_thread_vm_ptr()->throw_completion<JS::TypeError>("Cannot add private elements to window or location object"sv);
+            return main_thread_vm_ptr()->throw_completion<JS::TypeError>(u"Cannot add private elements to window or location object"sv);
 
         // 2. Return NormalCompletion(unused).
         return {};
@@ -218,6 +218,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
             case JS::Promise::RejectionOperation::Reject:
                 // 1. Append promise to global's about-to-be-notified rejected promises list.
                 global_mixin.push_onto_about_to_be_notified_rejected_promises_list(promise);
+                HTML::main_thread_event_loop().did_reject_promise_without_handler();
                 break;
             // 7. If operation is "handle",
             case JS::Promise::RejectionOperation::Handle: {

@@ -43,6 +43,8 @@ struct WEBCOMMON_API KeyEvent {
 
     OwnPtr<BrowserInputData> browser_data {};
     bool async_scroll_performed_default_action { false };
+    // How many scrolls for user input the compositor had made when it found nothing to scroll for this key.
+    Optional<u64> user_input_scroll_count_with_nothing_to_scroll {};
 
     // The UI process numbers the events it sends, and a completion names the event it finished.
     u64 id { 0 };
@@ -195,9 +197,11 @@ struct WEBCOMMON_API PinchEvent {
     Web::UIEvents::KeyModifier modifiers { Web::UIEvents::KeyModifier::Mod_None };
     double scale_delta;
     bool async_zoom_performed_default_action { false };
-    // A frame another process hosts dispatched the pinch's ctrl+wheel event and did not cancel it, which leaves only the
-    // zoom of the page's visual viewport to do.
+    // The page dispatched the pinch's ctrl+wheel event and did not cancel it, which leaves only the zoom of the page's
+    // visual viewport to do.
     bool wheel_event_was_dispatched { false };
+    // The fingers have not left the touchpad since an earlier step of the pinch.
+    bool continues_gesture { false };
     u64 id { 0 };
 };
 

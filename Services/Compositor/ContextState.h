@@ -93,6 +93,8 @@ public:
         bool accepted { false };
         Optional<PendingFrame> frame_to_present {};
         bool should_request_rendering_update { false };
+        // Whether a key event found nothing to scroll by the compositor's scroll range, which may lag behind the page's.
+        bool key_found_nothing_to_scroll { false };
         Optional<Web::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
         Optional<HistorySwipeCandidate> history_swipe_candidate {};
         // Why a wheel or mouse event was taken or turned away, and the scroller it was routed to.
@@ -196,6 +198,9 @@ public:
     void update_scroll_state(Compositing::ScrollStateSnapshot&&, Compositing::KeyboardScrollState);
     void set_video_sink(Compositing::VideoSinkResourceId, RefPtr<Media::DisplayingVideoSink>);
     HashMap<u64, Media::VideoSinkHandle> const& video_sink_handles() const { return m_scene.video_sink_handles(); }
+    bool has_image_frame(Compositing::ImageFrameResourceId id) { return m_scene.resource_storage().has_image_frame(id); }
+    Gfx::DecodedImageFrame const& image_frame(Compositing::ImageFrameResourceId id) { return m_scene.resource_storage().image_frame(id); }
+    void replace_image_frame_pixels(Compositing::ImageFrameResourceId id, Gfx::DecodedImageFrame frame) { m_scene.resource_storage().replace_image_frame_pixels(id, move(frame)); }
 
     void invalidate_wheel_event_listener_state(u64 generation);
     void invalidate_keyboard_scroll_state(u64 generation);
@@ -252,6 +257,11 @@ public:
     void end_wheel_gesture_stretch(MonotonicTime now) { m_elastic_overscroll_controller.end_gesture(now); }
     ContextUpdateResult handle_pinch_event(Web::PinchEvent const&);
     bool admits_async_pinch() const { return m_wheel_gesture_routing.admits_async_pinch(); }
+    // Whether this context's page may cancel the ctrl+wheel event of a pinch at the position, or has yet to tell.
+    bool page_may_cancel_pinch_at(Gfx::FloatPoint position);
+    bool pinch_gesture_was_let_through() const { return m_pinch_gesture_was_let_through; }
+    u64 user_input_scroll_count() const { return m_context_user_input_scroll_count; }
+    void set_pinch_gesture_was_let_through(bool was_let_through) { m_pinch_gesture_was_let_through = was_let_through; }
 
     bool may_hand_first_wheel_steps_to_nested_contexts() const;
     Optional<Compositing::NestedContextHit> nested_context_for_wheel_at(Gfx::FloatPoint position);
@@ -310,12 +320,15 @@ public:
     Optional<Gfx::IntRect> advance_elastic_overscroll_rebounds(MonotonicTime frame_time);
     Optional<PendingFrame> advance_scrollbar_fades(MonotonicTime frame_time);
     // The installed scrolling state, its routing admission, and how far the given scroller is stretched, as JSON.
-    String scroll_state_for_testing(Web::AsyncScrollNodeStableID stretched_scroller) const;
+    String scroll_state_for_testing(Web::AsyncScrollNodeStableID scroller) const;
     Web::InputTraceRecorder& input_trace() { return m_input_trace; }
     // Where the first step of a wheel gesture at the position, by the delta in CSS pixels, would go.
     Compositing::FirstWheelStepRouteForTesting route_first_wheel_step_for_testing(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels, Compositing::NestedContextRegions);
     bool advance_visual_animations(MonotonicTime now);
     bool visual_animations_need_frame();
+    // Where the pointer is in this context's device pixels, as the mouse event the context takes or hands on says, or
+    // nowhere, as the pointer leaves it.
+    void note_pointer_position(Optional<Gfx::FloatPoint>);
     Compositing::PendingAsyncScrollUpdates take_pending_async_scroll_updates();
     bool has_pending_async_scroll_updates() const;
 
@@ -372,7 +385,8 @@ private:
     void end_keyboard_scroll_gesture();
     struct KeyScroll {
         KeyboardScrollController::KeyStep step;
-        Compositing::SpatialNodeIndex target_scroll_node_index;
+        // Empty if every box the key could scroll is at the end of its scroll range.
+        Optional<Compositing::SpatialNodeIndex> target_scroll_node_index;
     };
     Optional<KeyScroll> key_scroll_for(Web::KeyEvent const&) const;
     Optional<Web::MouseEvent> interrupt_reported_scroll_momentum();
@@ -487,12 +501,14 @@ private:
     HashMap<Web::AsyncScrollNodeStableID, u64> m_applied_scroll_request_ids;
     // How many times this context scrolled each box for user input of its own, which the reports are marked with too.
     HashMap<Web::AsyncScrollNodeStableID, u64> m_user_input_scroll_counts;
+    u64 m_context_user_input_scroll_count { 0 };
     // The boxes the last frame brought, whose offsets came from that frame's snapshot.
     HashTable<Web::AsyncScrollNodeStableID> m_scroll_nodes_seeded_by_last_frame;
     // Whether this context has scrolled boxes to offsets that WebContent's last frame does not have them at.
     bool m_scroll_offsets_differ_from_last_frame { false };
     // The document whose visual viewport this context zoomed or panned, which it presents as it left it from then on.
     Optional<Web::UniqueNodeID> m_visual_viewport_document_id;
+    bool m_pinch_gesture_was_let_through { false };
     KeyboardScrollController m_keyboard_scroll_controller;
     // The boxes that the keys held since none was have scrolled, whose gesture lasts until the last of them is released.
     Vector<Web::AsyncScrollNodeStableID> m_boxes_scrolled_by_held_keys;
@@ -510,6 +526,8 @@ private:
     bool m_scrollbar_track_press_jumps { false };
     RefPtr<Core::Timer> m_scrollbar_paging_timer;
     PointerInNestedContexts m_pointer_in_nested_contexts;
+    Optional<Gfx::FloatPoint> m_pointer_position;
+    bool m_animated_content_was_under_pointer { false };
     ScrollFlingController m_scroll_fling_controller;
     Optional<Web::MouseEvent> m_last_reported_scroll_momentum_step;
     bool m_reported_scroll_momentum_was_interrupted { false };

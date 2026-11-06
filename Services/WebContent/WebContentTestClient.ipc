@@ -21,6 +21,9 @@ endpoint WebContentTestClient routed by Web::PageId page_id
 
     [NotRouted] set_permission_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId document_id, String name, String state) => (Web::Permissions::PermissionSnapshot snapshot)
     [NotRouted] set_next_permission_prompt_outcome_for_testing(Web::PageId page_id, String name, String outcome, bool held) => ()
+    [NotRouted] set_system_microphone_authorization_for_testing(Web::PageId page_id, String authorization, String answer, bool held) => ()
+    [NotRouted] release_system_microphone_answer_for_testing(Web::PageId page_id) => ()
+    [NotRouted] did_request_microphone_state_for_testing(Web::PageId page_id) => (String state)
     [NotRouted] release_held_permission_prompt_for_testing(Web::PageId page_id, u32 waiters) => ()
     [NotRouted] advance_permission_clock_for_testing(Web::PageId page_id, u64 milliseconds) => (Web::Permissions::PermissionSnapshot snapshot)
     [NotRouted] did_spoof_document_origin_for_testing(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, URL::Origin origin) => ()
@@ -28,6 +31,7 @@ endpoint WebContentTestClient routed by Web::PageId page_id
     [NotRouted] did_request_ui_process_session_history_for_testing(Web::PageId page_id) => (String session_history)
     [NotRouted] did_request_site_isolation_process_tree_for_testing(Web::PageId page_id) => (String process_tree)
     [NotRouted] did_request_tab_is_playing_audio_for_testing(Web::PageId page_id) => (bool is_playing_audio)
+    [NotRouted] did_request_tab_is_heard_playing_audio_for_testing(Web::PageId page_id) => (bool is_heard_playing_audio)
     [NotRouted] did_request_tab_audibility_change_count_for_testing(Web::PageId page_id) => (u64 change_count)
     [NotRouted] did_request_has_populated_document_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) => (bool has_populated_document)
     did_request_crash_of_remote_frame_processes_for_testing(Web::PageId page_id) =|

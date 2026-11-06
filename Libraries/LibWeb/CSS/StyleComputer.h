@@ -43,8 +43,6 @@ class WEB_API StyleComputer final : public GC::Cell {
     GC_DECLARE_ALLOCATOR(StyleComputer);
 
 public:
-    static void for_each_property_expanding_shorthands(PropertyID, StyleValue const&, Function<void(PropertyID, StyleValue const&)> const& set_longhand_property);
-
     static Optional<Utf16String> user_agent_style_sheet_source(Utf16View name);
 
     static Vector<StyleProperty> collect_presentational_hint_properties(DOM::AbstractElement);
@@ -62,7 +60,7 @@ public:
     void update_root_element_font_metrics(ComputedValues const&);
     // The style of a pseudo-element the element holds no style for, as the style engine derives it for one read alone;
     // null where the engine leaves the read to C++.
-    [[nodiscard]] RefPtr<ComputedValues const> engine_transient_pseudo_element_style(Layout::BegunRead const& read, DOM::Element const&, StyleEngine::DemandedPseudoElement);
+    [[nodiscard]] RefPtr<ComputedValues const> engine_transient_pseudo_element_style(Layout::BegunRead const& read, DOM::Element const&, StyleEngine::DemandedPseudoElement, StyleAtomID highlight_name = {});
     [[nodiscard]] JsonArray collect_devtools_applied_style_rules(Layout::BegunRead const& read, DOM::AbstractElement, bool include_inherited, bool include_user_agent_styles);
 
     // The way back from a StyleEngine rule identity to what that rule contributes to the cascade.
@@ -253,6 +251,15 @@ public:
     void ensure_style_node_slot(StyleNodeID);
     void unregister_style_node(StyleNodeID style_node_id);
     [[nodiscard]] GC::Ptr<DOM::Element> element_for_style_node(StyleNodeID style_node_id) const;
+    // Every element holding a style node, in the order of the nodes.
+    template<typename Callback>
+    void for_each_element_with_style_node(Callback callback) const
+    {
+        for (auto const& node : m_element_style_nodes) {
+            if (auto* element = as_if<DOM::Element>(node.ptr()))
+                callback(*element);
+        }
+    }
     [[nodiscard]] GC::Ptr<DOM::Node> node_for_style_node(StyleNodeID style_node_id) const;
     // The node a style node id the render clock's lanes report names, or none where the id left its node since the
     // rendering update the lanes follow took them in last: the id may name another node by now, which the lanes, on a
@@ -304,7 +311,7 @@ private:
     struct ProvisionalTransitionState {
         GC::Ptr<DOM::Element> element;
         Optional<PseudoElement> pseudo_element;
-        PropertyID property_id;
+        PropertyNameAndID property;
         GC::Ptr<CSSTransition> committed_transition;
         GC::Ptr<CSSTransition> proposed_transition;
         StyleValueFFI::FfiTransitionActionKind action {};

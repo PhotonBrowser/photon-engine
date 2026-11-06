@@ -99,7 +99,26 @@ void StyleEngine::mint_text_style_nodes(Span<StyleNodeID> nodes)
     StyleEngineFFI::style_engine_mint_style_nodes(m_render_document->host(), true, raw_nodes);
 }
 
-HashTable<StyleNodeID> StyleEngine::take_deferred_element_initial_features()
+void StyleEngine::defer_element_initial_features(DOM::Element& element)
+{
+    element.set_initial_style_features_pending(true);
+    m_nodes_with_pending_initial_features.append(element.style_node_id());
+    note_element_awaiting_first_style_computation(element);
+}
+
+void StyleEngine::note_element_awaiting_first_style_computation(DOM::Element& element)
+{
+    if (element.needs_preparation_for_style_computation())
+        m_nodes_awaiting_first_style_computation.set(element.style_node_id());
+}
+
+void StyleEngine::cancel_deferred_element_initial_features(DOM::Element& element)
+{
+    element.set_initial_style_features_pending(false);
+    m_nodes_awaiting_first_style_computation.remove(element.style_node_id());
+}
+
+Vector<StyleNodeID> StyleEngine::take_deferred_element_initial_features()
 {
     return move(m_nodes_with_pending_initial_features);
 }
@@ -191,8 +210,6 @@ Optional<StyleEngine::DemandedPseudoElement> StyleEngine::demanded_pseudo_elemen
     // The engine numbers each pseudo-element it answers as its kind: the synthetic ones, the ones an element in the
     // shadow tree backs, and the named view transition ones. ::part() and ::slotted() name other elements.
     switch (pseudo_element) {
-    // FIXME: Compute the styles of ::highlight() pseudo-elements for each custom highlight name.
-    case PseudoElement::Highlight:
     case PseudoElement::Part:
     case PseudoElement::Slotted:
     case PseudoElement::KnownPseudoElementCount:
@@ -249,18 +266,23 @@ void StyleEngine::publish_html_element_namespace(StyleAtomID namespace_atom)
 StyleEngine::WithheldFeaturesNowRead StyleEngine::take_withheld_features_now_read(Layout::BegunRead const& read)
 {
     WithheldFeaturesNowRead now_read;
-    if (m_withheld_local_link_states.is_empty() && m_withheld_attribute_carriers.is_empty())
+    if (!m_local_link_state_is_withheld && !m_validity_state_is_withheld && m_withheld_attribute_names.is_empty())
         return now_read;
     StyleEngineFFI::document_host_learn_selector_requirements(host(), &read);
-    if (!m_withheld_local_link_states.is_empty() && !local_link_is_known_untested())
-        now_read.local_link_states = move(m_withheld_local_link_states);
-    Vector<WithheldAttributeName> names_now_read;
-    for (auto const& [name, carriers] : m_withheld_attribute_carriers) {
-        if (!attribute_is_known_unread(intern_attribute_name(name.local_name, name.namespace_uri)))
-            names_now_read.append(name);
+    if (m_local_link_state_is_withheld && !local_link_is_known_untested()) {
+        m_local_link_state_is_withheld = false;
+        now_read.local_link_state = true;
     }
-    for (auto const& name : names_now_read)
-        now_read.attributes.set(name, m_withheld_attribute_carriers.take(name).release_value());
+    if (m_validity_state_is_withheld && !validity_is_known_untested()) {
+        m_validity_state_is_withheld = false;
+        now_read.validity_state = true;
+    }
+    for (auto const& name : m_withheld_attribute_names) {
+        if (!attribute_is_known_unread(intern_attribute_name(name.local_name, name.namespace_uri)))
+            now_read.attributes.append(name);
+    }
+    for (auto const& name : now_read.attributes)
+        m_withheld_attribute_names.remove(name);
     return now_read;
 }
 
@@ -349,13 +371,13 @@ void StyleEngine::record_element_arrivals(ReadonlySpan<StyleEngineFFI::FfiArrivi
     StyleEngineFFI::style_engine_stage_element_arrivals(host(), elements);
 }
 
-void StyleEngine::record_element_arrival(StyleEngineFFI::FfiElementArrival const& arrival, ReadonlySpan<StyleAtomID> custom_states, ReadonlySpan<StyleAtomID> classes, ReadonlySpan<StyleAtomID> attributes)
+void StyleEngine::record_element_arrival_rows(ReadonlySpan<StyleEngineFFI::FfiElementArrivalRow> rows, ReadonlySpan<u32> atoms)
 {
-    VERIFY(custom_states.size() == arrival.custom_state_count && classes.size() == arrival.class_count && attributes.size() == 2 * static_cast<size_t>(arrival.attribute_count));
+    if (rows.is_empty())
+        return;
     flush_deferred_geometry_transaction_before_non_replayable_input(*this, m_style_computer);
     request_frame_for_first_recorded_input(*this, m_style_computer);
-    static_assert(sizeof(StyleAtomID) == sizeof(u32));
-    StyleEngineFFI::style_engine_stage_element_arrival(host(), &arrival, reinterpret_cast<u32 const*>(custom_states.data()), reinterpret_cast<u32 const*>(classes.data()), reinterpret_cast<u32 const*>(attributes.data()));
+    StyleEngineFFI::style_engine_stage_element_arrival_rows(host(), rows, atoms);
 }
 
 void StyleEngine::record_local_feature_delta(StyleEngineFFI::FfiLocalFeatureDelta const& delta)
@@ -398,6 +420,14 @@ void StyleEngine::set_highlight_observing_elements(PseudoElement pseudo_element,
     flush_deferred_geometry_transaction_before_non_replayable_input(*this, m_style_computer);
     request_frame_for_first_recorded_input(*this, m_style_computer);
     StyleEngineFFI::style_engine_set_highlight_observing_elements(host(), to_underlying(pseudo_element), style_nodes);
+}
+
+void StyleEngine::set_custom_highlight_observing_elements(ReadonlySpan<StyleNodeID> style_nodes, ReadonlySpan<StyleAtomID> names)
+{
+    VERIFY(style_nodes.size() == names.size());
+    flush_deferred_geometry_transaction_before_non_replayable_input(*this, m_style_computer);
+    request_frame_for_first_recorded_input(*this, m_style_computer);
+    StyleEngineFFI::style_engine_set_custom_highlight_observing_elements(host(), style_nodes, names);
 }
 
 void StyleEngine::record_container_query_input_change(StyleNodeID style_node)
@@ -447,7 +477,7 @@ void StyleEngine::submit_recorded_input()
         m_style_computer->document().assign_slottables_if_needed();
     Layout::ForcedReadScope read { render_document() };
     if (m_style_computer) {
-        take_in_pending_style_arrivals(m_style_computer->document(), HiddenChildArrivals::MayWait);
+        take_in_and_publish_pending_style_arrivals(m_style_computer->document(), HiddenChildArrivals::MayWait, read);
         publish_pending_element_features(*this, *m_style_computer, read);
         publish_withheld_element_features(*this, *m_style_computer, read);
     }
@@ -571,12 +601,17 @@ void StyleEngine::gather_computation_inputs(LentComputationInputs& lent)
     // Each scope's @function rules, published after the media environment is settled: a media
     // change rebuilds the definitions. The style engine decides which of them a call names. Most
     // documents hold none, and then no scope is published.
-    auto has_function_rules = [](StyleScope const& scope) { return !scope.rule_cache().function_rules.is_empty(); };
-    bool document_has_function_rules = has_function_rules(document.style_scope());
-    document.for_each_shadow_root([&](DOM::ShadowRoot& shadow_root) {
-        document_has_function_rules = document_has_function_rules || has_function_rules(shadow_root.style_scope());
-    });
-    if (document_has_function_rules) {
+    // OPTIMIZATION: Only a change to the document's style sheets or shadow roots moves the answer, so a style update
+    //               visits them only after one, and a document with many shadow trees pays nothing per update.
+    if (m_function_rules_checked_generation != document.style_sheet_set_generation()) {
+        m_function_rules_checked_generation = document.style_sheet_set_generation();
+        auto has_function_rules = [](StyleScope const& scope) { return !scope.rule_cache().function_rules.is_empty(); };
+        m_document_has_function_rules = has_function_rules(document.style_scope());
+        document.for_each_shadow_root([&](DOM::ShadowRoot& shadow_root) {
+            m_document_has_function_rules = m_document_has_function_rules || has_function_rules(shadow_root.style_scope());
+        });
+    }
+    if (m_document_has_function_rules) {
         auto& style_engine = m_style_computer->style_engine();
         auto publish_scope = [&](StyleScope const& scope) {
             StyleEngineFFI::FfiCustomFunctionEntry entry {

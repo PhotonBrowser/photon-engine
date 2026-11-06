@@ -71,6 +71,8 @@ enum class HiddenChildArrivals {
     MayWait,
 };
 WEB_API void take_in_pending_style_arrivals(DOM::Document&, HiddenChildArrivals = HiddenChildArrivals::TakeIn);
+// The same, with the features of the elements that arrive published as they do, in one write of each element's row.
+WEB_API void take_in_and_publish_pending_style_arrivals(DOM::Document&, HiddenChildArrivals, Layout::BegunRead const&);
 
 // Called once an element whose children, or some descendant's, wait to arrive in a display:none
 // subtree takes a style that is not display:none, or an animation, either of which may reveal them.
@@ -166,6 +168,8 @@ WEB_API void record_element_emptiness_changed(DOM::Element&, DOM::Node const& ch
 // Called for each element whose pseudo-class state actually changed, with the value it changed to.
 // Only the states StyleEngine models as facts are recorded; the rest arrive when it models them.
 WEB_API bool can_record_element_state_change(DOM::Element&);
+// Whether nothing reads the validity of the element, which notes it as withheld from the engine.
+WEB_API bool element_validity_is_withheld(DOM::Element&);
 WEB_API void record_element_state_changed(DOM::Element&, PseudoClass, bool new_value);
 
 // Called before each style flush. The user-agent and user origins have no sheet list to announce

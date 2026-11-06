@@ -129,7 +129,6 @@ pub struct FfiValueParsingContext<'a> {
 pub struct RandomFunctionIndex(std::cell::Cell<usize>);
 
 impl RandomFunctionIndex {
-    #[cfg(test)]
     pub(crate) fn new(index: usize) -> Self {
         Self(std::cell::Cell::new(index))
     }
@@ -336,7 +335,7 @@ fn clamp_to_single_precision_range(value: f64) -> f64 {
     value.clamp(f32::MIN as f64, f32::MAX as f64)
 }
 
-fn round_to_nearest_integer(value: f64) -> i32 {
+pub(crate) fn round_to_nearest_integer(value: f64) -> i32 {
     if value.is_nan() {
         return 0;
     }
@@ -913,6 +912,12 @@ pub(crate) fn parse_ratio_value_with_context(
     values: &[&ComponentValue],
 ) -> Option<StyleValueData> {
     let parse_component = |value: &ComponentValue| {
+        // NB: A query parses its feature values as no property, and resolves a tree-counting function itself.
+        if property == crate::css::property_metadata::property_id::CUSTOM
+            && let Some(tree_counting) = parse_tree_counting_value(context, value, 0)
+        {
+            return Some(tree_counting);
+        }
         if let Some((name, arguments)) = value.function()
             && math_function_from_name(name).is_some()
         {
@@ -5626,11 +5631,18 @@ fn shared_single_layer_initial_list(property: u16) -> Option<RetainedStyleValueD
     // NB: An initial value parses the same in every context, so the list is parsed in the empty one.
     LISTS[index]
         .get_or_init(|| {
-            Some(RetainedStyleValueData::from_owned(value_list(
+            let list = RetainedStyleValueData::from_owned(value_list(
                 vec![coordinating_initial_item(&ParseContext::default(), property)?],
                 1,
                 true,
-            )))
+            ));
+            // NB: The longhand's initial value where it is this list, so that the element declaring the
+            //     list holds the very value its seed does.
+            let initial = crate::css::style_compute::initial_value_handle(property);
+            Some(match *initial == list {
+                true => initial.clone(),
+                false => list,
+            })
         })
         .clone()
 }
@@ -5986,32 +5998,28 @@ fn parse_css_value_after_substitution_scan(
         //     text are written as that serialization.
         let serialization;
         let mut unresolved = if context.is_substituted_value || unresolved_source.is_empty() {
-            let text = if context.is_substituted_value {
-                unresolved_source
-            } else {
-                serialization = crate::css::serialize::serialize_component_values_to_utf16(
-                    values,
-                    crate::css::parser::component_value::ComponentSerializationMode::Retokenize,
-                );
-                &serialization
-            };
+            serialization = crate::css::serialize::serialize_component_values_to_utf16(
+                values,
+                crate::css::parser::component_value::ComponentSerializationMode::Retokenize,
+            );
             unresolved_value_with_components(
-                text,
+                &serialization,
                 UnresolvedValueComponents::OfSerialization(values),
                 substitution_presence,
             )
         } else {
+            serialization = Vec::new();
             unresolved_value(unresolved_source, values.to_vec(), substitution_presence)
         };
         if let StyleValueData::Unresolved(unresolved_payload) = &mut unresolved {
             unresolved_payload.payload_mut().contains_attr_tainted_values = context.contains_attr_tainted_values;
             if property_id == property_id::CUSTOM && context.is_substituted_value {
-                let first_non_whitespace = unresolved_source
+                let first_non_whitespace = serialization
                     .iter()
                     .position(|unit| !matches!(*unit, 0x09 | 0x0a | 0x0c | 0x0d | 0x20))
-                    .unwrap_or(unresolved_source.len());
-                *unresolved_payload = unresolved_payload
-                    .with_source_text(TokenizerInput::Utf16(&unresolved_source[first_non_whitespace..]));
+                    .unwrap_or(serialization.len());
+                *unresolved_payload =
+                    unresolved_payload.with_source_text(TokenizerInput::Utf16(&serialization[first_non_whitespace..]));
             }
         }
         return ParseOutcome::Parsed(shared_style_value(unresolved));
@@ -6637,9 +6645,10 @@ pub unsafe extern "C" fn rust_parse_entire_css_primitive_from_source(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_is_valid_animation_name_custom_ident(source: FfiUtf16View) -> bool {
-    let Some(source) = source.units() else {
-        return false;
-    };
+    source.units().is_some_and(is_valid_animation_name)
+}
+
+pub(crate) fn is_valid_animation_name(source: TokenizerInput<'_>) -> bool {
     is_valid_custom_ident_matching(
         |expected| {
             source.len() == expected.len()

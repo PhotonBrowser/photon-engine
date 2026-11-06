@@ -13,7 +13,6 @@
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
-#include <LibAudio/Audibility.h>
 #include <LibWakeLock/DisplaySleepInhibitor.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/Page/ScreenWakeLockState.h>
@@ -177,6 +176,7 @@ public:
     void show_site_settings_popover();
     void refresh_site_settings_popover();
     void show_zoom_popover();
+    void show_translation_menu();
     void show_bookmark_popover();
     void close_popovers();
 
@@ -188,7 +188,7 @@ public slots:
 signals:
     void title_changed(int id, QString const&);
     void favicon_changed(int id, QIcon const&);
-    void audibility_changed(int id, Audio::Audibility);
+    void playing_audio_indicator_changed(int id);
     void loading_changed();
     void performance_stats_changed();
     void loaded();
@@ -213,6 +213,8 @@ private:
     void update_tab_title();
     void leave_report_review();
     void position_private_session_popover();
+    QWidget& site_settings_anchor() const;
+    void update_permission_prompts();
     void hide_hover_label();
     QImage render_hover_text(QString const&) const;
     void set_loading(bool);
@@ -226,6 +228,8 @@ private:
     Optional<URL::Origin> m_site_settings_popover_origin;
     QTimer* m_content_blocking_update_timer { nullptr };
     QPointer<Popover> m_zoom_popover;
+    QPointer<QAction> m_translate_action;
+    QPointer<QMenu> m_translation_menu;
     QPointer<BookmarkPopover> m_bookmark_popover;
     QPointer<Tab> m_tab_to_activate_on_close;
     QPointer<LocationEdit> m_location_edit;

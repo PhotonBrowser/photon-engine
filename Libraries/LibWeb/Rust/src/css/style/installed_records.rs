@@ -17,12 +17,10 @@
 //! the other named after the fork, the name means nothing to it: it installs a copy of the record,
 //! and the name is told from one of its own by whether its slot holds the record.
 //!
-//! Records that hold the same values share a slot, as the host builds what it renders from once
-//! per identity. They are found by their longhand table's slot hash sum, which the table keeps as
-//! it is written, and told apart by comparing what they hold.
-//! A record a pass computes that holds what an installed one does gives way to the installed one
-//! before it is installed, so that elements computing the same style, such as the clones of a
-//! subtree, hold one record, and their children are computed from it.
+//! An element holds the record it computed. The records of styles derived for what no element is, as
+//! the anonymous boxes of a layout tree and the samples of animations, that hold the same values share
+//! a slot: there is one of them per box, which nothing shares before they are made. They are found
+//! by a hash of the longhands styles most often differ in, and told apart by comparing what they hold.
 
 use super::fast_hash::FastSet as HashSet;
 use super::pipeline::Record;
@@ -30,7 +28,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// The slot of an installed record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct InstalledRecordSlot(u32);
 
 impl InstalledRecordSlot {
@@ -94,23 +92,18 @@ impl InstalledRecord {
     pub(super) fn dependency_flags(&self) -> u8 {
         self.record.view_dependency_flags()
     }
-
-    /// The key the slot is found under by what its record holds.
-    fn content_key(&self) -> u64 {
-        InstalledRecords::content_key(self.record())
-    }
 }
 
 /// The slots of the installed records.
 #[derive(Clone, Default)]
 pub(super) struct InstalledRecords {
-    slots: Vec<Option<InstalledRecord>>,
-    generations: Vec<u32>,
-    free: Vec<InstalledRecordSlot>,
-    /// The slots by the key of what their records hold, which each slot's record keeps.
-    by_content: hashbrown::HashTable<InstalledRecordSlot>,
+    slots: crate::fork_vec::ForkVec<Option<InstalledRecord>>,
+    generations: crate::fork_vec::ForkVec<u32>,
+    free: crate::fork_vec::ForkVec<InstalledRecordSlot>,
+    /// The slots of the records derived for what no element is, by the key of what they hold.
+    derived_by_content: crate::cow_map::CowMap<u64, InstalledRecordSlot>,
     /// The records whose last holder let go, which the next sweep frees unless one took them again.
-    released: Vec<InstalledRecordID>,
+    released: crate::fork::ForkShared<Vec<InstalledRecordID>>,
     /// How many leases on the records held as they are taken were taken.
     lease_epoch: u32,
 }
@@ -125,10 +118,10 @@ impl InstalledRecords {
         }
         report.add(
             super::memory_report::MemoryOwner::Installed,
-            vec_bytes(&self.slots)
-                + vec_bytes(&self.generations)
-                + vec_bytes(&self.free)
-                + crate::heap_size::hash_table_bytes(self.by_content.capacity(), size_of::<InstalledRecordSlot>())
+            self.slots.row_bytes()
+                + self.generations.row_bytes()
+                + self.free.row_bytes()
+                + self.derived_by_content.heap_size()
                 + vec_bytes(&self.released),
         );
     }
@@ -140,23 +133,12 @@ impl InstalledRecords {
         self.slots[id.slot.index()].as_ref()
     }
 
-    /// The identity `record` is installed under: that of the slot holding it, that of a slot
-    /// holding the same values, or a new slot, which the record names, or a copy of it where a
-    /// fork's slot names it already. `dependency_flags` says what a new slot's view depends on.
+    /// The identity `record` is installed under: that of the slot holding it, or a new slot, which
+    /// the record names, or a copy of it where a fork's slot names it already. `dependency_flags`
+    /// says what a new slot's view depends on.
     pub(super) fn install(&mut self, record: &Arc<Record>, dependency_flags: impl FnOnce() -> u8) -> InstalledRecordID {
         if let Some(id) = self.named_by(record) {
             return id;
-        }
-        let content_key = Self::content_key(record);
-        if let Some(&slot) = self.by_content.find(content_key, |&slot| {
-            self.slots[slot.index()]
-                .as_ref()
-                .is_some_and(|entry| entry.record().holds_the_same_as(record))
-        }) {
-            return InstalledRecordID {
-                slot,
-                generation: self.generations[slot.index()],
-            };
         }
         let id = match self.free.pop() {
             Some(slot) => InstalledRecordID {
@@ -189,21 +171,43 @@ impl InstalledRecords {
             holders: 0,
             released_in: self.lease_epoch,
         });
-        let slots = &self.slots;
-        self.by_content.insert_unique(content_key, id.slot, |slot| {
-            slots[slot.index()]
-                .as_ref()
-                .expect("an indexed slot holds its record")
-                .content_key()
-        });
         // NB: A slot nothing holds yet is freed by the next sweep unless an assignment takes it.
         self.released.push(id);
         id
     }
 
-    /// The key a slot for `record` is found under by what the record holds: the
-    /// content hashes of the values of the longhands styles most often differ in, which records
-    /// holding the same values hash alike.
+    /// The identity the record `record`, derived for what no element is, is installed under: that of a slot holding
+    /// the same, or a new slot as [`Self::install`] takes.
+    pub(super) fn install_derived(
+        &mut self,
+        record: &Arc<Record>,
+        dependency_flags: impl FnOnce() -> u8,
+    ) -> InstalledRecordID {
+        if let Some(id) = self.named_by(record) {
+            return id;
+        }
+        // NB: The key reads a few longhands, so records that differ in others share it: each takes the next key free. A
+        //     sweep can open a gap in such a run, which costs a record past it no more than a slot of its own.
+        let mut content_key = Self::content_key(record);
+        while let Some(&slot) = self.derived_by_content.get(&content_key) {
+            if self.slots[slot.index()]
+                .as_ref()
+                .is_some_and(|entry| entry.record().holds_the_same_as(record))
+            {
+                return InstalledRecordID {
+                    slot,
+                    generation: self.generations[slot.index()],
+                };
+            }
+            content_key = content_key.wrapping_add(1);
+        }
+        let id = self.install(record, dependency_flags);
+        self.derived_by_content.insert(content_key, id.slot);
+        id
+    }
+
+    /// The key a record is found under by what it holds: the content hashes of the values of the longhands styles most
+    /// often differ in, which records holding the same values hash alike.
     fn content_key(record: &Record) -> u64 {
         use crate::css::computed_values::LonghandID;
         use crate::css::property_metadata::property_id as prop;
@@ -228,16 +232,6 @@ impl InstalledRecords {
             .hash(&mut hasher);
         }
         hasher.finish()
-    }
-
-    /// An installed record holding the style `record` does, whatever pseudo-elements either styles.
-    pub(super) fn holding_the_same_style_as(&self, record: &Record) -> Option<&Arc<Record>> {
-        let slot = self.by_content.find(Self::content_key(record), |&slot| {
-            self.slots[slot.index()]
-                .as_ref()
-                .is_some_and(|entry| entry.record().holds_the_same_style_as(record))
-        })?;
-        Some(self.slots[slot.index()].as_ref()?.record())
     }
 
     /// The identity of the slot holding `record`, where one here does. A record can name a slot of
@@ -304,9 +298,10 @@ impl InstalledRecords {
             {
                 return false;
             }
-            // NB: A record the host or a reader still holds a reference to keeps its slot, so that
+            // NB: A record the host, a reader or a fork sharing the slot still holds a reference to keeps its slot, so that
             //     its identity keeps naming it until the last reference beside the slot's goes.
             if kept.contains(&id)
+                || self.slots.shares_row(index)
                 || self.slots[index].as_ref().is_some_and(|entry| {
                     Arc::strong_count(entry.record()) > 1
                         || oldest_lease.is_some_and(|epoch| entry.released_in >= epoch)
@@ -316,9 +311,6 @@ impl InstalledRecords {
             }
             let entry = self.slots[index].take().expect("a released slot holds its record");
             entry.record().forget_installed_record();
-            if let Ok(indexed) = self.by_content.find_entry(entry.content_key(), |&slot| slot == id.slot) {
-                indexed.remove();
-            }
             // NB: A slot whose generations ran out is never taken again.
             if self.generations[index] < InstalledRecordID::MAX_GENERATION {
                 self.generations[index] += 1;
@@ -328,6 +320,10 @@ impl InstalledRecords {
             false
         });
         self.released = released;
+        if freed != 0 {
+            let slots = &self.slots;
+            self.derived_by_content.retain(|_, slot| slots[slot.index()].is_some());
+        }
         freed
     }
 
@@ -353,6 +349,17 @@ mod tests {
     }
 
     #[test]
+    fn derived_records_whose_content_shares_a_key_each_keep_a_slot() {
+        let mut records = InstalledRecords::default();
+        let first = records.install_derived(&record(1), || 0);
+        let second = records.install_derived(&record(2), || 0);
+
+        assert_ne!(first, second);
+        assert_eq!(records.install_derived(&record(1), || 0), first);
+        assert_eq!(records.install_derived(&record(2), || 0), second);
+    }
+
+    #[test]
     fn a_record_a_fork_named_first_takes_a_copy_in_a_slot_here() {
         let mut original = InstalledRecords::default();
         let shared = record(1);
@@ -368,7 +375,6 @@ mod tests {
         assert!(!Arc::ptr_eq(&copy, &shared));
         assert!(copy.holds_the_same_as(&shared));
         assert_eq!(original.named_by(&copy), Some(here));
-        assert_eq!(original.install(&shared, || 0), here);
     }
 
     #[test]

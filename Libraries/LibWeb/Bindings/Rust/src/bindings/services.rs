@@ -29,11 +29,25 @@ unsafe extern "C" {
     /// interface implemented in Rust, or null.
     pub(crate) fn web_bindings_rust_wrapper_for(realm: *mut c_void, cell: *mut c_void) -> *mut c_void;
 
+    /// Defines the unforgeable attributes of the interface implemented in C++ on the wrapper.
+    pub(crate) fn web_bindings_define_unforgeable_attributes(
+        realm: *mut c_void,
+        wrapper: *mut c_void,
+        interface_name: u16,
+    );
+
     /// Makes `wrapper` the wrapper that the world of its realm, which is not a main world, holds for the cell.
     pub(crate) fn web_bindings_set_rust_wrapper(realm: *mut c_void, cell: *mut c_void, wrapper: *mut c_void);
 
+    /// Pushes a new element queue onto the custom element reactions stack of the agent of the main thread.
+    pub(crate) fn web_bindings_push_element_queue();
+
+    /// Pops the element queue from that stack and invokes the custom element reactions in it.
+    pub(crate) fn web_bindings_pop_element_queue_and_invoke_reactions();
+
     /// Whether the global object of the realm is a Window.
     pub(crate) fn web_bindings_realm_is_window(realm: *mut c_void) -> bool;
+    pub(crate) fn web_bindings_realm_is_secure_context(realm: *mut c_void) -> bool;
 
     /// Runs the steps with the context while an execution context of the realm is on the stack, as an
     /// HTML::TemporaryExecutionContext puts it there, with callbacks enabled if `callbacks_enabled`.

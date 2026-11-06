@@ -231,7 +231,7 @@ pub struct ObjectMethods {
     pub has_constructor: fn(&Object) -> bool,
     pub is_strict_mode: fn(&Object) -> bool,
     /// Takes the VM since an ECMAScript function compiles its body the first time it is asked.
-    pub get_stack_frame_info: fn(&Object, &Vm, &mut StackFrameInfo),
+    pub get_stack_frame_info: fn(&Object, &Vm, &mut StackFrameInfo) -> ThrowCompletionOr<()>,
     /// FunctionObject::realm(), the [[Realm]] of a function that has one.
     pub function_realm: fn(&Object) -> Option<Gc<Realm>>,
     /// FunctionObject::name_for_call_stack(), which every class of function object defines.
@@ -278,7 +278,7 @@ pub static ORDINARY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     internal_construct: None,
     has_constructor: |_| false,
     is_strict_mode: |_| false,
-    get_stack_frame_info: |_, _, _| {},
+    get_stack_frame_info: |_, _, _| Ok(()),
     function_realm: |_| None,
     name_for_call_stack: |_| unreachable!("FunctionObject::name_for_call_stack is pure virtual"),
     native_function: None,
@@ -1021,8 +1021,8 @@ impl Object {
             return false;
         }
         let methods = self.methods();
-        // NB: ECMAScript function objects only answer "caller", "arguments" and lazily created "length", "name" and
-        //     "prototype" properties themselves, and arrays only "length" and array indices.
+        // NB: ECMAScript function objects only answer lazily created "length", "name" and "prototype" properties
+        //     themselves, and arrays only "length" and array indices.
         (core::ptr::fn_addr_eq(
             methods.internal_get_own_property,
             ORDINARY_OBJECT_METHODS.internal_get_own_property,
@@ -1069,14 +1069,12 @@ impl Object {
         if core::ptr::fn_addr_eq(internal_get_own_property, ordinary_get_own_property) {
             return true;
         }
-        // NB: ECMAScript function objects only answer "caller", "arguments" and lazily created "length", "name" and
-        //     "prototype" properties themselves.
+        // NB: ECMAScript function objects only answer lazily created "length", "name" and "prototype" properties
+        //     themselves.
         core::ptr::fn_addr_eq(
             internal_get_own_property,
             ECMASCRIPT_FUNCTION_OBJECT_METHODS.internal_get_own_property,
-        ) && *property_key != vm.names.caller
-            && *property_key != vm.names.arguments
-            && *property_key != vm.names.prototype
+        ) && *property_key != vm.names.prototype
             && *property_key != vm.names.length
             && *property_key != vm.names.name
     }
@@ -1243,13 +1241,16 @@ impl Object {
                         target_shape = target_shape.create_configure_transition(vm, property_key, new_attributes);
                     }
                 }
+                if !target_shape.is_non_extensible() {
+                    target_shape = target_shape.create_non_extensible_transition(vm);
+                }
                 shape.set_cached_integrity_level_shape(vm, level, target_shape);
                 target_shape
             }
         };
 
-        self.set_extensible(false);
         self.shape.set(target_shape);
+        self.set_non_extensible(vm);
         true
     }
 
@@ -1422,7 +1423,6 @@ impl Object {
         let from_shape = from.shape();
         if !(self.shape() == new_object_shape
             && self.indexed_storage_kind() == IndexedStorageKind::None
-            && self.extensible()
             && self.eligible_for_own_property_enumeration_fast_path()
             && !self.has_intrinsic_accessors()
             && !self.may_interfere_with_indexed_property_access()
@@ -1541,7 +1541,6 @@ impl Object {
             && excluded_values.is_empty()
             && self.shape() == current_realm().new_object_shape()
             && self.indexed_storage_kind() == IndexedStorageKind::None
-            && self.extensible()
             && self.eligible_for_own_property_enumeration_fast_path()
             && !self.has_intrinsic_accessors()
             && !self.may_interfere_with_indexed_property_access()
@@ -1553,6 +1552,7 @@ impl Object {
             && !from.requires_slow_add_own_property()
             && !from.shape().is_dictionary()
             && !from.shape().is_prototype_shape()
+            && !from.shape().is_non_extensible()
             // NB: No other object may share the shape of a global object (see `Dependency::GlobalPropertyUnassigned`).
             && !from.has_global_object_flag()
             && from.shape().realm() == current_realm()
@@ -2076,8 +2076,8 @@ impl Object {
         (self.methods().is_strict_mode)(self)
     }
 
-    pub fn get_stack_frame_info(&self, vm: &Vm, info: &mut StackFrameInfo) {
-        (self.methods().get_stack_frame_info)(self, vm, info);
+    pub fn get_stack_frame_info(&self, vm: &Vm, info: &mut StackFrameInfo) -> ThrowCompletionOr<()> {
+        (self.methods().get_stack_frame_info)(self, vm, info)
     }
 
     pub fn function_realm(&self) -> Option<Gc<Realm>> {
@@ -2162,9 +2162,9 @@ impl Object {
     }
 
     // 10.1.4 [[PreventExtensions]] ( ), https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-preventextensions
-    pub fn ordinary_prevent_extensions(&self, _vm: &Vm) -> ThrowCompletionOr<bool> {
+    pub fn ordinary_prevent_extensions(&self, vm: &Vm) -> ThrowCompletionOr<bool> {
         // 1. Set O.[[Extensible]] to false.
-        self.set_extensible(false);
+        self.set_non_extensible(vm);
 
         // 2. Return true.
         Ok(true)
@@ -3481,11 +3481,19 @@ impl Object {
         self.has_flag(object_flag::IS_EXTENSIBLE)
     }
 
-    pub fn set_extensible(&self, value: bool) {
-        if value {
-            self.set_flag(object_flag::IS_EXTENSIBLE);
+    pub fn set_non_extensible(&self, vm: &Vm) {
+        self.clear_flag(object_flag::IS_EXTENSIBLE);
+        if self.shape().is_non_extensible() {
+            return;
+        }
+        // NB: Reifying lazy function properties rebuilds the shape without the flag, so it comes first.
+        self.reify_lazy_function_properties(vm);
+        let shape = self.shape();
+        if shape.is_dictionary() {
+            self.dictionary_shape_to_change_in_place(vm)
+                .set_non_extensible_without_transition(vm);
         } else {
-            self.clear_flag(object_flag::IS_EXTENSIBLE);
+            self.shape.set(shape.create_non_extensible_transition(vm));
         }
     }
 

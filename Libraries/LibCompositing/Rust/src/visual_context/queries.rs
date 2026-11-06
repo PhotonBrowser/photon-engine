@@ -9,6 +9,7 @@ use super::{
     IncludeVisualViewportTransform, SpatialData, SpatialNodeIndex, TransformDataRole, VISUAL_VIEWPORT_NODE_INDEX,
     VisualContextTree, device_offset_for_index,
 };
+use ak::math;
 use libgfx_rust::{
     CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, IntPoint, IntRect, map_rect_through_matrix,
 };
@@ -353,6 +354,30 @@ impl VisualContextTree {
                 clip_path.path.contains(point.x, point.y, clip_path.fill_rule)
             }
             ClipNodeData::Dead => true,
+        }
+    }
+
+    pub fn can_snap_composited_context_origin(&self, mut spatial_node_index: SpatialNodeIndex) -> bool {
+        loop {
+            let Some(node) = self.spatial_nodes.get(spatial_node_index.0 as usize) else {
+                return false;
+            };
+
+            if !node.data.is_live() {
+                return false;
+            }
+
+            if spatial_node_index == VISUAL_VIEWPORT_NODE_INDEX {
+                return true;
+            }
+
+            match &node.data {
+                SpatialData::Transform(transform) if transform.matrix != FloatMatrix4x4::identity() => return false,
+                SpatialData::Perspective(_) => return false,
+                _ => {}
+            }
+
+            spatial_node_index = node.parent;
         }
     }
 
@@ -828,7 +853,7 @@ impl VisualContextTree {
                 let origin = transform.origin;
                 let dx = (rect.x - origin.x).abs().max((rect.right() - origin.x).abs());
                 let dy = (rect.y - origin.y).abs().max((rect.bottom() - origin.y).abs());
-                let radius = dx.hypot(dy);
+                let radius = math::hypot(dx, dy);
                 rect = FloatRect::new(origin.x - radius, origin.y - radius, 2.0 * radius, 2.0 * radius);
             } else {
                 let matrix = self.local_spatial_matrix(index, scroll_offsets).matrix;
@@ -886,6 +911,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         }
     }
 

@@ -125,6 +125,25 @@ describe("testing behavior", () => {
         expect(passed).toBeTrue();
     });
 
+    test("reads the specifier before evaluating the options", () => {
+        let specifier = "./empty.mjs";
+        let passed = false;
+        let error = null;
+
+        import(specifier, ((specifier = "./does-not-exist.mjs"), undefined))
+            .then(() => {
+                passed = true;
+            })
+            .catch(err => {
+                error = err;
+            });
+
+        runQueuedPromiseJobs();
+        if (error) throw error;
+
+        expect(passed).toBeTrue();
+    });
+
     test("expectModulePassed works", () => {
         expectModulePassed("./single-const-export.mjs");
     });
@@ -173,8 +192,16 @@ describe("in- and exports", () => {
         expectModulePassed("./declarations-tests.mjs");
     });
 
+    test("var declarations can repeat a name", () => {
+        expectModulePassed("./var-redeclaration.mjs");
+    });
+
     test("string '*' is not a full namespace import", () => {
         expectModulePassed("./string-import-names.mjs");
+    });
+
+    test("a name after the empty name keeps its meaning in functions", () => {
+        expectModulePassed("./empty-string-export-after-functions.mjs");
     });
 
     test("can combine string and default exports", () => {

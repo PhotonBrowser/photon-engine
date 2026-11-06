@@ -62,6 +62,7 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
+#include <LibWeb/HTML/Scripting/CompiledScriptCache.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
@@ -217,15 +218,20 @@ private:
     HashMap<Utf16String, NonnullRefPtr<HTTP::MemoryCache>> m_cache;
 };
 
-// https://fetch.spec.whatwg.org/#determine-the-http-cache-partition
-static RefPtr<HTTP::MemoryCache> determine_the_http_cache_partition(Infrastructure::Request const& request)
+Optional<Utf16String> http_cache_partition(Infrastructure::Request const& request)
 {
-    // 1. Let key be the result of determining the network partition key given request.
     auto key = Infrastructure::determine_the_network_partition_key(request);
 
     // NB: We partition this cache like RequestServer's disk cache, which a request from a document with an opaque
     //     origin does not use.
-    auto partition = key.has_value() ? key->disk_cache_partition() : OptionalNone {};
+    return key.has_value() ? key->disk_cache_partition() : OptionalNone {};
+}
+
+// https://fetch.spec.whatwg.org/#determine-the-http-cache-partition
+static RefPtr<HTTP::MemoryCache> determine_the_http_cache_partition(Infrastructure::Request const& request)
+{
+    // 1. Let key be the result of determining the network partition key given request.
+    auto partition = http_cache_partition(request);
 
     // 2. If key is null, then return null.
     if (!partition.has_value())
@@ -251,9 +257,6 @@ static RefPtr<Infrastructure::Response> select_response_from_cache(HTTP::MemoryC
     response->set_status(cache_entry->status_code);
     response->set_status_message(cache_entry->reason_phrase);
     response->set_header_list(cache_entry->response_headers);
-    response->set_javascript_bytecode_cache(cache_entry->javascript_bytecode_cache);
-    response->set_javascript_bytecode_cache_vary_key(cache_entry->javascript_bytecode_cache_vary_key);
-    response->set_javascript_bytecode_cache_memory_cache_request_headers(HTTP::HeaderList::create(cache_entry->request_headers->headers()));
 
     response->set_body(Infrastructure::ResponseBody::from_bytes(cache_entry->response_body));
 
@@ -267,8 +270,7 @@ static void store_response_in_cache(HTTP::MemoryCache& http_cache, Infrastructur
     if (request.cache_mode() == HTTP::CacheMode::NoStore)
         return;
 
-    response.set_javascript_bytecode_cache_memory_cache_request_headers(HTTP::HeaderList::create(request.header_list()->headers()));
-    http_cache.create_entry(request.current_url(), request.method(), request.header_list(), request.request_time(), response.status(), response.status_message(), response.header_list(), response.javascript_bytecode_cache(), response.javascript_bytecode_cache_vary_key());
+    http_cache.create_entry(request.current_url(), request.method(), request.header_list(), request.request_time(), response.status(), response.status_message(), response.header_list());
 }
 
 // Ends the delivery of a response's body that the fetch will not read.
@@ -2784,7 +2786,7 @@ GC::Ptr<Infrastructure::Body> adopt_navigation_response_body(JS::Realm& realm, I
     auto body_pump = GC::make_root(network_body.body_pump);
     auto cross_origin_isolated_capability = Bindings::principal_host_defined_environment_settings_object(realm).cross_origin_isolated_capability();
     request->set_unbuffered_request_callbacks(
-        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) { },
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Requests::CacheState) { },
         [body_pump](Requests::ResponseData data) {
             body_pump->handle_network_data(move(data));
         },
@@ -2892,7 +2894,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     // A load without a RequestServer request, such as one for a file: URL, hands over its whole body at once.
     auto whole_body_transport = create_whole_body_transport(*delivery_gate, *channel);
 
-    auto on_headers_received = GC::create_function(GC::Heap::the(), [fetch_params = NonnullRefPtr { fetch_params }, pending_response, request, body_pump, channel, delivery_gate, whole_body_transport, http_cache](Engine::NetworkTransportHandle* network_transport, HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, Requests::CacheState cache_state) {
+    auto on_headers_received = GC::create_function(GC::Heap::the(), [fetch_params = NonnullRefPtr { fetch_params }, pending_response, request, body_pump, channel, delivery_gate, whole_body_transport, http_cache](Engine::NetworkTransportHandle* network_transport, HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase, Requests::CacheState cache_state) {
         if (pending_response->is_resolved()) {
             // RequestServer will send us the response headers twice, the second time being for HTTP trailers. This
             // fetch algorithm is not interested in trailers, so just drop them here.
@@ -2908,8 +2910,6 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
 
         if (reason_phrase.has_value())
             response->set_status_message(reason_phrase->to_byte_string());
-        response->set_javascript_bytecode_cache(move(javascript_bytecode));
-        response->set_javascript_bytecode_cache_vary_key(javascript_bytecode_cache_vary_key);
 
         // AD-HOC: RequestServer selects responses from the HTTP cache on WebContent's behalf, so it reports whether
         //         this response was served from a stored response ("local") or from a stored response that the
@@ -3090,10 +3090,27 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
 
         // 4. Incrementally read request’s body given processBodyChunk, processEndOfBody, processBodyError, and
         //    fetchParams’s task destination.
-        // AD-HOC: A request holds its body's source and length but not its stream. A body with a source is read as its
-        //         stream would give it, as one chunk of the whole source, and a body without one through the reader
-        //         fetch() acquired for its stream.
-        if (auto const& source = body->source(); source.has_value()) {
+        // AD-HOC: A request holds its body's source and length but not its stream. A body with a source is read in the
+        //         chunks RequestServer reports sending it in, when it goes over the network, and otherwise as one
+        //         chunk of the whole source. A body without a source is read through the reader fetch() acquired for
+        //         its stream.
+        auto const& source = body->source();
+        if (source.has_value() && source->size() > 0 && network_transport) {
+            network_transport->set_on_upload_progress([fetch_params = NonnullRefPtr { fetch_params }, process_body_chunk, process_end_of_body = GC::Root { process_end_of_body }, length = source->size(), bytes_read = u64 { 0 }](u64 bytes_sent) mutable {
+                bytes_sent = min(bytes_sent, length);
+                if (bytes_sent <= bytes_read)
+                    return;
+                auto chunk_length = bytes_sent - bytes_read;
+                bytes_read = bytes_sent;
+
+                auto controller = fetch_params->controller();
+                Infrastructure::queue_fetch_task(controller, controller->task_destination(), GC::create_function(GC::Heap::the(), [process_body_chunk, chunk_length] {
+                    process_body_chunk(chunk_length);
+                }));
+                if (bytes_read == length)
+                    Infrastructure::queue_fetch_task(controller, controller->task_destination(), GC::Ref { *process_end_of_body });
+            });
+        } else if (source.has_value()) {
             if (auto length = source->size(); length > 0) {
                 Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.controller()->task_destination(), GC::create_function(GC::Heap::the(), [process_body_chunk, length] {
                     process_body_chunk(length);
@@ -3577,16 +3594,7 @@ bool http_memory_cache_enabled()
 void clear_http_memory_cache()
 {
     HTTPCache::the().clear_cache();
-}
-
-void update_javascript_bytecode_cache_in_http_memory_cache(Utf16String const& partition, URL::URL const& url, ByteString const& method, HTTP::HeaderList const& request_headers, u64 vary_key, Core::ImmutableBytes javascript_bytecode_cache)
-{
-    if (!g_http_memory_cache_enabled)
-        return;
-
-    // Only back-fill into a partition that already has a cache; do not create an empty one just to drop bytecode into.
-    if (auto* http_cache = HTTPCache::the().get_if_exists(partition))
-        http_cache->update_javascript_bytecode_cache(url, method, request_headers, vary_key, move(javascript_bytecode_cache));
+    HTML::CompiledScriptCache::the().clear();
 }
 
 }

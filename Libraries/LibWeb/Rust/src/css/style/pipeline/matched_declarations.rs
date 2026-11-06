@@ -840,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn elements_with_one_key_wait_on_a_font_once() {
+    fn elements_with_one_key_resolve_a_font_once() {
         let (mut engine, nodes) = document_with_children(12);
         let sheet = add_sheet(&mut engine, TreeScopeID::DOCUMENT);
         add_rules(&mut engine, sheet, ".item { font-size: 13px; }");
@@ -917,9 +917,8 @@ mod tests {
         let plain = nodes[RECORDS + 2];
         // NB: A value no other test holds, as tests run side by side and small numbers are shared.
         let written = RetainedStyleValueData::from_owned(StyleValueData::Number { value: 8675309.25 });
-        engine.element_declarations.set(
+        engine.element_declarations.set_inline_for_test(
             declaring,
-            ElementDeclarationKind::InlineStyle,
             vec![(
                 DeclarationEntry::new(
                     crate::css::property_metadata::property_id::MARGIN_LEFT,

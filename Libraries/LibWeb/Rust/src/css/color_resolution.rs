@@ -15,6 +15,7 @@ use crate::css::style_value::{
     CalculatedPayload, ColorFunctionPayload, ColorMixPayload, LightDarkPayload, StyleValueBox,
 };
 use crate::css::style_value_arc::StyleValueArc;
+use ak::math;
 
 use crate::css::calc::{
     ANGLE_UNIT_CANONICAL_RATIOS, ResolveAs, resolve_as_from_fields, resolve_calculated_angle_with_channels,
@@ -249,7 +250,7 @@ impl Rgba {
             if srgb <= 0.04045 {
                 srgb / 12.92
             } else {
-                ((srgb + 0.055) / 1.055).powf(2.4)
+                math::pow((srgb + 0.055) / 1.055, 2.4)
             }
         }
         0.2126 * linearize(self.r) + 0.7152 * linearize(self.g) + 0.0722 * linearize(self.b)
@@ -984,8 +985,8 @@ fn construct_color(color_type: u8, c1: f64, c2: f64, c3: f64, alpha: f64) -> Opt
             let hue_radians = c3.to_radians();
             Rgba::from_lab(
                 l as f32,
-                (c2 * hue_radians.cos()) as f32,
-                (c2 * hue_radians.sin()) as f32,
+                (c2 * math::cos(hue_radians)) as f32,
+                (c2 * math::sin(hue_radians)) as f32,
                 alpha as f32,
             )
         }
@@ -996,8 +997,8 @@ fn construct_color(color_type: u8, c1: f64, c2: f64, c3: f64, alpha: f64) -> Opt
             let hue_radians = c3.to_radians();
             Rgba::from_oklab(
                 l as f32,
-                (chroma * hue_radians.cos()) as f32,
-                (chroma * hue_radians.sin()) as f32,
+                (chroma * math::cos(hue_radians)) as f32,
+                (chroma * math::sin(hue_radians)) as f32,
                 alpha as f32,
             )
         }
@@ -1601,57 +1602,6 @@ pub(crate) fn relative_color_computed_value_form(value: StyleValueData) -> Style
         name: CssString::none(),
         origin_color: retained_null(),
     }))
-}
-
-/// The resolved value of a relative color function against a style: its relative form in its
-/// computed value form. Returns one strong reference, or null when the origin color does not
-/// resolve.
-///
-/// # Safety
-/// `style` must be null or point at a style whose group payloads outlive the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_relative_color_resolved_value(
-    value: &StyleValueData,
-    style: *const FfiColorResolutionStyle,
-) -> *const StyleValueData {
-    // SAFETY: Guaranteed by the caller.
-    let resolution_input = unsafe { ColorResolutionInput::for_ffi_style(style) };
-    match resolve_relative_form(value, &resolution_input) {
-        Some(resolved) => StyleValueArc::into_raw(StyleValueArc::new(relative_color_computed_value_form(resolved))),
-        None => core::ptr::null(),
-    }
-}
-
-/// The resolved value of a `color-mix()` against a style: the color it mixes, in the form a mix whose colors are all
-/// known computes to. A computed mix stays a mix only where it reads `currentcolor`, which the style names. Returns
-/// one strong reference, or null when the value is no mix or does not resolve.
-///
-/// # Safety
-/// `style` must be null or point at a style whose group payloads outlive the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_color_mix_resolved_value(
-    value: &StyleValueData,
-    style: *const FfiColorResolutionStyle,
-) -> *const StyleValueData {
-    if !matches!(value, StyleValueData::ColorMix { .. }) {
-        return core::ptr::null();
-    }
-    // SAFETY: Guaranteed by the caller.
-    let resolution_input = unsafe { ColorResolutionInput::for_ffi_style(style) };
-    match resolve_color_mix(value, &resolution_input) {
-        Some(resolved) => StyleValueArc::into_raw(StyleValueArc::new(resolved)),
-        None => core::ptr::null(),
-    }
-}
-
-/// Whether a color function value has a missing color component, which its resolved value keeps.
-///
-/// # Safety
-/// `value` must point at live style value data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_color_function_has_missing_component(value: *const core::ffi::c_void) -> bool {
-    let value = unsafe { &*value.cast::<StyleValueData>() };
-    crate::css::serialize::color_function_has_missing_component(value)
 }
 
 /// Port of ColorStyleValue::extract_channels_in_color_space().

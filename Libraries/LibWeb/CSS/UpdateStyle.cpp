@@ -177,6 +177,8 @@ static void apply_element_style_invalidation_after_style_change(Layout::BegunRea
 
 static void apply_document_style_invalidation_after_style_change(DOM::Document& document, RequiredInvalidationAfterStyleChange const& invalidation)
 {
+    if (invalidation.cursor_changed)
+        document.set_cursor_may_be_stale();
     if (!invalidation.needs_repaint())
         return;
     if (invalidation.invalidates_hit_test_display_list())
@@ -344,6 +346,10 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
                 Optional<PseudoElement> pseudo_element;
                 if (swap.slot != NumericLimits<u8>::max())
                     pseudo_element = static_cast<PseudoElement>(swap.slot);
+                if (pseudo_element == PseudoElement::Highlight) {
+                    element->swap_in_custom_highlight_style_record(StyleAtomID { swap.highlight_name }, swap.record);
+                    continue;
+                }
                 // A pseudo-element's transitions may start in a later pass too.
                 if (pseudo_element.has_value()) {
                     DOM::AbstractElement abstract_element { *element, pseudo_element };
@@ -359,10 +365,16 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         }
     };
 
+    // NB: No element holds children waiting to arrive where the document has none below it.
+    auto const reveal_waiting = document.descendant_style_arrival_pending() ? CSS::MainEffects::RevealWaiting : CSS::MainEffects::None;
     for (auto const& element_effects : ReadonlySpan<InstalledElementEffects> { effects, effect_count }) {
+        auto main_effects = static_cast<CSS::MainEffects>(element_effects.effects);
+        main_effects &= ~CSS::MainEffects::RevealWaiting | reveal_waiting;
+        // NB: The swaps of an element with nothing else to do come with the next element's that has.
+        if (main_effects == CSS::MainEffects::None && element_effects.pseudo_elements_composed == 0)
+            continue;
         swap_in_styles_until(element_effects.swaps_begin);
         auto* element = element_for(element_effects.style_node);
-        auto const main_effects = static_cast<CSS::MainEffects>(element_effects.effects);
         // https://drafts.csswg.org/css-transitions-1/#starting
         // The transition step compares the style the element held before its swaps with the record they install, so the
         // record it held has to outlive its replacement until the step has read it. A step toward a record that declares
@@ -385,7 +397,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         InstalledStyle const old_style { element_effects.old_record };
         swap_in_styles_until(element_effects.swaps_end);
 
-        if (!element || !element->has_style() || main_effects == CSS::MainEffects::None)
+        if (!element || !element->has_style())
             continue;
         element->note_subtree_style_moved();
         auto invalidation = decode_style_invalidation(element_effects.damage);
@@ -555,7 +567,7 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
     // since the last update under the identities they take here.
     // NB: What connected beside the transaction that flew is the next transaction's.
     if constexpr (!drains_flown_transaction) {
-        take_in_pending_style_arrivals(document, HiddenChildArrivals::MayWait);
+        take_in_and_publish_pending_style_arrivals(document, HiddenChildArrivals::MayWait, read);
         document.update_highlight_style_observability();
     }
     StyleUpdateScope style_update_scope { document.style_computer() };
@@ -575,8 +587,21 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
             return begin_style_update_inputs(read, document, container_layout);
         }
     }();
-    if (!inputs.has_value())
+    auto const self_check = [&] {
+        auto* root = document.document_element();
+        StyleEngineFFI::style_engine_self_check(document.style_computer().style_engine().host(), &read, root ? root->style_node_id().value() : 0);
+    };
+    // NB: An update behind one that flew and left nothing to do is the one that checks it.
+    auto const self_check_a_flown_update = [&] {
+        if constexpr (!drains_flown_transaction) {
+            if (StyleEngineFFI::style_engine_flown_update_awaits_self_check(document.style_computer().style_engine().host()))
+                self_check();
+        }
+    };
+    if (!inputs.has_value()) {
+        self_check_a_flown_update();
         return;
+    }
     if (has_no_style_work) {
         dbgln("Style update found work its document said it had none of");
         VERIFY_NOT_REACHED();
@@ -611,8 +636,10 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
         if (element.installed_style().view().animated_overlay || element.custom_property_data_is_animation_overlay({}))
             sample_animations_for_installed_record(DOM::AbstractElement { element });
     });
-    if (!applied.had_reactions)
+    if (!applied.had_reactions) {
+        self_check_a_flown_update();
         return;
+    }
 
     document.set_has_completed_style_update();
     apply_document_style_invalidation_after_style_change(document, application.invalidation);
@@ -626,10 +653,8 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
     //     update checks. So does the one after an update that stopped at its limit of passes with what they fed back
     //     still pending. An update that stopped with nothing left has settled.
     auto const stopped_with_work_left = applied.pass_guard_hits != 0 && document.style_computer().style_engine().has_pending_transaction(read);
-    if (!drains_flown_transaction && !stopped_with_work_left && StyleEngineFFI::style_engine_self_check_is_enabled(document.style_computer().style_engine().host())) {
-        auto* root = document.document_element();
-        StyleEngineFFI::style_engine_self_check(document.style_computer().style_engine().host(), &read, root ? root->style_node_id().value() : 0);
-    }
+    if (!drains_flown_transaction && !stopped_with_work_left && StyleEngineFFI::style_engine_self_check_is_enabled(document.style_computer().style_engine().host()))
+        self_check();
 }
 
 // Records what update_style() records before it runs the document's style update, and lets the update fly
@@ -788,7 +813,7 @@ static bool update_style_for_element(Layout::BegunRead const& read, DOM::Documen
     auto const& read_element = abstract_element.element();
     auto read_may_need_waiting_children = document.descendant_style_arrival_pending()
         && read_element.has_inclusive_ancestor_with_display_none_ignoring_animations();
-    take_in_pending_style_arrivals(document, read_may_need_waiting_children ? HiddenChildArrivals::TakeIn : HiddenChildArrivals::MayWait);
+    take_in_and_publish_pending_style_arrivals(document, read_may_need_waiting_children ? HiddenChildArrivals::TakeIn : HiddenChildArrivals::MayWait, read);
     document.update_highlight_style_observability();
     StyleUpdateScope style_update_scope { document.style_computer() };
     // Refresh computed properties for an abstract element. An ordinary read first consumes the complete exact

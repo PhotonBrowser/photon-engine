@@ -54,6 +54,7 @@
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
+#include <LibWeb/CSS/StylePropertyMapReadOnly.h>
 #include <LibWeb/CSS/StyleSheetInvalidation.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ContentStyleValue.h>
@@ -148,10 +149,12 @@
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
+#include <LibWeb/MathML/MathMLAnchorElement.h>
 #include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/MathML/TagNames.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/PageHoverLink.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -227,6 +230,8 @@ void Element::RareData::visit_edges(Cell::Visitor& visitor)
         for (auto& observer : *registered_intersection_observers)
             visitor.visit(observer);
     }
+    if (registered_resize_observers)
+        visitor.visit(*registered_resize_observers);
 }
 
 OwnPtr<Node::RareData> Element::create_rare_data() const
@@ -608,7 +613,7 @@ bool Element::cannot_navigate() const
         return true;
 
     // - element is not an a element and is not connected.
-    return !(is_html_anchor_element() || is_svg_a_element()) && !is_connected();
+    return !(is_html_anchor_element() || is_svg_a_element() || is_mathml_anchor_element()) && !is_connected();
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#links-created-by-a-and-area-elements
@@ -617,6 +622,8 @@ HTML::HTMLHyperlinkElementUtils const* Element::created_hyperlink() const
     HTML::HTMLHyperlinkElementUtils const* hyperlink_element = as_if<HTML::HTMLAnchorElement>(*this);
     if (!hyperlink_element)
         hyperlink_element = as_if<HTML::HTMLAreaElement>(*this);
+    if (!hyperlink_element)
+        hyperlink_element = as_if<MathML::MathMLAnchorElement>(*this);
     if (!hyperlink_element)
         return nullptr;
 
@@ -643,7 +650,7 @@ void Element::follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML:
     Utf16String target_attribute_value;
 
     // 3. If subject is an a or area element, then set targetAttributeValue to the result of getting an element's target given subject.
-    if (is_html_anchor_element() || is_html_area_element() || is_svg_a_element())
+    if (is_html_anchor_element() || is_html_area_element() || is_svg_a_element() || is_mathml_anchor_element())
         target_attribute_value = get_an_elements_target();
 
     // 4. Let urlRecord be the result of encoding-parsing a URL given subject's href attribute value, relative to subject's node document.
@@ -1953,10 +1960,44 @@ void Element::swap_in_style_record(Layout::BegunRead const& read, Optional<CSS::
     ++m_animation_style_generation;
     VERIFY(record);
     m_installed_style = CSS::InstalledStyle { record };
+    // A new style can change the states and the text formatting the accessibility tree reports for the element.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_records_after_style_change(*this);
     auto const style_record = m_installed_style.record();
     // NB: The render side installed the record in a box it styles itself, which the box adopts.
     if (auto* layout_node = unsafe_layout_node(read))
         layout_node->set_style_record_identity(style_record);
+}
+
+Element::CustomHighlightStyles const* Element::custom_highlight_styles() const
+{
+    auto const* rare_data = element_rare_data();
+    if (!rare_data || rare_data->custom_highlight_styles.is_empty())
+        return nullptr;
+    return &rare_data->custom_highlight_styles;
+}
+
+void Element::swap_in_custom_highlight_style_record(CSS::StyleAtomID name, void const* record)
+{
+    if (record) {
+        ensure_element_rare_data().custom_highlight_styles.set(name, CSS::InstalledStyle { record });
+        return;
+    }
+    if (auto* rare_data = element_rare_data())
+        rare_data->custom_highlight_styles.remove(name);
+}
+
+void Element::clear_custom_highlight_styles()
+{
+    auto* rare_data = element_rare_data();
+    if (!rare_data || rare_data->custom_highlight_styles.is_empty())
+        return;
+    auto styles = move(rare_data->custom_highlight_styles);
+    if (style_node_id() == 0)
+        return;
+    auto& style_engine = document().style_computer().style_engine();
+    for (auto const& [name, style] : styles)
+        CSS::StyleEngineFFI::style_engine_set_held_pseudo_style_record(style_engine.host(), style_node_id(), to_underlying(CSS::PseudoElement::Highlight), name, 0, style.record_pointer());
 }
 
 // The custom-property environment of a style record: what the element inherits, or its own custom declarations over
@@ -1971,16 +2012,19 @@ RefPtr<CSS::CustomPropertyData const> Element::style_custom_property_environment
     // NB: Where the animations of the element's parent sample custom properties, the parent holds their composition
     //     over the environment the style engine resolved the element's over. The element inherits the composition, and
     //     its own declarations stand over it, as when the animations move the parent's environment.
+    // NB: An environment names the environment it was resolved over last, which a descendant holding the store can have
+    //     moved. So this also comes to the root, whose declarations stand over nothing.
     auto parent = DOM::AbstractElement { const_cast<Element&>(*this) }.element_to_inherit_style_from();
-    VERIFY(parent.has_value());
     auto& style_computer = document().style_computer();
     auto& style_engine = style_computer.style_engine();
     RefPtr<CSS::CustomPropertyData const> inherited_data;
-    if (auto parent_data = parent->custom_property_data())
-        inherited_data = parent_data->inheritable(read, document());
-    auto const parent_identity = parent->installed_style().custom_property_environment();
-    if (identity == CSS::StyleEngineFFI::style_engine_inheritable_custom_property_environment(style_engine.host(), &read, parent_identity))
-        return inherited_data;
+    if (parent.has_value()) {
+        if (auto parent_data = parent->custom_property_data())
+            inherited_data = parent_data->inheritable(read, document());
+        auto const parent_identity = parent->installed_style().custom_property_environment();
+        if (identity == CSS::StyleEngineFFI::style_engine_inheritable_custom_property_environment(style_engine.host(), &read, parent_identity))
+            return inherited_data;
+    }
     auto declarations = style_computer.engine_custom_property_declarations_over(read, identity, inherited_data);
     VERIFY(declarations);
     return declarations;
@@ -2016,6 +2060,13 @@ void Element::apply_style_main_effects(Layout::BegunRead const& read, CSS::MainE
 
     if (has_flag(effects, CSS::MainEffects::ContainerEffects))
         record_engine_container_query_effects(read, *this);
+
+    // A style change that needs a relayout can change which nodes render and what generated content they have, and so
+    // the accessible names that come from them. Of the changes that need just a repaint, only one of visibility can:
+    // Content that isn't visible is left out of a name that comes from content.
+    auto visibility_changed = old_values && old_values->visibility() != new_computed_values->visibility();
+    if ((invalidation.needs_relayout() || visibility_changed) && document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_data(*this);
 
     // The environment the record was published with: what the element inherits, or what the engine resolved its own
     // custom declarations to over that, and those of the pseudo-elements over the element's.
@@ -2201,6 +2252,7 @@ void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunR
         element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
             pseudo_element.clear_computed_style();
         });
+        element->clear_custom_highlight_styles();
         return TraversalDecision::Continue;
     });
 }
@@ -2928,7 +2980,7 @@ int Element::client_width() const
 
     // 1. If the element has no associated CSS layout box or if the CSS layout box is inline, return zero.
     auto const* layout_node = this->layout_node(read);
-    if (!layout_node || !Painting::has_committed_box(*layout_node))
+    if (!layout_node || layout_node->is_fragmented_inline() || !Painting::has_committed_box(*layout_node))
         return 0;
 
     // 3. Return the width of the padding edge excluding the width of any rendered scrollbar between the padding edge and the border edge,
@@ -2956,7 +3008,7 @@ int Element::client_height() const
 
     // 1. If the element has no associated CSS layout box or if the CSS layout box is inline, return zero.
     auto const* layout_node = this->layout_node(read);
-    if (!layout_node || !Painting::has_committed_box(*layout_node))
+    if (!layout_node || layout_node->is_fragmented_inline() || !Painting::has_committed_box(*layout_node))
         return 0;
 
     // 3. Return the height of the padding edge excluding the height of any rendered scrollbar between the padding edge and the border edge,
@@ -2979,8 +3031,6 @@ double Element::current_css_zoom() const
 
 static bool style_attribute_is_blocked_by_content_security_policy(Element& element, Utf16View value)
 {
-    if (auto shadow_root = element.containing_shadow_root(); shadow_root && shadow_root->is_user_agent_internal())
-        return false;
     return ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(element, ContentSecurityPolicy::Directives::Directive::InlineType::StyleAttribute, value) == ContentSecurityPolicy::Directives::Directive::Result::Blocked;
 }
 
@@ -3082,6 +3132,7 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
         note_subtree_style_moved();
         pseudo_element.clear_computed_style();
     });
+    clear_custom_highlight_styles();
 
     // A shadow root's counter style names pass on to the scope its host is in, which a move of the host can change.
     if (m_shadow_root)
@@ -3149,6 +3200,16 @@ void Element::record_style_environment_change()
     document().style_computer().style_engine().record_derived_element_style_input_change(style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 }
 
+void Element::update_hover_link()
+{
+    if (m_style_node_id == 0)
+        return;
+    Optional<Utf16String> href;
+    if (created_hyperlink())
+        href = attribute(HTML::AttributeNames::href);
+    document().hover_link_reporter().set_link(m_style_node_id.value(), move(href));
+}
+
 void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
 {
     if (m_style_node_id == style_node_id)
@@ -3157,6 +3218,11 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
     auto old_style_node_id = m_style_node_id;
     m_style_node_id = style_node_id;
     Layout::Node::dom_node_style_node_changed(*this, old_style_node_id);
+    if (created_hyperlink()) {
+        if (old_style_node_id != 0)
+            document().hover_link_reporter().set_link(old_style_node_id.value(), {});
+        update_hover_link();
+    }
     // An element keeps the random base values of its own keys for its whole life: it holds them while it has no style
     // node, and its next one takes them back.
     auto& style_engine = document().style_computer().style_engine();
@@ -3175,6 +3241,8 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
             if (!pseudo_element.scroll_offset().is_zero())
                 pseudo_element.publish_scroll_offset();
         });
+        if (document().has_custom_highlights())
+            document().set_needs_highlight_style_update(CSS::PseudoElement::Highlight);
     }
     // NB: A newly minted identity holds no style on the render side, whatever the element and its pseudo-elements
     //     still hold: the render side styles the element as it arrives, and swaps in what it computed.
@@ -3306,7 +3374,7 @@ bool Element::matches_placeholder_shown_pseudo_class() const
 bool Element::matches_link_pseudo_class() const
 {
     // All a elements that have an href attribute, and all area elements that have an href attribute, must match one of :link and :visited.
-    if (!is<HTML::HTMLAnchorElement>(*this) && !is<HTML::HTMLAreaElement>(*this) && !is<SVG::SVGAElement>(*this))
+    if (!is<HTML::HTMLAnchorElement>(*this) && !is<HTML::HTMLAreaElement>(*this) && !is<SVG::SVGAElement>(*this) && !is<MathML::MathMLAnchorElement>(*this))
         return false;
     return has_attribute(HTML::AttributeNames::href);
 }
@@ -3356,22 +3424,37 @@ bool Element::matches_local_link_pseudo_class() const
     return document_url.equals(*target_url, URL::ExcludeFragment::Yes);
 }
 
-bool Element::matches_focus_within_pseudo_class() const
+template<typename Callback>
+static void for_each_node_focus_within_holds_on(Document const& document, Callback callback)
 {
-    auto focused_area = document().focused_area();
-    if (!focused_area)
-        return false;
-
     // https://drafts.csswg.org/selectors-4/#useraction-pseudos
     // Specifically, if these match on a given element, they also match on the element's flat tree ancestors, up to and
     // including the first top layer element or the root element, whichever is encountered first.
-    for (auto const* node = focused_area.ptr(); node; node = node->flat_tree_parent()) {
-        if (node == this)
-            return true;
+    for (auto const* node = document.focused_area().ptr(); node; node = node->flat_tree_parent()) {
+        if (callback(*node) == IterationDecision::Break)
+            return;
         if (auto const* element = as_if<Element>(*node); element && element->rendered_in_top_layer())
-            break;
+            return;
     }
-    return false;
+}
+
+bool Element::matches_focus_within_pseudo_class() const
+{
+    bool matches = false;
+    for_each_node_focus_within_holds_on(document(), [&](Node const& node) {
+        matches = &node == this;
+        return matches ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return matches;
+}
+
+void Element::set_marks_on_focus_within_chain(Document const& document, bool marked)
+{
+    for_each_node_focus_within_holds_on(document, [&](Node const& node) {
+        if (auto const* element = as_if<Element>(node))
+            const_cast<Element*>(element)->m_is_marked_on_focus_within_chain = marked;
+        return IterationDecision::Continue;
+    });
 }
 
 bool Element::has_synthetic_pseudo_elements(Layout::BegunRead const& read) const
@@ -5309,6 +5392,10 @@ void Element::replace_installed_style(Layout::BegunRead const& read, CSS::Instal
     if (m_installed_style.record() == style_record_identity)
         return;
     auto held_before = exchange(m_installed_style, move(style));
+    // Every new style, an animation's included, can change the states and the text formatting the accessibility tree
+    // reports for the element.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_records_after_style_change(*this);
     // The element holds the record it installed before until the engine takes the new one in, so the layout node reads
     // what it moves from, and everything below that compares against the old record is read from it, before the
     // element lets go of it. The engine keeps the old record until it takes the new one in.
@@ -5509,8 +5596,8 @@ void Element::replace_custom_property_data(Optional<CSS::PseudoElement> pseudo_e
     install_custom_property_data(read, pseudo_element, move(data), is_animation_overlay);
 }
 
-// The style engine keeps the custom-property environments an element and its synthetic pseudo-elements hold; the
-// element keeps no copy of its own. This is the only place they move.
+// An element and its synthetic pseudo-elements hold the custom-property environment of their records. The style engine
+// keeps the ones lying over that; the element keeps no copy of its own. This is the only place they move.
 void Element::install_custom_property_data(Layout::BegunRead const& read, Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data, CSS::IsAnimationOverlay is_animation_overlay)
 {
     VERIFY(data || is_animation_overlay == CSS::IsAnimationOverlay::No);
@@ -5522,6 +5609,9 @@ void Element::install_custom_property_data(Layout::BegunRead const& read, Option
         VERIFY(style_node != 0 || !data);
         if (style_node == 0)
             return;
+        // NB: What the record holds already lies over nothing.
+        if (is_animation_overlay == CSS::IsAnimationOverlay::No && data && data->identity() == installed_style(pseudo_element).custom_property_environment())
+            data = nullptr;
         auto& style_engine = document().style_computer().style_engine();
         if (!pseudo_element.has_value()) {
             style_engine.set_element_custom_property_data(read, *this, data.ptr(), is_animation_overlay);
@@ -5570,9 +5660,13 @@ RefPtr<CSS::CustomPropertyData const> Element::custom_property_data(Optional<CSS
         if (style_node == 0)
             return nullptr;
         auto const& style_engine = document().style_computer().style_engine();
-        if (!pseudo_element.has_value())
-            return static_cast<CSS::CustomPropertyData const*>(CSS::StyleEngineFFI::style_engine_element_custom_property_data(style_engine.host(), style_node.value()));
-        return static_cast<CSS::CustomPropertyData const*>(CSS::StyleEngineFFI::style_engine_pseudo_element_custom_property_data(style_engine.host(), style_node.value(), to_underlying(pseudo_element.value())));
+        auto const* lying_over = static_cast<CSS::CustomPropertyData const*>(pseudo_element.has_value()
+                ? CSS::StyleEngineFFI::style_engine_pseudo_element_custom_property_data(style_engine.host(), style_node.value(), to_underlying(pseudo_element.value()))
+                : CSS::StyleEngineFFI::style_engine_element_custom_property_data(style_engine.host(), style_node.value()));
+        if (lying_over)
+            return lying_over;
+        // NB: The identity of an environment is the address of its store, which the record holds a reference to.
+        return reinterpret_cast<CSS::CustomPropertyData const*>(static_cast<FlatPtr>(installed_style(pseudo_element).custom_property_environment()));
     }
 
     if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
@@ -6004,6 +6098,24 @@ void Element::unregister_intersection_observer(Badge<IntersectionObserver::Inter
     });
 }
 
+void Element::register_resize_observer(Badge<ResizeObserver::ResizeObserver>, GC::Ref<ResizeObserver::ResizeObserver> observer)
+{
+    auto& registered_resize_observers = ensure_element_rare_data().registered_resize_observers;
+    if (!registered_resize_observers)
+        registered_resize_observers = make<Vector<GC::Ref<ResizeObserver::ResizeObserver>>>();
+    registered_resize_observers->append(observer);
+}
+
+void Element::unregister_resize_observer(Badge<ResizeObserver::ResizeObserver>, GC::Ref<ResizeObserver::ResizeObserver> observer)
+{
+    auto* rare_data = element_rare_data();
+    if (!rare_data || !rare_data->registered_resize_observers)
+        return;
+    rare_data->registered_resize_observers->remove_first_matching([&observer](GC::Ref<ResizeObserver::ResizeObserver> const& entry) {
+        return entry == observer;
+    });
+}
+
 CSSPixelPoint Element::scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type) const
 {
     if (pseudo_element_type.has_value()) {
@@ -6099,6 +6211,18 @@ bool Element::has_auto_directionality() const
 // https://html.spec.whatwg.org/multipage/dom.html#the-directionality
 Element::Directionality Element::directionality() const
 {
+    if (auto directionality = directionality_unless_from_parent(); directionality.has_value())
+        return *directionality;
+
+    // Otherwise:
+    // Return the parent directionality of element.
+    return parent_directionality();
+}
+
+// NB: Every case of the directionality of an element but the last, which reads the parent's. A caller that has the
+//     parent's at hand spares the walk up.
+Optional<Element::Directionality> Element::directionality_unless_from_parent() const
+{
     // The directionality of an element (any element, not just an HTML element) is either 'ltr' or 'rtl'.
     // To compute the directionality given an element element, switch on element's dir attribute state:
     auto maybe_dir = this->dir();
@@ -6148,9 +6272,7 @@ Element::Directionality Element::directionality() const
         return Directionality::Ltr;
     }
 
-    // Otherwise:
-    // Return the parent directionality of element.
-    return parent_directionality();
+    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#auto-directionality-form-associated-elements
@@ -6777,6 +6899,12 @@ void Element::invalidate_lang_value()
     m_lang_value.clear();
 }
 
+void Element::invalidate_lang_value_of_inclusive_ancestors()
+{
+    for (auto* element = this; element && element->m_lang_value.has_value(); element = element->parent_or_shadow_host_element())
+        element->invalidate_lang_value();
+}
+
 // https://drafts.csswg.org/css-images-4/#element-not-rendered
 bool Element::not_rendered(Layout::BegunRead const& read) const
 {
@@ -7074,7 +7202,7 @@ GC::Ref<CSS::StylePropertyMapReadOnly> Element::computed_style_map()
     //    until a given property is actually requested.
     auto& computed_style_map_cache = ensure_element_rare_data().computed_style_map_cache;
     if (computed_style_map_cache == nullptr) {
-        computed_style_map_cache = CSS::StylePropertyMapReadOnly::create_computed_style(AbstractElement { *this });
+        computed_style_map_cache = CSS::StylePropertyMapReadOnly::create_computed_style(*this);
     }
 
     // 2. Return this’s [[computedStyleMapCache]] internal slot.

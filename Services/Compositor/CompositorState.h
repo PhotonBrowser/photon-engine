@@ -12,6 +12,7 @@
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
+#include <Compositor/AnimatedImage.h>
 #include <Compositor/CanvasSurfaceRegistry.h>
 #include <Compositor/ContextState.h>
 #include <Compositor/DisplayListPlayerSkia.h>
@@ -52,7 +53,7 @@ public:
     virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) = 0;
     virtual void did_detect_history_swipe_candidate(Web::CompositorContextId, u64 gesture_id, bool back, float unconsumed_delta) = 0;
     // The compositor forwarded the key event to WebContent, after performing its default action by scrolling if it says so.
-    virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool async_scroll_performed_default_action) = 0;
+    virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool performed_default_action) = 0;
 };
 
 class CompositorStateWebContentClient {
@@ -67,12 +68,15 @@ public:
     virtual void clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds, Vector<Web::CompositorScrollOffset> const& scroll_offsets) = 0;
     virtual void pointer_moved(Web::CompositorContextId, Web::DevicePixelPoint, u32 /* buttons */, bool /* scrolled_since_frame */, u64 /* input_event_id */) { }
     virtual void pointer_left(Web::CompositorContextId, u64 /* input_event_id */) { }
+    virtual void pointer_rests_on_moving_content(Web::CompositorContextId) { }
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) = 0;
+    virtual void animated_content_moved_under_pointer(Web::CompositorContextId, i64 /* frame_time_nanoseconds */) { }
     virtual void overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> const&) { }
     virtual void create_video_edge(Media::VideoSinkHandle) = 0;
     virtual void release_video_edge(Media::VideoSinkHandle) = 0;
     virtual void video_sink_presented_frame(Media::VideoSinkHandle, RefPtr<Media::VideoFrame>, Media::DisplayingVideoSinkFrameCounts) { }
     virtual void video_sink_counted_frames(Media::VideoSinkHandle, Media::DisplayingVideoSinkFrameCounts) { }
+    virtual void request_animated_image_frames(AnimatedImage::FrameRequest const&) { }
     virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) = 0;
     // The owner of this client's canvases, which are the only ones its contexts may draw.
     virtual Compositing::CanvasSurfaceOwnerId canvas_surface_owner_id() const = 0;
@@ -127,6 +131,15 @@ public:
     void remove_video_sink(CompositorStateWebContentClient&, Media::VideoSinkHandle);
     void set_video_sink_ticking(CompositorStateWebContentClient&, Media::VideoSinkHandle, bool should_tick);
     void on_video_sink_ready(CompositorStateWebContentClient&, Media::VideoSinkHandle, NonnullRefPtr<Media::DisplayingVideoSink> const&);
+    void add_animated_image(CompositorStateWebContentClient&, Compositing::ImageFrameResourceId, AnimatedImage::Description);
+    void remove_animated_image(CompositorStateWebContentClient&, Compositing::ImageFrameResourceId);
+    void start_animated_image(CompositorStateWebContentClient&, Compositing::ImageFrameResourceId);
+    void stop_animated_image(CompositorStateWebContentClient&, Compositing::ImageFrameResourceId);
+    void animated_image_frames_decoded(CompositorStateWebContentClient&, i64 session_id, Vector<NonnullRefPtr<Gfx::Bitmap>>);
+    void animated_image_decode_failed(CompositorStateWebContentClient&, i64 session_id);
+    // The client's images lost the decoder their sessions were on. Each keeps the frame it shows.
+    void animated_image_decoder_lost(CompositorStateWebContentClient&);
+    AnimatedImage const* animated_image(CompositorStateWebContentClient&, Compositing::ImageFrameResourceId) const;
     void invalidate_wheel_event_listener_state(Web::CompositorContextId, u64 generation);
     void invalidate_keyboard_scroll_state(Web::CompositorContextId, u64 generation);
     void handle_and_dispatch_key_event(Web::CompositorContextId, Web::KeyEvent, bool allow_keyboard_scroll);
@@ -314,7 +327,7 @@ private:
     // without regard to where their content is or what clips it.
     Optional<Gfx::FloatPoint> position_in_nested_context_ignoring_clips(Web::CompositorContextId presenting_context_id, ContextState& presenting_context, ContextState& nested_context, Gfx::FloatPoint position);
     bool is_nested_in(Web::CompositorContextId containing_context_id, ContextState const&) const;
-    bool nested_context_may_cancel_pinch(Web::CompositorContextId) const;
+    bool page_under_pinch_may_cancel_it(Web::CompositorContextId, ContextState&, Gfx::FloatPoint position);
     void dispatch_scroll_fling_step(Web::CompositorContextId, ContextState&, Optional<Web::MouseEvent>, MonotonicTime now);
     void present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
     void schedule_present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
@@ -361,6 +374,17 @@ private:
     bool video_sink_is_painted_by_any_context(CompositorStateWebContentClient*, Media::VideoSinkHandle) const;
     void update_unpainted_video_update_scheduling();
     HashMap<CompositorStateWebContentClient*, HashMap<Media::VideoSinkHandle, VideoSinkState>> m_video_sink_states;
+
+    AnimatedImage* animated_image_mutable(CompositorStateWebContentClient&, Compositing::ImageFrameResourceId);
+    AnimatedImage* animated_image_with_session(CompositorStateWebContentClient&, i64 session_id);
+    bool animated_image_is_drawn(CompositorStateWebContentClient*, Compositing::ImageFrameResourceId);
+    void show_animated_image_frame(CompositorStateWebContentClient*, Compositing::ImageFrameResourceId, Gfx::DecodedImageFrame const&);
+    // A frame that names an animated image brings frame 0 with it, whichever frame the image is at.
+    void show_animated_image_frames_in(ContextState&);
+    void update_animated_images();
+    void schedule_animated_image_update(AK::Duration delay);
+    HashMap<CompositorStateWebContentClient*, HashMap<u64, NonnullOwnPtr<AnimatedImage>>> m_animated_images;
+    RefPtr<Core::Timer> m_animated_image_update_timer;
     RefPtr<Core::Timer> m_unpainted_video_update_timer;
 
     struct PlaceholderCanvas {

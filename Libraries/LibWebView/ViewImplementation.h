@@ -69,7 +69,6 @@
 #include <LibWebCommon/WebView/PageInfo.h>
 #include <LibWebCommon/WebView/StorageSetResult.h>
 #include <LibWebCommon/WebView/ZoomLevel.h>
-#include <LibWebView/AudibilityHold.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
@@ -77,11 +76,13 @@
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HistoryVisitTransition.h>
+#include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/SpellChecker.h>
+#include <LibWebView/TabIndicators.h>
 #include <LibWebView/TabPerformanceStats.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
@@ -89,11 +90,19 @@
 
 namespace WebView {
 
+class MicrophoneAuthorizerForTesting;
+
 struct GeolocationRequestKey {
     NonnullRefPtr<WebContentPage> page;
     u64 request_id { 0 };
 
     bool operator==(GeolocationRequestKey const&) const = default;
+};
+
+enum class PermissionPromptKind : u8 {
+    Question,
+    // Tells the user the system keeps the feature from the browser, so no site can have it. Its answer decides nothing.
+    SystemDeniedNotice,
 };
 
 // What the UI shows the user when a site asks for a permission. The origin is the top-level one the decision is kept
@@ -105,10 +114,11 @@ struct PermissionPromptRequest {
     Web::HTML::CrossProcessId requesting_document_id;
     bool is_file { false };
     bool show_os_hint { false };
+    PermissionPromptKind kind { PermissionPromptKind::Question };
 
     bool is_same_request_as(PermissionPromptRequest const& other) const
     {
-        return name == other.name && is_file == other.is_file && top_level_origin.is_same_origin(other.top_level_origin);
+        return name == other.name && kind == other.kind && is_file == other.is_file && top_level_origin.is_same_origin(other.top_level_origin);
     }
 };
 
@@ -166,7 +176,24 @@ public:
     void did_request_permission(Badge<WebContentPage>, Web::Permissions::PermissionName);
     void did_request_http_credentials(Badge<WebContentPage>, WebContentPage&, u64 request_id, URL::URL, String realm);
 
-    bool location_in_use() const { return m_location_in_use; }
+    MicrophoneAuthorization microphone_authorization() const;
+    // Calls back with whether the system lets the browser use the microphone, once the system has asked the user if it
+    // never has. The user is told why when it doesn't.
+    void ensure_microphone_authorization(Function<void(bool authorized)>);
+    // Tells the user the system keeps the microphone from the browser, unless this tab has already shown them that for
+    // the site it shows.
+    void show_microphone_denied_notice();
+    // The UI calls this each time a prompt comes up on screen.
+    void did_show_permission_prompt(PermissionPromptRequest const&);
+
+    // The system answers with answer when it's asked, which it is while authorization is NotDetermined. A held answer
+    // waits for release_system_microphone_answer_for_testing().
+    void set_microphone_authorization_for_testing(MicrophoneAuthorization authorization, MicrophoneAuthorization answer, bool held);
+    void release_system_microphone_answer_for_testing();
+    u64 system_microphone_requests_for_testing() const;
+    u64 microphone_denied_notices_shown_for_testing() const { return m_microphone_denied_notices_shown; }
+
+    bool location_in_use() const { return m_tab_indicators.is_active(TabIndicator::UsingLocation); }
 
     // Ends every location request and watch whose document the user has since taken the permission away from.
     void revoke_geolocation_without_permission();
@@ -307,7 +334,7 @@ public:
     void did_lose_input_event_endpoint(Badge<WebContentPage>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
-    void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action);
+    void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool performed_default_action);
     void discard_input_events_routed_through_lost_compositor(Badge<Application>);
     void restart_unresponsive_page();
     size_t pending_input_event_count_for_testing() const { return m_pending_input_events.size(); }
@@ -501,13 +528,14 @@ public:
     Web::HTML::MuteState page_mute_state() const { return m_mute_state; }
     void toggle_page_mute_state();
 
-    // The tab is audible while the AudioServer has recently heard any page of it, and for a while after a page leaves it
-    // while heard. A page lost along with its process doesn't leave.
+    // The tab plays audio while the AudioServer has recently heard any page of it.
     void update_audibility(Badge<WebContentPage>) { update_audibility(); }
-    void did_release_page(Badge<CanonicalTraversable>, WebContentPage const& page) { page_left(page); }
-    void did_close_page(Badge<WebContentPage>, Web::PageId page_id) { m_audibility_hold.page_closed(page_id); }
+    void did_release_page(Badge<CanonicalTraversable>) { update_audibility(); }
     Audio::Audibility audibility() const { return m_audibility; }
-    u64 audibility_change_count() const { return m_audibility_change_count; }
+    bool is_playing_audio() const { return m_tab_indicators.is_active(TabIndicator::PlayingAudio); }
+
+    bool tab_indicator_visible(TabIndicator indicator) const { return m_tab_indicators.is_visible(indicator); }
+    u64 playing_audio_indicator_change_count() const { return m_playing_audio_indicator_change_count; }
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
 
     void did_reset_state_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
@@ -625,7 +653,8 @@ public:
     Function<void(Optional<JsonObject>)> on_received_current_grid;
     Function<void(Optional<JsonObject>)> on_received_current_flexbox;
     Function<void(JsonObject)> on_received_accessibility_tree;
-    Function<void(Vector<AccessibilityNodeData>)> on_accessibility_tree_received;
+    Function<void(u64 sequence, Vector<AccessibilityNodeData>)> on_accessibility_tree_received;
+    Function<void(u64 base_sequence, u64 sequence, AccessibilityTreeDelta)> on_accessibility_tree_changed;
     Function<void(i64)> on_accessibility_focus_changed;
     Function<void(Web::UniqueNodeID)> on_received_hovered_node_id;
     Function<void(Mutation)> on_dom_mutation_received;
@@ -665,7 +694,7 @@ public:
     // Without a handler, every request is answered as cancelled.
     Function<void(HTTPCredentialsRequest const&, HTTPCredentialsCallback)> on_request_http_credentials;
     Function<void(PermissionPromptRequest const&)> on_cancel_permission_prompt;
-    Function<void(bool)> on_location_in_use_change;
+    Function<void(TabIndicator, bool visible)> on_tab_indicator_change;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;
     Function<void(Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)> on_request_select_dropdown;
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
@@ -703,7 +732,7 @@ public:
     void reset_spell_checking();
     void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<u64> text_fragment_generation_id);
     void did_generate_text_fragment_url(u64 request_id, Optional<URL::URL>);
-    void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap);
+    void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type);
     void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu, Optional<Web::HTML::PreparedNavigationDescriptor>);
 
     void did_request_color_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Color current_color);
@@ -715,6 +744,8 @@ public:
     Action& navigate_forward_action() { return *m_navigate_forward_action; }
     Action& toggle_bookmark_action() { return *m_toggle_bookmark_action; }
     Action& reset_zoom_action() { return *m_reset_zoom_action; }
+
+    PageTranslation& page_translation() { return *m_page_translation; }
 
     WebContentPage& page() const;
 
@@ -833,7 +864,6 @@ protected:
     WebContentPage& focused_navigable_host() const;
     void reset_page_media_state();
     void update_audibility();
-    void page_left(WebContentPage const&);
 
     // A navigation to make again on reload: one the user stopped before its document was activated, or one a crash cut
     // short. It's made again from the source it was first made from, when it has one (a javascript: URL has none).
@@ -869,6 +899,7 @@ protected:
     NonnullRefPtr<Menu> create_selected_text_link_context_menu(bool is_editable, String const& selected_text, URL::URL const&, Optional<DictionaryLookup> const&, Gfx::IntPoint content_position);
     void add_open_in_new_tab_action(Menu&, StringView text, URL::URL const&, Optional<Web::HTML::PreparedNavigationDescriptor> const&);
     void add_open_url_actions(Menu&, URL::URL const&, Optional<Web::HTML::PreparedNavigationDescriptor> const&);
+    void add_link_actions(Menu&, Web::HTML::PreparedNavigationDescriptor const&);
     void add_text_edit_actions(Menu&, bool is_editable, bool has_selected_text);
     void add_look_up_action(Menu&, Optional<DictionaryLookup> const&, Gfx::IntPoint content_position);
     void update_report_website_issue_action();
@@ -885,7 +916,7 @@ protected:
         No,
         Yes,
     };
-    void download_url(URL::URL const&, PromptForPath);
+    void download_url(URL::URL const&, PromptForPath, Optional<String> const& image_mime_type = {});
 
     struct SharedBitmap {
         i32 id { -1 };
@@ -899,6 +930,7 @@ protected:
     SharedBitmap m_front_bitmap;
     Vector<SharedBitmap> m_other_bitmaps;
     bool m_has_usable_bitmap { false };
+    bool m_pinch_gesture_was_canceled { false };
     bool m_presents_from_cpu_memory { false };
 
     // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
@@ -949,6 +981,7 @@ protected:
     RefPtr<Action> m_navigate_forward_action;
 
     RefPtr<Action> m_toggle_bookmark_action;
+    OwnPtr<PageTranslation> m_page_translation;
 
     RefPtr<Action> m_reset_zoom_action;
 
@@ -987,6 +1020,9 @@ protected:
         bool routed_through_compositor { false };
         i64 enqueued_at_ms { 0 };
         bool watches_page_response { false };
+
+        // Set while an answer of the compositor is still to come for a trip through it that WebContent already finished.
+        bool expects_stale_compositor_answer { false };
 
         // A key event stays routed through the compositor until it forwards the event or hands it back. Later input
         // waits until then.
@@ -1135,10 +1171,9 @@ protected:
     // https://w3c.github.io/webdriver/#dfn-current-parent-browsing-context
     Optional<Web::HTML::CrossProcessId> m_webdriver_current_parent_navigable_id;
 
+    TabIndicators m_tab_indicators;
     Audio::Audibility m_audibility { Audio::Audibility::Inaudible };
-    u64 m_audibility_change_count { 0 };
-    AudibilityHold m_audibility_hold;
-    RefPtr<Core::Timer> m_audibility_hold_timer;
+    u64 m_playing_audio_indicator_change_count { 0 };
     Web::ScreenWakeLockState m_screen_wake_lock_state { Web::ScreenWakeLockState::Released };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
@@ -1181,12 +1216,12 @@ protected:
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::RequestId> m_geolocation_position_request_ids;
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::WatchId> m_geolocation_watch_ids;
     HashMap<GeolocationRequestKey, Web::HTML::CrossProcessId> m_geolocation_request_documents;
-    bool m_location_in_use { false };
     Vector<Web::Permissions::PermissionName> m_permissions_requested_by_page;
 
     struct PendingPermissionPrompt {
         PermissionPromptRequest request;
         Vector<PermissionPromptCallback> waiters;
+        bool shown { false };
     };
     Vector<PendingPermissionPrompt> m_pending_permission_prompts;
 
@@ -1199,6 +1234,12 @@ protected:
     Web::Permissions::PromptOutcome m_held_permission_prompt_outcome_for_testing { Web::Permissions::PromptOutcome::Cancelled };
     Optional<u32> m_held_permission_prompt_release_waiters_for_testing;
     void release_held_permission_prompt_if_ready_for_testing();
+
+    MicrophoneAuthorizer& microphone_authorizer() const;
+    bool has_shown_microphone_denied_notice(URL::Origin const& top_level_origin) const;
+    OwnPtr<MicrophoneAuthorizerForTesting> m_microphone_authorizer_for_testing;
+    Vector<URL::Origin> m_sites_shown_microphone_denied_notice;
+    u64 m_microphone_denied_notices_shown { 0 };
 
     Core::AnonymousBuffer m_document_cookie_version_buffer;
     HashMap<String, Core::SharedVersionIndex> m_document_cookie_version_indices;

@@ -45,6 +45,7 @@ use super::super::index::StateSet;
 use super::super::index::StyleAtomID;
 use super::super::index::dispatch_bloom_bit;
 use super::super::input_types::StateFact;
+use super::super::input_types::TransactionFactSide;
 use super::super::input_types::TreeRelations;
 use super::super::selector::Incomplete;
 use super::super::selector::MatchScratch;
@@ -60,7 +61,6 @@ use super::super::selector_evaluation::SelectorEvaluator;
 use super::super::selector_evaluation::SelectorSubject;
 use super::super::selector_evaluation::SelectorTree;
 use super::super::selector_evaluation::StructuralRead;
-use super::super::transaction_view::TransactionFactSide;
 use super::super::tree::StyleNodeID;
 use super::super::tree::TreeScopeID;
 use crate::cow_column::ColumnSnapshot;
@@ -81,12 +81,21 @@ pub(in crate::css::style) use writer::ProjectionWriter;
 /// copies.
 const ROWS_PER_CHUNK: usize = 64;
 
+/// Empty a list of what one transaction wrote or changed. Keep small lists warm for the next transaction, but do not
+/// retain what a batch of arriving elements grew one to for the lifetime of every document.
+fn clear_transaction_list<T>(list: &mut Vec<T>) {
+    list.clear();
+    if list.capacity() * size_of::<T>() > 4096 {
+        *list = Vec::new();
+    }
+}
+
 /// A set of elements whose rows were written, each listed once, with a bit per element slot saying
 /// which.
 #[derive(Clone, Default)]
 struct WrittenRows {
     nodes: Vec<StyleNodeID>,
-    bits: Vec<u64>,
+    bits: crate::cow_column::CowVec<u64, 64>,
 }
 
 impl WrittenRows {
@@ -94,7 +103,7 @@ impl WrittenRows {
     fn insert(&mut self, node: StyleNodeID, slot: usize) -> bool {
         let (word, bit) = (slot / 64, 1_u64 << (slot % 64));
         if word >= self.bits.len() {
-            self.bits.resize(word + 1, 0);
+            self.bits.resize_with_default(word + 1);
         }
         if self.bits[word] & bit != 0 {
             return false;
@@ -123,7 +132,7 @@ impl WrittenRows {
     /// Empty the set, keeping `nodes`, taken from it, as its allocation.
     fn reuse(&mut self, mut nodes: Vec<StyleNodeID>) {
         debug_assert!(self.nodes.is_empty());
-        nodes.clear();
+        clear_transaction_list(&mut nodes);
         self.nodes = nodes;
     }
 }
@@ -147,7 +156,7 @@ impl Clone for PendingChangeScan {
 
 impl PendingChangeScan {
     fn clear(&mut self) {
-        self.writes.clear();
+        clear_transaction_list(&mut self.writes);
         *self.checked.get_mut() = 0;
     }
 
@@ -676,12 +685,33 @@ impl ProjectionGeneration {
             return Some(slot);
         }
         let parent = row.links.parent?;
+        // NB: The column only reaches as far as the last element that has a shadow root.
         let host = self
             .shadows
-            .get(parent.element_slot())?
-            .as_deref()
+            .get(parent.element_slot())
+            .and_then(Option::as_deref)
             .and_then(|shadow| shadow.host);
         Some(host.unwrap_or(parent))
+    }
+
+    /// The link around `element`, walking up as `DOM::Node::enclosing_link_element()` does: no link where none is
+    /// around it, or where the link is `is_editable`, and none at all where only the host knows.
+    pub(in crate::css::style) fn enclosing_link(
+        &self,
+        mut element: StyleNodeID,
+        is_link: impl Fn(StyleNodeID) -> bool,
+        is_editable: impl Fn(StyleNodeID) -> bool,
+    ) -> Option<Option<StyleNodeID>> {
+        loop {
+            self.committed.get(element.element_slot())?;
+            if is_link(element) {
+                return Some((!is_editable(element)).then_some(element));
+            }
+            match self.element_inheritance_parent(element) {
+                Some(parent) if parent.element_index().is_some() => element = parent,
+                _ => return Some(None),
+            }
+        }
     }
 }
 
@@ -699,7 +729,8 @@ impl StructuralFlags {
     pub(in crate::css::style) const CHILDREN_READ_POSITIONS: Self = Self(1 << 2);
     /// A selector read whether the element is `:empty`.
     pub(in crate::css::style) const READ_EMPTINESS: Self = Self(1 << 3);
-    /// The record of a child, or of a pseudo-element of it, computes from its place among its siblings.
+    /// The record of a child, or of a pseudo-element of it, or a style query asking the child as a container, computes
+    /// from its place among its siblings.
     pub(in crate::css::style) const CHILD_READS_SIBLING_POSITION: Self = Self(1 << 4);
     /// A selector read where a child stands counted from the end.
     pub(in crate::css::style) const CHILDREN_READ_POSITIONS_FROM_END: Self = Self(1 << 5);
@@ -757,9 +788,9 @@ pub(in crate::css::style) struct Projection {
     /// The distinct sets of host facts the rows name, as the host last published them.
     host_fact_sets: Arc<HostFactSets>,
     /// A slotted text node's slot. Text nodes have no rows, and a slotted one is rare.
-    text_assigned_slots: Arc<HashMap<StyleNodeID, StyleNodeID>>,
+    text_assigned_slots: crate::cow_map::CowMap<StyleNodeID, StyleNodeID>,
     /// The elements whose facts say they are disabled, as the host last published them.
-    disabled: Arc<HashSet<StyleNodeID>>,
+    disabled: crate::cow_map::CowSet<StyleNodeID>,
     /// The elements whose rows the host's publications wrote since the last barrier.
     written: WrittenRows,
     /// Each write since the last barrier, which whether a written row changes the committed
@@ -804,6 +835,8 @@ pub(in crate::css::style) struct Projection {
 
 /// Everything an element arrives with that its selectors test, which its row takes in one write.
 pub(in crate::css::style) struct ArrivalFacts<'a> {
+    /// How the element stands in the tree, where it arrives there with its facts.
+    pub relations: Option<TreeRelations>,
     pub tag: StyleAtomID,
     /// The ASCII-lowercase folding of the tag, or the tag itself where folding leaves it as it is.
     pub folded_tag: StyleAtomID,
@@ -849,7 +882,7 @@ impl Row {
 
 impl WrittenRows {
     fn heap_size(&self) -> usize {
-        crate::heap_size::vec_bytes(&self.nodes) + crate::heap_size::vec_bytes(&self.bits)
+        crate::heap_size::vec_bytes(&self.nodes) + self.bits.row_bytes()
     }
 }
 
@@ -857,7 +890,6 @@ impl Projection {
     /// Counts the rows of every generation the projection holds, each chunk once, and its
     /// catalogs and change sets, with the live elements it holds.
     pub(in crate::css::style) fn report_memory(&self, report: &mut crate::css::style::memory_report::MemoryReport) {
-        use crate::heap_size::map_bytes;
         let owner = crate::css::style::memory_report::MemoryOwner::Projection;
         let sizer = &mut report.sizer;
         let mut bytes = self.rows.heap_size(sizer, Row::heap_size)
@@ -888,8 +920,8 @@ impl Projection {
             bytes += texts.heap_size(sizer);
             bytes += texts.values().map(|text| size_of_val::<[u16]>(text)).sum::<usize>();
         }
-        bytes += sizer.arc_shallow(&self.text_assigned_slots) + map_bytes(&self.text_assigned_slots);
-        bytes += sizer.arc_shallow(&self.disabled) + crate::heap_size::set_bytes(&self.disabled);
+        bytes += self.text_assigned_slots.heap_size();
+        bytes += self.disabled.heap_size();
         if let Some(watched_keys) = &self.watched_keys {
             bytes += sizer.arc_shallow(watched_keys) + crate::heap_size::set_bytes(&watched_keys.keys);
         }
@@ -964,7 +996,10 @@ impl Projection {
     ///
     /// The transaction that flushes a geometry read's seal publishes the sealed rows instead, and
     /// the elements written after the seal stay written for the transaction after it.
-    pub(in crate::css::style) fn commit(&mut self) {
+    ///
+    /// What a transaction changed is three scans over every written row, for the live style to read. `note_changes`
+    /// says whether anything will.
+    pub(in crate::css::style) fn commit_noting(&mut self, note_changes: NoteChanges) {
         let committed = match self.flushing_seal {
             true => self.sealed.clone().expect("a flushed seal holds its rows"),
             false => self.rows.clone(),
@@ -981,16 +1016,18 @@ impl Projection {
         let hovered = HoveredFacts::of(chain, &self.committed);
         self.hover.before = std::mem::replace(&mut self.hover.committed, hovered);
         let mut written = self.written.take();
-        written.sort_unstable();
         self.pending_change_scan.clear();
         self.changes.clear();
-        for pass in ChangePass::ALL {
-            for &node in &written {
-                let slot = node.element_slot();
-                let before = self.before.get(slot);
-                let after = self.committed.get(slot);
-                let hovered = (self.hover.before.contains(node), self.hover.committed.contains(node));
-                note_changes(pass, node, (before, after), hovered, &mut self.changes);
+        if note_changes == NoteChanges::Yes {
+            written.sort_unstable();
+            for pass in ChangePass::ALL {
+                for &node in &written {
+                    let slot = node.element_slot();
+                    let before = self.before.get(slot);
+                    let after = self.committed.get(slot);
+                    let hovered = (self.hover.before.contains(node), self.hover.committed.contains(node));
+                    self::note_changes(pass, node, (before, after), hovered, &mut self.changes);
+                }
             }
         }
         self.note_watched_key_writes(&written);
@@ -1004,6 +1041,11 @@ impl Projection {
         } else {
             self.forget_written_since_seal();
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::css::style) fn commit(&mut self) {
+        self.commit_noting(NoteChanges::Yes);
     }
 
     /// Note those of the elements `written`, in the transaction being taken, that carried a watched key or carry one,
@@ -1196,7 +1238,7 @@ impl Projection {
     pub(in crate::css::style) fn release(&mut self) {
         self.before = ColumnSnapshot::default();
         self.hover.before = HoveredFacts::default();
-        self.changes.clear();
+        clear_transaction_list(&mut self.changes);
         let links_written = self.links_written.take();
         self.links_written.reuse(links_written);
         let relations_written = self.relations_written.take();
@@ -1292,6 +1334,7 @@ impl Projection {
         let ProjectionPublication {
             rows,
             shadows,
+            inline_declarations: _,
             slot_count,
             catalogs,
             host_fact_sets,
@@ -1351,7 +1394,7 @@ impl Projection {
 
     /// The elements whose facts as written say they are disabled.
     #[must_use]
-    pub(in crate::css::style) fn written_disabled(&self) -> &HashSet<StyleNodeID> {
+    pub(in crate::css::style) fn written_disabled(&self) -> &crate::cow_map::CowSet<StyleNodeID> {
         &self.disabled
     }
 
@@ -1402,7 +1445,7 @@ impl Projection {
     /// Which principal box the element asks for.
     #[must_use]
     pub(in crate::css::style) fn box_kind(&self, node: StyleNodeID) -> super::super::bridge::ElementBoxKind {
-        self.host_facts(node).box_kind()
+        self.host_facts(node).box_kind
     }
 
     /// The element-backed pseudo-element kind of its shadow host the element stands for, as published.
@@ -1994,6 +2037,13 @@ fn relations_of(row: &Row) -> Option<TreeRelations> {
         tree_scope: row.facts.lists.tree_scope(),
         assigned_slot: row.facts.lists.assigned_slot(),
     })
+}
+
+/// Whether a transaction being taken notes what it changed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::css::style) enum NoteChanges {
+    Yes,
+    No,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

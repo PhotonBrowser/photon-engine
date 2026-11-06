@@ -51,6 +51,7 @@ struct Web::KeyEvent {
     bool repeat;
     bool should_insert_text;
     bool async_scroll_performed_default_action;
+    Optional<u64> user_input_scroll_count_with_nothing_to_scroll;
     u64 id;
     Vector<Web::TextEditingCommand> editing_commands;
     bool native_editing_binding_resolved;
@@ -115,5 +116,6 @@ struct Web::PinchEvent {
     [Finite] double scale_delta;
     bool async_zoom_performed_default_action;
     bool wheel_event_was_dispatched;
+    bool continues_gesture;
     u64 id;
 }

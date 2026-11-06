@@ -12,7 +12,7 @@
 //! actual pseudo-element kinds use sparse rows. An element's or pseudo-element's animations compose
 //! an animation overlay record over the record it is assigned, in a recyclable slot of its own.
 
-use super::fast_hash::FastMap as HashMap;
+use super::index::StyleAtomID;
 use super::installed_records::{InstalledRecord, InstalledRecordID, InstalledRecords};
 use super::tree::StyleNodeID;
 use crate::css::computed_longhand_table::DEPENDS_ON_VIEWPORT_METRICS;
@@ -107,6 +107,23 @@ impl SharedLonghands {
         let place = layout.place(longhand);
         // NB: The inherited bits are no group's: the records' values of them compare by value.
         layout.holds_value(longhand) && place.bit_field().is_none() && self.shared_groups & (1 << place.group()) != 0
+    }
+
+    /// The longhands whose values the records may hold differently, one bit per longhand from the
+    /// first: those in a group they do not share, and those that map elsewhere or hold no value of a
+    /// group.
+    pub(crate) fn longhands_to_compare(self) -> [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT] {
+        use crate::css::property_metadata::LONGHAND_WORD_COUNT;
+        let group_longhands = crate::css::computed_values::GroupValueLayout::group_longhands();
+        let mut longhands = [u64::MAX; LONGHAND_WORD_COUNT];
+        for (group, group_words) in group_longhands.iter().enumerate() {
+            if self.shared_groups & (1 << group) != 0 {
+                for (word, group_word) in longhands.iter_mut().zip(group_words) {
+                    *word &= !group_word;
+                }
+            }
+        }
+        longhands
     }
 }
 
@@ -471,6 +488,9 @@ pub(crate) struct HoverFrameLease {
 /// as many as they are, so that reading them costs a task less than what it made them for, but at least this many.
 const MIN_RECORDS_RELEASED_BEFORE_READING_LEASES: usize = 1024;
 
+/// How few released records a reclamation leaves to a later sweep.
+const MIN_RECORDS_RELEASED_BEFORE_SWEEPING: usize = 64;
+
 /// A reader's hold on the payloads of every style record published so far: while one is held, the
 /// engine frees no record's payloads, which a reader on another thread may be reading.
 pub(crate) struct StyleRecordLease {
@@ -506,6 +526,7 @@ impl ReleasedAnimationOverlayRecords {
         self.records.push(record);
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.records.is_empty() && !self.overflowed
     }
@@ -643,6 +664,7 @@ mod animation_overlay_slots {
 #[derive(Clone, Copy)]
 struct PseudoComputedRow {
     kind: u8,
+    highlight_name: StyleAtomID,
     published: bool,
     /// The installed record the pseudo-element is assigned.
     installed: Option<InstalledRecordID>,
@@ -650,9 +672,12 @@ struct PseudoComputedRow {
     installed_overlay_slot: Option<u32>,
 }
 
+/// The rows of an element's pseudo-elements, of which it rarely has more than one.
+type PseudoComputedRows = smallvec::SmallVec<[PseudoComputedRow; 1]>;
+
 /// The slot of the animation overlay composed over each element's record, by element.
 #[derive(Clone, Default)]
-struct AnimationOverlayColumn(Vec<u32>);
+struct AnimationOverlayColumn(crate::fork_vec::ForkVec<u32>);
 
 impl AnimationOverlayColumn {
     fn get(&self, index: usize) -> Option<u32> {
@@ -661,10 +686,8 @@ impl AnimationOverlayColumn {
 
     fn set(&mut self, index: usize, slot: Option<u32>) {
         if self.0.len() <= index {
-            self.0.resize(
-                index.checked_add(1).expect("animation overlay column space exhausted"),
-                0,
-            );
+            self.0
+                .resize_with_default(index.checked_add(1).expect("animation overlay column space exhausted"));
         }
         self.0[index] = slot.map_or(0, |slot| {
             slot.checked_add(1)
@@ -683,9 +706,10 @@ impl AnimationOverlayColumn {
 }
 
 impl PseudoComputedRow {
-    fn new(kind: u8) -> Self {
+    fn new(target: super::pipeline::PseudoElementTarget) -> Self {
         Self {
-            kind,
+            kind: target.kind,
+            highlight_name: target.highlight_name,
             published: false,
             installed: None,
             installed_overlay_slot: None,
@@ -694,6 +718,13 @@ impl PseudoComputedRow {
 
     fn is_empty(&self) -> bool {
         !self.published && self.installed.is_none()
+    }
+
+    fn target(&self) -> super::pipeline::PseudoElementTarget {
+        super::pipeline::PseudoElementTarget {
+            kind: self.kind,
+            highlight_name: self.highlight_name,
+        }
     }
 }
 #[derive(Clone, Copy)]
@@ -718,11 +749,32 @@ pub struct AnimationOverlayUpdate {
 pub struct ComputedStyleTarget {
     node: StyleNodeID,
     pseudo_kind: u8,
+    highlight_name: StyleAtomID,
 }
 
 impl ComputedStyleTarget {
     pub fn new(node: StyleNodeID, pseudo_kind: u8) -> Self {
-        Self { node, pseudo_kind }
+        Self {
+            node,
+            pseudo_kind,
+            highlight_name: StyleAtomID::NONE,
+        }
+    }
+
+    pub(super) fn of_pseudo_element(node: StyleNodeID, target: super::pipeline::PseudoElementTarget) -> Self {
+        Self {
+            node,
+            pseudo_kind: target.kind,
+            highlight_name: target.highlight_name,
+        }
+    }
+
+    #[must_use]
+    pub(super) fn pseudo_element(self) -> super::pipeline::PseudoElementTarget {
+        super::pipeline::PseudoElementTarget {
+            kind: self.pseudo_kind,
+            highlight_name: self.highlight_name,
+        }
     }
 
     #[must_use]
@@ -773,6 +825,9 @@ pub(crate) struct InstalledPseudoStyle {
 /// How many elements a chunk of the installed style columns holds.
 const INSTALLED_STYLE_CHUNK: usize = 64;
 
+/// The styles installed for an element's pseudo-elements, of which it rarely has more than one.
+type InstalledPseudoStyles = smallvec::SmallVec<[InstalledPseudoStyle; 1]>;
+
 /// The styles installed for the elements and their pseudo-elements, by element slot, as one
 /// installation left them: a published generation of the sets' columns, which later
 /// installations do not change. Publishing one costs a reference count however many elements
@@ -781,7 +836,7 @@ const INSTALLED_STYLE_CHUNK: usize = 64;
 pub(crate) struct InstalledStyles {
     elements: crate::cow_column::ColumnSnapshot<Option<InstalledStyle>, INSTALLED_STYLE_CHUNK>,
     pseudo_elements:
-        crate::cow_column::ColumnSnapshot<Option<std::sync::Arc<Box<[InstalledPseudoStyle]>>>, INSTALLED_STYLE_CHUNK>,
+        crate::cow_column::ColumnSnapshot<Option<std::sync::Arc<InstalledPseudoStyles>>, INSTALLED_STYLE_CHUNK>,
 }
 
 impl InstalledStyles {
@@ -823,29 +878,32 @@ pub struct ComputedGroupSets {
     /// the column was last published, by element index. A row is one thin pointer: most elements
     /// have none.
     installed_pseudo_column:
-        crate::cow_column::CowColumn<Option<std::sync::Arc<Box<[InstalledPseudoStyle]>>>, INSTALLED_STYLE_CHUNK>,
+        crate::cow_column::CowColumn<Option<std::sync::Arc<InstalledPseudoStyles>>, INSTALLED_STYLE_CHUNK>,
     /// The elements whose pseudo rows moved since the pseudo column was last published.
-    pseudo_rows_moved: Vec<StyleNodeID>,
+    pseudo_rows_moved: crate::fork::ForkShared<Vec<StyleNodeID>>,
     /// Long-lived immutable readers pin only the records they actually read. Expired readers leave weak entries
     /// that the next lease removes, so they neither block reclamation nor need to call back into the owner.
     hover_frame_leases: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Weak<HoverFrameLease>>>>,
     /// How many released records have the next sweep read the rows of the hover frames' leases.
     released_records_reading_leases: usize,
+    /// How many records have to be released, as a sweep leaves them, for a reclamation to sweep them. A sweep reads
+    /// every record it does not free, so a style update that releases a few sweeps only once they add up.
+    released_records_sweeping: usize,
     // Recyclable animation overlays are deliberately separate from the installed records above.
     // Dense element assignments and sparse pseudo assignments pin at most one slot each.
     animation_overlay_column: AnimationOverlayColumn,
-    animation_overlay_slots: animation_overlay_slots::AnimationOverlaySlots,
-    animation_overlay_slots_by_record: HashMap<FinalStyleRecordID, u32>,
+    animation_overlay_slots: crate::fork::ForkShared<animation_overlay_slots::AnimationOverlaySlots>,
+    animation_overlay_slots_by_record: crate::cow_map::CowMap<FinalStyleRecordID, u32>,
     /// The slots of overlay records nothing assigns or pins but something else holds, such as the host for the element
     /// it last applied the record to, which go once nothing does.
-    held_animation_overlay_slots: Vec<u32>,
+    held_animation_overlay_slots: crate::fork::ForkShared<Vec<u32>>,
     released_animation_overlay_records: ReleasedAnimationOverlayRecords,
     /// How many leases are held, shared with every copy of the sets: a copy holds no lease of its own.
     // NB: Either copy may be the host's, whose published frames hold their leases here.
     leases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     live_animation_overlay_assignments: usize,
     next_animation_overlay_generation: u64,
-    pseudo_rows_by_node: crate::fork::ForkShared<HashMap<StyleNodeID, Box<[PseudoComputedRow]>>>,
+    pseudo_rows_by_node: crate::cow_map::CowMap<StyleNodeID, PseudoComputedRows>,
     /// How many installed records were freed since what they named was last reclaimed.
     records_freed_since_reclamation: usize,
     next_reclamation_after: usize,
@@ -857,13 +915,14 @@ impl Default for ComputedGroupSets {
             installed: InstalledRecords::default(),
             installed_column: Default::default(),
             installed_pseudo_column: Default::default(),
-            pseudo_rows_moved: Vec::new(),
+            pseudo_rows_moved: Default::default(),
             hover_frame_leases: std::sync::Arc::default(),
             released_records_reading_leases: MIN_RECORDS_RELEASED_BEFORE_READING_LEASES,
+            released_records_sweeping: MIN_RECORDS_RELEASED_BEFORE_SWEEPING,
             animation_overlay_column: AnimationOverlayColumn::default(),
-            animation_overlay_slots: animation_overlay_slots::AnimationOverlaySlots::default(),
-            animation_overlay_slots_by_record: HashMap::default(),
-            held_animation_overlay_slots: Vec::new(),
+            animation_overlay_slots: Default::default(),
+            animation_overlay_slots_by_record: Default::default(),
+            held_animation_overlay_slots: Default::default(),
             released_animation_overlay_records: ReleasedAnimationOverlayRecords::default(),
             leases: std::sync::Arc::default(),
             live_animation_overlay_assignments: 0,
@@ -879,27 +938,24 @@ impl ComputedGroupSets {
     /// Counts the installed records and the columns naming them toward the installed records,
     /// and the records by owner.
     pub(super) fn report_memory(&self, report: &mut super::memory_report::MemoryReport) {
-        use crate::heap_size::{map_bytes, vec_bytes};
+        use crate::heap_size::{small_vec_bytes, vec_bytes};
         self.installed.report_memory(report);
         for record in self.animation_overlay_slots.records() {
             super::pipeline::Record::report_memory(record, report);
         }
-        let pseudo_rows = &*self.pseudo_rows_by_node;
+        let pseudo_rows = &self.pseudo_rows_by_node;
         report.add(
             super::memory_report::MemoryOwner::Installed,
             self.installed_column.len() * size_of::<Option<InstalledStyle>>()
-                + self.installed_pseudo_column.len() * size_of::<Option<std::sync::Arc<Box<[InstalledPseudoStyle]>>>>()
+                + self.installed_pseudo_column.len() * size_of::<Option<std::sync::Arc<InstalledPseudoStyles>>>()
                 + vec_bytes(&self.pseudo_rows_moved)
-                + vec_bytes(&self.animation_overlay_column.0)
+                + self.animation_overlay_column.0.row_bytes()
                 + self.animation_overlay_slots.heap_size()
-                + map_bytes(&self.animation_overlay_slots_by_record)
+                + self.animation_overlay_slots_by_record.heap_size()
                 + vec_bytes(&self.held_animation_overlay_slots)
                 + vec_bytes(&self.released_animation_overlay_records.records)
-                + map_bytes(pseudo_rows)
-                + pseudo_rows
-                    .values()
-                    .map(|rows| size_of_val::<[PseudoComputedRow]>(rows))
-                    .sum::<usize>(),
+                + pseudo_rows.heap_size()
+                + pseudo_rows.iter().map(|(_, rows)| small_vec_bytes(rows)).sum::<usize>(),
         );
     }
 
@@ -958,7 +1014,8 @@ impl ComputedGroupSets {
         self.animation_overlay_slots.retired_records()
     }
 
-    pub(super) fn has_released_animation_overlay_records(&self) -> bool {
+    #[cfg(test)]
+    fn has_released_animation_overlay_records(&self) -> bool {
         !self.released_animation_overlay_records.is_empty()
     }
 
@@ -967,55 +1024,55 @@ impl ComputedGroupSets {
     }
 
     fn pseudo_rows(&self, node: StyleNodeID) -> &[PseudoComputedRow] {
-        self.pseudo_rows_by_node.get(&node).map_or(&[], Box::as_ref)
+        self.pseudo_rows_by_node.get(&node).map_or(&[], |rows| rows.as_slice())
     }
 
-    fn pseudo_row(&self, node: StyleNodeID, kind: u8) -> Option<&PseudoComputedRow> {
-        self.pseudo_rows(node).iter().find(|row| row.kind == kind)
+    fn pseudo_row(
+        &self,
+        node: StyleNodeID,
+        target: super::pipeline::PseudoElementTarget,
+    ) -> Option<&PseudoComputedRow> {
+        self.pseudo_rows(node).iter().find(|row| row.target() == target)
     }
 
-    fn pseudo_row_mut(&mut self, node: StyleNodeID, kind: u8) -> Option<&mut PseudoComputedRow> {
+    fn pseudo_row_mut(
+        &mut self,
+        node: StyleNodeID,
+        target: super::pipeline::PseudoElementTarget,
+    ) -> Option<&mut PseudoComputedRow> {
         self.pseudo_rows_moved.push(node);
         self.pseudo_rows_by_node
             .get_mut(&node)
-            .and_then(|rows| rows.iter_mut().find(|row| row.kind == kind))
+            .and_then(|rows| rows.iter_mut().find(|row| row.target() == target))
     }
 
-    fn ensure_pseudo_row(&mut self, node: StyleNodeID, kind: u8) -> &mut PseudoComputedRow {
+    fn ensure_pseudo_row(
+        &mut self,
+        node: StyleNodeID,
+        target: super::pipeline::PseudoElementTarget,
+    ) -> &mut PseudoComputedRow {
         self.pseudo_rows_moved.push(node);
         let rows = self.pseudo_rows_by_node.entry(node).or_default();
-        let row_index = rows.iter().position(|row| row.kind == kind).unwrap_or_else(|| {
-            let mut extended = std::mem::take(rows).into_vec();
-            let row_index = extended.len();
-            extended.push(PseudoComputedRow::new(kind));
-            *rows = extended.into_boxed_slice();
-
-            row_index
+        let row_index = rows.iter().position(|row| row.target() == target).unwrap_or_else(|| {
+            rows.push(PseudoComputedRow::new(target));
+            rows.len() - 1
         });
         &mut rows[row_index]
     }
 
-    fn remove_empty_pseudo_row(&mut self, node: StyleNodeID, kind: u8) {
+    fn remove_empty_pseudo_row(&mut self, node: StyleNodeID, target: super::pipeline::PseudoElementTarget) {
         self.pseudo_rows_moved.push(node);
-        let std::collections::hash_map::Entry::Occupied(mut entry) = self.pseudo_rows_by_node.entry(node) else {
+        let Some(rows) = self.pseudo_rows_by_node.get(&node) else {
             return;
         };
-        let Some(row_index) = entry.get().iter().position(|row| row.kind == kind && row.is_empty()) else {
+        let Some(row_index) = rows.iter().position(|row| row.target() == target && row.is_empty()) else {
             return;
         };
-        let mut rows = std::mem::take(entry.get_mut()).into_vec();
+        let rows = self.pseudo_rows_by_node.get_mut(&node).expect("the node has rows");
         rows.remove(row_index);
-
         if rows.is_empty() {
-            entry.remove();
-        } else {
-            entry.insert(rows.into_boxed_slice());
+            self.pseudo_rows_by_node.remove(&node);
         }
-    }
-
-    /// The installed record `record` names, while it is live.
-    fn installed(&self, record: FinalStyleRecordID) -> Option<&InstalledRecord> {
-        self.installed.get(record.installed_record()?)
     }
 
     /// Take a slot for a record the engine computed, or answer the one it holds already.
@@ -1028,21 +1085,22 @@ impl ComputedGroupSets {
         FinalStyleRecordID::installed(self.installed.install(record, dependency_flags))
     }
 
+    /// Take a slot for a record derived for what no element is, or answer one holding the same.
+    /// `dependency_flags` says what the view of a record in a new slot depends on.
+    pub(super) fn install_derived_record(
+        &mut self,
+        record: &std::sync::Arc<super::pipeline::Record>,
+        dependency_flags: impl FnOnce() -> u8,
+    ) -> FinalStyleRecordID {
+        FinalStyleRecordID::installed(self.installed.install_derived(record, dependency_flags))
+    }
+
     /// The identity `record` holds already, if it holds one.
     pub(super) fn installed_record_named_by(
         &self,
         record: &std::sync::Arc<super::pipeline::Record>,
     ) -> Option<FinalStyleRecordID> {
         self.installed.named_by(record).map(FinalStyleRecordID::installed)
-    }
-
-    /// An installed record holding the style `record` does, which an element computing `record`
-    /// holds in its place.
-    pub(super) fn installed_record_holding_the_same_style_as(
-        &self,
-        record: &super::pipeline::Record,
-    ) -> Option<&std::sync::Arc<super::pipeline::Record>> {
-        self.installed.holding_the_same_style_as(record)
     }
 
     /// The record the engine computed that the installed `record` installs, where it is one.
@@ -1098,9 +1156,22 @@ impl ComputedGroupSets {
         pseudo_kind: u8,
         record: FinalStyleRecordID,
     ) {
+        self.assign_installed_pseudo_record_of(
+            node,
+            super::pipeline::PseudoElementTarget::of_kind(pseudo_kind),
+            record,
+        );
+    }
+
+    pub(super) fn assign_installed_pseudo_record_of(
+        &mut self,
+        node: StyleNodeID,
+        target: super::pipeline::PseudoElementTarget,
+        record: FinalStyleRecordID,
+    ) {
         let installed = record.installed_record().expect("an installed record");
         self.installed.hold(installed);
-        let row = self.ensure_pseudo_row(node, pseudo_kind);
+        let row = self.ensure_pseudo_row(node, target);
         row.published = true;
         let previous = row.installed.replace(installed);
         let overlay = row.installed_overlay_slot.take();
@@ -1118,13 +1189,14 @@ impl ComputedGroupSets {
         let mut moved = std::mem::take(&mut self.pseudo_rows_moved);
         moved.sort_unstable();
         moved.dedup();
-        for &node in &moved {
+        for &node in moved.iter() {
             let Some(index) = node.element_index().map(|index| index as usize) else {
                 continue;
             };
-            let styles: Vec<InstalledPseudoStyle> = self
+            let styles: InstalledPseudoStyles = self
                 .pseudo_rows(node)
                 .iter()
+                .filter(|row| row.highlight_name.is_none())
                 .filter_map(|row| {
                     let id = row.installed?;
                     Some(InstalledPseudoStyle {
@@ -1136,7 +1208,7 @@ impl ComputedGroupSets {
                     })
                 })
                 .collect();
-            let styles = (!styles.is_empty()).then(|| std::sync::Arc::new(styles.into_boxed_slice()));
+            let styles = (!styles.is_empty()).then(|| std::sync::Arc::new(styles));
             if styles.is_some() {
                 self.installed_pseudo_column.grow_to(index + 1);
             }
@@ -1214,7 +1286,7 @@ impl ComputedGroupSets {
         target: ComputedStyleTarget,
     ) -> Option<(InstalledRecordID, Option<u32>)> {
         if target.is_pseudo() {
-            let row = self.pseudo_row(target.node, target.pseudo_kind)?;
+            let row = self.pseudo_row(target.node, target.pseudo_element())?;
             return Some((row.installed?, row.installed_overlay_slot));
         }
         let index = target.node.element_index()? as usize;
@@ -1272,7 +1344,7 @@ impl ComputedGroupSets {
 
     fn set_animation_overlay_slot_of(&mut self, target: ComputedStyleTarget, slot: Option<u32>) {
         if target.is_pseudo() {
-            let Some(row) = self.pseudo_row_mut(target.node, target.pseudo_kind) else {
+            let Some(row) = self.pseudo_row_mut(target.node, target.pseudo_element()) else {
                 return;
             };
             if row.installed.is_some() {
@@ -1374,9 +1446,10 @@ impl ComputedGroupSets {
         let mut slots = std::mem::take(&mut self.held_animation_overlay_slots);
         slots.sort_unstable();
         slots.dedup();
-        for slot in slots {
-            // NB: A slot a pin took again goes back on the list when its last pin goes.
-            let Some(record) = self.animation_overlay_slots.get(slot) else {
+        for slot in slots.iter().copied() {
+            // NB: Taken for writing so that a fork sharing the slots has a copy of its own, which counts as holding the
+            //     record. A slot a pin took again goes back on the list when its last pin goes.
+            let Some(record) = self.animation_overlay_slots.get_mut(slot) else {
                 continue;
             };
             if record.is_assigned || record.pin_count != 0 {
@@ -1455,6 +1528,12 @@ impl ComputedGroupSets {
                     record_updated: false,
                 };
             }
+            // NB: Taken for writing so that a fork sharing the slots has a copy of its own, which counts as holding the
+            //     record. Both ways on from here write the slots.
+            let current = self
+                .animation_overlay_slots
+                .get_mut(slot)
+                .expect("animation-overlay slot is live");
             if current.pin_count == 0 && !current.is_held_elsewhere() {
                 let record = self.make_animation_overlay_record(
                     base,
@@ -1557,8 +1636,31 @@ impl ComputedGroupSets {
     }
 
     pub fn pseudo_style_record(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<FinalStyleRecordID> {
-        let row = self.pseudo_row(node, pseudo_kind)?;
+        self.pseudo_style_record_of(node, super::pipeline::PseudoElementTarget::of_kind(pseudo_kind))
+    }
+
+    pub(super) fn pseudo_style_record_of(
+        &self,
+        node: StyleNodeID,
+        target: super::pipeline::PseudoElementTarget,
+    ) -> Option<FinalStyleRecordID> {
+        let row = self.pseudo_row(node, target)?;
         Some(self.final_style_record(row.installed?, row.installed_overlay_slot))
+    }
+
+    pub(super) fn custom_highlight_records(
+        &self,
+        node: StyleNodeID,
+    ) -> impl Iterator<Item = (StyleAtomID, FinalStyleRecordID)> + '_ {
+        self.pseudo_rows(node).iter().filter_map(move |row| {
+            if row.highlight_name.is_none() {
+                return None;
+            }
+            Some((
+                row.highlight_name,
+                self.final_style_record(row.installed?, row.installed_overlay_slot),
+            ))
+        })
     }
 
     /// Each record a pseudo-element holds, with the node it belongs to.
@@ -1576,13 +1678,9 @@ impl ComputedGroupSets {
     pub fn assigned_pseudo_kinds(&self, node: StyleNodeID) -> impl Iterator<Item = u8> + '_ {
         self.pseudo_rows(node)
             .iter()
-            .filter_map(|row| row.published.then_some(row.kind))
+            .filter_map(|row| (row.published && row.highlight_name.is_none()).then_some(row.kind))
     }
 
-    fn longhands_for_target(&self, target: ComputedStyleTarget) -> Option<ViewLonghands<'_>> {
-        let installed = self.installed(self.assigned_final_style_record(target)?)?;
-        Some(ViewLonghands::of_record(installed.record()))
-    }
     /// The groups whose values read, from `values`, the recorded specified values of the longhands
     /// whose computed values depend on what the element inherits, one that `depends_on_input`.
     pub(super) fn specified_value_dependency_mask_of<'a>(
@@ -1597,19 +1695,15 @@ impl ComputedGroupSets {
             .fold(0, |mask, groups| mask | groups)
     }
 
-    /// The groups whose previous specified values actually read `currentColor` while computing.
-    /// Missing dependency coverage stays typed so a color winner change can widen safely.
+    /// The groups whose specified values in `longhands` actually read `currentColor` while computing.
     #[must_use]
-    pub fn current_color_dependency_mask(&self, target: ComputedStyleTarget) -> Option<u32> {
-        let longhands = self.longhands_for_target(target)?;
-        Some(
-            Self::specified_value_dependency_mask_of(
-                longhands.inheritance_dependent_values(),
-                retained_value_depends_on_current_color,
-            ) | crate::css::table_group_builder::groups_reading_current_color_through_inherited_values(|property| {
-                longhands.value(property)
-            }),
-        )
+    pub(crate) fn current_color_dependency_mask(longhands: ViewLonghands<'_>) -> u32 {
+        Self::specified_value_dependency_mask_of(
+            longhands.inheritance_dependent_values(),
+            retained_value_depends_on_current_color,
+        ) | crate::css::table_group_builder::groups_reading_current_color_through_inherited_values(|property| {
+            longhands.value(property)
+        })
     }
 
     /// Whether a raw final record identity still names a live installed record.
@@ -1623,6 +1717,15 @@ impl ComputedGroupSets {
     pub fn custom_property_environment_identity(&self, node: StyleNodeID) -> Option<u64> {
         let installed = self.installed_column.get(node.element_index()? as usize)?.as_ref()?.id;
         Some(self.installed.get(installed)?.custom_property_environment())
+    }
+
+    /// Each element holding an installed record, with the custom-property environment that names.
+    pub(super) fn installed_custom_property_environments(&self) -> impl Iterator<Item = (StyleNodeID, u64)> + '_ {
+        (0..self.installed_column.len()).filter_map(|index| {
+            let installed = self.installed_column.get(index)?.as_ref()?;
+            let node = StyleNodeID::element(u32::try_from(index).ok()?);
+            Some((node, installed.record.custom_property_environment()))
+        })
     }
 
     /// Every raw custom-property environment identity a live record was installed with.
@@ -1653,7 +1756,7 @@ impl ComputedGroupSets {
         }
         self.pseudo_rows_moved.push(node);
         if let Some(rows) = self.pseudo_rows_by_node.remove(&node) {
-            for row in rows.into_vec() {
+            for row in rows {
                 if let Some(installed) = row.installed {
                     self.installed.release(installed);
                 }
@@ -1664,8 +1767,12 @@ impl ComputedGroupSets {
         }
     }
 
-    pub fn remove_pseudo(&mut self, node: StyleNodeID, pseudo_kind: u8) -> Option<FinalStyleRecordID> {
-        let row = self.pseudo_row_mut(node, pseudo_kind)?;
+    pub(super) fn remove_pseudo_of(
+        &mut self,
+        node: StyleNodeID,
+        target: super::pipeline::PseudoElementTarget,
+    ) -> Option<FinalStyleRecordID> {
+        let row = self.pseudo_row_mut(node, target)?;
         let installed = row.installed.take()?;
         let overlay = row.installed_overlay_slot.take();
         row.published = false;
@@ -1674,7 +1781,7 @@ impl ComputedGroupSets {
             self.release_animation_overlay_assignment(slot);
         }
         self.installed.release(installed);
-        self.remove_empty_pseudo_row(node, pseudo_kind);
+        self.remove_empty_pseudo_row(node, target);
         Some(final_style_record)
     }
     #[must_use]
@@ -1735,6 +1842,11 @@ impl ComputedGroupSets {
         self.sweep_installed_records();
     }
 
+    /// Has the next reclamation sweep however few records were released.
+    pub(super) fn sweep_at_next_reclamation(&mut self) {
+        self.released_records_sweeping = 0;
+    }
+
     /// Frees the installed records nothing holds, where nothing views or leases them, and answers
     /// whether enough were freed since the last time it did for what they named to be reclaimed.
     pub(super) fn reclaim_unreachable_if_needed(&mut self, records_are_viewed: bool) -> bool {
@@ -1743,7 +1855,11 @@ impl ComputedGroupSets {
         if records_are_viewed || self.style_records_are_leased() {
             return false;
         }
-        self.sweep_installed_records();
+        if self.installed.released_count() >= self.released_records_sweeping {
+            self.sweep_installed_records();
+            self.released_records_sweeping =
+                (self.installed.released_count() * 2).max(MIN_RECORDS_RELEASED_BEFORE_SWEEPING);
+        }
         if self.records_freed_since_reclamation < self.next_reclamation_after {
             return false;
         }
@@ -1853,7 +1969,7 @@ mod tests {
                 pseudo_element_styles,
             ))
             .with_test_dependency_flags(dependency_flags);
-        sets.install_record(&record, || 0)
+        sets.install_derived_record(&record, || 0)
     }
 
     /// Assigns `target` a record installed as [`install`] installs it.
@@ -1931,8 +2047,14 @@ mod tests {
         assert_eq!(pseudo_record, first_record);
         assert_eq!(sets.pseudo_style_record(pseudo.node, 2), Some(pseudo_record));
         assert_eq!(sets.assigned_pseudo_kinds(pseudo.node).collect::<Vec<_>>(), [2]);
-        assert_eq!(sets.remove_pseudo(pseudo.node, 2), Some(pseudo_record));
-        assert_eq!(sets.remove_pseudo(pseudo.node, 2), None);
+        assert_eq!(
+            sets.remove_pseudo_of(pseudo.node, super::super::pipeline::PseudoElementTarget::of_kind(2)),
+            Some(pseudo_record)
+        );
+        assert_eq!(
+            sets.remove_pseudo_of(pseudo.node, super::super::pipeline::PseudoElementTarget::of_kind(2)),
+            None
+        );
     }
 
     #[test]

@@ -55,17 +55,17 @@ pub(crate) struct RenderState {
 
 impl RenderState {
     /// Makes the state `seed` describes, whose style engine shares `process_style` with the other documents', and whose
-    /// style passes run on `style_pool`.
+    /// style passes run on `style_layout_pool`.
     fn new(
         seed: owner::StateSeed,
         process_style: &std::sync::Arc<crate::css::style::ProcessStyle>,
-        style_pool: &std::sync::Arc<crate::css::style::pipeline::pool::StylePool>,
+        style_layout_pool: &std::sync::Arc<crate::style_layout_pool::StyleLayoutPool>,
     ) -> Self {
         let owner::StateSeed { shared } = seed;
         let mut arena = Box::new(ArenaHandle::new());
         let mut engine = Box::new(crate::css::style::StyleEngine::new());
         engine.share_process_style(std::sync::Arc::clone(process_style));
-        engine.share_style_pool(style_pool.clone());
+        engine.share_style_layout_pool(style_layout_pool.clone());
         engine.share_element_random_base_values_exist(shared.element_random_base_values_exist);
         engine.share_declaration_block_versions(shared.declaration_block_versions);
         engine.share_container_effects_held(shared.container_effects_held);
@@ -193,6 +193,7 @@ impl RenderState {
                 .selector_attribute_value_text_requirements_version(),
             relational_arrival_keys_version: engine.relational_arrival_keys_version(),
             selectors_test_local_link: engine.selectors_test_local_link(),
+            selectors_test_validity: engine.selectors_test_validity(),
         };
         let selector_value_text_names = std::sync::Arc::clone(engine.selector_attribute_value_text_names());
         let selector_tested_attribute_names = std::sync::Arc::clone(engine.selector_tested_attribute_names());
@@ -231,13 +232,21 @@ impl RenderState {
         answer.note_host_styled_boxes(arena);
         let work = OwedHostWork::default();
         arena.queue_box_presence();
-        let styled = arena.install_styles(HostCalls(&work), answer.rows(), |node| answer.element_install(node));
+        let next_effects = std::cell::Cell::new(0);
+        let styled = arena.install_styles(HostCalls(&work), answer.rows(), |node| {
+            answer.element_install(node, &next_effects)
+        });
+        assert_eq!(
+            next_effects.get(),
+            answer.effects_count(),
+            "the rows and the effects of an installation stand in one order"
+        );
         let host_work = work.resolve(arena);
         self.engine_mut().end_reinheriting_for_install();
         if !host_work.is_empty() {
             self.owed.push(host_work);
         }
-        answer.note_styled(styled);
+        answer.note_styled(styled, self.arena.arena());
     }
 
     /// The style engine, and the layout arena beside it.
@@ -326,6 +335,7 @@ pub(crate) struct StateFacts {
     pub(crate) relational_arrival_keys_version: u64,
     /// Whether the engine's selectors test `:local-link`.
     pub(crate) selectors_test_local_link: bool,
+    pub(crate) selectors_test_validity: bool,
 }
 
 /// What the style engine answers of itself as a job or a frame leaves it, which only a write to the engine moves (see
@@ -889,7 +899,7 @@ fn wait_for_render_side() {
 /// Whether the calling thread's stack has room for a job on a render state that recurses through a tree `tree_depth`
 /// levels deep. Only the Render thread's stack is large enough for any tree.
 #[cfg(not(test))]
-fn stack_has_room_for_render_job(tree_depth: u32) -> bool {
+pub(crate) fn stack_has_room_for_render_job(tree_depth: u32) -> bool {
     /// The stack a job on a render state takes at most per level of the tree it recurses through, as it builds and
     /// lays out boxes, with room to spare for the boxes a level adds: release builds took about 1.5 KiB per element,
     /// and debug builds about 2 KiB.
@@ -917,7 +927,7 @@ fn stack_has_room_for_render_job(tree_depth: u32) -> bool {
 }
 
 #[cfg(test)]
-fn stack_has_room_for_render_job(_: u32) -> bool {
+pub(crate) fn stack_has_room_for_render_job(_: u32) -> bool {
     false
 }
 

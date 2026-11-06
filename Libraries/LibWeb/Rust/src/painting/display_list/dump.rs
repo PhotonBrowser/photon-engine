@@ -665,7 +665,7 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
         // The display list of a page holds none of the commands of the canvas 2D stream.
         DisplayListCommandType::Canvas2DFillPath
         | DisplayListCommandType::Canvas2DStrokePath
-        | DisplayListCommandType::Canvas2DDrawGlyphRun
+        | DisplayListCommandType::Canvas2DDrawGlyphRuns
         | DisplayListCommandType::Canvas2DClearRect
         | DisplayListCommandType::Canvas2DDrawImageFrame
         | DisplayListCommandType::Canvas2DDrawCanvas
@@ -831,6 +831,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         });
         let clip = tree.append_clip(
             ClipNodeData::rect_clip(libgfx_rust::FloatRect::new(0.0, 0.0, 9.0, 9.0)),

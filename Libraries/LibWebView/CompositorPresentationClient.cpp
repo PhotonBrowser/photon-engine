@@ -100,10 +100,10 @@ void CompositorPresentationClient::did_detect_history_swipe_candidate(Web::Compo
         page->did_detect_history_swipe_candidate(gesture_id, back, unconsumed_delta);
 }
 
-void CompositorPresentationClient::did_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id, bool async_scroll_performed_default_action)
+void CompositorPresentationClient::did_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id, bool performed_default_action)
 {
     if (auto* page = page_for_compositor_context_id(context_id))
-        page->did_dispatch_input_event_through_compositor(event_id, async_scroll_performed_default_action);
+        page->did_dispatch_input_event_through_compositor(event_id, performed_default_action);
 }
 
 }

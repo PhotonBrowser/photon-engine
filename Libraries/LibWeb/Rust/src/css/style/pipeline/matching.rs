@@ -8,10 +8,11 @@
 //! reject those whose required ancestor keys the filter lacks, and evaluate the rest.
 
 use super::super::component_matching::EntrySelector;
+use super::super::input_types::TransactionFactSide;
 use super::super::selector_evaluation::StructuralRead;
-use super::super::transaction_view::TransactionFactSide;
 use super::super::*;
 use super::bloom::{AncestorFilter, SiblingFilter};
+use super::extent_map::KeyHash;
 use super::projection::{ElementFacts, Projection, ProjectionEvaluator};
 use super::rules::{BucketSlots, BucketSource, Buckets, RuleIndex, ScopeGroupID, ScopeIndex};
 use crate::css::selector::Specificity;
@@ -36,6 +37,12 @@ pub(super) struct ElementMatch {
 }
 
 impl ElementMatch {
+    pub(super) fn styles(&self, index: &RuleIndex, target: super::PseudoElementTarget) -> bool {
+        self.pseudo_kind == target.kind
+            && (target.kind != super::super::publication::pseudo_kind::HIGHLIGHT
+                || index.entry_styles_custom_highlight(self.entry, target.highlight_name))
+    }
+
     /// Whether the entry styles a pseudo-element.
     #[cfg(test)]
     pub(super) fn pseudo_element(&self) -> bool {
@@ -468,21 +475,21 @@ impl<'a> Matcher<'a> {
             // NB: A tag that is its own ASCII-lowercase form has no folding of its own.
             tag_is_lowercase: facts.folded_tag().is_none(),
         };
+        // NB: Each source is asked for the same keys, which are read from the element and hashed once.
+        let mut probes: SmallVec<[(DispatchKey, KeyHash); 16]> = SmallVec::new();
+        projection.for_each_dispatch_probe(facts, is_document_root, |key, _| {
+            probes.push((key, Buckets::hash_of(&key)));
+        });
         for source in sources {
             let buckets = source.buckets.family(family);
             if buckets.is_empty() {
                 continue;
             }
-            let mut result = Ok(());
-            projection.for_each_dispatch_probe(facts, is_document_root, |key, _| {
-                if result.is_err() {
-                    return;
+            for (key, hash) in &probes {
+                if let Some(bucket) = buckets.get_hashed(key, *hash) {
+                    self.offer_all(bucket, source, node, reach, keys, out)?;
                 }
-                if let Some(bucket) = buckets.get(&key) {
-                    result = self.offer_all(bucket, source, node, reach, keys, out);
-                }
-            });
-            result?;
+            }
         }
         Ok(())
     }

@@ -193,6 +193,7 @@ public:
     virtual Node& slottable_as_node() override { return *this; }
 
     Utf16FlyString const& qualified_name() const { return m_qualified_name.as_string(); }
+    QualifiedName::Impl const* qualified_name_identity() const { return m_qualified_name.identity(); }
     Utf16FlyString const& html_uppercased_qualified_name() const;
 
     virtual Utf16FlyString node_name() const final { return html_uppercased_qualified_name(); }
@@ -240,6 +241,7 @@ public:
     Optional<Utf16String> lang() const;
     Optional<Utf16View> lang_view() const;
     void invalidate_lang_value();
+    void invalidate_lang_value_of_inclusive_ancestors();
 
     void set_attribute(FlyString qualified_name, Utf16String const& verified_value);
     void set_attribute_ns(QualifiedName const&, Utf16String const& verified_value);
@@ -266,6 +268,7 @@ public:
 
     // The element's attributes in order, borrowed until they next change.
     ReadonlySpan<Attribute> attribute_list() const;
+    void const* attribute_list_memory() const { return m_attributes.ptr(); }
 
     // A filter over the local names of the attributes and the classes of this element and its descendants: a name whose
     // bit is clear is on none of them. Bits are only ever added, so a name may keep its bit after it is last removed.
@@ -359,6 +362,8 @@ public:
     // elements keep 0, which is what makes them free.
     [[nodiscard]] CSS::StyleNodeID style_node_id() const { return m_style_node_id; }
     void set_style_node_id(CSS::StyleNodeID);
+    // Tells the hover of the render clock what link this element is, as its href or style node changed.
+    void update_hover_link();
     void record_style_environment_change();
 
     // https://html.spec.whatwg.org/multipage/embedded-content-other.html#dimension-attributes
@@ -398,6 +403,9 @@ public:
     // Swaps in the style record the render side installed for the element, or for one of its synthetic
     // pseudo-elements, in its box too. The side effects of the move are left to apply_style_main_effects().
     void swap_in_style_record(Layout::BegunRead const& read, Optional<CSS::PseudoElement>, void const* record);
+    using CustomHighlightStyles = HashMap<CSS::StyleAtomID, CSS::InstalledStyle>;
+    [[nodiscard]] CustomHighlightStyles const* custom_highlight_styles() const;
+    void swap_in_custom_highlight_style_record(CSS::StyleAtomID, void const* record);
     // Moves the animation subtree style generation of the element and its ancestors.
     void note_subtree_style_moved();
     [[nodiscard]] RefPtr<CSS::CustomPropertyData const> style_custom_property_environment(Layout::BegunRead const& read, CSS::InstalledStyle const&) const;
@@ -777,6 +785,7 @@ public:
     GC::Ptr<HTML::CustomStateSet const> custom_state_set() const;
     HTML::CustomStateSet& ensure_custom_state_set();
 
+    bool has_custom_element_definition() const { return !!custom_element_definition(); }
     bool can_upgrade_custom_element() const { return m_custom_element_state == CustomElementState::Undefined || m_custom_element_state == CustomElementState::Uncustomized; }
     void try_to_upgrade();
 
@@ -805,6 +814,9 @@ public:
     void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, GC::Ref<IntersectionObserver::IntersectionObserver>);
     void unregister_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, GC::Ref<IntersectionObserver::IntersectionObserver>);
 
+    void register_resize_observer(Badge<ResizeObserver::ResizeObserver>, GC::Ref<ResizeObserver::ResizeObserver>);
+    void unregister_resize_observer(Badge<ResizeObserver::ResizeObserver>, GC::Ref<ResizeObserver::ResizeObserver>);
+
     CSSPixelPoint scroll_offset(Optional<CSS::PseudoElement> type) const;
     void set_scroll_offset(Optional<CSS::PseudoElement> type, CSSPixelPoint offset);
     u8 last_relative_scroll_direction() const;
@@ -829,6 +841,7 @@ public:
         Rtl,
     };
     Directionality directionality() const;
+    Optional<Directionality> directionality_unless_from_parent() const;
     bool is_auto_directionality_form_associated_element() const;
 
     Optional<Utf16FlyString> const& id() const { return m_id; }
@@ -870,6 +883,8 @@ public:
     bool matches_visited_pseudo_class() const;
     bool matches_local_link_pseudo_class() const;
     bool matches_focus_within_pseudo_class() const;
+    static void set_marks_on_focus_within_chain(Document const&, bool);
+    bool is_marked_on_focus_within_chain() const { return m_is_marked_on_focus_within_chain; }
 
     void schedule_list_item_renumber_for_list_owner();
     bool list_item_renumber_affects_rendered_content() const;
@@ -921,6 +936,11 @@ public:
     virtual void initialize_element() { }
 
     void prepare_for_style_computation(Badge<CSS::StyleComputer>) { prepare_for_style_computation(); }
+    virtual bool needs_preparation_for_style_computation() const { return false; }
+
+    // Whether the element holds a style node whose initial features the style engine has not been told yet.
+    bool initial_style_features_pending() const { return m_initial_style_features_pending; }
+    void set_initial_style_features_pending(bool value) { m_initial_style_features_pending = value; }
 
     // Unregisters the anchor names this element registered in the tree scope `tree_root` is the root of.
     void unregister_anchor_names_before_leaving_tree_scope(Badge<Node>, Node& tree_root);
@@ -961,6 +981,7 @@ protected:
 
 private:
     void bump_dom_tree_version_for_attribute_change();
+    void clear_custom_highlight_styles();
     // The attributes of an element, in order, in the same allocation as their count and capacity.
     class AttributeList {
         AK_MAKE_NONCOPYABLE(AttributeList);
@@ -1083,7 +1104,9 @@ private:
     friend class Attr;
     friend class NamedNodeMap;
 
+    bool m_initial_style_features_pending : 1 { false };
     bool m_is_being_activated : 1 { false };
+    bool m_is_marked_on_focus_within_chain : 1 { false };
     bool m_in_top_layer : 1 { false };
     bool m_rendered_in_top_layer : 1 { false };
     // Authoritative dependency marks left by this element's latest style computation.

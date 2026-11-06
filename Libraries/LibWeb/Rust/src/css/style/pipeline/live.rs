@@ -10,12 +10,12 @@
 
 use super::super::component_matching::DocumentMatching;
 use super::super::index::dispatch_bloom_bit;
+use super::super::input_types::TransactionFactSide;
 use super::super::input_types::{
     STYLE_REACTION_FONT_INPUTS_CHANGED, STYLE_REACTION_PUBLISHED_STYLE, STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES,
     StyleEnvironment, StyleUpdate, TreeRelations,
 };
 use super::super::selector_evaluation::StructuralRead;
-use super::super::transaction_view::TransactionFactSide;
 use super::super::*;
 use super::drive::DriveRecords;
 use super::invalidation::{
@@ -28,8 +28,9 @@ use super::rule_changes::Restyled;
 use super::rule_store::RuleChanges;
 use super::rules::{IndexChanges, RuleIndex};
 use super::traversal::{
-    self, DIRTY_DESCENDANTS, HintBits, InitialStyle, MATCH_DESCENDANTS, MATCH_SELF, PARENT_CHANGED, PassContext,
-    RECOMPUTE_SELF, RESTYLE_DESCENDANTS, RESTYLE_PSEUDO_ELEMENTS, RESTYLE_SELF, RESTYLES_SELF, STYLES_SOMETHING,
+    self, CONTAINERS_MOVED, DIRTY_DESCENDANTS, HintBits, InitialStyle, MATCH_DESCENDANTS, MATCH_SELF, PARENT_CHANGED,
+    PassContext, RECOMPUTE_SELF, RESTYLE_DESCENDANTS, RESTYLE_PSEUDO_ELEMENTS, RESTYLE_SELF, RESTYLES_SELF,
+    STYLES_SOMETHING,
 };
 use crate::cow_column::CowColumn;
 use crate::css::style::custom_property_cascade::{
@@ -154,6 +155,9 @@ pub(in super::super) struct Live {
     /// is not displayed: the host asks for the styles of the SVG resources such a subtree holds,
     /// which paint wherever they are referenced, and of its elements with animations.
     pub(super) kept_hidden: Vec<StyleNodeID>,
+    /// Which records computed for `kept_hidden` still stand, so that an installation computes
+    /// only those something could have moved.
+    pub(super) kept_hidden_records: ForkReset<super::demand::KeptHiddenRecords>,
 }
 
 /// What passes and the invalidation of transactions work in, which holds nothing between them.
@@ -162,9 +166,9 @@ struct LiveScratch {
     /// The cells passes write their records to.
     cells: RecordCells,
     /// What a changed element matches, by thread, for the threads that followed a change.
-    memos: super::pool::PerThread<FollowScratch>,
+    memos: super::per_thread::PerThread<FollowScratch>,
     /// The group caches the passes keep for the next, by thread, for the threads that styled.
-    groups: super::pool::PerThread<super::compute::GroupCache>,
+    groups: super::per_thread::PerThread<super::compute::GroupCache>,
     /// The matched declarations cache the passes keep for the next.
     matched_declarations: super::matched_declarations::MatchedDeclarationsCache,
     /// The inputs of the document the entries of the matched declarations cache read, as they
@@ -435,6 +439,15 @@ struct MatchedDeclarationsInputs {
 }
 
 impl MatchedDeclarationsInputs {
+    /// Whether these inputs differ from `other` in nothing but the size of the viewport, which the
+    /// records reading it name.
+    fn same_besides_viewport(&self, other: &Self) -> bool {
+        Self {
+            viewport: other.viewport,
+            ..*self
+        } == *other
+    }
+
     fn of(inputs: &super::super::bridge::FfiDocumentStyleComputationInputs) -> Self {
         Self {
             initial_style: InitialStyleInputs::of(inputs),
@@ -471,10 +484,9 @@ impl Live {
                 }
                 bytes += crate::css::computed_values::group_payload_allocation_bytes(group, payload.as_ptr());
                 // SAFETY: The initial style holds a reference to each of its groups.
-                bytes += crate::heap_size::HeapSize::heap_size(
-                    unsafe { crate::css::computed_values::group_values(group, payload.as_ptr()) },
-                    &mut report.sizer,
-                );
+                bytes += unsafe {
+                    crate::css::computed_values::group_held_values_heap_size(group, payload.as_ptr(), &mut report.sizer)
+                };
             }
             report.add(MemoryOwner::Initial, bytes);
             report.count(MemoryOwner::Initial, &initial.value_facts);
@@ -544,6 +556,18 @@ impl Live {
             self.scratch.matched_declarations.forget();
         }
         let changes = state.projection.changes();
+        if transaction.restyles_everything {
+            self.kept_hidden_records.forget();
+        } else {
+            self.kept_hidden_records.note_environment_moved(transaction.environment);
+        }
+        self.kept_hidden_records
+            .note_moved(transaction.style_inputs.iter().map(|&(node, _)| node));
+        self.kept_hidden_records
+            .note_left(changes.iter().filter_map(|&(node, change)| match change {
+                ElementChange::Relations(_, None) => Some(node),
+                _ => None,
+            }));
         if transaction.has_no_element_inputs() && changes.is_empty() && transaction.rule_changes.is_empty() {
             return;
         }
@@ -569,6 +593,23 @@ impl Live {
             self.invalidate(state, transaction, changes);
         }
         self.bump(LiveField::InvalidationNanoseconds, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Note what no pass tells of the hints: a pass styles the elements holding a record and tells
+    /// whether their children compute from something else, but not those below an element that is
+    /// not displayed, or what restyling descendants reaches.
+    pub(super) fn note_hints_moved_kept_hidden_records(&mut self) {
+        let (hints, records, kept) = (&self.hints, &self.records, &mut *self.kept_hidden_records);
+        if !kept.holds_computations() {
+            return;
+        }
+        for &node in &hints.marked {
+            if hints.get(node) & RESTYLE_DESCENDANTS != 0 {
+                kept.note_descendants_moved(node);
+            } else if records.get(node).is_none() || kept.computed(node) {
+                kept.note_moved([node]);
+            }
+        }
     }
 
     /// Whether the next pass has anything to do: an input since the last pass can restyle any
@@ -662,7 +703,8 @@ impl Live {
     ///
     /// The pass styled nothing of an element in `waiting`, nor anything below it: the next one
     /// restyles the element, and its descendants where this one restyled every element or the
-    /// descendants of the element or of an ancestor. Elsewhere the hints of the elements below it
+    /// descendants of the element or of an ancestor, as `waiting_restyling_descendants` holds where the pass's
+    /// walk asked that of the element, such as below an element displayed again. Elsewhere the hints of the elements below it
     /// stay for the next pass, and its children are restyled where its style moves.
     ///
     /// The next pass computes an element in `waiting_with_kept_matches`, which the pass matched to
@@ -677,11 +719,13 @@ impl Live {
         waiting: &[StyleNodeID],
         waiting_with_kept_matches: &[StyleNodeID],
         waiting_pseudo_elements: &[StyleNodeID],
+        waiting_restyling_descendants: &HashSet<StyleNodeID>,
     ) -> Vec<(StyleNodeID, HintBits)> {
         let kept_matches: HashSet<StyleNodeID> = waiting_with_kept_matches.iter().copied().collect();
         let element = waiting.iter().map(|&node| {
             let tree = &state.projection;
             let restyles_descendants = !hinted
+                || waiting_restyling_descendants.contains(&node)
                 || std::iter::successors(Some(node), |&ancestor| tree.inheritance_parent(ancestor))
                     .any(|ancestor| self.hints.get(ancestor) & RESTYLE_DESCENDANTS != 0);
             let bits = match restyles_descendants {
@@ -726,6 +770,36 @@ impl Live {
         }
     }
 
+    /// Restyle, in the next pass, the elements and pseudo-elements below `node` whose `font-family: monospace` recascades
+    /// their font size, which goes on from the computed size of the nearest ancestor whose animations give it one, where
+    /// such animations of `node` came or went. What they inherit need not have moved.
+    fn note_animated_font_size_came_or_went(&mut self, state: &RetainedState, node: StyleNodeID) {
+        let is_monospace = |record: &Record| {
+            record
+                .longhand(crate::css::computed_values::LonghandID::new(
+                    crate::css::property_metadata::property_id::FONT_FAMILY,
+                ))
+                .optional_data()
+                .is_some_and(crate::css::style_compute::font_family_is_monospace)
+        };
+        self.hints.reserve(state.projection.element_slot_count());
+        for descendant in state.projection.style_preorder(node).skip(1) {
+            let Some(record) = self.records.get(descendant) else {
+                continue;
+            };
+            if is_monospace(record) {
+                self.hints.mark(descendant, RESTYLE_SELF | PARENT_CHANGED);
+            } else if self
+                .records
+                .pseudo_element_records(descendant)
+                .iter()
+                .any(|(_, record)| is_monospace(record))
+            {
+                self.hints.mark(descendant, RESTYLE_PSEUDO_ELEMENTS);
+            }
+        }
+    }
+
     /// Restyle, in the next pass, the elements whose records or pseudo-element records name a
     /// counter-style registry their style scope no longer has. A record reading the counter-style
     /// environment names the registry it was computed against, and the host minting a new one for
@@ -735,6 +809,7 @@ impl Live {
     /// so what a record names is compared with what it would name now.
     fn note_counter_style_environment_moved(&mut self, state: &RetainedState) {
         self.scratch.matched_declarations.forget();
+        self.kept_hidden_records.forget();
         self.restyle_records_where(state, |_, target, record| {
             record.rare().counter_style_environment_identity
                 != state.values_counter_style_environment_identity(target, |property| record.effective_value(property))
@@ -782,7 +857,7 @@ impl Live {
             } else if records
                 .pseudo_element_records(node)
                 .iter()
-                .any(|(kind, record)| moved(records, ComputedStyleTarget::new(node, *kind), record))
+                .any(|(target, record)| moved(records, ComputedStyleTarget::of_pseudo_element(node, *target), record))
             {
                 hints.mark(node, RESTYLE_PSEUDO_ELEMENTS);
             }
@@ -800,6 +875,7 @@ impl Live {
         }
         self.scratch.matched_declarations.forget();
         let raw: HashSet<usize> = names.iter().map(ak::Utf16FlyString::raw_identity).collect();
+        self.kept_hidden_records.forget();
         let texts: Vec<std::borrow::Cow<'_, [u16]>> = names.iter().map(ak::Utf16FlyString::to_utf16).collect();
         self.restyle_records_where(state, |records, target, record| {
             let node = target.node();
@@ -854,6 +930,10 @@ impl Live {
         }
         let program = &state.rules;
         let kind_of = |rule| program.rule_version(rule).kind;
+        // NB: Only what a style rule declares reaches an element through what it matches.
+        if changes.rules.iter().any(|&rule| kind_of(rule) != RuleKind::Style) {
+            self.kept_hidden_records.forget();
+        }
         let rules_of = |sheet| program.rules_in_sheet(sheet).into_iter().map(kind_of);
         // The `@keyframes` rules that moved, and those that may decide another rule of their name
         // where their scope was reordered.
@@ -910,6 +990,7 @@ impl Live {
     /// substitute something that may.
     fn note_custom_functions_moved(&mut self, state: &RetainedState) {
         self.scratch.matched_declarations.forget();
+        self.kept_hidden_records.forget();
         self.restyle_records_where(state, |_, _, record| {
             record.rare().custom_property_reads == LonghandCustomPropertyReads::Any
                 || record.custom_declarations().is_some_and(|declarations| {
@@ -922,6 +1003,12 @@ impl Live {
 
     pub(super) fn index(&self) -> &RuleIndex {
         &self.index
+    }
+
+    /// Whether a rule of the document's sheets styles `::selection`.
+    pub(in super::super) fn styles_selection(&self) -> bool {
+        self.index
+            .styles_pseudo_element(super::super::publication::pseudo_kind::SELECTION)
     }
 
     #[cfg(test)]
@@ -956,7 +1043,9 @@ impl Live {
                 .records
                 .pseudo_element_records(node)
                 .iter()
-                .find_map(|(pseudo, record)| (*pseudo == kind).then_some(record))?,
+                .find_map(|(pseudo, record)| {
+                    (*pseudo == super::PseudoElementTarget::of_kind(kind)).then_some(record)
+                })?,
         };
         Some(
             record
@@ -978,7 +1067,9 @@ impl Live {
                 .records
                 .pseudo_element_records(node)
                 .iter()
-                .find_map(|(pseudo, record)| (*pseudo == kind).then_some(record))?,
+                .find_map(|(pseudo, record)| {
+                    (*pseudo == super::PseudoElementTarget::of_kind(kind)).then_some(record)
+                })?,
         };
         Some(&record.rare().custom_property_reads)
     }
@@ -1173,7 +1264,8 @@ impl Live {
         // An element arriving, leaving or moving among its siblings changes what `sibling-index()`
         // and `sibling-count()` compute to for its siblings.
         for &parent in sibling_parents.iter() {
-            // NB: Every record reading it noted so on its element's parent as it was held.
+            // NB: Every record reading it noted so on its element's parent as it was held, and every style query
+            //     reading it on its container's parent as it answered.
             if !tree.is_live(parent)
                 || !projection
                     .structural_flags(parent)
@@ -1181,6 +1273,10 @@ impl Live {
             {
                 continue;
             }
+            let counted_containers = state
+                .containers_counted_by_style_queries
+                .lock()
+                .expect("the counted containers are never held across a panic");
             for child in projection.children(parent) {
                 if self
                     .records
@@ -1193,6 +1289,11 @@ impl Live {
                         .any(|(_, record)| record.rare().reads.reads_sibling_position)
                 {
                     self.hints.add(child, RESTYLE_SELF);
+                }
+                // A style() query counted where this child stands as a container, which no record of it may read: the
+                // elements below it that read their containers read them anew.
+                if counted_containers.contains(&child) {
+                    self.hints.add(child, CONTAINERS_MOVED);
                 }
             }
         }
@@ -1651,7 +1752,7 @@ impl Live {
         }
         let by_element = &*by_element;
         const CHANGES_PER_TASK: usize = 8;
-        let pool = state.style_pool.as_ref().and_then(|pool| pool.started());
+        let pool = state.style_layout_pool.as_ref().and_then(|pool| pool.started());
         let follow_all = |chunk: &[std::ops::Range<usize>]| {
             let thread = pool.as_ref().and_then(|pool| pool.current_thread_index());
             let memo = self
@@ -1948,6 +2049,7 @@ impl Live {
     fn rebuild_index(&mut self, state: &RetainedState) {
         let index = RuleIndex::build(&state.rules, state.process_rule_indexes());
         self.counts.note_index_build(&index);
+        self.kept_hidden_records.forget();
         let renumbering = index.renumbering_from(&self.index);
         self.records.renumber_matches(&renumbering);
         self.hints.renumber_reasons(&renumbering);
@@ -1973,6 +2075,7 @@ impl Live {
         let state: &RetainedState = retained;
         let started = Instant::now();
         self.generation += 1;
+        self.note_hints_moved_kept_hidden_records();
         let slot_count = state.projection.element_slot_count();
         self.hints.reserve(slot_count);
         self.scratch.cells.reserve(slot_count);
@@ -1992,6 +2095,14 @@ impl Live {
         let reordered_scopes = std::mem::take(&mut self.reordered_scopes);
         let layered_scopes = std::mem::take(&mut self.layered_scopes);
         let matched_declarations_inputs = MatchedDeclarationsInputs::of(&state.document_style_computation_inputs);
+        if keyframes_moved.is_some()
+            || self
+                .scratch
+                .matched_declarations_inputs
+                .is_none_or(|inputs| !inputs.same_besides_viewport(&matched_declarations_inputs))
+        {
+            self.kept_hidden_records.forget();
+        }
         if rebuilds_index
             || updates_index
             || self.scratch.matched_declarations_inputs != Some(matched_declarations_inputs)
@@ -2018,6 +2129,8 @@ impl Live {
                 },
             );
             self.counts.note_index_update(&self.index, changes.arrived_entries);
+            self.kept_hidden_records
+                .note_rule_index_update(state, &self.index, &self.records, &changes);
             if hinted && !changes.is_empty() {
                 let roots = rule_change_roots(state, root, &changes.scopes);
                 let hints = &mut self.hints;
@@ -2126,6 +2239,7 @@ impl Live {
         let (mut root_font, mut root_font_moved) = (None, None);
         let mut statistics = traversal::Statistics::default();
         let mut suspended = None;
+        let mut waiting_restyling_descendants = HashSet::default();
         for round in 1..=MAX_SUSPENDING_ROUNDS {
             let state: &RetainedState = retained;
             let reasons = self.hints.reasons();
@@ -2158,7 +2272,8 @@ impl Live {
                 break;
             }
             if round == MAX_SUSPENDING_ROUNDS {
-                traversal::settle_suspended(&context, std::mem::take(&mut statistics.suspended));
+                waiting_restyling_descendants =
+                    traversal::settle_suspended(&context, std::mem::take(&mut statistics.suspended));
                 break;
             }
             let (next, fonts, random_bases) = statistics.take_suspended();
@@ -2210,14 +2325,14 @@ impl Live {
         // anew.
         for &node in &kept {
             let holds_demanded = state.held_pseudo_style_records.get(&node).is_some_and(|held| {
-                held.iter().any(|&(kind, record)| {
+                held.iter().any(|&(target, record)| {
                     record != 0
-                        && super::PSEUDO_ELEMENT_KINDS.contains(&kind)
+                        && super::PSEUDO_ELEMENT_KINDS.contains(&target.kind)
                         && !self
                             .records
                             .pseudo_element_records(node)
                             .iter()
-                            .any(|(generated, _)| *generated == kind)
+                            .any(|(generated, _)| *generated == target)
                 })
             });
             if holds_demanded {
@@ -2276,8 +2391,22 @@ impl Live {
             &statistics.waiting,
             &statistics.waiting_with_kept_matches,
             &statistics.waiting_pseudo_elements,
+            &waiting_restyling_descendants,
         );
         self.keep_deferred_hints(&state.projection, &statistics.deferred, &waiting);
+        self.kept_hidden_records
+            .note_moved(statistics.children_moved.iter().copied());
+        // NB: A pass tells nothing of the children of an element that is not displayed, as it walks none of them.
+        let records = &self.records;
+        self.kept_hidden_records.note_moved(
+            statistics
+                .styled
+                .iter()
+                .copied()
+                .filter(|&node| records.get(node).is_none_or(|record| !record.is_displayed())),
+        );
+        self.kept_hidden_records
+            .note_moved(statistics.moved_custom_properties.iter().copied());
         let styled = Instant::now();
         self.bump(LiveField::Passes, 1);
         self.bump(LiveField::FullPasses, u64::from(!hinted));
@@ -4025,7 +4154,7 @@ impl StyleEngine {
         {
             return;
         }
-        self.start_live_style(root, super::pool::threads_from_environment(), true);
+        self.start_live_style(root, crate::style_layout_pool::threads_from_environment(), true);
     }
 
     /// Have the engine own the document under `root` from a cold pass of it, with what the cold
@@ -4058,7 +4187,7 @@ impl StyleEngine {
         // NB: How many threads the machine has is asked once, as the engine starts: the answer reads the
         //     process's CPU affinity and quota from the kernel, which takes longer than a small pass does.
         let threads = match threads {
-            0 => traversal::thread_count() as u32,
+            0 => crate::style_layout_pool::default_thread_count() as u32,
             threads => threads,
         };
         let index = RuleIndex::build(&self.retained.rules, self.retained.process_rule_indexes());
@@ -4101,6 +4230,7 @@ impl StyleEngine {
                 .style_preorder(root)
                 .filter(|&node| self.retained.keeps_style_in_display_none_subtree(node))
                 .collect(),
+            kept_hidden_records: Default::default(),
         }));
         self.retained
             .cold_passes
@@ -4170,14 +4300,32 @@ impl StyleEngine {
         let display = |payloads: &crate::css::computed_values::StyleGroups| {
             crate::css::computed_value_views::ComputedValuesView::of(payloads).display()
         };
+        let font_size_animated = HeldComposition::animates_font_size(&view);
         let impact =
             match custom_properties == held.custom_properties && display(view.payloads) == display(&held.payloads) {
                 true => ChildImpact::of_groups(view.payloads, &held.payloads),
                 false => ChildImpact::All,
             };
+        // What resolved root-relative lengths against the font of the document element resolves them again, which the
+        // next pass tells as it restyles the element.
+        let root_font = super::compute::RootFontInputs::from_payloads(view.payloads, view.dependency_flags);
+        let root_font_moved = traversal::is_document_element(&self.retained, node)
+            && self
+                .retained
+                .live_style
+                .as_ref()
+                .and_then(|live| live.records.kept_root_font(node))
+                .is_some_and(|kept| kept != root_font);
         if let Some(mut live) = self.retained.live_style.take() {
             live.generation += 1;
             live.note_composition_moved(&self.retained, node, impact);
+            if font_size_animated != held.font_size_animated {
+                live.note_animated_font_size_came_or_went(&self.retained, node);
+            }
+            if root_font_moved {
+                live.hints.reserve(self.retained.projection.element_slot_count());
+                live.hints.mark(node, RESTYLE_PSEUDO_ELEMENTS);
+            }
             self.retained.live_style = Some(live);
         }
     }
@@ -4191,7 +4339,7 @@ impl RetainedState {
             .element_custom_property_data
             .get(&node)
             .and_then(|held| held.sampled_over.map(|_| held.identity));
-        Some(HeldComposition::new(view.payloads, custom_properties))
+        Some(HeldComposition::new(&view, custom_properties))
     }
 
     /// Restyle the elements naming a counter-style registry their style scope no longer has, in
@@ -4319,7 +4467,15 @@ impl StyleEngine {
 
     fn live_pass_rounds(&mut self, root: StyleNodeID, everything: bool) {
         let threads = self.retained.live_style.as_ref().map_or(0, |live| live.threads);
-        let pool = self.style_pool(threads);
+        let pool = self.style_layout_pool(threads);
+        // NB: A thread that first asks for a font resolves it there and then, under a lock, rather than leave it for a
+        //     round between all the threads of the pass, each a barrier.
+        self.retained.pass_fonts = self
+            .host
+            .font_resolver
+            .as_ref()
+            .zip(self.retained.font_resolution.as_ref())
+            .map(|(resolver, cache)| Arc::new(super::super::font_resolution::PassFonts::new(resolver, cache)));
         let mut scope = match everything {
             true => RestyleScope::Everything,
             false => RestyleScope::Pending,
@@ -4347,6 +4503,14 @@ impl StyleEngine {
             // A pass after the first restyles what waited on a font or a random base value, now
             // that it resolved, as the last pass left it hinted.
             scope = RestyleScope::Pending;
+        }
+        if let Some(pass_fonts) = self.retained.pass_fonts.take().and_then(Arc::into_inner)
+            && let Some(cache) = self.retained.font_resolution.as_mut()
+        {
+            let resolved = cache.take_in_pass_fonts(pass_fonts);
+            self.retained
+                .counters
+                .add(Counter::FontResolutionRequests, resolved as u64);
         }
         if let Some(live) = self.retained.live_style.as_mut() {
             self.retained.live_counters.take_pass(&mut live.counts);
@@ -4390,14 +4554,26 @@ fn resolve_waits(
 pub(in super::super) struct HeldComposition {
     payloads: crate::css::computed_values::StyleGroups,
     custom_properties: Option<u64>,
+    /// Whether its animations gave it a font size.
+    font_size_animated: bool,
 }
 
 impl HeldComposition {
-    fn new(payloads: &crate::css::computed_values::StyleGroups, custom_properties: Option<u64>) -> Self {
+    fn new(view: &computed::StyleRecordView<'_>, custom_properties: Option<u64>) -> Self {
         Self {
-            payloads: payloads.clone(),
+            payloads: view.payloads.clone(),
             custom_properties,
+            font_size_animated: Self::animates_font_size(view),
         }
+    }
+
+    fn animates_font_size(view: &computed::StyleRecordView<'_>) -> bool {
+        view.longhands()
+            .overlay_value(
+                view.animated_overlay,
+                crate::css::property_metadata::property_id::FONT_SIZE,
+            )
+            .is_some()
     }
 }
 

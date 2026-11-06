@@ -63,6 +63,7 @@
 #endif
 
 class QKeyEvent;
+class QNativeGestureEvent;
 class QLabel;
 class QMenu;
 class QPushButton;
@@ -251,7 +252,6 @@ private:
 
     void update_viewport_size();
     void update_cursor(Gfx::Cursor cursor);
-    void apply_web_content_cursor(QCursor const&);
     void schedule_repaint();
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     void schedule_frame_damage_repaint();
@@ -302,10 +302,15 @@ private:
     friend class WebContentViewAccessible;
 #endif
 
+    // Takes the steps that follow each tree update: after a change, with the IDs of the nodes it removed.
+    void did_update_accessibility_tree(Optional<Vector<i64>> removed_ids);
+
     OwnPtr<WebView::AccessibilityTreeManager> m_accessibility_manager;
     bool m_posted_initial_accessibility_focus { false };
     // Set once this view has asked WebContent for the tree; from then on, WebContent pushes every change on its own.
     bool m_requested_accessibility_tree { false };
+    // Set while the whole tree is on its way, after a change this view couldn't apply.
+    bool m_accessibility_whole_tree_pending { false };
 #if !defined(Q_OS_WIN)
     // Set when an assistive technology turns up mid-page: The next tree to arrive reports the focus to it.
     bool m_report_accessibility_focus_with_next_tree { false };
@@ -339,6 +344,16 @@ private:
     QPointer<ScreenshotViewer> m_screenshot_viewer;
     Vector<QPointer<QWidget>> m_floating_surfaces;
     PageOverlay* m_web_compat_report_overlay { nullptr };
+
+    bool handle_native_gesture_event(QNativeGestureEvent const&);
+
+    // A pinch only tells where it began and ended apart from its steps.
+    enum class NativeGestureState : u8 {
+        None,
+        Began,
+        Zooming,
+    };
+    NativeGestureState m_native_gesture_state { NativeGestureState::None };
 
 #ifdef AK_OS_MACOS
     NativeTextEditingBindings m_native_text_editing_bindings;
@@ -409,9 +424,6 @@ private:
     bool current_paintable_can_use_vulkan_window() const;
     void schedule_vulkan_window_update();
     void update_vulkan_window_geometry();
-    void set_vulkan_window_cursor(QCursor const&);
-    bool handle_vulkan_window_event(QEvent*);
-    bool vulkan_window_has_native_focus() const;
     void set_vulkan_window_container_visible(bool);
     void fall_back_to_bitmap_rendering();
     void vulkan_window_exposure_changed();
@@ -423,7 +435,11 @@ private:
 
 #    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
     bool create_page_surface();
-    void update_page_surface();
+    enum class PageSurfaceContent {
+        Unchanged,
+        MayHaveChanged,
+    };
+    void update_page_surface(PageSurfaceContent);
     void hide_page_surface();
     bool page_surface_can_show_frames() const;
     void fall_back_from_page_surface();

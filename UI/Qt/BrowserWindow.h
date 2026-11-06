@@ -9,7 +9,6 @@
 
 #include <AK/Optional.h>
 #include <AK/kmalloc.h>
-#include <LibAudio/Audibility.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/HTML/ActivateTab.h>
 #include <LibWebCommon/Page/PageId.h>
@@ -239,7 +238,7 @@ public:
 public slots:
     void tab_title_changed(int index, QString const&);
     void tab_favicon_changed(int index, QIcon const& icon);
-    void tab_audibility_changed(int index, Audio::Audibility);
+    void tab_playing_audio_indicator_changed(int index);
     Tab& new_tab_from_url(URL::URL const&, Web::HTML::ActivateTab, TabLocation);
     void open_new_tab();
     void activate_tab(int index);
@@ -283,7 +282,6 @@ private:
     void set_current_tab(Tab* tab);
     Qt::Edges resize_edges_for_position(QPoint const&) const;
     Optional<Qt::CursorShape> resize_cursor_for_edges(Qt::Edges) const;
-    bool filter_native_window_event(QWindow&, QEvent&);
     void update_resize_cursor(QPoint const&);
     void refresh_resize_cursor_at_current_position(bool force_reapply = false);
     void clear_resize_cursor();

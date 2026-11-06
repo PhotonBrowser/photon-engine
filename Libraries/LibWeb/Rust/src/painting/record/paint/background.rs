@@ -139,8 +139,21 @@ pub(crate) fn paint_resolved_background<O: Observer>(
 
     // https://drafts.csswg.org/css-backgrounds-4/#valdef-background-clip-text
     let needs_text_clip = resolved.needs_text_clip && !inputs.is_root_element;
+    let text_clip_fragments = if needs_text_clip {
+        text_clip_fragments(recorder, paintable)
+    } else {
+        Vec::new()
+    };
+    // With no text, nothing clipped to it shows: Paint just the layers clipped to some other box, without a mask.
+    let omit_text_clipped = needs_text_clip && text_clip_fragments.is_empty();
+    let needs_text_clip = needs_text_clip && !omit_text_clipped;
+    // A blending layer can't blend with the color under it when the color is left out.
+    let backdrop = match backdrop {
+        LayerBackdrop::OpaqueColorUnderLoneLayer(_) if omit_text_clipped => LayerBackdrop::IsolatedGroup,
+        backdrop => backdrop,
+    };
     if !backdrop.is_isolated_group() && !needs_text_clip {
-        paint_background_layers(recorder, paintable, inputs, backdrop);
+        paint_background_layers(recorder, paintable, inputs, backdrop, omit_text_clipped);
         return;
     }
 
@@ -157,12 +170,12 @@ pub(crate) fn paint_resolved_background<O: Observer>(
     };
     let mut group = recorder.recorder.begin_isolated_group();
     recorder.trace_paint(Operation::Named(Some(paintable), "background-group"), |recorder| {
-        paint_background_layers(recorder, paintable, inputs, backdrop);
+        paint_background_layers(recorder, paintable, inputs, backdrop, omit_text_clipped);
     });
     if needs_text_clip {
         recorder.recorder.begin_group_mask(&mut group);
         recorder.trace_paint(Operation::Named(Some(paintable), "background-text-mask"), |recorder| {
-            append_text_clip_paths(recorder, paintable);
+            append_text_clip_paths(recorder, &text_clip_fragments);
         });
     }
     recorder.recorder.finish_isolated_group(
@@ -178,6 +191,8 @@ fn paint_background_layers<O: Observer>(
     paintable: NodeSlotId,
     inputs: &BackgroundPaintInputs<'_>,
     backdrop: LayerBackdrop,
+    // Leaves out the color and the layers clipped to the text, which the caller found none of.
+    omit_text_clipped: bool,
 ) {
     let converter = recorder.converter;
     let resolved = &inputs.resolved;
@@ -237,7 +252,9 @@ fn paint_background_layers<O: Observer>(
         })
     };
 
-    if is_root_element {
+    if omit_text_clipped {
+        // The color is clipped to the text.
+    } else if is_root_element {
         recorder.recorder.fill_animated_background_color(
             converter.enclosing_device_rect(color_box.rect),
             color,
@@ -330,6 +347,9 @@ fn paint_background_layers<O: Observer>(
 
     // Background layers are ordered front-to-back, so we paint them in reverse.
     for layer in layers.iter().rev() {
+        if omit_text_clipped && layer.clip == css_enums::background_box::TEXT {
+            continue;
+        }
         let clip_box = background_box_for(layer.clip, border_box, padding, border);
         let css_clip_rect = clip_box.rect;
         let unshrunken_clip_rect = converter.rounded_device_rect(css_clip_rect);
@@ -647,6 +667,7 @@ fn paint_image_layer_in_current_space<O: Observer>(
 
     image_rect.x = background_positioning_area.left() + layer.position_x;
     image_rect.y = background_positioning_area.top() + layer.position_y;
+    let anchor_tile_rect = image_rect;
 
     // Repetition
     let repeat_x;
@@ -681,9 +702,8 @@ fn paint_image_layer_in_current_space<O: Observer>(
         _ => repeat_x = false,
     }
     // Move image_rect to the left-most tile position that is still visible
-    if repeat_x && image_rect.x > css_clip_rect.x {
-        let x_delta = floor_css(x_step * ceil_fraction(image_rect.x - css_clip_rect.x, x_step));
-        image_rect.x -= x_delta;
+    if repeat_x {
+        image_rect.x = first_css_tile_start(image_rect.x, css_clip_rect.x, x_step);
     }
 
     match layer.repeat_y {
@@ -697,7 +717,7 @@ fn paint_image_layer_in_current_space<O: Observer>(
                 y_step = image_rect.height;
                 repeat_y = false;
             } else {
-                let space = (background_positioning_area.height.to_float() % image_rect.height.to_float()) as f64;
+                let space = background_positioning_area.height.to_double() % image_rect.height.to_double();
                 y_step = image_rect.height + CssPixels::nearest_value_for(space / (whole_images - 1) as f64);
                 repeat_y = true;
                 repeat_y_has_gap = true;
@@ -710,9 +730,8 @@ fn paint_image_layer_in_current_space<O: Observer>(
         _ => repeat_y = false,
     }
     // Move image_rect to the top-most tile position that is still visible
-    if repeat_y && image_rect.y > css_clip_rect.y {
-        let y_delta = floor_css(y_step * ceil_fraction(image_rect.y - css_clip_rect.y, y_step));
-        image_rect.y -= y_delta;
+    if repeat_y {
+        image_rect.y = first_css_tile_start(image_rect.y, css_clip_rect.y, y_step);
     }
 
     let initial_image_x = image_rect.x;
@@ -811,13 +830,30 @@ fn paint_image_layer_in_current_space<O: Observer>(
         // Use a dedicated painting command for repeated images instead of recording a separate command for each
         // instance of a repeated background, so the painter has the opportunity to optimize the painting of
         // repeated images.
-        let mut dest_rect = converter.rounded_device_rect(image_rect);
+        // NB: Tiles repeat in all directions at a whole device pixel size. Round the tile at the background position to
+        //     get that size, as a tile any number of steps away can round to a different one. A lone tile has to stay
+        //     where it is: only the tile that tile_count found covers the clip, and it is the only one that we paint.
+        let mut dest_rect = converter.rounded_device_rect(if tile_count == 1.0 {
+            image_rect
+        } else {
+            anchor_tile_rect
+        });
         // If the image's dimensions were rounded to zero then they need to be restored to avoid a crash.
         if dest_rect.width == 0 {
             dest_rect.width = 1;
         }
         if dest_rect.height == 0 {
             dest_rect.height = 1;
+        }
+        // NB: Whole tile steps don't change what repeats, but the painter works in floats, which can't hold the phase
+        //     of a distant tile. Keep the origin next to the clip.
+        if tile_count != 1.0 {
+            if repeat_x {
+                dest_rect.x = first_tile_start(dest_rect.x, clip_rect.x, dest_rect.width);
+            }
+            if repeat_y {
+                dest_rect.y = first_tile_start(dest_rect.y, clip_rect.y, dest_rect.height);
+            }
         }
         if let crate::painting::image_content::ImageContent::Vector { content_identity, .. } = &facts.content {
             if clip_rect.is_empty() {
@@ -1055,15 +1091,24 @@ fn fraction_to_int(numerator: CssPixels, denominator: CssPixels) -> i32 {
     numerator.div_as_fraction(denominator).to_int()
 }
 
-fn ceil_fraction(numerator: CssPixels, denominator: CssPixels) -> CssPixels {
-    if denominator.raw_value() == 0 {
-        return CssPixels::from_raw(0);
+/// Moves a tile start by whole steps to the last position at or before the clip start. Integer math keeps this exact: a
+/// fixed point quotient truncates a gap below 1/64 of a step to zero steps.
+fn first_tile_start(tile_start: i32, clip_start: i32, step: i32) -> i32 {
+    if step <= 0 {
+        return tile_start;
     }
-    numerator.div_as_fraction(denominator).ceil()
+    let clip_start = i64::from(clip_start);
+    let clip_offset_from_tile = clip_start - i64::from(tile_start);
+    let first_start = clip_start - clip_offset_from_tile.rem_euclid(i64::from(step));
+    first_start.max(i64::from(i32::MIN)) as i32
 }
 
-fn floor_css(value: CssPixels) -> CssPixels {
-    value.floor()
+fn first_css_tile_start(tile_start: CssPixels, clip_start: CssPixels, step: CssPixels) -> CssPixels {
+    CssPixels::from_raw(first_tile_start(
+        tile_start.raw_value(),
+        clip_start.raw_value(),
+        step.raw_value(),
+    ))
 }
 
 fn source_rect_for_visible_image_part(
@@ -1081,26 +1126,16 @@ fn source_rect_for_visible_image_part(
     )
 }
 
-fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
+fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, fragments: &[(NodeSlotId, usize)]) {
     let converter = recorder.converter;
     let scale = recorder.inputs.device_pixels_per_css_pixel;
 
-    let append_fragment = |recorder: &mut PaintRecorder<'_, O>, owner: NodeSlotId, fragment_index: usize| {
+    for &(owner, fragment_index) in fragments {
         let side = recorder.source.committed_side_data(owner);
         let fragment = &side.fragments()[fragment_index];
-        let is_text = recorder
-            .source
-            .node_kind_if_live(fragment.layout_node)
-            .is_some_and(node_facts::kind_is_text);
-        if !is_text {
-            return;
-        }
         let Some(run) = &fragment.glyph_run else {
-            return;
+            continue;
         };
-        if run.glyphs.is_empty() {
-            return;
-        }
         let fragment_absolute_rect = crate::painting::text_fragment::absolute_rect(recorder.source, fragment);
         let fragment_absolute_device_rect = converter.enclosing_device_rect(fragment_absolute_rect);
         let font_id = recorder.register_font(&run.font);
@@ -1123,7 +1158,7 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pain
                 font_id: crate::painting::display_list::commands::FontResourceId(font_id),
                 glyphs: run
                     .glyphs
-                    .iter()
+                    .placed()
                     .map(crate::painting::display_list::commands::DisplayListGlyph::from),
             },
             libgfx_rust::Color::from_rgb(0, 0, 0),
@@ -1133,6 +1168,26 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pain
             emission.glyph_bounding_rect,
             ForceDarkRole::None,
         );
+    }
+}
+
+/// The text fragments, in the paintable and its in-flow and floated descendants, whose glyphs the background is clipped
+/// to: each one as its owner and its index among the owner's fragments.
+fn text_clip_fragments<O: Observer>(
+    recorder: &PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+) -> Vec<(NodeSlotId, usize)> {
+    let mut fragments = Vec::new();
+    let mut append_fragment = |owner: NodeSlotId, fragment_index: usize| {
+        let side = recorder.source.committed_side_data(owner);
+        let fragment = &side.fragments()[fragment_index];
+        let is_text = recorder
+            .source
+            .node_kind_if_live(fragment.layout_node)
+            .is_some_and(node_facts::kind_is_text);
+        if is_text && fragment.glyph_run.as_ref().is_some_and(|run| !run.glyphs.is_empty()) {
+            fragments.push((owner, fragment_index));
+        }
     };
 
     let data = recorder.data(paintable);
@@ -1147,7 +1202,7 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pain
             for piece_index in side.inline_box_piece_indices(paintable) {
                 let piece = &side.inline_box_pieces()[*piece_index as usize];
                 for fragment_index in piece.first_fragment_index..piece.first_fragment_index + piece.fragment_count {
-                    append_fragment(recorder, root, fragment_index as usize);
+                    append_fragment(root, fragment_index as usize);
                 }
             }
         }
@@ -1173,8 +1228,9 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pain
         if node_painting::has_lines(recorder.source, current) {
             let count = recorder.source.committed_side_data(current).fragments().len();
             for fragment_index in 0..count {
-                append_fragment(recorder, current, fragment_index);
+                append_fragment(current, fragment_index);
             }
         }
     }
+    fragments
 }

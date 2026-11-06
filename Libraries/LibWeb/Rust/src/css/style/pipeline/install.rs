@@ -39,6 +39,7 @@ impl PseudoSlot {
 pub struct StyleSwap {
     style_node: u32,
     slot: PseudoSlot,
+    highlight_name: u32,
     record: *const std::ffi::c_void,
 }
 
@@ -53,6 +54,7 @@ impl StyleSwap {
         state: &RetainedState,
         node: StyleNodeID,
         slot: PseudoSlot,
+        highlight_name: StyleAtomID,
         style_record: computed::FinalStyleRecordID,
     ) -> Self {
         let record = match style_record.raw() {
@@ -68,6 +70,7 @@ impl StyleSwap {
         Self {
             style_node: node.raw(),
             slot,
+            highlight_name: highlight_name.0,
             record,
         }
     }
@@ -92,31 +95,20 @@ pub(crate) struct EffectsIndex(u32);
 pub(crate) struct StyleInstallation {
     pub(crate) swaps: Vec<StyleSwap>,
     pub(crate) effects: Vec<InstalledElementEffects>,
-    /// The indices of the effects, sorted by the elements they are of, for the render side to find an element's, or
-    /// none where the effects are sorted by their elements already.
-    effects_by_node: Vec<EffectsIndex>,
     pub(crate) document_damage: u32,
     /// The records the elements and their pseudo-elements move away from, which their moves and effects read, pinned
     /// until the host ends the transaction.
     pub(crate) pinned_records: Vec<u64>,
+    /// The elements taking their first style whose parent, its layout tree parent as well, takes its first style in
+    /// this installation too, in the order of their effects, each with the index of those and that parent.
+    first_styles_below_first_styles: Vec<(EffectsIndex, StyleNodeID)>,
 }
 
 impl StyleInstallation {
     /// The effects of `node`, where its style moves.
+    #[cfg(test)]
     pub(crate) fn effects_of(&self, node: StyleNodeID) -> Option<&InstalledElementEffects> {
-        if self.effects_by_node.is_empty() {
-            let index = self
-                .effects
-                .binary_search_by_key(&node, InstalledElementEffects::node)
-                .ok()?;
-            return Some(&self.effects[index]);
-        }
-        let index = self
-            .effects_by_node
-            .binary_search_by_key(&node, |&EffectsIndex(index)| self.effects[index as usize].node())
-            .ok()?;
-        let EffectsIndex(index) = self.effects_by_node[index];
-        Some(&self.effects[index as usize])
+        self.effects.iter().find(|effects| effects.node() == node)
     }
 
     /// Takes what the main thread does, leaving the records the installation pinned, which stay pinned until the host
@@ -144,7 +136,13 @@ impl StyleInstallation {
                     PseudoSlot::ELEMENT => {
                         state.set_held_style_record(node, unsafe { bridge::retain_host_record(swap.record) });
                     }
-                    PseudoSlot(kind) => state.set_held_pseudo_style_record(node, kind, swap.style_record()),
+                    PseudoSlot(kind) => {
+                        let target = super::PseudoElementTarget {
+                            kind,
+                            highlight_name: StyleAtomID(swap.highlight_name),
+                        };
+                        state.set_held_pseudo_style_record(node, target, swap.style_record());
+                    }
                 }
             }
         };
@@ -179,13 +177,24 @@ impl StyleInstallation {
         self.keep_effects_with_host_work();
     }
 
+    /// Notes that the element whose effects the installation noted last takes its first style below `parent`, which
+    /// takes its first style too.
+    fn note_first_style_below_first_style(&mut self, parent: StyleNodeID) {
+        let index = u32::try_from(self.effects.len() - 1).expect("an installation's effects fit their index");
+        self.first_styles_below_first_styles.push((EffectsIndex(index), parent));
+    }
+
+    /// Takes the elements `note_first_style_below_first_style` noted.
+    pub(crate) fn take_first_styles_below_first_styles(&mut self) -> Vec<(u32, StyleNodeID)> {
+        std::mem::take(&mut self.first_styles_below_first_styles)
+            .into_iter()
+            .map(|(EffectsIndex(index), parent)| (index, parent))
+            .collect()
+    }
+
     /// Keeps the effects of only the elements the main thread has anything to do for beside swapping in their styles.
     pub(crate) fn keep_effects_with_host_work(&mut self) {
-        let before = self.effects.len();
         self.effects.retain(InstalledElementEffects::has_host_work);
-        if self.effects.len() != before {
-            self.sort_effects_by_node();
-        }
     }
 
     /// Ends the element `node`, whose styles the installation noted from the swap `first_swap` on. The elements whose
@@ -201,26 +210,12 @@ impl StyleInstallation {
     /// Ends the installation: what all its moves damage is `document_damage`.
     fn finish(&mut self, document_damage: u32) {
         self.document_damage = document_damage;
-        self.sort_effects_by_node();
-    }
-
-    /// Indexes the effects by their elements, where they are not sorted by them already.
-    fn sort_effects_by_node(&mut self) {
-        self.effects_by_node.clear();
-        if self.effects.is_sorted_by(|a, b| a.node() < b.node()) {
-            return;
-        }
-        let count = u32::try_from(self.effects.len()).expect("an installation's effects fit their index");
-        self.effects_by_node = (0..count).map(EffectsIndex).collect();
-        let effects = &self.effects;
-        self.effects_by_node
-            .sort_unstable_by_key(|&EffectsIndex(index)| effects[index as usize].node());
     }
 }
 
 impl RetainedState {
     /// The identity `record` is installed under: the one it names, the one another element took
-    /// for it in this installation, kept in `installed`, or a new one.
+    /// for a copy of it in this installation, kept in `installed`, or a new one.
     #[expect(
         clippy::mutable_key_type,
         reason = "a key hashes and compares only the address it holds"
@@ -237,11 +232,48 @@ impl RetainedState {
         if let Some(&id) = installed.get(&PointerLookup::new(record, ())) {
             return id;
         }
-        let id = records.install_record(record, || {
-            computed::record_dependency_flags(&record.facts(), &record.payloads)
-        });
-        installed.insert(PointerKey::new(record, ()), id);
+        let id = records.install_record(record, || record.dependency_flags_for_a_slot());
+        // NB: A record a fork's slot names took a copy in this slot, which it finds again here.
+        if records.installed_record_named_by(record).is_none() {
+            installed.insert(PointerKey::new(record, ()), id);
+        }
         id
+    }
+
+    /// What moving each of `elements` from the record assigned it to the one `live` holds for it damages, on the threads
+    /// of the pool where many move. Installing an element reads only its own records, which none of this changes.
+    fn element_move_damages(&self, live: &Live, elements: &[StyleNodeID]) -> Vec<u32> {
+        const ELEMENTS_PER_TASK: usize = 64;
+        let moves = |&(index, new): &(usize, &Arc<Record>)| {
+            let node = elements[index];
+            let old = self.computed_group_sets.assigned_style_record(node);
+            old.map_or(0, |old| self.element_record_damage_to(node, old.raw(), new))
+        };
+        // NB: An element's first style moves from nothing, which is every element of a page arriving.
+        let moving: Vec<(usize, &Arc<Record>)> = elements
+            .iter()
+            .enumerate()
+            .filter(|&(_, &node)| self.computed_group_sets.assigned_style_record(node).is_some())
+            .filter_map(|(index, &node)| Some((index, live.demanded_record(node)?)))
+            .collect();
+        let pool = self.style_layout_pool.as_ref().and_then(|pool| pool.started());
+        let answers: Vec<u32> = match pool.as_deref() {
+            Some(pool) if moving.len() > ELEMENTS_PER_TASK => {
+                use rayon::prelude::*;
+                pool.install(|| {
+                    moving
+                        .par_chunks(ELEMENTS_PER_TASK)
+                        .flat_map_iter(|chunk| chunk.iter().map(moves))
+                        .collect()
+                })
+            }
+            _ => moving.iter().map(moves).collect(),
+        };
+        let mut damages = vec![0; elements.len()];
+        for (&(index, _), answer) in moving.iter().zip(answers) {
+            damages[index] = answer;
+        }
+        damages
     }
 
     /// The rows installing the records `live` holds for the elements of `changed`, in tree order,
@@ -264,8 +296,15 @@ impl RetainedState {
         scratch.start(&self.projection);
         scratch.order(&self.projection, root, changed);
         let ordered = std::mem::take(&mut scratch.ordered);
+        let element_damages = self.element_move_damages(live, &ordered);
         let mut rows = Vec::with_capacity(ordered.len());
-        for &node in &ordered {
+        for (index, (&node, &element_damage)) in ordered.iter().zip(&element_damages).enumerate() {
+            if let Some(ahead) = ordered
+                .get(index + super::records::RECORDS_AHEAD)
+                .and_then(|&ahead| live.demanded_record(ahead))
+            {
+                ahead.prefetch();
+            }
             let Some(record) = live.demanded_record(node) else {
                 continue;
             };
@@ -301,9 +340,8 @@ impl RetainedState {
                 || parent.is_some_and(|parent| self.hidden_before(parent, scratch));
             scratch.note_hidden_before(node, below_display_none || self.record_is_display_none(old));
             let new_record = self.install_record(record, &mut scratch.installed);
-            // NB: Where the record holds what one installed before it does, or the element installs a copy of it in
-            //     another custom property environment, the element keeps what it installed, and its own goes: the
-            //     composition of its animations lies over what it holds.
+            // NB: Where the element installs a copy of the record, as in another custom property environment, the element
+            //     keeps what it installed, and its own goes: the composition of its animations lies over what it holds.
             if let Some(installed) = self.computed_group_sets.installed_record(new_record)
                 && !Arc::ptr_eq(installed, computed_record)
             {
@@ -340,21 +378,22 @@ impl RetainedState {
             // display:none.
             let main_holds_new = self.held_style_record(node) == Some(new);
             if !main_holds_new {
-                installation
-                    .swaps
-                    .push(StyleSwap::new(self, node, PseudoSlot::ELEMENT, new_record));
+                installation.swaps.push(StyleSwap::new(
+                    self,
+                    node,
+                    PseudoSlot::ELEMENT,
+                    StyleAtomID::NONE,
+                    new_record,
+                ));
             }
             let record_damage = match old != 0 && old != new {
-                true => {
-                    self.element_record_damage(node, false, old, new)
-                        | bridge::FfiStyleInvalidationField::EngineComputed as u32
-                }
+                true => element_damage | bridge::FfiStyleInvalidationField::EngineComputed as u32,
                 false => 0,
             };
             let plan_owed = plans_owed.binary_search(&node).is_ok();
             let composition_owed = compositions_owed.binary_search(&node).is_ok();
-            let owes_an_animation_plan =
-                (plan_owed && self.record_declares_animations(new)) || self.row_owes_an_animation_plan(node, old, new);
+            let owes_an_animation_plan = (plan_owed && self.record_declares_animations(new))
+                || self.row_owes_an_animation_plan(node, old, new, record);
             let owes_a_transition_step = self.row_owes_a_transition_step(node, old_record, new_record);
             // The host composes the record where the element has animations, or the row owes their plan
             // or the transition step, before it settles the element's pseudo-elements. It composes it too
@@ -381,11 +420,11 @@ impl RetainedState {
             });
             // The pseudo-elements follow their element, the ones that no longer generate a box
             // with no record.
-            let main_holds_pseudo = |state: &Self, kind: u8| {
+            let main_holds_pseudo = |state: &Self, target: super::PseudoElementTarget| {
                 state
                     .held_pseudo_style_records
                     .get(&node)
-                    .and_then(|held| held.iter().find(|&&(held_kind, _)| held_kind == kind))
+                    .and_then(|held| held.iter().find(|&&(held_target, _)| held_target == target))
                     .map_or(0, |&(_, record)| record)
             };
             for kind in super::PSEUDO_ELEMENT_KINDS {
@@ -394,7 +433,10 @@ impl RetainedState {
                     .pseudo_style_record(node, kind)
                     .unwrap_or(computed::FinalStyleRecordID::NONE);
                 let old_pseudo = old_pseudo_record.raw();
-                let new_pseudo_record = match pseudo_element_records.iter().find(|(held, _)| *held == kind) {
+                let new_pseudo_record = match pseudo_element_records
+                    .iter()
+                    .find(|(held, _)| *held == super::PseudoElementTarget::of_kind(kind))
+                {
                     Some((_, pseudo_record)) => {
                         // A pseudo-element's containers are its originating element's.
                         self.note_container_unit_reads(node, pseudo_record, true);
@@ -420,16 +462,22 @@ impl RetainedState {
                     }
                     // The main thread may hold a record a read demanded for a pseudo-element that generates no
                     // box, which goes as the element's styles move.
-                    None if old_pseudo == 0 && main_holds_pseudo(self, kind) == 0 => continue,
+                    None if old_pseudo == 0
+                        && main_holds_pseudo(self, super::PseudoElementTarget::of_kind(kind)) == 0 =>
+                    {
+                        continue;
+                    }
                     None => computed::FinalStyleRecordID::NONE,
                 };
                 let new_pseudo = new_pseudo_record.raw();
-                let main_holds_new_pseudo = main_holds_pseudo(self, kind) == new_pseudo;
+                let main_holds_new_pseudo =
+                    main_holds_pseudo(self, super::PseudoElementTarget::of_kind(kind)) == new_pseudo;
                 if !main_holds_new_pseudo {
                     installation.swaps.push(StyleSwap::new(
                         self,
                         node,
                         PseudoSlot::pseudo_element(kind),
+                        StyleAtomID::NONE,
                         new_pseudo_record,
                     ));
                 }
@@ -506,6 +554,83 @@ impl RetainedState {
                     composed_by_the_host: composition.composed_by_the_host,
                 });
             }
+            let custom_highlights = self
+                .computed_group_sets
+                .custom_highlight_records(node)
+                .map(|(name, _)| super::PseudoElementTarget::custom_highlight(name))
+                .chain(
+                    pseudo_element_records
+                        .iter()
+                        .map(|&(target, _)| target)
+                        .filter(|target| target.is_custom_highlight()),
+                )
+                .fold(
+                    SmallVec::<[super::PseudoElementTarget; 2]>::new(),
+                    |mut targets, target| {
+                        if !targets.contains(&target) {
+                            targets.push(target);
+                        }
+                        targets
+                    },
+                );
+            for target in custom_highlights {
+                let old_pseudo_record = self
+                    .computed_group_sets
+                    .pseudo_style_record_of(node, target)
+                    .unwrap_or(computed::FinalStyleRecordID::NONE);
+                let old_pseudo = old_pseudo_record.raw();
+                let new_pseudo_record = match pseudo_element_records.iter().find(|(held, _)| *held == target) {
+                    Some((_, pseudo_record)) => {
+                        self.note_container_unit_reads(node, pseudo_record, true);
+                        let pseudo_environment = self.pseudo_element_environment(
+                            node,
+                            pseudo_record,
+                            record,
+                            environment,
+                            &mut scratch.minted,
+                        );
+                        let pseudo_record: &Arc<Record> =
+                            &self.record_in_environment(pseudo_record, pseudo_environment);
+                        let new_pseudo_record = self.install_record(pseudo_record, &mut scratch.installed);
+                        if old_pseudo != 0 && old_pseudo != new_pseudo_record.raw() {
+                            self.computed_group_sets.pin_style_record(old_pseudo);
+                            installation.pinned_records.push(old_pseudo);
+                        }
+                        self.computed_group_sets
+                            .assign_installed_pseudo_record_of(node, target, new_pseudo_record);
+                        new_pseudo_record
+                    }
+                    None if old_pseudo == 0 && main_holds_pseudo(self, target) == 0 => continue,
+                    None => computed::FinalStyleRecordID::NONE,
+                };
+                let new_pseudo = new_pseudo_record.raw();
+                if main_holds_pseudo(self, target) != new_pseudo {
+                    installation.swaps.push(StyleSwap::new(
+                        self,
+                        node,
+                        PseudoSlot::pseudo_element(target.kind),
+                        target.highlight_name,
+                        new_pseudo_record,
+                    ));
+                }
+                if old_pseudo == new_pseudo {
+                    continue;
+                }
+                let record_damage =
+                    self.pseudo_element_record_damage(node, target.kind, old_pseudo, new_pseudo, new, false)
+                        | bridge::FfiStyleInvalidationField::EngineComputed as u32;
+                self.note_pseudo_element_move(
+                    &mut pseudo_elements,
+                    node,
+                    target.kind,
+                    (old_pseudo, new_pseudo, new),
+                    record_damage,
+                    below_display_none,
+                );
+                if new_pseudo_record == computed::FinalStyleRecordID::NONE {
+                    self.remove_computed_pseudo_of(node, target);
+                }
+            }
             if old != new
                 || !main_holds_new
                 || plan_owed
@@ -529,9 +654,18 @@ impl RetainedState {
                     old_record: old_view.and(computed::FinalStyleRecordID::from_raw(old)),
                     pseudo_elements,
                 };
+                let first_style = facts.element_damage.is_none();
                 let effects = self.main_effects(node, old_view, new_view, facts);
                 scratch.document_damage.push(effects.damage());
                 installation.note_element_effects(effects, first_swap);
+                if first_style {
+                    scratch.note_first_style(node);
+                    if let Some(parent) = parent.filter(|&parent| {
+                        scratch.takes_first_style(parent) && self.projection.parent(node) == Some(parent)
+                    }) {
+                        installation.note_first_style_below_first_style(parent);
+                    }
+                }
             }
             installation.end_element(node, first_swap);
         }
@@ -659,22 +793,22 @@ impl RetainedState {
         }
     }
 
-    /// Whether a descendant of `node` in the shadow-including tree that holds a style is an SVG element content can
-    /// reference, which keeps its style while hidden. An element without a style holds none below it.
+    /// Whether a descendant of `node` in the flat tree that holds a style is an SVG element content can reference,
+    /// which keeps its style while hidden. An element without a style holds none below it.
     fn has_referenceable_svg_descendant(&self, node: StyleNodeID) -> bool {
         let mut found = false;
-        self.for_each_held_shadow_including_descendant(node, |state, element| {
+        self.for_each_held_flat_tree_descendant(node, |state, element| {
             found = found || state.is_referenceable_in_display_none_subtree(element);
             !found
         });
         found
     }
 
-    /// Notes that the host cleared the styles of `node`'s descendants that hold one, in the shadow-including tree, as
-    /// it does for the descendants of a hidden element.
+    /// Notes that the host cleared the styles of `node`'s descendants that hold one, in the flat tree, as it does for
+    /// the descendants of a hidden element.
     pub(crate) fn clear_hidden_descendants(&mut self, node: StyleNodeID) {
         let mut cleared = Vec::new();
-        self.for_each_held_shadow_including_descendant(node, |_, element| {
+        self.for_each_held_flat_tree_descendant(node, |_, element| {
             cleared.push(element);
             true
         });
@@ -683,9 +817,10 @@ impl RetainedState {
         }
     }
 
-    /// Calls `callback` with each descendant of `node` in the shadow-including tree that holds a style, in no
-    /// particular order, skipping the descendants of those that hold none, until it answers false.
-    fn for_each_held_shadow_including_descendant(
+    /// Calls `callback` with each descendant of `node` in the flat tree that holds a style, in no particular order,
+    /// skipping the descendants of those that hold none, until it answers false. As in the walk with which the host
+    /// clears the styles, a slottable is below the slot it is assigned to, and not reached from its host.
+    fn for_each_held_flat_tree_descendant(
         &self,
         node: StyleNodeID,
         mut callback: impl FnMut(&Self, StyleNodeID) -> bool,
@@ -696,9 +831,18 @@ impl RetainedState {
             pending.extend(projection.shadow_root_of(parent));
             let mut child = projection.first_element_child(parent);
             while let Some(current) = child {
-                pending.push(current);
+                if projection.assigned_slot_of(current).is_none() {
+                    pending.push(current);
+                }
                 child = projection.next_element_sibling(current);
             }
+            pending.extend(
+                projection
+                    .assigned_nodes_of(parent)
+                    .iter()
+                    .copied()
+                    .filter(|assigned| assigned.text_index().is_none()),
+            );
         };
         push_children(&mut pending, node);
         while let Some(current) = pending.pop() {
@@ -837,9 +981,39 @@ impl RetainedState {
 #[cfg(test)]
 mod tests {
     use super::super::super::TreeScopeID;
+    use super::super::super::computed;
     use super::super::super::custom_property_environments::environment_identity;
     use super::super::test_support::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_store_holding_what_the_record_of_an_element_holds_resolves_to_its_environment() {
+        let (mut engine, nodes) = nested_document();
+        let sheet = add_sheet(&mut engine, TreeScopeID::DOCUMENT);
+        add_rules(&mut engine, sheet, ".theme { --theme: 1px; }");
+        add_class(&mut engine, nodes[0], "theme");
+        start_live(&mut engine, nodes[0]);
+
+        let record = live_record(&engine, nodes[0]);
+        let store = record.custom_properties().unwrap().clone();
+        let state = &mut engine.retained;
+        let registry = state.document_style_computation_inputs.custom_property_registry();
+        let environment =
+            state
+                .custom_property_environments
+                .adopt_engine_environment(store.clone(), None, 0, None, registry);
+        let installed = state.computed_group_sets.install_derived_record(&record, || {
+            computed::record_dependency_flags(&record.facts(), &record.payloads)
+        });
+        state.computed_group_sets.assign_installed_record(nodes[0], installed);
+
+        // NB: The element holds no environment of its own, as nothing lies over its record.
+        assert!(!state.element_custom_property_data.contains_key(&nodes[0]));
+        assert_eq!(
+            state.environment_resolving_to_the_same_values(nodes[0], None, &store, registry),
+            Some(environment)
+        );
+    }
 
     #[test]
     fn a_pseudo_element_inheriting_a_store_leaves_the_environment_of_its_holder() {

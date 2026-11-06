@@ -48,9 +48,18 @@ unsafe extern "C" {
         pixels: &FramePixels,
         out_frame: &mut *mut c_void,
     ) -> RawNativeFunctionResult;
-    fn web_image_bitmap_transfer_bitmap(data_holder: *mut c_void, frame: *const c_void) -> RawNativeFunctionResult;
-    fn web_image_bitmap_receive_bitmap(
+    fn web_image_bitmap_copy_to_shared_pixels(
+        image_bitmap_pixels: *mut c_void,
+        frame: *const c_void,
+        buffer_index: &mut u32,
+        offset: &mut u64,
+    ) -> bool;
+    fn web_image_bitmap_create_frame_from_shared_pixels(
+        realm: *mut c_void,
         data_holder: *mut c_void,
+        buffer_index: u32,
+        offset: u64,
+        pixels: &FramePixels,
         out_frame: &mut *mut c_void,
     ) -> RawNativeFunctionResult;
 }
@@ -134,12 +143,8 @@ fn deserialize_enumeration(
         .ok_or_else(|| data_clone_error(unknown_message))
 }
 
-/// Writes a copy of the bitmap data of the frame, or that there is none.
-fn serialize_bitmap_data(serialized: &mut SerializationWriter, frame: *const c_void, for_storage: bool) {
-    if frame.is_null() {
-        serialized.write_u8(BITMAP_KIND_NONE);
-        return;
-    }
+/// The values of the bitmap and the color space of the frame, with bytes that borrow from it.
+fn frame_pixels(frame: *const c_void) -> FramePixels {
     let mut pixels = FramePixels {
         width: 0,
         height: 0,
@@ -156,6 +161,16 @@ fn serialize_bitmap_data(serialized: &mut SerializationWriter, frame: *const c_v
     };
     // SAFETY: The frame is live.
     unsafe { web_image_bitmap_frame_pixels(frame, &mut pixels) };
+    pixels
+}
+
+/// Writes a copy of the bitmap data of the frame, or that there is none.
+fn serialize_bitmap_data(serialized: &mut SerializationWriter, frame: *const c_void, for_storage: bool) {
+    if frame.is_null() {
+        serialized.write_u8(BITMAP_KIND_NONE);
+        return;
+    }
+    let pixels = frame_pixels(frame);
 
     let has_color_space = pixels.color_space_kind != COLOR_SPACE_KIND_SRGB;
     serialized.write_u8(if has_color_space {
@@ -181,6 +196,149 @@ fn serialize_bitmap_data(serialized: &mut SerializationWriter, frame: *const c_v
         // SAFETY: The bytes borrow from the frame, which lives for the call.
         serialized.write_bytes(unsafe { ak::slice_from_raw_parts(pixels.icc_profile, pixels.icc_profile_size) });
     }
+}
+
+fn write_transferred_color_space(data_holder: &mut TransferDataWriter, pixels: &FramePixels) {
+    data_holder.write(&pixels.color_space_kind);
+    if pixels.color_space_kind == COLOR_SPACE_KIND_CICP {
+        data_holder.write(&pixels.color_primaries);
+        data_holder.write(&pixels.transfer_characteristics);
+    } else if pixels.color_space_kind == COLOR_SPACE_KIND_ICC_PROFILE {
+        // SAFETY: The bytes borrow from the frame, which lives for the call.
+        data_holder.write(unsafe { ak::slice_from_raw_parts(pixels.icc_profile, pixels.icc_profile_size) });
+    }
+}
+
+/// Writes the bitmap data of the frame, or that there is none, to the data holder of a transfer: its pixels go to the
+/// shared memory of the transfer if there is room for them there, and inline otherwise.
+fn write_transferred_bitmap_data(data_holder: &mut TransferDataWriter, frame: *const c_void) {
+    let (mut buffer_index, mut offset) = (0, 0);
+    // SAFETY: The pixels are lent for the steps, and the frame is live.
+    let in_shared_pixels = !frame.is_null()
+        && unsafe {
+            web_image_bitmap_copy_to_shared_pixels(
+                data_holder.image_bitmap_pixels_as_raw(),
+                frame,
+                &mut buffer_index,
+                &mut offset,
+            )
+        };
+    data_holder.write_bool(in_shared_pixels);
+    if frame.is_null() {
+        data_holder.write(&BITMAP_KIND_NONE);
+        return;
+    }
+    let pixels = frame_pixels(frame);
+    if in_shared_pixels {
+        data_holder.write(&buffer_index);
+        data_holder.write(&offset);
+        data_holder.write(&pixels.width);
+        data_holder.write(&pixels.height);
+        data_holder.write(&pixels.format);
+        data_holder.write(&pixels.alpha_type);
+        write_transferred_color_space(data_holder, &pixels);
+        return;
+    }
+    let has_color_space = pixels.color_space_kind != COLOR_SPACE_KIND_SRGB;
+    data_holder.write(&if has_color_space {
+        BITMAP_KIND_WITH_COLOR_SPACE
+    } else {
+        BITMAP_KIND_SRGB
+    });
+    data_holder.write(&pixels.width);
+    data_holder.write(&pixels.height);
+    data_holder.write(&pixels.pitch);
+    data_holder.write(&pixels.format);
+    data_holder.write(&pixels.alpha_type);
+    // SAFETY: The bytes borrow from the frame, which lives for the call.
+    data_holder.write(unsafe { ak::slice_from_raw_parts(pixels.data, pixels.data_size) });
+    if has_color_space {
+        write_transferred_color_space(data_holder, &pixels);
+    }
+}
+
+/// Reads what write_transferred_color_space() writes into the pixels.
+fn read_transferred_color_space(data_holder: &mut TransferDataReader, pixels: &mut FramePixels) -> WebIdlResult<()> {
+    pixels.color_space_kind = data_holder.read()?;
+    match pixels.color_space_kind {
+        COLOR_SPACE_KIND_SRGB => {}
+        COLOR_SPACE_KIND_CICP => {
+            pixels.color_primaries = data_holder.read()?;
+            pixels.transfer_characteristics = data_holder.read()?;
+        }
+        COLOR_SPACE_KIND_ICC_PROFILE => {
+            let icc_profile = data_holder.read_bytes()?;
+            pixels.icc_profile = icc_profile.as_ptr();
+            pixels.icc_profile_size = icc_profile.len();
+        }
+        _ => return Err(data_clone_error(b"Invalid ImageBitmap color space")),
+    }
+    Ok(())
+}
+
+/// Reads what write_transferred_bitmap_data() writes, and creates the bitmap data in the realm of the data holder.
+fn read_transferred_bitmap_data(data_holder: &mut TransferDataReader) -> WebIdlResult<Option<BitmapData>> {
+    let realm = data_holder.realm();
+    let in_shared_pixels = data_holder.read_bool()?;
+    let mut pixels = FramePixels {
+        width: 0,
+        height: 0,
+        pitch: 0,
+        format: 0,
+        alpha_type: 0,
+        data: core::ptr::null(),
+        data_size: 0,
+        color_space_kind: COLOR_SPACE_KIND_SRGB,
+        color_primaries: 0,
+        transfer_characteristics: 0,
+        icc_profile: core::ptr::null(),
+        icc_profile_size: 0,
+    };
+    let mut frame = core::ptr::null_mut();
+    if in_shared_pixels {
+        let buffer_index = data_holder.read::<u32>()?;
+        let offset = data_holder.read::<u64>()?;
+        pixels.width = data_holder.read()?;
+        pixels.height = data_holder.read()?;
+        pixels.format = data_holder.read()?;
+        pixels.alpha_type = data_holder.read()?;
+        read_transferred_color_space(data_holder, &mut pixels)?;
+        // SAFETY: The realm is live, the data holder is lent for the steps, and the call borrows the bytes.
+        unsafe {
+            web_image_bitmap_create_frame_from_shared_pixels(
+                realm.as_ptr().cast(),
+                data_holder.as_raw(),
+                buffer_index,
+                offset,
+                &pixels,
+                &mut frame,
+            )
+        }
+        .into_completion()?;
+    } else {
+        let kind = data_holder.read::<u8>()?;
+        if kind == BITMAP_KIND_NONE {
+            return Ok(None);
+        }
+        if kind != BITMAP_KIND_SRGB && kind != BITMAP_KIND_WITH_COLOR_SPACE {
+            return Err(data_clone_error(b"Invalid ImageBitmap bitmap data"));
+        }
+        pixels.width = data_holder.read()?;
+        pixels.height = data_holder.read()?;
+        pixels.pitch = data_holder.read()?;
+        pixels.format = data_holder.read()?;
+        pixels.alpha_type = data_holder.read()?;
+        let data = data_holder.read_bytes()?;
+        pixels.data = data.as_ptr();
+        pixels.data_size = data.len();
+        if kind == BITMAP_KIND_WITH_COLOR_SPACE {
+            read_transferred_color_space(data_holder, &mut pixels)?;
+        }
+        // SAFETY: The realm is live, and the call borrows the bytes.
+        unsafe { web_image_bitmap_create_frame(realm.as_ptr().cast(), &pixels, &mut frame) }.into_completion()?;
+    }
+    // SAFETY: C++ hands over the frame it created.
+    Ok(unsafe { BitmapData::from_handed_over_frame(frame) })
 }
 
 /// Reads what serialize_bitmap_data() writes, and creates the bitmap data in the realm of the call context.
@@ -414,9 +572,7 @@ impl Transferable for ImageBitmap {
         }
 
         // 2. Set dataHolder.[[BitmapData]] to value's bitmap data.
-        // NB: The pixels go to the shared memory of the transfer if there is room for them there, and inline otherwise.
-        // SAFETY: The data holder is lent for the steps, and the frame lives while the bitmap data is set.
-        unsafe { web_image_bitmap_transfer_bitmap(data_holder.as_raw(), this.raw_frame()) }.into_completion()?;
+        write_transferred_bitmap_data(data_holder, this.raw_frame());
 
         // 3. Unset value's bitmap data.
         this.bitmap.replace(None);
@@ -427,12 +583,7 @@ impl Transferable for ImageBitmap {
     /// https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#the-imagebitmap-interface:transfer-receiving-steps
     fn transfer_receiving_steps(cx: &mut CallContext, data_holder: &mut TransferDataReader) -> WebIdlResult<Ref<Self>> {
         // 1. Set value's bitmap data to dataHolder.[[BitmapData]].
-        let mut frame = core::ptr::null_mut();
-        // SAFETY: The data holder is lent for the steps.
-        unsafe { web_image_bitmap_receive_bitmap(data_holder.as_raw(), &mut frame) }.into_completion()?;
-        // SAFETY: C++ hands over the frame it decoded, or null.
-        Ok(allocate(cx.vm(), |_| {
-            Self::new(unsafe { BitmapData::from_handed_over_frame(frame) })
-        }))
+        let bitmap_data = read_transferred_bitmap_data(data_holder)?;
+        Ok(allocate(cx.vm(), |_| Self::new(bitmap_data)))
     }
 }

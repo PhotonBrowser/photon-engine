@@ -18,6 +18,7 @@ use liburl_rust::FfiOrigin;
 use liburl_rust::origin::Origin;
 
 use crate::bindings::CallContext;
+use crate::bindings::callback::CallbackInterface;
 use crate::bindings::cpp_cell::CppCell;
 use crate::bindings::interface::{Interface, Ref, Wrappable, cell_from_abi, cell_into_abi};
 
@@ -38,6 +39,16 @@ unsafe extern "C" {
     fn web_bindings_set_event_handler_attribute(event_target: *mut c_void, name: ak::Span<'_, u8>, value: u64);
     fn web_bindings_add_event_listener(
         realm: *mut c_void,
+        event_target: *mut c_void,
+        r#type: ak::Span<'_, u8>,
+        callback: *mut c_void,
+    );
+    fn web_bindings_add_event_listener_without_options(
+        event_target: *mut c_void,
+        r#type: ak::Span<'_, u8>,
+        callback: *mut c_void,
+    );
+    fn web_bindings_remove_event_listener_without_options(
         event_target: *mut c_void,
         r#type: ak::Span<'_, u8>,
         callback: *mut c_void,
@@ -78,6 +89,8 @@ unsafe extern "C" {
         event: *mut c_void,
     ) -> bool;
     fn web_bindings_event_canceled(event: *mut c_void) -> bool;
+    fn web_bindings_event_dispatched(event: *mut c_void) -> bool;
+    fn web_bindings_initialize_event(event: *mut c_void, r#type: usize, bubbles: bool, cancelable: bool);
 }
 
 /// The EventTarget that an object owns.
@@ -165,6 +178,32 @@ impl CppEventTarget {
         }
     }
 
+    /// Adds an event listener for the event type whose callback is the EventListener, with no options,
+    /// https://dom.spec.whatwg.org/#add-an-event-listener
+    pub(crate) fn add_event_listener_without_options(&self, event_type: &str, callback: &CallbackInterface) {
+        // SAFETY: The EventTarget and the callback are live, and the type is lent for the call.
+        unsafe {
+            web_bindings_add_event_listener_without_options(
+                self.as_ptr(),
+                ak::Span::new(event_type.as_bytes()),
+                callback.as_ptr(),
+            );
+        }
+    }
+
+    /// Removes the event listener for the event type whose callback is the EventListener and whose capture is false,
+    /// https://dom.spec.whatwg.org/#remove-an-event-listener
+    pub(crate) fn remove_event_listener_without_options(&self, event_type: &str, callback: &CallbackInterface) {
+        // SAFETY: The EventTarget and the callback are live, and the type is lent for the call.
+        unsafe {
+            web_bindings_remove_event_listener_without_options(
+                self.as_ptr(),
+                ak::Span::new(event_type.as_bytes()),
+                callback.as_ptr(),
+            );
+        }
+    }
+
     /// https://dom.spec.whatwg.org/#concept-event-dispatch
     pub(crate) fn dispatch_event(&self, event: &CppEvent) -> bool {
         // SAFETY: The EventTarget and the event are live.
@@ -188,7 +227,7 @@ pub(crate) struct CppEvent(CppCell);
 impl CppEvent {
     pub(crate) fn create(realm: Gc<Realm>, r#type: &str, bubbles: bool, cancelable: bool, composed: bool) -> Self {
         // SAFETY: The realm is live, the type is lent for the call, and LibWeb returns a live event.
-        Self(unsafe {
+        let event = Self(unsafe {
             CppCell::from_raw(web_bindings_create_event(
                 realm.as_ptr().cast(),
                 ak::Span::new(r#type.as_bytes()),
@@ -196,7 +235,10 @@ impl CppEvent {
                 cancelable,
                 composed,
             ))
-        })
+        });
+        // NB: Only the implementation creates events this way, to fire them.
+        event.set_is_trusted(true);
+        event
     }
 
     pub(crate) fn create_for_owner(
@@ -276,6 +318,18 @@ impl CppEvent {
     pub(crate) fn canceled(&self) -> bool {
         // SAFETY: The event is live.
         unsafe { web_bindings_event_canceled(self.as_ptr()) }
+    }
+
+    /// https://dom.spec.whatwg.org/#dispatch-flag
+    pub(crate) fn dispatched(&self) -> bool {
+        // SAFETY: The event is live.
+        unsafe { web_bindings_event_dispatched(self.as_ptr()) }
+    }
+
+    /// https://dom.spec.whatwg.org/#concept-event-initialize
+    pub(crate) fn initialize_event(&self, r#type: &Utf16String, bubbles: bool, cancelable: bool) {
+        // SAFETY: The event is live, and the type is lent for the call.
+        unsafe { web_bindings_initialize_event(self.as_ptr(), r#type.raw_identity(), bubbles, cancelable) };
     }
 }
 

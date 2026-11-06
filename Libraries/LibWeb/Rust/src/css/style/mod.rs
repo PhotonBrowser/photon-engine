@@ -8,22 +8,14 @@
 //! memory-bounded incremental computation.
 //!
 //! DOM structure, element state, stylesheets, CSSOM mutations, cascade topology, and environment
-//! values are versioned inputs. Selectors, cascade decisions, and computed values form a shared
-//! logical dependency program. A style flush discovers and propagates exact changes through that
-//! program and stops as soon as a semantic value is unchanged.
-//!
-//! The cache-free exact matcher is part of the architecture rather than a fallback bolted on:
-//! optional incremental state may accelerate matching but is never required to answer a style read
-//! correctly. Derived state lives as long as the node or rule it describes.
+//! values are versioned inputs. A style flush propagates exact changes through selectors, cascade
+//! decisions, and computed values, and stops as soon as a semantic value is unchanged. Derived state
+//! lives as long as the node or rule it describes.
 //!
 //! Everything between a style input and a computed value is authoritative here, on the Rust side.
 //! C++ remains authoritative for DOM and CSSOM object identity, mutation semantics, document
 //! lifecycle, loading order, style-observation barriers, layout, and paint - and holds no second
 //! copy of the state this engine owns.
-//!
-//! A few modules exist that the original module sketch did not name, because the concepts they hold
-//! did not belong in any of the modules it did name: [`tree`] for style node identity and the
-//! relation columns, and [`order`] for cascade order maintenance.
 
 macro_rules! define_id {
     ($(#[$attribute:meta])* $visibility:vis struct $name:ident();) => {
@@ -46,25 +38,6 @@ macro_rules! define_id {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
         $visibility struct $name($field_visibility u32);
     };
-    // An identity an `InternTable` hands out, which indexes the table directly.
-    ($(#[$attribute:meta])* interned $($rest:tt)*) => {
-        define_id! { $(#[$attribute])* $($rest)* }
-        define_id!(@interned $($rest)*);
-    };
-    (@interned default $($rest:tt)*) => {
-        define_id!(@interned $($rest)*);
-    };
-    (@interned $visibility:vis struct $name:ident($($field:tt)*);) => {
-        impl $crate::css::style::intern_table::InternIdentity for $name {
-            fn index(self) -> usize {
-                self.0 as usize
-            }
-
-            fn from_index(index: usize) -> Self {
-                Self(u32::try_from(index).expect("interned identity exceeds u32"))
-            }
-        }
-    };
 }
 
 pub(crate) mod animations;
@@ -83,6 +56,7 @@ pub(crate) use container_queries::ContainerUnitBases;
 mod custom_property_cascade;
 mod custom_property_environments;
 mod dom_reads;
+pub(crate) mod drag_selection;
 pub(crate) mod effect_descriptions;
 mod element_declarations;
 mod element_host_facts;
@@ -91,7 +65,6 @@ pub mod engine_calls;
 pub(crate) mod engine_sample;
 #[cfg(test)]
 pub mod exact_matcher;
-mod facts_types;
 pub(crate) mod host_atoms;
 pub(crate) mod style_job;
 pub(crate) use crate::fast_hash;
@@ -105,7 +78,6 @@ mod inputs;
 mod installed_records;
 pub(crate) use inputs::next_declaration_block_version;
 pub mod instrumentation;
-mod intern_table;
 pub(crate) mod layout_style;
 pub(crate) mod memory_report;
 pub mod order;
@@ -132,13 +104,16 @@ pub(crate) use process_style::ProcessStyle;
 pub(crate) use publication::RecordDemand;
 pub(crate) use transition_baselines::{InheritedAnimatedValue, TransitionBaselines};
 pub mod input_types;
-pub mod relative_selector;
 pub mod selector;
 pub mod selector_evaluation;
-mod shareable;
 mod size_container_invalidation;
 mod specified_value;
-mod transaction_view;
+
+/// Whether the host has to note what `value` reads of its element's attributes.
+pub(crate) fn value_reads_attributes(value: &crate::css::style_value::StyleValueData) -> bool {
+    custom_property_cascade::unresolved_reading_attributes(value).is_some()
+}
+
 pub mod tree;
 mod weak_pool;
 
@@ -155,6 +130,10 @@ use std::sync::Mutex;
 
 /// Attribute names a document's selectors read, which its engine shares with its host.
 pub(crate) type SelectorAttributeNames = Arc<HashSet<StyleAtomID>>;
+
+/// The style record each pseudo-element of an element holds.
+type HeldPseudoStyleRecords =
+    crate::cow_map::CowMap<StyleNodeID, smallvec::SmallVec<[(pipeline::PseudoElementTarget, u64); 1]>>;
 
 /// What an element's arrival has to carry to reach the anchor of a `:has()` argument: a name whose raw identity is
 /// among `names` as its tag, ID, class or attribute name, or a state among `states`. Where an argument can be reached
@@ -201,7 +180,7 @@ use input_types::InputValue;
 use input_types::PendingElementInputs;
 use input_types::StateFact;
 use input_types::StyleUpdate;
-use input_types::StyleUpdateVersion;
+use input_types::TransactionFactSide;
 use input_types::TreeRelations;
 use pipeline::rule_store::CascadeLayerID;
 use pipeline::rule_store::CustomDeclaration;
@@ -217,8 +196,6 @@ use pipeline::rule_store::StyleScopeID;
 use selector::Incomplete;
 use selector::MatchScratch;
 use selector::Specificity;
-use specified_value::CanonicalValues;
-use transaction_view::TransactionFactSide;
 use tree::HostTree;
 use tree::SegmentedNodeColumn;
 use tree::StyleNodeID;
@@ -233,7 +210,7 @@ pub struct RetainedState {
     counters: Counters,
     /// The elements the host shows each kind of highlight in.
     highlight_observers: pipeline::highlight_observers::HighlightObservers,
-    tree: crate::fork::ForkShared<HostTree>,
+    tree: HostTree,
     /// The depth of the deepest element the tree ever held, which the document's host reads.
     deepest_element: Arc<std::sync::atomic::AtomicU32>,
     /// Where the hover is.
@@ -243,8 +220,6 @@ pub struct RetainedState {
     process_style: Arc<process_style::ProcessStyle>,
     /// The last declaration block version minted, by the engine or by its document's host, which mints without it.
     declaration_block_version: Arc<std::sync::atomic::AtomicU32>,
-    /// Monotonic identity assigned to each non-empty normalized style update.
-    next_style_update_version: StyleUpdateVersion,
     /// Latest document-wide scalar computation facts, copied at the transaction boundary. The host
     /// publishes them with every transaction, before it asks for any row.
     document_style_computation_inputs: bridge::FfiDocumentStyleComputationInputs,
@@ -261,31 +236,31 @@ pub struct RetainedState {
     /// Every font resolution this document has been given. An evaluation step reads it; only a
     /// host round between passes adds to it.
     font_resolution: Option<font_resolution::FontResolutionCache>,
+    /// The fonts the threads of the style pass under way resolve, where they do.
+    pass_fonts: Option<std::sync::Arc<font_resolution::PassFonts>>,
     /// `font-family: monospace`, the family the monospace font-size recascade resolves an
     /// ancestor's font-relative lengths against.
     monospace_font_family: RetainedStyleValueData,
 
-    /// The values elements' own declarations share, one per content.
-    canonical_values: crate::fork::ForkShared<CanonicalValues>,
     /// The shared computed-group payload tuple last published for each live element. This is the
     /// computed half of the eventual base style record; custom properties and metadata remain
     /// separate inputs until that record is complete.
-    computed_group_sets: crate::fork::ForkShared<ComputedGroupSets>,
+    computed_group_sets: ComputedGroupSets,
     /// How many epochs of style record views the host has open. No computed record is reclaimed while one is.
     style_record_view_epoch_depth: u32,
     /// The stores behind the custom-property environments live records are published with.
     custom_property_environments: crate::fork::ForkShared<custom_property_environments::CustomPropertyEnvironments>,
     /// The custom-property environment each element holds, for the elements that hold one. This is
     /// the only copy: the element reads its environment from here.
-    element_custom_property_data: crate::fork::ForkShared<HashMap<StyleNodeID, inputs::HeldCustomPropertyEnvironment>>,
+    element_custom_property_data: crate::cow_map::CowMap<StyleNodeID, inputs::HeldCustomPropertyEnvironment>,
     /// The custom-property environments of each element's synthetic pseudo-elements, by
     /// pseudo-element kind, for the elements with a pseudo-element that holds one.
     pseudo_element_custom_property_data:
-        crate::fork::ForkShared<HashMap<StyleNodeID, Vec<(u8, inputs::HeldCustomPropertyEnvironment)>>>,
+        crate::cow_map::CowMap<StyleNodeID, Vec<(u8, inputs::HeldCustomPropertyEnvironment)>>,
     /// The elements whose animations' keyframes say `inherit` for a property that does not
     /// inherit, as the host last sampled them: they read their parent's values of properties that
     /// do not inherit, whether or not their records do.
-    keyframes_reading_parent_reset_values: crate::fork::ForkShared<HashSet<StyleNodeID>>,
+    keyframes_reading_parent_reset_values: crate::cow_map::CowSet<StyleNodeID>,
     /// What the container conditions of the rows the engine answered read of their containers,
     /// per element, taken when the host installs the element's record.
     container_effects_for_host: container_queries::ContainerEffectsForHost,
@@ -298,21 +273,21 @@ pub struct RetainedState {
     /// The counter-style registry each tree scope's style scope has, as one identity per scope:
     /// what a record whose `list-style-type` names a counter style the registry may define names,
     /// so that an edit to `@counter-style` moves it.
-    counter_style_environment_identities: crate::fork::ForkShared<HashMap<TreeScopeID, u64>>,
+    counter_style_environment_identities: crate::cow_map::CowMap<TreeScopeID, u64>,
     /// The style record each element holds, for the elements that hold one, as the host reports
     /// every record it installs or clears.
     /// Copied on write in chunks of its own, which a fork shares.
     held_style_records: inputs::HeldStyleRecords,
-    /// The style record each pseudo-element holds, by its kind, for the elements whose pseudo-elements
+    /// The style record each pseudo-element holds, for the elements whose pseudo-elements
     /// hold one, as the host reports every record it installs or clears.
-    held_pseudo_style_records: crate::fork::ForkShared<HashMap<StyleNodeID, Vec<(u8, u64)>>>,
+    held_pseudo_style_records: HeldPseudoStyleRecords,
     /// The records a clock frame shows in place of the ones the host installed, which it lends the published reads
     /// for as long as it runs.
     tick_shown: engine_sample::TickShownRecords,
     /// Per shadow host, the elements of its shadow tree that stood for one of its element-backed
     /// pseudo-elements when the host published them; [`RetainedState::backing_elements`] reads the
     /// ones that still do.
-    backing_elements: crate::fork::ForkShared<HashMap<StyleNodeID, SmallVec<[StyleNodeID; 2]>>>,
+    backing_elements: crate::cow_map::CowMap<StyleNodeID, SmallVec<[StyleNodeID; 2]>>,
     /// The names of the CSS animations the host holds for each element, which the computation of
     /// its animation definitions matches them against.
     css_defined_animations: crate::fork::ForkShared<animations::CssDefinedAnimations>,
@@ -332,7 +307,7 @@ pub struct RetainedState {
     random_base_values: random_bases::RandomBaseValues,
     /// What each element that has replaced content gives its natural size, which layout resolves
     /// against the style of the element's box.
-    replaced_content_inputs: crate::fork::ForkShared<HashMap<StyleNodeID, inputs::ReplacedContentInput>>,
+    replaced_content_inputs: crate::cow_map::CowMap<StyleNodeID, inputs::ReplacedContentInput>,
     /// The before-change style each transition target's transitions are decided against for the
     /// rest of the style stabilization epoch, pinned until the epoch commits.
     transition_baselines: transition_baselines::TransitionBaselines,
@@ -342,14 +317,17 @@ pub struct RetainedState {
     custom_property_registrations_changed: bool,
     /// The record a private demand last answered for each target it was asked about, pinned for
     /// the host to read: no node holds it.
-    demand_records: crate::fork::ForkShared<HashMap<computed::ComputedStyleTarget, computed::FinalStyleRecordID>>,
+    demand_records: crate::cow_map::CowMap<computed::ComputedStyleTarget, computed::FinalStyleRecordID>,
 
     /// The places of the children of parents with many of them, which sibling-counting functions
     /// read, kept while the tree's DOM order stands.
     sibling_positions: crate::fork::ForkReset<Mutex<publication::SiblingPositionCache>>,
-    /// What the last the engine cold pass measured.
+    /// The elements a style() container query asked as containers with a value counting their place among their
+    /// siblings. A fork shares them, as too many only walk more. An element's identity used again stays here too.
+    containers_counted_by_style_queries: Arc<Mutex<HashSet<StyleNodeID>>>,
+    /// What the last cold pass measured.
     cold_pass_report: pipeline::Report,
-    /// The engine kept live beside this engine, when asked for, which a fork goes on keeping.
+    /// What the engine keeps of the document it owns, which a fork goes on keeping.
     live_style: Option<Box<pipeline::Live>>,
     /// Whether this is the state the host writes, on which alone the engine starts.
     live_style_may_start: crate::fork::ForkReset<crate::fork::IsOriginal>,
@@ -359,14 +337,14 @@ pub struct RetainedState {
     live_counters: pipeline::counters::Counters,
     /// The threads style passes run on, which the process shares where a render state holds the
     /// engine.
-    style_pool: Option<std::sync::Arc<pipeline::pool::StylePool>>,
+    style_layout_pool: Option<std::sync::Arc<crate::style_layout_pool::StyleLayoutPool>>,
     /// The font longhand values the engine substituted, one value per property and content: the
     /// font resolver knows a family and its feature values by their values' identities.
     substituted_font_values: std::sync::Arc<std::sync::Mutex<Vec<(u16, RetainedStyleValueData)>>>,
     /// The longhand properties each element declares itself, by the kind of declaration they came
     /// from. An element-attached declaration beats every rule in its context, so the cascade needs
     /// to know which properties one covers just as it does for a rule.
-    element_declarations: crate::fork::ForkShared<element_declarations::ElementDeclarationStore>,
+    element_declarations: element_declarations::ElementDeclarationStore,
     /// The document as the engine reads it: every element fact and link the host publishes.
     projection: pipeline::projection::Projection,
     /// The attribute names whose value text a selector reads, which the host holds a copy of between jobs.
@@ -376,6 +354,7 @@ pub struct RetainedState {
     attribute_value_text_requirements_version: u64,
     /// Whether a selector tests `:local-link`, which the host holds a copy of between jobs.
     selectors_test_local_link: bool,
+    selectors_test_validity: bool,
     /// What an arrival has to carry to reach a `:has()` anchor, which the host holds a copy of between jobs.
     relational_arrival_keys: Arc<RelationalArrivalKeys>,
     /// The keys rules added since, which the host learns of once they are resolved.
@@ -428,8 +407,8 @@ pub struct HostState {
     /// Whether the deferred element style inputs are owed to the next transaction, as opposed to
     /// held back by a flush without a document root.
     deferred_element_style_inputs_are_pending: bool,
-    /// The custom properties that changed between pairs of environments during this transaction.
-    /// Program-family before/after rows retained until the transaction is released.
+    /// The rule edits this transaction staged, with their before and after values, until it is
+    /// released.
     program_staging: ProgramStaging,
     sheet_occurrences: HashMap<TreeScopeID, pipeline::rule_store::ScopeSheetOccurrences>,
     /// The old dense rule sequence while one sheet is synchronously reparsed.
@@ -458,6 +437,14 @@ pub struct StyleEngine {
 }
 
 impl RetainedState {
+    pub(crate) fn deepest_element_depth(&self) -> u32 {
+        self.deepest_element.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn started_style_layout_pool(&self) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+        self.style_layout_pool.as_ref()?.started()
+    }
+
     /// The groups of default values every computation starting from nothing starts from.
     pub(crate) fn default_groups(&self) -> &crate::css::computed_values::DefaultGroups {
         &self.process_style.default_groups

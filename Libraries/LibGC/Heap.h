@@ -11,6 +11,7 @@
 #include <AK/HashTable.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/StackInfo.h>
@@ -87,6 +88,26 @@ public:
     NEVER_INLINE void collect_garbage(CollectionType = CollectionType::CollectGarbage, bool print_report = false);
     NEVER_INLINE AK::JsonObject dump_graph();
 
+    // How a cell on a retaining path reaches the next one: through a field it visits, or through a word a conservative
+    // scan of its contents (a GC::Function's captures, for example) took for a pointer, whole or as either 32-bit half.
+    enum class RetainingEdgeKind : u8 {
+        Precise,
+        ConservativeWord,
+        ConservativeHalf,
+    };
+    struct RetainingPathStep {
+        StringView class_name;
+        RetainingEdgeKind edge_kind { RetainingEdgeKind::Precise };
+    };
+    struct RetainingPath {
+        HeapRoot root;
+        // The first step is the root cell, whose edge kind is unused, and the last is the target.
+        Vector<RetainingPathStep> steps;
+    };
+    // The shortest path from a root to each reachable cell that is_target accepts, for at most max_paths of them.
+    NEVER_INLINE Vector<RetainingPath> find_retaining_paths(AK::Function<bool(Cell&)> const& is_target, size_t max_paths);
+    static String describe_root(HeapRoot const&);
+
     bool should_collect_on_every_allocation() const { return m_should_collect_on_every_allocation; }
     // This is true for any CollectEverything cycle, not only heap teardown.
     bool is_collecting_everything() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectEverything; }
@@ -156,6 +177,7 @@ private:
     friend class HeapBlock;
     friend class MarkingVisitor;
     friend class GraphConstructorVisitor;
+    friend class RetainingPathVisitor;
     friend class DeferGC;
 
     void defer_gc();
@@ -228,7 +250,9 @@ private:
     void give_back_local_free_lists();
 
     void will_allocate(size_t, TriggersCollection = TriggersCollection::Yes);
-    void update_gc_bytes_threshold(size_t live_cell_bytes, size_t live_external_bytes);
+    void update_allocation_rate();
+    double next_growth_factor(size_t live_cell_bytes);
+    void update_gc_bytes_threshold(size_t live_external_bytes);
 
     enum class IncludeIncomingCrossHeapMembers {
         No,
@@ -247,6 +271,7 @@ private:
     //     being scanned.
     NEVER_INLINE void run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType, bool print_report);
     NEVER_INLINE AK::JsonObject build_graph(ReadonlySpan<FlatPtr> callee_saved_registers);
+    NEVER_INLINE Vector<RetainingPath> build_retaining_paths(ReadonlySpan<FlatPtr> callee_saved_registers, AK::Function<bool(Cell&)> const& is_target, size_t max_paths);
 
     void gather_roots(ConservativeScanOrigin const&, HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr, IncludeIncomingCrossHeapMembers = IncludeIncomingCrossHeapMembers::Yes);
     static void mark_live_cells_across(ReadonlySpan<Heap* const>, HashMap<Cell*, HeapRoot>& roots);
@@ -337,7 +362,7 @@ private:
 
     bool m_incremental_sweep_active { false };
     size_t m_block_sweeps_in_progress { 0 };
-    size_t m_sweep_live_cell_bytes { 0 };
+    size_t m_marked_cell_bytes { 0 };
     size_t m_sweep_live_external_bytes { 0 };
     Optional<size_t> m_last_swept_live_bytes;
     Vector<GC::Ptr<Cell>> m_cells_allocated_during_sweep;
@@ -349,6 +374,14 @@ private:
     // The context a heap created through LibGC/CAPI.h was created with.
     void* m_foreign_context { nullptr };
     IdleCollectionPolicy m_idle_collection_policy;
+
+    // What decides the next collection budget. See next_growth_factor().
+    double m_allocation_bytes_per_second { 0 };
+    Optional<double> m_wanted_growth_factor;
+    u64 m_total_allocated_bytes_at_last_collection { 0 };
+    i64 m_last_collection_end_ns { 0 };
+    i64 m_mark_duration_ns { 0 };
+    i64 m_sweep_duration_ns { 0 };
 };
 
 inline void Heap::did_create_root(Badge<RootImpl>, RootImpl& impl)

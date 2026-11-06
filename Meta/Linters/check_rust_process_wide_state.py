@@ -97,6 +97,8 @@ RENDER_STATE_ALLOWED = {
     **render_state_entries(
         ENVIRONMENT_SWITCH,
         [
+            "layout/parallel_layout.rs:FORK_SETTINGS",
+            "layout/parallel_layout.rs:SUBTREE_LEASES_ARE_VERIFIED",
             "layout/run_repeatability.rs:ENABLED",
             "layout/run_repeatability.rs:VERIFICATION",
             "render_state/clock/hover.rs:LOGS",
@@ -105,10 +107,11 @@ RENDER_STATE_ALLOWED = {
     **render_state_entries(
         IDENTITY,
         [
+            "cow_column.rs:NEXT",
             "css/declaration_block.rs:NEXT_DECLARATION_BLOCK_IDENTITY",
             "css/rule.rs:NEXT_RULE_IDENTITY",
             "css/style_sheet.rs:NEXT_SHEET_IDENTITY",
-            "layout/fragment_tree.rs:NEXT_IDENTITY",
+            "layout/fragment_tree.rs:NEXT_UNRESERVED_IDENTITY",
             "render_state/owner.rs:NEXT",
         ],
     ),
@@ -125,6 +128,8 @@ RENDER_STATE_ALLOWED = {
         ["render_state/owner.rs:DROPPED_AFTER_HOLD"],
     ),
     f"{RENDER_STATE_CRATE}/src/render_state.rs:STACK_BASE": "per-thread cache of the thread's own stack bounds",
+    f"{RENDER_STATE_CRATE}/src/layout/parallel_layout.rs:SUBTREE_LEASE_OF_THIS_THREAD": "per-thread lease of the subtree the layout task running on the thread may write, held only while LIBWEB_VERIFY_LAYOUT_FORK_SCOPE checks it and only for that task",
+    f"{RENDER_STATE_CRATE}/src/layout/layout_pass.rs:WORKER_SCRATCH_OF_THIS_THREAD": "per-thread spare layout buffers and the fragment identities the thread reserved; a thread without one only allocates more and reserves another range",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:UNFINISHED_HANDED": "per-thread count of the jobs the thread made for each stage thread that have yet to run",
     **render_state_entries(
         BUILT_ONCE,
@@ -144,6 +149,7 @@ RENDER_STATE_ALLOWED = {
             "css/style_compute.rs:RANKS",
             "css/style_compute.rs:REMAINING_ORDER",
             "css/style_compute.rs:TABLE",
+            "style_layout_pool.rs:THREAD_COUNT",
         ],
     ),
     **render_state_entries(
@@ -173,6 +179,7 @@ RENDER_STATE_ALLOWED = {
             "css/style_compute/ffi_test_stubs.rs:NEXT",
         ],
     ),
+    f"{RENDER_STATE_CRATE}/src/css/custom_properties.rs:COMPARED_STORES": "per-thread memo of comparing immutable stores; a thread without one only walks their values again",
     f"{RENDER_STATE_CRATE}/src/css/parser/stylesheet_cache.rs:PARSE_DEPENDENCIES": "per-thread record of the parse running on this thread; scoped to that parse",
     f"{RENDER_STATE_CRATE}/src/css/style_value.rs:VALUES": "built-once keyword values, and a replay-only table of the same name",
     f"{RENDER_STATE_CRATE}/src/css/parser/value_parser.rs:LISTS": "built-once immutable lists of initial background values",

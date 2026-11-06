@@ -218,7 +218,7 @@ pub struct FfiPropertyNumericRange {
 }
 
 pub fn property_numeric_ranges(property_id: u16) -> &'static [FfiPropertyNumericRange] {
-    PROPERTY_NUMERIC_RANGES[longhand_index(property_id)]
+    PROPERTY_NUMERIC_RANGES[property_index(property_id)]
 }
 
 /// Returns the longhand property identifiers in computation order.
@@ -324,6 +324,23 @@ pub fn longhands_for_shorthand(property_id: u16) -> &'static [u16] {
         return &[];
     }
     SHORTHAND_EXPANSIONS[(property_id - FIRST_SHORTHAND_PROPERTY_ID) as usize]
+}
+
+/// The longhands of a shorthand, through any shorthand nested in it.
+pub(crate) fn expanded_longhands_for_shorthand(property_id: u16) -> &'static [u16] {
+    if !property_is_shorthand(property_id) {
+        return &[];
+    }
+    EXPANDED_LONGHANDS_FOR_SHORTHAND[(property_id - FIRST_SHORTHAND_PROPERTY_ID) as usize]
+}
+
+/// The shorthands a property maps to, in preferred order.
+pub(crate) fn shorthands_for_longhand(property_id: u16) -> &'static [u16] {
+    SHORTHANDS_FOR_LONGHAND[property_index(property_id)]
+}
+
+pub(crate) fn property_is_legacy_shorthand(property_id: u16) -> bool {
+    LEGACY_SHORTHANDS.binary_search(&property_id).is_ok()
 }
 
 pub(crate) fn property_is_positional_value_list_shorthand(property_id: u16) -> bool {

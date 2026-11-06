@@ -13,6 +13,7 @@ use crate::css::style::bridge::{
     ElementBoxKind, FfiDemandedPseudoElement, FfiPseudoElementRecordDemand, answer_record_demand,
     element_adjustment_fact,
 };
+use crate::css::style::index::StyleAtomID;
 use crate::css::style::layout_style::{AnonymousStyleKind, AnonymousStyleOverrides, DerivedStyleRecord, LayoutStyle};
 use crate::css::style::tree::StyleNodeID;
 use crate::layout::layout_node_arena::{LayoutNodeArena, OwedImageResources, StaleWalkFacts};
@@ -66,6 +67,8 @@ pub(crate) struct TreeBuilderState {
     /// The document's style, which the build is handed before it starts when it may build the
     /// viewport, held until the viewport's row takes it or the build ends without one.
     pub(super) document_style: Option<DerivedStyleRecord>,
+    /// The run of new siblings the walk is placing in DOM order, if the last insertion started or continued one.
+    dom_order_run: Option<DomOrderRun>,
 }
 
 impl Default for TreeBuilderState {
@@ -87,6 +90,7 @@ impl Default for TreeBuilderState {
             reports: Vec::new(),
             pinned_style_records: Vec::new(),
             document_style: None,
+            dom_order_run: None,
         }
     }
 }
@@ -2288,6 +2292,7 @@ fn update_principal_node_descendants(
         // Add the ::before pseudo-element before walking normal children.
         if update.kind.is_element()
             && layout_node_can_have_children
+            && box_can_have_generated_children(host, update.mirror_identity, layout_node)
             && !content_visibility_hidden
             && !context.has_svg_root
         {
@@ -2499,7 +2504,10 @@ fn update_principal_node_descendants(
         }
     }
 
-    if update.update_pseudo_elements_in_place && !should_create_layout_node {
+    if update.update_pseudo_elements_in_place
+        && !should_create_layout_node
+        && box_can_have_generated_children(host, update.mirror_identity, layout_node)
+    {
         state.ancestor_stack.push(layout_node);
         let placed = create_pseudo_element(
             host,
@@ -2544,15 +2552,39 @@ fn create_marker_and_after_boxes(
         );
         assert!(placed.is_none());
     }
-    let placed = create_pseudo_element(
-        host,
-        state,
-        element,
-        FfiPseudoElement::After,
-        Some(FfiInsertionMode::Append),
-    );
-    assert!(placed.is_none());
+    if box_can_have_generated_children(host, element, layout_node) {
+        let placed = create_pseudo_element(
+            host,
+            state,
+            element,
+            FfiPseudoElement::After,
+            Some(FfiInsertionMode::Append),
+        );
+        assert!(placed.is_none());
+    }
     assert!(state.ancestor_stack.pop().is_some());
+}
+
+/// Whether the box of `element` can hold the boxes of its ::before and ::after pseudo-elements. A form control whose
+/// content the user agent supplies holds none: a text control, a range input, an input element shown as a button, or a
+/// select.
+fn box_can_have_generated_children(host: &TreeBuilderHost<'_>, element: StyleNodeID, layout_node: LayoutNode) -> bool {
+    use crate::css::style::bridge::element_construction_fact::IS_HTML_SELECT_ELEMENT;
+    let data = host.data(layout_node);
+    if matches!(
+        data.kind.get(),
+        NodeKind::TextInputBox | NodeKind::TextAreaBox | NodeKind::RangeInputBox
+    ) {
+        return false;
+    }
+    if node_facts::has_flag(data, NodeFlag::IsHtmlInputElement)
+        && node_facts::has_flag(data, NodeFlag::UsesButtonLayout)
+    {
+        return false;
+    }
+    !host
+        .arena()
+        .with_style_store(|engine| engine.element_construction_facts(element) & IS_HTML_SELECT_ELEMENT != 0)
 }
 
 /// Empties the child list of a box that keeps its place while its children are placed again: frees the element's
@@ -3565,7 +3597,10 @@ fn stamp_nested_list_marker_row(
     generator: StyleNodeID,
     pseudo_element: FfiPseudoElement,
     list_item_box: NodeSlotId,
-) -> NodeSlotId {
+) -> Option<NodeSlotId> {
+    let list_item_shows_its_type = host
+        .style(list_item_box)
+        .is_some_and(|style| !style.list_style_type_is_none());
     let derived = host.arena_mut().with_style_engine(|engine| {
         // The generator's own `::marker` record, which the engine derives for this read alone where the generator
         // holds none. It answers one for every list item; should it not, the marker takes the generator's style.
@@ -3575,16 +3610,25 @@ fn stamp_nested_list_marker_row(
                 let demand = RecordDemand::PseudoElement(
                     FfiPseudoElementRecordDemand::ReadOnly,
                     FfiDemandedPseudoElement::Marker,
+                    StyleAtomID::NONE,
                 );
                 let record = answer_record_demand(engine, generator, demand).record.style_record;
                 (record != 0).then_some(record)
             })
             .or_else(|| engine.element_published_style_record(generator))
             .expect("a list item the build reaches has published its style");
+        // As for an element's ::marker, the marker shows its own list-style-image, or else the list item's
+        // list-style-type, which shows nothing where it's none. Where neither shows anything, there's no marker.
+        let marker_shows_its_image = engine
+            .style_record_view(record)
+            .is_some_and(|view| ComputedValuesView::of(view.payloads).list_style_image_is_set());
+        if !marker_shows_its_image && !list_item_shows_its_type {
+            return None;
+        }
         // NB: Republishing the generator's own `::marker` record can retire its animation record while the nested
         //     marker still refers to it. The marker takes a record of its own, copied from it.
-        LayoutStyle::from_record(engine, record).intern(engine)
-    });
+        Some(LayoutStyle::from_record(engine, record).intern(engine))
+    })?;
     let slot = host.arena.allocate_unbound();
     host.arena_mut()
         .stamp_anonymous_box(slot, NodeKind::ListItemMarkerBox, derived);
@@ -3602,7 +3646,7 @@ fn stamp_nested_list_marker_row(
             owns_content_replacement_image: false,
         },
     );
-    slot
+    Some(slot)
 }
 
 /// The row one item of a pseudo-element's generated content is built in, and its layout node. An
@@ -3761,8 +3805,10 @@ fn create_pseudo_element(
     let owner = resolve_counters(host, element_identity, pseudo_element);
 
     // FIXME: This code actually computes style for element::marker, and shouldn't for element::pseudo::marker.
-    if layout_node_kind == NodeKind::ListItemBox {
-        let marker_slot = stamp_nested_list_marker_row(host, element_identity, pseudo_element, layout_node);
+    let nested_marker_slot = (layout_node_kind == NodeKind::ListItemBox)
+        .then(|| stamp_nested_list_marker_row(host, element_identity, pseudo_element, layout_node))
+        .flatten();
+    if let Some(marker_slot) = nested_marker_slot {
         let marker = host.created(marker_slot);
         let first_child = host.first_child(layout_node);
         host.attach_child(layout_node, marker, first_child);
@@ -3950,6 +3996,30 @@ pub extern "C" fn layout_node_kind_is_replaced_box(kind: NodeKind) -> bool {
     node_facts::kind_is_replaced_box(kind)
 }
 
+/// Whether a box of `kind`, built for an element whose style was `built_for`, can show the style `style` as it is. A box
+/// whose kind its display decided can't show a display that asks for another kind of box: the layout tree update that
+/// the display change marks replaces it, and until then it keeps the style it was built for.
+///
+/// # Safety
+/// Each of `built_for` and `style` is null or the groups of a style record the caller keeps alive for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_box_can_show_style(
+    kind: NodeKind,
+    built_for: *const std::ffi::c_void,
+    style: *const std::ffi::c_void,
+) -> bool {
+    use super::node_data::LayoutStyleRef;
+    // SAFETY: Guaranteed by the caller.
+    let (Some(built_for), Some(style)) = (unsafe { LayoutStyleRef::from_raw(built_for) }, unsafe {
+        LayoutStyleRef::from_raw(style)
+    }) else {
+        return true;
+    };
+    // SAFETY: Guaranteed by the caller.
+    let (built_for, style) = unsafe { (built_for.view().display(), style.view().display()) };
+    node_kind_for_display(built_for) != Some(kind) || node_kind_for_display(style) == Some(kind)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn layout_node_kind_is_svg_box(kind: NodeKind) -> bool {
     node_facts::kind_is_svg_box(kind)
@@ -4051,6 +4121,11 @@ impl<'a> TreeBuilderHost<'a> {
     fn create_element_box(&mut self, element: StyleNodeID, kind: NodeKind, record: u64) -> NodeSlotId {
         let slot = self.stamp_dom_box(kind, Some(element));
         self.arena_mut().stamp_published_style(slot, record);
+        if kind == NodeKind::ImageBox {
+            self.arena_mut()
+                .paint_state_mut()
+                .bump_custom_highlight_row_generation();
+        }
         match kind {
             // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
             // If the computed outer display type is inline, the fieldset is expected to behave as inline-block.
@@ -4102,6 +4177,9 @@ impl<'a> TreeBuilderHost<'a> {
     fn create_text_box(&mut self, style_node: StyleNodeID) -> NodeSlotId {
         let slot = self.stamp_dom_box(NodeKind::TextNode, Some(style_node));
         self.stamp_text_row_facts(slot, style_node);
+        self.arena_mut()
+            .paint_state_mut()
+            .bump_custom_highlight_row_generation();
         slot
     }
 
@@ -4166,6 +4244,7 @@ impl<'a> TreeBuilderHost<'a> {
                         .pseudo_published_style_record(element, highlight.pseudo_kind())
                         .is_some()
                 })
+                || !engine.pseudo_published_custom_highlight_records(element).is_empty()
         })
     }
 
@@ -4693,8 +4772,55 @@ fn wrap_children_in_anonymous_wrapper(
     }
 }
 
+/// A run of new siblings that a walk places in DOM order. Every one of them goes before the same box: the first of the
+/// run looked past the siblings after it for a box of `parent`, and a walk reaches those siblings in DOM order, so none
+/// of the ones it looked past has gained such a box since. Without this, placing N new siblings looks past O(N) siblings
+/// N times, which stalls a large document that arrives in a few chunks.
+#[derive(Clone, Copy)]
+struct DomOrderRun {
+    parent: LayoutNode,
+    last_placed: StyleNodeID,
+    /// The sibling whose box the run goes before, where it goes before a sibling's box.
+    next_sibling_with_box: Option<StyleNodeID>,
+    before: LayoutNode,
+}
+
+impl DomOrderRun {
+    /// The siblings between two children of a run that have no box of their own, such as the white space between two
+    /// elements. A longer gap ends the run, which costs one more look past the siblings after it.
+    const MAX_SKIPPED_SIBLINGS: usize = 8;
+
+    fn continues_with(&self, host: &TreeBuilderHost<'_>, parent: LayoutNode, identity: StyleNodeID) -> bool {
+        // NB: The walk may have replaced the box, whose slot then holds nothing or another box.
+        if self.parent != parent
+            || (!self.before.is_invalid()
+                && (!host.arena().slot_is_live(self.before) || host.parent(self.before) != parent))
+        {
+            return false;
+        }
+        if identity == self.last_placed {
+            return true;
+        }
+        let mut sibling = self.last_placed;
+        for _ in 0..=Self::MAX_SKIPPED_SIBLINGS {
+            let Some(next) = host.next_dom_sibling(sibling) else {
+                return false;
+            };
+            if Some(next) == self.next_sibling_with_box {
+                return false;
+            }
+            if next == identity {
+                return true;
+            }
+            sibling = next;
+        }
+        false
+    }
+}
+
 fn insert_child_in_dom_order(
     host: &mut TreeBuilderHost<'_>,
+    state: &mut TreeBuilderState,
     parent: LayoutNode,
     child: UnplacedLayoutNode,
     identity: StyleNodeID,
@@ -4723,12 +4849,36 @@ fn insert_child_in_dom_order(
         }
     }
 
+    if let Some(run) = state.dom_order_run.as_mut()
+        && run.continues_with(host, parent, identity)
+    {
+        run.last_placed = identity;
+        host.attach_child(parent, child, run.before);
+        return;
+    }
+
+    let (before, next_sibling_with_box) = box_to_place_dom_child_before(host, parent, identity);
+    state.dom_order_run = Some(DomOrderRun {
+        parent,
+        last_placed: identity,
+        next_sibling_with_box,
+        before,
+    });
+    host.attach_child(parent, child, before);
+}
+
+/// The child of `parent` that a new box of `identity` goes before, or an invalid node for the end of the child list,
+/// and the sibling of `identity` that child is the box of, if it is one.
+fn box_to_place_dom_child_before(
+    host: &TreeBuilderHost<'_>,
+    parent: LayoutNode,
+    identity: StyleNodeID,
+) -> (LayoutNode, Option<StyleNodeID>) {
     let mut sibling = host.next_dom_sibling(identity);
     while let Some(current) = sibling {
         let sibling_layout_node = host.arena().bound_row(current);
         if !sibling_layout_node.is_invalid() && host.parent(sibling_layout_node) == parent {
-            host.attach_child(parent, child, sibling_layout_node);
-            return;
+            return (sibling_layout_node, Some(current));
         }
         sibling = host.next_dom_sibling(current);
     }
@@ -4740,20 +4890,18 @@ fn insert_child_in_dom_order(
             after_layout_child = host.parent(after_layout_child);
         }
         if host.parent(after_layout_child) == parent {
-            host.attach_child(parent, child, after_layout_child);
-            return;
+            return (after_layout_child, None);
         }
     }
 
     let mut layout_child = host.first_child(parent);
     while !layout_child.is_invalid() {
         if host.data(layout_child).generated_for.get() == GENERATED_FOR_AFTER {
-            host.attach_child(parent, child, layout_child);
-            return;
+            return (layout_child, None);
         }
         layout_child = host.next_sibling(layout_child);
     }
-    host.attach_child(parent, child, NodeSlotId::INVALID);
+    (NodeSlotId::INVALID, None)
 }
 
 /// Whether `node` is an absolutely positioned box that would be inline-level in flow, laid out among the inline content
@@ -4818,6 +4966,7 @@ fn insert_node_into_inline_or_block_ancestor(
         }
         FfiInsertionMode::InDomOrder => insert_child_in_dom_order(
             host,
+            state,
             insertion_point,
             node,
             identity.expect("an insertion in DOM order names its node"),

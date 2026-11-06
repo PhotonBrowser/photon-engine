@@ -266,13 +266,24 @@ impl StyleJobAnswer {
 
     /// How the boxes of `node`, an element whose style record the transaction installed, take it: they are built
     /// again from the root the move names, or the host installs it where they take the composition of its animations, or
-    /// appear or go.
-    pub(crate) fn element_install(&self, node: StyleNodeID) -> crate::layout::ElementInstall {
+    /// appear or go. Asked of the elements of the rows in their order, which is that of the effects, as `next_effects`
+    /// says it has come to.
+    pub(crate) fn element_install(
+        &self,
+        node: StyleNodeID,
+        next_effects: &std::cell::Cell<usize>,
+    ) -> crate::layout::ElementInstall {
         use super::bridge::MainEffects;
         use crate::layout::ElementInstall;
-        let Some(row) = self.installation_for_host.effects_of(node) else {
+        let Some(row) = self
+            .installation_for_host
+            .effects
+            .get(next_effects.get())
+            .filter(|row| row.node() == node)
+        else {
             return ElementInstall::Boxes;
         };
+        next_effects.set(next_effects.get() + 1);
         if row
             .effects
             .intersects(MainEffects::ANIMATED | MainEffects::DISPLAY_NONE_FLIP)
@@ -285,15 +296,31 @@ impl StyleJobAnswer {
         }
     }
 
-    /// Notes `styled`, what the render side installed of the transaction's style rows.
-    pub(crate) fn note_styled(&mut self, styled: crate::layout::StyledRows) {
+    /// How many elements have effects.
+    pub(crate) fn effects_count(&self) -> usize {
+        self.installation_for_host.effects.len()
+    }
+
+    /// Notes `styled`, what the render side installed of the transaction's style rows in `arena`.
+    pub(crate) fn note_styled(&mut self, styled: crate::layout::StyledRows, arena: &crate::layout::LayoutNodeArena) {
         debug_assert!(
             self.styled_rows.pinned_records.is_empty() && self.styled_rows.rebuilt.is_empty(),
             "the render side installs a transaction once"
         );
         use super::bridge::MainEffects;
-        for row in &mut self.installation_for_host.effects {
+        let below_first_styles = self.installation_for_host.take_first_styles_below_first_styles();
+        let mut below_first_styles = below_first_styles.into_iter().peekable();
+        for (index, row) in self.installation_for_host.effects.iter_mut().enumerate() {
             let node = row.node();
+            // The boxes of an element with no box are built with its children's, which have none to replace: the build
+            // reaches them from the first of them to have a parent with a box, whatever they are marked with.
+            if let Some((_, parent)) = below_first_styles.next_if(|&(below, _)| below as usize == index)
+                && arena.bound_row(node).is_invalid()
+                && arena.bound_row(parent).is_invalid()
+            {
+                row.effects = row.effects.without(MainEffects::REBUILD);
+                continue;
+            }
             // The render side marked the rebuilds of these elements, which leaves the host none to mark.
             if styled.rebuilt.binary_search(&node).is_ok() {
                 row.effects = row.effects.without(MainEffects::REBUILD);
@@ -515,6 +542,9 @@ pub extern "C" fn style_engine_drain_flown_style_update(host: &DocumentHost, rea
 #[unsafe(no_mangle)]
 pub extern "C" fn style_engine_end_flown_style_drain(host: &DocumentHost) {
     host.end_style_drain();
+    let memo = host.engine_memo();
+    memo.flown_update_awaits_self_check
+        .set(memo.style_self_check.is_enabled());
 }
 
 /// Whether the render state installed the record `style_record` of the element `style_node` names in its box ahead of

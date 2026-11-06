@@ -86,25 +86,11 @@ function (generate_css_implementation)
     )
 
     invoke_py_idl_generator(
-        "GeneratedCSSNumericFactoryMethods.cpp"
         "GeneratedCSSNumericFactoryMethods.idl"
         "generate_libweb_css_numeric_factory_methods.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-        "CSS/GeneratedCSSNumericFactoryMethods.h"
-        "CSS/GeneratedCSSNumericFactoryMethods.cpp"
         "CSS/GeneratedCSSNumericFactoryMethods.idl"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-    )
-
-    invoke_py_idl_generator(
-        "GeneratedCSSStyleProperties.cpp"
-        "GeneratedCSSStyleProperties.idl"
-        "generate_libweb_css_style_properties.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/Properties.json"
-        "CSS/GeneratedCSSStyleProperties.h"
-        "CSS/GeneratedCSSStyleProperties.cpp"
-        "CSS/GeneratedCSSStyleProperties.idl"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Properties.json"
     )
 
     embed_as_string(
@@ -141,8 +127,6 @@ function (generate_css_implementation)
 
     set(CSS_GENERATED_HEADERS
        "CSS/Enums.h"
-       "CSS/GeneratedCSSStyleProperties.h"
-       "CSS/GeneratedCSSNumericFactoryMethods.h"
        "CSS/Keyword.h"
        "CSS/MediaFeatureID.h"
        "CSS/PropertyID.h"
@@ -158,7 +142,6 @@ function (generate_css_implementation)
     set(LIBWEB_ALL_GENERATED_HEADERS ${LIBWEB_ALL_GENERATED_HEADERS} PARENT_SCOPE)
 
     set(CSS_GENERATED_IDL
-        "GeneratedCSSStyleProperties.idl"
         "GeneratedCSSNumericFactoryMethods.idl"
     )
     list(APPEND LIBWEB_ALL_GENERATED_IDL ${CSS_GENERATED_IDL})

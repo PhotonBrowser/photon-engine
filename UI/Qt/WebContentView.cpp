@@ -47,6 +47,7 @@
 #endif
 #include <UI/Qt/InputMethodUtils.h>
 #include <UI/Qt/Menu.h>
+#include <UI/Qt/PlainText.h>
 #include <UI/Qt/SelectDropdown.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/SystemAppearance.h>
@@ -87,7 +88,6 @@
 #include <QStyleHints>
 #include <QTextEdit>
 #include <QTimer>
-#include <QToolTip>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWindow>
@@ -199,10 +199,7 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
 
     QObject::connect(&m_tooltip_hover_timer, &QTimer::timeout, this, [this] {
         if (m_tooltip_text.has_value())
-            QToolTip::showText(
-                QCursor::pos(),
-                qstring_from_ak_string(m_tooltip_text.value()),
-                this);
+            show_tooltip(QCursor::pos(), qstring_from_ak_string(m_tooltip_text.value()), *this);
     });
 
     if (initial_state.owner_view)
@@ -245,60 +242,25 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     QAccessible::installActivationObserver(this);
 #endif
 
-    on_accessibility_tree_received = [this](auto nodes) {
-        m_accessibility_manager->update_tree(AK::move(nodes));
+    on_accessibility_tree_received = [this](u64 sequence, auto nodes) {
+        m_accessibility_whole_tree_pending = false;
+        m_accessibility_manager->update_tree(AK::move(nodes), sequence);
+        did_update_accessibility_tree({});
+    };
 
-#if defined(Q_OS_MACOS)
-        // Only the first tree for a page announces the load. WebContent rebuilds the tree on DOM mutations too, and
-        // announcing each of those would move VoiceOver's cursor back to the top of the page while the user is reading
-        // it. Same gate as the AT-SPI focus post in the branch below.
-        // NB: A page load never moves the keyboard focus, with or without an assistive technology. For example, a new
-        //     tab's location editor keeps the focus while the new tab page loads.
-        auto const announce_load = !m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty();
-        if (announce_load)
-            m_posted_initial_accessibility_focus = true;
-        // An assistive technology that turned up mid-page got no focused element from its first queries: The first tree
-        // has AppKit look the focus up again — if the page has the keyboard focus (update_accessibility_tree() checks).
-        auto const report_focus = m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty();
-        if (report_focus)
-            m_report_accessibility_focus_with_next_tree = false;
-        QTimer::singleShot(100, this, [this, announce_load, report_focus] {
-            update_accessibility_tree(this, announce_load, report_focus);
-        });
-#elif !defined(Q_OS_WIN)
-        // Prune interfaces for nodes no longer in the tree.
-        QList<i64> stale_ids;
-        for (auto it = m_accessibility_elements.begin(); it != m_accessibility_elements.end(); ++it) {
-            if (!it.value()->isValid())
-                stale_ids.append(it.key());
+    on_accessibility_tree_changed = [this](u64 base_sequence, u64 sequence, auto delta) {
+        // Once the whole tree has been asked for, every change before it arrives is to a tree this view doesn't hold.
+        if (m_accessibility_whole_tree_pending)
+            return;
+        auto removed_ids = m_accessibility_manager->apply_delta(delta, base_sequence, sequence);
+        if (!removed_ids.has_value()) {
+            // A change to a tree this view doesn't hold (one it dropped while it didn't display the tab, e.g.), or one
+            // that doesn't fit the tree it holds: Start over from the whole tree.
+            m_accessibility_whole_tree_pending = true;
+            request_accessibility_tree();
+            return;
         }
-        for (auto id : stale_ids) {
-            auto* iface = m_accessibility_elements.take(id);
-            QAccessible::deleteAccessibleInterface(QAccessible::uniqueId(iface));
-        }
-
-        // An assistive technology that turned up mid-page found no tree to take the focus from: Tell it where the focus
-        // is now that there's one — if the page has the keyboard focus at all.
-        if (m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty()) {
-            m_report_accessibility_focus_with_next_tree = false;
-            if (hasFocus())
-                announce_accessibility_focus();
-        }
-
-        // Post a Focus AT-SPI2 event on the document root the first time a tree arrives. This is what lets Orca's
-        // browse-mode commands (H/K/L structural nav) work on page load — without the user having to Tab/click into the
-        // page first. The event is posted unconditionally — even when the address bar has Qt focus — because our Orca
-        // script re-suspends browse-mode commands when it later sees a focus event for an editable chrome widget. So if
-        // the user explicitly focuses the address bar (Ctrl+L, mouse click), typing there still works. Firing this on
-        // every subsequent tree update would be wrong: it would re-focus the document root while the user is
-        // mid-navigation — causing Orca to re-present the current structural-nav target.
-        if (!m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty()) {
-            m_posted_initial_accessibility_focus = true;
-            QTimer::singleShot(1000, this, [this] {
-                notify_accessibility_focus_on_document_root();
-            });
-        }
-#endif
+        did_update_accessibility_tree(removed_ids.release_value());
     };
 
     on_accessibility_focus_changed = [this](i64 node_id) {
@@ -382,13 +344,7 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         if (m_tooltip_hover_timer.isActive())
             m_tooltip_hover_timer.stop();
 
-        auto tooltip_without_carriage_return = tooltip.contains("\r"sv)
-            ? tooltip.replace("\r\n"sv, "\n"sv, ReplaceMode::All).replace("\r"sv, "\n"sv, ReplaceMode::All)
-            : tooltip;
-        QToolTip::showText(
-            mapToGlobal(QPoint(position.x(), position.y())),
-            qstring_from_ak_string(tooltip_without_carriage_return),
-            this);
+        show_tooltip(mapToGlobal(QPoint(position.x(), position.y())), qstring_from_ak_string(tooltip), *this);
     };
 
     on_stop_tooltip_override = [this]() {
@@ -396,9 +352,7 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
     };
 
     on_enter_tooltip_area = [this](auto const& tooltip) {
-        m_tooltip_text = tooltip.contains("\r"sv)
-            ? tooltip.replace("\r\n"sv, "\n"sv, ReplaceMode::All).replace("\r"sv, "\n"sv, ReplaceMode::All)
-            : tooltip;
+        m_tooltip_text = tooltip;
     };
 
     on_leave_tooltip_area = [this]() {
@@ -945,8 +899,7 @@ void WebContentView::mouseMoveEvent(QMouseEvent* event)
     }
 
     if (!m_tooltip_override) {
-        if (QToolTip::isVisible())
-            QToolTip::hideText();
+        hide_tooltip();
         m_tooltip_hover_timer.start(600);
     }
 
@@ -1118,17 +1071,10 @@ void WebContentView::focusOutEvent(QFocusEvent*)
 
 void WebContentView::update_page_focus()
 {
-    // Focus can move between this widget, the native window container, and the embedded native window in bursts of
-    // events whose order is not meaningful (e.g. the container reports losing focus after native focus has already
-    // moved to the embedded window). Instead of trusting individual events, evaluate the resulting focus state once
-    // the burst has settled.
+    // A change of the active window and the change of focus it leads to arrive as separate events. Instead of trusting
+    // individual events, evaluate the resulting focus state once they have all arrived.
     QTimer::singleShot(0, this, [this] {
-        auto focused = hasFocus();
-#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
-        if (!focused)
-            focused = vulkan_window_has_native_focus();
-#endif
-        set_has_system_focus(focused);
+        set_has_system_focus(hasFocus());
     });
 }
 
@@ -1886,12 +1832,9 @@ void WebContentView::resizeEvent(QResizeEvent* event)
     update_vulkan_window_geometry();
 #endif
 #ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
-    // NB: The page surface would stick out of a browser window that shrinks, so it is cropped to the view, and shows
-    //     that only together with the browser window's next commit at its new size.
-    if (m_page_surface && !QRect { QPoint { 0, 0 }, size() * m_device_pixel_ratio }.contains(m_page_surface_rect)) {
-        m_page_surface->set_synchronized(true);
-        update_page_surface();
-    }
+    // NB: The page surface would stick out of a browser window that shrinks, so it is cropped to the view.
+    if (m_page_surface && !QRect { QPoint { 0, 0 }, size() * m_device_pixel_ratio }.contains(m_page_surface_rect))
+        update_page_surface(PageSurfaceContent::Unchanged);
 #endif
     // One window resize reaches the view as several resize events in one turn of the event loop
     // (the chrome around it settles after it). The page gets one viewport size per turn: the size
@@ -2137,7 +2080,7 @@ void WebContentView::notify_accessibility_focus_on_document_root()
             // Mark the root as focused in the shared tree data *before* posting the Qt Focus event. Otherwise, state()
             // reports focused=false and Qt's AT-SPI2 bridge emits the focus event with detail1=0 (focus lost) rather
             // than detail1=1 (focus gained) — defeating the announcement.
-            m_accessibility_manager->set_focused_node(root->id);
+            m_accessibility_manager->show_focus_on_root();
             auto* root_iface = accessibility_interface_for_node(root->id);
             if (root_iface) {
                 QAccessibleEvent focus_event(root_iface, QAccessible::Focus);
@@ -2166,6 +2109,69 @@ void WebContentView::announce_accessibility_focus()
     notify_accessibility_focus_on_document_root();
 }
 #endif
+
+void WebContentView::did_update_accessibility_tree([[maybe_unused]] Optional<Vector<i64>> removed_ids)
+{
+#if defined(Q_OS_MACOS)
+    // Only the first tree for a page announces the load. WebContent rebuilds the tree on DOM mutations too, and
+    // announcing each of those would move VoiceOver's cursor back to the top of the page while the user is reading
+    // it. Same gate as the AT-SPI focus post in the branch below.
+    // NB: A page load never moves the keyboard focus, with or without an assistive technology. For example, a new
+    //     tab's location editor keeps the focus while the new tab page loads.
+    auto const announce_load = !m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty();
+    if (announce_load)
+        m_posted_initial_accessibility_focus = true;
+    // An assistive technology that turned up mid-page got no focused element from its first queries: The first tree
+    // has AppKit look the focus up again — if the page has the keyboard focus (update_accessibility_tree() checks).
+    auto const report_focus = m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty();
+    if (report_focus)
+        m_report_accessibility_focus_with_next_tree = false;
+    QTimer::singleShot(100, this, [this, announce_load, report_focus, removed_ids = AK::move(removed_ids)] {
+        update_accessibility_tree(this, announce_load, report_focus, removed_ids);
+    });
+#elif !defined(Q_OS_WIN)
+    // Prune interfaces for nodes no longer in the tree: after a change, the ones it removed; after a whole new tree,
+    // every one whose node is gone.
+    QList<i64> stale_ids;
+    if (removed_ids.has_value()) {
+        for (auto id : *removed_ids) {
+            if (m_accessibility_elements.contains(id))
+                stale_ids.append(id);
+        }
+    } else {
+        for (auto it = m_accessibility_elements.begin(); it != m_accessibility_elements.end(); ++it) {
+            if (!it.value()->isValid())
+                stale_ids.append(it.key());
+        }
+    }
+    for (auto id : stale_ids) {
+        auto* iface = m_accessibility_elements.take(id);
+        QAccessible::deleteAccessibleInterface(QAccessible::uniqueId(iface));
+    }
+
+    // An assistive technology that turned up mid-page found no tree to take the focus from: Tell it where the focus
+    // is now that there's one — if the page has the keyboard focus at all.
+    if (m_report_accessibility_focus_with_next_tree && m_accessibility_manager && !m_accessibility_manager->is_empty()) {
+        m_report_accessibility_focus_with_next_tree = false;
+        if (hasFocus())
+            announce_accessibility_focus();
+    }
+
+    // Post a Focus AT-SPI2 event on the document root the first time a tree arrives. This is what lets Orca's
+    // browse-mode commands (H/K/L structural nav) work on page load — without the user having to Tab/click into the
+    // page first. The event is posted unconditionally — even when the address bar has Qt focus — because our Orca
+    // script re-suspends browse-mode commands when it later sees a focus event for an editable chrome widget. So if
+    // the user explicitly focuses the address bar (Ctrl+L, mouse click), typing there still works. Firing this on
+    // every subsequent tree update would be wrong: it would re-focus the document root while the user is
+    // mid-navigation — causing Orca to re-present the current structural-nav target.
+    if (!m_posted_initial_accessibility_focus && m_accessibility_manager && !m_accessibility_manager->is_empty()) {
+        m_posted_initial_accessibility_focus = true;
+        QTimer::singleShot(1000, this, [this] {
+            notify_accessibility_focus_on_document_root();
+        });
+    }
+#endif
+}
 
 #if !defined(Q_OS_WIN)
 void WebContentView::fetch_accessibility_tree()
@@ -2237,64 +2243,64 @@ void WebContentView::update_cursor(Gfx::Cursor cursor)
     cursor.visit([this](Gfx::StandardCursor standard_cursor) {
         switch (standard_cursor) {
         case Gfx::StandardCursor::Hidden:
-            apply_web_content_cursor(Qt::BlankCursor);
+            setCursor(Qt::BlankCursor);
             break;
         case Gfx::StandardCursor::Arrow:
-            apply_web_content_cursor(Qt::ArrowCursor);
+            setCursor(Qt::ArrowCursor);
             break;
         case Gfx::StandardCursor::Crosshair:
-            apply_web_content_cursor(Qt::CrossCursor);
+            setCursor(Qt::CrossCursor);
             break;
         case Gfx::StandardCursor::IBeam:
-            apply_web_content_cursor(Qt::IBeamCursor);
+            setCursor(Qt::IBeamCursor);
             break;
         case Gfx::StandardCursor::ResizeHorizontal:
-            apply_web_content_cursor(Qt::SizeHorCursor);
+            setCursor(Qt::SizeHorCursor);
             break;
         case Gfx::StandardCursor::ResizeVertical:
-            apply_web_content_cursor(Qt::SizeVerCursor);
+            setCursor(Qt::SizeVerCursor);
             break;
         case Gfx::StandardCursor::ResizeDiagonalTLBR:
-            apply_web_content_cursor(Qt::SizeFDiagCursor);
+            setCursor(Qt::SizeFDiagCursor);
             break;
         case Gfx::StandardCursor::ResizeDiagonalBLTR:
-            apply_web_content_cursor(Qt::SizeBDiagCursor);
+            setCursor(Qt::SizeBDiagCursor);
             break;
         case Gfx::StandardCursor::ResizeColumn:
-            apply_web_content_cursor(Qt::SplitHCursor);
+            setCursor(Qt::SplitHCursor);
             break;
         case Gfx::StandardCursor::ResizeRow:
-            apply_web_content_cursor(Qt::SplitVCursor);
+            setCursor(Qt::SplitVCursor);
             break;
         case Gfx::StandardCursor::Hand:
-            apply_web_content_cursor(Qt::PointingHandCursor);
+            setCursor(Qt::PointingHandCursor);
             break;
         case Gfx::StandardCursor::Help:
-            apply_web_content_cursor(Qt::WhatsThisCursor);
+            setCursor(Qt::WhatsThisCursor);
             break;
         case Gfx::StandardCursor::OpenHand:
-            apply_web_content_cursor(Qt::OpenHandCursor);
+            setCursor(Qt::OpenHandCursor);
             break;
         case Gfx::StandardCursor::Drag:
-            apply_web_content_cursor(Qt::ClosedHandCursor);
+            setCursor(Qt::ClosedHandCursor);
             break;
         case Gfx::StandardCursor::DragCopy:
-            apply_web_content_cursor(Qt::DragCopyCursor);
+            setCursor(Qt::DragCopyCursor);
             break;
         case Gfx::StandardCursor::Move:
-            apply_web_content_cursor(Qt::DragMoveCursor);
+            setCursor(Qt::DragMoveCursor);
             break;
         case Gfx::StandardCursor::Wait:
-            apply_web_content_cursor(Qt::BusyCursor);
+            setCursor(Qt::BusyCursor);
             break;
         case Gfx::StandardCursor::Disallowed:
-            apply_web_content_cursor(Qt::ForbiddenCursor);
+            setCursor(Qt::ForbiddenCursor);
             break;
         case Gfx::StandardCursor::Eyedropper:
         case Gfx::StandardCursor::Zoom:
             // FIXME: No corresponding Qt cursors, default to Arrow
         default:
-            apply_web_content_cursor(Qt::ArrowCursor);
+            setCursor(Qt::ArrowCursor);
             break;
         } },
         [this](Gfx::ImageCursor const& image_cursor) {
@@ -2313,16 +2319,8 @@ void WebContentView::update_cursor(Gfx::Cursor cursor)
                 dbgln("Failed to set cursor: Couldn't create QPixmap from QImage.");
                 return;
             }
-            apply_web_content_cursor(QCursor { qpixmap, image_cursor.hotspot.x(), image_cursor.hotspot.y() });
+            setCursor(QCursor { qpixmap, image_cursor.hotspot.x(), image_cursor.hotspot.y() });
         });
-}
-
-void WebContentView::apply_web_content_cursor(QCursor const& cursor)
-{
-    setCursor(cursor);
-#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
-    set_vulkan_window_cursor(cursor);
-#endif
 }
 
 Web::DevicePixelPoint WebContentView::node_picker_position_for(QSinglePointEvent const& event) const
@@ -2387,7 +2385,7 @@ void WebContentView::place_native_view_again()
 {
     // NB: Presenting the frame again places it, and crops it to what the widgets the view is in still show of it.
     if (m_page_surface && m_page_surface->is_showing())
-        update_page_surface();
+        update_page_surface(PageSurfaceContent::Unchanged);
 }
 #endif
 
@@ -2420,18 +2418,8 @@ bool WebContentView::event(QEvent* event)
         keyReleaseEvent(static_cast<QKeyEvent*>(event));
         return true;
     }
-    if (event->type() == QEvent::NativeGesture) {
-        auto const& native_gesture_event = *static_cast<QNativeGestureEvent const*>(event);
-        if (native_gesture_event.gestureType() == Qt::ZoomNativeGesture) {
-            Web::PinchEvent pinch_event;
-            auto const local_position = mapFromGlobal(native_gesture_event.globalPosition());
-            pinch_event.position = { local_position.x() * m_device_pixel_ratio, local_position.y() * m_device_pixel_ratio };
-            pinch_event.modifiers = get_modifiers_from_qt_keyboard_modifiers(native_gesture_event.modifiers());
-            pinch_event.scale_delta = native_gesture_event.value();
-            enqueue_input_event(AK::move(pinch_event));
-            return true;
-        }
-    }
+    if (event->type() == QEvent::NativeGesture && handle_native_gesture_event(*static_cast<QNativeGestureEvent const*>(event)))
+        return true;
 
 #if defined(LADYBIRD_QT_USE_IOSURFACE_LAYER) || defined(LADYBIRD_HAS_WAYLAND_GPU_QUERY)
     if (event->type() == QEvent::ParentChange || event->type() == QEvent::Show)
@@ -2474,88 +2462,31 @@ bool WebContentView::event(QEvent* event)
     return WebContentViewBase::event(event);
 }
 
-#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
-bool WebContentView::handle_vulkan_window_event(QEvent* event)
+bool WebContentView::handle_native_gesture_event(QNativeGestureEvent const& event)
 {
-    switch (event->type()) {
-    case QEvent::KeyPress:
-        keyPressEvent(static_cast<QKeyEvent*>(event));
+    switch (event.gestureType()) {
+    case Qt::BeginNativeGesture:
+        m_native_gesture_state = NativeGestureState::Began;
         return true;
-    case QEvent::KeyRelease:
-        keyReleaseEvent(static_cast<QKeyEvent*>(event));
+    case Qt::EndNativeGesture:
+        m_native_gesture_state = NativeGestureState::None;
         return true;
-    case QEvent::MouseMove:
-        mouseMoveEvent(static_cast<QMouseEvent*>(event));
-        return true;
-    case QEvent::MouseButtonPress:
-        mousePressEvent(static_cast<QMouseEvent*>(event));
-        return true;
-    case QEvent::MouseButtonRelease:
-        mouseReleaseEvent(static_cast<QMouseEvent*>(event));
-        return true;
-    case QEvent::MouseButtonDblClick:
-        // QWindow sends a MouseButtonPress before MouseButtonDblClick for the second click, so the press has already
-        // been forwarded and included in the click count.
-        return true;
-    case QEvent::Wheel:
-        wheelEvent(static_cast<QWheelEvent*>(event));
-        // An ignored event is reserved for a browser shortcut such as Ctrl+wheel zoom. A native window has no widget
-        // ancestors to propagate it through, so send it to the top-level window directly.
-        if (!event->isAccepted())
-            return QCoreApplication::sendEvent(window(), event);
-        return true;
-    case QEvent::Leave:
-        leaveEvent(event);
-        return true;
-    case QEvent::FocusIn:
-        focusInEvent(static_cast<QFocusEvent*>(event));
-        return true;
-    case QEvent::FocusOut:
-        focusOutEvent(static_cast<QFocusEvent*>(event));
-        return true;
-    case QEvent::InputMethod:
-        inputMethodEvent(static_cast<QInputMethodEvent*>(event));
-        return true;
-    case QEvent::DragEnter:
-        dragEnterEvent(static_cast<QDragEnterEvent*>(event));
-        return true;
-    case QEvent::DragMove:
-        dragMoveEvent(static_cast<QDragMoveEvent*>(event));
-        return true;
-    case QEvent::DragLeave:
-        dragLeaveEvent(static_cast<QDragLeaveEvent*>(event));
-        return true;
-    case QEvent::Drop:
-        dropEvent(static_cast<QDropEvent*>(event));
-        return true;
-    case QEvent::NativeGesture: {
-        auto const& native_gesture_event = *static_cast<QNativeGestureEvent const*>(event);
-        if (native_gesture_event.gestureType() == Qt::ZoomNativeGesture) {
-            Web::PinchEvent pinch_event;
-            auto const local_position = mapFromGlobal(native_gesture_event.globalPosition());
-            pinch_event.position = { local_position.x() * m_device_pixel_ratio, local_position.y() * m_device_pixel_ratio };
-            pinch_event.modifiers = get_modifiers_from_qt_keyboard_modifiers(native_gesture_event.modifiers());
-            pinch_event.scale_delta = native_gesture_event.value();
-            enqueue_input_event(AK::move(pinch_event));
-            return true;
-        }
-        return false;
-    }
-    case QEvent::ShortcutOverride: {
-        auto* key_event = static_cast<QKeyEvent*>(event);
-        if (is_browser_reserved_shortcut(*key_event)) {
-            event->ignore();
-            return false;
-        }
-
-        event->accept();
+    case Qt::ZoomNativeGesture: {
+        Web::PinchEvent pinch_event;
+        auto const local_position = mapFromGlobal(event.globalPosition());
+        pinch_event.position = { local_position.x() * m_device_pixel_ratio, local_position.y() * m_device_pixel_ratio };
+        pinch_event.modifiers = get_modifiers_from_qt_keyboard_modifiers(event.modifiers());
+        pinch_event.scale_delta = event.value();
+        pinch_event.continues_gesture = m_native_gesture_state == NativeGestureState::Zooming;
+        if (m_native_gesture_state == NativeGestureState::Began)
+            m_native_gesture_state = NativeGestureState::Zooming;
+        enqueue_input_event(AK::move(pinch_event));
         return true;
     }
     default:
         return false;
     }
 }
-#endif
 
 void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePointEvent const& event, Optional<Web::ScrollGesturePhase> scroll_gesture_phase_the_platform_reports)
 {

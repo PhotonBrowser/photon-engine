@@ -16,8 +16,8 @@ use crate::display_list::commands::{
     CanvasId, ClipMode, ClipNodeIndex, CompositorScrollbar, ContextRef, DeclareMaskContent, DisplayListCommandHeader,
     DisplayListCommandRun, DisplayListCommandType, DisplayListDataSpan, DisplayListInlineClip,
     DisplayListPaintStyleType, DrawGlyphRun, DrawScaledDecodedImageFrame, EffectNodeIndex, FillPath, FillRect,
-    INLINE_CLIP_ENTRY_SIZE, OptionalColor, OptionalFloatRect, PaintScrollBar, PaintTextShadow, PathPaintKind,
-    SpatialNodeIndex, StrokePath, VISUAL_VIEWPORT_NODE_INDEX, VideoSinkResourceId,
+    INLINE_CLIP_ENTRY_SIZE, ImageFrameResourceId, OptionalColor, OptionalFloatRect, PaintScrollBar, PaintTextShadow,
+    PathPaintKind, SpatialNodeIndex, StrokePath, VISUAL_VIEWPORT_NODE_INDEX, VideoSinkResourceId,
 };
 use crate::fast_hash::FastMap;
 use crate::host::FfiAnimatedContentViewportEffect;
@@ -957,7 +957,7 @@ impl DamageAccumulator {
         self.add_command_damage(command, chains.new_side());
     }
 
-    // A backdrop filter reads the pixels around its region, so damage beneath the region changes it
+    // A backdrop filter can read the pixels around its region, so damage beneath the region changes it
     // wherever the filter carries that damage in. The whole region then changes as content of the
     // backdrop's effect: that effect's own filter and the filters above it spread it further, and it
     // can carry the damage on to the backdrop filters above it.
@@ -1462,23 +1462,27 @@ pub struct DisplayListFrame<'a> {
     pub scroll_offsets: &'a [FloatPoint],
 }
 
-// The canvases and video sinks whose pixels changed since the old frame. The lists draw them with
-// commands that stay the same, so the diff cannot see the change.
+// The canvases, video sinks and image frames whose pixels changed since the old frame. The lists draw
+// them with commands that stay the same, so the diff cannot see the change.
 #[derive(Clone, Copy, Default)]
 pub struct LiveContentChanges<'a> {
     pub canvases: &'a [CanvasId],
     pub video_sinks: &'a [VideoSinkResourceId],
+    pub image_frames: &'a [ImageFrameResourceId],
+    /// What the compositor repaints whatever the lists hold, such as a blinking caret.
+    pub forced_damage_rect: IntRect,
 }
 
 impl LiveContentChanges<'_> {
     fn is_empty(&self) -> bool {
-        self.canvases.is_empty() && self.video_sinks.is_empty()
+        self.canvases.is_empty() && self.video_sinks.is_empty() && self.image_frames.is_empty()
     }
 
     fn includes(&self, content: LiveContent) -> bool {
         match content {
             LiveContent::Canvas(canvas_id) => self.canvases.contains(&canvas_id),
             LiveContent::VideoFrame(video_sink_id) => self.video_sinks.contains(&video_sink_id),
+            LiveContent::ImageFrame(image_frame_id) => self.image_frames.contains(&image_frame_id),
         }
     }
 }
@@ -1647,6 +1651,14 @@ pub fn compute_display_list_damage(
         }
     }
 
+    // NB: A backdrop filter reads more than the part of its region that is repainted, so forced damage goes through it too.
+    let forced_damage_rect = live_content_changes.forced_damage_rect;
+    if !forced_damage_rect.is_empty() {
+        damage.damage_rect = Some(match damage.damage_rect {
+            Some(damage_rect) => damage_rect.united(forced_damage_rect),
+            None => forced_damage_rect,
+        });
+    }
     damage.add_backdrop_filter_damage(chains.new_side(), new_command_runs);
 
     if damage.changed_unbounded_command {
@@ -1672,8 +1684,7 @@ mod tests {
     use crate::display_list::builder::{HEADER_SIZE, note_command};
     use crate::display_list::commands::{
         BackdropFilterRegion, CanvasId, CompositorMainThreadWheelEventRegion, DisplayListCommand, DisplayListGlyph,
-        DrawCanvas, DrawIsolatedGroup, DrawVideoFrame, FillRect, FontResourceId, ImageFrameResourceId, InlineClipKind,
-        TextShadowLayer,
+        DrawCanvas, DrawIsolatedGroup, DrawVideoFrame, FillRect, FontResourceId, InlineClipKind, TextShadowLayer,
     };
     use crate::display_list::ffi_bytes::FfiBytes;
     use crate::node_slot_id::NodeSlotId;
@@ -1911,6 +1922,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         }
     }
 
@@ -2105,6 +2117,32 @@ mod tests {
         );
         assert_eq!(
             damage_for_live_content_changes(&video, &tree, changed_canvas),
+            Some(IntRect::default())
+        );
+
+        let image = command_bytes(
+            &DrawScaledDecodedImageFrame {
+                dst_rect: FloatRect::new(10.0, 10.0, 20.0, 20.0),
+                src_rect: OptionalFloatRect::default(),
+                frame_id: ImageFrameResourceId(1),
+                scaling_mode: ScalingMode::NearestNeighbor,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                isolated_backdrop_color: OptionalColor::default(),
+                apply_force_dark: false,
+            },
+            Some(rect),
+            ContextRef::default(),
+        );
+        let changed_image = LiveContentChanges {
+            image_frames: &[ImageFrameResourceId(1)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&image, &tree, changed_image),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        assert_eq!(
+            damage_for_live_content_changes(&image, &tree, changed_video),
             Some(IntRect::default())
         );
     }
@@ -3129,6 +3167,36 @@ mod tests {
         assert_eq!(
             damage(&scene(out_of_reach, RED), &tree, &scene(out_of_reach, BLUE), &tree),
             Some(IntRect::new(0, 9, 11, 22))
+        );
+    }
+
+    #[test]
+    fn forced_damage_at_a_backdrop_filter_repaints_its_whole_region() {
+        let region = IntRect::new(25, 0, 50, 50);
+        let mut tree = identity_tree();
+        let backdrop_context = context_in(
+            VISUAL_VIEWPORT_NODE_INDEX,
+            effect_context(&mut tree, backdrop_effects(blur_filter(4.0), region)),
+        );
+        let bytes = command_bytes(&BackdropFilterRegion { rect: region }, Some(region), backdrop_context);
+        let forced_damage = |forced_damage_rect| {
+            damage_for_live_content_changes(
+                &bytes,
+                &tree,
+                LiveContentChanges {
+                    forced_damage_rect,
+                    ..LiveContentChanges::default()
+                },
+            )
+        };
+        assert_eq!(forced_damage(IntRect::default()), Some(IntRect::default()));
+        assert_eq!(
+            forced_damage(IntRect::new(40, 10, 3, 20)),
+            Some(IntRect::new(24, 0, 52, 51))
+        );
+        assert_eq!(
+            forced_damage(IntRect::new(0, 10, 3, 20)),
+            Some(IntRect::new(0, 9, 4, 22))
         );
     }
 

@@ -177,11 +177,11 @@ fn counter_style_mutation_preserves_names_and_descriptor_snapshots() {
         let data = other_descriptors.data();
         let replacement = data.descriptors[0].view();
         assert!(rust_descriptor_block_set(&mut descriptors, &replacement));
-        assert!(rust_counter_style_set_name(&rule, view(&utf16("UPPER-ROMAN"))));
+        assert!(counter_style_set_name(&rule, view(&utf16("UPPER-ROMAN"))));
         assert_eq!(retained.name().units(), utf16("upper-roman"));
         assert_eq!(shared.name().units(), utf16("初"));
-        assert!(!rust_counter_style_set_name(&rule, view(&utf16("DiSc"))));
-        assert!(!rust_counter_style_set_name(&rule, view(&utf16("NONE"))));
+        assert!(!counter_style_set_name(&rule, view(&utf16("DiSc"))));
+        assert!(!counter_style_set_name(&rule, view(&utf16("NONE"))));
         let changed = snapshot(&rule);
         assert_eq!(changed.name().units(), utf16("upper-roman"));
         assert_eq!(
@@ -199,7 +199,7 @@ fn counter_style_mutation_preserves_names_and_descriptor_snapshots() {
         ));
         assert!(retained.descriptors().descriptors.is_empty());
         assert_eq!(changed.descriptors().descriptors.len(), 1);
-        assert!(rust_counter_style_set_name(&rule, view(&utf16("名前 空白"))));
+        assert!(counter_style_set_name(&rule, view(&utf16("名前 空白"))));
         assert_eq!(retained.name().units(), utf16("名前 空白"));
         assert_eq!(changed.name().units(), utf16("upper-roman"));
     }
@@ -319,8 +319,11 @@ fn keyframe_mutation_preserves_exposed_declarations_and_snapshots() {
         let children = &*rust_rule_children(&frames);
         let originals = &*rust_rule_children(&original_frames);
         let owners = RULE_OWNER_ALLOCATIONS.get();
-        assert_eq!(rust_keyframes_find_rule(&frames, view(&utf16("from, 50%"))), 0);
-        assert_eq!(rust_keyframes_find_rule(&frames, view(&utf16("50%"))), usize::MAX);
+        assert_eq!(
+            frames.find_keyframe(&ak::Utf16String::from_utf16(&utf16("from, 50%"))),
+            Some(0)
+        );
+        assert_eq!(frames.find_keyframe(&ak::Utf16String::from_utf16(&utf16("50%"))), None);
         assert_eq!(RULE_OWNER_ALLOCATIONS.get(), owners);
         let mut early = declarations_at(children, 1);
         let later = children.rule_at(1);
@@ -348,7 +351,7 @@ fn keyframe_mutation_preserves_exposed_declarations_and_snapshots() {
             serialize_style_value_to_utf16(&snapshot.properties().get(0).unwrap().value),
             utf16("31px")
         );
-        rust_keyframes_set_name(&frames, view(&utf16("新しい名前")));
+        frames.set_keyframes_name(&ak::Utf16String::from_utf16(&utf16("新しい名前")));
         assert_eq!(
             rust_rule_payload(&retained).name.to_utf16().unwrap(),
             utf16("新しい名前")
@@ -364,7 +367,10 @@ fn keyframe_mutation_preserves_exposed_declarations_and_snapshots() {
         rust_rule_list_remove(children, 0);
         assert_eq!(rust_rule_list_count(&*rust_rule_children(&retained)), 1);
         assert_eq!(first_value(&later_declarations), utf16("23px"));
-        assert_eq!(rust_keyframes_find_rule(&retained, view(&utf16("to"))), 0);
+        assert_eq!(
+            retained.find_keyframe(&ak::Utf16String::from_utf16(&utf16("to"))),
+            Some(0)
+        );
         assert_eq!(first_value(&exposed_declarations), utf16("29px"));
     }
 }
@@ -1074,7 +1080,7 @@ fn declaration_image_traversal_skips_non_resource_values() {
 #[test]
 fn declaration_mutation_does_not_change_cached_or_nested_shared_blocks() {
     use crate::css::declaration_block::{
-        DeclarationBlock, rust_declaration_block_remove, rust_declaration_block_remove_custom,
+        DeclarationBlock, rust_declaration_block_remove_custom, rust_declaration_block_remove_expanding_shorthands,
     };
     use crate::css::property_metadata::property_id;
     let source = utf16("a { margin: 13px; --色: green }");
@@ -1089,7 +1095,10 @@ fn declaration_mutation_does_not_change_cached_or_nested_shared_blocks() {
     let mut changed = DeclarationBlock::new(original.clone());
     let independent = DeclarationBlock::new(original.clone());
     assert_eq!(changed.data().properties().len(), 4);
-    assert!(rust_declaration_block_remove(&mut changed, property_id::MARGIN_TOP));
+    assert!(rust_declaration_block_remove_expanding_shorthands(
+        &mut changed,
+        property_id::MARGIN_TOP
+    ));
     assert!(rust_declaration_block_remove_custom(&mut changed, view(&utf16("--色"))));
     assert_eq!(independent.data().properties().len(), 4);
     assert_eq!(independent.data().custom_properties().len(), 1);
@@ -1119,7 +1128,10 @@ fn declaration_mutation_does_not_change_cached_or_nested_shared_blocks() {
     let shared = DeclarationBlock::new(original);
     assert_eq!(changed.data().properties().len(), 5);
     assert_eq!(changed.data().custom_properties().len(), 1);
-    assert!(rust_declaration_block_remove(&mut changed, property_id::MARGIN_LEFT));
+    assert!(rust_declaration_block_remove_expanding_shorthands(
+        &mut changed,
+        property_id::MARGIN_LEFT
+    ));
     assert_eq!(shared.data().properties().len(), 5);
 }
 
@@ -1148,25 +1160,25 @@ fn media_mutation_preserves_live_owners_and_shared_snapshots() {
         assert!(rust_media_list_matches(&retained));
         assert!(!rust_media_list_matches(&shared));
         assert!(matches!(
-            rust_media_list_delete(&media, view(&utf16("all"))),
+            media.delete_medium(ak::Utf16StringUnits::Utf16(&utf16("all"))),
             MediaListDeleteResult::Removed
         ));
         assert!(!rust_media_list_matches(&media));
         assert_eq!(text(&retained), utf16("print"));
         assert_eq!(text(&shared), utf16("all, print"));
-        assert!(!rust_media_list_append(&media, view(&utf16("PRINT"))));
-        assert!(!rust_media_list_append(&media, view(&utf16("screen, print"))));
+        assert!(!media.append_medium(ak::Utf16StringUnits::Utf16(&utf16("PRINT"))));
+        assert!(!media.append_medium(ak::Utf16StringUnits::Utf16(&utf16("screen, print"))));
         assert!(matches!(
-            rust_media_list_delete(&media, view(&utf16("screen, print"))),
+            media.delete_medium(ak::Utf16StringUnits::Utf16(&utf16("screen, print"))),
             MediaListDeleteResult::Invalid
         ));
         assert!(matches!(
-            rust_media_list_delete(&media, view(&utf16("screen"))),
+            media.delete_medium(ak::Utf16StringUnits::Utf16(&utf16("screen"))),
             MediaListDeleteResult::NotFound
         ));
         rust_media_list_set_text(&media, view(&utf16("écran, écran")));
         assert!(matches!(
-            rust_media_list_delete(&media, view(&utf16("écran"))),
+            media.delete_medium(ak::Utf16StringUnits::Utf16(&utf16("écran"))),
             MediaListDeleteResult::Removed
         ));
         assert_eq!(rust_media_list_length(&retained), 0);
@@ -1178,7 +1190,7 @@ fn media_mutation_preserves_live_owners_and_shared_snapshots() {
             (&raw mut item).cast(),
             collect_text
         ));
-        assert!(rust_media_list_append(&media, view(&utf16(""))));
+        assert!(media.append_medium(ak::Utf16StringUnits::Utf16(&utf16(""))));
         assert!(rust_media_list_item(&retained, 0, (&raw mut item).cast(), collect_text));
         assert_eq!(item, utf16("not all"));
         drop(media);

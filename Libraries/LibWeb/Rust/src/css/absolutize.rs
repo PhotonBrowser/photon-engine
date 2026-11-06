@@ -9,10 +9,8 @@
 //! Mirrors the C++ `StyleValue::absolutized(ComputationContext const&)` dispatch: structural
 //! values recurse into their children and rebuild only when a child changed, dimensions convert
 //! to their canonical units, and lengths resolve through the shared length-resolution context.
-//! Types whose absolutization has not been ported (or that need C++-only state not captured in the
-//! computation environment) decline, and the caller routes the whole value through the C++ fallback. Preserving
-//! identity for unchanged values is a real contract: the store batch reuses wrappers and shared
-//! allocations based on pointer equality.
+//! Preserving identity for unchanged values is a real contract: the store batch reuses wrappers
+//! and shared allocations based on pointer equality.
 
 // Style value data allocations are thread-confined, like style_value.rs.
 
@@ -469,6 +467,27 @@ fn canonical_legacy_rgb(value: &StyleValueData) -> Option<StyleValueData> {
         f64::from(rgba.a) / 255.0,
         COLOR_SYNTAX_LEGACY,
     ))
+}
+
+/// Whether `value` is the canonical computed form of a fully-resolved opaque legacy sRGB color, which
+/// computes to itself.
+pub(crate) fn color_function_is_canonical_legacy_rgb(value: &StyleValueData) -> bool {
+    let StyleValueData::ColorFunction(color_function) = value else {
+        return false;
+    };
+    let channel_is_a_byte = |channel: &RetainedStyleValueData| {
+        matches!(channel.optional_data(), Some(StyleValueData::Number { value })
+            if (0.0..=255.0).contains(value) && value.fract() == 0.0)
+    };
+    color_function.color_base.has_color_type
+        && color_function.color_base.color_type == crate::css::color_conversion::RGB
+        && color_function.color_base.color_syntax == COLOR_SYNTAX_LEGACY
+        && !color_function.has_name
+        && color_function.origin_color.optional_data().is_none()
+        && channel_is_a_byte(&color_function.channel_0)
+        && channel_is_a_byte(&color_function.channel_1)
+        && channel_is_a_byte(&color_function.channel_2)
+        && matches!(color_function.alpha.optional_data(), Some(StyleValueData::Number { value }) if *value == 1.0)
 }
 
 /// Port of hsl_to_absolutized_rgb() in ColorFunctionStyleValue.cpp.
@@ -1495,6 +1514,37 @@ fn map_grid_track_entries(
         .collect()
 }
 
+/// Whether `changes` answers yes of any value in a grid track entry list, recursing through repeat() entries, or none
+/// where it declines before that.
+fn grid_track_entries_change(
+    entries: &[crate::css::style_value::RetainedGridTrackEntry],
+    changes: &mut impl FnMut(&RetainedStyleValueData) -> Option<bool>,
+) -> Option<bool> {
+    for entry in entries {
+        if changes(&entry.size_value)?
+            || changes(&entry.min_value)?
+            || changes(&entry.max_value)?
+            || changes(&entry.repeat_count)?
+            || grid_track_entries_change(entry.repeat_entries(), changes)?
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Whether `changes` answers yes of any value [`map_grid_values`] maps, or none where it declines before that.
+fn grid_values_change(
+    value: &StyleValueData,
+    changes: &mut impl FnMut(&RetainedStyleValueData) -> Option<bool>,
+) -> Option<bool> {
+    match value {
+        StyleValueData::GridTrackPlacement(placement) => changes(&placement.value),
+        StyleValueData::GridTrackSizeList(list) => grid_track_entries_change(list.entries.as_slice(), changes),
+        _ => unreachable!(),
+    }
+}
+
 fn map_grid_values(
     value: &StyleValueData,
     map: &mut impl FnMut(&RetainedStyleValueData) -> Option<RetainedStyleValueData>,
@@ -1557,7 +1607,7 @@ fn canonicalized_dimension(value: f64, unit: u8, ratios: &[f64]) -> Option<(f64,
     Some((value * ratios[unit as usize], canonical))
 }
 
-/// Absolutizes a style value. None means the C++ fallback must handle the whole value.
+/// Absolutizes a style value. None means the value has no absolutized form in this context.
 pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext) -> Option<Absolutized> {
     use crate::css::calc::{
         ANGLE_UNIT_CANONICAL_RATIOS, FREQUENCY_UNIT_CANONICAL_RATIOS, RESOLUTION_UNIT_CANONICAL_RATIOS,
@@ -2221,6 +2271,15 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
             )
         }
         StyleValueData::GridTrackPlacement { .. } | StyleValueData::GridTrackSizeList { .. } => {
+            // NB: Tracks and lines are mostly absolute already, which a walk answers without building a list.
+            if !grid_values_change(value, &mut |child| {
+                let Some(data) = child.optional_data() else {
+                    return Some(false);
+                };
+                Some(matches!(absolutize(data, context)?, Absolutized::Changed(_)))
+            })? {
+                return Some(Absolutized::Unchanged);
+            }
             let mut changed = false;
             let mapped = map_grid_values(value, &mut |child| absolutize_child(child, context, &mut changed))?;
             rebuild!(changed, mapped)

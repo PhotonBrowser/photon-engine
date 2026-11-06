@@ -88,6 +88,7 @@ pub enum FfiStyleInvalidationField {
     /// The white space of the element's text children collapses where it did not, or the other way round, so the white
     /// space text among them may gain or lose its box.
     WhiteSpaceCollapseChanged = 1 << 25,
+    CursorChanged = 1 << 26,
 }
 
 /// The `InvalidationLevel` of a style move at which its box is painted again, the one at which it lays out again, and
@@ -163,8 +164,6 @@ pub const PSEUDO_RECORD_SLOTS: usize = 11;
 
 #[derive(Default)]
 pub(crate) struct FfiStyleUpdateOutput {
-    scoped: bool,
-    transaction_version: u64,
     answers: Vec<FfiStyleDelta>,
     reclaimed_style_atoms: Vec<super::atoms::ReclaimedStyleAtom>,
 }
@@ -464,7 +463,7 @@ pub struct FfiStyleRecordView {
     pub present: bool,
 }
 
-// NB: Every element and pseudo-element the host styles holds one of these.
+// NB: Every styled element and pseudo-element holds one of these.
 const _: () = assert!(size_of::<FfiStyleRecordView>() == 32);
 
 impl FfiStyleRecordView {
@@ -545,7 +544,7 @@ pub struct FfiTreeRelations {
 }
 
 impl FfiTreeRelations {
-    fn decode(self) -> TreeRelations {
+    pub(super) fn decode(self) -> TreeRelations {
         TreeRelations {
             parent: StyleNodeID::from_raw(self.parent),
             previous_element_sibling: StyleNodeID::from_raw(self.previous_element_sibling),
@@ -596,8 +595,8 @@ pub struct FfiElementArrival {
     /// One plus the element-backed pseudo-element kind the element stands for in its host's
     /// shadow tree, or zero.
     pub associated_pseudo_kind_plus_one: u8,
-    /// The `ElementBoxKind` the element asks for, as its raw byte.
-    pub box_kind: u8,
+    /// The principal box the element asks for.
+    pub box_kind: ElementBoxKind,
     /// The element's `ElementStyleAdjustmentFact` bits: what the box-type transformation and the
     /// element style adjustments read of the DOM. Mirrors the C++ enum.
     pub adjustment_facts: u32,
@@ -625,7 +624,7 @@ pub(in crate::css::style) fn element_arrival_facts<'a>(
         states: super::index::StateSet(arrival.states),
         adjustment_facts: arrival.adjustment_facts,
         construction_facts: arrival.construction_facts,
-        box_kind: ElementBoxKind::from_raw(arrival.box_kind),
+        box_kind: arrival.box_kind,
         atoms,
         custom_state_count: arrival.custom_state_count as usize,
         class_count: arrival.class_count as usize,
@@ -803,9 +802,11 @@ pub mod element_construction_fact {
 
 /// Which principal box an element asks for before its computed style has a say. The element's own
 /// type and state decide this; the tree build resolves it against the computed `display` and
-/// `appearance`. Mirrors the C++ `CSS::ElementBoxKind`; it crosses the boundary as its raw byte.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// `appearance`. Mirrors the C++ `CSS::ElementBoxKind`, which lists the same kinds in the same
+/// order and crosses the boundary as its underlying byte.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum ElementBoxKind {
     /// The computed display decides the box on its own.
     #[default]
@@ -847,38 +848,6 @@ impl ElementBoxKind {
             self,
             Self::InputButton | Self::InputCheckBox | Self::InputRadioButton | Self::InputRange | Self::InputText
         )
-    }
-
-    /// The kind C++ sends as `raw`. The two enums list the same kinds in the same order, which
-    /// `ElementBoxKind.h` asserts for the last one.
-    #[must_use]
-    pub(crate) fn from_raw(raw: u8) -> Self {
-        match raw {
-            0 => Self::FromDisplay,
-            1 => Self::NoBox,
-            2 => Self::Break,
-            3 => Self::FieldSet,
-            4 => Self::Legend,
-            5 => Self::Audio,
-            6 => Self::Video,
-            7 => Self::Canvas,
-            8 => Self::NavigableContainerViewport,
-            9 => Self::TextArea,
-            10 => Self::Image,
-            11 => Self::SvgGraphics,
-            12 => Self::SvgSvg,
-            13 => Self::SvgText,
-            14 => Self::SvgTextPath,
-            15 => Self::SvgForeignObject,
-            16 => Self::SvgImage,
-            17 => Self::SvgGeometry,
-            18 => Self::InputButton,
-            19 => Self::InputCheckBox,
-            20 => Self::InputRadioButton,
-            21 => Self::InputRange,
-            22 => Self::InputText,
-            _ => unreachable!("C++ sent an unknown element box kind {raw}"),
-        }
     }
 }
 
@@ -1071,7 +1040,7 @@ impl super::projection_writes::ProjectionWrites<'_> {
             return;
         };
         *atoms = rest;
-        self.record_element_arrival(node, &element_arrival_facts(arrival, arrival_atoms));
+        self.record_element_arrival(node, &element_arrival_facts(arrival, arrival_atoms), None);
     }
 
     /// Write the local fact the host published as `delta`.
@@ -1434,13 +1403,20 @@ pub(super) fn register_element_declared_properties<'a>(
     node: StyleNodeID,
     kind: FfiElementDeclarationKind,
     declarations: impl ExactSizeIterator<Item = crate::css::declaration_block::DeclarationRef<'a>>,
-    custom_properties: crate::css::declaration_block::CustomProperties<'_>,
 ) {
     let declarations = super::specified_value::element_declared_properties(declarations);
-    let custom_declarations = collect_native_custom_declarations(engine, custom_properties);
-    let declaration_kind = decode_element_declaration_kind(kind);
-    engine.set_element_declared_properties(node, declaration_kind, declarations, custom_declarations);
+    engine.set_element_declared_properties(node, decode_element_declaration_kind(kind), declarations);
     // The engine holds the declarations as they were published.
+}
+
+/// Records the custom properties an element's inline declaration block declares.
+pub(super) fn register_element_custom_properties(
+    engine: &mut StyleEngine,
+    node: StyleNodeID,
+    custom_properties: crate::css::declaration_block::CustomProperties<'_>,
+) {
+    let custom_declarations = collect_native_custom_declarations(engine, custom_properties);
+    engine.element_declarations.set_custom(node, custom_declarations);
 }
 
 /// Whether `declarations` can define transitions.
@@ -1465,11 +1441,25 @@ pub extern "C" fn style_engine_set_element_inline_style_properties(
     let Some(node) = StyleNodeID::from_raw(node) else {
         return false;
     };
-    let data = block.map(DeclarationBlock::data);
-    let has_transitions = data
-        .as_ref()
-        .is_some_and(|data| declares_transitions(data.properties()));
-    super::engine_calls::queue(host, super::engine_calls::EngineWrite::InlineStyle { node, data });
+    let data = block.map(DeclarationBlock::data).filter(|data| !data.is_empty());
+    let has_transitions = data.as_ref().is_some_and(|data| data.declares_transitions());
+    if let Some(data) = &data
+        && data.reads_attributes()
+    {
+        super::host_atoms::note_attr_names_read_by_block(host, data);
+    }
+    let declares_custom = data.as_ref().is_some_and(|data| !data.custom_properties().is_empty());
+    let previous = host
+        .engine_memo()
+        .projection
+        .borrow_mut()
+        .write_inline_declarations(node, data.clone());
+    if declares_custom || previous.is_some_and(|previous| !previous.custom_properties().is_empty()) {
+        super::engine_calls::queue(
+            host,
+            super::engine_calls::EngineWrite::InlineCustomProperties { node, data },
+        );
+    }
     has_transitions
 }
 
@@ -1705,9 +1695,8 @@ pub(crate) unsafe fn run_style_update(
     };
     engine.document_style_computation_inputs = computation_inputs;
     let mut output = FfiStyleUpdateOutput::default();
-    output.scoped = engine.run_style_update(root, |transaction_version, answers| {
+    engine.run_style_update(root, |answers| {
         assert!(output.answers.is_empty(), "a style update emitted more than one batch");
-        output.transaction_version = transaction_version.0;
         output.answers.extend_from_slice(answers);
     });
     output.reclaimed_style_atoms = std::mem::take(&mut engine.host.reclaimed_style_atoms);
@@ -2000,7 +1989,7 @@ mod tests {
             is_slot: false,
             has_text_content: false,
             associated_pseudo_kind_plus_one: 0,
-            box_kind: 0,
+            box_kind: ElementBoxKind::FromDisplay,
         }
     }
 

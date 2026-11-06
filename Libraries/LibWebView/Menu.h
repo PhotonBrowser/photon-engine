@@ -102,6 +102,12 @@ enum class ActionID {
     EnterPictureInPicture,
     ExitPictureInPicture,
 
+    TranslatePage,
+    TranslateTo,
+    ShowOriginal,
+    DownloadTranslationLanguages,
+    EditPreferredLanguages,
+
     ZoomIn,
     ZoomOut,
     ResetZoom,
@@ -125,6 +131,7 @@ enum class ActionID {
     DumpLocalStorage,
     DumpSessionStorage,
     DumpGCGraph,
+    ReportLeakedDocuments,
     ShowLineBoxBorders,
     ShowCaretHitTestDebugOverlay,
     CollectGarbage,

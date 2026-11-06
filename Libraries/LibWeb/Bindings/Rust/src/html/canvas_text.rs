@@ -13,7 +13,7 @@ use ak::Utf16String;
 use libcompositing_rust::display_list::commands::DisplayListGlyph;
 use libgfx_rust::path::Path;
 use libgfx_rust::text_layout::glyph_run_ink_bounding_box;
-use libgfx_rust::{CompositingAndBlendingOperator, FloatPoint, WindingRule};
+use libgfx_rust::{CompositingAndBlendingOperator, FloatPoint};
 
 use super::text_metrics::{TextMeasurements, TextMetrics};
 use crate::bindings::interface::Ref;
@@ -29,10 +29,6 @@ use crate::html::canvas_rendering_context2d::CanvasTextBaseline;
 impl ContextState {
     /// The outlines of the glyphs of the text, drawn at the point.
     fn text_path(&self, vm: &Vm, text: &[u16], x: f32, y: f32, max_width: Option<f64>) -> Path {
-        if max_width.is_some_and(|max_width| max_width <= 0.0) {
-            return Path::new();
-        }
-
         let font = self.current_font(vm);
         let letter_spacing = self.resolved_letter_spacing();
         let word_spacing = self.resolved_word_spacing();
@@ -53,8 +49,10 @@ impl ContextState {
 }
 
 /// Whether the arguments of fillText() or strokeText() let it draw.
-fn are_finite(x: f32, y: f32, max_width: Option<f64>) -> bool {
-    x.is_finite() && y.is_finite() && max_width.is_none_or(f64::is_finite)
+/// INTEROP: A maxWidth of zero or less draws nothing at all, rather than a draw of no text, which an operator such as
+///          copy would composite over the whole canvas.
+fn arguments_let_text_draw(x: f32, y: f32, max_width: Option<f64>) -> bool {
+    x.is_finite() && y.is_finite() && max_width.is_none_or(|max_width| max_width.is_finite() && max_width > 0.0)
 }
 
 impl<K: CanvasKind> RenderingContext2D<K> {
@@ -68,43 +66,9 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         max_width: Option<f64>,
     ) -> WebIdlResult<()> {
         let (x, y) = (float(x), float(y));
-        if !are_finite(x, y, max_width) {
+        if !arguments_let_text_draw(x, y, max_width) {
             return Ok(());
         }
-        // https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm
-        // 2. Replace all ASCII whitespace in text with U+0020 SPACE characters.
-        let text = replace_ascii_whitespace(&text.to_utf16());
-
-        // Complex text effects continue to use the combined outline so they are applied once to the entire text,
-        // including runs that use different fallback fonts.
-        let has_shadow = {
-            let state = self.drawing_state();
-            state.shadow_blur != 0.0 || state.shadow_offset_x != 0.0 || state.shadow_offset_y != 0.0
-        };
-        if max_width.is_some() || has_shadow {
-            self.fill_internal(&self.text_path(cx.vm(), &text, x, y, max_width), WindingRule::Nonzero);
-            return Ok(());
-        }
-
-        let font = self.current_font(cx.vm());
-        let letter_spacing = self.resolved_letter_spacing();
-        let word_spacing = self.resolved_word_spacing();
-        let runs = shape_text(
-            &font.cascade,
-            &text,
-            FloatPoint { x: 0.0, y: 0.0 },
-            letter_spacing,
-            word_spacing,
-        );
-        let [run] = runs.as_slice() else {
-            self.fill_internal(&self.text_path(cx.vm(), &text, x, y, max_width), WindingRule::Nonzero);
-            return Ok(());
-        };
-        if run.font.is_invisible() {
-            self.fill_internal(&self.text_path(cx.vm(), &text, x, y, max_width), WindingRule::Nonzero);
-            return Ok(());
-        }
-
         if !self.recorder_is_ready() {
             return Ok(());
         }
@@ -116,26 +80,59 @@ impl<K: CanvasKind> RenderingContext2D<K> {
                 return Ok(());
             }
         }
-        let glyphs: Vec<DisplayListGlyph> = run
-            .glyphs
+
+        // https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm
+        // 2. Replace all ASCII whitespace in text with U+0020 SPACE characters.
+        let text = replace_ascii_whitespace(&text.to_utf16());
+
+        let font = self.current_font(cx.vm());
+        let letter_spacing = self.resolved_letter_spacing();
+        let word_spacing = self.resolved_word_spacing();
+        let runs = shape_text(
+            &font.cascade,
+            &text,
+            FloatPoint { x: 0.0, y: 0.0 },
+            letter_spacing,
+            word_spacing,
+        );
+
+        // NB: The glyphs are not filled as outlines, since the glyphs of a color font can have none. All runs are a
+        //     single draw, so that the fallback fonts of the text share one shadow and one composite.
+        let lent_fonts: Vec<LentFont> = runs
             .iter()
-            .filter(|glyph| glyph.should_paint)
-            .map(|glyph| DisplayListGlyph {
-                position: FloatPoint { x: glyph.x, y: glyph.y },
-                glyph_id: glyph.glyph_id,
-            })
+            .map(|run| LentFont(NonNull::new(run.font.as_raw().cast_mut()).expect("a font has a font")))
             .collect();
+        let mut glyphs = Vec::new();
+        let mut glyph_runs = Vec::with_capacity(runs.len());
+        let mut text_width = 0.0;
+        for (run, lent_font) in runs.iter().zip(&lent_fonts) {
+            text_width += run.width;
+            if run.font.is_invisible() {
+                continue;
+            }
+            let first_glyph = glyphs.len();
+            glyphs.extend(
+                run.glyphs
+                    .placed()
+                    .filter(|placed| placed.glyph.should_paint())
+                    .map(DisplayListGlyph::from),
+            );
+            if glyphs.len() > first_glyph {
+                glyph_runs.push((lent_font, glyphs.len() - first_glyph));
+            }
+        }
         let first_font = font.cascade.first();
         let state = self.drawing_state();
-        let translation = text_transform(&state, self.direction_is_rtl(), &first_font, x, run.width, None)
-            .map_point(FloatPoint { x, y });
-        let lent_font = LentFont(NonNull::new(run.font.as_raw().cast_mut()).expect("a font has a font"));
+        let transform = text_transform(&state, self.direction_is_rtl(), &first_font, x, text_width, max_width);
+        let translation = transform.map_point(FloatPoint { x, y });
+        let horizontal_scale = transform.a();
         self.record(|recorder| {
             let paint = paint_of(recorder, &state.fill_style, self.context_attributes.color_space);
-            recorder.draw_glyph_run(
-                &lent_font,
+            recorder.draw_glyph_runs(
+                &glyph_runs,
                 &glyphs,
                 translation,
+                horizontal_scale,
                 &paint,
                 &ContextState::compositing(&state),
             );
@@ -155,7 +152,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         max_width: Option<f64>,
     ) -> WebIdlResult<()> {
         let (x, y) = (float(x), float(y));
-        if !are_finite(x, y, max_width) {
+        if !arguments_let_text_draw(x, y, max_width) {
             return Ok(());
         }
         // https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm

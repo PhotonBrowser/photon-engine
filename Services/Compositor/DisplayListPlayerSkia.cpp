@@ -16,6 +16,7 @@
 #include <core/SkColorSpace.h>
 #include <core/SkMaskFilter.h>
 #include <core/SkPath.h>
+#include <core/SkPathBuilder.h>
 #include <core/SkPathEffect.h>
 #include <core/SkPathUtils.h>
 #include <core/SkPicture.h>
@@ -299,7 +300,16 @@ void DisplayListPlayerSkia::play_command(DrawCompositedContext const& command)
     if (!m_composited_context_resolver)
         return;
 
-    auto composited_context = (*m_composited_context_resolver)(command.child_context_id, command.dst_rect, canvas_matrix());
+    auto destination_rect = command.dst_rect;
+
+    // Snap iframe origins to device pixels for browser compatibility when transforms are absent or identity.
+    // Preserve fractional placement under other transforms to retain the raster phase of surrounding content.
+    if (command.snap_origin_if_untransformed && active_visual_context_tree().can_snap_composited_context_origin(command.spatial_node_index)) {
+        destination_rect.set_x(roundf(destination_rect.x()));
+        destination_rect.set_y(roundf(destination_rect.y()));
+    }
+
+    auto composited_context = (*m_composited_context_resolver)(command.child_context_id, destination_rect, canvas_matrix());
     if (!composited_context.surface || composited_context.content_rect.is_empty())
         return;
 
@@ -307,7 +317,7 @@ void DisplayListPlayerSkia::play_command(DrawCompositedContext const& command)
     if (!image)
         return;
 
-    auto dst_rect = to_skia_rect(command.dst_rect);
+    auto dst_rect = to_skia_rect(destination_rect);
     auto src_rect = to_skia_rect(composited_context.content_rect);
     auto& canvas = surface().canvas();
     SkPaint paint;
@@ -987,7 +997,19 @@ void DisplayListPlayerSkia::play_command(FillRoundedRectRing const& command)
         inner_corner(command.corner_radii.bottom_right, right_width, bottom_width),
         inner_corner(command.corner_radii.bottom_left, left_width, bottom_width),
     };
-    canvas.drawDRRect(outer_rounded_rect, to_skia_rrect(inner_rect, inner_corner_radii), paint);
+    if (top_width > 0 && right_width > 0 && bottom_width > 0 && left_width > 0) {
+        canvas.drawDRRect(outer_rounded_rect, to_skia_rrect(inner_rect, inner_corner_radii), paint);
+        return;
+    }
+
+    // Skia's GPU drawDRRect leaves ghost edges where the outlines coincide. A single path cancels those edges.
+    auto path = SkPathBuilder(SkPathFillType::kEvenOdd)
+                    .addRRect(outer_rounded_rect)
+                    .addRRect(to_skia_rrect(inner_rect, inner_corner_radii))
+                    .setIsVolatile(true)
+                    .detach();
+
+    canvas.drawPath(path, paint);
 }
 
 static SkTileMode to_skia_tile_mode(DisplayListGradientSpreadMethod spread_method)
@@ -1548,13 +1570,43 @@ void DisplayListPlayerSkia::push_layer(ReplayLayer const& layer)
     canvas.saveLayer(SkCanvas::SaveLayerRec(nullptr, &paint, backdrop_image_filter(layer, true).get(), 0));
 }
 
-// With `limited_to_region`, the filtered backdrop is cropped to the rounded region inside the filter
-// graph, which also bounds what the filter reads.
+// Replay gives the edge as the clips around the box leave it. What lies beyond the surface cannot be read, so the edge
+// stops there too, which keeps a box larger than the surface cheap to read. Skia keeps only whole pixels of a mirroring
+// crop, so the edge has to span the pixels it touches; otherwise, a region thinner than a pixel would vanish.
+static Gfx::FloatRect backdrop_blur_edge_on_surface(SkCanvas const& canvas, Gfx::FloatRect clipped_region)
+{
+    auto const& matrix = canvas.getTotalMatrix();
+    SkMatrix inverse;
+    if (!matrix.invert(&inverse))
+        return clipped_region;
+    auto edge = to_skia_rect(clipped_region);
+    auto surface_bounds = SkRect::Make(canvas.getBaseLayerSize());
+    if (matrix.rectStaysRect()) {
+        edge = SkRect::Make(matrix.mapRect(edge).roundOut());
+        if (!edge.intersect(surface_bounds))
+            return {};
+        edge = inverse.mapRect(edge);
+    } else {
+        if (!edge.intersect(inverse.mapRect(surface_bounds)))
+            return {};
+        // Skia picks the pixels of a turned box in a space of its own, so only their largest possible size is known.
+        if (auto scale = matrix.getMinScale(); scale > 0) {
+            auto pixel = 1 / scale;
+            edge.outset(edge.width() < 2 * pixel ? pixel : 0, edge.height() < 2 * pixel ? pixel : 0);
+        }
+    }
+    return { edge.x(), edge.y(), edge.width(), edge.height() };
+}
+
+// With `limited_to_region`, the filtered backdrop is cropped to the rounded region inside the filter graph.
 sk_sp<SkImageFilter> DisplayListPlayerSkia::backdrop_image_filter(ReplayLayer const& layer, bool limited_to_region)
 {
     ReadonlyBytes filter_bytes { layer.backdrop_filter_bytes, layer.backdrop_filter_bytes_size };
-    return raster_cache().backdrop_image_filter(active_visual_context_tree().structural_epoch(), layer, limited_to_region, [&] {
-        auto image_filter = image_filter_from_bytes(filter_bytes);
+    Optional<Gfx::FloatRect> blur_edge;
+    if (layer.backdrop_blur_edge.has_value())
+        blur_edge = backdrop_blur_edge_on_surface(surface().canvas(), *layer.backdrop_blur_edge);
+    return raster_cache().backdrop_image_filter(active_visual_context_tree().structural_epoch(), layer, blur_edge, limited_to_region, [&] {
+        auto image_filter = image_filter_from_bytes(filter_bytes, blur_edge);
         if (layer.backdrop_base_color.alpha() != 0) {
             auto base = SkImageFilters::Shader(SkShaders::Color(to_skia_color(layer.backdrop_base_color)));
             image_filter = SkImageFilters::Compose(move(image_filter), SkImageFilters::Blend(SkBlendMode::kSrcOver, move(base), nullptr));
@@ -1584,11 +1636,9 @@ sk_sp<SkImageFilter> DisplayListPlayerSkia::layer_image_filter(ReplayLayer const
     });
 }
 
-sk_sp<SkImageFilter> DisplayListPlayerSkia::image_filter_from_bytes(ReadonlyBytes filter_bytes)
+sk_sp<SkImageFilter> DisplayListPlayerSkia::image_filter_from_bytes(ReadonlyBytes filter_bytes, Optional<Gfx::FloatRect> blur_edge)
 {
-    return Gfx::to_skia_image_filter(filter_bytes, [&](u64 image_id) -> Gfx::DecodedImageFrame const& {
-        return resource_storage().image_frame(ImageFrameResourceId { image_id });
-    });
+    return Gfx::to_skia_image_filter(filter_bytes, [&](u64 image_id) -> Gfx::DecodedImageFrame const& { return resource_storage().image_frame(ImageFrameResourceId { image_id }); }, blur_edge);
 }
 
 // A mask that applies to a box's filtered backdrop starts its layer with that backdrop, read from the

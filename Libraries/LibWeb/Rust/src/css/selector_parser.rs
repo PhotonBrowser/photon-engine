@@ -26,6 +26,7 @@ use super::selector_tree::{
     PseudoElementValue, SelectorList, SimpleSelector, TransitionNameAndClassSelector, TransitionNameSelector,
     search_text_match_filter,
 };
+use crate::css::retained_fly_string::RetainedUtf16FlyString;
 use crate::css::style::AtomLease;
 use crate::css::style::index::StyleAtomID;
 
@@ -1024,17 +1025,22 @@ impl<'a> SelectorParser<'a> {
             }
             // https://drafts.csswg.org/css-pseudo-4/#typedef-highlight-name-selector
             // <highlight-name-selector> = '*' | <custom-ident>
-            // FIXME: Support the '*' argument, which selects every custom highlight.
             PseudoElementParameterType::HighlightNameSelector => {
-                let name = stream.next().and_then(ComponentValue::ident).ok_or(())?;
-                if is_css_wide_keyword(name) || ascii_eq(name, "default") {
-                    return Err(());
-                }
+                let argument = stream.next().ok_or(())?;
+                let value = if argument.is_delim(b'*') {
+                    PseudoElementValue::Universal
+                } else {
+                    let name = argument.ident().ok_or(())?;
+                    if is_css_wide_keyword(name) || ascii_eq(name, "default") {
+                        return Err(());
+                    }
+                    PseudoElementValue::Identifiers(Box::new([name.into()]))
+                };
                 stream.discard_whitespace();
                 if !stream.is_empty() {
                     return Err(());
                 }
-                Ok(PseudoElementValue::Identifiers(Box::new([name.into()])))
+                Ok(value)
             }
             PseudoElementParameterType::IdentList => {
                 let mut identifiers = Vec::new();
@@ -1110,7 +1116,11 @@ impl<'a> SelectorParser<'a> {
     fn parse_compound_simple_selectors(&mut self, stream: &mut Stream<'_>) -> Result<Vec<SimpleSelector>, ()> {
         let mut simple_selectors = Vec::new();
         while let Some(simple_selector) = self.parse_simple_selector(stream)? {
-            if matches!(simple_selector, SimpleSelector::TagName(_)) && !simple_selectors.is_empty() {
+            if matches!(
+                simple_selector,
+                SimpleSelector::TagName(_) | SimpleSelector::Universal(_)
+            ) && !simple_selectors.is_empty()
+            {
                 return Err(());
             }
             if let SimpleSelector::PseudoElement(pseudo_element) = &simple_selector {
@@ -1497,6 +1507,7 @@ pub(crate) unsafe fn parse_selector_list_from_ffi(
 pub struct FfiParsedPseudoElement {
     pub selector: *mut RustSelector,
     pub pseudo_element: u8,
+    pub highlight_name: usize,
 }
 
 /// Parses the restricted pseudo-element syntax accepted by `getComputedStyle()` and animation APIs.
@@ -1505,21 +1516,24 @@ pub extern "C" fn rust_selector_parse_pseudo_element(
     input: FfiUtf16View,
     for_computed_style: bool,
 ) -> FfiParsedPseudoElement {
+    let failure = FfiParsedPseudoElement {
+        selector: std::ptr::null_mut(),
+        pseudo_element: u8::MAX,
+        highlight_name: 0,
+    };
     let Some(input) = input.units() else {
-        return FfiParsedPseudoElement {
-            selector: std::ptr::null_mut(),
-            pseudo_element: u8::MAX,
-        };
+        return failure;
     };
     let Ok((selector, pseudo_element)) = parse_pseudo_element_selector(input, for_computed_style) else {
-        return FfiParsedPseudoElement {
-            selector: std::ptr::null_mut(),
-            pseudo_element: u8::MAX,
-        };
+        return failure;
     };
+    let highlight_name = selector.view().target_highlight_name_text().map_or(0, |name| {
+        std::mem::ManuallyDrop::new(RetainedUtf16FlyString::from_utf16(name)).raw()
+    });
     FfiParsedPseudoElement {
         selector: Box::into_raw(Box::new(RustSelector { selector })),
         pseudo_element: pseudo_element as u8,
+        highlight_name,
     }
 }
 

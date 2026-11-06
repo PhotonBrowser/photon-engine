@@ -77,7 +77,7 @@ public:
     WebIDL::UnsignedLongLong discard_decoded_image_frames();
     WebIDL::ExceptionOr<void> mark_as_garbage(Utf16String const& variable_name);
     bool wrapper_is_preserved(JS::Object&);
-    bool has_activity_root(JS::Object&);
+    bool has_pending_activity(JS::Object&, GC::Ptr<DOM::Document>);
     WebIDL::UnsignedLongLong message_port_pending_outgoing_message_count(HTML::MessagePort&);
     WebIDL::UnsignedLongLong html_collection_cache_generation(DOM::HTMLCollection&);
     void fail_next_message_port_transfer(HTML::MessagePort&);
@@ -92,6 +92,9 @@ public:
     Utf16String spelling_error_ranges(GC::Ref<DOM::Node>);
     GC::Ref<WebIDL::Promise> check_spelling_for_testing(Utf16String const& text);
     GC::Ref<WebIDL::Promise> spell_check_settled();
+
+    void translate_page(Utf16String const& target_language);
+    GC::Ref<WebIDL::Promise> translation_settled();
 
     GC::Ref<WebIDL::Promise> request_writing_suggestion_for_testing(Utf16String const& text, WebIDL::UnsignedLong caret_offset);
     Utf16String writing_suggestion();
@@ -127,9 +130,10 @@ public:
     void wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, Bindings::WheelTicks const&, GC::Ref<WebIDL::Promise>);
     GC::Ref<JS::Object> compositor_scroll_state(GC::Ptr<DOM::Element> scroller);
     void pinch(double x, double y, double scale_delta, WebIDL::UnsignedShort modifiers);
-    void pinch_through_ui_process(double x, double y, double scale_delta);
+    void pinch_through_ui_process(double x, double y, double scale_delta, bool continues_gesture);
     void reset_zoom();
 
+    Optional<Utf16String> hovered_link();
     Utf16String current_cursor();
     Optional<Utf16String> current_cursor_pixel(i32 x, i32 y);
     Utf16String theme_color();
@@ -173,6 +177,8 @@ public:
     WebIDL::ExceptionOr<bool> has_cookie_for_url(Utf16String const& url, String const& name, String const& value);
 
     bool set_http_memory_cache_enabled(bool enabled);
+    bool functions_share_code(JS::Value a, JS::Value b);
+    bool compiled_script_cache_contains(Utf16String const& url);
     bool set_disk_cache_enabled_for_navigations(bool enabled);
     void simulate_request_server_connection_loss();
     void simulate_worker_request_server_connection_loss();
@@ -226,6 +232,13 @@ public:
 
     Utf16String dump_display_list();
     Utf16String dump_accessibility_tree();
+    String accessibility_character_offsets(GC::Ref<DOM::Node>);
+    String dump_accessibility_node_data(GC::Ref<DOM::Node>);
+    String accessibility_cached_text_mismatches();
+    String accessibility_cached_record_mismatches();
+    String accessibility_cached_geometry_mismatches();
+    String accessibility_change_tracking_mismatches();
+    String accessibility_last_change_size() const { return m_last_accessibility_change_size; }
     Utf16String dump_layout_tree(GC::Ref<DOM::Node>);
     Utf16String dump_stacking_context_tree();
     Utf16String stacking_context_structure_verification_report();
@@ -247,6 +260,7 @@ public:
     void reload_bypassing_cache_through_ui_process();
     void traverse_history_through_ui_process(i32 delta);
     GC::Ref<WebIDL::Promise> flush_session_history_traversal_queue();
+    void exhaust_navigation_rate_limit();
     bool html_parser_body_is_exhausted(DOM::Document&);
     bool has_html_parser_end_state(DOM::Document& document) { return document.has_html_parser_end_state(); }
 
@@ -270,6 +284,10 @@ public:
     GC::Ref<WebIDL::Promise> request_permission(Utf16String const& name);
     GC::Ref<WebIDL::Promise> set_permission(Utf16String const& name, Utf16String const& state);
     void set_next_permission_prompt_outcome(Utf16String const& name, Utf16String const& outcome, bool held);
+    void set_system_microphone_authorization(Utf16String const& authorization, Utf16String const& answer, bool held);
+    void release_system_microphone_answer();
+    Utf16String microphone_state();
+    bool audio_capture_is_pending();
     void release_held_permission_prompt(WebIDL::UnsignedLong waiters);
     GC::Ref<WebIDL::Promise> advance_permission_clock(WebIDL::UnsignedLongLong milliseconds);
     Vector<String> permission_cache_origins();
@@ -292,11 +310,16 @@ public:
     Utf16String last_frame_presented_by(DOM::Document&);
     void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
     void inject_clock_tick_scrolling_element(double frame_time_ms, DOM::Element& scroller, double x, double y);
-    void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id);
+    void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id, u32 buttons);
+    void inject_hover_pointer_left(double frame_time_ms);
+    void note_animated_content_moved_under_pointer(double frame_time_ms);
+    void inject_pointer_rests_on_moving_content(double frame_time_ms);
     u64 queue_mouse_move(double x, double y, u32 buttons);
     void move_hover_pointer(double x, double y, Optional<u64> input_event_id);
     Utf16String clock_lane_state(DOM::Document&);
     bool clock_lane_is_coming(DOM::Document&);
+    Utf16String presented_selection();
+    Utf16String painted_selection();
     GC::Ptr<Geometry::DOMRect> presented_border_box(DOM::Element&);
     Optional<u32> presented_compositor_animation_count(DOM::Element&);
     Optional<double> presented_opacity(DOM::Element&);
@@ -318,10 +341,8 @@ public:
     GC::Ref<JS::Object> style_memory_report();
     u64 style_memory_of_frames();
     u64 style_record_identity(DOM::Element&);
+    u64 custom_property_environment_identity(DOM::Element&);
     u64 layout_style_record_identity(DOM::Element&);
-    u64 before_style_record_identity(DOM::Element&);
-    u64 before_layout_style_record_identity(DOM::Element&);
-    u64 paint_style_record_identity(DOM::Element&);
     u64 layout_node_identity(DOM::Node&);
     u64 layout_arena_live_slot_count();
     void panic_render_state_for_testing();
@@ -350,6 +371,7 @@ public:
     bool media_element_is_playing_audio(HTML::HTMLMediaElement&);
     bool document_is_playing_audio(DOM::Document&);
     bool tab_is_playing_audio();
+    bool tab_is_heard_playing_audio();
     WebIDL::UnsignedLongLong tab_audibility_change_count();
     bool media_element_video_sink_is_ticking(HTML::HTMLMediaElement&);
     void set_media_element_ready_state(HTML::HTMLMediaElement&, u16 ready_state);
@@ -377,6 +399,10 @@ private:
     Vector<GC::Ref<InternalGamepad>> m_gamepads;
     Optional<HTML::DevToolsObjectTable> m_devtools_object_table;
     HTML::DevToolsLoggedObjects m_devtools_logged_objects;
+    // The accessibility tree as accessibility_change_tracking_mismatches() last left it, built up from changes alone.
+    DOM::AccessibilityChangeTracker m_accessibility_change_tracker;
+    HashMap<i64, WebView::AccessibilityNodeData> m_accessibility_tracked_tree;
+    String m_last_accessibility_change_size;
 };
 
 }

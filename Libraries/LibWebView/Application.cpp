@@ -61,8 +61,10 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/NoOpMicrophoneAuthorizer.h>
 #include <LibWebView/NoOpNotificationBackend.h>
 #include <LibWebView/PermissionManager.h>
+#include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/PictureInPictureWindow.h>
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/RequestServerManager.h>
@@ -71,6 +73,7 @@
 #include <LibWebView/SpellChecker.h>
 #include <LibWebView/StorageAreaRegistry.h>
 #include <LibWebView/TabPerformanceMonitor.h>
+#include <LibWebView/Translator.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/Utilities.h>
@@ -279,6 +282,8 @@ Application::~Application()
     }
 
     m_spare_web_content_process = nullptr;
+
+    PictureInPictureManager::the().destroy_all_windows();
 
     // Connection die() handlers use the process manager, so destroy the processes while it is still reachable.
     if (m_process_manager)
@@ -961,7 +966,7 @@ void Application::start_next_content_blocker_list_update()
     timeout->start();
 
     m_content_blocker_list_update_request->set_unbuffered_request_callbacks(
-        [this](NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+        [this](NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Requests::CacheState) {
             if (m_content_blocker_list_update_cancelled)
                 return;
             if (response_code.has_value() && Web::Fetch::Infrastructure::is_redirect_status(*response_code)) {
@@ -2341,6 +2346,11 @@ Core::EventLoop& Application::create_platform_event_loop()
     return Core::EventLoop::initialize_for_current_thread();
 }
 
+NonnullOwnPtr<MicrophoneAuthorizer> Application::create_microphone_authorizer()
+{
+    return make<NoOpMicrophoneAuthorizer>();
+}
+
 ChildIdentity Application::add_child_process(WebView::Process&& process)
 {
     return m_process_manager->add_process(move(process));
@@ -2990,6 +3000,7 @@ void Application::initialize_actions()
     m_debug_menu->add_action(*m_show_caret_hit_test_debug_overlay_action);
     m_debug_menu->add_separator();
 
+    m_debug_menu->add_action(Action::create("Report Leaked Documents"sv, ActionID::ReportLeakedDocuments, debug_request("report-leaked-documents"sv)));
     m_debug_menu->add_action(Action::create("Collect Garbage"sv, ActionID::CollectGarbage, debug_request("collect-garbage"sv)));
     m_debug_menu->add_action(Action::create("Crash Current Page"sv, ActionID::CrashCurrentPage, debug_request("crash-current-page"sv)));
     m_debug_menu->add_action(Action::create("Crash Compositor Process"sv, ActionID::CrashCompositorProcess, [this]() { crash_compositor_process(); }));
@@ -3382,6 +3393,18 @@ void Application::toggle_bookmark_for_view(ViewImplementation& view)
 void Application::set_spell_checker(OwnPtr<SpellChecker> spell_checker)
 {
     m_spell_checker = move(spell_checker);
+}
+
+void Application::set_translator(OwnPtr<Translator> translator)
+{
+    m_translator = move(translator);
+}
+
+MicrophoneAuthorizer& Application::microphone_authorizer()
+{
+    if (!m_microphone_authorizer)
+        m_microphone_authorizer = create_microphone_authorizer();
+    return *m_microphone_authorizer;
 }
 
 ErrorOr<NonnullRawPtr<Core::GeolocationProvider>> Application::ensure_geolocation_provider()

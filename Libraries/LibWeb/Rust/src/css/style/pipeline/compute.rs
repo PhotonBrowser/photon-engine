@@ -6,6 +6,7 @@
 
 //! The engine's computation of one element's style from the winners its cascade decided.
 
+use super::super::process_style::{InitialGroupsInputs, SharedInitialGroups};
 use super::super::publication::pseudo_kind;
 use super::super::*;
 use super::cascade::Winner;
@@ -128,6 +129,18 @@ impl RetainedState {
         &self,
         root: StyleNodeID,
     ) -> Result<ComputedInitialStyle, Option<Box<font_resolution::FontRequest>>> {
+        let inputs = InitialGroupsInputs::of(&self.document_style_computation_inputs);
+        match self.process_style.initial_groups_of(&inputs) {
+            Some(shared) => self.initial_style_over(root, &shared),
+            None => self.initial_style_driven(root),
+        }
+    }
+
+    /// The initial values computed from nothing: every longhand is driven and every group built.
+    fn initial_style_driven(
+        &self,
+        root: StyleNodeID,
+    ) -> Result<ComputedInitialStyle, Option<Box<font_resolution::FontRequest>>> {
         let subject = DriveSubject {
             target: computed::ComputedStyleTarget::new(root, u8::MAX),
             parent: None,
@@ -138,16 +151,15 @@ impl RetainedState {
         let mut font_scratch = drive::FontDriveScratch::default();
         // The initial values compute from nothing: from the default groups, which hold no values.
         crate::css::computed_values::with_default_seed(&self.process_style.default_groups, |seed| {
-            let writer = GroupValuesWriter::seeded_for_child(
+            let mut writer = GroupValuesWriter::seeded_for_child(
                 seed,
                 seed,
                 std::iter::empty(),
                 crate::css::computed_longhand_table::LonghandTableFlags::empty(),
                 0,
             );
-            match self.engine_full_drive(subject, writer, &store, &inputs, &mut font_scratch) {
+            match self.engine_full_drive(subject, &mut writer, &store, &inputs, &mut font_scratch) {
                 Ok(drive::DrivenValues {
-                    writer,
                     length,
                     font: Some(font),
                 }) => {
@@ -178,14 +190,17 @@ impl RetainedState {
                     }
                     // The initial groups hold the initial values, each group in its own allocation.
                     // SAFETY: Each payload is a live payload of its group, whose reference the style takes.
-                    unsafe { values.put_into(&mut payloads) };
+                    unsafe { values.put_into(&mut payloads, 0) };
                     let initial_font = super::traversal::InitialFont {
                         first_available_font: font.first_available_font as usize,
                         font_cascade_list: font.font_cascade_list as usize,
                     };
+                    let value_facts = values.facts().clone();
                     Ok(ComputedInitialStyle {
                         payloads,
-                        value_facts: values.into_facts(),
+                        value_groups: Some(values.into_groups()),
+                        shared: None,
+                        value_facts,
                         flags,
                         dependency_flags,
                         color: color_inputs.1,
@@ -198,6 +213,136 @@ impl RetainedState {
                 _ => Err(None),
             }
         })
+    }
+
+    /// The initial values another document computed from what this one computes them from, which
+    /// `shared` holds: only the font group holds anything of this document, its fonts.
+    fn initial_style_over(
+        &self,
+        root: StyleNodeID,
+        shared: &Arc<SharedInitialGroups>,
+    ) -> Result<ComputedInitialStyle, Option<Box<font_resolution::FontRequest>>> {
+        use crate::css::computed_values::StyleGroupIndex;
+        use crate::css::table_group_builder::group_index;
+        let subject = DriveSubject {
+            target: computed::ComputedStyleTarget::new(root, u8::MAX),
+            parent: None,
+            facts: 0,
+        };
+        let store = WinnerStore::new(Vec::new());
+        let inputs = self.document_style_computation_inputs;
+        let mut font_scratch = drive::FontDriveScratch::default();
+        let held = shared.values();
+        let seed = crate::css::computed_values::GroupSeed::new(shared.seed_groups(), &held.value_facts);
+        let mut writer = GroupValuesWriter::seeded_for_child(
+            seed,
+            seed,
+            std::iter::empty(),
+            held.flags.clone(),
+            held.dependency_flags,
+        );
+        let selected = [0_u64; crate::css::property_metadata::LONGHAND_WORD_COUNT];
+        let driven = self.engine_drive_with(
+            self,
+            subject,
+            &mut writer,
+            Some(&selected),
+            &store,
+            &inputs,
+            &mut font_scratch,
+        );
+        let (length, font) = match driven {
+            Ok(drive::DrivenValues {
+                length,
+                font: Some(font),
+            }) => (length, font),
+            Err(Unanswered::Suspended(Suspension::Font)) => {
+                return Err(Some(Box::new(font_scratch.take_suspended_request())));
+            }
+            _ => return Err(None),
+        };
+        let (values, _, _) = writer.finish(&[seed]);
+        let source = crate::css::table_group_builder::LonghandSource::Values {
+            values: &values,
+            reads: None,
+        };
+        let color_inputs = crate::css::table_group_builder::assembly_color_inputs_from_source(&source, &length);
+        let mut payloads = std::array::from_fn(|group| match group == group_index::FONT {
+            // SAFETY: The values are those of an element with no parent.
+            true => unsafe {
+                crate::css::table_group_builder::assemble_group_from_source(
+                    &source,
+                    group_index::FONT,
+                    Some(&font),
+                    crate::css::computed_values::GroupShares::new(
+                        &self.process_style.default_groups,
+                        group_index::FONT,
+                        None,
+                    ),
+                    color_inputs,
+                    &length,
+                )
+            },
+            false => shared
+                .groups()
+                .group(StyleGroupIndex::new(group))
+                .held()
+                .into_retained(),
+        });
+        // SAFETY: Each payload is a live payload of its group, whose reference the style takes, and the groups
+        //         but the font group hold the values already.
+        unsafe { values.put_into(&mut payloads, !(1 << group_index::FONT)) };
+        let initial_font = super::traversal::InitialFont {
+            first_available_font: font.first_available_font as usize,
+            font_cascade_list: font.font_cascade_list as usize,
+        };
+        let computed = ComputedInitialStyle {
+            payloads,
+            value_groups: None,
+            value_facts: held.value_facts.clone(),
+            flags: held.flags.clone(),
+            dependency_flags: held.dependency_flags,
+            color: held.color,
+            font: initial_font,
+            shared: None,
+        };
+        if self.process_style.verifies_reads {
+            self.verify_initial_style_over(root, shared, &computed, color_inputs.1);
+        }
+        Ok(ComputedInitialStyle {
+            shared: Some(Arc::clone(shared)),
+            ..computed
+        })
+    }
+
+    /// Check that driving every longhand computes what the shared groups hold for this document.
+    fn verify_initial_style_over(
+        &self,
+        root: StyleNodeID,
+        shared: &SharedInitialGroups,
+        computed: &ComputedInitialStyle,
+        color: u32,
+    ) {
+        let Ok(driven) = self.initial_style_driven(root) else {
+            return;
+        };
+        // SAFETY: The groups take over the references the drive made.
+        let groups = unsafe {
+            crate::css::computed_values::StyleGroups::adopt(
+                driven.payloads,
+                crate::css::computed_value_types::StyleBits::INITIAL,
+            )
+        };
+        assert!(
+            shared.hold_the_same_as(&groups)
+                && driven.flags == computed.flags
+                && driven.dependency_flags == computed.dependency_flags
+                && driven.color == color
+                && driven.color == computed.color
+                && driven.value_facts.publication_equals(&computed.value_facts)
+                && driven.font == computed.font,
+            "a document's initial values are those of the documents it shares initial groups with"
+        );
     }
 
     /// The engine: compute the record of `node` from the cascade winners it decided, against the
@@ -251,7 +396,7 @@ impl RetainedState {
         custom_properties: super::custom_properties::CustomPropertyStores<'_>,
         group_cache: &mut GroupCache,
         absolutized: &mut crate::css::style_compute::AbsolutizedValues,
-        target_pseudo_kind: u8,
+        target_pseudo_element: super::PseudoElementTarget,
         root_font: Option<RootFontInputs>,
         group_seeds: GroupSeeds<'_>,
     ) -> Drive<ComputedElement> {
@@ -278,6 +423,7 @@ impl RetainedState {
         };
         let parent_longhands = parent_view.as_ref().map(computed::StyleRecordView::longhands);
         let parent_overlay = parent_view.as_ref().and_then(|view| view.animated_overlay);
+        let target_pseudo_kind = target_pseudo_element.kind;
         // A pseudo-element's computation reads only the facts about its element's markup language.
         let is_pseudo_element = target_pseudo_kind != u8::MAX;
         let declared_only = cascade.declared_only();
@@ -300,297 +446,151 @@ impl RetainedState {
             }
             .map(|declarations| (kind, declarations))
         });
+        let parent_values = ParentValues {
+            longhands: parent_longhands,
+            overlay: parent_overlay,
+        };
+        let parent_value = |property: u16| parent_values.value(property);
+        let defaulting = WinnerDefaulting {
+            parent: parent_values,
+            winners,
+            initial,
+        };
         // The written values of the declarations live for the pass, so only substituted and
         // defaulted ones are held here.
-        let mut easy: smallvec::SmallVec<[DirectWinner<'_>; 24]> = smallvec::SmallVec::new();
-        let mut hard: smallvec::SmallVec<[u16; 24]> = smallvec::SmallVec::new();
-        // The font longhands that compute natively, where the element resolves its font without
-        // a drive.
-        let mut native_font: smallvec::SmallVec<[(u16, std::borrow::Cow<'_, RetainedStyleValueData>); 8]> =
-            smallvec::SmallVec::new();
-        // The winners computing directly, with whether each takes the value its parent computed.
-        let mut direct_inheritance: smallvec::SmallVec<[(u16, bool); 24]> = smallvec::SmallVec::new();
-        // What each winner substituted to, where its value waited on substitution.
-        let mut substituted: smallvec::SmallVec<[Option<RetainedStyleValueData>; 24]> = smallvec::SmallVec::new();
-        // The winners that decide anything, with what each substituted to where its value waited
-        // on substitution.
-        let mut deciding: smallvec::SmallVec<[Winner; 24]> = smallvec::SmallVec::new();
-        // Whether a winner computes against the element itself rather than only its context.
-        let mut element_dependent = false;
-        // The style groups of the properties that do not inherit whose value the winners take from the
-        // parent.
-        let mut parent_reset_groups = 0u32;
-        // Whether a winner computes against the element's place among its siblings.
-        let mut reads_sibling_position = false;
-        // How much of the root element's font a winner resolves lengths against.
-        let mut reads_root_font = RootFontReads::None;
-        // Whether a winner resolves a length against a metric of a first available font.
-        let mut reads_font_metric_lengths = false;
-        // What the winners compute from of the document's environment.
-        let mut environment_reads = StyleEnvironment::default();
-        // What the winners' substitutions read beyond the element's custom properties.
-        let mut substitution_reads = 0;
-        // The custom properties the winners substitute, and whether one may read others.
-        let mut custom_property_reads = Vec::new();
-        let mut reads_unnamed_custom_properties = false;
-        // A parent's computed value: its record's, or its table's with the animated value it hands
-        // down where its animations compose.
-        let parent_value = |property: u16| {
-            let parent_longhands = parent_longhands?;
-            parent_longhands
-                .overlay_value(parent_overlay, property)
-                .or_else(|| parent_longhands.handle(property))
+        let mut easy = smallvec::SmallVec::new();
+        let mut hard = smallvec::SmallVec::new();
+        let mut native_font = smallvec::SmallVec::new();
+        let mut direct_inheritance = smallvec::SmallVec::new();
+        let mut substituted = smallvec::SmallVec::new();
+        let mut deciding = smallvec::SmallVec::new();
+        let mut keyword_aliases = smallvec::SmallVec::new();
+        let mut reads = ElementWinnerReads::default();
+        let mut decided = DecidedWinners {
+            easy: &mut easy,
+            hard: &mut hard,
+            native_font: &mut native_font,
+            direct_inheritance: &mut direct_inheritance,
+            substituted: &mut substituted,
+            deciding: &mut deciding,
+            keyword_aliases: &mut keyword_aliases,
+            reads: &mut reads,
         };
-        // https://drafts.csswg.org/css-logical/#box
-        // A logical alias computes as its physical counterpart for the element's writing mode and
-        // direction, which an element declaring neither has from its parent.
-        let parent_flow =
-            match winners
-                .iter()
-                .any(|winner| winner.property == prop::WRITING_MODE || winner.property == prop::DIRECTION)
-            {
-                true => None,
-                false => parent_value(prop::WRITING_MODE).zip(parent_value(prop::DIRECTION)).map(
-                    |(writing_mode, direction)| {
-                        crate::css::style_compute::writing_mode_and_direction_of(Some(writing_mode), Some(direction))
-                    },
-                ),
+        // A winner that needs nothing but its value absolutized against the element's context, with
+        // what it computes against known from how it was written, is applied as it is. An element
+        // whose every winner is one takes no drive, whatever it declares.
+        let takes_no_drive = parent_view.is_some()
+            && !pseudo_kind::is_highlight(target_pseudo_kind)
+            && parent_longhands.is_some_and(|longhands| longhands.effective_zoom() == 1.0);
+        let mut plain_dependencies = takes_no_drive.then_some(0_u32);
+        let mut plain_block = None;
+        for &Winner {
+            property,
+            source,
+            index,
+            ..
+        } in winners
+        {
+            let Some(dependencies) = plain_dependencies else {
+                break;
             };
-        // The logical aliases declared with a CSS-wide keyword that compute directly, with the
-        // physical longhand each computes as and whether it takes the parent's value.
-        let mut keyword_aliases: smallvec::SmallVec<[(u16, u16, bool); 8]> = smallvec::SmallVec::new();
-        // Each winner's classification, with the declaration it decides with and, where it rolled
-        // back below a revert, the place of that declaration and of the revert.
-        let mut resolved: smallvec::SmallVec<[(_, _, Option<RolledBack>); 24]> = smallvec::SmallVec::new();
-        let mut rolled_below = false;
-        for (position, &winner) in winners.iter().enumerate() {
-            // https://drafts.csswg.org/css-cascade-5/#default
-            // `revert` and `revert-layer`, declared or substituted, roll the property back below
-            // the declaration that held them, to a lower declaration that is substituted in turn.
-            // The declarations it rolled back, with the keyword of each.
-            let mut reverted: smallvec::SmallVec<[(CascadePriority, CascadeOperator); 2]> = smallvec::SmallVec::new();
-            let (mut priority, mut winner) = (None, winner);
-            let classified = loop {
-                let Winner {
-                    property,
-                    important,
+            // NB: A block's winners come one after another.
+            if plain_block.is_none_or(|(held, _)| held != source) {
+                plain_block = Some((
                     source,
-                    index,
-                } = winner;
-                let mut classified =
-                    self.classify_winner(&element_declarations, custom_properties, property, source, index);
-                // A declaration that rolls back still decides where it does.
-                custom_property_reads.append(&mut classified.reads.custom_properties);
-                reads_unnamed_custom_properties |= classified.reads.unnamed_custom_properties;
-                let operator = match &classified.value {
-                    ResolvedWinnerValue::Substituted(value) => value
-                        .optional_data()
-                        .map(crate::css::declaration_block::declaration_operator),
-                    _ => classified.reads.css_wide_keyword,
-                };
-                let Some(operator @ (CascadeOperator::Revert | CascadeOperator::RevertLayer)) = operator else {
-                    break Some(classified);
-                };
-                reverted.push((
-                    priority.unwrap_or_else(|| cascade.priority_of(source, important)),
-                    operator,
+                    match source {
+                        WinnerSource::Rule(rule) => {
+                            crate::css::style::element_declarations::ElementDeclarations::of_parts(
+                                self.rules.declared_properties_of(rule),
+                                self.rules.written_values_of(rule),
+                                self.rules.written_value_checks_of(rule),
+                            )
+                        }
+                        WinnerSource::Element(kind) => {
+                            let (_, declarations) = element_declarations
+                                .iter()
+                                .flatten()
+                                .find(|(declarations_kind, _)| *declarations_kind == kind)
+                                .expect("the style engine answers every row");
+                            *declarations
+                        }
+                    },
                 ));
-                // What the property rolls back to is decided by declarations the winners do not name.
-                element_dependent = true;
-                match cascade.winner_below(property, &reverted) {
-                    Some((lower_priority, lower)) => (priority, winner) = (Some(lower_priority), lower),
-                    // Nothing below declares the property, which is undeclared and computes as the
-                    // element's seed holds it.
-                    // https://drafts.csswg.org/css-logical/#box
-                    // A logical or physical counterpart declared before the revert, which the revert
-                    // rolls back past as well, leaves the group's value as if it were not declared
-                    // either: the property computes as `unset` in the place of the revert.
-                    None if !winners[position + 1..].iter().any(
-                        |&Winner {
-                             property: other,
-                             important: other_important,
-                             source: other_source,
-                             ..
-                         }| {
-                            is_logical_counterpart(property, other)
-                                && reverted[0]
-                                    .0
-                                    .reverts_past(reverted[0].1, &cascade.priority_of(other_source, other_important))
-                        },
-                    ) =>
-                    {
-                        break None;
-                    }
-                    None => {
-                        // The revert decides in its own place.
-                        winner = winners[position];
-                        priority = None;
-                        break Some(ClassifiedWinner {
-                            value: ResolvedWinnerValue::Substituted(RetainedStyleValueData::from_owned(
-                                crate::css::style_value::StyleValueData::Keyword {
-                                    keyword: crate::css::style_compute::keyword::UNSET,
-                                },
-                            )),
-                            computation: WinnerComputation::Full,
-                            reads: WinnerReads {
-                                element: true,
-                                parent_reset_value: !crate::css::property_metadata::property_is_inherited(property),
-                                css_wide_keyword: Some(CascadeOperator::Unset),
-                                sibling_position: false,
-                                substitution: 0,
-                                ..WinnerReads::default()
-                            },
-                        });
-                    }
-                }
+            }
+            let (_, block) = plain_block.expect("the block was just taken");
+            let checks = block.checks(index);
+            let declaration = block
+                .declared_property(index)
+                .expect("the style engine answers every row");
+            let written = block.written(index);
+            if !checks.is_plain() || declaration.operator() != CascadeOperator::Declared {
+                plain_dependencies = None;
+                break;
+            }
+            let prepared = checks.dependencies();
+            let value = match checks.is_shorthand() {
+                true => shorthand_longhand_data(property, written.data()).expect("the style engine answers every row"),
+                false => written,
             };
-            let rolled_back = priority.map(|priority| RolledBack {
-                place: (priority, winner.index),
-                revert: (reverted[0].0, winners[position].index),
-                operator: reverted[0].1,
+            decided.easy.push((
+                property,
+                std::borrow::Cow::Borrowed(value),
+                Some(winner_store::unpack_dependencies(prepared)),
+                checks.known_computation(),
+            ));
+            decided.direct_inheritance.push((property, false));
+            decided.reads.environment_reads |= property_environment_reads(property);
+            plain_dependencies = Some(dependencies | (prepared & winner_store::DEPENDENCY_BITS));
+        }
+        if plain_dependencies.is_none() {
+            decided.easy.clear();
+            decided.direct_inheritance.clear();
+            decided.reads.environment_reads = StyleEnvironment::default();
+        }
+        if let Some(dependencies) = plain_dependencies {
+            let dependencies = winner_store::unpack_dependencies(dependencies);
+            decided.reads.reads_root_font = dependencies.root_font_reads;
+            decided.reads.reads_font_metric_lengths = dependencies.font_metric_relative_length;
+            decided.reads.environment_reads |= dependency_environment_reads(dependencies);
+        }
+        let is_plain = plain_dependencies.is_some();
+        // NB: A winner decides as it is classified, in the order of the winners, until one rolls back.
+        let rolls_back = !is_plain
+            && winners.iter().any(|&winner| {
+                let classified = self.classify_winner(
+                    &element_declarations,
+                    custom_properties,
+                    winner.property,
+                    winner.source,
+                    winner.index,
+                );
+                let rolls_back = classified.rolls_back();
+                if !rolls_back {
+                    decided.take(winner, classified, &defaulting);
+                }
+                rolls_back
             });
-            rolled_below |= rolled_back.is_some();
-            resolved.push((winner, classified, rolled_back));
+        if rolls_back {
+            self.decide_rolling_back(
+                &mut decided,
+                winners,
+                cascade,
+                &element_declarations,
+                custom_properties,
+                &defaulting,
+            );
         }
-        // https://drafts.csswg.org/css-logical/#box
-        // Of a logical property and its physical counterpart, the one declared with higher priority
-        // decides both. A property rolled back below a revert decides at the place of the
-        // declaration it rolled back to, unless the revert is above a counterpart that does not
-        // roll back and rolls back past it as well: the group's value is then as if the
-        // counterpart were not declared either, and the property decides at the place of the
-        // revert.
-        if rolled_below {
-            // The longhand of each winner, the place it decides at, and whether it rolled back.
-            type Place = (u16, (CascadePriority, usize), bool);
-            let places: smallvec::SmallVec<[Place; 24]> = resolved
-                .iter()
-                .map(|&(winner, _, ref rolled_back)| match rolled_back {
-                    Some(rolled_back) => (winner.property, rolled_back.place, true),
-                    None => (
-                        winner.property,
-                        (cascade.priority_of(winner.source, winner.important), winner.index),
-                        false,
-                    ),
-                })
-                .collect();
-            let key = |position: usize, rolled_back: &Option<RolledBack>| match rolled_back {
-                Some(rolled_back)
-                    if places.iter().any(|&(property, counterpart, rolled)| {
-                        !rolled
-                            && is_logical_counterpart(places[position].0, property)
-                            && rolled_back.revert > counterpart
-                            && rolled_back.revert.0.reverts_past(rolled_back.operator, &counterpart.0)
-                    }) =>
-                {
-                    rolled_back.revert
-                }
-                _ => places[position].1,
-            };
-            let mut keyed: smallvec::SmallVec<[_; 24]> = resolved
-                .into_iter()
-                .enumerate()
-                .map(|(position, entry)| (key(position, &entry.2), entry))
-                .collect();
-            keyed.sort_by(|(a, _), (b, _)| b.cmp(a));
-            resolved = keyed.into_iter().map(|(_, entry)| entry).collect();
-        }
-        for (winner, classified, _) in resolved {
-            let Some(ClassifiedWinner {
-                value,
-                computation,
-                reads,
-            }) = classified
-            else {
-                continue;
-            };
-            substitution_reads |= reads.substitution;
-            let property = winner.property;
-            element_dependent |= reads.element;
-            if reads.parent_reset_value {
-                parent_reset_groups |= crate::css::property_metadata::property_style_group_index(property)
-                    .map_or(u32::MAX, |group| 1 << group);
-            }
-            reads_sibling_position |= reads.sibling_position;
-            reads_root_font = reads_root_font.max(reads.root_font);
-            reads_font_metric_lengths |= reads.font_metrics;
-            environment_reads |= reads.environment | property_environment_reads(property);
-            let Some(written) = value.value() else {
-                continue;
-            };
-            // https://drafts.csswg.org/css-cascade-5/#defaulting-keywords
-            // A CSS-wide keyword's computed value is the initial value or the parent's computed
-            // value, which computes directly as any computed value does.
-            let mut inherits_keyword = false;
-            let is_logical_alias = table_row_bits(property) & LOGICAL_ALIAS_BIT != 0;
-            // The longhand whose parent's value the winner inherits: a logical alias inherits its
-            // physical counterpart's.
-            let mut inherited_property = property;
-            let keyword_value = reads.css_wide_keyword.and_then(|keyword| {
-                if is_logical_alias {
-                    let (writing_mode, direction) = parent_flow?;
-                    inherited_property = map_logical_alias_to_physical(property, writing_mode, direction);
-                }
-                let inherits = match keyword {
-                    CascadeOperator::Inherit => true,
-                    CascadeOperator::Initial => false,
-                    CascadeOperator::Unset => crate::css::property_metadata::property_is_inherited(property),
-                    _ => return None,
-                };
-                inherits_keyword = inherits;
-                match (inherits, parent_longhands.is_some()) {
-                    (true, true) => parent_value(inherited_property),
-                    // NB: Both longhands of a logical pair take the alias's initial value, where a
-                    //     drive gives each its own.
-                    _ => {
-                        let initial_value = |property| {
-                            Some(initial.longhand(crate::css::computed_values::LonghandID::new(property)))
-                                .filter(|value| !value.pointer().is_null())
-                        };
-                        initial_value(property).filter(|value| initial_value(inherited_property) == Some(*value))
-                    }
-                }
-                .filter(|value| {
-                    value.optional_data().is_some_and(|data| {
-                        crate::css::style_compute::value_computes_directly(property, data, Some(Default::default()))
-                    })
-                })
-                .cloned()
-            });
-            if is_logical_alias {
-                if keyword_value.is_some() {
-                    keyword_aliases.push((property, inherited_property, inherits_keyword));
-                }
-            } else if matches!(computation, WinnerComputation::Direct(_)) || keyword_value.is_some() {
-                direct_inheritance.push((property, keyword_value.is_some() && inherits_keyword));
-            }
-            let font_computes_natively = !is_logical_alias
-                && matches!(computation, WinnerComputation::Full)
-                && reads.css_wide_keyword.is_none()
-                && written
-                    .optional_data()
-                    .is_some_and(|data| crate::css::style_compute::font_value_computes_natively(property, data));
-            match (computation, keyword_value) {
-                (_, Some(value)) => easy.push((property, std::borrow::Cow::Owned(value), Some(Default::default()))),
-                (WinnerComputation::Direct(dependencies), None) => easy.push((
-                    property,
-                    match &value {
-                        ResolvedWinnerValue::Written(written) => std::borrow::Cow::Borrowed(*written),
-                        _ => std::borrow::Cow::Owned(written.clone()),
-                    },
-                    dependencies,
-                )),
-                (WinnerComputation::Full, None) if font_computes_natively => native_font.push((
-                    property,
-                    match &value {
-                        ResolvedWinnerValue::Written(written) => std::borrow::Cow::Borrowed(*written),
-                        _ => std::borrow::Cow::Owned(written.clone()),
-                    },
-                )),
-                (WinnerComputation::Full, None) => hard.push(property),
-            }
-            deciding.push(winner);
-            substituted.push(value.into_substituted());
-        }
+        let ElementWinnerReads {
+            element_dependent,
+            parent_reset_groups,
+            reads_sibling_position,
+            reads_root_font,
+            reads_font_metric_lengths,
+            mut environment_reads,
+            substitution_reads,
+            custom_property_reads,
+            reads_unnamed_custom_properties,
+        } = reads;
         // Both longhands of a logical pair take their value from the one declared with higher
         // priority, so where the alias's physical counterpart is declared as well, the alias's
         // keyword computes directly only where the two inherit alike, and so mark the pair alike.
@@ -604,7 +604,10 @@ impl RetainedState {
             }
             alike
         });
-        let winners = &deciding[..];
+        let winners = match is_plain {
+            true => winners,
+            false => &deciding[..],
+        };
         let mut groups = 0_u32;
         for winner in winners {
             groups |= moved_longhand_groups(winner.property);
@@ -737,35 +740,33 @@ impl RetainedState {
             Some(_) => crate::css::computed_longhand_table::LonghandTableFlags::of_child_seed(&initial.flags),
             None => crate::css::computed_longhand_table::LonghandTableFlags::of_drive_copy(&initial.flags),
         };
-        let mut writer = match (parent_view.as_ref(), seeded_parent) {
-            (None, None) => GroupValuesWriter::seeded_for_child(
-                seeds[0],
-                seeds[1],
-                std::iter::empty(),
-                flags,
-                initial.dependency_flags,
-            ),
+        let overrides_of_seed = match (parent_view.as_ref(), seeded_parent) {
+            (None, None) => Some(Vec::new()),
             (Some(_), Some(seeded)) if parent_longhands.is_some_and(|longhands| longhands.are_of_record(seeded)) => {
-                GroupValuesWriter::seeded_for_child(
-                    seeds[0],
-                    seeds[1],
-                    inherited_overrides(seeded).into_iter(),
-                    flags,
-                    initial.dependency_flags,
-                )
+                Some(inherited_overrides(seeded))
             }
-            _ => {
+            _ => None,
+        };
+        let mut writer = GroupValuesWriter::seeded(
+            seeds[usize::from(overrides_of_seed.is_none())],
+            seeds[1],
+            flags,
+            initial.dependency_flags,
+        );
+        match overrides_of_seed {
+            Some(overrides) => writer.inherit(seeds[1], overrides.into_iter()),
+            None => {
                 let parent_longhands = parent_longhands.expect("the style engine answers every row");
-                let inherited = crate::css::computed_values::GroupValueLayout::inherited_longhands()
-                    .filter_map(|property| Some((property, parent_longhands.handle(property)?.clone())))
-                    .chain(parent_longhands.inherited_overrides(parent_overlay));
-                let mut writer =
-                    GroupValuesWriter::seeded_for_child(seeds[1], seeds[1], inherited, flags, initial.dependency_flags);
+                writer.inherit(
+                    seeds[1],
+                    crate::css::computed_values::GroupValueLayout::inherited_longhands()
+                        .filter_map(|property| Some((property, parent_longhands.handle(property)?.clone())))
+                        .chain(parent_longhands.inherited_overrides(parent_overlay)),
+                );
                 writer.set_effective_zoom(parent_longhands.effective_zoom());
                 writer.set_effective_color_scheme(parent_longhands.effective_color_scheme());
-                writer
             }
-        };
+        }
 
         // The inputs every drive evaluates move their groups only when their values do.
         let seeded_bits = writer.bits();
@@ -780,9 +781,18 @@ impl RetainedState {
             parent.map(|(parent, _)| parent),
         );
         let is_th_element = facts & bridge::element_adjustment_fact::IS_TH != 0;
+        // https://drafts.csswg.org/css-ui/#appearance-disabling-properties
+        // NB: Only an element whose appearance is not none can have a native appearance to disable. Leaving the flag
+        //     clear for every other element keeps their author backgrounds and borders from splitting style groups.
+        let appearance_is_none = |writer: &GroupValuesWriter<'_>| {
+            matches!(
+                writer.get(prop::APPEARANCE).map(RetainedStyleValueData::data),
+                Some(StyleValueData::Keyword { keyword }) if *keyword == crate::css::style_compute::keyword::NONE
+            )
+        };
         // A container-relative length never computes directly, so only a drive resolves one.
         let mut container_units = 0;
-        let (mut writer, length, font, author_disables_native_appearance) = if runs_drive {
+        let (length, font, author_disables_native_appearance) = if runs_drive {
             let store = WinnerStore::new(
                 winners
                     .iter()
@@ -826,7 +836,7 @@ impl RetainedState {
                 return Err(Unanswered::Suspended(Suspension::RandomBaseValues));
             }
             let subject = DriveSubject {
-                target: computed::ComputedStyleTarget::new(node, target_pseudo_kind),
+                target: computed::ComputedStyleTarget::of_pseudo_element(node, target_pseudo_element),
                 parent: parent.map(|(parent, _)| parent),
                 facts,
             };
@@ -834,7 +844,7 @@ impl RetainedState {
             let driven = self.engine_drive_with(
                 records,
                 subject,
-                writer,
+                &mut writer,
                 (!drives_everything).then_some(&selected[..]),
                 &store,
                 &inputs,
@@ -843,11 +853,7 @@ impl RetainedState {
             if matches!(driven, Err(Unanswered::Suspended(Suspension::Font))) {
                 *suspended_font = Some(font_scratch.take_suspended_request());
             }
-            let drive::DrivenValues {
-                mut writer,
-                length,
-                font,
-            } = driven?;
+            let drive::DrivenValues { length, font } = driven?;
             let font = font.expect("the style engine answers every row");
             let scheme = u8::try_from(writer.effective_color_scheme()).ok();
             // A drive of every longhand computed the winners that compute directly too.
@@ -855,7 +861,7 @@ impl RetainedState {
                 && !crate::css::style_compute::compute_declared_values(
                     &mut writer,
                     easy.iter()
-                        .map(|(property, value, dependencies)| (*property, &**value, *dependencies)),
+                        .map(|(property, value, dependencies, known)| (*property, &**value, *dependencies, *known)),
                     &length,
                     scheme,
                     &box_type_input,
@@ -868,9 +874,9 @@ impl RetainedState {
             {
                 unreachable!("the style engine answers every row");
             }
-            let author_disables_native_appearance =
-                crate::css::style_compute::has_author_value_disabling_native_appearance(&store.view(self));
-            (writer, length, Some(font), author_disables_native_appearance)
+            let author_disables_native_appearance = !appearance_is_none(&writer)
+                && crate::css::style_compute::has_author_value_disabling_native_appearance(&store.view(self));
+            (length, Some(font), author_disables_native_appearance)
         } else {
             // https://drafts.csswg.org/css-fonts/#font-size-prop
             // NB: The document element's font resolves against the document's initial font, as in
@@ -925,7 +931,7 @@ impl RetainedState {
             if !crate::css::style_compute::compute_declared_values(
                 &mut writer,
                 easy.iter()
-                    .map(|(property, value, dependencies)| (*property, &**value, *dependencies)),
+                    .map(|(property, value, dependencies, known)| (*property, &**value, *dependencies, *known)),
                 &length,
                 scheme,
                 &box_type_input,
@@ -938,24 +944,18 @@ impl RetainedState {
                 unreachable!("the style engine answers every row");
             }
             // NB: None of these winners reverts, so each is the cascaded value of its property.
-            let author_disables_native_appearance = winners.iter().any(|winner| {
-                crate::css::style_compute::PROPERTIES_DISABLING_NATIVE_APPEARANCE.contains(&winner.property)
-                    && matches!(
-                        cascade.priority_of(winner.source, winner.important).cascade_origin(),
-                        crate::css::cascaded_properties::CascadeOrigin::Author
-                            | crate::css::cascaded_properties::CascadeOrigin::AuthorPresentationalHint
-                    )
-            });
-            (writer, length, font, author_disables_native_appearance)
+            let author_disables_native_appearance = !appearance_is_none(&writer)
+                && winners.iter().any(|winner| {
+                    crate::css::style_compute::property_disables_native_appearance(winner.property)
+                        && matches!(
+                            cascade.priority_of(winner.source, winner.important).cascade_origin(),
+                            crate::css::cascaded_properties::CascadeOrigin::Author
+                                | crate::css::cascaded_properties::CascadeOrigin::AuthorPresentationalHint
+                        )
+                });
+            (length, font, author_disables_native_appearance)
         };
-        // https://drafts.csswg.org/css-ui/#appearance-disabling-properties
-        // NB: Only an element whose appearance is not none can have a native appearance to disable. Leaving the flag
-        //     clear for every other element keeps their author backgrounds and borders from splitting style groups.
-        let appearance_is_none = matches!(
-            writer.get(prop::APPEARANCE).map(RetainedStyleValueData::data),
-            Some(StyleValueData::Keyword { keyword }) if *keyword == crate::css::style_compute::keyword::NONE
-        );
-        writer.set_native_appearance_disabled(!appearance_is_none && author_disables_native_appearance);
+        writer.set_native_appearance_disabled(author_disables_native_appearance);
         let required_moved = crate::css::style_compute::REQUIRED_DRIVER_INPUTS
             .iter()
             .filter(|&&property| writer.moved_from_seed(property, seeded_bits))
@@ -1005,25 +1005,17 @@ impl RetainedState {
             values: &values,
             reads: None,
         };
-        let color_inputs = crate::css::table_group_builder::assembly_color_inputs_from_source(&group_values, &length);
+        let color_inputs = match parent {
+            Some(_) if seeded_parent.is_some() && values.keeps_the_color_of(seeds[0]) => (
+                crate::css::table_group_builder::used_color_scheme_of_source(&group_values),
+                seeds[0].current_color(),
+            ),
+            _ => crate::css::table_group_builder::assembly_color_inputs_from_source(&group_values, &length),
+        };
         let current_color = color_inputs.1;
         // Groups holding colors resolved against `currentcolor` resolve again where the element's
         // color differs from the one their shared payload resolved against.
-        let current_color_groups = computed::ComputedGroupSets::specified_value_dependency_mask_of(
-            values
-                .facts()
-                .inheritance_dependent_values()
-                .filter(|(property, value)| {
-                    !crate::css::table_group_builder::group_holds_current_color_for_its_reader(
-                        *property,
-                        value.optional_data(),
-                    )
-                }),
-            crate::css::style_value::retained_value_depends_on_current_color,
-        )
-            | crate::css::table_group_builder::groups_reading_current_color_through_inherited_values(|property| {
-                values.value(property).optional_data()
-            });
+        let current_color_groups = values.facts().current_color_groups();
         let inherited_groups = (1_u32 << ENGINE_INHERITED_GROUP_COUNT) - 1;
         let parent_color = parent.map_or(initial.color, |(_, color)| color);
         if parent_color != current_color {
@@ -1049,24 +1041,20 @@ impl RetainedState {
         // NB: A group that is not built and whose values are the shared group's own is the parent's
         //     or the initial one, taken without a reference of its own: a record sharing its set
         //     needs none, and one that does not counts it as it makes its own set.
-        let shared_payload = |group: usize| match group < ENGINE_INHERITED_GROUP_COUNT {
-            true => parent_view
-                .as_ref()
-                .map_or(std::ptr::null(), |view| view.payloads[group].as_ptr()),
-            false => initial.payloads[group].as_ptr(),
-        };
-        let borrowed = crate::css::computed_values::BorrowedGroups::of_groups_where(|group| {
-            let shared = shared_payload(group);
-            groups & (1 << group) == 0 && !shared.is_null() && values.hold_the_seed(group, shared)
-        });
+        let parent_payloads = parent_view
+            .as_ref()
+            .map_or([std::ptr::null(); group_index::COUNT], |view| view.payloads.pointers());
+        let initial_payloads = initial.payloads.pointers();
         // The lookups of the groups assembled anew, which the cache takes the groups for once they
         // hold their values.
         let mut assembled: smallvec::SmallVec<[GroupLookup<'_>; 4]> = smallvec::SmallVec::new();
+        let group_inputs = GroupCache::inputs(&values, color_inputs.0, &length);
+        // The groups the cache had, which hold the element's values.
+        let mut found_holding = 0_u32;
         let mut payloads = [std::ptr::null(); group_index::COUNT];
+        let mut borrowed = crate::css::computed_values::BorrowedGroups::default();
         for (group, payload) in payloads.iter_mut().enumerate() {
-            let parent_payload = parent_view
-                .as_ref()
-                .map_or(std::ptr::null(), |view| view.payloads[group].as_ptr());
+            let parent_payload = parent_payloads[group];
             *payload = if groups & (1 << group) != 0 {
                 let key = (group != group_index::FONT && group_cache.worth_looking_for(group)).then(|| {
                     // A group holding plain `currentcolor` for its reader is the same whatever the
@@ -1075,7 +1063,12 @@ impl RetainedState {
                         || crate::css::table_group_builder::GROUPS_HOLDING_CURRENT_COLOR_FOR_THEIR_READER
                             & (1 << group)
                             == 0;
-                    GroupCache::key(&values, group, color_inputs, reads_current_color, &length)
+                    GroupCache::key(
+                        &values,
+                        group,
+                        reads_current_color.then_some(current_color),
+                        &group_inputs,
+                    )
                 });
                 let found = key.as_ref().and_then(|key| group_cache.find(key));
                 if key.is_some() {
@@ -1101,6 +1094,7 @@ impl RetainedState {
                     },
                     Some(payload) => {
                         crate::css::computed_values::retain_group_payload(group, payload);
+                        found_holding |= 1 << group;
                         payload
                     }
                     None => {
@@ -1126,14 +1120,18 @@ impl RetainedState {
             } else {
                 let shared = match group < ENGINE_INHERITED_GROUP_COUNT && !parent_payload.is_null() {
                     true => parent_payload,
-                    false => initial.payloads[group].as_ptr(),
+                    false => initial_payloads[group],
                 };
-                if !borrowed.contains(group) {
-                    crate::css::computed_values::retain_group_payload(group, shared);
+                match values.hold_the_seed(group, shared) && borrowed.note_if_of_a_set(group) {
+                    true => {}
+                    false => crate::css::computed_values::retain_group_payload(group, shared),
                 }
                 shared
             };
         }
+        // SAFETY: Each payload is a live payload of its group holding a reference for the element,
+        //         but the borrowed ones, whose values are the very values the element holds.
+        unsafe { values.put_into(&mut payloads, found_holding) };
         if self.process_style.verifies_reads {
             Self::verify_value_built_groups(
                 &values,
@@ -1142,16 +1140,6 @@ impl RetainedState {
                 color_inputs,
                 &length,
                 &self.process_style.default_groups,
-            );
-        }
-        let before = payloads;
-        // SAFETY: Each payload is a live payload of its group holding a reference for the element,
-        //         but the borrowed ones, whose values are the very values the element holds.
-        unsafe { values.put_into(&mut payloads) };
-        for group in (0..group_index::COUNT).filter(|&group| borrowed.contains(group)) {
-            assert_eq!(
-                payloads[group], before[group],
-                "a borrowed group holds the element's values"
             );
         }
         for lookup in &assembled {
@@ -1266,22 +1254,22 @@ impl RetainedState {
         value
     }
 
-    /// What the engine computes a winner from: its written value, or what that substitutes to where
-    /// it waits on substitution, and, where the value computes directly from a plain declaration
-    /// of a longhand the engine computes directly, the value's external dependencies.
-    #[allow(clippy::too_many_arguments)]
-    fn classify_winner<'a>(
+    /// The declaration at `index` of the block `source` names, with its written value and checks.
+    #[inline]
+    fn declaration_of<'a>(
         &'a self,
         element_declarations: &[Option<(
             ElementDeclarationKind,
             crate::css::style::element_declarations::ElementDeclarations<'a>,
         )>; 3],
-        custom_properties: super::custom_properties::CustomPropertyStores<'_>,
-        property: u16,
         source: WinnerSource,
         index: usize,
-    ) -> ClassifiedWinner<'a> {
-        let (declaration, written, checks) = match source {
+    ) -> (
+        crate::css::declaration_block::DeclarationEntry,
+        &'a RetainedStyleValueData,
+        WrittenValueChecks,
+    ) {
+        match source {
             WinnerSource::Rule(rule) => (
                 *self
                     .rules
@@ -1308,7 +1296,190 @@ impl RetainedState {
                     declarations.checks(index),
                 )
             }
-        };
+        }
+    }
+
+    /// Decides the winners of an element one of which rolls back below a revert, over what was
+    /// decided before that was known.
+    #[cold]
+    #[inline(never)]
+    fn decide_rolling_back<'a>(
+        &'a self,
+        decided: &mut DecidedWinners<'_, 'a>,
+        winners: &[Winner],
+        cascade: &dyn CascadeBelow,
+        element_declarations: &[Option<(
+            ElementDeclarationKind,
+            crate::css::style::element_declarations::ElementDeclarations<'a>,
+        )>; 3],
+        custom_properties: super::custom_properties::CustomPropertyStores<'_>,
+        defaulting: &WinnerDefaulting<'_>,
+    ) {
+        decided.easy.clear();
+        decided.hard.clear();
+        decided.native_font.clear();
+        decided.direct_inheritance.clear();
+        decided.substituted.clear();
+        decided.deciding.clear();
+        decided.keyword_aliases.clear();
+        *decided.reads = ElementWinnerReads::default();
+        // Each winner's classification, with the declaration it decides with and, where it rolled
+        // back below a revert, the place of that declaration and of the revert.
+        let mut resolved: Vec<(_, _, Option<RolledBack>)> = Vec::with_capacity(winners.len());
+        let mut rolled_below = false;
+        for (position, &winner) in winners.iter().enumerate() {
+            // https://drafts.csswg.org/css-cascade-5/#default
+            // `revert` and `revert-layer`, declared or substituted, roll the property back below
+            // the declaration that held them, to a lower declaration that is substituted in turn.
+            // The declarations it rolled back, with the keyword of each.
+            let mut reverted: smallvec::SmallVec<[(CascadePriority, CascadeOperator); 2]> = smallvec::SmallVec::new();
+            let (mut priority, mut winner) = (None, winner);
+            let classified = loop {
+                let Winner {
+                    property,
+                    important,
+                    source,
+                    index,
+                } = winner;
+                let mut classified =
+                    self.classify_winner(element_declarations, custom_properties, property, source, index);
+                // A declaration that rolls back still decides where it does.
+                decided
+                    .reads
+                    .custom_property_reads
+                    .append(&mut classified.reads.custom_properties);
+                decided.reads.reads_unnamed_custom_properties |= classified.reads.unnamed_custom_properties;
+                decided.reads.substitution_reads |= classified.reads.substitution;
+                let Some(operator @ (CascadeOperator::Revert | CascadeOperator::RevertLayer)) =
+                    classified.cascade_operator()
+                else {
+                    break Some(classified);
+                };
+                reverted.push((
+                    priority.unwrap_or_else(|| cascade.priority_of(source, important)),
+                    operator,
+                ));
+                // What the property rolls back to is decided by declarations the winners do not name.
+                decided.reads.element_dependent = true;
+                match cascade.winner_below(property, &reverted) {
+                    Some((lower_priority, lower)) => (priority, winner) = (Some(lower_priority), lower),
+                    // Nothing below declares the property, which is undeclared and computes as the
+                    // element's seed holds it.
+                    // https://drafts.csswg.org/css-logical/#box
+                    // A logical or physical counterpart declared before the revert, which the revert
+                    // rolls back past as well, leaves the group's value as if it were not declared
+                    // either: the property computes as `unset` in the place of the revert.
+                    None if !winners[position + 1..].iter().any(
+                        |&Winner {
+                             property: other,
+                             important: other_important,
+                             source: other_source,
+                             ..
+                         }| {
+                            is_logical_counterpart(property, other)
+                                && reverted[0]
+                                    .0
+                                    .reverts_past(reverted[0].1, &cascade.priority_of(other_source, other_important))
+                        },
+                    ) =>
+                    {
+                        break None;
+                    }
+                    None => {
+                        // The revert decides in its own place.
+                        winner = winners[position];
+                        priority = None;
+                        break Some(ClassifiedWinner {
+                            value: ResolvedWinnerValue::Substituted(RetainedStyleValueData::from_owned(
+                                crate::css::style_value::StyleValueData::Keyword {
+                                    keyword: crate::css::style_compute::keyword::UNSET,
+                                },
+                            )),
+                            computation: WinnerComputation::Full,
+                            reads: WinnerReads {
+                                element: true,
+                                parent_reset_value: !crate::css::property_metadata::property_is_inherited(property),
+                                css_wide_keyword: Some(CascadeOperator::Unset),
+                                sibling_position: false,
+                                substitution: 0,
+                                ..WinnerReads::default()
+                            },
+                        });
+                    }
+                }
+            };
+            let rolled_back = priority.map(|priority| RolledBack {
+                place: (priority, winner.index),
+                revert: (reverted[0].0, winners[position].index),
+                operator: reverted[0].1,
+            });
+            rolled_below |= rolled_back.is_some();
+            resolved.push((winner, classified, rolled_back));
+        }
+        // https://drafts.csswg.org/css-logical/#box
+        // Of a logical property and its physical counterpart, the one declared with higher priority
+        // decides both. A property rolled back below a revert decides at the place of the
+        // declaration it rolled back to, unless the revert is above a counterpart that does not
+        // roll back and rolls back past it as well: the group's value is then as if the
+        // counterpart were not declared either, and the property decides at the place of the
+        // revert.
+        if rolled_below {
+            // The longhand of each winner, the place it decides at, and whether it rolled back.
+            type Place = (u16, (CascadePriority, usize), bool);
+            let places: Vec<Place> = resolved
+                .iter()
+                .map(|&(winner, _, ref rolled_back)| match rolled_back {
+                    Some(rolled_back) => (winner.property, rolled_back.place, true),
+                    None => (
+                        winner.property,
+                        (cascade.priority_of(winner.source, winner.important), winner.index),
+                        false,
+                    ),
+                })
+                .collect();
+            let key = |position: usize, rolled_back: &Option<RolledBack>| match rolled_back {
+                Some(rolled_back)
+                    if places.iter().any(|&(property, counterpart, rolled)| {
+                        !rolled
+                            && is_logical_counterpart(places[position].0, property)
+                            && rolled_back.revert > counterpart
+                            && rolled_back.revert.0.reverts_past(rolled_back.operator, &counterpart.0)
+                    }) =>
+                {
+                    rolled_back.revert
+                }
+                _ => places[position].1,
+            };
+            let mut keyed: Vec<_> = resolved
+                .into_iter()
+                .enumerate()
+                .map(|(position, entry)| (key(position, &entry.2), entry))
+                .collect();
+            keyed.sort_by(|(a, _), (b, _)| b.cmp(a));
+            resolved = keyed.into_iter().map(|(_, entry)| entry).collect();
+        }
+        for (winner, classified, _) in resolved {
+            if let Some(classified) = classified {
+                decided.take(winner, classified, defaulting);
+            }
+        }
+    }
+
+    /// What the engine computes a winner from: its written value, or what that substitutes to where
+    /// it waits on substitution, and, where the value computes directly from a plain declaration
+    /// of a longhand the engine computes directly, the value's external dependencies.
+    fn classify_winner<'a>(
+        &'a self,
+        element_declarations: &[Option<(
+            ElementDeclarationKind,
+            crate::css::style::element_declarations::ElementDeclarations<'a>,
+        )>; 3],
+        custom_properties: super::custom_properties::CustomPropertyStores<'_>,
+        property: u16,
+        source: WinnerSource,
+        index: usize,
+    ) -> ClassifiedWinner<'a> {
+        let (declaration, written, checks) = self.declaration_of(element_declarations, source, index);
         if checks.waits_on_substitution() {
             use crate::css::style_value::StyleValueData;
             let value = match written.data() {
@@ -1508,11 +1679,7 @@ impl RetainedState {
             inputs,
             || self.font_feature_values_scope(node),
         );
-        let Some(resolved) = self
-            .font_resolution
-            .as_ref()
-            .and_then(|resolutions| resolutions.lookup(request))
-        else {
+        let Some(resolved) = self.resolved_font(request) else {
             *suspended_font = Some(font_resolution::FontRequest::new(request));
             return Err(Unanswered::Suspended(Suspension::Font));
         };
@@ -1650,15 +1817,20 @@ pub(in crate::css::style) struct GroupCache {
     hits: [u32; crate::css::table_group_builder::group_index::COUNT],
     misses: [u32; crate::css::table_group_builder::group_index::COUNT],
     lookups: u32,
-    /// The longhands and recorded specified values the groups of the entries read in place of
-    /// computed values, compared by identity, one run per entry, which the keys name by where it
-    /// starts. The entries hold them, as they outlive the pass they came from and no other value
-    /// may take their addresses. Most entries have none.
-    key_values: Vec<(u16, crate::css::style_value::RetainedStyleValueData)>,
+    /// The values of the keys of the entries, one run per entry, which the keys name by where it
+    /// starts: what was written over the values the group read, by where each comes in place order,
+    /// then the longhands and recorded specified values it read in place of computed values,
+    /// compared by identity. The entries hold them, as they outlive the pass they came from and no
+    /// other value may take their addresses.
+    key_values: Vec<(u32, crate::css::style_value::RetainedStyleValueData)>,
     /// The distinct inputs of the entries, which the keys name by index. The elements of a pass
     /// mostly assemble their groups against the same ones.
-    key_inputs: Vec<[u64; 18]>,
+    key_inputs: Vec<GroupInputs>,
 }
+
+/// What an element's groups are built from beside their values, but for the color they resolve
+/// `currentcolor` against, which only some read.
+pub(in crate::css::style) type GroupInputs = [u64; 17];
 
 struct GroupCacheEntry {
     group: usize,
@@ -1671,14 +1843,17 @@ const READ_GROUPS_INLINE: usize = 3;
 
 /// What an entry's payload was assembled from.
 struct GroupKey {
-    /// The values of the groups the group read any of, in group order, which the entry keeps.
-    groups: smallvec::SmallVec<[crate::css::computed_values::HeldGroup; READ_GROUPS_INLINE]>,
-    /// The recorded specified values the group read in place of computed values, as the run of
-    /// the cache's key values starting here and this long.
+    /// The seeds of the groups the group read any of, in group order, which the entry keeps.
+    seeds: smallvec::SmallVec<[crate::css::computed_values::HeldGroup; READ_GROUPS_INLINE]>,
+    /// The run of the cache's key values starting here: this many values written over the values it
+    /// read, then this many recorded specified values it read in place of computed values.
     values_start: u32,
-    values_length: u32,
+    writes_length: u32,
+    read_in_place_length: u32,
     /// The index of the inputs in the cache's key inputs.
     inputs: u32,
+    /// The color the group resolved `currentcolor` against, where it reads one.
+    current_color: u64,
 }
 
 /// What a group's payload is looked for by: the element's values the group reads, which are only
@@ -1687,8 +1862,10 @@ struct GroupLookup<'a> {
     hash: u64,
     group: usize,
     values: &'a crate::css::computed_values::GroupValues<'a>,
-    reads: crate::css::computed_values::GroupReads,
-    inputs: [u64; 18],
+    reads: &'static crate::css::computed_values::GroupReads,
+    read_groups: u32,
+    inputs: &'a GroupInputs,
+    current_color: u64,
 }
 
 impl GroupLookup<'_> {
@@ -1696,20 +1873,27 @@ impl GroupLookup<'_> {
     fn values_read_in_place(
         &self,
     ) -> impl Iterator<Item = (u16, &crate::css::style_value::RetainedStyleValueData)> + '_ {
-        self.values.facts().values_read_in_place(&self.reads)
+        self.values.facts().values_read_in_place(self.reads, self.read_groups)
     }
 
     fn matches(&self, group: usize, key: &GroupKey, cache: &GroupCache) -> bool {
         let start = key.values_start as usize;
+        let read_in_place_start = start + key.writes_length as usize;
         group == self.group
-            && cache.key_inputs[key.inputs as usize] == self.inputs
-            && self.values.holds_read_values(&self.reads, &key.groups)
-            && cache.key_values[start..start + key.values_length as usize]
+            && key.current_color == self.current_color
+            && cache.key_inputs[key.inputs as usize] == *self.inputs
+            && self.values.hold_read_values(
+                self.reads,
+                self.read_groups,
+                &key.seeds,
+                &cache.key_values[start..read_in_place_start],
+            )
+            && cache.key_values[read_in_place_start..read_in_place_start + key.read_in_place_length as usize]
                 .iter()
                 .map(|(property, value)| (*property, value.pointer()))
                 .eq(self
                     .values_read_in_place()
-                    .map(|(property, value)| (property, value.pointer())))
+                    .map(|(property, value)| (u32::from(property), value.pointer())))
     }
 }
 
@@ -1764,14 +1948,13 @@ impl GroupCache {
         self.misses[group] < 32 || self.hits[group] * 4 >= self.misses[group]
     }
 
-    fn key<'a>(
-        values: &'a crate::css::computed_values::GroupValues<'a>,
-        group: usize,
-        (scheme, current_color): (u8, u32),
-        reads_current_color: bool,
+    /// What the groups of an element with `values`, in the color scheme `scheme`, are built from
+    /// beside their values, with their hash: what its lookups have in common.
+    fn inputs(
+        values: &crate::css::computed_values::GroupValues<'_>,
+        scheme: u8,
         length: &crate::css::style_compute::FfiLengthResolutionContext,
-    ) -> GroupLookup<'a> {
-        use crate::css::computed_values::{GroupValueLayout, LonghandID};
+    ) -> (GroupInputs, u64) {
         use std::hash::{Hash, Hasher};
         let metrics = |metrics: &crate::css::style_compute::FfiFontMetrics| {
             [
@@ -1788,11 +1971,6 @@ impl GroupCache {
         let facts = values.facts();
         let inputs = [
             u64::from(scheme),
-            if reads_current_color {
-                u64::from(current_color)
-            } else {
-                0
-            },
             u64::from(facts.display_before_box_type_transformation())
                 | (u64::from(facts.native_appearance_disabled()) << u32::BITS),
             u64::from(facts.effective_zoom().to_bits()),
@@ -1811,30 +1989,40 @@ impl GroupCache {
             i,
             j,
         ];
-        let mut reads = *GroupValueLayout::get().reads_of(group);
-        // A background group's payload for one element is another's with the background color
-        // patched, where the two hold the same values of every other longhand the group reads.
-        // The key of the group leaves the longhand out.
-        if group == crate::css::table_group_builder::group_index::BACKGROUND {
-            let color = GroupValueLayout::get().place(LonghandID::new(
-                crate::css::property_metadata::property_id::BACKGROUND_COLOR,
-            ));
-            reads[color.group()] &= !(1 << color.index());
-        }
+        let mut hasher = crate::fast_hash::fast_hasher();
+        inputs.hash(&mut hasher);
+        (inputs, hasher.finish())
+    }
+
+    fn key<'a>(
+        values: &'a crate::css::computed_values::GroupValues<'a>,
+        group: usize,
+        current_color: Option<u32>,
+        (inputs, inputs_hash): &'a (GroupInputs, u64),
+    ) -> GroupLookup<'a> {
+        use crate::css::computed_values::GroupValueLayout;
+        use std::hash::{Hash, Hasher};
+        let layout = GroupValueLayout::get();
+        let reads = layout.key_reads_of(group);
+        let read_groups = layout.read_groups_of(group);
+        let current_color = current_color.map_or(0, |color| u64::from(color) | (1 << u32::BITS));
         let mut hasher = crate::fast_hash::fast_hasher();
         group.hash(&mut hasher);
-        values.read_hash(&reads, &mut hasher);
-        for (property, value) in facts.values_read_in_place(&reads) {
+        hasher.write_u64(*inputs_hash);
+        hasher.write_u64(current_color);
+        values.read_hash(reads, read_groups, &mut hasher);
+        for (property, value) in values.facts().values_read_in_place(reads, read_groups) {
             hasher.write_u16(property);
             hasher.write_usize(value.pointer() as usize);
         }
-        inputs.hash(&mut hasher);
         GroupLookup {
             hash: hasher.finish(),
             group,
             values,
             reads,
+            read_groups,
             inputs,
+            current_color,
         }
     }
 
@@ -1854,20 +2042,29 @@ impl GroupCache {
         }
         let group = lookup.group;
         crate::css::computed_values::retain_group_payload(group, payload);
-        if self.key_inputs.last() != Some(&lookup.inputs) {
-            self.key_inputs.push(lookup.inputs);
+        if self.key_inputs.last() != Some(lookup.inputs) {
+            self.key_inputs.push(*lookup.inputs);
         }
         let values_start = self.key_values.len();
         self.key_values.extend(
             lookup
+                .values
+                .read_writes(lookup.reads, lookup.read_groups)
+                .map(|(order, value)| (order, value.clone())),
+        );
+        let writes_length = self.key_values.len() - values_start;
+        self.key_values.extend(
+            lookup
                 .values_read_in_place()
-                .map(|(property, value)| (property, value.clone())),
+                .map(|(property, value)| (u32::from(property), value.clone())),
         );
         let key = GroupKey {
-            groups: lookup.values.held_read_groups(&lookup.reads).collect(),
+            seeds: lookup.values.held_read_seeds(lookup.read_groups).collect(),
             values_start: values_start as u32,
-            values_length: (self.key_values.len() - values_start) as u32,
+            writes_length: writes_length as u32,
+            read_in_place_length: (self.key_values.len() - values_start - writes_length) as u32,
             inputs: (self.key_inputs.len() - 1) as u32,
+            current_color: lookup.current_color,
         };
         self.entries
             .entry(lookup.hash)
@@ -1898,6 +2095,7 @@ type DirectWinner<'a> = (
     u16,
     std::borrow::Cow<'a, RetainedStyleValueData>,
     Option<crate::css::style_compute::ExternalValueDependencies>,
+    crate::css::style_compute::KnownComputation,
 );
 
 /// The engine: what an element's group values start from.
@@ -1913,6 +2111,10 @@ pub(in crate::css::style) struct GroupSeeds<'a> {
 /// The initial values as a drive computes them, with a reference to each payload.
 pub(in crate::css::style) struct ComputedInitialStyle {
     pub(in crate::css::style) payloads: [*const std::ffi::c_void; crate::css::table_group_builder::group_index::COUNT],
+    /// The groups of the initial values, with no font in them, where a drive computed them.
+    pub(in crate::css::style) value_groups: Option<crate::css::computed_values::StyleGroups>,
+    /// The groups of the process the values were found in, where they were.
+    pub(in crate::css::style) shared: Option<Arc<SharedInitialGroups>>,
     pub(in crate::css::style) value_facts: crate::css::computed_values::GroupValueFacts,
     pub(in crate::css::style) flags: crate::css::computed_longhand_table::LonghandTableFlags,
     pub(in crate::css::style) dependency_flags: u8,
@@ -1951,6 +2153,235 @@ struct ClassifiedWinner<'a> {
     value: ResolvedWinnerValue<'a>,
     computation: WinnerComputation,
     reads: WinnerReads,
+}
+
+/// What an element's winners come to: which compute directly, with their values, and which need the
+/// drive, and what they read.
+/// NB: The lists are the caller's own locals, of which only the winners' entries are written. A struct
+///     holding their inline room would have the room written whole as it is made.
+struct DecidedWinners<'l, 'a> {
+    easy: &'l mut smallvec::SmallVec<[DirectWinner<'a>; 24]>,
+    hard: &'l mut smallvec::SmallVec<[u16; 24]>,
+    /// The font longhands that compute natively, where the element resolves its font without
+    /// a drive.
+    native_font: &'l mut smallvec::SmallVec<[(u16, std::borrow::Cow<'a, RetainedStyleValueData>); 8]>,
+    /// The winners computing directly, with whether each takes the value its parent computed.
+    direct_inheritance: &'l mut smallvec::SmallVec<[(u16, bool); 24]>,
+    /// What each winner substituted to, where its value waited on substitution.
+    substituted: &'l mut smallvec::SmallVec<[Option<RetainedStyleValueData>; 24]>,
+    /// The winners that decide anything, with what each substituted to where its value waited
+    /// on substitution.
+    deciding: &'l mut smallvec::SmallVec<[Winner; 24]>,
+    /// The logical aliases declared with a CSS-wide keyword that compute directly, with the
+    /// physical longhand each computes as and whether it takes the parent's value.
+    keyword_aliases: &'l mut smallvec::SmallVec<[(u16, u16, bool); 8]>,
+    reads: &'l mut ElementWinnerReads,
+}
+
+/// What an element's winners read.
+#[derive(Default)]
+struct ElementWinnerReads {
+    /// Whether a winner computes against the element itself rather than only its context.
+    element_dependent: bool,
+    /// The style groups of the properties that do not inherit whose value the winners take from the
+    /// parent.
+    parent_reset_groups: u32,
+    /// Whether a winner computes against the element's place among its siblings.
+    reads_sibling_position: bool,
+    /// How much of the root element's font a winner resolves lengths against.
+    reads_root_font: RootFontReads,
+    /// Whether a winner resolves a length against a metric of a first available font.
+    reads_font_metric_lengths: bool,
+    /// What the winners compute from of the document's environment.
+    environment_reads: StyleEnvironment,
+    /// What the winners' substitutions read beyond the element's custom properties.
+    substitution_reads: u8,
+    /// The custom properties the winners substitute, and whether one may read others.
+    custom_property_reads: Vec<std::sync::Arc<[u16]>>,
+    reads_unnamed_custom_properties: bool,
+}
+
+/// What a CSS-wide keyword computes from.
+struct WinnerDefaulting<'a> {
+    parent: ParentValues<'a>,
+    winners: &'a [Winner],
+    initial: &'a super::traversal::InitialStyle,
+}
+
+impl WinnerDefaulting<'_> {
+    /// https://drafts.csswg.org/css-logical/#box
+    /// A logical alias computes as its physical counterpart for the element's writing mode and
+    /// direction, which an element declaring neither has from its parent.
+    fn parent_flow(&self) -> Option<(u8, u8)> {
+        use crate::css::property_metadata::property_id as prop;
+        if self
+            .winners
+            .iter()
+            .any(|winner| winner.property == prop::WRITING_MODE || winner.property == prop::DIRECTION)
+        {
+            return None;
+        }
+        self.parent
+            .value(prop::WRITING_MODE)
+            .zip(self.parent.value(prop::DIRECTION))
+            .map(|(writing_mode, direction)| {
+                crate::css::style_compute::writing_mode_and_direction_of(Some(writing_mode), Some(direction))
+            })
+    }
+}
+
+/// The computed values of an element's parent.
+#[derive(Clone, Copy)]
+struct ParentValues<'a> {
+    longhands: Option<computed::ViewLonghands<'a>>,
+    overlay: Option<&'a crate::css::animated_overlay::AnimatedOverlay>,
+}
+
+impl<'a> ParentValues<'a> {
+    /// A parent's computed value: its record's, or its table's with the animated value it hands
+    /// down where its animations compose.
+    fn value(self, property: u16) -> Option<&'a RetainedStyleValueData> {
+        let longhands = self.longhands?;
+        longhands
+            .overlay_value(self.overlay, property)
+            .or_else(|| longhands.handle(property))
+    }
+}
+
+impl<'a> DecidedWinners<'_, 'a> {
+    /// Takes a winner as it decides, in cascade order, with its classification.
+    #[inline]
+    fn take(&mut self, winner: Winner, classified: ClassifiedWinner<'a>, defaulting: &WinnerDefaulting<'_>) {
+        use crate::css::style_compute::{LOGICAL_ALIAS_BIT, map_logical_alias_to_physical, table_row_bits};
+        let ClassifiedWinner {
+            value,
+            computation,
+            reads,
+        } = classified;
+        let mut custom_properties = reads.custom_properties;
+        self.reads.custom_property_reads.append(&mut custom_properties);
+        self.reads.reads_unnamed_custom_properties |= reads.unnamed_custom_properties;
+        self.reads.substitution_reads |= reads.substitution;
+        let property = winner.property;
+        self.reads.element_dependent |= reads.element;
+        if reads.parent_reset_value {
+            self.reads.parent_reset_groups |= crate::css::property_metadata::property_style_group_index(property)
+                .map_or(u32::MAX, |group| 1 << group);
+        }
+        self.reads.reads_sibling_position |= reads.sibling_position;
+        self.reads.reads_root_font = self.reads.reads_root_font.max(reads.root_font);
+        self.reads.reads_font_metric_lengths |= reads.font_metrics;
+        self.reads.environment_reads |= reads.environment | property_environment_reads(property);
+        let Some(written) = value.value() else {
+            return;
+        };
+        // https://drafts.csswg.org/css-cascade-5/#defaulting-keywords
+        // A CSS-wide keyword's computed value is the initial value or the parent's computed
+        // value, which computes directly as any computed value does.
+        let mut inherits_keyword = false;
+        let is_logical_alias = table_row_bits(property) & LOGICAL_ALIAS_BIT != 0;
+        // The longhand whose parent's value the winner inherits: a logical alias inherits its
+        // physical counterpart's.
+        let mut inherited_property = property;
+        let keyword_value = reads.css_wide_keyword.and_then(|keyword| {
+            if is_logical_alias {
+                let (writing_mode, direction) = defaulting.parent_flow()?;
+                inherited_property = map_logical_alias_to_physical(property, writing_mode, direction);
+            }
+            let inherits = match keyword {
+                CascadeOperator::Inherit => true,
+                CascadeOperator::Initial => false,
+                CascadeOperator::Unset => crate::css::property_metadata::property_is_inherited(property),
+                _ => return None,
+            };
+            inherits_keyword = inherits;
+            match (inherits, defaulting.parent.longhands.is_some()) {
+                (true, true) => defaulting.parent.value(inherited_property),
+                // NB: Both longhands of a logical pair take the alias's initial value, where a
+                //     drive gives each its own.
+                _ => {
+                    let initial_value = |property| {
+                        Some(
+                            defaulting
+                                .initial
+                                .longhand(crate::css::computed_values::LonghandID::new(property)),
+                        )
+                        .filter(|value| !value.pointer().is_null())
+                    };
+                    initial_value(property).filter(|value| initial_value(inherited_property) == Some(*value))
+                }
+            }
+            .filter(|value| {
+                value.optional_data().is_some_and(|data| {
+                    crate::css::style_compute::value_computes_directly(property, data, Some(Default::default()))
+                })
+            })
+            .cloned()
+        });
+        if is_logical_alias {
+            if keyword_value.is_some() {
+                self.keyword_aliases
+                    .push((property, inherited_property, inherits_keyword));
+            }
+        } else if matches!(computation, WinnerComputation::Direct(_)) || keyword_value.is_some() {
+            self.direct_inheritance
+                .push((property, keyword_value.is_some() && inherits_keyword));
+        }
+        let font_computes_natively = !is_logical_alias
+            && matches!(computation, WinnerComputation::Full)
+            && reads.css_wide_keyword.is_none()
+            && written
+                .optional_data()
+                .is_some_and(|data| crate::css::style_compute::font_value_computes_natively(property, data));
+        match (computation, keyword_value) {
+            (_, Some(value)) => self.easy.push((
+                property,
+                std::borrow::Cow::Owned(value),
+                Some(Default::default()),
+                Default::default(),
+            )),
+            (WinnerComputation::Direct(dependencies), None) => self.easy.push((
+                property,
+                match &value {
+                    ResolvedWinnerValue::Written(written) => std::borrow::Cow::Borrowed(*written),
+                    _ => std::borrow::Cow::Owned(written.clone()),
+                },
+                dependencies,
+                Default::default(),
+            )),
+            (WinnerComputation::Full, None) if font_computes_natively => self.native_font.push((
+                property,
+                match &value {
+                    ResolvedWinnerValue::Written(written) => std::borrow::Cow::Borrowed(*written),
+                    _ => std::borrow::Cow::Owned(written.clone()),
+                },
+            )),
+            (WinnerComputation::Full, None) => self.hard.push(property),
+        }
+        self.deciding.push(winner);
+        self.substituted.push(value.into_substituted());
+    }
+}
+
+impl ClassifiedWinner<'_> {
+    /// Whether the winner's value is `revert` or `revert-layer`, declared or substituted, so that
+    /// the winner rolls back below its declaration.
+    #[inline]
+    fn rolls_back(&self) -> bool {
+        matches!(
+            self.cascade_operator(),
+            Some(CascadeOperator::Revert | CascadeOperator::RevertLayer)
+        )
+    }
+
+    fn cascade_operator(&self) -> Option<CascadeOperator> {
+        match &self.value {
+            ResolvedWinnerValue::Substituted(value) => value
+                .optional_data()
+                .map(crate::css::declaration_block::declaration_operator),
+            _ => self.reads.css_wide_keyword,
+        }
+    }
 }
 
 /// How a winner's value computes.
@@ -2035,8 +2466,15 @@ fn environment_reads(
     let Some(value) = value else {
         return StyleEnvironment::default();
     };
-    let dependencies =
-        dependencies.unwrap_or_else(|| crate::css::style_compute::collect_external_value_dependencies(value));
+    dependency_environment_reads(
+        dependencies.unwrap_or_else(|| crate::css::style_compute::collect_external_value_dependencies(value)),
+    )
+}
+
+/// What of the document's environment a value with `dependencies` resolves against.
+fn dependency_environment_reads(
+    dependencies: crate::css::style_compute::ExternalValueDependencies,
+) -> StyleEnvironment {
     let mut reads = StyleEnvironment::default();
     if dependencies.color_scheme_dependent {
         reads |= StyleEnvironment::COLOR_SCHEME;
@@ -2274,6 +2712,16 @@ fn moved_longhand_groups(property: u16) -> u32 {
     }
 }
 
+/// Whether what `property_id` is declared with, where its value computes directly, computes without
+/// a drive and without a logical mapping.
+fn longhand_takes_plain_values(property: u16) -> bool {
+    use crate::css::style_compute::{LOGICAL_ALIAS_BIT, computes_directly, computes_in_font_phases, table_row_bits};
+    computes_directly(property)
+        && !computes_in_font_phases(property)
+        && table_row_bits(property) & LOGICAL_ALIAS_BIT == 0
+        && moved_longhand_groups(property) & (1 << crate::css::table_group_builder::group_index::FONT) == 0
+}
+
 /// The font-phase longhands the font group carries without a group binding of their own.
 fn font_group_carries_longhand(property: u16) -> bool {
     use crate::css::property_metadata::property_id as prop;
@@ -2298,32 +2746,6 @@ fn font_group_carries_longhand(property: u16) -> bool {
         )
 }
 
-/// Whether a value resolves against the element itself: a `random()` it draws, or a
-/// container-relative length its query containers measure.
-fn value_resolves_against_the_element(dependencies: &crate::css::style_compute::ExternalValueDependencies) -> bool {
-    dependencies.uses_random_function
-        || dependencies.has_unfixed_random_sharing
-        || dependencies.container_relative_length_unit_mask != 0
-}
-
-/// Whether a written value computes from the record, the parent and the document's computation
-/// inputs alone: no custom-property substitution, and none of the element or sheet facts the C++
-/// computation gathers per drive.
-fn value_computes_without_document_context(value: &StyleValueData) -> bool {
-    // A longhand a shorthand written with a substitution declares holds a pending substitution
-    // until the shorthand resolves.
-    !matches!(
-        value,
-        StyleValueData::Unresolved { .. } | StyleValueData::PendingSubstitution { .. }
-    ) && crate::css::style_compute::value_is_computationally_independent(value).is_some_and(|_| {
-        let dependencies = crate::css::style_compute::external_value_dependencies(value);
-        !value_resolves_against_the_element(&dependencies)
-            && !dependencies.needs_document_base_url
-            && !dependencies.may_need_style_sheet_resource_context
-            && !dependencies.uses_tree_counting_function
-    })
-}
-
 /// The proof that a record reads no resource context: no value its winners give it resolves a
 /// `url()` against a style sheet's or the document's base URL. The engine keeps only such records
 /// across transactions, so a move of those base URLs, which every `history.pushState()` makes
@@ -2333,9 +2755,8 @@ pub(in crate::css::style) struct ReadsNoResourceContexts(pub(in crate::css::styl
 
 /// Static checks attached to the original declaration spelling at input preparation, in one word:
 /// the external dependencies of the value a longhand computes from, packed the way a winner
-/// memoizes them (bits 0-20 and 31), or zero for a value that waits on substitution; whether the
-/// whole value computes without document context (bit 21); and whether its longhand does (bit 22),
-/// where it does not wait on substitution (bit 23 clear).
+/// memoizes them (bits 0-20 and 31), or zero for a value that waits on substitution (bit 23), and how
+/// the longhand computes from the value (bits 24-27).
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub(in crate::css::style) struct WrittenValueChecks(u32);
@@ -2343,16 +2764,40 @@ pub(in crate::css::style) struct WrittenValueChecks(u32);
 const _: () = assert!(size_of::<WrittenValueChecks>() == 4);
 const _: () = assert!(
     winner_store::DEPENDENCY_BITS
-        & (WrittenValueChecks::WHOLE_CONTEXT_FREE
-            | WrittenValueChecks::LONGHAND_CONTEXT_FREE
-            | WrittenValueChecks::WAITS_ON_SUBSTITUTION)
+        & (WrittenValueChecks::WAITS_ON_SUBSTITUTION
+            | WrittenValueChecks::IS_SHORTHAND
+            | WrittenValueChecks::PLAIN
+            | WrittenValueChecks::COMPUTES_TO_ITSELF
+            | WrittenValueChecks::IS_INITIAL)
         == 0
 );
 
 impl WrittenValueChecks {
-    const WHOLE_CONTEXT_FREE: u32 = 1 << 21;
-    const LONGHAND_CONTEXT_FREE: u32 = 1 << 22;
     const WAITS_ON_SUBSTITUTION: u32 = 1 << 23;
+    const IS_SHORTHAND: u32 = 1 << 24;
+    const PLAIN: u32 = 1 << 25;
+    const COMPUTES_TO_ITSELF: u32 = 1 << 26;
+    const IS_INITIAL: u32 = 1 << 27;
+
+    /// Whether the value is a shorthand declared whole, of which a longhand computes from its part.
+    fn is_shorthand(self) -> bool {
+        self.0 & Self::IS_SHORTHAND != 0
+    }
+
+    /// Whether the longhand computes from this value, written as a declared value, by having it
+    /// absolutized against the element's context, with what it computes against told by these
+    /// checks: no drive, no font resolution and no logical mapping have anything to do with it.
+    fn is_plain(self) -> bool {
+        self.0 & Self::PLAIN != 0
+    }
+
+    /// What is known of how the longhand computes from the value where nothing zooms it.
+    fn known_computation(self) -> crate::css::style_compute::KnownComputation {
+        crate::css::style_compute::KnownComputation {
+            to_itself: self.0 & Self::COMPUTES_TO_ITSELF != 0,
+            is_initial: self.0 & Self::IS_INITIAL != 0,
+        }
+    }
 
     /// The packed external dependencies of the value, when they were prepared.
     pub(in crate::css::style) fn dependencies(self) -> u32 {
@@ -2369,36 +2814,86 @@ impl WrittenValueChecks {
         value: &crate::css::style_value::RetainedStyleValueData,
     ) -> Self {
         use crate::css::style_value::StyleValueData;
-        let whole_context_free = value_computes_without_document_context(value.data());
-        let longhand_context_free = match value.data() {
-            StyleValueData::Unresolved { .. } | StyleValueData::PendingSubstitution { .. } => None,
-            StyleValueData::Shorthand { .. } => Some(
-                shorthand_longhand_value(property, value.data())
-                    .is_some_and(|value| value_computes_without_document_context(value.data())),
+        match value.data() {
+            StyleValueData::Unresolved { .. } | StyleValueData::PendingSubstitution { .. } => {
+                Self(Self::WAITS_ON_SUBSTITUTION)
+            }
+            // The longhand a shorthand declared whole contributes is what a winner computes from.
+            data @ StyleValueData::Shorthand { .. } => Self(
+                Self::IS_SHORTHAND
+                    | shorthand_longhand_value(property, data)
+                        .map_or(0, |part| Self::of_longhand_value(property, &part)),
             ),
-            _ => Some(whole_context_free),
-        };
-        // The longhand a shorthand declared whole contributes is what a winner computes from.
-        let dependencies = match value.data() {
-            StyleValueData::Unresolved { .. } | StyleValueData::PendingSubstitution { .. } => 0,
-            StyleValueData::Shorthand { .. } => shorthand_longhand_value(property, value.data())
-                .filter(|value| !matches!(value.data(), StyleValueData::Unresolved { .. }))
-                .and_then(|value| crate::css::style_compute::try_external_value_dependencies(value.data()))
-                .map_or(0, winner_store::pack_dependencies),
-            data => crate::css::style_compute::try_external_value_dependencies(data)
-                .map_or(0, winner_store::pack_dependencies),
-        };
-        debug_assert_eq!(dependencies & !winner_store::DEPENDENCY_BITS, 0);
-        let mut bits = dependencies;
-        if whole_context_free {
-            bits |= Self::WHOLE_CONTEXT_FREE;
+            _ => Self(Self::of_longhand_value(property, value)),
         }
-        match longhand_context_free {
-            None => bits |= Self::WAITS_ON_SUBSTITUTION,
-            Some(true) => bits |= Self::LONGHAND_CONTEXT_FREE,
-            Some(false) => {}
+    }
+
+    /// The checks of `value` that depend on the value alone: what it computes against, and whether
+    /// it computes to itself. Zero for a value it is not known of.
+    fn of_value(value: &crate::css::style_value::RetainedStyleValueData) -> u32 {
+        use crate::css::style_compute::{
+            try_external_value_dependencies, value_absolutization_is_identity_where_nothing_zooms,
+            value_is_a_plain_scalar,
+        };
+        use crate::css::style_value::StyleValueData;
+        let data = value.data();
+        // NB: Most declared values are scalars, of which nothing need be walked to tell this. It runs for
+        //     each declaration of a style attribute, on the one thread that takes them in.
+        if value_is_a_plain_scalar(data) {
+            return winner_store::pack_dependencies(Default::default()) | Self::COMPUTES_TO_ITSELF;
         }
-        Self(bits)
+        if matches!(data, StyleValueData::Unresolved { .. }) {
+            return 0;
+        }
+        let Some(dependencies) = try_external_value_dependencies(data) else {
+            return 0;
+        };
+        let to_itself = match value_absolutization_is_identity_where_nothing_zooms(data) {
+            true => Self::COMPUTES_TO_ITSELF,
+            false => 0,
+        };
+        winner_store::pack_dependencies(dependencies) | to_itself
+    }
+
+    /// The checks of `value`, which `property` computes from: those of the value alone, then those
+    /// of this longhand declaring it.
+    fn of_longhand_value(property: u16, value: &crate::css::style_value::RetainedStyleValueData) -> u32 {
+        use crate::css::style_compute::{
+            initial_value_data, initial_value_dependencies, table_row_bits, value_computes_directly,
+        };
+        if !(crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID
+            ..=crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID)
+            .contains(&property)
+        {
+            return Self::of_value(value);
+        }
+        let is_initial_value = value.pointer() == initial_value_data(property);
+        // NB: A shorthand mostly leaves longhands at their initial values, whose dependencies are known.
+        let mut bits = match is_initial_value {
+            true => {
+                let to_itself =
+                    crate::css::style_compute::value_absolutization_is_identity_where_nothing_zooms(value.data());
+                winner_store::pack_dependencies(initial_value_dependencies(property))
+                    | (u32::from(to_itself) * Self::COMPUTES_TO_ITSELF)
+            }
+            false => Self::of_value(value),
+        };
+        if bits & winner_store::DEPENDENCIES_COMPUTED == 0 {
+            return bits;
+        }
+        let dependencies = winner_store::unpack_dependencies(bits & winner_store::DEPENDENCY_BITS);
+        if longhand_takes_plain_values(property) && value_computes_directly(property, value.data(), Some(dependencies))
+        {
+            bits |= Self::PLAIN;
+        }
+        if is_initial_value
+            && !crate::css::property_metadata::property_is_inherited(property)
+            && table_row_bits(property) == 0
+            && !dependencies.inheritance_dependent
+        {
+            bits |= Self::IS_INITIAL;
+        }
+        bits
     }
 }
 

@@ -1271,11 +1271,7 @@ handler Mov(
     dispatch_next;
 }
 
-specialize Mov() + Mov() as Mov2;
-specialize Mov() + Mov() + Mov() as Mov3;
 specialize Mov(src: Undefined);
-specialize Mov(src: Undefined) + Mov(src: Undefined) as MovUndefined2;
-specialize Mov(src: Undefined) + Mov(src: Undefined) + Mov(src: Undefined) as MovUndefined3;
 
 specialize Add(lhs: Int32);
 specialize Add(rhs: Int32);
@@ -1515,13 +1511,24 @@ handler ImportCall(
     options: Operand
 ) @cold = call_slow_path(import_call);
 
+handler GetClassFieldInitializerName(
+    dst: out Operand
+) @cold = call_slow_path(get_class_field_initializer_name);
+
+handler GetClassProtoParent(
+    dst: out Operand,
+    super_class: Operand
+) @cold = call_slow_path(get_class_proto_parent);
+
 handler NewClass(
     length: u32,
     dst: out Operand,
     super_class: Optional<Operand>,
+    proto_parent: Optional<Operand>,
     class_environment: Operand,
     class_blueprint_index: u32,
     lhs_name: Optional<IdentifierTableIndex>,
+    computed_name: Optional<Operand>,
     element_keys_count: u32,
     element_keys: Optional<Operand>[]
 ) @cold = call_slow_path(new_class);

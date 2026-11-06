@@ -20,6 +20,7 @@
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Size.h>
 #include <LibIPC/ConnectionFromClient.h>
+#include <LibImageDecoderClient/Client.h>
 #include <LibMedia/VideoPresentation/VideoPresentationClientConnection.h>
 
 namespace Compositor {
@@ -43,6 +44,12 @@ private:
 
     virtual void die() override;
 
+    virtual void connect_to_image_decoder(IPC::TransportHandle) override;
+    virtual void add_animated_image(u64 frame_id, i64 session_id, Gfx::IntSize, Gfx::ColorSpace, Vector<u32> frame_durations_in_milliseconds, u32 loop_count) override;
+    virtual void remove_animated_image(u64 frame_id) override;
+    virtual void start_animated_image(u64 frame_id) override;
+    virtual void stop_animated_image(u64 frame_id) override;
+    virtual Messages::CompositorWebContentServer::AnimatedImageStateForTestingResponse animated_image_state_for_testing(u64 frame_id) override;
     virtual void add_video_sink(Media::VideoSinkHandle, NonnullRefPtr<Compositing::VideoFramePresentationPage>) override;
     virtual void remove_video_sink(Media::VideoSinkHandle) override;
     virtual void release_video_frame_hold(Media::VideoSinkHandle, u64 generation) override;
@@ -102,10 +109,13 @@ private:
     virtual void clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds, Vector<Web::CompositorScrollOffset> const& scroll_offsets) override;
     virtual void pointer_moved(Web::CompositorContextId, Web::DevicePixelPoint, u32 buttons, bool scrolled_since_frame, u64 input_event_id) override;
     virtual void pointer_left(Web::CompositorContextId, u64 input_event_id) override;
+    virtual void pointer_rests_on_moving_content(Web::CompositorContextId) override;
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) override;
+    virtual void animated_content_moved_under_pointer(Web::CompositorContextId, i64 frame_time_nanoseconds) override;
     virtual void overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> const&) override;
     virtual void create_video_edge(Media::VideoSinkHandle) override;
     virtual void release_video_edge(Media::VideoSinkHandle) override;
+    virtual void request_animated_image_frames(AnimatedImage::FrameRequest const&) override;
     virtual void video_sink_presented_frame(Media::VideoSinkHandle, RefPtr<Media::VideoFrame>, Media::DisplayingVideoSinkFrameCounts) override;
     virtual void video_sink_counted_frames(Media::VideoSinkHandle, Media::DisplayingVideoSinkFrameCounts) override;
     virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) override;
@@ -128,6 +138,9 @@ private:
 
     // The presentation client end of this WebContent's video presentation channel (connect-only for now).
     RefPtr<Media::VideoPresentationClientConnection> m_video_presentation_connection;
+    void drop_image_decoder();
+
+    RefPtr<ImageDecoderClient::Client> m_image_decoder;
     RefPtr<RenderClockConnection> m_render_clock_connection;
 };
 

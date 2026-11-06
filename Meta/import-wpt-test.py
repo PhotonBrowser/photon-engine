@@ -28,8 +28,6 @@ download_exclude_list = {
     "/resources/testdriver-vendor.js",
     # Modified to use a relative path, which the importer can't rewrite.
     "/fonts/ahem.css",
-    # Modified to round the results of Math functions that appear in test names, since they differ between platforms.
-    "/css/css-transforms/animation/transform-interpolation-005.html",
 }
 visited_destinations = set()
 
@@ -104,6 +102,11 @@ class LinkedResourceFinder(HTMLParser):
             attr_dict = dict(attrs)
             if "src" in attr_dict:
                 self._resources.add(attr_dict["src"])
+            # An SVG script element names its script with href or xlink:href.
+            if tag == "script":
+                for name in ["href", "xlink:href"]:
+                    if name in attr_dict:
+                        self._resources.add(attr_dict[name])
         if tag == "link":
             attr_dict = dict(attrs)
             if "rel" in attr_dict and attr_dict["rel"] == "stylesheet":

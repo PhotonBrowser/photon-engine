@@ -168,7 +168,7 @@ impl LayoutNodeArena {
         if node_facts::has_flag(data, NodeFlag::IsDocumentElement) {
             return false;
         }
-        if self.saved_abspos_layout_inputs(data).is_none() {
+        if self.saved_abspos_layout_inputs(node).is_none() {
             return false;
         }
 
@@ -436,7 +436,7 @@ impl LayoutNodeArena {
     fn containing_block_the_commit_stands_in(&self, node: NodeSlotId) -> Option<NodeSlotId> {
         let data = self.data(node);
         let committed = if node_facts::node_style_view(data).is_some_and(|style| style.is_absolutely_positioned()) {
-            self.saved_abspos_layout_inputs(data)?.containing_block
+            self.saved_abspos_layout_inputs(node)?.containing_block
         } else {
             self.with_committed_fragment_link(node, |link| link.map(|link| link.containing_block))?
         };
@@ -445,7 +445,7 @@ impl LayoutNodeArena {
 
     pub(crate) fn node_can_replay_saved_abspos_layout_inputs_after_style_change(&self, node: NodeSlotId) -> bool {
         let data = self.data(node);
-        let Some(inputs) = self.saved_abspos_layout_inputs(data) else {
+        let Some(inputs) = self.saved_abspos_layout_inputs(node) else {
             return false;
         };
         if inputs.containing_block.is_invalid() || !self.slot_is_live(inputs.containing_block) {
@@ -463,11 +463,19 @@ impl LayoutNodeArena {
             return false;
         };
         let inset = &style.surround().inset;
-        let uses_static_position =
-            (inset.left.is_auto() && inset.right.is_auto()) || (inset.top.is_auto() && inset.bottom.is_auto());
-        if uses_static_position
-            && (!inputs.static_position_rect.is_known
-                || inputs.static_position_rect.alignment_derives_from_own_computed_values)
+        let inline_uses_static_position = inset.left.is_auto() && inset.right.is_auto();
+        let block_uses_static_position = inset.top.is_auto() && inset.bottom.is_auto();
+        // NB: The saved inputs hold no static position in an axis the box's insets placed it in. Once it falls back to
+        //     its static position there, that has to be computed.
+        let (inline_placed_by_insets, block_placed_by_insets) =
+            inputs.containing_block_info.axes_placed_by_own_insets();
+        if (inline_uses_static_position && inline_placed_by_insets)
+            || (block_uses_static_position && block_placed_by_insets)
+        {
+            return false;
+        }
+        if (inline_uses_static_position || block_uses_static_position)
+            && inputs.static_position_rect.alignment_derives_from_own_computed_values
         {
             return false;
         }
@@ -571,9 +579,6 @@ impl LayoutNodeArena {
             return None;
         }
         // Anchor functions resolve against anchors this path does not look up.
-        let size_contains_anchor_function = |size: &crate::layout::ComputedSize| {
-            size.is_length_percentage() && size.length_percentage().contains_anchor_function()
-        };
         let side_contains_anchor_function = |side: &crate::layout::ComputedLengthPercentageOrAuto| {
             side.length_percentage()
                 .is_some_and(|length_percentage| length_percentage.contains_anchor_function())
@@ -588,7 +593,7 @@ impl LayoutNodeArena {
             style.max_height(),
         ]
         .into_iter()
-        .any(size_contains_anchor_function)
+        .any(crate::layout::ComputedSize::contains_anchor_function)
             || [&surround.inset, &surround.margin].into_iter().any(|sides| {
                 [&sides.top, &sides.right, &sides.bottom, &sides.left]
                     .into_iter()
@@ -639,7 +644,6 @@ impl LayoutNodeArena {
                 inline_alignment: StaticPositionAlignment::Start,
                 block_alignment: StaticPositionAlignment::Start,
                 alignment_derives_from_own_computed_values: false,
-                is_known: false,
             },
             containing_block_info: AbsposContainingBlockInfo {
                 rect: LogicalRect {
@@ -963,7 +967,7 @@ mod tests {
     #[test]
     fn marking_a_node_marks_clean_ancestors_and_drops_their_intrinsic_sizes() {
         let mut arena = LayoutNodeArena::new();
-        let scratch = LayoutScratch::default();
+        let mut scratch = LayoutScratch::default();
         let parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
         arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);
@@ -1000,7 +1004,7 @@ mod tests {
     #[test]
     fn remarking_a_dirty_non_boundary_node_leaves_its_parent_clean_and_drops_their_intrinsic_sizes() {
         let mut arena = LayoutNodeArena::new();
-        let scratch = LayoutScratch::default();
+        let mut scratch = LayoutScratch::default();
         let parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
         arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);

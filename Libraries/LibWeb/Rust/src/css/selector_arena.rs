@@ -373,6 +373,7 @@ enum PseudoElementRareValue {
         /// Ranges into the arena's text ranges.
         classes: PoolRange,
     },
+    Universal,
 }
 
 /// The `@namespace` declarations of the sheet an arena's selectors are of, as process atoms.
@@ -684,6 +685,7 @@ impl SelectorArena {
                         classes: texts(classes),
                     })
                 }
+                PseudoElementRareValue::Universal => PseudoElementValue::Universal,
             },
             identifier_identities: PoolRange::of(&self.atoms, rare.identifier_identities),
         })
@@ -1188,6 +1190,35 @@ impl<'a> Selector<'a> {
         })
     }
 
+    fn target_highlight(self) -> Option<PseudoElementSelector<'a>> {
+        if self.target_pseudo_element() != Some(PseudoElementType::Highlight) {
+            return None;
+        }
+        match self.first_compound().simple_selectors.first()? {
+            SimpleSelector::PseudoElement(selector) => Some(selector),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn targets_custom_highlight(self, name: StyleAtomID) -> bool {
+        let Some(selector) = self.target_highlight() else {
+            return false;
+        };
+        match selector.value {
+            PseudoElementValue::Universal => !name.is_none(),
+            _ => selector.identifier_identities.first() == Some(&name),
+        }
+    }
+
+    #[must_use]
+    pub fn target_highlight_name_text(self) -> Option<&'a [u16]> {
+        match self.target_highlight()?.value {
+            PseudoElementValue::Identifiers(names) => names.iter().next(),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn styles_every_search_text_match(self) -> bool {
         self.target_pseudo_element() == Some(PseudoElementType::SearchText)
@@ -1243,6 +1274,11 @@ impl<'a> Selector<'a> {
                             && argument.name == Some(TransitionNameSelector::Universal)
                             && argument.classes.is_empty()
                         {
+                            Specificity::default()
+                        }
+                        // https://drafts.csswg.org/css-pseudo-4/#selectordef-highlight-highlight-name-selector
+                        // The specificity of a ::highlight() selector with a * argument is zero.
+                        else if matches!(pseudo_element.value, PseudoElementValue::Universal) {
                             Specificity::default()
                         } else {
                             let pseudo_specificity = Specificity {
@@ -1428,6 +1464,7 @@ pub enum PseudoElementValue<'a> {
     CompoundSelector(Selector<'a>),
     Identifiers(TextList<'a>),
     TransitionName(TransitionNameAndClassSelector<'a>),
+    Universal,
 }
 
 // https://drafts.csswg.org/css-view-transitions-1/#typedef-pt-name-selector
@@ -2018,6 +2055,7 @@ impl Builder {
                 let classes = self.push_text_list(argument.classes.iter().map(|class| (class.units(), false)));
                 PseudoElementRareValue::TransitionName { name, classes }
             }
+            tree::PseudoElementValue::Universal => PseudoElementRareValue::Universal,
         };
         let identities_start = index_u32(self.atoms.len());
         for &atom in &pseudo_element.identifier_identities {
@@ -2452,6 +2490,7 @@ fn simple_to_tree(simple: &SimpleSelector<'_>) -> tree::SimpleSelector {
                             classes: argument.classes.iter().map(SelectorString::from).collect(),
                         }))
                     }
+                    PseudoElementValue::Universal => tree::PseudoElementValue::Universal,
                 },
                 identifier_identities: pseudo_element.identifier_identities.into(),
             }))

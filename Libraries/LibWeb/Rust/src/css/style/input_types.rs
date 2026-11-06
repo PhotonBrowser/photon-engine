@@ -21,9 +21,12 @@ use super::pipeline::rule_store::DeclarationBlockID;
 use super::tree::StyleNodeID;
 use super::tree::TreeScopeID;
 
-/// Monotonic identity of one normalized style update published by a document.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct StyleUpdateVersion(pub u64);
+/// The sides of a transaction that its readers compare.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransactionFactSide {
+    Before,
+    After,
+}
 
 // -- Typed semantic inputs -------------------------------------------------------------------
 
@@ -96,7 +99,7 @@ impl ElementDeclarationKind {
 
 /// The tree relations of one style node, as of one side of a mutation.
 ///
-/// This is the minimum old-side information the applicable transpose rules need. It is not a
+/// This is the minimum old-side information invalidation needs. It is not a
 /// traversable old DOM and does not copy unchanged descendant fields: old-side facts exist to
 /// establish a complete impact region, not to reconstruct history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

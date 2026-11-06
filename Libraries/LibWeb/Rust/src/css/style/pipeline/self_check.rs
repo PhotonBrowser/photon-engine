@@ -65,7 +65,7 @@ impl SelfCheckSettings {
 
 /// How many threads the self-check's cold passes on several threads run on.
 fn reference_thread_count() -> u32 {
-    traversal::thread_count().max(4) as u32
+    crate::style_layout_pool::default_thread_count().max(4) as u32
 }
 
 /// The names of the groups, by `group_index`.
@@ -126,6 +126,13 @@ pub(super) fn pseudo_element_name(kind: u8) -> String {
         BACKDROP => "::backdrop".to_owned(),
         MARKER => "::marker".to_owned(),
         kind => format!("pseudo-element {kind}"),
+    }
+}
+
+pub(super) fn pseudo_element_target_name(target: super::PseudoElementTarget) -> String {
+    match target.is_custom_highlight() {
+        true => format!("::highlight() of atom {}", target.highlight_name.0),
+        false => pseudo_element_name(target.kind),
     }
 }
 
@@ -385,6 +392,9 @@ pub(super) fn differences_by_element(
             (Some(_), None) if hidden_in_cold(node) => continue,
             (Some(_), None) => failures.push((node, "live holds a record, cold computed none".to_owned())),
             (None, Some(_)) => failures.push((node, "live holds no record, cold computed one".to_owned())),
+            // NB: No pass samples the animations of an element that is not displayed. A cold pass reads what a read
+            //     below it last sampled, which the record the passes keep does not, and a read samples them again.
+            (Some(live), Some(_)) if !live.is_displayed() && state.element_samples_custom_properties(node) => continue,
             (Some(live), Some(cold)) => {
                 let differences = record_differences(live, cold);
                 if !differences.is_empty() {
@@ -394,27 +404,31 @@ pub(super) fn differences_by_element(
         }
         compared += 1;
         let (live, cold) = (live.pseudo_element_records(node), cold.pseudo_element_records(node));
-        let kinds = |records: &[(u8, Arc<Record>)]| records.iter().map(|(kind, _)| *kind).collect::<Vec<_>>();
-        if kinds(live) != kinds(cold) {
-            let names = |kinds: Vec<u8>| kinds.into_iter().map(pseudo_element_name).collect::<Vec<_>>();
+        let targets = |records: &[(super::PseudoElementTarget, Arc<Record>)]| {
+            records.iter().map(|(target, _)| *target).collect::<Vec<_>>()
+        };
+        if targets(live) != targets(cold) {
+            let names = |targets: Vec<super::PseudoElementTarget>| {
+                targets.into_iter().map(pseudo_element_target_name).collect::<Vec<_>>()
+            };
             failures.push((
                 node,
                 format!(
                     "live holds the pseudo-elements {:?}, cold computed {:?}",
-                    names(kinds(live)),
-                    names(kinds(cold))
+                    names(targets(live)),
+                    names(targets(cold))
                 ),
             ));
             continue;
         }
-        for ((kind, live), (_, cold)) in live.iter().zip(cold) {
+        for ((target, live), (_, cold)) in live.iter().zip(cold) {
             let differences = record_differences(live, cold);
             if !differences.is_empty() {
                 failures.push((
                     node,
                     format!(
                         "{}: live differs from cold in {}",
-                        pseudo_element_name(*kind),
+                        pseudo_element_target_name(*target),
                         differences.join(", ")
                     ),
                 ));
@@ -437,11 +451,11 @@ pub(super) fn installed_differences(
     let mut failures = Vec::new();
     for node in state.projection.style_preorder(root) {
         // NB: The engine keeps the records of the elements below one that stopped being displayed,
-        //     which no pass keeps current and the host installs none of.
-        let hidden = std::iter::successors(state.projection.inheritance_parent(node), |&ancestor| {
-            state.projection.inheritance_parent(ancestor)
-        })
-        .any(|ancestor| live.get(ancestor).is_none_or(|record| !record.is_displayed()));
+        //     which no pass keeps current and the host installs none of. What the host holds for an
+        //     element that is itself not displayed is what a read below it last sampled, and a read
+        //     of it demands its style again.
+        let hidden = std::iter::successors(Some(node), |&ancestor| state.projection.inheritance_parent(ancestor))
+            .any(|ancestor| live.get(ancestor).is_none_or(|record| !record.is_displayed()));
         if hidden {
             continue;
         }
@@ -459,9 +473,9 @@ pub(super) fn installed_differences(
                 ));
             }
         }
-        for (kind, held) in live.pseudo_element_records(node) {
-            let Some(record) = installed
-                .pseudo_style_record(node, *kind)
+        for (target, held) in live.pseudo_element_records(node) {
+            let Some(record) = state
+                .installed_pseudo_style_record(node, *target)
                 .and_then(|record| installed.installed_base_record(record))
             else {
                 continue;
@@ -470,7 +484,7 @@ pub(super) fn installed_differences(
             if !differences.is_empty() {
                 failures.push(format!(
                     "{} of {}: the installed record differs from live in {}",
-                    pseudo_element_name(*kind),
+                    pseudo_element_target_name(*target),
                     describe(node),
                     differences.join(", ")
                 ));
@@ -506,7 +520,7 @@ pub(super) fn reference_pass(
 ) -> Option<ReferencePass> {
     let initial = engine.computed_initial(root)?;
     // NB: A pass on one thread leaves the engine's pool as it is.
-    let pool = (threads > 1).then(|| engine.style_pool(threads)).flatten();
+    let pool = (threads > 1).then(|| engine.style_layout_pool(threads)).flatten();
     let started = Instant::now();
     let index = RuleIndex::build(&engine.retained.rules, engine.retained.process_rule_indexes());
     let index_nanoseconds = started.elapsed().as_nanos() as u64;
@@ -602,6 +616,7 @@ impl StyleEngine {
             }));
         }
         failures.extend(installed_differences(&self.retained, root, &live.records, &describe));
+        failures.extend(live.kept_hidden_differences(&self.retained, &describe));
         failures
     }
 

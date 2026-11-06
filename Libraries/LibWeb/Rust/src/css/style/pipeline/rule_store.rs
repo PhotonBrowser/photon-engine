@@ -293,7 +293,7 @@ impl BlockCascadeData {
     }
 
     /// The checks of each longhand's written value.
-    fn checks(&self) -> &[WrittenValueChecks] {
+    pub(in crate::css::style) fn checks(&self) -> &[WrittenValueChecks] {
         // SAFETY: The allocation holds `length` checks after the header.
         unsafe {
             ak::slice_from_raw_parts(
@@ -306,7 +306,7 @@ impl BlockCascadeData {
         }
     }
 
-    fn heap_bytes(&self) -> usize {
+    pub(in crate::css::style) fn heap_bytes(&self) -> usize {
         Self::layout(self.length as usize).size()
     }
 
@@ -1342,6 +1342,14 @@ impl RuleStore {
     pub(in crate::css::style) fn rule_may_affect_layout_geometry(&self, rule: RuleID) -> bool {
         self.cascade_data_of(rule)
             .is_some_and(|data| data.may_affect_layout_geometry)
+    }
+
+    /// The checks of the values the rule's declarations were written with, parallel to them.
+    pub(in crate::css::style) fn written_value_checks_of(
+        &self,
+        rule: RuleID,
+    ) -> &[super::pipeline::compute::WrittenValueChecks] {
+        self.cascade_data_of(rule).map_or(&[], |data| data.checks())
     }
 
     pub(in crate::css::style) fn written_value_checks(

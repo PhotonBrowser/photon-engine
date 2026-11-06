@@ -13,6 +13,7 @@
 #include <AK/Optional.h>
 #include <AK/Span.h>
 #include <AK/StringView.h>
+#include <AK/TemporaryChange.h>
 #include <AK/Time.h>
 #include <AK/Types.h>
 #include <AK/Utf16FlyString.h>
@@ -40,6 +41,7 @@ using Layout::RustFFI::DocumentHost;
 // test there checks each declaration against its row. An AK Span crosses by value as the table's FfiSpan.
 extern "C" {
 void style_engine_set_highlight_observing_elements(DocumentHost const*, u8 kind, ReadonlySpan<StyleNodeID> nodes);
+void style_engine_set_custom_highlight_observing_elements(DocumentHost const*, ReadonlySpan<StyleNodeID> nodes, ReadonlySpan<StyleAtomID> names);
 void style_engine_set_fold_id_and_class_name_case(DocumentHost const*, bool fold);
 void style_engine_set_html_element_namespace(DocumentHost const*, StyleAtomID namespace_atom);
 void style_engine_mark_relation_only_style_node(DocumentHost const*, StyleNodeID node);
@@ -90,12 +92,13 @@ void style_engine_evaluate_size_containers_needing_evaluation_after_layout(Docum
 void style_engine_set_element_backing_pseudo_kind(DocumentHost const*, StyleNodeID node, u8 pseudo_kind_plus_one);
 void style_engine_set_counter_style_environment_identity(DocumentHost const*, TreeScopeID tree_scope, u64 identity);
 void style_engine_set_held_style_record(DocumentHost const*, StyleNodeID node, void const* record);
-void style_engine_set_held_pseudo_style_record(DocumentHost const*, StyleNodeID node, u8 pseudo_kind, u64 style_record, void const* released);
+void style_engine_set_held_pseudo_style_record(DocumentHost const*, StyleNodeID node, u8 pseudo_kind, StyleAtomID highlight_name, u64 style_record, void const* released);
 void style_engine_set_element_css_defined_animations(DocumentHost const*, StyleNodeID node, u8 slot, ReadonlySpan<FlatPtr> names, ReadonlySpan<FfiAppliedAnimationDefinition> definitions);
 void style_engine_set_tree_scope_root(DocumentHost const*, TreeScopeID tree_scope, StyleNodeID root);
 void style_engine_set_sheet_conditions_hold(DocumentHost const*, SheetID sheet, bool conditions_hold);
 u32 style_engine_connected_element_count(DocumentHost const*, BegunRead const*);
 bool style_engine_self_check_is_enabled(DocumentHost const*);
+bool style_engine_flown_update_awaits_self_check(DocumentHost const*);
 bool style_engine_custom_property_environment_is_engine_made(DocumentHost const*, BegunRead const*, u64 identity);
 bool style_engine_pending_transaction_may_affect_layout_geometry(DocumentHost const*, BegunRead const*);
 void style_engine_defer_pending_transaction_for_geometry_read(DocumentHost const*, BegunRead const*);
@@ -185,20 +188,14 @@ public:
     StyleNodeID mint_style_node();
     void mint_style_nodes(Span<StyleNodeID> nodes);
     void mint_text_style_nodes(Span<StyleNodeID> nodes);
-    void defer_element_initial_features(StyleNodeID style_node)
-    {
-        m_nodes_with_pending_initial_features.set(style_node);
-        m_nodes_awaiting_first_style_computation.set(style_node);
-    }
-    void cancel_deferred_element_initial_features(StyleNodeID style_node)
-    {
-        m_nodes_with_pending_initial_features.remove(style_node);
-        m_nodes_awaiting_first_style_computation.remove(style_node);
-    }
-    [[nodiscard]] bool has_deferred_element_initial_features(StyleNodeID style_node) const { return m_nodes_with_pending_initial_features.contains(style_node); }
+    bool is_taking_in_pending_arrivals() const { return m_taking_in_pending_arrivals; }
+    [[nodiscard]] TemporaryChange<bool> begin_taking_in_pending_arrivals() { return TemporaryChange<bool>(m_taking_in_pending_arrivals, true); }
+    void defer_element_initial_features(DOM::Element&);
+    void note_element_awaiting_first_style_computation(DOM::Element&);
+    void cancel_deferred_element_initial_features(DOM::Element&);
     // Whether any element waits to have its initial features published, or to be prepared for its first style.
     [[nodiscard]] bool has_elements_awaiting_initial_style_work() const { return !m_nodes_with_pending_initial_features.is_empty() || !m_nodes_awaiting_first_style_computation.is_empty(); }
-    HashTable<StyleNodeID> take_deferred_element_initial_features();
+    Vector<StyleNodeID> take_deferred_element_initial_features();
     HashTable<StyleNodeID> take_elements_awaiting_first_style_computation();
 
     void set_element_parts(StyleNodeID node, ReadonlySpan<StyleAtomID> names, ReadonlySpan<StyleNodeID> hosts);
@@ -277,8 +274,13 @@ public:
     {
         return StyleEngineFFI::document_host_local_link_is_known_untested(host());
     }
+    bool validity_is_known_untested() const
+    {
+        return StyleEngineFFI::document_host_validity_is_known_untested(host());
+    }
     // What an element arrives with that the host knows nothing reads is withheld from the engine: whether a link is a
-    // local link where no selector tests `:local-link`, and each attribute no selector and no attr() reads. Each
+    // local link where no selector tests `:local-link`, a control's validity where none tests that, and each attribute
+    // no selector and no attr() reads. Each
     // withheld fact notes the element it was withheld from, so that once something may read it, it is published for
     // those elements alone.
     struct WithheldAttributeName {
@@ -291,27 +293,28 @@ public:
     };
     // NB: An element's identity may have been retired, or taken by another element, by the time a fact withheld from
     //     it is published: what is published is read from whatever element holds the identity then.
-    using WithheldAttributeCarriers = HashMap<WithheldAttributeName, HashTable<StyleNodeID>, WithheldAttributeNameTraits>;
-    void note_local_link_state_withheld(StyleNodeID node) { m_withheld_local_link_states.set(node); }
-    void note_attribute_withheld(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_uri, StyleNodeID node)
+    void note_local_link_state_withheld() { m_local_link_state_is_withheld = true; }
+    void note_validity_state_withheld() { m_validity_state_is_withheld = true; }
+    void note_attribute_withheld(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_uri)
     {
-        m_withheld_attribute_carriers.ensure({ local_name, namespace_uri }).set(node);
+        m_withheld_attribute_names.set({ local_name, namespace_uri });
     }
     // What was withheld that something may read now, which is withheld no longer, with the elements it was withheld
     // from.
     struct WithheldFeaturesNowRead {
-        HashTable<StyleNodeID> local_link_states;
-        WithheldAttributeCarriers attributes;
+        bool local_link_state { false };
+        bool validity_state { false };
+        Vector<WithheldAttributeName> attributes;
     };
     WithheldFeaturesNowRead take_withheld_features_now_read(Layout::BegunRead const&);
 
     // The document host stages deltas, which cross to the engine in one batch per style flush, never one write per
     // element.
     void record_tree_delta(StyleEngineFFI::FfiTreeDelta const&);
-    // Everything an element's selectors test arrives with it, as one row: its custom states, classes, and attributes
-    // as name and value atom pairs, beside the facts the arrival names.
+    // Everything an element's selectors test arrives with it, as one row, and the rows of many elements in one write.
+    // The atoms hold each row's custom states, classes, and attributes as name and value atom pairs in turn.
     void record_element_arrivals(ReadonlySpan<StyleEngineFFI::FfiArrivingElement>);
-    void record_element_arrival(StyleEngineFFI::FfiElementArrival const&, ReadonlySpan<StyleAtomID> custom_states, ReadonlySpan<StyleAtomID> classes, ReadonlySpan<StyleAtomID> attributes);
+    void record_element_arrival_rows(ReadonlySpan<StyleEngineFFI::FfiElementArrivalRow>, ReadonlySpan<u32> atoms);
     void record_local_feature_delta(StyleEngineFFI::FfiLocalFeatureDelta const&);
     void record_state_delta(StyleEngineFFI::FfiStateDelta const&);
     // The hover moves to `target`, or off the document for none, as the events of a mouse move hover it, once the rest
@@ -328,6 +331,8 @@ public:
     // The elements the host shows the highlight pseudo-element of the kind in, which style updates
     // style that pseudo-element of. Those that start or stop showing it are restyled.
     void set_highlight_observing_elements(PseudoElement, ReadonlySpan<StyleNodeID>);
+    // The elements the host shows custom highlights in, with the name of each at the same index in `names`.
+    void set_custom_highlight_observing_elements(ReadonlySpan<StyleNodeID> style_nodes, ReadonlySpan<StyleAtomID> names);
     // What a container query or container-relative length read of the element's containers moved.
     void record_container_query_input_change(StyleNodeID style_node);
     // Records every element whose style a size query or container-relative unit decided against the container.
@@ -456,6 +461,8 @@ private:
 
     Optional<StyleSheetResourceContexts> m_style_sheet_resource_contexts;
     u64 m_style_sheet_resource_contexts_version { 0 };
+    Optional<u64> m_function_rules_checked_generation;
+    bool m_document_has_function_rules { false };
 
     NonnullRefPtr<Layout::RenderDocument> m_render_document;
     u64 m_published_font_environment_generation { 0 };
@@ -466,7 +473,10 @@ private:
     StyleAtomID m_last_language_atom;
     u64 m_last_language_atom_generation { 0 };
 
-    HashTable<StyleNodeID> m_nodes_with_pending_initial_features;
+    // NB: In the order the elements arrived, which is tree order. An element that left since is still listed, and no
+    //     longer holds its mark, DOM::Element::initial_style_features_pending().
+    Vector<StyleNodeID> m_nodes_with_pending_initial_features;
+    bool m_taking_in_pending_arrivals { false };
     HashTable<StyleNodeID> m_nodes_awaiting_first_style_computation;
 
     HashTable<StyleNodeID> m_parents_whose_children_changed_beside_flown_transaction;
@@ -477,8 +487,9 @@ private:
     RelationalArrivalKeys m_relational_arrival_keys;
     Optional<u64> m_waiting_children_checked_against_keys_version;
     bool m_may_have_waiting_children { false };
-    HashTable<StyleNodeID> m_withheld_local_link_states;
-    WithheldAttributeCarriers m_withheld_attribute_carriers;
+    bool m_local_link_state_is_withheld { false };
+    bool m_validity_state_is_withheld { false };
+    HashTable<WithheldAttributeName, WithheldAttributeNameTraits> m_withheld_attribute_names;
     bool m_css_transitions_may_observe_style_changes { false };
     mutable bool m_geometry_read_deferred_transaction { false };
     StyleAtomID m_html_element_namespace;

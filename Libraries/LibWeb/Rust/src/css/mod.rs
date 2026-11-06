@@ -49,6 +49,7 @@ pub(crate) mod namespace_rule;
 pub(crate) mod parser;
 pub mod property_metadata;
 pub(crate) mod property_rule;
+pub(crate) mod resolved_value;
 pub(crate) mod retained_fly_string;
 pub(crate) mod rule;
 pub(crate) mod scope_selectors;
@@ -68,6 +69,7 @@ pub(crate) mod style_value_arc;
 pub mod table_group_builder;
 pub(crate) mod thin_slice;
 pub mod transition;
+pub mod typed_om;
 pub(crate) mod value_codes;
 
 pub(crate) mod dimension_units {

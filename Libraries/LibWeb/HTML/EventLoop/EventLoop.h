@@ -12,6 +12,7 @@
 #include <AK/Noncopyable.h>
 #include <AK/OwnPtr.h>
 #include <AK/Queue.h>
+#include <AK/Time.h>
 #include <LibCore/Forward.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Weak.h>
@@ -30,6 +31,12 @@ enum class FfiFlightBlocker : uint8_t;
 namespace Web::HTML {
 
 class EventLoopTestAccess;
+// Where the event loop follows the pointer at rest: between two tasks, or as a rendering update begins, which brings
+// the style and layout up to date itself.
+enum class HoverUpdatePoint : u8 {
+    BetweenTasks,
+    RenderingUpdateBegins,
+};
 
 // What the render clock's lanes do with a document's running animations.
 enum class ClockAnimations : u8 {
@@ -122,6 +129,7 @@ public:
     };
     bool rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp frame_time, RenderingOpportunitySource);
     bool rendering_task_queued_or_running() const { return m_rendering_task_queued || m_running_rendering_task; }
+    double last_render_opportunity_time() const { return m_last_render_opportunity_time; }
     void queue_task_to_process_input_events();
     bool running_synchronous_rendering_update() const { return m_running_synchronous_rendering_update; }
 
@@ -135,6 +143,7 @@ public:
     u64 task_generation() const { return m_task_generation; }
 
     void schedule();
+    void schedule_for_queued_task();
 
     void perform_a_microtask_checkpoint();
 
@@ -168,6 +177,11 @@ public:
 
     double compute_deadline() const;
 
+    void did_reject_promise_without_handler() { m_has_rejected_promises_to_notify_about = true; }
+
+    void did_run_idle_callback() { m_task_generation_of_last_idle_callback = m_task_generation; }
+    void did_request_idle_callback();
+
     enum class UpdateTheRendering {
         No,
         Yes,
@@ -191,6 +205,9 @@ public:
     void ensure_frame_completion_registered();
     // Whether a frame flies beside the event loop, which has not taken it in yet.
     bool has_frame_in_flight() const;
+    // Notes that the hover of `navigable` may be stale, which the event loop updates between two tasks, or as the next
+    // rendering update begins.
+    void note_hover_may_be_stale(LocalNavigable&);
     // Whether a rendering update has let its frame fly and has not run its steps from its style and layout on yet.
     bool has_rendering_update_in_flight() const { return m_rendering_update_in_flight; }
     // Whether the layout of the rendering update in flight runs, or ran, beside the event loop.
@@ -200,6 +217,8 @@ public:
     // The serial number of the first rendering update that may gather a resize observation of `document` made now. A
     // task beside a rendering update whose style and layout of the document have yet to run comes after the whole of it.
     u64 first_rendering_update_to_gather_resize_observations_of(DOM::Document const&) const;
+    // Whether the rendering task lets the tasks behind it go first, for a document to finish loading.
+    bool rendering_task_yields_to_document_loading() const;
     // A rendering task that would find a rendering update not yet finished keeps its place in the queue until the update
     // has finished, rather than wait for it. One that finds a frame still in flight runs beside it.
     bool holds_rendering_opportunity() const;
@@ -224,9 +243,11 @@ private:
 
     virtual void visit_edges(Visitor&) override;
 
+    [[nodiscard]] bool run_one_turn_of_the_processing_model();
+
     void process_input_events() const;
     void process_input_events_task();
-    Vector<GC::Root<DOM::Document>> take_clock_lanes_and_input_events_in(u64 update_serial);
+    Vector<GC::Root<DOM::Document>> take_clock_lanes_and_input_events_in(Optional<u64> update_serial);
     void update_the_rendering();
     // How the steps after style and layout take the layout of the docs: up to date, or as the update's layout that flew
     // left it, whatever was written since.
@@ -245,6 +266,8 @@ private:
     void note_script_ran_beside_rendering_update_in_flight();
     // Goes on with the rendering update in flight where it has landed, and presents the recordings that have landed.
     void take_finished_frames_in();
+    void update_hovers_that_may_be_stale(HoverUpdatePoint);
+    bool queue_hover_that_may_be_stale(LocalNavigable&);
     bool let_layout_of_rendering_update_fly();
     void note_clock_lanes(ClockAnimations);
 
@@ -267,9 +290,14 @@ private:
 
     GC::Ptr<Platform::Timer> m_system_event_loop_timer;
     GC::Ptr<Platform::Timer> m_idle_period_timer;
+    u64 m_task_generation_of_last_idle_callback { 0 };
+    bool m_idle_callback_requested_outside_idle_period { false };
+    bool m_may_have_idle_callbacks { false };
+    bool m_turn_requested_without_a_task { false };
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#performing-a-microtask-checkpoint
     bool m_performing_a_microtask_checkpoint { false };
+    bool m_has_rejected_promises_to_notify_about { false };
     u32 m_microtask_checkpoint_deferrals { 0 };
 
     mutable Vector<GC::Weak<DOM::Document>> m_documents;
@@ -293,6 +321,7 @@ private:
     bool m_rendering_task_queued { false };
     bool m_input_events_task_queued { false };
     bool m_rendering_update_requested { false };
+    MonotonicTime m_rendering_task_queued_time { MonotonicTime::now_coarse() };
 
     RenderingSchedulerCounters m_rendering_scheduler_counters;
     RenderingSchedulerCounters m_rendering_scheduler_counters_at_last_update;
@@ -302,6 +331,8 @@ private:
 
     // The navigables whose committed frame flies beside the event loop, which has not taken it in yet.
     Vector<GC::Ref<LocalNavigable>> m_navigables_with_frames_in_flight;
+    // The navigables whose hover may be stale: what is under their pointer at rest may have moved, or changed its cursor.
+    Vector<GC::Root<LocalNavigable>> m_navigables_with_hover_that_may_be_stale;
     // The navigables whose active document a rendering update left a plan for the lane of its frame, which the event
     // loop tells whether it runs a task.
     Vector<GC::Ref<LocalNavigable>> m_navigables_with_clock_lanes;

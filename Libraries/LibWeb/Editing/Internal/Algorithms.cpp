@@ -1001,18 +1001,18 @@ struct ResolvedWhiteSpace {
             && first_is_one_of(*collapse, CSS::Keyword::Preserve, CSS::Keyword::PreserveBreaks, CSS::Keyword::BreakSpaces);
     }
 
-    Optional<StringView> white_space_value() const
+    Optional<Utf16View> white_space_value() const
     {
         if (!collapse.has_value() || !wrap_mode.has_value())
             return {};
         auto nowrap = *wrap_mode == CSS::Keyword::Nowrap;
         switch (*collapse) {
         case CSS::Keyword::Collapse:
-            return nowrap ? "nowrap"sv : "normal"sv;
+            return nowrap ? u"nowrap"sv : u"normal"sv;
         case CSS::Keyword::Preserve:
-            return nowrap ? "pre"sv : "pre-wrap"sv;
+            return nowrap ? u"pre"sv : u"pre-wrap"sv;
         case CSS::Keyword::PreserveBreaks:
-            return nowrap ? OptionalNone {} : Optional<StringView> { "pre-line"sv };
+            return nowrap ? OptionalNone {} : Optional<Utf16View> { u"pre-line"sv };
         default:
             return {};
         }
@@ -1140,13 +1140,10 @@ static bool author_style_sheet_sets_white_space(DOM::Element& element)
         return false;
     };
 
-    auto& style_sheets = element.document().style_sheets();
-    for (size_t index = 0; index < style_sheets.length(); ++index) {
-        auto* style_sheet = style_sheets.item(index);
-        if (!style_sheet || style_sheet->disabled())
+    for (auto const& style_sheet : element.document().style_scope().style_sheets()) {
+        if (style_sheet->disabled() || !style_sheet->is_origin_clean())
             continue;
-        auto rules = style_sheet->css_rules();
-        if (!rules.is_error() && rule_list_sets_white_space(rule_list_sets_white_space, *rules.value()))
+        if (rule_list_sets_white_space(rule_list_sets_white_space, style_sheet->rules()))
             return true;
     }
     return false;

@@ -4,13 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Hex.h>
 #include <AK/LexicalPath.h>
 #include <AK/QuickSort.h>
-#include <AK/StringBuilder.h>
+#include <AK/Random.h>
 #include <LibCore/DirIterator.h>
+#include <LibCore/Directory.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
+#include <LibCrypto/Authentication/HMAC.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibHTTP/Cache/DiskCache.h>
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HelperProcess.h>
@@ -29,6 +33,8 @@ static constexpr u64 cache_eviction_target_percent = 90;
 
 static constexpr auto cache_eviction_timeout = AK::Duration::from_seconds(10);
 
+static constexpr size_t site_cache_key_size = 32;
+
 RequestServerInstance::RequestServerInstance(NonnullRefPtr<BrowsingSession> session, Optional<Utf16String> site, ByteString cache_path)
     : m_session(move(session))
     , m_site(move(site))
@@ -46,6 +52,13 @@ RequestServerManager& RequestServerManager::the()
 RequestServerManager::RequestServerManager()
     : m_maximum_site_instances(Application::request_server_options().maximum_site_request_servers)
 {
+    if (!uses_site_request_servers())
+        return;
+
+    // Older versions kept the responses of every site in the cache of the RequestServer with no site.
+    HTTP::DiskCache::remove(HTTP::DiskCache::Mode::Normal, LexicalPath { Application::request_server_options().cache_path });
+
+    m_site_cache_key = load_or_create_site_cache_key();
 }
 
 RequestServerManager::~RequestServerManager() = default;
@@ -107,7 +120,7 @@ void RequestServerManager::for_each_instance(Function<IterationDecision(RequestS
 
 ErrorOr<NonnullRefPtr<RequestServerInstance>> RequestServerManager::launch(NonnullRefPtr<BrowsingSession> session, Optional<Utf16String> site)
 {
-    auto cache_path = site.has_value() ? cache_path_for_site(sites_directory(), *site) : Application::request_server_options().cache_path;
+    auto cache_path = site.has_value() ? cache_path_for_site(*site) : Application::request_server_options().cache_path;
     auto instance = adopt_ref(*new RequestServerInstance(session, move(site), move(cache_path)));
     TRY(launch_process(*instance));
     m_instances.append(instance);
@@ -119,8 +132,10 @@ ErrorOr<NonnullRefPtr<RequestServerInstance>> RequestServerManager::launch(Nonnu
 ErrorOr<void> RequestServerManager::launch_process(RequestServerInstance& instance)
 {
     // Private sessions keep nothing on disk. Every RequestServer of a session would open the same cache otherwise.
-    auto disk_cache_mode = instance.session().is_private() == IsPrivate::Yes ? HTTPDiskCacheMode::Disabled : Application::request_server_options().http_disk_cache_mode;
-    auto control_client = TRY(launch_request_server_process(instance.cache_path(), instance.site(), uses_site_request_servers(), disk_cache_mode));
+    // A site's responses only pass through the RequestServer with no site on their way to the site's own.
+    auto keeps_disk_cache = instance.session().is_private() == IsPrivate::No && (instance.site().has_value() || !uses_site_request_servers());
+    auto disk_cache_mode = keeps_disk_cache ? Application::request_server_options().http_disk_cache_mode : HTTPDiskCacheMode::Disabled;
+    auto control_client = TRY(launch_request_server_process(instance.cache_path(), instance.site(), disk_cache_mode));
 
     auto weak_instance = instance.make_weak_ptr();
     control_client->on_client_disconnected = [weak_instance](int client_id) {
@@ -302,20 +317,40 @@ ByteString RequestServerManager::sites_directory() const
     return LexicalPath::join(Application::request_server_options().cache_path, "RequestServer"sv, "Sites"sv).string();
 }
 
-ByteString RequestServerManager::cache_path_for_site(ByteString const& sites_directory, Utf16String const& site)
+// The sandbox of a RequestServer does not stop it from asking whether a path exists, so a name that it could work out
+// itself would tell it which other sites the user has visited.
+ByteString RequestServerManager::cache_path_for_site(Utf16String const& site) const
 {
-    // Keep the site name readable; append a hash to distinguish sites after sanitizing and truncating it.
-    StringBuilder name;
-    for (auto character : site.to_byte_string()) {
-        if (name.length() >= 48)
-            break;
-        if (is_ascii_alphanumeric(character) || character == '.' || character == '-')
-            name.append(character);
-        else
-            name.append('_');
+    Crypto::Authentication::HMAC hmac(Crypto::Hash::HashKind::SHA256, m_site_cache_key);
+    auto site_bytes = site.to_byte_string();
+    auto digest = hmac.process(site_bytes.view());
+    return LexicalPath::join(sites_directory(), encode_hex(digest.bytes())).string();
+}
+
+ByteBuffer RequestServerManager::load_or_create_site_cache_key() const
+{
+    auto path = LexicalPath::join(Application::request_server_options().cache_path, "RequestServer"sv, "SiteCacheKey"sv);
+
+    if (auto file = Core::File::open(path.string(), Core::File::OpenMode::Read); !file.is_error()) {
+        if (auto key = file.value()->read_until_eof(); !key.is_error() && key.value().size() == site_cache_key_size)
+            return key.release_value();
     }
-    name.appendff("-{:08x}", site.hash());
-    return LexicalPath::join(sites_directory, name.string_view()).string();
+
+    // Nothing can find the caches of sites that were named with another key, or by older versions.
+    (void)FileSystem::remove(sites_directory(), FileSystem::RecursionMode::Allowed);
+
+    auto key = MUST(ByteBuffer::create_uninitialized(site_cache_key_size));
+    fill_with_random(key.bytes());
+
+    auto store_key = [&]() -> ErrorOr<void> {
+        TRY(Core::Directory::create(path.parent(), Core::Directory::CreateDirectories::Yes));
+        auto file = TRY(Core::File::open(path.string(), Core::File::OpenMode::Write, 0600));
+        return file->write_until_depleted(key.bytes());
+    };
+    if (auto result = store_key(); result.is_error())
+        warnln("Unable to store the site cache key: {}", result.error());
+
+    return key;
 }
 
 // Private sessions keep nothing in the cache directories of their RequestServers.

@@ -51,6 +51,7 @@ public:
     enum class SurfaceAccess {
         Internal,
         External,
+        SharedImage,
     };
 
 #ifdef USE_DIRECTX

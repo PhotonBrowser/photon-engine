@@ -88,8 +88,9 @@ pub(crate) enum EngineWrite {
         kind: super::bridge::FfiElementDeclarationKind,
         properties: Box<[crate::css::declaration_block::DeclaredProperty]>,
     },
-    /// An element's inline declaration block, or none.
-    InlineStyle {
+    /// The custom properties an element's inline declaration block declares, which the engine names in atoms of its own.
+    /// The rest of the block reaches it with the host's rows.
+    InlineCustomProperties {
         node: StyleNodeID,
         data: Option<crate::css::declaration_block::SharedDeclarationBlock>,
     },
@@ -254,7 +255,6 @@ impl EngineWrite {
                     properties
                         .iter()
                         .map(crate::css::declaration_block::DeclaredProperty::borrowed),
-                    Default::default(),
                 );
             }
             Self::AnimationKeyframes { tree_scope, row } => engine.animation_keyframes.set(tree_scope, row),
@@ -269,14 +269,10 @@ impl EngineWrite {
                         .keep_timing(node, 0, identity, timing);
                 }
             }
-            Self::InlineStyle { node, data } => {
-                super::bridge::register_element_declared_properties(
+            Self::InlineCustomProperties { node, data } => {
+                super::bridge::register_element_custom_properties(
                     engine,
                     node,
-                    super::bridge::FfiElementDeclarationKind::InlineStyle,
-                    data.as_ref()
-                        .map_or_else(Default::default, |data| data.properties())
-                        .iter(),
                     data.as_ref()
                         .map_or(Default::default(), |data| data.custom_properties()),
                 );
@@ -550,40 +546,80 @@ pub extern "C" fn style_engine_stage_tree_delta(host: &DocumentHost, delta: &Ffi
         .record_ffi_tree_delta(delta);
 }
 
-/// Writes the arrival of an element, with every fact its selectors test, into its projection row in one go, and keeps
-/// what it arrives with beside its row for the host's next barrier.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, `custom_states` and `classes` must point at
-/// `arrival.custom_state_count` and `arrival.class_count` readable atoms, and `attributes` at
-/// `2 * arrival.attribute_count` readable atoms, a name and a value per attribute.
+/// An element's facts arriving, with how it stands in the tree where it arrives there with them. Elements that took
+/// their place in the tree earlier arrive with `has_relations` false.
+#[repr(C)]
+pub struct FfiElementArrivalRow {
+    pub arrival: FfiElementArrival,
+    pub unique_node_id: u64,
+    pub relations: FfiTreeRelations,
+    pub has_relations: bool,
+}
+
+/// Writes the arrival of each element of `rows`, with every fact its selectors test, into its projection row in one go,
+/// and keeps what it arrives with beside its row for the host's next barrier. `atoms` holds each row's custom states,
+/// classes and attributes in turn.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_stage_element_arrival(
+pub extern "C" fn style_engine_stage_element_arrival_rows(
     host: &DocumentHost,
-    arrival: &FfiElementArrival,
-    custom_states: *const u32,
-    classes: *const u32,
-    attributes: *const u32,
+    rows: ak::Span<'_, FfiElementArrivalRow>,
+    atoms: ak::Span<'_, u32>,
 ) {
-    let Some(node) = StyleNodeID::from_raw(arrival.node) else {
-        debug_assert!(false, "an element arrival named an invalid style node");
-        return;
-    };
-    let mut atoms: smallvec::SmallVec<[u32; 32]> = smallvec::SmallVec::new();
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        atoms.extend_from_slice(borrow(custom_states, arrival.custom_state_count as usize));
-        atoms.extend_from_slice(borrow(classes, arrival.class_count as usize));
-        atoms.extend_from_slice(borrow(attributes, 2 * arrival.attribute_count as usize));
-    }
+    let rows = rows.as_slice();
+    let mut atoms = atoms.as_slice();
     let memo = host.engine_memo();
-    memo.projection
-        .borrow_mut()
-        .writes()
-        .record_element_arrival(node, &super::bridge::element_arrival_facts(arrival, &atoms));
-    if arrival.associated_pseudo_kind_plus_one != 0 {
-        memo.unpublished.borrow_mut().backing_elements.push(node);
+    {
+        let mut projection = memo.projection.borrow_mut();
+        let mut writes = projection.writes();
+        let mut unpublished = memo.unpublished.borrow_mut();
+        for row in rows {
+            let arrival = &row.arrival;
+            let count = arrival.custom_state_count as usize
+                + arrival.class_count as usize
+                + 2 * arrival.attribute_count as usize;
+            let (row_atoms, rest) = atoms.split_at(count);
+            atoms = rest;
+            let Some(node) = StyleNodeID::from_raw(arrival.node) else {
+                debug_assert!(false, "an element arrival named an invalid style node");
+                continue;
+            };
+            let relations = row.has_relations.then(|| row.relations.decode());
+            writes.record_element_arrival(
+                node,
+                &super::bridge::element_arrival_facts(arrival, row_atoms),
+                relations,
+            );
+            if arrival.associated_pseudo_kind_plus_one != 0 {
+                unpublished.backing_elements.push(node);
+            }
+        }
     }
+    let ids: Box<[(StyleNodeID, i64)]> = rows
+        .iter()
+        .filter(|row| row.has_relations)
+        .filter_map(|row| {
+            Some((
+                StyleNodeID::from_raw(row.arrival.node)?,
+                row.unique_node_id.cast_signed(),
+            ))
+        })
+        .collect();
+    if !ids.is_empty() {
+        host.queue_change(ArenaChange::Engine(EngineWrite::ElementUniqueNodeIds(ids)));
+    }
+}
+
+/// Whether the host's projection row of `node` holds the attribute `name`.
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_row_holds_attribute(host: &DocumentHost, node: u32, name: u32) -> bool {
+    let name = StyleAtomID(name);
+    StyleNodeID::from_raw(node).is_some_and(|node| {
+        host.engine_memo()
+            .projection
+            .borrow()
+            .written_facts(node)
+            .is_some_and(|facts| facts.attributes().iter().any(|attribute| attribute.name == name))
+    })
 }
 
 /// Writes the local feature delta `delta` into the host's projection rows.
@@ -821,7 +857,8 @@ pub extern "C" fn style_engine_answer_record_demand(
     ask_record_demand(host, read, node, RecordDemand::Element(demand))
 }
 
-/// Answer a read of one of an element's pseudo-elements the host makes before the next style update.
+/// Answer a read of one of an element's pseudo-elements the host makes before the next style update. `highlight_name`
+/// is the atom of the custom highlight name of a `::highlight()`, and zero for any other pseudo-element.
 #[unsafe(no_mangle)]
 pub extern "C" fn style_engine_answer_pseudo_element_record_demand(
     host: &DocumentHost,
@@ -829,8 +866,14 @@ pub extern "C" fn style_engine_answer_pseudo_element_record_demand(
     node: u32,
     demand: FfiPseudoElementRecordDemand,
     pseudo_element: FfiDemandedPseudoElement,
+    highlight_name: u32,
 ) -> FfiRecordDemandAnswer {
-    ask_record_demand(host, read, node, RecordDemand::PseudoElement(demand, pseudo_element))
+    ask_record_demand(
+        host,
+        read,
+        node,
+        RecordDemand::PseudoElement(demand, pseudo_element, StyleAtomID(highlight_name)),
+    )
 }
 
 fn ask_record_demand(
@@ -880,6 +923,8 @@ pub(crate) struct EngineMemo {
     takes_transaction_to_apply: std::cell::Cell<bool>,
     /// What `LIBWEB_STYLE_SELFCHECK` asked for as the host started.
     pub(super) style_self_check: super::pipeline::SelfCheckSettings,
+    /// Whether the self-check of a style update that flew is yet to run: it is the next update's to run.
+    pub(super) flown_update_awaits_self_check: std::cell::Cell<bool>,
 }
 
 impl EngineMemo {
@@ -1009,6 +1054,7 @@ impl Default for EngineMemo {
             applying_reactions: Default::default(),
             takes_transaction_to_apply: Default::default(),
             style_self_check: super::pipeline::SelfCheckSettings::from_environment(),
+            flown_update_awaits_self_check: Default::default(),
         }
     }
 }
@@ -1257,11 +1303,20 @@ pub extern "C" fn style_engine_for_each_element_custom_property_environment(
     // The engine keeps each environment alive while an element holds it, and nothing moves one on before the
     // callbacks have run.
     let held: Vec<(u32, *const c_void)> = with_engine(read, host, |engine| {
-        engine
-            .retained
-            .element_custom_property_data
+        let retained = &engine.retained;
+        let lying_over = &retained.element_custom_property_data;
+        let mut named = super::fast_hash::FastSet::default();
+        lying_over
             .iter()
             .map(|(node, held)| (node.raw(), held.data.data()))
+            .chain(
+                retained
+                    .computed_group_sets
+                    .installed_custom_property_environments()
+                    .filter(|&(node, environment)| environment != 0 && !lying_over.contains_key(&node))
+                    .filter(|&(_, environment)| named.insert(environment))
+                    .map(|(node, environment)| (node.raw(), std::ptr::with_exposed_provenance(environment as usize))),
+            )
             .collect()
     });
     for (node, data) in held {
@@ -1605,11 +1660,15 @@ pub unsafe extern "C" fn style_engine_decide_transitions(
     let element_box = crate::layout::node_data::NodeSlotId {
         index: input.element_box_slot,
     };
-    let actions = with_engine_and_arena(read, host, |engine, arena| {
+    let (mut actions, custom_properties) = with_engine_and_arena(read, host, |engine, arena| {
         let reference_box =
             crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
-        decision.decide(engine, reference_box, existing)
+        (
+            decision.decide(engine, reference_box, existing),
+            decision.decide_custom_properties(engine, existing),
+        )
     });
+    actions.extend_from_slice(&custom_properties.actions);
     hand_over(&actions);
 }
 

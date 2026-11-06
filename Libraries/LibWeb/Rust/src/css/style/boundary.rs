@@ -79,7 +79,7 @@ carried! {
     StyleAtomID: u32 as "StyleAtomID" = |atom| StyleAtomID(atom);
     TreeScopeID: u32 as "TreeScopeID" = |tree_scope| TreeScopeID(tree_scope);
     CascadeLayerID: u32 as "u32" = |layer| CascadeLayerID(layer);
-    ElementBoxKind: u8 as "u8" = |box_kind| ElementBoxKind::from_raw(box_kind);
+    ElementBoxKind: ElementBoxKind as "u8" = |box_kind| box_kind;
     Option<StyleNodeID>: u32 as "StyleNodeID" = |node| StyleNodeID::from_raw(node);
     Option<SheetID>: u32 as "SheetID" = |sheet| sheet.checked_sub(1).map(SheetID);
     [u32; 4]: *const [u32; 4] as "u32 const*" = |values| unsafe { *values };
@@ -329,6 +329,9 @@ style_boundary! {
     writes {
         set_highlight_observing_elements => SetHighlightObservingElements { kind: u8, nodes: Box<[StyleNodeID]> } =>
             engine.set_highlight_observing_elements(kind, &nodes);
+        set_custom_highlight_observing_elements => SetCustomHighlightObservingElements {
+            nodes: Box<[StyleNodeID]>, names: Box<[StyleAtomID]>
+        } => engine.set_custom_highlight_observing_elements(&nodes, &names);
         set_fold_id_and_class_name_case => SetFoldIdAndClassNameCase { fold: bool };
         set_html_element_namespace => SetHtmlElementNamespace { namespace_atom: StyleAtomID };
         mark_relation_only_style_node => MarkRelationOnlyStyleNode { node: StyleNodeID };
@@ -402,9 +405,13 @@ style_boundary! {
         set_held_style_record => SetHeldStyleRecord { node: StyleNodeID, record: HeldHostRecord }
             => engine.set_held_style_record(node, record.0);
         set_held_pseudo_style_record => SetHeldPseudoStyleRecord {
-            node: StyleNodeID, pseudo_kind: u8, style_record: u64, released: ReleasedHostRecord
+            node: StyleNodeID, pseudo_kind: u8, highlight_name: StyleAtomID, style_record: u64, released: ReleasedHostRecord
         } => {
-            engine.set_held_pseudo_style_record(node, pseudo_kind, style_record);
+            let target = super::pipeline::PseudoElementTarget {
+                kind: pseudo_kind,
+                highlight_name,
+            };
+            engine.set_held_pseudo_style_record(node, target, style_record);
             drop(released);
         };
         set_element_css_defined_animations => SetElementCssDefinedAnimations {

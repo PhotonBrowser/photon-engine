@@ -21,6 +21,7 @@
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Cursor.h>
+#include <LibHTTP/Cache/Utilities.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
@@ -62,6 +63,7 @@
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/NodeList.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/DOM/Text.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
@@ -88,6 +90,7 @@
 #include <LibWeb/HTML/MessagePort.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/Scripting/CompiledScriptCache.h>
 #include <LibWeb/HTML/Scripting/ConsoleInputCompletion.h>
 #include <LibWeb/HTML/Scripting/DevToolsObjectTable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -98,6 +101,7 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Internals/InternalGamepad.h>
 #include <LibWeb/Internals/Internals.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -117,14 +121,12 @@
 #include <LibWeb/PermissionsAPI/PermissionStore.h>
 #include <LibWeb/PermissionsAPI/Permissions.h>
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
-#include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/Streams/ReadableStream.h>
 #include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/WebDriver/Actions.h>
 #include <LibWeb/WebDriver/InputState.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
-#include <LibWeb/WebSockets/WebSocket.h>
 #include <LibWeb/XHR/XMLHttpRequest.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
@@ -132,6 +134,7 @@
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/StorageAPI/StorageEndpoint.h>
 #include <LibWebCommon/WebDriver/Response.h>
+#include <LibWebCommon/WebView/AccessibilityNodeData.h>
 
 namespace Web::Internals {
 
@@ -497,15 +500,14 @@ bool Internals::wrapper_is_preserved(JS::Object& object)
     return Bindings::wrapper_is_preserved(*platform_object);
 }
 
-bool Internals::has_activity_root(JS::Object& object)
+bool Internals::has_pending_activity(JS::Object& object, GC::Ptr<DOM::Document> document)
 {
-    if (auto* xhr = Bindings::impl_from<XHR::XMLHttpRequest>(&object))
-        return xhr->has_activity_root();
-    if (auto* resize_observer = Bindings::impl_from<ResizeObserver::ResizeObserver>(&object))
-        return resize_observer->has_activity_root();
-    if (auto* web_socket = Bindings::impl_from<WebSockets::WebSocket>(&object))
-        return web_socket->has_activity_root();
-    return false;
+    auto* target = Bindings::impl_from<DOM::EventTarget>(&object);
+    if (!target)
+        return false;
+    if (document)
+        return document->window() && document->window()->has_pending_activity(*target);
+    return HTML::relevant_window_or_worker_global_scope(object).has_pending_activity(*target);
 }
 
 WebIDL::UnsignedLongLong Internals::message_port_pending_outgoing_message_count(HTML::MessagePort& port)
@@ -1070,13 +1072,14 @@ void Internals::pinch(double x, double y, double scale_delta, WebIDL::UnsignedSh
     page.handle_pinch_event(position, modifiers, scale_delta);
 }
 
-void Internals::pinch_through_ui_process(double x, double y, double scale_delta)
+void Internals::pinch_through_ui_process(double x, double y, double scale_delta, bool continues_gesture)
 {
     let_compositor_take_in_every_rendered_frame(window());
 
     Web::PinchEvent event;
     event.position = page().css_to_device_point(window().navigable()->to_page_position({ x, y }));
     event.scale_delta = scale_delta;
+    event.continues_gesture = continues_gesture;
     page().client().page_did_request_pinch_event_for_testing(window().navigable()->local_root()->id(), event);
 }
 
@@ -1084,6 +1087,14 @@ void Internals::reset_zoom()
 {
     if (auto local_root = local_root_of(window()))
         local_root->reset_zoom();
+}
+
+Optional<Utf16String> Internals::hovered_link()
+{
+    auto url = page().hover_link().current();
+    if (!url.has_value())
+        return {};
+    return utf16_string_from_url_ascii(url->serialize());
 }
 
 Utf16String Internals::current_cursor()
@@ -1403,6 +1414,32 @@ bool Internals::set_http_memory_cache_enabled(bool enabled)
     return was_enabled;
 }
 
+bool Internals::functions_share_code(JS::Value a, JS::Value b)
+{
+    if (!a.is_function() || !b.is_function())
+        return false;
+    return JS::functions_share_code(vm(), a.as_function(), b.as_function());
+}
+
+bool Internals::compiled_script_cache_contains(Utf16String const& url)
+{
+    auto parsed_url = DOMURL::parse(url);
+    if (!parsed_url.has_value())
+        return false;
+
+    auto key = Fetch::Infrastructure::determine_the_network_partition_key(window().associated_document().relevant_settings_object());
+    auto partition = key.has_value() ? key->disk_cache_partition() : OptionalNone {};
+    if (!partition.has_value())
+        return false;
+
+    return HTML::CompiledScriptCache::the().contains({
+        .partition = partition.release_value(),
+        .url_without_fragment = HTTP::serialize_url_for_cache_storage(*parsed_url),
+        .program_type = JS::ProgramType::Script,
+        .line_number_offset = 1,
+    });
+}
+
 bool Internals::set_disk_cache_enabled_for_navigations(bool enabled)
 {
     auto was_enabled = Web::Fetch::Fetching::disk_cache_enabled_for_navigations_for_testing();
@@ -1596,7 +1633,7 @@ static void define_scroller_properties(HTML::Window& window, JS::Object& object,
     object.define_direct_property("scroller"_utf16_fly_string, wrapped_node_with_unique_id(window, scroller.map([](auto const& id) { return id.node_id; })), JS::default_attributes);
     if (scroller.has_value() && scroller->kind == AsyncScrollNodeKind::PseudoElement) {
         auto pseudo_element = CSS::pseudo_element_name(static_cast<CSS::PseudoElement>(scroller->pseudo_element_type));
-        object.define_direct_property("scrollerPseudoElement"_utf16_fly_string, JS::PrimitiveString::create(vm, pseudo_element), JS::default_attributes);
+        object.define_direct_property("scrollerPseudoElement"_utf16_fly_string, JS::PrimitiveString::create(vm, Utf16View::from_ascii(pseudo_element)), JS::default_attributes);
     }
 }
 
@@ -1609,8 +1646,8 @@ GC::Ref<JS::Object> Internals::take_input_trace()
         auto const& record = records[i];
         auto object = JS::Object::create(realm, nullptr);
         object->define_direct_property("id"_utf16_fly_string, JS::Value(static_cast<double>(record.input_event_id)), JS::default_attributes);
-        object->define_direct_property("stage"_utf16_fly_string, JS::PrimitiveString::create(vm(), input_trace_stage_name(record.stage)), JS::default_attributes);
-        object->define_direct_property("decision"_utf16_fly_string, JS::PrimitiveString::create(vm(), input_routing_decision_name(record.decision)), JS::default_attributes);
+        object->define_direct_property("stage"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16View::from_ascii(input_trace_stage_name(record.stage))), JS::default_attributes);
+        object->define_direct_property("decision"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16View::from_ascii(input_routing_decision_name(record.decision))), JS::default_attributes);
         define_scroller_properties(window(), *object, record.scroller);
         object->define_direct_property("target"_utf16_fly_string, wrapped_node_with_unique_id(window(), record.dom_target), JS::default_attributes);
         MUST(array->create_data_property_or_throw(i, object));
@@ -1622,7 +1659,7 @@ GC::Ref<JS::Object> Internals::first_wheel_step_route_to_object(Compositing::Fir
 {
     auto& realm = HTML::relevant_realm(window());
     auto object = JS::Object::create(realm, nullptr);
-    object->define_direct_property("decision"_utf16_fly_string, JS::PrimitiveString::create(vm(), input_routing_decision_name(result.route.decision)), JS::default_attributes);
+    object->define_direct_property("decision"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16View::from_ascii(input_routing_decision_name(result.route.decision))), JS::default_attributes);
     define_scroller_properties(window(), *object, result.route.scroller);
     object->define_direct_property("document"_utf16_fly_string, wrapped_node_with_unique_id(window(), result.document_id), JS::default_attributes);
     return object;
@@ -1878,6 +1915,256 @@ Utf16String Internals::dump_accessibility_tree()
     return window().associated_document().dump_accessibility_tree_as_json();
 }
 
+String Internals::accessibility_character_offsets(GC::Ref<DOM::Node> node)
+{
+    auto& document = node->document();
+    document.update_layout(DOM::UpdateLayoutReason::InspectAccessibilityTree);
+    auto node_id = static_cast<i64>(node->unique_id().value());
+    StringBuilder builder;
+    for (auto const& node_data : document.build_accessibility_node_data()) {
+        if (node_data.id != node_id)
+            continue;
+        for (auto const& offset : node_data.character_offsets) {
+            if (!builder.is_empty())
+                builder.append(' ');
+            builder.appendff("{},{}", offset.x(), offset.y());
+        }
+        break;
+    }
+    return builder.to_string_without_validation();
+}
+
+// Dumps the node data in a form that stays the same from run to run: Node IDs become labels in tree order (n0 is the
+// dumped node), a reference to a node outside the dumped subtree prints as "outside", and only the fields that differ
+// from their defaults print. So a test can compare the data the UI process receives before and after a change.
+String Internals::dump_accessibility_node_data(GC::Ref<DOM::Node> node)
+{
+    auto& document = node->document();
+    document.update_layout(DOM::UpdateLayoutReason::InspectAccessibilityTree);
+    auto nodes = document.build_accessibility_node_data();
+
+    HashMap<i64, size_t> index_by_id;
+    for (size_t i = 0; i < nodes.size(); ++i)
+        index_by_id.set(nodes[i].id, i);
+    auto root_index = index_by_id.get(static_cast<i64>(node->unique_id().value()));
+    if (!root_index.has_value())
+        return "(not in the accessibility tree)"_string;
+
+    // Label the subtree's nodes in tree order.
+    HashMap<i64, size_t> label_by_id;
+    Vector<size_t> order;
+    Vector<size_t> depths;
+    auto label = [&](this auto const& self, size_t index, size_t depth) -> void {
+        if (label_by_id.contains(nodes[index].id))
+            return;
+        label_by_id.set(nodes[index].id, label_by_id.size());
+        order.append(index);
+        depths.append(depth);
+        for (auto child_id : nodes[index].child_ids) {
+            if (auto child_index = index_by_id.get(child_id); child_index.has_value())
+                self(*child_index, depth + 1);
+        }
+    };
+    label(*root_index, 0);
+
+    auto reference = [&](i64 id) -> String {
+        if (id == -1)
+            return "none"_string;
+        if (auto found = label_by_id.get(id); found.has_value())
+            return MUST(String::formatted("n{}", *found));
+        return "outside"_string;
+    };
+    auto references = [&](Vector<i64> const& ids) {
+        StringBuilder builder;
+        for (auto id : ids) {
+            if (!builder.is_empty())
+                builder.append(' ');
+            builder.append(reference(id));
+        }
+        return builder.to_string_without_validation();
+    };
+    auto quoted = [](String const& string) {
+        StringBuilder builder;
+        builder.append('"');
+        for (auto code_point : string.code_points()) {
+            if (code_point == '"' || code_point == '\\')
+                builder.append('\\');
+            if (code_point == '\n')
+                builder.append("\\n"sv);
+            else
+                builder.append_code_point(code_point);
+        }
+        builder.append('"');
+        return builder.to_string_without_validation();
+    };
+
+    StringBuilder builder;
+    for (size_t i = 0; i < order.size(); ++i) {
+        auto const& data = nodes[order[i]];
+        builder.append_repeated("  "sv, depths[i]);
+        builder.appendff("n{} {}", i, data.role.is_empty() ? "(no role)"sv : data.role.bytes_as_string_view());
+        auto field = [&](StringView name, auto const& value) { builder.appendff(" {}={}", name, value); };
+        if (!data.name.is_empty())
+            field("name"sv, quoted(data.name));
+        if (!data.description.is_empty())
+            field("description"sv, quoted(data.description));
+        if (!data.value.is_empty())
+            field("value"sv, quoted(data.value));
+        if (!data.url.is_empty())
+            field("url"sv, quoted(data.url));
+        if (!data.language.is_empty())
+            field("language"sv, data.language);
+        builder.appendff(" bounds={},{} {}x{}", data.bounds.x(), data.bounds.y(), data.bounds.width(), data.bounds.height());
+        if (data.is_focused)
+            builder.append(" focused"sv);
+        if (data.is_disabled)
+            builder.append(" disabled"sv);
+        if (data.heading_level != 0)
+            field("heading_level"sv, data.heading_level);
+        if (data.hierarchical_level != 0)
+            field("hierarchical_level"sv, data.hierarchical_level);
+        if (!data.live.is_empty())
+            field("live"sv, data.live);
+        if (data.column_span != 1 || data.row_span != 1)
+            builder.appendff(" span={}x{}", data.column_span, data.row_span);
+        if (data.cell_column_index != -1)
+            field("column_index"sv, data.cell_column_index);
+        if (data.table_row_count != -1 || data.table_column_count != -1)
+            builder.appendff(" table={}x{}", data.table_row_count, data.table_column_count);
+        if (data.table_caption_id != -1)
+            field("caption"sv, reference(data.table_caption_id));
+        if (!data.table_summary.is_empty())
+            field("summary"sv, quoted(data.table_summary));
+        if (!data.column_header_ids.is_empty())
+            builder.appendff(" column_headers=[{}]", references(data.column_header_ids));
+        if (!data.row_header_ids.is_empty())
+            builder.appendff(" row_headers=[{}]", references(data.row_header_ids));
+        if (!data.keybinding.is_empty())
+            field("keybinding"sv, quoted(data.keybinding));
+        if (data.value_numeric.has_value())
+            field("value_now"sv, *data.value_numeric);
+        if (data.value_minimum.has_value())
+            field("value_min"sv, *data.value_minimum);
+        if (data.value_maximum.has_value())
+            field("value_max"sv, *data.value_maximum);
+        if (data.value_step.has_value())
+            field("value_step"sv, *data.value_step);
+        if (data.is_selected)
+            builder.append(" selected"sv);
+        using CheckedState = WebView::AccessibilityNodeData::CheckedState;
+        using ExpandedState = WebView::AccessibilityNodeData::ExpandedState;
+        using PressedState = WebView::AccessibilityNodeData::PressedState;
+        auto tristate = [](bool is_true, bool is_mixed) {
+            if (is_mixed)
+                return "mixed"sv;
+            return is_true ? "true"sv : "false"sv;
+        };
+        if (data.checked_state != CheckedState::NotApplicable)
+            field("checked"sv, tristate(data.checked_state == CheckedState::Checked, data.checked_state == CheckedState::Mixed));
+        if (data.expanded_state != ExpandedState::NotApplicable)
+            field("expanded"sv, tristate(data.expanded_state == ExpandedState::Expanded, false));
+        if (data.pressed_state != PressedState::NotApplicable)
+            field("pressed"sv, tristate(data.pressed_state == PressedState::Pressed, data.pressed_state == PressedState::Mixed));
+        auto flag = [&](bool value, StringView name) {
+            if (value)
+                builder.appendff(" {}", name);
+        };
+        flag(data.is_editable, "editable"sv);
+        flag(data.is_multi_line, "multi_line"sv);
+        flag(data.is_password, "password"sv);
+        flag(data.is_read_only, "read_only"sv);
+        flag(data.is_required, "required"sv);
+        flag(data.is_invalid, "invalid"sv);
+        flag(data.is_multi_selectable, "multi_selectable"sv);
+        flag(data.is_visited, "visited"sv);
+        if (data.caret_offset != -1)
+            field("caret"sv, data.caret_offset);
+        if (data.selection_start != -1 || data.selection_end != -1)
+            builder.appendff(" selection={}..{}", data.selection_start, data.selection_end);
+        if (!data.font_family.is_empty())
+            builder.appendff(" font={} {} {} {}", quoted(data.font_family), data.font_size, data.font_weight, data.font_style);
+        if (!data.color.is_empty())
+            field("color"sv, data.color);
+        if (!data.background_color.is_empty())
+            field("background"sv, data.background_color);
+        if (!data.text_decoration.is_empty() && data.text_decoration != "none"sv)
+            field("decoration"sv, data.text_decoration);
+        if (!data.character_offsets.is_empty()) {
+            builder.append(" characters="sv);
+            for (size_t j = 0; j < data.character_offsets.size(); ++j)
+                builder.appendff("{}{},{}", j ? " "sv : ""sv, data.character_offsets[j].x(), data.character_offsets[j].y());
+        }
+        if (!data.line_break_character_offsets.is_empty()) {
+            builder.append(" lines="sv);
+            for (size_t j = 0; j < data.line_break_character_offsets.size(); ++j) {
+                auto height = j < data.line_heights.size() ? data.line_heights[j] : -1;
+                builder.appendff("{}{}@{}", j ? " "sv : ""sv, data.line_break_character_offsets[j], height);
+            }
+        }
+        builder.append('\n');
+    }
+    return builder.to_string_without_validation();
+}
+
+String Internals::accessibility_cached_text_mismatches()
+{
+    StringBuilder builder;
+    for (auto const& mismatch : window().associated_document().cached_accessible_text_mismatches())
+        builder.appendff("{}\n", mismatch);
+    return builder.to_string_without_validation();
+}
+
+String Internals::accessibility_cached_record_mismatches()
+{
+    StringBuilder builder;
+    for (auto const& mismatch : window().associated_document().cached_accessibility_record_mismatches())
+        builder.appendff("{}\n", mismatch);
+    return builder.to_string_without_validation();
+}
+
+String Internals::accessibility_change_tracking_mismatches()
+{
+    auto& document = window().associated_document();
+    document.update_layout(DOM::UpdateLayoutReason::InspectAccessibilityTree);
+
+    // Apply what changed since the last call to the tree as it stood then, as the UI process does with what WebContent
+    // sends it, and compare the result with the whole tree built again.
+    auto change = document.build_accessibility_tree_change(m_accessibility_change_tracker, false);
+    m_last_accessibility_change_size = change.is_whole_tree
+        ? MUST(String::formatted("whole tree of {} nodes", change.nodes.size()))
+        : MUST(String::formatted("{} nodes changed, {} removed", change.nodes.size(), change.removed_ids.size()));
+    if (change.is_whole_tree)
+        m_accessibility_tracked_tree.clear();
+    for (auto id : change.removed_ids)
+        m_accessibility_tracked_tree.remove(id);
+    for (auto& node : change.nodes)
+        m_accessibility_tracked_tree.set(node.id, move(node));
+
+    StringBuilder builder;
+    HashTable<i64> built_ids;
+    for (auto const& node : document.build_accessibility_node_data()) {
+        built_ids.set(node.id);
+        auto tracked = m_accessibility_tracked_tree.find(node.id);
+        if (tracked == m_accessibility_tracked_tree.end())
+            builder.appendff("{} \"{}\": missing from the tree built from changes\n", node.role, node.name);
+        else if (tracked->value != node)
+            builder.appendff("{} \"{}\": differs in the tree built from changes\n", node.role, node.name);
+    }
+    for (auto const& [id, node] : m_accessibility_tracked_tree) {
+        if (!built_ids.contains(id))
+            builder.appendff("{} \"{}\": still in the tree built from changes\n", node.role, node.name);
+    }
+    return builder.to_string_without_validation();
+}
+
+String Internals::accessibility_cached_geometry_mismatches()
+{
+    StringBuilder builder;
+    for (auto const& mismatch : window().associated_document().cached_text_geometry_mismatches())
+        builder.appendff("{}\n", mismatch);
+    return builder.to_string_without_validation();
+}
+
 Utf16String Internals::dump_layout_tree(GC::Ref<DOM::Node> node)
 {
     // The test API's read of the render state of the node's document.
@@ -2129,6 +2416,12 @@ GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()
     return promise;
 }
 
+void Internals::exhaust_navigation_rate_limit()
+{
+    if (auto navigable = window().associated_document().navigable())
+        navigable->exhaust_navigation_or_history_update_rate_limit_for_testing();
+}
+
 bool Internals::has_shadow_root(GC::Ref<DOM::Element> element)
 {
     return element->shadow_root() != nullptr;
@@ -2258,6 +2551,26 @@ void Internals::set_next_permission_prompt_outcome(Utf16String const& name, Utf1
     page().client().page_did_set_next_permission_prompt_outcome_for_testing(name.to_utf8(), outcome.to_utf8(), held);
 }
 
+void Internals::set_system_microphone_authorization(Utf16String const& authorization, Utf16String const& answer, bool held)
+{
+    page().client().page_did_set_system_microphone_authorization_for_testing(authorization.to_utf8(), answer.to_utf8(), held);
+}
+
+void Internals::release_system_microphone_answer()
+{
+    page().client().page_did_release_system_microphone_answer_for_testing();
+}
+
+Utf16String Internals::microphone_state()
+{
+    return Utf16String::from_utf8(page().client().page_did_request_microphone_state_for_testing());
+}
+
+bool Internals::audio_capture_is_pending()
+{
+    return Audio::ClientConnection::capture_is_pending_for_testing();
+}
+
 void Internals::release_held_permission_prompt(WebIDL::UnsignedLong waiters)
 {
     page().client().page_did_release_held_permission_prompt_for_testing(waiters);
@@ -2323,6 +2636,11 @@ bool Internals::document_is_playing_audio(DOM::Document& document)
 bool Internals::tab_is_playing_audio()
 {
     return window().associated_document().page().client().page_did_request_tab_is_playing_audio_for_testing();
+}
+
+bool Internals::tab_is_heard_playing_audio()
+{
+    return window().associated_document().page().client().page_did_request_tab_is_heard_playing_audio_for_testing();
 }
 
 WebIDL::UnsignedLongLong Internals::tab_audibility_change_count()
@@ -2427,12 +2745,34 @@ void Internals::inject_clock_tick_scrolling_element(double frame_time_ms, DOM::E
     inject_clock_tick_at_scroll_offset(window().associated_document(), frame_time_ms, &scroll_offset);
 }
 
-void Internals::inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id)
+void Internals::inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id, u32 buttons)
 {
     auto& document = window().associated_document();
     auto device_pixels_per_css_pixel = page().client().device_pixels_per_css_pixel();
     auto frame_time = frame_time_ms.has_value() ? document.relevant_settings_object().time_origin() + *frame_time_ms : HighResolutionTime::unsafe_shared_current_time();
-    Layout::RustFFI::document_host_inject_pointer(document.layout_node_arena().host(), static_cast<float>(x * device_pixels_per_css_pixel), static_cast<float>(y * device_pixels_per_css_pixel), static_cast<i64>(frame_time * 1'000'000.0), input_event_id.value_or(0));
+    Layout::RustFFI::document_host_inject_pointer(document.layout_node_arena().host(), static_cast<float>(x * device_pixels_per_css_pixel), static_cast<float>(y * device_pixels_per_css_pixel), buttons, static_cast<i64>(frame_time * 1'000'000.0), input_event_id.value_or(0));
+}
+
+void Internals::inject_hover_pointer_left(double frame_time_ms)
+{
+    auto& document = window().associated_document();
+    auto frame_time = document.relevant_settings_object().time_origin() + frame_time_ms;
+    Layout::RustFFI::document_host_inject_pointer_left(document.layout_node_arena().host(), static_cast<i64>(frame_time * 1'000'000));
+}
+
+void Internals::note_animated_content_moved_under_pointer(double frame_time_ms)
+{
+    auto& document = window().associated_document();
+    auto frame_time = document.relevant_settings_object().time_origin() + frame_time_ms;
+    if (auto navigable = document.navigable())
+        navigable->event_handler().note_animated_content_moved_under_pointer(static_cast<i64>(frame_time * 1'000'000.0));
+}
+
+void Internals::inject_pointer_rests_on_moving_content(double frame_time_ms)
+{
+    auto& document = window().associated_document();
+    auto frame_time = document.relevant_settings_object().time_origin() + frame_time_ms;
+    Layout::RustFFI::document_host_inject_pointer_rest(document.layout_node_arena().host(), static_cast<i64>(frame_time * 1'000'000.0));
 }
 
 u64 Internals::queue_mouse_move(double x, double y, u32 buttons)
@@ -2477,6 +2817,59 @@ Utf16String Internals::clock_lane_state(DOM::Document& document)
 bool Internals::clock_lane_is_coming(DOM::Document& document)
 {
     return Layout::RustFFI::document_host_clock_lane_is_coming(document.layout_node_arena().host());
+}
+
+struct SelectionForTesting {
+    GC::Ref<DOM::Document> document;
+    Utf16StringBuilder text {};
+};
+
+static void push_selection_for_testing(void* context, u32 style_node, u8 state, size_t start_offset, size_t end_offset, u32 background_color, u32 text_color)
+{
+    auto& selection = *static_cast<SelectionForTesting*>(context);
+    auto node = selection.document->style_computer().node_for_style_node(CSS::StyleNodeID { style_node });
+    if (!node)
+        return;
+    if (!selection.text.is_empty())
+        selection.text.append_ascii(" | "sv);
+    auto const* text = as_if<DOM::Text>(*node);
+    auto append_selection_colors = [&] {
+        if (background_color != 0 || text_color != 0)
+            selection.text.appendff(" ({} on {})", Color::from_bgra(text_color).serialize_a_srgb_value(), Color::from_bgra(background_color).serialize_a_srgb_value());
+    };
+    if (!text) {
+        selection.text.appendff("<{}>", node->node_name());
+        append_selection_colors();
+        return;
+    }
+    auto data = text->data().utf16_view();
+    auto selection_state = static_cast<Painting::SelectionState>(state);
+    auto start = first_is_one_of(selection_state, Painting::SelectionState::Start, Painting::SelectionState::StartAndEnd) ? min(start_offset, data.length_in_code_units()) : 0;
+    auto end = first_is_one_of(selection_state, Painting::SelectionState::End, Painting::SelectionState::StartAndEnd) ? min(end_offset, data.length_in_code_units()) : data.length_in_code_units();
+    selection.text.append(data.substring_view(start, max(start, end) - start));
+    append_selection_colors();
+}
+
+enum class SelectionShownBy : u8 {
+    Lane,
+    Host,
+};
+
+static Utf16String selection_for_testing(DOM::Document& document, SelectionShownBy shown_by)
+{
+    SelectionForTesting selection { document };
+    Layout::RustFFI::document_host_selection_for_testing(document.layout_node_arena().host(), shown_by == SelectionShownBy::Lane, &selection, push_selection_for_testing);
+    return selection.text.to_string();
+}
+
+Utf16String Internals::presented_selection()
+{
+    return selection_for_testing(window().associated_document(), SelectionShownBy::Lane);
+}
+
+Utf16String Internals::painted_selection()
+{
+    return selection_for_testing(window().associated_document(), SelectionShownBy::Host);
 }
 
 GC::Ptr<Geometry::DOMRect> Internals::presented_border_box(DOM::Element& element)
@@ -2780,35 +3173,17 @@ u64 Internals::style_record_identity(DOM::Element& element)
     return element.style_record_identity().value();
 }
 
+u64 Internals::custom_property_environment_identity(DOM::Element& element)
+{
+    return element.installed_style().custom_property_environment();
+}
+
 u64 Internals::layout_style_record_identity(DOM::Element& element)
 {
     Layout::ForcedReadScope read { element.document() };
     element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
     auto const* layout_node = element.layout_node(read);
     return layout_node ? layout_node->style_record_identity().value() : 0;
-}
-
-u64 Internals::before_style_record_identity(DOM::Element& element)
-{
-    return element.style_record_identity(CSS::PseudoElement::Before).value();
-}
-
-u64 Internals::before_layout_style_record_identity(DOM::Element& element)
-{
-    Layout::ForcedReadScope read { element.document() };
-    element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = element.pseudo_element_layout_node(read, CSS::PseudoElement::Before);
-    return layout_node ? layout_node->style_record_identity().value() : 0;
-}
-
-u64 Internals::paint_style_record_identity(DOM::Element& element)
-{
-    Layout::ForcedReadScope read { element.document() };
-    element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = element.layout_node(read);
-    if (!layout_node || !Painting::has_committed_box(*layout_node))
-        return 0;
-    return Painting::style_record_identity(*layout_node).value();
 }
 
 u64 Internals::layout_node_identity(DOM::Node& node)
@@ -3168,8 +3543,9 @@ void Internals::set_preferred_color_scheme(Utf16String const& color_scheme)
 
 void Internals::set_page_focus(bool has_focus)
 {
-    page().client().set_has_focus(has_focus);
+    // Publish before dispatching events so a handler's later focus change supersedes this one.
     page().client().page_did_request_set_system_focus(has_focus);
+    page().client().set_has_focus(has_focus);
 }
 
 void Internals::set_system_visibility_state(Utf16String const& state)
@@ -3243,11 +3619,13 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> Internals::image_animation_state_for_ur
 
     auto object = JS::Object::create(window().principal_realm(), nullptr);
 
-    object->define_direct_property("timerActive"_utf16_fly_string, JS::Value(animated_bitmap_data->m_animation_timer->is_active()), JS::default_attributes);
+    auto state = animated_bitmap_data->state_for_testing();
+    object->define_direct_property("isAnimating"_utf16_fly_string, JS::Value(state.is_animating), JS::default_attributes);
     object->define_direct_property("sessionID"_utf16_fly_string, JS::Value(static_cast<double>(animated_bitmap_data->m_session_id)), JS::default_attributes);
-    object->define_direct_property("frameIndex"_utf16_fly_string, JS::Value(animated_bitmap_data->m_current_frame_index), JS::default_attributes);
+    object->define_direct_property("frameIndex"_utf16_fly_string, JS::Value(state.frame_index), JS::default_attributes);
+    object->define_direct_property("shownFrameIndex"_utf16_fly_string, JS::Value(state.shown_frame_index), JS::default_attributes);
     object->define_direct_property("frameCount"_utf16_fly_string, JS::Value(animated_bitmap_data->m_frame_count), JS::default_attributes);
-    object->define_direct_property("loopsCompleted"_utf16_fly_string, JS::Value(animated_bitmap_data->m_loops_completed), JS::default_attributes);
+    object->define_direct_property("loopsCompleted"_utf16_fly_string, JS::Value(state.loops_completed), JS::default_attributes);
     object->define_direct_property("loopCount"_utf16_fly_string, JS::Value(animated_bitmap_data->m_loop_count), JS::default_attributes);
     object->define_direct_property("clientCount"_utf16_fly_string, JS::Value(image_data->m_clients.size()), JS::default_attributes);
 
@@ -3350,6 +3728,10 @@ GC::Ptr<JS::Object> Internals::take_context_menu_request()
     object->define_direct_property("target"_utf16_fly_string, target, JS::default_attributes);
     object->define_direct_property("x"_utf16_fly_string, JS::Value(request->position.x().to_double()), JS::default_attributes);
     object->define_direct_property("y"_utf16_fly_string, JS::Value(request->position.y().to_double()), JS::default_attributes);
+    if (request->link_url.has_value())
+        object->define_direct_property("linkURL"_utf16_fly_string, JS::PrimitiveString::create(vm(), utf16_string_from_url_ascii(request->link_url->serialize())), JS::default_attributes);
+    if (request->image_mime_type.has_value())
+        object->define_direct_property("imageMimeType"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16String::from_utf8(*request->image_mime_type)), JS::default_attributes);
     if (request->media.has_value()) {
         object->define_direct_property("isPictureInPicture"_utf16_fly_string, JS::Value(request->media->is_picture_in_picture), JS::default_attributes);
         object->define_direct_property("canEnterPictureInPicture"_utf16_fly_string, JS::Value(request->media->can_enter_picture_in_picture), JS::default_attributes);
@@ -3417,6 +3799,22 @@ GC::Ref<WebIDL::Promise> Internals::spell_check_settled()
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
     page().when_spell_checking_settled(GC::create_function(heap(), [&realm, promise] {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        WebIDL::resolve_promise(promise);
+    }));
+    return promise;
+}
+
+void Internals::translate_page(Utf16String const& target_language)
+{
+    page().request_translation_for_testing(target_language.to_utf8_but_should_be_ported_to_utf16());
+}
+
+GC::Ref<WebIDL::Promise> Internals::translation_settled()
+{
+    auto& realm = window().principal_realm();
+    auto promise = WebIDL::create_promise_for(window());
+    page().when_translation_settled(GC::create_function(heap(), [&realm, promise] {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));

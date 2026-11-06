@@ -24,7 +24,9 @@ const HOLDING: u32 = 1 << 1;
 const HIDDEN_BEFORE_KNOWN: u32 = 1 << 2;
 /// The element, or an ancestor of it, was display:none before the installation.
 const HIDDEN_BEFORE: u32 = 1 << 3;
-const MARK_BITS: u32 = 4;
+/// The element takes its first style in the installation.
+const FIRST_STYLE: u32 = 1 << 4;
+const MARK_BITS: u32 = 5;
 const LAST_GENERATION: u32 = u32::MAX >> MARK_BITS;
 
 #[derive(Default)]
@@ -43,8 +45,8 @@ pub(super) struct InstallScratch {
     pub(super) installed: HashMap<PointerKey<std::sync::Arc<super::Record>>, computed::FinalStyleRecordID>,
     /// The elements the installation let go of the animation overlay of, with its view.
     pub(super) released_compositions: Vec<(StyleNodeID, super::live::HeldComposition)>,
-    /// The elements whose records hold what a record installed before them does, which they keep
-    /// in place of their own, by the address of their own.
+    /// The elements that installed a copy of their records, which they keep in place of their own,
+    /// by the address of their own.
     pub(super) adopted: Vec<(StyleNodeID, usize, std::sync::Arc<super::Record>)>,
 }
 
@@ -148,6 +150,16 @@ impl InstallScratch {
         }
     }
 
+    /// Notes that `node` takes its first style in the installation.
+    pub(super) fn note_first_style(&mut self, node: StyleNodeID) {
+        self.mark(node, FIRST_STYLE);
+    }
+
+    /// Whether `node` takes its first style in the installation, as noted so far.
+    pub(super) fn takes_first_style(&self, node: StyleNodeID) -> bool {
+        self.marks_of(node) & FIRST_STYLE != 0
+    }
+
     /// Empties the scratch for the next installation, keeping its room up to
     /// `KEPT_SCRATCH_CAPACITY` entries in each collection.
     pub(super) fn recycle(&mut self) {
@@ -189,25 +201,6 @@ mod tests {
     }
 
     #[test]
-    fn an_element_whose_record_holds_what_an_installed_one_does_keeps_that_one() {
-        let (mut engine, nodes) = linear_document();
-        let sheet = add_sheet(&mut engine, TreeScopeID::DOCUMENT);
-        add_rules(
-            &mut engine,
-            sheet,
-            ".a { color: rgb(0, 128, 0); } .b { color: rgb(0, 128, 0); }",
-        );
-        start_live(&mut engine, nodes[0]);
-        add_class(&mut engine, nodes[1], "a");
-        add_class(&mut engine, nodes[2], "b");
-        run_style_update(&mut engine, nodes[0]);
-        assert!(std::sync::Arc::ptr_eq(
-            &live_record(&engine, nodes[1]),
-            &live_record(&engine, nodes[2])
-        ));
-    }
-
-    #[test]
     fn orders_each_live_element_once_in_tree_order() {
         let (engine, nodes) = document_with_a_late_first_child();
         let tree = &engine.retained.projection;
@@ -232,54 +225,5 @@ mod tests {
         assert_eq!(scratch.hidden_before(nodes[3]), None);
         scratch.order(tree, nodes[0], [nodes[0], nodes[1]]);
         assert_eq!(scratch.ordered, [nodes[0], nodes[1]]);
-    }
-
-    #[test]
-    fn finds_the_effects_of_each_element_in_tree_order_or_not() {
-        let (mut engine, nodes) = document_with_a_late_first_child();
-        let children = &nodes[1..];
-        for class_present in [true, false] {
-            match class_present {
-                true => add_class(&mut engine, nodes[0], "x"),
-                false => remove_class(&mut engine, nodes[0], "x"),
-            }
-            run_style_update(&mut engine, nodes[0]);
-            let installation = engine.take_installation();
-            let effects: Vec<_> = installation.effects.iter().map(|effects| effects.node()).collect();
-            assert_eq!(effects, children, "effects are in tree order");
-            for &child in children {
-                assert_eq!(
-                    installation.effects_of(child).map(|effects| effects.node()),
-                    Some(child)
-                );
-            }
-            assert!(installation.effects_of(nodes[0]).is_none());
-        }
-
-        // Where the elements stand in the order of their identities, the effects are found as well.
-        add_class(&mut engine, nodes[2], "x");
-        let grandchildren = allocate_nodes(&mut engine, 2);
-        engine.record_tree_delta(grandchildren[0], None, Some(relations(Some(nodes[2]), None, None)));
-        engine.record_tree_delta(
-            grandchildren[1],
-            None,
-            Some(relations(Some(nodes[2]), Some(grandchildren[0]), None)),
-        );
-        for &grandchild in &grandchildren {
-            set_tag(&mut engine, grandchild, "div");
-        }
-        run_style_update(&mut engine, nodes[0]);
-        engine.take_installation();
-        remove_class(&mut engine, nodes[2], "x");
-        run_style_update(&mut engine, nodes[0]);
-        let installation = engine.take_installation();
-        let effects: Vec<_> = installation.effects.iter().map(|effects| effects.node()).collect();
-        assert_eq!(effects, grandchildren);
-        for &grandchild in &grandchildren {
-            assert_eq!(
-                installation.effects_of(grandchild).map(|effects| effects.node()),
-                Some(grandchild)
-            );
-        }
     }
 }

@@ -12,6 +12,7 @@
 #include <AK/Platform.h>
 #include <AK/StdLibExtras.h>
 #include <AK/TypeCasts.h>
+#include <LibCore/BrowserVersion.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/SessionStore.h>
@@ -848,7 +849,7 @@ void BrowserWindow::initialize_tab(Tab* tab)
 
     QObject::connect(tab, &Tab::title_changed, this, &BrowserWindow::tab_title_changed);
     QObject::connect(tab, &Tab::favicon_changed, this, &BrowserWindow::tab_favicon_changed);
-    QObject::connect(tab, &Tab::audibility_changed, this, &BrowserWindow::tab_audibility_changed);
+    QObject::connect(tab, &Tab::playing_audio_indicator_changed, this, &BrowserWindow::tab_playing_audio_indicator_changed);
     QObject::connect(tab, &Tab::loading_changed, this, [this] {
         m_tabs_container->tab_bar()->update_loading_ring_animation();
     });
@@ -1222,8 +1223,8 @@ int BrowserWindow::tab_index(Tab* tab)
 void BrowserWindow::update_window_title(QString const& title)
 {
     char const* format = is_private() == WebView::IsPrivate::Yes
-        ? "%1 - Ladybird (Private)"
-        : "%1 - Ladybird";
+        ? "%1 - " BROWSER_PRODUCT_NAME " (Private)"
+        : "%1 - " BROWSER_PRODUCT_NAME;
     setWindowTitle(QString(format).arg(title));
 }
 
@@ -1408,21 +1409,22 @@ void BrowserWindow::set_always_on_top(bool always_on_top)
         handle->setFlags(flags);
 }
 
-void BrowserWindow::tab_audibility_changed(int index, Audio::Audibility)
+void BrowserWindow::tab_playing_audio_indicator_changed(int index)
 {
     if (index < 0)
         return;
     update_tab_audio_button(*m_tabs_container->tab(index));
 }
 
-// The tab is shown playing audio, muted or not, while the AudioServer recently heard it. A muted tab keeps its button,
-// as that is the only way to unmute it.
+// The tab is shown playing audio, muted or not, while the view shows it playing audio. A muted tab keeps its button, as
+// that is the only way to unmute it.
 void BrowserWindow::update_tab_audio_button(Tab& tab)
 {
     auto index = tab_index(&tab);
     auto* tab_bar = m_tabs_container->tab_bar();
+    auto shows_playing_audio = tab.is_loaded() && tab.view().tab_indicator_visible(WebView::TabIndicator::PlayingAudio);
 
-    if (!tab.is_loaded() || (tab.view().audibility() == Audio::Audibility::Inaudible && tab.view().page_mute_state() == Web::HTML::MuteState::Unmuted)) {
+    if (!tab.is_loaded() || (!shows_playing_audio && tab.view().page_mute_state() == Web::HTML::MuteState::Unmuted)) {
         // The tab bar only hides the button it lets go of.
         if (auto* button = tab_bar->tabButton(index, AUDIO_STATE_BUTTON_POSITION))
             button->deleteLater();
@@ -1602,12 +1604,6 @@ bool BrowserWindow::event(QEvent* event)
 
 bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
 {
-    if (auto* native_window = as_if<QWindow>(object)) {
-        if (filter_native_window_event(*native_window, *event))
-            return true;
-        return QMainWindow::eventFilter(object, event);
-    }
-
     auto* widget = as_if<QWidget>(object);
     if (!widget || widget->window() != this)
         return QMainWindow::eventFilter(object, event);
@@ -1709,56 +1705,6 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
         return true;
 
     return QMainWindow::eventFilter(object, event);
-}
-
-bool BrowserWindow::filter_native_window_event(QWindow& window, QEvent& event)
-{
-    if (!uses_client_side_decorations())
-        return false;
-
-    auto* window_handle = windowHandle();
-    if (!window_handle)
-        return false;
-
-    bool window_is_embedded_in_this_window = false;
-    for (auto const* ancestor = window.parent(); ancestor; ancestor = ancestor->parent()) {
-        if (ancestor == window_handle) {
-            window_is_embedded_in_this_window = true;
-            break;
-        }
-    }
-    if (!window_is_embedded_in_this_window)
-        return false;
-
-    switch (event.type()) {
-    case QEvent::Enter:
-        update_resize_cursor(mapFromGlobal(QCursor::pos()));
-        return false;
-    case QEvent::MouseMove:
-        update_resize_cursor(mapFromGlobal(static_cast<QMouseEvent const&>(event).globalPosition().toPoint()));
-        return false;
-    case QEvent::Leave: {
-        auto position = mapFromGlobal(QCursor::pos());
-        if (rect().contains(position))
-            update_resize_cursor(position);
-        else
-            clear_resize_cursor();
-        return false;
-    }
-    case QEvent::MouseButtonPress: {
-        auto const& mouse_event = static_cast<QMouseEvent const&>(event);
-        if (mouse_event.button() != Qt::LeftButton || isMaximized() || isFullScreen())
-            return false;
-
-        auto edges = resize_edges_for_position(mapFromGlobal(mouse_event.globalPosition().toPoint()));
-        if (edges == Qt::Edges {})
-            return false;
-
-        return window_handle->startSystemResize(edges);
-    }
-    default:
-        return false;
-    }
 }
 
 Qt::Edges BrowserWindow::resize_edges_for_position(QPoint const& position) const

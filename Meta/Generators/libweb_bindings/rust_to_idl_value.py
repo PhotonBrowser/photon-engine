@@ -26,6 +26,7 @@ from Generators.libweb_bindings.rust_types import cpp_interface_name_constant
 from Generators.libweb_bindings.rust_types import dictionary_holds_sequence_of_cells
 from Generators.libweb_bindings.rust_types import holds_cells
 from Generators.libweb_bindings.rust_types import inheriting_interfaces
+from Generators.libweb_bindings.rust_types import is_callback_interface
 from Generators.libweb_bindings.rust_types import is_named_union
 from Generators.libweb_bindings.rust_types import is_promise_type
 from Generators.libweb_bindings.rust_types import is_sequence_of_cells
@@ -53,7 +54,10 @@ from Utils.webidl_parser import IDLUnionType
 from Utils.webidl_parser import Interface
 from Utils.webidl_parser import OperationParameter
 
-STRING_TYPES = ("DOMString", "USVString")
+# NB: CSSOMString is a string type that an implementation chooses, https://drafts.csswg.org/cssom/#cssomstring-type,
+#     and it is a DOMString here, as it is in the C++ bindings.
+DOM_STRING_TYPES = ("CSSOMString", "DOMString")
+STRING_TYPES = (*DOM_STRING_TYPES, "USVString")
 
 
 def buffer_source_rules(idl_type: IDLType, parameter_attributes: dict[str, str]) -> str:
@@ -86,7 +90,7 @@ def rust_to_idl_value(
                 f"{what} has the type {idl_type} with [{integer_attribute}], which the Rust bindings only handle on "
                 "integer types"
             )
-    if "LegacyNullToEmptyString" in attributes and (idl_type.nullable or name != "DOMString"):
+    if "LegacyNullToEmptyString" in attributes and (idl_type.nullable or name not in DOM_STRING_TYPES):
         raise UnsupportedByRustBindings(
             f"{what} has the type {idl_type} with [LegacyNullToEmptyString], which applies to DOMString only"
         )
@@ -114,7 +118,7 @@ def rust_to_idl_value(
         raise UnsupportedByRustBindings(
             f"{what} has the type {idl_type}, which the Rust bindings do not convert to yet"
         )
-    if name == "DOMString":
+    if name in DOM_STRING_TYPES:
         if "LegacyNullToEmptyString" in attributes:
             return f"to_dom_string_treating_null_as_empty(vm, {value})"
         return f"to_dom_string(vm, {value})"
@@ -155,6 +159,8 @@ def rust_to_idl_value(
         if is_promise_type(callback_function.return_type):
             return f"PromiseCallbackFunction::from_js(vm, {value})"
         return f"CallbackFunction::from_js(vm, {value})"
+    if is_callback_interface(idl_type, context):
+        return f"CallbackInterface::from_js(vm, {value})"
     interface = rust_interface(idl_type, context)
     if interface is not None:
         if inheriting_interfaces(interface, context):
@@ -300,6 +306,8 @@ def rust_default_value(
     """An expression of the default value of the parameter or of the dictionary member."""
     name = member.type.name
     default_value = member.default_value
+    if member.type.nullable and default_value == "null":
+        return "None"
     string_literal = rust_string_literal(default_value, name, what)
     if string_literal is not None:
         return string_literal
@@ -369,12 +377,12 @@ def write_dictionary_from_js(out: TextIO, context: GenerationContext, dictionary
     path = rust_dictionary_path(dictionary, context)
     holds_sequence_of_cells = dictionary_holds_sequence_of_cells(dictionary, context)
     ancestors = context.dictionary_inheritance_stack(dictionary)[1:]
-    if ancestors and any(dictionary_holds_sequence_of_cells(other, context) for other in [dictionary] + ancestors):
+    if any(dictionary_holds_sequence_of_cells(ancestor, context) for ancestor in ancestors):
         # NB: The struct of such a dictionary has the lifetime of the reference to the VM, which the struct of a
-        #     dictionary that inherits from it or that it inherits from would have to have as well.
+        #     dictionary that inherits from it would have to pass on.
         raise UnsupportedByRustBindings(
-            f"the dictionary {dictionary.name} inherits from another dictionary, and one of them holds a sequence of "
-            "values that are or can hold cells, which the Rust bindings do not convert to yet"
+            f"the dictionary {dictionary.name} inherits from a dictionary that holds a sequence of values that are or "
+            "can hold cells, which the Rust bindings do not convert to yet"
         )
     keys = []
     conversions = []
@@ -448,7 +456,7 @@ def write_dictionary_from_js(out: TextIO, context: GenerationContext, dictionary
     impl<'vm> {path}<'vm> {{
         pub(crate) fn from_js(vm: &'vm Vm, value: Value) -> ThrowCompletionOr<Self> {{
 {"".join(keys)}            let object = dictionary_object(vm, value, "{dictionary.name}")?;
-{"".join(conversions)}            Ok(Self {{ {fields} }})
+{parent_conversion}{"".join(conversions)}            Ok(Self {{ {fields} }})
         }}
 {empty}    }}
 """

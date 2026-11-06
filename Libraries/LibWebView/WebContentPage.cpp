@@ -30,8 +30,10 @@
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/GamepadManager.h>
 #include <LibWebView/HistoryStore.h>
+#include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/NavigationLoader.h>
 #include <LibWebView/NotificationManager.h>
+#include <LibWebView/PageTranslation.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/RecordingNotificationBackend.h>
@@ -572,16 +574,16 @@ void WebContentPage::did_detect_history_swipe_candidate(u64 gesture_id, bool bac
     }
 }
 
-void WebContentPage::did_dispatch_input_event_through_compositor(u64 event_id, bool async_scroll_performed_default_action)
+void WebContentPage::did_dispatch_input_event_through_compositor(u64 event_id, bool performed_default_action)
 {
     if (displays_tab()) {
-        view().did_dispatch_input_event_through_compositor({}, event_id, async_scroll_performed_default_action);
+        view().did_dispatch_input_event_through_compositor({}, event_id, performed_default_action);
         return;
     }
 
     if (auto display_page = traversable().display_page(); display_page) {
         if (display_page->is_open() && display_page.ptr() != this)
-            display_page->did_dispatch_input_event_through_compositor(event_id, async_scroll_performed_default_action);
+            display_page->did_dispatch_input_event_through_compositor(event_id, performed_default_action);
     }
 }
 
@@ -686,10 +688,6 @@ void WebContentPage::close()
             bidi->push_session_state_for_client(*m_client);
         m_client->forget_audio_playback(m_id);
         GamepadManager::the().page_closed(*this);
-    }
-    if (m_traversable) {
-        if (auto view = m_traversable->view(); view.has_value())
-            view->did_close_page({}, m_id);
     }
     set_audibility(Audio::Audibility::Inaudible);
     m_web_ui = nullptr;
@@ -1183,11 +1181,19 @@ void WebContentPage::did_inspect_accessibility_tree(String accessibility_tree)
     }
 }
 
-void WebContentPage::did_get_accessibility_tree(Vector<AccessibilityNodeData> nodes)
+void WebContentPage::did_get_accessibility_tree(u64 sequence, Vector<AccessibilityNodeData> nodes)
 {
     if (displays_tab()) {
         if (view().on_accessibility_tree_received)
-            view().on_accessibility_tree_received(move(nodes));
+            view().on_accessibility_tree_received(sequence, move(nodes));
+    }
+}
+
+void WebContentPage::did_change_accessibility_tree(u64 base_sequence, u64 sequence, AccessibilityTreeDelta delta)
+{
+    if (displays_tab()) {
+        if (view().on_accessibility_tree_changed)
+            view().on_accessibility_tree_changed(base_sequence, sequence, move(delta));
     }
 }
 
@@ -1840,6 +1846,14 @@ void WebContentPage::did_request_permission(u64 request_id, Web::HTML::CrossProc
         return;
     }
 
+    // Allowing the site the microphone the system keeps from the browser would get it nothing, so the user is told why
+    // instead of being asked. Nothing is decided for the site, which may ask again once the system relents.
+    if (*permission_name == Web::Permissions::PermissionName::Microphone && view().microphone_authorization() == MicrophoneAuthorization::Denied) {
+        view().show_microphone_denied_notice();
+        async_permission_request_completed(request_id, Web::Permissions::EffectiveState::Prompt);
+        return;
+    }
+
     auto generation_when_asked = manager.decision_generation(*permission_name, *top_level_origin);
     // When the system hasn't yet let the browser use the feature either, the prompt says the system will ask next.
     auto show_os_hint = [&] {
@@ -1849,7 +1863,7 @@ void WebContentPage::did_request_permission(u64 request_id, Web::HTML::CrossProc
         case Web::Permissions::PermissionName::Notifications:
             return NotificationManager::the().backend().os_authorization_is_undetermined();
         case Web::Permissions::PermissionName::Microphone:
-            return false;
+            return view().microphone_authorization() == MicrophoneAuthorization::NotDetermined;
         }
         VERIFY_NOT_REACHED();
     }();
@@ -1884,10 +1898,24 @@ void WebContentPage::did_request_permission(u64 request_id, Web::HTML::CrossProc
         }
 
         // The AudioServer hears of the permission before the page does, so the page's first request finds it in place.
-        if (permission_name == Web::Permissions::PermissionName::Microphone)
+        auto is_microphone = permission_name == Web::Permissions::PermissionName::Microphone;
+        if (is_microphone)
             page->client().update_audio_capture_permission();
 
-        page->async_permission_request_completed(request_id, state);
+        if (!is_microphone || state != Web::Permissions::EffectiveState::Granted) {
+            page->async_permission_request_completed(request_id, state);
+            return;
+        }
+
+        // The system may only now ask the user for the microphone. If it keeps it from the browser, the site keeps the
+        // user's answer for when it relents, but this request gets nothing.
+        page->view().ensure_microphone_authorization([page, request_id, document_id](bool authorized) {
+            if (!page->is_open())
+                return;
+            // The user may have taken the permission away while the system asked.
+            auto granted = authorized && page->document_may_use(document_id, Web::Permissions::PermissionName::Microphone);
+            page->async_permission_request_completed(request_id, granted ? Web::Permissions::EffectiveState::Granted : Web::Permissions::EffectiveState::Prompt);
+        });
     });
 }
 
@@ -1931,6 +1959,41 @@ void WebContentPage::set_next_permission_prompt_outcome_for_testing(String const
         prompt_outcome = Web::Permissions::PromptOutcome::Ignored;
     if (prompt_outcome.has_value())
         view().set_next_permission_prompt_outcome_for_testing(*permission_name, *prompt_outcome, held);
+}
+
+static Optional<MicrophoneAuthorization> microphone_authorization_from_string(StringView string)
+{
+    if (string == "not-determined"sv)
+        return MicrophoneAuthorization::NotDetermined;
+    if (string == "authorized"sv)
+        return MicrophoneAuthorization::Authorized;
+    if (string == "denied"sv)
+        return MicrophoneAuthorization::Denied;
+    return {};
+}
+
+void WebContentPage::set_system_microphone_authorization_for_testing(String const& authorization, String const& answer, bool held)
+{
+    auto current = microphone_authorization_from_string(authorization);
+    auto answered = microphone_authorization_from_string(answer);
+    if (current.has_value() && answered.has_value())
+        view().set_microphone_authorization_for_testing(*current, *answered, held);
+}
+
+void WebContentPage::release_system_microphone_answer_for_testing()
+{
+    view().release_system_microphone_answer_for_testing();
+}
+
+String WebContentPage::microphone_state_for_testing() const
+{
+    JsonObject state;
+    state.set("noticesShown"sv, view().microphone_denied_notices_shown_for_testing());
+    state.set("systemRequests"sv, view().system_microphone_requests_for_testing());
+    state.set("captureDecisions"sv, client().audio_capture_decision_count());
+    state.set("captureRefusals"sv, client().audio_capture_refusal_count());
+    state.set("dismissals"sv, view().session().permission_manager->dismissals_for_testing(Web::Permissions::PermissionName::Microphone, view().permission_origin()));
+    return state.serialized();
 }
 
 void WebContentPage::release_held_permission_prompt_for_testing(u32 waiters)
@@ -2146,8 +2209,9 @@ void WebContentPage::did_request_key_event_for_testing(Web::KeyEvent event)
         client().did_misbehave("did_request_key_event_for_testing"sv, "not driven by WebDriver or a test"sv);
         return;
     }
-    // Only the compositor sets this, on its way to WebContent.
+    // Only the compositor sets these, on its way to WebContent.
     event.async_scroll_performed_default_action = false;
+    event.user_input_scroll_count_with_nothing_to_scroll = {};
     view().enqueue_input_event(move(event));
 }
 
@@ -2175,9 +2239,14 @@ void WebContentPage::beforeunload_check_result(Web::HTML::CrossProcessId operati
     traversable().did_receive_beforeunload_check_result(*this, operation_id, result, unload_prompt_shown);
 }
 
-void WebContentPage::changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only, Optional<Web::HTML::CrossProcessId> target_document_id)
+void WebContentPage::changing_navigable_history_job_reached_population(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationSourceSnapshot active_document_source_snapshot_params)
 {
-    traversable().did_receive_changing_navigable_history_job_ready(*this, operation_id, navigable_id, disposition, update_only, target_document_id);
+    traversable().did_receive_changing_navigable_history_job_reached_population(*this, operation_id, navigable_id, move(active_document_source_snapshot_params));
+}
+
+void WebContentPage::changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only)
+{
+    traversable().did_receive_changing_navigable_history_job_ready(*this, operation_id, navigable_id, disposition, update_only);
 }
 
 void WebContentPage::descendant_unload_task_complete(Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id)
@@ -2416,6 +2485,16 @@ void WebContentPage::did_request_writing_suggestion(u64 request_id, Utf16String 
     view().did_request_writing_suggestion({}, *this, request_id, move(text), caret_offset);
 }
 
+void WebContentPage::did_get_translation_language_sample(u64 request_id, Web::TranslationLanguageSample sample)
+{
+    view().page_translation().did_get_language_sample({}, request_id, move(sample));
+}
+
+void WebContentPage::did_request_translation(Web::TranslationUnit unit)
+{
+    view().page_translation().did_request_translation({}, *this, move(unit));
+}
+
 void WebContentPage::did_request_set_system_focus(bool has_system_focus)
 {
     if (!may_change_window(*this, "did_request_set_system_focus"sv))
@@ -2611,10 +2690,10 @@ void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProce
     });
 }
 
-void WebContentPage::did_finish_history_navigation_params_creation(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population)
+void WebContentPage::did_finish_history_navigation_params_creation(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationPopulationResult result)
 {
     auto& host = this->traversable();
-    host.top_level_traversable().did_finish_history_navigation_params_creation(*this, operation_id, move(population));
+    host.top_level_traversable().did_finish_history_navigation_params_creation(*this, operation_id, navigable_id, move(result));
 }
 
 void WebContentPage::did_fail_navigation_population(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id)
@@ -2768,7 +2847,16 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
             && candidate->uncommitted_navigation() && candidate->uncommitted_navigation()->host() == this)
             navigable = candidate;
     }
+    if (!navigable.has_value())
+        navigable = traversable().top_level_traversable().find(navigable_id);
     if (navigable.has_value()) {
+        auto ongoing_navigation = navigation_id.has_value() ? navigable->navigation_with_id(*navigation_id) : nullptr;
+        bool owns_navigation = ongoing_navigation
+            && ((ongoing_navigation->state.has<CanonicalNavigation::CreatingNavigationParams>() && ongoing_navigation->worker() == this)
+                || (ongoing_navigation->state.has<CanonicalNavigation::Populating>() && ongoing_navigation->host() == this));
+        // The active host can report a response after navigation is canceled, so BiDi still needs its terminal error.
+        if (!owns_navigation && !traversable().hosts(*navigable, *this))
+            return { Optional<u64> {} };
         if (auto* bidi = WebDriverBiDi::the();
             bidi && network_response.is_object()) {
             on_response_finished = [weak_bidi = bidi->make_weak_ptr(),
@@ -2782,10 +2870,7 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
                         timing, error);
             };
         }
-        auto ongoing_navigation = navigation_id.has_value() ? navigable->navigation_with_id(*navigation_id) : nullptr;
-        if (ongoing_navigation
-            && (ongoing_navigation->state.has<CanonicalNavigation::CreatingNavigationParams>() || ongoing_navigation->state.has<CanonicalNavigation::Populating>())
-            && ongoing_navigation->loader()->response_body_matches(request_server_client_id, request_server_request_id)) {
+        if (owns_navigation && ongoing_navigation->loader()->response_body_matches(request_server_client_id, request_server_request_id)) {
             matches_in_flight_navigation = true;
             navigable->did_cancel_navigation(*navigation_id);
         }
@@ -2948,6 +3033,16 @@ void WebContentPage::did_request_spelling_menu_action_for_testing(Web::SpellingM
     view().activate_spelling_menu_action_for_testing({}, *this, action, guess_index);
 }
 
+void WebContentPage::did_request_page_translation_for_testing(String target_language)
+{
+    // NB: This translates the tab as its menu would, so only automation may ask for it.
+    if (!WebContentClient::renderers_may_synthesize_input()) {
+        client().did_misbehave("did_request_page_translation_for_testing"sv, "not driven by WebDriver or a test"sv);
+        return;
+    }
+    view().page_translation().translate_for_testing({}, move(target_language));
+}
+
 void WebContentPage::did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<u64> text_fragment_generation_id)
 {
     auto verified_navigation = navigation_from_page(client(), move(navigation));
@@ -2962,13 +3057,17 @@ void WebContentPage::did_generate_text_fragment_url(u64 request_id, Optional<URL
     view().did_generate_text_fragment_url(request_id, move(url));
 }
 
-void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap)
+void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type)
 {
     auto verified_navigation = navigation_from_page(client(), move(navigation));
     if (!verified_navigation.has_value())
         return;
+    // NB: A link the page may not navigate to takes only its own actions out of the menu, the image's stay.
+    Optional<Web::HTML::PreparedNavigationDescriptor> verified_link_navigation;
+    if (link_navigation.has_value())
+        verified_link_navigation = navigation_from_page(client(), link_navigation.release_value());
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_image_context_menu({}, target->position, verified_navigation.release_value(), move(bitmap));
+        target->view.did_request_image_context_menu({}, target->position, verified_navigation.release_value(), move(bitmap), move(verified_link_navigation), move(image_mime_type));
 }
 
 void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)
@@ -3385,13 +3484,19 @@ Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResp
 Messages::WebContentTestClient::DidRequestTabIsPlayingAudioForTestingResponse WebContentPage::did_request_tab_is_playing_audio_for_testing()
 {
     auto view = traversable().view();
-    return view.has_value() && view->audibility() == Audio::Audibility::Audible;
+    return view.has_value() && view->tab_indicator_visible(TabIndicator::PlayingAudio);
+}
+
+Messages::WebContentTestClient::DidRequestTabIsHeardPlayingAudioForTestingResponse WebContentPage::did_request_tab_is_heard_playing_audio_for_testing()
+{
+    auto view = traversable().view();
+    return view.has_value() && view->is_playing_audio();
 }
 
 Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResponse WebContentPage::did_request_tab_audibility_change_count_for_testing()
 {
     auto view = traversable().view();
-    return view.has_value() ? view->audibility_change_count() : 0;
+    return view.has_value() ? view->playing_audio_indicator_change_count() : 0;
 }
 
 void WebContentPage::did_request_crash_of_remote_frame_processes_for_testing()

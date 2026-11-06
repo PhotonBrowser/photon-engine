@@ -19,9 +19,13 @@ pub(in crate::css::style) trait DriveRecords:
 {
     fn assigned_record_view(&self, node: StyleNodeID) -> Option<computed::StyleRecordView<'_>>;
 
-    /// The record the highlight pseudo-element of `kind` of `node` inherits from: that of the same
+    /// The record the highlight pseudo-element `target` of `node` inherits from: that of the same
     /// pseudo-element of its nearest flat-tree ancestor holding one.
-    fn highlight_inheritance_parent_view(&self, node: StyleNodeID, kind: u8) -> Option<computed::StyleRecordView<'_>>;
+    fn highlight_inheritance_parent_view(
+        &self,
+        node: StyleNodeID,
+        target: super::records::PseudoElementTarget,
+    ) -> Option<computed::StyleRecordView<'_>>;
 }
 
 impl DriveRecords for RetainedState {
@@ -31,8 +35,12 @@ impl DriveRecords for RetainedState {
             .and_then(|record| self.computed_group_sets.style_record_view(record.raw()))
     }
 
-    fn highlight_inheritance_parent_view(&self, node: StyleNodeID, kind: u8) -> Option<computed::StyleRecordView<'_>> {
-        self.retained_highlight_inheritance_parent_style_record(node, kind)
+    fn highlight_inheritance_parent_view(
+        &self,
+        node: StyleNodeID,
+        target: super::records::PseudoElementTarget,
+    ) -> Option<computed::StyleRecordView<'_>> {
+        self.retained_highlight_inheritance_parent_style_record(node, target)
             .and_then(|record| self.computed_group_sets.style_record_view(record.raw()))
     }
 }
@@ -71,8 +79,7 @@ pub(in crate::css::style) enum MonospaceRecascade {
 
 /// Driven values, with the length context they were driven against and the font a full drive
 /// resolved.
-pub(in crate::css::style) struct DrivenValues<'a> {
-    pub(in crate::css::style) writer: GroupValuesWriter<'a>,
+pub(in crate::css::style) struct DrivenValues {
     pub(in crate::css::style) length: crate::css::style_compute::FfiLengthResolutionContext,
     pub(in crate::css::style) font: Option<crate::css::table_group_builder::FfiFontGroupBuildInputs>,
 }
@@ -179,14 +186,36 @@ impl RetainedState {
         };
         let default_size = CssPixels::from_integer(13).raw_value();
         let document_inputs = FontSizeRecascadeDocumentInputs::from_document(inputs);
+        // NB: The size an ancestor's animations give it wins over what the cascade of its ancestors decides, so the
+        //     recascade goes on from that ancestor's computed size.
+        let animated = views.iter().enumerate().rev().find_map(|(index, (_, view))| {
+            let view = view.as_ref()?;
+            view.longhands()
+                .overlay_value(
+                    view.animated_overlay,
+                    crate::css::property_metadata::property_id::FONT_SIZE,
+                )
+                .map(|_| (index, view))
+        });
+        let (start_index, start_size_raw, start_depends_on_viewport) =
+            animated.map_or((0, default_size, false), |(index, view)| {
+                (
+                    index + 1,
+                    crate::css::computed_value_views::ComputedValuesView::of(view.payloads)
+                        .font()
+                        .font_size
+                        .raw_value(),
+                    view.dependency_flags & FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS != 0,
+                )
+            });
         let mut batch = recascade_font_size_batch(
             views.len(),
             value_at,
             |index| zooms[index],
             applies_zoom_at,
-            0,
-            default_size,
-            false,
+            start_index,
+            start_size_raw,
+            start_depends_on_viewport,
             default_size,
             document_inputs,
             None,
@@ -222,11 +251,7 @@ impl RetainedState {
                 font_feature_values_scope: TreeScopeID::DOCUMENT.0,
                 font_environment_generation: inputs.font_environment_generation,
             };
-            let Some(resolved) = self
-                .font_resolution
-                .as_ref()
-                .and_then(|resolutions| resolutions.lookup(request))
-            else {
+            let Some(resolved) = self.resolved_font(request) else {
                 return Some(MonospaceRecascade::AwaitsFont(request));
             };
             // NB: The ancestor's own font is the one being recascaded; its line height is the one it
@@ -398,14 +423,14 @@ impl RetainedState {
     /// transformation reads. Root-input preparation finishes only the font and line-height
     /// phases and preserves them for completion.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub(in crate::css::style) fn engine_full_drive<'a>(
+    pub(in crate::css::style) fn engine_full_drive(
         &self,
         subject: DriveSubject,
-        writer: GroupValuesWriter<'a>,
+        writer: &mut GroupValuesWriter<'_>,
         store: &WinnerStore,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         font_scratch: &mut FontDriveScratch,
-    ) -> Drive<DrivenValues<'a>> {
+    ) -> Drive<DrivenValues> {
         self.engine_drive_with(self, subject, writer, None, store, inputs, font_scratch)
     }
 
@@ -414,16 +439,16 @@ impl RetainedState {
     /// only those, beside the inputs every drive evaluates, and keeps the writer's values for the
     /// rest.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub(in crate::css::style) fn engine_drive_with<'a>(
+    pub(in crate::css::style) fn engine_drive_with(
         &self,
         records: &impl DriveRecords,
         subject: DriveSubject,
-        writer: GroupValuesWriter<'a>,
+        writer: &mut GroupValuesWriter<'_>,
         selected: Option<&[u64]>,
         store: &WinnerStore,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         font_scratch: &mut FontDriveScratch,
-    ) -> Drive<DrivenValues<'a>> {
+    ) -> Drive<DrivenValues> {
         let random_base_values = store
             .drive_random_base_values(self, subject.target.node())
             .expect("a random function's base values are drawn before the row is driven");
@@ -533,7 +558,7 @@ impl RetainedState {
         // pseudo-element of the nearest ancestor.
         let highlight = pseudo_kind::is_highlight(target.pseudo_kind()).then(|| {
             let snapshot = records
-                .highlight_inheritance_parent_view(target.node(), target.pseudo_kind())
+                .highlight_inheritance_parent_view(target.node(), target.pseudo_element())
                 .map(|view| {
                     crate::css::style_compute::ParentSnapshot::from_view(
                         view.longhands(),
@@ -647,7 +672,7 @@ impl RetainedState {
         if !resuming {
             self.counters.bump(Counter::EngineFullDrivesStarted);
         }
-        let (mut writer, mut results, mut effective_color_scheme) = match resumed {
+        let (mut results, mut effective_color_scheme) = match resumed {
             Some(pending) => {
                 resolved_viewport_relative_length = pending.resolved_viewport_relative_length;
                 if !pending.root_font_complete {
@@ -657,9 +682,10 @@ impl RetainedState {
                         u64::from(pending.results.longhand_evaluations),
                     );
                 }
-                (pending.writer, pending.results, pending.effective_color_scheme)
+                *writer = pending.writer;
+                (pending.results, pending.effective_color_scheme)
             }
-            None => (writer, empty_longhand_driver_results(), -1),
+            None => (empty_longhand_driver_results(), -1),
         };
         let drive = |counters: &Counters,
                      writer: &mut GroupValuesWriter<'_>,
@@ -714,7 +740,7 @@ impl RetainedState {
             }
             drive(
                 &self.counters,
-                &mut writer,
+                writer,
                 &mut results,
                 &mut effective_color_scheme,
                 LONGHAND_DRIVE_PHASE_FONT,
@@ -736,16 +762,12 @@ impl RetainedState {
             || self.font_feature_values_scope(target.node()),
         );
         let font_size = request.font_size();
-        let Some(resolved) = self
-            .font_resolution
-            .as_ref()
-            .and_then(|resolutions| resolutions.lookup(request))
-        else {
+        let Some(resolved) = self.resolved_font(request) else {
             let progress = DriveProgress {
                 root_font_complete: false,
                 color_scheme_complete: false,
                 recascaded_font_size,
-                writer: writer.detached(),
+                writer: writer.clone().detached(),
                 results,
                 effective_color_scheme,
                 resolved_viewport_relative_length,
@@ -784,7 +806,7 @@ impl RetainedState {
         if !root_font_complete {
             drive(
                 &self.counters,
-                &mut writer,
+                writer,
                 &mut results,
                 &mut effective_color_scheme,
                 LONGHAND_DRIVE_PHASE_LINE_HEIGHT,
@@ -798,7 +820,7 @@ impl RetainedState {
         if !color_scheme_complete {
             drive(
                 &self.counters,
-                &mut writer,
+                writer,
                 &mut results,
                 &mut effective_color_scheme,
                 LONGHAND_DRIVE_PHASE_COLOR_SCHEME,
@@ -835,7 +857,7 @@ impl RetainedState {
         };
         drive(
             &self.counters,
-            &mut writer,
+            writer,
             &mut results,
             &mut effective_color_scheme,
             LONGHAND_DRIVE_PHASE_REMAINING,
@@ -854,7 +876,6 @@ impl RetainedState {
             ..remaining_length
         };
         Ok(DrivenValues {
-            writer,
             length,
             font: Some(font),
         })

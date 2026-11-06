@@ -13,8 +13,6 @@
 //! An element that left the tree is retired and forgotten here as its departure is published: the generations
 //! published before keep its facts, which is where the render owner reads what a departed element carried.
 
-use super::super::super::fast_hash::FastMap as HashMap;
-use super::super::super::fast_hash::FastSet as HashSet;
 use super::super::super::index::AttributeFact;
 use super::super::super::index::AttributeNameForms;
 use super::super::super::index::StyleAtomID;
@@ -24,6 +22,9 @@ use super::super::super::instrumentation::Counter;
 use super::super::super::instrumentation::Counters;
 use super::super::super::tree::StyleNodeID;
 
+use super::super::super::element_declarations::{
+    InlineDeclarationColumn, InlineDeclarationSnapshot, InlineDeclarations,
+};
 use super::super::super::element_host_facts::HostFactSet;
 use super::super::super::element_host_facts::HostFactSets;
 use super::ArrivalFacts;
@@ -44,6 +45,7 @@ use super::list_bloom_of;
 use super::relations_of;
 use crate::cow_column::ColumnSnapshot;
 use crate::cow_column::CowColumn;
+use crate::css::declaration_block::SharedDeclarationBlock;
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -66,6 +68,11 @@ pub(in crate::css::style) struct ProjectionWriter {
     rows: CowColumn<Row, ROWS_PER_CHUNK>,
     /// The elements' shadow relations, made only as far as the last element that held any.
     shadows: ShadowColumn,
+    /// The elements' inline declarations.
+    inline_declarations: InlineDeclarationColumn,
+    /// Whether the inline declarations of an element were written since the last publication, which the rows written do
+    /// not list: what a transaction takes of them the host says beside its rows.
+    inline_declarations_written: bool,
     /// The rows as the host last published them.
     published: ColumnSnapshot<Row, ROWS_PER_CHUNK>,
     /// One past the greatest element slot written.
@@ -75,9 +82,9 @@ pub(in crate::css::style) struct ProjectionWriter {
     host_fact_sets: Arc<HostFactSets>,
     recent_lists: RecentFactLists,
     /// A slotted text node's slot. Text nodes have no rows, and a slotted one is rare.
-    text_assigned_slots: Arc<HashMap<StyleNodeID, StyleNodeID>>,
+    text_assigned_slots: crate::cow_map::CowMap<StyleNodeID, StyleNodeID>,
     /// The elements whose facts say they are disabled, which only the writes of their states and their departures move.
-    disabled: Arc<HashSet<StyleNodeID>>,
+    disabled: crate::cow_map::CowSet<StyleNodeID>,
     /// The elements whose rows were written since the last publication.
     written: WrittenRows,
     /// Of those, the elements whose links were written.
@@ -100,11 +107,12 @@ pub(in crate::css::style) struct ProjectionWriter {
 pub(in crate::css::style) struct ProjectionPublication {
     pub(super) rows: ColumnSnapshot<Row, ROWS_PER_CHUNK>,
     pub(super) shadows: ShadowSnapshot,
+    pub(in crate::css::style) inline_declarations: InlineDeclarationSnapshot,
     pub(super) slot_count: usize,
     pub(super) catalogs: Catalogs,
     pub(super) host_fact_sets: Arc<HostFactSets>,
-    pub(super) text_assigned_slots: Arc<HashMap<StyleNodeID, StyleNodeID>>,
-    pub(super) disabled: Arc<HashSet<StyleNodeID>>,
+    pub(super) text_assigned_slots: crate::cow_map::CowMap<StyleNodeID, StyleNodeID>,
+    pub(super) disabled: crate::cow_map::CowSet<StyleNodeID>,
     pub(super) written: Vec<StyleNodeID>,
     pub(super) links_written: Vec<StyleNodeID>,
     pub(super) relations_written: Vec<StyleNodeID>,
@@ -132,12 +140,12 @@ impl ProjectionWriter {
     /// counted where they are seen first, and the lists of what it wrote. Like the generations a
     /// transaction in flight holds, how much that is depends on when the report runs.
     pub(in crate::css::style) fn report_memory(&self, report: &mut crate::css::style::memory_report::MemoryReport) {
-        use crate::heap_size::map_bytes;
         let sizer = &mut report.sizer;
         let mut bytes = self.rows.heap_size(sizer, Row::heap_size)
             + self.shadows.heap_size(sizer, |shadow, sizer| {
                 super::shadow_links_heap_size(shadow.as_ref(), sizer)
             })
+            + self.inline_declarations.heap_size(sizer, InlineDeclarations::heap_size)
             + self.published.heap_size(sizer, Row::heap_size);
         if sizer.arc_shallow(&self.host_fact_sets) != 0 {
             bytes += crate::heap_size::ARC_HEADER_BYTES + size_of::<HostFactSets>() + self.host_fact_sets.heap_size();
@@ -149,8 +157,8 @@ impl ProjectionWriter {
             bytes += texts.heap_size(sizer);
             bytes += texts.values().map(|text| size_of_val::<[u16]>(text)).sum::<usize>();
         }
-        bytes += sizer.arc_shallow(&self.text_assigned_slots) + map_bytes(&self.text_assigned_slots);
-        bytes += sizer.arc_shallow(&self.disabled) + crate::heap_size::set_bytes(&self.disabled);
+        bytes += self.text_assigned_slots.heap_size();
+        bytes += self.disabled.heap_size();
         bytes += [&self.written, &self.links_written, &self.relations_written]
             .iter()
             .map(|rows| rows.heap_size())
@@ -170,7 +178,10 @@ impl ProjectionWriter {
     /// Whether anything was written since the last publication.
     #[must_use]
     pub(in crate::css::style) fn has_unpublished_writes(&self) -> bool {
-        !self.written.nodes.is_empty() || self.catalogs_written || self.host_facts_written
+        !self.written.nodes.is_empty()
+            || self.catalogs_written
+            || self.host_facts_written
+            || self.inline_declarations_written
     }
 
     /// Publish the rows as written: the barrier the render owner takes them at. The elements that left the tree are
@@ -192,6 +203,7 @@ impl ProjectionWriter {
         let rows = self.rows.publish();
         self.catalogs_written = false;
         self.host_facts_written = false;
+        self.inline_declarations_written = false;
         let counts = WRITE_COUNTERS
             .into_iter()
             .filter_map(|counter| {
@@ -203,11 +215,12 @@ impl ProjectionWriter {
         let publication = ProjectionPublication {
             rows: rows.clone(),
             shadows: self.shadows.publish(),
+            inline_declarations: self.inline_declarations.publish(),
             slot_count: self.slot_count,
             catalogs: self.catalogs.clone(),
             host_fact_sets: Arc::clone(&self.host_fact_sets),
-            text_assigned_slots: Arc::clone(&self.text_assigned_slots),
-            disabled: Arc::clone(&self.disabled),
+            text_assigned_slots: self.text_assigned_slots.clone(),
+            disabled: self.disabled.clone(),
             written: self.written.take(),
             links_written: self.links_written.take(),
             relations_written: self.relations_written.take(),
@@ -241,7 +254,7 @@ impl ProjectionWriter {
         if self.disabled.contains(&node) == disabled {
             return;
         }
-        let elements = Arc::make_mut(&mut self.disabled);
+        let elements = &mut self.disabled;
         if disabled {
             elements.insert(node);
         } else {
@@ -397,9 +410,33 @@ impl ProjectionWriter {
         });
     }
 
+    /// Have the inline declarations of `node` be `block`, answering those it held. The render owner reads them from the
+    /// next publication on.
+    pub(in crate::css::style) fn write_inline_declarations(
+        &mut self,
+        node: StyleNodeID,
+        block: Option<SharedDeclarationBlock>,
+    ) -> Option<SharedDeclarationBlock> {
+        let slot = node.element_slot();
+        if block.is_none()
+            && !self
+                .inline_declarations
+                .get(slot)
+                .is_some_and(InlineDeclarations::is_some)
+        {
+            return None;
+        }
+        self.inline_declarations.grow_to(slot + 1);
+        self.inline_declarations_written = true;
+        self.inline_declarations
+            .replace(slot, InlineDeclarations::new(block))
+            .and_then(InlineDeclarations::into_block)
+    }
+
     /// Retire the element identity `node`, dropping its links and every shadow relation that names
     /// it. Its facts stay until [`Self::forget`].
     pub(in crate::css::style) fn retire(&mut self, node: StyleNodeID) {
+        self.write_inline_declarations(node, None);
         let slot = self.edit(node, |row| {
             assert!(row.live(), "retiring an identity that is not live");
             row.links = Links::default();
@@ -420,7 +457,7 @@ impl ProjectionWriter {
         for &assigned in shadow.assigned_nodes.as_slice() {
             if assigned.text_index().is_some() {
                 if self.text_assigned_slots.get(&assigned) == Some(&node) {
-                    Arc::make_mut(&mut self.text_assigned_slots).remove(&assigned);
+                    self.text_assigned_slots.remove(&assigned);
                 }
             } else if self.row(assigned).and_then(|row| row.facts.lists.assigned_slot()) == Some(node) {
                 self.edit_lists_quietly(assigned, |lists| std::mem::take(&mut lists.assigned_slot).is_some());
@@ -437,7 +474,7 @@ impl ProjectionWriter {
     /// Retire text identities, dropping them from the slot each was assigned to.
     pub(in crate::css::style) fn retire_texts(&mut self, nodes: impl IntoIterator<Item = StyleNodeID>) {
         for node in nodes {
-            let Some(slot) = Arc::make_mut(&mut self.text_assigned_slots).remove(&node) else {
+            let Some(slot) = self.text_assigned_slots.remove(&node) else {
                 continue;
             };
             self.remove_assigned_node(slot, node);
@@ -619,6 +656,7 @@ impl ProjectionWriter {
 
     /// Write every fact an element arrives with in one edit of its row: the facts it names are
     /// set, its classes and attributes join any its row holds, and its states join those set.
+    /// Relations it arrives with are written in the same edit, as [`Self::write_relations`] writes them.
     pub(in crate::css::style) fn write_arrival_facts(&mut self, node: StyleNodeID, arrival: &ArrivalFacts<'_>) {
         let empty = FactLists::default();
         let mut lists = self
@@ -654,11 +692,28 @@ impl ProjectionWriter {
             true => StyleAtomID::NONE,
             false => arrival.folded_tag,
         };
+        if let Some(relations) = arrival.relations {
+            lists.tree_scope = relations.tree_scope;
+            lists.assigned_slot = relations.assigned_slot;
+        }
         let lists = Self::make_lists(&mut self.recent_lists, &self.catalogs.name_forms, lists);
+        if arrival.relations.is_some() {
+            self.relations_written.insert(node, node.element_slot());
+            self.note_links_written(node);
+        }
         if arrival.states.contains(StateFact::Disabled) {
             self.note_disabled(node, true);
         }
-        self.edit_facts(node, |facts| {
+        self.edit(node, |row| {
+            if let Some(relations) = arrival.relations {
+                assert!(row.live(), "linking an identity that is not live");
+                row.links.parent = relations.parent;
+                row.links.previous_element_sibling = relations.previous_element_sibling;
+                row.links.next_element_sibling = relations.next_element_sibling;
+                row.facts.set_flag(ElementFacts::CONNECTED, true);
+            }
+            let facts = &mut row.facts;
+            facts.set_flag(ElementFacts::RESIDENT, true);
             facts.tag = arrival.tag;
             facts.set_flag(ElementFacts::IS_SLOT, arrival.is_slot);
             facts.set_flag(ElementFacts::HAS_TEXT_CONTENT, arrival.has_text_content);
@@ -667,6 +722,7 @@ impl ProjectionWriter {
                 facts.heading_level = arrival.heading_level;
             }
             facts.lists = lists;
+            facts.refresh_dispatch_bloom();
         });
     }
 
@@ -847,7 +903,7 @@ impl ProjectionWriter {
             return;
         }
         let previous: Vec<_> = self.assigned_nodes_of(slot).to_vec();
-        let text_slots = Arc::make_mut(&mut self.text_assigned_slots);
+        let text_slots = &mut self.text_assigned_slots;
         // A tree-wide assignment can have moved a departing text node to another slot already,
         // and this slot must not take that newer assignment away again.
         for node in &previous {

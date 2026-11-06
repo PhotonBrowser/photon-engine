@@ -37,7 +37,7 @@ mod matched_rules;
 mod matching;
 mod pending_inputs;
 pub(super) use pending_inputs::HoverSealMemo;
-pub(crate) mod pool;
+pub(crate) mod per_thread;
 pub(in crate::css::style) mod projection;
 mod records;
 mod rule_changes;
@@ -59,6 +59,7 @@ pub(super) use cascade::DeclaredOnly;
 pub(super) use live::Live;
 #[cfg(test)]
 pub(super) use records::PseudoElementStyles;
+pub(super) use records::PseudoElementTarget;
 pub(crate) use records::Record;
 pub(crate) use records::{CustomDeclarations, RareSetFacts, RareStyleFacts};
 pub(super) use records::{RecordFacts, Sample};
@@ -192,7 +193,7 @@ impl StyleEngine {
         // have asked the resolver for yet.
         self.until_resolved(root, |engine| {
             match engine.retained.initial_style(root) {
-                Ok(computed) => {
+                Ok(mut computed) => {
                     // SAFETY: The initial style takes over the references the drive made.
                     let mut payloads = unsafe {
                         crate::css::computed_values::StyleGroups::adopt(
@@ -207,18 +208,31 @@ impl StyleEngine {
                         )
                     };
                     // The documents of the process share the initial groups but the font group.
-                    let shared = engine.retained.process_style.share_initial_groups(
-                        engine
-                            .retained
-                            .document_style_computation_inputs
-                            .device_pixels_per_css_pixel,
-                        &payloads,
-                    );
-                    for index in crate::css::computed_values::StyleGroupIndex::all() {
-                        if index.usize() != crate::css::table_group_builder::group_index::FONT {
-                            payloads.share_group(shared.groups(), index);
+                    let shared = computed.shared.take().unwrap_or_else(|| {
+                        let value_groups = computed
+                            .value_groups
+                            .take()
+                            .expect("a drive made the groups of its values");
+                        let shared = engine.retained.process_style.share_initial_groups(
+                            super::process_style::InitialGroupsInputs::of(
+                                &engine.retained.document_style_computation_inputs,
+                            ),
+                            &payloads,
+                            &value_groups,
+                            super::process_style::InitialGroupsValues {
+                                flags: computed.flags.clone(),
+                                dependency_flags: computed.dependency_flags,
+                                color: computed.color,
+                                value_facts: computed.value_facts.clone(),
+                            },
+                        );
+                        for index in crate::css::computed_values::StyleGroupIndex::all() {
+                            if index.usize() != crate::css::table_group_builder::group_index::FONT {
+                                payloads.share_group(shared.groups(), index);
+                            }
                         }
-                    }
+                        shared
+                    });
                     Ok(Some(traversal::InitialStyle::new(computed, payloads, shared)))
                 }
                 // NB: An engine no host published its fonts to yet, such as a test's bare engine, has no resolver
@@ -235,17 +249,17 @@ impl StyleEngine {
     }
 
     /// Has style passes run on the threads of `pool`, which the process shares.
-    pub(crate) fn share_style_pool(&mut self, pool: std::sync::Arc<pool::StylePool>) {
-        self.retained.style_pool = Some(pool);
+    pub(crate) fn share_style_layout_pool(&mut self, pool: std::sync::Arc<crate::style_layout_pool::StyleLayoutPool>) {
+        self.retained.style_layout_pool = Some(pool);
     }
 
     /// The pool a pass on `threads` threads runs on besides the calling thread, or on the default
     /// number for the machine for none.
-    fn style_pool(&mut self, threads: u32) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    fn style_layout_pool(&mut self, threads: u32) -> Option<std::sync::Arc<rayon::ThreadPool>> {
         // NB: An engine no render state holds, such as a test's, starts threads of its own.
         self.retained
-            .style_pool
-            .get_or_insert_with(|| std::sync::Arc::new(pool::StylePool::of_engine()))
+            .style_layout_pool
+            .get_or_insert_with(|| std::sync::Arc::new(crate::style_layout_pool::StyleLayoutPool::of_engine()))
             .for_threads(threads)
     }
 }

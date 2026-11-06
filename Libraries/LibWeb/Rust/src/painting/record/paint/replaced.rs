@@ -321,6 +321,8 @@ pub(crate) fn paint_image_foreground<O: Observer>(recorder: &mut PaintRecorder<'
         }
     }
 
+    paint_custom_highlight_washes(recorder, paintable, image_rect_device_pixels);
+
     if recorder.data(paintable).selection_state != 0 {
         let selection_wash_color = recorder.element_selection_style(paintable).facts.wash_color;
         if selection_wash_color.alpha() > 0 {
@@ -334,6 +336,56 @@ pub(crate) fn paint_image_foreground<O: Observer>(recorder: &mut PaintRecorder<'
                 .fill_rect(image_rect_device_pixels, selection_wash_color, ForceDarkRole::Selection);
             recorder.recorder.set_contrast_backdrop(previous);
         }
+    }
+}
+
+// https://drafts.csswg.org/css-pseudo-4/#highlight-replaced
+// [...] for replaced content, the UA should create a semi-transparent wash to coat the content so that it can show
+// through the selection. This wash should be of the specified background-color if that is not transparent, else of the
+// specified color; however the UA may adjust the alpha channel.
+fn paint_custom_highlight_washes<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    rect: libgfx_rust::IntRect,
+) {
+    let Some(layers) = recorder.paint_state.custom_highlights.replaced.get(&paintable).cloned() else {
+        return;
+    };
+    let Some(style) = recorder.source.node_style_if_live(paintable) else {
+        return;
+    };
+    let backdrop = libgfx_rust::Color(style.background_color());
+    // https://drafts.csswg.org/css-pseudo-4/#highlight-text
+    // [...] currentColor on a highlight pseudo-element’s color property represents the color of the next active
+    // highlight pseudo-element layer below, falling back finally to the colors that would otherwise have been
+    // used [...].
+    let mut current_color = libgfx_rust::Color(style.inherited_text().color);
+    for layer in layers {
+        let Some(answer) = recorder.custom_highlight_style(paintable, layer) else {
+            continue;
+        };
+        let facts = &answer.facts;
+        if !facts.colors_authored {
+            continue;
+        }
+        let color = facts.text_color.get().unwrap_or(current_color);
+        current_color = color;
+        let background_color = if facts.background_color_is_current_color {
+            color
+        } else {
+            facts.background_color
+        };
+        let wash_color = if background_color.alpha() > 0 {
+            background_color
+        } else {
+            color
+        };
+        if wash_color.alpha() == 0 {
+            continue;
+        }
+        let previous = recorder.recorder.set_contrast_backdrop(Some(backdrop));
+        recorder.recorder.fill_rect(rect, wash_color, ForceDarkRole::Selection);
+        recorder.recorder.set_contrast_backdrop(previous);
     }
 }
 
@@ -442,6 +494,9 @@ pub(crate) fn paint_navigable_container_foreground<O: Observer>(
     let absolute_rect = absolute_rect(recorder.source, paintable);
     let (content_rect, mut inline_clips, corner_radii) = replaced_content_clip_geometry(recorder, paintable);
     inline_clips.push(PendingInlineClip::intersecting_float_rect(content_rect));
+    if let Some(corner_radii) = corner_radii {
+        inline_clips.push(PendingInlineClip::intersecting_rounded_rect(content_rect, corner_radii));
+    }
     // Preserve fractional placement so the child raster uses the same pixel phase as content
     // painted directly under the embedding transform.
     let scale = recorder.converter.device_pixels_per_css_pixel();

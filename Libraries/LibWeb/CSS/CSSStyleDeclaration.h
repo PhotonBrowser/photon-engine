@@ -11,6 +11,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/CSS/CSSRule.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
@@ -22,7 +23,7 @@ namespace Web::CSS {
 // https://drafts.csswg.org/cssom/#css-declaration-blocks
 class CSSStyleDeclaration
     : public Bindings::GCAllocatedWrappable {
-    WEB_WRAPPABLE(CSSStyleDeclaration, Bindings::GCAllocatedWrappable);
+    WEB_NON_IDL_WRAPPABLE(CSSStyleDeclaration, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(CSSStyleDeclaration);
 
 public:
@@ -51,14 +52,13 @@ public:
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-parent-css-rule
     GC::Ptr<CSSRule> parent_rule() const { return m_parent_rule; }
     void set_parent_rule(GC::Ptr<CSSRule> parent) { m_parent_rule = parent; }
-    static constexpr GC::MemberOffset parent_rule_offset() { return GC_FIELD_OFFSET(CSSStyleDeclaration, m_parent_rule); }
 
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-owner-node
     Optional<DOM::AbstractElement> owner_node() const
     {
         if (!m_owner_element)
             return {};
-        return DOM::AbstractElement { m_owner_element.as_nonnull(), m_owner_pseudo_element };
+        return DOM::AbstractElement { m_owner_element.as_nonnull(), m_owner_pseudo_element, owner_highlight_name() };
     }
     void set_owner_node(Optional<DOM::AbstractElement>);
 
@@ -66,9 +66,15 @@ public:
     [[nodiscard]] bool is_updating() const { return m_updating; }
     void set_is_updating(bool value) { m_updating = value; }
 
+    virtual Utf16FlyString owner_highlight_name() const { return {}; }
+
     virtual bool has_property(PropertyNameAndID const&) const { VERIFY_NOT_REACHED(); }
     virtual RefPtr<StyleValue const> get_property_style_value(PropertyNameAndID const&) const { VERIFY_NOT_REACHED(); }
     virtual WebIDL::ExceptionOr<void> set_property_style_value(PropertyNameAndID const&, NonnullRefPtr<StyleValue const>) { VERIFY_NOT_REACHED(); }
+
+    // The object of an interface implemented in Rust that owns this declaration block, whose wrappers are this block's.
+    void set_owner(Bindings::InterfaceName, Bindings::RustInterfaceCell&);
+    Bindings::RustInterfaceCell& ensure_owner();
 
 protected:
     enum class Computed : u8 {
@@ -83,10 +89,16 @@ protected:
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
 
+    // Creates the object that owns this block, for a block whose owner is created on first use.
+    virtual void create_owner() { VERIFY_NOT_REACHED(); }
+
     void prepare_to_update_style_attribute();
     void update_style_attribute();
 
 private:
+    virtual bool is_owned_by_rust_interface_object() const override { return true; }
+    virtual GC::Ref<JS::HostObject> create_wrapper(JS::Realm&) override;
+
     // NB: The flags come first, so that they fill the padding at the end of the wrappable's fields.
 
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-computed-flag
@@ -106,6 +118,9 @@ private:
     //     element compressed.
     GC::Member<DOM::Element> m_owner_element;
     Optional<PseudoElement> m_owner_pseudo_element;
+
+    Bindings::InterfaceName m_rust_owner_interface_name { Bindings::InterfaceName::Unknown };
+    GC::Member<Bindings::RustInterfaceCell> m_rust_owner;
 };
 
 }

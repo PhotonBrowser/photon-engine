@@ -26,6 +26,7 @@
 #include <LibWeb/Platform/ImageCodecPlugin.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
+#include <LibWebCommon/MimeSniff/Resource.h>
 
 namespace Web::HTML {
 
@@ -61,6 +62,32 @@ GC::Ref<SharedResourceRequest> SharedResourceRequest::get_or_create(DOM::Documen
             : CORSSettingAttribute::Anonymous;
     }
     return get_or_create(document, { request.url(), cors_setting, request.integrity_metadata(), request.referrer_policy() });
+}
+
+GC::Ref<SharedResourceRequest> SharedResourceRequest::create_from_navigation_response_body(DOM::Document& document, Fetch::Infrastructure::Body const& body, GC::Ref<GC::Function<void()>> on_body_read)
+{
+    auto request = GC::Heap::the().allocate<SharedResourceRequest>(document.page(), Key { document.url(), CORSSettingAttribute::NoCORS, {}, ReferrerPolicy::ReferrerPolicy::EmptyString }, document);
+    request->m_can_be_shared = false;
+    request->m_state = State::Fetching;
+    // NB: The element that presents the image may start to wait for it only after the body has been read.
+    request->m_load_event_delayer.emplace(document);
+
+    GC::Weak weak_request { *request };
+    auto process_body = GC::create_function(GC::Heap::the(), [weak_request, on_body_read](ByteBuffer data) {
+        // NB: A document for an SVG image is an XML document, so this is never an SVG image.
+        if (auto request = weak_request.ptr())
+            request->handle_successful_fetch(request->url(), IsSVGImage::No, move(data), false);
+        on_body_read->function()();
+    });
+    auto process_body_error = GC::create_function(GC::Heap::the(), [weak_request, on_body_read](JS::Value) {
+        if (auto request = weak_request.ptr())
+            request->handle_failed_fetch();
+        on_body_read->function()();
+    });
+
+    auto& realm = HTML::relevant_realm(document);
+    body.fully_read(realm, process_body, process_body_error, GC::Ref { realm.global_object() });
+    return request;
 }
 
 SharedResourceRequest::SharedResourceRequest(GC::Ref<Page> page, Key key, GC::Ref<DOM::Document> document)
@@ -165,6 +192,8 @@ void SharedResourceRequest::fetch_resource(NonnullRefPtr<Fetch::Infrastructure::
             auto const is_svg_image = extracted_mime_type.has_value()
                 ? extracted_mime_type.value().essence() == "image/svg+xml"sv
                 : request->url().basename().ends_with(".svg"sv);
+            if (extracted_mime_type.has_value())
+                self->m_image_mime_type = extracted_mime_type->essence();
             self->handle_successful_fetch(request->url(), is_svg_image ? IsSVGImage::Yes : IsSVGImage::No, move(data), image_data_is_cors_cross_origin);
         });
         auto process_body_error = GC::create_function(GC::Heap::the(), [weak_this](JS::Value) {
@@ -296,17 +325,30 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
     // FIXME: Bring this closer to spec.
 
     if (is_svg_image == IsSVGImage::Yes) {
+        m_image_mime_type = "image/svg+xml"_string;
+
+        // NB: The decode waits for the image's document to load completely, which it may never do, and its promise keeps
+        //     both handlers. So they hold this request weakly: its document keeps it alive for as long as it is needed.
         SVG::SVGDecodedImageData::decode(m_page, url_string, data)
-            ->when_resolved([self = GC::Root { *this }, image_data_is_cors_cross_origin](auto& image_data) {
+            ->when_resolved([weak_this = GC::Weak { *this }, image_data_is_cors_cross_origin](auto& image_data) {
+                auto self = weak_this.ptr();
+                if (!self)
+                    return;
                 self->m_image_data = image_data.ptr();
                 self->m_image_data->set_is_cors_cross_origin(image_data_is_cors_cross_origin);
                 self->handle_successful_resource_load();
             })
-            .when_rejected([self = GC::Root { *this }](Error&) {
-                self->handle_failed_fetch();
+            .when_rejected([weak_this = GC::Weak { *this }](Error&) {
+                if (auto self = weak_this.ptr())
+                    self->handle_failed_fetch();
             });
         return;
     }
+
+    // NB: The image's own bytes are a better source than the server's claim, which is often missing or wrong. Formats
+    //     that sniffing does not know keep the claimed type.
+    if (auto sniffed_type = MimeSniff::Resource::sniff(data, { .sniffing_context = MimeSniff::SniffingContext::Image }); sniffed_type.is_image())
+        m_image_mime_type = sniffed_type.essence();
 
     // NB: Keeping the encoded data lets the decoded image data discard its frame while it is not in use. The decode
     //     request copies the bytes before it returns, so the handler can own the buffer they are read from.
@@ -315,23 +357,13 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
     auto handle_successful_bitmap_decode = [strong_this = GC::Root(*this), image_data_is_cors_cross_origin, encoded_data = move(encoded_data)](Web::Platform::DecodedImage& result) mutable -> ErrorOr<void> {
         if (result.session_id != 0) {
             // Streaming animated decode: create AnimatedBitmapDecodedImageData.
-            Vector<NonnullRefPtr<Gfx::Bitmap>> initial_bitmaps;
-            initial_bitmaps.ensure_capacity(result.frames.size());
-            for (auto& frame : result.frames)
-                initial_bitmaps.unchecked_append(*frame.bitmap);
-
-            auto first_bitmap = result.frames.first().bitmap;
-            auto size = first_bitmap->size();
-
             strong_this->m_image_data = AnimatedBitmapDecodedImageData::create(
                 *strong_this->m_document,
                 result.session_id,
-                result.frame_count,
                 result.loop_count,
-                size,
                 move(result.color_space),
                 move(result.all_durations),
-                move(initial_bitmaps));
+                *result.frames.first().bitmap);
         } else {
             // Single-shot decode: create BitmapDecodedImageData as before.
             Vector<BitmapDecodedImageData::Frame> frames;

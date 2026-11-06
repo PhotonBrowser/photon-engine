@@ -401,13 +401,30 @@ bool style_record_installed_by_render_state(NodeWithStyle const& node, CSS::Styl
     return style_record_identity.value() != 0 && RustFFI::render_state_installed_style_record(node.document_host(), Node::slot_id(&node)) == style_record_identity.value();
 }
 
+// A box keeps the style it was built for when the new record's display asks for another kind of box: the layout tree
+// update that the display change marks builds that box from the element's record, and a layout that runs before the
+// build would otherwise lay out a box of one kind by the style of another. The element holds the new record from now
+// on, so the box pins the one it keeps until the build replaces it. A record the render side installed in the box
+// already passed its own check.
+bool NodeWithStyle::keeps_style_until_rebuilt(CSS::StyleRecordID style_record_identity)
+{
+    if (!m_style_record || m_has_layout_derived_style || style_record_installed_by_render_state(*this, style_record_identity))
+        return false;
+    auto const style = document().style_computer().install_style(held_read(), style_record_identity);
+    if (!style || RustFFI::layout_box_can_show_style(kind(), m_style_record, style.groups()))
+        return false;
+    pin_style_record_for_cxx_consumers();
+    return true;
+}
+
 void NodeWithStyle::apply_style(CSS::StyleRecordID style_record_identity)
 {
+    if (keeps_style_until_rebuilt(style_record_identity))
+        return;
     // The render side installed the record in this node's row ahead of the host, with everything below that follows
     // from it in the layout tree: the node adopts it as its own.
     bool const installed_by_render_state = style_record_installed_by_render_state(*this, style_record_identity);
     bool const changes_published_record = m_style_record_identity != style_record_identity || m_has_layout_derived_style;
-    release_pinned_style_record();
     m_background_images.clear();
     m_mask_images.clear();
     m_border_image_source.clear();
@@ -421,6 +438,7 @@ void NodeWithStyle::apply_style(CSS::StyleRecordID style_record_identity)
         publish_style_record_to_node_data();
     else
         did_update_style_record();
+    release_pinned_style_record();
     set_flag(RustFFI::NodeFlag::HasAnimatedOpacityOrTransform, false);
     // A style change can introduce the properties that make a node carry replaced-content facts,
     // such as size containment arriving on a kept layout node.
@@ -575,8 +593,10 @@ void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_id
         return;
     }
 
+    if (keeps_style_until_rebuilt(style_record_identity))
+        return;
+
     bool should_repin_style_record = m_style_record_pinned_for_cxx_consumers;
-    release_pinned_style_record();
     m_background_images.clear();
     m_mask_images.clear();
     m_border_image_source.clear();
@@ -586,6 +606,7 @@ void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_id
         adopt_style_record_installed_by_render_state();
     else
         publish_style_record_to_node_data();
+    release_pinned_style_record();
     if (should_repin_style_record)
         pin_style_record_for_cxx_consumers();
 
@@ -650,7 +671,7 @@ void NodeWithStyle::adopt_style_record_installed_by_render_state()
 
 void NodeWithStyle::did_update_style_record()
 {
-    if (auto const* element = as_if<DOM::Element>(dom_node()); element && (element->has_style(CSS::PseudoElement::Selection) || element->has_style(CSS::PseudoElement::SearchText) || element->has_style(CSS::PseudoElement::SearchTextCurrent) || element->has_style(CSS::PseudoElement::SpellingError)))
+    if (auto const* element = as_if<DOM::Element>(dom_node()); element && (element->has_style(CSS::PseudoElement::Selection) || element->has_style(CSS::PseudoElement::SearchText) || element->has_style(CSS::PseudoElement::SearchTextCurrent) || element->has_style(CSS::PseudoElement::SpellingError) || element->custom_highlight_styles()))
         Painting::push_highlight_pseudo_styles(*element);
 
     if (style_group<CSS::ComputedValues::MiscInteractionValues>().scroll_snap_strictness_value() != CSS::ScrollSnapStrictness::None)

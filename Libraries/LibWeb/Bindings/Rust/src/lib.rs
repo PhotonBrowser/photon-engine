@@ -27,6 +27,8 @@ mod rust_demangle;
 mod rust_panic;
 
 pub(crate) mod ak_format;
+#[cfg(test)]
+mod ffi_test_stubs;
 
 #[cfg(not(test))]
 #[allow(
@@ -55,6 +57,16 @@ pub(crate) mod canvas_2d;
 pub(crate) mod compression;
 #[cfg(not(test))]
 pub(crate) mod crypto;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod css;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the dictionaries")
@@ -115,8 +127,29 @@ pub(crate) mod indexed_db;
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
+pub(crate) mod notifications_api;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod server_timing;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
 pub(crate) mod speech;
-#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
 pub(crate) mod storage_api;
 #[cfg_attr(
     not(web_idl_bindings),
@@ -155,6 +188,15 @@ pub(crate) mod web_gl;
 pub(crate) mod webidl;
 #[cfg(not(test))]
 pub(crate) mod webrtc;
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod xhr;
 
 // The generators of the build script, whose tests run with those of the crate.
 #[cfg(test)]

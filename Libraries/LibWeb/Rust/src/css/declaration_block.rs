@@ -7,21 +7,21 @@
 use crate::css::css_string::CssString;
 use crate::css::ffi_support::{FfiUtf16View, OwnedBox};
 use crate::css::property_metadata::{
-    property_is_logical_alias_including_shorthands, property_is_shorthand, property_logical_group,
-    shorthand_has_leaf_longhand,
+    longhands_for_shorthand, property_is_logical_alias_including_shorthands, property_is_shorthand,
+    property_logical_group, shorthand_has_leaf_longhand,
 };
 use crate::css::style::cascade::CascadeOperator;
 use crate::css::style::pipeline::rule_store::BlockCascadeData;
 use crate::css::style_compute::expand_shorthands_with;
 use crate::css::style_value::ContentPayload;
-use crate::css::style_value::StyleValueData;
+use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
 use crate::css::style_value_arc::StyleValueArc;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering, fence};
 
 #[derive(Clone)]
 pub(crate) struct DeclaredProperty {
@@ -253,7 +253,11 @@ impl<'a> CustomProperties<'a> {
 /// need no padding: 16 + 10 bytes per property and 18 per custom property. C++ holds a block by a
 /// pointer at this header, as an opaque type.
 pub struct DeclarationBlockHeader {
-    references: AtomicUsize,
+    references: AtomicU32,
+    /// Whether any declaration of the block can define a transition.
+    declares_transitions: bool,
+    /// Whether any value of the block reads an attribute.
+    reads_attributes: bool,
     property_count: u32,
     custom_property_count: u32,
     /// What the style engine derives from the block, made by the first engine that publishes it,
@@ -358,6 +362,15 @@ impl DeclarationBlockHeader {
         }
     }
 
+    /// Ask the processor to fetch the block's arrays, reading its header.
+    pub(crate) fn prefetch_arrays(&self) {
+        let layout = self.layout();
+        let base = std::ptr::from_ref(self).cast::<u8>();
+        prefetch(base.wrapping_add(layout.values));
+        prefetch(base.wrapping_add(layout.entries));
+        prefetch(self.cascade.load(Ordering::Relaxed).cast_const());
+    }
+
     /// The bytes of the block's allocation and of the names of its custom properties.
     pub(crate) fn heap_bytes(&self) -> usize {
         let mut size = self.layout().layout.size();
@@ -404,7 +417,19 @@ const _: () = {
 };
 
 /// The most references a block may have, beyond which counting aborts.
-const MAXIMUM_BLOCK_REFERENCES: usize = isize::MAX as usize;
+const MAXIMUM_BLOCK_REFERENCES: u32 = i32::MAX as u32;
+
+/// Ask the processor to fetch the cache line at `address` without waiting for it.
+#[inline]
+pub(crate) fn prefetch<T>(address: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: A prefetch reads nothing and cannot fault, whatever the address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(address.cast());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = address;
+}
 
 impl SharedDeclarationBlock {
     pub(crate) fn as_ptr(&self) -> *const DeclarationBlockHeader {
@@ -464,7 +489,17 @@ impl SharedDeclarationBlock {
 
     #[cfg(test)]
     pub(crate) fn reference_count(&self) -> usize {
-        self.references.load(Ordering::Relaxed)
+        self.references.load(Ordering::Relaxed) as usize
+    }
+
+    /// Whether any declaration of the block can define a transition.
+    pub(crate) fn declares_transitions(&self) -> bool {
+        self.declares_transitions
+    }
+
+    /// Whether any value of the block reads an attribute.
+    pub(crate) fn reads_attributes(&self) -> bool {
+        self.reads_attributes
     }
 }
 
@@ -557,8 +592,24 @@ impl DeclarationBlockBuilder {
             if base.is_null() {
                 handle_alloc_error(layout.layout);
             }
+            let declares_transitions = self
+                .properties
+                .iter()
+                .any(|property| crate::css::property_metadata::property_defines_a_css_transition(property.property_id));
+            let reads_attributes = self
+                .properties
+                .iter()
+                .map(|property| &property.value)
+                .chain(
+                    self.custom_properties
+                        .iter()
+                        .map(|property| &property.declaration.value),
+                )
+                .any(|value| crate::css::style::value_reads_attributes(value));
             base.cast::<DeclarationBlockHeader>().write(DeclarationBlockHeader {
-                references: AtomicUsize::new(1),
+                references: AtomicU32::new(1),
+                declares_transitions,
+                reads_attributes,
                 property_count,
                 custom_property_count,
                 cascade: AtomicPtr::new(std::ptr::null_mut()),
@@ -660,7 +711,18 @@ impl DeclarationBlockBuilder {
             self.append_normalized_property(declaration.to_declared());
         }
         for property in other.custom_properties().iter() {
-            self.set_custom_property(property.name.clone(), property.declaration.to_declared());
+            self.append_custom_property(property.name.clone(), property.declaration.to_declared());
+        }
+    }
+
+    pub(crate) fn append_custom_property(&mut self, name: CssString, declaration: DeclaredProperty) {
+        if let Some(property) = self.custom_properties.iter_mut().find(|property| property.name == name) {
+            if property.declaration.important && !declaration.important {
+                return;
+            }
+            property.declaration = declaration;
+        } else {
+            self.custom_properties.push(CustomProperty { name, declaration });
         }
     }
 
@@ -812,6 +874,21 @@ impl DeclarationBlock {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        match &*self.state.borrow() {
+            DeclarationBlockState::Immutable(data) => data.is_empty(),
+            DeclarationBlockState::Mutable(owner) => owner.borrow().data.is_empty(),
+        }
+    }
+
+    /// Asks for the memory [`Self::is_empty`] reads past the block.
+    fn prefetch_header(&self) {
+        match &*self.state.borrow() {
+            DeclarationBlockState::Immutable(data) => prefetch(data.as_ptr()),
+            DeclarationBlockState::Mutable(owner) => prefetch(owner.borrow().data.as_ptr()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_immutable(&self) -> bool {
         matches!(&*self.state.borrow(), DeclarationBlockState::Immutable(_))
@@ -891,9 +968,20 @@ pub(crate) fn visit_declaration_images(data: &DeclarationBlockHeader, visit: &mu
     }
 }
 
+/// The block serialized, as a raw AK::Utf16String the caller adopts.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_declaration_block_serialize(block: &DeclarationBlock) -> usize {
+    crate::css::serialize::sink_into_raw(crate::css::serialize::serialize_a_css_declaration_block(&block.data()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_declaration_block_prefetch_header(block: &DeclarationBlock) {
+    block.prefetch_header();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_declaration_block_is_empty(block: &DeclarationBlock) -> bool {
-    block.data().is_empty()
+    block.is_empty()
 }
 
 /// Whether a declaration of the block holds an image or a gradient, as its value or as an item of its list.
@@ -1045,32 +1133,111 @@ pub extern "C" fn rust_declaration_block_visit(
     rust_declaration_data_visit(&block.data(), context, visit);
 }
 
+/// The value of the shorthand whose longhands, in canonical order, have the values, or null if it serializes to the
+/// empty string.
+///
+/// # Safety
+/// `values` must point to `count` live style values.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_set(
+pub unsafe extern "C" fn rust_shorthand_value_of_longhands(
+    shorthand: u16,
+    values: *const *const c_void,
+    count: usize,
+) -> *const c_void {
+    let values = unsafe { ak::slice_from_raw_parts(values, count) }
+        .iter()
+        .map(|&value| RetainedStyleValueData::from_arc(unsafe { retain_value(value) }))
+        .collect();
+    crate::css::serialize::shorthand_value_of_longhands(shorthand, values)
+        .map_or(std::ptr::null(), |value| StyleValueArc::into_raw(value).cast())
+}
+
+/// The declarations that the declaration stands for: itself for a longhand, and otherwise its longhands.
+unsafe fn declarations_expanding_shorthands(property: &FfiDeclaredProperty) -> Vec<DeclaredProperty> {
+    let important = property.important;
+    let value = RetainedStyleValueData::from_arc(unsafe { retain_value(property.value) });
+    let mut declarations = Vec::new();
+    expand_shorthands_with(property.property_id, &value, false, &mut |property_id, value, _| {
+        declarations.push(DeclaredProperty {
+            property_id,
+            important,
+            value: value.clone().into_arc(),
+        });
+    });
+    declarations
+}
+
+/// https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_declaration_block_set_expanding_shorthands(
     block: &mut DeclarationBlock,
     property: &FfiDeclaredProperty,
 ) -> bool {
-    let declaration = unsafe { declaration_from_view(property) };
-    let property_id = declaration.property_id;
+    let declarations = unsafe { declarations_expanding_shorthands(property) };
     block.mutate(|data| {
-        let updated = data.set_declaration(declaration);
-        if updated {
-            data.drop_shorthands_no_longer_pending_in(property_id);
+        // 7. Let updated be false.
+        let mut updated = false;
+
+        // 8. If property is a shorthand property, then for each longhand property longhand that property maps to, in
+        //    canonical order, follow these substeps:
+        // 9. Otherwise, let updated be the result of set the CSS declaration property with value component value list,
+        //    with the important flag set if priority is not the empty string, and unset otherwise, and with the list
+        //    of declarations being the declarations.
+        for declaration in declarations {
+            let property_id = declaration.property_id;
+            // 1. Let longhand result be the result of set the CSS declaration longhand with the appropriate value(s)
+            //    from component value list, with the important flag set if priority is not the empty string, and unset
+            //    otherwise, and with the list of declarations being the declarations.
+            // 2. If longhand result is true, let updated be true.
+            if data.set_declaration(declaration) {
+                data.drop_shorthands_no_longer_pending_in(property_id);
+                updated = true;
+            }
         }
         updated
     })
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_append(block: &mut DeclarationBlock, property: &FfiDeclaredProperty) {
-    let declaration = unsafe { declaration_from_view(property) };
+pub unsafe extern "C" fn rust_declaration_block_append_expanding_shorthands(
+    block: &mut DeclarationBlock,
+    property: &FfiDeclaredProperty,
+) {
+    let declarations = unsafe { declarations_expanding_shorthands(property) };
     block.mutate(|data| {
-        let property_id = declaration.property_id;
-        data.properties.retain(|existing| existing.property_id != property_id);
-        data.properties.push(declaration);
-        data.drop_shorthands_no_longer_pending_in(property_id);
+        for declaration in declarations {
+            let property_id = declaration.property_id;
+            data.properties.retain(|existing| existing.property_id != property_id);
+            data.properties.push(declaration);
+            data.drop_shorthands_no_longer_pending_in(property_id);
+        }
         true
     });
+}
+
+/// https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-removeproperty
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_declaration_block_remove_expanding_shorthands(
+    block: &mut DeclarationBlock,
+    property_id: u16,
+) -> bool {
+    // 4. Let removed be false.
+    let mut removed = false;
+
+    // 5. If property is a shorthand property, for each longhand property longhand that property maps to:
+    if property_is_shorthand(property_id) {
+        for &longhand in longhands_for_shorthand(property_id) {
+            // 1. If longhand is not a property name of a CSS declaration in the declarations, continue.
+            // 2. Remove that CSS declaration and let removed be true.
+            removed |= rust_declaration_block_remove_expanding_shorthands(block, longhand);
+        }
+    }
+    // 6. Otherwise, if property is a case-sensitive match for a property name of a CSS declaration in the declarations,
+    //    remove that CSS declaration and let removed be true.
+    else {
+        removed = block.remove(property_id);
+    }
+    removed
 }
 
 #[unsafe(no_mangle)]
@@ -1084,11 +1251,6 @@ pub unsafe extern "C" fn rust_declaration_block_set_custom(
         data.set_custom_property(name, declaration);
         true
     });
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_declaration_block_remove(block: &mut DeclarationBlock, property_id: u16) -> bool {
-    block.remove(property_id)
 }
 
 #[unsafe(no_mangle)]
@@ -1146,7 +1308,7 @@ mod tests {
             let current = block.data();
             let mut view = current.properties().get(0).unwrap().view(FfiUtf16View::default());
             view.important = true;
-            assert!(unsafe { rust_declaration_block_set(&mut block, &view) });
+            assert!(unsafe { rust_declaration_block_set_expanding_shorthands(&mut block, &view) });
             let name = block.data().custom_properties().get(0).unwrap().name.clone();
             assert!(rust_declaration_block_remove_custom(
                 &mut block,
@@ -1181,14 +1343,20 @@ mod tests {
         assert_eq!(rust_declaration_block_revision(block), 0);
         assert!(rust_declaration_block_external_memory_size(block) > 0);
         let mut fork = unsafe { Box::from_raw(rust_declaration_block_share(block)) };
-        assert!(!rust_declaration_block_remove(&mut fork, property_id::HEIGHT));
+        assert!(!rust_declaration_block_remove_expanding_shorthands(
+            &mut fork,
+            property_id::HEIGHT
+        ));
         assert!(matches!(*block.state.borrow(), DeclarationBlockState::Immutable(_)));
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Immutable(_)));
         assert!(SharedDeclarationBlock::ptr_eq(&snapshot, &fork.data()));
 
         let mut retained = unsafe { Box::from_raw(rust_declaration_block_retain(block)) };
         assert!(Rc::ptr_eq(&block.owner(), &retained.owner()));
-        assert!(rust_declaration_block_remove(&mut retained, property_id::WIDTH));
+        assert!(rust_declaration_block_remove_expanding_shorthands(
+            &mut retained,
+            property_id::WIDTH
+        ));
         assert!(block.data().properties().is_empty());
         assert_eq!(rust_declaration_block_revision(block), 1);
         // A different handle's mutation cannot invalidate a pinned snapshot.
@@ -1203,7 +1371,10 @@ mod tests {
         assert_eq!(rust_declaration_block_revision(block), 2);
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Immutable(_)));
         drop((nested, rule, rules));
-        assert!(rust_declaration_block_remove(&mut fork, property_id::WIDTH));
+        assert!(rust_declaration_block_remove_expanding_shorthands(
+            &mut fork,
+            property_id::WIDTH
+        ));
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Mutable(_)));
         assert!(fork.data().properties().is_empty());
         assert_eq!(retained.data().properties().len(), 1);

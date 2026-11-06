@@ -1,15 +1,15 @@
 words: 160x20, 50x60, 160x20, 120x40
 collapsed whitespace: 100x20, 50x40, 100x20, 100x20
 inline edges: 178x20, 59x60, 178x20, 120x40
-adjacent inline edges: 111x20, 61x40, 111x20, 111x20
+adjacent inline edges: 114x20, 64x40, 114x20, 114x20
 inline edges before break: 50x40, 50x40, 50x40, 50x40
-inline edges before absolute: 50x20, 50x20, 50x20, 50x20
+inline edges before absolute: 56x20, 56x20, 56x20, 56x20
 nowrap: 160x20, 160x20, 160x20, 160x20
 pre: 135x40, 135x40, 135x40, 135x40
 pre-wrap: 140x40, 50x100, 140x40, 120x60
 pre-line: 100x40, 50x60, 100x40, 100x40
 break-spaces: 130x40, 60x60, 130x40, 120x40
-mixed whitespace: 230x40, 110x40, 230x40, 120x40
+mixed whitespace: 230x20, 110x40, 230x20, 120x40
 forced breaks: 100x60, 50x80, 100x60, 100x60
 indent: 173x20, 63x60, 173x20, 120x40
 negative indent: 147x20, 50x60, 147x20, 120x40
@@ -104,8 +104,8 @@ floating table: 152x22, 52x62, 152x22, 120x42
 floating table with collapsed borders: 166x30, 116x50, 166x30, 120x50
 percentage height table cell: 102x80, 52x80, 102x80, 102x80
 row flex: 161x20, 111x40, 161x20, 120x40
-row flex with flex factors: 185x20, 110x40, 185x20, 120x40
-row flex with item constraints: 190x40, 190x40, 190x40, 190x40
+row flex with flex factors: 150x40, 100x40, 150x40, 120x40
+row flex with item constraints: 170x40, 170x40, 170x40, 170x40
 row flex with a scroll container item: 140x20, 140x20, 140x20, 140x20
 row flex with a percentage gap: 90x20, 90x20, 90x20, 90x20
 wrapping row flex: 208x20, 50x88, 208x20, 120x44

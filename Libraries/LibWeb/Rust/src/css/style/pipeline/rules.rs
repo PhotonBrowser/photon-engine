@@ -24,7 +24,7 @@ use super::super::selector_analysis::{EntryFacts, collect_tested_ids, state_disp
 use super::super::weak_pool::WeakPool;
 use super::super::*;
 use super::bloom::AncestorHashes;
-use super::extent_map::{Extent, ExtentMap, FrozenExtentMap, PagedExtentMap};
+use super::extent_map::{Extent, ExtentMap, FrozenExtentMap, KeyHash, PagedExtentMap};
 use super::rule_changes::{Regrouped, RuleIndexChanges, StayedEntry};
 use super::rule_store::UserAgentVariant;
 use super::shared_pages::{PagePool, SharedPages};
@@ -489,6 +489,22 @@ impl Buckets {
         let words = match self {
             Self::Growing(map) => map.get(key),
             Self::Frozen(map) => map.get(key),
+        };
+        words.map(|words| BucketSlots { words })
+    }
+
+    /// The hash [`Self::get_hashed`] takes for `key`.
+    #[inline]
+    pub(super) fn hash_of(key: &DispatchKey) -> KeyHash {
+        FrozenExtentMap::<DispatchKey, u32>::hash_of(key)
+    }
+
+    /// The slots of `key`, whose hash is `hash`, where it has any.
+    #[inline]
+    pub(super) fn get_hashed(&self, key: &DispatchKey, hash: KeyHash) -> Option<BucketSlots<'_>> {
+        let words = match self {
+            Self::Growing(map) => map.get(key),
+            Self::Frozen(map) => map.get_hashed(key, hash),
         };
         words.map(|words| BucketSlots { words })
     }
@@ -1605,18 +1621,30 @@ impl ProcessRuleIndexes {
         rules: &mut Arc<Vec<RuleID>>,
         rule_order: &mut Arc<crate::css::style::order::OrderMaintenance>,
     ) {
-        fn share<T: PartialEq + Hash>(pool: &std::sync::Mutex<WeakPool<T>>, value: &mut Arc<T>) {
+        // NB: What a document finds here is what another document built, so it holds no room for how this one grew.
+        fn share<T: Clone + PartialEq + Hash>(
+            pool: &std::sync::Mutex<WeakPool<T>>,
+            value: &mut Arc<T>,
+            shrink: impl FnOnce(&mut T),
+        ) {
             let mut hasher = super::super::fast_hash::fast_hasher();
             value.hash(&mut hasher);
             let hash = std::hash::Hasher::finish(&hasher);
             let mut pool = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             match pool.find(hash, |candidate| candidate == &**value) {
                 Some(found) => *value = found,
-                None => pool.insert(hash, value),
+                None => {
+                    shrink(Arc::make_mut(value));
+                    pool.insert(hash, value);
+                }
             }
         }
-        share(&self.sheet_rules, rules);
-        share(&self.sheet_rule_orders, rule_order);
+        share(&self.sheet_rules, rules, |rules| rules.shrink_to_fit());
+        share(
+            &self.sheet_rule_orders,
+            rule_order,
+            crate::css::style::order::OrderMaintenance::shrink_to_fit,
+        );
     }
 
     /// The segment of `selectors`, built where no document of the process binds one, and whether
@@ -2125,6 +2153,14 @@ impl RuleIndex {
         RuleID(view.rule().0)
     }
 
+    /// Whether a live entry of the document's sheets styles the pseudo-element of `kind`.
+    pub(super) fn styles_pseudo_element(&self, kind: u8) -> bool {
+        self.entries.own_numbers().any(|id| {
+            let view = self.entries.view(id);
+            view.pseudo_kind() == kind && view.live()
+        })
+    }
+
     /// Whether an entry that does not revalidate tests for the id `id`.
     pub(super) fn tests_id(&self, id: StyleAtomID) -> bool {
         self.tested_ids.contains(&id)
@@ -2246,6 +2282,10 @@ impl RuleIndex {
     pub(super) fn selector_of_entry(&self, entry: u32) -> crate::css::selector::Selector<'_> {
         self.space_of_entry(entry)
             .resolve(self.entries.view(entry as usize).selector())
+    }
+
+    pub(super) fn entry_styles_custom_highlight(&self, entry: u32, name: StyleAtomID) -> bool {
+        self.selector_of_entry(entry).targets_custom_highlight(name)
     }
 
     /// The arena holding the selector of entry `entry`.

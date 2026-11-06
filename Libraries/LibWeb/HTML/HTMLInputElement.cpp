@@ -25,6 +25,7 @@
 #include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
+#include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/SelectorMatching.h>
@@ -212,6 +213,9 @@ void HTMLInputElement::set_checked(bool checked)
         return;
 
     m_checked = checked;
+    // The accessibility tree reports this state, with nothing else about the element changing.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_data(*this);
 
     CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
 
@@ -257,6 +261,9 @@ void HTMLInputElement::set_indeterminate(bool value)
         return;
     m_indeterminateness = value;
     CSS::Invalidation::invalidate_style_after_indeterminate_state_change(*this, value);
+    // The accessibility tree reports this state, with nothing else about the element changing.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_data(*this);
     Painting::push_form_control_paint_facts(*this);
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
@@ -1964,6 +1971,7 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
         CSS::Invalidation::invalidate_style_after_default_state_change(*this, was_default);
     }
     CSS::Invalidation::invalidate_style_after_read_write_state_change(*this, was_read_write);
+    CSS::Invalidation::invalidate_style_after_focused_element_keyboard_input_change(document());
     clear_element_reference_pseudo_elements();
     auto should_materialize_shadow_tree = shadow_root() || has_style();
     set_shadow_root(nullptr);
@@ -3198,7 +3206,7 @@ Utf16String HTMLInputElement::convert_number_to_string(double input) const
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-date
-WebIDL::ExceptionOr<Optional<double>> HTMLInputElement::convert_string_to_date(StringView input) const
+WebIDL::ExceptionOr<Optional<double>> HTMLInputElement::convert_string_to_date(Utf16View input) const
 {
     // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-string-date
     if (type_state() == TypeAttributeState::Date) {
@@ -3254,7 +3262,7 @@ WebIDL::ExceptionOr<Optional<double>> HTMLInputElement::convert_string_to_date(U
     // FIXME: Implement a UTF-16 GenericLexer.
     if (!input.has_ascii_storage())
         return Optional<double> {};
-    return convert_string_to_date(input.ascii_view());
+    return convert_string_to_date(input.utf16_view());
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#concept-input-value-date-string

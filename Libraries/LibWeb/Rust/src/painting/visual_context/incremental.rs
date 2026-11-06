@@ -69,10 +69,10 @@ struct WorkPlan {
 fn expand_dirty_entries(
     layout_arena: &impl PaintableRowsRead,
     dirty: &VisualContextDirtySet,
-    offset_path_boxes: &HashSet<NodeSlotId>,
+    offset_path_boxes: &crate::cow_map::CowSet<NodeSlotId>,
 ) -> Result<WorkPlan, VisualContextUpdateScope> {
     let mut work: HashMap<NodeSlotId, BoxDirtyBits> = HashMap::default();
-    for (slot, bits) in &dirty.boxes {
+    for (slot, bits) in dirty.boxes.iter() {
         if !layout_arena.paintable_row_is_populated(*slot) {
             continue;
         }
@@ -781,6 +781,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         })
     }
 

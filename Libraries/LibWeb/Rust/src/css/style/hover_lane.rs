@@ -48,6 +48,16 @@ pub(crate) struct HoverCursorFacts {
 }
 
 impl HoverCursorFacts {
+    /// See [`super::pipeline::projection::ProjectionGeneration::enclosing_link`].
+    pub(crate) fn enclosing_link(
+        &self,
+        element: StyleNodeID,
+        is_link: impl Fn(StyleNodeID) -> bool,
+    ) -> Option<Option<StyleNodeID>> {
+        self.projection
+            .enclosing_link(element, is_link, |element| self.is_editable(element))
+    }
+
     pub(super) fn editable(&self) -> std::sync::Arc<super::fast_hash::FastSet<StyleNodeID>> {
         self.editable.clone()
     }
@@ -123,6 +133,19 @@ impl StyleEngine {
                     .is_some_and(|facts| facts.states().contains(StateFact::Disabled))
             });
         (!disabled).then_some(node)
+    }
+
+    /// The link around `element` in the engine of this hover's fork. See
+    /// [`super::pipeline::projection::ProjectionGeneration::enclosing_link`].
+    pub(crate) fn hover_enclosing_link(
+        &self,
+        element: StyleNodeID,
+        is_link: impl Fn(StyleNodeID) -> bool,
+    ) -> Option<Option<StyleNodeID>> {
+        self.retained
+            .projection
+            .generation()
+            .enclosing_link(element, is_link, |element| self.hover_target_is_editable(element))
     }
 
     /// Whether `element` is editable or an editing host.
@@ -906,7 +929,7 @@ pub unsafe extern "C" fn style_engine_adopt_lane_transitions(
         transition_count: usize,
     ),
 ) {
-    for transitions in host.take_lane_transitions() {
+    host.adopt_lane_transitions(|transitions| {
         let lane_transitions: Vec<_> = transitions.lane_transitions().collect();
         let host_seen = &transitions.host_seen;
         // SAFETY: Guaranteed by the caller; the element's transitions keep the values alive across the call.
@@ -922,5 +945,5 @@ pub unsafe extern "C" fn style_engine_adopt_lane_transitions(
                 lane_transitions.len(),
             );
         }
-    }
+    });
 }

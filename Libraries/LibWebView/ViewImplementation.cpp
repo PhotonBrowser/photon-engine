@@ -39,6 +39,7 @@
 #include <LibWebView/HistoryDebug.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/PageTranslation.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/TabPerformanceMonitor.h>
@@ -104,6 +105,7 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
     all_views().set(m_view_id, this);
 
     initialize_context_menus();
+    m_page_translation = make<PageTranslation>(*this);
 
     m_repeated_crash_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1000), [this] {
         // Reset the "crashing a lot" counter after 1 second in case we just
@@ -111,15 +113,12 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
         this->m_crash_count = 0;
     });
 
-    m_audibility_hold_timer = Core::Timer::create_single_shot(AK::Duration::zero(), [this] {
-        // The hold, not the timer's resolution, decides when it has ended.
-        auto now = MonotonicTime::now();
-        if (m_audibility_hold.is_held(now)) {
-            m_audibility_hold_timer->restart(*m_audibility_hold.held_until() - now);
-            return;
-        }
-        update_audibility();
-    });
+    m_tab_indicators.on_visibility_change = [this](TabIndicator indicator, bool visible) {
+        if (indicator == TabIndicator::PlayingAudio)
+            ++m_playing_audio_indicator_change_count;
+        if (on_tab_indicator_change)
+            on_tab_indicator_change(indicator, visible);
+    };
 }
 
 ViewImplementation::~ViewImplementation()
@@ -128,12 +127,12 @@ ViewImplementation::~ViewImplementation()
         m_input_response_timer->stop();
     if (m_page_responsiveness_timer)
         m_page_responsiveness_timer->stop();
-    // The frontend may be torn down already, so clearing the ongoing navigation must not report a URL change to it, nor
-    // cancelling the view's location requests that the location is no longer in use, nor closing the view's page (which
-    // revokes its audio playback) that the tab went quiet.
+    // The frontend may be torn down already, so clearing the ongoing navigation must not report a URL change, cancel
+    // location requests, or close the view's page while the frontend is no longer observing it.
     on_url_change = nullptr;
-    on_location_in_use_change = nullptr;
     on_audibility_changed = nullptr;
+    on_page_unresponsive_changed = nullptr;
+    on_tab_indicator_change = nullptr;
     answer_pending_console_input_completions();
     TabPerformanceMonitor::forget_view(view_id());
     // Leave the views before the permission manager hears: a one-time grant that ends with this view has it revoke
@@ -265,6 +264,8 @@ void ViewImplementation::request_permission_prompt(PermissionPromptRequest reque
             }
             outcome = next->outcome;
         }
+        // A prompt a test answers counts as having come up on screen.
+        did_show_permission_prompt(request);
         settle_permission_prompt(request, outcome);
         return;
     }
@@ -314,6 +315,9 @@ void ViewImplementation::reset_permission_prompts_for_testing()
     m_next_permission_prompt_outcomes_for_testing.clear();
     m_held_permission_prompt_for_testing.clear();
     m_held_permission_prompt_release_waiters_for_testing.clear();
+    m_microphone_authorizer_for_testing.clear();
+    m_sites_shown_microphone_denied_notice.clear();
+    m_microphone_denied_notices_shown = 0;
     auto pending_prompts = move(m_pending_permission_prompts);
     for (auto& pending : pending_prompts) {
         for (auto& waiter : pending.waiters)
@@ -339,6 +343,7 @@ void ViewImplementation::release_held_permission_prompt_if_ready_for_testing()
 
     m_held_permission_prompt_release_waiters_for_testing.clear();
     auto held_request = m_held_permission_prompt_for_testing.release_value();
+    did_show_permission_prompt(held_request);
     settle_permission_prompt(held_request, m_held_permission_prompt_outcome_for_testing);
 }
 
@@ -359,6 +364,7 @@ void ViewImplementation::did_change_ongoing_navigation(Badge<CanonicalNavigable>
 
 void ViewImplementation::did_change_active_document(Badge<CanonicalTraversable>)
 {
+    m_page_translation->did_change_active_document();
     // A prompt the document that asked has left behind goes unanswered: the user ignored it.
     ignore_pending_permission_prompts();
     report_permission_presence();
@@ -1100,25 +1106,27 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 // Input waits while the compositor decides whether it forwards a key event, so a key it hands back is not overtaken.
 void ViewImplementation::send_queued_input_events()
 {
-    bool has_earlier_pinch = false;
+    bool has_earlier_pinch_yet_to_zoom = false;
     for (size_t index = 0; index < m_pending_input_events.size(); ++index) {
         // Pinches in different processes share the tab's visual viewport. A later pinch must not zoom it before an
-        // earlier frame has dispatched its wheel event and, if uncanceled, returned for the zoom.
-        if (m_pending_input_events[index].event.has<Web::PinchEvent>()) {
-            if (has_earlier_pinch)
-                continue;
-            has_earlier_pinch = true;
-        }
+        // earlier frame has dispatched its wheel event and, if uncanceled, returned for the zoom. A pinch the
+        // compositor zoomed for holds back nothing, so a busy page does not hold back the zoom.
+        if (m_pending_input_events[index].event.has<Web::PinchEvent>() && has_earlier_pinch_yet_to_zoom)
+            continue;
         if (!m_pending_input_events[index].sent)
             send_input_event(index);
+        if (auto const* pinch_event = m_pending_input_events[index].event.get_pointer<Web::PinchEvent>())
+            has_earlier_pinch_yet_to_zoom = !pinch_event->async_zoom_performed_default_action;
         if (m_pending_input_events[index].awaits_compositor_dispatch())
             return;
     }
 }
 
-// A key press may scroll in the compositor only while no earlier input the pages have yet to handle can change its
-// target. Key release always reaches the compositor's keyboard scrolling, even if it could no longer accept a new
-// scroll.
+// A key press may scroll in the compositor unless earlier input the pages have yet to handle is likely to change its
+// target: a key press the compositor left to the page or a mouse event other than a move. Key release always reaches
+// the compositor's keyboard scrolling, even if it could no longer accept a new scroll.
+// NB: A handler of a key release or a pointer move may change the target too. We accept that, as waiting for those
+//     would stall scrolling beside a busy page for every move of the pointer.
 bool ViewImplementation::may_scroll_for_key_event_in_compositor(size_t index) const
 {
     auto const& key_event = m_pending_input_events[index].event.get<Web::KeyEvent>();
@@ -1126,12 +1134,17 @@ bool ViewImplementation::may_scroll_for_key_event_in_compositor(size_t index) co
         return false;
     if (key_event.type == Web::KeyEvent::Type::KeyUp)
         return true;
-    if (!m_has_usable_bitmap)
-        return false;
     for (size_t preceding = 0; preceding < index; ++preceding) {
-        auto const* key = m_pending_input_events[preceding].event.get_pointer<Web::KeyEvent>();
-        if (!key || key->type != Web::KeyEvent::Type::KeyDown || !key->async_scroll_performed_default_action)
+        auto const& event = m_pending_input_events[preceding].event;
+        if (auto const* key = event.get_pointer<Web::KeyEvent>()) {
+            if (key->type == Web::KeyEvent::Type::KeyDown && !key->async_scroll_performed_default_action)
+                return false;
+        } else if (auto const* mouse = event.get_pointer<Web::MouseEvent>()) {
+            if (mouse->buttons != 0 || !first_is_one_of(mouse->type, Web::MouseEvent::Type::MouseMove, Web::MouseEvent::Type::MouseLeave))
+                return false;
+        } else {
             return false;
+        }
     }
     return true;
 }
@@ -1347,12 +1360,23 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
     // Keep the returned default action in its original position. Removing it and scheduling the queue first would
     // let a later pinch overtake it, which changes the zoom when focal points differ or a scale limit is reached.
     auto& pending_input = m_pending_input_events[*index];
+    auto pinch_default_action_returned = event_result == Web::EventResult::Accepted
+        || (pending_input.forwarded_to_child_frame && event_result != Web::EventResult::Handled && event_result != Web::EventResult::Cancelled);
+    // A gesture the page canceled stays canceled, even once the pinch moves to where nothing cancels it.
+    if (auto const* pinch_event = pending_input.event.get_pointer<Web::PinchEvent>()) {
+        if (!pinch_event->continues_gesture)
+            m_pinch_gesture_was_canceled = false;
+        if (event_result == Web::EventResult::Cancelled)
+            m_pinch_gesture_was_canceled = true;
+    }
     if (auto* pinch_event = pending_input.event.get_pointer<Web::PinchEvent>();
-        pinch_event && pending_input.forwarded_to_child_frame && !pinch_event->wheel_event_was_dispatched && !pinch_event->async_zoom_performed_default_action
-        && event_result != Web::EventResult::Handled && event_result != Web::EventResult::Cancelled) {
+        pinch_event && pinch_default_action_returned && !m_pinch_gesture_was_canceled && !pinch_event->wheel_event_was_dispatched && !pinch_event->async_zoom_performed_default_action) {
         pinch_event->wheel_event_was_dispatched = true;
         pending_input.endpoint = page();
         pending_input.sent = false;
+        // NB: WebContent's answer travels on another connection than the compositor's and may overtake it. What the
+        //     compositor still answers for this trip must not be taken for an answer to the next one.
+        pending_input.expects_stale_compositor_answer = pending_input.routed_through_compositor;
         pending_input.routed_through_compositor = false;
         send_queued_input_events();
         return;
@@ -1539,18 +1563,25 @@ void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<W
     send_queued_input_events();
 }
 
-void ViewImplementation::did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action)
+void ViewImplementation::did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool performed_default_action)
 {
     auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
     if (!index.has_value())
         return;
 
     auto& pending = m_pending_input_events[*index];
-    if (!pending.awaits_compositor_dispatch())
+    if (exchange(pending.expects_stale_compositor_answer, false))
+        return;
+    if (!pending.routed_through_compositor)
+        return;
+    if (auto* key_event = pending.event.get_pointer<Web::KeyEvent>())
+        key_event->async_scroll_performed_default_action = performed_default_action;
+    else if (auto* pinch_event = pending.event.get_pointer<Web::PinchEvent>())
+        pinch_event->async_zoom_performed_default_action = performed_default_action;
+    else
         return;
     // WebContent finishes the event from here on, as it does an event the view sends it directly.
     pending.routed_through_compositor = false;
-    pending.event.get<Web::KeyEvent>().async_scroll_performed_default_action = async_scroll_performed_default_action;
     send_queued_input_events();
 }
 
@@ -1799,6 +1830,7 @@ void ViewImplementation::send_preferences_to_page(WebContentPage& page)
     auto* spell_checker = Application::the().spell_checker();
     page.async_set_spell_checking_available(spell_checker != nullptr);
     page.async_set_writing_suggestions_available(spell_checker && spell_checker->can_suggest());
+    m_page_translation->did_create_page(page);
     send_geolocation_emulated_position(page);
     page.async_set_has_picture_in_picture_support(Application::the().supports_picture_in_picture());
 }
@@ -3131,28 +3163,18 @@ void ViewImplementation::toggle_page_mute_state()
 
 void ViewImplementation::update_audibility()
 {
-    auto audibility = Audio::Audibility::Inaudible;
-    if (m_audibility_hold.is_held(MonotonicTime::now()))
-        audibility = Audio::Audibility::Audible;
+    auto audible = false;
     traversable().for_each_hosting_page([&](WebContentPage& page) {
         if (page.audibility() == Audio::Audibility::Audible)
-            audibility = Audio::Audibility::Audible;
+            audible = true;
     });
+    m_tab_indicators.set_active(TabIndicator::PlayingAudio, audible, MonotonicTime::now());
+    auto audibility = audible ? Audio::Audibility::Audible : Audio::Audibility::Inaudible;
     if (m_audibility == audibility)
         return;
     m_audibility = audibility;
-    ++m_audibility_change_count;
     if (on_audibility_changed)
-        on_audibility_changed(m_audibility);
-}
-
-void ViewImplementation::page_left(WebContentPage const& page)
-{
-    if (page.audibility() != Audio::Audibility::Audible)
-        return;
-    auto now = MonotonicTime::now();
-    if (m_audibility_hold.page_left(page.id(), now))
-        m_audibility_hold_timer->restart(*m_audibility_hold.held_until() - now);
+        on_audibility_changed(audibility);
 }
 
 void ViewImplementation::reset_page_media_state()
@@ -3538,6 +3560,7 @@ void ViewImplementation::did_cancel_loading(Badge<CanonicalNavigable>, bool canc
 void ViewImplementation::did_finish_navigation()
 {
     set_loading_state(false);
+    m_page_translation->did_finish_loading();
 
     if (!m_webdriver_navigation_observation.has_value())
         return;
@@ -3724,7 +3747,6 @@ void ViewImplementation::prepare_page_for_navigable(WebContentPage& page)
     // The page's sound plays while it hosts the tab's documents, unless the tab is muted.
     page.client().set_audio_playback_mute_state(page.id(), m_mute_state);
     page.client().authorize_audio_playback(page.id());
-    m_audibility_hold.page_began_hosting(page.id());
     if (Application::browser_options().webdriver_browser_endpoint.has_value())
         Application::the().push_webdriver_session_config(page);
     Application::the().apply_view_options({}, *this, page);
@@ -3785,15 +3807,6 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
         m_debugger_overlay_pointer_state.reset();
         fail_pending_debugger_requests();
         reject_pending_selection_requests();
-
-        // The previous page leaves the tab now, before it is let go of, unless it goes on hosting some of it.
-        auto previous_page_goes_on_hosting = false;
-        traversable().for_each_hosting_page([&](WebContentPage& page) {
-            if (&page == previous_page.ptr())
-                previous_page_goes_on_hosting = true;
-        });
-        if (!previous_page_goes_on_hosting)
-            page_left(*previous_page);
         reset_page_media_state();
 
         // Keep showing the outgoing page until the page paints its first frame.
@@ -4730,14 +4743,142 @@ void ViewImplementation::did_request_permission(Badge<WebContentPage>, Web::Perm
         m_permissions_requested_by_page.append(name);
 }
 
+class MicrophoneAuthorizerForTesting final : public MicrophoneAuthorizer {
+public:
+    MicrophoneAuthorizerForTesting(MicrophoneAuthorization authorization, MicrophoneAuthorization answer, bool held)
+        : m_authorization(authorization)
+        , m_answer(answer)
+        , m_held(held)
+    {
+    }
+
+    u64 requests() const { return m_requests; }
+
+    void release()
+    {
+        m_held = false;
+        for (auto& on_complete : exchange(m_waiting, {}))
+            answer(move(on_complete));
+    }
+
+    virtual MicrophoneAuthorization authorization() const override { return m_authorization; }
+
+    virtual void request_authorization(Function<void(MicrophoneAuthorization)> on_complete) override
+    {
+        ++m_requests;
+        if (m_held) {
+            m_waiting.append(move(on_complete));
+            return;
+        }
+        answer(move(on_complete));
+    }
+
+    virtual void open_system_settings() override { }
+
+private:
+    void answer(Function<void(MicrophoneAuthorization)> on_complete)
+    {
+        m_authorization = m_answer;
+        on_complete(m_authorization);
+    }
+
+    MicrophoneAuthorization m_authorization;
+    MicrophoneAuthorization m_answer;
+    bool m_held { false };
+    u64 m_requests { 0 };
+    Vector<Function<void(MicrophoneAuthorization)>> m_waiting;
+};
+
+MicrophoneAuthorizer& ViewImplementation::microphone_authorizer() const
+{
+    if (m_microphone_authorizer_for_testing)
+        return *m_microphone_authorizer_for_testing;
+    return Application::the().microphone_authorizer();
+}
+
+MicrophoneAuthorization ViewImplementation::microphone_authorization() const
+{
+    return microphone_authorizer().authorization();
+}
+
+void ViewImplementation::ensure_microphone_authorization(Function<void(bool authorized)> on_complete)
+{
+    // The notice is about the site that asked, which the tab may have left by the time the system answers.
+    auto settle = [weak_this = make_weak_ptr(), requesting_origin = permission_origin(), on_complete = move(on_complete)](MicrophoneAuthorization authorization) {
+        auto authorized = authorization == MicrophoneAuthorization::Authorized;
+        if (auto* view = weak_this.ptr(); view && !authorized && view->permission_origin().is_same_origin(requesting_origin))
+            view->show_microphone_denied_notice();
+        on_complete(authorized);
+    };
+
+    auto authorization = microphone_authorization();
+    if (authorization != MicrophoneAuthorization::NotDetermined) {
+        settle(authorization);
+        return;
+    }
+    microphone_authorizer().request_authorization(move(settle));
+}
+
+bool ViewImplementation::has_shown_microphone_denied_notice(URL::Origin const& top_level_origin) const
+{
+    return m_sites_shown_microphone_denied_notice.find_first_index_if([&](auto const& site) { return site.is_same_origin(top_level_origin); }).has_value();
+}
+
+void ViewImplementation::show_microphone_denied_notice()
+{
+    // Once the user has seen the notice, the site can't bring it back in this tab, however often it asks. The notice
+    // goes through the prompts, so requests made while it waits to come up share it.
+    auto top_level_origin = permission_origin();
+    if (has_shown_microphone_denied_notice(top_level_origin))
+        return;
+
+    auto is_file = top_level_origin.is_opaque() && url().scheme() == "file"sv;
+    PermissionPromptRequest request {
+        .name = Web::Permissions::PermissionName::Microphone,
+        .top_level_origin = top_level_origin,
+        .requesting_origin = top_level_origin,
+        .requesting_document_id = {},
+        .is_file = is_file,
+        .show_os_hint = false,
+        .kind = PermissionPromptKind::SystemDeniedNotice,
+    };
+    request_permission_prompt(move(request), [](Web::Permissions::PromptOutcome) { });
+}
+
+void ViewImplementation::did_show_permission_prompt(PermissionPromptRequest const& request)
+{
+    // A prompt that comes up again, once its hidden tab is shown, is still the one prompt.
+    auto pending = m_pending_permission_prompts.find_if([&](auto const& candidate) { return candidate.request.is_same_request_as(request); });
+    if (pending == m_pending_permission_prompts.end() || exchange(pending->shown, true))
+        return;
+    if (request.kind != PermissionPromptKind::SystemDeniedNotice)
+        return;
+
+    ++m_microphone_denied_notices_shown;
+    if (!has_shown_microphone_denied_notice(request.top_level_origin))
+        m_sites_shown_microphone_denied_notice.append(request.top_level_origin);
+}
+
+void ViewImplementation::set_microphone_authorization_for_testing(MicrophoneAuthorization authorization, MicrophoneAuthorization answer, bool held)
+{
+    m_microphone_authorizer_for_testing = make<MicrophoneAuthorizerForTesting>(authorization, answer, held);
+}
+
+void ViewImplementation::release_system_microphone_answer_for_testing()
+{
+    if (m_microphone_authorizer_for_testing)
+        m_microphone_authorizer_for_testing->release();
+}
+
+u64 ViewImplementation::system_microphone_requests_for_testing() const
+{
+    return m_microphone_authorizer_for_testing ? m_microphone_authorizer_for_testing->requests() : 0;
+}
+
 void ViewImplementation::update_location_in_use()
 {
     auto in_use = !m_geolocation_position_request_ids.is_empty() || !m_geolocation_watch_ids.is_empty();
-    if (in_use == m_location_in_use)
-        return;
-    m_location_in_use = in_use;
-    if (on_location_in_use_change)
-        on_location_in_use_change(in_use);
+    m_tab_indicators.set_active(TabIndicator::UsingLocation, in_use, MonotonicTime::now());
 }
 
 void ViewImplementation::revoke_geolocation_without_permission()
@@ -5611,12 +5752,8 @@ void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, We
     });
 }
 
-void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<u64> text_fragment_generation_id)
+void ViewImplementation::add_link_actions(Menu& menu, Web::HTML::PreparedNavigationDescriptor const& navigation)
 {
-    request_text_fragment_url(text_fragment_generation_id);
-    prepare_inspect_element_action(content_position);
-    ++m_context_menu_request_id;
-
     auto url = navigation.url;
     auto copy_url_text = [&] {
         switch (url_type(url)) {
@@ -5630,27 +5767,39 @@ void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gf
         VERIFY_NOT_REACHED();
     }();
 
-    auto menu = Menu::create("Link Context Menu"sv);
-    add_open_url_actions(*menu, url, navigation);
-    menu->add_separator();
-    menu->add_action(create_copy_url_action(copy_url_text, url));
-    menu->add_action(Action::create("Download Linked File"sv, ActionID::DownloadLinkedFile, [this, url]() {
+    add_open_url_actions(menu, url, navigation);
+    menu.add_separator();
+    menu.add_action(create_copy_url_action(copy_url_text, url));
+    menu.add_action(Action::create("Download Linked File"sv, ActionID::DownloadLinkedFile, [this, url]() {
         download_url(url, PromptForPath::No);
     }));
-    menu->add_action(Action::create("Save Link As…"sv, ActionID::DownloadLinkedFileAs, [this, url]() {
+    menu.add_action(Action::create("Save Link As…"sv, ActionID::DownloadLinkedFileAs, [this, url]() {
         download_url(url, PromptForPath::Yes);
     }));
+}
+
+void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<u64> text_fragment_generation_id)
+{
+    request_text_fragment_url(text_fragment_generation_id);
+    prepare_inspect_element_action(content_position);
+    ++m_context_menu_request_id;
+
+    auto menu = Menu::create("Link Context Menu"sv);
+    add_link_actions(*menu, navigation);
     menu->add_action(*m_copy_link_to_highlight_action);
     menu->add_separator();
     menu->add_action(*m_inspect_element_action);
     open_context_menu(move(menu), content_position);
 }
 
-void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_for_path)
+void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_for_path, Optional<String> const& image_mime_type)
 {
     // URLs with an opaque path, such as data: URLs, do not contain a usable filename, so the default filename is
     // used instead.
     auto suggested_filename = url.has_an_opaque_path() ? ByteString {} : url.basename();
+    if (image_mime_type.has_value())
+        suggested_filename = image_filename_with_extension(move(suggested_filename), *image_mime_type);
+
     if (prompt_for_path == PromptForPath::Yes && on_request_download_path) {
         // NB: The view may be gone by the time the user chooses, so the download keeps only what it needs.
         on_request_download_path(Web::sanitize_suggested_download_filename(suggested_filename),
@@ -5681,7 +5830,7 @@ void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_
     });
 }
 
-void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap)
+void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type)
 {
     prepare_inspect_element_action(content_position);
     ++m_context_menu_request_id;
@@ -5700,6 +5849,10 @@ void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, G
     copy_image_action->set_enabled(bitmap.has_value());
 
     auto menu = Menu::create("Image Context Menu"sv);
+    if (link_navigation.has_value()) {
+        add_link_actions(*menu, *link_navigation);
+        menu->add_separator();
+    }
     add_open_in_new_tab_action(*menu, "Open Image in New Tab"sv, url, navigation);
     menu->add_action(Action::create("Open Image"sv, ActionID::OpenImage, [this, navigation]() {
         load(navigation);
@@ -5707,8 +5860,8 @@ void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, G
     menu->add_separator();
     menu->add_action(move(copy_image_action));
     menu->add_action(create_copy_url_action("Copy Image Address"sv, url));
-    menu->add_action(Action::create("Save Image As…"sv, ActionID::SaveImage, [this, url]() {
-        download_url(url, PromptForPath::Yes);
+    menu->add_action(Action::create("Save Image As…"sv, ActionID::SaveImage, [this, url, image_mime_type = move(image_mime_type)]() {
+        download_url(url, PromptForPath::Yes, image_mime_type);
     }));
     menu->add_separator();
     menu->add_action(*m_inspect_element_action);

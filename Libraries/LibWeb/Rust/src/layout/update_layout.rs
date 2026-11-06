@@ -618,10 +618,8 @@ impl SealedRound {
         }
         let mut answer = self.job.run(state);
         answer.prepare_committed_layout_for_rendering(state.arena_mut());
-        Some(FlownRound {
-            answer,
-            rebuilds_tree: self.rebuilds_tree,
-        })
+        let rebuilds_tree = self.rebuilds_tree || answer.build.is_some();
+        Some(FlownRound { answer, rebuilds_tree })
     }
 }
 
@@ -790,6 +788,12 @@ impl LayoutRoundJob {
 
     fn run_with(mut self, state: &mut ArenaHandle, work: &OwedHostWork) -> LayoutRoundAnswer {
         let facts = self.facts;
+        if self.build.is_none()
+            && state.arena().layout_tree_update_marks_need_build()
+            && let Some(document) = state.arena().document_style_node()
+        {
+            self.build = Some(TreeBuildJob::new(document, None));
+        }
         let mut answer = LayoutRoundAnswer {
             build: None,
             work: HostWorkDue::default(),
@@ -1005,7 +1009,9 @@ fn next_round(
 ) -> SealedRound {
     let rebuilds_tree = facts.document_needs_layout_tree_build
         || read_arena(document_host, read, (), |arena, ()| {
-            arena.layout_root().is_invalid() || arena.needs_full_layout_tree_update()
+            arena.layout_root().is_invalid()
+                || arena.needs_full_layout_tree_update()
+                || arena.layout_tree_update_marks_need_build()
         });
     let build = rebuilds_tree.then(|| {
         let document_style_node = StyleNodeID::from_raw(facts.document_style_node)
@@ -1079,6 +1085,8 @@ fn take_flown_layout_in(main_thread: &MainThread, document_host: &DocumentHost, 
     else {
         return false;
     };
+    // Paying the round drains its commits.
+    let resized_size_container = answer.resized_size_containers().next().is_some();
     answer.pay(main_thread, document_host, read);
     if rebuilds_tree && host.reconcile_stale_list_item_counters_after_tree_build(main_thread, &answer.rebuilt_roots) {
         return false;
@@ -1094,7 +1102,7 @@ fn take_flown_layout_in(main_thread: &MainThread, document_host: &DocumentHost, 
     }
     // The style written since the round flew is the next layout update's; only container queries the layout decides
     // restyle what the round laid out.
-    !host.container_query_evaluation_is_pending(main_thread, read)
+    !resized_size_container && !host.container_query_evaluation_is_pending(main_thread, read)
 }
 
 fn update_layout(
@@ -1133,7 +1141,7 @@ fn update_layout(
         // A round that flew in the frame the update took in is the update's first, which the host pays before
         // anything else of the update reads the layout.
         document_host.take_frame_in_with(read);
-        let (rebuilds_tree, mut next) = match document_host.take_flown_round() {
+        let (mut rebuilds_tree, mut next) = match document_host.take_flown_round() {
             Some(FlownRound { answer, rebuilds_tree }) => {
                 trace.flown_rounds += 1;
                 (rebuilds_tree, NextRound::Flown(answer))
@@ -1166,6 +1174,7 @@ fn update_layout(
                 NextRound::Job(job) => run_layout_round_job(document_host, read, job),
             };
             trace.note_build_reports(&answer);
+            rebuilds_tree |= answer.build.is_some();
             answer.pay(main_thread, document_host, read);
             if matches!(answer.end, LayoutRoundEnd::NeedsDocumentStyle) {
                 let facts = host.document_facts(main_thread, read);

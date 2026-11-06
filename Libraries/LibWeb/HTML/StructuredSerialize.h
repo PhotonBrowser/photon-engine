@@ -35,19 +35,25 @@ class HostObject;
 
 namespace Web::HTML {
 
+// A received data holder, whose bytes Rust reads. The values that have attachments C++ decodes for it, at the offset
+// that Rust has read to.
 class WEB_API TransferDataDecoder {
     AK_ALLOC_WITH_KMALLOC;
 
 public:
     explicit TransferDataDecoder(TransferDataEncoder&&);
 
-    template<typename T>
-    ErrorOr<T> decode()
-    {
-        return m_decoder.decode<T>();
-    }
+    ReadonlyBytes bytes() const { return m_buffer.data().span(); }
 
-    WebIDL::ExceptionOr<ByteBuffer> decode_buffer();
+    // Decodes a value at the offset, and sets the offset to the end of the value.
+    template<typename T>
+    ErrorOr<T> decode_at(size_t& offset)
+    {
+        TRY(m_stream.seek(offset, SeekMode::SetPosition));
+        auto value = TRY(m_decoder.decode<T>());
+        offset = TRY(m_stream.tell());
+        return value;
+    }
 
     // The shared memory of the record that this transfer data belongs to, for transfer-receiving steps that map theirs.
     void set_shared_buffers(Vector<Core::AnonymousBuffer> const& shared_buffers) { m_shared_buffers = &shared_buffers; }
@@ -114,31 +120,14 @@ WebIDL::ExceptionOr<void> encode_or_throw_data_clone_error(JS::Realm& realm, Tra
     return {};
 }
 
-template<typename T>
-WebIDL::ExceptionOr<T> decode_or_throw_data_clone_error(JS::Realm& realm, TransferDataDecoder& decoder)
-{
-    auto result = decoder.decode<T>();
-    if (result.is_error())
-        return data_clone_error_from_serialization_error(realm, result.release_error());
-    return result.release_value();
-}
-
 WEB_API WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer(JS::Realm&, JS::Value, ReadonlySpan<GC::Ref<JS::Object>> transfer_list);
 WEB_API WebIDL::ExceptionOr<DeserializedTransferRecord> structured_deserialize_with_transfer(SerializedTransferRecord&, JS::Realm&);
-WEB_API WebIDL::ExceptionOr<JS::Value> structured_deserialize_with_transfer_internal(TransferDataDecoder&, JS::Realm&);
-
-}
-
-namespace Web::HTML {
-
-struct ImageBitmapSharedPixels;
 
 }
 
 namespace Web::Bindings {
 
 class RustInterfaceCell;
-class Transferable;
 
 // A platform object that is a serializable object: an implementation object of an interface implemented in C++, whose
 // steps run in Rust over its fields, or the cell of an object of an interface implemented in Rust, whose steps the Rust
@@ -152,24 +141,8 @@ struct SerializablePlatformObject {
     WebIDL::ExceptionOr<void> serialization_steps(void* serialized, bool for_storage) const;
 };
 
-// A platform object that is a transferable object, of an interface implemented in C++ or in Rust.
-struct TransferablePlatformObject {
-    Transferable* transferable { nullptr };
-    GC::Ptr<RustInterfaceCell> rust_object { nullptr };
-    HTML::TransferType primary_interface { HTML::TransferType::Unknown };
-
-    // https://html.spec.whatwg.org/multipage/structured-data.html#detached
-    bool is_detached() const;
-    void set_detached() const;
-
-    // The pixels of a transferred ImageBitmap go to the shared memory of the transfer, if there is room for them.
-    WebIDL::ExceptionOr<void> transfer_steps(JS::Realm&, HTML::TransferDataEncoder&, HTML::ImageBitmapSharedPixels*) const;
-};
-
-WEB_API Optional<TransferablePlatformObject> transferable_from_object(JS::Object&);
 WEB_API Optional<SerializablePlatformObject> serializable_from_object(JS::Object&);
 WEB_API bool is_platform_object(JS::Object const&);
-WEB_API WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> create_transferred_platform_object(HTML::TransferType, JS::Realm&, HTML::TransferDataDecoder&);
 
 // The deserialization steps of an interface implemented in Rust create its object from what they read, rather than
 // fill in an object that was created before them. The record that they read is the Rust SerializationReader that the

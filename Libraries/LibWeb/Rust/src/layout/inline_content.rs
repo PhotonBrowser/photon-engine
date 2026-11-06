@@ -29,6 +29,26 @@ pub struct InlineContent {
     pub writing_mode: u8,
     /// The pieces of each inline box, by box.
     pub inline_boxes: InlineBoxIndex,
+    /// The fragments of each node, by node.
+    pub text_fragments: TextFragmentIndex,
+}
+
+/// The indices of each node's fragments in its line root's content, which queries that start from a node look up in a
+/// line root with many fragments. Most line roots are never asked, so the index is built the first time one is.
+#[derive(Default)]
+pub struct TextFragmentIndex(std::sync::OnceLock<InlineBoxIndex>);
+
+// NB: The index follows from the fragments, so a copy builds its own, and it does not tell two contents apart.
+impl Clone for TextFragmentIndex {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for TextFragmentIndex {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// The indices of each inline box's pieces in its line root's content, in line order, which painting and geometry
@@ -53,11 +73,14 @@ fn inline_box_order(node: NodeSlotId) -> (u32, u8) {
 
 impl InlineBoxIndex {
     fn of(pieces: &[InlineBoxPieceRecord]) -> Self {
-        let mut pieces_by_box: Vec<(NodeSlotId, u32)> = pieces
-            .iter()
+        Self::of_nodes(pieces.iter().map(|piece| piece.node))
+    }
+
+    fn of_nodes(nodes: impl Iterator<Item = NodeSlotId>) -> Self {
+        let mut pieces_by_box: Vec<(NodeSlotId, u32)> = nodes
             .enumerate()
-            .filter(|(_, piece)| !piece.node.is_invalid())
-            .map(|(index, piece)| (piece.node, index as u32))
+            .filter(|(_, node)| !node.is_invalid())
+            .map(|(index, node)| (node, index as u32))
             .collect();
         pieces_by_box.sort_unstable_by_key(|&(node, index)| (inline_box_order(node), index));
         let mut index = Self {
@@ -124,6 +147,9 @@ pub struct LineRecord {
     pub block_length: CssPixels,
     pub block_start: CssPixels,
     pub block_end: CssPixels,
+    /// The part of the block length that a clearing break after the line adds past the line's own content, so that
+    /// the line reaches down to the clearance.
+    pub(crate) clearance_block_length: CssPixels,
     pub(crate) next_line_block_offset: CssPixels,
     pub baseline: CssPixels,
     pub block_level_box_block_end_margin: CssPixels,
@@ -276,6 +302,7 @@ impl InlineContent {
             lines,
             fragments,
             inline_boxes: InlineBoxIndex::of(&pieces),
+            text_fragments: TextFragmentIndex::default(),
             inline_box_pieces: pieces,
             items: Vec::new(),
             lines_after_clamp_point_rect: data.lines_after_clamp_point_rect,
@@ -353,6 +380,15 @@ impl InlineContent {
     /// Indexes the pieces of each inline box again, after they were renumbered or given to other boxes.
     pub(crate) fn index_inline_boxes(&mut self) {
         self.inline_boxes = InlineBoxIndex::of(&self.inline_box_pieces);
+        self.text_fragments = TextFragmentIndex::default();
+    }
+
+    /// The indices of the fragments of `node`, in fragment order.
+    pub(crate) fn fragment_indices_of(&self, node: NodeSlotId) -> &[u32] {
+        self.text_fragments
+            .0
+            .get_or_init(|| InlineBoxIndex::of_nodes(self.fragments.iter().map(|fragment| fragment.layout_node)))
+            .piece_indices_of(node)
     }
 
     fn drop_repeated_placeholder_pieces(&mut self) {
@@ -489,11 +525,11 @@ impl InlineContent {
                 let ascent = fragment.baseline.to_double() as f32;
                 let line_width = rect.width.to_double() as f32;
                 let mut glyphs = run.glyphs.clone();
-                for glyph in glyphs.to_mut().iter_mut() {
-                    let inline_position = glyph.x;
-                    glyph.x = (line_width - glyph.glyph_width) / 2.0;
-                    glyph.y += inline_position;
-                }
+                glyphs.update_positions(|glyph, x, y| {
+                    let inline_position = *x;
+                    *x = (line_width - glyph.advance) / 2.0;
+                    *y += inline_position;
+                });
                 let bounding_box = libgfx_rust::FloatRect::from_array(
                     libgfx_rust::text_layout::glyph_run_bounding_box(&run.font, &glyphs, 1.0),
                 );
@@ -661,8 +697,11 @@ impl<'content> PhysicalPlane<'content> {
         let Some(line) = self.content.lines.get(line_index as usize) else {
             return block_offset;
         };
+        // The line's content is mirrored within its own extent: a clearing break after the line extends the line
+        // toward the clearance, and the content stays where it is.
         let line_block_start = line.block_end - line.block_length;
-        line_block_start + line.block_end - block_offset - block_length
+        let line_content_block_end = line.block_end - line.clearance_block_length;
+        line_block_start + line_content_block_end - block_offset - block_length
     }
 
     fn unmoved_fragment_rect(

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::css::thin_slice::ThinSlice;
 use smallvec::SmallVec;
@@ -231,6 +231,23 @@ impl FromIterator<(usize, CustomPropertyEntry)> for CustomPropertyEntries {
         }
         collected.finished()
     }
+}
+
+/// How many answers of [`CustomPropertyStore::hold_the_same_values`] a thread keeps.
+const COMPARED_STORE_SLOTS: usize = 64;
+
+/// What comparing two stores answered, which stands for as long as it is kept: a store is immutable,
+/// and the weak references keep another store from taking the place of either without keeping
+/// anything it holds.
+struct ComparedStores {
+    first: Weak<CustomPropertyStore>,
+    second: Weak<CustomPropertyStore>,
+    same: bool,
+}
+
+thread_local! {
+    static COMPARED_STORES: RefCell<[Option<ComparedStores>; COMPARED_STORE_SLOTS]> =
+        const { RefCell::new([const { None }; COMPARED_STORE_SLOTS]) };
 }
 
 pub struct CustomPropertyStore {
@@ -716,9 +733,6 @@ impl CustomPropertyRegistry {
             ) => Some(parse_substituted_value(
                 parse_context,
                 property_id::CUSTOM,
-                // NB: The value keeps this text alone and tokenizes it where it is read, so it is the
-                //     serialization that tokenizes back to the components.
-                &serialize_component_values_to_utf16(&components, ComponentSerializationMode::Retokenize),
                 &components,
                 contains_attr_tainted_values,
             )),
@@ -936,14 +950,7 @@ impl CustomPropertyStore {
     /// element inherits read what the pass resolved.
     pub(crate) fn animation_overlay_over(self: &Arc<Self>, base: Option<&Arc<Self>>) -> Arc<Self> {
         let sampled_over = self.animation_overlay_base.as_ref();
-        let moved = match (sampled_over, base) {
-            (None, None) => false,
-            (Some(sampled_over), Some(base)) => {
-                !Arc::ptr_eq(sampled_over, base) && !sampled_over.holds_same_values_as(base)
-            }
-            _ => true,
-        };
-        if !moved {
+        if Self::absent_or_holding_the_same_values(sampled_over, base) {
             return self.clone();
         }
         let animated: SmallVec<[(usize, CustomPropertyEntry); 8]> = self
@@ -993,6 +1000,12 @@ impl CustomPropertyStore {
         self.own_values
             .get(&name_raw)
             .or_else(|| self.parent.as_ref()?.get(name_raw))
+    }
+
+    /// The names of the values the store, or a store it is built over, holds. A name can come more than once.
+    pub(crate) fn held_names(&self) -> impl Iterator<Item = &Utf16FlyString> {
+        std::iter::successors(Some(self), |store| store.parent.as_deref())
+            .flat_map(|store| store.own_values.values().map(|entry| &entry.name))
     }
 
     /// Whether the store, or a store it is built over, holds a value of `name`.
@@ -1048,15 +1061,74 @@ impl CustomPropertyStore {
         }))
     }
 
+    /// Whether `other` declares the custom properties the store does, in the same order. Both hold
+    /// their entries by name, so this takes no sorting, which a store of a design system's thousands
+    /// of custom properties would pay for each element compared against it.
+    fn declares_the_same_names_as(&self, other: &Self) -> bool {
+        fn declared(store: &CustomPropertyStore) -> impl Iterator<Item = (usize, std::num::NonZeroU32)> + '_ {
+            store
+                .own_values
+                .iter()
+                .filter_map(|(name_raw, entry)| Some((name_raw, entry.declared?)))
+        }
+        declared(self).eq(declared(other))
+    }
+
+    /// Whether `first` and `second` hold the same values, as [`Self::holds_same_values_as`] tells.
+    /// Every element below a store asks this of the same two stores, each answer taking a walk of
+    /// their values, so a thread keeps the answers it found.
+    pub(crate) fn hold_the_same_values(first: &Arc<Self>, second: &Arc<Self>) -> bool {
+        if Arc::ptr_eq(first, second) {
+            return true;
+        }
+        // NB: The answer is the same whichever of the two is asked.
+        let (first, second) = if Arc::as_ptr(first) < Arc::as_ptr(second) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let identities = (Arc::as_ptr(first) as u64) ^ (Arc::as_ptr(second) as u64).rotate_left(32);
+        let slot =
+            (identities.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (u64::BITS - COMPARED_STORE_SLOTS.ilog2())) as usize;
+        let known = COMPARED_STORES.with_borrow(|compared| {
+            compared[slot]
+                .as_ref()
+                .filter(|compared| {
+                    compared.first.as_ptr() == Arc::as_ptr(first) && compared.second.as_ptr() == Arc::as_ptr(second)
+                })
+                .map(|compared| compared.same)
+        });
+        if let Some(same) = known {
+            return same;
+        }
+        let same = first.holds_same_values_as(second);
+        COMPARED_STORES.with_borrow_mut(|compared| {
+            compared[slot] = Some(ComparedStores {
+                first: Arc::downgrade(first),
+                second: Arc::downgrade(second),
+                same,
+            });
+        });
+        same
+    }
+
+    /// Whether `first` and `second` are both absent, or hold the same values.
+    pub(crate) fn absent_or_holding_the_same_values(first: Option<&Arc<Self>>, second: Option<&Arc<Self>>) -> bool {
+        match (first, second) {
+            (None, None) => true,
+            (Some(first), Some(second)) => Self::hold_the_same_values(first, second),
+            _ => false,
+        }
+    }
+
     /// Whether the store holds the same values as `other`, built over the same store and chained to
     /// the same parent.
-    pub(crate) fn holds_same_values_as(&self, other: &Self) -> bool {
-        let same_inheritance = match (&self.inheritance_parent, &other.inheritance_parent) {
-            (None, None) => true,
-            (Some(first), Some(second)) => Arc::ptr_eq(first, second) || first.holds_same_values_as(second),
-            _ => false,
-        };
-        if !same_inheritance || self.declared_names() != other.declared_names() {
+    fn holds_same_values_as(&self, other: &Self) -> bool {
+        let same_inheritance = Self::absent_or_holding_the_same_values(
+            self.inheritance_parent.as_ref(),
+            other.inheritance_parent.as_ref(),
+        );
+        if !same_inheritance || !self.declares_the_same_names_as(other) {
             return false;
         }
         // NB: What a store took in from the chain above it, and which stores stand there, depends on how it was built:
@@ -1195,9 +1267,8 @@ const MAX_SUBSTITUTION_RECURSION_DEPTH: u32 = 64;
 
 pub(crate) enum NativeVarResolution {
     Resolved {
-        /// The substituted components, serialized to tokenize back to them where comments only keep
-        /// tokens apart.
-        source: Vec<u16>,
+        /// The substituted components.
+        components: ComponentValueList,
         contains_attr_tainted_values: bool,
     },
     Invalid,
@@ -2747,22 +2818,46 @@ pub(crate) fn evaluate_retained_container_style_feature(
     length_resolution_context: &crate::css::style_compute::FfiLengthResolutionContext,
     color_resolution_input: crate::css::color_resolution::ColorResolutionInput<'_>,
     tree_counting: Option<(u64, u64)>,
+    read_sibling_position: &mut bool,
 ) -> MatchResult {
+    let mut dependencies = None;
     let mut context = ASFResolutionContext {
         inheritance_store: store.and_then(|store| store.inheritance_parent.as_deref()),
         style_query_length_resolution_context: Some(length_resolution_context),
         style_query_color_resolution_input: Some(color_resolution_input),
         style_query_tree_counting: tree_counting,
+        style_query_dependencies: Some(&mut dependencies),
         ..Default::default()
     };
     let registry = Some(registry);
     let result = match feature {
         StyleFeature::Boolean(name) => evaluate_named_style_feature(store, registry, name, None, &mut context, 0),
+        // The value is computed with respect to the query container, as the property it is compared with was.
+        StyleFeature::Plain { name, value, .. }
+            if name.starts_with_ascii("--") && contains_arbitrary_substitution_function(value) =>
+        {
+            match substitute_tokens(store, registry, value.as_slice(), &mut context, 0) {
+                TokenResolution::Resolved(query) => {
+                    evaluate_named_style_feature(store, registry, name, Some(&query), &mut context, 0)
+                }
+                // NB: A value that substitutes to nothing valid matches a property that holds nothing valid either.
+                TokenResolution::Invalid | TokenResolution::Cyclic => {
+                    match resolve_custom_property(store, registry, name.fly_string().as_ref(), &mut context, 1) {
+                        TokenResolution::Resolved(_) => ConditionEvaluation::Match(false),
+                        TokenResolution::Invalid | TokenResolution::Cyclic => ConditionEvaluation::Match(true),
+                        TokenResolution::NotHandled => ConditionEvaluation::NotHandled,
+                    }
+                }
+                TokenResolution::NotHandled => ConditionEvaluation::NotHandled,
+            }
+        }
         StyleFeature::Plain { name, value, .. } => {
             evaluate_named_style_feature(store, registry, name, Some(value), &mut context, 0)
         }
         StyleFeature::Range { .. } => evaluate_style_range(store, registry, feature, &mut context, 0),
     };
+    *read_sibling_position |=
+        dependencies.is_some_and(|dependencies: Box<StyleQueryDependencies>| dependencies.sibling_position);
     match result {
         ConditionEvaluation::Match(true) => MatchResult::True,
         ConditionEvaluation::Match(false) => MatchResult::False,
@@ -3807,8 +3902,8 @@ pub(crate) fn resolve_vars(
     match result {
         // A custom property carries its taint to the values that substitute it; another property is invalid where a
         // tainted value reaches a URL.
-        TokenResolution::Resolved(tokens) => NativeVarResolution::Resolved {
-            source: serialize_component_values_to_utf16(&tokens, ComponentSerializationMode::Retokenize),
+        TokenResolution::Resolved(components) => NativeVarResolution::Resolved {
+            components,
             contains_attr_tainted_values: if property_id == crate::css::property_metadata::property_id::CUSTOM {
                 context.contains_attr_tainted_values
             } else {
@@ -3861,27 +3956,29 @@ mod tests {
         }
     }
 
+    fn store(
+        parent: Option<Arc<CustomPropertyStore>>,
+        names: impl IntoIterator<Item = u32>,
+        value: f64,
+    ) -> Arc<CustomPropertyStore> {
+        let entries = names
+            .into_iter()
+            .map(|index| {
+                let name = Utf16FlyString::from_utf16(&utf16(&format!("--name-{index}")));
+                let entry = CustomPropertyEntry {
+                    name: name.clone(),
+                    value: RetainedStyleValueData::from_owned(StyleValueData::Number { value }),
+                    important: false,
+                    declared: None,
+                };
+                (name.raw_identity(), entry)
+            })
+            .collect();
+        CustomPropertyStore::child(parent, entries)
+    }
+
     #[test]
     fn stores_built_apart_hold_the_same_values_where_every_name_reads_the_same() {
-        fn store(
-            parent: Option<Arc<CustomPropertyStore>>,
-            names: std::ops::Range<u32>,
-            value: f64,
-        ) -> Arc<CustomPropertyStore> {
-            let entries = names
-                .map(|index| {
-                    let name = Utf16FlyString::from_utf16(&utf16(&format!("--name-{index}")));
-                    let entry = CustomPropertyEntry {
-                        name: name.clone(),
-                        value: RetainedStyleValueData::from_owned(StyleValueData::Number { value }),
-                        important: false,
-                        declared: None,
-                    };
-                    (name.raw_identity(), entry)
-                })
-                .collect();
-            CustomPropertyStore::child(parent, entries)
-        }
         // NB: A parent of more names than a child takes in stays a store of the child's chain.
         let child_over = |value| store(Some(store(None, 0..20, value)), 20..22, 2.0);
         let (first, second) = (child_over(1.0), child_over(1.0));
@@ -3892,6 +3989,51 @@ mod tests {
         let wider = store(Some(store(None, 0..21, 1.0)), 21..22, 2.0);
         assert!(!first.holds_same_values_as(&wider));
         assert!(!wider.holds_same_values_as(&first));
+    }
+
+    #[test]
+    fn stores_declaring_the_same_names_in_another_order_do_not_hold_the_same_values() {
+        let (first, second) = (store(None, [0, 1], 1.0), store(None, [1, 0], 1.0));
+        assert!(!first.holds_same_values_as(&second));
+        assert!(first.holds_same_values_as(&store(None, [0, 1], 1.0)));
+    }
+
+    #[test]
+    fn stores_compared_again_answer_as_they_did_whichever_is_asked() {
+        // NB: Turning every answer kept around shows that the next one is the one kept, and not a walk of the values.
+        fn turn_kept_answers() {
+            COMPARED_STORES.with_borrow_mut(|compared| {
+                for compared in compared.iter_mut().flatten() {
+                    compared.same = !compared.same;
+                }
+            });
+        }
+        let (first, second, other) = (
+            store(None, 0..20, 1.0),
+            store(None, 0..20, 1.0),
+            store(None, 0..20, 2.0),
+        );
+        assert!(CustomPropertyStore::hold_the_same_values(&first, &first));
+
+        // NB: Two pairs can share a slot, so each pair is asked about again before the next is compared.
+        assert!(CustomPropertyStore::hold_the_same_values(&first, &second));
+        turn_kept_answers();
+        assert!(!CustomPropertyStore::hold_the_same_values(&second, &first));
+        assert!(first.holds_same_values_as(&second));
+
+        assert!(!CustomPropertyStore::hold_the_same_values(&first, &other));
+        turn_kept_answers();
+        assert!(CustomPropertyStore::hold_the_same_values(&other, &first));
+        assert!(!first.holds_same_values_as(&other));
+    }
+
+    #[test]
+    fn a_kept_answer_keeps_no_store_alive() {
+        let (first, second) = (store(None, 0..1, 1.0), store(None, 0..1, 1.0));
+        assert!(CustomPropertyStore::hold_the_same_values(&first, &second));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

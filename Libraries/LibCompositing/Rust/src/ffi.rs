@@ -64,6 +64,9 @@ pub unsafe extern "C" fn display_list_compute_damage(
     canvases_with_new_content_len: usize,
     video_sinks_with_new_frames: *const crate::display_list::commands::VideoSinkResourceId,
     video_sinks_with_new_frames_len: usize,
+    image_frames_with_new_pixels: *const crate::display_list::commands::ImageFrameResourceId,
+    image_frames_with_new_pixels_len: usize,
+    forced_damage_rect: libgfx_rust::IntRect,
     out_damage_rect: *mut libgfx_rust::IntRect,
 ) -> bool {
     // SAFETY: The caller guarantees live handles and valid slices for the duration of the call.
@@ -82,6 +85,8 @@ pub unsafe extern "C" fn display_list_compute_damage(
         crate::display_list::damage::LiveContentChanges {
             canvases: ak::slice_from_raw_parts(canvases_with_new_content, canvases_with_new_content_len),
             video_sinks: ak::slice_from_raw_parts(video_sinks_with_new_frames, video_sinks_with_new_frames_len),
+            image_frames: ak::slice_from_raw_parts(image_frames_with_new_pixels, image_frames_with_new_pixels_len),
+            forced_damage_rect,
         }
     };
     let damage = crate::display_list::damage::compute_display_list_damage(
@@ -258,7 +263,7 @@ mod viewport_scroll_reuse_tests {
         ClipNodeIndex, EffectNodeData, EffectNodeIndex, EffectsData, ScrollData, SpatialData, StickyData,
         TransformData, TransformDataRole, scroll_state::NO_SCROLL_STATE_SLOT,
     };
-    use libgfx_rust::{FloatMatrix4x4, FloatPoint};
+    use libgfx_rust::{FloatMatrix4x4, FloatPoint, FloatRect};
 
     fn tree_with_viewport_scroll_node() -> (crate::visual_context::VisualContextTree, SpatialNodeIndex) {
         let mut tree = crate::visual_context::VisualContextTree::create(TransformData {
@@ -269,6 +274,7 @@ mod viewport_scroll_reuse_tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         });
         let viewport_scroll_node = tree.append_spatial(
             SpatialData::Scroll(ScrollData {
@@ -321,6 +327,7 @@ mod viewport_scroll_reuse_tests {
                 role: TransformDataRole::CssTransform,
                 synthetic_plane: false,
                 establishes_sorting_context: false,
+                bounds: FloatRect::default(),
             }),
             viewport_scroll_node,
         );
@@ -778,11 +785,39 @@ pub unsafe extern "C" fn visual_context_tree_has_visual_animations(tree: *const 
 ///
 /// `tree` must be a live retained tree handle.
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_can_snap_composited_context_origin(
+    tree: *const c_void,
+    spatial_node_index: SpatialNodeIndex,
+) -> bool {
+    unsafe { tree_from_handle(tree) }.can_snap_composited_context_origin(spatial_node_index)
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_has_active_visual_animation_at(
     tree: *const c_void,
     sample_time_ns: i64,
 ) -> bool {
     unsafe { tree_from_handle(tree) }.has_active_visual_animation_at(sample_time_ns)
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle, and `scroll_offsets` must address `scroll_offsets_len` points.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_running_transform_animation_covers_point(
+    tree: *const c_void,
+    sample_time_ns: i64,
+    screen_point: libgfx_rust::FloatPoint,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+) -> bool {
+    let tree = unsafe { tree_from_handle(tree) };
+    // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
+    let scroll_offsets = unsafe { ak::slice_from_raw_parts(scroll_offsets, scroll_offsets_len) };
+    tree.running_transform_animation_covers_point(sample_time_ns, screen_point, scroll_offsets)
 }
 
 /// # Safety
@@ -870,6 +905,7 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_create() -> *mut c_voi
         role: crate::visual_context::TransformDataRole::CssTransform,
         synthetic_plane: false,
         establishes_sorting_context: false,
+        bounds: libgfx_rust::FloatRect::default(),
     });
     Box::into_raw(Box::new(tree)).cast()
 }
@@ -902,6 +938,7 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_transform(
             role: crate::visual_context::TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: libgfx_rust::FloatRect::default(),
         }),
         SpatialNodeIndex(parent),
     )

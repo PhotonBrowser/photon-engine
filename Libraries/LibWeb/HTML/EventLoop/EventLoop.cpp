@@ -11,6 +11,8 @@
 #include <AK/TemporaryChange.h>
 #include <cstdlib>
 #include <LibCore/EventLoop.h>
+#include <LibCore/ThreadEventQueue.h>
+#include <LibCore/ThreadEventQueue.h>
 #include <LibGC/Heap.h>
 #include <LibGC/HeapAccess.h>
 #include <LibJS/Runtime/VM.h>
@@ -111,6 +113,12 @@ void EventLoop::visit_edges(Visitor& visitor)
 
 void EventLoop::schedule()
 {
+    m_turn_requested_without_a_task = true;
+    schedule_for_queued_task();
+}
+
+void EventLoop::schedule_for_queued_task()
+{
     if (!m_system_event_loop_timer) {
         m_system_event_loop_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), [this] {
             process();
@@ -175,12 +183,45 @@ void EventLoop::spin_until(GC::Ref<GC::Function<bool()>> goal_condition)
     // NOTE: This is achieved by returning from the function.
 }
 
-// https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
 void EventLoop::process()
 {
+    m_turn_requested_without_a_task = false;
+
     if (execution_paused())
         return;
 
+    // OPTIMIZATION: A trip through the platform event loop costs more than a small task does, so run the tasks that are
+    //               ready here for a short while. Each turn is one turn of the processing model with one task, so this
+    //               is not visible to the page. The platform event loop gets its turn as soon as anything was posted to
+    //               it. What it would only learn from the kernel waits for no longer than this deadline. A nested event
+    //               loop goes back after every task, to check what it is waiting for.
+    static constexpr auto maximum_time_between_platform_event_loop_turns = AK::Duration::from_microseconds(100);
+    auto const turn_deadline = MonotonicTime::now() + maximum_time_between_platform_event_loop_turns;
+    bool has_runnable_tasks = false;
+    for (;;) {
+        has_runnable_tasks = run_one_turn_of_the_processing_model();
+        if (!has_runnable_tasks || execution_paused() || m_spin_depth > 0)
+            break;
+        if (Core::ThreadEventQueue::current().has_pending_events() || MonotonicTime::now() >= turn_deadline)
+            break;
+    }
+
+    // If there are eligible tasks in the queue, schedule a new round of processing. :^)
+    if (has_runnable_tasks || (!m_microtask_queue.is_empty() && !m_performing_a_microtask_checkpoint)) {
+        schedule();
+        return;
+    }
+
+    // NB: A task that the turns above have run may have armed the timer for itself. What asked for a turn without
+    //     queueing a task still gets one.
+    if (m_system_event_loop_timer && !m_turn_requested_without_a_task)
+        m_system_event_loop_timer->stop();
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
+// Answers whether the event loop has a runnable task after this turn.
+bool EventLoop::run_one_turn_of_the_processing_model()
+{
     if (Core::StatsLog::the())
         begin_rendering_pending_task();
     ScopeGuard pending_task = [] {
@@ -204,22 +245,24 @@ void EventLoop::process()
     for (auto& reached_step_1_task : reached_step_1_tasks)
         reached_step_1_task->function()();
 
+    // 2. If the event loop has a task queue with at least one runnable task, then:
+    // NB: Looking for the first runnable task once answers this as well.
+
+    // 1. Let taskQueue be one such task queue, chosen in an implementation-defined manner.
+    auto task_queue = m_task_queue;
+
+    // 2. Set taskStartTime to the unsafe shared current time.
+    task_start_time = HighResolutionTime::unsafe_shared_current_time();
+
+    // 3. Set oldestTask to the first runnable task in taskQueue, and remove it from taskQueue.
+    oldest_task = task_queue->take_first_runnable();
+
     // AD-HOC: Beside an idle event loop, whose rendering updates run a document's animations, the render clock's lanes
     //         only hover what is under the pointer.
-    if (!m_task_queue->has_runnable_tasks())
+    if (!oldest_task && !task_queue->has_runnable_tasks())
         note_clock_lanes(ClockAnimations::Hold);
 
-    // 2. If the event loop has a task queue with at least one runnable task, then:
-    if (m_task_queue->has_runnable_tasks()) {
-        // 1. Let taskQueue be one such task queue, chosen in an implementation-defined manner.
-        auto task_queue = m_task_queue;
-
-        // 2. Set taskStartTime to the unsafe shared current time.
-        task_start_time = HighResolutionTime::unsafe_shared_current_time();
-
-        // 3. Set oldestTask to the first runnable task in taskQueue, and remove it from taskQueue.
-        oldest_task = task_queue->take_first_runnable();
-
+    if (oldest_task) {
         // FIXME: 4. If oldestTask's document is not null, then record task start time given taskStartTime and oldestTask's document.
 
         // AD-HOC: While a task runs, the render clock's lanes tick the animations the last rendering update planned for.
@@ -291,20 +334,39 @@ void EventLoop::process()
         // FIXME: 4. If oldestTask's document is not null, then record task end time given taskEndTime and oldestTask's document.
     }
 
+    bool has_runnable_tasks = m_task_queue->has_runnable_tasks();
+
     // 5. If this is a window event loop that has no runnable task in this event loop's task queues, then:
-    if (m_type == Type::Window && !m_task_queue->has_runnable_tasks() && (!m_idle_period_timer || !m_idle_period_timer->is_active())) {
+    // NB: A callback that asks for the next one through a task still waits, as a page would otherwise spin while idle.
+    static constexpr double minimum_time_between_idle_periods_in_ms = 1;
+    bool idle_period_may_start = !m_idle_period_timer || !m_idle_period_timer->is_active()
+        || (m_idle_callback_requested_outside_idle_period && HighResolutionTime::unsafe_shared_current_time() - m_last_idle_period_start_time >= minimum_time_between_idle_periods_in_ms);
+    if (m_type == Type::Window && !has_runnable_tasks && m_may_have_idle_callbacks && idle_period_may_start) {
         auto windows = same_loop_windows();
         bool has_idle_callbacks = false;
+        bool has_callbacks_of_hidden_document = false;
         for (auto& window : windows) {
-            if (!window->associated_document().hidden() && window->has_idle_callbacks()) {
-                has_idle_callbacks = true;
-                break;
+            if (!window->has_idle_callbacks())
+                continue;
+            if (window->associated_document().hidden()) {
+                has_callbacks_of_hidden_document = true;
+                continue;
             }
+            has_idle_callbacks = true;
+            break;
         }
+        // NB: same_loop_windows() leaves out a document that is not fully active, whose callbacks wait for it to come back.
+        bool has_callbacks_of_inactive_document = any_of(m_documents, [](auto const& document) {
+            return document && !document->is_fully_active() && document->window() && document->window()->has_idle_callbacks();
+        });
+        // OPTIMIZATION: Nothing is looked at here again until an idle callback is asked for.
+        m_may_have_idle_callbacks = has_idle_callbacks || has_callbacks_of_hidden_document || has_callbacks_of_inactive_document;
         if (has_idle_callbacks) {
             // NB: Delay the next idle period until this one's 50 ms budget has elapsed. Callbacks registered
             //     during an idle period belong to the next one; immediately starting it lets self-scheduling
-            //     callbacks spin continuously even when they have no work to do.
+            //     callbacks spin continuously even when they have no work to do. A callback requested from
+            //     anything but an idle callback starts an idle period right away (see did_request_idle_callback()).
+            m_idle_callback_requested_outside_idle_period = false;
             if (!m_idle_period_timer) {
                 m_idle_period_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(50), GC::create_function(GC::Heap::the(), [this] {
                     schedule();
@@ -321,13 +383,11 @@ void EventLoop::process()
             // 3. For each win of the same-loop windows for this event loop, perform the start an idle period algorithm for win with the following step: return the result of calling computeDeadline, coarsened given win's relevant settings object's cross-origin isolated capability. [REQUESTIDLECALLBACK]
             for (auto& window : windows)
                 window->start_an_idle_period();
+            has_runnable_tasks = m_task_queue->has_runnable_tasks();
         }
     }
 
-    // If there are eligible tasks in the queue, schedule a new round of processing. :^)
-    if (m_task_queue->has_runnable_tasks() || (!m_microtask_queue.is_empty() && !m_performing_a_microtask_checkpoint)) {
-        schedule();
-    }
+    return has_runnable_tasks;
 }
 
 void EventLoop::request_rendering_update()
@@ -398,6 +458,7 @@ bool EventLoop::rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp fr
     //         opportunity instead of one global task per page local root.
     VERIFY(!m_rendering_task_queued);
     m_rendering_task_queued = true;
+    m_rendering_task_queued_time = MonotonicTime::now();
     queue_a_task(Task::Source::Rendering, this, nullptr, *m_rendering_task_function);
     ++m_rendering_scheduler_counters.opportunities_that_queued_a_task;
     return true;
@@ -494,7 +555,7 @@ void EventLoop::process_input_events() const
                 [&](Web::KeyEvent const& key_event) {
                     switch (key_event.type) {
                     case Web::KeyEvent::Type::KeyDown:
-                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat, key_event.should_insert_text, key_event.async_scroll_performed_default_action, key_event.editing_commands, key_event.native_editing_binding_resolved);
+                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat, key_event.should_insert_text, key_event.async_scroll_performed_default_action, key_event.editing_commands, key_event.native_editing_binding_resolved, key_event.user_input_scroll_count_with_nothing_to_scroll);
                     case Web::KeyEvent::Type::KeyUp:
                         return page.handle_keyup(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat);
                     }
@@ -774,8 +835,9 @@ static bool is_renderable(DOM::Document const& document)
 }
 
 // Takes in what the render clock's lanes did, then the queued input events. The lanes wait for the plan of the rendering
-// update with the serial number `update_serial`. Answers the documents whose lanes were taken in.
-Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(u64 update_serial)
+// update with the serial number `update_serial`, or tick on beside the task that handles a press where no update comes
+// with it. Answers the documents whose lanes were taken in.
+Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(Optional<u64> update_serial)
 {
     // AD-HOC: The render clock's lanes present frames of a document's animations and hover beside the tasks since the
     //         last update, at display ticks later than the opportunity this update renders for, which reached the event
@@ -809,7 +871,10 @@ Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(
             if (auto* root_arena = root_document ? root_document->layout_node_arena_if_created() : nullptr)
                 outer_input_event = Layout::RustFFI::document_host_newest_pointer_input_event(root_arena->host());
         }
-        if (Layout::RustFFI::document_host_take_clock_lanes_in(arena->host(), update_serial, outer_input_event)) {
+        auto const lane_presented = update_serial.has_value()
+            ? Layout::RustFFI::document_host_take_clock_lanes_in(arena->host(), *update_serial, outer_input_event)
+            : Layout::RustFFI::document_host_take_in_what_clock_lanes_did(arena->host(), outer_input_event);
+        if (lane_presented) {
             tick_presented = true;
             navigable->set_needs_to_record_display_list();
             navigable->set_needs_repaint();
@@ -868,6 +933,9 @@ Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(
         else
             owed.navigable->event_handler().handle_mouseleave();
     }
+    // AD-HOC: A hover left stale between the tasks, as the style or layout it reads was pending, follows now. The
+    //         update brings the style and layout up to date next, so the hover may bring them up to date first.
+    update_hovers_that_may_be_stale(HoverUpdatePoint::RenderingUpdateBegins);
     // What the lanes reported has been taken in: the style node ids that left their nodes since name nothing of theirs.
     // A document with no lanes has none that report any.
     for (auto& document : documents_in_this_event_loop_matching([](auto const&) { return true; })) {
@@ -876,8 +944,9 @@ Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(
         if (!style_computer)
             continue;
         auto* arena = document->layout_node_arena_if_created();
-        bool const lanes_taken_in = any_of(documents_with_lanes, [&](auto const& taken_in) { return taken_in.ptr() == document.ptr(); });
-        if (lanes_taken_in || !arena || !Layout::RustFFI::document_host_may_have_lanes(arena->host()))
+        // NB: Lanes that tick on beside a task may still name them, and report that later.
+        bool const lanes_stopped = update_serial.has_value() && any_of(documents_with_lanes, [&](auto const& taken_in) { return taken_in.ptr() == document.ptr(); });
+        if (lanes_stopped || !arena || !Layout::RustFFI::document_host_may_have_lanes(arena->host()))
             style_computer->forget_style_nodes_retired_beside_lanes();
     }
     return documents_with_lanes;
@@ -902,7 +971,8 @@ void EventLoop::process_input_events_task()
     // Input dispatch can run script and request another frame. Keep that work
     // behind the reentrancy guard without starting a rendering-update lifecycle.
     TemporaryChange running { m_running_rendering_task, true };
-    take_clock_lanes_and_input_events_in(m_rendering_update_serial + 1);
+    // NB: No rendering update comes with this task, and script may run for long before the next one: the lanes tick on.
+    take_clock_lanes_and_input_events_in({});
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
@@ -1318,8 +1388,8 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         auto now = relative_frame_timestamp_for(*document);
         document->run_the_update_intersection_observations_steps(now);
 
-        // AD-HOC: The cursor shows the style the update applied to what the pointer is over.
-        document->navigable()->event_handler().update_cursor_after_rendering_update();
+        // AD-HOC: The hover and the cursor follow a style the update applied to what the pointer is over.
+        document->navigable()->event_handler().update_hover_after_rendering_update();
     }
 
     // AD-HOC: Whether a video sink is ticked depends on whether the element would be painted, which is only known once
@@ -1546,6 +1616,26 @@ bool EventLoop::lays_out_rendering_update_in_flight() const
     return m_rendering_update_in_flight && m_rendering_update_in_flight->layout_flew;
 }
 
+// AD-HOC: A rendering update of a document that is still loading lays out content that is about to change, and a first
+//         layout can take long. The event loop may choose its task queues freely, so the tasks that take the document
+//         to DOMContentLoaded go first, for a short while. Without this, the first layout of a large document runs
+//         between the last of its bytes and the steps after them, as the rendering task is queued first.
+bool EventLoop::rendering_task_yields_to_document_loading() const
+{
+    static constexpr auto maximum_time_to_yield = AK::Duration::from_milliseconds(4);
+
+    if (m_spin_depth > 0 || MonotonicTime::now() - m_rendering_task_queued_time >= maximum_time_to_yield)
+        return false;
+    return any_of(m_documents, [](auto const& document) {
+        return document
+            && document->readiness() != DocumentReadyState::Complete
+            && document->load_timing_info().dom_content_loaded_event_start_time == 0
+            && !document->has_layout_box()
+            && !document->is_initial_about_blank()
+            && document->is_fully_active();
+    });
+}
+
 bool EventLoop::holds_rendering_opportunity() const
 {
     return m_rendering_update_in_flight && !m_rendering_update_in_flight->ended();
@@ -1593,6 +1683,35 @@ bool EventLoop::let_layout_of_rendering_update_fly()
     return true;
 }
 
+void EventLoop::note_hover_may_be_stale(LocalNavigable& navigable)
+{
+    if (!queue_hover_that_may_be_stale(navigable))
+        return;
+    // An idle loop comes between two tasks only as the next task comes: this makes it come now.
+    schedule();
+}
+
+bool EventLoop::queue_hover_that_may_be_stale(LocalNavigable& navigable)
+{
+    if (any_of(m_navigables_with_hover_that_may_be_stale, [&](auto const& entry) { return entry.ptr() == &navigable; }))
+        return false;
+    m_navigables_with_hover_that_may_be_stale.append(navigable);
+    return true;
+}
+
+void EventLoop::update_hovers_that_may_be_stale(HoverUpdatePoint hover_update_point)
+{
+    // What the hover dispatches may note a hover as stale again, which waits for the next point.
+    auto navigables = move(m_navigables_with_hover_that_may_be_stale);
+    for (auto& navigable : navigables) {
+        if (navigable->has_been_destroyed())
+            continue;
+        // A hover that waits for a frame, or for a rendering update, comes here again as it lands or begins.
+        if (navigable->event_handler().update_hover_where_the_pointer_rests(hover_update_point))
+            queue_hover_that_may_be_stale(*navigable);
+    }
+}
+
 void EventLoop::take_finished_frames_in()
 {
     // A rendering update whose style update, then layout, has landed goes on; the tasks before that run beside it,
@@ -1606,6 +1725,8 @@ void EventLoop::take_finished_frames_in()
     // A frame that was taken in leaves the list as it is, which moves only the entries after it.
     for (size_t index = m_navigables_with_frames_in_flight.size(); index-- > 0;)
         (void)m_navigables_with_frames_in_flight[index]->take_recording_in_flight_in(LocalNavigable::TakeIn::IfFinished);
+    // The frames taken in are the ones the hover waits for.
+    update_hovers_that_may_be_stale(HoverUpdatePoint::BetweenTasks);
 
     // NB: This runs between tasks, so no end of a task takes what the style drains above queued, such as the reaction
     //     to a promise an animation resolved, and no task may follow for a long time.
@@ -1743,16 +1864,19 @@ void EventLoop::perform_a_microtask_checkpoint()
     }
 
     // 4. For each environment settings object settingsObject whose responsible event loop is this event loop, notify about rejected promises given settingsObject's global object.
-    GC::RootVector<GC::Ref<EnvironmentSettingsObject>> environments;
-    for (auto const& entry : m_related_environment_settings_objects)
-        environments.append(*entry.value);
-    for (auto& environment_settings_object : environments) {
-        auto& global_object = environment_settings_object->global_object();
-        if (auto* worklet_global_scope = Bindings::impl_from<WorkletGlobalScope>(&global_object)) {
-            worklet_global_scope->notify_about_rejected_promises({});
-            continue;
+    // OPTIMIZATION: This runs for every callback, and only a promise rejected since the last time gives it anything to do.
+    if (exchange(m_has_rejected_promises_to_notify_about, false)) {
+        GC::RootVector<GC::Ref<EnvironmentSettingsObject>> environments;
+        for (auto const& entry : m_related_environment_settings_objects)
+            environments.append(*entry.value);
+        for (auto& environment_settings_object : environments) {
+            auto& global_object = environment_settings_object->global_object();
+            if (auto* worklet_global_scope = Bindings::impl_from<WorkletGlobalScope>(&global_object)) {
+                worklet_global_scope->notify_about_rejected_promises({});
+                continue;
+            }
+            relevant_window_or_worker_global_scope(global_object).notify_about_rejected_promises({});
         }
-        relevant_window_or_worker_global_scope(global_object).notify_about_rejected_promises({});
     }
 
     // 5. Cleanup Indexed Database transactions.
@@ -1798,15 +1922,20 @@ void EventLoop::add_stats(JsonObject& values) const
     size_t shared_image_requests = 0;
     size_t style_sheets = 0;
     size_t font_faces = 0;
+    size_t destroyed_documents = 0;
     for (auto const& document : m_documents) {
         if (!document)
             continue;
+        // NB: Unless script still holds its objects, a destroyed document that survives a collection is leaked.
+        if (document->has_been_destroyed())
+            ++destroyed_documents;
         available_images += document->list_of_available_images().size();
         shared_image_requests += document->shared_resource_requests().size();
         style_sheets += document->style_scope().style_sheets().size();
         font_faces += document->fonts()->set_size();
     }
     values.set("dom.documents"sv, m_documents.size());
+    values.set("dom.destroyed_documents"sv, destroyed_documents);
     values.set("images.available_entries"sv, available_images);
     values.set("images.shared_requests"sv, shared_image_requests);
     values.set("css.document_style_sheet_entries"sv, style_sheets);
@@ -1918,6 +2047,16 @@ Vector<GC::Root<HTML::Window>> EventLoop::same_loop_windows() const
         windows.append(GC::make_root(document->window()));
     }
     return windows;
+}
+
+// NB: A page that asks for an idle callback from a task or a rendering update does not keep the event loop busy by
+//     doing so, so its callback need not wait for the last idle period's 50 ms to run out. One that an idle callback
+//     or a reaction to it asks for does wait, or the two would run back to back.
+void EventLoop::did_request_idle_callback()
+{
+    m_may_have_idle_callbacks = true;
+    if (m_task_generation != m_task_generation_of_last_idle_callback)
+        m_idle_callback_requested_outside_idle_period = true;
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model:last-idle-period-start-time

@@ -8,6 +8,8 @@
 //! container query inputs, the previous layout's boxes and the containers' style records.
 
 use super::bridge::FfiContainerEffectKind;
+use super::input_types::TransactionFactSide;
+use super::selector_evaluation::StructuralRead;
 use super::tree::StyleNodeID;
 use super::*;
 use crate::css::computed_longhand_table::FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS;
@@ -53,7 +55,7 @@ impl ContainerVerdict {
 /// `Length::container_relative_length_to_px_without_rounding` finds it: the content size of the
 /// nearest flat-tree ancestor that accepts size queries on that axis as of the last layout commit,
 /// zero while that container has no box, and the viewport's size when there is no such container.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ContainerUnitBasis {
     basis: f64,
     /// The container the basis is read from, or none for the viewport.
@@ -75,7 +77,7 @@ impl ContainerUnitBasis {
 }
 
 /// The bases of both physical axes, width and height.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ContainerUnitBases([ContainerUnitBasis; 2]);
 
 impl ContainerUnitBases {
@@ -135,8 +137,8 @@ impl ContainerRecords for RetainedState {
         self.container_query_inputs(node)
     }
 
-    /// One holding no record yet is one the host styles in this update, which decides it. One
-    /// this batch settled is read as the host will leave it, as a query container is.
+    /// One holding no record yet is one this update styles, which decides it. One this batch
+    /// settled is read as the install will leave it, as a query container is.
     fn any_element_row(&self, node: StyleNodeID) -> Option<tree::ContainerQueryInputs<'_>> {
         self.container_query_input_row(node, self.container_style_record(node)?, true)
     }
@@ -565,6 +567,12 @@ impl RetainedState {
                         .map(|position| (u64::from(position.count), u64::from(position.index))),
                 });
             }
+            let read_sibling_position = std::cell::Cell::new(false);
+            let tree_counting = || {
+                read_sibling_position.set(true);
+                self.sibling_position(candidate)
+                    .map(|position| (u64::from(position.count), u64::from(position.index)))
+            };
             let facts = ContainerFacts {
                 container_available: true,
                 size_available: snapshot.has_committed_box && inputs.size_queries_available,
@@ -574,6 +582,7 @@ impl RetainedState {
                 // styled, so the writing mode is the record's, not the last commit's.
                 inline_axis_horizontal,
                 length_resolution_context: std::ptr::from_ref(&length).cast(),
+                tree_counting: &tree_counting,
                 scroll_state_available: requirements & CONTAINER_QUERY_REQUIRES_SCROLL_STATE != 0,
                 stuck: snapshot.stuck,
                 snapped: snapshot.snapped,
@@ -633,16 +642,32 @@ impl RetainedState {
                     let Some(context) = &style_context else {
                         return MatchResult::Unknown;
                     };
-                    crate::css::custom_properties::evaluate_retained_container_style_feature(
+                    let mut read = false;
+                    let result = crate::css::custom_properties::evaluate_retained_container_style_feature(
                         context.store,
                         context.registry,
                         feature,
                         &length,
                         context.color,
                         context.tree_counting,
-                    )
+                        &mut read,
+                    );
+                    read_sibling_position.set(read_sibling_position.get() || read);
+                    result
                 })
             };
+            // NB: Its siblings moving is what moves the answer, as for a record reading its own place.
+            if read_sibling_position.get() {
+                self.containers_counted_by_style_queries
+                    .lock()
+                    .expect("the counted containers are never held across a panic")
+                    .insert(candidate);
+                self.projection.note_structural_read(
+                    TransactionFactSide::After,
+                    candidate,
+                    StructuralRead::SiblingPositionValue,
+                );
+            }
             if resolved_viewport_relative_length {
                 verdict
                     .effects

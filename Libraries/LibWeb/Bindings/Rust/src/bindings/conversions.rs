@@ -14,8 +14,8 @@ use std::borrow::Cow;
 use ak::{Utf16String, Utf16StringUnits, convert_valid_utf16_to_utf8, utf8_length_from_valid_utf16};
 use libjs_rust::api::{
     Array, ArrayBuffer, ArrayBufferOrder, ArrayBufferShared, DataView, ErrorKind, ErrorType, FunctionObject, Gc,
-    MarkedVec, Must, Object, PrimitiveString, PropertyKey, ThrowCompletionOr, Trace, TypedArrayBase, TypedArrayKind,
-    Value, Vm, create_typed_array_on_buffer, get_iterator_from_method_impl, get_view_byte_length,
+    IntegrityLevel, MarkedVec, Must, Object, PrimitiveString, PropertyKey, ThrowCompletionOr, Trace, TypedArrayBase,
+    TypedArrayKind, Value, Vm, create_typed_array_on_buffer, get_iterator_from_method_impl, get_view_byte_length,
     is_typed_array_out_of_bounds, is_view_out_of_bounds, iterator_step_value,
     make_data_view_with_buffer_witness_record, make_typed_array_with_buffer_witness_record, to_well_formed,
     typed_array_byte_length,
@@ -28,7 +28,8 @@ use crate::bindings::services::web_bindings_object_implements_interface;
 use crate::bindings::{CallContext, WebIdlResult};
 
 /// A USVString, a string without lone surrogates. Its UTF-16 code units are always well-formed.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Trace)]
+#[gc(crate = libjs_rust)]
 pub(crate) struct UsvString(Utf16String);
 
 impl UsvString {
@@ -100,6 +101,19 @@ impl UsvString {
 
     pub(crate) fn into_utf16_string(self) -> Utf16String {
         self.0
+    }
+
+    pub(crate) fn as_utf16_string(&self) -> &Utf16String {
+        &self.0
+    }
+
+    /// https://infra.spec.whatwg.org/#javascript-string-convert
+    pub(crate) fn from_utf16_string(string: &Utf16String) -> Self {
+        Self(to_well_formed(string))
+    }
+
+    pub(crate) fn to_utf16(&self) -> std::borrow::Cow<'_, [u16]> {
+        self.0.to_utf16()
     }
 
     pub(crate) fn from_utf8(string: &str) -> Self {
@@ -761,8 +775,15 @@ pub(crate) fn buffer_source_if(
         return Ok(Some(BufferSource::ArrayBuffer(buffer)));
     }
 
-    // FIXME: 7. If V is an Object, V has an [[ArrayBufferData]] internal slot, and IsSharedArrayBuffer(V) is true,
-    //           then:
+    // 7. If V is an Object, V, has an [[ArrayBufferData]] internal slot, and IsSharedArrayBuffer(V) is true, then:
+    //     1. If types includes SharedArrayBuffer, then return the result of converting V to SharedArrayBuffer.
+    if rules.allow_shared
+        && let Some(buffer) = object.downcast::<ArrayBuffer>()
+        && buffer.is_shared_array_buffer()
+    {
+        check_buffer_of_buffer_source(vm, &buffer, "SharedArrayBuffer", rules)?;
+        return Ok(Some(BufferSource::ArrayBuffer(buffer)));
+    }
 
     // 8. If V is an Object and V has a [[DataView]] internal slot, then:
     //     1. If types includes DataView, then return the result of converting V to DataView.
@@ -1231,6 +1252,21 @@ pub(crate) fn sequence_to_js<T>(
     Ok(Value::from_object(array))
 }
 
+/// https://webidl.spec.whatwg.org/#js-frozen-array
+pub(crate) fn frozen_array_to_js(cx: &CallContext, array: ThrowCompletionOr<Value>) -> ThrowCompletionOr<Value> {
+    // 1. Let array be the result of converting the sequence of type T to a JavaScript value.
+    let array = array?;
+
+    // 2. Perform ! SetIntegrityLevel(array, "frozen").
+    array
+        .as_object()
+        .set_integrity_level(cx.vm(), IntegrityLevel::Frozen)
+        .must();
+
+    // 3. Return array.
+    Ok(array)
+}
+
 /// sequence_to_js() for a sequence of cells, which stay rooted while converting an element allocates.
 pub(crate) fn rooted_sequence_to_js<T: Trace + Clone + 'static>(
     cx: &CallContext,
@@ -1244,6 +1280,16 @@ pub(crate) fn rooted_sequence_to_js<T: Trace + Clone + 'static>(
         array.create_data_property(cx.vm(), &PropertyKey::from(index), element, None, None)?;
     }
     Ok(Value::from_object(array))
+}
+
+/// The elements of a sequence of a dictionary in a MarkedVec, which keeps them alive while the dictionary is converted.
+pub(crate) fn mark_sequence<'vm, T: Trace + Clone + 'static>(
+    cx: &CallContext<'vm>,
+    sequence: &[T],
+) -> MarkedVec<'vm, T> {
+    let marked = MarkedVec::with_capacity(cx.vm(), sequence.len());
+    marked.extend_from_slice(sequence);
+    marked
 }
 
 /// An IDL record converted to a JS value, https://webidl.spec.whatwg.org/#js-record, with the conversion of its

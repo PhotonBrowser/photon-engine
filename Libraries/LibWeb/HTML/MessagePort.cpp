@@ -29,11 +29,8 @@ void web_rust_message_port_discard_pending_messages(void* port);
 size_t web_rust_message_port_pending_outgoing_message_count(void* port);
 void web_rust_message_port_fail_next_transfer_for_testing(void* port);
 void web_rust_message_port_disentangle_ports_of_realm(JSVM*, void* realm);
-
-// The entry points of the generated bindings of the interface.
-bool web_rust_message_port_is_detached(void* port);
-JSCompletion web_rust_message_port_transfer_steps(JSVM*, void* realm, void* port, Bindings::RustTransferDataWriter*);
-JSCompletion web_rust_message_port_transfer_receiving_steps(JSVM*, void* realm, Bindings::RustTransferDataReader*);
+JSCompletion web_rust_message_port_transfer_steps(JSVM*, void* realm, void* port, TransferDataEncoder** out_data_holder);
+JSCompletion web_rust_message_port_transfer_receiving_steps(JSVM*, void* realm, TransferDataDecoder*);
 }
 
 static JSVM* vm_abi()
@@ -48,8 +45,7 @@ GC::Ref<MessagePort> MessagePort::create(JS::Realm& realm)
 
 GC::Ref<MessagePort> MessagePort::create_from_transfer(JS::Realm& realm, TransferDataDecoder& data_holder)
 {
-    Bindings::RustTransferDataReader reader { .realm = realm, .data_holder = data_holder };
-    auto wrapper = MUST(JS::HostABI::completion_from_abi<JS::Value>(web_rust_message_port_transfer_receiving_steps(vm_abi(), &realm, &reader)));
+    auto wrapper = MUST(JS::HostABI::completion_from_abi<JS::Value>(web_rust_message_port_transfer_receiving_steps(vm_abi(), &realm, &data_holder)));
     return *Bindings::impl_from<MessagePort>(&wrapper.as_object());
 }
 
@@ -98,16 +94,13 @@ void MessagePort::discard_pending_messages()
     web_rust_message_port_discard_pending_messages(this);
 }
 
-WebIDL::ExceptionOr<void> MessagePort::transfer_steps(JS::Realm& realm, TransferDataEncoder& data_holder)
+WebIDL::ExceptionOr<TransferDataEncoder> MessagePort::transfer_steps(JS::Realm& realm)
 {
-    Bindings::RustTransferDataWriter writer { .realm = realm, .data_holder = data_holder };
-    TRY(JS::HostABI::completion_from_abi<void>(web_rust_message_port_transfer_steps(vm_abi(), &realm, this, &writer)));
-    return {};
-}
-
-bool MessagePort::is_detached() const
-{
-    return web_rust_message_port_is_detached(const_cast<MessagePort*>(this));
+    TransferDataEncoder* data_holder = nullptr;
+    TRY(JS::HostABI::completion_from_abi<void>(web_rust_message_port_transfer_steps(vm_abi(), &realm, this, &data_holder)));
+    auto result = move(*data_holder);
+    delete data_holder;
+    return result;
 }
 
 size_t MessagePort::pending_outgoing_message_count() const

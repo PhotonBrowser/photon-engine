@@ -7,6 +7,7 @@
  */
 
 #include <AK/SourceLocation.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGC/Heap.h>
 #include <LibGC/HeapVector.h>
 #include <LibGfx/Bitmap.h>
@@ -19,10 +20,12 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Range.h>
+#include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/CheckUnloadingCanceledState.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/Focus.h>
@@ -39,6 +42,7 @@
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/TagNames.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Layout/Viewport.h>
@@ -52,6 +56,7 @@
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/Translation/DocumentTranslator.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
@@ -152,6 +157,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_pending_clipboard_requests);
     visitor.visit(m_pending_spell_check_requests);
     visitor.visit(m_spell_checking_settled_callbacks);
+    visitor.visit(m_translation_settled_callbacks);
     visitor.visit(m_pending_writing_suggestion_requests);
     visitor.visit(m_writing_suggestions_settled_callbacks);
     visitor.visit(m_writing_suggestion_requested_callbacks);
@@ -164,6 +170,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_pending_permission_requests);
     visitor.visit(m_pending_http_credentials_requests);
     visitor.visit(m_notifications_list);
+    visitor.visit(m_unloading_canceled_checks);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
         operation.visit([&](PendingFullscreenEnter const& enter_operation) {
                 visitor.visit(enter_operation.element);
@@ -230,6 +237,11 @@ void Page::system_focus_changed()
             if (auto media_devices = navigator->media_devices_if_created())
                 media_devices->system_focus_changed();
         }
+    }
+
+    if (auto focused_navigable = hosted_focused_navigable()) {
+        if (auto focused_document = focused_navigable->active_document())
+            HTML::dispatch_system_focus_events(*focused_document, client().has_focus());
     }
 }
 
@@ -625,7 +637,8 @@ EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPo
 
 EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, PinchEvent const& event, Optional<RemoteInputEventTarget>* remote_target)
 {
-    if (event.async_zoom_performed_default_action && root.is_top_level_traversable())
+    // The compositor forwards its scroll updates ahead of the event. Listeners must see the zoom already presented.
+    if (root.is_top_level_traversable())
         root.adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
     return root.event_handler().handle_pinch_event(device_to_css_point(event.position), event, remote_target);
 }
@@ -637,10 +650,16 @@ EventResult Page::handle_pinch_event(DevicePixelPoint position, unsigned modifie
         .modifiers = static_cast<UIEvents::KeyModifier>(modifiers),
         .scale_delta = scale,
     };
+    auto result = handle_pinch_event(local_traversable(), event, nullptr);
+    if (result != EventResult::Accepted)
+        return result;
+
+    // NB: No UI process is there to ask for the zoom of an event left uncanceled.
+    event.wheel_event_was_dispatched = true;
     return handle_pinch_event(local_traversable(), event, nullptr);
 }
 
-EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved)
+EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved, Optional<u64> user_input_scroll_count_with_nothing_to_scroll)
 {
     // The compositor forwards these updates ahead of keyboard events. Both DOM listeners and a main-thread
     // fallback default action must observe the offsets that have already been presented.
@@ -648,6 +667,12 @@ EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 
     if (!navigable)
         return EventResult::Dropped;
     navigable->local_root()->adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
+    // NB: The compositor found nothing to scroll for this key, and left it here for content the page may have added
+    //     past the end of a scroll range it knew. This thread may hear of the key late. Once the compositor has
+    //     scrolled for later input, the key has been left behind, and scrolling for it now would go against that input.
+    if (user_input_scroll_count_with_nothing_to_scroll.has_value()
+        && navigable->local_root()->compositor_user_input_scroll_count() > *user_input_scroll_count_with_nothing_to_scroll)
+        async_scroll_performed_default_action = true;
     return navigable->event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text, async_scroll_performed_default_action, editing_commands, native_editing_binding_resolved);
 }
 
@@ -1648,6 +1673,16 @@ void Page::http_credentials_provided(u64 request_id, Optional<HTTPCredentials> c
         callback.value()->function()(move(credentials));
 }
 
+void Page::add_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState> check)
+{
+    m_unloading_canceled_checks.set(check);
+}
+
+void Page::remove_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState> check)
+{
+    m_unloading_canceled_checks.remove(check);
+}
+
 void Page::register_showing_notification(u64 notification_id, GC::Ref<NotificationsAPI::Notification> notification)
 {
     m_notifications_list.set(notification_id, notification);
@@ -2603,7 +2638,12 @@ void PageClient::navigation_params_creation_finished(HTML::LocalNavigable&, HTML
     VERIFY_NOT_REACHED();
 }
 
-void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId, HTML::HistoryNavigationPopulation)
+void PageClient::changing_navigable_history_job_reached_population(HTML::CrossProcessId, HTML::CrossProcessId, HTML::NavigationSourceSnapshot)
+{
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId, HTML::CrossProcessId, HTML::NavigationPopulationResult)
 {
     VERIFY_NOT_REACHED();
 }
@@ -2621,6 +2661,151 @@ NonnullOwnPtr<MediaClient::RemotePlaybackManager> PageClient::create_media_playb
 void PageClient::rebind_media_playback_manager(MediaClient::RemotePlaybackManager&)
 {
     VERIFY_NOT_REACHED();
+}
+
+// The UI process asks for the language of the tab's document, which a page hosting it answers.
+TranslationLanguageSample Page::translation_language_sample()
+{
+    // Enough text to tell its language by, but no more.
+    static constexpr size_t MAXIMUM_SAMPLE_LENGTH = 4096;
+
+    TranslationLanguageSample sample;
+    for (auto const& navigable : hosted_navigables()) {
+        if (!navigable->is_top_level_traversable())
+            continue;
+        auto document = navigable->active_document();
+        if (!document)
+            break;
+        if (auto* document_element = document->document_element()) {
+            if (auto language = document_element->lang(); language.has_value() && !language->is_empty())
+                sample.declared_language = language->to_utf8_but_should_be_ported_to_utf16();
+        }
+        // NB: The sample is the text in the tree, rather than the rendered text, so taking it never lays the page out: It's
+        //     taken from every page that loads, and a layout would change when the page itself sees its layout happen.
+        if (auto* body = document->body()) {
+            Utf16StringBuilder builder;
+            body->for_each_in_subtree([&](DOM::Node const& node) {
+                if (builder.length_in_code_units() >= MAXIMUM_SAMPLE_LENGTH)
+                    return TraversalDecision::Break;
+                if (auto const* element = as_if<DOM::Element>(node)) {
+                    if (first_is_one_of(element->local_name(), HTML::TagNames::script, HTML::TagNames::style, HTML::TagNames::template_, HTML::TagNames::noscript))
+                        return TraversalDecision::SkipChildrenAndContinue;
+                    return TraversalDecision::Continue;
+                }
+                if (auto const* text = as_if<DOM::Text>(node)) {
+                    builder.append(text->data());
+                    builder.append_code_point(' ');
+                }
+                return TraversalDecision::Continue;
+            });
+            auto text = builder.to_string();
+            if (text.length_in_code_units() > MAXIMUM_SAMPLE_LENGTH)
+                text = Utf16String::from_utf16(text.substring_view(0, MAXIMUM_SAMPLE_LENGTH));
+            sample.text = move(text);
+        }
+        break;
+    }
+    return sample;
+}
+
+void Page::start_translation(String source_language, String target_language)
+{
+    if (is_translating())
+        return;
+    m_translation_source_language = move(source_language);
+    m_translation_target_language = move(target_language);
+    // NB: A document still loading starts too: The text its parser adds later is translated as the page adds it.
+    for (auto const& navigable : hosted_navigables()) {
+        if (auto document = navigable->active_document())
+            document->document_translator().start(*m_translation_source_language, *m_translation_target_language);
+    }
+    notify_translation_progress();
+}
+
+// The UI process stops the translation as the tab's document changes, and as the user shows the original. So the page
+// forgets it, and the next document isn't translated unless the UI process asks again.
+void Page::stop_translation()
+{
+    m_translation_source_language.clear();
+    m_translation_target_language.clear();
+    m_translation_units_in_flight.clear();
+    for (auto const& navigable : hosted_navigables()) {
+        if (auto document = navigable->active_document())
+            document->forget_document_translator();
+    }
+}
+
+// A document that finishes loading in a translated page is translated too, e.g. an iframe's. The tab's own document is
+// translated only as the UI process asks, since the translation applies to the document it was asked for.
+void Page::did_completely_load_document(DOM::Document& document)
+{
+    auto navigable = document.navigable();
+    if (is_translating() && navigable && !navigable->is_top_level_traversable())
+        document.document_translator().start(*m_translation_source_language, *m_translation_target_language);
+}
+
+void Page::did_translate(TranslatedUnit unit)
+{
+    if (auto document = m_translation_units_in_flight.take(unit.id); document.has_value()) {
+        if (auto strong_document = document->ptr()) {
+            if (auto* translator = strong_document->document_translator_if_exists())
+                translator->did_translate(unit);
+        }
+    }
+    notify_translation_progress();
+}
+
+void Page::notify_translation_progress()
+{
+    // The translator takes one unit at a time, so only a few are sent ahead: The next one to send is picked when one
+    // comes back, which is when the page may have scrolled, or changed.
+    static constexpr size_t MAXIMUM_UNITS_IN_FLIGHT = 2;
+
+    while (is_translating() && m_translation_units_in_flight.size() < MAXIMUM_UNITS_IN_FLIGHT) {
+        GC::Ptr<DOM::Document> best_document;
+        Optional<Translation::DocumentTranslator::Candidate> best_candidate;
+        for (auto const& navigable : hosted_navigables()) {
+            auto document = navigable->active_document();
+            if (!document)
+                continue;
+            auto* translator = document->document_translator_if_exists();
+            if (!translator || !translator->is_started())
+                continue;
+            auto candidate = translator->next_candidate();
+            if (candidate.has_value() && (!best_candidate.has_value() || candidate->priority < best_candidate->priority)) {
+                best_candidate = candidate;
+                best_document = document;
+            }
+        }
+        if (!best_candidate.has_value())
+            break;
+        auto unit = best_document->document_translator().take_unit_for_translation(best_candidate->unit_id);
+        m_translation_units_in_flight.set(unit.id, *best_document);
+        client().page_did_request_translation(unit);
+    }
+
+    if (m_translation_settled_callbacks.is_empty() || !is_translating() || !m_translation_units_in_flight.is_empty())
+        return;
+    for (auto const& navigable : hosted_navigables()) {
+        if (auto document = navigable->active_document()) {
+            if (auto* translator = document->document_translator_if_exists(); translator && !translator->is_settled())
+                return;
+        }
+    }
+    GC::RootVector callbacks { exchange(m_translation_settled_callbacks, {}) };
+    for (auto& callback : callbacks)
+        callback->function()();
+}
+
+void Page::request_translation_for_testing(String const& target_language)
+{
+    client().page_did_request_page_translation_for_testing(target_language);
+}
+
+void Page::when_translation_settled(GC::Ref<GC::Function<void()>> callback)
+{
+    m_translation_settled_callbacks.append(callback);
+    notify_translation_progress();
 }
 
 }

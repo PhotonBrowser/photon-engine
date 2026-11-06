@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/NeverDestroyed.h>
 #include <LibAudio/ClientConnection.h>
 #include <LibAudio/RemotePlaybackStream.h>
@@ -40,6 +41,14 @@ ErrorOr<NonnullRefPtr<ClientConnection>> ClientConnection::acquire()
     auto connection = adopt_ref(*new ClientConnection(move(transport)));
     *s_connection = connection;
     return connection;
+}
+
+bool ClientConnection::capture_is_pending_for_testing()
+{
+    auto const& connection = *s_connection;
+    if (!connection)
+        return false;
+    return any_of(connection->m_capture_sources, [](auto const& entry) { return !entry.value.specification.has_value(); });
 }
 
 ClientConnection::ClientConnection(NonnullOwnPtr<IPC::Transport> transport)
@@ -398,21 +407,16 @@ void ClientConnection::pump_thread_main()
     MutexLocker locker(m_pump_mutex);
     while (!m_pump_should_exit) {
         streams.clear_with_capacity();
-        record_streams.clear_with_capacity();
         capture_rings.clear_with_capacity();
         for (auto* stream : m_streams) {
             if (stream->try_ref())
                 streams.append(adopt_ref(*stream));
         }
-        for (auto* stream : m_record_streams) {
-            if (stream->try_ref())
-                record_streams.append(adopt_ref(*stream));
-        }
         for (auto& [stream_id, ring] : m_capture_rings)
             capture_rings.append({ .stream_id = stream_id, .ring = ring });
         m_pump_woken = false;
 
-        if (streams.is_empty() && record_streams.is_empty()) {
+        if (streams.is_empty() && m_record_streams.is_empty()) {
             m_pump_condition.wait();
             continue;
         }
@@ -428,14 +432,21 @@ void ClientConnection::pump_thread_main()
             scratch.resize(frames_available * ring.channel_count());
             auto frames_popped = ring.try_pop(scratch);
             auto samples = scratch.span().trim(frames_popped * ring.channel_count());
-            for (auto& stream : record_streams) {
-                if (stream->stream_id() == stream_id)
-                    stream->deliver(samples);
+
+            // The streams are gathered after the pop, so every stream registered before these frames were captured
+            // receives them.
+            locker.lock();
+            for (auto* stream : m_record_streams) {
+                if (stream->stream_id() == stream_id && stream->try_ref())
+                    record_streams.append(adopt_ref(*stream));
             }
+            locker.unlock();
+            for (auto& stream : record_streams)
+                stream->deliver(samples);
+            record_streams.clear_with_capacity();
         }
         // Drop the references before sleeping, so a stream's last reference does not idle here.
         streams.clear_with_capacity();
-        record_streams.clear_with_capacity();
         capture_rings.clear_with_capacity();
         locker.lock();
 

@@ -159,6 +159,12 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
     m_page->cursor().set_send([&client = client(), id = m_id](Gfx::Cursor const& cursor) {
         client.async_did_request_cursor_change(id, cursor);
     });
+    m_page->hover_link().set_send([&client = client(), id = m_id](Optional<URL::URL> const& url) {
+        if (url.has_value())
+            client.async_did_hover_link(id, *url);
+        else
+            client.async_did_unhover_link(id);
+    });
 
     m_frame_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this] {
         if (m_is_closed)
@@ -331,9 +337,14 @@ void PageClient::navigation_params_creation_finished(Web::HTML::LocalNavigable& 
     client().async_did_finish_navigation_params_creation(m_id, navigable.id(), request.navigation_id, move(result));
 }
 
-void PageClient::history_navigation_params_creation_finished(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population)
+void PageClient::changing_navigable_history_job_reached_population(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationSourceSnapshot active_document_source_snapshot_params)
 {
-    client().async_did_finish_history_navigation_params_creation(m_id, operation_id, move(population));
+    client().async_changing_navigable_history_job_reached_population(m_id, operation_id, navigable_id, move(active_document_source_snapshot_params));
+}
+
+void PageClient::history_navigation_params_creation_finished(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationPopulationResult result)
+{
+    client().async_did_finish_history_navigation_params_creation(m_id, operation_id, navigable_id, move(result));
 }
 
 void PageClient::navigation_population_failed(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id)
@@ -716,8 +727,13 @@ void PageClient::request_rendering_opportunity_if_needed()
             schedule_local_rendering_opportunity();
             return;
         }
+        // NB: A frame within the resolution of the time a page reads would repeat the last one's timestamp, and script
+        //     would see the document timeline stand still from one frame to the next.
+        static constexpr double maximum_time_resolution_in_milliseconds = 0.1;
+        auto now = Web::HighResolutionTime::unsafe_shared_current_time();
+        auto is_within_time_resolution = now - Web::HTML::main_thread_event_loop().last_render_opportunity_time() < maximum_time_resolution_in_milliseconds;
         m_frame_timer_purpose = FrameTimerPurpose::LocalFallback;
-        m_frame_timer->restart(AK::Duration::zero());
+        m_frame_timer->restart(is_within_time_resolution ? AK::Duration::from_milliseconds(1) : AK::Duration::zero());
         return;
     }
 
@@ -997,16 +1013,6 @@ void PageClient::page_did_leave_tooltip_area()
     client().async_did_leave_tooltip_area(m_id);
 }
 
-void PageClient::page_did_hover_link(URL::URL const& url)
-{
-    client().async_did_hover_link(m_id, url);
-}
-
-void PageClient::page_did_unhover_link()
-{
-    client().async_did_unhover_link(m_id);
-}
-
 void PageClient::page_did_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers)
 {
     client().async_did_click_link(m_id, move(navigation), target, modifiers);
@@ -1173,14 +1179,7 @@ void PageClient::schedule_accessibility_tree_update()
         m_accessibility_update_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(200), [this] {
             if (m_is_closed)
                 return;
-            // The tab's document can move to another process before the timer fires, which leaves this page's
-            // traversable remote, with no document of its own to report.
-            if (!page().has_local_traversable())
-                return;
-            if (auto doc = page().local_traversable()->active_document()) {
-                doc->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
-                client().async_did_get_accessibility_tree(m_id, doc->build_accessibility_node_data());
-            }
+            publish_accessibility_tree(false);
         });
     }
 
@@ -1192,6 +1191,29 @@ void PageClient::schedule_accessibility_tree_update()
     // m_performCacheUpdateTimer only while it's inactive) and Blink (AXObjectCacheImpl::ScheduleAXUpdate) coalesce.
     if (!m_accessibility_update_timer->is_active())
         m_accessibility_update_timer->start();
+}
+
+void PageClient::publish_accessibility_tree(bool whole_tree_requested)
+{
+    // The tab's document can move to another process, which leaves this page's traversable remote, with no document of
+    // its own to report.
+    if (!page().has_local_traversable())
+        return;
+    auto document = page().local_traversable()->active_document();
+    if (!document)
+        return;
+    document->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
+
+    auto change = document->build_accessibility_tree_change(m_accessibility_change_tracker, whole_tree_requested);
+    if (change.is_whole_tree) {
+        client().async_did_get_accessibility_tree(m_id, ++m_accessibility_tree_sequence, move(change.nodes));
+        return;
+    }
+    if (change.nodes.is_empty() && change.removed_ids.is_empty())
+        return;
+    auto base_sequence = m_accessibility_tree_sequence++;
+    client().async_did_change_accessibility_tree(m_id, base_sequence, m_accessibility_tree_sequence,
+        WebView::AccessibilityTreeDelta { move(change.nodes), move(change.removed_ids) });
 }
 
 void PageClient::page_did_finish_test(Utf16String const& text)
@@ -1284,13 +1306,13 @@ void PageClient::page_did_request_link_context_menu(Web::HTML::CrossProcessId lo
     client().async_did_request_link_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, text_fragment_generation_id);
 }
 
-void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
+void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type)
 {
     Optional<Gfx::ShareableBitmap> bitmap;
     if (bitmap_pointer.has_value() && bitmap_pointer.value())
         bitmap = bitmap_pointer.value()->to_shareable_bitmap();
 
-    client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, bitmap);
+    client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, bitmap, move(link_navigation), move(image_mime_type));
 }
 
 void PageClient::page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)
@@ -1405,6 +1427,25 @@ void PageClient::page_did_set_next_permission_prompt_outcome_for_testing(String 
 {
     if (auto* test_connection = client().test_connection())
         (void)test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::SetNextPermissionPromptOutcomeForTesting>(m_id, name, outcome, held);
+}
+
+void PageClient::page_did_set_system_microphone_authorization_for_testing(String const& authorization, String const& answer, bool held)
+{
+    if (auto* test_connection = client().test_connection())
+        (void)test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::SetSystemMicrophoneAuthorizationForTesting>(m_id, authorization, answer, held);
+}
+
+void PageClient::page_did_release_system_microphone_answer_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        (void)test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::ReleaseSystemMicrophoneAnswerForTesting>(m_id);
+}
+
+String PageClient::page_did_request_microphone_state_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        return test_connection->did_request_microphone_state_for_testing(m_id);
+    return "{}"_string;
 }
 
 void PageClient::page_did_release_held_permission_prompt_for_testing(u32 waiters)
@@ -1930,6 +1971,13 @@ bool PageClient::page_did_request_tab_is_playing_audio_for_testing()
     return false;
 }
 
+bool PageClient::page_did_request_tab_is_heard_playing_audio_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        return test_connection->did_request_tab_is_heard_playing_audio_for_testing(m_id);
+    return false;
+}
+
 u64 PageClient::page_did_request_tab_audibility_change_count_for_testing()
 {
     if (auto* test_connection = client().test_connection())
@@ -2098,6 +2146,16 @@ void PageClient::page_did_request_clipboard_entries(u64 request_id)
 void PageClient::page_did_request_spell_check(u64 request_id, Utf16String const& text)
 {
     client().async_did_request_spell_check(m_id, request_id, text);
+}
+
+void PageClient::page_did_request_translation(Web::TranslationUnit const& unit)
+{
+    client().async_did_request_translation(m_id, unit);
+}
+
+void PageClient::page_did_request_page_translation_for_testing(String const& target_language)
+{
+    client().async_did_request_page_translation_for_testing(m_id, target_language);
 }
 
 void PageClient::page_did_request_writing_suggestion(u64 request_id, Utf16String const& text, u32 caret_offset)

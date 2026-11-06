@@ -8,8 +8,12 @@
 #include <LibURL/InternalURLs.h>
 #include <LibURL/URL.h>
 #include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/NotificationBackend.h>
+#include <LibWebView/PageTranslation.h>
+#include <LibWebView/PictureInPictureManager.h>
 #if defined(AK_OS_MACOS)
+#    include <LibWebView/MicrophoneAuthorizerMacOS.h>
 #    include <LibWebView/NotificationBackendMacOS.h>
 #elif defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
 #    include <LibWebView/NotificationBackendFreedesktop.h>
@@ -26,6 +30,7 @@
 #include <UI/Qt/ExternalURLHandler.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/PictureInPictureWindow.h>
+#include <UI/Qt/PlainText.h>
 #include <UI/Qt/ProcessManagerWindow.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/Tab.h>
@@ -63,6 +68,10 @@
 #include <QShortcut>
 #include <QStandardPaths>
 #include <QTimer>
+
+#if defined(AK_OS_MACOS)
+#    include <QUtiMimeConverter>
+#endif
 
 #if defined(AK_OS_WINDOWS)
 #    include <AK/Windows.h>
@@ -234,6 +243,7 @@ public:
         install_appkit_event_capture();
 #endif
         update_chrome_style();
+        installEventFilter(&m_plain_text_event_filter);
 
         // Suppress some warnings that end up flooding the console when Orca is in use. QSpiAccessibleBridge logs both
         // (1) one-time at startup, a couple warnings for some AT-SPI2 methods it doesn't implement, and (2) for *every*
@@ -540,6 +550,8 @@ private:
     // widget instead, which we also can't properly parent as it would need a QWidget owner as well.
     OwnPtr<QWidget> m_application_widget { nullptr };
 
+    PlainTextEventFilter m_plain_text_event_filter;
+
 #if defined(AK_OS_MACOS)
     QMenuBar* m_menu_bar { nullptr };
     QMenu* m_dock_menu { nullptr };
@@ -571,6 +583,34 @@ private:
     QAction* m_quit_action { nullptr };
 };
 
+#if defined(AK_OS_MACOS)
+// Qt stores a MIME type it has no converter for under a private type that only Qt applications can read. This puts PNG
+// data on the pasteboard as public.png, for other applications to paste. The bytes pass through undecoded, as they may
+// come from a page.
+class PNGMimeConverter final : public QUtiMimeConverter {
+public:
+    virtual QString utiForMime(QString const& mime) const override
+    {
+        return mime == "image/png" ? QStringLiteral("public.png") : QString {};
+    }
+
+    virtual QString mimeForUti(QString const& uti) const override
+    {
+        return uti == "public.png" ? QStringLiteral("image/png") : QString {};
+    }
+
+    virtual QVariant convertToMime(QString const&, QList<QByteArray> const& data, QString const&) const override
+    {
+        return data.isEmpty() ? QVariant {} : QVariant { data.first() };
+    }
+
+    virtual QList<QByteArray> convertFromMime(QString const&, QVariant const& data, QString const&) const override
+    {
+        return { data.toByteArray() };
+    }
+};
+#endif
+
 Application::Application() = default;
 Application::~Application()
 {
@@ -586,6 +626,9 @@ Application::~Application()
     }
     for (auto& window : windows)
         delete window.data();
+
+    // A Picture-in-Picture window is a widget too, so it must also go before the QApplication does.
+    WebView::PictureInPictureManager::the().destroy_all_windows();
 }
 
 void Application::show_process_manager()
@@ -641,6 +684,10 @@ Core::EventLoop& Application::create_platform_event_loop()
         qputenv("NO_AT_BRIDGE", "1");
 #endif
         m_application = make<LadybirdQApplication>(arguments());
+#if defined(AK_OS_MACOS)
+        // NB: Qt owns its converters, and deletes them along with the QApplication.
+        new PNGMimeConverter;
+#endif
 #if defined(AK_OS_LINUX)
         QGuiApplication::setDesktopFileName(QStringLiteral("org.ladybird.Ladybird"));
         Ladybird::clip_translucent_windows_that_cannot_blend();
@@ -665,6 +712,15 @@ Core::EventLoop& Application::create_platform_event_loop()
     }
 
     return event_loop;
+}
+
+NonnullOwnPtr<WebView::MicrophoneAuthorizer> Application::create_microphone_authorizer()
+{
+#if defined(AK_OS_MACOS)
+    return make<WebView::MicrophoneAuthorizerMacOS>();
+#else
+    return WebView::Application::create_microphone_authorizer();
+#endif
 }
 
 Optional<String> Application::ui_font_family() const
@@ -1508,16 +1564,23 @@ NonnullRefPtr<Core::Promise<ByteString>> Application::ask_user_for_download_path
     return promise;
 }
 
+static QMessageBox* create_message_box(QMessageBox::Icon icon, StringView text, QWidget* parent)
+{
+    auto* dialog = new QMessageBox(parent);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle("Ladybird");
+    dialog->setIcon(icon);
+    dialog->setTextFormat(Qt::PlainText);
+    dialog->setText(qstring_from_ak_string(text));
+    dialog->addButton(QMessageBox::Ok);
+    return dialog;
+}
+
 void Application::display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const
 {
     auto message = MUST(String::formatted("{} saved to: {}", download_name, path));
 
-    auto* dialog = new QMessageBox(active_window_if_any());
-    dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->setWindowTitle("Ladybird");
-    dialog->setIcon(QMessageBox::Information);
-    dialog->setText(qstring_from_ak_string(message));
-    dialog->addButton(QMessageBox::Ok);
+    auto* dialog = create_message_box(QMessageBox::Information, message, active_window_if_any());
 
     auto* open_folder_button = dialog->addButton(QMessageBox::Open);
     open_folder_button->setText("Open folder");
@@ -1535,9 +1598,7 @@ void Application::display_error_dialog(StringView error_message) const
         return;
     }
 
-    auto* dialog = new QMessageBox(QMessageBox::Warning, "Ladybird", qstring_from_ak_string(error_message), QMessageBox::Ok, active_window_if_any());
-    dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->open();
+    create_message_box(QMessageBox::Warning, error_message, active_window_if_any())->open();
 }
 
 void Application::open_download(WebView::FileDownloader::Download const& download) const
@@ -1923,6 +1984,17 @@ QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_
         zoom_menu->addAction(zoom_in_action());
         zoom_menu->addAction(zoom_out_action());
         zoom_menu->addAction(reset_zoom_action());
+
+        // The translation menu is the active tab's, so it's filled in as it opens.
+        if (WebView::Application::the().translator()) {
+            auto* translation_menu = view_menu->addMenu("&Translation");
+            QObject::connect(translation_menu, &QMenu::aboutToShow, translation_menu, [translation_menu] {
+                if (auto* tab = Application::the().active_tab())
+                    repopulate_application_menu(*translation_menu, tab->view().page_translation().translation_menu());
+                else
+                    translation_menu->clear();
+            });
+        }
         view_menu->addSeparator();
     }
     view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));

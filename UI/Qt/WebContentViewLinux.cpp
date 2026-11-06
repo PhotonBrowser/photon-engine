@@ -1042,8 +1042,6 @@ struct WebContentView::VulkanWindow final : public QVulkanWindow {
 
     virtual bool event(QEvent* event) override
     {
-        if (m_view && m_view->handle_vulkan_window_event(event))
-            return true;
         // NB: Every step of a resize asks to present again, which recreates the swap chain at the new size only to show
         //     the same frame in it. Until the page has a frame for the new size, keep the last one on screen. Its
         //     surface keeps its size until it presents again, and the view paints the edge it leaves bare.
@@ -1089,23 +1087,13 @@ void WebContentView::create_vulkan_window()
         VK_FORMAT_R8G8B8A8_UNORM,
     });
 
-    m_vulkan_window_container = QWidget::createWindowContainer(m_vulkan_window, this);
-    m_vulkan_window_container->setAcceptDrops(true);
-    m_vulkan_window_container->setFocusPolicy(Qt::FocusPolicy::StrongFocus);
-    m_vulkan_window_container->setMouseTracking(true);
+    m_vulkan_window_container = create_native_window_container(*m_vulkan_window, *this);
     m_vulkan_window_container->setGeometry(rect());
     m_vulkan_window_container->hide();
-
-    install_native_window_container_event_forwarding(*this, *m_vulkan_window, *m_vulkan_window_container);
 
     m_unexposed_vulkan_window_timer.setSingleShot(true);
     m_unexposed_vulkan_window_timer.setInterval(500);
     QObject::connect(&m_unexposed_vulkan_window_timer, &QTimer::timeout, this, [this] { remap_unexposed_vulkan_window(); });
-}
-
-bool WebContentView::vulkan_window_has_native_focus() const
-{
-    return m_vulkan_window && QGuiApplication::focusWindow() == m_vulkan_window;
 }
 
 void WebContentView::set_vulkan_window_container_visible(bool visible)
@@ -1113,7 +1101,7 @@ void WebContentView::set_vulkan_window_container_visible(bool visible)
     if (!visible)
         m_presented_page_window_size = {};
     if (m_vulkan_window_container)
-        set_native_window_container_visible(*this, *m_vulkan_window_container, visible);
+        m_vulkan_window_container->setVisible(visible);
 }
 
 bool WebContentView::vulkan_window_update_would_only_resize() const
@@ -1195,7 +1183,6 @@ void WebContentView::fall_back_to_bitmap_rendering()
 
 void WebContentView::destroy_vulkan_window()
 {
-    setFocusProxy(nullptr);
     if (m_vulkan_window)
         m_vulkan_window->clear_view();
 
@@ -1228,7 +1215,7 @@ void WebContentView::schedule_vulkan_window_update()
         //     such as a hover card, which comes and goes quickly. Qt reads the frame back from GPU memory then.
         if (isVisible())
             set_presents_from_cpu_memory(is_page_covered_by_overlay());
-        update_page_surface();
+        update_page_surface(PageSurfaceContent::MayHaveChanged);
         return;
     }
 #endif
@@ -1329,7 +1316,7 @@ void WebContentView::hide_page_surface()
     }
 }
 
-void WebContentView::update_page_surface()
+void WebContentView::update_page_surface(PageSurfaceContent content)
 {
     auto paintable = current_paintable();
     auto const* dmabuf = paintable.has_value() ? paintable->shared_image_buffer->linux_dmabuf_handle() : nullptr;
@@ -1379,11 +1366,13 @@ void WebContentView::update_page_surface()
         .source = source,
         .position = view_position + QPoint { qRound(target.x() / m_device_pixel_ratio), qRound(target.y() / m_device_pixel_ratio) },
         .destination = { to_logical(target.width()), to_logical(target.height()) },
+        .has_new_content = content == PageSurfaceContent::MayHaveChanged,
     };
 
-    // NB: The position of the page surface changes when the browser window commits next, so whatever else changes in
-    //     the frame waits for that commit too.
-    if (m_page_surface->is_showing() && frame.position != m_page_surface_position)
+    // NB: The layout of the browser window changes on screen when it commits next, and so does the position of the page
+    //     surface. Whatever else changes in where the frame goes waits for that commit too, such as the crop to a
+    //     shrinking window, which would otherwise show before the window has shrunk.
+    if (m_page_surface->is_showing() && m_page_surface->would_change_placement(frame))
         m_page_surface->set_synchronized(true);
 
     m_page_surface->forget_buffers_except(backing_stores());
@@ -1404,9 +1393,10 @@ void WebContentView::update_page_surface()
         covered_rect = result == WaylandPageSurface::PresentResult::Presented ? frame_rect : m_page_surface_rect;
     if (!covered_rect.contains(m_page_surface_rect))
         update();
-    // NB: Nothing else may make the browser window commit, so have Qt repaint a pixel of it.
+    // NB: Nothing else may make the browser window commit, so have Qt repaint a pixel of it. Qt drops updates to any
+    //     part of the view that the widgets it is in clip away.
     else if (result == WaylandPageSurface::PresentResult::Presented && m_page_surface->needs_parent_commit())
-        update(0, 0, 1, 1);
+        update(QRect { rect_shown_in_window().topLeft(), QSize { 1, 1 } });
     m_page_surface_rect = covered_rect;
     if (result == WaylandPageSurface::PresentResult::Presented)
         m_page_surface_position = frame.position;
@@ -1535,12 +1525,13 @@ void WebContentView::update_vulkan_window_mask()
     if (!m_vulkan_window || !m_vulkan_window_container)
         return;
 
-    // On X11, the native window's bounding shape exposes the regions painted transparent for hover-expanded chrome.
-    // Wayland instead uses the renderer's alpha output and empties the native window's input region separately.
+    // On X11, the native window's bounding shape exposes the regions of hover-expanded chrome, with or without alpha
+    // blending. Wayland instead uses the renderer's alpha output and empties the native window's input region
+    // separately.
     auto size = m_vulkan_window_container->size();
     QRegion window_mask { QRect { QPoint { 0, 0 }, size } };
 
-    if (m_vulkan_window_supports_alpha_blending.value_or(false)) {
+    if (QGuiApplication::platformName() == "xcb" || m_vulkan_window_supports_alpha_blending.value_or(false)) {
         if (m_vertical_tab_overlay_left > 0)
             window_mask -= QRect { 0, 0, m_vertical_tab_overlay_left, size.height() };
         if (m_vertical_tab_overlay_right > 0)
@@ -1589,20 +1580,8 @@ void WebContentView::update_vulkan_alpha_blending_support()
 
     m_vulkan_window_supports_alpha_blending = color_format_has_alpha && (capabilities.supportedCompositeAlpha & blending_modes) != 0;
 
-    // Route pointer input through QWidget when it can also display widgets beneath the Vulkan surface. QWidget's
-    // implicit mouse capture then preserves move and release events while the pointer is outside the browser window.
-    m_vulkan_window->setFlag(Qt::WindowTransparentForInput, *m_vulkan_window_supports_alpha_blending);
-
     // The window mask was computed while support was still unknown; refresh it now that any stored insets can apply.
     update_vulkan_window_mask();
-}
-
-void WebContentView::set_vulkan_window_cursor(QCursor const& cursor)
-{
-    if (m_vulkan_window_container)
-        m_vulkan_window_container->setCursor(cursor);
-    if (m_vulkan_window)
-        m_vulkan_window->setCursor(cursor);
 }
 
 }

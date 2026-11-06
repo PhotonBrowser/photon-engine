@@ -77,7 +77,7 @@ pub(super) struct PseudoElementFacts {
     /// Whether any of them moved.
     pub(super) moved: bool,
     /// What each move damages, a counter-style rebuild of its box included.
-    pub(super) damages: Vec<u32>,
+    pub(super) damages: smallvec::SmallVec<[u32; 2]>,
     /// Whether the custom-property environment of any of them moved.
     pub(super) environment_moved: bool,
     /// Whether the record any of them moves from or to holds an image.
@@ -311,7 +311,8 @@ impl RetainedState {
             )
             .with(
                 MainEffects::HIGHLIGHTS,
-                self.holds_pseudo_element_records_of(node, &HIGHLIGHT_PSEUDO_ELEMENTS),
+                self.holds_pseudo_element_records_of(node, &HIGHLIGHT_PSEUDO_ELEMENTS)
+                    || self.computed_group_sets.custom_highlight_records(node).next().is_some(),
             )
             .with(
                 MainEffects::ANIMATED,
@@ -338,9 +339,14 @@ impl RetainedState {
                 MainEffects::VISIBILITY_FLIP,
                 old_values.is_some_and(|old| old.visibility() != new_values.visibility()),
             )
+            // NB: An element's environment is the store its record holds. The host has something to do only where
+            //     another lies over that: what animations sample, on the element or a parent it inherits them from.
             .with(
                 MainEffects::CUSTOM_PROPERTIES,
-                custom_properties || facts.pseudo_elements.environment_moved,
+                (custom_properties || facts.pseudo_elements.environment_moved)
+                    && (facts.inherits_sampled_custom_properties
+                        || self.element_custom_property_data.contains_key(&node)
+                        || self.pseudo_element_custom_property_data.contains_key(&node)),
             )
             .with(
                 MainEffects::ANCHOR_NAMES,
@@ -435,7 +441,7 @@ mod tests {
         let marker_record = held(state.computed_group_sets.pseudo_style_record(node, MARKER));
         let element_held = state.computed_group_sets.host_record(element_record).cloned();
         state.set_held_style_record(node, element_held);
-        state.set_held_pseudo_style_record(node, MARKER, marker_record);
+        state.set_held_pseudo_style_record(node, super::super::PseudoElementTarget::of_kind(MARKER), marker_record);
         installation
             .effects_of(node)
             .is_some_and(|effects| effects.effects.intersects(MainEffects::REBUILD))

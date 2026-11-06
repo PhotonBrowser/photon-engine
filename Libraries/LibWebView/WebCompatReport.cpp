@@ -7,6 +7,7 @@
 #include <AK/Math.h>
 #include <AK/StringBuilder.h>
 #include <AK/WeakPtr.h>
+#include <LibCore/BrowserVersion.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibCore/Promise.h>
 #include <LibWebCommon/Loader/UserAgent.h>
@@ -27,11 +28,7 @@ static constexpr auto browser_version = BROWSER_VERSION ""sv;
 static constexpr auto platform = OS_STRING ""sv;
 static constexpr auto architecture = CPU_STRING ""sv;
 
-#ifdef NDEBUG
-static constexpr auto build_configuration = "release"sv;
-#else
-static constexpr auto build_configuration = "debug"sv;
-#endif
+static constexpr auto build_configuration = BROWSER_BUILD_CONFIGURATION ""sv;
 
 static String to_string(StringView text)
 {
@@ -125,8 +122,6 @@ ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps) con
 {
     StringBuilder builder;
     builder.append("Ladybird web compatibility report, format 1\n"sv);
-    builder.appendff("Version: {}\nPlatform: {}\nArchitecture: {}\n", browser_version, platform, architecture);
-    builder.appendff("Build configuration: {}\n", build_configuration);
     append_build_information_for_process(builder, ProcessType::Browser);
     builder.appendff("URL: {}\n", m_page.url.serialize());
     builder.appendff("User agent: {}\n", m_page.user_agent);
@@ -180,10 +175,7 @@ Optional<String> WebCompatReport::send(String const& description, Optional<ByteB
     contents.add_text("viewport_size"sv, "text"sv, viewport_size);
     contents.add("device_pixel_ratio"sv, "number"sv, m_page.device_pixel_ratio);
     contents.add("zoom_level"sv, "number"sv, m_page.zoom_level);
-    contents.add_text("platform"sv, "text"sv, platform);
-    contents.add_text("architecture"sv, "text"sv, architecture);
-    contents.add_text("git_commit"sv, "text"sv, LADYBIRD_COMMIT);
-    contents.add_text("build_configuration"sv, "text"sv, build_configuration);
+    contents.add_build_information(platform, architecture, LADYBIRD_COMMIT, build_configuration);
 
     auto manifest = ReportSubmission::build_manifest(contents, attachments);
     m_payload = ReportSubmission::Payload { move(manifest), move(attachments) };

@@ -128,9 +128,9 @@ void ConnectionFromPresentation::did_detect_history_swipe_candidate(Web::Composi
     async_did_detect_history_swipe_candidate(context_id, gesture_id, back, unconsumed_delta);
 }
 
-void ConnectionFromPresentation::did_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id, bool async_scroll_performed_default_action)
+void ConnectionFromPresentation::did_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id, bool performed_default_action)
 {
-    async_did_dispatch_input_event(context_id, event_id, async_scroll_performed_default_action);
+    async_did_dispatch_input_event(context_id, event_id, performed_default_action);
 }
 
 void ConnectionFromPresentation::handle_and_dispatch_key_event(Web::CompositorContextId context_id, Web::KeyEvent event, bool allow_keyboard_scroll)

@@ -46,7 +46,7 @@ WebIDL::UnsignedLong AnimationFrameCallbackDriver::add_after_callbacks(Callback 
 
 bool AnimationFrameCallbackDriver::remove(WebIDL::UnsignedLong id)
 {
-    return m_callbacks.remove(id) || m_after_callbacks.remove(id);
+    return m_callbacks.remove(id) || m_executing_callbacks.remove(id) || m_after_callbacks.remove(id) || m_executing_after_callbacks.remove(id);
 }
 
 bool AnimationFrameCallbackDriver::has_callbacks() const
@@ -62,7 +62,9 @@ void AnimationFrameCallbackDriver::run(double now)
     m_executing_after_callbacks = move(m_after_callbacks);
 
     static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
-    for (auto& [id, callback] : m_executing_callbacks) {
+    while (!m_executing_callbacks.is_empty()) {
+        auto id = m_executing_callbacks.begin()->key;
+        auto callback = m_executing_callbacks.take(id).release_value();
         if (trace_enabled)
             dbgln("[FrameTrace] raf_callback_begin driver={} handle={} at_ms={:.3f}", reinterpret_cast<FlatPtr>(this), id, HighResolutionTime::unsafe_shared_current_time());
         callback->function()(now);
@@ -74,8 +76,8 @@ void AnimationFrameCallbackDriver::run(double now)
 void AnimationFrameCallbackDriver::run_after_callbacks(double now)
 {
     AK::ScopeGuard guard { [&]() { m_executing_after_callbacks.clear(); } };
-    for (auto& [id, callback] : m_executing_after_callbacks)
-        callback->function()(now);
+    while (!m_executing_after_callbacks.is_empty())
+        m_executing_after_callbacks.take_first()->function()(now);
 }
 
 }

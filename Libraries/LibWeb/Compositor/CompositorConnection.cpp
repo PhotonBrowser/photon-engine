@@ -19,11 +19,14 @@
 #include <LibGfx/Bitmap.h>
 #include <LibIPC/Limits.h>
 #include <LibIPC/Transport.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibMediaClient/Client.h>
 #include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Platform/ImageCodecPlugin.h>
 
 // The Paint stage presents frames, and only the connection hands it the sink it presents them through, and the
 // screenshots it asks for after them.
@@ -280,6 +283,65 @@ void CompositorConnection::hand_frame_sink_to_paint_thread()
 {
     NonnullRefPtr<CompositorFrameSink> sink = m_frame_sink;
     paint_stage_adopt_frame_sink(&sink.leak_ref());
+}
+
+// Gives the compositor a connection of its own to this process's image decoder, so that an animated image keeps getting
+// frames while the main thread is busy.
+void CompositorConnection::ensure_image_decoder_channel()
+{
+    auto& image_codec = Platform::ImageCodecPlugin::the();
+    if (m_image_decoder_channel_client_generation == image_codec.client_generation())
+        return;
+
+    auto channel_or_error = IPC::TransportHandle::create_pair();
+    if (channel_or_error.is_error()) {
+        dbgln("Failed to create an image decoder channel for the Compositor: {}", channel_or_error.error());
+        return;
+    }
+    auto channel = channel_or_error.release_value();
+    image_codec.connect_frame_client(move(channel.first));
+    async_connect_to_image_decoder(channel.second);
+    m_image_decoder_channel_client_generation = image_codec.client_generation();
+}
+
+void CompositorConnection::add_animated_image(u64 frame_id, AnimatedImageRegistration const& image)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    ensure_image_decoder_channel();
+    // NB: Session ids start over with each decoder, so a session of a replaced decoder could name one of another image.
+    auto session_id = image.image_decoder_client_generation == Platform::ImageCodecPlugin::the().client_generation() ? image.session_id : 0;
+    async_add_animated_image(frame_id, session_id, image.size, image.color_space, image.frame_durations_in_milliseconds, image.loop_count);
+}
+
+void CompositorConnection::remove_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_remove_animated_image(frame_id);
+}
+
+void CompositorConnection::start_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_start_animated_image(frame_id);
+}
+
+void CompositorConnection::stop_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_stop_animated_image(frame_id);
+}
+
+AnimatedImageState CompositorConnection::animated_image_state_for_testing(u64 frame_id)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AnimatedImageStateForTesting>(frame_id);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
+    return { .is_animating = response->is_animating(), .frame_index = response->frame_index(), .shown_frame_index = response->shown_frame_index(), .loops_completed = response->loops_completed() };
 }
 
 void CompositorConnection::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
@@ -876,6 +938,16 @@ void CompositorConnection::rendering_opportunity(Web::CompositorContextId contex
         if (navigable->compositor_context().id() != context_id)
             continue;
         navigable->page().client().rendering_opportunity(frame_time_nanoseconds, frame_interval_milliseconds);
+        return;
+    }
+}
+
+void CompositorConnection::animated_content_moved_under_pointer(Web::CompositorContextId context_id, i64 frame_time_nanoseconds)
+{
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
+        if (!navigable->has_compositor_context() || navigable->compositor_context().id() != context_id)
+            continue;
+        navigable->event_handler().note_animated_content_moved_under_pointer(frame_time_nanoseconds);
         return;
     }
 }

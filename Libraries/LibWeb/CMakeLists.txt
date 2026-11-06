@@ -30,7 +30,6 @@ set(SOURCES
     Bindings/PlatformObject.cpp
     Bindings/RustBindingsServices.cpp
     Bindings/RustEventTarget.cpp
-    Bindings/StylePropertyMapReadOnlyIterator.cpp
     Bindings/PrincipalHostDefined.cpp
     Bindings/Wrappable.cpp
     Bindings/WrapperWorld.cpp
@@ -70,7 +69,6 @@ set(SOURCES
     Crypto/CryptoKey.cpp
     Crypto/SubtleCrypto.cpp
     CSS/Angle.cpp
-    CSS/AnimationEvent.cpp
     CSS/ComputedStyleWorkingSet.cpp
     CSS/ComputedValues.cpp
     CSS/RustDeclarationBlock.cpp
@@ -81,67 +79,21 @@ set(SOURCES
     CSS/GeneratedContent.cpp
     CSS/CSS.cpp
     CSS/CSSAnimation.cpp
-    CSS/CSSConditionRule.cpp
-    CSS/CSSContainerRule.cpp
-    CSS/CSSCounterStyleRule.cpp
     CSS/CSSDescriptors.cpp
-    CSS/CSSFontFaceDescriptors.cpp
     CSS/CSSFontFaceRule.cpp
-    CSS/CSSFontFeatureValuesMap.cpp
     CSS/CSSFontFeatureValuesRule.cpp
-    CSS/CSSFunctionDeclarations.cpp
-    CSS/CSSFunctionDescriptors.cpp
-    CSS/CSSFunctionRule.cpp
     CSS/CSSGroupingRule.cpp
-    CSS/CSSImageValue.cpp
     CSS/CSSImportRule.cpp
-    CSS/CSSKeyframeRule.cpp
     CSS/CSSKeyframesRule.cpp
-    CSS/CSSKeywordValue.cpp
-    CSS/CSSLayerBlockRule.cpp
-    CSS/CSSLayerStatementRule.cpp
-    CSS/CSSMarginRule.cpp
-    CSS/CSSMathClamp.cpp
-    CSS/CSSMathInvert.cpp
-    CSS/CSSMathMax.cpp
-    CSS/CSSMathMin.cpp
-    CSS/CSSMathNegate.cpp
-    CSS/CSSMathProduct.cpp
-    CSS/CSSMathSum.cpp
-    CSS/CSSMathValue.cpp
-    CSS/CSSMatrixComponent.cpp
-    CSS/CSSMediaRule.cpp
-    CSS/CSSNamespaceRule.cpp
     CSS/CSSNestedDeclarations.cpp
-    CSS/CSSNumericArray.cpp
-    CSS/CSSNumericValue.cpp
-    CSS/CSSPageRule.cpp
-    CSS/CSSPageDescriptors.cpp
-    CSS/CSSPerspective.cpp
     CSS/CSSPositionTryDescriptors.cpp
-    CSS/CSSPositionTryRule.cpp
-    CSS/CSSPropertyRule.cpp
-    CSS/CSSRotate.cpp
     CSS/CSSRule.cpp
     CSS/CSSRuleList.cpp
-    CSS/CSSScale.cpp
-    CSS/CSSScopeRule.cpp
-    CSS/CSSSkew.cpp
-    CSS/CSSSkewX.cpp
-    CSS/CSSSkewY.cpp
     CSS/CSSStyleDeclaration.cpp
     CSS/CSSStyleProperties.cpp
     CSS/CSSStyleRule.cpp
     CSS/CSSStyleSheet.cpp
-    CSS/CSSStyleValue.cpp
-    CSS/CSSSupportsRule.cpp
-    CSS/CSSTransformComponent.cpp
-    CSS/CSSTransformValue.cpp
     CSS/CSSTransition.cpp
-    CSS/CSSTranslate.cpp
-    CSS/CSSUnitValue.cpp
-    CSS/CSSUnparsedValue.cpp
-    CSS/CSSVariableReferenceValue.cpp
     CSS/ColorFunctionDescriptor.cpp
     CSS/CustomPropertyData.cpp
     CSS/Descriptor.cpp
@@ -154,9 +106,7 @@ set(SOURCES
     CSS/FontLoading.cpp
     CSS/FontResolution.cpp
     CSS/FontFaceSet.cpp
-    CSS/FontFaceSetLoadEvent.cpp
     CSS/Frequency.cpp
-    CSS/Highlight.cpp
     CSS/HighlightRegistry.cpp
     CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
@@ -174,7 +124,6 @@ set(SOURCES
     CSS/LengthBox.cpp
     CSS/MediaList.cpp
     CSS/MediaQueryList.cpp
-    CSS/MediaQueryListEvent.cpp
     CSS/Number.cpp
     CSS/NumericType.cpp
     CSS/Parser/ErrorReporter.cpp
@@ -190,7 +139,6 @@ set(SOURCES
     CSS/Resolution.cpp
     CSS/ResolvedTransform.cpp
     CSS/Screen.cpp
-    CSS/ScreenOrientation.cpp
     CSS/ScrollStateContainerQuery.cpp
     CSS/Selector.cpp
     CSS/SelectorMatching.cpp
@@ -204,13 +152,10 @@ set(SOURCES
     CSS/StyleProperty.cpp
     CSS/StylePropertyMapReadOnly.cpp
     CSS/Zoom.cpp
-    CSS/StylePropertyMap.cpp
     CSS/StyleScope.cpp
-    CSS/StyleSheet.cpp
     CSS/StyleSheetIdentifier.cpp
     CSS/StyleSheetImport.cpp
     CSS/StyleSheetInvalidation.cpp
-    CSS/StyleSheetList.cpp
     CSS/StyleSheetState.cpp
     CSS/StyleValues/AbstractImageStyleValue.cpp
     CSS/StyleValues/AngleStyleValue.cpp
@@ -243,7 +188,7 @@ set(SOURCES
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
     CSS/Time.cpp
-    CSS/TransitionEvent.cpp
+    CSS/TypedOM.cpp
     CSS/URL.cpp
     CSS/UpdateStyle.cpp
     CSS/ValueType.cpp
@@ -252,6 +197,7 @@ set(SOURCES
     DOM/AbortSignal.cpp
     DOM/AbstractElement.cpp
     DOM/AbstractRange.cpp
+    DOM/AccessibilityChangeTracker.cpp
     DOM/AccessibilityTreeNode.cpp
     DOM/AdoptedStyleSheets.cpp
     DOM/AnchorNameMap.cpp
@@ -405,8 +351,6 @@ set(SOURCES
     Gamepad/GamepadRegistry.cpp
     Gamepad/NavigatorGamepad.cpp
     Geolocation/Geolocation.cpp
-    Serial/Serial.cpp
-    Serial/SerialPort.cpp
     Geolocation/GeolocationCoordinates.cpp
     Geolocation/GeolocationPosition.cpp
     Geolocation/GeolocationPositionError.cpp
@@ -539,6 +483,7 @@ set(SOURCES
     HTML/HTMLOptionElement.cpp
     HTML/HTMLOptionsCollection.cpp
     HTML/HTMLOrSVGOrMathMLElement.cpp
+    HTML/HTMLOrSVGScriptElement.cpp
     HTML/HTMLOutputElement.cpp
     HTML/HTMLParagraphElement.cpp
     HTML/HTMLParamElement.cpp
@@ -632,6 +577,7 @@ set(SOURCES
     HTML/SanitizerConfiguration.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
+    HTML/Scripting/CompiledScriptCache.cpp
     HTML/Scripting/ConsoleInputCompletion.cpp
     HTML/Scripting/DevToolsLoggedObjects.cpp
     HTML/Scripting/DevToolsObjectTable.cpp
@@ -707,13 +653,11 @@ set(SOURCES
     IndexedDB/RustIntegration.cpp
     Infra/ByteSequences.cpp
     Infra/JSON.cpp
-    Internals/FakeXRDevice.cpp
     Internals/InternalAnimationTimeline.cpp
     Internals/InternalGamepad.cpp
     Internals/Internals.cpp
     Internals/InternalsBase.cpp
     Internals/WebUI.cpp
-    Internals/XRTest.cpp
     IntersectionObserver/IntersectionObserver.cpp
     IntersectionObserver/IntersectionObserverEntry.cpp
     LargestContentfulPaint/LargestContentfulPaint.cpp
@@ -769,6 +713,7 @@ set(SOURCES
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
     Page/PageCursor.cpp
+    Page/PageHoverLink.cpp
     Page/RenderingStats.cpp
     Page/ScreenWakeLockHandle.cpp
     PaintTiming/PaintTiming.cpp
@@ -838,11 +783,9 @@ set(SOURCES
     SRI/IntegrityPolicy.cpp
     SRI/SRI.cpp
     StorageAPI/NavigatorStorage.cpp
-    StorageAPI/StorageAreaMirror.cpp
-    StorageAPI/StorageBottle.cpp
+    StorageAPI/StorageAreaMirrorClient.cpp
     StorageAPI/StorageKey.cpp
     StorageAPI/StorageManager.cpp
-    StorageAPI/StorageShelf.cpp
     Streams/ReadableStream.cpp
     Streams/TransformStream.cpp
     Streams/WritableStream.cpp
@@ -949,6 +892,7 @@ set(SOURCES
     SVG/SVGViewElement.cpp
     SVG/TagNames.cpp
     SVG/TimeEvent.cpp
+    Translation/DocumentTranslator.cpp
     TrustedTypes/InjectionSink.cpp
     TrustedTypes/RequireTrustedTypesForDirective.cpp
     TrustedTypes/TrustedHTML.cpp
@@ -1057,7 +1001,6 @@ set(SOURCES
     WebGL/EventNames.cpp
     WebGL/RemoteWebGLTransportFFI.cpp
     WebGL/WebGLContextAttributes.cpp
-    WebGL/WebGLContextEvent.cpp
     WebGL/WebGLRenderingContextBase.cpp
     WebIDL/AbstractOperations.cpp
     WebIDL/AsyncIterator.cpp
@@ -1105,15 +1048,8 @@ set(SOURCES
     WebVTT/Parser.cpp
     WebVTT/VTTCue.cpp
     WebVTT/VTTRegion.cpp
-    WebXR/XRLayer.cpp
-    WebXR/XRRenderState.cpp
-    WebXR/XRSession.cpp
-    WebXR/XRSessionEvent.cpp
-    WebXR/XRSystem.cpp
-    WebXR/XRWebGLLayer.cpp
     XHR/EventNames.cpp
     XHR/FormData.cpp
-    XHR/FormDataIterator.cpp
     XHR/ProgressEvent.cpp
     XHR/XMLHttpRequest.cpp
     XHR/XMLHttpRequestEventTarget.cpp
@@ -1139,10 +1075,7 @@ set(GENERATED_SOURCES
     CSS/DefaultStyleSheetSource.cpp
     CSS/DescriptorID.cpp
     CSS/Enums.cpp
-    CSS/GeneratedCSSNumericFactoryMethods.cpp
     CSS/GeneratedCSSNumericFactoryMethods.idl
-    CSS/GeneratedCSSStyleProperties.cpp
-    CSS/GeneratedCSSStyleProperties.idl
     CSS/Keyword.cpp
     CSS/MediaFeatureID.h
     CSS/PropertyID.cpp

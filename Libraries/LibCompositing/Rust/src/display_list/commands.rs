@@ -56,7 +56,7 @@ pub enum DisplayListCommandType {
     CompositorNestedContextWheelRegion,
     Canvas2DFillPath,
     Canvas2DStrokePath,
-    Canvas2DDrawGlyphRun,
+    Canvas2DDrawGlyphRuns,
     Canvas2DClearRect,
     Canvas2DDrawImageFrame,
     Canvas2DDrawCanvas,
@@ -107,7 +107,7 @@ impl DisplayListCommandType {
             self,
             Self::Canvas2DFillPath
                 | Self::Canvas2DStrokePath
-                | Self::Canvas2DDrawGlyphRun
+                | Self::Canvas2DDrawGlyphRuns
                 | Self::Canvas2DClearRect
                 | Self::Canvas2DDrawImageFrame
                 | Self::Canvas2DDrawCanvas
@@ -164,7 +164,7 @@ impl DisplayListCommandType {
             Self::CompositorNestedContextWheelRegion => "CompositorNestedContextWheelRegion",
             Self::Canvas2DFillPath => "Canvas2DFillPath",
             Self::Canvas2DStrokePath => "Canvas2DStrokePath",
-            Self::Canvas2DDrawGlyphRun => "Canvas2DDrawGlyphRun",
+            Self::Canvas2DDrawGlyphRuns => "Canvas2DDrawGlyphRuns",
             Self::Canvas2DClearRect => "Canvas2DClearRect",
             Self::Canvas2DDrawImageFrame => "Canvas2DDrawImageFrame",
             Self::Canvas2DDrawCanvas => "Canvas2DDrawCanvas",
@@ -262,6 +262,9 @@ pub struct ReplayLayer {
     pub backdrop_corner_radii: CornerRadii,
     /// The color the backdrop is read over, transparent unless the parent layer is the root isolation layer.
     pub backdrop_base_color: Color,
+    /// Where a blur() in the backdrop filter mirrors: the region as the clips around the box leave it, in the
+    /// effect's space. None when the filter holds no such blur.
+    pub backdrop_blur_edge: OptionalFloatRect,
     pub effect: EffectNodeIndex,
     /// Bounds of everything replay draws into the layer, in the effect's space, when known.
     pub content_bounds: OptionalFloatRect,
@@ -564,11 +567,14 @@ pub struct DisplayListGlyph {
 }
 ffi_bytes_fields!(DisplayListGlyph { position, glyph_id });
 
-impl From<&text_layout::DrawGlyph> for DisplayListGlyph {
-    fn from(glyph: &text_layout::DrawGlyph) -> Self {
+impl From<text_layout::PlacedGlyph> for DisplayListGlyph {
+    fn from(placed: text_layout::PlacedGlyph) -> Self {
         Self {
-            position: FloatPoint { x: glyph.x, y: glyph.y },
-            glyph_id: glyph.glyph_id,
+            position: FloatPoint {
+                x: placed.x,
+                y: placed.y,
+            },
+            glyph_id: u32::from(placed.glyph.glyph_id),
         }
     }
 }
@@ -907,11 +913,15 @@ pub struct DrawCompositedContext {
     pub dst_rect: FloatRect,
     pub child_context_id: CompositorContextId,
     pub scaling_mode: ScalingMode,
+    pub spatial_node_index: SpatialNodeIndex,
+    pub snap_origin_if_untransformed: bool,
 }
 ffi_bytes_fields!(DrawCompositedContext {
     dst_rect,
     child_context_id,
-    scaling_mode
+    scaling_mode,
+    spatial_node_index,
+    snap_origin_if_untransformed
 });
 
 impl DisplayListCommand for DrawCompositedContext {
@@ -1874,26 +1884,39 @@ impl DisplayListCommand for Canvas2DStrokePath {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DStrokePath;
 }
 
-// The glyphs of one font, positioned relative to the translation, with the top of the line box at the glyph position.
+// A font and how many of the next glyphs of a Canvas2DDrawGlyphRuns it draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
-pub struct Canvas2DDrawGlyphRun {
+pub struct Canvas2DGlyphRun {
     pub font_id: FontResourceId,
+    pub glyph_count: u64,
+}
+ffi_bytes_fields!(Canvas2DGlyphRun { font_id, glyph_count });
+
+// The glyphs of a text, positioned relative to the translation, with the top of the line box at the glyph position.
+// The text is a single draw, so that its runs of different fonts share one shadow and one composite. The horizontal
+// scale condenses the glyphs and their positions towards the translation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DDrawGlyphRuns {
+    pub runs: DisplayListDataSpan,
     pub glyphs: DisplayListDataSpan,
     pub translation: FloatPoint,
+    pub horizontal_scale: f32,
     pub paint: Canvas2DPaint,
     pub compositing: Canvas2DCompositing,
 }
-ffi_bytes_fields!(Canvas2DDrawGlyphRun {
-    font_id,
+ffi_bytes_fields!(Canvas2DDrawGlyphRuns {
+    runs,
     glyphs,
     translation,
+    horizontal_scale,
     paint,
     compositing
 });
 
-impl DisplayListCommand for Canvas2DDrawGlyphRun {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DDrawGlyphRun;
+impl DisplayListCommand for Canvas2DDrawGlyphRuns {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DDrawGlyphRuns;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

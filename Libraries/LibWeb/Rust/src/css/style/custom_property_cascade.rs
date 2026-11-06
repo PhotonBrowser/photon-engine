@@ -418,23 +418,27 @@ pub(super) fn append_named_custom_property_reads(value: &StyleValueData, names: 
     let Some(reads) = named_custom_property_reads(value) else {
         return false;
     };
-    names.extend(reads.into_iter().map(Arc::from));
+    names.extend(reads.map(Arc::from));
     true
 }
 
 /// The custom properties a written value reads by name, or `None` when it may read others: an
-/// `if()` condition, a custom function or an attribute's value can read any.
-fn named_custom_property_reads(value: &StyleValueData) -> Option<Vec<&[u16]>> {
+/// `if()` condition, a custom function or an attribute's value can read any, and `inherit()` reads
+/// what the parent holds, which holds more than it hands down.
+fn named_custom_property_reads(value: &StyleValueData) -> Option<impl Iterator<Item = &[u16]>> {
     let value = substituted_tokens(value);
     if let StyleValueData::Unresolved(unresolved) = value
-        && (unresolved.presence().attr || unresolved.presence().dashed_function || unresolved.presence().if_)
+        && (unresolved.presence().attr
+            || unresolved.presence().dashed_function
+            || unresolved.presence().if_
+            || unresolved.presence().inherit)
     {
         return None;
     }
     let Some((references, all_references_visible)) = custom_property_references(value) else {
-        return Some(Vec::new());
+        return Some(None.into_iter().flatten());
     };
-    all_references_visible.then_some(references)
+    all_references_visible.then(|| Some(references).into_iter().flatten())
 }
 
 /// Whether a written value holds a function that substitutes anything.
@@ -501,7 +505,7 @@ fn nodes_on_a_cycle(edges: &[Vec<usize>]) -> Vec<bool> {
 
 /// Whether a written value may read one of the custom properties `moved` holds.
 pub(super) fn value_reads_any_custom_property_of(value: &StyleValueData, moved: impl Fn(&[u16]) -> bool) -> bool {
-    named_custom_property_reads(value).is_none_or(|names| names.into_iter().any(moved))
+    named_custom_property_reads(value).is_none_or(|mut names| names.any(moved))
 }
 
 pub(super) fn sorted_custom_property_names(mut names: Vec<Arc<[u16]>>) -> CustomPropertyNames {
@@ -775,11 +779,6 @@ impl RetainedState {
         noted.filter(|noted| noted.raw() != 0)
     }
 
-    /// The environment the element's declarations resolved to last, beneath any animation overlay, where they resolve to
-    /// its values again in `resolved`: an environment resolved anew, as one holding a registered value is, would move
-    /// what the element's descendants inherit without moving any value they see. What an environment hands down was
-    /// decided under the registrations it was resolved under, so only one handing down every value, then and now, is
-    /// kept.
     /// The store of the environment the element's declarations resolved to last, where `resolved` holds the same values
     /// over the same stores, as [`Self::environment_resolving_to_the_same_values`] keeps it: a store computed again
     /// gives way to it, so that the element's record holds the store its environment is named by.
@@ -794,25 +793,35 @@ impl RetainedState {
         self.custom_property_environments.store(previous).cloned()
     }
 
+    /// The environment the element's declarations resolved to last, beneath any animation overlay, where they resolve to
+    /// its values again in `resolved`: an environment resolved anew, as one holding a registered value is, would move
+    /// what the element's descendants inherit without moving any value they see. What an environment hands down was
+    /// decided under the registrations it was resolved under, so only one handing down every value, then and now, is
+    /// kept.
     pub(super) fn environment_resolving_to_the_same_values(
         &self,
         node: StyleNodeID,
         pseudo: Option<u8>,
-        resolved: &CustomPropertyStore,
+        resolved: &Arc<CustomPropertyStore>,
         registry: &crate::css::custom_properties::CustomPropertyRegistry,
     ) -> Option<u64> {
         if pseudo.is_some() {
             return None;
         }
-        let held = self.element_custom_property_data.get(&node)?;
-        let previous = held.sampled_over.unwrap_or(held.identity);
+        // NB: An element holds an environment of its own only where one lies over its record's.
+        let previous = match self.element_custom_property_data.get(&node) {
+            Some(held) => held.sampled_over.unwrap_or(held.identity),
+            None => self.computed_group_sets.custom_property_environment_identity(node)?,
+        };
         if !self.custom_property_environments.is_engine_made(previous)
             || self.custom_property_environments.inheritable(previous) != previous
         {
             return None;
         }
         let previous_store = self.custom_property_environments.store(previous)?;
-        (resolved.hands_down_every_value(registry) && resolved.holds_same_values_as(previous_store)).then_some(previous)
+        (resolved.hands_down_every_value(registry)
+            && CustomPropertyStore::hold_the_same_values(resolved, previous_store))
+        .then_some(previous)
     }
 
     /// The custom properties in a dependency cycle through what an element's animations declare, as
@@ -998,7 +1007,12 @@ impl RetainedState {
             .filter(|(declared, _)| declared.operator() == CascadeOperator::Declared)
             .filter_map(|(declared, value)| {
                 let name = self.declared_custom_property_name(declared.name)?;
-                Some((name, declared, value, named_custom_property_reads(value.data())))
+                Some((
+                    name,
+                    declared,
+                    value,
+                    named_custom_property_reads(value.data()).map(Iterator::collect),
+                ))
             })
             .filter(|(name, _, _, _)| !moved.contains(name.to_utf16().as_ref()))
             .collect();
@@ -1230,18 +1244,9 @@ pub(super) fn substitute_against_stores(
     let invalid = || RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid);
     match resolution {
         NativeVarResolution::Resolved {
-            source,
+            components,
             contains_attr_tainted_values,
-        } => {
-            let Ok(values) = crate::css::style_value::components_of_text(
-                crate::css::css_tokenizer::TokenizerInput::Utf16(&source),
-                crate::css::css_tokenizer::Comments::Separating,
-            ) else {
-                crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionParse);
-                return invalid();
-            };
-            parse_substituted_value(&parse_context, property, &source, &values, contains_attr_tainted_values)
-        }
+        } => parse_substituted_value(&parse_context, property, &components, contains_attr_tainted_values),
         NativeVarResolution::Invalid | NativeVarResolution::NotHandled => invalid(),
     }
 }

@@ -37,7 +37,7 @@ private:
     virtual void did_consume_input_event(Web::CompositorContextId, u64 event_id) override;
     virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) override;
     virtual void did_detect_history_swipe_candidate(Web::CompositorContextId, u64 gesture_id, bool back, float unconsumed_delta) override;
-    virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool async_scroll_performed_default_action) override;
+    virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool performed_default_action) override;
 
     virtual void handle_and_dispatch_key_event(Web::CompositorContextId, Web::KeyEvent, bool allow_keyboard_scroll) override;
     virtual void handle_and_dispatch_pinch_event(Web::CompositorContextId, Web::PinchEvent) override;

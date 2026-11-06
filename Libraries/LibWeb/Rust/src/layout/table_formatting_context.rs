@@ -1090,20 +1090,20 @@ struct TableParticipantBox {
 
 impl TableTree for TableFormattingContext<'_> {
     fn first_child(&self, node: Node) -> Node {
-        self.run.callbacks.first_child(node)
+        self.run.pass.first_child(node)
     }
 
     fn next_sibling(&self, node: Node) -> Node {
-        self.run.callbacks.next_sibling(node)
+        self.run.pass.next_sibling(node)
     }
 
     fn node_data(&self, node: Node) -> &NodeData {
-        self.run.callbacks.node_data(node)
+        self.run.pass.node_data(node)
     }
 
     fn display(&self, node: Node) -> FfiDisplay {
         self.run
-            .callbacks
+            .pass
             .computed_values_view_if_styled(node)
             .map_or_else(FfiDisplay::block, |style| style.display())
     }
@@ -1162,12 +1162,12 @@ impl TableFormattingContext<'_> {
 
 impl<'pass> TableFormattingContext<'pass> {
     fn node_facts(&self, node: Node) -> NodeFacts<'_> {
-        NodeFacts::new(&self.run.callbacks, node)
+        NodeFacts::new(&self.run.pass, node)
     }
 
     #[inline]
     fn style(&self, node: Node) -> StyleValues<'pass> {
-        StyleValues::for_node(&self.run.callbacks, node)
+        StyleValues::for_node(&self.run.pass, node)
     }
 
     pub(super) fn new(
@@ -1259,16 +1259,16 @@ impl<'pass> TableFormattingContext<'pass> {
 
     #[inline]
     fn sizing(&self) -> sizing_context::SizingContext<'pass, 'static> {
-        sizing_context::SizingContext::new(self.run.state, self.run.callbacks)
+        sizing_context::SizingContext::new(self.run.state, self.run.pass)
     }
 
     fn parent(&self, node: Node) -> Node {
-        self.run.callbacks.parent(node)
+        self.run.pass.parent(node)
     }
 
     fn matching_children(&mut self, parent: Node, predicate: impl Fn(NodeFacts<'_>) -> bool) -> Vec<Node> {
         self.run
-            .callbacks
+            .pass
             .children(parent)
             .filter(|&child| {
                 let facts = self.node_facts(child);
@@ -1635,7 +1635,7 @@ impl<'pass> TableFormattingContext<'pass> {
         };
         let participant_box = |participant| TableParticipantBox {
             cells: Cell::new(used_values::cells_before_sizing(
-                &self.run.callbacks,
+                &self.run.pass,
                 participant,
                 self.participant_constraints,
             )),
@@ -1669,8 +1669,7 @@ impl<'pass> TableFormattingContext<'pass> {
             .cells
             .iter()
             .map(|cell| {
-                let cells =
-                    used_values::cells_before_sizing(&self.run.callbacks, cell.box_, self.participant_constraints);
+                let cells = used_values::cells_before_sizing(&self.run.pass, cell.box_, self.participant_constraints);
                 note_percentage_block_size_dependency_of(cell.box_);
                 cells
             })
@@ -1884,7 +1883,11 @@ impl<'pass> TableFormattingContext<'pass> {
                 (content_sizes.min, content_sizes.max)
             };
             // The outer min-content inline size of a table cell is its minimum inline size adjusted by the cell intrinsic offsets.
-            self.cells[cell_index].outer_min_inline_size = min_inline.max(min_content_inline) + inline_offsets;
+            // AD-HOC: The spec's max(min-width, min-content width) lets the min-content width override a definite max-width,
+            //         so a cell whose content can't wrap widens its column past its max-width, where pages expect the cell
+            //         to cut that content off. So cap the min-content width at the max-width; min-width still wins over both.
+            let capped_min_content_inline = min_content_inline.min(max_inline);
+            self.cells[cell_index].outer_min_inline_size = min_inline.max(capped_min_content_inline) + inline_offsets;
             self.cells[cell_index].max_content_inline_size = (!fixed).then_some(max_content_inline);
 
             if include_rows {
@@ -1961,7 +1964,8 @@ impl<'pass> TableFormattingContext<'pass> {
             } else {
                 // The outer max-content width of a table-cell in a non-constrained column is
                 // max(min-width, width, min-content width, min(max-width, max-content width)) adjusted by the cell intrinsic offsets.
-                min_inline.max(inline_size.max(min_content_inline.max(max_inline.min(max_content_inline))))
+                // AD-HOC: With the min-content width capped at a definite max-width, as for the outer min-content width.
+                min_inline.max(inline_size.max(capped_min_content_inline.max(max_inline.min(max_content_inline))))
                     + inline_offsets
             };
         }
@@ -2822,14 +2826,16 @@ impl<'pass> TableFormattingContext<'pass> {
         cell_index: usize,
         input: AvailableSpace,
         adopt_automatic_content_block_size: bool,
-        intrinsic_block_padding: Option<(CssPixels, CssPixels)>,
     ) -> (DerivedBaselines, Option<fragment_tree::RunRootFragment>) {
         let layout_input = LayoutInput {
             available_space: input,
             containing_block_constraints: ContainingBlockConstraints::default(),
             sizing: RootSizingDirectives {
-                adopt_automatic_content_block_size,
-                table_cell_intrinsic_block_padding: intrinsic_block_padding,
+                content_block_size_after_run: if adopt_automatic_content_block_size {
+                    geometry::ContentBlockSizeAfterRun::Automatic
+                } else {
+                    geometry::ContentBlockSizeAfterRun::HandedOver
+                },
                 ..RootSizingDirectives::default()
             },
             participation: ParticipationInParentFormattingContext::Item,
@@ -2933,7 +2939,7 @@ impl<'pass> TableFormattingContext<'pass> {
         adopt_automatic_content_block_size: bool,
     ) -> Option<TableCellMeasurement> {
         let cell = self.cells[cell_index];
-        let facts = NodeFacts::new(&self.run.callbacks, cell.box_);
+        let facts = NodeFacts::new(&self.run.pass, cell.box_);
         if !facts.can_have_children() {
             return None;
         }
@@ -2946,13 +2952,17 @@ impl<'pass> TableFormattingContext<'pass> {
                 available_space: inner,
                 containing_block_constraints: ContainingBlockConstraints::default(),
                 sizing: RootSizingDirectives {
-                    adopt_automatic_content_block_size,
+                    content_block_size_after_run: if adopt_automatic_content_block_size {
+                        geometry::ContentBlockSizeAfterRun::Automatic
+                    } else {
+                        geometry::ContentBlockSizeAfterRun::HandedOver
+                    },
                     ..RootSizingDirectives::default()
                 },
                 participation: ParticipationInParentFormattingContext::Item,
             },
         );
-        let result = formatting_context::lay_out_shape_for_its_result(run.callbacks, shape);
+        let result = formatting_context::lay_out_shape_for_its_result(run.pass, shape);
         Some(TableCellMeasurement {
             automatic_content_block_size: result.automatic_content_block_size,
             baselines: result.baselines,
@@ -3050,7 +3060,7 @@ impl<'pass> TableFormattingContext<'pass> {
                     content_baselines = Some(measured.baselines);
                 }
             } else {
-                let (baselines, fragment_arrival) = self.layout_inside_cell(run, cell_index, inner, true, None);
+                let (baselines, fragment_arrival) = self.layout_inside_cell(run, cell_index, inner, true);
                 self.keep_fragment_arrival_of_cell(cell_index, fragment_arrival);
                 content_baselines = Some(baselines);
             }
@@ -3436,7 +3446,7 @@ impl<'pass> TableFormattingContext<'pass> {
                 self.content_baselines_of_handed_back_cells[cell_index] = Some(laid_out.baselines);
                 formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
                     run.state,
-                    &run.callbacks,
+                    &run.pass,
                     cell.box_,
                     measurement.depends_on_percentage_block_size,
                 );
@@ -3446,15 +3456,13 @@ impl<'pass> TableFormattingContext<'pass> {
             // it; restore the pre-layout size so the cell's children resolve percentages against
             // the same basis the measurement saw.
             let pre_layout_content_block_size = self.cell_pre_layout_content_block_sizes[cell_index];
-            self.cell_box_cells[cell_index].set_content_block_size(pre_layout_content_block_size);
+            let cell_box = &mut self.cell_box_cells[cell_index];
+            cell_box.set_content_block_size(pre_layout_content_block_size);
+            cell_box.padding_top += intrinsic_block_padding.0;
+            cell_box.padding_bottom += intrinsic_block_padding.1;
             let inner = self.cell_inside_layout_inputs[cell_index];
-            let (_, fragment_arrival) = self.layout_inside_cell(
-                run,
-                cell_index,
-                inner,
-                adopt_automatic_content_block_size,
-                Some(intrinsic_block_padding),
-            );
+            let (_, fragment_arrival) =
+                self.layout_inside_cell(run, cell_index, inner, adopt_automatic_content_block_size);
             self.keep_fragment_arrival_of_cell(cell_index, fragment_arrival);
             if adopt_automatic_content_block_size {
                 debug_assert_eq!(
@@ -3673,7 +3681,7 @@ impl<'pass> TableFormattingContext<'pass> {
             let mut y = block_start;
             if let Some((group, group_box)) =
                 group_placement.map(|group_placement| &self.column_group_and_column_boxes[group_placement])
-                && self.run.callbacks.in_flow_containing_block(node) == *group
+                && self.run.pass.in_flow_containing_block(node) == *group
             {
                 let group_offset = group_box.content_offset.get();
                 x -= group_offset.x;

@@ -68,12 +68,13 @@ pub use crate::runtime::iterator::{
     iterator_complete, iterator_next, iterator_step_value, iterator_to_list, iterator_value,
 };
 pub use crate::runtime::map::Map;
+pub use crate::runtime::map_iterator::MapIterator;
 pub use crate::runtime::module::Module;
 pub use crate::runtime::module_environment::ModuleEnvironment;
 pub use crate::runtime::module_request::ModuleRequest;
 pub use crate::runtime::native_function::{NativeFunction, RawNativeFunction};
 pub use crate::runtime::number_object::NumberObject;
-pub use crate::runtime::object::{IntegrityLevel, Object, PropertyKind};
+pub use crate::runtime::object::{IntegrityLevel, Object, PropertyKind, ShouldThrowExceptions};
 pub use crate::runtime::primitive_string::PrimitiveString;
 pub use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 pub use crate::runtime::promise_capability::{PromiseCapability, new_promise_capability};
@@ -82,6 +83,7 @@ pub use crate::runtime::property_key::PropertyKey;
 pub use crate::runtime::realm::Realm;
 pub use crate::runtime::regexp_object::{RegExpObject, regexp_create};
 pub use crate::runtime::set::Set;
+pub use crate::runtime::set_iterator::SetIterator;
 pub use crate::runtime::string_object::StringObject;
 pub use crate::runtime::typed_array::{
     Kind as TypedArrayKind, TypedArrayBase, TypedArrayWithBufferWitness, create_typed_array_on_buffer,

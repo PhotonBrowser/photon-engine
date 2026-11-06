@@ -9,6 +9,7 @@ mod pseudo;
 
 use super::pipeline::compute::RootFontInputs;
 use super::*;
+use crate::css::cascaded_properties::NO_PSEUDO_ELEMENT;
 use crate::css::computed_longhand_table::IN_DISPLAY_NONE_SUBTREE;
 use crate::css::computed_value_views::QuoteTransfer;
 use animations::DeclarationScope;
@@ -32,19 +33,27 @@ pub(crate) struct SubtreeGeneratedContentEffects {
 impl RetainedState {
     /// The record a highlight pseudo-element inherits from: the same pseudo-element's record on its
     /// nearest flat-tree ancestor holding one, as the engine has it assigned.
-    pub(crate) fn retained_highlight_inheritance_parent_style_record(
+    pub(in crate::css::style) fn retained_highlight_inheritance_parent_style_record(
         &self,
         node: StyleNodeID,
-        pseudo_kind: u8,
+        target: pipeline::PseudoElementTarget,
     ) -> Option<computed::FinalStyleRecordID> {
         let mut ancestor = self.projection.inheritance_parent(node);
         while let Some(candidate) = ancestor {
-            if let Some(record) = self.computed_group_sets.pseudo_style_record(candidate, pseudo_kind) {
+            if let Some(record) = self.installed_pseudo_style_record(candidate, target) {
                 return Some(record);
             }
             ancestor = self.projection.inheritance_parent(candidate);
         }
         None
+    }
+
+    pub(in crate::css::style) fn installed_pseudo_style_record(
+        &self,
+        node: StyleNodeID,
+        target: pipeline::PseudoElementTarget,
+    ) -> Option<computed::FinalStyleRecordID> {
+        self.computed_group_sets.pseudo_style_record_of(node, target)
     }
 
     #[cfg(test)]
@@ -118,26 +127,51 @@ impl RetainedState {
     }
 
     /// Whether the host owes an element the engine settled the animation plan its record decides,
-    /// once it installs the record: the record moved the declarations, or the element runs CSS
-    /// animations, whose `@keyframes` may have moved without the declarations.
-    pub(super) fn row_owes_an_animation_plan(&self, node: StyleNodeID, old: u64, new: u64) -> bool {
-        self.row_owes_an_animation_plan_declaring(node, old, new, || self.record_declares_animations(new))
-    }
-
-    /// [`Self::row_owes_an_animation_plan`], for a `new` record of which `new_declares_animations`
-    /// answers whether it declares animations.
-    pub(super) fn row_owes_an_animation_plan_declaring(
+    /// once it installs the record `new`: the record moved the declarations, or the element runs
+    /// CSS animations the plan would change, as where their `@keyframes` moved without the
+    /// declarations.
+    pub(super) fn row_owes_an_animation_plan(
         &self,
         node: StyleNodeID,
         old: u64,
         new: u64,
-        new_declares_animations: impl Fn() -> bool,
+        new_record: &std::sync::Arc<super::pipeline::Record>,
     ) -> bool {
         // An element the host holds no record for, its style cleared under display:none and its
         // animations with it, starts the animations its record names as a first record does.
         let old = if self.held_style_records.contains(node) { old } else { 0 };
-        self.record_owes_an_animation_plan(old, new, new_declares_animations)
-            || self.css_defined_animations.node_runs_a_css_animation(node)
+        self.record_owes_an_animation_plan(old, new, || self.record_declares_animations(new))
+            || (self.css_defined_animations.node_runs_a_css_animation(node)
+                && self
+                    .animation_plan_of_record(node, NO_PSEUDO_ELEMENT, new_record)
+                    .is_some())
+    }
+
+    /// The animation plan `record` decides for an element, or for its pseudo-element `pseudo_kind`,
+    /// where applying it would change the animations they run: none where it would not, or where
+    /// the record installs no `animation-name`. The definitions borrow the record's values.
+    pub(crate) fn animation_plan_of_record(
+        &self,
+        node: StyleNodeID,
+        pseudo_kind: u8,
+        record: &std::sync::Arc<super::pipeline::Record>,
+    ) -> Option<smallvec::SmallVec<[crate::css::style_compute::FfiComputedAnimation; 1]>> {
+        let longhands = StyleRecordView::of_host_record(record).longhands();
+        let declaration_scope = self.animation_name_declaration_scope_of(node, pseudo_kind, record)?;
+        let existing_animations =
+            self.element_css_defined_animations(node, crate::css::style_compute::animation_slot(pseudo_kind));
+        let element_tree_scope = self.element_tree_scope(node);
+        let mut definitions = smallvec::SmallVec::new();
+        crate::css::style_compute::build_computed_animation_list(
+            longhands,
+            existing_animations,
+            |name| {
+                self.animation_keyframes()
+                    .resolve(declaration_scope, element_tree_scope, name)
+            },
+            &mut definitions,
+        );
+        (!animations::plan_changes_nothing(&definitions, existing_animations)).then_some(definitions)
     }
 
     /// Whether installing the `new` record the engine derived for an element, in place of the
@@ -532,7 +566,7 @@ impl RetainedState {
             .unwrap_or_else(|| self.default_groups().groups().clone());
         let record = std::sync::Arc::new(super::pipeline::Record::derived(&source, &payloads))
             .with_pseudo_element_styles(super::pipeline::PseudoElementStyles::from_bits(pseudo_element_styles));
-        let identity = self.computed_group_sets.install_record(&record, || {
+        let identity = self.computed_group_sets.install_derived_record(&record, || {
             computed::record_dependency_flags(&record.facts(), &record.payloads)
         });
         match target.is_pseudo() {
@@ -571,10 +605,6 @@ impl RetainedState {
     }
 
     pub(crate) fn take_released_animation_overlay_records(&mut self) -> computed::ReleasedAnimationOverlayRecords {
-        // Even an empty take copies the sets while a fork shares them.
-        if !self.computed_group_sets.has_released_animation_overlay_records() {
-            return computed::ReleasedAnimationOverlayRecords::default();
-        }
         self.computed_group_sets.take_released_animation_overlay_records()
     }
 
@@ -616,9 +646,8 @@ impl RetainedState {
         self.computed_group_sets.unpin_style_record(style_record);
     }
 
-    pub(crate) fn current_color_dependent_group_mask(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<u32> {
-        let target = computed::ComputedStyleTarget::new(node, pseudo_kind);
-        let dependencies = self.computed_group_sets.current_color_dependency_mask(target)?;
+    pub(crate) fn current_color_dependent_group_mask(longhands: ViewLonghands<'_>) -> Option<u32> {
+        let dependencies = computed::ComputedGroupSets::current_color_dependency_mask(longhands);
         let caret_color_group = computed_group_output_mask(crate::css::property_metadata::property_id::CARET_COLOR)?;
         let accent_color_group = computed_group_output_mask(crate::css::property_metadata::property_id::ACCENT_COLOR)?;
         Some(dependencies | caret_color_group | accent_color_group)
@@ -629,8 +658,16 @@ impl RetainedState {
         node: StyleNodeID,
         pseudo_kind: u8,
     ) -> Option<computed::FinalStyleRecordID> {
+        self.remove_computed_pseudo_of(node, pipeline::PseudoElementTarget::of_kind(pseudo_kind))
+    }
+
+    pub(in crate::css::style) fn remove_computed_pseudo_of(
+        &mut self,
+        node: StyleNodeID,
+        target: pipeline::PseudoElementTarget,
+    ) -> Option<computed::FinalStyleRecordID> {
         let live_animation_overlays_before = self.computed_group_sets.live_animation_overlay_records();
-        let removed_style_record = self.computed_group_sets.remove_pseudo(node, pseudo_kind);
+        let removed_style_record = self.computed_group_sets.remove_pseudo_of(node, target);
         let live_animation_overlays_after = self.computed_group_sets.live_animation_overlay_records();
         let removed_style_record = removed_style_record?;
         self.counters.bump(Counter::ComputedPseudoAssignmentsRemoved);
@@ -652,6 +689,7 @@ impl StyleEngine {
     /// takes a recording in, so that a document that styles nothing more still frees what its recording kept.
     pub(crate) fn free_style_records_kept_for_leases(&mut self) {
         self.retained.computed_group_sets.free_retired_animation_overlays();
+        self.retained.computed_group_sets.sweep_at_next_reclamation();
         self.reclaim_unreachable_computed_records();
     }
 
@@ -816,10 +854,15 @@ pub(super) mod pseudo_kind {
     pub(in crate::css::style) const SELECTION: u8 = 8;
     pub(in crate::css::style) const SPELLING_ERROR: u8 = 9;
     pub(in crate::css::style) const SYNTHETIC_COUNT: usize = 11;
+    pub(in crate::css::style) const HIGHLIGHT: u8 = 17;
+    const _: () = assert!(HIGHLIGHT as u16 == crate::css::selector::PseudoElementType::Highlight as u16);
 
     /// https://drafts.csswg.org/css-pseudo-4/#highlight-pseudos
     pub(in crate::css::style) const fn is_highlight(kind: u8) -> bool {
-        matches!(kind, SEARCH_TEXT | SEARCH_TEXT_CURRENT | SELECTION | SPELLING_ERROR)
+        matches!(
+            kind,
+            SEARCH_TEXT | SEARCH_TEXT_CURRENT | SELECTION | SPELLING_ERROR | HIGHLIGHT
+        )
     }
 }
 
@@ -850,16 +893,17 @@ mod tests {
         };
         let root_record = publish(&mut engine, root, 0);
         assert_eq!(
-            engine.retained_highlight_inheritance_parent_style_record(parent, 0),
+            engine
+                .retained_highlight_inheritance_parent_style_record(parent, pipeline::PseudoElementTarget::of_kind(0)),
             Some(root_record)
         );
         assert_eq!(
-            engine.retained_highlight_inheritance_parent_style_record(child, 0),
+            engine.retained_highlight_inheritance_parent_style_record(child, pipeline::PseudoElementTarget::of_kind(0)),
             Some(root_record)
         );
         let slot_record = publish(&mut engine, slot, 0);
         assert_eq!(
-            engine.retained_highlight_inheritance_parent_style_record(child, 0),
+            engine.retained_highlight_inheritance_parent_style_record(child, pipeline::PseudoElementTarget::of_kind(0)),
             Some(slot_record)
         );
     }
@@ -884,6 +928,15 @@ impl StyleEngine {
 }
 
 impl RetainedState {
+    /// The resolution of `request`: the one the cache holds, or, on a thread of a pass that resolves as it goes, one of
+    /// the pass.
+    pub(super) fn resolved_font(&self, request: bridge::FfiFontResolutionRequest) -> Option<bridge::FfiResolvedFont> {
+        self.font_resolution
+            .as_ref()
+            .and_then(|resolutions| resolutions.lookup(request))
+            .or_else(|| self.pass_fonts.as_ref().map(|pass_fonts| pass_fonts.resolve(request)))
+    }
+
     /// Resolve `request` through `resolver` into the font resolution cache, between passes or the
     /// rounds of one, on the thread that runs them.
     pub(super) fn refill_font_request(

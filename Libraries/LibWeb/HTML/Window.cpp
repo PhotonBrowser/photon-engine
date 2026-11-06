@@ -94,13 +94,11 @@
 #include <LibWeb/RequestIdleCallback/IdleDeadline.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/Speech/SpeechSynthesis.h>
-#include <LibWeb/StorageAPI/StorageBottle.h>
 #include <LibWeb/ViewTransition/ViewTransition.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/ExceptionOrUtils.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
-#include <LibWebCommon/StorageAPI/StorageEndpoint.h>
 
 namespace Web::Bindings {
 
@@ -796,20 +794,18 @@ WebIDL::ExceptionOr<GC::Ref<Storage>> Window::local_storage()
         return GC::Ref { *storage };
 
     // 2. Let map be the result of running obtain a local storage bottle map with this's relevant settings object and "localStorage".
-    auto map = StorageAPI::obtain_a_local_storage_bottle_map(this->relevant_settings_object(), StorageAPI::StorageEndpointType::LocalStorage);
-
     // 3. If map is failure, then throw a "SecurityError" DOMException.
-    if (!map)
-        return WebIDL::SecurityError::create("localStorage is not available"_utf16);
-
     // 4. Let storage be a new Storage object whose map is map.
-    auto storage = Storage::create(*this, Storage::Type::Local, *map);
+    // NB: The bottle map is Rust's, so Storage::create() obtains it, and returns null for failure.
+    auto storage = Storage::create(*this, Storage::Type::Local);
+    if (!storage)
+        return WebIDL::SecurityError::create("localStorage is not available"_utf16);
 
     // 5. Set this's associated Document's local storage holder to storage.
     associated_document.set_local_storage_holder(storage);
 
     // 6. Return storage.
-    return storage;
+    return GC::Ref { *storage };
 }
 
 // https://html.spec.whatwg.org/multipage/webstorage.html#dom-sessionstorage
@@ -821,20 +817,18 @@ WebIDL::ExceptionOr<GC::Ref<Storage>> Window::session_storage()
         return GC::Ref { *storage };
 
     // 2. Let map be the result of running obtain a session storage bottle map with this's relevant settings object and "sessionStorage".
-    auto map = StorageAPI::obtain_a_session_storage_bottle_map(this->relevant_settings_object(), StorageAPI::StorageEndpointType::SessionStorage);
-
     // 3. If map is failure, then throw a "SecurityError" DOMException.
-    if (!map)
-        return WebIDL::SecurityError::create("sessionStorage is not available"_utf16);
-
     // 4. Let storage be a new Storage object whose map is map.
-    auto storage = Storage::create(*this, Storage::Type::Session, *map);
+    // NB: The bottle map is Rust's, so Storage::create() obtains it, and returns null for failure.
+    auto storage = Storage::create(*this, Storage::Type::Session);
+    if (!storage)
+        return WebIDL::SecurityError::create("sessionStorage is not available"_utf16);
 
     // 5. Set this's associated Document's session storage holder to storage.
     associated_document.set_session_storage_holder(storage);
 
     // 6. Return storage.
-    return storage;
+    return GC::Ref { *storage };
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#sticky-activation
@@ -1002,6 +996,7 @@ void Window::invoke_idle_callbacks()
         // 2. Let deadlineArg be a new IdleDeadline whose [get deadline time algorithm] is getDeadline.
         auto deadline_arg = RequestIdleCallback::IdleDeadline::create();
         // 3. Call callback with deadlineArg as its argument. If an uncaught runtime script error occurs, then report the exception.
+        event_loop.did_run_idle_callback();
         auto result = callback->invoke(deadline_arg);
         if (result.is_error())
             report_exception(result, principal_realm());
@@ -1031,6 +1026,7 @@ void Window::invoke_idle_callback_timeout(u32 handle)
     auto callback = taken.release_value();
 
     callback->clear_timeout_timer_id();
+    main_thread_event_loop().did_run_idle_callback();
 
     // 2.1. Remove callback from both window's list of idle request callbacks and the list of runnable idle callbacks.
     // NB: Taking the callback from whichever list contained it above implements this step, since it can only be in one.
@@ -1811,7 +1807,7 @@ GC::Ref<CSS::CSSStyleProperties> Window::get_computed_style(DOM::Element& elemen
         // 3. Otherwise let obj be the given pseudo-element of elt.
         else {
             // TODO: Keep the function arguments of the pseudo-element if there are any.
-            object = { element, type.value().type() };
+            object = { element, type.value().type(), type.value().highlight_name() };
         }
 
         // https://drafts.csswg.org/css-view-transitions-1/#update-pseudo-element-styles
@@ -1855,7 +1851,7 @@ WebIDL::ExceptionOr<GC::Ref<CSS::MediaQueryList>> Window::match_media(Utf16View 
     auto parsed_media_query_list = CSS::RustMediaList::parse(query);
 
     // 2. Return a new MediaQueryList object, with this's associated Document as the document, with parsed media query list as its associated media query list.
-    auto media_query_list = CSS::MediaQueryList::create(associated_document(), move(parsed_media_query_list));
+    auto media_query_list = CSS::MediaQueryList::create(associated_document(), parsed_media_query_list);
     associated_document().add_media_query_list(media_query_list);
     return media_query_list;
 }
@@ -2235,6 +2231,7 @@ u32 Window::request_idle_callback(IdleCallbackHandler callback, IdleRequestOptio
     // 4. Push callback to the end of window's list of idle request callbacks, associated with handle.
     auto idle_callback = GC::Heap::the().allocate<IdleCallback>(GC::create_function(GC::Heap::the(), move(callback)), handle);
     m_idle_request_callbacks.set(handle, idle_callback);
+    main_thread_event_loop().did_request_idle_callback();
 
     // 5. Return handle and then continue running this algorithm asynchronously.
 

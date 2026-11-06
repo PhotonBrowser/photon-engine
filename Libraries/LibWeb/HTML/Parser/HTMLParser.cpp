@@ -191,7 +191,6 @@ extern "C" size_t ladybird_html_parser_child_at_index(size_t, size_t);
 extern "C" u32 ladybird_html_parser_declarative_shadow_root_attributes(size_t);
 extern "C" void ladybird_html_parser_remove_node(size_t);
 extern "C" void ladybird_html_parser_handle_element_popped(size_t);
-extern "C" void ladybird_html_parser_prepare_svg_script(void*, size_t, size_t);
 extern "C" void ladybird_html_parser_set_script_source_line(void*, size_t, size_t);
 extern "C" void ladybird_html_parser_mark_script_already_started(void*, size_t);
 extern "C" void ladybird_html_parser_process_meta_element(void*, size_t);
@@ -344,15 +343,16 @@ void HTMLParser::set_sanitizer_configuration(SanitizerConfiguration const& confi
 
 void HTMLParser::configure_element_created_by_rust_parser(DOM::Element& element)
 {
-    if (element.local_name() != HTML::TagNames::script || element.namespace_uri() != Namespace::HTML)
+    // AD-HOC: The parser sets up SVG script elements like HTML script elements, matching other engines.
+    auto* script_element = as_if<HTMLOrSVGScriptElement>(element);
+    if (!script_element)
         return;
 
-    auto& script_element = as<HTMLScriptElement>(element);
     if (!m_parsing_fragment && m_scripting_mode != ParserScriptingMode::Fragment)
-        script_element.set_parser_document(Badge<HTMLParser> {}, document());
-    script_element.set_force_async(Badge<HTMLParser> {}, false);
+        script_element->set_parser_document(Badge<HTMLParser> {}, document());
+    script_element->set_force_async(Badge<HTMLParser> {}, false);
     if (m_parsing_fragment && m_scripting_mode != ParserScriptingMode::Fragment)
-        script_element.set_already_started(Badge<HTMLParser> {}, true);
+        script_element->set_already_started(Badge<HTMLParser> {}, true);
 }
 
 GC::Ref<DOM::Element> HTMLParser::create_element_for_rust_parser(Utf16FlyString const& local_name, ReadonlySpan<RustFfiHtmlParserAttribute> attributes, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement> form_element, bool has_template_element_on_stack)
@@ -406,7 +406,7 @@ bool HTMLParser::process_script_end_tag_from_rust_parser(HTMLScriptElement& scri
 
     // https://w3c.github.io/trusted-types/dist/spec/#setting-slot-values-from-parser
     // Set script’s script text value to its child text content.
-    script.set_string_text(script.child_text_content());
+    script.set_script_text_from_parser();
 
     // If the active speculative HTML parser is null, then prepare the script element script.
     // This might cause some script to execute, which might cause new characters to be inserted into the tokenizer,
@@ -451,28 +451,10 @@ bool HTMLParser::process_script_end_tag_from_rust_parser(HTMLScriptElement& scri
     return m_parser_pause_flag;
 }
 
-void HTMLParser::prepare_svg_script_for_rust_parser(SVG::SVGScriptElement& script, size_t source_line_number)
-{
-    // AD-HOC: For SVG script elements, set the parser-inserted flag before the element is inserted into the DOM.
-    // Otherwise inserted()/attribute_changed() would invoke process_the_script_element() with the flag still unset
-    // and bypass the parser-blocking fetch handling.
-    //
-    // https://html.spec.whatwg.org/multipage/parsing.html#scripting-mode
-    // The Fragment scripting mode treats parser-inserted scripts as if they were not parser-inserted, allowing, for
-    // example, executing scripts when applying a fragment created by createContextualFragment().
-    if (m_scripting_mode != ParserScriptingMode::Fragment)
-        script.set_parser_inserted({});
-    script.set_source_line_number({}, source_line_number);
-}
-
 void HTMLParser::set_script_source_line_from_rust_parser(DOM::Element& element, size_t source_line_number)
 {
-    if (auto* html_script_element = as_if<HTML::HTMLScriptElement>(element)) {
-        html_script_element->set_source_line_number({}, source_line_number);
-        return;
-    }
-    if (auto* svg_script_element = as_if<SVG::SVGScriptElement>(element))
-        svg_script_element->set_source_line_number({}, source_line_number);
+    if (auto* script_element = as_if<HTMLOrSVGScriptElement>(element))
+        script_element->set_source_line_number({}, source_line_number);
 }
 
 void HTMLParser::mark_script_already_started_from_rust_parser(HTMLScriptElement& script)
@@ -594,9 +576,14 @@ bool HTMLParser::process_svg_script_end_tag_from_rust_parser(SVG::SVGScriptEleme
     // Set the parser pause flag to true.
     m_parser_pause_flag = true;
 
+    // https://w3c.github.io/trusted-types/dist/spec/#setting-slot-values-from-parser
+    // Set script’s script text value to its child text content.
+    script.set_script_text_from_parser();
+
     // If the active speculative HTML parser is null and the user agent supports SVG, then Process the SVG script element according to the SVG rules. [SVG]
     // The active speculative HTML parser is null here.
-    script.process_the_script_element();
+    // NB: SVG defines the SVG script element as equivalent to the HTML script element, so it is prepared as one.
+    script.prepare_script(Badge<HTMLParser> {});
 
     // Decrement the parser's script nesting level by one.
     decrement_script_nesting_level();
@@ -611,7 +598,10 @@ bool HTMLParser::process_svg_script_end_tag_from_rust_parser(SVG::SVGScriptEleme
     // If the SVG script registered itself as a pending parsing-blocking script (external fetch in flight),
     // pause the parser and schedule a resume check. The parser will resume from
     // resume_after_parser_blocking_script when the fetch completes.
-    if (!m_parsing_fragment && document().pending_parsing_blocking_svg_script()) {
+    if (!m_parsing_fragment && document().pending_parsing_blocking_script()) {
+        // AD-HOC: Start the speculative HTML parser while the script blocks the parser, as for an HTML script.
+        if (script_nesting_level() == 0)
+            start_the_speculative_html_parser();
         m_parser_pause_flag = true;
         schedule_resume_check();
     }
@@ -805,7 +795,7 @@ void HTMLParserEndState::check_progress()
     case Phase::WaitingForDeferredScripts:
         // 5. While the list of scripts that will execute when the document has finished parsing is not empty:
         while (!m_document->scripts_to_execute_when_parsing_has_finished().is_empty()) {
-            auto& first_script = *m_document->scripts_to_execute_when_parsing_has_finished().first();
+            auto& first_script = as<HTMLOrSVGScriptElement>(*m_document->scripts_to_execute_when_parsing_has_finished().first());
 
             // 1. Spin the event loop until the first script in the list of scripts that will execute when the document has finished parsing
             //    has its "ready to be parser-executed" flag set and the parser's Document has no style sheet that is blocking scripts.
@@ -1313,13 +1303,7 @@ void HTMLParser::resume_after_parser_blocking_script()
         return;
 
     auto pending = document().pending_parsing_blocking_script();
-    auto pending_svg = document().pending_parsing_blocking_svg_script();
-    bool ready = false;
-    if (pending)
-        ready = pending->is_ready_to_be_parser_executed();
-    else if (pending_svg)
-        ready = pending_svg->is_ready_to_be_parser_executed();
-    else
+    if (!pending)
         return;
 
     // 5. If the parser's Document has a style sheet that is blocking scripts or the script's ready to be
@@ -1329,7 +1313,7 @@ void HTMLParser::resume_after_parser_blocking_script()
     // relevant state changes.
     if (m_document->has_a_style_sheet_that_is_blocking_scripts())
         return;
-    if (!ready)
+    if (!pending->is_ready_to_be_parser_executed())
         return;
 
     // 3. Start the speculative HTML parser for this instance of the HTML parser.
@@ -1365,10 +1349,7 @@ void HTMLParser::resume_after_parser_blocking_script()
     // 1. Let the script be the pending parsing-blocking script.
     // 2. Set the pending parsing-blocking script to null.
     // 11. Execute the script element the script.
-    if (pending)
-        document().take_pending_parsing_blocking_script({})->execute_script();
-    else
-        document().take_pending_parsing_blocking_svg_script({})->execute_pending_parser_blocking_script({});
+    document().take_pending_parsing_blocking_script({}).execute_script();
 
     // 12. Decrement the parser's script nesting level by one.
     decrement_script_nesting_level();
@@ -2255,7 +2236,7 @@ Utf16String HTMLParser::serialize_html_fragment(DOM::Node const& node, Serializa
                 builder.append_ascii("<template shadowrootmode=\""sv);
 
                 // 2. If shadow's mode is "open", then append "open". Otherwise, append "closed".
-                builder.append(shadow->mode() == Web::DOM::ShadowRootMode::Open ? "open"sv : "closed"sv);
+                builder.append_ascii(shadow->mode() == Web::DOM::ShadowRootMode::Open ? "open"sv : "closed"sv);
 
                 // 3. Append """.
                 builder.append_ascii('"');
@@ -2924,6 +2905,7 @@ struct NodeAndOffset {
 
 static void insert_node_for_parser(DOM::Node& parent, DOM::Node& node, DOM::Node* child)
 {
+    HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { parent };
     if (!parent.is_tracked_by_style_engine()) {
         parent.parser_insert_before(node, child);
         return;
@@ -3013,6 +2995,7 @@ extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u
 
     auto data = text_node_data_from_span(ReadonlySpan<char> { reinterpret_cast<char const*>(data_ptr), data_len });
     if (auto* previous_text = as_if<DOM::Text>(insertion_location.previous_child())) {
+        HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { parent_node };
         (void)previous_text->append_data(data);
         return;
     }
@@ -3108,11 +3091,6 @@ extern "C" void ladybird_html_parser_handle_element_popped(size_t element)
     // up-to-date before cloning.
     if (auto* option_element = as_if<HTML::HTMLOptionElement>(node_from_html_parser_ffi(element)))
         MUST(option_element->maybe_clone_into_selectedcontent());
-}
-
-extern "C" void ladybird_html_parser_prepare_svg_script(void* parser, size_t element, size_t source_line_number)
-{
-    parser_from_html_parser_ffi(parser).prepare_svg_script_for_rust_parser(as<SVG::SVGScriptElement>(node_from_html_parser_ffi(element)), source_line_number);
 }
 
 extern "C" void ladybird_html_parser_set_script_source_line(void* parser, size_t element, size_t source_line_number)
@@ -3290,8 +3268,7 @@ extern "C" bool ladybird_html_parser_is_shadow_host(size_t node)
 extern "C" void ladybird_html_parser_set_script_text_from_parser(size_t element)
 {
     // Set script's script text value to its child text content.
-    auto& script = as<HTMLScriptElement>(node_from_html_parser_ffi(element));
-    script.set_string_text(script.child_text_content());
+    as<HTMLScriptElement>(node_from_html_parser_ffi(element)).set_script_text_from_parser();
 }
 
 }

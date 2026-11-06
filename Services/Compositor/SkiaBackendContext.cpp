@@ -5,6 +5,7 @@
  */
 
 #include <AK/Array.h>
+#include <AK/AnyOf.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/RefPtr.h>
@@ -40,9 +41,12 @@
 
 #ifdef USE_VULKAN
 #    include <Compositor/SkiaVulkanMemoryAllocator.h>
+#    include <gpu/MutableTextureState.h>
 #    include <gpu/ganesh/vk/GrVkDirectContext.h>
 #    include <gpu/vk/VulkanBackendContext.h>
 #    include <gpu/vk/VulkanExtensions.h>
+#    include <gpu/vk/VulkanMutableTextureState.h>
+#    include <string.h>
 
 template<>
 constexpr bool AllocatedWithSystemAllocator<skgpu::VulkanExtensions> = true;
@@ -94,9 +98,9 @@ static auto& main_thread_context()
 static SkiaBackendContext::SurfaceAccess surface_access_for(PaintingSurface const& surface)
 {
     // Keep both contracts: Photon can require external access, and upstream marks images shared with another process.
-    return surface.requires_external_access() || surface.wraps_shared_image()
-        ? SkiaBackendContext::SurfaceAccess::External
-        : SkiaBackendContext::SurfaceAccess::Internal;
+    if (surface.wraps_shared_image())
+        return SkiaBackendContext::SurfaceAccess::SharedImage;
+    return surface.requires_external_access() ? SkiaBackendContext::SurfaceAccess::External : SkiaBackendContext::SurfaceAccess::Internal;
 }
 
 #if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
@@ -122,12 +126,37 @@ static void invoke_graphite_flush_callback(skgpu::graphite::GpuFinishedContext c
 
 static SkSurfaces::BackendSurfaceAccess to_backend_surface_access(SkiaBackendContext::SurfaceAccess access)
 {
-    return access == SkiaBackendContext::SurfaceAccess::External
+    return access != SkiaBackendContext::SurfaceAccess::Internal
         ? SkSurfaces::BackendSurfaceAccess::kPresent
         : SkSurfaces::BackendSurfaceAccess::kNoAccess;
 }
 
-static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurface* surface, SkiaBackendContext::SurfaceAccess access, Function<void()>&& callback, GrBackendSemaphore* signal_semaphore = nullptr)
+#ifdef USE_VULKAN
+// The external queue family only reaches the same device and driver. Anything else takes the foreign one, which not
+// every device has.
+static u32 queue_family_receiving_shared_images(VulkanContext const& vulkan_context)
+{
+    auto has_foreign_queue_family = any_of(vulkan_context.enabled_device_extensions, [](char const* extension) {
+        return std::strcmp(extension, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) == 0;
+    });
+    return !vulkan_context.is_preferred_device && has_foreign_queue_family ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
+}
+#endif
+
+static void flush_surface(GrDirectContext& context, SkSurface* surface, SkiaBackendContext::SurfaceAccess access, GrFlushInfo const& flush_info, [[maybe_unused]] VulkanContext const* vulkan_context = nullptr)
+{
+#ifdef USE_VULKAN
+    if (access == SkiaBackendContext::SurfaceAccess::SharedImage && vulkan_context) {
+        // Some Vulkan drivers keep shared images compressed until ownership is released to another queue family.
+        auto const handed_over_state = skgpu::MutableTextureStates::MakeVulkan(VK_IMAGE_LAYOUT_GENERAL, queue_family_receiving_shared_images(*vulkan_context));
+        context.flush(surface, flush_info, &handed_over_state);
+        return;
+    }
+#endif
+    context.flush(surface, to_backend_surface_access(access), flush_info);
+}
+
+static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurface* surface, SkiaBackendContext::SurfaceAccess access, Function<void()>&& callback, GrBackendSemaphore* signal_semaphore = nullptr, VulkanContext const* vulkan_context = nullptr)
 {
     GrFlushInfo flush_info {};
     if (signal_semaphore) {
@@ -137,12 +166,12 @@ static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurfac
     flush_info.fFinishedProc = invoke_async_flush_callback;
     flush_info.fFinishedContext = new Function<void()>(move(callback));
     if (!photon_verbose()) {
-        context.flush(surface, to_backend_surface_access(access), flush_info);
+        flush_surface(context, surface, access, flush_info, vulkan_context);
         VERIFY(context.submit(GrSyncCpu::kNo));
         return;
     }
     auto const flush_started_at = MonotonicTime::now();
-    context.flush(surface, to_backend_surface_access(access), flush_info);
+    flush_surface(context, surface, access, flush_info, vulkan_context);
     auto const flush_duration = MonotonicTime::now() - flush_started_at;
     auto const submit_started_at = MonotonicTime::now();
     VERIFY(context.submit(GrSyncCpu::kNo));
@@ -163,6 +192,18 @@ void SkiaBackendContext::check_async_work_completion()
     if (auto* context = sk_context())
         context->checkAsyncWorkCompletion();
 }
+
+#ifdef USE_VULKAN
+// The external queue family only reaches the same device and driver. Anything else takes the foreign one, which not
+// every device has.
+static u32 queue_family_receiving_shared_images(VulkanContext const& vulkan_context)
+{
+    auto has_foreign_queue_family = any_of(vulkan_context.enabled_device_extensions, [](char const* extension) {
+        return strcmp(extension, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) == 0;
+    });
+    return !vulkan_context.is_preferred_device && has_foreign_queue_family ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
+}
+#endif
 
 void SkiaBackendContext::flush_and_submit(PaintingSurface& surface)
 {
@@ -464,13 +505,13 @@ public:
     void flush_and_submit_impl(SkSurface* surface, SurfaceAccess access) override
     {
         GrFlushInfo const flush_info {};
-        m_context->flush(surface, to_backend_surface_access(access), flush_info);
+        flush_surface(*m_context, surface, access, flush_info, &m_vulkan_context);
         m_context->submit(GrSyncCpu::kYes);
     }
 
     void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t) override
     {
-        flush_and_submit_async_to_context(*m_context, surface, access, move(callback));
+        flush_and_submit_async_to_context(*m_context, surface, access, move(callback), nullptr, &m_vulkan_context);
     }
 
     skgpu::VulkanExtensions const* extensions() const { return m_extensions.ptr(); }
@@ -567,7 +608,7 @@ public:
         }
         skgpu::graphite::SubmitInfo submit_info;
         submit_info.fSync = skgpu::graphite::SyncToCpu::kYes;
-        submit_info.fMarkBoundary = access == SurfaceAccess::External ? skgpu::graphite::MarkFrameBoundary::kYes : skgpu::graphite::MarkFrameBoundary::kNo;
+        submit_info.fMarkBoundary = access != SurfaceAccess::Internal ? skgpu::graphite::MarkFrameBoundary::kYes : skgpu::graphite::MarkFrameBoundary::kNo;
         if (!m_context->submit(submit_info))
             dbgln("Photon Graphite synchronous submit failed");
     }
@@ -593,7 +634,7 @@ public:
             dbgln("Photon Graphite recording insertion failed: {}", status.message().c_str());
         skgpu::graphite::SubmitInfo submit_info;
         submit_info.fSync = skgpu::graphite::SyncToCpu::kNo;
-        submit_info.fMarkBoundary = access == SurfaceAccess::External || presentation_signal_value != 0
+        submit_info.fMarkBoundary = access != SurfaceAccess::Internal || presentation_signal_value != 0
             ? skgpu::graphite::MarkFrameBoundary::kYes
             : skgpu::graphite::MarkFrameBoundary::kNo;
         if (!m_context->submit(submit_info))

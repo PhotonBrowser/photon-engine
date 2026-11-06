@@ -11,5 +11,5 @@ endpoint CompositorPresentationClient
     did_consume_input_event(Web::CompositorContextId context_id, u64 event_id) =|
     did_not_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id) =|
     did_detect_history_swipe_candidate(Web::CompositorContextId context_id, u64 gesture_id, bool back, float unconsumed_delta) =|
-    did_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id, bool async_scroll_performed_default_action) =|
+    did_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id, bool performed_default_action) =|
 }

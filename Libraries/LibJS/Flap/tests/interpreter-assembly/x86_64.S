@@ -23,6 +23,8 @@ asm_dispatch_table:
     .quad asm_handler_ConcatString
     .quad asm_handler_CopyObjectExcludingProperties
     .quad asm_handler_ImportCall
+    .quad asm_handler_GetClassFieldInitializerName
+    .quad asm_handler_GetClassProtoParent
     .quad asm_handler_NewClass
     .quad asm_handler_Jump
     .quad asm_handler_JumpIf
@@ -196,11 +198,7 @@ asm_dispatch_table:
     .quad asm_handler_ResolveThisBinding
     .quad asm_handler_GetPrivateById
     .quad asm_handler_PutPrivateById
-    .quad asm_handler_Mov2
-    .quad asm_handler_Mov3
     .quad asm_handler_MovSrcUndefined
-    .quad asm_handler_MovUndefined2
-    .quad asm_handler_MovUndefined3
     .quad asm_handler_AddLhsInt32
     .quad asm_handler_AddRhsInt32
     .quad asm_handler_SubRhsInt32
@@ -238,6 +236,8 @@ asm_dispatch_table:
     .quad asm_handler_JumpStrictlyInequalsLoopRhsInt32
     .quad asm_handler_JumpLooselyEqualsLoopRhsInt32
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32
+    .quad asm_handler_fallback
+    .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
@@ -570,6 +570,14 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_ImportCall_hot_end
     .quad asm_handler_ImportCall_cold
     .quad asm_handler_ImportCall_cold_end
+    .quad asm_handler_GetClassFieldInitializerName
+    .quad asm_handler_GetClassFieldInitializerName_hot_end
+    .quad asm_handler_GetClassFieldInitializerName_cold
+    .quad asm_handler_GetClassFieldInitializerName_cold_end
+    .quad asm_handler_GetClassProtoParent
+    .quad asm_handler_GetClassProtoParent_hot_end
+    .quad asm_handler_GetClassProtoParent_cold
+    .quad asm_handler_GetClassProtoParent_cold_end
     .quad asm_handler_NewClass
     .quad asm_handler_NewClass_hot_end
     .quad asm_handler_NewClass_cold
@@ -1262,26 +1270,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_PutPrivateById_hot_end
     .quad asm_handler_PutPrivateById_cold
     .quad asm_handler_PutPrivateById_cold_end
-    .quad asm_handler_Mov2
-    .quad asm_handler_Mov2_hot_end
-    .quad asm_handler_Mov2_cold
-    .quad asm_handler_Mov2_cold_end
-    .quad asm_handler_Mov3
-    .quad asm_handler_Mov3_hot_end
-    .quad asm_handler_Mov3_cold
-    .quad asm_handler_Mov3_cold_end
     .quad asm_handler_MovSrcUndefined
     .quad asm_handler_MovSrcUndefined_hot_end
     .quad asm_handler_MovSrcUndefined_cold
     .quad asm_handler_MovSrcUndefined_cold_end
-    .quad asm_handler_MovUndefined2
-    .quad asm_handler_MovUndefined2_hot_end
-    .quad asm_handler_MovUndefined2_cold
-    .quad asm_handler_MovUndefined2_cold_end
-    .quad asm_handler_MovUndefined3
-    .quad asm_handler_MovUndefined3_hot_end
-    .quad asm_handler_MovUndefined3_cold
-    .quad asm_handler_MovUndefined3_cold_end
     .quad asm_handler_AddLhsInt32
     .quad asm_handler_AddLhsInt32_hot_end
     .quad asm_handler_AddLhsInt32_cold
@@ -1430,6 +1422,14 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32_hot_end
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32_cold
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32_cold_end
+    .quad asm_handler_fallback
+    .quad asm_handler_fallback_hot_end
+    .quad asm_handler_fallback_cold
+    .quad asm_handler_fallback_cold_end
+    .quad asm_handler_fallback
+    .quad asm_handler_fallback_hot_end
+    .quad asm_handler_fallback_cold
+    .quad asm_handler_fallback_cold_end
     .quad asm_handler_fallback
     .quad asm_handler_fallback_hot_end
     .quad asm_handler_fallback_cold
@@ -6761,40 +6761,6 @@ asm_handler_ResolveThisBinding:
 asm_handler_ResolveThisBinding_hot_end:
 
 .p2align 6
-asm_handler_Mov2:
-    mov eax, DWORD PTR [r14 + r13 + 4]
-    mov ecx, DWORD PTR [r14 + r13 + 8]
-    mov rcx, QWORD PTR [rbx + rcx * 8]
-    mov QWORD PTR [rbx + rax * 8], rcx
-    mov eax, DWORD PTR [r14 + r13 + 12]
-    mov ecx, DWORD PTR [r14 + r13 + 16]
-    mov rcx, QWORD PTR [rbx + rcx * 8]
-    mov QWORD PTR [rbx + rax * 8], rcx
-    add r13d, 24
-    movzx eax, BYTE PTR [r14 + r13]
-    jmp [r12 + rax * 8]
-asm_handler_Mov2_hot_end:
-
-.p2align 6
-asm_handler_Mov3:
-    mov eax, DWORD PTR [r14 + r13 + 4]
-    mov ecx, DWORD PTR [r14 + r13 + 8]
-    mov rcx, QWORD PTR [rbx + rcx * 8]
-    mov QWORD PTR [rbx + rax * 8], rcx
-    mov eax, DWORD PTR [r14 + r13 + 12]
-    mov ecx, DWORD PTR [r14 + r13 + 16]
-    mov rcx, QWORD PTR [rbx + rcx * 8]
-    mov QWORD PTR [rbx + rax * 8], rcx
-    mov eax, DWORD PTR [r14 + r13 + 20]
-    mov ecx, DWORD PTR [r14 + r13 + 24]
-    mov rcx, QWORD PTR [rbx + rcx * 8]
-    mov QWORD PTR [rbx + rax * 8], rcx
-    add r13d, 32
-    movzx eax, BYTE PTR [r14 + r13]
-    jmp [r12 + rax * 8]
-asm_handler_Mov3_hot_end:
-
-.p2align 6
 asm_handler_MovSrcUndefined:
     movabs r11, 9222809086901354496
     mov eax, DWORD PTR [r14 + r13 + 4]
@@ -6803,35 +6769,6 @@ asm_handler_MovSrcUndefined:
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
 asm_handler_MovSrcUndefined_hot_end:
-
-.p2align 6
-asm_handler_MovUndefined2:
-    movabs r11, 9222809086901354496
-    mov eax, DWORD PTR [r14 + r13 + 4]
-    mov QWORD PTR [rbx + rax * 8], r11
-    movabs r11, 9222809086901354496
-    mov eax, DWORD PTR [r14 + r13 + 8]
-    mov QWORD PTR [rbx + rax * 8], r11
-    add r13d, 16
-    movzx eax, BYTE PTR [r14 + r13]
-    jmp [r12 + rax * 8]
-asm_handler_MovUndefined2_hot_end:
-
-.p2align 6
-asm_handler_MovUndefined3:
-    movabs r11, 9222809086901354496
-    mov eax, DWORD PTR [r14 + r13 + 4]
-    mov QWORD PTR [rbx + rax * 8], r11
-    movabs r11, 9222809086901354496
-    mov eax, DWORD PTR [r14 + r13 + 8]
-    mov QWORD PTR [rbx + rax * 8], r11
-    movabs r11, 9222809086901354496
-    mov eax, DWORD PTR [r14 + r13 + 12]
-    mov QWORD PTR [rbx + rax * 8], r11
-    add r13d, 16
-    movzx eax, BYTE PTR [r14 + r13]
-    jmp [r12 + rax * 8]
-asm_handler_MovUndefined3_hot_end:
 
 .p2align 6
 asm_handler_AddLhsInt32:
@@ -9074,13 +9011,95 @@ asm_handler_ImportCall_cold:
 asm_handler_ImportCall_cold_end:
 
 .p2align 4
+asm_handler_GetClassFieldInitializerName:
+    mov DWORD PTR [rbx + -64], r13d
+    lea r11, [r14 + r13]
+    mov rdi, QWORD PTR [rbp - 48]
+    mov esi, r13d
+    lea rdx, [r14 + r13]
+    call CSYM(asm_slow_path_get_class_field_initializer_name)
+    test rax, rax
+    js .Lasm_GetClassFieldInitializerName.scalar_result_done_0
+    bt rax, 32
+    jnc .Lasm_GetClassFieldInitializerName.scalar_result_done_0
+    lea rcx, [r14 + r13]
+    mov r10d, DWORD PTR [rcx + 4]
+    mov QWORD PTR [rbx + r10 * 8], rdx
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_GetClassFieldInitializerName.scalar_result_done_0:
+    test rax, rax
+    js .Lexit
+    bt rax, 32
+    jnc .Lasm_GetClassFieldInitializerName.slow_path_transfer_1
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_GetClassFieldInitializerName.slow_path_transfer_1:
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rbx, QWORD PTR [rcx]
+    add rbx, 128
+    mov rcx, QWORD PTR [rbx + -40]
+    mov r14, QWORD PTR [rcx + 40]
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+asm_handler_GetClassFieldInitializerName_hot_end:
+asm_handler_GetClassFieldInitializerName_cold:
+asm_handler_GetClassFieldInitializerName_cold_end:
+
+.p2align 4
+asm_handler_GetClassProtoParent:
+    mov DWORD PTR [rbx + -64], r13d
+    lea r11, [r14 + r13]
+    mov r10d, DWORD PTR [r11 + 8]
+    mov rax, QWORD PTR [rbx + r10 * 8]
+.Lasm_GetClassProtoParent.scalar_value_ready_0:
+    mov rcx, rax
+    mov rdi, QWORD PTR [rbp - 48]
+    mov esi, r13d
+    lea rdx, [r14 + r13]
+    call CSYM(asm_slow_path_get_class_proto_parent)
+    test rax, rax
+    js .Lasm_GetClassProtoParent.scalar_result_done_1
+    bt rax, 32
+    jnc .Lasm_GetClassProtoParent.scalar_result_done_1
+    lea rcx, [r14 + r13]
+    mov r10d, DWORD PTR [rcx + 4]
+    mov QWORD PTR [rbx + r10 * 8], rdx
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_GetClassProtoParent.scalar_result_done_1:
+    test rax, rax
+    js .Lexit
+    bt rax, 32
+    jnc .Lasm_GetClassProtoParent.slow_path_transfer_2
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_GetClassProtoParent.slow_path_transfer_2:
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rbx, QWORD PTR [rcx]
+    add rbx, 128
+    mov rcx, QWORD PTR [rbx + -40]
+    mov r14, QWORD PTR [rcx + 40]
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+asm_handler_GetClassProtoParent_hot_end:
+asm_handler_GetClassProtoParent_cold:
+asm_handler_GetClassProtoParent_cold_end:
+
+.p2align 4
 asm_handler_NewClass:
     mov DWORD PTR [rbx + -64], r13d
     lea rcx, [r14 + r13]
     mov r11, rsp
-    mov r10d, DWORD PTR [rcx + 28]
+    mov r10d, DWORD PTR [rcx + 36]
     shl r10, 3
-    add r10, 55
+    add r10, 71
     and r10, -16
     mov rax, rsp
     sub rax, r10
@@ -9112,55 +9131,69 @@ asm_handler_NewClass:
     mov rax, QWORD PTR [rbx + r10 * 8]
 .Lasm_NewClass.value_ready_4:
     mov QWORD PTR [rsp + 24], rax
+    movabs rax, 9221964661971222528
     mov r10d, DWORD PTR [rcx + 16]
+    cmp r10d, -1
+    je .Lasm_NewClass.value_ready_5
     mov rax, QWORD PTR [rbx + r10 * 8]
 .Lasm_NewClass.value_ready_5:
     mov QWORD PTR [rsp + 32], rax
+    mov r10d, DWORD PTR [rcx + 20]
+    mov rax, QWORD PTR [rbx + r10 * 8]
+.Lasm_NewClass.value_ready_6:
+    mov QWORD PTR [rsp + 40], rax
+    movabs rax, 9221964661971222528
+    mov r10d, DWORD PTR [rcx + 32]
+    cmp r10d, -1
+    je .Lasm_NewClass.value_ready_7
+    mov rax, QWORD PTR [rbx + r10 * 8]
+.Lasm_NewClass.value_ready_7:
+    mov QWORD PTR [rsp + 48], rax
     mov r11d, 0
-    mov r10d, DWORD PTR [rcx + 28]
-.Lasm_NewClass.array_value_next_6:
+    mov r10d, DWORD PTR [rcx + 36]
+.Lasm_NewClass.array_value_next_8:
     cmp r11, r10
-    jae .Lasm_NewClass.array_values_end_8
-    mov edx, DWORD PTR [rcx + r11 * 4 + 32]
+    jae .Lasm_NewClass.array_values_end_10
+    mov edx, DWORD PTR [rcx + r11 * 4 + 40]
     movabs rax, 9221964661971222528
     cmp edx, -1
-    je .Lasm_NewClass.array_value_ready_7
+    je .Lasm_NewClass.array_value_ready_9
     mov rax, QWORD PTR [rbx + rdx * 8]
-.Lasm_NewClass.array_value_ready_7:
-    mov QWORD PTR [rsp + r11 * 8 + 40], rax
+.Lasm_NewClass.array_value_ready_9:
+    mov QWORD PTR [rsp + r11 * 8 + 56], rax
     add r11, 1
-    jmp .Lasm_NewClass.array_value_next_6
-.Lasm_NewClass.array_values_end_8:
+    jmp .Lasm_NewClass.array_value_next_8
+.Lasm_NewClass.array_values_end_10:
     mov rdi, QWORD PTR [rbp - 48]
     mov esi, r13d
     lea rdx, [r14 + r13]
     lea rcx, [rsp + 16]
     call CSYM(asm_slow_path_new_class)
     test rax, rax
-    js .Lasm_NewClass.values_exceptional_outputs_10
+    js .Lasm_NewClass.values_exceptional_outputs_12
     bt rax, 32
-    jnc .Lasm_NewClass.values_exceptional_outputs_10
+    jnc .Lasm_NewClass.values_exceptional_outputs_12
     lea rcx, [r14 + r13]
     mov r10d, DWORD PTR [rcx + 8]
     mov r11, QWORD PTR [rsp + 16]
     mov QWORD PTR [rbx + r10 * 8], r11
-.Lasm_NewClass.skip_output_value_11:
+.Lasm_NewClass.skip_output_value_13:
     mov rsp, QWORD PTR [rsp]
     mov r13d, eax
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_NewClass.values_exceptional_outputs_10:
-.Lasm_NewClass.values_restore_stack_9:
+.Lasm_NewClass.values_exceptional_outputs_12:
+.Lasm_NewClass.values_restore_stack_11:
     mov rsp, QWORD PTR [rsp]
 .Lasm_NewClass.values_call_done_0:
     test rax, rax
     js .Lexit
     bt rax, 32
-    jnc .Lasm_NewClass.slow_path_transfer_12
+    jnc .Lasm_NewClass.slow_path_transfer_14
     mov r13d, eax
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_NewClass.slow_path_transfer_12:
+.Lasm_NewClass.slow_path_transfer_14:
     mov rcx, QWORD PTR [rbp - 48]
     mov rbx, QWORD PTR [rcx]
     add rbx, 128
@@ -17633,16 +17666,8 @@ asm_handler_PutPrivateById_hot_end:
 asm_handler_PutPrivateById_cold:
 asm_handler_PutPrivateById_cold_end:
 
-asm_handler_Mov2_cold:
-asm_handler_Mov2_cold_end:
-asm_handler_Mov3_cold:
-asm_handler_Mov3_cold_end:
 asm_handler_MovSrcUndefined_cold:
 asm_handler_MovSrcUndefined_cold_end:
-asm_handler_MovUndefined2_cold:
-asm_handler_MovUndefined2_cold_end:
-asm_handler_MovUndefined3_cold:
-asm_handler_MovUndefined3_cold_end:
 asm_handler_AddLhsInt32_cold:
 # Cold paths for AddLhsInt32
 .Lasm_AddLhsInt32.ssa_block_6:

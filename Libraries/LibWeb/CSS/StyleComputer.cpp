@@ -32,13 +32,9 @@
 #include <LibWeb/Animations/ScrollTimeline.h>
 #include <LibWeb/Animations/ViewTimeline.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
-#include <LibWeb/CSS/AnimationEvent.h>
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSImportRule.h>
-#include <LibWeb/CSS/CSSLayerBlockRule.h>
-#include <LibWeb/CSS/CSSLayerStatementRule.h>
 #include <LibWeb/CSS/CSSNestedDeclarations.h>
-#include <LibWeb/CSS/CSSScopeRule.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSTransition.h>
@@ -416,8 +412,8 @@ void StyleComputer::commit_transition_stabilization_epoch()
         VERIFY(state.element);
         auto& element = *state.element;
         auto remove_committed_transition = [&] {
-            if (element.property_transition(state.pseudo_element, state.property_id) == state.committed_transition)
-                element.remove_transition(state.pseudo_element, state.property_id);
+            if (element.property_transition(state.pseudo_element, state.property) == state.committed_transition)
+                element.remove_transition(state.pseudo_element, state.property);
         };
         auto cancel_and_remove_committed_transition = [&] {
             VERIFY(state.committed_transition);
@@ -490,26 +486,6 @@ struct ResolvedScope {
     GC::Ptr<DOM::Element const> root;
     size_t proximity { NumericLimits<size_t>::max() };
 };
-
-void StyleComputer::for_each_property_expanding_shorthands(PropertyID property_id, StyleValue const& value, Function<void(PropertyID, StyleValue const&)> const& set_longhand_property)
-{
-    // The expansion recursion and pending-substitution values live in the Rust style value graph.
-    // This wrapper creates C++ facades only for the returned longhand roots.
-    auto expansion = ComputedValuesFFI::rust_expand_property_shorthands(
-        to_underlying(property_id), value.rust_style_value_data());
-    ScopeGuard destroy_expansion = [&] {
-        ComputedValuesFFI::rust_shorthand_expansion_destroy(expansion.storage);
-    };
-    HashMap<void const*, NonnullRefPtr<StyleValue const>> wrapper_cache;
-    for (size_t i = 0; i < expansion.count; ++i) {
-        auto const& property = expansion.properties[i];
-        auto& expanded_value = wrapper_cache.ensure(property.data, [&] {
-            return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
-                static_cast<StyleValueFFI::StyleValueData const*>(property.data)));
-        });
-        set_longhand_property(static_cast<PropertyID>(property.property_id), *expanded_value);
-    }
-}
 
 static RefPtr<CustomPropertyData const> inheritable_custom_property_data(Layout::BegunRead const& read, DOM::AbstractElement abstract_element)
 {
@@ -1193,11 +1169,25 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
     auto style_change_event_time = current_time->value;
 
     Vector<StyleValueFFI::FfiExistingTransition> existing_transitions;
+    Vector<NonnullRefPtr<StyleValue const>> custom_current_values;
+    // A running transition of a custom property holds it at what the overlay of the target's environment answers. One
+    // not sampled yet holds it at its start value.
+    auto custom_current_value = [&](PropertyNameAndID const& property, CSSTransition const& transition) -> StyleValueFFI::StyleValueData const* {
+        auto value = transition.transition_start_value();
+        if (auto data = abstract_element.custom_property_data(); data && abstract_element.custom_property_data_is_animation_overlay()) {
+            if (auto animated = data->get(property.name()); animated.has_value())
+                value = *animated->value;
+        }
+        custom_current_values.append(value);
+        return value->rust_style_value_data();
+    };
     if (auto const* transitions = element.existing_transitions(pseudo_element)) {
-        for (auto const& [property_id, transition] : *transitions) {
+        for (auto const& [property, transition] : *transitions) {
             bool running = !transition->is_finished() && !transition->is_idle();
             existing_transitions.append({
-                .property_id = to_underlying(property_id),
+                .property_id = to_underlying(property.id()),
+                .custom_name = property.is_custom_property() ? property.name().raw_identity() : 0,
+                .custom_current_value = property.is_custom_property() && running ? custom_current_value(property, transition) : nullptr,
                 .running = running,
                 .end_value = transition->transition_end_value()->rust_style_value_data(),
                 .reversing_adjusted_start_value = transition->reversing_adjusted_start_value()->rust_style_value_data(),
@@ -1219,22 +1209,36 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
         state.proposed_transition = nullptr;
         state.action = action;
     };
-    auto ensure_state = [&](PropertyID property_id) -> ProvisionalTransitionState& {
-        auto index = m_provisional_transition_state_indices.ensure((target_key << 16) | to_underlying(property_id), [&] {
+    auto ensure_state = [&](PropertyNameAndID const& property) -> ProvisionalTransitionState& {
+        auto create_state = [&] {
             VERIFY(document().is_in_style_stabilization_epoch());
             m_provisional_transition_state_indices_by_target.ensure(target_key).append(m_provisional_transition_states.size());
             m_provisional_transition_states.append({
                 .element = element,
                 .pseudo_element = pseudo_element,
-                .property_id = property_id,
-                .committed_transition = element.property_transition(pseudo_element, property_id),
+                .property = property,
+                .committed_transition = element.property_transition(pseudo_element, property),
                 .proposed_transition = nullptr,
                 .action = StyleValueFFI::FfiTransitionActionKind::None,
                 .has_decision = false,
             });
             return m_provisional_transition_states.size() - 1;
-        });
+        };
+        if (property.is_custom_property()) {
+            auto indices = m_provisional_transition_state_indices_by_target.get(target_key);
+            for (auto index : indices.has_value() ? indices->span() : ReadonlySpan<size_t> {}) {
+                if (m_provisional_transition_states[index].property == property)
+                    return m_provisional_transition_states[index];
+            }
+            return m_provisional_transition_states[create_state()];
+        }
+        auto index = m_provisional_transition_state_indices.ensure((target_key << 16) | to_underlying(property.id()), create_state);
         return m_provisional_transition_states[index];
+    };
+    auto property_of_action = [](StyleValueFFI::FfiTransitionAction const& action) {
+        if (action.custom_name != 0)
+            return PropertyNameAndID::from_name(Utf16FlyString::from_raw(action.custom_name)).release_value();
+        return PropertyNameAndID::from_id(static_cast<PropertyID>(action.property_id));
     };
     auto adopt = [](StyleValueFFI::StyleValueData const* value) {
         return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(value));
@@ -1244,8 +1248,8 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
     GC::RootHashTable<Animations::KeyframeEffect*> replaced_transition_effects;
     auto on_actions = [&](ReadonlySpan<StyleValueFFI::FfiTransitionAction> actions) {
         for (auto const& action : actions) {
-            auto property_id = static_cast<PropertyID>(action.property_id);
-            auto& state = ensure_state(property_id);
+            auto property = property_of_action(action);
+            auto& state = ensure_state(property);
             decide(state, action.kind);
             if (action.kind != StyleValueFFI::FfiTransitionActionKind::None && action.kind != StyleValueFFI::FfiTransitionActionKind::Start) {
                 VERIFY(state.committed_transition);
@@ -1254,7 +1258,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
             }
             if (!action.start_value)
                 continue;
-            auto transition = CSSTransition::start_a_provisional_transition(abstract_element, property_id, document().transition_generation(),
+            auto transition = CSSTransition::start_a_provisional_transition(abstract_element, property, document().transition_generation(),
                 action.delay, style_change_event_time, style_change_event_time + action.active_duration,
                 adopt(action.start_value), adopt(action.end_value), adopt(action.reversing_adjusted_start_value),
                 action.reversing_shortening_factor, EasingFunction::from_style_value(adopt(action.timing_function)));
@@ -1265,7 +1269,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
         auto indices = m_provisional_transition_state_indices_by_target.get(target_key);
         for (auto index : indices.has_value() ? indices->span() : ReadonlySpan<size_t> {}) {
             auto& state = m_provisional_transition_states[index];
-            if (!any_of(actions, [&](auto const& action) { return action.property_id == to_underlying(state.property_id); }))
+            if (!any_of(actions, [&](auto const& action) { return property_of_action(action) == state.property; }))
                 decide(state, StyleValueFFI::FfiTransitionActionKind::None);
         }
     };
@@ -1807,9 +1811,9 @@ StyleRecordID StyleComputer::install_computed_style_inputs(Layout::BegunRead con
     return const_cast<StyleComputer&>(*this).style_engine().install_host_style_record(read, payloads, payload_source.inherited_set_values(), payload_source.reset_bits(), custom_property_environment ? custom_property_environment->identity() : 0, counter_style_environment_identity, base.record().get(), custom_property_environment ? custom_property_environment->rust_store() : nullptr);
 }
 
-RefPtr<ComputedValues const> StyleComputer::engine_transient_pseudo_element_style(Layout::BegunRead const& read, DOM::Element const& element, StyleEngine::DemandedPseudoElement pseudo_element)
+RefPtr<ComputedValues const> StyleComputer::engine_transient_pseudo_element_style(Layout::BegunRead const& read, DOM::Element const& element, StyleEngine::DemandedPseudoElement pseudo_element, StyleAtomID highlight_name)
 {
-    auto answer = StyleEngineFFI::style_engine_answer_pseudo_element_record_demand(m_style_engine.host(), &read, element.style_node_id().value(), StyleEngine::PseudoElementRecordDemand::ReadOnly, pseudo_element);
+    auto answer = StyleEngineFFI::style_engine_answer_pseudo_element_record_demand(m_style_engine.host(), &read, element.style_node_id().value(), StyleEngine::PseudoElementRecordDemand::ReadOnly, pseudo_element, highlight_name.value());
     InstalledStyle const style { answer.record.host_record };
     if (!style)
         return {};

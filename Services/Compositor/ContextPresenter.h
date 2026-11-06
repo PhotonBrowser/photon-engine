@@ -164,6 +164,7 @@ private:
         HashMap<Compositing::VideoSinkResourceId, Optional<u64>> video_frame_ids;
         Optional<Compositing::SpatialNodeIndex> scroll_blit_eligibility_node;
         bool scroll_blit_is_safe { false };
+        HashMap<u64, u64> image_frame_pixel_generations;
     };
 
     struct ScrollBlit {
@@ -181,7 +182,7 @@ private:
     Gfx::IntSize raster_size() const;
     Gfx::IntRect raster_damage_rect(Gfx::IntRect) const;
     Gfx::IntRect frame_damage_for(PendingFrame const&, FrameContent const&, Optional<ScrollBlit>* = nullptr, PreparedFrame::ScrollBlitStatus* = nullptr);
-    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const&, Optional<ScrollBlit>*, PreparedFrame::ScrollBlitStatus*);
+    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const&, Gfx::IntRect forced_damage_rect, Optional<ScrollBlit>*, PreparedFrame::ScrollBlitStatus*);
     Optional<ScrollBlit> scroll_blit_for(Gfx::IntSize viewport_size, FrameContent const&, PreparedFrame::ScrollBlitStatus&);
     void shift_surface_for_scroll(Gfx::PaintingSurface& destination, Gfx::PaintingSurface& source, Gfx::FloatPoint translation);
     void reset_scroll_blit_base();

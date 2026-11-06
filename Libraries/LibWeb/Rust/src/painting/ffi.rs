@@ -632,6 +632,7 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
         role: TransformDataRole::CssTransform,
         synthetic_plane: false,
         establishes_sorting_context: false,
+        bounds: libgfx_rust::FloatRect::default(),
     });
     // Force-dark never reaches here: an image is darkened by classifying the image itself — not by inverting the
     // fills that raster it.
@@ -1270,9 +1271,17 @@ pub unsafe extern "C" fn compositor_animation_effect_build(
 ) -> crate::painting::host::FfiCompositorAnimationBuildOutcome {
     use crate::painting::visual_animation_builder::{Host, Request};
     // SAFETY: Guaranteed by the caller.
-    let request = unsafe { Request::new(&*request) };
+    let mut request = unsafe { Request::new(&*request) };
     let host = Host::new(host);
     let layout_node = request.layout_node();
+    if request.target_kind() == crate::painting::host::FfiVisualAnimationTargetKind::Transform {
+        let additional_element_transform = read_arena(document_host, node_read(), layout_node, |arena, layout_node| {
+            crate::painting::paintable_geometry::committed_svg_additional_element_transform(arena, layout_node)
+        });
+        if let Some(transform) = additional_element_transform {
+            request.set_additional_translation(transform.e, transform.f);
+        }
+    }
     state.build(&request, &host, |kind| {
         read_arena(
             document_host,

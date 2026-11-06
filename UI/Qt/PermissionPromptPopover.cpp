@@ -16,6 +16,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QShowEvent>
+#include <QTimer>
 #include <QVBoxLayout>
 
 namespace Ladybird {
@@ -44,20 +45,6 @@ static QString feature_text(Web::Permissions::PermissionName name)
         return QStringLiteral("use your microphone");
     case Web::Permissions::PermissionName::Notifications:
         return QStringLiteral("send you notifications");
-    }
-    VERIFY_NOT_REACHED();
-}
-
-// Shown while the system hasn't yet been asked whether Ladybird may use the feature: it asks right after this prompt.
-static QString hint_text(Web::Permissions::PermissionName name)
-{
-    switch (name) {
-    case Web::Permissions::PermissionName::Geolocation:
-        return QStringLiteral("macOS will then ask you to let Ladybird use your location.");
-    case Web::Permissions::PermissionName::Microphone:
-        return QStringLiteral("macOS will then ask you to let Ladybird use your microphone.");
-    case Web::Permissions::PermissionName::Notifications:
-        return QStringLiteral("macOS will then ask you to let Ladybird show notifications.");
     }
     VERIFY_NOT_REACHED();
 }
@@ -103,18 +90,30 @@ PermissionPromptPopover::PermissionPromptPopover(QWidget* parent, WebView::Permi
     m_icon_tile->setFixedSize(32, 32);
     m_icon_tile->setAlignment(Qt::AlignCenter);
     header->addWidget(m_icon_tile, 0, Qt::AlignTop);
-    auto* title = new QLabel(QStringLiteral("%1 wants to %2").arg(requester_text(request), feature_text(request.name)), &card());
+    auto is_notice = request.kind == WebView::PermissionPromptKind::SystemDeniedNotice;
+    auto title_text = is_notice
+        ? QStringLiteral("Ladybird can't %1").arg(feature_text(request.name))
+        : QStringLiteral("%1 wants to %2").arg(requester_text(request), feature_text(request.name));
+    auto* title = new QLabel(title_text, &card());
     title->setObjectName("LadybirdPermissionPromptTitle");
     title->setTextFormat(Qt::PlainText);
     title->setWordWrap(true);
     header->addWidget(title, 1);
     layout->addLayout(header);
 
-    auto* hint = new QLabel(hint_text(request.name), &card());
+    // Shown while the system hasn't yet been asked whether Ladybird may use the feature: it asks right after this prompt.
+    auto* hint = new QLabel(QStringLiteral("Your system will then ask you to let Ladybird %1.").arg(feature_text(request.name)), &card());
     hint->setObjectName("LadybirdPermissionPromptHint");
     hint->setWordWrap(true);
     hint->setVisible(request.show_os_hint);
     layout->addWidget(hint);
+
+    if (is_notice) {
+        auto* body = new QLabel(QStringLiteral("Your system's privacy settings don't let Ladybird %1.").arg(feature_text(request.name)), &card());
+        body->setObjectName("LadybirdPermissionPromptBody");
+        body->setWordWrap(true);
+        layout->addWidget(body);
+    }
 
     layout->addSpacing(8);
     auto add_button = [&](char const* name, QString const& text, Web::Permissions::PromptOutcome outcome) {
@@ -125,12 +124,23 @@ PermissionPromptPopover::PermissionPromptPopover(QWidget* parent, WebView::Permi
         button->setAttribute(Qt::WA_LayoutUsesWidgetRect);
         QObject::connect(button, &QPushButton::clicked, this, [this, outcome] { finish(outcome); });
         layout->addWidget(button);
+        return button;
     };
-    auto one_time_grant = offers_one_time_grant(request.name);
-    add_button("LadybirdPermissionPromptAllowAlways", one_time_grant ? QStringLiteral("Allow while visiting the site") : QStringLiteral("Allow"), Web::Permissions::PromptOutcome::AllowAlways);
-    if (one_time_grant)
-        add_button("LadybirdPermissionPromptAllowOnce", QStringLiteral("Allow this time"), Web::Permissions::PromptOutcome::AllowOnce);
-    add_button("LadybirdPermissionPromptBlock", QStringLiteral("Never allow"), Web::Permissions::PromptOutcome::Block);
+    if (is_notice) {
+        // The notice decides nothing for the site, so either button only closes it.
+        auto* open_settings = add_button("LadybirdPermissionPromptOpenSettings", QStringLiteral("Open Settings"), Web::Permissions::PromptOutcome::Dismissed);
+        QObject::connect(open_settings, &QPushButton::clicked, this, [this] {
+            if (on_open_settings)
+                on_open_settings();
+        });
+        add_button("LadybirdPermissionPromptNotNow", QStringLiteral("Not now"), Web::Permissions::PromptOutcome::Dismissed);
+    } else {
+        auto one_time_grant = offers_one_time_grant(request.name);
+        add_button("LadybirdPermissionPromptAllowAlways", one_time_grant ? QStringLiteral("Allow while visiting the site") : QStringLiteral("Allow"), Web::Permissions::PromptOutcome::AllowAlways);
+        if (one_time_grant)
+            add_button("LadybirdPermissionPromptAllowOnce", QStringLiteral("Allow this time"), Web::Permissions::PromptOutcome::AllowOnce);
+        add_button("LadybirdPermissionPromptBlock", QStringLiteral("Never allow"), Web::Permissions::PromptOutcome::Block);
+    }
 
     update_icon();
     adjustSize();
@@ -192,9 +202,14 @@ void PermissionPromptPopover::hideEvent(QHideEvent* event)
 {
     Popover::hideEvent(event);
 
-    // A popover hides itself when the user clicks outside it, which dismisses the prompt.
-    if (!m_suspended)
-        finish(Web::Permissions::PromptOutcome::Dismissed);
+    // A popover hides itself when the user clicks outside it, which dismisses the prompt. Qt also closes a popup as its
+    // window goes inactive, before it says so, so the prompt waits a turn to see whether it was suspended instead.
+    if (m_suspended || m_finished)
+        return;
+    QTimer::singleShot(0, this, [this] {
+        if (!m_suspended && !isVisible())
+            finish(Web::Permissions::PromptOutcome::Dismissed);
+    });
 }
 
 void PermissionPromptPopover::finish(Web::Permissions::PromptOutcome outcome)

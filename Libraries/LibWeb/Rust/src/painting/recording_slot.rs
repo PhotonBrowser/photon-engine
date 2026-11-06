@@ -449,24 +449,25 @@ pub(crate) fn record_frame(
         published_inputs,
     } = recorder;
     let source = PaintSource::new(&frame, absolute_rects);
-    let recording = crate::painting::record::traversal::record_display_list(
-        &source,
-        scratch,
-        paint_order_tree,
-        viewport,
-        &inputs,
-        published_recording.clone(),
-        published_hit_test_items.clone(),
-        trace_recordings,
-    );
+    let (recording, publishes_recording) = paint_order_tree.with_access(inputs.publishes_recording, |tree| {
+        crate::painting::record::traversal::record_display_list(
+            &source,
+            scratch,
+            tree,
+            viewport,
+            &inputs,
+            published_recording.clone(),
+            published_hit_test_items.clone(),
+            trace_recordings,
+        )
+    });
     let trace = trace_recordings.then_some(PendingRecordingTrace {
         viewport,
         should_paint_overlay: inputs.should_paint_overlay,
     });
     let svg_paint_resources = frame.svg_paint_resources().clone();
     drop(frame);
-    let publishes_recording = inputs.publishes_recording;
-    if publishes_recording {
+    if inputs.publishes_recording {
         *published_inputs = Some(inputs);
     }
     (
