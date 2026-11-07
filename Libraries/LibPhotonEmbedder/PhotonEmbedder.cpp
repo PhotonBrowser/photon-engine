@@ -5,7 +5,6 @@
 
 #include "PhotonEmbedderInternal.h"
 #include <LibCore/EventLoop.h>
-#include <LibCore/MachPort.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Palette.h>
@@ -32,6 +31,7 @@
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/StorageJar.h>
 #if defined(AK_OS_MACOS)
+#    include <LibCore/MachPort.h>
 #    include <LibWebView/ProcessReaper.h>
 #endif
 #include <LibWebView/TabPerformanceMonitor.h>
@@ -69,11 +69,13 @@ static bool external_image_lease_trace_enabled()
 
 static constexpr int hidden_page_gc_delay_ms = 10'000;
 
+#if defined(AK_OS_MACOS)
 static uint64_t next_native_backing_id()
 {
     static std::atomic<uint64_t> next_id { 1 };
     return next_id.fetch_add(1, std::memory_order_relaxed);
 }
+#endif
 
 class PhotonHeadlessWebView;
 
@@ -224,8 +226,10 @@ private:
         // Viewport scrollbars are painted into the page's shared GPU surface.
         content.paint_viewport_scrollbars = PaintViewportScrollbars::Yes;
 
-        // Deprecated diagnostic fallback. Normal Photon painting uses Vulkan;
-        // remove this option once the GPU path is reliable on supported devices.
+#if defined(AK_OS_LINUX)
+        if (!std::getenv("PHOTON_ENABLE_GPU_PAINTING"))
+            content.force_cpu_painting = ForceCPUPainting::Yes;
+#endif
         if (std::getenv("PHOTON_FORCE_CPU_PAINTING"))
             content.force_cpu_painting = ForceCPUPainting::Yes;
     }
@@ -260,10 +264,14 @@ public:
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
         auto view = adopt_own(*new PhotonHeadlessWebView(theme.release_value(), { physical_width, physical_height }, dpr, move(callbacks), is_private));
+#if defined(AK_OS_MACOS)
         if (!view->m_callbacks.native_metal_presentation
             || !view->m_callbacks.native_backing_registered
             || !view->m_callbacks.native_frame_ready)
             Application::the().notify_compositor_gpu_presentation_unavailable();
+#else
+        Application::the().notify_compositor_gpu_presentation_unavailable();
+#endif
         view->initialize_tab(Web::HTML::VisibilityState::Visible);
         // initialize_tab() establishes the WebContent client and can
         // initialize its viewport from the platform screen before the
@@ -577,6 +585,7 @@ public:
 
     void clear_callbacks() { m_callbacks = {}; }
 
+#if defined(AK_OS_MACOS)
     void set_native_metal_presentation(bool enabled)
     {
         m_native_metal_presentation = enabled;
@@ -585,6 +594,7 @@ public:
         else
             Application::the().notify_compositor_gpu_presentation_unavailable();
     }
+#endif
 
     void set_performance_monitor_enabled(bool enabled)
     {
@@ -1256,8 +1266,8 @@ private:
                 });
                 return;
             }
-#endif
         cpu_fallback:
+#endif
             if (!front.shared_image_buffer || !m_callbacks.frame_ready) {
                 dbgln("Photon embedder: paint callback without a shared image buffer");
                 return;

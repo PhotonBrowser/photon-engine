@@ -197,8 +197,6 @@ impl ComputedContainIntrinsicSize {
 pub struct BoxValues {
     pub display: crate::css::display::FfiDisplay,
     pub display_before_box_type_transformation: crate::css::display::FfiDisplay,
-    pub overscroll_behavior_x: u8,
-    pub overscroll_behavior_y: u8,
     pub field_sizing: u8,
     pub baseline_source: u8,
     pub resize: u8,

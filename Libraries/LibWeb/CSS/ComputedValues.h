@@ -609,8 +609,6 @@ public:
 
     Overflow overflow_x() const { return overflow_x_from_reset_bits(m_noninherited.reset_bits); }
     Overflow overflow_y() const { return overflow_y_from_reset_bits(m_noninherited.reset_bits); }
-    OverscrollBehavior overscroll_behavior_x() const { return static_cast<OverscrollBehavior>(m_noninherited.box->overscroll_behavior_x); }
-    OverscrollBehavior overscroll_behavior_y() const { return static_cast<OverscrollBehavior>(m_noninherited.box->overscroll_behavior_y); }
     ComputedValuesFFI::ResetBits reset_bits() const { return m_noninherited.reset_bits; }
 
     Color color() const { return m_inherited.text->color_value(); }
