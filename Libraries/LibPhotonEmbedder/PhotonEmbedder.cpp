@@ -226,8 +226,10 @@ private:
         // Viewport scrollbars are painted into the page's shared GPU surface.
         content.paint_viewport_scrollbars = PaintViewportScrollbars::Yes;
 
-        // Deprecated diagnostic fallback. Normal Photon painting uses Vulkan;
-        // remove this option once the GPU path is reliable on supported devices.
+#if defined(AK_OS_LINUX)
+        if (!std::getenv("PHOTON_ENABLE_GPU_PAINTING"))
+            content.force_cpu_painting = ForceCPUPainting::Yes;
+#endif
         if (std::getenv("PHOTON_FORCE_CPU_PAINTING"))
             content.force_cpu_painting = ForceCPUPainting::Yes;
     }
