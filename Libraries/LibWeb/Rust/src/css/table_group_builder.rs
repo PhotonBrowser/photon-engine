@@ -3056,8 +3056,8 @@ fn build_box_group(
         BoxValues, ComputedAspectRatio, ComputedContainIntrinsicSize, ComputedVerticalAlign,
     };
     use crate::css::css_enums::{
-        keyword_to_baseline_source, keyword_to_continue_value, keyword_to_field_sizing, keyword_to_overscroll_behavior,
-        keyword_to_resize, keyword_to_text_overflow, keyword_to_vertical_align,
+        keyword_to_baseline_source, keyword_to_continue_value, keyword_to_field_sizing, keyword_to_resize,
+        keyword_to_text_overflow, keyword_to_vertical_align,
     };
 
     let display = match values.value(property_id::DISPLAY) {
@@ -3284,16 +3284,6 @@ fn build_box_group(
         display,
         display_before_box_type_transformation: crate::css::display::FfiDisplay::from_raw(
             display_before_transformation_raw,
-        ),
-        overscroll_behavior_x: required_keyword_code(
-            values,
-            property_id::OVERSCROLL_BEHAVIOR_X,
-            keyword_to_overscroll_behavior,
-        ),
-        overscroll_behavior_y: required_keyword_code(
-            values,
-            property_id::OVERSCROLL_BEHAVIOR_Y,
-            keyword_to_overscroll_behavior,
         ),
         field_sizing: required_keyword_code(values, property_id::FIELD_SIZING, keyword_to_field_sizing),
         baseline_source: required_keyword_code(values, property_id::BASELINE_SOURCE, keyword_to_baseline_source),
