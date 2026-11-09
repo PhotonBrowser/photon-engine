@@ -544,10 +544,17 @@ void BookmarkStore::remove_observer(Badge<BookmarkStoreObserver>, BookmarkStoreO
     VERIFY(was_removed);
 }
 
-BookmarkStoreObserver::BookmarkStoreObserver()
-    : m_bookmark_store(Application::bookmark_store())
+BookmarkStoreObserver::BookmarkStoreObserver(BookmarkStore& store)
 {
-    m_bookmark_store->add_observer({}, *this);
+    observe(store);
+}
+
+void BookmarkStoreObserver::observe(BookmarkStore& store)
+{
+    if (m_bookmark_store)
+        m_bookmark_store->remove_observer({}, *this);
+    m_bookmark_store = store.make_weak_ptr();
+    store.add_observer({}, *this);
 }
 
 BookmarkStoreObserver::~BookmarkStoreObserver()

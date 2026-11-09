@@ -70,9 +70,9 @@ static JsonObject serialize_download(FileDownloader::Download const& download)
 
 // The page lists and acts on the downloads of its own browsing session only, so those of a private session stay out of
 // the pages of every other session.
-static bool is_download_of_session(FileDownloader::Download const& download, IsPrivate is_private)
+static bool is_download_of_session(FileDownloader::Download const& download, BrowsingSession const& session)
 {
-    return download.is_private == is_private;
+    return download.is_private == session.is_private() && download.profile_identity == session.profile_identity;
 }
 
 void DownloadsUI::register_interfaces()
@@ -102,28 +102,28 @@ void DownloadsUI::register_interfaces()
 
 void DownloadsUI::download_added(FileDownloader::Download const& download)
 {
-    if (!has_client() || !is_download_of_session(download, client().is_private()))
+    if (!has_client() || !is_download_of_session(download, client().session()))
         return;
     async_send_message("downloadAdded"sv, serialize_download(download));
 }
 
 void DownloadsUI::download_updated(FileDownloader::Download const& download)
 {
-    if (!has_client() || !is_download_of_session(download, client().is_private()))
+    if (!has_client() || !is_download_of_session(download, client().session()))
         return;
     async_send_message("downloadUpdated"sv, serialize_download(download));
 }
 
-void DownloadsUI::download_removed(u64 id, IsPrivate is_private)
+void DownloadsUI::download_removed(u64 id, IsPrivate is_private, StringView profile_identity)
 {
-    if (!has_client() || is_private != client().is_private())
+    if (!has_client() || is_private != client().is_private() || profile_identity != client().session().profile_identity)
         return;
     async_send_message("downloadRemoved"sv, JsonValue { id });
 }
 
 void DownloadsUI::load_downloads()
 {
-    auto downloads = Application::the().file_downloader().downloads_of_session(client().is_private());
+    auto downloads = Application::the().file_downloader().downloads_of_session(client().is_private(), client().session().profile_identity);
 
     JsonArray serialized_downloads;
     serialized_downloads.ensure_capacity(downloads.size());
@@ -135,10 +135,10 @@ void DownloadsUI::load_downloads()
 
 void DownloadsUI::prune_inactive_downloads()
 {
-    (void)Application::the().file_downloader().prune_inactive_downloads(client().is_private());
+    (void)Application::the().file_downloader().prune_inactive_downloads(client().is_private(), client().session().profile_identity);
 }
 
-static Optional<FileDownloader::Download const&> download_from_message(JsonValue const& data, IsPrivate is_private)
+static Optional<FileDownloader::Download const&> download_from_message(JsonValue const& data, BrowsingSession const& session)
 {
     if (!data.is_object())
         return {};
@@ -148,14 +148,14 @@ static Optional<FileDownloader::Download const&> download_from_message(JsonValue
         return {};
 
     auto download = Application::the().file_downloader().download(*id);
-    if (!download.has_value() || !is_download_of_session(*download, is_private))
+    if (!download.has_value() || !is_download_of_session(*download, session))
         return {};
     return download;
 }
 
 void DownloadsUI::cancel_download(JsonValue const& data)
 {
-    auto download = download_from_message(data, client().is_private());
+    auto download = download_from_message(data, client().session());
     if (!download.has_value())
         return;
 
@@ -167,7 +167,7 @@ void DownloadsUI::cancel_download(JsonValue const& data)
 
 void DownloadsUI::pause_download(JsonValue const& data)
 {
-    auto download = download_from_message(data, client().is_private());
+    auto download = download_from_message(data, client().session());
     if (!download.has_value())
         return;
 
@@ -179,7 +179,7 @@ void DownloadsUI::pause_download(JsonValue const& data)
 
 void DownloadsUI::resume_download(JsonValue const& data)
 {
-    auto download = download_from_message(data, client().is_private());
+    auto download = download_from_message(data, client().session());
     if (!download.has_value())
         return;
 
@@ -198,7 +198,7 @@ static bool consume_user_activation_of_page(WebContentClient& client, Web::PageI
 
 void DownloadsUI::open_download(JsonValue const& data)
 {
-    auto download = download_from_message(data, client().is_private());
+    auto download = download_from_message(data, client().session());
     if (!download.has_value())
         return;
 
@@ -212,7 +212,7 @@ void DownloadsUI::open_download(JsonValue const& data)
 
 void DownloadsUI::show_download_in_folder(JsonValue const& data)
 {
-    auto download = download_from_message(data, client().is_private());
+    auto download = download_from_message(data, client().session());
     if (!download.has_value())
         return;
 

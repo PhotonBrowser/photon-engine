@@ -178,7 +178,7 @@ public:
     String user_agent_string() const;
     Web::NavigatorCompatibilityMode navigator_compatibility_mode() const;
 
-    static BookmarkStore& bookmark_store() { return *the().m_bookmark_store; }
+    static BookmarkStore& bookmark_store() { return default_session().bookmark_store(); }
     void update_bookmark_action_for_current_web_view();
     void update_actions_for_active_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
@@ -228,6 +228,8 @@ public:
     static BrowsingSession& default_session() { return *the().m_default_session; }
 
     static NonnullRefPtr<BrowsingSession> session_for_new_view(IsPrivate);
+    static ErrorOr<NonnullRefPtr<BrowsingSession>> session_for_profile_path(StringView, IsPrivate);
+    static void for_each_profile_session(Function<void(BrowsingSession&)>);
 
     static RefPtr<BrowsingSession> existing_session(IsPrivate);
 
@@ -396,6 +398,7 @@ public:
         Delete delete_site_data { Delete::No };
     };
     NonnullRefPtr<Core::Promise<Empty>> clear_browsing_data(ClearBrowsingDataOptions const&);
+    NonnullRefPtr<Core::Promise<Empty>> clear_browsing_data(ClearBrowsingDataOptions const&, BrowsingSession&);
 
     Action& reload_action() { return *m_reload_action; }
     Action& reload_bypassing_cache_action() { return *m_reload_bypassing_cache_action; }
@@ -538,6 +541,7 @@ private:
     void update_permission_defaults();
     void update_os_location_authorization();
     void schedule_permission_expiry();
+    ErrorOr<NonnullRefPtr<BrowsingSession>> create_profile_session(Profile&&);
 
     void initialize_actions();
     void update_vertical_tabs_action();
@@ -646,6 +650,11 @@ private:
     static Application* s_the;
 
     Optional<Profile> m_profile;
+    Optional<Profile> m_default_browsing_profile;
+    ProfileRoots m_profile_roots;
+    Optional<ByteString> m_default_browsing_profile_path;
+    HashMap<ByteString, RefPtr<BrowsingSession>> m_profile_sessions;
+    HashMap<ByteString, WeakPtr<BrowsingSession>> m_private_profile_sessions;
     OwnPtr<Settings> m_settings;
     OwnPtr<BrowserProcess> m_browser_process;
     bool m_should_exit_after_profile_coordination { false };
@@ -653,7 +662,6 @@ private:
     OwnPtr<ApplicationPermissionManagerObserver> m_permission_manager_observer;
     RefPtr<Core::Timer> m_permission_expiry_timer;
 
-    OwnPtr<BookmarkStore> m_bookmark_store;
     OwnPtr<ApplicationBookmarkStoreObserver> m_bookmark_store_observer;
 
     OwnPtr<AutocompleteService> m_autocomplete_service;
@@ -723,7 +731,6 @@ private:
     u64 m_next_cross_process_id_namespace { 1 };
     Web::HTML::CrossProcessIdAllocator m_ui_process_cross_process_id_allocator;
 
-    OwnPtr<DownloadStore> m_download_store;
     RefPtr<BrowsingSession> m_default_session;
     WeakPtr<BrowsingSession> m_private_session;
     HashMap<int, WeakPtr<BrowsingSession>> m_request_server_client_sessions;

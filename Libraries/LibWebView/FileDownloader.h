@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Badge.h>
+#include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
@@ -63,6 +64,7 @@ public:
 
         u64 id { 0 };
         IsPrivate is_private { IsPrivate::No };
+        ByteString profile_identity;
         URL::URL url;
         LexicalPath destination;
         DownloadStatus status { DownloadStatus::InProgress };
@@ -88,11 +90,11 @@ public:
         Yes,
     };
 
-    u64 download_file(IsPrivate, URL::URL const&, LexicalPath, MayReplaceDestination = MayReplaceDestination::No);
+    u64 download_file(IsPrivate, ByteString profile_identity, URL::URL const&, LexicalPath, MayReplaceDestination = MayReplaceDestination::No);
     using ResponseFinished = Function<void(u64 decoded_body_size, Requests::RequestTimingInfo const*,
         Optional<StringView> error)>;
-    u64 adopt_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data = {}, ResponseFinished = {});
-    u64 start_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size = {}, MayReplaceDestination = MayReplaceDestination::No);
+    u64 adopt_download(IsPrivate, ByteString profile_identity, URL::URL const&, LexicalPath, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data = {}, ResponseFinished = {});
+    u64 start_download(IsPrivate, ByteString profile_identity, URL::URL const&, LexicalPath, Optional<u64> total_size = {}, MayReplaceDestination = MayReplaceDestination::No);
     bool has_active_downloads() const;
     bool has_unresumable_downloads() const;
     void set_cancel_callback(u64 id, Function<void()>);
@@ -105,17 +107,17 @@ public:
     void resume_download(u64 id);
     void pause_active_downloads();
     void fail_download(u64 id, String);
-    Vector<u64> prune_inactive_downloads(IsPrivate);
-    Vector<u64> remove_inactive_downloads_created_since(UnixDateTime, Optional<IsPrivate> = {});
+    Vector<u64> prune_inactive_downloads(IsPrivate, Optional<StringView> profile_identity = {});
+    Vector<u64> remove_inactive_downloads_created_since(UnixDateTime, Optional<IsPrivate> = {}, Optional<StringView> profile_identity = {});
 
     ReadonlySpan<Download> downloads() const { return m_downloads.span(); }
     // The downloads of one browsing session, which that session's UI lists without the other's.
-    Vector<Download> downloads_of_session(IsPrivate) const;
+    Vector<Download> downloads_of_session(IsPrivate, StringView profile_identity) const;
     Optional<Download const&> download(u64 id) const;
 
     Vector<SegmentProgress> segment_progress(u64 id) const;
 
-    void adopt_download_store(Badge<Application>, DownloadStore&);
+    void adopt_download_store(Badge<Application>, ByteString profile_identity, DownloadStore&);
 
     void add_observer(Badge<FileDownloaderObserver>, FileDownloaderObserver&);
     void remove_observer(Badge<FileDownloaderObserver>, FileDownloaderObserver&);
@@ -151,8 +153,9 @@ private:
     };
     void persist_download_snapshot(u64 id, PersistUrgency);
     void forget_persisted_download(u64 id);
-    void restore_persisted_downloads();
-    bool restore_persisted_download(DownloadRecord&);
+    DownloadStore* download_store_for(StringView profile_identity) const;
+    void restore_persisted_downloads(ByteString const& profile_identity, DownloadStore&);
+    bool restore_persisted_download(DownloadRecord&, ByteString const& profile_identity);
     static void remove_orphaned_temporary_files(HashTable<ByteString> const& directories, HashTable<ByteString> const& temporary_paths_in_use);
 
     void maybe_split_download(u64 id);
@@ -166,12 +169,16 @@ private:
 
     void notify_download_added(Download const&);
     void notify_download_updated(Download const&);
-    void notify_download_removed(u64 id, IsPrivate);
+    void notify_download_removed(u64 id, IsPrivate, StringView profile_identity);
 
     Vector<Download> m_downloads;
     HashMap<u64, NonnullOwnPtr<ActiveDownload>> m_active_downloads;
     Vector<FileDownloaderObserver&> m_observers;
-    DownloadStore* m_download_store { nullptr };
+    struct ProfileDownloadStore {
+        ByteString profile_identity;
+        DownloadStore* store { nullptr };
+    };
+    Vector<ProfileDownloadStore> m_download_stores;
     u64 m_next_download_id { 0 };
 };
 
@@ -182,7 +189,7 @@ public:
 
     virtual void download_added(FileDownloader::Download const&) { }
     virtual void download_updated(FileDownloader::Download const&) { }
-    virtual void download_removed(u64, IsPrivate) { }
+    virtual void download_removed(u64, IsPrivate, StringView) { }
 
 private:
     WeakPtr<FileDownloader> m_file_downloader;

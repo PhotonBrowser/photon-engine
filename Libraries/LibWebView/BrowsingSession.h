@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/ByteString.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
@@ -41,8 +42,19 @@ public:
     OwnPtr<HistoryStore> history_store;
     OwnPtr<SessionStore> session_store;
     OwnPtr<PermissionManager> permission_manager;
+    OwnPtr<BookmarkStore> owned_bookmark_store;
+    OwnPtr<DownloadStore> owned_download_store;
+
+    BookmarkStore& bookmark_store() const;
+    void share_bookmark_store_with(BrowsingSession&);
+
+    // Persistent identity and cache root for this browsing context. Private sessions leave these empty.
+    ByteString profile_identity;
+    ByteString cache_path;
 
 private:
+    BookmarkStore* m_shared_bookmark_store { nullptr };
+
     explicit BrowsingSession(IsPrivate);
 
     IsPrivate m_is_private { IsPrivate::No };

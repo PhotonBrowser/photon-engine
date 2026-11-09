@@ -241,7 +241,7 @@ public:
     bool has_completed_document_load() const { return m_document_load_finished; }
     uint64_t document_generation() const { return m_document_generation; }
 
-    static OwnPtr<PhotonHeadlessWebView> create(int width, int height, double dpr, Photon::ViewCallbacks callbacks, IsPrivate is_private)
+    static OwnPtr<PhotonHeadlessWebView> create(int width, int height, double dpr, Photon::ViewCallbacks callbacks, StringView profile_path, IsPrivate is_private)
     {
         auto resource_root = s_ladybird_resource_root;
         auto theme_path = LexicalPath::join(resource_root, "themes"sv, "Default.ini"sv);
@@ -260,6 +260,12 @@ public:
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
         auto view = adopt_own(*new PhotonHeadlessWebView(theme.release_value(), { physical_width, physical_height }, dpr, move(callbacks), is_private));
+        auto session = Application::session_for_profile_path(profile_path, is_private);
+        if (session.is_error()) {
+            warnln("Unable to create browsing session for {}: {}", profile_path, session.error());
+            return nullptr;
+        }
+        view->set_session(session.release_value());
         if (!view->m_callbacks.native_metal_presentation
             || !view->m_callbacks.native_backing_registered
             || !view->m_callbacks.native_frame_ready)
@@ -288,6 +294,7 @@ public:
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
         // A page opened from a private page stays in its private session.
         auto view = adopt_own(*new PhotonHeadlessWebView(opener.m_theme, { physical_width, physical_height }, dpr, move(callbacks), opener.is_private()));
+        view->set_session(opener.m_session);
         view->m_force_dark_mode_enabled = opener.m_force_dark_mode_enabled;
         view->initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
         view->resize(width, height, dpr);
@@ -530,7 +537,7 @@ public:
         // A page from a host whose certificate error the user chose to ignore is not secure.
         if (url().scheme() == "https"sv)
             state.connection_secure = !url().host().has_value()
-                || !Application::request_server_manager().allows_certificate_errors_for_host(url().serialized_host().to_byte_string());
+                || !Application::request_server_manager().allows_certificate_errors_for_host(session(), url().serialized_host().to_byte_string());
         else if (url().scheme() == "http"sv)
             state.connection_secure = false;
         m_callbacks.state_changed(state);
@@ -1528,6 +1535,7 @@ Photon::Download download_state(WebView::FileDownloader::Download const& downloa
     }
     Photon::Download state;
     state.id = download.id;
+    state.profile_identity = to_std(download.profile_identity.view());
     state.url = to_std(download.url.serialize().bytes_as_string_view());
     state.path = to_std(download.destination.string().view());
     state.status = status;
@@ -1565,7 +1573,7 @@ private:
             m_changed(download_state(download));
     }
 
-    virtual void download_removed(u64 id, WebView::IsPrivate) override
+    virtual void download_removed(u64 id, WebView::IsPrivate, StringView) override
     {
         if (m_removed)
             m_removed(id);
@@ -1585,9 +1593,11 @@ struct Runtime::Impl {
     std::vector<AK::StringView> argument_views;
     Main::Arguments arguments;
 
-    void set_arguments(std::string const& profile_path)
+    void set_arguments(std::string const& profile_path, std::string const& default_browsing_profile_path)
     {
         strings = { "photon", profile_path.empty() ? "--temporary-profile" : "--profile-path=" + profile_path };
+        if (!default_browsing_profile_path.empty())
+            strings.push_back("--photon-default-browsing-profile-path=" + default_browsing_profile_path);
         for (auto& string : strings) {
             argv.push_back(string.data());
             argument_views.emplace_back(string.data(), string.size());
@@ -1653,10 +1663,10 @@ Runtime::Runtime(std::unique_ptr<Impl> impl)
 {
 }
 
-std::unique_ptr<Runtime> Runtime::create(std::string const& helper_directory, std::string const& profile_path, std::string& error)
+std::unique_ptr<Runtime> Runtime::create(std::string const& helper_directory, std::string const& profile_path, std::string const& default_browsing_profile_path, std::string& error)
 {
     auto impl = std::make_unique<Impl>();
-    impl->set_arguments(profile_path);
+    impl->set_arguments(profile_path, default_browsing_profile_path);
     auto app = WebView::PhotonApplication::create(impl->arguments, ByteString(helper_directory.c_str()));
     if (app.is_error()) {
         error = "Photon Engine runtime initialization failed";
@@ -1862,9 +1872,19 @@ void Runtime::pause_download(uint64_t id) { m_impl->application->file_downloader
 void Runtime::resume_download(uint64_t id) { m_impl->application->file_downloader().resume_download(id); }
 void Runtime::cancel_download(uint64_t id) { m_impl->application->file_downloader().cancel_download(id); }
 
-void Runtime::clear_inactive_downloads()
+void Runtime::clear_inactive_downloads(std::string const& profile_path)
 {
-    m_impl->application->file_downloader().prune_inactive_downloads(WebView::IsPrivate::No);
+    auto identity = profile_path.empty()
+        ? WebView::Application::default_session().profile_identity.view()
+        : StringView { profile_path.data(), profile_path.size() };
+    m_impl->application->file_downloader().prune_inactive_downloads(WebView::IsPrivate::No, identity);
+}
+
+void Runtime::ensure_profile_session(std::string const& profile_path)
+{
+    auto session = WebView::Application::session_for_profile_path(StringView { profile_path.data(), profile_path.size() }, WebView::IsPrivate::No);
+    if (session.is_error())
+        warnln("Unable to open browsing profile {}: {}", StringView { profile_path.data(), profile_path.size() }, session.error());
 }
 
 void Runtime::set_clipboard(Clipboard clipboard)
@@ -1877,14 +1897,30 @@ void Runtime::set_external_apps(ExternalApps apps)
     m_impl->application->set_external_apps(move(apps));
 }
 
-void Runtime::allow_certificate_errors_for_host(std::string const& host)
+void Runtime::allow_certificate_errors_for_host(std::string const& profile_path, bool is_private, std::string const& host)
 {
-    WebView::Application::request_server_manager().allow_certificate_errors_for_host(ByteString(host.c_str()));
+    auto session = WebView::Application::session_for_profile_path(
+        StringView { profile_path.data(), profile_path.size() },
+        is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
+    if (session.is_error()) {
+        warnln("Unable to allow certificate errors for profile {}: {}", StringView { profile_path.data(), profile_path.size() }, session.error());
+        return;
+    }
+    WebView::Application::request_server_manager().allow_certificate_errors_for_host(
+        *session.value(), ByteString(host.c_str()));
 }
 
-void Runtime::peer_certificate(std::string const& host, std::function<void(std::optional<CertificateInfo> const&)> done)
+void Runtime::peer_certificate(std::string const& profile_path, bool is_private, std::string const& host, std::function<void(std::optional<CertificateInfo> const&)> done)
 {
-    auto promise = WebView::Application::request_server_manager().peer_certificate_for_host(ByteString(host.c_str()));
+    auto session = WebView::Application::session_for_profile_path(
+        StringView { profile_path.data(), profile_path.size() },
+        is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
+    if (session.is_error()) {
+        done(std::nullopt);
+        return;
+    }
+    auto promise = WebView::Application::request_server_manager().peer_certificate_for_host(
+        *session.value(), ByteString(host.c_str()));
     promise->when_resolved([done](Optional<Requests::CertificateSummary> const& summary) {
         if (!summary.has_value()) {
             done(std::nullopt);
@@ -1911,7 +1947,7 @@ void Runtime::peer_certificate(std::string const& host, std::function<void(std::
     promise->when_rejected([done](Error&) { done(std::nullopt); });
 }
 
-void Runtime::clear_browsing_data(ClearBrowsingData const& request, std::function<void()> done)
+void Runtime::clear_browsing_data(ClearBrowsingData const& request, std::string const& profile_path, std::function<void()> done)
 {
     using Delete = WebView::Application::ClearBrowsingDataOptions::Delete;
     WebView::Application::ClearBrowsingDataOptions options {
@@ -1922,10 +1958,24 @@ void Runtime::clear_browsing_data(ClearBrowsingData const& request, std::functio
         .delete_download_history = Delete::No,
         .delete_site_data = request.site_data ? Delete::Yes : Delete::No,
     };
-    m_impl->application->clear_browsing_data(options)->when_resolved([done = move(done)](auto) {
+    auto clear = [&](WebView::BrowsingSession& session) {
+        m_impl->application->clear_browsing_data(options, session)->when_resolved([done = move(done)](auto) {
+            if (done)
+                done();
+        });
+    };
+    if (profile_path.empty()) {
+        clear(WebView::Application::default_session());
+        return;
+    }
+    auto session = WebView::Application::session_for_profile_path(StringView { profile_path.data(), profile_path.size() }, WebView::IsPrivate::No);
+    if (session.is_error()) {
+        warnln("Unable to clear browsing data for profile {}: {}", StringView { profile_path.data(), profile_path.size() }, session.error());
         if (done)
             done();
-    });
+        return;
+    }
+    clear(*session.value());
 }
 
 // Whether `host` is `domain` or one of its subdomains.
@@ -1936,11 +1986,24 @@ static bool is_same_or_subdomain(StringView host, StringView domain)
     return host.length() > domain.length() && host.ends_with(domain) && host[host.length() - domain.length() - 1] == '.';
 }
 
-void Runtime::clear_site_data(std::string const& host, std::function<void()> done)
+void Runtime::clear_site_data(std::string const& host, std::string const& profile_path, std::function<void()> done)
 {
     auto site = MUST(String::from_utf8(StringView { host.data(), host.size() })).to_ascii_lowercase();
     if (!site.is_empty()) {
-        auto& session = WebView::Application::default_session();
+        WebView::BrowsingSession* session_pointer = &WebView::Application::default_session();
+        Optional<NonnullRefPtr<WebView::BrowsingSession>> session_for_profile;
+        if (!profile_path.empty()) {
+            auto session = WebView::Application::session_for_profile_path(StringView { profile_path.data(), profile_path.size() }, WebView::IsPrivate::No);
+            if (session.is_error()) {
+                warnln("Unable to clear site data for profile {}: {}", StringView { profile_path.data(), profile_path.size() }, session.error());
+                if (done)
+                    done();
+                return;
+            }
+            session_for_profile = session.release_value();
+            session_pointer = &*session_for_profile.value();
+        }
+        auto& session = *session_pointer;
         for (auto& cookie : session.cookie_jar->get_all_cookies()) {
             if (!is_same_or_subdomain(site, cookie.domain) && !is_same_or_subdomain(cookie.domain, site))
                 continue;
@@ -1974,10 +2037,10 @@ void Runtime::schedule_native_release_drain()
 }
 #endif
 
-std::unique_ptr<View> Runtime::create_view(int width, int height, double device_pixel_ratio, ViewCallbacks callbacks, bool is_private)
+std::unique_ptr<View> Runtime::create_view(int width, int height, double device_pixel_ratio, ViewCallbacks callbacks, std::string const& profile_path, bool is_private)
 {
     auto impl = std::make_unique<View::Impl>();
-    impl->view = WebView::PhotonHeadlessWebView::create(width, height, device_pixel_ratio, move(callbacks), is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
+    impl->view = WebView::PhotonHeadlessWebView::create(width, height, device_pixel_ratio, move(callbacks), StringView { profile_path.data(), profile_path.size() }, is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
     if (!impl->view)
         return {};
     impl->last_viewport_width = max(1, static_cast<int>(std::lround(width * device_pixel_ratio)));

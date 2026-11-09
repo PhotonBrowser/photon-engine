@@ -8,7 +8,7 @@
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <LibURL/Parser.h>
-#include <LibWebView/Application.h>
+#include <LibWebView/BookmarkStore.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebUI/HistoryUI.h>
@@ -116,7 +116,7 @@ void HistoryUI::remove_history_entry(JsonValue const& data)
     if (!parsed_url.has_value())
         return;
 
-    auto remove_engagements = Application::bookmark_store().is_bookmarked(*parsed_url)
+    auto remove_engagements = client().session().bookmark_store().is_bookmarked(*parsed_url)
         ? RemoveHistoryEntryEngagements::No
         : RemoveHistoryEntryEngagements::Yes;
     client().session().history_store->remove_entry_for_url(*parsed_url, remove_engagements);

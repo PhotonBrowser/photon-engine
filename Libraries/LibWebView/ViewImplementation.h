@@ -157,6 +157,7 @@ public:
 
     IsPrivate is_private() const { return m_is_private; }
     BrowsingSession& session() const { return *m_session; }
+    void set_session(NonnullRefPtr<BrowsingSession> session);
 
     // Asks the user, unless an identical prompt is already up, in which case its answer goes to every request for it.
     void request_permission_prompt(PermissionPromptRequest, PermissionPromptCallback);

@@ -96,14 +96,14 @@ public:
     void disk_cache_settings_changed();
     void dns_settings_changed();
 
-    // Lets requests to `host` proceed although its certificate cannot be verified, for this run of the browser.
-    void allow_certificate_errors_for_host(ByteString host);
-    bool allows_certificate_errors_for_host(ByteString const& host) const { return m_hosts_allowing_certificate_errors.contains(host); }
-    // The certificate `host` last presented to any of the RequestServers, if one connected to it.
-    NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> peer_certificate_for_host(ByteString const& host);
+    // Lets requests to `host` proceed although its certificate cannot be verified in this browsing session.
+    void allow_certificate_errors_for_host(BrowsingSession&, ByteString host);
+    bool allows_certificate_errors_for_host(BrowsingSession const&, ByteString const& host) const;
+    // The certificate `host` last presented to this session's RequestServers, if one connected to it.
+    NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> peer_certificate_for_host(BrowsingSession&, ByteString const& host);
 
     NonnullRefPtr<Core::Promise<Requests::CacheSizes>> estimate_cache_size_accessed_since(UnixDateTime since);
-    NonnullRefPtr<Core::Promise<Empty>> clear_cache(UnixDateTime since);
+    NonnullRefPtr<Core::Promise<Empty>> clear_cache(UnixDateTime since, BrowsingSession* session = nullptr);
 
     bool uses_site_request_servers() const { return m_maximum_site_instances > 0; }
 
@@ -116,9 +116,9 @@ private:
     void retire(RequestServerInstance&);
     void retire_idle_instances();
 
-    ByteString sites_directory() const;
-    ByteString cache_path_for_site(Utf16String const& site) const;
-    ByteBuffer load_or_create_site_cache_key() const;
+    ByteString sites_directory(StringView cache_root) const;
+    ByteString cache_path_for_site(Utf16String const& site, StringView cache_root) const;
+    ByteBuffer load_or_create_site_cache_key(StringView cache_root) const;
     bool is_live_cache_path(ByteString const&) const;
     Vector<ByteString> dormant_site_cache_paths();
 
@@ -135,11 +135,8 @@ private:
     HashMap<ByteString, DormantSiteCache>& dormant_site_caches();
 
     Vector<NonnullRefPtr<RequestServerInstance>> m_instances;
-    HashTable<ByteString> m_hosts_allowing_certificate_errors;
+    HashMap<ByteString, HashMap<bool, HashTable<ByteString>>> m_hosts_allowing_certificate_errors;
     size_t m_maximum_site_instances { 0 };
-
-    // Only the UI process has this. It names the cache directories of sites, see cache_path_for_site().
-    ByteBuffer m_site_cache_key;
 
     Optional<HashMap<ByteString, DormantSiteCache>> m_dormant_site_caches;
     // Time out evictions if a RequestServer disappears before answering.

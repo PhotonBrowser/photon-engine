@@ -58,7 +58,6 @@ RequestServerManager::RequestServerManager()
     // Older versions kept the responses of every site in the cache of the RequestServer with no site.
     HTTP::DiskCache::remove(HTTP::DiskCache::Mode::Normal, LexicalPath { Application::request_server_options().cache_path });
 
-    m_site_cache_key = load_or_create_site_cache_key();
 }
 
 RequestServerManager::~RequestServerManager() = default;
@@ -120,7 +119,8 @@ void RequestServerManager::for_each_instance(Function<IterationDecision(RequestS
 
 ErrorOr<NonnullRefPtr<RequestServerInstance>> RequestServerManager::launch(NonnullRefPtr<BrowsingSession> session, Optional<Utf16String> site)
 {
-    auto cache_path = site.has_value() ? cache_path_for_site(*site) : Application::request_server_options().cache_path;
+    auto cache_root = session->cache_path.is_empty() ? Application::request_server_options().cache_path : session->cache_path;
+    auto cache_path = site.has_value() ? cache_path_for_site(*site, cache_root) : cache_root;
     auto instance = adopt_ref(*new RequestServerInstance(session, move(site), move(cache_path)));
     TRY(launch_process(*instance));
     m_instances.append(instance);
@@ -151,8 +151,14 @@ ErrorOr<void> RequestServerManager::launch_process(RequestServerInstance& instan
             the().disk_cache_size_changed(*instance, size);
     };
     Application::the().configure_request_server_control_client(*control_client);
-    for (auto const& host : m_hosts_allowing_certificate_errors)
-        control_client->async_allow_certificate_errors_for_host(host);
+    if (auto profile = m_hosts_allowing_certificate_errors.find(instance.session().profile_identity);
+        profile != m_hosts_allowing_certificate_errors.end()) {
+        auto is_private = instance.session().is_private() == IsPrivate::Yes;
+        if (auto privacy = profile->value.find(is_private); privacy != profile->value.end()) {
+            for (auto const& host : privacy->value)
+                control_client->async_allow_certificate_errors_for_host(host);
+        }
+    }
 
     instance.m_control_client = move(control_client);
     instance.m_ui_client = nullptr;
@@ -277,15 +283,36 @@ void RequestServerManager::dns_settings_changed()
         apply_dns_settings(instance->control_client());
 }
 
-void RequestServerManager::allow_certificate_errors_for_host(ByteString host)
+void RequestServerManager::allow_certificate_errors_for_host(BrowsingSession& session, ByteString host)
 {
-    if (m_hosts_allowing_certificate_errors.set(host) != HashSetResult::InsertedNewEntry)
+    auto profile = m_hosts_allowing_certificate_errors.find(session.profile_identity);
+    if (profile == m_hosts_allowing_certificate_errors.end()) {
+        m_hosts_allowing_certificate_errors.set(session.profile_identity, HashMap<bool, HashTable<ByteString>> {});
+        profile = m_hosts_allowing_certificate_errors.find(session.profile_identity);
+    }
+    auto is_private = session.is_private() == IsPrivate::Yes;
+    auto privacy = profile->value.find(is_private);
+    if (privacy == profile->value.end()) {
+        profile->value.set(is_private, HashTable<ByteString> {});
+        privacy = profile->value.find(is_private);
+    }
+    if (privacy->value.set(host) != HashSetResult::InsertedNewEntry)
         return;
     for (auto& instance : m_instances)
-        instance->control_client().async_allow_certificate_errors_for_host(host);
+        if (&instance->session() == &session)
+            instance->control_client().async_allow_certificate_errors_for_host(host);
 }
 
-NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> RequestServerManager::peer_certificate_for_host(ByteString const& host)
+bool RequestServerManager::allows_certificate_errors_for_host(BrowsingSession const& session, ByteString const& host) const
+{
+    auto profile = m_hosts_allowing_certificate_errors.find(session.profile_identity);
+    if (profile == m_hosts_allowing_certificate_errors.end())
+        return false;
+    auto privacy = profile->value.find(session.is_private() == IsPrivate::Yes);
+    return privacy != profile->value.end() && privacy->value.contains(host);
+}
+
+NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> RequestServerManager::peer_certificate_for_host(BrowsingSession& session, ByteString const& host)
 {
     struct Lookup : public RefCounted<Lookup> {
         Optional<Requests::CertificateSummary> certificate;
@@ -299,8 +326,11 @@ NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> RequestServ
     };
 
     // Each site's RequestServer connects to the hosts its pages load from, so any of them may know this one.
-    lookup->pending = m_instances.size() + 1;
+    lookup->pending = 1;
     for (auto& instance : m_instances) {
+        if (&instance->session() != &session)
+            continue;
+        ++lookup->pending;
         instance->control_client().retrieve_peer_certificate(host)->when_resolved([lookup, settle](Optional<Requests::CertificateSummary> certificate) {
                                                                       if (certificate.has_value() && !lookup->certificate.has_value())
                                                                           lookup->certificate = move(certificate);
@@ -312,24 +342,25 @@ NonnullRefPtr<Core::Promise<Optional<Requests::CertificateSummary>>> RequestServ
     return lookup->promise;
 }
 
-ByteString RequestServerManager::sites_directory() const
+ByteString RequestServerManager::sites_directory(StringView cache_root) const
 {
-    return LexicalPath::join(Application::request_server_options().cache_path, "RequestServer"sv, "Sites"sv).string();
+    return LexicalPath::join(cache_root, "RequestServer"sv, "Sites"sv).string();
 }
 
 // The sandbox of a RequestServer does not stop it from asking whether a path exists, so a name that it could work out
 // itself would tell it which other sites the user has visited.
-ByteString RequestServerManager::cache_path_for_site(Utf16String const& site) const
+ByteString RequestServerManager::cache_path_for_site(Utf16String const& site, StringView cache_root) const
 {
-    Crypto::Authentication::HMAC hmac(Crypto::Hash::HashKind::SHA256, m_site_cache_key);
+    auto site_cache_key = load_or_create_site_cache_key(cache_root);
+    Crypto::Authentication::HMAC hmac(Crypto::Hash::HashKind::SHA256, site_cache_key);
     auto site_bytes = site.to_byte_string();
     auto digest = hmac.process(site_bytes.view());
-    return LexicalPath::join(sites_directory(), encode_hex(digest.bytes())).string();
+    return LexicalPath::join(sites_directory(cache_root), encode_hex(digest.bytes())).string();
 }
 
-ByteBuffer RequestServerManager::load_or_create_site_cache_key() const
+ByteBuffer RequestServerManager::load_or_create_site_cache_key(StringView cache_root) const
 {
-    auto path = LexicalPath::join(Application::request_server_options().cache_path, "RequestServer"sv, "SiteCacheKey"sv);
+    auto path = LexicalPath::join(cache_root, "RequestServer"sv, "SiteCacheKey"sv);
 
     if (auto file = Core::File::open(path.string(), Core::File::OpenMode::Read); !file.is_error()) {
         if (auto key = file.value()->read_until_eof(); !key.is_error() && key.value().size() == site_cache_key_size)
@@ -337,7 +368,7 @@ ByteBuffer RequestServerManager::load_or_create_site_cache_key() const
     }
 
     // Nothing can find the caches of sites that were named with another key, or by older versions.
-    (void)FileSystem::remove(sites_directory(), FileSystem::RecursionMode::Allowed);
+    (void)FileSystem::remove(sites_directory(cache_root), FileSystem::RecursionMode::Allowed);
 
     auto key = MUST(ByteBuffer::create_uninitialized(site_cache_key_size));
     fill_with_random(key.bytes());
@@ -364,12 +395,20 @@ bool RequestServerManager::is_live_cache_path(ByteString const& path) const
 Vector<ByteString> RequestServerManager::dormant_site_cache_paths()
 {
     Vector<ByteString> paths;
-    Core::DirIterator iterator(sites_directory(), Core::DirIterator::SkipParentAndBaseDir);
-    while (iterator.has_next()) {
-        auto path = iterator.next_full_path();
-        if (!is_live_cache_path(path))
-            paths.append(move(path));
-    }
+    HashTable<ByteString> visited_directories;
+    Application::for_each_profile_session([&](BrowsingSession& session) {
+        if (session.cache_path.is_empty())
+            return;
+        auto directory = sites_directory(session.cache_path);
+        if (visited_directories.set(directory) != HashSetResult::InsertedNewEntry)
+            return;
+        Core::DirIterator iterator(directory, Core::DirIterator::SkipParentAndBaseDir);
+        while (iterator.has_next()) {
+            auto path = iterator.next_full_path();
+            if (!is_live_cache_path(path))
+                paths.append(move(path));
+        }
+    });
     return paths;
 }
 
@@ -406,7 +445,8 @@ NonnullRefPtr<Core::Promise<Requests::CacheSizes>> RequestServerManager::estimat
     };
     auto estimation = adopt_ref(*new Estimation);
 
-    for (auto const& path : dormant_site_cache_paths()) {
+    auto dormant_paths = dormant_site_cache_paths();
+    for (auto const& path : dormant_paths) {
         for_each_file_under(path, [&](auto const&, struct stat const& stat) {
             estimation->sizes.total += stat.st_size;
             if (UnixDateTime::from_seconds_since_epoch(stat.st_mtime) >= since)
@@ -433,7 +473,7 @@ NonnullRefPtr<Core::Promise<Requests::CacheSizes>> RequestServerManager::estimat
     return estimation->promise;
 }
 
-NonnullRefPtr<Core::Promise<Empty>> RequestServerManager::clear_cache(UnixDateTime since)
+NonnullRefPtr<Core::Promise<Empty>> RequestServerManager::clear_cache(UnixDateTime since, BrowsingSession* session)
 {
     struct Clearing : public RefCounted<Clearing> {
         size_t pending { 0 };
@@ -442,19 +482,40 @@ NonnullRefPtr<Core::Promise<Empty>> RequestServerManager::clear_cache(UnixDateTi
     auto clearing = adopt_ref(*new Clearing);
 
     // Dormant sites lose their whole cache if any file was used since the cutoff.
-    for (auto const& path : dormant_site_cache_paths()) {
+    auto cache_root = session ? sites_directory(session->cache_path) : ByteString {};
+    auto belongs_to_session = [&](ByteString const& path) {
+        if (!session)
+            return true;
+        return path.starts_with(cache_root) && path.length() > cache_root.length()
+            && path[cache_root.length()] == '/';
+    };
+    auto dormant_paths = dormant_site_cache_paths();
+    for (auto const& path : dormant_paths) {
+        if (!belongs_to_session(path))
+            continue;
         if (last_use_of_site_cache(path) >= since)
             (void)FileSystem::remove(path, FileSystem::RecursionMode::Allowed);
     }
-    m_dormant_site_caches.clear();
+    if (m_dormant_site_caches.has_value()) {
+        for (auto const& path : dormant_paths) {
+            if (belongs_to_session(path))
+                m_dormant_site_caches->remove(path);
+        }
+    }
 
     auto settle = [clearing] {
         if (--clearing->pending == 0)
             clearing->promise->resolve({});
     };
 
-    clearing->pending = m_instances.size() + 1;
+    clearing->pending = 1;
+    for (auto const& instance : m_instances) {
+        if (!session || &instance->session() == session)
+            ++clearing->pending;
+    }
     for (auto& instance : m_instances) {
+        if (session && &instance->session() != session)
+            continue;
         instance->control_client().clear_cache(since)->when_resolved([settle](Empty) { settle(); }).when_rejected([settle](Error&) { settle(); });
     }
     settle();

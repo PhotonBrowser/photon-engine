@@ -212,9 +212,9 @@ static String status_to_error_string(Optional<Requests::NetworkError> const& net
     return MUST(String::formatted("Received error response code {} while downloading file", *response_code));
 }
 
-u64 FileDownloader::download_file(IsPrivate is_private, URL::URL const& url, LexicalPath destination, MayReplaceDestination may_replace_destination)
+u64 FileDownloader::download_file(IsPrivate is_private, ByteString profile_identity, URL::URL const& url, LexicalPath destination, MayReplaceDestination may_replace_destination)
 {
-    auto download_id = start_download(is_private, url, move(destination), {}, may_replace_destination);
+    auto download_id = start_download(is_private, move(profile_identity), url, move(destination), {}, may_replace_destination);
     auto* active = active_download(download_id);
     if (!active)
         return download_id;
@@ -285,7 +285,7 @@ void FileDownloader::follow_download_redirect(u64 download_id, HTTP::HeaderList 
     start_download_request(download_id, redirect_url.release_value());
 }
 
-u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data,
+u64 FileDownloader::adopt_download(IsPrivate is_private, ByteString profile_identity, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data,
     ResponseFinished on_response_finished)
 {
     ScopeGuard report_failure = [&] {
@@ -293,7 +293,7 @@ u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, Le
             on_response_finished(0, nullptr,
                 "Unable to adopt the download response"sv);
     };
-    auto download_id = start_download(is_private, url, move(destination), total_size);
+    auto download_id = start_download(is_private, move(profile_identity), url, move(destination), total_size);
     auto* active = active_download(download_id);
     if (!active)
         return download_id;
@@ -946,13 +946,14 @@ void FileDownloader::restart_download_from_zero(u64 download_id, String reason_i
     start_download_request(download_id, active->effective_url);
 }
 
-u64 FileDownloader::start_download(IsPrivate is_private, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, MayReplaceDestination may_replace_destination)
+u64 FileDownloader::start_download(IsPrivate is_private, ByteString profile_identity, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, MayReplaceDestination may_replace_destination)
 {
     auto download_id = m_next_download_id++;
 
     m_downloads.append(Download {
         .id = download_id,
         .is_private = is_private,
+        .profile_identity = move(profile_identity),
         .url = url,
         .destination = move(destination),
         .total_size = total_size,
@@ -1325,25 +1326,30 @@ void FileDownloader::fail_or_pause_download(u64 id, String error)
     fail_download(id, move(error));
 }
 
-void FileDownloader::adopt_download_store(Badge<Application>, DownloadStore& download_store)
+void FileDownloader::adopt_download_store(Badge<Application>, ByteString profile_identity, DownloadStore& download_store)
 {
-    m_download_store = &download_store;
+    for (auto& entry : m_download_stores) {
+        if (entry.profile_identity == profile_identity) {
+            entry.store = &download_store;
+            return;
+        }
+    }
 
     m_next_download_id = max(m_next_download_id, static_cast<u64>(download_store.maximum_download_id()) + 1);
-
-    restore_persisted_downloads();
+    m_download_stores.append({ move(profile_identity), &download_store });
+    restore_persisted_downloads(m_download_stores.last().profile_identity, download_store);
 }
 
 void FileDownloader::persist_download_snapshot(u64 id, PersistUrgency urgency)
 {
     static constexpr i64 persist_interval_ms = 1000;
 
-    if (!m_download_store)
-        return;
-
     auto* download = mutable_download_or_null(id);
     auto* active = active_download(id);
     if (!download || !active)
+        return;
+    auto* store = download_store_for(download->profile_identity);
+    if (!store)
         return;
 
     if (download->is_private == IsPrivate::Yes)
@@ -1380,42 +1386,71 @@ void FileDownloader::persist_download_snapshot(u64 id, PersistUrgency urgency)
 
     quick_sort(record.segments, [](auto const& a, auto const& b) { return a.start_offset < b.start_offset; });
 
-    m_download_store->save_download(record);
+    store->save_download(record);
 }
 
 void FileDownloader::forget_persisted_download(u64 id)
 {
-    if (!m_download_store || id > static_cast<u64>(NumericLimits<i64>::max()))
+    if (id > static_cast<u64>(NumericLimits<i64>::max()))
         return;
-    m_download_store->remove_download(static_cast<i64>(id));
+    auto* download = mutable_download_or_null(id);
+    if (!download)
+        return;
+    if (auto* store = download_store_for(download->profile_identity))
+        store->remove_download(static_cast<i64>(id));
 }
 
-void FileDownloader::restore_persisted_downloads()
+DownloadStore* FileDownloader::download_store_for(StringView profile_identity) const
 {
-    VERIFY(m_download_store);
+    for (auto const& entry : m_download_stores) {
+        if (entry.profile_identity == profile_identity)
+            return entry.store;
+    }
+    return nullptr;
+}
+
+void FileDownloader::restore_persisted_downloads(ByteString const& profile_identity, DownloadStore& store)
+{
 
     HashTable<ByteString> directories;
     HashTable<ByteString> temporary_paths_in_use;
 
     directories.set(Core::StandardPaths::downloads_directory());
 
-    for (auto& record : m_download_store->resumable_downloads()) {
+    for (auto& record : store.resumable_downloads()) {
+        if (record.id >= 0 && download(static_cast<u64>(record.id)).has_value()) {
+            auto previous_id = record.id;
+            while (download(m_next_download_id).has_value())
+                ++m_next_download_id;
+            if (m_next_download_id > static_cast<u64>(NumericLimits<i64>::max())) {
+                store.remove_download(previous_id);
+                continue;
+            }
+            record.id = static_cast<i64>(m_next_download_id++);
+            store.save_download(record);
+            store.remove_download(previous_id);
+        }
+        if (record.id >= 0)
+            m_next_download_id = max(m_next_download_id, static_cast<u64>(record.id) + 1);
         LexicalPath temporary_destination { record.temporary_destination.to_byte_string() };
         directories.set(temporary_destination.dirname());
 
-        if (restore_persisted_download(record)) {
+        if (restore_persisted_download(record, profile_identity)) {
             temporary_paths_in_use.set(temporary_destination.string());
             continue;
         }
 
-        m_download_store->remove_download(record.id);
+        store.remove_download(record.id);
         (void)FileSystem::remove(temporary_destination.string(), FileSystem::RecursionMode::Disallowed);
     }
 
-    remove_orphaned_temporary_files(directories, temporary_paths_in_use);
+    // Do not sweep shared download directories until every space's store has been inspected. An unopened space may
+    // still have a partial download whose temporary file looks orphaned to this store.
+    (void)directories;
+    (void)temporary_paths_in_use;
 }
 
-bool FileDownloader::restore_persisted_download(DownloadRecord& record)
+bool FileDownloader::restore_persisted_download(DownloadRecord& record, ByteString const& profile_identity)
 {
     if (record.id < 0 || record.total_size <= 0 || record.segments.is_empty())
         return false;
@@ -1455,6 +1490,7 @@ bool FileDownloader::restore_persisted_download(DownloadRecord& record)
     m_downloads.append(Download {
         .id = id,
         .is_private = IsPrivate::No,
+        .profile_identity = profile_identity,
         .url = url.release_value(),
         .destination = LexicalPath { record.destination.to_byte_string() },
         .status = DownloadStatus::Paused,
@@ -1628,11 +1664,12 @@ void FileDownloader::discard_private_downloads()
             continue;
 
         auto id = download.id;
+        auto profile_identity = download.profile_identity;
         if (status_is_active(download.status))
             cancel_download(id);
 
         m_downloads.remove(i - 1);
-        notify_download_removed(id, IsPrivate::Yes);
+        notify_download_removed(id, IsPrivate::Yes, profile_identity);
     }
 }
 
@@ -1666,35 +1703,39 @@ void FileDownloader::fail_download(u64 id, String error)
     notify_download_updated(*download);
 }
 
-Vector<FileDownloader::Download> FileDownloader::downloads_of_session(IsPrivate is_private) const
+Vector<FileDownloader::Download> FileDownloader::downloads_of_session(IsPrivate is_private, StringView profile_identity) const
 {
     Vector<Download> downloads;
     for (auto const& download : m_downloads) {
-        if (download.is_private == is_private)
+        if (download.is_private == is_private && download.profile_identity == profile_identity)
             downloads.append(download);
     }
     return downloads;
 }
 
-Vector<u64> FileDownloader::prune_inactive_downloads(IsPrivate is_private)
+Vector<u64> FileDownloader::prune_inactive_downloads(IsPrivate is_private, Optional<StringView> profile_identity)
 {
-    return remove_inactive_downloads_created_since(UnixDateTime::earliest(), is_private);
+    return remove_inactive_downloads_created_since(UnixDateTime::earliest(), is_private, profile_identity);
 }
 
-Vector<u64> FileDownloader::remove_inactive_downloads_created_since(UnixDateTime since, Optional<IsPrivate> only_of_session)
+Vector<u64> FileDownloader::remove_inactive_downloads_created_since(UnixDateTime since, Optional<IsPrivate> only_of_session, Optional<StringView> profile_identity)
 {
     Vector<u64> removed_download_ids;
     Vector<IsPrivate> removed_download_sessions;
+    Vector<ByteString> removed_profile_identities;
 
     for (size_t i = m_downloads.size(); i > 0; --i) {
         auto const index = i - 1;
         auto const id = m_downloads[index].id;
         auto const is_private = m_downloads[index].is_private;
+        auto download_profile_identity = m_downloads[index].profile_identity;
         if (status_is_active(m_downloads[index].status))
             continue;
         if (m_downloads[index].created_time < since)
             continue;
         if (only_of_session.has_value() && is_private != *only_of_session)
+            continue;
+        if (profile_identity.has_value() && m_downloads[index].profile_identity != *profile_identity)
             continue;
 
         forget_persisted_download(id);
@@ -1702,10 +1743,11 @@ Vector<u64> FileDownloader::remove_inactive_downloads_created_since(UnixDateTime
         m_downloads.remove(index);
         removed_download_ids.append(id);
         removed_download_sessions.append(is_private);
+        removed_profile_identities.append(move(download_profile_identity));
     }
 
     for (size_t i = 0; i < removed_download_ids.size(); ++i)
-        notify_download_removed(removed_download_ids[i], removed_download_sessions[i]);
+        notify_download_removed(removed_download_ids[i], removed_download_sessions[i], removed_profile_identities[i]);
 
     return removed_download_ids;
 }
@@ -1737,10 +1779,10 @@ void FileDownloader::notify_download_updated(Download const& download)
     }
 }
 
-void FileDownloader::notify_download_removed(u64 id, IsPrivate is_private)
+void FileDownloader::notify_download_removed(u64 id, IsPrivate is_private, StringView profile_identity)
 {
     for (auto& observer : m_observers)
-        observer.download_removed(id, is_private);
+        observer.download_removed(id, is_private, profile_identity);
 }
 
 void FileDownloader::add_observer(Badge<FileDownloaderObserver>, FileDownloaderObserver& observer)

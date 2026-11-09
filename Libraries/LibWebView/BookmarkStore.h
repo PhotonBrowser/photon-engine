@@ -49,9 +49,10 @@ struct WEBVIEW_API BookmarkItem {
 
 class WEBVIEW_API BookmarkStoreObserver {
 public:
-    explicit BookmarkStoreObserver();
+    explicit BookmarkStoreObserver(BookmarkStore&);
     virtual ~BookmarkStoreObserver();
 
+    void observe(BookmarkStore&);
     virtual void bookmarks_changed() { }
 
 private:

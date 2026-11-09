@@ -97,11 +97,13 @@ Optional<ViewImplementation&> ViewImplementation::find_view_by_id(u64 id)
 }
 
 ViewImplementation::ViewImplementation(IsPrivate is_private)
-    : m_is_private(is_private)
+    : BookmarkStoreObserver(Application::default_session().bookmark_store())
+    , m_is_private(is_private)
     , m_session(Application::session_for_new_view(is_private))
     , m_document_cookie_version_buffer(Core::create_shared_version_buffer())
     , m_view_id(s_view_count++)
 {
+    observe(m_session->bookmark_store());
     all_views().set(m_view_id, this);
 
     initialize_context_menus();
@@ -119,6 +121,12 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
         if (on_tab_indicator_change)
             on_tab_indicator_change(indicator, visible);
     };
+}
+
+void ViewImplementation::set_session(NonnullRefPtr<BrowsingSession> session)
+{
+    m_session = move(session);
+    observe(m_session->bookmark_store());
 }
 
 ViewImplementation::~ViewImplementation()
@@ -429,7 +437,7 @@ void ViewImplementation::set_favicon(Optional<Gfx::Bitmap const&> favicon)
 
         if (m_favicon_hash.has_value()) {
             if (m_is_private == IsPrivate::No)
-                Application::bookmark_store().update_favicon(url(), *m_favicon_hash);
+                session().bookmark_store().update_favicon(url(), *m_favicon_hash);
             m_session->history_store->update_favicon(url(), *m_favicon_hash);
         }
     }
@@ -4954,7 +4962,7 @@ void ViewImplementation::update_bookmark_action()
 {
     Application::the().update_bookmark_action_for_current_web_view();
 
-    auto is_bookmarked = Application::bookmark_store().is_bookmarked(url());
+    auto is_bookmarked = session().bookmark_store().is_bookmarked(url());
 
     m_toggle_bookmark_action->set_tooltip(is_bookmarked ? "Remove bookmark"sv : "Bookmark this page"sv);
     m_toggle_bookmark_action->set_engaged(is_bookmarked);
@@ -5189,30 +5197,32 @@ void ViewImplementation::initialize_context_menus()
     });
     m_inspect_element_action->set_visible(false);
 
-    auto add_bookmark_action = Action::create("Add Bookmark…"sv, ActionID::AddBookmark, []() {
+    auto add_bookmark_action = Action::create("Add Bookmark…"sv, ActionID::AddBookmark, [this]() {
         auto& application = Application::the();
 
         auto bookmark_id = application.bookmark_item_id_for_context_menu();
         if (!bookmark_id.has_value())
             return;
 
+        auto* store = &session().bookmark_store();
         application.display_add_bookmark_dialog(bookmark_id->target_folder_id)
-            ->when_resolved([](Application::BookmarkDialogResult result) {
+            ->when_resolved([store](Application::BookmarkDialogResult result) {
                 auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
-                Application::bookmark_store().add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), result.target_folder_id);
+                store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), result.target_folder_id);
             });
     });
-    auto add_bookmark_folder_action = Action::create("New Folder…"sv, ActionID::AddBookmarkFolder, []() {
+    auto add_bookmark_folder_action = Action::create("New Folder…"sv, ActionID::AddBookmarkFolder, [this]() {
         auto& application = Application::the();
 
         auto bookmark_id = application.bookmark_item_id_for_context_menu();
         if (!bookmark_id.has_value())
             return;
 
+        auto* store = &session().bookmark_store();
         application.display_add_bookmark_folder_dialog({}, bookmark_id->target_folder_id)
-            ->when_resolved([](Application::BookmarkDialogResult result) {
+            ->when_resolved([store](Application::BookmarkDialogResult result) {
                 auto& folder = result.data.get<BookmarkItem::Folder>();
-                Application::bookmark_store().add_folder(move(folder.title), result.target_folder_id);
+                store->add_folder(move(folder.title), result.target_folder_id);
             });
     });
 
@@ -5246,42 +5256,42 @@ void ViewImplementation::initialize_context_menus()
         }));
     }
     m_bookmark_context_menu->add_separator();
-    m_bookmark_context_menu->add_action(Action::create("Edit…"sv, ActionID::EditBookmark, []() {
+    m_bookmark_context_menu->add_action(Action::create("Edit…"sv, ActionID::EditBookmark, [this]() {
         auto& application = Application::the();
 
         auto bookmark_id = application.bookmark_item_id_for_context_menu();
         if (!bookmark_id.has_value())
             return;
 
-        auto current_bookmark = Application::bookmark_store().find_item_by_id(bookmark_id->id);
+        auto* store = &session().bookmark_store();
+        auto current_bookmark = store->find_item_by_id(bookmark_id->id);
         if (!current_bookmark.has_value() || !current_bookmark->is_bookmark())
             return;
 
         application.display_edit_bookmark_dialog(*current_bookmark, bookmark_id->parent_folder_id)
-            ->when_resolved([bookmark_id = bookmark_id.release_value()](Application::BookmarkDialogResult result) {
-                auto& store = Application::bookmark_store();
+            ->when_resolved([store, bookmark_id = bookmark_id.release_value()](Application::BookmarkDialogResult result) {
                 auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
-                store.edit_bookmark(bookmark_id.id, move(bookmark.url), move(bookmark.title));
+                store->edit_bookmark(bookmark_id.id, move(bookmark.url), move(bookmark.title));
                 if (bookmark_id.parent_folder_id != result.target_folder_id)
-                    store.move_item(bookmark_id.id, result.target_folder_id, NumericLimits<size_t>::max());
+                    store->move_item(bookmark_id.id, result.target_folder_id, NumericLimits<size_t>::max());
             });
     }));
-    m_bookmark_context_menu->add_action(Action::create("Copy Link"sv, ActionID::CopyURL, []() {
+    m_bookmark_context_menu->add_action(Action::create("Copy Link"sv, ActionID::CopyURL, [this]() {
         auto& application = Application::the();
 
         auto bookmark_id = application.bookmark_item_id_for_context_menu();
         if (!bookmark_id.has_value())
             return;
 
-        auto bookmark = Application::bookmark_store().find_item_by_id(bookmark_id->id);
+        auto bookmark = session().bookmark_store().find_item_by_id(bookmark_id->id);
         if (!bookmark.has_value() || !bookmark->is_bookmark())
             return;
 
         application.insert_clipboard_entry({ "text/plain"_string, url_text_to_copy(bookmark->bookmark().url) });
     }));
-    m_bookmark_context_menu->add_action(Action::create("Delete"sv, ActionID::DeleteBookmark, []() {
+    m_bookmark_context_menu->add_action(Action::create("Delete"sv, ActionID::DeleteBookmark, [this]() {
         if (auto bookmark_id = Application::the().bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-            Application::bookmark_store().remove_item(bookmark_id->id);
+            session().bookmark_store().remove_item(bookmark_id->id);
     }));
     m_bookmark_context_menu->add_separator();
     m_bookmark_context_menu->add_action(add_bookmark_folder_action);
@@ -5296,29 +5306,29 @@ void ViewImplementation::initialize_context_menus()
             application.open_bookmark_folder_in_new_tabs(bookmark_id->id);
     }));
     m_bookmark_folder_context_menu->add_separator();
-    m_bookmark_folder_context_menu->add_action(Action::create("Edit Folder…"sv, ActionID::EditBookmarkFolder, []() {
+    m_bookmark_folder_context_menu->add_action(Action::create("Edit Folder…"sv, ActionID::EditBookmarkFolder, [this]() {
         auto& application = Application::the();
 
         auto bookmark_id = application.bookmark_item_id_for_context_menu();
         if (!bookmark_id.has_value())
             return;
 
-        auto current_folder = Application::bookmark_store().find_item_by_id(bookmark_id->id);
+        auto* store = &session().bookmark_store();
+        auto current_folder = store->find_item_by_id(bookmark_id->id);
         if (!current_folder.has_value() || !current_folder->is_folder())
             return;
 
         application.display_edit_bookmark_folder_dialog(*current_folder, bookmark_id->parent_folder_id)
-            ->when_resolved([bookmark_id = bookmark_id.release_value()](Application::BookmarkDialogResult result) {
-                auto& store = Application::bookmark_store();
+            ->when_resolved([store, bookmark_id = bookmark_id.release_value()](Application::BookmarkDialogResult result) {
                 auto& folder = result.data.get<BookmarkItem::Folder>();
-                store.edit_folder(bookmark_id.id, move(folder.title));
+                store->edit_folder(bookmark_id.id, move(folder.title));
                 if (bookmark_id.parent_folder_id != result.target_folder_id)
-                    store.move_item(bookmark_id.id, result.target_folder_id, NumericLimits<size_t>::max());
+                    store->move_item(bookmark_id.id, result.target_folder_id, NumericLimits<size_t>::max());
             });
     }));
-    m_bookmark_folder_context_menu->add_action(Action::create("Delete Folder"sv, ActionID::DeleteBookmarkFolder, []() {
+    m_bookmark_folder_context_menu->add_action(Action::create("Delete Folder"sv, ActionID::DeleteBookmarkFolder, [this]() {
         if (auto bookmark_id = Application::the().bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-            Application::bookmark_store().remove_item(bookmark_id->id);
+            session().bookmark_store().remove_item(bookmark_id->id);
     }));
     m_bookmark_folder_context_menu->add_separator();
     m_bookmark_folder_context_menu->add_action(add_bookmark_action);
@@ -5802,31 +5812,33 @@ void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_
 
     if (prompt_for_path == PromptForPath::Yes && on_request_download_path) {
         // NB: The view may be gone by the time the user chooses, so the download keeps only what it needs.
+        auto profile_identity = session().profile_identity;
         on_request_download_path(Web::sanitize_suggested_download_filename(suggested_filename),
-            [url, is_private = is_private()](Optional<ByteString> path) {
+            [url, is_private = is_private(), profile_identity = move(profile_identity)](Optional<ByteString> path) {
                 if (!path.has_value())
                     return;
                 // NB: A file at a path the user chose was there when the user chose to replace it.
                 auto may_replace_destination = FileSystem::exists(*path)
                     ? FileDownloader::MayReplaceDestination::Yes
                     : FileDownloader::MayReplaceDestination::No;
-                Application::the().file_downloader().download_file(is_private, url, LexicalPath { path.release_value() }, may_replace_destination);
+                Application::the().file_downloader().download_file(is_private, profile_identity, url, LexicalPath { path.release_value() }, may_replace_destination);
             });
         return;
     }
 
     if (prompt_for_path == PromptForPath::No) {
         if (auto download_path = Application::the().default_path_for_downloaded_file(suggested_filename); !download_path.is_error())
-            Application::the().file_downloader().download_file(is_private(), url, download_path.release_value(), FileDownloader::MayReplaceDestination::No);
+            Application::the().file_downloader().download_file(is_private(), session().profile_identity, url, download_path.release_value(), FileDownloader::MayReplaceDestination::No);
         return;
     }
 
-    Application::the().path_for_downloaded_file(suggested_filename)->when_resolved([is_private = is_private(), url](auto const& download_path) {
+    auto profile_identity = session().profile_identity;
+    Application::the().path_for_downloaded_file(suggested_filename)->when_resolved([is_private = is_private(), profile_identity = move(profile_identity), url](auto const& download_path) {
         // NB: A file at a path the user chose was there when the user chose to replace it, as saving asks before replacing.
         auto may_replace_destination = FileSystem::exists(download_path.string())
             ? FileDownloader::MayReplaceDestination::Yes
             : FileDownloader::MayReplaceDestination::No;
-        Application::the().file_downloader().download_file(is_private, url, download_path, may_replace_destination);
+        Application::the().file_downloader().download_file(is_private, profile_identity, url, download_path, may_replace_destination);
     });
 }
 

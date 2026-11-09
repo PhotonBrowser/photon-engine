@@ -6,7 +6,10 @@
 
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BrowsingSession.h>
+#include <LibWebView/BookmarkStore.h>
+#include <AK/Debug.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/DownloadStore.h>
 #include <LibWebView/FaviconStore.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HistoryStore.h>
@@ -22,6 +25,19 @@ BrowsingSession::BrowsingSession(IsPrivate is_private)
 }
 
 BrowsingSession::~BrowsingSession() = default;
+
+BookmarkStore& BrowsingSession::bookmark_store() const
+{
+    if (m_shared_bookmark_store)
+        return *m_shared_bookmark_store;
+    VERIFY(owned_bookmark_store);
+    return *owned_bookmark_store;
+}
+
+void BrowsingSession::share_bookmark_store_with(BrowsingSession& session)
+{
+    m_shared_bookmark_store = &session.bookmark_store();
+}
 
 NonnullRefPtr<BrowsingSession> BrowsingSession::create(IsPrivate is_private)
 {

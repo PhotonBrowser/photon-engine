@@ -506,6 +506,7 @@ enum class DownloadStatus : uint8_t { InProgress,
 // A file the Engine saves for a page, in the profile's download list.
 struct Download {
     uint64_t id { 0 };
+    std::string profile_identity;
     std::string url;
     std::string path;
     DownloadStatus status { DownloadStatus::InProgress };
@@ -522,7 +523,7 @@ class PHOTONEMBEDDER_API Runtime {
 public:
     // Keeps cookies, site storage and the cache in `profile_path`. An empty
     // path uses a temporary profile that is removed on a clean shutdown.
-    static std::unique_ptr<Runtime> create(std::string const& helper_directory, std::string const& profile_path, std::string& error);
+    static std::unique_ptr<Runtime> create(std::string const& helper_directory, std::string const& profile_path, std::string const& default_browsing_profile_path, std::string& error);
     ~Runtime();
     Runtime(Runtime&&) noexcept;
     Runtime& operator=(Runtime&&) noexcept;
@@ -563,22 +564,23 @@ public:
     void resume_download(uint64_t id);
     void cancel_download(uint64_t id);
     // Removes finished, cancelled and failed downloads from the list.
-    void clear_inactive_downloads();
+    void clear_inactive_downloads(std::string const& profile_path);
+    void ensure_profile_session(std::string const& profile_path);
     // Use the host's system clipboard for copying and pasting.
     void set_clipboard(Clipboard);
     void set_external_apps(ExternalApps);
     // Deletes website data, then calls `done`.
-    void clear_browsing_data(ClearBrowsingData const&, std::function<void()> done);
+    void clear_browsing_data(ClearBrowsingData const&, std::string const& profile_path, std::function<void()> done);
     // Deletes the cookies and web storage of one site in the default profile: cookies for `host`, its subdomains and
     // the domains it shares cookies with, and the web storage of every origin on `host` or its subdomains, whatever
     // its scheme or port. IndexedDB keeps nothing past its page, so there is none to delete.
-    void clear_site_data(std::string const& host, std::function<void()> done);
-    // Lets pages from `host` load although its certificate cannot be verified, until the browser quits.
-    void allow_certificate_errors_for_host(std::string const& host);
-    // Calls `done` with the certificate `host` last presented, or nothing if Engine has not connected to it.
-    void peer_certificate(std::string const& host, std::function<void(std::optional<CertificateInfo> const&)> done);
+    void clear_site_data(std::string const& host, std::string const& profile_path, std::function<void()> done);
+    // Lets pages in this profile load `host` despite certificate errors until the browser quits.
+    void allow_certificate_errors_for_host(std::string const& profile_path, bool is_private, std::string const& host);
+    // Calls `done` with this profile's certificate for `host`, or nothing if it has not connected to it.
+    void peer_certificate(std::string const& profile_path, bool is_private, std::string const& host, std::function<void(std::optional<CertificateInfo> const&)> done);
     // A private view keeps nothing once it and the other private views close.
-    std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks, bool is_private = false);
+    std::unique_ptr<View> create_view(int width, int height, double device_pixel_ratio, ViewCallbacks, std::string const& profile_path, bool is_private = false);
     std::unique_ptr<View> create_view_for_traversable(View& opener, void* traversable, int width, int height, double device_pixel_ratio, ViewCallbacks);
 
 private:

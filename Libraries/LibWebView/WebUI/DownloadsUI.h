@@ -21,7 +21,7 @@ private:
 
     virtual void download_added(FileDownloader::Download const&) override;
     virtual void download_updated(FileDownloader::Download const&) override;
-    virtual void download_removed(u64, IsPrivate) override;
+    virtual void download_removed(u64, IsPrivate, StringView) override;
 
     void load_downloads();
     void prune_inactive_downloads();

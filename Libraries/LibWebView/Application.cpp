@@ -192,6 +192,11 @@ struct ApplicationPermissionManagerObserver final : public PermissionManagerObse
 struct ApplicationBookmarkStoreObserver final : public BookmarkStoreObserver {
     AK_ALLOC_WITH_KMALLOC;
 
+    ApplicationBookmarkStoreObserver()
+        : BookmarkStoreObserver(Application::bookmark_store())
+    {
+    }
+
     virtual void bookmarks_changed() override
     {
         Application::the().bookmarks_changed({});
@@ -359,6 +364,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     StringView stats_log_directory;
     Optional<StringView> profile_name;
     Optional<StringView> profile_path;
+    Optional<StringView> default_browsing_profile_path;
     bool temporary_profile = false;
     bool allow_popups = false;
     bool disable_scripting = false;
@@ -446,6 +452,19 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(profile_name, "Select or create a named profile", "profile", 0, "name");
     args_parser.add_option(profile_path, "Use a self-contained profile at an absolute path", "profile-path", 0, "path");
+    args_parser.add_option(Core::ArgsParser::Option {
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
+        .help_string = "Photon's default space browsing-data directory",
+        .long_name = "photon-default-browsing-profile-path",
+        .value_name = "path",
+        .accept_value = [&](StringView value) {
+            if (value.is_empty())
+                return false;
+            default_browsing_profile_path = value;
+            return true;
+        },
+        .hide_mode = Core::ArgsParser::OptionHideMode::CommandLineAndMarkdown,
+    });
     args_parser.add_option(temporary_profile, "Use a temporary profile that is removed on clean shutdown", "temporary-profile");
 #endif
     args_parser.add_option(allow_popups, "Disable popup blocking by default", "allow-popups");
@@ -650,6 +669,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     };
 
     create_platform_options(m_browser_options, m_request_server_options, m_web_content_options);
+    if (default_browsing_profile_path.has_value())
+        m_default_browsing_profile_path = default_browsing_profile_path->to_byte_string();
     TRY(create_profile(profile_name, profile_path, force_new_process, temporary_profile));
 
     // Browsers launched by WebDriver are driven directly and must never join an existing browser process. A browser
@@ -676,8 +697,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     auto platform_languages = m_web_content_options.is_test_mode == IsTestMode::Yes ? Vector<String> {} : platform_preferred_languages();
 
     m_settings = make<Settings>(Settings::create(LexicalPath::join(profile().paths().config, "Settings.json"sv).string(), move(platform_languages)));
-    m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(profile().paths().config, "Bookmarks.json"sv).string()));
-
     if (m_web_content_options.is_test_mode == IsTestMode::Yes) {
         TRY(m_settings->complete_first_run());
         m_settings->set_background_networking_enabled(false);
@@ -685,8 +704,11 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     }
 
     m_browser_options.urls = sanitize_urls(m_browser_options.raw_urls);
-    m_request_server_options.cache_path = profile().paths().cache;
-    m_web_content_options.cache_path = profile().paths().cache;
+    auto const& browsing_profile = m_default_browsing_profile.has_value()
+        ? *m_default_browsing_profile
+        : profile();
+    m_request_server_options.cache_path = browsing_profile.paths().cache;
+    m_web_content_options.cache_path = browsing_profile.paths().cache;
 
     m_content_blocker_lists_directory = LexicalPath::join(profile().paths().data, "ContentBlocking/Lists"sv).string();
     rebuild_content_blocker_list_paths();
@@ -777,12 +799,17 @@ ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> 
     profile_roots.data = LexicalPath { profile_roots.data }.parent().string();
     profile_roots.cache = LexicalPath { profile_roots.cache }.parent().string();
 #endif
+    m_profile_roots = profile_roots;
 
 #if defined(AK_OS_ANDROID)
     m_profile = TRY(Profile::create_legacy(profile_roots));
 #else
     m_profile = TRY(Profile::create(profile_selection, profile_roots));
 #endif
+    if (m_default_browsing_profile_path.has_value()) {
+        ProfileSelection browsing_profile_selection { .path = *m_default_browsing_profile_path };
+        m_default_browsing_profile = TRY(Profile::create(browsing_profile_selection, profile_roots));
+    }
 
     return {};
 }
@@ -1115,7 +1142,7 @@ void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
 
 void Application::open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab activate_tab) const
 {
-    auto bookmark = m_bookmark_store->find_item_by_id(bookmark_id);
+    auto bookmark = bookmark_store().find_item_by_id(bookmark_id);
     if (!bookmark.has_value() || !bookmark->is_bookmark())
         return;
 
@@ -1140,7 +1167,7 @@ static void collect_bookmark_urls(BookmarkItem::Folder const& folder, Vector<URL
 
 void Application::open_bookmark_folder_in_new_tabs(String const& folder_id) const
 {
-    auto folder = m_bookmark_store->find_item_by_id(folder_id);
+    auto folder = bookmark_store().find_item_by_id(folder_id);
     if (!folder.has_value() || !folder->is_folder())
         return;
 
@@ -1161,7 +1188,7 @@ void Application::open_bookmark_folder_in_new_tabs(String const& folder_id) cons
 
 void Application::open_bookmark_in_new_window(String const& bookmark_id, IsPrivate is_private)
 {
-    auto bookmark = m_bookmark_store->find_item_by_id(bookmark_id);
+    auto bookmark = bookmark_store().find_item_by_id(bookmark_id);
     if (!bookmark.has_value() || !bookmark->is_bookmark())
         return;
 
@@ -1258,10 +1285,123 @@ NonnullRefPtr<BrowsingSession> Application::session_for_new_view(IsPrivate is_pr
         return *session;
 
     auto session = BrowsingSession::create(IsPrivate::Yes);
+    session->share_bookmark_store_with(*the().m_default_session);
     session->permission_manager = PermissionManager::create_for_private_session(*the().m_default_session->permission_manager);
     session->permission_manager->register_observer(*the().m_permission_manager_observer);
     session->permission_manager->on_deadlines_changed = [] { the().schedule_permission_expiry(); };
     the().m_private_session = session;
+    return session;
+}
+
+void Application::for_each_profile_session(Function<void(BrowsingSession&)> callback)
+{
+    auto& application = the();
+    HashTable<BrowsingSession*> visited;
+    auto visit = [&](BrowsingSession& session) {
+        if (visited.set(&session) == HashSetResult::InsertedNewEntry)
+            callback(session);
+    };
+    if (application.m_default_session)
+        visit(*application.m_default_session);
+    for (auto& entry : application.m_profile_sessions)
+        visit(*entry.value);
+}
+
+ErrorOr<NonnullRefPtr<BrowsingSession>> Application::session_for_profile_path(StringView path, IsPrivate is_private)
+{
+    auto& application = the();
+    if (path.is_empty())
+        return session_for_new_view(is_private);
+
+    ProfileSelection selection { .path = path.to_byte_string() };
+    auto profile = TRY(Profile::create(selection, application.m_profile_roots));
+    auto identity = profile.paths().identity;
+
+    if (is_private == IsPrivate::Yes) {
+        if (identity == application.m_default_session->profile_identity) {
+            if (auto session = application.m_private_session.strong_ref())
+                return *session;
+
+            auto session = BrowsingSession::create(IsPrivate::Yes);
+            session->profile_identity = identity;
+            session->share_bookmark_store_with(*application.m_default_session);
+            session->permission_manager = PermissionManager::create_for_private_session(*application.m_default_session->permission_manager);
+            session->permission_manager->register_observer(*application.m_permission_manager_observer);
+            session->permission_manager->on_deadlines_changed = [] { the().schedule_permission_expiry(); };
+            application.m_private_session = session;
+            return session;
+        }
+
+        if (auto it = application.m_private_profile_sessions.find(identity); it != application.m_private_profile_sessions.end()) {
+            if (auto session = it->value.strong_ref())
+                return *session;
+        }
+
+        auto ordinary = TRY(session_for_profile_path(identity, IsPrivate::No));
+        auto session = BrowsingSession::create(IsPrivate::Yes);
+        session->profile_identity = identity;
+        session->share_bookmark_store_with(*ordinary);
+        session->permission_manager = PermissionManager::create_for_private_session(*ordinary->permission_manager);
+        session->permission_manager->register_observer(*application.m_permission_manager_observer);
+        session->permission_manager->on_deadlines_changed = [] { the().schedule_permission_expiry(); };
+        application.m_private_profile_sessions.set(identity, session);
+        return session;
+    }
+
+    if (auto it = application.m_profile_sessions.find(identity); it != application.m_profile_sessions.end())
+        return *it->value;
+
+    return application.create_profile_session(move(profile));
+}
+
+ErrorOr<NonnullRefPtr<BrowsingSession>> Application::create_profile_session(Profile&& profile)
+{
+    auto session = BrowsingSession::create(IsPrivate::No);
+    auto const& paths = profile.paths();
+    session->profile_identity = paths.identity;
+    session->cache_path = paths.cache;
+    session->owned_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(paths.config, "Bookmarks.json"sv).string()));
+    session->permission_manager = PermissionManager::create_for_ordinary_session(LexicalPath::join(paths.config, "Permissions.json"sv).string());
+    session->permission_manager->register_observer(*m_permission_manager_observer);
+    session->permission_manager->on_deadlines_changed = [this] { schedule_permission_expiry(); };
+
+    if (m_browser_options.disable_sql_database == DisableSQLDatabase::Yes) {
+        session->cookie_jar = CookieJar::create();
+        session->storage_jar = StorageJar::create();
+        session->hsts_store = HSTSStore::create();
+        session->favicon_store = FaviconStore::create();
+        session->history_store = HistoryStore::create_disabled();
+        session->session_store = SessionStore::create();
+        session->owned_download_store = DownloadStore::create_disabled();
+    } else {
+        auto database = TRY(Database::Database::create(paths.data, "Ladybird"sv));
+        auto history_database = TRY(Database::Database::create(paths.data, "History"sv));
+
+        if (TRY(CookieJar::migrate_schema(database)) != Database::MigrationOutcome::Success
+            || TRY(HSTSStore::migrate_schema(database)) != Database::MigrationOutcome::Success
+            || TRY(StorageJar::migrate_schema(database)) != Database::MigrationOutcome::Success
+            || TRY(DownloadStore::migrate_schema(database)) != Database::MigrationOutcome::Success)
+            return Error::from_string_literal("space browsing database could not be migrated");
+
+        session->cookie_jar = TRY(CookieJar::create(database));
+        session->hsts_store = TRY(HSTSStore::create(database));
+        session->storage_jar = TRY(StorageJar::create(database));
+        session->owned_download_store = TRY(DownloadStore::create(database));
+
+        if (TRY(FaviconStore::migrate_schema(history_database)) != Database::MigrationOutcome::Success
+            || TRY(HistoryStore::migrate_schema(history_database)) != Database::MigrationOutcome::Success)
+            return Error::from_string_literal("space history database could not be migrated");
+
+        session->favicon_store = TRY(FaviconStore::create(history_database));
+        session->history_store = TRY(HistoryStore::create(history_database));
+        session->session_store = SessionStore::create();
+    }
+
+    session->blob_url_store = make<BlobURLStore>();
+    m_profile_sessions.set(session->profile_identity, session);
+    m_file_downloader.adopt_download_store({}, session->profile_identity, *session->owned_download_store);
+    update_permission_defaults();
+    schedule_permission_expiry();
     return session;
 }
 
@@ -1767,14 +1907,20 @@ static void notify_devtools_of_storage_change(StorageJar& jar, StorageChange con
 
 ErrorOr<void> Application::launch_services()
 {
+    auto const& browsing_profile = m_default_browsing_profile.has_value()
+        ? *m_default_browsing_profile
+        : profile();
     m_default_session = BrowsingSession::create(IsPrivate::No);
+    m_default_session->profile_identity = browsing_profile.paths().identity;
+    m_default_session->cache_path = browsing_profile.paths().cache;
+    m_default_session->owned_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(browsing_profile.paths().config, "Bookmarks.json"sv).string()));
     StorageAreaRegistry::the().on_change_for_devtools = [this](StorageJar& jar, WebView::StorageChange const& change) {
         // Only an attached DevTools has anyone to tell, and the lookup below isn't free on a page's write path.
         if (m_devtools)
             notify_devtools_of_storage_change(jar, change);
     };
 
-    m_default_session->permission_manager = PermissionManager::create_for_ordinary_session(LexicalPath::join(profile().paths().config, "Permissions.json"sv).string());
+    m_default_session->permission_manager = PermissionManager::create_for_ordinary_session(LexicalPath::join(browsing_profile.paths().config, "Permissions.json"sv).string());
     m_permission_manager_observer = make<ApplicationPermissionManagerObserver>();
     m_default_session->permission_manager->register_observer(*m_permission_manager_observer);
     m_default_session->permission_manager->on_deadlines_changed = [this] { schedule_permission_expiry(); };
@@ -1796,7 +1942,7 @@ ErrorOr<void> Application::launch_services()
     bool should_remove_unreferenced_favicons = false;
 
     if (m_browser_options.disable_sql_database == DisableSQLDatabase::No) {
-        auto database_path = profile().paths().data;
+        auto database_path = browsing_profile.paths().data;
         history_database_directory = database_path;
 
         auto database = TRY(Database::Database::create(database_path, "Ladybird"sv));
@@ -1856,9 +2002,9 @@ ErrorOr<void> Application::launch_services()
             m_default_session->storage_jar = StorageJar::create();
 
         if (downloads_outcome == Database::MigrationOutcome::Success)
-            m_download_store = TRY(DownloadStore::create(database));
+            m_default_session->owned_download_store = TRY(DownloadStore::create(database));
         else
-            m_download_store = DownloadStore::create_disabled();
+            m_default_session->owned_download_store = DownloadStore::create_disabled();
 
         // The History database is shared by the favicon and history stores. Preflight both before applying either
         // migration so a database that is too new remains untouched.
@@ -1911,20 +2057,21 @@ ErrorOr<void> Application::launch_services()
         m_default_session->history_store = HistoryStore::create_disabled();
         m_default_session->hsts_store = HSTSStore::create();
         m_default_session->storage_jar = StorageJar::create();
-        m_download_store = DownloadStore::create_disabled();
+        m_default_session->owned_download_store = DownloadStore::create_disabled();
         m_default_session->session_store = SessionStore::create();
     }
 
     m_default_session->blob_url_store = make<BlobURLStore>();
 
     if (should_remove_unreferenced_favicons) {
-        auto referenced_hashes = m_bookmark_store->favicon_hashes();
+        auto referenced_hashes = bookmark_store().favicon_hashes();
         for (auto& hash : m_default_session->history_store->referenced_favicon_hashes())
             referenced_hashes.set(move(hash));
         m_default_session->favicon_store->remove_unreferenced_favicons(referenced_hashes);
     }
 
-    m_file_downloader.adopt_download_store({}, *m_download_store);
+    m_file_downloader.adopt_download_store({}, m_default_session->profile_identity, *m_default_session->owned_download_store);
+    m_profile_sessions.set(m_default_session->profile_identity, m_default_session);
 
     m_default_session->session_store->on_closed_units_changed = [this] {
         on_recently_closed_entries_changed();
@@ -1945,7 +2092,7 @@ ErrorOr<void> Application::launch_services()
 
     VERIFY(m_event_loop);
     m_autocomplete_service = make<AutocompleteService>(*m_event_loop, move(history_database_directory));
-    m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(*m_bookmark_store));
+    m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(bookmark_store()));
 
     // No need to monitor the system time zone if the TZ environment variable is set, as it overrides system preferences.
     if (!Core::Environment::has("TZ"sv)) {
@@ -2640,15 +2787,22 @@ NonnullRefPtr<Core::Promise<Application::BrowsingDataSizes>> Application::estima
 
 NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsingDataOptions const& options)
 {
+    return clear_browsing_data(options, *m_default_session);
+}
+
+NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsingDataOptions const& options, BrowsingSession& session)
+{
     RefPtr<Core::Promise<Empty>> promise;
     bool did_change_history = false;
 
     if (options.delete_cached_files == ClearBrowsingDataOptions::Delete::Yes) {
-        promise = m_request_server_manager->clear_cache(options.since);
+        promise = m_request_server_manager->clear_cache(options.since, &session);
 
         // FIXME: Maybe we should forward the "since" parameter to the WebContent process, but the in-memory cache is
         //        transient anyways, so just assuming they were all accessed in the last hour is fine for now.
-        ViewImplementation::for_each_view([](ViewImplementation& view) {
+        ViewImplementation::for_each_view([&](ViewImplementation& view) {
+            if (&view.session() != &session)
+                return IterationDecision::Continue;
             // FIXME: This should be promoted from a debug request to a proper endpoint.
             view.debug_request("clear-cache"sv);
             return IterationDecision::Continue;
@@ -2656,32 +2810,22 @@ NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsi
     }
 
     if (options.delete_history == ClearBrowsingDataOptions::Delete::Yes) {
-        m_default_session->history_store->remove_entries_accessed_since(options.since);
-        if (auto result = m_default_session->session_store->remove_entries_accessed_since(options.since); result.is_error())
+        session.history_store->remove_entries_accessed_since(options.since);
+        if (auto result = session.session_store->remove_entries_accessed_since(options.since); result.is_error())
             dbgln("Unable to remove closed session entries: {}", result.error());
-        if (auto private_session = m_private_session.strong_ref()) {
-            if (auto result = private_session->session_store->remove_entries_accessed_since(options.since); result.is_error())
-                dbgln("Unable to remove closed private session entries: {}", result.error());
-        }
         did_change_history = true;
     }
 
     if (options.delete_download_history == ClearBrowsingDataOptions::Delete::Yes)
-        m_file_downloader.remove_inactive_downloads_created_since(options.since);
+        m_file_downloader.remove_inactive_downloads_created_since(options.since, session.is_private(), session.profile_identity);
 
     if (options.delete_site_data == ClearBrowsingDataOptions::Delete::Yes) {
-        m_default_session->cookie_jar->expire_cookies_accessed_since(options.since);
-        m_default_session->storage_jar->remove_items_accessed_since(options.since);
-        m_default_session->hsts_store->remove_policies_observed_since(options.since);
-
-        if (auto private_session = m_private_session.strong_ref()) {
-            private_session->cookie_jar->expire_cookies_accessed_since(options.since);
-            private_session->storage_jar->remove_items_accessed_since(options.since);
-            private_session->hsts_store->remove_policies_observed_since(options.since);
-        }
+        session.cookie_jar->expire_cookies_accessed_since(options.since);
+        session.storage_jar->remove_items_accessed_since(options.since);
+        session.hsts_store->remove_policies_observed_since(options.since);
     }
 
-    if (did_change_history)
+    if (did_change_history && &session == m_default_session.ptr())
         on_recently_closed_entries_changed();
 
     if (!promise) {
@@ -2913,12 +3057,12 @@ void Application::initialize_actions()
 
         auto default_title = MUST(UnixDateTime::now().to_string("Saved Tabs %Y-%m-%d"sv));
         display_add_bookmark_folder_dialog(default_title)
-            ->when_resolved([this, bookmarks = move(bookmarks)](BookmarkDialogResult result) mutable {
+            ->when_resolved([bookmarks = move(bookmarks)](BookmarkDialogResult result) mutable {
                 auto& folder = result.data.get<BookmarkItem::Folder>();
-                auto folder_id = m_bookmark_store->add_folder(move(folder.title), result.target_folder_id);
+                auto folder_id = bookmark_store().add_folder(move(folder.title), result.target_folder_id);
 
                 for (auto& bookmark : bookmarks)
-                    m_bookmark_store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), folder_id);
+                    bookmark_store().add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), folder_id);
             });
     }));
 
@@ -3124,9 +3268,15 @@ void Application::schedule_permission_expiry()
         if (auto next = manager.next_deadline(); next.has_value() && (!deadline.has_value() || *next < *deadline))
             deadline = next;
     };
-    consider(*m_default_session->permission_manager);
+    for_each_profile_session([&](BrowsingSession& session) {
+        consider(*session.permission_manager);
+    });
     if (auto private_session = m_private_session.strong_ref())
         consider(*private_session->permission_manager);
+    for (auto& entry : m_private_profile_sessions) {
+        if (auto session = entry.value.strong_ref())
+            consider(*session->permission_manager);
+    }
 
     if (!deadline.has_value()) {
         if (m_permission_expiry_timer)
@@ -3137,9 +3287,15 @@ void Application::schedule_permission_expiry()
     auto delay = max(*deadline - UnixDateTime::now(), AK::Duration::zero());
     if (!m_permission_expiry_timer) {
         m_permission_expiry_timer = Core::Timer::create_single_shot(AK::Duration::zero(), [this] {
-            m_default_session->permission_manager->run_expiry();
+            for_each_profile_session([](BrowsingSession& session) {
+                session.permission_manager->run_expiry();
+            });
             if (auto private_session = m_private_session.strong_ref())
                 private_session->permission_manager->run_expiry();
+            for (auto& entry : m_private_profile_sessions) {
+                if (auto session = entry.value.strong_ref())
+                    session->permission_manager->run_expiry();
+            }
             schedule_permission_expiry();
         });
     }
@@ -3165,7 +3321,9 @@ void Application::notifications_policy_changed(Badge<ApplicationSettingsObserver
 void Application::update_os_location_authorization()
 {
     auto denied = m_geolocation_provider && m_geolocation_provider->authorization() == Core::GeolocationAuthorization::Denied;
-    m_default_session->permission_manager->set_os_denies_geolocation(denied);
+    for_each_profile_session([&](BrowsingSession& session) {
+        session.permission_manager->set_os_denies_geolocation(denied);
+    });
 }
 
 Core::GeolocationAuthorization Application::geolocation_authorization()
@@ -3182,8 +3340,10 @@ void Application::update_permission_defaults()
 {
     // NB: A private session reads its defaults from the ordinary one.
     auto state_for = [](bool sites_can_ask) { return sites_can_ask ? Web::Permissions::EffectiveState::Prompt : Web::Permissions::EffectiveState::Denied; };
-    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Geolocation, state_for(sites_can_ask_for_location()));
-    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Notifications, state_for(sites_can_ask_for_notifications()));
+    for_each_profile_session([&](BrowsingSession& session) {
+        session.permission_manager->set_global_default(Web::Permissions::PermissionName::Geolocation, state_for(sites_can_ask_for_location()));
+        session.permission_manager->set_global_default(Web::Permissions::PermissionName::Notifications, state_for(sites_can_ask_for_notifications()));
+    });
 }
 
 void Application::languages_changed(Badge<ApplicationSettingsObserver>)
@@ -3351,7 +3511,7 @@ void Application::download_content_blocker_list_if_needed(Badge<Application, Set
 void Application::update_bookmark_action_for_current_web_view()
 {
     auto view = active_web_view();
-    auto is_bookmarked = view.has_value() && m_bookmark_store->is_bookmarked(view->url());
+    auto is_bookmarked = view.has_value() && view->session().bookmark_store().is_bookmarked(view->url());
 
     m_toggle_bookmark_action->set_text(is_bookmarked ? "Remove Bookmark"sv : "Add Bookmark"sv);
     m_toggle_bookmark_action->set_engaged(is_bookmarked);
@@ -3370,7 +3530,7 @@ void Application::update_actions_for_active_web_view()
 void Application::bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>)
 {
     if (m_autocomplete_service)
-        m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(*m_bookmark_store));
+        m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(bookmark_store()));
     m_bookmarks_menu->shrink(m_bookmarks_menu_static_size);
     create_bookmark_menu_items();
     rebuild_bookmarks_menu();
@@ -3378,15 +3538,16 @@ void Application::bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>)
 
 void Application::toggle_bookmark_for_view(ViewImplementation& view)
 {
-    if (auto bookmark = m_bookmark_store->find_bookmark_by_url(view.url()); bookmark.has_value()) {
-        m_bookmark_store->remove_item(bookmark->id);
+    auto* store = &view.session().bookmark_store();
+    if (auto bookmark = store->find_bookmark_by_url(view.url()); bookmark.has_value()) {
+        store->remove_item(bookmark->id);
         return;
     }
 
     display_add_bookmark_dialog()
-        ->when_resolved([this](BookmarkDialogResult result) {
+        ->when_resolved([store](BookmarkDialogResult result) {
             auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
-            m_bookmark_store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), result.target_folder_id);
+            store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), result.target_folder_id);
         });
 }
 
@@ -3464,7 +3625,7 @@ void Application::create_bookmark_menu_items(Optional<MenuData> data)
     auto const& [menu, items, target_folder_id] = data.ensure([&]() -> MenuData {
         return {
             .menu = *m_bookmarks_menu,
-            .items = m_bookmark_store->root_items(),
+            .items = bookmark_store().root_items(),
             .target_folder_id = {},
         };
     });

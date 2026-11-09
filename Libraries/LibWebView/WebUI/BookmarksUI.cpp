@@ -8,9 +8,21 @@
 #include <LibCore/Promise.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BookmarkStore.h>
+#include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebUI/BookmarksUI.h>
 
 namespace WebView {
+
+NonnullRefPtr<BookmarksUI> BookmarksUI::create(WebContentClient& client, Web::PageId page_id, NonnullOwnPtr<IPC::Transport> transport, String host)
+{
+    return adopt_ref(*new BookmarksUI(client, page_id, move(transport), move(host)));
+}
+
+BookmarksUI::BookmarksUI(WebContentClient& client, Web::PageId page_id, NonnullOwnPtr<IPC::Transport> transport, String host)
+    : WebUI(client, page_id, move(transport), move(host))
+    , BookmarkStoreObserver(client.session().bookmark_store())
+{
+}
 
 void BookmarksUI::register_interfaces()
 {
@@ -41,7 +53,7 @@ void BookmarksUI::bookmarks_changed()
 
 void BookmarksUI::load_bookmarks()
 {
-    async_send_message("loadBookmarks"sv, Application::bookmark_store().serialize_items(*Application::default_session().favicon_store));
+    async_send_message("loadBookmarks"sv, client().session().bookmark_store().serialize_items(*client().session().favicon_store));
 }
 
 void BookmarksUI::move_item(JsonValue const& data)
@@ -56,7 +68,7 @@ void BookmarksUI::move_item(JsonValue const& data)
         return;
 
     auto target_folder_id = object.get_string("targetFolderId"sv);
-    Application::bookmark_store().move_item(*id, target_folder_id, *index);
+    client().session().bookmark_store().move_item(*id, target_folder_id, *index);
 }
 
 void BookmarksUI::new_folder(JsonValue const& data)
@@ -67,9 +79,10 @@ void BookmarksUI::new_folder(JsonValue const& data)
             target_folder_id = *folder_id;
     }
 
-    Application::the().display_add_bookmark_folder_dialog({}, target_folder_id)->when_resolved([](Application::BookmarkDialogResult result) {
+    auto* store = &client().session().bookmark_store();
+    Application::the().display_add_bookmark_folder_dialog({}, target_folder_id)->when_resolved([store](Application::BookmarkDialogResult result) {
         auto& folder = result.data.get<BookmarkItem::Folder>();
-        Application::bookmark_store().add_folder(move(folder.title), result.target_folder_id);
+        store->add_folder(move(folder.title), result.target_folder_id);
     });
 }
 
@@ -78,7 +91,7 @@ void BookmarksUI::import_bookmarks(JsonValue const& data)
     if (!data.is_array())
         return;
 
-    Application::bookmark_store().import_items(data.as_array());
+    client().session().bookmark_store().import_items(data.as_array());
 }
 
 void BookmarksUI::export_bookmarks(JsonValue const& data)
@@ -120,7 +133,7 @@ void BookmarksUI::show_context_menu(JsonValue const& data)
         return;
 
     if (auto id = object.get_string("id"sv); id.has_value()) {
-        auto item = Application::bookmark_store().find_item_by_id(*id);
+        auto item = client().session().bookmark_store().find_item_by_id(*id);
         auto target_folder_id = object.get_string("targetFolderId"sv);
         auto parent_folder_id = object.get_string("parentFolderId"sv);
 

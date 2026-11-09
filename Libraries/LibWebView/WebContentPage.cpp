@@ -2815,7 +2815,7 @@ Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentPag
         return { Optional<u64> {} };
 
     auto& file_downloader = Application::the().file_downloader();
-    auto download_id = file_downloader.start_download(client().is_private(), url, destination.release_value(), total_size);
+    auto download_id = file_downloader.start_download(client().is_private(), client().session().profile_identity, url, destination.release_value(), total_size);
     if (!is_download_in_progress(file_downloader, download_id))
         return { Optional<u64> {} };
 
@@ -2892,7 +2892,7 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
     }
 
     auto& file_downloader = Application::the().file_downloader();
-    auto download_id = file_downloader.adopt_download(client().is_private(), url, destination.release_value(), total_size, request_server_client_id, request_server_request_id, initial_data.bytes(),
+    auto download_id = file_downloader.adopt_download(client().is_private(), client().session().profile_identity, url, destination.release_value(), total_size, request_server_client_id, request_server_request_id, initial_data.bytes(),
         move(on_response_finished));
     if (!is_download_in_progress(file_downloader, download_id))
         return { Optional<u64> {} };
